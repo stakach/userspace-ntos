@@ -1,0 +1,36 @@
+# ntos-root — the userspace-ntos root task.
+#
+# The first component booted by the rust-micro microkernel. Today it is a boot
+# smoke-test; it will grow into the host for the NT Object Manager and the rest
+# of the NT executive personality. Built for the kernel's bare-metal target and
+# staged as the kernel's rootserver ELF by `scripts/run.sh`.
+#
+# Standalone workspace root so `cargo build` here never gets absorbed into the
+# rust-micro submodule's directory tree.
+[workspace]
+
+[package]
+name = "ntos-root"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-root"
+path = "src/main.rs"
+
+[dependencies]
+# The kernel's shared user-space ABI (syscalls, invocation helpers, BootInfo),
+# consumed from the rust-micro submodule — one source of truth, no re-hand-rolling.
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
