@@ -174,3 +174,27 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
 - The mock driver gained `set_pending_completion` (queue a completion delivered on
   the next `pump`); `force_pending` now applies to the data operations only, so a
   device still opens + closes normally.
+
+## Service mode — core (implemented, Milestone 7a — `nt-io-server`, `nt-io-client`)
+
+- The I/O service is split from its transport, mirroring the Object Manager.
+  `nt-io-server::IoServer<P>` wraps an `IoManager<P>` and exposes a
+  transport-agnostic `dispatch(client, opcode, in_buf, out_buf) -> IoReply`, plus
+  `connect` (register a client), `disconnect` (free its IRPs + files + close it,
+  spec §16.6 client side), and `pump` (drive pending completions).
+- **Inline buffer model (v0.1):** a request's variable data — an open path, write
+  bytes, IOCTL input — follows the fixed header in the request buffer; read / IOCTL
+  output is written into the reply buffer. Zero-copy registered SURT buffers
+  (`buffer_id`) are a later optimisation. Requests are decoded with
+  `bytemuck::try_pod_read_unaligned` + explicit slice bounds, so a malformed /
+  truncated request returns `STATUS_INVALID_PARAMETER` — never a panic (spec §23.3).
+- Opcodes wired: PING, OPEN (→ handle in `detail0`), READ, WRITE, DEVICE_CONTROL,
+  INTERNAL_CONTROL, CLEANUP, CLOSE, FLUSH, CANCEL (best-effort via the library's
+  race-safe cancel). QUERY/SET_INFORMATION are deferred.
+- `nt-io-client::IoClient<B>` is the ergonomic stub over a pluggable `Backend`
+  (encode request + inline payload, decode `IoReply`); it depends on neither the
+  server nor SURT. A `Direct` backend (in-process) drives full round-trips in tests.
+- Verified end-to-end (client stub → server dispatch → real `IoManager` + mock
+  driver): open by path + symlink, write→read loopback, echoing IOCTL, cleanup +
+  close (read-after-close → `INVALID_HANDLE`), malformed-request rejection, write on
+  a read-only handle → `ACCESS_DENIED`, and client disconnect closing its files.

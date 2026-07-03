@@ -90,6 +90,21 @@ impl<P: ObjectManagerPort> IoManager<P> {
         )
     }
 
+    /// Flush an open file's buffers (`IRP_MJ_FLUSH_BUFFERS`, spec §17.1).
+    pub fn flush(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
+        let (file_id, device_id) = self.reference_open_file(client, handle, AccessMask::empty())?;
+        let mut empty: [u8; 0] = [];
+        self.build_and_dispatch_sync(
+            client,
+            device_id,
+            Some(file_id),
+            major::IRP_MJ_FLUSH_BUFFERS,
+            IoParameters::FlushBuffers,
+            &mut empty,
+        )
+        .map(|_| ())
+    }
+
     // --- shared request path (used by read/write/device-control) -----------
 
     /// Reference a File by handle for `client` (access-checked via the Object

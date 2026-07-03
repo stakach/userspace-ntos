@@ -1,0 +1,27 @@
+[package]
+name = "nt-io-server"
+description = "Transport-agnostic NT I/O Manager service dispatcher: decode/validate wire requests and drive the I/O Manager (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std", "nt-types/std", "nt-io-manager/std"]
+# In-process Object Manager adapter (for integration tests / library mode).
+object-manager = ["nt-io-manager/object-manager"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-types = { workspace = true }
+nt-io-abi = { workspace = true }
+nt-io-manager = { workspace = true }
+bytemuck = { version = "1", default-features = false }
+
+[dev-dependencies]
+nt-io-client = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
