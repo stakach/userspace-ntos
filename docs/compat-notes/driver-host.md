@@ -246,3 +246,22 @@ runs in a seL4 user-space component**, calling back into the Rust NT runtime.
 - Scope: step 1 = real `DriverEntry` + IAT callbacks; step 2 = IRP dispatch into the
   driver. Step 3 = isolate over the SURT `DH_OP_*` transport to a separate I/O
   Manager component. v0.1 uses RWX + a hard-coded cookie RVA + one driver.
+
+## Isolated Driver Host component (implemented, Milestone 9 step 3a — `components/driver-host-svc`)
+
+The real Windows driver runs inside a **fully-isolated seL4 component** (its own
+CSpace + VSpace), so a driver fault is contained to the child, not the broker.
+
+- A broker root task spawns one isolated child. The child's VSpace adds, over the
+  usual cap-transfer layout: an RW `STATE_VADDR` page for the driver-runtime state
+  (the child's image `.bss` is mapped **read-only** — a mutable static there `#PF`s,
+  which was the first fault), and a fresh RWX region at `CODE_VADDR` (its own
+  PDPT/PD/PT) for the driver image.
+- The child copies `SurtTest.sys` into the RWX region, patches its IAT to native
+  `extern "win64"` NT export stubs, seeds the `/GS` cookie, calls `DriverEntry`, and
+  drives `IRP_MJ_CREATE` + `IOCTL_SURT_PING`/`GET_VERSION`/`ECHO` into the driver's
+  dispatch routines — reporting the pass count to the broker over an endpoint.
+- Verified in QEMU: 9/9 PASS (real `DriverEntry` + full IRP dispatch in the isolated
+  child). `./scripts/run-driver-host-svc.sh`.
+- Scope: 3a = real driver in an isolated, fault-contained child. 3b = drive the IRPs
+  from a *separate* component over the SURT `DH_OP_*` transport.

@@ -1,0 +1,30 @@
+# The Driver Host as an ISOLATED seL4 component: a broker rootserver spawns a
+# child with its own CSpace + VSpace that maps the real SurtTest.sys executable
+# and runs it. Phase 3a proves real-driver execution inside an isolated child
+# (fault-contained); 3b drives IRPs over the SURT DH_OP_* transport.
+[workspace]
+
+[package]
+name = "ntos-driver-host-svc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host-svc"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
