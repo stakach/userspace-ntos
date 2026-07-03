@@ -13,9 +13,11 @@
 
 extern crate alloc;
 
+mod handles;
 mod store;
 mod types;
 
+pub use handles::{ClientKind, ClientRegistry, HandleTable};
 pub use store::{ObjectRef, ObjectStore};
 pub use types::{
     ComponentId, DeleteFn, DirectoryBody, EventBody, ObjectBody, ObjectType, ObjectTypeDef,
@@ -23,7 +25,9 @@ pub use types::{
 };
 
 use nt_status::NtStatus;
-use nt_types::{ObjectId, ObjectTypeId};
+use nt_types::{
+    AccessMask, AccessMode, ClientId, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId,
+};
 
 /// The library-mode Object Manager (spec §11). Owns the object store and the
 /// type registry; grows handle tables + namespace in later milestones.
@@ -31,6 +35,7 @@ use nt_types::{ObjectId, ObjectTypeId};
 pub struct ObjectManager {
     store: ObjectStore,
     types: TypeRegistry,
+    clients: ClientRegistry,
 }
 
 impl ObjectManager {
@@ -39,6 +44,7 @@ impl ObjectManager {
         Self {
             store: ObjectStore::new(),
             types: TypeRegistry::new(),
+            clients: ClientRegistry::new(),
         }
     }
 
@@ -76,6 +82,57 @@ impl ObjectManager {
     pub fn live_object_count(&self) -> usize {
         self.store.live_count()
     }
+
+    // --- Clients + handles (Milestone 3) -----------------------------------
+
+    /// Register a connected client, returning its id.
+    pub fn register_client(&mut self, kind: ClientKind, access_mode: AccessMode) -> ClientId {
+        self.clients.register(kind, access_mode)
+    }
+
+    /// Close a client: close all its handles (dropping their references) and
+    /// retire its id. Objects still referenced elsewhere survive.
+    pub fn close_client(&mut self, client: ClientId) -> Result<(), NtStatus> {
+        self.clients.close(client)
+    }
+
+    /// Open a handle to `object` for `client` with `granted_access`. Increments
+    /// the object's handle + pointer counts (the handle holds a strong reference).
+    pub fn open_handle(
+        &mut self,
+        client: ClientId,
+        object: &ObjectRef,
+        granted_access: AccessMask,
+        attributes: ObjAttrFlags,
+    ) -> Result<HandleValue, NtStatus> {
+        self.clients
+            .open_handle(client, object.clone(), granted_access, attributes)
+    }
+
+    /// Reference an object by handle (spec §11.5). Enforces `expected_type`
+    /// (`STATUS_OBJECT_TYPE_MISMATCH`) and that `desired_access` is within the
+    /// handle's granted access (`STATUS_ACCESS_DENIED`). Returns a new counted
+    /// reference. A stale/unknown handle yields `STATUS_INVALID_HANDLE`.
+    pub fn reference_by_handle(
+        &self,
+        client: ClientId,
+        handle: HandleValue,
+        expected_type: Option<ObjectTypeId>,
+        desired_access: AccessMask,
+    ) -> Result<ObjectRef, NtStatus> {
+        self.clients
+            .reference_by_handle(client, handle, expected_type, desired_access)
+    }
+
+    /// Close a handle in `client`'s table (decrements handle + pointer counts).
+    pub fn close_handle(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
+        self.clients.close_handle(client, handle)
+    }
+
+    /// Number of open handles held by `client` (debug / tests).
+    pub fn open_handle_count(&self, client: ClientId) -> Result<usize, NtStatus> {
+        self.clients.open_handle_count(client)
+    }
 }
 
 #[cfg(test)]
@@ -85,16 +142,27 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use nt_types::{AccessMask, GenericMapping, UnicodeString};
+    use nt_types::{
+        AccessMask, AccessMode, ClientId, GenericMapping, HandleValue, ObjAttrFlags, ObjectId,
+        ObjectTypeId, UnicodeString,
+    };
     use proptest::prelude::*;
 
-    fn type_def(delete: Option<DeleteFn>) -> ObjectTypeDef {
+    fn named_type_def(name: &'static str, delete: Option<DeleteFn>) -> ObjectTypeDef {
         ObjectTypeDef {
-            name: "Test",
+            name,
             valid_access: AccessMask::GENERIC_ALL,
             generic_mapping: GenericMapping::default(),
             delete,
         }
+    }
+
+    fn type_def(delete: Option<DeleteFn>) -> ObjectTypeDef {
+        named_type_def("Test", delete)
+    }
+
+    fn test_client(om: &mut ObjectManager) -> ClientId {
+        om.register_client(ClientKind::Test, AccessMode::UserMode)
     }
 
     fn opaque() -> ObjectBody {
@@ -281,6 +349,212 @@ mod tests {
                 prop_assert_eq!(refs[0].pointer_count(), refs.len());
                 prop_assert!(om.reference_by_id(id).is_ok());
                 prop_assert_eq!(om.live_object_count(), 1);
+            }
+        }
+    }
+
+    // --- Milestone 3: handles -----------------------------------------------
+
+    #[test]
+    fn open_handle_bumps_counts_and_close_decrements() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(type_def(None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om.create_object(ty, opaque()).unwrap();
+        assert_eq!(obj.pointer_count(), 1);
+        assert_eq!(obj.handle_count(), 0);
+
+        let h = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        assert_eq!(obj.pointer_count(), 2); // creator ref + handle
+        assert_eq!(obj.handle_count(), 1);
+        assert_eq!(om.open_handle_count(client).unwrap(), 1);
+
+        om.close_handle(client, h).unwrap();
+        assert_eq!(obj.pointer_count(), 1);
+        assert_eq!(obj.handle_count(), 0);
+        assert_eq!(om.open_handle_count(client).unwrap(), 0);
+
+        // closing again is a stale handle
+        assert_eq!(
+            om.close_handle(client, h).unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn reference_by_handle_roundtrip() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(type_def(None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om.create_object(ty, opaque()).unwrap();
+        let id = obj.id();
+        let h = om
+            .open_handle(
+                client,
+                &obj,
+                AccessMask::GENERIC_READ,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+        let r = om
+            .reference_by_handle(client, h, Some(ty), AccessMask::GENERIC_READ)
+            .unwrap();
+        assert_eq!(r.id(), id);
+    }
+
+    #[test]
+    fn stale_handle_rejected_after_close_and_reuse() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(type_def(None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om.create_object(ty, opaque()).unwrap();
+
+        let h1 = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        om.close_handle(client, h1).unwrap();
+        assert_eq!(
+            om.reference_by_handle(client, h1, None, AccessMask::empty())
+                .unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+
+        let h2 = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        assert_eq!(h2.slot(), h1.slot()); // reused slot
+        assert_ne!(h2.generation(), h1.generation()); // generation bumped
+        assert_eq!(
+            om.reference_by_handle(client, h1, None, AccessMask::empty())
+                .unwrap_err(),
+            NtStatus::INVALID_HANDLE // old handle stays stale
+        );
+        assert!(om
+            .reference_by_handle(client, h2, None, AccessMask::empty())
+            .is_ok());
+    }
+
+    #[test]
+    fn per_client_isolation() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(type_def(None)).unwrap();
+        let a = test_client(&mut om);
+        let b = test_client(&mut om);
+        let obj = om.create_object(ty, opaque()).unwrap();
+        let h = om
+            .open_handle(a, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+
+        // B cannot use A's handle value.
+        assert_eq!(
+            om.reference_by_handle(b, h, None, AccessMask::empty())
+                .unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(om.close_handle(b, h).unwrap_err(), NtStatus::INVALID_HANDLE);
+        // A can.
+        assert!(om
+            .reference_by_handle(a, h, None, AccessMask::empty())
+            .is_ok());
+    }
+
+    #[test]
+    fn type_mismatch_and_access_denied() {
+        let mut om = ObjectManager::new();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let dir = om.register_type(named_type_def("Directory", None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        let h = om
+            .open_handle(
+                client,
+                &obj,
+                AccessMask::GENERIC_READ,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            om.reference_by_handle(client, h, Some(dir), AccessMask::GENERIC_READ)
+                .unwrap_err(),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+        assert_eq!(
+            om.reference_by_handle(client, h, Some(ev), AccessMask::GENERIC_WRITE)
+                .unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
+        assert!(om
+            .reference_by_handle(client, h, Some(ev), AccessMask::GENERIC_READ)
+            .is_ok());
+    }
+
+    #[test]
+    fn client_death_closes_handles() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(type_def(None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om.create_object(ty, opaque()).unwrap();
+        let id = obj.id();
+        let _h = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        assert_eq!(obj.pointer_count(), 2);
+        assert_eq!(obj.handle_count(), 1);
+
+        om.close_client(client).unwrap();
+        assert_eq!(obj.handle_count(), 0);
+        assert_eq!(obj.pointer_count(), 1); // handle ref dropped; creator survives
+
+        // The client id is retired.
+        assert_eq!(
+            om.open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+                .unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+
+        // The object dies once the creator drops it.
+        drop(obj);
+        assert_eq!(
+            om.reference_by_id(id).unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
+    }
+
+    proptest! {
+        /// `handle_count` equals the number of open handles; each open handle
+        /// holds a strong reference (so `pointer_count` = 1 creator + open
+        /// handles); every open handle resolves and closed ones do not.
+        #[test]
+        fn handle_count_tracks_open_handles(ops in prop::collection::vec(any::<bool>(), 0..64)) {
+            let mut om = ObjectManager::new();
+            let ty = om.register_type(type_def(None)).unwrap();
+            let client = test_client(&mut om);
+            let obj = om.create_object(ty, opaque()).unwrap();
+            let mut open: Vec<HandleValue> = Vec::new();
+
+            for do_open in ops {
+                if do_open {
+                    let h = om
+                        .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+                        .unwrap();
+                    open.push(h);
+                } else if let Some(h) = open.pop() {
+                    om.close_handle(client, h).unwrap();
+                }
+            }
+
+            prop_assert_eq!(obj.handle_count(), open.len());
+            prop_assert_eq!(obj.pointer_count(), 1 + open.len());
+            prop_assert_eq!(om.open_handle_count(client).unwrap(), open.len());
+            for h in &open {
+                prop_assert!(om
+                    .reference_by_handle(client, *h, Some(ty), AccessMask::GENERIC_ALL)
+                    .is_ok());
             }
         }
     }

@@ -67,3 +67,21 @@ No proprietary NT source is copied; only documented semantics are reproduced.
 - `create_object` returns the initial reference (`pointer_count == 1`); dropping
   the last `ObjectRef` dereferences and deletes. Named creation, handles, and
   access checks are layered on in Milestones 3–6.
+
+## Handles (implemented, Milestone 3 — `handles.rs`)
+
+- Handles are **per-client**: each client has its own `HandleTable` (a
+  generation-protected slot map, same scheme as the object store). A
+  `HandleValue` from one client never resolves in another's table.
+- An open handle holds a **strong `ObjectRef`**, so it counts toward the object's
+  `pointer_count` (keeping it alive) and increments `handle_count`. `close_handle`
+  decrements `handle_count` and drops the reference (which may delete the object).
+  Closed/reused/foreign handles resolve to `STATUS_INVALID_HANDLE`.
+- `reference_by_handle` enforces the expected type
+  (`STATUS_OBJECT_TYPE_MISMATCH`) and that the requested access is within the
+  handle's **granted access** (`STATUS_ACCESS_DENIED`). The granted access is
+  supplied at `open_handle` for now; the access *check* that computes it from
+  desired-vs-valid (+ generic mapping) lands in Milestone 6.
+- **Client death** (`close_client`) closes all of the client's handles
+  (decrementing counts, dropping references) and retires the `ClientId` (not
+  reused in v0.1, so ids never alias). Objects referenced elsewhere survive.
