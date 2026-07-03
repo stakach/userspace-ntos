@@ -18,3 +18,21 @@ must be real Driver-Host memory), and connects an ISR on vector 5; a
   `HalMapIoSpaceReq` (40B), `HalUnmapIoSpaceReq`, `HalConnectInterruptReq` (opaque
   ISR `*_token` fields — no raw pointers cross SURT, spec §6.2/§16.3),
   `HalDisconnectInterruptReq`, `HalInjectInterruptReq`. Static layout tests.
+
+## Resource Manager (implemented, Milestone 11.2 — `nt-resource-manager`)
+
+- `ResourceManager` is the canonical assignment store (spec §7/§8/§9). `no_std` +
+  `alloc`, works purely in physical addresses + opaque IDs — no driver code, no raw
+  pointers (spec §16).
+- `with_mmio_test_fixture(owner)` builds the `MmioInterruptTest` static fixture
+  (memory phys `0x1000_0000` len `0x1000` RW non-cached; exclusive level-sensitive
+  interrupt vector 5).
+- `map_io_space` succeeds only if `[phys, phys+len)` lies within a memory resource
+  **assigned to that owner**, not revoked, with read rights (spec §6.1) — else
+  `NotAssigned`/`OutOfRange`/`WrongOwner`/`Revoked`/`AccessDenied`. `unmap_io_space`
+  invalidates by `mapping_id`; a re-unmap (stale ID) fails.
+- `connect_interrupt` is exclusive (second connect → `AlreadyConnected`), ownership-
+  checked; `disconnect_interrupt` invalidates the ID. `inject_vector`/
+  `inject_interrupt` resolve a connected interrupt to its Driver-Host callback
+  tokens (dropped after disconnect). `revoke_host` cleans up all mappings +
+  interrupts for a faulted host (spec §15.1). 6 unit tests (§18.1/§18.4).
