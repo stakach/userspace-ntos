@@ -66,6 +66,10 @@ pub const SCRATCH_VADDR: u64 = 0x0000_0100_005F_C000; // broker-only (its own VS
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
+
+/// Read/write **non-executable** — the rights for the component's data
+/// regions (stack, heap, rings, buffers); only legitimate code is executable.
+const RW_NX: u64 = 3 | PAGE_EXECUTE_NEVER;
 pub const REP_DATA_LEN: usize = 4096;
 const QLEN: u32 = 8;
 
@@ -173,19 +177,19 @@ unsafe fn build_component_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64
     for i in 0..allocator::HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, /* RW */ 3, pml4);
+        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, /* RW */ RW_NX, pml4);
     }
     // Private stack — read/write.
     for i in 0..STACK_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, STACK_BASE + i * 0x1000, /* RW */ 3, pml4);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, /* RW */ RW_NX, pml4);
     }
     // Shared SURT rings + data frames — read/write, same vaddrs in both peers.
-    let _ = page_map(sub, SUB_RING_VADDR, 3, pml4);
-    let _ = page_map(comp, COMP_RING_VADDR, 3, pml4);
-    let _ = page_map(req, REQ_DATA_VADDR, 3, pml4);
-    let _ = page_map(rep, REP_DATA_VADDR, 3, pml4);
+    let _ = page_map(sub, SUB_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(comp, COMP_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(req, REQ_DATA_VADDR, RW_NX, pml4);
+    let _ = page_map(rep, REP_DATA_VADDR, RW_NX, pml4);
     pml4
 }
 
@@ -212,7 +216,7 @@ unsafe fn spawn_component(
     let pml4 = build_component_vspace(sub, comp, req, rep);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
-    let _ = page_map(ipcbuf, IPCBUF_VADDR, 3, pml4);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
     let cnode = build_component_cnode();
     seed_cnode(cnode, CT_PML4, pml4);
     for &(slot, src) in seeds {
