@@ -1,0 +1,24 @@
+[package]
+name = "nt-driver-host"
+description = "Orchestrates loading a WDM .sys into a Driver Host: PE map + relocate, IAT patch to export trampolines, DRIVER_OBJECT + RegistryPath projections, the DriverEntry call gate, and dispatch-table capture. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-status = { path = "../nt-status" }
+nt-kernel-abi = { path = "../nt-kernel-abi" }
+nt-pe-loader = { path = "../nt-pe-loader" }
+nt-compat-exports = { path = "../nt-compat-exports" }
+nt-driver-runtime = { path = "../nt-driver-runtime" }
+
+[dev-dependencies]
+nt-driver-test-fixtures = { path = "../nt-driver-test-fixtures" }
+nt-pe-loader = { path = "../nt-pe-loader" }
+nt-kernel-abi = { path = "../nt-kernel-abi" }
+nt-driver-runtime = { path = "../nt-driver-runtime" }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

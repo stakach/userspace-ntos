@@ -104,3 +104,24 @@ isolated user-space component and completing IRPs through the I/O Manager. See
   (raise/lower + invalid-transition counter) and a `PKEVENT`-keyed `EventTable`
   (init/set/clear/reset with previous-state), tracked runtime-side. 134 workspace
   tests.
+
+## DriverEntry call gate (implemented, Milestone 5 — `nt-driver-host`)
+
+- Orchestrates the v0.1 load path (spec §9): `DriverHost::load` parses the `.sys`
+  with `nt-pe-loader`, resolves **every** import against the export set and fails
+  with `BlockedImports` before any execution (§9 step 5), maps + relocates the
+  image, patches each IAT slot to a bound export trampoline (§9 steps 7–8), and
+  creates the `DRIVER_OBJECT` + UTF-16 `RegistryPath` projections in the runtime.
+- `DriverHost::start` calls `DriverEntry` through a `DriverEntryGate` and captures
+  the `MajorFunction` dispatch table + `DriverUnload` the driver installed; on a
+  failure `NTSTATUS` it cleans up the partial projections (retires them) and marks
+  the driver `Failed` (§9 failure path).
+- **The call gate is abstracted** (spec §8.1): `MockGate<F>` runs a Rust closure so
+  host tests exercise the gate + capture + cleanup logic without executing x64 code
+  (this build host is aarch64); `Win64Gate` (cfg `x86_64`) transmutes the mapped
+  entry point to an `extern "win64" fn(u64, u64) -> i32` and calls it — the real
+  path, proven in QEMU (M9). The single `unsafe` block carries a `SAFETY:` note.
+- Verified: a synthetic driver importing supported exports loads (3 trampolines
+  bound + IAT patched), a mock `DriverEntry` installs CREATE/CLOSE/DEVICE_CONTROL +
+  unload and the host captures them, an `IoConnectInterrupt` import blocks the load,
+  and a failing `DriverEntry` retires the projections. 138 workspace tests.
