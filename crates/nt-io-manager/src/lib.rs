@@ -15,6 +15,7 @@ mod device;
 mod driver;
 mod file;
 mod irp;
+mod object_port;
 mod store;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
@@ -28,7 +29,11 @@ pub use irp::{
     IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, ReadWriteParameters,
     StackControl, StackFlags,
 };
+pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use store::{GenStore, IoId};
+
+#[cfg(feature = "object-manager")]
+pub use object_port::ObjectManagerLibraryPort;
 
 // Re-export the canonical id types so downstream crates get them from one place.
 pub use nt_io_abi::{DeviceId, DriverId, FileId, IoRequestId, IrpId};
@@ -350,5 +355,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Object Manager port (Milestone 3) ---------------------------------
+
+    #[test]
+    fn mock_port_device_open_and_symlink() {
+        let mut port = MockObjectPort::new();
+        // Create a named device + a DOS-devices symlink to it.
+        let dev = port
+            .create_device_object(Some(&path("\\Device\\Test0")), 100)
+            .unwrap();
+        port.create_symbolic_link(&path("\\??\\Test0"), &path("\\Device\\Test0"))
+            .unwrap();
+
+        // Open by direct path and via the symlink both resolve to the device.
+        assert_eq!(port.open_device_object(&path("\\Device\\Test0")), Ok(dev));
+        assert_eq!(port.open_device_object(&path("\\??\\Test0")), Ok(dev));
+        assert_eq!(
+            port.open_device_object(&path("\\Device\\Missing")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert!(port.reference_device(dev).is_ok());
+    }
+
+    #[test]
+    fn mock_port_file_handle_lifecycle() {
+        let mut port = MockObjectPort::new();
+        let client = port.register_client();
+        let dev = port
+            .create_device_object(Some(&path("\\Device\\Test0")), 1)
+            .unwrap();
+
+        let (file, handle) = port
+            .create_file_object_and_handle(client, dev, 7, AccessMask::GENERIC_READ)
+            .unwrap();
+
+        // Reference within granted access succeeds; beyond it is denied.
+        assert_eq!(
+            port.reference_file_by_handle(client, handle, AccessMask::GENERIC_READ),
+            Ok(file)
+        );
+        assert_eq!(
+            port.reference_file_by_handle(client, handle, AccessMask::GENERIC_WRITE),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        // Another client cannot use this handle.
+        let other = port.register_client();
+        assert_eq!(
+            port.reference_file_by_handle(other, handle, AccessMask::GENERIC_READ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        // Close makes it stale.
+        assert!(port.close_handle(client, handle).is_ok());
+        assert_eq!(
+            port.reference_file_by_handle(client, handle, AccessMask::GENERIC_READ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
+    #[test]
+    fn mock_port_bad_device_and_symlink_errors() {
+        let mut port = MockObjectPort::new();
+        let client = port.register_client();
+        // File-and-handle against an unknown device object fails.
+        assert_eq!(
+            port.create_file_object_and_handle(client, ObjectId(999), 1, AccessMask::empty()),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        // reference_device rejects a non-device id.
+        assert_eq!(
+            port.reference_device(ObjectId(999)),
+            Err(NtStatus::OBJECT_TYPE_MISMATCH)
+        );
+        // Duplicate symlink + delete of a missing link.
+        port.create_symbolic_link(&path("\\??\\A"), &path("\\Device\\A"))
+            .unwrap();
+        assert_eq!(
+            port.create_symbolic_link(&path("\\??\\A"), &path("\\Device\\A")),
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+        );
+        assert!(port.delete_symbolic_link(&path("\\??\\A")).is_ok());
+        assert_eq!(
+            port.delete_symbolic_link(&path("\\??\\A")),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
+    #[cfg(feature = "object-manager")]
+    #[test]
+    fn library_port_against_real_object_manager() {
+        use nt_object_manager::ComponentId;
+
+        let mut port = ObjectManagerLibraryPort::new(ComponentId(0x10)).unwrap();
+        let client = port.register_client();
+
+        // IoCreateDevice-style: \Driver\Test + \Device\Test0, then \??\Test0 link.
+        port.create_driver_object(&path("\\Driver\\Test"), 1)
+            .unwrap();
+        let dev = port
+            .create_device_object(Some(&path("\\Device\\Test0")), 100)
+            .unwrap();
+        port.create_symbolic_link(&path("\\??\\Test0"), &path("\\Device\\Test0"))
+            .unwrap();
+
+        // Open by direct path + via the symlink both resolve to the device.
+        assert_eq!(port.open_device_object(&path("\\Device\\Test0")), Ok(dev));
+        assert_eq!(port.open_device_object(&path("\\??\\Test0")), Ok(dev));
+
+        // Brokered file+handle, then reference it back for the client.
+        let (file, handle) = port
+            .create_file_object_and_handle(client, dev, 7, AccessMask::GENERIC_READ)
+            .unwrap();
+        assert_eq!(
+            port.reference_file_by_handle(client, handle, AccessMask::GENERIC_READ),
+            Ok(file)
+        );
+        assert!(port.reference_device(dev).is_ok());
+        assert!(port.close_handle(client, handle).is_ok());
     }
 }

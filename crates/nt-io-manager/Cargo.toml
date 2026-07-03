@@ -11,11 +11,14 @@ authors.workspace = true
 default = ["alloc"]
 alloc = []
 std = ["alloc", "nt-status/std", "nt-types/std"]
+# In-process adapter driving the real Object Manager (library mode).
+object-manager = ["dep:nt-object-manager"]
 
 [dependencies]
 nt-status = { workspace = true }
 nt-types = { workspace = true }
 nt-io-abi = { workspace = true }
+nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 
 [dev-dependencies]

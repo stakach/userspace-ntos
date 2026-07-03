@@ -53,3 +53,28 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   APIs (with Object Manager integration) arrive in M3+. A store proptest asserts
   live ids resolve, removed ids stay stale, and counts stay consistent over random
   insert/remove sequences.
+
+## Object Manager integration (implemented, Milestone 3 — `object_port.rs`)
+
+- **`ObjectManagerPort`** is the trait through which the I/O Manager reaches the
+  Object Manager (spec §8): register/close a client, create Driver/Device objects,
+  resolve a device path (following symlinks), create/delete symbolic links, the
+  brokered **create-File-object-and-handle-for-a-client** (§8.4), reference a File
+  by handle for a client (access-checked), reference a Device, and close a handle.
+  The I/O Manager never owns identity/names/handles — it only keeps the returned
+  `ObjectId`s/`HandleValue`s.
+- **`MockObjectPort`** — an in-memory fake (assigns object ids + handles, tracks
+  named devices/drivers, symlinks, and per-client handles, exact + symlink path
+  resolution). Unblocks host tests of the dispatch/open/read/write paths (M4-M6).
+- **`ObjectManagerLibraryPort`** (feature `object-manager`, deps `nt-object-manager`)
+  — the real in-process adapter (library mode: I/O Manager + Object Manager share a
+  node). It maps the trait onto the actual OM: `create_driver`/`create_device`/
+  `create_file` + `open_handle` + `reference_by_handle`/`reference_by_id` +
+  `create_symbolic_link`/`remove_named_object` + `lookup_path` (splitting a full NT
+  path into parent-dir + leaf). Tested against a real bootstrapped `ObjectManager`:
+  create `\Driver\Test` + `\Device\Test0`, link `\??\Test0`, open by both paths,
+  brokered file+handle, reference back for the client.
+- The brokered "create object + handle for a target client" (§8.4) is satisfied by
+  composing OM `create_file` + `open_handle` in the adapter; no new OM opcode was
+  needed for library mode. A service-mode executive path (over SURT) is deferred to
+  the client-facing server milestone.
