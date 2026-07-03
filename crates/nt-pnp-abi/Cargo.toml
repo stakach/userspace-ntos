@@ -1,0 +1,11 @@
+[package]
+name = "nt-pnp-abi"
+description = "SURT/service ABI for the NT PnP Manager: opcodes, devnode + device-instance IDs, the v0.1 devnode state enum, PnP IRP major/minor function constants, and fixed-layout request/response structs. no_std, no allocation, no seL4 dependency, no raw pointers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
