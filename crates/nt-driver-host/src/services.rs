@@ -9,7 +9,7 @@
 use alloc::string::String;
 
 use nt_driver_runtime::{DriverRuntime, ObjectKind};
-use nt_kernel_abi::{device_flags, GuestAddr, UnicodeString};
+use nt_kernel_abi::{device_flags, GuestAddr, Irp, UnicodeString};
 use nt_status::NtStatus;
 
 const STATUS_SUCCESS: i32 = 0;
@@ -184,6 +184,29 @@ impl<'a> DriverServices<'a> {
             None => return STATUS_INVALID_PARAMETER,
         };
         self.bridge.delete_symbolic_link(&link).raw()
+    }
+
+    // --- IRP dispatch exports (spec §10) -----------------------------------
+
+    /// `IoGetCurrentIrpStackLocation` — the current stack location of `irp`.
+    pub fn io_get_current_irp_stack_location(&self, irp: GuestAddr) -> GuestAddr {
+        if self.runtime.validate(irp, ObjectKind::Irp).is_none() {
+            return GuestAddr::NULL;
+        }
+        self.runtime
+            .arena()
+            .read::<Irp>(irp)
+            .map(|i| i.current_stack_location)
+            .unwrap_or(GuestAddr::NULL)
+    }
+
+    /// `IoCompleteRequest` / `IofCompleteRequest` — complete `irp` exactly once
+    /// (spec §10.2), reading the `IoStatus` the driver set.
+    pub fn io_complete_request(&mut self, irp: GuestAddr) -> i32 {
+        match self.runtime.complete_irp(irp) {
+            Ok(_) => STATUS_SUCCESS,
+            Err(_) => STATUS_INVALID_PARAMETER,
+        }
     }
 
     // --- RtlInitUnicodeString ----------------------------------------------

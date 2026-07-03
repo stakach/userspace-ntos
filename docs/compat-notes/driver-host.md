@@ -150,3 +150,28 @@ isolated user-space component and completing IRPs through the I/O Manager. See
   I/O Manager then **opens the device by symlink** — plus a bogus `DriverObject`
   pointer is rejected and the canonical `DeviceId` lands in the local projection.
   140 workspace tests.
+
+## IRP dispatch end-to-end (implemented, Milestone 7 — `nt-driver-host` dispatch)
+
+- The other direction of the driver path (spec §10): the I/O Manager dispatches an
+  IRP, the loaded driver's `MajorFunction[major]` runs, and the IRP completes.
+- `DriverHost::dispatch_irp(gate, bridge, req, io_buffer)` (a `DH_OP_DISPATCH_IRP`):
+  resolves the local `DEVICE_OBJECT` from the canonical `DeviceId`, checks the
+  captured dispatch table, stages `io_buffer` into a `SystemBuffer`, builds the
+  local `IRP` + `IO_STACK_LOCATION` (major/minor/device + `DeviceIoControl`
+  parameters), calls `MajorFunction[major]` through the dispatch gate, and returns
+  `Completed` / `Pending` / `Failed`. On completion the driver's `SystemBuffer`
+  output is mirrored back (`METHOD_BUFFERED`, spec §12).
+- The dispatch gate mirrors the entry gate: `MockDispatchGate<F>` runs a Rust
+  closure (host tests); `Win64Gate::call_dispatch` transmutes the captured routine
+  to an `extern "win64" fn(PDEVICE_OBJECT, PIRP)` (real path, QEMU/M9).
+- Exports: `io_get_current_irp_stack_location` (reads `Irp.CurrentStackLocation`)
+  and `io_complete_request` / `IofCompleteRequest`. Completion is tracked in the
+  runtime and enforced **exactly once** (spec §10.2) — a second completion, an
+  unknown IRP, or a non-IRP address all fail.
+- Verified: `IRP_MJ_CREATE`/`CLOSE`/`DEVICE_CONTROL` reach the driver, the buffered
+  echo of `"ping"` round-trips, double-completion + unknown-IRP completion are
+  rejected, and — end to end over the **real `nt-io-manager`** — a client `open` by
+  symlink reaches the driver's CREATE and `device_control` echoes `"ping"` back
+  through the loaded driver (a `DriverHostBackend` bridging the I/O Manager's
+  `DriverDispatchBackend` to `dispatch_irp`). 143 workspace tests.

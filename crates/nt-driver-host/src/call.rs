@@ -38,9 +38,39 @@ where
     }
 }
 
-/// The real gate: calls the mapped driver's entry point under the Microsoft x64
-/// calling convention. Only available on x86_64 (the loaded code is x64). The
-/// driver reaches kernel services through its import trampolines, not `services`.
+/// The arguments to a driver dispatch routine call — `MajorFunction[major]`.
+#[derive(Copy, Clone, Debug)]
+pub struct DispatchInvoke {
+    /// Address of the dispatch routine (`MajorFunction[major]`).
+    pub routine: u64,
+    /// Guest address of the target `DEVICE_OBJECT` projection.
+    pub device_object: GuestAddr,
+    /// Guest address of the `IRP` projection.
+    pub irp: GuestAddr,
+}
+
+/// A gate that invokes a driver dispatch routine `Dispatch(DeviceObject, Irp)`
+/// under the Microsoft x64 ABI (spec §8.1, §10.1 step 7).
+pub trait DriverDispatchGate {
+    fn call_dispatch(&self, inv: DispatchInvoke, services: &mut DriverServices) -> i32;
+}
+
+/// A host/test dispatch gate backed by a Rust closure.
+pub struct MockDispatchGate<F>(pub F);
+
+impl<F> DriverDispatchGate for MockDispatchGate<F>
+where
+    F: Fn(&DispatchInvoke, &mut DriverServices) -> i32,
+{
+    fn call_dispatch(&self, inv: DispatchInvoke, services: &mut DriverServices) -> i32 {
+        (self.0)(&inv, services)
+    }
+}
+
+/// The real gate: calls the mapped driver's entry point / dispatch routine under
+/// the Microsoft x64 calling convention. Only available on x86_64 (the loaded
+/// code is x64). The driver reaches kernel services through its import
+/// trampolines, not `services`.
 #[cfg(target_arch = "x86_64")]
 pub struct Win64Gate;
 
@@ -55,6 +85,20 @@ impl DriverEntryGate for Win64Gate {
             let f: extern "win64" fn(u64, u64) -> i32 =
                 core::mem::transmute(ctx.entry_point as *const ());
             f(ctx.driver_object.0, ctx.registry_path.0)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DriverDispatchGate for Win64Gate {
+    fn call_dispatch(&self, inv: DispatchInvoke, _services: &mut DriverServices) -> i32 {
+        // SAFETY: `routine` is a captured `MajorFunction[major]` entry the driver
+        // installed in its (validated, mapped, executable) image; it takes
+        // `(PDEVICE_OBJECT, PIRP)` under the Microsoft x64 ABI (spec §8.1).
+        unsafe {
+            let f: extern "win64" fn(u64, u64) -> i32 =
+                core::mem::transmute(inv.routine as *const ());
+            f(inv.device_object.0, inv.irp.0)
         }
     }
 }

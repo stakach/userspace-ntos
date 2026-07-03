@@ -13,12 +13,16 @@
 extern crate alloc;
 
 mod call;
+mod dispatch;
 mod load;
 mod services;
 
 #[cfg(target_arch = "x86_64")]
 pub use call::Win64Gate;
-pub use call::{DriverEntryGate, EntryContext, MockGate};
+pub use call::{
+    DispatchInvoke, DriverDispatchGate, DriverEntryGate, EntryContext, MockDispatchGate, MockGate,
+};
+pub use dispatch::{DispatchRequest, DispatchResult};
 pub use services::{
     BridgeCreateDevice, BridgeDeviceIds, DriverServices, IoManagerBridge, NullBridge,
 };

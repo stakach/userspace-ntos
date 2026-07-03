@@ -51,6 +51,24 @@ impl UnloadReport {
     }
 }
 
+/// Why an `IoCompleteRequest` failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CompleteError {
+    /// The IRP was already completed (double completion, spec §10.2).
+    AlreadyCompleted,
+    /// The address is not a tracked in-flight IRP.
+    UnknownIrp,
+    /// The IRP projection could not be read.
+    BadIrp,
+}
+
+struct IrpTrack {
+    addr: GuestAddr,
+    completed: bool,
+    status: i32,
+    information: u64,
+}
+
 /// The driver-local runtime.
 pub struct DriverRuntime {
     arena: Arena,
@@ -59,6 +77,7 @@ pub struct DriverRuntime {
     irql: Irql,
     events: EventTable,
     driver_object: Option<GuestAddr>,
+    irp_tracks: Vec<IrpTrack>,
 }
 
 impl DriverRuntime {
@@ -71,7 +90,60 @@ impl DriverRuntime {
             irql: Irql::default(),
             events: EventTable::new(),
             driver_object: None,
+            irp_tracks: Vec::new(),
         }
+    }
+
+    // --- IRP completion tracking (spec §10.2) ------------------------------
+
+    /// Begin tracking `irp` as in-flight (before calling the dispatch routine).
+    pub fn track_irp(&mut self, irp: GuestAddr) {
+        if !self.irp_tracks.iter().any(|t| t.addr == irp) {
+            self.irp_tracks.push(IrpTrack {
+                addr: irp,
+                completed: false,
+                status: 0,
+                information: 0,
+            });
+        }
+    }
+
+    /// `IoCompleteRequest`: read `irp`'s `IoStatus` + mark it complete **exactly
+    /// once**. A second completion, an unknown IRP, or a non-IRP address fails.
+    pub fn complete_irp(&mut self, irp: GuestAddr) -> Result<(i32, u64), CompleteError> {
+        if self.objects.find_kind(irp, ObjectKind::Irp).is_none() {
+            return Err(CompleteError::UnknownIrp);
+        }
+        let record: Irp = self.arena.read(irp).ok_or(CompleteError::BadIrp)?;
+        let status = record.io_status.status;
+        let information = record.io_status.information;
+        match self.irp_tracks.iter_mut().find(|t| t.addr == irp) {
+            Some(t) if t.completed => Err(CompleteError::AlreadyCompleted),
+            Some(t) => {
+                t.completed = true;
+                t.status = status;
+                t.information = information;
+                Ok((status, information))
+            }
+            None => Err(CompleteError::UnknownIrp),
+        }
+    }
+
+    /// The `(status, information)` of `irp` if it has completed.
+    pub fn irp_completion(&self, irp: GuestAddr) -> Option<(i32, u64)> {
+        self.irp_tracks
+            .iter()
+            .find(|t| t.addr == irp && t.completed)
+            .map(|t| (t.status, t.information))
+    }
+
+    pub fn is_irp_completed(&self, irp: GuestAddr) -> bool {
+        self.irp_tracks.iter().any(|t| t.addr == irp && t.completed)
+    }
+
+    /// Stop tracking a finished IRP.
+    pub fn untrack_irp(&mut self, irp: GuestAddr) {
+        self.irp_tracks.retain(|t| t.addr != irp);
     }
 
     pub fn arena(&self) -> &Arena {
