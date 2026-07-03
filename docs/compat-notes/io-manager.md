@@ -198,3 +198,23 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   driver): open by path + symlink, write→read loopback, echoing IOCTL, cleanup +
   close (read-after-close → `INVALID_HANDLE`), malformed-request rejection, write on
   a read-only handle → `ACCESS_DENIED`, and client disconnect closing its files.
+
+## Service mode — isolated components over SURT (implemented, Milestone 7b — `components/io-manager`)
+
+- The on-kernel form of the I/O service: client and server run as **two
+  fully-isolated seL4 components** (own CSpaces + VSpaces), sharing only SURT ring
+  frames a broker (the rootserver) creates + transfers — the exact cap-transfer
+  machinery + broker from `components/object-service`, with the I/O server/client
+  swapped in.
+- The **server component embeds an in-process Object Manager**
+  (`ObjectManagerLibraryPort`, library mode) plus a mock driver, and registers
+  `\Driver\Test` / `\Device\Test0` / `\??\Test0` before serving. `IoServer::dispatch`
+  and `IoClient` are reused **unchanged**; only the SURT transport is new. `SurtSqe`
+  (opcode + a request-frame slice) is an I/O request; `SurtCqe` is an `IoReply`
+  field-for-field.
+- Verified in QEMU: **7/7 ops** (ping, open by symlink, write, read loopback,
+  echoing IOCTL, cleanup, close) pass across the isolation boundary, no `#PF`, clean
+  exit. `./scripts/run-io-manager.sh` builds + boots it.
+- Heap is 256 KiB (the server holds both an I/O Manager and an Object Manager).
+  Scope: one client ↔ one server, single request in flight, a mock driver. A real
+  Driver Host peer over SURT is M8.
