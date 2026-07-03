@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod dpc;
 mod event;
+mod interrupt;
 mod irql;
 mod runtime;
 mod spin;
@@ -22,6 +23,7 @@ mod work_item;
 
 pub use dpc::{DpcImportance, DpcQueue};
 pub use event::{EventKind, EventStore, WaitResult};
+pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use spin::{SpinError, SpinLockTable};

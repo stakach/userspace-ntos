@@ -108,3 +108,17 @@ IoCreateDevice with a device extension). Driver callbacks run via a win64 gate w
 **no runtime borrow held** across the call (`take_ready`/`finish_callback`, spec §17),
 so the callback can re-enter the runtime. Verified in QEMU: all async paths complete
 with the correct value + IRQL (bad-IRQL count 0, spec §20 quality gate).
+
+## Simulated interrupt bridge (implemented, Milestone 10.7 — `nt-kernel-exec::interrupt`)
+
+- `InterruptTable` (spec §11): a `KINTERRUPT` keyed by the driver's pointer.
+  `connect` = `IoConnectInterrupt[Ex]` (ISR `KSERVICE_ROUTINE`, service context,
+  vector, synthetic DIRQL); `disconnect` = `IoDisconnectInterrupt[Ex]`;
+  `find_vector` resolves the ISR bound to a vector.
+- `KernelExecRuntime::inject_interrupt(vector)` runs the spec §11 simulated flow:
+  raise to the synthetic DIRQL and return the ISR (`ReadyIsr`). The Driver Host runs
+  the `KSERVICE_ROUTINE` (no runtime borrow held, §17) — the top half typically
+  queues a DPC bottom-half — then `finish_isr` lowers the IRQL and the DPC queue
+  drains at `DISPATCH_LEVEL`. Real seL4 IRQ notifications arrive in the later
+  HAL/device-resource milestone. 2 tests (connect/find/disconnect; ISR→DPC bottom
+  half). 29 `nt-kernel-exec` unit tests total.

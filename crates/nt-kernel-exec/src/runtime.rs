@@ -5,6 +5,7 @@
 
 use crate::dpc::DpcQueue;
 use crate::event::EventStore;
+use crate::interrupt::{InterruptTable, ReadyIsr};
 use crate::irql::{IrqlState, DISPATCH_LEVEL, PASSIVE_LEVEL};
 use crate::spin::SpinLockTable;
 use crate::timer::{Clock, TimerQueue};
@@ -43,6 +44,7 @@ pub struct KernelExecRuntime<C: Clock> {
     events: EventStore,
     work: WorkQueue,
     spin: SpinLockTable,
+    interrupts: InterruptTable,
     clock: C,
 }
 
@@ -57,12 +59,16 @@ impl<C: Clock> KernelExecRuntime<C> {
             events: EventStore::new(),
             work: WorkQueue::new(work_handle_base),
             spin: SpinLockTable::new(),
+            interrupts: InterruptTable::new(),
             clock,
         }
     }
 
     pub fn irql(&mut self) -> &mut IrqlState {
         &mut self.irql
+    }
+    pub fn interrupts(&mut self) -> &mut InterruptTable {
+        &mut self.interrupts
     }
     pub fn dpc(&mut self) -> &mut DpcQueue {
         &mut self.dpc
@@ -166,6 +172,28 @@ impl<C: Clock> KernelExecRuntime<C> {
         self.irql.lower(PASSIVE_LEVEL);
     }
 
+    /// Simulated interrupt injection (spec §11): find the ISR connected to
+    /// `vector`, raise to its synthetic DIRQL, and return it. The caller runs the
+    /// `KSERVICE_ROUTINE` with no runtime borrow held (spec §17) — it typically
+    /// queues a DPC bottom-half — then calls [`Self::finish_isr`] to lower the IRQL,
+    /// after which the DPC queue is drained. Returns `None` if no ISR is connected.
+    pub fn inject_interrupt(&mut self, vector: u32) -> Option<ReadyIsr> {
+        let (service_routine, interrupt, service_context, dirql) =
+            self.interrupts.find_vector(vector)?;
+        self.irql.raise(dirql);
+        Some(ReadyIsr {
+            service_routine,
+            interrupt,
+            service_context,
+            dirql,
+        })
+    }
+
+    /// Lower the IRQL back to `PASSIVE_LEVEL` after an injected ISR returns.
+    pub fn finish_isr(&mut self) {
+        self.irql.lower(PASSIVE_LEVEL);
+    }
+
     /// Drain point after a driver dispatch returns (spec §7.3).
     pub fn on_after_driver_dispatch(&mut self, invoker: &mut dyn DriverCallbackInvoker) -> usize {
         self.drain_ready(invoker, 4096)
@@ -239,6 +267,34 @@ mod tests {
         rt.drain_ready(&mut inv, 100);
         assert_eq!(inv.work_ran, 1);
         assert_eq!(inv.last_work_irql, PASSIVE_LEVEL);
+    }
+
+    #[test]
+    fn simulated_interrupt_isr_queues_dpc_bottom_half() {
+        use crate::interrupt::SYNTHETIC_DIRQL;
+        let mut rt = KernelExecRuntime::new(FakeClock::new(), 0x9000);
+        // Driver connects an ISR for vector 0x30.
+        rt.interrupts()
+            .connect(0x17, 0x15E, 0xC7, 0x30, SYNTHETIC_DIRQL);
+
+        // Inject the interrupt: runtime raises to the synthetic DIRQL + hands back
+        // the ISR to run.
+        let isr = rt.inject_interrupt(0x30).unwrap();
+        assert_eq!(isr.service_routine, 0x15E);
+        assert!(rt.irql().current() >= SYNTHETIC_DIRQL); // top-half context
+        assert!(!rt.irql().can_wait()); // can't block in an ISR
+
+        // The ISR (simulated) requests a DPC bottom-half.
+        rt.dpc().initialize(0xD1, 0x808, 0);
+        rt.dpc().insert(0xD1, 0, 0);
+
+        // ISR returns → lower IRQL → drain the DPC (bottom half) at DISPATCH.
+        rt.finish_isr();
+        assert_eq!(rt.irql().current(), PASSIVE_LEVEL);
+        let mut inv = TestInvoker::default();
+        rt.drain_ready(&mut inv, 10);
+        assert_eq!(inv.dpc_ran, 1);
+        assert_eq!(inv.last_dpc_irql, DISPATCH_LEVEL);
     }
 
     #[test]
