@@ -93,3 +93,32 @@ teardown/revoke (disconnect unbinds + masks; revoke staleness; host-fault cleanu
   into an isolated `hal-service` component over SURT (`nt-hal-server`/`nt-hal-client`)
   is the next step toward the capability-backed real-hardware model; the wire ABI
   (`nt-hal-abi`) and the design above are already in place for it.
+
+## SURT HAL service isolation (implemented, Milestone 11.4 — `hal-svc`)
+
+The `hal-svc` broker spawns **two fully-isolated seL4 components** (own CSpace +
+VSpace) — a Driver Host (loads `MmioInterruptTest.sys`) and a HAL service (hosts the
+Resource Manager + owns the register bank) — sharing a SURT ring pair + a **shared
+MMIO frame**. This realises the spec's isolation topology (§4, §16): the service is
+the authority; the Driver Host holds no resource authority of its own.
+
+- HAL requests ride the SURT `SurtSqe` `arg0..arg3` fields directly (no data frame):
+  `MmMapIoSpace` → `HAL_OP_MAP_IO_SPACE(phys, len, cache)` → CQE `detail0` =
+  `mapping_id`; `IoConnectInterrupt` → `HAL_OP_CONNECT_INTERRUPT(resource_id,
+  routine_token, context_token, vector)` → `detail0` = `interrupt_id`;
+  `IoDisconnectInterrupt`; `MmUnmapIoSpace`.
+- **Register access** is inlined in the driver, so `MmMapIoSpace` returns the shared
+  frame's vaddr and the driver dereferences it directly — the frame is the same
+  physical page the HAL service writes (the "real hardware = device frame cap" model,
+  §16.1, with an anonymous frame standing in for the device frame).
+- **Injection** (spec §9.4, §11.1): the Driver Host sends `HAL_OP_INJECT_INTERRUPT`;
+  the service asserts the device line in the shared frame and returns the connected
+  ISR's **opaque tokens** (`detail0`/`detail1`); the Driver Host runs the ISR
+  **locally** at the device IRQL, then drains the DPC — the service never calls
+  driver code (§16.3). DPC / ISR / spin-lock / completion run in a private
+  `nt-kernel-exec` runtime on the Driver Host's RW state page.
+- Verified in QEMU (10/10) across the address-space boundary: map/connect/read/
+  wait/inject→ISR→DPC→complete/count/disconnect, no callback at the wrong IRQL.
+
+This closes the last substantive item of Milestone 11: the Resource + Interrupt
+Managers now run isolated, exactly as the seL4 IRQ bridge design (§11.8) anticipated.

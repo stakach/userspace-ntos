@@ -1,0 +1,36 @@
+# The HAL service isolated over SURT: a broker rootserver spawns a Driver Host
+# child (loads MmioInterruptTest.sys) and a HAL service child (Resource Manager +
+# simulated device). They share SURT rings + a shared MMIO frame; the Driver Host's
+# HAL exports round-trip to the service, which validates + injects. (Milestone 11.4.)
+[workspace]
+
+[package]
+name = "ntos-hal-svc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-hal-svc"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-hal-abi = { path = "../../crates/nt-hal-abi" }
+nt-resource-manager = { path = "../../crates/nt-resource-manager" }
+nt-register-access = { path = "../../crates/nt-register-access" }
+nt-sim-device = { path = "../../crates/nt-sim-device" }
+nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
