@@ -3,6 +3,7 @@
 //! with the event-loop drain hooks (spec §7.3) that run deferred driver callbacks
 //! at deterministic points.
 
+use crate::completion::{CancelResult, CompleteResult, CompletionTracker};
 use crate::dpc::DpcQueue;
 use crate::event::EventStore;
 use crate::interrupt::{InterruptTable, ReadyIsr};
@@ -45,6 +46,7 @@ pub struct KernelExecRuntime<C: Clock> {
     work: WorkQueue,
     spin: SpinLockTable,
     interrupts: InterruptTable,
+    completion: CompletionTracker,
     clock: C,
 }
 
@@ -60,6 +62,7 @@ impl<C: Clock> KernelExecRuntime<C> {
             work: WorkQueue::new(work_handle_base),
             spin: SpinLockTable::new(),
             interrupts: InterruptTable::new(),
+            completion: CompletionTracker::new(),
             clock,
         }
     }
@@ -69,6 +72,25 @@ impl<C: Clock> KernelExecRuntime<C> {
     }
     pub fn interrupts(&mut self) -> &mut InterruptTable {
         &mut self.interrupts
+    }
+    pub fn completion(&mut self) -> &mut CompletionTracker {
+        &mut self.completion
+    }
+
+    /// `IoMarkIrpPending` for a local projected IRP.
+    pub fn mark_irp_pending(&mut self, irp: u64, request_id: u64) {
+        self.completion.mark_pending(irp, request_id);
+    }
+
+    /// Complete a pending IRP exactly once (spec §20). A double-complete — or a
+    /// completion racing a prior cancel — is dropped.
+    pub fn complete_irp(&mut self, irp: u64, status: i32, information: u64) -> CompleteResult {
+        self.completion.complete(irp, status, information)
+    }
+
+    /// Conservatively cancel a pending IRP (spec §12); loses to a published completion.
+    pub fn cancel_irp(&mut self, irp: u64) -> CancelResult {
+        self.completion.cancel(irp)
     }
     pub fn dpc(&mut self) -> &mut DpcQueue {
         &mut self.dpc

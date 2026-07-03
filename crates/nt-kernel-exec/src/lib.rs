@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+mod completion;
 mod dpc;
 mod event;
 mod interrupt;
@@ -21,6 +22,7 @@ mod spin;
 mod timer;
 mod work_item;
 
+pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dpc::{DpcImportance, DpcQueue};
 pub use event::{EventKind, EventStore, WaitResult};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};

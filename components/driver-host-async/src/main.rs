@@ -21,7 +21,10 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::boxed::Box;
-use nt_kernel_exec::{EventKind, FakeClock, KernelExecRuntime, ReadyCallback, DISPATCH_LEVEL};
+use nt_kernel_exec::{
+    CancelResult, CompleteResult, EventKind, FakeClock, KernelExecRuntime, ReadyCallback,
+    DISPATCH_LEVEL,
+};
 use nt_pe_loader::{ImportRef, PeFile};
 use sel4_rt::*;
 
@@ -106,6 +109,7 @@ struct DhState {
     dpc_runs: u32,
     timer_runs: u32,
     work_runs: u32,
+    double_complete_rejected: u32,
 }
 
 static mut DH: DhState = DhState {
@@ -120,6 +124,7 @@ static mut DH: DhState = DhState {
     dpc_runs: 0,
     timer_runs: 0,
     work_runs: 0,
+    double_complete_rejected: 0,
 };
 
 fn dh() -> &'static mut DhState {
@@ -215,9 +220,20 @@ extern "win64" fn ntos_iof_complete_request(irp: *const u8, _priority: i8) {
     }
     // SAFETY: `irp` is an IRP we built; IoStatus.Status@48, .Information@56.
     unsafe {
-        dh().last_status = core::ptr::read_unaligned(irp.add(48) as *const i32);
-        dh().last_info = core::ptr::read_unaligned(irp.add(56) as *const u64);
-        dh().completed = true;
+        let status = core::ptr::read_unaligned(irp.add(48) as *const i32);
+        let information = core::ptr::read_unaligned(irp.add(56) as *const u64);
+        // Route through the exactly-once completion guard (spec §7.7, §20): a
+        // double-complete (or one racing a cancel) is dropped, not published.
+        match rt().complete_irp(irp as u64, status, information) {
+            CompleteResult::Completed => {
+                dh().last_status = status;
+                dh().last_info = information;
+                dh().completed = true;
+            }
+            CompleteResult::AlreadyFinal => {
+                dh().double_complete_rejected += 1;
+            }
+        }
     }
 }
 
@@ -420,6 +436,9 @@ unsafe fn dispatch(driver_object: u64, device_object: u64, major: u8, code: u32)
     dh().completed = false;
     dh().last_status = 0;
     dh().last_info = 0;
+    // Track this local projected IRP so completion is exactly-once (spec §7.7). The
+    // request_id doubles as the IOCTL code for tracing.
+    rt().mark_irp_pending(irp, code as u64);
 
     let routine = core::ptr::read_unaligned((driver_object + 112 + major as u64 * 8) as *const u64);
     let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(routine as *const ());
@@ -548,6 +567,29 @@ unsafe fn run() {
 
     // Quality gate (spec §20): no DPC ran at PASSIVE, no work item at DISPATCH.
     check(b"callbacks_ran_at_correct_irql", dh().bad_irql == 0);
+
+    // Each async IRP above completed exactly once — the guard rejected no valid
+    // completion (spec §20: "pending IRP completes exactly once").
+    check(b"no_valid_completion_dropped", dh().double_complete_rejected == 0);
+
+    // On-target exactly-once guard: a second completion of the same IRP is dropped.
+    rt().mark_irp_pending(0xDEAD_0001, 100);
+    let first = rt().complete_irp(0xDEAD_0001, 0, 4);
+    let second = rt().complete_irp(0xDEAD_0001, -1, 0);
+    check(
+        b"double_complete_rejected",
+        first == CompleteResult::Completed && second == CompleteResult::AlreadyFinal,
+    );
+
+    // On-target cancellation race (spec §12): a cancel makes the later callback's
+    // completion a no-op — cancellation cannot double-complete.
+    rt().mark_irp_pending(0xDEAD_0002, 101);
+    let cancelled = rt().cancel_irp(0xDEAD_0002);
+    let late = rt().complete_irp(0xDEAD_0002, 0, 8);
+    check(
+        b"cancel_prevents_double_complete",
+        cancelled == CancelResult::Cancelled && late == CompleteResult::AlreadyFinal,
+    );
 }
 
 #[no_mangle]

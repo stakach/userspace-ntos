@@ -122,3 +122,20 @@ with the correct value + IRQL (bad-IRQL count 0, spec §20 quality gate).
   drains at `DISPATCH_LEVEL`. Real seL4 IRQ notifications arrive in the later
   HAL/device-resource milestone. 2 tests (connect/find/disconnect; ISR→DPC bottom
   half). 29 `nt-kernel-exec` unit tests total.
+
+## Deferred IRP completion — exactly-once + cancellation (implemented — `nt-kernel-exec::completion`)
+
+- `CompletionTracker` (spec §7.7, §12) tracks the Driver Host's local projected IRP
+  pointers (the I/O Manager stays the canonical owner). State machine
+  `Pending → {Completed | Cancelled}`, both terminal:
+  - `mark_pending` = `IoMarkIrpPending` (records `request_id` for the I/O Manager).
+  - `complete` = `IoCompleteRequest` — completes **exactly once**; a second
+    completion, or one racing a prior cancel, returns `AlreadyFinal` and is dropped.
+  - `cancel` — conservative; wins only while pending, loses to a published
+    completion (`TooLate`). The four §12 race cases are unit-tested.
+- Wired into `KernelExecRuntime` (`mark_irp_pending`/`complete_irp`/`cancel_irp`).
+  `driver-host-async` routes the real driver's `IofCompleteRequest` through the
+  guard, so the three async completions are exactly-once-checked; verified in QEMU
+  (`no_valid_completion_dropped`, `double_complete_rejected`,
+  `cancel_prevents_double_complete`). Closes the spec §20 gates "pending IRP
+  completes exactly once" + "cancellation cannot double-complete". 34 unit tests.
