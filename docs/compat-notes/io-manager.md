@@ -126,3 +126,27 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   the completion engine.
 - Verified: `\Device\Test0` and `\??\Test0` (symlink) both open through the mock
   driver, and end-to-end against a real bootstrapped `ObjectManager`.
+
+## Read / write / device-control (implemented, Milestone 6 — `read_write.rs`, `device_control.rs`)
+
+- Every data request references the client's File handle through the Object
+  Manager, access-checked (`reference_open_file`): read requires `GENERIC_READ`,
+  write `GENERIC_WRITE`, an IOCTL the access from its `CTL_CODE` bits. The
+  FileRecord must be in the `Open` state, else `STATUS_FILE_CLOSED`; a bad handle
+  is `STATUS_INVALID_HANDLE`, insufficient access `STATUS_ACCESS_DENIED`.
+- The shared synchronous path (`build_and_dispatch_sync` + `complete_sync`) builds
+  the IRP + stack location, attaches an `IoBufferRef`, dispatches to the driver
+  backend, and on synchronous completion frees the IRP and returns
+  `IoStatus.Information`. A failure fails + frees the IRP; a `Pending` outcome parks
+  the IRP and returns `STATUS_PENDING` (the completion engine that finishes pending
+  IRPs is a later milestone). Transfers are bounded (`validate_transfer`, 64 KiB).
+- **Buffered model only** (`METHOD_BUFFERED`, spec §14.2). Read stages a zeroed
+  `SystemBuffer` the driver fills; write stages a copy of the client data; an IOCTL
+  stages one buffer sized `max(input, output)` holding the input, then copies the
+  driver's output back. `METHOD_IN_DIRECT`/`OUT_DIRECT`/`NEITHER` →
+  `STATUS_NOT_SUPPORTED`.
+- The mock driver is a loopback for tests: a write records the bytes and makes them
+  the data a subsequent read returns, and an IOCTL echoes its input — so
+  round-trips are observable through the I/O result (no backend downcast). Verified
+  end-to-end against a real bootstrapped `ObjectManager` (write→read loopback + an
+  echoing IOCTL through real OM handle validation).

@@ -15,6 +15,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 mod device;
+mod device_control;
 mod dispatch;
 mod driver;
 mod file;
@@ -22,6 +23,7 @@ mod irp;
 mod mock_driver;
 mod object_port;
 mod open;
+mod read_write;
 mod store;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
@@ -197,7 +199,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use nt_io_abi::major;
+    use nt_io_abi::{ioctl, major};
     use nt_status::NtStatus;
     use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
     use proptest::prelude::*;
@@ -766,6 +768,126 @@ mod tests {
         assert_eq!(om.irp_count(), 0); // IRP freed
     }
 
+    // --- Read / write / device-control (Milestone 6) -----------------------
+
+    fn open_device_with(
+        mock: MockDriverBackend,
+        access: AccessMask,
+    ) -> (IoManager<MockObjectPort>, ClientId, HandleValue) {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(&path("\\Driver\\Test"), Box::new(mock))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Test0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\Test0"),
+                access,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        (om, client, handle)
+    }
+
+    fn any_ioctl(function: u32, method: u32) -> u32 {
+        ioctl::ctl_code(0x22, function, method, ioctl::FILE_ANY_ACCESS)
+    }
+
+    #[test]
+    fn read_returns_driver_data() {
+        let (mut om, client, handle) = open_device_with(
+            MockDriverBackend::new().with_read_data(b"hello"),
+            AccessMask::GENERIC_READ,
+        );
+        let mut out = [0u8; 16];
+        let n = om.read(client, handle, 0, &mut out).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&out[..5], b"hello");
+        assert_eq!(om.irp_count(), 0); // request IRP freed
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let (mut om, client, handle) = open_device_with(
+            MockDriverBackend::new(),
+            AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+        );
+        assert_eq!(om.write(client, handle, 0, b"world").unwrap(), 5);
+        let mut out = [0u8; 8];
+        let n = om.read(client, handle, 0, &mut out).unwrap();
+        assert_eq!(&out[..n as usize], b"world");
+    }
+
+    #[test]
+    fn ioctl_echo_round_trips() {
+        let (mut om, client, handle) =
+            open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
+        let code = any_ioctl(0x800, ioctl::METHOD_BUFFERED);
+        let mut out = [0u8; 8];
+        let n = om
+            .device_control(client, handle, code, b"ping", &mut out)
+            .unwrap();
+        assert_eq!(&out[..n as usize], b"ping");
+    }
+
+    #[test]
+    fn ioctl_unsupported_method_rejected() {
+        let (mut om, client, handle) =
+            open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
+        let code = any_ioctl(0x801, ioctl::METHOD_IN_DIRECT);
+        let mut out = [0u8; 8];
+        assert_eq!(
+            om.device_control(client, handle, code, b"x", &mut out),
+            Err(NtStatus::NOT_SUPPORTED)
+        );
+    }
+
+    #[test]
+    fn ioctl_fixed_status() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_ioctl(IoctlBehavior::Status(NtStatus::INVALID_DEVICE_REQUEST));
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let code = any_ioctl(0x802, ioctl::METHOD_BUFFERED);
+        let mut out = [0u8; 8];
+        assert_eq!(
+            om.device_control(client, handle, code, b"x", &mut out),
+            Err(NtStatus::INVALID_DEVICE_REQUEST)
+        );
+    }
+
+    #[test]
+    fn io_on_bad_handle_rejected() {
+        let (mut om, client, _handle) =
+            open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
+        let mut out = [0u8; 4];
+        assert_eq!(
+            om.read(client, HandleValue(9999), 0, &mut out),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
+    #[test]
+    fn write_on_read_only_handle_denied() {
+        let (mut om, client, handle) =
+            open_device_with(MockDriverBackend::new(), AccessMask::GENERIC_READ);
+        assert_eq!(
+            om.write(client, handle, 0, b"nope"),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+    }
+
     #[cfg(feature = "object-manager")]
     #[test]
     fn library_port_against_real_object_manager() {
@@ -857,5 +979,50 @@ mod tests {
         );
         let after = om.port_mut().object_manager().live_object_count();
         assert_eq!(before, after);
+    }
+
+    #[cfg(feature = "object-manager")]
+    #[test]
+    fn read_write_ioctl_against_real_object_manager() {
+        use nt_object_manager::ComponentId;
+
+        let mut om = IoManager::new(ObjectManagerLibraryPort::new(ComponentId(0x10)).unwrap());
+        let client = om.register_client();
+        let driver = om
+            .create_driver(&path("\\Driver\\Test"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Test0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\Test0"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+
+        // Write then read loopback + an echoing IOCTL, all through the real OM
+        // handle validation.
+        assert_eq!(om.write(client, handle, 0, b"echo").unwrap(), 4);
+        let mut out = [0u8; 8];
+        let n = om.read(client, handle, 0, &mut out).unwrap();
+        assert_eq!(&out[..n as usize], b"echo");
+
+        let code = ioctl::ctl_code(0x22, 0x800, ioctl::METHOD_BUFFERED, ioctl::FILE_ANY_ACCESS);
+        let mut io_out = [0u8; 8];
+        let n = om
+            .device_control(client, handle, code, b"ping", &mut io_out)
+            .unwrap();
+        assert_eq!(&io_out[..n as usize], b"ping");
     }
 }

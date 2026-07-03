@@ -152,6 +152,9 @@ impl DriverDispatchBackend for MockDriverBackend {
                 };
                 let n = want.min(ctx.system_buffer.len());
                 self.written = ctx.system_buffer[..n].to_vec();
+                // Loopback: a later read returns what was written (so a
+                // write/read round-trip is observable through the I/O result).
+                self.read_data = self.written.clone();
                 DispatchOutcome::Completed {
                     status: NtStatus::SUCCESS,
                     information: n as u64,

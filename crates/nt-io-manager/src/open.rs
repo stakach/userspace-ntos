@@ -226,7 +226,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     /// Route an IRP to its device's driver backend + dispatch it.
-    fn dispatch(
+    pub(crate) fn dispatch(
         &mut self,
         irp_id: IrpId,
         system_buffer: &mut [u8],
