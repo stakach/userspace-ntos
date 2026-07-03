@@ -30,7 +30,7 @@ macro_rules! packed_id {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
         #[repr(transparent)]
-        #[derive(Copy, Clone, PartialEq, Eq, Hash)]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
         pub struct $name(pub u64);
 
         impl $name {

@@ -15,6 +15,7 @@ extern crate alloc;
 
 mod access;
 mod handles;
+mod io;
 mod namespace;
 mod store;
 mod types;
@@ -23,8 +24,8 @@ pub use access::compute_granted;
 pub use handles::{ClientKind, ClientRegistry, HandleTable};
 pub use store::{ObjectRef, ObjectStore};
 pub use types::{
-    ComponentId, DeleteFn, DirectoryBody, EventBody, ObjectBody, ObjectType, ObjectTypeDef,
-    OpaqueBody, OpaqueFlags, SymbolicLinkBody, TypeRegistry,
+    ComponentId, DeleteFn, DeviceBody, DirectoryBody, DriverBody, EventBody, FileBody, ObjectBody,
+    ObjectType, ObjectTypeDef, OpaqueBody, OpaqueFlags, SymbolicLinkBody, TypeRegistry,
 };
 
 use nt_status::NtStatus;
@@ -46,6 +47,10 @@ pub struct ObjectManager {
     directory_type: Option<ObjectTypeId>,
     /// The built-in SymbolicLink type id.
     symlink_type: Option<ObjectTypeId>,
+    /// Built-in Driver / Device / File type ids (registered lazily).
+    driver_type: Option<ObjectTypeId>,
+    device_type: Option<ObjectTypeId>,
+    file_type: Option<ObjectTypeId>,
 }
 
 impl ObjectManager {
@@ -58,6 +63,9 @@ impl ObjectManager {
             root: None,
             directory_type: None,
             symlink_type: None,
+            driver_type: None,
+            device_type: None,
+            file_type: None,
         }
     }
 
@@ -998,5 +1006,72 @@ mod tests {
                 .unwrap_err(),
             NtStatus::ACCESS_DENIED
         );
+    }
+
+    // --- Milestone 8: I/O Manager readiness ---------------------------------
+
+    #[test]
+    fn io_manager_device_flow() {
+        use nt_types::rights::device as devr;
+        let mut om = bootstrapped();
+        let io = ComponentId(42);
+        let driver_dir = om.lookup_path(&path("\\Driver"), CI).unwrap();
+        let device_dir = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        let kclient = om.register_client(ClientKind::DriverHost, AccessMode::KernelMode);
+
+        // IoCreateDriver / IoCreateDevice
+        let driver = om
+            .create_driver(&driver_dir, &uni("Test"), io, 1, true)
+            .unwrap();
+        assert_eq!(driver.type_id(), om.driver_type().unwrap());
+        let dev = om
+            .create_device(&device_dir, &uni("Test0"), io, 100, true)
+            .unwrap();
+        assert_eq!(dev.type_id(), om.device_type().unwrap());
+        let dev_id = dev.id();
+
+        // IoCreateSymbolicLink: \??\Test0 -> \Device\Test0
+        om.create_symbolic_link(&dosdev, &uni("Test0"), path("\\Device\\Test0"), true)
+            .unwrap();
+
+        // Open the device by its DOS path (through the symlink) + reference by handle.
+        let found = om.lookup_path(&path("\\??\\Test0"), CI).unwrap();
+        assert_eq!(found.id(), dev_id);
+        let h = om
+            .open(kclient, &found, devr::READ, ObjAttrFlags::empty())
+            .unwrap();
+        let r = om
+            .reference_by_handle(kclient, h, om.device_type(), devr::READ)
+            .unwrap();
+        assert_eq!(r.id(), dev_id);
+        // Referencing it as the wrong type fails.
+        assert_eq!(
+            om.reference_by_handle(kclient, h, om.driver_type(), devr::READ)
+                .unwrap_err(),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+        // The body routes to the owning I/O Manager.
+        r.with_body(|b| {
+            assert!(matches!(b, ObjectBody::Device(d) if d.owner == io && d.owner_local_id == 100))
+        });
+    }
+
+    #[test]
+    fn file_object_targets_device() {
+        let mut om = bootstrapped();
+        let io = ComponentId(7);
+        let device_dir = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let dev = om
+            .create_device(&device_dir, &uni("D"), io, 1, true)
+            .unwrap();
+        let file = om.create_file(io, 9, dev.id()).unwrap();
+        assert_eq!(file.type_id(), om.file_type().unwrap());
+        assert!(file.name().is_none()); // files are unnamed here
+        file.with_body(|b| {
+            assert!(
+                matches!(b, ObjectBody::File(f) if f.device == dev.id() && f.owner_local_id == 9)
+            )
+        });
     }
 }

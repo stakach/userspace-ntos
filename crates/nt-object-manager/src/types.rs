@@ -112,6 +112,12 @@ pub enum ObjectBody {
     Directory(DirectoryBody),
     SymbolicLink(SymbolicLinkBody),
     Event(EventBody),
+    /// A driver object (the I/O Manager owns the real `DriverObject`).
+    Driver(DriverBody),
+    /// A device object (the I/O Manager owns the real `DeviceObject`).
+    Device(DeviceBody),
+    /// A file object (the I/O Manager owns the real `FileObject`).
+    File(FileBody),
     /// A body whose real state lives in another component (service mode).
     Opaque(OpaqueBody),
 }
@@ -206,6 +212,29 @@ pub struct SymbolicLinkBody {
 pub struct EventBody {
     pub signaled: bool,
     pub manual_reset: bool,
+}
+
+/// A driver object body — the Object Manager owns the identity/name/lifetime; the
+/// I/O Manager owns the real `DriverObject`, reached via `owner`/`owner_local_id`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriverBody {
+    pub owner: ComponentId,
+    pub owner_local_id: u64,
+}
+
+/// A device object body (routing to the owning I/O Manager, spec §13.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceBody {
+    pub owner: ComponentId,
+    pub owner_local_id: u64,
+}
+
+/// A file object body — routes to the owner and names the device it targets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileBody {
+    pub owner: ComponentId,
+    pub owner_local_id: u64,
+    pub device: ObjectId,
 }
 
 bitflags::bitflags! {

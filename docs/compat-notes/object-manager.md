@@ -170,3 +170,22 @@ No proprietary NT source is copied; only documented semantics are reproduced.
 - Opcodes wired end-to-end so far: PING, OPEN_OBJECT, CLOSE_HANDLE, LOOKUP_PATH,
   CREATE_DIRECTORY, CREATE_SYMBOLIC_LINK, QUERY_SYMBOLIC_LINK. CREATE_OBJECT (a
   generic body) and DUPLICATE_HANDLE are deferred.
+
+## I/O Manager readiness (implemented, Milestone 8 — `io.rs`)
+
+- `Driver`, `Device`, and `File` are registered object **types** (lazily, with
+  real generic mappings + valid access from `nt_types::rights`), but their
+  **bodies carry only routing** — `owner: ComponentId` + `owner_local_id` (and,
+  for a file, its target `device`). The Object Manager owns the canonical
+  identity/name/type/lifetime; the I/O Manager owns the real
+  `DriverObject`/`DeviceObject`/`FileObject` internals (spec §13.2). No large
+  cross-component object graphs live in the OM.
+- Primitives for an I/O Manager MVP (spec §18.1): `create_driver`,
+  `create_device` (`IoCreateDevice`-style, named under `\Driver` / `\Device`),
+  `create_file` (unnamed, targeting a device). Symbolic links (`\??\Name →
+  \Device\Name`), path open (through the symlink), and reference-by-handle with a
+  device type + rights are already provided by M4–M6, so the classic
+  create-device → create-symlink → open-by-DOS-path → reference-by-handle flow
+  works end to end.
+- `create_named_object(ty, body, parent, name, permanent)` is the shared
+  create-and-link primitive (`create_directory` and the I/O helpers build on it).

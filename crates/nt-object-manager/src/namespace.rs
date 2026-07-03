@@ -105,6 +105,22 @@ impl ObjectManager {
         Ok(())
     }
 
+    /// Create an object of type `ty` with `body` and insert it into `parent`
+    /// under `name` in one step (create + link). Used by `create_directory`, the
+    /// I/O-object helpers, etc.
+    pub fn create_named_object(
+        &mut self,
+        ty: ObjectTypeId,
+        body: ObjectBody,
+        parent: &ObjectRef,
+        name: &UnicodeString,
+        permanent: bool,
+    ) -> Result<ObjectRef, NtStatus> {
+        let obj = self.create_object(ty, body)?;
+        self.insert_named_object(parent, name, &obj, permanent)?;
+        Ok(obj)
+    }
+
     /// Create a directory named `name` inside `parent`.
     pub fn create_directory(
         &mut self,
@@ -113,9 +129,13 @@ impl ObjectManager {
         permanent: bool,
     ) -> Result<ObjectRef, NtStatus> {
         let dir_ty = self.ensure_directory_type()?;
-        let dir = self.create_object(dir_ty, ObjectBody::Directory(DirectoryBody::default()))?;
-        self.insert_named_object(parent, name, &dir, permanent)?;
-        Ok(dir)
+        self.create_named_object(
+            dir_ty,
+            ObjectBody::Directory(DirectoryBody::default()),
+            parent,
+            name,
+            permanent,
+        )
     }
 
     /// Insert `child` into the directory `parent` under `name`, setting the

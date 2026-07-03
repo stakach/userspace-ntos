@@ -109,6 +109,26 @@ pub mod rights {
         pub const READ: AccessMask = AccessMask::from_bits_retain(0x0001);
         pub const WRITE: AccessMask = AccessMask::from_bits_retain(0x0002);
         pub const EXECUTE: AccessMask = AccessMask::from_bits_retain(0x0004);
+        /// STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | READ | WRITE | EXECUTE.
+        pub const ALL_ACCESS: AccessMask =
+            AccessMask::from_bits_retain(0x000F_0000 | 0x0010_0000 | 0x0007);
+    }
+
+    /// Driver object rights (no object-specific rights in v0.1).
+    pub mod driver {
+        use super::AccessMask;
+        /// STANDARD_RIGHTS_REQUIRED.
+        pub const ALL_ACCESS: AccessMask = AccessMask::from_bits_retain(0x000F_0000);
+    }
+
+    /// File object rights (minimal subset of the Windows FILE_* rights).
+    pub mod file {
+        use super::AccessMask;
+        pub const READ_DATA: AccessMask = AccessMask::from_bits_retain(0x0001);
+        pub const WRITE_DATA: AccessMask = AccessMask::from_bits_retain(0x0002);
+        /// STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | READ_DATA | WRITE_DATA.
+        pub const ALL_ACCESS: AccessMask =
+            AccessMask::from_bits_retain(0x000F_0000 | 0x0010_0000 | 0x0003);
     }
 }
 
