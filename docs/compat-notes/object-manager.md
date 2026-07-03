@@ -85,3 +85,25 @@ No proprietary NT source is copied; only documented semantics are reproduced.
 - **Client death** (`close_client`) closes all of the client's handles
   (decrementing counts, dropping references) and retires the `ClientId` (not
   reused in v0.1, so ids never alias). Objects referenced elsewhere survive.
+
+## Namespace (implemented, Milestone 4 — `namespace.rs`, `DirectoryBody`)
+
+- Directories are ordinary objects; `DirectoryBody` maps names to **strong** child
+  references, so the whole named tree is kept alive by the Object Manager's strong
+  reference to the root. No parent→child *and* child→parent strong cycle: the child
+  stores only its parent's `ObjectId` (not an `Rc`).
+- `bootstrap_namespace` creates `\` (permanent) plus the MVP directories `\Device`,
+  `\Driver`, `\??`, `\BaseNamedObjects`. `\??` is just a normal directory at this
+  layer (no Win32 translation).
+- Lookup follows spec §21: a missing/non-directory **intermediate** component →
+  `STATUS_OBJECT_PATH_NOT_FOUND`; a missing **final** name →
+  `STATUS_OBJECT_NAME_NOT_FOUND`. Insertion collisions → `STATUS_OBJECT_NAME_COLLISION`.
+- **Case**: insertion is case-insensitive (ASCII fold, one entry per folded key);
+  lookup/remove take a `CaseSensitivity`. Case-insensitive matches the folded key;
+  case-sensitive matches the original name exactly. Full Unicode folding deferred.
+- **Temporary vs permanent**: a directory entry holds a strong reference. A
+  **temporary** named object loses its name (and that reference) when its last
+  handle closes (`on_handle_closed` reaps it — wired into `close_handle` /
+  `close_client`), which can then delete the object. A **permanent** object keeps
+  its name until `make_temporary` clears the flag (removing the name immediately if
+  no handles remain).

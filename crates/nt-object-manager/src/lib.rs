@@ -14,6 +14,7 @@
 extern crate alloc;
 
 mod handles;
+mod namespace;
 mod store;
 mod types;
 
@@ -36,6 +37,11 @@ pub struct ObjectManager {
     store: ObjectStore,
     types: TypeRegistry,
     clients: ClientRegistry,
+    /// The root directory `\`, once `bootstrap_namespace` has run (holds the
+    /// whole named tree alive).
+    root: Option<ObjectRef>,
+    /// The built-in Directory type id.
+    directory_type: Option<ObjectTypeId>,
 }
 
 impl ObjectManager {
@@ -45,6 +51,8 @@ impl ObjectManager {
             store: ObjectStore::new(),
             types: TypeRegistry::new(),
             clients: ClientRegistry::new(),
+            root: None,
+            directory_type: None,
         }
     }
 
@@ -91,9 +99,14 @@ impl ObjectManager {
     }
 
     /// Close a client: close all its handles (dropping their references) and
-    /// retire its id. Objects still referenced elsewhere survive.
+    /// retire its id. Temporary named objects whose last handle was here lose
+    /// their names; objects still referenced elsewhere survive.
     pub fn close_client(&mut self, client: ClientId) -> Result<(), NtStatus> {
-        self.clients.close(client)
+        let closed = self.clients.close(client)?;
+        for obj in &closed {
+            self.on_handle_closed(obj);
+        }
+        Ok(())
     }
 
     /// Open a handle to `object` for `client` with `granted_access`. Increments
@@ -125,8 +138,12 @@ impl ObjectManager {
     }
 
     /// Close a handle in `client`'s table (decrements handle + pointer counts).
+    /// If this was the last handle on a temporary named object, its name is
+    /// removed from the namespace.
     pub fn close_handle(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
-        self.clients.close_handle(client, handle)
+        let obj = self.clients.close_handle(client, handle)?;
+        self.on_handle_closed(&obj);
+        Ok(())
     }
 
     /// Number of open handles held by `client` (debug / tests).
@@ -143,10 +160,20 @@ mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use nt_types::{
-        AccessMask, AccessMode, ClientId, GenericMapping, HandleValue, ObjAttrFlags, ObjectId,
-        ObjectTypeId, UnicodeString,
+        AccessMask, AccessMode, CaseSensitivity, ClientId, GenericMapping, HandleValue, NtPath,
+        ObjAttrFlags, ObjectId, ObjectTypeId, UnicodeString,
     };
     use proptest::prelude::*;
+
+    const CI: CaseSensitivity = CaseSensitivity::CaseInsensitive;
+
+    fn path(s: &str) -> NtPath {
+        NtPath::parse_str(s).unwrap()
+    }
+
+    fn uni(s: &str) -> UnicodeString {
+        UnicodeString::from_str(s)
+    }
 
     fn named_type_def(name: &'static str, delete: Option<DeleteFn>) -> ObjectTypeDef {
         ObjectTypeDef {
@@ -557,5 +584,182 @@ mod tests {
                     .is_ok());
             }
         }
+    }
+
+    // --- Milestone 4: namespace ---------------------------------------------
+
+    fn bootstrapped() -> ObjectManager {
+        let mut om = ObjectManager::new();
+        om.bootstrap_namespace().unwrap();
+        om
+    }
+
+    #[test]
+    fn bootstrap_creates_root_and_mvp_dirs() {
+        let om = bootstrapped();
+        let root = om.lookup_path(&path("\\"), CI).unwrap();
+        assert!(root.is_permanent());
+        for p in ["\\Device", "\\Driver", "\\??", "\\BaseNamedObjects"] {
+            let d = om.lookup_path(&path(p), CI).unwrap();
+            assert!(d.is_permanent());
+        }
+        assert_eq!(
+            om.lookup_path(&path("\\NoSuch"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn nested_lookup_case_and_missing() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("Test0"), &obj, true)
+            .unwrap();
+
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Test0"), CI).unwrap().id(),
+            obj.id()
+        );
+        // case-insensitive hit
+        assert_eq!(
+            om.lookup_path(&path("\\device\\test0"), CI).unwrap().id(),
+            obj.id()
+        );
+        // case-sensitive miss
+        assert!(om
+            .lookup_path(&path("\\device\\test0"), CaseSensitivity::CaseSensitive)
+            .is_err());
+        // missing intermediate -> PATH_NOT_FOUND
+        assert_eq!(
+            om.lookup_path(&path("\\NoDir\\X"), CI).unwrap_err(),
+            NtStatus::OBJECT_PATH_NOT_FOUND
+        );
+        // missing final -> NAME_NOT_FOUND
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Missing"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        // traverse into a non-directory -> PATH_NOT_FOUND
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Test0\\Foo"), CI)
+                .unwrap_err(),
+            NtStatus::OBJECT_PATH_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn name_collision_case_insensitive() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let a = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        let b = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("Dup"), &a, false)
+            .unwrap();
+        assert_eq!(
+            om.insert_named_object(&device, &uni("Dup"), &b, false)
+                .unwrap_err(),
+            NtStatus::OBJECT_NAME_COLLISION
+        );
+        assert_eq!(
+            om.insert_named_object(&device, &uni("DUP"), &b, false)
+                .unwrap_err(),
+            NtStatus::OBJECT_NAME_COLLISION
+        );
+        // inserting into a non-directory
+        assert_eq!(
+            om.insert_named_object(&a, &uni("X"), &b, false)
+                .unwrap_err(),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+    }
+
+    #[test]
+    fn temporary_name_removed_on_last_handle_close() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        let id = obj.id();
+        om.insert_named_object(&device, &uni("Temp0"), &obj, false)
+            .unwrap(); // temporary
+        let h = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        drop(obj); // only the directory entry + the handle keep it now
+
+        assert!(om.lookup_path(&path("\\Device\\Temp0"), CI).is_ok());
+        om.close_handle(client, h).unwrap(); // last handle -> temporary name removed
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Temp0"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            om.reference_by_id(id).unwrap_err(),
+            NtStatus::INVALID_HANDLE // object deleted
+        );
+    }
+
+    #[test]
+    fn permanent_retained_then_make_temporary() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let client = test_client(&mut om);
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("Perm0"), &obj, true)
+            .unwrap(); // permanent
+        let h = om
+            .open_handle(client, &obj, AccessMask::GENERIC_ALL, ObjAttrFlags::empty())
+            .unwrap();
+        drop(obj);
+        om.close_handle(client, h).unwrap(); // last handle closed
+
+        // permanent -> name retained
+        let found = om.lookup_path(&path("\\Device\\Perm0"), CI).unwrap();
+        // make it temporary with no handles -> name removed immediately
+        om.make_temporary(&found).unwrap();
+        drop(found);
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\Perm0"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn remove_named_object_unlinks() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let obj = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("R0"), &obj, true)
+            .unwrap();
+        assert!(om.lookup_path(&path("\\Device\\R0"), CI).is_ok());
+
+        om.remove_named_object(&device, &uni("R0"), CI).unwrap();
+        assert_eq!(obj.name(), None);
+        assert_eq!(
+            om.lookup_path(&path("\\Device\\R0"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            om.remove_named_object(&device, &uni("R0"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
     }
 }

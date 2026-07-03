@@ -98,9 +98,10 @@ impl HandleTable {
         slot.entry.as_ref().ok_or(NtStatus::INVALID_HANDLE)
     }
 
-    /// Close a handle: decrement the object's handle count and drop the
-    /// reference (which may take `pointer_count` to zero and delete the object).
-    fn close(&mut self, handle: HandleValue) -> Result<(), NtStatus> {
+    /// Close a handle: decrement the object's handle count and return the
+    /// reference so the caller can run namespace reaping before it drops (which
+    /// may take `pointer_count` to zero and delete the object).
+    fn close(&mut self, handle: HandleValue) -> Result<ObjectRef, NtStatus> {
         let idx = handle.slot() as usize;
         let slot = self.slots.get_mut(idx).ok_or(NtStatus::INVALID_HANDLE)?;
         if slot.generation != handle.generation() {
@@ -108,17 +109,20 @@ impl HandleTable {
         }
         let entry = slot.entry.take().ok_or(NtStatus::INVALID_HANDLE)?;
         entry.object.dec_handle_count();
-        // `entry` (and its ObjectRef) drops here.
-        Ok(())
+        Ok(entry.object)
     }
 
-    /// Close every handle (client death). Decrements each object's handle count.
-    fn close_all(&mut self) {
+    /// Close every handle (client death), returning the closed references so the
+    /// caller can reap. Decrements each object's handle count.
+    fn close_all(&mut self) -> Vec<ObjectRef> {
+        let mut closed = Vec::new();
         for slot in &mut self.slots {
             if let Some(entry) = slot.entry.take() {
                 entry.object.dec_handle_count();
+                closed.push(entry.object);
             }
         }
+        closed
     }
 
     fn find_free_slot(&self) -> usize {
@@ -176,12 +180,12 @@ impl ClientRegistry {
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 
-    /// Close a client: close all its handles, then drop its record.
-    pub fn close(&mut self, client: ClientId) -> Result<(), NtStatus> {
-        let rec = self.record_mut(client)?;
-        rec.handle_table.close_all();
+    /// Close a client: close all its handles (returning the closed references for
+    /// the caller to reap), then drop its record.
+    pub fn close(&mut self, client: ClientId) -> Result<Vec<ObjectRef>, NtStatus> {
+        let closed = self.record_mut(client)?.handle_table.close_all();
         self.clients[client.0 as usize] = None;
-        Ok(())
+        Ok(closed)
     }
 
     /// Open a handle to `object` for `client`.
@@ -218,8 +222,12 @@ impl ClientRegistry {
         Ok(entry.object.clone())
     }
 
-    /// Close a handle in `client`'s table.
-    pub fn close_handle(&mut self, client: ClientId, handle: HandleValue) -> Result<(), NtStatus> {
+    /// Close a handle in `client`'s table, returning the closed reference.
+    pub fn close_handle(
+        &mut self,
+        client: ClientId,
+        handle: HandleValue,
+    ) -> Result<ObjectRef, NtStatus> {
         self.record_mut(client)?.handle_table.close(handle)
     }
 

@@ -2,7 +2,11 @@
 
 use alloc::vec::Vec;
 use nt_status::NtStatus;
-use nt_types::{AccessMask, GenericMapping, NtPath, ObjectId, ObjectTypeId};
+use nt_types::{
+    AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectId, ObjectTypeId, UnicodeString,
+};
+
+use crate::store::ObjectRef;
 
 /// Identifies a service-mode owner component (for [`OpaqueBody`]).
 #[repr(transparent)]
@@ -112,11 +116,85 @@ pub enum ObjectBody {
     Opaque(OpaqueBody),
 }
 
-/// A directory body (name → child map). Filled in with the namespace milestone
-/// (M4), where each entry holds a strong reference to keep named children alive;
-/// a placeholder here so the object/type/lifetime machinery is exercised first.
+/// One directory entry: the ASCII-folded lookup key, the original name, and a
+/// **strong** reference to the child (so a named object stays alive while it is
+/// in the namespace).
+struct DirEntry {
+    key: UnicodeString,
+    name: UnicodeString,
+    child: ObjectRef,
+}
+
+/// A directory body: a name → child map. Case-insensitive lookups match on the
+/// ASCII-folded key; case-sensitive lookups match the original name. Insertion
+/// is case-insensitive (one entry per folded name), matching NT's default.
 #[derive(Default)]
-pub struct DirectoryBody {}
+pub struct DirectoryBody {
+    entries: Vec<DirEntry>,
+}
+
+impl DirectoryBody {
+    /// Insert `child` under `name`. `STATUS_OBJECT_NAME_COLLISION` if a name that
+    /// folds to the same key already exists.
+    pub(crate) fn insert(&mut self, name: UnicodeString, child: ObjectRef) -> Result<(), NtStatus> {
+        let key = name.to_ascii_folded();
+        if self.entries.iter().any(|e| e.key == key) {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        self.entries.push(DirEntry { key, name, child });
+        Ok(())
+    }
+
+    /// Look up a child by name, returning a new counted reference.
+    pub(crate) fn lookup(&self, name: &UnicodeString, case: CaseSensitivity) -> Option<ObjectRef> {
+        self.find(name, case).map(|e| e.child.clone())
+    }
+
+    /// Remove a child by name, returning the (now unlinked) reference.
+    pub(crate) fn remove(
+        &mut self,
+        name: &UnicodeString,
+        case: CaseSensitivity,
+    ) -> Option<ObjectRef> {
+        let pos = self.position(name, case)?;
+        Some(self.entries.remove(pos).child)
+    }
+
+    fn find(&self, name: &UnicodeString, case: CaseSensitivity) -> Option<&DirEntry> {
+        match case {
+            CaseSensitivity::CaseInsensitive => {
+                let key = name.to_ascii_folded();
+                self.entries.iter().find(|e| e.key == key)
+            }
+            CaseSensitivity::CaseSensitive => self.entries.iter().find(|e| &e.name == name),
+        }
+    }
+
+    fn position(&self, name: &UnicodeString, case: CaseSensitivity) -> Option<usize> {
+        match case {
+            CaseSensitivity::CaseInsensitive => {
+                let key = name.to_ascii_folded();
+                self.entries.iter().position(|e| e.key == key)
+            }
+            CaseSensitivity::CaseSensitive => self.entries.iter().position(|e| &e.name == name),
+        }
+    }
+
+    /// The names of the direct children (for debug / namespace dump).
+    pub fn names(&self) -> impl Iterator<Item = &UnicodeString> {
+        self.entries.iter().map(|e| &e.name)
+    }
+
+    /// Number of direct children.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the directory is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// A symbolic-link body.
 pub struct SymbolicLinkBody {
