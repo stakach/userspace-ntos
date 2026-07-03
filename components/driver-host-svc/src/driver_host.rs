@@ -1,25 +1,26 @@
 //! The isolated Driver Host child: maps the real `SurtTest.sys` into its
-//! (broker-provided) executable region, runs `DriverEntry`, drives a few IRPs
-//! into the driver's dispatch routines, and reports the pass count to the broker.
+//! (broker-provided) executable region, runs `DriverEntry`, then serves
+//! `DH_OP_DISPATCH_IRP` requests over SURT — running the real driver's dispatch
+//! routine per request and replying with the completion.
 
 use alloc::boxed::Box;
+use nt_driver_abi::opcode::DH_OP_DISPATCH_IRP;
 use nt_pe_loader::{ImportRef, PeFile};
+use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
+use surt_sel4::surt_core::{Consumer, Producer};
+use surt_sel4::{drain_blocking, Sel4Notify};
 
-use crate::{CODE_VADDR, CT_RESULT, STATE_VADDR};
-
-/// Total checks the child performs (for the broker's failed count).
-pub const CHECKS: u64 = 9;
+use crate::{
+    CODE_VADDR, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, ENV, REP_DATA_VADDR, REQ_DATA_VADDR,
+    RING_LEN, STATE_VADDR, SUB_RING_VADDR,
+};
 
 static SURTTEST_SYS: &[u8] =
     include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/SurtTest.sys");
 
 // --- the native NT runtime the driver calls into ---------------------------
 
-/// Captured state from the driver's `DriverEntry` + dispatch calls. Lives on the
-/// broker-provided RW [`STATE_VADDR`] page (the image `.bss` is read-only).
 struct DhState {
-    device_created: bool,
-    symlink_created: bool,
     device_object: u64,
     completed: bool,
     last_status: i32,
@@ -73,11 +74,10 @@ extern "win64" fn ntos_io_create_device(
     device_object_out: *mut u64,
 ) -> i32 {
     let dev = alloc_obj();
-    // SAFETY: single-threaded; `out` is a writable driver pointer.
-    unsafe {
-        dh().device_created = true;
-        dh().device_object = dev;
-        if !device_object_out.is_null() {
+    dh().device_object = dev;
+    if !device_object_out.is_null() {
+        // SAFETY: `out` is a writable driver pointer.
+        unsafe {
             core::ptr::write_unaligned(device_object_out, dev);
         }
     }
@@ -85,7 +85,6 @@ extern "win64" fn ntos_io_create_device(
 }
 
 extern "win64" fn ntos_io_create_symbolic_link(_link: *const u8, _target: *const u8) -> i32 {
-    dh().symlink_created = true;
     0
 }
 
@@ -97,8 +96,8 @@ extern "win64" fn ntos_iof_complete_request(irp: *const u8, _priority: i8) {
     unsafe {
         dh().last_status = core::ptr::read_unaligned(irp.add(48) as *const i32);
         dh().last_info = core::ptr::read_unaligned(irp.add(56) as *const u64);
-        dh().completed = true;
     }
+    dh().completed = true;
 }
 
 extern "win64" fn ntos_stub() -> i32 {
@@ -116,6 +115,7 @@ fn export_addr(name: &str) -> u64 {
     }
 }
 
+/// Dispatch one IRP into the driver; returns `(status, information, output)`.
 unsafe fn dispatch(
     driver_object: u64,
     device_object: u64,
@@ -154,34 +154,15 @@ unsafe fn dispatch(
     (dh().last_status, dh().last_info, out)
 }
 
-fn tick(name: &[u8], ok: bool, passed: &mut u64) {
-    crate::print_str(if ok { b"  PASS " } else { b"  FAIL " });
-    crate::print_str(name);
-    crate::print_str(b"\n");
-    if ok {
-        *passed += 1;
-    }
-}
-
-unsafe fn run() -> u64 {
-    let mut passed = 0u64;
-
-    let pe = match PeFile::parse(SURTTEST_SYS) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-
-    // Copy the laid-out image into the broker-provided executable region.
-    let mapped = match pe.map(CODE_VADDR) {
-        Ok(m) => m,
-        Err(_) => return 0,
-    };
+/// Load + relocate the image, patch the IAT, run `DriverEntry`. Returns the
+/// `DRIVER_OBJECT` address on success.
+unsafe fn setup() -> Option<u64> {
+    let pe = PeFile::parse(SURTTEST_SYS).ok()?;
+    let mapped = pe.map(CODE_VADDR).ok()?;
     let dst = CODE_VADDR as *mut u8;
     for (i, b) in mapped.bytes.iter().enumerate() {
         core::ptr::write_volatile(dst.add(i), *b);
     }
-
-    // Patch the IAT to the native export stubs.
     if let Ok(imports) = pe.imports() {
         for dll in &imports {
             for f in &dll.functions {
@@ -194,11 +175,8 @@ unsafe fn run() -> u64 {
             }
         }
     }
-
-    // Seed __security_cookie (.data RVA 0x3000 for this image).
     core::ptr::write_unaligned((CODE_VADDR + 0x3000) as *mut u64, 0x1234_5678_9abc_def0);
 
-    // Build DRIVER_OBJECT + RegistryPath, call DriverEntry.
     let driver_object = alloc_obj();
     core::ptr::write_unaligned(driver_object as *mut i16, 4);
     core::ptr::write_unaligned((driver_object + 2) as *mut i16, 336);
@@ -207,44 +185,75 @@ unsafe fn run() -> u64 {
     let entry = CODE_VADDR + pe.entry_point_rva() as u64;
     let driver_entry: extern "win64" fn(u64, u64) -> i32 =
         core::mem::transmute(entry as *const ());
-    let status = driver_entry(driver_object, reg_path);
-    tick(b"driver_entry_success", status == 0, &mut passed);
+    if driver_entry(driver_object, reg_path) != 0 {
+        return None;
+    }
+    Some(driver_object)
+}
 
-    let major = |m: u64| core::ptr::read_unaligned((driver_object + 112 + m * 8) as *const u64);
-    tick(b"dispatch_create", major(0x00) != 0, &mut passed);
-    tick(b"dispatch_device_control", major(0x0e) != 0, &mut passed);
-    tick(b"io_create_device", dh().device_created, &mut passed);
-    tick(b"io_create_symbolic_link", dh().symlink_created, &mut passed);
+/// Serve one `DH_OP_DISPATCH_IRP`: read `[major, code, in_len, out_len, input]`
+/// from the request frame, run the driver's dispatch, write the output to the
+/// reply frame. Returns `(status, information)`.
+unsafe fn serve(driver_object: u64, device_object: u64) -> (i32, u64) {
+    let base = REQ_DATA_VADDR as *const u8;
+    let major = core::ptr::read_volatile(base);
+    let code = core::ptr::read_unaligned(base.add(4) as *const u32);
+    let in_len = core::ptr::read_unaligned(base.add(8) as *const u32) as usize;
+    let out_cap = core::ptr::read_unaligned(base.add(12) as *const u32);
+    let mut input = [0u8; 64];
+    let n = in_len.min(64);
+    for (i, b) in input.iter_mut().enumerate().take(n) {
+        *b = core::ptr::read_volatile(base.add(16 + i));
+    }
+    let (status, info, out) = dispatch(driver_object, device_object, major, code, &input[..n], out_cap);
+    let rep = REP_DATA_VADDR as *mut u8;
+    for (i, b) in out.iter().enumerate().take((info as usize).min(64)) {
+        core::ptr::write_volatile(rep.add(i), *b);
+    }
+    (status, info)
+}
 
-    let dev = dh().device_object;
-
-    let (st, _i, _o) = dispatch(driver_object, dev, 0x00, 0, &[], 0);
-    tick(b"irp_create", dh().completed && st == 0, &mut passed);
-
-    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2000, &[], 8);
-    let ping = core::ptr::read_unaligned(out.as_ptr() as *const u32);
-    tick(b"ioctl_ping", st == 0 && info == 4 && ping == 0x5355_5254, &mut passed);
-
-    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2008, &[], 16);
-    let v = |o: usize| core::ptr::read_unaligned(out.as_ptr().add(o) as *const u32);
-    tick(
-        b"ioctl_get_version",
-        st == 0 && info == 16 && v(0) == 0 && v(4) == 1 && v(8) == 0 && v(12) == 9,
-        &mut passed,
-    );
-
-    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2004, b"hello", 8);
-    tick(b"ioctl_echo", st == 0 && info == 5 && &out[..5] == b"hello", &mut passed);
-
-    passed
+fn park() -> ! {
+    loop {
+        crate::yield_now();
+    }
 }
 
 #[no_mangle]
 #[link_section = ".text.driver_host_entry"]
 pub unsafe extern "C" fn driver_host_entry() -> ! {
-    let passed = run();
-    let _ = crate::ep_send_one(CT_RESULT, passed);
-    loop {
-        crate::yield_now();
-    }
+    let driver_object = match setup() {
+        Some(d) => d,
+        None => park(),
+    };
+    let device_object = dh().device_object;
+
+    let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
+        Ok(c) => c,
+        Err(_) => park(),
+    };
+    let mut completions = match Producer::<SurtCqe>::attach(COMP_RING_VADDR as *mut u8, RING_LEN) {
+        Ok(p) => p,
+        Err(_) => park(),
+    };
+    let wait_requests = Sel4Notify::new(&ENV, CT_N_SUB);
+    let signal_completion = Sel4Notify::new(&ENV, CT_N_COMP);
+
+    let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
+        if sqe.opcode == DH_OP_DISPATCH_IRP as u16 {
+            let (status, information) = serve(driver_object, device_object);
+            let cqe = SurtCqe {
+                request_id: sqe.request_id,
+                status,
+                information,
+                ..Default::default()
+            };
+            while completions.try_push(cqe).is_err() {
+                crate::yield_now();
+            }
+            let _ = completions.notify_consumer(&signal_completion);
+        }
+        true
+    });
+    park()
 }

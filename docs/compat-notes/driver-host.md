@@ -247,7 +247,7 @@ runs in a seL4 user-space component**, calling back into the Rust NT runtime.
   driver. Step 3 = isolate over the SURT `DH_OP_*` transport to a separate I/O
   Manager component. v0.1 uses RWX + a hard-coded cookie RVA + one driver.
 
-## Isolated Driver Host component (implemented, Milestone 9 step 3a — `components/driver-host-svc`)
+## Isolated Driver Host over SURT (implemented, Milestone 9 step 3 — `components/driver-host-svc`)
 
 The real Windows driver runs inside a **fully-isolated seL4 component** (its own
 CSpace + VSpace), so a driver fault is contained to the child, not the broker.
@@ -261,7 +261,12 @@ CSpace + VSpace), so a driver fault is contained to the child, not the broker.
   `extern "win64"` NT export stubs, seeds the `/GS` cookie, calls `DriverEntry`, and
   drives `IRP_MJ_CREATE` + `IOCTL_SURT_PING`/`GET_VERSION`/`ECHO` into the driver's
   dispatch routines — reporting the pass count to the broker over an endpoint.
-- Verified in QEMU: 9/9 PASS (real `DriverEntry` + full IRP dispatch in the isolated
-  child). `./scripts/run-driver-host-svc.sh`.
-- Scope: 3a = real driver in an isolated, fault-contained child. 3b = drive the IRPs
-  from a *separate* component over the SURT `DH_OP_*` transport.
+- 3b adds the SURT transport: a separate `io_side` component sends
+  `DH_OP_DISPATCH_IRP` requests over the ring pair; the Driver Host serves them by
+  building an `IRP` + `IO_STACK_LOCATION` and running the real driver's dispatch
+  routine, then replies with the completion.
+- Verified in QEMU: 3/3 PASS — `IOCTL_SURT_PING`/`GET_VERSION`/`ECHO` dispatched
+  from the io_side component, across an address-space boundary, into the real driver
+  running in the isolated Driver Host, and back. `./scripts/run-driver-host-svc.sh`.
+  **This completes Milestone 9: a real Windows driver executing in an isolated,
+  fault-contained seL4 component, driven over SURT.**

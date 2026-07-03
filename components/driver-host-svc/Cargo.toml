@@ -16,7 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-driver-abi = { path = "../../crates/nt-driver-abi" }
 
 [profile.release]
 panic = "abort"
