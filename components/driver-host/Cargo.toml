@@ -1,0 +1,39 @@
+# The NT I/O Manager as TWO isolated seL4 components (client + server) talking
+# over SURT rings, brokered by the rootserver. The server embeds an in-process
+# Object Manager (library mode). Standalone bare-metal crate (own workspace +
+# custom target); staged as the kernel rootserver by build.sh.
+[workspace]
+
+[package]
+name = "ntos-driver-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel ABI + SURT transport.
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
+# The io-side embeds an in-process Object Manager (object-manager feature) + the
+# I/O Manager driving a DriverPeerBackend; the peer decodes the wire ABI directly.
+nt-status = { path = "../../crates/nt-status" }
+nt-types = { path = "../../crates/nt-types" }
+nt-io-abi = { path = "../../crates/nt-io-abi" }
+nt-io-manager = { path = "../../crates/nt-io-manager", features = ["object-manager"] }
+nt-object-manager = { path = "../../crates/nt-object-manager" }
+bytemuck = { version = "1", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"

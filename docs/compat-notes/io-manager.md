@@ -266,3 +266,19 @@ This completes the NT I/O Manager spec milestones (1-9): the full driver model �
 records + stores, Object Manager integration, dispatch backends (mock + driver
 peer), open/read/write/IOCTL, completion + cancellation, cleanup/close, the SURT
 service (host + on-kernel isolated components), and Driver Host readiness.
+
+## Driver-peer on the kernel (implemented, Milestone 8b — `components/driver-host`)
+
+- The on-kernel form of the driver-peer protocol: two isolated seL4 components — an
+  **io-side** (an `IoManager` over an in-process Object Manager, its driver backed
+  by a `DriverPeerBackend<SurtPeerTransport>`) and an untrusted **driver peer** —
+  sharing a SURT ring pair + data frame via the same broker/cap-transfer machinery
+  as `object-service` / `io-manager`.
+- The io-side runs the file path (open / write / read / IOCTL / cleanup / close) on
+  its own I/O Manager; every IRP is marshalled as an `IODRV_OP_DISPATCH_IRP` +
+  `IrpDispatchRequest` to the peer over SURT and completed with a `SurtCqe`
+  (`IODRV_CQE_FINAL`). The `IoManager` + `DriverPeerBackend` are reused **unchanged**
+  — only `SurtPeerTransport` is new. The peer decodes the wire ABI directly (no heap).
+- Verified in QEMU: 6/6 ops pass with the driver work crossing the isolation
+  boundary into the peer, no `#PF`, clean exit. Synchronous completion only;
+  pending / cancel / peer-fault are host-tested (M8a). `./scripts/run-driver-host.sh`.
