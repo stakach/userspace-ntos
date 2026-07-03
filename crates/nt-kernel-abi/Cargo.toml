@@ -1,0 +1,19 @@
+[package]
+name = "nt-kernel-abi"
+description = "Driver-visible NT kernel structure projections (DRIVER_OBJECT / DEVICE_OBJECT / IRP / IO_STACK_LOCATION …) at exact WDK x64 offsets — the layout a loaded WDM driver sees inside a Driver Host. no_std, no seL4/executive dependency."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# Safe zero-init + byte<->struct for the driver-visible layouts (no unsafe here).
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
