@@ -20,6 +20,7 @@ members = [
     "crates/nt-kernel-abi",
     "crates/nt-pe-loader",
     "crates/nt-compat-exports",
+    "crates/nt-driver-runtime",
     "crates/nt-driver-test-fixtures",
     "tools/driver-import-report",
 ]
@@ -51,4 +52,5 @@ nt-io-client = { path = "crates/nt-io-client" }
 nt-kernel-abi = { path = "crates/nt-kernel-abi" }
 nt-pe-loader = { path = "crates/nt-pe-loader" }
 nt-compat-exports = { path = "crates/nt-compat-exports" }
+nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }

@@ -1,0 +1,15 @@
+[package]
+name = "nt-driver-runtime"
+description = "The driver-local NT kernel runtime inside one Driver Host: a guest-memory arena, driver-object/device/IRP projections, driver pool, UTF-16 strings, IRQL/event/spinlock stubs, and pointer validation. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-kernel-abi = { path = "../nt-kernel-abi" }
+bytemuck = { version = "1", default-features = false }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

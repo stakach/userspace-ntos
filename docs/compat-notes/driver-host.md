@@ -75,3 +75,32 @@ isolated user-space component and completing IRPs through the I/O Manager. See
 - `nt-driver-test-fixtures` emits synthetic PE32+ images (headers, sections,
   imports, relocations) so the loader/exports/tool are testable without a Windows
   toolchain. 125 workspace tests.
+
+## Driver-local runtime (implemented, Milestone 4 — `nt-driver-runtime`)
+
+- The local NT runtime inside one Driver Host (spec §7.4): a guest-memory arena,
+  the projected objects a loaded driver sees, the driver pool, UTF-16 strings,
+  IRQL/event/spinlock stubs, and pointer validation. `no_std` + `alloc`, no `unsafe`.
+- **Arena** (`arena.rs`): a bump allocator over a byte buffer modelling the Driver
+  Host address space; objects are addressed by `GuestAddr` (`base + offset`), and
+  typed reads/writes are bounds-checked + **unaligned** (`pod_read_unaligned`), so
+  the 16-aligned `DEVICE_OBJECT`/`IRP` projections are safe at arbitrary offsets.
+- **Projections** (`DriverRuntime`): `create_driver_object` / `create_device_object`
+  (+ `DeviceExtension` region) / `create_irp` (+ stack locations) build the M1
+  layouts in the arena. The `ObjectTable` tracks each projection's guest address,
+  kind, and the **canonical id** it stands for (set by the I/O Manager in M6), with a
+  `retire()` that makes a deleted object's pointer stale.
+- **Pointer validation** (spec §19.2/§19.3): `validate(addr, kind)` accepts only a
+  live projection of the expected kind at exactly `addr`; `validate_driver_object`,
+  `validate_writable(addr, len)` (output params), and `is_known_pointer` round it
+  out. A valid-looking pointer grants access only to the local projection — never
+  canonical authority. Stale (retired), foreign (outside-arena), and wrong-kind
+  pointers are all rejected.
+- **Pool** (`pool.rs`, spec §13): `ExAllocatePoolWithTag`/`ExFreePoolWithTag` over
+  the arena, with `DoubleFree` / `UnknownPointer` traps and an `unload_report()` that
+  lists leaked blocks (`addr`, `size`, tag) + live devices.
+- **Strings** (`strings.rs`): allocate/read a `UNICODE_STRING` + UTF-16LE buffer.
+- **IRQL / events** (`sync.rs`, spec §14): a simulated single-CPU `Irql`
+  (raise/lower + invalid-transition counter) and a `PKEVENT`-keyed `EventTable`
+  (init/set/clear/reset with previous-state), tracked runtime-side. 134 workspace
+  tests.
