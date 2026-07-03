@@ -104,6 +104,26 @@ impl<C: Clock> KernelExecRuntime<C> {
     pub fn work(&mut self) -> &mut WorkQueue {
         &mut self.work
     }
+
+    /// `KeInitializeSpinLock`.
+    pub fn initialize_spin(&mut self, ptr: u64) {
+        self.spin.initialize(ptr);
+    }
+
+    /// `KeAcquireSpinLock` / `KeAcquireSpinLockRaiseToDpc` — take the lock, raising
+    /// to `DISPATCH_LEVEL`, and return the old IRQL to restore on release. (Borrows
+    /// both the spin table + IRQL together, which separate accessor calls can't.)
+    pub fn acquire_spin(&mut self, ptr: u64) -> u8 {
+        match self.spin.acquire(ptr, &mut self.irql) {
+            Ok(old) => old,
+            Err(_) => self.irql.current(),
+        }
+    }
+
+    /// `KeReleaseSpinLock` — release + restore the IRQL saved by `acquire_spin`.
+    pub fn release_spin(&mut self, ptr: u64, old_irql: u8) {
+        let _ = self.spin.release(ptr, &mut self.irql, old_irql);
+    }
     pub fn spin(&mut self) -> &mut SpinLockTable {
         &mut self.spin
     }

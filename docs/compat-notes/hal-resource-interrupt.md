@@ -49,3 +49,28 @@ must be real Driver-Host memory), and connects an ISR on vector 5; a
   irq-count. `raise_interrupt` asserts the line; `acknowledge` clears it + bumps the
   count. `mmio_ptr` is the `MmMapIoSpace` result the driver dereferences directly.
   5 unit tests (width/bounds/alignment/read-only; ID + interrupt line).
+
+## MmioInterruptTest.sys in QEMU (implemented, Milestones 11.5-11.7 — `driver-host-mmio`)
+
+The `driver-host-mmio` seL4 component hosts the Resource Manager + simulated device
+**in-process** (the "simulated register backend direct call" of spec §19; register
+macros are inlined so the mapping must be real Driver-Host memory) and runs the real
+`MmioInterruptTest.sys`. Verified in QEMU (17/17):
+
+- `DriverEntry` → `IoCreateDevice` → `MmMapIoSpace(0x10000000)` (validated against
+  the fixture, returns the sim register-bank pointer) → `READ_REGISTER_ULONG(ID)` =
+  `0x4d4d494f` (direct dereference) → `IoConnectInterrupt(vector 5)` (ownership-
+  validated, ISR tokens registered).
+- IOCTLs: `GET_ID` / `READ_REG32` read the ID register; `WAIT_FOR_INTERRUPT` pends
+  the IRP.
+- Injection: the test asserts the device line, resolves the connected ISR through
+  the Resource Manager, runs it at the device IRQL (no runtime borrow held), then
+  drains the DPC it queued — which completes the pending IRP. `GET_INTERRUPT_COUNT`
+  = 1; `DISCONNECT_INTERRUPT` releases it (further injection dropped). No callback
+  ran at the wrong IRQL.
+
+Compat exports added (in the component): `MmMapIoSpace`, `MmUnmapIoSpace`,
+`IoConnectInterrupt`, `IoDisconnectInterrupt`, `KeInitializeSpinLock`,
+`KeAcquireSpinLockRaiseToDpc`, `KeReleaseSpinLock` (+ the existing DPC/completion
+path). `nt-kernel-exec` gained `acquire_spin`/`release_spin`/`initialize_spin`.
+Register access (`READ/WRITE_REGISTER_ULONG`) is inlined in the driver — no export.

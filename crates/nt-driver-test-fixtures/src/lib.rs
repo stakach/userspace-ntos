@@ -181,3 +181,10 @@ pub fn pe_importing(dll: &str, funcs: &[&str]) -> Vec<u8> {
 pub fn asynctest_sys() -> &'static [u8] {
     include_bytes!("../fixtures/AsyncTest.sys")
 }
+
+/// The real MSVC-built `MmioInterruptTest.sys` WDM driver (simulated MMIO + a
+/// connected interrupt), built by <https://github.com/stakach/ntdriver>. Used by
+/// the `driver-host-mmio` component + the HAL Milestone 11 integration.
+pub fn mmio_interrupt_test_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/MmioInterruptTest.sys")
+}
