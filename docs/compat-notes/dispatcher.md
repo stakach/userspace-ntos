@@ -19,3 +19,22 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
   IRQL be `>= DISPATCH_LEVEL`; `try_acquire_at_dpc` returns whether it was taken.
   Double-acquire / release-without-acquire are rejected (`SpinError`).
 - 8 unit tests (§14.1/§14.2). Host-only library — the SurtTest driver is unaffected.
+
+## DPC queue (implemented, Milestone 10.2 — `nt-kernel-exec::dpc`)
+
+- `DpcQueue` (spec §6.3): one DPC queue per Driver Host. A `KDPC` is opaque driver
+  storage; the runtime keeps its metadata (routine, deferred context, queued state,
+  importance) in a side table keyed by the driver's `KDPC` pointer.
+  - `initialize` = `KeInitializeDpc`; `insert` = `KeInsertQueueDpc` (returns `false`
+    if already queued — queued-once); `remove` = `KeRemoveQueueDpc`;
+    `set_importance` / `set_target_processor`.
+  - `drain(irql, invoker, budget)` runs queued DPCs (highest importance first, then
+    FIFO) each at `DISPATCH_LEVEL` via a `DriverCallbackInvoker`
+    (`Routine(Dpc, DeferredContext, Arg1, Arg2)`), copying the metadata + marking
+    the DPC unqueued **before** calling (spec §17: no runtime borrow across the
+    driver callback). The `budget` bounds work so a hostile driver can't livelock
+    (spec §7.3). `KeFlushQueuedDpcs` = unbounded drain.
+- `DriverCallbackInvoker` (spec §7.2): calls DPC / work-item routines (driver
+  function pointers). Host tests use a recording mock; the real Driver Host impl
+  makes a Microsoft-x64 call. 3 tests (§14.3: insert-once, importance ordering,
+  budget).
