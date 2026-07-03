@@ -297,3 +297,14 @@ Two robustness improvements to the on-kernel Driver Host executors
   driver's code sections executable.
 - Both components re-verified in QEMU with the changes (driver-host-exec 15/15 incl.
   `security_cookie` + `w_xor_x`; driver-host-svc 3/3 over SURT). 152 workspace tests.
+
+## Component-wide NX (stack + heap)
+
+Extends NX from the driver image to the whole isolated `driver-host-svc` component:
+the broker maps **every** RW data region the child owns — stack, heap, SURT ring
+frames, request/reply data frames, the driver-runtime state page, and the IPC
+buffer — `RW | PAGE_EXECUTE_NEVER`. The component image stays read-only + executable
+(its `.text` runs) and the driver's code region is RX via `apply_wx`, so the **only**
+executable memory in the component is legitimate code — a compromised driver can't
+execute injected code from the stack or heap. Verified in QEMU (3/3): NX on the
+stack/heap is transparent to correct code (Rust never executes from them).

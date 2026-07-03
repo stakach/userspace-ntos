@@ -63,6 +63,10 @@ pub const STACK_FRAMES: u64 = 8;
 pub const RING_LEN: usize = 4096;
 const QLEN: u32 = 8;
 
+/// Read/write **non-executable** — the rights for all of a component's data
+/// regions (stack, heap, rings, buffers). Only legitimate code is executable.
+const RW_NX: u64 = 3 | PAGE_EXECUTE_NEVER;
+
 // Child CSpace slots.
 pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
@@ -184,24 +188,24 @@ unsafe fn build_component_vspace(
     for i in 0..allocator::HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, /* RW */ 3, pml4);
+        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
     }
     for i in 0..STACK_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, STACK_BASE + i * 0x1000, /* RW */ 3, pml4);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
     }
-    // Shared SURT rings + data frames — RW, same vaddrs in both children.
-    let _ = page_map(sub, SUB_RING_VADDR, 3, pml4);
-    let _ = page_map(comp, COMP_RING_VADDR, 3, pml4);
-    let _ = page_map(req, REQ_DATA_VADDR, 3, pml4);
-    let _ = page_map(rep, REP_DATA_VADDR, 3, pml4);
+    // Shared SURT rings + data frames — RW+NX, same vaddrs in both children.
+    let _ = page_map(sub, SUB_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(comp, COMP_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(req, REQ_DATA_VADDR, RW_NX, pml4);
+    let _ = page_map(rep, REP_DATA_VADDR, RW_NX, pml4);
 
     if with_driver {
-        // Driver-runtime state page — RW.
+        // Driver-runtime state page — RW+NX.
         let state = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, state);
-        let _ = page_map(state, STATE_VADDR, /* RW */ 3, pml4);
+        let _ = page_map(state, STATE_VADDR, RW_NX, pml4);
         // Driver image region — RW(X) at a fresh PML4 entry.
         map_fresh_region(pml4, CODE_VADDR, CODE_FRAMES, /* RW + exec */ 3);
     }
@@ -233,7 +237,7 @@ unsafe fn spawn_component(
     let pml4 = build_component_vspace(sub, comp, req, rep, with_driver);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
-    let _ = page_map(ipcbuf, IPCBUF_VADDR, 3, pml4);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
     let cnode = build_component_cnode();
     seed_cnode(cnode, CT_PML4, pml4);
     for &(slot, src) in seeds {
