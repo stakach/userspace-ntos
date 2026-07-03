@@ -61,15 +61,19 @@ unsafe fn map_region(base: u64, frames: u64) {
     }
 }
 
-/// Re-map the driver image W^X: executable + read-only sections become read-only
-/// (rights 2 — code can no longer be modified at runtime), only writable data
-/// stays writable (rights 3). No page remains both writable and executable.
-/// (`page_map` here can't set `ExecuteNever`, so writable data is still executable
-/// — true NX needs a kernel-ABI extension.)
+/// Re-map the driver image W^X: executable code is read-only (rights 2), writable
+/// data is read/write, and every non-executable page (data + read-only data) is
+/// mapped `ExecuteNever` (NX). No page is both writable and executable, and only
+/// the driver's code sections are executable at all.
 unsafe fn apply_wx(pe: &nt_pe_loader::PeFile, frames: u64) {
     for i in 0..frames {
-        let rva = (i * 0x1000) as u32;
-        let rights = if pe.protection_at(rva).writable() { 3 } else { 2 };
+        let prot = pe.protection_at((i * 0x1000) as u32);
+        let base = if prot.writable() { 3 } else { 2 };
+        let rights = if prot.executable() {
+            base
+        } else {
+            base | PAGE_EXECUTE_NEVER
+        };
         let f = CODE_FRAME_CAPS[i as usize];
         let _ = page_unmap(f);
         let _ = page_map(f, CODE_VADDR + i * 0x1000, rights, CAP_INIT_THREAD_VSPACE);

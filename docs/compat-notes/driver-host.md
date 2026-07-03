@@ -289,8 +289,11 @@ Two robustness improvements to the on-kernel Driver Host executors
   section characteristics. In `driver-host-exec` the root task keeps the image frame
   caps; in `driver-host-svc` the broker seeds them into the child so it can remap
   its own region.
-- Limitation: `sel4-rt`'s `page_map` can't set `ExecuteNever`, so writable data
-  pages remain executable (no NX) — true NX needs a kernel-ABI extension. The
-  achievable W^X (code read-only after load) is in place; documented as a follow-on.
+- **True NX**: non-executable pages (data + read-only data) are mapped
+  `ExecuteNever` via `sel4-rt`'s `PAGE_EXECUTE_NEVER` rights bit (a rust-micro
+  kernel extension: `X86Page::Map` now honours a NX flag → `PTE_NX`). So the loaded
+  driver's code is RX (read-execute, not writable), its data is RW+NX (writable, not
+  executable), and its read-only data is RO+NX — a full W^X mapping, with only the
+  driver's code sections executable.
 - Both components re-verified in QEMU with the changes (driver-host-exec 15/15 incl.
   `security_cookie` + `w_xor_x`; driver-host-svc 3/3 over SURT). 152 workspace tests.

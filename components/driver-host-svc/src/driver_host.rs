@@ -180,13 +180,16 @@ unsafe fn setup() -> Option<u64> {
         core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
     }
 
-    // Re-map the image W^X: code + read-only data become read-only; only writable
-    // data stays writable. No page is left both writable and executable.
+    // Re-map the image W^X: executable code is read-only, writable data is R/W, and
+    // every non-executable page is mapped ExecuteNever (NX). No page is both
+    // writable and executable.
     for i in 0..CODE_FRAMES {
-        let rights = if pe.protection_at((i * 0x1000) as u32).writable() {
-            3
+        let prot = pe.protection_at((i * 0x1000) as u32);
+        let base = if prot.writable() { 3 } else { 2 };
+        let rights = if prot.executable() {
+            base
         } else {
-            2
+            base | crate::PAGE_EXECUTE_NEVER
         };
         let _ = crate::page_unmap(CT_CODE_BASE + i);
         let _ = crate::page_map(CT_CODE_BASE + i, CODE_VADDR + i * 0x1000, rights, CT_PML4);
