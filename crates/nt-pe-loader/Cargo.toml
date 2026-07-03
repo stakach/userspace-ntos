@@ -1,0 +1,18 @@
+[package]
+name = "nt-pe-loader"
+description = "Checked PE32+/x86_64 kernel-image loader: parse, validate, map, relocate, and list imports of a Windows .sys image — structured errors, never panics. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = []
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

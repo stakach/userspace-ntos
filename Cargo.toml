@@ -18,6 +18,7 @@ members = [
     "crates/nt-io-server",
     "crates/nt-io-client",
     "crates/nt-kernel-abi",
+    "crates/nt-pe-loader",
 ]
 exclude = [
     "rust-micro",
@@ -45,3 +46,4 @@ nt-io-manager = { path = "crates/nt-io-manager" }
 nt-io-server = { path = "crates/nt-io-server" }
 nt-io-client = { path = "crates/nt-io-client" }
 nt-kernel-abi = { path = "crates/nt-kernel-abi" }
+nt-pe-loader = { path = "crates/nt-pe-loader" }

@@ -27,3 +27,26 @@ isolated user-space component and completing IRPs through the I/O Manager. See
   call-gate signatures. All layouts derive `bytemuck::Pod`/`Zeroable` so the runtime
   can zero-init + view parameter unions (`device_io_control()` / `read_write()`).
 - `major` module: the IRP major-function codes; `MAJOR_FUNCTION_COUNT` = 28.
+
+## PE loader (implemented, Milestone 2 — `nt-pe-loader`)
+
+- A checked PE32+/x86_64 loader for Windows kernel images (`.sys`): parse → validate
+  → list imports/relocations → map → relocate (spec §7.2, §20 M2). `no_std` + `alloc`,
+  **no `unsafe`**. Every read goes through bounded `u16/u32/u64/bytes_at` helpers; a
+  malformed image returns a structured `PeError`, **never panics or executes**.
+- `PeFile::parse` validates DOS (`MZ`) → NT (`PE\0\0`) → COFF (`machine == AMD64`,
+  bounded section count) → optional header (`PE32+` magic) → data directories, then
+  the section table. Exposes `image_base`, `size_of_image`, `entry_point_rva`.
+- `imports()` walks `IMAGE_IMPORT_DESCRIPTOR`s → one `ImportedDll` per module with its
+  `ByName {name, hint}` / `ByOrdinal` functions **and each function's IAT slot RVA**
+  (where the Driver Host will later patch the resolved trampoline).
+- `relocations()` walks the base-reloc blocks; only `DIR64` (applied) + `ABSOLUTE`
+  (padding) are accepted — any other type is `UnsupportedRelocation`.
+- `map(load_base)` allocates `SizeOfImage`, copies headers + sections to their virtual
+  addresses (BSS zero-filled), applies `DIR64` relocations for `load_base`, and exposes
+  `entry_point()` + `patch_iat(slot_rva, addr)` for the import-patch step (§9).
+- Rejected in v0.1 (per spec §7.2): x86/ARM64, non-PE32+, TLS callbacks, resources,
+  packed images, signature enforcement, unsupported relocations.
+- Tests: hand-crafted PE images (parse+map+entry, import listing with IAT slots, DIR64
+  relocation on rebase, malformed-image rejection) + proptest fuzz (arbitrary + mutated
+  bytes never panic) + a `cargo-fuzz` target (`fuzz/`, run manually). 116 workspace tests.

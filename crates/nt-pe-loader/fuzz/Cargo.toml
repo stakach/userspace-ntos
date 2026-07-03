@@ -1,0 +1,23 @@
+[package]
+name = "nt-pe-loader-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone (NOT in the host workspace); run with `cargo +nightly fuzz run pe_parse`
+# on a host with cargo-fuzz + libFuzzer installed.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nt-pe-loader = { path = ".." }
+
+[[bin]]
+name = "pe_parse"
+path = "fuzz_targets/pe_parse.rs"
+test = false
+doc = false
+bench = false
