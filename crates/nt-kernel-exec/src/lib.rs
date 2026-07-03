@@ -15,10 +15,12 @@ extern crate alloc;
 mod dpc;
 mod irql;
 mod spin;
+mod timer;
 
 pub use dpc::{DpcImportance, DpcQueue};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use spin::{SpinError, SpinLockTable};
+pub use timer::{Clock, FakeClock, TimerQueue};
 
 /// Invokes driver callbacks (DPC / timer-DPC / work-item routines) — function
 /// pointers into the loaded driver image (spec §7.2). Calling into driver code is

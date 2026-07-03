@@ -38,3 +38,16 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
   function pointers). Host tests use a recording mock; the real Driver Host impl
   makes a Microsoft-x64 call. 3 tests (§14.3: insert-once, importance ordering,
   budget).
+
+## Timers + fake clock (implemented, Milestone 10.3 — `nt-kernel-exec::timer`)
+
+- `TimerQueue` (spec §6.4): a `KTIMER` keyed by the driver's pointer.
+  `initialize` = `KeInitializeTimer[Ex]`; `set` = `KeSetTimer[Ex]` (100ns
+  `LARGE_INTEGER` due time — negative relative / non-negative absolute; `period_ms`
+  0 = one-shot); `cancel` = `KeCancelTimer`; `read_state` = `KeReadStateTimer`.
+  `run_due(clock)` expires due timers (sets signaled, reschedules periodic ones) and
+  returns the associated `KDPC` pointers to queue. Resetting bumps a per-timer
+  generation, invalidating the old due time (spec §6.4).
+- `Clock` trait + a deterministic `FakeClock` (`advance_100ns`/`advance_ms`/
+  `set_system_time`) for reproducible tests (spec §10.3). 5 tests (§14.4: relative +
+  absolute fire, reset invalidates old expiry, periodic requeue, cancel).
