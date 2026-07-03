@@ -74,3 +74,22 @@ Compat exports added (in the component): `MmMapIoSpace`, `MmUnmapIoSpace`,
 `KeAcquireSpinLockRaiseToDpc`, `KeReleaseSpinLock` (+ the existing DPC/completion
 path). `nt-kernel-exec` gained `acquire_spin`/`release_spin`/`initialize_spin`.
 Register access (`READ/WRITE_REGISTER_ULONG`) is inlined in the driver — no export.
+
+## seL4 IRQ bridge design (Milestone 11.8 — `docs/architecture/sel4_irq_bridge.md`)
+
+Design-only deliverable: how the simulated injection path becomes a real
+seL4-delivered interrupt under the same HAL API (IRQControl → IRQHandler +
+Notification, an IRQ-waiter thread that forwards a SURT interrupt-event token to the
+owning Driver Host, which runs the ISR/DPC exactly as today), plus the authority
+model (only the bootstrap holds IRQControl + device-frame authority; only resource/
+mapping/interrupt IDs cross SURT; only the Driver Host calls driver callbacks) and
+teardown/revoke (disconnect unbinds + masks; revoke staleness; host-fault cleanup).
+
+## Deferred (follow-up)
+
+- **SURT HAL service isolation (spec §M4)**: the Resource Manager + Interrupt Manager
+  currently run in-process in `driver-host-mmio` (the "simulated register backend
+  direct call" of §19 — valid for v0.1 since register access is inlined). Moving them
+  into an isolated `hal-service` component over SURT (`nt-hal-server`/`nt-hal-client`)
+  is the next step toward the capability-backed real-hardware model; the wire ABI
+  (`nt-hal-abi`) and the design above are already in place for it.
