@@ -21,6 +21,7 @@ mod device;
 mod device_control;
 mod dispatch;
 mod driver;
+mod driver_host;
 mod driver_peer;
 mod fault;
 mod file;
@@ -28,6 +29,7 @@ mod irp;
 mod mock_driver;
 mod object_port;
 mod open;
+mod projection;
 mod read_write;
 mod store;
 
@@ -39,6 +41,7 @@ pub use driver::{
     DeviceList, DispatchTarget, DriverBackendId, DriverFlags, DriverPeerId, DriverRecord,
     DriverUnloadState, MajorFunctionTable, MockDispatchId,
 };
+pub use driver_host::{DriverHostRoutine, MvpStatus};
 pub use driver_peer::{DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl};
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use irp::{
@@ -53,8 +56,11 @@ pub use store::{GenStore, IoId};
 #[cfg(feature = "object-manager")]
 pub use object_port::ObjectManagerLibraryPort;
 
-// Re-export the canonical id types so downstream crates get them from one place.
-pub use nt_io_abi::{DeviceId, DriverId, FileId, IoRequestId, IrpId};
+// Re-export the canonical id types + Driver Host projections from one place.
+pub use nt_io_abi::{
+    DeviceId, DeviceObjectProjection, DriverId, DriverObjectProjection, FileId,
+    FileObjectProjection, IoRequestId, IrpId,
+};
 
 /// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP
 /// stores, the registered dispatch backends, and the port to the Object Manager
@@ -1182,6 +1188,85 @@ mod tests {
         // The unrelated mock device is untouched + still usable.
         assert!(!om.device(mdev).unwrap().delete_pending);
         assert!(om.write(client, mh, 0, b"ok").is_ok());
+    }
+
+    // --- Driver Host readiness (Milestone 9) -------------------------------
+
+    #[test]
+    fn projections_reflect_the_records() {
+        let mut om = io();
+        let drv = a_driver(&mut om);
+        let dev = a_device(&mut om, drv);
+
+        let dp = om.project_driver(drv).unwrap();
+        assert_eq!(dp.driver_id, drv.0);
+        assert_eq!(dp.device_count, 1);
+
+        let dvp = om.project_device(dev).unwrap();
+        assert_eq!(dvp.device_id, dev.0);
+        assert_eq!(dvp.driver_id, drv.0);
+        assert_eq!(dvp.device_type, DeviceType::UNKNOWN.0);
+        assert_eq!(dvp.flags, DeviceFlags::BUFFERED_IO.bits());
+        assert_eq!(dvp.stack_size, 1);
+
+        // Unknown ids project to None.
+        assert!(om.project_device(DeviceId::NULL).is_none());
+    }
+
+    #[test]
+    fn file_projection_targets_device() {
+        let mut om = io();
+        let drv = a_driver(&mut om);
+        let dev = a_device(&mut om, drv);
+        let fid = om.add_file(FileRecord::new(
+            ObjectId::NULL,
+            ClientId(1),
+            dev,
+            AccessMask::GENERIC_READ,
+            ShareAccess::READ,
+            CreateOptions::empty(),
+            None,
+        ));
+        let fp = om.project_file(fid).unwrap();
+        assert_eq!(fp.file_id, fid.0);
+        assert_eq!(fp.device_id, dev.0);
+    }
+
+    #[test]
+    fn support_routine_plan_is_complete() {
+        use nt_io_abi::projection::cqe_flags;
+
+        // Every routine has an export name matching its identifier.
+        for r in DriverHostRoutine::ALL {
+            assert!(!r.export_name().is_empty());
+        }
+        assert_eq!(
+            DriverHostRoutine::IoCreateDevice.export_name(),
+            "IoCreateDevice"
+        );
+        // The §20 status table.
+        assert_eq!(
+            DriverHostRoutine::IoCreateDevice.mvp_status(),
+            MvpStatus::RequiredInternal
+        );
+        assert_eq!(
+            DriverHostRoutine::IoCompleteRequest.mvp_status(),
+            MvpStatus::ThroughPeerProtocol
+        );
+        assert_eq!(
+            DriverHostRoutine::IoCallDriver.mvp_status(),
+            MvpStatus::SingleStackStub
+        );
+        assert_eq!(
+            DriverHostRoutine::IoCancelIrp.mvp_status(),
+            MvpStatus::Partial
+        );
+
+        // The completion flags are distinct bits.
+        assert_ne!(
+            cqe_flags::IODRV_CQE_FINAL,
+            cqe_flags::IODRV_CQE_PENDING_ACCEPTED
+        );
     }
 
     #[cfg(feature = "object-manager")]

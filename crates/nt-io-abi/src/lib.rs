@@ -12,8 +12,12 @@
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;
+pub mod projection;
 pub mod wire;
 
+pub use projection::{
+    DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,
+};
 pub use wire::{
     IoCancelRequest, IoDeviceControlRequest, IoFileRequest, IoOpenRequest, IoReadWriteRequest,
     IoReply, IrpDispatchRequest,

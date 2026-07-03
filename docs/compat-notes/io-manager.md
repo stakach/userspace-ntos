@@ -242,3 +242,27 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   IODRV protocol, peer create failure cleanup, peer pending → pump / cancel, and the
   peer-fault isolation above. The on-kernel Driver Host peer component (a real
   isolated peer over SURT) is M8b.
+
+## Driver Host readiness (implemented, Milestone 9 — `projection.rs`, `driver_host.rs`)
+
+- **Projection ABI** (`nt-io-abi::projection`): the fixed-layout, ids-only records a
+  Driver Host peer receives (spec §4.3) — `DriverObjectProjection`,
+  `DeviceObjectProjection`, `FileObjectProjection`, `IoStackLocationProjection` — all
+  Pod with compile-time size/align asserts, plus the dispatch-CQE flags
+  (`IODRV_CQE_FINAL`, `IODRV_CQE_PENDING_ACCEPTED`, spec §16.5). The IRP projection is
+  `IrpDispatchRequest`. These carry **no canonical pointers** (spec §4.2).
+- **Projection builders** (`IoManager::project_driver` / `project_device` /
+  `project_file`) derive the wire projections from the canonical records.
+- **Support-routine plan** (`DriverHostRoutine` + `MvpStatus`): a machine-readable
+  encoding of the §20 table — the `Io*` routine names, their v0.1 MVP status
+  (`RequiredInternal` / `ThroughPeerProtocol` / `DriverHostLater` / `SingleStackStub`
+  / `Deferred` / `Partial` / `Optional`), and the `export_name` a future
+  `nt-compat-exports` crate will provide. Planned now, not yet callable by real
+  drivers, so the Driver Host spec can build on this I/O Manager without redesigning
+  IRP ownership.
+- Architecture write-up: `docs/architecture/nt-io-manager.md`.
+
+This completes the NT I/O Manager spec milestones (1-9): the full driver model —
+records + stores, Object Manager integration, dispatch backends (mock + driver
+peer), open/read/write/IOCTL, completion + cancellation, cleanup/close, the SURT
+service (host + on-kernel isolated components), and Driver Host readiness.
