@@ -75,3 +75,15 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
   - `drain(irql, invoker, budget)` runs queued items at `PASSIVE_LEVEL`, copying
     metadata + marking unqueued before the callback (a callback may `IoFreeWorkItem`
     itself). 3 tests (§14.6). 23 `nt-kernel-exec` unit tests total.
+
+## Runtime + drain hooks (implemented — `nt-kernel-exec::runtime`)
+
+- `KernelExecRuntime<C: Clock>` (spec §7.1) ties together IRQL, spin locks, the DPC
+  queue, timers, events, and work items over a clock source, exposing each
+  sub-store plus `set_timer` (against its clock).
+- `drain_ready(invoker, budget)` (spec §7.3): expire due timers → their DPCs onto
+  the DPC queue → run queued DPCs (DISPATCH) + work items (PASSIVE) until quiescent
+  or `budget` callbacks run. `budget` bounds a driver that re-queues work forever.
+  `on_after_driver_dispatch` / `on_before_block` are the event-loop drain points.
+- 27 `nt-kernel-exec` unit tests: DPC drains at DISPATCH, timer→DPC, work at PASSIVE,
+  budget cap.
