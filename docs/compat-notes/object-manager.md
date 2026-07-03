@@ -50,12 +50,20 @@ No proprietary NT source is copied; only documented semantics are reproduced.
 - All wire structs are `#[repr(C)]`, fixed-width, no pointers/references, with
   explicit length fields; sizes/alignments are asserted at compile time.
 
-## Lifetime model (planned, Milestone 2+)
+## Lifetime model (implemented, Milestone 2 — `nt-object-manager`)
 
 - `pointer_count` is realised as an `Rc` strong count (single-threaded core, spec
-  §15): the store holds `Weak`; strong refs are held by open handles, live
-  `ObjectRef`s, named-directory entries, and the permanent flag. Last strong drop
-  → the delete callback runs exactly once. This deviates from the spec's
-  `AtomicUsize` sketch (§8.2) to get memory safety from Rust ownership rather than
-  manual counting + unsafe. `handle_count` stays a separate counter for
-  temporary-name removal. Stale-id detection is independent (generation slot-map).
+  §15): the store holds `Weak`; strong refs are held by live `ObjectRef`s (and,
+  from later milestones, open handles, named-directory entries, and the permanent
+  flag). Last strong drop → `ObjectInner::Drop` runs the type's delete callback
+  exactly once. This deviates from the spec's `AtomicUsize` sketch (§8.2) to get
+  memory safety from Rust ownership rather than manual counting + unsafe — the
+  crate has **no `unsafe`**. `handle_count` is a separate `Cell` (for the
+  temporary-name removal that lands with the namespace).
+- Stale-id detection is independent of lifetime: the store is a slot map of
+  `{generation, Weak}`; a reused slot bumps its generation, so an `ObjectId` with
+  the old generation, or one whose `Weak` is dead, resolves to
+  `STATUS_INVALID_HANDLE`. Generations start at 1 so no live id is ever 0 (null).
+- `create_object` returns the initial reference (`pointer_count == 1`); dropping
+  the last `ObjectRef` dereferences and deletes. Named creation, handles, and
+  access checks are layered on in Milestones 3–6.

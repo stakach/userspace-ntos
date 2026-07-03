@@ -1,0 +1,23 @@
+[package]
+name = "nt-object-manager"
+description = "The NT Object Manager core: object store, type registry, handle tables, namespace, and lifetime (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std", "nt-types/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-types = { workspace = true }
+bitflags = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -10,6 +10,7 @@ members = [
     "crates/nt-status",
     "crates/nt-types",
     "crates/nt-object-abi",
+    "crates/nt-object-manager",
 ]
 exclude = [
     "rust-micro",
@@ -29,3 +30,4 @@ bitflags = { version = "2", default-features = false }
 nt-status = { path = "crates/nt-status" }
 nt-types = { path = "crates/nt-types" }
 nt-object-abi = { path = "crates/nt-object-abi" }
+nt-object-manager = { path = "crates/nt-object-manager" }
