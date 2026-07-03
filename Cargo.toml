@@ -22,6 +22,7 @@ members = [
     "crates/nt-compat-exports",
     "crates/nt-driver-abi",
     "crates/nt-driver-host",
+    "crates/nt-kernel-exec",
     "crates/nt-driver-runtime",
     "crates/nt-driver-test-fixtures",
     "tools/driver-import-report",
@@ -56,5 +57,6 @@ nt-pe-loader = { path = "crates/nt-pe-loader" }
 nt-compat-exports = { path = "crates/nt-compat-exports" }
 nt-driver-abi = { path = "crates/nt-driver-abi" }
 nt-driver-host = { path = "crates/nt-driver-host" }
+nt-kernel-exec = { path = "crates/nt-kernel-exec" }
 nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }

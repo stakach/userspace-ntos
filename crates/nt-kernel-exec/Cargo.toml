@@ -1,0 +1,15 @@
+[package]
+name = "nt-kernel-exec"
+description = "The local NT kernel execution runtime a Driver Host provides to a loaded driver: IRQL, spin locks, DPC queue, timers, events, and work items — enabling deferred/asynchronous IRP completion. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
