@@ -1,0 +1,19 @@
+[package]
+name = "nt-io-abi"
+description = "Fixed-layout SURT wire ABI for the NT I/O Manager: client + driver-peer opcodes, request/response structs, IRP major-function + IOCTL constants, and I/O id types (no_std, no allocation)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# Safe POD <-> bytes for the fixed-layout wire structs (no unsafe in our code).
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

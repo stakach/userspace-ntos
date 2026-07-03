@@ -99,6 +99,18 @@ statuses! {
     NOT_SUPPORTED = 0xC000_00BBu32;
     /// A general failure (catch-all, e.g. a faulted transport).
     UNSUCCESSFUL = 0xC000_0001u32;
+    /// The I/O request is invalid for this device (bad major function).
+    INVALID_DEVICE_REQUEST = 0xC000_0010u32;
+    /// The request was cancelled.
+    CANCELLED = 0xC000_0120u32;
+    /// The device is not connected (e.g. the owning driver peer faulted).
+    DEVICE_NOT_CONNECTED = 0xC000_009Du32;
+    /// The file has been closed.
+    FILE_CLOSED = 0xC000_0128u32;
+    /// The output buffer is too small for the result.
+    BUFFER_TOO_SMALL = 0xC000_0023u32;
+    /// The end of the file / device stream was reached.
+    END_OF_FILE = 0xC000_0011u32;
 }
 
 #[cfg(test)]
