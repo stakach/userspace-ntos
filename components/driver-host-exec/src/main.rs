@@ -58,13 +58,17 @@ unsafe fn map_region(base: u64, frames: u64) {
 
 // --- the native NT kernel runtime the driver calls into --------------------
 
-/// Captured state from the driver's `DriverEntry` calls.
+/// Captured state from the driver's `DriverEntry` + dispatch calls.
 struct DhState {
     device_created: bool,
     symlink_created: bool,
     device_object: u64,
     name_units: [u16; 64],
     name_len: usize,
+    // Last IRP completion (from IofCompleteRequest).
+    completed: bool,
+    last_status: i32,
+    last_info: u64,
 }
 
 static mut DH: DhState = DhState {
@@ -73,6 +77,9 @@ static mut DH: DhState = DhState {
     device_object: 0,
     name_units: [0; 64],
     name_len: 0,
+    completed: false,
+    last_status: 0,
+    last_info: 0,
 };
 
 /// A driver-visible `DEVICE_OBJECT` allocation (16-aligned, room for a small
@@ -149,7 +156,22 @@ extern "win64" fn ntos_io_create_symbolic_link(_link: *const u8, _target: *const
     0
 }
 
-/// Fail-safe stub for exports not exercised by `DriverEntry`.
+/// `IofCompleteRequest(Irp, PriorityBoost)` — record the completion the driver's
+/// dispatch routine produced (reads `Irp->IoStatus`).
+extern "win64" fn ntos_iof_complete_request(irp: *const u8, _priority: i8) {
+    if irp.is_null() {
+        return;
+    }
+    // SAFETY: `irp` is the IRP we built; IoStatus is at offset 48 (status @48,
+    // Information @56).
+    unsafe {
+        DH.last_status = core::ptr::read_unaligned(irp.add(48) as *const i32);
+        DH.last_info = core::ptr::read_unaligned(irp.add(56) as *const u64);
+        DH.completed = true;
+    }
+}
+
+/// Fail-safe stub for exports not exercised by this driver.
 extern "win64" fn ntos_stub() -> i32 {
     0
 }
@@ -159,8 +181,55 @@ fn export_addr(name: &str) -> u64 {
         "RtlInitUnicodeString" => ntos_rtl_init_unicode_string as usize as u64,
         "IoCreateDevice" => ntos_io_create_device as usize as u64,
         "IoCreateSymbolicLink" => ntos_io_create_symbolic_link as usize as u64,
+        "IofCompleteRequest" | "IoCompleteRequest" => ntos_iof_complete_request as usize as u64,
         _ => ntos_stub as usize as u64,
     }
+}
+
+/// Dispatch one IRP into the driver's `MajorFunction[major]` and return
+/// `(status, information, output-buffer)`. `code` + buffers apply to
+/// `IRP_MJ_DEVICE_CONTROL` (`METHOD_BUFFERED`).
+unsafe fn dispatch(
+    driver_object: u64,
+    device_object: u64,
+    major: u8,
+    code: u32,
+    input: &[u8],
+    out_cap: u32,
+) -> (i32, u64, [u8; 64]) {
+    let irp = alloc_device_object(); // ≥208, 16-aligned, zeroed
+    let stack = alloc_device_object(); // ≥72
+    let sysbuf = Box::leak(Box::new([0u8; 64])) as *mut u8;
+    for (i, b) in input.iter().enumerate().take(64) {
+        core::ptr::write_volatile(sysbuf.add(i), *b);
+    }
+
+    // IRP: Type=IO_TYPE_IRP, AssociatedIrp.SystemBuffer @24, CurrentStackLocation @184.
+    core::ptr::write_unaligned(irp as *mut i16, 6);
+    core::ptr::write_unaligned((irp + 24) as *mut u64, sysbuf as u64);
+    core::ptr::write_unaligned((irp + 184) as *mut u64, stack);
+    // IO_STACK_LOCATION: MajorFunction @0, DeviceIoControl Out @8 / In @16 / Code @24.
+    core::ptr::write_unaligned(stack as *mut u8, major);
+    core::ptr::write_unaligned((stack + 8) as *mut u32, out_cap);
+    core::ptr::write_unaligned((stack + 16) as *mut u32, input.len() as u32);
+    core::ptr::write_unaligned((stack + 24) as *mut u32, code);
+
+    DH.completed = false;
+    DH.last_status = 0;
+    DH.last_info = 0;
+
+    // MajorFunction[] lives in the DRIVER_OBJECT; the routine takes the
+    // DEVICE_OBJECT + IRP.
+    let routine =
+        core::ptr::read_unaligned((driver_object + 112 + major as u64 * 8) as *const u64);
+    let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(routine as *const ());
+    let _ = f(device_object, irp);
+
+    let mut out = [0u8; 64];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = core::ptr::read_volatile(sysbuf.add(i));
+    }
+    (DH.last_status, DH.last_info, out)
 }
 
 fn check(name: &[u8], ok: bool) {
@@ -254,6 +323,30 @@ unsafe fn run() {
     }
     print_str(&ascii[..n]);
     print_str(b"\n");
+
+    // --- drive real IRPs into the driver's dispatch routines (spec §10) -----
+    let dev = DH.device_object;
+
+    // IRP_MJ_CREATE (open) → SurtCreateClose completes STATUS_SUCCESS.
+    let (st, _info, _out) = dispatch(driver_object, dev, 0x00, 0, &[], 0);
+    check(b"irp_create", DH.completed && st == 0);
+
+    // IOCTL_SURT_PING → returns ULONG 0x53555254 ("SURT"), Information = 4.
+    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2000, &[], 8);
+    let ping = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(b"ioctl_ping", st == 0 && info == 4 && ping == 0x5355_5254);
+
+    // IOCTL_SURT_GET_VERSION → { 0, 1, 0, 9 }, Information = 16.
+    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2008, &[], 16);
+    let v = |o: usize| core::ptr::read_unaligned(out.as_ptr().add(o) as *const u32);
+    check(
+        b"ioctl_get_version",
+        st == 0 && info == 16 && v(0) == 0 && v(4) == 1 && v(8) == 0 && v(12) == 9,
+    );
+
+    // IOCTL_SURT_ECHO → METHOD_BUFFERED echo of the input.
+    let (st, info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2004, b"hello", 8);
+    check(b"ioctl_echo", st == 0 && info == 5 && &out[..5] == b"hello");
 }
 
 #[no_mangle]

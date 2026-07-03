@@ -234,7 +234,15 @@ runs in a seL4 user-space component**, calling back into the Rust NT runtime.
   device name is `\Device\SurtTest`. `./scripts/run-driver-host-exec.sh`.
 - Phase A of the same component first proved executable mapping + calling mapped
   code (a hand-written `mov eax,0x1234; ret` stub) in isolation.
-- Scope: step 1 = real `DriverEntry` + IAT callbacks (in the root task). Step 2 =
-  IRP dispatch into the driver (`IOCTL_SURT_PING`/`ECHO`). Step 3 = isolate over the
-  SURT `DH_OP_*` transport to a separate I/O Manager component. v0.1 uses RWX + a
-  hard-coded cookie RVA.
+- **Step 2 (done)**: real IRP dispatch into the driver. The component builds an
+  `IRP` + `IO_STACK_LOCATION` at real addresses (wiring `Irp->CurrentStackLocation`
+  @0xB8 — the driver's inline `IoGetCurrentIrpStackLocation` reads it — plus
+  `AssociatedIrp.SystemBuffer` @24 and the `DeviceIoControl` params), calls
+  `MajorFunction[major](DeviceObject, Irp)`, and the driver's `IofCompleteRequest`
+  calls back into `ntos_iof_complete_request` (reading `Irp->IoStatus` @48). Verified
+  in QEMU: `IRP_MJ_CREATE` completes; `IOCTL_SURT_PING` returns `0x53555254`
+  (`"SURT"`, info 4); `IOCTL_SURT_GET_VERSION` returns `{0,1,0,9}` (info 16);
+  `IOCTL_SURT_ECHO` round-trips `METHOD_BUFFERED` input (info 5). 12/12 PASS.
+- Scope: step 1 = real `DriverEntry` + IAT callbacks; step 2 = IRP dispatch into the
+  driver. Step 3 = isolate over the SURT `DH_OP_*` transport to a separate I/O
+  Manager component. v0.1 uses RWX + a hard-coded cookie RVA + one driver.

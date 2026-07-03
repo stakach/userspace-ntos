@@ -32,6 +32,10 @@ Expected tail:
   PASS io_create_device
   PASS io_create_symbolic_link
   device: \Device\SurtTest
+  PASS irp_create
+  PASS ioctl_ping
+  PASS ioctl_get_version
+  PASS ioctl_echo
 [microtest done]
 ```
 
@@ -60,8 +64,10 @@ Expected tail:
 - **Step 1 (this)**: real `DriverEntry` execution + trampoline callbacks, in the
   root task. Proves executable mapping, the x64 ABI call gate, and the IAT-callback
   mechanism on hardware.
-- **Step 2**: drive `IRP_MJ_CREATE`/`DEVICE_CONTROL` into the driver's dispatch
-  routines (the `IOCTL_SURT_PING`/`ECHO` round-trip) in-component.
+- **Step 2 (done)**: real IRPs driven into the driver's dispatch routines — an
+  `IRP` + `IO_STACK_LOCATION` built at real addresses, `MajorFunction[major]`
+  called; `IOCTL_SURT_PING` returns `"SURT"`, `GET_VERSION` returns `{0,1,0,9}`,
+  `ECHO` round-trips, and `IofCompleteRequest` calls back into the runtime.
 - **Step 3**: isolate as a child component with the SURT `DH_OP_*` transport to a
   separate I/O Manager component (the `nt-driver-abi` protocol).
 
