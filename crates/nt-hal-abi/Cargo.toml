@@ -1,0 +1,11 @@
+[package]
+name = "nt-hal-abi"
+description = "Fixed-layout SURT ABI for the NT HAL / Resource Manager: opcodes, resource descriptors, MMIO map/unmap + interrupt connect/disconnect/inject request structs. no_std, no alloc, no seL4 or Driver Host dependency — pure #[repr(C)] wire types shared across components."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
