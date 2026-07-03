@@ -1,0 +1,11 @@
+[package]
+name = "nt-cm-resources"
+description = "NT-compatible CM_RESOURCE_LIST encoding for PnP IRP_MN_START_DEVICE — the WDK pack(4) variable-length resource-list layout (memory + interrupt partial descriptors) a driver reads from Parameters.StartDevice. no_std, no allocation, no raw pointers in the encoded ABI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
