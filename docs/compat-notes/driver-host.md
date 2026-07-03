@@ -195,3 +195,23 @@ isolated user-space component and completing IRPs through the I/O Manager. See
 - `fault()` fails every pending IRP with `STATUS_DEVICE_REMOVED` (so the I/O Manager
   can finalize them) and marks the driver `Faulted`; a faulted driver rejects new
   dispatch (spec §17). 148 workspace tests.
+
+## Real driver validation (`SurtTest.sys`)
+
+The loader + export registry are validated against a **real MSVC-built WDM driver**
+(<https://github.com/stakach/ntdriver>, checked in at
+`crates/nt-driver-test-fixtures/fixtures/SurtTest.sys`, exposed as `surttest_sys()`):
+
+- `driver-import-report SurtTest.sys` → all six `ntoskrnl.exe` imports
+  (`IofCompleteRequest`, `IoCreateDevice`, `IoCreateSymbolicLink`, `IoDeleteDevice`,
+  `IoDeleteSymbolicLink`, `RtlInitUnicodeString`) resolve to `Implemented`; **verdict
+  runnable**.
+- `DriverHost::load` parses the real image (6 sections: `.text .rdata .data .pdata
+  INIT .reloc`, image base `0x140000000`, `DriverEntry` at RVA `0x5000`), maps it,
+  applies its real `DIR64` relocations (verified by loading at a different base), and
+  binds all imports — reaching `Loaded`.
+- The driver creates `\Device\SurtTest` + `\DosDevices\SurtTest` and implements
+  `IOCTL_SURT_PING` (0x222000 → `"SURT"`), `IOCTL_SURT_ECHO` (0x222004,
+  `METHOD_BUFFERED`), `IOCTL_SURT_GET_VERSION` (0x222008 → `{0,1,0,9}`).
+- Executing its `DriverEntry`/dispatch requires x86_64 — proven in QEMU (M9); this
+  host is aarch64.

@@ -7,6 +7,14 @@
 /// The default preferred load address for emitted images.
 pub const DEFAULT_IMAGE_BASE: u64 = 0x1_4000_0000;
 
+/// The real `SurtTest.sys` — a WDM driver built with the MSVC WDK by
+/// <https://github.com/stakach/ntdriver> (x64 Release). Its preferred image base
+/// is `0x140000000` and its entry (`DriverEntry`) is at RVA `0x5000`. Real x64
+/// execution is only possible in QEMU (this build host is aarch64).
+pub fn surttest_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/SurtTest.sys")
+}
+
 const NT_OFF: usize = 0x40;
 const OPT_OFF: usize = 0x58; // NT_OFF + 4 (sig) + 20 (file header)
 const SECTION_TABLE: usize = 0x148; // OPT_OFF + 240
