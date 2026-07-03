@@ -29,3 +29,16 @@ MMIO + connects the interrupt; `IRP_MN_REMOVE_DEVICE` disconnects/unmaps/detache
   `is_live` false after `Removed`. `set_fdo`/`set_driver`/`resources`/`pdo`/`fdo`
   accessors. 5 unit tests (fixture, full start lifecycle, invalid transitions, no
   duplicate start, remove-then-stale).
+
+## Full lifecycle in QEMU (implemented, Milestones 12.4-12.8 — `driver-host-pnp`)
+
+The `driver-host-pnp` component orchestrates the real `PnpMmioInterruptTest.sys`
+lifecycle against an in-process HAL + PnP Manager. Verified in QEMU (17/17):
+DriverEntry sets AddDevice + PnP dispatch → PnP Manager enumerates the fixture devnode
++ creates the PDO → AddDevice builds the FDO→PDO stack → an IOCTL before START fails
+`STATUS_DEVICE_NOT_READY` → START_DEVICE delivers a translated CM_RESOURCE_LIST; the
+driver parses it, maps MMIO + connects the interrupt, devnode → Started → GET_ID works,
+a pended WAIT_FOR_INTERRUPT is completed by an injected interrupt (count = 1) →
+REMOVE_DEVICE disconnects/unmaps/detaches, resources revoked, devnode → Removed. No
+callback at the wrong IRQL. See docs/compat-notes/device-stack.md for the stack/IRP
+mechanics.

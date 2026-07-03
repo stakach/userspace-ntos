@@ -188,3 +188,11 @@ pub fn asynctest_sys() -> &'static [u8] {
 pub fn mmio_interrupt_test_sys() -> &'static [u8] {
     include_bytes!("../fixtures/MmioInterruptTest.sys")
 }
+
+/// The real MSVC-built `PnpMmioInterruptTest.sys` WDM driver (PnP AddDevice /
+/// START_DEVICE lifecycle — resources delivered via CM_RESOURCE_LIST), built by
+/// <https://github.com/stakach/ntdriver>. Used by the `driver-host-pnp` component +
+/// the PnP Milestone 12 integration.
+pub fn pnp_mmio_interrupt_test_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/PnpMmioInterruptTest.sys")
+}
