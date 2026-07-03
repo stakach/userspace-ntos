@@ -25,3 +25,31 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   every struct.
 - New `nt-status` codes for I/O: `INVALID_DEVICE_REQUEST`, `CANCELLED`,
   `DEVICE_NOT_CONNECTED`, `FILE_CLOSED`, `BUFFER_TOO_SMALL`, `END_OF_FILE`.
+
+## Core records + stores (implemented, Milestone 2 — `nt-io-manager`)
+
+- **`GenStore<I, T>`** (`store.rs`) is a generation-protected slot-map: `insert`
+  returns a fresh id, `remove` bumps the slot's generation so any surviving id no
+  longer resolves. Same 24/40 gen/slot scheme as the Object Manager; `IoId` is a
+  small trait implemented for the `nt-io-abi` id types. No `unsafe`, no OM coupling.
+- **`DriverRecord`** carries the `MajorFunctionTable` (per-major `DispatchTarget`:
+  `Unsupported` / `Mock(MockDispatchId)` / `DriverPeer(DriverPeerId)` — never a raw
+  function pointer, spec §10.2), a device list, a backend id, flags, and unload state.
+- **`DeviceRecord`** carries `DeviceType` (`FILE_DEVICE_*`), characteristics, flags
+  (`DO_BUFFERED_IO`/`DO_DIRECT_IO`), and single-device-stack fields (`top_of_stack ==
+  id`, `attached_to == None` in v0.1).
+- **`FileRecord`** + **`FileState`** machine (`Allocated → CreateIrpDispatched → Open
+  → CleanupPending → CleanupComplete → ClosePending → Closed`). The spec's separate
+  `cleanup_done`/`close_done` booleans are subsumed by the state enum, which keeps
+  cleanup and close distinct (spec §12.2). Illegal transitions are rejected + tested.
+- **`IrpRecord`** + **`IrpState`** machine (`Allocated → Initialized → Queued/
+  Dispatched → Pending → CancelRequested/Completing → Completed/Cancelled/Failed →
+  Freed`), the `IoStackLocation` + `IoParameters` per-major payloads (only the v0.1
+  variants are functional), `CancelState`, and `IoBufferRef` (a validated registered-
+  buffer reference — never a raw pointer). Exactly the allowed transitions pass; e.g.
+  `Completed → Completed` is rejected (no double-completion).
+- **`IoManager`** owns the four stores + record CRUD; `add_device` links the device
+  into the driver's list and stamps `top_of_stack`. Higher-level create/open/read
+  APIs (with Object Manager integration) arrive in M3+. A store proptest asserts
+  live ids resolve, removed ids stay stale, and counts stay consistent over random
+  insert/remove sequences.

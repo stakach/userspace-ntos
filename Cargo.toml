@@ -14,6 +14,7 @@ members = [
     "crates/nt-object-server",
     "crates/nt-object-client",
     "crates/nt-io-abi",
+    "crates/nt-io-manager",
 ]
 exclude = [
     "rust-micro",
@@ -37,3 +38,4 @@ nt-object-manager = { path = "crates/nt-object-manager" }
 nt-object-server = { path = "crates/nt-object-server" }
 nt-object-client = { path = "crates/nt-object-client" }
 nt-io-abi = { path = "crates/nt-io-abi" }
+nt-io-manager = { path = "crates/nt-io-manager" }

@@ -1,0 +1,25 @@
+[package]
+name = "nt-io-manager"
+description = "Core NT I/O Manager: driver/device/file/IRP records, generation-protected stores, dispatch + completion + cancellation state machines (no_std + alloc, host-testable)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["alloc"]
+alloc = []
+std = ["alloc", "nt-status/std", "nt-types/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-types = { workspace = true }
+nt-io-abi = { workspace = true }
+bitflags = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
