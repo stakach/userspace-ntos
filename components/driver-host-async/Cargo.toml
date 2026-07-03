@@ -1,0 +1,34 @@
+# The Driver Host executor as a seL4 component: a bare-metal root task that maps a
+# real WDM .sys image executable in its own VSpace and runs its DriverEntry under
+# the Microsoft x64 ABI on the rust-micro kernel. Built independently (own
+# workspace + custom target); staged as the kernel's rootserver by build.sh.
+[workspace]
+
+[package]
+name = "ntos-driver-host-async"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host-async"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+nt-status = { path = "../../crates/nt-status" }
+nt-kernel-abi = { path = "../../crates/nt-kernel-abi" }
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-compat-exports = { path = "../../crates/nt-compat-exports" }
+nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"

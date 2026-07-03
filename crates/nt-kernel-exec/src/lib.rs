@@ -23,7 +23,7 @@ mod work_item;
 pub use dpc::{DpcImportance, DpcQueue};
 pub use event::{EventKind, EventStore, WaitResult};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
-pub use runtime::KernelExecRuntime;
+pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{Clock, FakeClock, TimerQueue};
 pub use work_item::WorkQueue;

@@ -174,3 +174,10 @@ pub fn pe_importing(dll: &str, funcs: &[&str]) -> Vec<u8> {
         &[(1, sec_va, desc_sz as u32)],
     )
 }
+
+/// The real MSVC-built `AsyncTest.sys` WDM driver (async DPC/timer/work-item IRP
+/// completion), built by <https://github.com/stakach/ntdriver>. Used by the
+/// `driver-host-async` component + Milestone 10 integration.
+pub fn asynctest_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/AsyncTest.sys")
+}

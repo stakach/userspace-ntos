@@ -117,6 +117,27 @@ impl DpcQueue {
         self.dpcs.iter().filter(|d| d.queued).count()
     }
 
+    /// Pop the next ready DPC (highest importance, then FIFO), marking it unqueued,
+    /// and return `(routine, dpc, deferred_context, arg1, arg2)`. Used by a Driver
+    /// Host that must call the driver routine **without** holding a runtime borrow
+    /// (spec §17); the callback may re-enter the runtime.
+    pub fn take_ready(&mut self) -> Option<(u64, u64, u64, u64, u64)> {
+        let i = self
+            .dpcs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.queued)
+            .max_by(|(_, a), (_, b)| {
+                a.importance
+                    .cmp(&b.importance)
+                    .then(b.sequence.cmp(&a.sequence))
+            })
+            .map(|(i, _)| i)?;
+        let d = &mut self.dpcs[i];
+        d.queued = false;
+        Some((d.routine, d.ptr, d.deferred_context, d.arg1, d.arg2))
+    }
+
     /// Drain up to `budget` queued DPCs, running each at `DISPATCH_LEVEL` (highest
     /// importance first, then FIFO). Returns the number run. `KeFlushQueuedDpcs`
     /// is `drain(.., usize::MAX)`.

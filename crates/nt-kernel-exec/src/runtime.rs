@@ -5,11 +5,35 @@
 
 use crate::dpc::DpcQueue;
 use crate::event::EventStore;
-use crate::irql::IrqlState;
+use crate::irql::{IrqlState, DISPATCH_LEVEL, PASSIVE_LEVEL};
 use crate::spin::SpinLockTable;
 use crate::timer::{Clock, TimerQueue};
 use crate::work_item::WorkQueue;
 use crate::DriverCallbackInvoker;
+
+/// A driver callback ready to run, returned by [`KernelExecRuntime::take_ready`].
+/// The Driver Host invokes the routine (a driver function pointer) **without**
+/// holding any runtime borrow (spec §17), then calls
+/// [`KernelExecRuntime::finish_callback`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReadyCallback {
+    /// `Routine(Dpc, DeferredContext, SystemArgument1, SystemArgument2)` at DISPATCH.
+    Dpc {
+        routine: u64,
+        dpc: u64,
+        deferred_context: u64,
+        arg1: u64,
+        arg2: u64,
+    },
+    /// `Routine(DeviceObject, Context)` at PASSIVE (an `IO_WORKITEM`).
+    WorkIo {
+        routine: u64,
+        device_object: u64,
+        context: u64,
+    },
+    /// `Routine(Parameter)` at PASSIVE (a `WORK_QUEUE_ITEM`).
+    WorkEx { routine: u64, parameter: u64 },
+}
 
 /// The Driver Host's kernel execution runtime, generic over its clock source.
 pub struct KernelExecRuntime<C: Clock> {
@@ -99,6 +123,47 @@ impl<C: Clock> KernelExecRuntime<C> {
             }
         }
         total
+    }
+
+    /// Pop the next ready callback (expiring due timers first) and set the
+    /// simulated IRQL for it: `DISPATCH_LEVEL` for DPCs, `PASSIVE_LEVEL` for work
+    /// items. Returns `None` when nothing is ready. The caller invokes the driver
+    /// routine with **no** runtime borrow held (spec §17), then calls
+    /// [`Self::finish_callback`] to restore the IRQL. This is the re-entrancy-safe
+    /// alternative to [`Self::drain_ready`] for a real Driver Host whose callbacks
+    /// re-enter the runtime through the `Ke*`/`Io*` exports.
+    pub fn take_ready(&mut self) -> Option<ReadyCallback> {
+        self.expire_timers();
+        if let Some((routine, dpc, deferred_context, arg1, arg2)) = self.dpc.take_ready() {
+            self.irql.raise(DISPATCH_LEVEL);
+            return Some(ReadyCallback::Dpc {
+                routine,
+                dpc,
+                deferred_context,
+                arg1,
+                arg2,
+            });
+        }
+        if let Some((routine, device, context)) = self.work.take_ready() {
+            // Work items run at PASSIVE_LEVEL (no raise).
+            return Some(match device {
+                Some(device_object) => ReadyCallback::WorkIo {
+                    routine,
+                    device_object,
+                    context,
+                },
+                None => ReadyCallback::WorkEx {
+                    routine,
+                    parameter: context,
+                },
+            });
+        }
+        None
+    }
+
+    /// Restore the IRQL to `PASSIVE_LEVEL` after a [`Self::take_ready`] callback.
+    pub fn finish_callback(&mut self) {
+        self.irql.lower(PASSIVE_LEVEL);
     }
 
     /// Drain point after a driver dispatch returns (spec §7.3).

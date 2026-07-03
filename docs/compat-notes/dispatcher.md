@@ -87,3 +87,24 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
   `on_after_driver_dispatch` / `on_before_block` are the event-loop drain points.
 - 27 `nt-kernel-exec` unit tests: DPC drains at DISPATCH, timer→DPC, work at PASSIVE,
   budget cap.
+
+## AsyncTest.sys in QEMU (implemented, Milestone 10.6 — `driver-host-async`)
+
+The `driver-host-async` seL4 component loads the real MSVC-built `AsyncTest.sys`
+(W^X + NX), runs `DriverEntry`, and drives the three asynchronous completion paths.
+Each `DeviceIoControl` marks the IRP pending, queues deferred work, and returns
+`STATUS_PENDING`; the Driver Host then advances its clock (for timers) and drains
+the `nt-kernel-exec` runtime, running the deferred callback which completes the IRP:
+
+- `IOCTL_ASYNC_COMPLETE_VIA_DPC` → a KDPC runs at `DISPATCH_LEVEL`, completes "DPC!".
+- `IOCTL_ASYNC_COMPLETE_VIA_TIMER` → a KTIMER fires → its KDPC completes "TMR!".
+- `IOCTL_ASYNC_COMPLETE_VIA_WORKITEM` → an IO_WORKITEM runs at `PASSIVE_LEVEL`,
+  completes "WKI!".
+
+The component adds the compat exports the driver imports (KeInitializeDpc/
+KeInsertQueueDpc, KeInitializeTimer/KeSetTimer, KeInitialize/Set/ClearEvent,
+KeWaitForSingleObject, ExAllocate/FreePoolWithTag, IoAllocate/Queue/FreeWorkItem,
+IoCreateDevice with a device extension). Driver callbacks run via a win64 gate with
+**no runtime borrow held** across the call (`take_ready`/`finish_callback`, spec §17),
+so the callback can re-enter the runtime. Verified in QEMU: all async paths complete
+with the correct value + IRQL (bad-IRQL count 0, spec §20 quality gate).

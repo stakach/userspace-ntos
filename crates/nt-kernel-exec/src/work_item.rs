@@ -111,6 +111,21 @@ impl WorkQueue {
         self.items.iter().filter(|w| w.queued).count()
     }
 
+    /// Pop the next ready work item, marking it unqueued. Returns
+    /// `(routine, Some(device_object) | None for Ex, context)`. Used by a Driver
+    /// Host that must call the driver routine **without** a runtime borrow held
+    /// (spec §17).
+    pub fn take_ready(&mut self) -> Option<(u64, Option<u64>, u64)> {
+        let i = self.items.iter().position(|w| w.queued)?;
+        let w = &mut self.items[i];
+        w.queued = false;
+        let device = match &w.kind {
+            WorkKind::Io { device_object } => Some(*device_object),
+            WorkKind::Ex => None,
+        };
+        Some((w.routine, device, w.context))
+    }
+
     /// Drain up to `budget` queued work items, running each at `PASSIVE_LEVEL`.
     /// Returns the number run.
     pub fn drain(
