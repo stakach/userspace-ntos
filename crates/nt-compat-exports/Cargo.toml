@@ -1,0 +1,11 @@
+[package]
+name = "nt-compat-exports"
+description = "The minimal ntoskrnl.exe / hal.dll export table a loaded WDM driver links against: each export's compatibility status + trampoline binding, plus a fail-fast policy for unsupported exports. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

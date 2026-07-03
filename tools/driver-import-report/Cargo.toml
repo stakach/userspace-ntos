@@ -1,0 +1,26 @@
+[package]
+name = "driver-import-report"
+description = "Standalone tool: report a Windows .sys driver's imports + which the Driver Host can satisfy, and whether it can run under the v0.1 export set. Runs without seL4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "driver-import-report"
+path = "src/main.rs"
+
+[lib]
+name = "driver_import_report"
+path = "src/lib.rs"
+
+[dependencies]
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-compat-exports = { path = "../../crates/nt-compat-exports" }
+
+[dev-dependencies]
+nt-driver-test-fixtures = { path = "../../crates/nt-driver-test-fixtures" }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

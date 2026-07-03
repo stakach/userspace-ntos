@@ -50,3 +50,28 @@ isolated user-space component and completing IRPs through the I/O Manager. See
 - Tests: hand-crafted PE images (parse+map+entry, import listing with IAT slots, DIR64
   relocation on rebase, malformed-image rejection) + proptest fuzz (arbitrary + mutated
   bytes never panic) + a `cargo-fuzz` target (`fuzz/`, run manually). 116 workspace tests.
+
+## Export registry + import report (implemented, Milestone 3 — `nt-compat-exports`, `driver-import-report`)
+
+- `nt-compat-exports` is the driver-visible `ntoskrnl.exe` / `hal.dll` symbol table
+  (spec §7.3). Each export has an `ExportStatus` — `Implemented` / `Partial` /
+  `StubSuccess` / `StubFailure` / `Unsupported` / `TrapIfCalled` — and every
+  `Partial` documents its deviations (enforced by a test). The `ExportRegistry`
+  resolves `dll!name` (DLL name case-insensitive, symbol case-sensitive) to an
+  `ImportOutcome`: `Available(status)` (loads), `Blocked` (unsupported — fail-fast),
+  or `Missing`. `check()` produces an `ImportReport` with a `runnable()` verdict.
+- v0.1 statuses: the device/symlink/IRP/Rtl/pool exports are `Implemented` (the
+  runtime provides them in M4–M7); DbgPrint, the events, IRQL, and spinlocks are
+  `Partial` (single-threaded / simulated / local-state); and the hardware / DMA /
+  interrupt / device-stacking / `PsCreateSystemThread` / WDF exports are
+  `Unsupported` — importing any of them blocks the load, so no driver gets fake
+  hardware authority (spec §19.4). Trampoline addresses are bound later by the
+  runtime (M5) via `set_trampoline`.
+- `driver-import-report <driver.sys>` (spec §15, runs without seL4): parses the
+  image with `nt-pe-loader`, resolves its imports against the registry, prints an
+  `OK` / `UNSUPP` / `MISSING` line per import + a `runnable` / `BLOCKED` verdict,
+  and exits non-zero when the driver cannot run under the v0.1 export set — so
+  missing imports are reported **before** `DriverEntry`.
+- `nt-driver-test-fixtures` emits synthetic PE32+ images (headers, sections,
+  imports, relocations) so the loader/exports/tool are testable without a Windows
+  toolchain. 125 workspace tests.

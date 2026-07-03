@@ -1,0 +1,11 @@
+[package]
+name = "nt-driver-test-fixtures"
+description = "Synthetic PE32+/x86_64 image emitter for Driver Host tests + tools — build valid .sys-like images (imports, relocations) without a Windows toolchain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
