@@ -61,7 +61,7 @@ pub const OB_NULL_OBJECT_ID: u64 = 0;
 
 /// `OB_OP_CREATE_OBJECT` payload.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObCreateObjectRequest {
     /// Size of this struct as the sender knew it (forward-compat guard).
     pub abi_size: u16,
@@ -81,7 +81,7 @@ pub struct ObCreateObjectRequest {
 
 /// `OB_OP_OPEN_OBJECT` payload.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObOpenObjectRequest {
     pub abi_size: u16,
     pub flags: u16,
@@ -94,7 +94,7 @@ pub struct ObOpenObjectRequest {
 
 /// `OB_OP_CREATE_DIRECTORY` payload.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObCreateDirectoryRequest {
     pub abi_size: u16,
     pub obj_attributes: u16,
@@ -105,7 +105,7 @@ pub struct ObCreateDirectoryRequest {
 
 /// `OB_OP_CREATE_SYMBOLIC_LINK` payload — link path + target path both in-buffer.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObCreateSymbolicLinkRequest {
     pub abi_size: u16,
     pub obj_attributes: u16,
@@ -118,7 +118,7 @@ pub struct ObCreateSymbolicLinkRequest {
 
 /// `OB_OP_LOOKUP_PATH` payload.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObLookupPathRequest {
     pub abi_size: u16,
     pub flags: u16,
@@ -126,11 +126,21 @@ pub struct ObLookupPathRequest {
     pub path_len_bytes: u32,
 }
 
+/// `OB_OP_CLOSE_HANDLE` payload.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObCloseHandleRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub handle: u64,
+}
+
 /// A generic reply carried in the SURT CQE (spec §12.3). `status` is an
 /// `NTSTATUS` as `i32`; `detail0`/`detail1` carry a handle or object id split
 /// (low/high) or a scalar result, per opcode.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ObReply {
     pub status: i32,
     pub information: u32,
@@ -148,6 +158,7 @@ const _: () = {
     assert!(size_of::<ObCreateDirectoryRequest>() == 16);
     assert!(size_of::<ObCreateSymbolicLinkRequest>() == 24);
     assert!(size_of::<ObLookupPathRequest>() == 12);
+    assert!(size_of::<ObCloseHandleRequest>() == 16);
     assert!(size_of::<ObReply>() == 24);
     // 8-byte alignment (u64 fields) except the all-32-bit ones.
     assert!(align_of::<ObOpenObjectRequest>() == 8);

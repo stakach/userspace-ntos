@@ -11,6 +11,8 @@ members = [
     "crates/nt-types",
     "crates/nt-object-abi",
     "crates/nt-object-manager",
+    "crates/nt-object-server",
+    "crates/nt-object-client",
 ]
 exclude = [
     "rust-micro",
@@ -31,3 +33,5 @@ nt-status = { path = "crates/nt-status" }
 nt-types = { path = "crates/nt-types" }
 nt-object-abi = { path = "crates/nt-object-abi" }
 nt-object-manager = { path = "crates/nt-object-manager" }
+nt-object-server = { path = "crates/nt-object-server" }
+nt-object-client = { path = "crates/nt-object-client" }

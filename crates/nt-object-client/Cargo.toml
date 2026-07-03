@@ -1,0 +1,21 @@
+[package]
+name = "nt-object-client"
+description = "Ergonomic client stub for the NT Object Manager service: encodes requests / decodes replies over a pluggable transport backend (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std", "nt-types/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-types = { workspace = true }
+nt-object-abi = { workspace = true }
+bytemuck = { version = "1", default-features = false }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

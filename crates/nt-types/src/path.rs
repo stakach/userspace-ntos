@@ -154,6 +154,37 @@ impl NtPath {
     pub fn leaf(&self) -> Option<&UnicodeString> {
         self.components.last()
     }
+
+    /// The parent path (all components but the last), or `None` for the root.
+    pub fn parent(&self) -> Option<NtPath> {
+        if self.components.is_empty() {
+            None
+        } else {
+            Some(NtPath {
+                components: self.components[..self.components.len() - 1].to_vec(),
+            })
+        }
+    }
+
+    /// Build a path directly from components (absolute; empty = root).
+    pub fn from_components(components: Vec<UnicodeString>) -> NtPath {
+        NtPath { components }
+    }
+
+    /// Serialise back to absolute NT-path UTF-16 code units (`\` + components
+    /// joined by `\`; the root is a single `\`).
+    pub fn to_units(&self) -> Vec<u16> {
+        let mut out = Vec::new();
+        if self.components.is_empty() {
+            out.push(SEPARATOR);
+            return out;
+        }
+        for comp in &self.components {
+            out.push(SEPARATOR);
+            out.extend_from_slice(comp.as_units());
+        }
+        out
+    }
 }
 
 #[cfg(test)]

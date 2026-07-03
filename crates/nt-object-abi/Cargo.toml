@@ -14,6 +14,8 @@ default = []
 surt = []
 
 [dependencies]
+# Safe POD <-> bytes for the fixed-layout wire structs (no unsafe in our code).
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

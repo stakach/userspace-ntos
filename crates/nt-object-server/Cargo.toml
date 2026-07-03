@@ -1,0 +1,27 @@
+[package]
+name = "nt-object-server"
+description = "Transport-agnostic NT Object Manager service dispatcher: decode/validate wire requests and drive the object model (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std", "nt-types/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-types = { workspace = true }
+nt-object-abi = { workspace = true }
+nt-object-manager = { workspace = true }
+bytemuck = { version = "1", default-features = false }
+
+[dev-dependencies]
+# The client stub, to drive full encode -> dispatch -> decode round-trips in
+# tests via an in-process backend.
+nt-object-client = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

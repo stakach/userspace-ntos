@@ -147,3 +147,26 @@ No proprietary NT source is copied; only documented semantics are reproduced.
   `SymbolicLink` types use the real Windows values (`nt_types::rights`). Types that
   aren't synchronizable (e.g. Directory) don't include `SYNCHRONIZE` in their valid
   access, so requesting it is denied for user-mode callers.
+
+## Service mode — core (implemented, Milestone 7a — `nt-object-server`, `nt-object-client`)
+
+- The service is split from its transport. `nt-object-server::Server` owns an
+  `ObjectManager` and a **transport-agnostic dispatcher**: `dispatch(client, opcode,
+  in_buf, out_buf) -> ObReply`. A SURT binding (the on-kernel component, M7b) just
+  feeds it opcodes + buffers, so the dispatcher is fully host-testable.
+- **Client identity is bound by the transport**, not carried in requests: the
+  server assigns a `ClientId` at `connect()` and it is passed to `dispatch`, so a
+  client cannot spoof another's id. `disconnect()` is client death (closes handles).
+- Requests are decoded with `bytemuck::try_pod_read_unaligned` + explicit slice
+  bounds checks; paths are read from the request buffer as UTF-16 and re-parsed.
+  A malformed/truncated request returns `STATUS_INVALID_PARAMETER` — it can never
+  panic the server (spec §24). Object-model errors (`OBJECT_NAME_NOT_FOUND`,
+  `ACCESS_DENIED`, …) map straight through into the reply `status`.
+- `nt-object-client::ObjectClient<B>` is the ergonomic stub: it encodes the same
+  wire structs and decodes replies over a pluggable `Backend`. A `DirectBackend`
+  (in-process, straight to the server) covers library mode + tests; the SURT
+  backend arrives with the component (M7b). The crate depends on neither the server
+  nor SURT.
+- Opcodes wired end-to-end so far: PING, OPEN_OBJECT, CLOSE_HANDLE, LOOKUP_PATH,
+  CREATE_DIRECTORY, CREATE_SYMBOLIC_LINK, QUERY_SYMBOLIC_LINK. CREATE_OBJECT (a
+  generic body) and DUPLICATE_HANDLE are deferred.
