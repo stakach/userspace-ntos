@@ -21,6 +21,8 @@ mod device;
 mod device_control;
 mod dispatch;
 mod driver;
+mod driver_peer;
+mod fault;
 mod file;
 mod irp;
 mod mock_driver;
@@ -37,6 +39,7 @@ pub use driver::{
     DeviceList, DispatchTarget, DriverBackendId, DriverFlags, DriverPeerId, DriverRecord,
     DriverUnloadState, MajorFunctionTable, MockDispatchId,
 };
+pub use driver_peer::{DriverPeerBackend, DriverPeerTransport, MockDriverPeer, MockPeerControl};
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use irp::{
     BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
@@ -984,6 +987,201 @@ mod tests {
             om.read(client, handle, 0, &mut out),
             Err(NtStatus::INVALID_HANDLE)
         );
+    }
+
+    // --- Driver-peer backend (Milestone 8) ---------------------------------
+
+    fn peer_device(
+        control: &MockPeerControl,
+        access: AccessMask,
+    ) -> (IoManager<MockObjectPort>, ClientId, HandleValue) {
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver_peer(
+                &path("\\Driver\\Peer"),
+                Box::new(DriverPeerBackend::new(control.transport())),
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Peer0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\Peer0"),
+                access,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        (om, client, handle)
+    }
+
+    #[test]
+    fn peer_sync_read_write_ioctl() {
+        let ctrl = MockPeerControl::new();
+        let (mut om, client, handle) =
+            peer_device(&ctrl, AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE);
+
+        // write -> read loopback through the peer protocol
+        assert_eq!(om.write(client, handle, 0, b"peer!").unwrap(), 5);
+        assert_eq!(ctrl.written(), b"peer!".to_vec());
+        let mut out = [0u8; 8];
+        let n = om.read(client, handle, 0, &mut out).unwrap();
+        assert_eq!(&out[..n as usize], b"peer!");
+
+        // echoing IOCTL (equal input/output lengths)
+        let code = any_ioctl(0x800, ioctl::METHOD_BUFFERED);
+        let mut io_out = [0u8; 4];
+        let n = om
+            .device_control(client, handle, code, b"ping", &mut io_out)
+            .unwrap();
+        assert_eq!(&io_out[..n as usize], b"ping");
+        assert_eq!(om.irp_count(), 0);
+    }
+
+    #[test]
+    fn peer_create_failure_cleans_up() {
+        let ctrl = MockPeerControl::new();
+        ctrl.set_create_status(NtStatus::ACCESS_DENIED);
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver_peer(
+                &path("\\Driver\\Peer"),
+                Box::new(DriverPeerBackend::new(ctrl.transport())),
+            )
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Peer0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            open_read(&mut om, client, "\\Device\\Peer0"),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.file_count(), 0);
+    }
+
+    #[test]
+    fn peer_pending_then_pump_and_cancel() {
+        // Pending then pump completes.
+        {
+            let ctrl = MockPeerControl::new();
+            ctrl.set_force_pending(true);
+            ctrl.set_pending_completion(NtStatus::SUCCESS, 4);
+            let (mut om, client, handle) = peer_device(&ctrl, AccessMask::GENERIC_READ);
+            let mut out = [0u8; 8];
+            assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+            assert_eq!(om.pump(), 1);
+            assert!(om.pending_irps().is_empty());
+        }
+        // Pending then cancel.
+        {
+            let ctrl = MockPeerControl::new();
+            ctrl.set_force_pending(true);
+            let (mut om, client, handle) = peer_device(&ctrl, AccessMask::GENERIC_READ);
+            let mut out = [0u8; 8];
+            let _ = om.read(client, handle, 0, &mut out);
+            let irp = om.pending_irps()[0];
+            om.cancel(client, irp).unwrap();
+            assert!(om.irp(irp).is_none());
+        }
+    }
+
+    #[test]
+    fn peer_fault_fails_its_irps_only() {
+        let peer = MockPeerControl::new();
+        peer.set_force_pending(true);
+        let mut om = io();
+        let client = om.register_client();
+
+        // A peer driver + device.
+        let pdrv = om
+            .create_driver_peer(
+                &path("\\Driver\\Peer"),
+                Box::new(DriverPeerBackend::new(peer.transport())),
+            )
+            .unwrap();
+        let pdev = om
+            .create_device(
+                pdrv,
+                Some(&path("\\Device\\Peer0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+        // An unrelated in-process mock driver + device.
+        let mdrv = om
+            .create_driver(&path("\\Driver\\Mock"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        let mdev = om
+            .create_device(
+                mdrv,
+                Some(&path("\\Device\\Mock0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+
+        let ph = om
+            .open(
+                client,
+                &path("\\Device\\Peer0"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        let mh = om
+            .open(
+                client,
+                &path("\\Device\\Mock0"),
+                AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+
+        // A pending read on the peer device.
+        let mut out = [0u8; 8];
+        let _ = om.read(client, ph, 0, &mut out);
+        let irp = om.pending_irps()[0];
+
+        // The peer faults; pump detects it + fails the peer's in-flight IRPs.
+        peer.set_faulted(true);
+        om.pump();
+        assert!(om.irp(irp).is_none());
+        assert!(om.pending_irps().is_empty());
+        assert!(om.device(pdev).unwrap().delete_pending);
+        assert!(om
+            .driver(pdrv)
+            .unwrap()
+            .flags
+            .contains(DriverFlags::FAULTED));
+
+        // The unrelated mock device is untouched + still usable.
+        assert!(!om.device(mdev).unwrap().delete_pending);
+        assert!(om.write(client, mh, 0, b"ok").is_ok());
     }
 
     #[cfg(feature = "object-manager")]

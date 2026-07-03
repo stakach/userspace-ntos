@@ -14,7 +14,7 @@ use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
 use crate::device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 use crate::dispatch::{DispatchContext, DispatchOutcome, DriverDispatchBackend, IrpProjection};
 use crate::driver::{
-    DispatchTarget, DriverBackendId, DriverRecord, MajorFunctionTable, MockDispatchId,
+    DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, MajorFunctionTable, MockDispatchId,
 };
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
 use crate::irp::{CreateParameters, IoParameters, IoStackLocation, IrpRecord, IrpState};
@@ -46,10 +46,35 @@ impl<P: ObjectManagerPort> IoManager<P> {
         name: &NtPath,
         backend: Box<dyn DriverDispatchBackend>,
     ) -> Result<DriverId, NtStatus> {
+        self.install_driver(name, backend, false)
+    }
+
+    /// Create a driver whose backend is an isolated driver **peer** (spec §15.3).
+    /// Functionally identical to [`create_driver`] but the dispatch table marks
+    /// the target as a `DriverPeer` (informational; both route to the backend).
+    pub fn create_driver_peer(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+    ) -> Result<DriverId, NtStatus> {
+        self.install_driver(name, backend, true)
+    }
+
+    fn install_driver(
+        &mut self,
+        name: &NtPath,
+        backend: Box<dyn DriverDispatchBackend>,
+        peer: bool,
+    ) -> Result<DriverId, NtStatus> {
         let idx = self.register_backend(backend);
+        let target = if peer {
+            DispatchTarget::DriverPeer(DriverPeerId(idx as u64))
+        } else {
+            DispatchTarget::Mock(MockDispatchId(idx as u64))
+        };
         let mut table = MajorFunctionTable::new();
         for m in SUPPORTED_MAJORS {
-            table.set(m, DispatchTarget::Mock(MockDispatchId(idx as u64)));
+            table.set(m, target);
         }
         let driver_id = self.register_driver(DriverRecord::new(
             ObjectId::NULL,
@@ -246,7 +271,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .get(major_fn);
         let idx = match target {
             DispatchTarget::Mock(id) => id.0 as usize,
-            DispatchTarget::DriverPeer(_) => return Err(NtStatus::NOT_IMPLEMENTED),
+            DispatchTarget::DriverPeer(id) => id.0 as usize,
             DispatchTarget::Unsupported => {
                 return Ok(DispatchOutcome::Failed {
                     status: NtStatus::INVALID_DEVICE_REQUEST,

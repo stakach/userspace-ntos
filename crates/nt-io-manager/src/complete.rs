@@ -27,6 +27,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 }
             }
         }
+        // A peer that faulted mid-flight fails its in-flight IRPs (spec §16.6).
+        self.detect_driver_faults();
         finalized
     }
 

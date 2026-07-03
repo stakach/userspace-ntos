@@ -121,4 +121,11 @@ pub trait DriverDispatchBackend {
     fn poll_completion(&mut self) -> Option<DriverCompletion> {
         None
     }
+
+    /// Whether the backend's driver has faulted/disconnected (spec §16.6). The
+    /// I/O Manager's `pump` faults such a driver — failing its in-flight IRPs and
+    /// marking its devices delete-pending. In-process backends never fault.
+    fn is_faulted(&self) -> bool {
+        false
+    }
 }

@@ -218,3 +218,27 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
 - Heap is 256 KiB (the server holds both an I/O Manager and an Object Manager).
   Scope: one client ↔ one server, single request in flight, a mock driver. A real
   Driver Host peer over SURT is M8.
+
+## Driver-peer backend + fault handling (implemented, Milestone 8a — `driver_peer.rs`, `fault.rs`)
+
+- `DriverPeerBackend<T>` is a `DriverDispatchBackend` that marshals an
+  `IrpProjection` into the wire `IrpDispatchRequest` (spec §16.4) and hands it to a
+  `DriverPeerTransport` — a SURT ring pair on the kernel, or a `MockDriverPeer` in
+  tests. The peer completes synchronously (a dispatch response → `Completed` /
+  `Failed`), accepts a request as pending (→ `Pending`, later a reverse-ring
+  completion drained by `pump`), or is faulted. The peer is **untrusted**.
+- `DriverDispatchBackend` gained a defaulted `is_faulted()` hook. A faulted peer's
+  new dispatches fail with `STATUS_DEVICE_NOT_CONNECTED`; **`pump` auto-detects a
+  newly-faulted backend and calls `fault_driver`** (spec §16.6): the driver is
+  marked `FAULTED`, its in-flight IRPs (dispatched / pending / cancel-requested /
+  completing) are failed with `DEVICE_NOT_CONNECTED` and freed, and its devices are
+  marked delete-pending. **Unrelated drivers + devices are untouched** — verified:
+  after a peer fault, an unrelated in-process device is still writable.
+- `create_driver_peer` registers a peer-backed driver (the dispatch table marks the
+  target `DriverPeer`; both `Mock` and `DriverPeer` targets route to the backend
+  registry). `MockPeerControl` is a shared handle (Rc/RefCell) so a test can
+  configure + fault a peer that has already been boxed into the registry.
+- Verified host-side: peer sync read/write (loopback) + echoing IOCTL through the
+  IODRV protocol, peer create failure cleanup, peer pending → pump / cancel, and the
+  peer-fault isolation above. The on-kernel Driver Host peer component (a real
+  isolated peer over SURT) is M8b.
