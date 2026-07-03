@@ -135,9 +135,8 @@ impl HandleTable {
 
 /// Per-client state (spec §16).
 struct ClientRecord {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // informational until per-kind policy lands
     kind: ClientKind,
-    #[allow(dead_code)]
     access_mode: AccessMode,
     handle_table: HandleTable,
 }
@@ -234,5 +233,10 @@ impl ClientRegistry {
     /// Number of open handles held by `client` (debug/tests).
     pub fn open_handle_count(&self, client: ClientId) -> Result<usize, NtStatus> {
         Ok(self.record(client)?.handle_table.open_count())
+    }
+
+    /// The access mode of `client` (governs access-check policy).
+    pub fn client_mode(&self, client: ClientId) -> Result<AccessMode, NtStatus> {
+        Ok(self.record(client)?.access_mode)
     }
 }

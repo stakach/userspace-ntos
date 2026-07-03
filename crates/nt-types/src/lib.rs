@@ -51,6 +51,12 @@ bitflags::bitflags! {
 impl AccessMask {
     /// `STANDARD_RIGHTS_REQUIRED` — DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER.
     pub const STANDARD_RIGHTS_REQUIRED: AccessMask = AccessMask::from_bits_retain(0x000F_0000);
+    /// `STANDARD_RIGHTS_READ` (== READ_CONTROL on Windows).
+    pub const STANDARD_RIGHTS_READ: AccessMask = AccessMask::READ_CONTROL;
+    /// `STANDARD_RIGHTS_WRITE` (== READ_CONTROL on Windows).
+    pub const STANDARD_RIGHTS_WRITE: AccessMask = AccessMask::READ_CONTROL;
+    /// `STANDARD_RIGHTS_EXECUTE` (== READ_CONTROL on Windows).
+    pub const STANDARD_RIGHTS_EXECUTE: AccessMask = AccessMask::READ_CONTROL;
     /// Bits that are generic (`GENERIC_*`) and must be mapped away before use.
     pub const GENERIC_BITS: AccessMask = AccessMask::from_bits_retain(0xF000_0000);
 
@@ -58,6 +64,51 @@ impl AccessMask {
     #[inline]
     pub const fn has_generic(self) -> bool {
         self.bits() & Self::GENERIC_BITS.bits() != 0
+    }
+}
+
+/// Object-type-specific access rights (spec §10.2). These occupy the low 16 bits
+/// of an [`AccessMask`] and are interpreted per object type, so they intentionally
+/// collide across types (e.g. `directory::QUERY == event::QUERY_STATE == 0x1`).
+/// Values are the real Windows rights.
+pub mod rights {
+    use crate::AccessMask;
+
+    /// Directory object rights.
+    pub mod directory {
+        use super::AccessMask;
+        pub const QUERY: AccessMask = AccessMask::from_bits_retain(0x0001);
+        pub const TRAVERSE: AccessMask = AccessMask::from_bits_retain(0x0002);
+        pub const CREATE_OBJECT: AccessMask = AccessMask::from_bits_retain(0x0004);
+        pub const CREATE_SUBDIRECTORY: AccessMask = AccessMask::from_bits_retain(0x0008);
+        /// `DIRECTORY_ALL_ACCESS` = STANDARD_RIGHTS_REQUIRED | 0xF.
+        pub const ALL_ACCESS: AccessMask = AccessMask::from_bits_retain(0x000F_0000 | 0x000F);
+    }
+
+    /// SymbolicLink object rights.
+    pub mod symbolic_link {
+        use super::AccessMask;
+        pub const QUERY: AccessMask = AccessMask::from_bits_retain(0x0001);
+        /// `SYMBOLIC_LINK_ALL_ACCESS` = STANDARD_RIGHTS_REQUIRED | 0x1.
+        pub const ALL_ACCESS: AccessMask = AccessMask::from_bits_retain(0x000F_0000 | 0x0001);
+    }
+
+    /// Event object rights.
+    pub mod event {
+        use super::AccessMask;
+        pub const QUERY_STATE: AccessMask = AccessMask::from_bits_retain(0x0001);
+        pub const MODIFY_STATE: AccessMask = AccessMask::from_bits_retain(0x0002);
+        /// `EVENT_ALL_ACCESS` = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3.
+        pub const ALL_ACCESS: AccessMask =
+            AccessMask::from_bits_retain(0x000F_0000 | 0x0010_0000 | 0x0003);
+    }
+
+    /// Device object rights (minimal placeholders for v0.1).
+    pub mod device {
+        use super::AccessMask;
+        pub const READ: AccessMask = AccessMask::from_bits_retain(0x0001);
+        pub const WRITE: AccessMask = AccessMask::from_bits_retain(0x0002);
+        pub const EXECUTE: AccessMask = AccessMask::from_bits_retain(0x0004);
     }
 }
 

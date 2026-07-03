@@ -10,6 +10,7 @@
 use alloc::vec::Vec;
 
 use nt_status::NtStatus;
+use nt_types::rights;
 use nt_types::{AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectTypeId, UnicodeString};
 
 use crate::store::ObjectRef;
@@ -34,10 +35,18 @@ impl ObjectManager {
         if let Some(id) = self.directory_type {
             return Ok(id);
         }
+        use rights::directory as dir;
         let id = self.register_type(ObjectTypeDef {
             name: DIRECTORY_TYPE_NAME,
-            valid_access: AccessMask::GENERIC_ALL, // refined in M6
-            generic_mapping: GenericMapping::default(),
+            valid_access: dir::ALL_ACCESS,
+            generic_mapping: GenericMapping {
+                generic_read: AccessMask::STANDARD_RIGHTS_READ | dir::QUERY | dir::TRAVERSE,
+                generic_write: AccessMask::STANDARD_RIGHTS_WRITE
+                    | dir::CREATE_OBJECT
+                    | dir::CREATE_SUBDIRECTORY,
+                generic_execute: AccessMask::STANDARD_RIGHTS_EXECUTE | dir::QUERY | dir::TRAVERSE,
+                generic_all: dir::ALL_ACCESS,
+            },
             delete: None, // children drop with the DirectoryBody
         })?;
         self.directory_type = Some(id);
@@ -49,10 +58,16 @@ impl ObjectManager {
         if let Some(id) = self.symlink_type {
             return Ok(id);
         }
+        use rights::symbolic_link as sym;
         let id = self.register_type(ObjectTypeDef {
             name: SYMLINK_TYPE_NAME,
-            valid_access: AccessMask::GENERIC_ALL, // refined in M6
-            generic_mapping: GenericMapping::default(),
+            valid_access: sym::ALL_ACCESS,
+            generic_mapping: GenericMapping {
+                generic_read: AccessMask::STANDARD_RIGHTS_READ | sym::QUERY,
+                generic_write: AccessMask::STANDARD_RIGHTS_WRITE,
+                generic_execute: AccessMask::STANDARD_RIGHTS_EXECUTE | sym::QUERY,
+                generic_all: sym::ALL_ACCESS,
+            },
             delete: None,
         })?;
         self.symlink_type = Some(id);

@@ -127,3 +127,23 @@ No proprietary NT source is copied; only documented semantics are reproduced.
   rejected rather than hang.)
 - A **broken** target resolves as far as it can and fails naturally at the missing
   component (`STATUS_OBJECT_NAME_NOT_FOUND` / `STATUS_OBJECT_PATH_NOT_FOUND`).
+
+## Access checks (implemented, Milestone 6 — `access.rs`)
+
+- v0.1 has **no security descriptors**; the policy (`compute_granted`) is: map the
+  requested access's `GENERIC_*` bits through the type's `GenericMapping`, resolve
+  `MAXIMUM_ALLOWED` to the type's full valid access, then grant `mapped ∩ valid`.
+- **Denial**: a **user-mode** caller (native/test clients) that, after mapping,
+  still requests specific rights the type does not define is denied at open with
+  `STATUS_ACCESS_DENIED`. A **kernel-mode** caller (Driver Host, executive) is
+  trusted — the surplus bits are simply masked off, not denied. (Real NT skips the
+  check entirely for `KernelMode` previous mode; masking is the conservative
+  equivalent here.)
+- `open` runs the check (using the client's registered access mode) and records the
+  **granted** access on the handle; `reference_by_handle` then checks each request
+  against that granted mask (`STATUS_ACCESS_DENIED`). `open_handle` remains the raw
+  primitive that stores a caller-supplied granted mask without a check.
+- Object-specific rights + generic mappings for the built-in `Directory` and
+  `SymbolicLink` types use the real Windows values (`nt_types::rights`). Types that
+  aren't synchronizable (e.g. Directory) don't include `SYNCHRONIZE` in their valid
+  access, so requesting it is denied for user-mode callers.

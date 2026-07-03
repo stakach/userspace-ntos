@@ -13,11 +13,13 @@
 
 extern crate alloc;
 
+mod access;
 mod handles;
 mod namespace;
 mod store;
 mod types;
 
+pub use access::compute_granted;
 pub use handles::{ClientKind, ClientRegistry, HandleTable};
 pub use store::{ObjectRef, ObjectStore};
 pub use types::{
@@ -865,6 +867,136 @@ mod tests {
         assert_eq!(
             om.lookup_path(&path("\\??\\A"), CI).unwrap_err(),
             NtStatus::OBJECT_PATH_NOT_FOUND
+        );
+    }
+
+    // --- Milestone 6: access checks -----------------------------------------
+
+    fn event_type_def() -> ObjectTypeDef {
+        use nt_types::rights::event as ev;
+        ObjectTypeDef {
+            name: "Event",
+            valid_access: ev::ALL_ACCESS,
+            generic_mapping: GenericMapping {
+                generic_read: AccessMask::STANDARD_RIGHTS_READ
+                    | AccessMask::SYNCHRONIZE
+                    | ev::QUERY_STATE,
+                generic_write: AccessMask::STANDARD_RIGHTS_WRITE
+                    | AccessMask::SYNCHRONIZE
+                    | ev::MODIFY_STATE,
+                generic_execute: AccessMask::STANDARD_RIGHTS_EXECUTE | AccessMask::SYNCHRONIZE,
+                generic_all: ev::ALL_ACCESS,
+            },
+            delete: None,
+        }
+    }
+
+    #[test]
+    fn compute_granted_policy() {
+        use nt_types::rights::event as ev;
+        let def = event_type_def();
+        let valid = def.valid_access;
+        let m = &def.generic_mapping;
+
+        // GENERIC_ALL -> all valid rights
+        assert_eq!(
+            compute_granted(AccessMask::GENERIC_ALL, valid, m, AccessMode::UserMode).unwrap(),
+            valid
+        );
+        // GENERIC_READ -> read rights only (no generic bits left)
+        let g = compute_granted(AccessMask::GENERIC_READ, valid, m, AccessMode::UserMode).unwrap();
+        assert!(g.contains(ev::QUERY_STATE));
+        assert!(!g.contains(ev::MODIFY_STATE));
+        assert!(!g.has_generic());
+        // MAXIMUM_ALLOWED -> all valid rights
+        assert_eq!(
+            compute_granted(AccessMask::MAXIMUM_ALLOWED, valid, m, AccessMode::UserMode).unwrap(),
+            valid
+        );
+        // user-mode requesting a right the type does not define -> denied
+        let bogus = AccessMask::from_bits_retain(0x0800);
+        assert_eq!(
+            compute_granted(bogus, valid, m, AccessMode::UserMode).unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
+        // kernel-mode -> trusted; the bit is masked off, not denied
+        assert_eq!(
+            compute_granted(bogus, valid, m, AccessMode::KernelMode).unwrap(),
+            AccessMask::empty()
+        );
+    }
+
+    #[test]
+    fn open_records_granted_and_reference_checks() {
+        use nt_types::rights::event as ev;
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(event_type_def()).unwrap();
+        let user = om.register_client(ClientKind::NativeUser, AccessMode::UserMode);
+        let obj = om
+            .create_object(ty, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+
+        // Open for GENERIC_READ -> handle records the mapped read rights.
+        let h = om
+            .open(user, &obj, AccessMask::GENERIC_READ, ObjAttrFlags::empty())
+            .unwrap();
+        assert!(om
+            .reference_by_handle(user, h, Some(ty), ev::QUERY_STATE)
+            .is_ok());
+        assert_eq!(
+            om.reference_by_handle(user, h, Some(ty), ev::MODIFY_STATE)
+                .unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn open_user_over_request_denied_kernel_masked() {
+        let mut om = ObjectManager::new();
+        let ty = om.register_type(event_type_def()).unwrap();
+        let user = om.register_client(ClientKind::NativeUser, AccessMode::UserMode);
+        let kernel = om.register_client(ClientKind::ExecutiveService, AccessMode::KernelMode);
+        let obj = om
+            .create_object(ty, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        let bogus = AccessMask::from_bits_retain(0x0800);
+
+        assert_eq!(
+            om.open(user, &obj, bogus, ObjAttrFlags::empty())
+                .unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
+        // kernel-mode opens fine (granted is masked to empty).
+        let h = om.open(kernel, &obj, bogus, ObjAttrFlags::empty()).unwrap();
+        assert!(om
+            .reference_by_handle(kernel, h, Some(ty), AccessMask::empty())
+            .is_ok());
+    }
+
+    #[test]
+    fn open_directory_via_access_check() {
+        use nt_types::rights::directory as dir;
+        let mut om = bootstrapped();
+        let user = om.register_client(ClientKind::NativeUser, AccessMode::UserMode);
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+
+        let h = om
+            .open(
+                user,
+                &device,
+                AccessMask::GENERIC_READ,
+                ObjAttrFlags::empty(),
+            )
+            .unwrap();
+        // read maps to QUERY | TRAVERSE
+        assert!(om
+            .reference_by_handle(user, h, om.directory_type(), dir::QUERY | dir::TRAVERSE)
+            .is_ok());
+        // but not a create (write) right
+        assert_eq!(
+            om.reference_by_handle(user, h, om.directory_type(), dir::CREATE_OBJECT)
+                .unwrap_err(),
+            NtStatus::ACCESS_DENIED
         );
     }
 }
