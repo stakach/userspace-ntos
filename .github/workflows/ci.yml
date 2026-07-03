@@ -6,8 +6,27 @@ on:
   pull_request:
 
 jobs:
-  build:
-    name: build root task (bare-metal)
+  core:
+    name: NT core (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: no_std build (alloc-free crates)
+        run: |
+          rustup target add x86_64-unknown-none
+          cargo build -p nt-status -p nt-object-abi --target x86_64-unknown-none
+
+  root-task:
+    name: root task (bare-metal)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src, rustfmt
-      - name: rustfmt
+      - name: rustfmt (ntos-root)
         run: cd crates/ntos-root && cargo fmt --check
       - name: build ntos-root for the kernel's bare-metal target
         run: |

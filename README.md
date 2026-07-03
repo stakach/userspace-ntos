@@ -16,12 +16,26 @@ objects, handles, symbolic links).
 
 ```
 rust-micro/            the seL4-style microkernel (git submodule, pinned)
+Cargo.toml             workspace for the host-testable NT crates (cargo test on the host)
 crates/
-  ntos-root/           the root task the kernel boots — today a boot smoke-test,
-                       will host the NT Object Manager + executive
+  nt-status/           NTSTATUS-style status codes                       no_std
+  nt-types/            ids, access masks, UnicodeString, NtPath parser   no_std + alloc
+  nt-object-abi/       fixed-layout SURT wire ABI (opcodes + structs)    no_std
+  nt-object-manager/   the Object Manager core (store/handles/namespace) [in progress]
+  ntos-root/           the root task the kernel boots (standalone, custom target)
+components/            seL4 service components (e.g. object-manager)      [later]
 scripts/
   run.sh               build the root task + kernel (via the submodule) and boot QEMU
+docs/compat-notes/     behavioural compatibility notes vs Windows NT
+references/            NT/ReactOS/driver reference trees (gitignored, local only)
 ```
+
+The **host-testable NT core** (`nt-status`, `nt-types`, `nt-object-abi`,
+`nt-object-manager`) is a normal cargo workspace — `cargo test` on your laptop,
+no seL4 or QEMU. The kernel-bound bins (`ntos-root`, `components/*`) are
+standalone crates built for the microkernel's bare-metal target and excluded from
+the workspace. Implementation follows the milestones in
+[`references/nt-object-manager-spec.md`](references/nt-object-manager-spec.md) §22.
 
 The kernel is a **pinned git submodule**, not vendored source: `userspace-ntos`
 depends on an exact kernel SHA (its syscall/invocation ABI is tightly coupled),

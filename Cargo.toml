@@ -1,0 +1,31 @@
+# userspace-ntos — top-level workspace for the host-testable NT executive crates.
+#
+# The kernel-bound bins (crates/ntos-root, components/*) are standalone crates
+# with their own [workspace] + custom bare-metal target, so they are excluded
+# here; this workspace is the pure Rust core that runs under `cargo test` on the
+# host (no seL4, no QEMU).
+[workspace]
+resolver = "2"
+members = [
+    "crates/nt-status",
+    "crates/nt-types",
+    "crates/nt-object-abi",
+]
+exclude = [
+    "rust-micro",
+    "crates/ntos-root",
+    "references",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stakach/userspace-ntos"
+authors = ["Stephen von Takach <steve@place.technology>"]
+
+[workspace.dependencies]
+bitflags = { version = "2", default-features = false }
+nt-status = { path = "crates/nt-status" }
+nt-types = { path = "crates/nt-types" }
+nt-object-abi = { path = "crates/nt-object-abi" }

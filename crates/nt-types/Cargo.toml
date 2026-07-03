@@ -1,0 +1,22 @@
+[package]
+name = "nt-types"
+description = "Common NT primitive types (ids, access masks, Unicode strings, NT paths) for userspace-ntos (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["alloc"]
+# `alloc` gates the owned string/path/attributes types; the scalar id + mask
+# types are available without it.
+alloc = []
+std = ["alloc", "nt-status/std"]
+
+[dependencies]
+bitflags = { workspace = true }
+nt-status = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

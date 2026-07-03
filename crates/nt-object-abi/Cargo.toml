@@ -1,0 +1,19 @@
+[package]
+name = "nt-object-abi"
+description = "Fixed-layout SURT wire ABI (opcodes + request/response structs) for the NT Object Manager service mode (no_std)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# `surt` will pull in surt-abi's SQE/CQE types once service mode lands; the
+# payload structs + opcodes here are transport-agnostic and need no dependency.
+surt = []
+
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
