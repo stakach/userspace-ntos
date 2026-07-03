@@ -27,9 +27,11 @@ crates/
   ntos-root/           the root task the kernel boots (standalone, custom target)
 components/
   object-manager/      the Object Manager as a seL4 component (runs the stack on the kernel)
+  object-service/      client + server as TWO isolated components over SURT rings
 scripts/
   run.sh               build the hello root task + kernel and boot QEMU
   run-object-manager.sh  build + boot the Object Manager component in QEMU
+  run-object-service.sh  build + boot the isolated client/server (over SURT) in QEMU
 docs/compat-notes/     behavioural compatibility notes vs Windows NT
 references/            NT/ReactOS/driver reference trees (gitignored, local only)
 ```

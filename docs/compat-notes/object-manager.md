@@ -189,3 +189,27 @@ No proprietary NT source is copied; only documented semantics are reproduced.
   works end to end.
 - `create_named_object(ty, body, parent, name, permanent)` is the shared
   create-and-link primitive (`create_directory` and the I/O helpers build on it).
+
+## Service mode — isolated components over SURT (implemented, `components/object-service`)
+
+- The hardened form of the M7b in-process component: client and server run as **two
+  fully-isolated seL4 components** (own CSpaces + VSpaces), sharing only SURT ring
+  frames a broker (the rootserver) creates + transfers. The OB protocol crosses a
+  real address-space boundary.
+- **Transport = the SURT descriptors carrying OB verbatim.** `SurtSqe`(opcode +
+  offset/len into a shared request frame) is one OB request; `SurtCqe`(status,
+  information, detail0, detail1) is an `ObReply` field-for-field. So
+  `Server::dispatch` and `ObjectClient` are reused **unchanged** — only a
+  `SurtBackend` (client) and a `drain_blocking` dispatch loop (server) are new.
+- **Broker-mediated setup** (realistic NT topology): the trusted rootserver owns the
+  untypeds, so it creates the two ring frames + two data frames + two notifications,
+  `init_ring`s both rings before spawn (so each side just `attach`es — no
+  producer/consumer race), maps everything RW into both children at fixed vaddrs,
+  and seeds each child's CNode. No component-to-component cap transfer needed.
+- **Per-component heap**: the NT crates need `alloc`, but a spawned component's image
+  `.bss` is mapped **read-only**, so the bump allocator's counter lives in the RW
+  heap region the broker maps (not a static). 128 KiB per component, single-threaded.
+- Verified in QEMU: 8/8 OB operations (ping, create/lookup/open, symlink create +
+  follow + query, close) pass across the isolation boundary, no `#PF`, clean exit.
+- Scope: one client ↔ one server, single request in flight (synchronous RPC). The
+  ring API already supports batching / multiple in flight; multi-client is future work.
