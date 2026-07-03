@@ -36,3 +36,16 @@ must be real Driver-Host memory), and connects an ISR on vector 5; a
   `inject_interrupt` resolve a connected interrupt to its Driver-Host callback
   tokens (dropped after disconnect). `revoke_host` cleans up all mappings +
   interrupts for a faulted host (spec §15.1). 6 unit tests (§18.1/§18.4).
+
+## Register access + simulated device (implemented, Milestone 11.3)
+
+- `nt-register-access::RegisterBank` (spec §5.5, §8.6): a bounded byte buffer with
+  width-specific (`u8`/`u16`/`u32`) little-endian read/write, checking bounds +
+  alignment + per-range read-only permissions before each access. `poke_u32`
+  bypasses read-only (device-side mutation); `as_mut_ptr` exposes the backing store
+  for the Driver Host to hand a driver directly (register macros are inlined).
+- `nt-sim-device::SimDevice` (spec §5.8, §12): the fake MMIO device — ID
+  (`0x4d4d494f`, read-only) / control / status (bit0 = interrupt pending) / ack /
+  irq-count. `raise_interrupt` asserts the line; `acknowledge` clears it + bumps the
+  count. `mmio_ptr` is the `MmMapIoSpace` result the driver dereferences directly.
+  5 unit tests (width/bounds/alignment/read-only; ID + interrupt line).

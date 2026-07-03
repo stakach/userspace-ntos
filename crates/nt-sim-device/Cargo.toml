@@ -1,0 +1,14 @@
+[package]
+name = "nt-sim-device"
+description = "Simulated hardware model for the HAL milestone: a fake MMIO register bank (ID/control/status/ack/irq-count) with a test-triggered interrupt line. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-register-access = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

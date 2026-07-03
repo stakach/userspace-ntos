@@ -1,0 +1,11 @@
+[package]
+name = "nt-register-access"
+description = "Safe internal register-access abstraction for simulated MMIO: bounded, width-specific (u8/u16/u32) volatile-style load/store with alignment + read-only enforcement. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
