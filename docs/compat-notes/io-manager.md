@@ -78,3 +78,26 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   composing OM `create_file` + `open_handle` in the adapter; no new OM opcode was
   needed for library mode. A service-mode executive path (over SURT) is deferred to
   the client-facing server milestone.
+
+## Dispatch backend + mock driver (implemented, Milestone 4 — `dispatch.rs`, `mock_driver.rs`)
+
+- **`DriverDispatchBackend`** is the pluggable seam between the I/O Manager and a
+  driver (spec §15.1): `dispatch_irp(ctx, &IrpProjection) -> DispatchOutcome` +
+  `cancel_irp(IrpId)`. The backend receives an **`IrpProjection`** — ids + the
+  current stack location's parameters, never the canonical `IrpRecord` — plus a
+  `DispatchContext` carrying the buffered-I/O staging buffer (`SystemBuffer`).
+- **`DispatchOutcome`** = `Completed { status, information }` | `Pending` |
+  `Failed { status }`, with `from_status` mapping an `NtStatus` (success→Completed,
+  error→Failed).
+- **`MockDriverBackend`** (spec §15.2) is the in-process test/bring-up backend,
+  deterministic + configurable: create succeeds/fails (`set_create_status`), reads
+  return fixed data (`with_read_data`, filling the system buffer), writes record the
+  bytes (`written()`), IOCTLs echo their input or return a fixed status
+  (`IoctlBehavior::Echo | Status`), any dispatch can be forced `Pending` then
+  finished with `complete_pending(irp, status, info)`, `cancel_irp` marks a pending
+  IRP cancelled, and `inject_error` fails everything. Cleanup/close/flush complete
+  success; an unknown major returns `STATUS_INVALID_DEVICE_REQUEST`.
+- Buffered echo models `METHOD_BUFFERED`: input occupies the system buffer and the
+  output is those same bytes bounded by the output length. The router that maps a
+  major function to a backend, and the actual buffer staging, are wired up in M5/M6.
+- `NtStatus` now derives `Default` (= `STATUS_SUCCESS`).

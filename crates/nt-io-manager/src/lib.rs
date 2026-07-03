@@ -12,13 +12,16 @@
 extern crate alloc;
 
 mod device;
+mod dispatch;
 mod driver;
 mod file;
 mod irp;
+mod mock_driver;
 mod object_port;
 mod store;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
+pub use dispatch::{DispatchContext, DispatchOutcome, DriverDispatchBackend, IrpProjection};
 pub use driver::{
     DeviceList, DispatchTarget, DriverBackendId, DriverFlags, DriverPeerId, DriverRecord,
     DriverUnloadState, MajorFunctionTable, MockDispatchId,
@@ -29,6 +32,7 @@ pub use irp::{
     IoBufferRef, IoParameters, IoStackLocation, IrpRecord, IrpState, ReadWriteParameters,
     StackControl, StackFlags,
 };
+pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use store::{GenStore, IoId};
 
@@ -439,6 +443,207 @@ mod tests {
         assert_eq!(
             port.delete_symbolic_link(&path("\\??\\A")),
             Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
+    // --- Mock driver backend (Milestone 4) ---------------------------------
+
+    fn projection(major: u8, parameters: IoParameters) -> IrpProjection {
+        IrpProjection {
+            irp_id: IrpId::new(1, 1),
+            device_id: DeviceId::new(1, 1),
+            file_id: None,
+            major,
+            minor: 0,
+            parameters,
+            buffer: None,
+            user_data: 0,
+        }
+    }
+
+    fn ctx<'a>(buf: &'a mut [u8]) -> DispatchContext<'a> {
+        DispatchContext::new(DriverId::NULL, ClientId(1), buf)
+    }
+
+    #[test]
+    fn mock_create_sync_and_failure() {
+        let mut d = MockDriverBackend::new();
+        let mut buf = [0u8; 0];
+        let create = || {
+            projection(
+                major::IRP_MJ_CREATE,
+                IoParameters::Create(Default::default()),
+            )
+        };
+        assert_eq!(
+            d.dispatch_irp(ctx(&mut buf), &create()).unwrap(),
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0
+            }
+        );
+        d.set_create_status(NtStatus::ACCESS_DENIED);
+        assert_eq!(
+            d.dispatch_irp(ctx(&mut buf), &create()).unwrap(),
+            DispatchOutcome::Failed {
+                status: NtStatus::ACCESS_DENIED
+            }
+        );
+    }
+
+    #[test]
+    fn mock_read_returns_fixed_data() {
+        let mut d = MockDriverBackend::new().with_read_data(b"hello");
+        let mut buf = [0u8; 16];
+        let out = d
+            .dispatch_irp(
+                ctx(&mut buf),
+                &projection(
+                    major::IRP_MJ_READ,
+                    IoParameters::Read(ReadWriteParameters {
+                        length: 5,
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 5
+            }
+        );
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn mock_write_records_bytes() {
+        let mut d = MockDriverBackend::new();
+        let mut buf = *b"payload!";
+        let out = d
+            .dispatch_irp(
+                ctx(&mut buf),
+                &projection(
+                    major::IRP_MJ_WRITE,
+                    IoParameters::Write(ReadWriteParameters {
+                        length: 8,
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 8
+            }
+        );
+        assert_eq!(d.written(), b"payload!");
+    }
+
+    #[test]
+    fn mock_ioctl_echo_and_status() {
+        let mut d = MockDriverBackend::new();
+        let dc = IoParameters::DeviceControl(DeviceControlParameters {
+            ioctl_code: 0,
+            input_len: 8,
+            output_len: 8,
+        });
+        let mut buf = *b"in-data-more";
+        assert_eq!(
+            d.dispatch_irp(
+                ctx(&mut buf),
+                &projection(major::IRP_MJ_DEVICE_CONTROL, dc.clone())
+            )
+            .unwrap(),
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 8
+            }
+        );
+        d.set_ioctl(IoctlBehavior::Status(NtStatus::NOT_SUPPORTED));
+        let mut buf2 = [0u8; 4];
+        assert_eq!(
+            d.dispatch_irp(
+                ctx(&mut buf2),
+                &projection(major::IRP_MJ_DEVICE_CONTROL, dc)
+            )
+            .unwrap(),
+            DispatchOutcome::Failed {
+                status: NtStatus::NOT_SUPPORTED
+            }
+        );
+    }
+
+    #[test]
+    fn mock_pending_then_complete() {
+        let mut d = MockDriverBackend::new();
+        d.set_force_pending(true);
+        let mut buf = [0u8; 0];
+        let irp = IrpId::new(1, 5);
+        let mut p = projection(major::IRP_MJ_READ, IoParameters::Read(Default::default()));
+        p.irp_id = irp;
+        assert_eq!(
+            d.dispatch_irp(ctx(&mut buf), &p).unwrap(),
+            DispatchOutcome::Pending
+        );
+        assert!(d.is_pending(irp));
+        assert_eq!(
+            d.complete_pending(irp, NtStatus::SUCCESS, 42).unwrap(),
+            DispatchOutcome::Completed {
+                status: NtStatus::SUCCESS,
+                information: 42
+            }
+        );
+        assert!(!d.is_pending(irp));
+        assert!(d.complete_pending(irp, NtStatus::SUCCESS, 0).is_err());
+    }
+
+    #[test]
+    fn mock_pending_then_cancel() {
+        let mut d = MockDriverBackend::new();
+        d.set_force_pending(true);
+        let mut buf = [0u8; 0];
+        let irp = IrpId::new(1, 6);
+        let mut p = projection(major::IRP_MJ_WRITE, IoParameters::Write(Default::default()));
+        p.irp_id = irp;
+        d.dispatch_irp(ctx(&mut buf), &p).unwrap();
+        assert!(d.cancel_irp(irp).is_ok());
+        assert!(d.was_cancelled(irp));
+        assert!(!d.is_pending(irp));
+        assert!(d.cancel_irp(irp).is_err());
+    }
+
+    #[test]
+    fn mock_error_injection_and_unsupported_major() {
+        let mut d = MockDriverBackend::new();
+        d.inject_error(Some(NtStatus::DEVICE_NOT_CONNECTED));
+        let mut buf = [0u8; 0];
+        assert_eq!(
+            d.dispatch_irp(
+                ctx(&mut buf),
+                &projection(
+                    major::IRP_MJ_CREATE,
+                    IoParameters::Create(Default::default())
+                )
+            )
+            .unwrap(),
+            DispatchOutcome::Failed {
+                status: NtStatus::DEVICE_NOT_CONNECTED
+            }
+        );
+        d.inject_error(None);
+        assert_eq!(
+            d.dispatch_irp(
+                ctx(&mut buf),
+                &projection(major::IRP_MJ_PNP, IoParameters::Pnp)
+            )
+            .unwrap(),
+            DispatchOutcome::Failed {
+                status: NtStatus::INVALID_DEVICE_REQUEST
+            }
         );
     }
 

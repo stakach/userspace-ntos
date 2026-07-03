@@ -12,9 +12,9 @@
 
 #![no_std]
 
-/// An NT status code. See the module docs.
+/// An NT status code. See the module docs. `Default` is `STATUS_SUCCESS` (0).
 #[repr(transparent)]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct NtStatus(pub i32);
 
 impl NtStatus {
