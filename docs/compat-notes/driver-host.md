@@ -175,3 +175,23 @@ isolated user-space component and completing IRPs through the I/O Manager. See
   symlink reaches the driver's CREATE and `device_control` echoes `"ping"` back
   through the loaded driver (a `DriverHostBackend` bridging the I/O Manager's
   `DriverDispatchBackend` to `dispatch_irp`). 143 workspace tests.
+
+## Pending + cancel (implemented, Milestone 8 — `nt-driver-host` dispatch)
+
+- The async IRP cases (spec §10.2, §10.3, §17). A driver marks an IRP pending
+  (`io_mark_irp_pending` → `PendingReturned`) and returns `STATUS_PENDING`;
+  `dispatch_irp` returns `Pending` and records the IRP in the pending table
+  (keeping it tracked).
+- `complete_pending(irp_id, status, information)` models the driver's deferred
+  DPC/worker calling `IoCompleteRequest`: it writes the `IoStatus`, completes the
+  IRP (exactly-once), and queues a `DhCompletion`. `cancel_irp(irp_id)`
+  (`DH_OP_CANCEL_IRP`) completes a still-pending IRP with `STATUS_CANCELLED`
+  (v0.1 — cancel-routine invocation deferred). `poll_completion` drains ready
+  completions for the I/O Manager's pump.
+- **Exactly one final state** (spec §10.2/§10.3): completion and cancel both go
+  through the runtime's exactly-once `complete_irp`, so whichever wins the race
+  produces the single delivered completion and the loser is a no-op — verified in
+  both orders.
+- `fault()` fails every pending IRP with `STATUS_DEVICE_REMOVED` (so the I/O Manager
+  can finalize them) and marks the driver `Faulted`; a faulted driver rejects new
+  dispatch (spec §17). 148 workspace tests.

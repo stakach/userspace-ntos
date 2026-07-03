@@ -4,15 +4,32 @@
 //! exactly-once completion (spec §10.2).
 
 use nt_driver_runtime::ObjectKind;
-use nt_kernel_abi::{major, DeviceIoControlParams};
+use nt_kernel_abi::{major, DeviceIoControlParams, GuestAddr, Irp};
 
 use crate::{DispatchInvoke, DriverDispatchGate, DriverServices, DriverState, IoManagerBridge};
 
 const STATUS_PENDING: i32 = 0x0000_0103;
+const STATUS_CANCELLED: i32 = 0xC000_0120u32 as i32;
+const STATUS_DEVICE_REMOVED: i32 = 0xC000_02BFu32 as i32;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
 const STATUS_INVALID_DEVICE_STATE: i32 = 0xC000_0184u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
+
+/// A final completion the Driver Host delivers to the I/O Manager (a
+/// `DH_OP_COMPLETE_IRP`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DhCompletion {
+    pub irp_id: u64,
+    pub status: i32,
+    pub information: u64,
+}
+
+/// A pending (`STATUS_PENDING`) IRP awaiting a later completion/cancel/fault.
+pub(crate) struct PendingIrp {
+    pub irp_id: u64,
+    pub irp_addr: GuestAddr,
+}
 
 /// A request to dispatch one IRP to the loaded driver (a `DH_OP_DISPATCH_IRP`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -136,6 +153,12 @@ impl crate::DriverHost {
                 information,
             }
         } else if ret == STATUS_PENDING {
+            // The driver accepted the IRP as pending; track it for later
+            // completion / cancel / fault (spec §10.1 step 9).
+            self.pending.push(PendingIrp {
+                irp_id: req.irp_id,
+                irp_addr: irp,
+            });
             DispatchResult::Pending
         } else {
             DispatchResult::Failed { status: ret }
@@ -145,5 +168,105 @@ impl crate::DriverHost {
             self.runtime.untrack_irp(irp);
         }
         result
+    }
+
+    /// Number of IRPs the driver is holding as pending.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Complete a previously-pending IRP (the driver's deferred DPC/worker calling
+    /// `IoCompleteRequest`, spec §10.1 step 9). Queues a completion for
+    /// [`poll_completion`](Self::poll_completion). Returns `true` if this call
+    /// produced the completion (it may lose a race to a cancel — spec §10.2).
+    pub fn complete_pending(&mut self, irp_id: u64, status: i32, information: u64) -> bool {
+        let Some(idx) = self.pending.iter().position(|p| p.irp_id == irp_id) else {
+            return false;
+        };
+        let irp = self.pending[idx].irp_addr;
+        self.write_io_status(irp, status, information);
+        match self.runtime.complete_irp(irp) {
+            Ok((s, info)) => {
+                self.pending.remove(idx);
+                self.runtime.untrack_irp(irp);
+                self.completions.push(DhCompletion {
+                    irp_id,
+                    status: s,
+                    information: info,
+                });
+                true
+            }
+            Err(_) => {
+                // Already completed (a cancel won the race) — no-op.
+                self.pending.remove(idx);
+                false
+            }
+        }
+    }
+
+    /// `DH_OP_CANCEL_IRP` — cancel a pending IRP (spec §10.3). If it is still
+    /// pending, complete it with `STATUS_CANCELLED`; if completion already won the
+    /// race, this is a no-op. Exactly one final state reaches the I/O Manager.
+    pub fn cancel_irp(&mut self, irp_id: u64) -> bool {
+        let Some(idx) = self.pending.iter().position(|p| p.irp_id == irp_id) else {
+            return false;
+        };
+        let irp = self.pending[idx].irp_addr;
+        if self.runtime.is_irp_completed(irp) {
+            self.pending.remove(idx);
+            return false;
+        }
+        self.write_io_status(irp, STATUS_CANCELLED, 0);
+        if let Some(mut record) = self.runtime.arena().read::<Irp>(irp) {
+            record.cancel = 1;
+            self.runtime.arena_mut().write(irp, record);
+        }
+        match self.runtime.complete_irp(irp) {
+            Ok((s, info)) => {
+                self.pending.remove(idx);
+                self.runtime.untrack_irp(irp);
+                self.completions.push(DhCompletion {
+                    irp_id,
+                    status: s,
+                    information: info,
+                });
+                true
+            }
+            Err(_) => {
+                self.pending.remove(idx);
+                false
+            }
+        }
+    }
+
+    /// Drain one ready completion (the I/O Manager's `pump`, spec §16.5).
+    pub fn poll_completion(&mut self) -> Option<DhCompletion> {
+        if self.completions.is_empty() {
+            None
+        } else {
+            Some(self.completions.remove(0))
+        }
+    }
+
+    /// Fault the driver: fail all pending IRPs (`STATUS_DEVICE_REMOVED`) so the
+    /// I/O Manager can finalize them, and mark the driver faulted (spec §17).
+    pub fn fault(&mut self) {
+        for p in core::mem::take(&mut self.pending) {
+            self.runtime.untrack_irp(p.irp_addr);
+            self.completions.push(DhCompletion {
+                irp_id: p.irp_id,
+                status: STATUS_DEVICE_REMOVED,
+                information: 0,
+            });
+        }
+        self.state = DriverState::Faulted;
+    }
+
+    fn write_io_status(&mut self, irp: GuestAddr, status: i32, information: u64) {
+        if let Some(mut record) = self.runtime.arena().read::<Irp>(irp) {
+            record.io_status.status = status;
+            record.io_status.information = information;
+            self.runtime.arena_mut().write(irp, record);
+        }
     }
 }

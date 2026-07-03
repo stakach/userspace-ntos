@@ -22,7 +22,7 @@ pub use call::Win64Gate;
 pub use call::{
     DispatchInvoke, DriverDispatchGate, DriverEntryGate, EntryContext, MockDispatchGate, MockGate,
 };
-pub use dispatch::{DispatchRequest, DispatchResult};
+pub use dispatch::{DhCompletion, DispatchRequest, DispatchResult};
 pub use services::{
     BridgeCreateDevice, BridgeDeviceIds, DriverServices, IoManagerBridge, NullBridge,
 };
@@ -38,13 +38,15 @@ use nt_kernel_abi::{GuestAddr, MAJOR_FUNCTION_COUNT};
 use nt_pe_loader::{MappedImage, PeError};
 use nt_status::NtStatus;
 
-/// The driver's lifecycle state (spec §9).
+/// The driver's lifecycle state (spec §9, §17).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DriverState {
     Unloaded,
     Loaded,
     Started,
     Failed,
+    /// The driver faulted; its pending IRPs were failed (spec §17).
+    Faulted,
 }
 
 /// Why a load / start failed.
@@ -77,6 +79,8 @@ pub struct DriverHost {
     entry_status: i32,
     trampoline_next: u64,
     bound_trampolines: Vec<(String, String, u64)>,
+    pending: Vec<dispatch::PendingIrp>,
+    completions: Vec<dispatch::DhCompletion>,
 }
 
 impl DriverHost {
@@ -96,6 +100,8 @@ impl DriverHost {
             entry_status: 0,
             trampoline_next: trampoline_base,
             bound_trampolines: Vec::new(),
+            pending: Vec::new(),
+            completions: Vec::new(),
         }
     }
 

@@ -209,6 +209,21 @@ impl<'a> DriverServices<'a> {
         }
     }
 
+    /// `IoMarkIrpPending` — mark `irp` as pending (`PendingReturned`), so the
+    /// dispatch returns `STATUS_PENDING` and the IRP completes later (spec §10.1).
+    pub fn io_mark_irp_pending(&mut self, irp: GuestAddr) -> i32 {
+        if self.runtime.validate(irp, ObjectKind::Irp).is_none() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if let Some(mut record) = self.runtime.arena().read::<Irp>(irp) {
+            record.pending_returned = 1;
+            self.runtime.arena_mut().write(irp, record);
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_PARAMETER
+        }
+    }
+
     // --- RtlInitUnicodeString ----------------------------------------------
 
     /// `RtlInitUnicodeString(DestinationString, SourceString)` — point `dest` at a
