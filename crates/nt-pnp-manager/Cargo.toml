@@ -1,0 +1,14 @@
+[package]
+name = "nt-pnp-manager"
+description = "Core NT PnP Manager state machine: the devnode table, the v0.1 device lifecycle state machine with validated transitions, static device fixtures, and raw/translated resource assignments. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-pnp-abi = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

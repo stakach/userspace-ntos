@@ -15,3 +15,17 @@ MMIO + connects the interrupt; `IRP_MN_REMOVE_DEVICE` disconnects/unmaps/detache
 - `DeviceState` (`#[repr(u32)]`, spec §8.1): the 14-state devnode machine
   (Uninitialized → … → Started → … → Removed / Failed).
 - `#[repr(C)]` `PnpDevnodeReq` / `PnpLifecycleReq` / `PnpDevnodeInfo`. 4 layout tests.
+
+## PnP Manager core (implemented, Milestone 12.3 — `nt-pnp-manager`)
+
+- `PnpManager`: a devnode table over static fixtures; no driver pointers, only IDs +
+  resource values. `create_mmio_fixture_devnode` enumerates the `MmioInterruptTest`
+  fixture (memory `0x1000_0000`/`0x1000`, interrupt vector 5) in state `Enumerated`.
+- `can_transition(from, to)` encodes the §8.2 state machine; `transition` validates
+  it (invalid → `InvalidTransition`) and rejects a `Removed` devnode (`StaleId`). No
+  `START` before AddDevice; no duplicate `START` without a Stop; `Failed` from any
+  active state.
+- `mapping_allowed(id)` is true only in `Started` (spec §15.2 resource gating);
+  `is_live` false after `Removed`. `set_fdo`/`set_driver`/`resources`/`pdo`/`fdo`
+  accessors. 5 unit tests (fixture, full start lifecycle, invalid transitions, no
+  duplicate start, remove-then-stale).
