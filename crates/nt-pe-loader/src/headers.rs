@@ -12,6 +12,7 @@ pub const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 /// Data-directory indices.
 pub const DIRECTORY_ENTRY_IMPORT: usize = 1;
 pub const DIRECTORY_ENTRY_BASERELOC: usize = 5;
+pub const DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
 
 /// Section characteristics (subset).
 pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;

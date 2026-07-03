@@ -37,8 +37,12 @@ fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Map `frames` fresh RW(X) 4 KiB pages at `base` in the root's own VSpace,
-/// creating the PDPT/PD/PT. On x86_64 the pages are executable (no `ExecuteNever`).
+/// Frame caps backing the driver image region (kept so the pages can be remapped
+/// W^X once the image is loaded).
+static mut CODE_FRAME_CAPS: [u64; 16] = [0; 16];
+
+/// Map `frames` fresh RW 4 KiB pages at `base` in the root's own VSpace, creating
+/// the PDPT/PD/PT, recording the frame caps for the later W^X remap.
 unsafe fn map_region(base: u64, frames: u64) {
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
@@ -53,6 +57,22 @@ unsafe fn map_region(base: u64, frames: u64) {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        CODE_FRAME_CAPS[i as usize] = f;
+    }
+}
+
+/// Re-map the driver image W^X: executable + read-only sections become read-only
+/// (rights 2 — code can no longer be modified at runtime), only writable data
+/// stays writable (rights 3). No page remains both writable and executable.
+/// (`page_map` here can't set `ExecuteNever`, so writable data is still executable
+/// — true NX needs a kernel-ABI extension.)
+unsafe fn apply_wx(pe: &nt_pe_loader::PeFile, frames: u64) {
+    for i in 0..frames {
+        let rva = (i * 0x1000) as u32;
+        let rights = if pe.protection_at(rva).writable() { 3 } else { 2 };
+        let f = CODE_FRAME_CAPS[i as usize];
+        let _ = page_unmap(f);
+        let _ = page_map(f, CODE_VADDR + i * 0x1000, rights, CAP_INIT_THREAD_VSPACE);
     }
 }
 
@@ -176,6 +196,7 @@ extern "win64" fn ntos_stub() -> i32 {
     0
 }
 
+#[allow(function_casts_as_integer)] // taking each stub's address for the IAT
 fn export_addr(name: &str) -> u64 {
     match name {
         "RtlInitUnicodeString" => ntos_rtl_init_unicode_string as usize as u64,
@@ -286,10 +307,22 @@ unsafe fn run() {
     }
     check(b"patch_iat", true);
 
-    // Seed the /GS stack cookie (`__security_cookie`, at .data RVA 0x3000 for this
-    // image). The MSVC `GsDriverEntry` wrapper's `__security_init_cookie` fastfails
-    // (`int 0x29`) if it is left at 0 — normally the image loader initialises it.
-    core::ptr::write_unaligned((CODE_VADDR + 0x3000) as *mut u64, 0x1234_5678_9abc_def0);
+    // Seed the /GS stack cookie (`__security_cookie`), resolved from the PE
+    // load-config directory. The MSVC `GsDriverEntry` wrapper's
+    // `__security_init_cookie` fastfails (`int 0x29`) if it is left at 0 — normally
+    // the image loader initialises it.
+    let cookie_ok = if let Some(rva) = pe.security_cookie_rva() {
+        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
+        true
+    } else {
+        false
+    };
+    check(b"security_cookie", cookie_ok);
+
+    // Re-map the image W^X: code + read-only data become read-only; only writable
+    // data stays writable. No page is left both writable and executable.
+    apply_wx(&pe, frames);
+    check(b"w_xor_x", true);
 
     // Build the DRIVER_OBJECT + a RegistryPath UNICODE_STRING.
     let driver_object = alloc_device_object(); // 512 zeroed bytes, 16-aligned, ≥336

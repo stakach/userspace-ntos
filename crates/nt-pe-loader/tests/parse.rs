@@ -1,7 +1,7 @@
 //! PE-loader tests against hand-crafted PE32+ images: parse, map, relocate,
 //! import listing, and malformed-image rejection (no panics).
 
-use nt_pe_loader::{ImportRef, PeError, PeFile};
+use nt_pe_loader::{ImportRef, PeError, PeFile, Protection};
 
 // --- a minimal PE32+ image builder -----------------------------------------
 
@@ -223,6 +223,61 @@ fn relocations_are_applied_on_rebase() {
     let img = pe.map(new_base).unwrap();
     // The rebased pointer must have the delta applied.
     assert_eq!(img.u64_at_rva(data_va).unwrap(), new_base);
+}
+
+#[test]
+fn security_cookie_from_load_config() {
+    // A load-config directory at RVA 0x2000 whose SecurityCookie (offset 88) is
+    // the VA of __security_cookie at RVA 0x3000.
+    let lc_va: u32 = 0x2000;
+    let mut lc = vec![0u8; 0x148];
+    lc[88..96].copy_from_slice(&(BASE + 0x3000).to_le_bytes());
+    let sec = Sec {
+        name: *b".rdata\0\0",
+        va: lc_va,
+        chars: 0x4000_0040,
+        data: lc,
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x4000,
+        &[text_section(0x1000, vec![0xC3]), sec],
+        &[(10, lc_va, 0x148)],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.security_cookie_rva(), Some(0x3000));
+
+    // No load-config directory → None.
+    let plain = build_pe(
+        BASE,
+        0x1000,
+        0x2000,
+        &[text_section(0x1000, vec![0xC3])],
+        &[],
+    );
+    assert_eq!(PeFile::parse(&plain).unwrap().security_cookie_rva(), None);
+}
+
+#[test]
+fn protection_from_section_characteristics() {
+    let data = Sec {
+        name: *b".data\0\0\0",
+        va: 0x2000,
+        chars: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+        data: vec![0u8; 8],
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xC3]), data],
+        &[],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.protection_at(0x1000), Protection::ReadExecute); // .text
+    assert_eq!(pe.protection_at(0x2000), Protection::ReadWrite); // .data
+    assert_eq!(pe.protection_at(0), Protection::ReadOnly); // headers
 }
 
 #[test]

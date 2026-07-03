@@ -22,6 +22,28 @@ pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
 
+/// The memory protection a mapped page should carry, for a W^X mapping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Protection {
+    /// Read-only data.
+    ReadOnly,
+    /// Writable data (never executable).
+    ReadWrite,
+    /// Executable code (read + execute, never writable).
+    ReadExecute,
+}
+
+impl Protection {
+    /// True if a page with this protection must be writable.
+    pub fn writable(self) -> bool {
+        matches!(self, Protection::ReadWrite)
+    }
+    /// True if a page with this protection is executable.
+    pub fn executable(self) -> bool {
+        matches!(self, Protection::ReadExecute)
+    }
+}
+
 /// A structured PE-loader error. No parse path panics; every failure is one of
 /// these.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -146,6 +168,45 @@ impl<'a> PeFile<'a> {
     /// Parse the base-relocation table (spec §7.2).
     pub fn relocations(&self) -> Result<alloc::vec::Vec<Relocation>, PeError> {
         relocs::parse_relocations(self.bytes, &self.headers, &self.sections)
+    }
+
+    /// The RVA of the image's `__security_cookie` (`/GS`), read from the load-config
+    /// data directory's `SecurityCookie` VA (offset 88). `None` if the image has no
+    /// load config / cookie. The MSVC `GsDriverEntry` wrapper fastfails if this word
+    /// is left 0, so a loader must seed it before calling `DriverEntry`.
+    pub fn security_cookie_rva(&self) -> Option<u32> {
+        let dir = self
+            .headers
+            .data_directory(headers::DIRECTORY_ENTRY_LOAD_CONFIG);
+        if dir.virtual_address == 0 || dir.size < 96 {
+            return None;
+        }
+        let cookie_va =
+            rva::u64_at_rva(self.bytes, &self.sections, dir.virtual_address + 88).ok()?;
+        if cookie_va == 0 {
+            return None;
+        }
+        u32::try_from(cookie_va.checked_sub(self.headers.image_base)?).ok()
+    }
+
+    /// The memory protection a page at `rva` should get (from its section's
+    /// characteristics) — the basis for a W^X mapping (executable code + read-only
+    /// data are not writable; only writable data stays writable).
+    pub fn protection_at(&self, rva: u32) -> Protection {
+        for s in &self.sections {
+            let start = s.virtual_address;
+            let size = s.virtual_size.max(s.size_of_raw_data);
+            if rva >= start && rva - start < size {
+                if s.is_executable() {
+                    return Protection::ReadExecute;
+                }
+                if s.is_writable() {
+                    return Protection::ReadWrite;
+                }
+                return Protection::ReadOnly;
+            }
+        }
+        Protection::ReadOnly // headers / gaps
     }
 
     /// Map the image into a fresh buffer at `load_base`, copying headers +

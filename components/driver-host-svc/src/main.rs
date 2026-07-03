@@ -68,6 +68,10 @@ pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
 pub const CT_RESULT: u64 = 5;
+/// Base slot for the driver image frame caps, seeded so the child can remap W^X.
+pub const CT_CODE_BASE: u64 = 8;
+
+static mut CODE_FRAME_CAPS: [u64; CODE_FRAMES as usize] = [0; CODE_FRAMES as usize];
 
 const CN_RADIX: u32 = 5;
 const CN_GUARD_BADGE: u64 = 59;
@@ -143,6 +147,9 @@ unsafe fn map_fresh_region(pml4: u64, base: u64, frames: u64, rights: u64) {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, base + i * 0x1000, rights, pml4);
+        if i < CODE_FRAMES {
+            CODE_FRAME_CAPS[i as usize] = f;
+        }
     }
 }
 
@@ -231,6 +238,12 @@ unsafe fn spawn_component(
     seed_cnode(cnode, CT_PML4, pml4);
     for &(slot, src) in seeds {
         seed_cnode(cnode, slot, src);
+    }
+    if with_driver {
+        // Give the child its image frame caps so it can remap the region W^X.
+        for i in 0..CODE_FRAMES {
+            seed_cnode(cnode, CT_CODE_BASE + i, CODE_FRAME_CAPS[i as usize]);
+        }
     }
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);

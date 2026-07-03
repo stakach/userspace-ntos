@@ -41,6 +41,18 @@ fn real_surttest_sys_loads_at_preferred_base() {
 
     // DriverEntry is at RVA 0x5000.
     assert_eq!(host.image().unwrap().entry_point(), 0x1_4000_0000 + 0x5000);
+
+    // The /GS cookie is resolvable from the load-config directory (RVA 0x3000).
+    let pe = nt_pe_loader::PeFile::parse(surttest_sys()).unwrap();
+    assert_eq!(pe.security_cookie_rva(), Some(0x3000));
+    assert_eq!(
+        pe.protection_at(0x1000),
+        nt_pe_loader::Protection::ReadExecute
+    ); // .text
+    assert_eq!(
+        pe.protection_at(0x3000),
+        nt_pe_loader::Protection::ReadWrite
+    ); // .data (cookie)
 }
 
 #[test]

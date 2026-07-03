@@ -270,3 +270,27 @@ CSpace + VSpace), so a driver fault is contained to the child, not the broker.
   running in the isolated Driver Host, and back. `./scripts/run-driver-host-svc.sh`.
   **This completes Milestone 9: a real Windows driver executing in an isolated,
   fault-contained seL4 component, driven over SURT.**
+
+## Hardening: W^X + load-config cookie (implemented)
+
+Two robustness improvements to the on-kernel Driver Host executors
+(`driver-host-exec`, `driver-host-svc`):
+
+- **Security cookie via the PE load-config directory** — `nt-pe-loader`'s
+  `PeFile::security_cookie_rva()` reads the `SecurityCookie` VA from the load-config
+  data directory (index 10, offset 88) and returns its RVA, instead of the
+  components hard-coding `0x3000`. For `SurtTest.sys` this resolves to RVA `0x3000`
+  (test-verified). A driver with no load config → `None` (no seed needed).
+- **W^X mapping** — the image is mapped RW, loaded (copy + IAT patch + relocate +
+  cookie seed), then **re-mapped W^X**: executable + read-only sections become
+  read-only (`page_map` rights 2), only writable data stays writable (rights 3). No
+  page is left both writable and executable, so the driver's code can't be modified
+  at runtime. `nt-pe-loader`'s `PeFile::protection_at(rva)` drives this from the
+  section characteristics. In `driver-host-exec` the root task keeps the image frame
+  caps; in `driver-host-svc` the broker seeds them into the child so it can remap
+  its own region.
+- Limitation: `sel4-rt`'s `page_map` can't set `ExecuteNever`, so writable data
+  pages remain executable (no NX) — true NX needs a kernel-ABI extension. The
+  achievable W^X (code read-only after load) is in place; documented as a follow-on.
+- Both components re-verified in QEMU with the changes (driver-host-exec 15/15 incl.
+  `security_cookie` + `w_xor_x`; driver-host-svc 3/3 over SURT). 152 workspace tests.

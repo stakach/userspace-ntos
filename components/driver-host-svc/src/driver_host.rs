@@ -11,8 +11,8 @@ use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
 
 use crate::{
-    CODE_VADDR, COMP_RING_VADDR, CT_N_COMP, CT_N_SUB, ENV, REP_DATA_VADDR, REQ_DATA_VADDR,
-    RING_LEN, STATE_VADDR, SUB_RING_VADDR,
+    CODE_FRAMES, CODE_VADDR, COMP_RING_VADDR, CT_CODE_BASE, CT_N_COMP, CT_N_SUB, CT_PML4, ENV,
+    REP_DATA_VADDR, REQ_DATA_VADDR, RING_LEN, STATE_VADDR, SUB_RING_VADDR,
 };
 
 static SURTTEST_SYS: &[u8] =
@@ -175,7 +175,22 @@ unsafe fn setup() -> Option<u64> {
             }
         }
     }
-    core::ptr::write_unaligned((CODE_VADDR + 0x3000) as *mut u64, 0x1234_5678_9abc_def0);
+    // Seed the /GS cookie, resolved from the load-config directory.
+    if let Some(rva) = pe.security_cookie_rva() {
+        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
+    }
+
+    // Re-map the image W^X: code + read-only data become read-only; only writable
+    // data stays writable. No page is left both writable and executable.
+    for i in 0..CODE_FRAMES {
+        let rights = if pe.protection_at((i * 0x1000) as u32).writable() {
+            3
+        } else {
+            2
+        };
+        let _ = crate::page_unmap(CT_CODE_BASE + i);
+        let _ = crate::page_map(CT_CODE_BASE + i, CODE_VADDR + i * 0x1000, rights, CT_PML4);
+    }
 
     let driver_object = alloc_obj();
     core::ptr::write_unaligned(driver_object as *mut i16, 4);
