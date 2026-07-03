@@ -101,3 +101,28 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   output is those same bytes bounded by the output length. The router that maps a
   major function to a backend, and the actual buffer staging, are wired up in M5/M6.
 - `NtStatus` now derives `Default` (= `STATUS_SUCCESS`).
+
+## Open / create path (implemented, Milestone 5 — `open.rs`)
+
+- `IoManager` is now generic over the Object Manager port `P` and owns a registry
+  of dispatch backends (`Vec<Box<dyn DriverDispatchBackend>>`). `register_client`
+  delegates to the port so a client's canonical handles live in the Object Manager.
+- **`create_driver`** (spec §10.3) registers the driver's dispatch backend + a
+  `\Driver\Name` object and routes the v0.1 majors to that backend via the
+  `MajorFunctionTable`. **`create_device`** (`IoCreateDevice`, §11.3) creates the
+  `Device` object (named under `\Device`, or unnamed) owned by a driver.
+  **`create_symbolic_link`** (§11.4) delegates to the Object Manager.
+- **`open`** (spec §12.3) is the create path: resolve the Device object through the
+  Object Manager (symlink-following), allocate a `FileRecord`, broker the OM File
+  object + a handle for the client (§8.4), build + dispatch an `IRP_MJ_CREATE` to
+  the device's driver backend (routed via the driver's `MajorFunctionTable` — an
+  `Unsupported` major → `STATUS_INVALID_DEVICE_REQUEST`, a `DriverPeer` target →
+  `STATUS_NOT_IMPLEMENTED` until M8), and on synchronous success move the file to
+  `Open`, free the IRP, and return the handle. On any failure (driver failure, bad
+  create status, error) it **closes the handle, removes the FileRecord, and frees
+  the IRP** — no reference or record leaks (verified against the real Object
+  Manager: a failed open leaves `live_object_count` unchanged). v0.1 completes
+  creates synchronously; a `Pending` create returns `STATUS_NOT_SUPPORTED` pending
+  the completion engine.
+- Verified: `\Device\Test0` and `\??\Test0` (symlink) both open through the mock
+  driver, and end-to-end against a real bootstrapped `ObjectManager`.

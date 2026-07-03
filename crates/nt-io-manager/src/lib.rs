@@ -11,6 +11,9 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 mod device;
 mod dispatch;
 mod driver;
@@ -18,6 +21,7 @@ mod file;
 mod irp;
 mod mock_driver;
 mod object_port;
+mod open;
 mod store;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
@@ -42,19 +46,45 @@ pub use object_port::ObjectManagerLibraryPort;
 // Re-export the canonical id types so downstream crates get them from one place.
 pub use nt_io_abi::{DeviceId, DriverId, FileId, IoRequestId, IrpId};
 
-/// The canonical I/O Manager: owns the driver / device / file / IRP stores.
+/// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP
+/// stores, the registered dispatch backends, and the port to the Object Manager
+/// (`P`). Single-threaded (`&mut self`).
 #[derive(Default)]
-pub struct IoManager {
+pub struct IoManager<P> {
     drivers: GenStore<DriverId, DriverRecord>,
     devices: GenStore<DeviceId, DeviceRecord>,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
+    port: P,
+    backends: Vec<Box<dyn DriverDispatchBackend>>,
 }
 
-impl IoManager {
-    /// A fresh I/O Manager with empty stores.
-    pub fn new() -> Self {
-        Self::default()
+impl<P> IoManager<P> {
+    /// A fresh I/O Manager over Object Manager port `port`.
+    pub fn new(port: P) -> Self {
+        Self {
+            drivers: GenStore::new(),
+            devices: GenStore::new(),
+            files: GenStore::new(),
+            irps: GenStore::new(),
+            port,
+            backends: Vec::new(),
+        }
+    }
+
+    /// Borrow the Object Manager port.
+    pub fn port(&self) -> &P {
+        &self.port
+    }
+    /// Mutably borrow the Object Manager port.
+    pub fn port_mut(&mut self) -> &mut P {
+        &mut self.port
+    }
+
+    /// Register a dispatch backend, returning its registry index.
+    pub fn register_backend(&mut self, backend: Box<dyn DriverDispatchBackend>) -> usize {
+        self.backends.push(backend);
+        self.backends.len() - 1
     }
 
     // --- Drivers -----------------------------------------------------------
@@ -169,14 +199,18 @@ mod tests {
     use super::*;
     use nt_io_abi::major;
     use nt_status::NtStatus;
-    use nt_types::{AccessMask, ClientId, NtPath, ObjectId};
+    use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
     use proptest::prelude::*;
 
     fn path(s: &str) -> NtPath {
         NtPath::parse_str(s).unwrap()
     }
 
-    fn a_driver(om: &mut IoManager) -> DriverId {
+    fn io() -> IoManager<MockObjectPort> {
+        IoManager::new(MockObjectPort::new())
+    }
+
+    fn a_driver(om: &mut IoManager<MockObjectPort>) -> DriverId {
         om.register_driver(DriverRecord::new(
             ObjectId::NULL,
             path("\\Driver\\Test"),
@@ -185,7 +219,7 @@ mod tests {
         ))
     }
 
-    fn a_device(om: &mut IoManager, driver: DriverId) -> DeviceId {
+    fn a_device(om: &mut IoManager<MockObjectPort>, driver: DriverId) -> DeviceId {
         om.add_device(DeviceRecord::new(
             ObjectId::NULL,
             driver,
@@ -199,7 +233,7 @@ mod tests {
 
     #[test]
     fn driver_device_registration() {
-        let mut om = IoManager::new();
+        let mut om = io();
         let drv = a_driver(&mut om);
         assert_eq!(om.driver(drv).unwrap().id, drv);
         assert_eq!(om.driver_count(), 1);
@@ -215,7 +249,7 @@ mod tests {
 
     #[test]
     fn stale_ids_are_rejected() {
-        let mut om = IoManager::new();
+        let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
 
@@ -232,7 +266,7 @@ mod tests {
 
     #[test]
     fn null_and_cross_store_ids_never_resolve() {
-        let mut om = IoManager::new();
+        let mut om = io();
         assert!(om.driver(DriverId::NULL).is_none());
         assert!(om.device(DeviceId::NULL).is_none());
         assert!(om.file(FileId::NULL).is_none());
@@ -245,7 +279,7 @@ mod tests {
 
     #[test]
     fn file_lifecycle_transitions() {
-        let mut om = IoManager::new();
+        let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
         let fid = om.add_file(FileRecord::new(
@@ -274,7 +308,7 @@ mod tests {
 
     #[test]
     fn irp_lifecycle_transitions() {
-        let mut om = IoManager::new();
+        let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
         let iid = om.allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_CREATE));
@@ -294,7 +328,7 @@ mod tests {
 
     #[test]
     fn irp_pending_then_cancel_path() {
-        let mut om = IoManager::new();
+        let mut om = io();
         let drv = a_driver(&mut om);
         let dev = a_device(&mut om, drv);
         let iid = om.allocate_irp(IrpRecord::new(ClientId(1), dev, None, major::IRP_MJ_READ));
@@ -647,6 +681,91 @@ mod tests {
         );
     }
 
+    // --- Open / create path (Milestone 5) ----------------------------------
+
+    fn setup_device(om: &mut IoManager<MockObjectPort>) -> ClientId {
+        let client = om.register_client();
+        let driver = om
+            .create_driver(&path("\\Driver\\Test"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Test0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        om.create_symbolic_link(&path("\\??\\Test0"), &path("\\Device\\Test0"))
+            .unwrap();
+        client
+    }
+
+    fn open_read(
+        om: &mut IoManager<MockObjectPort>,
+        client: ClientId,
+        p: &str,
+    ) -> Result<HandleValue, NtStatus> {
+        om.open(
+            client,
+            &path(p),
+            AccessMask::GENERIC_READ,
+            ShareAccess::READ,
+            CreateOptions::empty(),
+            0,
+        )
+    }
+
+    #[test]
+    fn open_by_path_and_symlink() {
+        let mut om = io();
+        let client = setup_device(&mut om);
+        let h1 = open_read(&mut om, client, "\\Device\\Test0").unwrap();
+        assert_eq!(om.file_count(), 1);
+        assert_eq!(om.irp_count(), 0); // create IRP freed on completion
+        let h2 = open_read(&mut om, client, "\\??\\Test0").unwrap();
+        assert_ne!(h1, h2);
+        assert_eq!(om.file_count(), 2);
+    }
+
+    #[test]
+    fn open_unknown_path_rejected() {
+        let mut om = io();
+        let client = setup_device(&mut om);
+        assert_eq!(
+            open_read(&mut om, client, "\\Device\\Missing"),
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(om.file_count(), 0);
+    }
+
+    #[test]
+    fn open_create_failure_cleans_up() {
+        let mut om = io();
+        let client = om.register_client();
+        let mut bad = MockDriverBackend::new();
+        bad.set_create_status(NtStatus::ACCESS_DENIED);
+        let driver = om
+            .create_driver(&path("\\Driver\\Bad"), Box::new(bad))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Bad0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            open_read(&mut om, client, "\\Device\\Bad0"),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        assert_eq!(om.file_count(), 0); // FileRecord removed
+        assert_eq!(om.irp_count(), 0); // IRP freed
+    }
+
     #[cfg(feature = "object-manager")]
     #[test]
     fn library_port_against_real_object_manager() {
@@ -678,5 +797,65 @@ mod tests {
         );
         assert!(port.reference_device(dev).is_ok());
         assert!(port.close_handle(client, handle).is_ok());
+    }
+
+    #[cfg(feature = "object-manager")]
+    #[test]
+    fn open_against_real_object_manager() {
+        use nt_object_manager::ComponentId;
+
+        let mut om = IoManager::new(ObjectManagerLibraryPort::new(ComponentId(0x10)).unwrap());
+        let client = om.register_client();
+        let good = om
+            .create_driver(&path("\\Driver\\Good"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        om.create_device(
+            good,
+            Some(&path("\\Device\\Test0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        om.create_symbolic_link(&path("\\??\\Test0"), &path("\\Device\\Test0"))
+            .unwrap();
+
+        // Success: open by direct path + via the symlink through the real OM.
+        let open = |om: &mut IoManager<ObjectManagerLibraryPort>, p: &str| {
+            om.open(
+                client,
+                &path(p),
+                AccessMask::GENERIC_READ,
+                ShareAccess::READ,
+                CreateOptions::empty(),
+                0,
+            )
+        };
+        assert!(open(&mut om, "\\Device\\Test0").is_ok());
+        assert!(open(&mut om, "\\??\\Test0").is_ok());
+
+        // Failure cleanup leaks no Object Manager object.
+        let mut bad = MockDriverBackend::new();
+        bad.set_create_status(NtStatus::ACCESS_DENIED);
+        let bd = om
+            .create_driver(&path("\\Driver\\Bad"), Box::new(bad))
+            .unwrap();
+        om.create_device(
+            bd,
+            Some(&path("\\Device\\Bad0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+        let before = om.port_mut().object_manager().live_object_count();
+        assert_eq!(
+            open(&mut om, "\\Device\\Bad0"),
+            Err(NtStatus::ACCESS_DENIED)
+        );
+        let after = om.port_mut().object_manager().live_object_count();
+        assert_eq!(before, after);
     }
 }
