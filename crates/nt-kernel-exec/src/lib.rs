@@ -13,11 +13,13 @@
 extern crate alloc;
 
 mod dpc;
+mod event;
 mod irql;
 mod spin;
 mod timer;
 
 pub use dpc::{DpcImportance, DpcQueue};
+pub use event::{EventKind, EventStore, WaitResult};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{Clock, FakeClock, TimerQueue};

@@ -51,3 +51,14 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
 - `Clock` trait + a deterministic `FakeClock` (`advance_100ns`/`advance_ms`/
   `set_system_time`) for reproducible tests (spec §10.3). 5 tests (§14.4: relative +
   absolute fire, reset invalidates old expiry, periodic requeue, cancel).
+
+## Events + waits (implemented, Milestone 10.4 — `nt-kernel-exec::event`)
+
+- `EventStore` (spec §6.5): a `KEVENT` keyed by the driver's pointer, with
+  `Notification` (manual-reset) + `Synchronization` (auto-reset) kinds. `initialize`
+  = `KeInitializeEvent`; `set` = `KeSetEvent` (returns previous state); `reset` =
+  `KeResetEvent`; `clear` = `KeClearEvent`; `read_state` = `KeReadStateEvent`.
+- `poll(ptr, irql)` = the `KeWaitForSingleObject` core: a signaled event succeeds
+  (auto-resetting a Synchronization event); otherwise times out. Waiting above
+  `APC_LEVEL` fails (`WaitResult::BadIrql`, spec §6.1). Blocking waits integrate at
+  the runtime level (advance clock / drain, re-poll). 4 tests (§14.5).
