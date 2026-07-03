@@ -93,6 +93,15 @@ impl DispatchOutcome {
     }
 }
 
+/// A final completion of a previously-pending IRP, delivered by a driver back to
+/// the I/O Manager (spec §16.5, the reverse-ring `IODRV_OP_COMPLETE_IRP`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct DriverCompletion {
+    pub irp_id: IrpId,
+    pub status: NtStatus,
+    pub information: u64,
+}
+
 /// A driver dispatch backend (spec §15.1). Pluggable: the mock backend for
 /// tests/bring-up, or a SURT driver-peer backend for an isolated Driver Host.
 pub trait DriverDispatchBackend {
@@ -105,4 +114,11 @@ pub trait DriverDispatchBackend {
 
     /// Request cancellation of a (typically pending) IRP owned by this backend.
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus>;
+
+    /// Poll for a ready final completion of a previously-pending IRP. The I/O
+    /// Manager's `pump` drains these. Backends that only complete synchronously
+    /// use the default (never any pending completions).
+    fn poll_completion(&mut self) -> Option<DriverCompletion> {
+        None
+    }
 }

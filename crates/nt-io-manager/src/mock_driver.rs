@@ -11,7 +11,9 @@ use alloc::vec::Vec;
 use nt_io_abi::major;
 use nt_status::NtStatus;
 
-use crate::dispatch::{DispatchContext, DispatchOutcome, DriverDispatchBackend, IrpProjection};
+use crate::dispatch::{
+    DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
+};
 use crate::irp::IoParameters;
 use crate::IrpId;
 
@@ -32,10 +34,12 @@ pub struct MockDriverBackend {
     read_data: Vec<u8>,
     ioctl: IoctlBehavior,
     force_pending: bool,
+    pending_completion: Option<(NtStatus, u64)>,
     inject_error: Option<NtStatus>,
     written: Vec<u8>,
     pending: Vec<IrpId>,
     cancelled: Vec<IrpId>,
+    ready: Vec<DriverCompletion>,
 }
 
 impl MockDriverBackend {
@@ -64,9 +68,17 @@ impl MockDriverBackend {
     }
 
     /// If true, every dispatch is accepted as pending (completed later via
-    /// [`complete_pending`](Self::complete_pending)).
+    /// [`complete_pending`](Self::complete_pending) or, if a pending completion
+    /// is configured, on the next `pump`).
     pub fn set_force_pending(&mut self, pending: bool) {
         self.force_pending = pending;
+    }
+
+    /// Configure the final status a force-pending request completes with the next
+    /// time the I/O Manager pumps. Without this, a pending request stays pending
+    /// until cancelled.
+    pub fn set_pending_completion(&mut self, status: NtStatus, information: u64) {
+        self.pending_completion = Some((status, information));
     }
 
     /// Fail every dispatch with `status` (error injection); `None` disables it.
@@ -125,8 +137,24 @@ impl DriverDispatchBackend for MockDriverBackend {
         if let Some(status) = self.inject_error {
             return Ok(DispatchOutcome::Failed { status });
         }
-        if self.force_pending {
+        // Pending applies to the data operations only, so create/cleanup/close
+        // still complete synchronously (a device can be opened + closed normally).
+        let is_data = matches!(
+            irp.major,
+            major::IRP_MJ_READ
+                | major::IRP_MJ_WRITE
+                | major::IRP_MJ_DEVICE_CONTROL
+                | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        );
+        if self.force_pending && is_data {
             self.pending.push(irp.irp_id);
+            if let Some((status, information)) = self.pending_completion {
+                self.ready.push(DriverCompletion {
+                    irp_id: irp.irp_id,
+                    status,
+                    information,
+                });
+            }
             return Ok(DispatchOutcome::Pending);
         }
 
@@ -198,6 +226,8 @@ impl DriverDispatchBackend for MockDriverBackend {
     }
 
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), NtStatus> {
+        // Drop any queued completion so a cancelled IRP is not also completed.
+        self.ready.retain(|c| c.irp_id != irp_id);
         match self.pending.iter().position(|&i| i == irp_id) {
             Some(pos) => {
                 self.pending.remove(pos);
@@ -206,5 +236,9 @@ impl DriverDispatchBackend for MockDriverBackend {
             }
             None => Err(NtStatus::INVALID_PARAMETER),
         }
+    }
+
+    fn poll_completion(&mut self) -> Option<DriverCompletion> {
+        self.ready.pop()
     }
 }

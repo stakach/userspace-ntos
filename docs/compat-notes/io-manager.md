@@ -150,3 +150,27 @@ behaviour. Companion to the Object Manager notes; see `references/nt-io-manager-
   round-trips are observable through the I/O result (no backend downcast). Verified
   end-to-end against a real bootstrapped `ObjectManager` (write→read loopback + an
   echoing IOCTL through real OM handle validation).
+
+## Completion + cancellation engine + cleanup/close (implemented — `complete.rs`, `cancel.rs`, `close.rs`)
+
+- A request whose backend returns `Pending` parks the IRP in the `Pending` state
+  and the caller sees `STATUS_PENDING`. **`pump`** drains each backend's ready
+  completions (a new defaulted `DriverDispatchBackend::poll_completion` hook) and
+  finalizes the matching IRPs. **`pending_irps`** is the stuck-IRP detector (§19).
+- **Exactly-once completion** (§18, §19): `finalize_pending` (completion) and
+  `finalize_cancelled` (cancel) both guard on the IRP state, so an IRP is finalized
+  once with either its original completion **or** `STATUS_CANCELLED`, never both,
+  and freed once. `cancel` is best-effort + race-aware: unknown/already-final IRP →
+  successful no-op (the completion won); another client's IRP → `ACCESS_DENIED`; a
+  pending IRP → `CancelRequested` → `backend.cancel_irp` (which drops any queued
+  completion) → finalized `Cancelled`. Verified in both race orders (cancel-before-
+  pump and pump-before-cancel) — exactly one final result each.
+- **Cleanup/close** (§12.2): `cleanup` (`IRP_MJ_CLEANUP`) moves an open file
+  `Open → CleanupPending → CleanupComplete`, after which reads fail
+  (`STATUS_FILE_CLOSED`). `close` (`IRP_MJ_CLOSE`) moves it to `Closed`, releases
+  the Object Manager handle (reaping the File object) and drops the FileRecord;
+  the handle is then invalid. Verified against the real Object Manager: closing a
+  file returns `live_object_count` to baseline (references balanced).
+- The mock driver gained `set_pending_completion` (queue a completion delivered on
+  the next `pump`); `force_pending` now applies to the data operations only, so a
+  device still opens + closes normally.

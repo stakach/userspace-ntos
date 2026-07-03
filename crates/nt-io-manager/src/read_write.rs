@@ -92,21 +92,32 @@ impl<P: ObjectManagerPort> IoManager<P> {
 
     // --- shared request path (used by read/write/device-control) -----------
 
-    /// Reference an open File by handle for `client` (access-checked via the
-    /// Object Manager), returning its `(FileId, DeviceId)`. The FileRecord must be
-    /// in the `Open` state (spec §23.1).
+    /// Reference a File by handle for `client` (access-checked via the Object
+    /// Manager), returning its `FileId`. Does not constrain the file state — used
+    /// by close, which runs after cleanup.
+    pub(crate) fn reference_file(
+        &mut self,
+        client: ClientId,
+        handle: HandleValue,
+        required_access: AccessMask,
+    ) -> Result<FileId, NtStatus> {
+        let file_object = self
+            .port
+            .reference_file_by_handle(client, handle, required_access)?;
+        self.find_file_by_object(file_object)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    /// Reference an **open** File by handle for `client`, returning its
+    /// `(FileId, DeviceId)`. The FileRecord must be in the `Open` state, else
+    /// `STATUS_FILE_CLOSED` (spec §23.1).
     pub(crate) fn reference_open_file(
         &mut self,
         client: ClientId,
         handle: HandleValue,
         required_access: AccessMask,
     ) -> Result<(FileId, DeviceId), NtStatus> {
-        let file_object = self
-            .port
-            .reference_file_by_handle(client, handle, required_access)?;
-        let file_id = self
-            .find_file_by_object(file_object)
-            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let file_id = self.reference_file(client, handle, required_access)?;
         let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
         if !file.state.is_open() {
             return Err(NtStatus::FILE_CLOSED);

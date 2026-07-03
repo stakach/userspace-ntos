@@ -14,6 +14,9 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+mod cancel;
+mod close;
+mod complete;
 mod device;
 mod device_control;
 mod dispatch;
@@ -27,7 +30,9 @@ mod read_write;
 mod store;
 
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
-pub use dispatch::{DispatchContext, DispatchOutcome, DriverDispatchBackend, IrpProjection};
+pub use dispatch::{
+    DispatchContext, DispatchOutcome, DriverCompletion, DriverDispatchBackend, IrpProjection,
+};
 pub use driver::{
     DeviceList, DispatchTarget, DriverBackendId, DriverFlags, DriverPeerId, DriverRecord,
     DriverUnloadState, MajorFunctionTable, MockDispatchId,
@@ -888,6 +893,99 @@ mod tests {
         );
     }
 
+    // --- Completion / cancellation engine + cleanup/close ------------------
+
+    fn pending_read(mock: MockDriverBackend) -> (IoManager<MockObjectPort>, ClientId, IrpId) {
+        let (mut om, client, handle) = open_device_with(mock, AccessMask::GENERIC_READ);
+        let mut out = [0u8; 8];
+        assert_eq!(om.read(client, handle, 0, &mut out), Err(NtStatus::PENDING));
+        let irp = om.pending_irps()[0];
+        (om, client, irp)
+    }
+
+    #[test]
+    fn pending_read_completes_via_pump() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        mock.set_pending_completion(NtStatus::SUCCESS, 4);
+        let (mut om, _client, irp) = pending_read(mock);
+        assert_eq!(om.pending_irps().len(), 1);
+        assert_eq!(om.pump(), 1); // driver's completion is delivered
+        assert!(om.pending_irps().is_empty());
+        assert!(om.irp(irp).is_none()); // finalized + freed
+    }
+
+    #[test]
+    fn cancel_pending_irp() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true); // no completion queued
+        let (mut om, client, irp) = pending_read(mock);
+        om.cancel(client, irp).unwrap();
+        assert!(om.irp(irp).is_none()); // finalized as cancelled + freed
+        assert!(om.pending_irps().is_empty());
+        assert_eq!(om.pump(), 0);
+    }
+
+    #[test]
+    fn cancel_other_client_denied() {
+        let mut mock = MockDriverBackend::new();
+        mock.set_force_pending(true);
+        let (mut om, _client, irp) = pending_read(mock);
+        let other = om.register_client();
+        assert_eq!(om.cancel(other, irp), Err(NtStatus::ACCESS_DENIED));
+        assert_eq!(om.pending_irps().len(), 1); // still pending
+    }
+
+    #[test]
+    fn cancel_racing_completion_is_exactly_once() {
+        // Order A: cancel before pump — cancellation wins, completion dropped.
+        {
+            let mut mock = MockDriverBackend::new();
+            mock.set_force_pending(true);
+            mock.set_pending_completion(NtStatus::SUCCESS, 4);
+            let (mut om, client, irp) = pending_read(mock);
+            om.cancel(client, irp).unwrap();
+            assert_eq!(om.pump(), 0); // no double finalize
+            assert!(om.irp(irp).is_none());
+        }
+        // Order B: pump before cancel — completion wins, cancel is a no-op.
+        {
+            let mut mock = MockDriverBackend::new();
+            mock.set_force_pending(true);
+            mock.set_pending_completion(NtStatus::SUCCESS, 4);
+            let (mut om, client, irp) = pending_read(mock);
+            assert_eq!(om.pump(), 1);
+            om.cancel(client, irp).unwrap(); // already final: no-op
+            assert!(om.irp(irp).is_none());
+        }
+    }
+
+    #[test]
+    fn cleanup_close_lifecycle() {
+        let (mut om, client, handle) = open_device_with(
+            MockDriverBackend::new(),
+            AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+        );
+        let mut out = [0u8; 8];
+        assert!(om.read(client, handle, 0, &mut out).is_ok());
+
+        // Cleanup: the file is no longer usable for reads.
+        om.cleanup(client, handle).unwrap();
+        assert_eq!(
+            om.read(client, handle, 0, &mut out),
+            Err(NtStatus::FILE_CLOSED)
+        );
+
+        // Close: the record is dropped + the handle is invalidated.
+        assert_eq!(om.file_count(), 1);
+        om.close(client, handle).unwrap();
+        assert_eq!(om.file_count(), 0);
+        assert_eq!(
+            om.read(client, handle, 0, &mut out),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
     #[cfg(feature = "object-manager")]
     #[test]
     fn library_port_against_real_object_manager() {
@@ -1024,5 +1122,43 @@ mod tests {
             .device_control(client, handle, code, b"ping", &mut io_out)
             .unwrap();
         assert_eq!(&io_out[..n as usize], b"ping");
+    }
+
+    #[cfg(feature = "object-manager")]
+    #[test]
+    fn close_balances_object_manager_refs() {
+        use nt_object_manager::ComponentId;
+
+        let mut om = IoManager::new(ObjectManagerLibraryPort::new(ComponentId(0x10)).unwrap());
+        let client = om.register_client();
+        let driver = om
+            .create_driver(&path("\\Driver\\Test"), Box::new(MockDriverBackend::new()))
+            .unwrap();
+        om.create_device(
+            driver,
+            Some(&path("\\Device\\Test0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        )
+        .unwrap();
+
+        let before = om.port_mut().object_manager().live_object_count();
+        let handle = om
+            .open(
+                client,
+                &path("\\Device\\Test0"),
+                AccessMask::GENERIC_READ,
+                ShareAccess::empty(),
+                CreateOptions::empty(),
+                0,
+            )
+            .unwrap();
+        // The File object is alive while the handle is open.
+        assert!(om.port_mut().object_manager().live_object_count() > before);
+        // Close reaps it: the reference count returns to baseline.
+        om.close(client, handle).unwrap();
+        assert_eq!(om.port_mut().object_manager().live_object_count(), before);
     }
 }
