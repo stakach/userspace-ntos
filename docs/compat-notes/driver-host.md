@@ -308,3 +308,14 @@ buffer — `RW | PAGE_EXECUTE_NEVER`. The component image stays read-only + exec
 executable memory in the component is legitimate code — a compromised driver can't
 execute injected code from the stack or heap. Verified in QEMU (3/3): NX on the
 stack/heap is transparent to correct code (Rust never executes from them).
+
+## Root-task NX (loader)
+
+The last two on-kernel components without broker-mapped memory — `object-manager`
+(in-process root task) and `driver-host-exec` (root-task driver executor) — get NX
+from a rust-micro loader change: the ELF loader maps each `PT_LOAD` segment
+`execute_never = !executable` (the `r-x` code segment stays executable; the `r--`
+rodata and `rw-` `.data`/`.bss` — including the root task's heap — are NX), and the
+root task's stack, IPC buffer, and BootInfo pages are mapped NX. So every on-kernel
+component now runs with only legitimate code executable. Verified: object-manager
+9/9, driver-host-exec 14/14, 185 kernel-microtest checks, 0 regressions.
