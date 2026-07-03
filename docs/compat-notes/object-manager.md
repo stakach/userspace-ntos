@@ -107,3 +107,23 @@ No proprietary NT source is copied; only documented semantics are reproduced.
   `close_client`), which can then delete the object. A **permanent** object keeps
   its name until `make_temporary` clears the flag (removing the name immediately if
   no handles remain).
+
+## Symbolic links (implemented, Milestone 5 — `namespace.rs`, `SymbolicLinkBody`)
+
+- A `SymbolicLink` object stores an absolute `NtPath` target. `create_symbolic_link`
+  inserts it into the namespace like any named object; `query_symbolic_link` returns
+  the target (non-link → `STATUS_OBJECT_TYPE_MISMATCH`).
+- Resolution (`lookup_path_ex`) follows links: **intermediate** links are always
+  followed; the **final** component is followed unless the caller opted for
+  `lookup_link` (the `OBJ_OPENLINK` behaviour, used to open/query the link itself).
+  A link is followed by restarting resolution from the root with the target
+  prepended to the remaining components, so `\??\Foo → \Device\Bar` makes
+  `\??\Foo` resolve to the `\Device\Bar` object and `\??\Foo\x` resolve to
+  `\Device\Bar\x`.
+- **Loop bound**: at most 32 link expansions per lookup (spec §9.3). Exceeding it
+  (a self-loop `\??\Self → \??\Self`, a mutual loop `A↔B`, …) returns
+  `STATUS_OBJECT_PATH_NOT_FOUND`. (Windows' exact internal status for an exhausted
+  reparse budget isn't documented; behavioural compat here is that loops are
+  rejected rather than hang.)
+- A **broken** target resolves as far as it can and fails naturally at the missing
+  component (`STATUS_OBJECT_NAME_NOT_FOUND` / `STATUS_OBJECT_PATH_NOT_FOUND`).

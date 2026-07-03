@@ -7,18 +7,26 @@
 //! its name (and the directory's reference) when its last handle closes; a
 //! permanent object keeps its name until made temporary.
 
+use alloc::vec::Vec;
+
 use nt_status::NtStatus;
 use nt_types::{AccessMask, CaseSensitivity, GenericMapping, NtPath, ObjectTypeId, UnicodeString};
 
 use crate::store::ObjectRef;
-use crate::types::{DirectoryBody, ObjectBody, ObjectTypeDef};
+use crate::types::{DirectoryBody, ObjectBody, ObjectTypeDef, SymbolicLinkBody};
 use crate::ObjectManager;
 
 /// The built-in Directory object type name.
 const DIRECTORY_TYPE_NAME: &str = "Directory";
 
+/// The built-in SymbolicLink object type name.
+const SYMLINK_TYPE_NAME: &str = "SymbolicLink";
+
 /// The MVP root directories created at bootstrap (spec §9.1).
 const ROOT_DIRECTORIES: &[&str] = &["Device", "Driver", "??", "BaseNamedObjects"];
+
+/// Maximum symbolic-link expansions during one lookup (spec §9.3), to bound loops.
+const SYMLINK_LIMIT: u32 = 32;
 
 impl ObjectManager {
     /// Register the Directory type (idempotent), returning its id.
@@ -36,9 +44,29 @@ impl ObjectManager {
         Ok(id)
     }
 
+    /// Register the SymbolicLink type (idempotent), returning its id.
+    fn ensure_symlink_type(&mut self) -> Result<ObjectTypeId, NtStatus> {
+        if let Some(id) = self.symlink_type {
+            return Ok(id);
+        }
+        let id = self.register_type(ObjectTypeDef {
+            name: SYMLINK_TYPE_NAME,
+            valid_access: AccessMask::GENERIC_ALL, // refined in M6
+            generic_mapping: GenericMapping::default(),
+            delete: None,
+        })?;
+        self.symlink_type = Some(id);
+        Ok(id)
+    }
+
     /// The Directory type id, once the namespace is bootstrapped.
     pub fn directory_type(&self) -> Option<ObjectTypeId> {
         self.directory_type
+    }
+
+    /// The SymbolicLink type id, once one has been created.
+    pub fn symlink_type(&self) -> Option<ObjectTypeId> {
+        self.symlink_type
     }
 
     /// A reference to the root directory `\`, once bootstrapped.
@@ -120,22 +148,69 @@ impl ObjectManager {
         }
     }
 
-    /// Resolve an absolute NT path to its target object (spec §9), returning a
-    /// new counted reference. A missing/non-directory *intermediate* component
-    /// yields `STATUS_OBJECT_PATH_NOT_FOUND`; a missing *final* name yields
+    /// Create a symbolic link named `name` in `parent` pointing at `target`.
+    pub fn create_symbolic_link(
+        &mut self,
+        parent: &ObjectRef,
+        name: &UnicodeString,
+        target: NtPath,
+        permanent: bool,
+    ) -> Result<ObjectRef, NtStatus> {
+        let ty = self.ensure_symlink_type()?;
+        let link = self.create_object(ty, ObjectBody::SymbolicLink(SymbolicLinkBody { target }))?;
+        self.insert_named_object(parent, name, &link, permanent)?;
+        Ok(link)
+    }
+
+    /// The target of a symbolic-link object. `STATUS_OBJECT_TYPE_MISMATCH` if
+    /// `link` is not a symbolic link.
+    pub fn query_symbolic_link(&self, link: &ObjectRef) -> Result<NtPath, NtStatus> {
+        link.with_body(|b| match b {
+            ObjectBody::SymbolicLink(s) => Ok(s.target.clone()),
+            _ => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+        })
+    }
+
+    /// Resolve an absolute NT path to its target object (spec §9), **following
+    /// symbolic links**. A missing/non-directory *intermediate* component yields
+    /// `STATUS_OBJECT_PATH_NOT_FOUND`; a missing *final* name yields
     /// `STATUS_OBJECT_NAME_NOT_FOUND`. The root path `\` returns the root.
     pub fn lookup_path(&self, path: &NtPath, case: CaseSensitivity) -> Result<ObjectRef, NtStatus> {
-        let mut current = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
-        let comps = path.components();
-        for (i, comp) in comps.iter().enumerate() {
-            let is_final = i + 1 == comps.len();
+        self.lookup_path_ex(path, case, true)
+    }
+
+    /// Like [`lookup_path`](Self::lookup_path) but returns the symbolic-link
+    /// object itself if the final component is a link (does not follow it) — the
+    /// `OBJ_OPENLINK` behaviour, used to query a link.
+    pub fn lookup_link(&self, path: &NtPath, case: CaseSensitivity) -> Result<ObjectRef, NtStatus> {
+        self.lookup_path_ex(path, case, false)
+    }
+
+    /// Core path resolver. Intermediate symbolic links are always followed; the
+    /// final component is followed only when `follow_final`. A symbolic link is
+    /// followed by restarting resolution from the root with the link's target
+    /// prepended to the remaining components; more than [`SYMLINK_LIMIT`]
+    /// expansions in one lookup is treated as a loop (`STATUS_OBJECT_PATH_NOT_FOUND`).
+    fn lookup_path_ex(
+        &self,
+        path: &NtPath,
+        case: CaseSensitivity,
+        follow_final: bool,
+    ) -> Result<ObjectRef, NtStatus> {
+        let root = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
+        let mut comps: Vec<UnicodeString> = path.components().to_vec();
+        let mut current = root.clone();
+        let mut idx = 0usize;
+        let mut hops = 0u32;
+
+        while idx < comps.len() {
+            let is_final = idx + 1 == comps.len();
             let step = current.with_body(|b| match b {
-                ObjectBody::Directory(d) => Ok(d.lookup(comp, case)),
+                ObjectBody::Directory(d) => Ok(d.lookup(&comps[idx], case)),
                 _ => Err(()),
             });
-            current = match step {
+            let child = match step {
                 Err(()) => return Err(NtStatus::OBJECT_PATH_NOT_FOUND), // not a directory
-                Ok(Some(child)) => child,
                 Ok(None) => {
                     return Err(if is_final {
                         NtStatus::OBJECT_NAME_NOT_FOUND
@@ -143,7 +218,30 @@ impl ObjectManager {
                         NtStatus::OBJECT_PATH_NOT_FOUND
                     })
                 }
+                Ok(Some(c)) => c,
             };
+
+            let target = child.with_body(|b| match b {
+                ObjectBody::SymbolicLink(s) => Some(s.target.clone()),
+                _ => None,
+            });
+            match target {
+                Some(t) if !is_final || follow_final => {
+                    hops += 1;
+                    if hops > SYMLINK_LIMIT {
+                        return Err(NtStatus::OBJECT_PATH_NOT_FOUND); // loop / too many links
+                    }
+                    let mut rebuilt: Vec<UnicodeString> = t.components().to_vec();
+                    rebuilt.extend_from_slice(&comps[idx + 1..]);
+                    comps = rebuilt;
+                    current = root.clone();
+                    idx = 0;
+                }
+                _ => {
+                    current = child;
+                    idx += 1;
+                }
+            }
         }
         Ok(current)
     }

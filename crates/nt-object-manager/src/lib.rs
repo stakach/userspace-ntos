@@ -42,6 +42,8 @@ pub struct ObjectManager {
     root: Option<ObjectRef>,
     /// The built-in Directory type id.
     directory_type: Option<ObjectTypeId>,
+    /// The built-in SymbolicLink type id.
+    symlink_type: Option<ObjectTypeId>,
 }
 
 impl ObjectManager {
@@ -53,6 +55,7 @@ impl ObjectManager {
             clients: ClientRegistry::new(),
             root: None,
             directory_type: None,
+            symlink_type: None,
         }
     }
 
@@ -760,6 +763,108 @@ mod tests {
         assert_eq!(
             om.remove_named_object(&device, &uni("R0"), CI).unwrap_err(),
             NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    // --- Milestone 5: symbolic links ----------------------------------------
+
+    #[test]
+    fn symlink_follow_query_and_openlink() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let bar = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&device, &uni("Bar"), &bar, true)
+            .unwrap();
+        // \??\Foo -> \Device\Bar
+        let link = om
+            .create_symbolic_link(&dosdev, &uni("Foo"), path("\\Device\\Bar"), true)
+            .unwrap();
+
+        // lookup_path follows the link to the target object
+        assert_eq!(
+            om.lookup_path(&path("\\??\\Foo"), CI).unwrap().id(),
+            bar.id()
+        );
+        // lookup_link returns the link object itself (OBJ_OPENLINK)
+        assert_eq!(
+            om.lookup_link(&path("\\??\\Foo"), CI).unwrap().id(),
+            link.id()
+        );
+        // query the target
+        assert_eq!(
+            om.query_symbolic_link(&link).unwrap(),
+            path("\\Device\\Bar")
+        );
+        // querying a non-symlink is a type mismatch
+        assert_eq!(
+            om.query_symbolic_link(&bar).unwrap_err(),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+    }
+
+    #[test]
+    fn intermediate_symlink_followed() {
+        let mut om = bootstrapped();
+        let device = om.lookup_path(&path("\\Device"), CI).unwrap();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        let ev = om.register_type(named_type_def("Event", None)).unwrap();
+        let sub = om.create_directory(&device, &uni("Sub"), true).unwrap();
+        let x = om
+            .create_object(ev, ObjectBody::Event(EventBody::default()))
+            .unwrap();
+        om.insert_named_object(&sub, &uni("X"), &x, true).unwrap();
+        // \??\D -> \Device
+        om.create_symbolic_link(&dosdev, &uni("D"), path("\\Device"), true)
+            .unwrap();
+        // \??\D\Sub\X resolves to \Device\Sub\X
+        assert_eq!(
+            om.lookup_path(&path("\\??\\D\\Sub\\X"), CI).unwrap().id(),
+            x.id()
+        );
+    }
+
+    #[test]
+    fn broken_symlink_target_errors() {
+        let mut om = bootstrapped();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        om.create_symbolic_link(&dosdev, &uni("Broken"), path("\\Device\\Nope"), true)
+            .unwrap();
+        // follows into \Device (exists) then a missing final name
+        assert_eq!(
+            om.lookup_path(&path("\\??\\Broken"), CI).unwrap_err(),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        // the link object itself is still openable
+        assert!(om.lookup_link(&path("\\??\\Broken"), CI).is_ok());
+    }
+
+    #[test]
+    fn symlink_self_loop_rejected() {
+        let mut om = bootstrapped();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        om.create_symbolic_link(&dosdev, &uni("Self"), path("\\??\\Self"), true)
+            .unwrap();
+        assert_eq!(
+            om.lookup_path(&path("\\??\\Self"), CI).unwrap_err(),
+            NtStatus::OBJECT_PATH_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn symlink_mutual_loop_rejected() {
+        let mut om = bootstrapped();
+        let dosdev = om.lookup_path(&path("\\??"), CI).unwrap();
+        om.create_symbolic_link(&dosdev, &uni("A"), path("\\??\\B"), true)
+            .unwrap();
+        om.create_symbolic_link(&dosdev, &uni("B"), path("\\??\\A"), true)
+            .unwrap();
+        assert_eq!(
+            om.lookup_path(&path("\\??\\A"), CI).unwrap_err(),
+            NtStatus::OBJECT_PATH_NOT_FOUND
         );
     }
 }
