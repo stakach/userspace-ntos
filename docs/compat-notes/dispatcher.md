@@ -62,3 +62,16 @@ deferred / asynchronous IRP completion (spec: Milestone 10). See
   (auto-resetting a Synchronization event); otherwise times out. Waiting above
   `APC_LEVEL` fails (`WaitResult::BadIrql`, spec §6.1). Blocking waits integrate at
   the runtime level (advance clock / drain, re-poll). 4 tests (§14.5).
+
+## Work items (implemented, Milestone 10.5 — `nt-kernel-exec::work_item`)
+
+- `WorkQueue` (spec §6.6): work-item callbacks run at `PASSIVE_LEVEL` (unlike DPCs).
+  Two flavours:
+  - `IO_WORKITEM`: `allocate` = `IoAllocateWorkItem(DeviceObject)` (returns an opaque
+    handle tied to the device), `queue_io` = `IoQueueWorkItem` (queued-once), `free`
+    = `IoFreeWorkItem`. Drained via `call_work_item(Routine, DeviceObject, Context)`.
+  - `WORK_QUEUE_ITEM`: `initialize_ex` = `ExInitializeWorkItem`, `queue_ex` =
+    `ExQueueWorkItem`. Drained via `call_ex_work_item(Routine, Parameter)`.
+  - `drain(irql, invoker, budget)` runs queued items at `PASSIVE_LEVEL`, copying
+    metadata + marking unqueued before the callback (a callback may `IoFreeWorkItem`
+    itself). 3 tests (§14.6). 23 `nt-kernel-exec` unit tests total.

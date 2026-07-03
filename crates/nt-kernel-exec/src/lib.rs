@@ -17,12 +17,14 @@ mod event;
 mod irql;
 mod spin;
 mod timer;
+mod work_item;
 
 pub use dpc::{DpcImportance, DpcQueue};
 pub use event::{EventKind, EventStore, WaitResult};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{Clock, FakeClock, TimerQueue};
+pub use work_item::WorkQueue;
 
 /// Invokes driver callbacks (DPC / timer-DPC / work-item routines) — function
 /// pointers into the loaded driver image (spec §7.2). Calling into driver code is
@@ -42,6 +44,10 @@ pub trait DriverCallbackInvoker {
         arg2: u64,
     );
 
-    /// `Routine(DeviceObject, Context)`.
+    /// `Routine(DeviceObject, Context)` for an `IO_WORKITEM`.
     fn call_work_item(&mut self, irql: u8, routine: u64, device_object: u64, context: u64);
+
+    /// `Routine(Parameter)` for a static `WORK_QUEUE_ITEM`. Defaults to a no-op —
+    /// host tests + drivers that only use `IO_WORKITEM` need not override it.
+    fn call_ex_work_item(&mut self, _irql: u8, _routine: u64, _parameter: u64) {}
 }
