@@ -30,12 +30,14 @@ components/
   object-service/      client + server as TWO isolated components over SURT rings
   io-manager/          the I/O Manager (over an embedded OM) as isolated components over SURT
   driver-host/         the I/O Manager dispatching IRPs to an isolated driver peer over SURT
+  driver-host-exec/    runs a REAL WDM .sys driver's DriverEntry on seL4 (x64 exec)
 scripts/
   run.sh               build the hello root task + kernel and boot QEMU
   run-object-manager.sh  build + boot the Object Manager component in QEMU
   run-object-service.sh  build + boot the isolated client/server (over SURT) in QEMU
   run-io-manager.sh      build + boot the isolated I/O Manager client/server in QEMU
   run-driver-host.sh     build + boot the I/O Manager + isolated driver peer in QEMU
+  run-driver-host-exec.sh  build + boot the real-driver executor (runs SurtTest.sys on seL4)
 docs/compat-notes/     behavioural compatibility notes vs Windows NT
 references/            NT/ReactOS/driver reference trees (gitignored, local only)
 ```

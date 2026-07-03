@@ -215,3 +215,26 @@ The loader + export registry are validated against a **real MSVC-built WDM drive
   `METHOD_BUFFERED`), `IOCTL_SURT_GET_VERSION` (0x222008 → `{0,1,0,9}`).
 - Executing its `DriverEntry`/dispatch requires x86_64 — proven in QEMU (M9); this
   host is aarch64.
+
+## Real x64 execution on seL4 (implemented, Milestone 9 step 1 — `components/driver-host-exec`)
+
+The core thesis, proven on hardware: **a real MSVC-built WDM driver's machine code
+runs in a seL4 user-space component**, calling back into the Rust NT runtime.
+
+- `components/driver-host-exec` (bare-metal root task) maps `SurtTest.sys` **executable**
+  at its preferred base `0x140000000` (retyping fresh PDPT/PD/PT + frames into the
+  root's own VSpace; x86_64 pages are executable without `ExecuteNever`), copies the
+  `nt-pe-loader`-laid-out image in, patches each `ntoskrnl.exe` import to a native
+  `extern "win64"` NT export stub, seeds the `/GS` `__security_cookie` (the MSVC
+  `GsDriverEntry` wrapper fastfails via `int 0x29` otherwise), and calls
+  `DriverEntry(DriverObject, RegistryPath)` under the Microsoft x64 ABI.
+- Verified in QEMU: `DriverEntry` returns `STATUS_SUCCESS`, `MajorFunction[CREATE]`
+  + `[DEVICE_CONTROL]` are installed, the driver's `IoCreateDevice` +
+  `IoCreateSymbolicLink` reach the runtime through the patched IAT, and the captured
+  device name is `\Device\SurtTest`. `./scripts/run-driver-host-exec.sh`.
+- Phase A of the same component first proved executable mapping + calling mapped
+  code (a hand-written `mov eax,0x1234; ret` stub) in isolation.
+- Scope: step 1 = real `DriverEntry` + IAT callbacks (in the root task). Step 2 =
+  IRP dispatch into the driver (`IOCTL_SURT_PING`/`ECHO`). Step 3 = isolate over the
+  SURT `DH_OP_*` transport to a separate I/O Manager component. v0.1 uses RWX + a
+  hard-coded cookie RVA.
