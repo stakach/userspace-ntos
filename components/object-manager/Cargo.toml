@@ -1,0 +1,37 @@
+# The NT Object Manager as a seL4 component: a standalone bare-metal root task
+# that runs the whole NT object model + service dispatcher on the rust-micro
+# kernel. Built independently (own workspace + custom target); staged as the
+# kernel's rootserver by build.sh.
+[workspace]
+
+[package]
+name = "ntos-object-manager"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-object-manager"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel ABI (from the rust-micro submodule).
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+# The NT object-manager stack (host-testable crates, built no_std + alloc here).
+nt-status = { path = "../../crates/nt-status" }
+nt-types = { path = "../../crates/nt-types" }
+nt-object-abi = { path = "../../crates/nt-object-abi" }
+nt-object-manager = { path = "../../crates/nt-object-manager" }
+nt-object-server = { path = "../../crates/nt-object-server" }
+nt-object-client = { path = "../../crates/nt-object-client" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"

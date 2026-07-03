@@ -21,11 +21,15 @@ crates/
   nt-status/           NTSTATUS-style status codes                       no_std
   nt-types/            ids, access masks, UnicodeString, NtPath parser   no_std + alloc
   nt-object-abi/       fixed-layout SURT wire ABI (opcodes + structs)    no_std
-  nt-object-manager/   the Object Manager core (store/handles/namespace) [in progress]
+  nt-object-manager/   the Object Manager core (store/handles/namespace/symlinks/access)
+  nt-object-server/    transport-agnostic service dispatcher (decode/validate/dispatch)
+  nt-object-client/    ergonomic client stub over a pluggable transport backend
   ntos-root/           the root task the kernel boots (standalone, custom target)
-components/            seL4 service components (e.g. object-manager)      [later]
+components/
+  object-manager/      the Object Manager as a seL4 component (runs the stack on the kernel)
 scripts/
-  run.sh               build the root task + kernel (via the submodule) and boot QEMU
+  run.sh               build the hello root task + kernel and boot QEMU
+  run-object-manager.sh  build + boot the Object Manager component in QEMU
 docs/compat-notes/     behavioural compatibility notes vs Windows NT
 references/            NT/ReactOS/driver reference trees (gitignored, local only)
 ```
