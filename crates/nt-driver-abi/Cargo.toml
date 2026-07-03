@@ -1,0 +1,14 @@
+[package]
+name = "nt-driver-abi"
+description = "The DH_OP_* SURT wire protocol between the I/O Manager and a Driver Host: driver load/dispatch/completion + device/symbolic-link creation + fault messages. no_std, fixed-layout."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -2,8 +2,9 @@
 //! tests substitute a Rust closure (this host is aarch64 and cannot execute x64
 //! driver code) while the kernel uses the real Microsoft-x64 gate.
 
-use nt_driver_runtime::Arena;
 use nt_kernel_abi::GuestAddr;
+
+use crate::DriverServices;
 
 /// The arguments to a `DriverEntry` / dispatch call.
 #[derive(Copy, Clone, Debug)]
@@ -18,10 +19,11 @@ pub struct EntryContext {
 
 /// A gate that invokes a driver routine under the Microsoft x64 ABI (spec §8.1).
 pub trait DriverEntryGate {
-    /// Call `DriverEntry(DriverObject, RegistryPath)`; returns the `NTSTATUS`.
-    /// The routine may read/write guest memory (`mem`) — the real gate lets the
-    /// driver touch it directly; a mock gate manipulates it explicitly.
-    fn call_driver_entry(&self, ctx: EntryContext, mem: &mut Arena) -> i32;
+    /// Call `DriverEntry(DriverObject, RegistryPath)`; returns the `NTSTATUS`. The
+    /// routine reaches kernel services + guest memory via `services` — the real
+    /// gate lets the driver call export trampolines that reach the same services;
+    /// a mock gate calls them explicitly.
+    fn call_driver_entry(&self, ctx: EntryContext, services: &mut DriverServices) -> i32;
 }
 
 /// A host/test gate backed by a Rust closure — no real x64 execution.
@@ -29,21 +31,22 @@ pub struct MockGate<F>(pub F);
 
 impl<F> DriverEntryGate for MockGate<F>
 where
-    F: Fn(&EntryContext, &mut Arena) -> i32,
+    F: Fn(&EntryContext, &mut DriverServices) -> i32,
 {
-    fn call_driver_entry(&self, ctx: EntryContext, mem: &mut Arena) -> i32 {
-        (self.0)(&ctx, mem)
+    fn call_driver_entry(&self, ctx: EntryContext, services: &mut DriverServices) -> i32 {
+        (self.0)(&ctx, services)
     }
 }
 
 /// The real gate: calls the mapped driver's entry point under the Microsoft x64
-/// calling convention. Only available on x86_64 (the loaded code is x64).
+/// calling convention. Only available on x86_64 (the loaded code is x64). The
+/// driver reaches kernel services through its import trampolines, not `services`.
 #[cfg(target_arch = "x86_64")]
 pub struct Win64Gate;
 
 #[cfg(target_arch = "x86_64")]
 impl DriverEntryGate for Win64Gate {
-    fn call_driver_entry(&self, ctx: EntryContext, _mem: &mut Arena) -> i32 {
+    fn call_driver_entry(&self, ctx: EntryContext, _services: &mut DriverServices) -> i32 {
         // SAFETY: the Driver Host guarantees `entry_point` is a mapped, executable,
         // relocated `DriverEntry` whose ABI is the Microsoft x64 calling convention
         // (spec §8.1) before the driver is started; the driver accesses the

@@ -1,7 +1,9 @@
 //! DriverEntry call-gate tests against synthetic PE images + a Rust mock driver
 //! (this host is aarch64; real x64 execution is proven in QEMU, M9).
 
-use nt_driver_host::{Arena, DriverHost, DriverState, EntryContext, LoadError, MockGate};
+use nt_driver_host::{
+    DriverHost, DriverServices, DriverState, EntryContext, LoadError, MockGate, NullBridge,
+};
 use nt_driver_test_fixtures::pe_importing;
 use nt_kernel_abi::{major, DriverObject, GuestAddr};
 
@@ -15,7 +17,8 @@ fn host() -> DriverHost {
 
 /// A mock `DriverEntry`: install CREATE/CLOSE/DEVICE_CONTROL dispatch + unload,
 /// return STATUS_SUCCESS. Models what a real driver's machine code would do.
-fn mock_driver_entry(ctx: &EntryContext, mem: &mut Arena) -> i32 {
+fn mock_driver_entry(ctx: &EntryContext, services: &mut DriverServices) -> i32 {
+    let mem = services.arena_mut();
     let mut drv: DriverObject = mem.read(ctx.driver_object).unwrap();
     drv.major_function[major::IRP_MJ_CREATE as usize] = GuestAddr(0x9001);
     drv.major_function[major::IRP_MJ_CLOSE as usize] = GuestAddr(0x9002);
@@ -62,7 +65,8 @@ fn loads_maps_and_calls_driver_entry() {
     }
 
     // Run DriverEntry via the mock gate.
-    host.start(&MockGate(mock_driver_entry)).unwrap();
+    host.start(&MockGate(mock_driver_entry), &mut NullBridge)
+        .unwrap();
     assert_eq!(host.state(), DriverState::Started);
     assert_eq!(host.entry_status(), 0);
     assert_eq!(
@@ -95,8 +99,8 @@ fn driver_entry_failure_cleans_up() {
     host.load(&bytes, IMAGE_BASE, "\\Registry\\...").unwrap();
 
     // A driver whose DriverEntry returns STATUS_UNSUCCESSFUL.
-    let failing = MockGate(|_ctx: &EntryContext, _mem: &mut Arena| 0xC000_0001u32 as i32);
-    match host.start(&failing) {
+    let failing = MockGate(|_ctx: &EntryContext, _svc: &mut DriverServices| 0xC000_0001u32 as i32);
+    match host.start(&failing, &mut NullBridge) {
         Err(LoadError::DriverEntryFailed(s)) => assert_eq!(s, 0xC000_0001u32 as i32),
         other => panic!("expected DriverEntryFailed, got {other:?}"),
     }
@@ -113,7 +117,7 @@ fn driver_entry_failure_cleans_up() {
 fn start_before_load_is_rejected() {
     let mut host = host();
     assert!(matches!(
-        host.start(&MockGate(mock_driver_entry)),
+        host.start(&MockGate(mock_driver_entry), &mut NullBridge),
         Err(LoadError::NotLoaded)
     ));
 }

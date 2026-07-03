@@ -14,10 +14,14 @@ extern crate alloc;
 
 mod call;
 mod load;
+mod services;
 
 #[cfg(target_arch = "x86_64")]
 pub use call::Win64Gate;
 pub use call::{DriverEntryGate, EntryContext, MockGate};
+pub use services::{
+    BridgeCreateDevice, BridgeDeviceIds, DriverServices, IoManagerBridge, NullBridge,
+};
 
 // Re-exported so gate closures + callers need only depend on this crate.
 pub use nt_driver_runtime::{Arena, DriverRuntime};
@@ -92,10 +96,15 @@ impl DriverHost {
     }
 
     /// Call `DriverEntry` through `gate` and capture what it installs (spec §9
-    /// steps 10–11). On success the driver is `Started`; on failure the partial
-    /// projections are cleaned up (spec §9 failure path) and the driver is
+    /// steps 10–11). The driver reaches the I/O Manager through `bridge` (for
+    /// `IoCreateDevice` etc.). On success the driver is `Started`; on failure the
+    /// partial projections are cleaned up (spec §9 failure path) and the driver is
     /// `Failed`.
-    pub fn start(&mut self, gate: &dyn DriverEntryGate) -> Result<(), LoadError> {
+    pub fn start(
+        &mut self,
+        gate: &dyn DriverEntryGate,
+        bridge: &mut dyn IoManagerBridge,
+    ) -> Result<(), LoadError> {
         let (Some(drv), Some(regpath), Some(image)) =
             (self.driver_object, self.registry_path, self.image.as_ref())
         else {
@@ -106,7 +115,10 @@ impl DriverHost {
             driver_object: drv,
             registry_path: regpath,
         };
-        let status = gate.call_driver_entry(ctx, self.runtime.arena_mut());
+        let status = {
+            let mut services = DriverServices::new(&mut self.runtime, bridge);
+            gate.call_driver_entry(ctx, &mut services)
+        };
         self.entry_status = status;
 
         if NtStatus(status).is_success() {

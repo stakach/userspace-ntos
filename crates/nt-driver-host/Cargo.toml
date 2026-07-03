@@ -19,6 +19,9 @@ nt-driver-test-fixtures = { path = "../nt-driver-test-fixtures" }
 nt-pe-loader = { path = "../nt-pe-loader" }
 nt-kernel-abi = { path = "../nt-kernel-abi" }
 nt-driver-runtime = { path = "../nt-driver-runtime" }
+nt-types = { path = "../nt-types" }
+nt-io-manager = { path = "../nt-io-manager" }
+nt-object-manager = { path = "../nt-object-manager" }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

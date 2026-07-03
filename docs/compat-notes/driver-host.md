@@ -125,3 +125,28 @@ isolated user-space component and completing IRPs through the I/O Manager. See
   bound + IAT patched), a mock `DriverEntry` installs CREATE/CLOSE/DEVICE_CONTROL +
   unload and the host captures them, an `IoConnectInterrupt` import blocks the load,
   and a failing `DriverEntry` retires the projections. 138 workspace tests.
+
+## Device/symlink bridge (implemented, Milestone 6 — `nt-driver-abi`, `nt-driver-host` services)
+
+- `nt-driver-abi`: the `DH_OP_*` SURT protocol (spec §7.5) — opcodes `0x3000..=0x30ff`
+  (control/status, IRP dispatch/complete/cancel/buffer, device + symbolic-link
+  creation, trace) + fixed-layout Pod request/reply structs (`DhCreateDeviceRequest`
+  + inline UTF-16 name, `DhCreateDeviceReply` with the canonical ids,
+  `DhSymbolicLinkRequest`, `DhDeleteDeviceRequest`, `DhStatusReply`) with size asserts.
+- The driver-callable exports (spec §11), on `DriverServices` — the runtime + an
+  `IoManagerBridge` a driver reaches (via trampolines on the kernel; called directly
+  from the mock `DriverEntry` in host tests):
+  - `io_create_device` validates the `DriverObject` + output pointer, reads the
+    `DeviceName`, creates the local `DEVICE_OBJECT` projection, forwards a
+    `BridgeCreateDevice` to the I/O Manager, stores the returned canonical `DeviceId`
+    in the projection (`set_canonical_id`), and writes the `PDEVICE_OBJECT` out.
+  - `io_create_symbolic_link` / `io_delete_symbolic_link` / `io_delete_device` /
+    `rtl_init_unicode_string`.
+- The `DriverEntryGate` now passes `DriverServices` (was raw `Arena`), so the driver
+  can call these exports; `start(gate, bridge)` wires the bridge in. `NullBridge`
+  serves drivers that create no devices.
+- Verified end-to-end: a synthetic driver's `DriverEntry` creates `\Device\SurtTest0`
+  + `\??\SurtTest0` through a bridge backed by the **real `nt-io-manager`**, and the
+  I/O Manager then **opens the device by symlink** — plus a bogus `DriverObject`
+  pointer is rejected and the canonical `DeviceId` lands in the local projection.
+  140 workspace tests.
