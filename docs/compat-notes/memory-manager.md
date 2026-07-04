@@ -20,3 +20,12 @@ Section objects mapped into address-space views, kept coherent with the M23 Cach
 - 5 unit tests incl. the §24 acceptance (map file → edit through the view → unmap → flush → file
   reflects the edit), system-space mapping, anonymous section sharing, protection/access checks,
   partial-view offset.
+
+## Mapped sections in QEMU (implemented, Milestone 24 — `configuration-manager`)
+
+The `configuration-manager` component now also proves mapped sections bare-metal on seL4
+(24/24 checks) — the §24 acceptance flow end-to-end: ZwCreateFile+write "abcdef" on MemFs →
+ZwCreateSection (PAGE_READWRITE, SEC_COMMIT) over the file → ZwMapViewOfSection (materialises
+"abcdef" from the cache) → edit "XYZ" at offset 1 through the view → ZwUnmapViewOfSection
+(writeback → cache dirty) → CcFlushCache → ZwReadFile returns "aXYZef". Plus an anonymous
+(pagefile) section shared across two views.

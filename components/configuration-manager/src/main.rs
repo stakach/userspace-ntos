@@ -320,6 +320,60 @@ fn run() {
         rn == 20 && &rb[..] == b"cached through memfs"
     };
     check(b"cachemgr_reload_from_backing", reload_ok);
+
+    // --- Memory Manager: mapped section of a MemFs file (spec §24 acceptance) ----
+    use nt_memory_manager::{AddressSpace, MemoryManager};
+    // 1-3. Create + write the file "abcdef".
+    let mapped = r"\??\C:\Temp\mapped.bin";
+    {
+        let mut f = fs.borrow_mut();
+        let c = f.zw_create_file(mapped, nt_fs::FILE_WRITE_DATA, 0, 0, nt_fs::FILE_CREATE, 0);
+        f.zw_write_file(c.handle, Some(0), b"abcdef");
+        f.zw_close(c.handle);
+    }
+    let mm_ok = {
+        // 4. Section over the file, coherent through a cache map.
+        let mut cache = SharedCacheMap::cc_initialize_cache_map(
+            FileBacking::open(&fs, mapped),
+            FileSizes { allocation_size: 6, file_size: 6, valid_data_length: 6 },
+            false,
+        );
+        let mut mm = MemoryManager::new();
+        let sec = mm
+            .zw_create_section_file(6, nt_memory_manager::PAGE_READWRITE, nt_memory_manager::SEC_COMMIT)
+            .unwrap();
+        // 5-7. Map, verify "abcdef", edit "XYZ" at offset 1.
+        let view = mm
+            .zw_map_view_of_section_file(sec, &mut cache, 0, 0, nt_memory_manager::PAGE_READWRITE, AddressSpace::Process)
+            .unwrap();
+        let seen = mm.view_read(view, 0, 6).unwrap();
+        mm.view_write(view, 1, b"XYZ").unwrap();
+        // 8-9. Unmap (writeback → cache dirty) + flush to the file.
+        mm.zw_unmap_view_of_section_file(view, &mut cache).unwrap();
+        cache.cc_flush_cache(None, None);
+        seen == b"abcdef"
+    };
+    // 10. ZwReadFile returns the edited "aXYZef".
+    let final_bytes = {
+        let mut f = fs.borrow_mut();
+        let r = f.zw_create_file(mapped, nt_fs::FILE_READ_DATA, 0, 0, nt_fs::FILE_OPEN, 0);
+        let (_, b) = f.zw_read_file(r.handle, Some(0), 6);
+        f.zw_close(r.handle);
+        b
+    };
+    check(b"memmgr_mapped_file_edit", mm_ok && &final_bytes[..] == b"aXYZef");
+
+    // Anonymous (pagefile) section shared across views.
+    let anon_ok = {
+        let mut mm = MemoryManager::new();
+        let sec = mm.zw_create_section_pagefile(16, nt_memory_manager::PAGE_READWRITE, nt_memory_manager::SEC_COMMIT).unwrap();
+        let v1 = mm.zw_map_view_of_section_anon(sec, 0, 16, nt_memory_manager::PAGE_READWRITE, AddressSpace::Process).unwrap();
+        mm.view_write(v1, 4, b"anon").unwrap();
+        mm.zw_unmap_view_of_section_anon(v1).unwrap();
+        let v2 = mm.zw_map_view_of_section_anon(sec, 0, 16, nt_memory_manager::PAGE_READONLY, AddressSpace::Process).unwrap();
+        mm.view_read(v2, 4, 4).unwrap() == b"anon"
+    };
+    check(b"memmgr_anonymous_section", anon_ok);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).
