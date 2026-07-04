@@ -11,11 +11,13 @@
 
 extern crate alloc;
 
+mod file_backing;
 mod fs;
 mod hive_provider;
 mod path;
 mod status;
 
+pub use file_backing::FileBacking;
 pub use fs::{CreateResult, FileSystem, MemFs, StandardInformation, INVALID_HANDLE};
 pub use hive_provider::NtFileHiveIoProvider;
 pub use path::{normalize_separators, MountManager, MEMFS_VOLUME};

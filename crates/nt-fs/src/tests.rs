@@ -182,3 +182,64 @@ fn hive_persists_through_file_apis() {
         assert_eq!(hive.query_dword(key, "SeenByDriver"), Some(1)); // from the replayed log file
     }
 }
+
+#[test]
+fn cache_manager_over_memfs_file() {
+    use nt_cache_manager::{FileSizes, SharedCacheMap};
+    let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
+    // Create the backing file, then cache writes through to it (spec §22).
+    {
+        let mut f = fs.borrow_mut();
+        f.zw_create_file(
+            r"\??\C:\Temp\cached.bin",
+            FILE_WRITE_DATA,
+            0,
+            0,
+            FILE_CREATE,
+            0,
+        );
+    }
+    let sizes = FileSizes {
+        allocation_size: 0,
+        file_size: 0,
+        valid_data_length: 0,
+    };
+    {
+        let backing = FileBacking::open(&fs, r"\??\C:\Temp\cached.bin");
+        let mut ccm = SharedCacheMap::cc_initialize_cache_map(backing, sizes, false);
+        ccm.cc_copy_write(0, b"cached through memfs", false);
+        assert!(ccm.cc_is_there_dirty_data());
+        ccm.cc_flush_cache(None, None); // writes dirty pages back to the MemFs file
+    }
+    // The MemFs file now holds the data (read it directly via Zw*).
+    {
+        let mut f = fs.borrow_mut();
+        let r = f.zw_create_file(
+            r"\??\C:\Temp\cached.bin",
+            FILE_READ_DATA,
+            0,
+            0,
+            FILE_OPEN,
+            0,
+        );
+        let (_, bytes) = f.zw_read_file(r.handle, Some(0), 20);
+        f.zw_close(r.handle);
+        assert_eq!(&bytes[..], b"cached through memfs");
+    }
+    // A fresh cache map faults the same bytes back in.
+    {
+        let backing = FileBacking::open(&fs, r"\??\C:\Temp\cached.bin");
+        let mut ccm = SharedCacheMap::cc_initialize_cache_map(
+            backing,
+            FileSizes {
+                allocation_size: 20,
+                file_size: 20,
+                valid_data_length: 20,
+            },
+            false,
+        );
+        let mut buf = [0u8; 20];
+        let (_, n) = ccm.cc_copy_read(0, 20, &mut buf);
+        assert_eq!((n, &buf[..]), (20, &b"cached through memfs"[..]));
+    }
+}

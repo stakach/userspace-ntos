@@ -11,7 +11,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{addr_of_mut, null_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 128 * 1024;
+// The bump allocator never reclaims, and this component now exercises the whole config/storage
+// stack in one run (registry + persistence snapshots + hive images + MemFs files + cache pages),
+// so the cumulative high-water mark needs headroom.
+const HEAP_SIZE: usize = 512 * 1024;
 
 #[repr(align(16))]
 #[allow(dead_code)] // accessed only via a raw pointer (`addr_of_mut!`)

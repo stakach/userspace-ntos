@@ -290,6 +290,36 @@ fn run() {
         })
         .unwrap_or(false);
     check(b"hive_persists_through_memfs_file", disk_ok);
+
+    // --- Cache Manager: cached I/O over a MemFs file (spec §12-14, §22) -------
+    use nt_cache_manager::{FileSizes, SharedCacheMap};
+    use nt_fs::FileBacking;
+    {
+        let mut f = fs.borrow_mut();
+        f.zw_create_file(r"\??\C:\Temp\cached.bin", nt_fs::FILE_WRITE_DATA, 0, 0, nt_fs::FILE_CREATE, 0);
+    }
+    // Write through the cache; the dirty page holds the data until flush.
+    let empty = FileSizes { allocation_size: 0, file_size: 0, valid_data_length: 0 };
+    let cache_ok = {
+        let mut ccm = SharedCacheMap::cc_initialize_cache_map(FileBacking::open(&fs, r"\??\C:\Temp\cached.bin"), empty, false);
+        ccm.cc_copy_write(0, b"cached through memfs", false);
+        let dirty_before = ccm.cc_is_there_dirty_data();
+        // A cached read is served from the dirty page (no backing round-trip needed).
+        let mut rb = [0u8; 20];
+        let (_, rn) = ccm.cc_copy_read(0, 20, &mut rb);
+        ccm.cc_flush_cache(None, None); // write dirty pages back to the MemFs file
+        dirty_before && !ccm.cc_is_there_dirty_data() && rn == 20 && &rb[..] == b"cached through memfs"
+    };
+    check(b"cachemgr_write_read_flush", cache_ok);
+    // The flushed bytes are now in the MemFs file; a fresh cache map faults them back in.
+    let reload_ok = {
+        let full = FileSizes { allocation_size: 20, file_size: 20, valid_data_length: 20 };
+        let mut ccm = SharedCacheMap::cc_initialize_cache_map(FileBacking::open(&fs, r"\??\C:\Temp\cached.bin"), full, false);
+        let mut rb = [0u8; 20];
+        let (_, rn) = ccm.cc_copy_read(0, 20, &mut rb);
+        rn == 20 && &rb[..] == b"cached through memfs"
+    };
+    check(b"cachemgr_reload_from_backing", reload_ok);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).

@@ -22,3 +22,16 @@ The NT Cache Manager (spec: NT Cache Manager + Section-Backed File Cache). A per
 - 7 unit tests: copy-read faults from backing, copy-write dirties + flush writes back + cached
   read hits, EOF behaviour, truncate drops pages, pin/dirty/unpin, purge + evict clean pages,
   write-through flushes immediately.
+
+## Cache over MemFs + QEMU (implemented, Milestone 23 — `nt-fs::FileBacking`, `configuration-manager`)
+
+- `nt-fs::FileBacking` (spec §22.5): a `CachedStreamBacking` over a file on a `FileSystem` —
+  read_at/write_at through ZwReadFile/ZwWriteFile, flush via ZwFlushBuffersFile. A `SharedCacheMap`
+  can now cache a MemFs file's bytes. (nt-fs host test: cache write→flush→the MemFs file holds the
+  data; a fresh cache map faults it back in.)
+- The `configuration-manager` component proves it bare-metal on seL4 (22/22): cache write-through
+  over `\??\C:\Temp\cached.bin` — the dirty page serves a cached read, flush writes it back to the
+  MemFs file, and a fresh cache map reloads the bytes from the backing.
+- LESSON: the component's bump heap (never reclaims) now runs the whole config/storage stack in
+  one pass (registry + persistence snapshots + hive images + MemFs files + cache pages); 128 KiB
+  exhausted → silent hang (alloc returns null). Raised to 512 KiB.
