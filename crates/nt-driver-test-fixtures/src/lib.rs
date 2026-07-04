@@ -196,3 +196,10 @@ pub fn mmio_interrupt_test_sys() -> &'static [u8] {
 pub fn pnp_mmio_interrupt_test_sys() -> &'static [u8] {
     include_bytes!("../fixtures/PnpMmioInterruptTest.sys")
 }
+
+/// The real MSVC-built `PowerPnpMmioTest.sys` WDM driver (PnP + power D0/D3
+/// lifecycle via IRP_MJ_POWER), built by <https://github.com/stakach/ntdriver>.
+/// Used by the `driver-host-power` component + the Power Milestone 13 integration.
+pub fn power_pnp_mmio_test_sys() -> &'static [u8] {
+    include_bytes!("../fixtures/PowerPnpMmioTest.sys")
+}

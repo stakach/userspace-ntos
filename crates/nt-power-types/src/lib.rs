@@ -82,11 +82,13 @@ pub const IRP_MN_POWER_SEQUENCE: u8 = 0x01;
 pub const IRP_MN_SET_POWER: u8 = 0x02;
 pub const IRP_MN_QUERY_POWER: u8 = 0x03;
 
-/// Offset of `Parameters.Power.Type` within an `IO_STACK_LOCATION` (Parameters@8;
-/// `Power.SystemContext`@0, `Type`@4, `State`@8 → 8+4 / 8+8, spec §9.5).
-pub const PARAM_POWER_TYPE_OFFSET: u64 = 12;
+/// Offset of `Parameters.Power.Type` within an `IO_STACK_LOCATION` (spec §9.5).
+/// `Parameters`@8; the `Power` fields are `POINTER_ALIGNMENT` 8-byte slots (same as
+/// `DeviceIoControl`): `SystemContext`@Parameters+0, `Type`@Parameters+8,
+/// `State`@Parameters+16 → 16 / 24 within the stack location.
+pub const PARAM_POWER_TYPE_OFFSET: u64 = 16;
 /// Offset of `Parameters.Power.State`.
-pub const PARAM_POWER_STATE_OFFSET: u64 = 16;
+pub const PARAM_POWER_STATE_OFFSET: u64 = 24;
 
 /// `STATUS_DEVICE_POWERED_OFF`.
 pub const STATUS_DEVICE_POWERED_OFF: i32 = 0xC000_02DBu32 as i32;

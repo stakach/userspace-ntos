@@ -29,3 +29,23 @@ IOCTLs + interrupt delivery are gated on `Powered`.
   in-flight. `is_on` is true only in D0 (§8.1 I/O + interrupt gating). 6 unit tests
   (register→D0, D0→D3→D0, one-in-flight, set-failure-preserves-old, no-transition-
   after-remove, stale-devnode).
+
+## Po exports + full lifecycle in QEMU (implemented, Milestones 13.3-13.7 — `driver-host-power`)
+
+- Po exports: `PoCallDriver` = `IoCallDriver` (the PDO completes a forwarded power
+  IRP with success, non-pending so the driver's synchronous forward proceeds);
+  `PoStartNextPowerIrp` a no-op with a call count (spec §14.3); `PoSetPowerState`
+  updates the HAL power gate from the driver's reported `DevicePowerState` (D0 ⇒
+  powered, else gated) and returns the previous state.
+- **`Parameters.Power` layout (discovered)**: the `Power` fields are `POINTER_ALIGNMENT`
+  8-byte slots (same as `DeviceIoControl`): `Type`@**16**, `State`@**24** within the
+  `IO_STACK_LOCATION` — *not* 12/16 (packed) as a naive reading suggests.
+- Power IRP dispatch: `IRP_MJ_POWER`=0x16, `IRP_MN_QUERY_POWER`=3, `IRP_MN_SET_POWER`=2.
+  A device transition = Power-Manager `begin` (one-in-flight) → QUERY (fail aborts) →
+  SET → `complete`.
+- HAL power gating (§12.1): `inject_interrupt` drops the interrupt (ISR not called)
+  while not D0.
+- Verified in QEMU (20/20) with the real `PowerPnpMmioTest.sys`: START→D0 registered →
+  IOCTL works → SET_POWER D3 (Powered=0, IOCTL rejected, interrupt dropped) →
+  SET_POWER D0 (resumes, pended IOCTL completed by injected interrupt) → REMOVE
+  (resources revoked, power record unregistered). No callback at the wrong IRQL.
