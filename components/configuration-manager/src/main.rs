@@ -18,6 +18,7 @@ use core::panic::PanicInfo;
 
 use nt_config_manager::{encode_sz, ConfigManager, RegistryValueType, DEVICE_CLASSES_PATH, SERVICES_PATH};
 use nt_config_store::{journal::Mutation, snapshot, MemoryStore, Persistence};
+use nt_setupapi as setupapi;
 use sel4_rt::*;
 
 const PARAMS_PATH: &str =
@@ -165,6 +166,65 @@ fn run() {
     let last = snap.len() - 1;
     snap[last] ^= 0xFF;
     check(b"persistence_rejects_corruption", snapshot::parse_header(&snap).is_err());
+
+    // --- User-mode device discovery (CfgMgr32 + SetupAPI) --------------------
+    // A user program enumerates the {9A7B…} interface + resolves its device path (spec §14).
+    let lc_guid = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";
+    let size = setupapi::cm_get_device_interface_list_size(
+        &cm,
+        Some(lc_guid),
+        None,
+        setupapi::CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+    );
+    let list = size.and_then(|n| {
+        setupapi::cm_get_device_interface_list(&cm, Some(lc_guid), None, n, setupapi::CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
+    });
+    let cm_path = list.as_ref().ok().map(|l| decode_first_multi_sz(l)).unwrap_or_default();
+    check(
+        b"cfgmgr32_lists_interface_path",
+        list.ok().map(|l| l.len() as u32) == size.ok() && cm_path.starts_with(r"\\?\"),
+    );
+
+    // Edge cases (§9.4): null GUID + unknown flags rejected.
+    check(
+        b"cfgmgr32_edge_cases",
+        setupapi::cm_get_device_interface_list_size(&cm, None, None, 0)
+            == Err(setupapi::ConfigRet::InvalidPointer)
+            && setupapi::cm_get_device_interface_list_size(&cm, Some(lc_guid), None, 0x8000)
+                == Err(setupapi::ConfigRet::InvalidFlag),
+    );
+
+    // SetupAPI: HDEVINFO → enumerate → two-call detail → destroy (spec §11).
+    let mut sets = setupapi::DevInfoSets::new();
+    let h = sets.get_class_devs(&cm, Some(lc_guid), setupapi::DIGCF_PRESENT | setupapi::DIGCF_DEVICEINTERFACE);
+    let elem = sets.enum_device_interfaces(h, 0);
+    let (need_err, required) = sets.get_device_interface_detail(h, 0, 0).unwrap_err();
+    let sp_path = sets
+        .get_device_interface_detail(h, 0, required)
+        .ok()
+        .map(|p| decode_wstr(&p))
+        .unwrap_or_default();
+    let destroyed = sets.destroy_device_info_list(h);
+    check(
+        b"setupapi_enumerate_and_detail",
+        h.is_valid()
+            && elem.is_some()
+            && need_err == setupapi::ERROR_INSUFFICIENT_BUFFER
+            && sp_path == cm_path
+            && destroyed
+            && sets.enum_device_interfaces(h, 0).is_none(), // stale after destroy
+    );
+}
+
+/// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).
+fn decode_first_multi_sz(list: &[u16]) -> alloc::string::String {
+    let units: alloc::vec::Vec<u16> = list.iter().copied().take_while(|&u| u != 0).collect();
+    char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect()
+}
+/// Decode a NUL-terminated UTF-16LE string.
+fn decode_wstr(s: &[u16]) -> alloc::string::String {
+    let units: alloc::vec::Vec<u16> = s.iter().copied().take_while(|&u| u != 0).collect();
+    char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect()
 }
 
 #[no_mangle]

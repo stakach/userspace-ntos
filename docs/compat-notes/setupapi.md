@@ -19,3 +19,14 @@ their device paths (spec: NT User-Mode Device Discovery), backed by the Configur
   WCHARs, then the NUL-terminated path), `destroy_device_info_list` (stale handle rejected).
 - 6 unit tests: enabled-only + ALL_DEVICES listing, empty=single-NUL, edge cases, device-ID
   filter, SetupAPI enumerate+two-call detail+destroy, NT→Win32 path mapping.
+
+## Discovery in QEMU (implemented, Milestone 20 — `configuration-manager`)
+
+The `configuration-manager` component now also proves user-mode discovery bare-metal on seL4
+(16/16 checks). Over the seeded Config Manager (with the `{9A7B…}` interface registered), it runs
+the §14 acceptance flow: `CM_Get_Device_Interface_List_Size` → `_List` returns the interface's
+`\\?\` device path; the edge cases (null GUID → CR_INVALID_POINTER, unknown flags →
+CR_INVALID_FLAG) are rejected; then `SetupDiGetClassDevs` → `EnumDeviceInterfaces` → the two-call
+`GetDeviceInterfaceDetailW` (ERROR_INSUFFICIENT_BUFFER + required, then the path) →
+`DestroyDeviceInfoList` — and the SetupAPI path **equals** the CfgMgr32 path (both resolve to the
+interface the driver registered).
