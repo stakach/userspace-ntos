@@ -43,6 +43,7 @@ members = [
     "crates/nt-setupapi",
     "crates/nt-hive-core",
     "crates/nt-fs",
+    "crates/nt-cache-manager",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -103,6 +104,7 @@ nt-config-store = { path = "crates/nt-config-store" }
 nt-setupapi = { path = "crates/nt-setupapi" }
 nt-hive-core = { path = "crates/nt-hive-core" }
 nt-fs = { path = "crates/nt-fs" }
+nt-cache-manager = { path = "crates/nt-cache-manager" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }

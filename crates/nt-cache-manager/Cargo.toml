@@ -1,0 +1,11 @@
+[package]
+name = "nt-cache-manager"
+description = "NT Cache Manager: a section-backed file cache. A per-stream SharedCacheMap of 4K cache pages over a filesystem-neutral CachedStreamBacking, exposing the Cc* exports (CcInitializeCacheMap / CcCopyRead / CcCopyWrite / CcFlushCache / CcSetFileSizes / CcPurgeCacheSection / CcPinRead / CcUnpinData), a lazy writer, LRU eviction, and NT EOF/extend semantics. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
