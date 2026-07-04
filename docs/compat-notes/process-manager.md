@@ -20,3 +20,13 @@ Process + thread objects, handle tables, and SEC_IMAGE image sections.
   so two processes reference identical immutable image bytes; terminate releases the ref.
 - 6 unit tests: lifecycle + signal, system-thread-doesn't-exit-process, handle table ops, image
   section load+entry (Stage 1), image section shared across processes (Stage 4), invalid image.
+
+## Process/thread lifecycle in QEMU (implemented, Milestone 26 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the process/thread model bare-metal on seL4
+(30/30 checks): create a process + its main thread (→ Running), transition thread state, resolve
+the Client ID; a per-process handle table where a handle is process-local, duplicates into another
+process, and closes; and termination signalling — terminating the last non-system thread exits +
+signals the process (wait returns the exit status) and terminates its system thread, leaving an
+unrelated process untouched. (Image-section loading is host-tested; nt-pe-loader is already
+QEMU-proven by the driver hosts.)

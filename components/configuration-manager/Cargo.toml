@@ -15,6 +15,7 @@ nt-fs = { path = "../../crates/nt-fs" }
 nt-cache-manager = { path = "../../crates/nt-cache-manager" }
 nt-memory-manager = { path = "../../crates/nt-memory-manager" }
 nt-address-space = { path = "../../crates/nt-address-space" }
+nt-process = { path = "../../crates/nt-process" }
 
 [profile.release]
 panic = "abort"

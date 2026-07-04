@@ -413,6 +413,41 @@ fn run() {
         b
     };
     check(b"addrspace_writeback_to_file", &edited[..] == b"aXYZef" && aspace.commit_charge() == 0);
+
+    // --- Process Manager: process/thread lifecycle + handle tables (spec §7-§12) ----
+    use nt_process::{ClientId, HandleObject, ProcessManager, ProcessState, ThreadState};
+    let mut pm = ProcessManager::new();
+    let p1 = pm.create_process("worker.exe", None, None);
+    // First thread makes the process Running + becomes the main thread.
+    let t1 = pm.create_thread(p1, 0x1_4000_1000, 0, false).unwrap();
+    pm.set_thread_state(t1, ThreadState::Running).unwrap();
+    let lifecycle_ok = pm.process(p1).unwrap().state == ProcessState::Running
+        && pm.process(p1).unwrap().main_thread == Some(t1)
+        && pm.client_id(t1) == Some(ClientId { unique_process: p1, unique_thread: t1 });
+    check(b"process_thread_lifecycle", lifecycle_ok);
+
+    // Handle table: insert a cross-process handle, duplicate it, close it (process-local).
+    let p2 = pm.create_process("helper.exe", None, None);
+    let h = pm.insert_handle(p1, HandleObject::Process(p2), 0x1F_0000).unwrap();
+    // Handles are process-local: h isn't valid in p2's (still empty) table.
+    let local_ok = pm.lookup_handle(p1, h) == Some(HandleObject::Process(p2))
+        && pm.lookup_handle(p2, h).is_none();
+    let hdup = pm.duplicate_handle(p1, h, p2).unwrap();
+    let handles_ok = local_ok
+        && pm.lookup_handle(p2, hdup) == Some(HandleObject::Process(p2))
+        && pm.close_handle(p1, h).is_ok()
+        && pm.lookup_handle(p1, h).is_none();
+    check(b"process_handle_table", handles_ok);
+
+    // Termination signals the process object; a system thread doesn't force process exit.
+    let sys = pm.create_thread(p1, 0x1_4000_2000, 0, true).unwrap();
+    pm.terminate_thread(t1, 7).unwrap(); // last non-system thread → process exits
+    let term_ok = pm.is_thread_signaled(t1)
+        && pm.is_process_signaled(p1)
+        && pm.wait_process(p1) == Some(7)
+        && pm.is_thread_signaled(sys) // terminated by process exit
+        && !pm.is_process_signaled(p2); // unrelated process unaffected
+    check(b"process_terminate_signal", term_ok);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).
