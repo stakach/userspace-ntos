@@ -1,0 +1,14 @@
+[package]
+name = "nt-fs"
+description = "NT File Object + File System Runtime: an NT path/mount resolver (longest-prefix), an in-memory file system (MemFs) implementing the NtFileSystemRuntime trait, the Zw* native file API surface (ZwCreateFile/ReadFile/WriteFile/FlushBuffersFile/QueryInformationFile/Close) over a file-object + handle table, and a real NtFileHiveIoProvider that persists a hive image/log through those file APIs. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-hive-core = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

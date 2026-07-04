@@ -1,0 +1,39 @@
+//! NTSTATUS + Zw* file constants (spec §8, §12.5, §18, §20).
+
+// NTSTATUS
+pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+pub const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+// CreateDisposition (spec §8.1, §12.5)
+pub const FILE_SUPERSEDE: u32 = 0;
+pub const FILE_OPEN: u32 = 1;
+pub const FILE_CREATE: u32 = 2;
+pub const FILE_OPEN_IF: u32 = 3;
+pub const FILE_OVERWRITE: u32 = 4;
+pub const FILE_OVERWRITE_IF: u32 = 5;
+
+// IoStatusBlock.Information (spec §12.5)
+pub const FILE_SUPERSEDED: u32 = 0;
+pub const FILE_OPENED: u32 = 1;
+pub const FILE_CREATED: u32 = 2;
+pub const FILE_OVERWRITTEN: u32 = 3;
+pub const FILE_EXISTS: u32 = 4;
+pub const FILE_DOES_NOT_EXIST: u32 = 5;
+
+// CreateOptions (spec §8.1)
+pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+// DesiredAccess (spec §8.1)
+pub const FILE_READ_DATA: u32 = 0x0000_0001;
+pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const SYNCHRONIZE: u32 = 0x0010_0000;
