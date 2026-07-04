@@ -1,0 +1,14 @@
+[package]
+name = "nt-dma-manager"
+description = "Core NT DMA Manager: the DMA adapter registry, common-buffer allocator, and fake logical-address decoder (device addresses are allocator-controlled, never real host physical addresses), with owner + D0/removed gating and stale-ID rejection. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-mdl = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

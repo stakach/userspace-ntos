@@ -1,0 +1,11 @@
+[package]
+name = "nt-dma-abi"
+description = "SURT/service ABI for the NT DMA Manager: opcodes + fixed-layout request structs for DMA adapters, common buffers, MDL mapping, and scatter/gather. no_std, no allocation, no seL4 dependency, no raw pointers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
