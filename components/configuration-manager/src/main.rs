@@ -374,6 +374,45 @@ fn run() {
         mm.view_read(v2, 4, 4).unwrap() == b"anon"
     };
     check(b"memmgr_anonymous_section", anon_ok);
+
+    // --- Address space: demand-paged mapped MemFs file (spec §12 fault path) ----
+    use nt_address_space::{AddressSpace as VaSpace, FaultAccess, ViewType};
+    // Re-seed the mapped file to "abcdef" (M24 left it "aXYZef").
+    {
+        let mut f = fs.borrow_mut();
+        let c = f.zw_create_file(mapped, nt_fs::FILE_WRITE_DATA, 0, 0, nt_fs::FILE_OVERWRITE_IF, 0);
+        f.zw_write_file(c.handle, Some(0), b"abcdef");
+        f.zw_close(c.handle);
+    }
+    let mut fcache = SharedCacheMap::cc_initialize_cache_map(
+        FileBacking::open(&fs, mapped),
+        FileSizes { allocation_size: 6, file_size: 6, valid_data_length: 6 },
+        false,
+    );
+    let mut aspace = VaSpace::new(0x1_0000, 0x1000_0000, 0x1000_0000);
+    let (vad, base) = aspace
+        .reserve_view(None, 6, nt_address_space::PAGE_READWRITE, ViewType::MappedDataSection, Some(1), 0)
+        .unwrap();
+    // Demand paging: nothing resident until a fault touches it.
+    let not_resident = aspace.resident_page_count() == 0;
+    let read_ok = aspace.read(base, 6, &mut fcache).map(|b| &b[..] == b"abcdef").unwrap_or(false);
+    let resident_after = aspace.resident_page_count() == 1;
+    check(b"addrspace_demand_fault", not_resident && read_ok && resident_after);
+    // Access violation on an unreserved VA (fault with no VAD).
+    let av = aspace.fault(0x5000_0000, FaultAccess::Read, &mut fcache) == nt_address_space::STATUS_ACCESS_VIOLATION;
+    check(b"addrspace_access_violation", av);
+    // Edit through the fault/write path → unmap writeback → flush → the file reflects it.
+    aspace.write(base + 1, b"XYZ", &mut fcache).unwrap();
+    aspace.unmap_view(vad, &mut fcache).unwrap();
+    fcache.cc_flush_cache(None, None);
+    let edited = {
+        let mut f = fs.borrow_mut();
+        let r = f.zw_create_file(mapped, nt_fs::FILE_READ_DATA, 0, 0, nt_fs::FILE_OPEN, 0);
+        let (_, b) = f.zw_read_file(r.handle, Some(0), 6);
+        f.zw_close(r.handle);
+        b
+    };
+    check(b"addrspace_writeback_to_file", &edited[..] == b"aXYZef" && aspace.commit_charge() == 0);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).

@@ -20,3 +20,11 @@ Fault Handling). Address spaces with VAD trees + a page-fault resolver over the 
 - 7 unit tests: VA allocation + overlap, demand paging faults on touch, the mapped-edit acceptance
   through the fault path, anonymous zero-fill, access violations (unreserved/read-only/NOACCESS),
   commit-limit enforcement, MDL probe/lock/unlock.
+
+## Demand paging in QEMU (implemented, Milestone 25 — `configuration-manager`)
+
+The `configuration-manager` component now also proves demand paging bare-metal on seL4
+(27/27 checks): over a MemFs-backed cache it reserves a section view (0 pages resident), reads
+through the fault path (the page materialises → "abcdef", 1 page resident), raises an access
+violation faulting an unreserved VA, then edits through the write-fault path, unmaps (dirty
+writeback → CcCopyWrite) + flushes → the MemFs file reads "aXYZef", and commit is released.
