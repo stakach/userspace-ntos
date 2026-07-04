@@ -26,6 +26,8 @@ members = [
     "crates/nt-hal-abi",
     "crates/nt-cm-resources",
     "crates/nt-pnp-abi",
+    "crates/nt-power-types",
+    "crates/nt-power-abi",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
     "crates/nt-register-access",
@@ -68,6 +70,8 @@ nt-kernel-exec = { path = "crates/nt-kernel-exec" }
 nt-hal-abi = { path = "crates/nt-hal-abi" }
 nt-cm-resources = { path = "crates/nt-cm-resources" }
 nt-pnp-abi = { path = "crates/nt-pnp-abi" }
+nt-power-types = { path = "crates/nt-power-types" }
+nt-power-abi = { path = "crates/nt-power-abi" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
 nt-register-access = { path = "crates/nt-register-access" }

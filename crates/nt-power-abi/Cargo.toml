@@ -1,0 +1,14 @@
+[package]
+name = "nt-power-abi"
+description = "SURT/service ABI for the NT Power Manager: opcodes + fixed-layout request/response structs for device/system power query + set. no_std, no allocation, no seL4 dependency, no raw pointers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-power-types = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

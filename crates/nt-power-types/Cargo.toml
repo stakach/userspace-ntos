@@ -1,0 +1,11 @@
+[package]
+name = "nt-power-types"
+description = "NT power management types + IRP constants: POWER_STATE_TYPE, SYSTEM_POWER_STATE, DEVICE_POWER_STATE, POWER_STATE, IRP_MJ_POWER + power minor functions, and the Parameters.Power stack-location layout. no_std, no allocation, explicit repr."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
