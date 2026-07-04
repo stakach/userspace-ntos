@@ -1,0 +1,11 @@
+[package]
+name = "nt-security"
+description = "NT Security Reference Monitor: SIDs (+ well-known SIDs, S-1-x string form), access tokens (users/groups/privileges, default System/Admin/User tokens), security descriptors + ACLs + ACEs, access masks + generic mapping, and the NT access-check algorithm (deny-before-allow ACE evaluation, MAXIMUM_ALLOWED, null/empty DACL, owner rights, privilege overrides, KernelMode bypass). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
