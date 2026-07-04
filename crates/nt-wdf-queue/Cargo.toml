@@ -1,0 +1,14 @@
+[package]
+name = "nt-wdf-queue"
+description = "WDF I/O queue (WDFQUEUE) dispatch policy: sequential/parallel/manual presentation of requests to the driver, power-managed gating (requests held while the device is out of D0), and in-flight accounting. Pure state machine over opaque request handles. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-wdf-object = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

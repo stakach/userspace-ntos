@@ -1,0 +1,11 @@
+[package]
+name = "nt-wdf-types"
+description = "KMDF/WDF ABI constants: the KMDF 1.15 version + WDF_BIND_INFO layout, the WDFFUNCENUM function-table indices the runtime implements, and the byte offsets of the WDF config structs a driver fills (WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS). Sourced from the WDK KMDF 1.15 headers. no_std, no allocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

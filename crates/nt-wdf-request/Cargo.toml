@@ -1,0 +1,11 @@
+[package]
+name = "nt-wdf-request"
+description = "WDF request (WDFREQUEST) lifecycle + buffer retrieval logic: the presented→completed state machine (double-complete rejected), and the input/output buffer selection + minimum-length validation a driver drives via WdfRequestRetrieveInputBuffer / OutputBuffer / CompleteWithInformation. Buffers held as opaque address+length pairs. no_std, no allocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
