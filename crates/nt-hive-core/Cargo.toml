@@ -1,0 +1,15 @@
+[package]
+name = "nt-hive-core"
+description = "NT registry hive model: a cell arena (KeyCell/ValueCell addressed by stable CellId, never raw pointers), a hive mount table with CurrentControlSet aliasing + path→hive+relative resolution, a versioned checksummed hive image codec + append-only hive log with replay, and a pluggable HiveIoProvider (Memory/Fixture/FaultInjection) with a HiveManager boot/mutate/flush engine. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-config-manager = { workspace = true }
+nt-config-store = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

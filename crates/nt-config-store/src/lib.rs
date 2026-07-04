@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-mod codec;
+pub mod codec;
 mod store;
 
 use alloc::vec::Vec;
