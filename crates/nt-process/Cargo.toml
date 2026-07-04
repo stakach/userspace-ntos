@@ -1,0 +1,17 @@
+[package]
+name = "nt-process"
+description = "NT Process Manager: process + thread objects (states, Client ID), per-process handle tables, the process/thread lifecycle (create, schedule-state transitions, terminate with dispatcher signalling + wait), and SEC_IMAGE image sections (PE parse/layout/relocation via nt-pe-loader) with read-only image sharing across processes. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-pe-loader = { workspace = true }
+
+[dev-dependencies]
+nt-driver-test-fixtures = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
