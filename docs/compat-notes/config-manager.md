@@ -24,3 +24,15 @@ metadata only — no handles, IRPs, or driver pointers.
 - 8 unit tests incl. the §21 fixture (service Parameters Answer=42/Greeting, devnode enumeration,
   interface enable/disable). Driver-facing Zw*/WdfRegistry* exports + isolated SURT service:
   pending a registry-using driver artifact.
+
+## Configuration Manager component (implemented, Milestones 17.1-17.2 — `configuration-manager`)
+
+`components/configuration-manager` boots the registry authority bare-metal on seL4 (v0.1
+in-process model, spec §5.1/§20.1), seeds the §21 fixture, and verifies the registry the way a
+driver + the PnP/interface managers would. **9/9 checks pass in QEMU.**
+
+- root keys present; service registration + DriverEntry RegistryPath (case-preserved);
+  query Answer=42 + Greeting="hello registry"; driver writes SeenByDriver back; PnP enumerates
+  the devnode by service; devnode Service value; interface registered+enabled; disable hides it.
+- Driver-facing Zw*/WdfRegistry* exports + the isolated SURT service boundary await a
+  registry-using driver artifact (`KmdfInterfaceRegistryTest.sys`).

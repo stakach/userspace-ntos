@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "ntos-configuration-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
