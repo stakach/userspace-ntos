@@ -1,0 +1,14 @@
+[package]
+name = "nt-address-space"
+description = "NT Memory Manager address space + fault handling: an AddressSpace with a VAD tree (64K allocation granularity, 4K pages, first-fit VA allocation with overlap detection, commit accounting), demand-mode section/anonymous view reservation, a page-fault resolver (section-backed pages materialise from the Cache Manager, anonymous pages zero-fill) with protection + access-violation checks, dirty writeback on unmap, and MmProbeAndLockPages MDL locking. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-cache-manager = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
