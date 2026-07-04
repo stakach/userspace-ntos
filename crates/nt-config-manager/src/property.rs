@@ -100,4 +100,12 @@ impl PropertyBag {
     pub fn get_devprop(&self, key: &DevPropKey) -> Option<&PropertyValue> {
         self.devprops.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
+    /// The legacy `(ordinal, value)` entries (for persistence snapshots).
+    pub fn legacy_entries(&self) -> &[(u32, PropertyValue)] {
+        &self.legacy
+    }
+    /// The `(DEVPROPKEY, value)` entries (for persistence snapshots).
+    pub fn devprop_entries(&self) -> &[(DevPropKey, PropertyValue)] {
+        &self.devprops
+    }
 }

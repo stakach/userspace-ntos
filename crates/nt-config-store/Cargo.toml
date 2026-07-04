@@ -1,0 +1,14 @@
+[package]
+name = "nt-config-store"
+description = "Persistence for the NT Configuration Manager: a ConfigStore trait (snapshot + append-only journal) with in-memory + fault-injection backends, a versioned checksummed binary snapshot (TLV, UTF-16LE, CRC-32C), a journaled mutation log with idempotent replay, and the boot (snapshot+replay) / compaction engine over a ConfigManager. no_std + alloc, endianness-stable, safe to parse from untrusted bytes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-config-manager = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

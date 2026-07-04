@@ -355,6 +355,28 @@ impl Registry {
         self.record(key).map(|k| k.values.len()).unwrap_or(0)
     }
 
+    /// All named values on a key (for persistence snapshots).
+    pub fn values(&self, key: RegistryKeyId) -> &[RegistryValue] {
+        self.record(key).map(|k| k.values.as_slice()).unwrap_or(&[])
+    }
+
+    /// Walk the whole tree (skipping the anonymous root) as `(path, volatile, values)` — the
+    /// input to a persistence snapshot (spec §9.4). Ordered so parents precede children.
+    pub fn snapshot_keys(&self) -> Vec<(String, bool, Vec<RegistryValue>)> {
+        let mut out: Vec<(String, bool, Vec<RegistryValue>)> = self
+            .keys
+            .iter()
+            .filter(|k| k.parent.is_some())
+            .filter_map(|k| {
+                self.key_path(k.id)
+                    .map(|path| (path, k.volatile, k.values.clone()))
+            })
+            .collect();
+        // Shorter paths (parents) first, so a restore creates parents before children.
+        out.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+        out
+    }
+
     /// `ZwDeleteKey` — delete a leaf key (removing it from its parent). Fails if it has
     /// subkeys (matching NT semantics) unless `recursive`.
     pub fn delete_key(&mut self, key: RegistryKeyId, recursive: bool) -> bool {

@@ -76,3 +76,26 @@ registry" + a devnode) then the real driver reads/writes it.
 Milestone 18 complete: nt-config-manager property store + the WdfRuntime registry/interface/
 property bridge (17 host tests) + this component (20/20 QEMU) — a real KMDF driver on the
 Configuration Manager registry.
+
+## Persistence / hive store (implemented, Milestones 19.1-19.6 — `nt-config-store`)
+
+Durable storage for the Configuration Manager (spec: NT Configuration Manager Persistence).
+Explicit TLV wire format (never Rust struct layout), little-endian, UTF-16LE, CRC-32C; every
+read bounds-checked (safe to parse from untrusted bytes).
+
+- `ConfigStore` trait + backends: `MemoryStore` (in-memory / seL4 in-process v0.1), `FaultStore`
+  (crash-consistency injection). Snapshot read/write-atomic, journal read/append/truncate,
+  fsync, lock.
+- **Snapshot** (spec §9): a `USNTCM\0\1` header {schema, generation, base_journal_sequence,
+  record_count, payload_len, payload_crc32c, header_crc32c} + TLV records (RegistryKey /
+  Service / Devnode / Interface / LegacyProperty / DevProp). `snapshot::encode(cm,gen,base)` /
+  `parse_header` (validates both CRCs + schema) / `decode` → a fresh `ConfigManager`.
+- **Journal** (spec §10): a `CJR1` per-record header {op, sequence, txn, payload_crc, record_crc}
+  + payload. Ops REG_CREATE_KEY / SET_VALUE / DELETE_VALUE. `journal::replay` applies records with
+  sequence > base (idempotent, spec §10.5) and stops cleanly at a torn/invalid trailing record
+  (spec §21.2).
+- **`Persistence<S>` engine** (spec §11, §18-§20): `boot` (load+validate snapshot → replay journal),
+  `mutate` (append record + fsync in Strict + apply), `compact` (fresh snapshot + truncate journal).
+- 7 unit tests: snapshot round-trip, checksum/magic/truncation rejection, boot-replays-journal,
+  compaction-truncates-journal, idempotent replay, torn-record ignored, snapshot-write-fault
+  preserves the previous snapshot.

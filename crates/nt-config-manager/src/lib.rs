@@ -338,6 +338,18 @@ impl ConfigManager {
     pub fn interface(&self, id: InterfaceId) -> Option<&InterfaceRecord> {
         self.interfaces.iter().find(|i| i.id == id)
     }
+
+    // --- iteration (for persistence snapshots, spec §9) -----------------------
+
+    pub fn services(&self) -> &[ServiceRecord] {
+        &self.services
+    }
+    pub fn devnodes(&self) -> &[DevnodeRecord] {
+        &self.devnodes
+    }
+    pub fn interfaces(&self) -> &[InterfaceRecord] {
+        &self.interfaces
+    }
     /// Enumerate interfaces by class GUID, optionally only enabled ones (spec §11, §18.3).
     pub fn interfaces_by_guid(&self, guid: &str, enabled_only: bool) -> Vec<&InterfaceRecord> {
         self.interfaces

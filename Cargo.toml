@@ -39,6 +39,7 @@ members = [
     "crates/nt-wdf-interrupt",
     "crates/nt-wdf-dma",
     "crates/nt-config-manager",
+    "crates/nt-config-store",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -95,6 +96,7 @@ nt-wdf-runtime = { path = "crates/nt-wdf-runtime" }
 nt-wdf-interrupt = { path = "crates/nt-wdf-interrupt" }
 nt-wdf-dma = { path = "crates/nt-wdf-dma" }
 nt-config-manager = { path = "crates/nt-config-manager" }
+nt-config-store = { path = "crates/nt-config-store" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
