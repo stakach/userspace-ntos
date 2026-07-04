@@ -223,6 +223,10 @@ impl ConfigManager {
     fn devnode_by_id(&self, id: DevnodeId) -> Option<&DevnodeRecord> {
         self.devnodes.iter().find(|d| d.id == id)
     }
+    /// The `Enum\<InstanceId>` registry key of a devnode (`WdfDeviceOpenRegistryKey(DEVICE)`).
+    pub fn devnode_enum_key(&self, id: DevnodeId) -> Option<RegistryKeyId> {
+        self.devnode_by_id(id).map(|d| d.enum_key)
+    }
 
     // --- PnP properties (spec §11) --------------------------------------------
 

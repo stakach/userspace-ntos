@@ -16,12 +16,18 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use nt_config_manager::{ConfigManager, DevPropKey, DevnodeId, PropertyValue, RegistryKeyId};
 use nt_dma_manager::DmaOwner;
 use nt_wdf_dma::WdfDmaManager;
 use nt_wdf_interrupt::{WdfInterrupt, WdfInterruptConfig};
 use nt_wdf_object::{PendingCallback, WdfHandle, WdfObjectError, WdfObjectTable, WdfObjectType};
 use nt_wdf_queue::{DispatchType, WdfIoQueue};
 use nt_wdf_request::{RequestBuffers, WdfRequest, WdfRequestError};
+
+/// NTSTATUS values returned by the registry query APIs (spec §10.5).
+pub const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+pub const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+pub const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 
 /// The PnP/power event callbacks a device registered (spec §14), as function pointers.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -128,6 +134,12 @@ pub struct WdfRuntime {
     interrupts: BTreeMap<u64, WdfInterrupt>,
     timers: BTreeMap<u64, TimerRec>,
     workitems: BTreeMap<u64, WorkItemRec>,
+    // Configuration (spec: NT Device Interface / Registry / Property).
+    config: ConfigManager,
+    driver_service: alloc::string::String,
+    device_devnodes: BTreeMap<u64, DevnodeId>,
+    wdfkeys: BTreeMap<u64, RegistryKeyId>,
+    wdfstrings: BTreeMap<u64, alloc::string::String>,
 }
 
 impl Default for WdfRuntime {
@@ -151,7 +163,32 @@ impl WdfRuntime {
             interrupts: BTreeMap::new(),
             timers: BTreeMap::new(),
             workitems: BTreeMap::new(),
+            config: ConfigManager::new(),
+            driver_service: alloc::string::String::new(),
+            device_devnodes: BTreeMap::new(),
+            wdfkeys: BTreeMap::new(),
+            wdfstrings: BTreeMap::new(),
         }
+    }
+
+    /// The Configuration Manager registry authority (the Driver Host seeds fixtures here).
+    pub fn config(&self) -> &ConfigManager {
+        &self.config
+    }
+    pub fn config_mut(&mut self) -> &mut ConfigManager {
+        &mut self.config
+    }
+    /// Bind the driver to its service name (so `WdfDriverOpenParametersRegistryKey` resolves).
+    pub fn set_driver_service(&mut self, service: &str) {
+        self.driver_service = service.into();
+    }
+    /// Associate a WDFDEVICE with a Configuration Manager devnode (for interface + property +
+    /// `WdfDeviceOpenRegistryKey(DEVICE)`).
+    pub fn link_device_devnode(&mut self, device: WdfHandle, devnode: DevnodeId) {
+        self.device_devnodes.insert(device.0, devnode);
+    }
+    pub fn device_devnode(&self, device: WdfHandle) -> Option<DevnodeId> {
+        self.device_devnodes.get(&device.0).copied()
     }
 
     /// A DMA owner token derived from a device handle (one adapter domain per device).
@@ -679,6 +716,211 @@ impl WdfRuntime {
         self.workitems.get(&wi.0).map(|w| w.ran_count)
     }
 
+    // --- WDFKEY / registry (spec: Device Interface / Registry / Property §10) -
+
+    fn make_wdfkey(&mut self, registry_key: RegistryKeyId) -> Result<WdfHandle, WdfRuntimeError> {
+        let key = self.objects.create(WdfObjectType::Memory, self.driver)?;
+        self.wdfkeys.insert(key.0, registry_key);
+        Ok(key)
+    }
+    fn wdfkey_registry(&self, key: WdfHandle) -> Result<RegistryKeyId, WdfRuntimeError> {
+        self.wdfkeys
+            .get(&key.0)
+            .copied()
+            .ok_or(WdfRuntimeError::InvalidState)
+    }
+
+    /// `WdfDriverOpenParametersRegistryKey` — open the driver's service `Parameters` key as a
+    /// WDFKEY (spec §10.3).
+    pub fn open_driver_parameters_key(&mut self) -> Result<WdfHandle, WdfRuntimeError> {
+        let service = self.driver_service.clone();
+        let rk = self
+            .config
+            .service_parameters_key(&service)
+            .ok_or(WdfRuntimeError::InvalidState)?;
+        self.make_wdfkey(rk)
+    }
+
+    /// `WdfDeviceOpenRegistryKey` — open the device's `DEVICE` (devnode Enum) or `DRIVER`
+    /// (service) key as a WDFKEY (spec §10.4). `driver_key = true` selects the service key.
+    pub fn open_device_registry_key(
+        &mut self,
+        device: WdfHandle,
+        driver_key: bool,
+    ) -> Result<WdfHandle, WdfRuntimeError> {
+        let rk = if driver_key {
+            let service = self.driver_service.clone();
+            self.config
+                .service(&service)
+                .map(|s| s.service_key)
+                .ok_or(WdfRuntimeError::InvalidState)?
+        } else {
+            let dn = self
+                .device_devnode(device)
+                .ok_or(WdfRuntimeError::InvalidState)?;
+            self.config
+                .devnode_enum_key(dn)
+                .ok_or(WdfRuntimeError::InvalidState)?
+        };
+        self.make_wdfkey(rk)
+    }
+
+    /// `WdfRegistryQueryULong` — read a `REG_DWORD` (NTSTATUS on missing/type-mismatch, §10.5).
+    pub fn registry_query_ulong(&self, key: WdfHandle, name: &str) -> Result<u32, i32> {
+        let rk = self
+            .wdfkey_registry(key)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        match self.config.registry().query_value(rk, name) {
+            None => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            Some(v) => v.as_dword().ok_or(STATUS_OBJECT_TYPE_MISMATCH),
+        }
+    }
+    /// `WdfRegistryAssignULong` — write a `REG_DWORD`.
+    pub fn registry_assign_ulong(
+        &mut self,
+        key: WdfHandle,
+        name: &str,
+        value: u32,
+    ) -> Result<(), i32> {
+        let rk = self
+            .wdfkey_registry(key)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.config.registry_mut().set_dword(rk, name, value);
+        Ok(())
+    }
+    /// `WdfRegistryQueryString` — read a `REG_SZ` as a Rust string.
+    pub fn registry_query_string(
+        &self,
+        key: WdfHandle,
+        name: &str,
+    ) -> Result<alloc::string::String, i32> {
+        let rk = self
+            .wdfkey_registry(key)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        match self.config.registry().query_value(rk, name) {
+            None => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            Some(v) => v.as_string().ok_or(STATUS_OBJECT_TYPE_MISMATCH),
+        }
+    }
+    /// `WdfRegistryAssignString` — write a `REG_SZ`.
+    pub fn registry_assign_string(
+        &mut self,
+        key: WdfHandle,
+        name: &str,
+        value: &str,
+    ) -> Result<(), i32> {
+        let rk = self
+            .wdfkey_registry(key)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.config.registry_mut().set_string(rk, name, value);
+        Ok(())
+    }
+
+    // --- WDFSTRING (spec §10.5) -----------------------------------------------
+
+    /// `WdfStringCreate` — a WDFSTRING wrapping a value.
+    pub fn create_wdfstring(&mut self, value: &str) -> Result<WdfHandle, WdfRuntimeError> {
+        let s = self.objects.create(WdfObjectType::Memory, self.driver)?;
+        self.wdfstrings.insert(s.0, value.into());
+        Ok(s)
+    }
+    pub fn wdfstring_value(&self, s: WdfHandle) -> Option<&str> {
+        self.wdfstrings.get(&s.0).map(|s| s.as_str())
+    }
+    pub fn set_wdfstring(&mut self, s: WdfHandle, value: &str) {
+        self.wdfstrings.insert(s.0, value.into());
+    }
+
+    // --- device interfaces (spec §8) ------------------------------------------
+
+    /// `WdfDeviceCreateDeviceInterface` — register a device interface for the device's devnode.
+    pub fn create_device_interface(
+        &mut self,
+        device: WdfHandle,
+        guid: &str,
+        reference: &str,
+    ) -> Result<(), WdfRuntimeError> {
+        let dn = self
+            .device_devnode(device)
+            .ok_or(WdfRuntimeError::InvalidState)?;
+        // Interfaces are enabled by default once the device starts (KMDF connects on D0/start).
+        self.config.register_interface(dn, guid, reference, true);
+        Ok(())
+    }
+    /// `WdfDeviceSetDeviceInterfaceState` — enable/disable all of the device's interfaces of a
+    /// GUID.
+    pub fn set_device_interface_state(&mut self, device: WdfHandle, guid: &str, enabled: bool) {
+        let Some(dn) = self.device_devnode(device) else {
+            return;
+        };
+        let ids: Vec<_> = self
+            .config
+            .interfaces_by_guid(guid, false)
+            .iter()
+            .filter(|i| i.devnode == dn)
+            .map(|i| i.id)
+            .collect();
+        for id in ids {
+            self.config.set_interface_state(id, enabled);
+        }
+    }
+    /// The symbolic link of the device's (first) interface of a GUID, if any.
+    pub fn device_interface_link(
+        &self,
+        device: WdfHandle,
+        guid: &str,
+    ) -> Option<alloc::string::String> {
+        let dn = self.device_devnode(device)?;
+        self.config
+            .interfaces_by_guid(guid, false)
+            .iter()
+            .find(|i| i.devnode == dn)
+            .map(|i| i.symbolic_link.clone())
+    }
+
+    // --- PnP properties (spec §11) --------------------------------------------
+
+    /// `WdfDeviceAssignProperty` — set a `DEVPROPKEY` property on the device's devnode.
+    pub fn assign_device_property(
+        &mut self,
+        device: WdfHandle,
+        key: DevPropKey,
+        value: PropertyValue,
+    ) -> Result<(), WdfRuntimeError> {
+        let dn = self
+            .device_devnode(device)
+            .ok_or(WdfRuntimeError::InvalidState)?;
+        self.config.assign_devprop(dn, key, value);
+        Ok(())
+    }
+    pub fn query_device_property(
+        &self,
+        device: WdfHandle,
+        key: &DevPropKey,
+    ) -> Option<PropertyValue> {
+        let dn = self.device_devnode(device)?;
+        self.config.query_devprop(dn, key).cloned()
+    }
+    /// Set a legacy `DEVICE_REGISTRY_PROPERTY` (e.g. FriendlyName) — the Driver Host seeds these.
+    pub fn set_legacy_device_property(
+        &mut self,
+        device: WdfHandle,
+        property: u32,
+        value: PropertyValue,
+    ) {
+        if let Some(dn) = self.device_devnode(device) {
+            self.config.set_legacy_property(dn, property, value);
+        }
+    }
+    pub fn query_legacy_device_property(
+        &self,
+        device: WdfHandle,
+        property: u32,
+    ) -> Option<PropertyValue> {
+        let dn = self.device_devnode(device)?;
+        self.config.query_legacy_property(dn, property).cloned()
+    }
+
     /// `WdfObjectDelete` — delete an object + return the driver cleanup/destroy callbacks to
     /// run after the borrow releases (spec §7.3). Prunes any runtime side-state.
     pub fn delete_object(
@@ -696,6 +938,8 @@ impl WdfRuntime {
         self.interrupts.remove(&handle.0);
         self.timers.remove(&handle.0);
         self.workitems.remove(&handle.0);
+        self.wdfkeys.remove(&handle.0);
+        self.wdfstrings.remove(&handle.0);
         let _ = self.dma.free_common_buffer(handle.0);
         Ok(pending)
     }
@@ -901,6 +1145,82 @@ mod tests {
         rt.workitem_enqueue(wi);
         assert_eq!(rt.workitem_run(wi), Some(0x21D0));
         assert_eq!(rt.workitem_ran_count(wi), Some(1));
+    }
+
+    #[test]
+    fn registry_interface_property_flow() {
+        use nt_config_manager::{device_property, PropertyValue, RegistryValueType};
+        let mut rt = WdfRuntime::new();
+        // The Driver Host seeds the fixture + binds the service (spec §19).
+        rt.config_mut()
+            .register_service("Svc", "svc.sys", None, None, 3, 1);
+        rt.config_mut().set_service_parameter(
+            "Svc",
+            "Answer",
+            RegistryValueType::Dword,
+            42u32.to_le_bytes().to_vec(),
+        );
+        rt.config_mut().set_service_parameter(
+            "Svc",
+            "Greeting",
+            RegistryValueType::Sz,
+            nt_config_manager::encode_sz("hello registry"),
+        );
+        rt.set_driver_service("Svc");
+        let devnode = rt
+            .config_mut()
+            .register_devnode(r"ROOT\X\0000", Some("Svc"), None, &[], &[]);
+
+        rt.create_driver(1, 0).unwrap();
+        let init = rt.add_device(0);
+        let device = rt.create_device(init, 0xFD0).unwrap();
+        rt.link_device_devnode(device, devnode);
+
+        // Driver opens Parameters + reads Answer/Greeting, writes SeenByDriver.
+        let key = rt.open_driver_parameters_key().unwrap();
+        assert_eq!(rt.registry_query_ulong(key, "Answer"), Ok(42));
+        assert_eq!(
+            rt.registry_query_string(key, "greeting").as_deref(),
+            Ok("hello registry")
+        );
+        assert_eq!(
+            rt.registry_query_ulong(key, "Missing"),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            rt.registry_query_ulong(key, "Greeting"),
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        );
+        rt.registry_assign_ulong(key, "SeenByDriver", 1).unwrap();
+        assert_eq!(
+            rt.config().registry().query_dword(
+                rt.config().service_parameters_key("Svc").unwrap(),
+                "SeenByDriver"
+            ),
+            Some(1)
+        );
+
+        // Device interface + property.
+        let guid = "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}";
+        rt.create_device_interface(device, guid, "").unwrap();
+        assert!(rt
+            .device_interface_link(device, guid)
+            .unwrap()
+            .starts_with(r"\??\"));
+        assert_eq!(rt.config().interfaces_by_guid(guid, true).len(), 1);
+        rt.set_device_interface_state(device, guid, false);
+        assert_eq!(rt.config().interfaces_by_guid(guid, true).len(), 0);
+        rt.set_legacy_device_property(
+            device,
+            device_property::FRIENDLY_NAME,
+            PropertyValue::string("Test Device"),
+        );
+        assert_eq!(
+            rt.query_legacy_device_property(device, device_property::FRIENDLY_NAME)
+                .and_then(|v| v.as_string())
+                .as_deref(),
+            Some("Test Device")
+        );
     }
 
     #[test]

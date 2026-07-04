@@ -36,3 +36,19 @@ driver + the PnP/interface managers would. **9/9 checks pass in QEMU.**
   the devnode by service; devnode Service value; interface registered+enabled; disable hides it.
 - Driver-facing Zw*/WdfRegistry* exports + the isolated SURT service boundary await a
   registry-using driver artifact (`KmdfInterfaceRegistryTest.sys`).
+
+## WDF runtime registry/interface/property (implemented, M18 host support — `nt-wdf-runtime`)
+
+`WdfRuntime` gains a `ConfigManager` + the KMDF registry/interface/property bridge (spec: NT
+Device Interface / Registry / Property, §8-§11):
+- `config()`/`config_mut()` (the Driver Host seeds fixtures), `set_driver_service`,
+  `link_device_devnode`.
+- Registry (§10): `open_driver_parameters_key` (WdfDriverOpenParametersRegistryKey → WDFKEY),
+  `open_device_registry_key` (DEVICE=devnode Enum / DRIVER=service key),
+  `registry_query_ulong`/`registry_assign_ulong` (STATUS_OBJECT_NAME_NOT_FOUND /
+  STATUS_OBJECT_TYPE_MISMATCH), `registry_query_string`/`registry_assign_string`.
+  WDFKEY/WDFSTRING are WDF objects wrapping a RegistryKeyId / String; pruned on delete.
+- Device interface (§8): `create_device_interface` (WdfDeviceCreateDeviceInterface),
+  `set_device_interface_state`, `device_interface_link`.
+- Property (§11): `assign_device_property` (WdfDeviceAssignProperty, DEVPROPKEY),
+  `query_device_property`, `set/query_legacy_device_property` (FriendlyName, …).
