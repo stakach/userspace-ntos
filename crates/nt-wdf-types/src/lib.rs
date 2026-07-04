@@ -79,6 +79,36 @@ pub const IDX_WDF_WORK_ITEM_ENQUEUE: usize = 380;
 pub const IDX_WDF_WORK_ITEM_GET_PARENT_OBJECT: usize = 381;
 pub const IDX_WDF_WORK_ITEM_FLUSH: usize = 382;
 
+// Device interface / registry / property indices (KMDF 1.15).
+pub const IDX_WDF_DEVICE_OPEN_REGISTRY_KEY: usize = 48;
+pub const IDX_WDF_DEVICE_INIT_ASSIGN_NAME: usize = 67;
+pub const IDX_WDF_DEVICE_CREATE_DEVICE_INTERFACE: usize = 77;
+pub const IDX_WDF_DEVICE_SET_DEVICE_INTERFACE_STATE: usize = 78;
+pub const IDX_WDF_DEVICE_RETRIEVE_DEVICE_INTERFACE_STRING: usize = 79;
+pub const IDX_WDF_DRIVER_OPEN_PARAMETERS_REGISTRY_KEY: usize = 119;
+pub const IDX_WDF_REGISTRY_CLOSE: usize = 231;
+pub const IDX_WDF_REGISTRY_QUERY_STRING: usize = 239;
+pub const IDX_WDF_REGISTRY_QUERY_ULONG: usize = 240;
+pub const IDX_WDF_REGISTRY_ASSIGN_STRING: usize = 245;
+pub const IDX_WDF_REGISTRY_ASSIGN_ULONG: usize = 246;
+pub const IDX_WDF_STRING_CREATE: usize = 308;
+pub const IDX_WDF_STRING_GET_UNICODE_STRING: usize = 309;
+pub const IDX_WDF_DEVICE_ASSIGN_PROPERTY: usize = 435;
+
+/// `PLUGPLAY_REGKEY_DEVICE` — `WdfDeviceOpenRegistryKey` key type (spec §10.4).
+pub const PLUGPLAY_REGKEY_DEVICE: u32 = 1;
+pub const PLUGPLAY_REGKEY_DRIVER: u32 = 2;
+
+/// `WDF_DEVICE_PROPERTY_DATA` (wdfdevice.h): Size@0, PropertyKey@8 (→DEVPROPKEY), Lcid@16, Flags@20.
+pub mod device_property_data {
+    pub const PROPERTY_KEY: u64 = 8;
+}
+/// `DEVPROPKEY` layout: fmtid (GUID, 16 bytes) @0, pid (u32) @16.
+pub mod devpropkey {
+    pub const FMTID: u64 = 0;
+    pub const PID: u64 = 16;
+}
+
 /// `WDF_INTERRUPT_CONFIG` (wdfinterrupt.h; Size 0x68).
 pub mod interrupt_config {
     pub const EVT_INTERRUPT_ISR: u64 = 0x18;

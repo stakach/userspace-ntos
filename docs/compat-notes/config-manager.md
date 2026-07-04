@@ -52,3 +52,27 @@ Device Interface / Registry / Property, §8-§11):
   `set_device_interface_state`, `device_interface_link`.
 - Property (§11): `assign_device_property` (WdfDeviceAssignProperty, DEVPROPKEY),
   `query_device_property`, `set/query_legacy_device_property` (FriendlyName, …).
+
+## Driver Host registry/interface/property integration (implemented, M18 — `driver-host-direg`)
+
+`components/driver-host-direg` loads the real `KmdfInterfaceRegistryTest.sys` and runs it
+against the in-process `WdfRuntime` + Configuration Manager. **20/20 checks pass in QEMU, no
+#GP.** The Driver Host seeds the §21 fixture (service Parameters Answer=42 / Greeting="hello
+registry" + a devnode) then the real driver reads/writes it.
+
+- 14 new WDF thunks: WdfDriverOpenParametersRegistryKey / WdfDeviceOpenRegistryKey,
+  WdfRegistryQuery/AssignULong + Query/AssignString + Close, WdfStringCreate /
+  WdfStringGetUnicodeString (with a UNICODE_STRING projection), WdfDeviceCreateDeviceInterface /
+  RetrieveDeviceInterfaceString, WdfDeviceAssignProperty, WdfDeviceInitAssignName. Helpers
+  read a driver UNICODE_STRING + format a 16-byte GUID to `{…}`.
+- EvtDeviceAdd runs the real registry flow: reads Answer=42 + Greeting, writes SeenByDriver=1 +
+  DeviceSeenByDriver=1 + RuntimeValue=0, creates the interface (auto-enabled — the driver never
+  calls SetDeviceInterfaceState), assigns FriendlyName + a custom DEVPROPKEY (=Answer/UINT32).
+- IOCTLs: PING (0x4946_4B4D "MKFI"), GET_CONFIG (Answer=42/SeenByDriver=1/DeviceSeenByDriver=1),
+  GET_GREETING ("hello registry") + GET_INTERFACE_STRING (require a 0x20C output buffer),
+  SET/GET_REG_DWORD round-trip, ECHO. REMOVE disables the interface + deletes the device
+  (WDFKEY/WDFSTRING are driver-scoped, so they outlive the device — correct KMDF behaviour).
+
+Milestone 18 complete: nt-config-manager property store + the WdfRuntime registry/interface/
+property bridge (17 host tests) + this component (20/20 QEMU) — a real KMDF driver on the
+Configuration Manager registry.
