@@ -64,7 +64,12 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            base + i * 0x1000,
+            /* RW */ 3,
+            CAP_INIT_THREAD_VSPACE,
+        );
         CODE_FRAME_CAPS[i as usize] = f;
     }
 }
@@ -495,19 +500,18 @@ unsafe fn run() {
                 } = f
                 {
                     let addr = export_addr(name);
-                    core::ptr::write_unaligned((CODE_VADDR + *iat_slot_rva as u64) as *mut u64, addr);
+                    core::ptr::write_unaligned(
+                        (CODE_VADDR + *iat_slot_rva as u64) as *mut u64,
+                        addr,
+                    );
                 }
             }
         }
     }
     check(b"patch_iat", true);
 
-    let cookie_ok = if let Some(rva) = pe.security_cookie_rva() {
-        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
-        true
-    } else {
-        false
-    };
+    // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
+    let cookie_ok = pe.seed_security_cookie(CODE_VADDR);
     check(b"security_cookie", cookie_ok);
 
     apply_wx(&pe, frames);
@@ -533,7 +537,11 @@ unsafe fn run() {
     let n = dh().name_len.min(64);
     for i in 0..n {
         let c = dh().name_units[i];
-        ascii[i] = if (0x20..0x7f).contains(&c) { c as u8 } else { b'?' };
+        ascii[i] = if (0x20..0x7f).contains(&c) {
+            c as u8
+        } else {
+            b'?'
+        };
     }
     print_str(&ascii[..n]);
     print_str(b"\n");
@@ -570,7 +578,10 @@ unsafe fn run() {
 
     // Each async IRP above completed exactly once — the guard rejected no valid
     // completion (spec §20: "pending IRP completes exactly once").
-    check(b"no_valid_completion_dropped", dh().double_complete_rejected == 0);
+    check(
+        b"no_valid_completion_dropped",
+        dh().double_complete_rejected == 0,
+    );
 
     // On-target exactly-once guard: a second completion of the same IRP is dropped.
     rt().mark_irp_pending(0xDEAD_0001, 100);

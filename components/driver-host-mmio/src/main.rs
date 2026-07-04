@@ -67,7 +67,12 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            base + i * 0x1000,
+            /* RW */ 3,
+            CAP_INIT_THREAD_VSPACE,
+        );
         CODE_FRAME_CAPS[i as usize] = f;
     }
 }
@@ -498,16 +503,18 @@ unsafe fn run() {
                 } = f
                 {
                     let addr = export_addr(name);
-                    core::ptr::write_unaligned((CODE_VADDR + *iat_slot_rva as u64) as *mut u64, addr);
+                    core::ptr::write_unaligned(
+                        (CODE_VADDR + *iat_slot_rva as u64) as *mut u64,
+                        addr,
+                    );
                 }
             }
         }
     }
     check(b"patch_iat", true);
 
-    if let Some(rva) = pe.security_cookie_rva() {
-        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
-    }
+    // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
+    pe.seed_security_cookie(CODE_VADDR);
     apply_wx(&pe, frames);
     check(b"w_xor_x", true);
 
@@ -523,9 +530,15 @@ unsafe fn run() {
     let status = driver_entry(driver_object, reg_path);
     check(b"driver_entry_success", status == 0);
     check(b"io_create_device", dh().device_created);
-    check(b"mm_map_io_space", dh().mmio_base != 0 && rm().mapping_valid(dh().mmio_mapping_id));
+    check(
+        b"mm_map_io_space",
+        dh().mmio_base != 0 && rm().mapping_valid(dh().mmio_mapping_id),
+    );
     check(b"read_id_register_during_entry", dh().interrupt_id != 0); // reached connect past the ID check
-    check(b"io_connect_interrupt", rm().inject_vector(INT_VECTOR).is_some());
+    check(
+        b"io_connect_interrupt",
+        rm().inject_vector(INT_VECTOR).is_some(),
+    );
 
     let dev = dh().device_object;
 
@@ -543,13 +556,19 @@ unsafe fn run() {
 
     // IOCTL_MMIOIT_WAIT_FOR_INTERRUPT → the driver pends the IRP.
     let (st, _info, _out) = dispatch(driver_object, dev, 0x0e, 0x0022_2090, &[], 8);
-    check(b"wait_returns_pending", st == STATUS_PENDING && !dh().completed);
+    check(
+        b"wait_returns_pending",
+        st == STATUS_PENDING && !dh().completed,
+    );
 
     // Inject the interrupt: ISR runs at device IRQL, acks, queues a DPC that
     // completes the pending IRP.
     let injected = inject_interrupt(INT_VECTOR);
     check(b"interrupt_injected", injected);
-    check(b"isr_dpc_completed_irp", dh().completed && dh().last_status == 0);
+    check(
+        b"isr_dpc_completed_irp",
+        dh().completed && dh().last_status == 0,
+    );
 
     // IOCTL_MMIOIT_GET_INTERRUPT_COUNT → 1.
     let (st, _info, out) = dispatch(driver_object, dev, 0x0e, 0x0022_2094, &[], 8);

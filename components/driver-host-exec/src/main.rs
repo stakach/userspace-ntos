@@ -56,7 +56,12 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            base + i * 0x1000,
+            /* RW */ 3,
+            CAP_INIT_THREAD_VSPACE,
+        );
         CODE_FRAME_CAPS[i as usize] = f;
     }
 }
@@ -245,8 +250,7 @@ unsafe fn dispatch(
 
     // MajorFunction[] lives in the DRIVER_OBJECT; the routine takes the
     // DEVICE_OBJECT + IRP.
-    let routine =
-        core::ptr::read_unaligned((driver_object + 112 + major as u64 * 8) as *const u64);
+    let routine = core::ptr::read_unaligned((driver_object + 112 + major as u64 * 8) as *const u64);
     let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(routine as *const ());
     let _ = f(device_object, irp);
 
@@ -315,12 +319,8 @@ unsafe fn run() {
     // load-config directory. The MSVC `GsDriverEntry` wrapper's
     // `__security_init_cookie` fastfails (`int 0x29`) if it is left at 0 — normally
     // the image loader initialises it.
-    let cookie_ok = if let Some(rva) = pe.security_cookie_rva() {
-        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
-        true
-    } else {
-        false
-    };
+    // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
+    let cookie_ok = pe.seed_security_cookie(CODE_VADDR);
     check(b"security_cookie", cookie_ok);
 
     // Re-map the image W^X: code + read-only data become read-only; only writable
@@ -336,8 +336,7 @@ unsafe fn run() {
 
     // Call DriverEntry(DriverObject, RegistryPath) under the Microsoft x64 ABI.
     let entry = CODE_VADDR + pe.entry_point_rva() as u64;
-    let driver_entry: extern "win64" fn(u64, u64) -> i32 =
-        core::mem::transmute(entry as *const ());
+    let driver_entry: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
     let status = driver_entry(driver_object, reg_path);
     check(b"driver_entry_success", status == 0);
 
@@ -356,7 +355,11 @@ unsafe fn run() {
     let n = DH.name_len.min(64);
     for i in 0..n {
         let c = DH.name_units[i];
-        ascii[i] = if (0x20..0x7f).contains(&c) { c as u8 } else { b'?' };
+        ascii[i] = if (0x20..0x7f).contains(&c) {
+            c as u8
+        } else {
+            b'?'
+        };
     }
     print_str(&ascii[..n]);
     print_str(b"\n");

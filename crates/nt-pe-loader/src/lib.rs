@@ -22,6 +22,15 @@ pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
 
+/// A valid `__security_cookie` (`/GS`) seed. MSVC's x64 `__security_check_cookie`
+/// validates that the cookie's **top 16 bits are zero** (`rol rcx,0x10; test cx,0xffff`)
+/// — the invariant `__security_init_cookie` guarantees by masking a generated cookie to
+/// 48 bits. A seed with non-zero top bits (e.g. `0x1234_...`) makes every `/GS` epilogue
+/// `__fastfail(2)`, but only on images whose codegen emits the high-bits check, so the
+/// bug hides until a driver that has it runs. `GsDriverEntry` won't fix a non-default
+/// seed (`__security_init_cookie` only generates when the value is still the CRT default).
+pub const SECURITY_COOKIE_SEED: u64 = 0x0000_5678_9abc_def0;
+
 /// The memory protection a mapped page should carry, for a W^X mapping.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Protection {
@@ -187,6 +196,28 @@ impl<'a> PeFile<'a> {
             return None;
         }
         u32::try_from(cookie_va.checked_sub(self.headers.image_base)?).ok()
+    }
+
+    /// Seed the image's `__security_cookie` at `code_vaddr + security_cookie_rva()` with
+    /// a valid `/GS` cookie ([`SECURITY_COOKIE_SEED`]), the last step before calling
+    /// `DriverEntry`. Returns `true` if the image had a cookie to seed. Centralizing this
+    /// keeps the cookie's top-16-bits-zero invariant in one place — a hand-written seed
+    /// with non-zero top bits fastfails only on the MSVC codegen that emits the high-bits
+    /// check, so the drift is otherwise invisible.
+    ///
+    /// # Safety
+    /// `code_vaddr` must be the base of the image's mapped, writable code region.
+    pub unsafe fn seed_security_cookie(&self, code_vaddr: u64) -> bool {
+        match self.security_cookie_rva() {
+            Some(rva) => {
+                core::ptr::write_unaligned(
+                    (code_vaddr + rva as u64) as *mut u64,
+                    SECURITY_COOKIE_SEED,
+                );
+                true
+            }
+            None => false,
+        }
     }
 
     /// The memory protection a page at `rva` should get (from its section's

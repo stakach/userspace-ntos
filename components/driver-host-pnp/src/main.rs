@@ -65,7 +65,12 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            base + i * 0x1000,
+            /* RW */ 3,
+            CAP_INIT_THREAD_VSPACE,
+        );
         CODE_FRAME_CAPS[i as usize] = f;
     }
 }
@@ -352,13 +357,7 @@ extern "win64" fn ntos_ke_set_event(event: u64, _incr: i32, _wait: u8) -> i32 {
 extern "win64" fn ntos_ke_clear_event(event: u64) {
     unsafe { rt().events().clear(event) }
 }
-extern "win64" fn ntos_ke_wait_for_single_object(
-    _o: u64,
-    _r: u32,
-    _m: u8,
-    _a: u8,
-    _t: u64,
-) -> i32 {
+extern "win64" fn ntos_ke_wait_for_single_object(_o: u64, _r: u32, _m: u8, _a: u8, _t: u64) -> i32 {
     0
 }
 
@@ -598,9 +597,8 @@ unsafe fn run() {
     }
     check(b"patch_iat", true);
 
-    if let Some(rva) = pe.security_cookie_rva() {
-        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
-    }
+    // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
+    pe.seed_security_cookie(CODE_VADDR);
     apply_wx(&pe, frames);
     check(b"w_xor_x", true);
 
@@ -675,7 +673,10 @@ unsafe fn run() {
         let _ = pnp().transition(devnode, DeviceState::Started);
     }
     check(b"start_device_success", started_ok);
-    check(b"devnode_started", pnp().state(devnode) == Some(DeviceState::Started));
+    check(
+        b"devnode_started",
+        pnp().state(devnode) == Some(DeviceState::Started),
+    );
 
     // --- device works after Started -----------------------------------------
     let (st, _i, out) = dispatch(driver_object, fdo, 0x0e, 0x0022_20C0, &[], 8); // GET_ID
@@ -702,9 +703,14 @@ unsafe fn run() {
     let _ = pnp().transition(devnode, DeviceState::Removed);
     check(
         b"remove_device_releases_resources",
-        remove_status == 0 && !rm().mapping_valid(mapping_id) && rm().inject_vector(INT_VECTOR).is_none(),
+        remove_status == 0
+            && !rm().mapping_valid(mapping_id)
+            && rm().inject_vector(INT_VECTOR).is_none(),
     );
-    check(b"devnode_removed", pnp().state(devnode) == Some(DeviceState::Removed));
+    check(
+        b"devnode_removed",
+        pnp().state(devnode) == Some(DeviceState::Removed),
+    );
 
     check(b"callbacks_ran_at_correct_irql", dh().bad_irql == 0);
     let _ = add_status;

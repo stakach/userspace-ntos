@@ -71,7 +71,12 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            base + i * 0x1000,
+            /* RW */ 3,
+            CAP_INIT_THREAD_VSPACE,
+        );
         CODE_FRAME_CAPS[i as usize] = f;
     }
 }
@@ -370,13 +375,7 @@ extern "win64" fn ntos_ke_set_event(event: u64, _incr: i32, _wait: u8) -> i32 {
 extern "win64" fn ntos_ke_clear_event(event: u64) {
     unsafe { rt().events().clear(event) }
 }
-extern "win64" fn ntos_ke_wait_for_single_object(
-    _o: u64,
-    _r: u32,
-    _m: u8,
-    _a: u8,
-    _t: u64,
-) -> i32 {
+extern "win64" fn ntos_ke_wait_for_single_object(_o: u64, _r: u32, _m: u8, _a: u8, _t: u64) -> i32 {
     0
 }
 
@@ -590,7 +589,10 @@ unsafe fn dispatch_power(
     core::ptr::write_unaligned(current as *mut u8, IRP_MJ_POWER);
     core::ptr::write_unaligned((current + 1) as *mut u8, minor);
     core::ptr::write_unaligned((current + PARAM_POWER_TYPE_OFFSET) as *mut u32, power_type);
-    core::ptr::write_unaligned((current + PARAM_POWER_STATE_OFFSET) as *mut u32, power_state);
+    core::ptr::write_unaligned(
+        (current + PARAM_POWER_STATE_OFFSET) as *mut u32,
+        power_state,
+    );
 
     dh().completed = false;
     dh().last_status = 0;
@@ -616,12 +618,24 @@ unsafe fn transition_device_power(
         return false;
     }
     let t = target as u32;
-    let q = dispatch_power(driver_object, fdo, IRP_MN_QUERY_POWER, POWER_STATE_TYPE_DEVICE, t);
+    let q = dispatch_power(
+        driver_object,
+        fdo,
+        IRP_MN_QUERY_POWER,
+        POWER_STATE_TYPE_DEVICE,
+        t,
+    );
     if q != 0 {
         let _ = pwr().complete_device_transition(devnode, target, false);
         return false;
     }
-    let s = dispatch_power(driver_object, fdo, IRP_MN_SET_POWER, POWER_STATE_TYPE_DEVICE, t);
+    let s = dispatch_power(
+        driver_object,
+        fdo,
+        IRP_MN_SET_POWER,
+        POWER_STATE_TYPE_DEVICE,
+        t,
+    );
     let ok = s == 0;
     let _ = pwr().complete_device_transition(devnode, target, ok);
     ok
@@ -712,9 +726,8 @@ unsafe fn run() {
     }
     check(b"patch_iat", true);
 
-    if let Some(rva) = pe.security_cookie_rva() {
-        core::ptr::write_unaligned((CODE_VADDR + rva as u64) as *mut u64, 0x1234_5678_9abc_def0);
-    }
+    // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
+    pe.seed_security_cookie(CODE_VADDR);
     apply_wx(&pe, frames);
     check(b"w_xor_x", true);
 
