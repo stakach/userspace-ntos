@@ -48,6 +48,7 @@ members = [
     "crates/nt-address-space",
     "crates/nt-process",
     "crates/nt-security",
+    "crates/nt-syscall",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -113,6 +114,7 @@ nt-memory-manager = { path = "crates/nt-memory-manager" }
 nt-address-space = { path = "crates/nt-address-space" }
 nt-process = { path = "crates/nt-process" }
 nt-security = { path = "crates/nt-security" }
+nt-syscall = { path = "crates/nt-syscall" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }

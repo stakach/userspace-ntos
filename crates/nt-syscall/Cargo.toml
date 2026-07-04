@@ -1,0 +1,15 @@
+[package]
+name = "nt-syscall"
+description = "NT native syscall dispatcher + userland ABI: a per-profile service table (syscall number <-> Nt* service), a NativeCallContext, the register ABI descriptor, a NativeSyscallHandler trait the kernel-services layer implements, and a dispatcher that validates the service number + argument count, sets PreviousMode (Nt=UserMode / Zw=KernelMode), routes to the handler, and rejects unknown services (STATUS_INVALID_SYSTEM_SERVICE) — plus user-buffer copyin/copyout helpers. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+nt-config-manager = { workspace = true }
+nt-process = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
