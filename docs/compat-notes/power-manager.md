@@ -15,3 +15,17 @@ IOCTLs + interrupt delivery are gated on `Powered`.
 - `nt-power-abi`: opcodes `POWER_OP_*` (0x7000..=0x70ff); `#[repr(C)]`
   `PowerStateWire`, `PowerSetDeviceReq`, `PowerRegisterDeviceReq`. Responses use
   `detail0` = old state, `detail1` = new state. 6 layout tests.
+
+## Power Manager core (implemented, Milestone 13.2 — `nt-power-manager`)
+
+- `PowerManager`: per-devnode power records; no driver pointers, only IDs + states.
+  `register_device` (D0 at Working on START), `unregister_device` (on REMOVE),
+  `mark_remove` (rejects new transitions, §11.3).
+- `begin_device_transition(devnode, target)` validates the devnode is registered, not
+  removing, and has no power IRP in flight (one-in-flight, §16.1) — else
+  `NotRegistered`/`Removed`/`Busy`/`InvalidState` — and marks it in-flight, returning
+  the old state. `complete_device_transition(devnode, target, success)` moves to
+  `target` on success or preserves the old state on failure (§9.4), always clearing
+  in-flight. `is_on` is true only in D0 (§8.1 I/O + interrupt gating). 6 unit tests
+  (register→D0, D0→D3→D0, one-in-flight, set-failure-preserves-old, no-transition-
+  after-remove, stale-devnode).

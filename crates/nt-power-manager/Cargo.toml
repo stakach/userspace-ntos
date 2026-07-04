@@ -1,0 +1,14 @@
+[package]
+name = "nt-power-manager"
+description = "Core NT Power Manager: per-devnode power records + the D0/D3 device power transition state machine with one-in-flight enforcement, no-transition-after-remove, and query-fails-prevents-set semantics. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-power-types = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
