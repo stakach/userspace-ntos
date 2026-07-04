@@ -1,0 +1,11 @@
+[package]
+name = "nt-wdf-object"
+description = "The KMDF/WDF object model core: a generation-validated handle table with parent/child depth-first deletion, cleanup/destroy callback ordering, reference counting, and per-object driver context storage. Canonical Rust state for the WDF runtime; holds driver pointers only as opaque integers. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

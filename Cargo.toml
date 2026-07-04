@@ -31,6 +31,7 @@ members = [
     "crates/nt-mdl",
     "crates/nt-dma-abi",
     "crates/nt-dma-manager",
+    "crates/nt-wdf-object",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -79,6 +80,7 @@ nt-power-abi = { path = "crates/nt-power-abi" }
 nt-mdl = { path = "crates/nt-mdl" }
 nt-dma-abi = { path = "crates/nt-dma-abi" }
 nt-dma-manager = { path = "crates/nt-dma-manager" }
+nt-wdf-object = { path = "crates/nt-wdf-object" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
