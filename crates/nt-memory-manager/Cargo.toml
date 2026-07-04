@@ -1,0 +1,14 @@
+[package]
+name = "nt-memory-manager"
+description = "NT Memory Manager section objects + mapped views: ZwCreateSection (file-backed via the Cache Manager, or pagefile/anonymous), ZwMapViewOfSection / ZwUnmapViewOfSection, MmMapViewInSystemSpace, a page-protection model with access checks, and Cache Manager coherency (section views materialize via CcCopyRead + write dirty pages back via CcCopyWrite/CcFlushCache). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-cache-manager = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
