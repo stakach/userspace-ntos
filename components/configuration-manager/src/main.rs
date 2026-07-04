@@ -247,6 +247,49 @@ fn run() {
         })
         .unwrap_or(false);
     check(b"hive_boot_survives_restart", hive_ok);
+
+    // --- Filesystem runtime: MemFs + Zw* file APIs + hive-on-disk (spec §8, §14) ----
+    use core::cell::RefCell;
+    use nt_fs::{FileSystem, MemFs, NtFileHiveIoProvider};
+    // A MemFs volume with the fixture tree; ZwCreateFile a temp file, write + read it back.
+    let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
+    let file_ok = {
+        let mut f = fs.borrow_mut();
+        let c = f.zw_create_file(r"\??\C:\Temp\probe", nt_fs::FILE_WRITE_DATA, 0, 0, nt_fs::FILE_CREATE, 0);
+        let wrote = f.zw_write_file(c.handle, None, b"hello fs").1;
+        let size = f.zw_query_standard_information(c.handle).map(|i| i.end_of_file).unwrap_or(0);
+        f.zw_close(c.handle);
+        let r = f.zw_create_file(r"\??\C:\Temp\probe", nt_fs::FILE_READ_DATA, 0, 0, nt_fs::FILE_OPEN, 0);
+        let (st, bytes) = f.zw_read_file(r.handle, Some(0), 8);
+        f.zw_close(r.handle);
+        c.status == nt_fs::STATUS_SUCCESS
+            && c.information == nt_fs::FILE_CREATED
+            && wrote == 8
+            && size == 8
+            && st == nt_fs::STATUS_SUCCESS
+            && &bytes[..] == b"hello fs"
+    };
+    check(b"memfs_zw_create_read_write", file_ok);
+
+    // §14.2 acceptance: a hive image persists through the Zw* file APIs on MemFs across a restart.
+    let sys_hive = r"\SystemRoot\System32\Config\SYSTEM";
+    {
+        let mut mgr = HiveManager::new(NtFileHiveIoProvider::open(&fs, sys_hive));
+        let mut hv = mgr.boot(HiveKind::System).unwrap();
+        mgr.mutate(&mut hv, HiveLogOp::CreateKey { path: svc }).ok();
+        mgr.mutate(&mut hv, HiveLogOp::SetValue { path: svc, name: "Answer", value_type: HRegType::Dword, data: &42u32.to_le_bytes() }).ok();
+        mgr.flush(&mut hv).ok(); // image file written under \Windows\System32\Config\SYSTEM
+        mgr.mutate(&mut hv, HiveLogOp::SetValue { path: svc, name: "SeenByDriver", value_type: HRegType::Dword, data: &1u32.to_le_bytes() }).ok();
+    }
+    let disk_ok = HiveManager::new(NtFileHiveIoProvider::open(&fs, sys_hive))
+        .boot(HiveKind::System)
+        .map(|hv| {
+            let key = hv.open_key(svc).unwrap();
+            hv.query_dword(key, "Answer") == Some(42) // from the image file
+                && hv.query_dword(key, "SeenByDriver") == Some(1) // from the replayed log file
+        })
+        .unwrap_or(false);
+    check(b"hive_persists_through_memfs_file", disk_ok);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).

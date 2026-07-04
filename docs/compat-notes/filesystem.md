@@ -24,3 +24,13 @@ storage seam the M21 Hive Manager reserved.
 - 5 unit tests incl. mount resolver, create dispositions, read/write offset + EOF, directory
   rejects data ops, and the §14.2 acceptance: HiveManager writes/reads a hive image + log through
   the Zw* APIs on MemFs and survives a restart (image + replayed log).
+
+## Filesystem + hive-on-disk in QEMU (implemented, Milestone 22 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the filesystem runtime bare-metal on seL4
+(20/20 checks). Over a MemFs volume it ZwCreateFile's a temp file, writes + reads it back +
+queries its size through the Zw* APIs; then the §14.2 acceptance: a `HiveManager` over
+`NtFileHiveIoProvider` writes the SYSTEM hive image to `\SystemRoot\System32\Config\SYSTEM`,
+journals a post-checkpoint write, and a **restarted HiveManager reads it back from the file** —
+Answer=42 from the image file, SeenByDriver=1 from the replayed `.LOG` file. The M21
+NtFileHiveIoProvider stub is now backed by a real filesystem.
