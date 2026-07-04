@@ -1,0 +1,11 @@
+[package]
+name = "nt-mdl"
+description = "NT Memory Descriptor List (MDL) support for DMA: the WDK MDL x64 layout constants + a canonical MDL registry for single-buffer nonpaged MDLs, with active-mapping tracking so an MDL can't be freed while DMA-mapped. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

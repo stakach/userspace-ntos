@@ -28,6 +28,7 @@ members = [
     "crates/nt-pnp-abi",
     "crates/nt-power-types",
     "crates/nt-power-abi",
+    "crates/nt-mdl",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -73,6 +74,7 @@ nt-cm-resources = { path = "crates/nt-cm-resources" }
 nt-pnp-abi = { path = "crates/nt-pnp-abi" }
 nt-power-types = { path = "crates/nt-power-types" }
 nt-power-abi = { path = "crates/nt-power-abi" }
+nt-mdl = { path = "crates/nt-mdl" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
