@@ -16,6 +16,9 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use nt_dma_manager::DmaOwner;
+use nt_wdf_dma::WdfDmaManager;
+use nt_wdf_interrupt::{WdfInterrupt, WdfInterruptConfig};
 use nt_wdf_object::{PendingCallback, WdfHandle, WdfObjectError, WdfObjectTable, WdfObjectType};
 use nt_wdf_queue::{DispatchType, WdfIoQueue};
 use nt_wdf_request::{RequestBuffers, WdfRequest, WdfRequestError};
@@ -94,6 +97,22 @@ impl From<WdfObjectError> for WdfRuntimeError {
     }
 }
 
+/// A WDFTIMER's state (spec: NT KMDF Hardware Extensions, §11).
+struct TimerRec {
+    parent: WdfHandle,
+    evt_timer: u64,
+    running: bool,
+    fired_count: u64,
+}
+
+/// A WDFWORKITEM's state (§12).
+struct WorkItemRec {
+    parent: WdfHandle,
+    evt_workitem: u64,
+    queued: bool,
+    ran_count: u64,
+}
+
 /// The canonical WDF runtime state for one Driver Host.
 pub struct WdfRuntime {
     objects: WdfObjectTable,
@@ -104,6 +123,11 @@ pub struct WdfRuntime {
     devices: BTreeMap<u64, DeviceInfo>,
     queues: BTreeMap<u64, QueueInfo>,
     requests: BTreeMap<u64, RequestInfo>,
+    // Hardware objects (spec: NT KMDF Hardware Extensions).
+    dma: WdfDmaManager,
+    interrupts: BTreeMap<u64, WdfInterrupt>,
+    timers: BTreeMap<u64, TimerRec>,
+    workitems: BTreeMap<u64, WorkItemRec>,
 }
 
 impl Default for WdfRuntime {
@@ -123,7 +147,16 @@ impl WdfRuntime {
             devices: BTreeMap::new(),
             queues: BTreeMap::new(),
             requests: BTreeMap::new(),
+            dma: WdfDmaManager::new(),
+            interrupts: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            workitems: BTreeMap::new(),
         }
+    }
+
+    /// A DMA owner token derived from a device handle (one adapter domain per device).
+    fn dma_owner(device: WdfHandle) -> DmaOwner {
+        DmaOwner::new(1, device.0)
     }
 
     // --- WdfDriverCreate (§10) ------------------------------------------------
@@ -426,16 +459,244 @@ impl WdfRuntime {
         })
     }
 
+    // --- WDFINTERRUPT (spec: HW Ext §7) ---------------------------------------
+
+    /// `WdfInterruptCreate` — create a WDFINTERRUPT (parented to the device) with the ISR/DPC
+    /// config; not yet connected to the HAL (§7.4).
+    pub fn create_interrupt(
+        &mut self,
+        device: WdfHandle,
+        config: WdfInterruptConfig,
+    ) -> Result<WdfHandle, WdfRuntimeError> {
+        self.objects.validate(device, WdfObjectType::Device)?;
+        let interrupt = self.objects.create(WdfObjectType::SpinLock, Some(device))?;
+        self.interrupts
+            .insert(interrupt.0, WdfInterrupt::new(config));
+        Ok(interrupt)
+    }
+
+    /// `WdfInterruptGetDevice` — the parent device of an interrupt.
+    pub fn interrupt_get_device(&self, interrupt: WdfHandle) -> Option<WdfHandle> {
+        self.objects.parent(interrupt).ok().flatten()
+    }
+
+    /// Framework auto-connect after `EvtDevicePrepareHardware` (§7.4): connect + enable every
+    /// interrupt parented to the device.
+    pub fn connect_device_interrupts(&mut self, device: WdfHandle) {
+        let owned: Vec<u64> = self
+            .interrupts
+            .keys()
+            .copied()
+            .filter(|&i| self.objects.parent(WdfHandle(i)).ok().flatten() == Some(device))
+            .collect();
+        for i in owned {
+            self.interrupts.get_mut(&i).unwrap().connect();
+        }
+    }
+
+    /// `WdfInterruptEnable` → returns `EvtInterruptEnable` (0 if none) (§7.8).
+    pub fn interrupt_enable(&mut self, interrupt: WdfHandle) -> u64 {
+        self.interrupts
+            .get_mut(&interrupt.0)
+            .map(|i| i.enable())
+            .unwrap_or(0)
+    }
+    /// `WdfInterruptDisable` → returns `EvtInterruptDisable` (0 if none) (§7.8).
+    pub fn interrupt_disable(&mut self, interrupt: WdfHandle) -> u64 {
+        self.interrupts
+            .get_mut(&interrupt.0)
+            .map(|i| i.disable())
+            .unwrap_or(0)
+    }
+
+    /// A HAL interrupt fired (§7.5): returns the `EvtInterruptIsr` to invoke if the interrupt
+    /// is active, else `None` (dropped in D3 / disabled, §14.3).
+    pub fn fire_interrupt(&mut self, interrupt: WdfHandle) -> Option<u64> {
+        self.interrupts
+            .get_mut(&interrupt.0)
+            .and_then(|i| i.on_hardware_interrupt())
+    }
+    /// `WdfInterruptQueueDpcForIsr` — latch a DPC; true if newly queued (§7.5).
+    pub fn interrupt_queue_dpc(&mut self, interrupt: WdfHandle) -> bool {
+        self.interrupts
+            .get_mut(&interrupt.0)
+            .map(|i| i.queue_dpc_for_isr())
+            .unwrap_or(false)
+    }
+    /// DPC delivery (§7.6): returns `EvtInterruptDpc` if a DPC is latched, else `None`.
+    pub fn interrupt_take_dpc(&mut self, interrupt: WdfHandle) -> Option<u64> {
+        self.interrupts
+            .get_mut(&interrupt.0)
+            .and_then(|i| i.take_dpc())
+    }
+    pub fn interrupt_counts(&self, interrupt: WdfHandle) -> Option<(u64, u64)> {
+        self.interrupts
+            .get(&interrupt.0)
+            .map(|i| (i.interrupt_count(), i.dpc_count()))
+    }
+
+    // --- WDF DMA objects (§8-§10) ---------------------------------------------
+
+    /// `WdfDmaEnablerCreate` — create a WDFDMAENABLER (parented to the device).
+    pub fn create_dma_enabler(
+        &mut self,
+        device: WdfHandle,
+        profile: u32,
+        maximum_length: u64,
+    ) -> Result<WdfHandle, WdfRuntimeError> {
+        self.objects.validate(device, WdfObjectType::Device)?;
+        let enabler = self.objects.create(WdfObjectType::Memory, Some(device))?;
+        self.dma
+            .create_enabler(enabler.0, Self::dma_owner(device), profile, maximum_length);
+        Ok(enabler)
+    }
+    pub fn dma_enabler_maximum_length(&self, enabler: WdfHandle) -> Option<u64> {
+        self.dma.enabler_maximum_length(enabler.0)
+    }
+
+    /// `WdfCommonBufferCreate` — allocate a common buffer (real backing `virtual_address` +
+    /// fake logical address) parented to the enabler. Returns `(handle, logical_address)`.
+    pub fn create_common_buffer(
+        &mut self,
+        enabler: WdfHandle,
+        length: u64,
+        virtual_address: u64,
+    ) -> Result<(WdfHandle, u64), WdfRuntimeError> {
+        let cb = self.objects.create(WdfObjectType::Memory, Some(enabler))?;
+        let logical = self
+            .dma
+            .create_common_buffer(cb.0, enabler.0, length, virtual_address)
+            .map_err(|_| WdfRuntimeError::InvalidState)?;
+        Ok((cb, logical))
+    }
+    pub fn common_buffer_virtual_address(&self, cb: WdfHandle) -> Option<u64> {
+        self.dma.common_buffer_virtual_address(cb.0)
+    }
+    pub fn common_buffer_logical_address(&self, cb: WdfHandle) -> Option<u64> {
+        self.dma.common_buffer_logical_address(cb.0)
+    }
+    pub fn common_buffer_length(&self, cb: WdfHandle) -> Option<u64> {
+        self.dma.common_buffer_length(cb.0)
+    }
+    /// Decode a device logical address to its backing VA — the sim DMA device's lookup (§9.4).
+    pub fn dma_decode_logical(&self, logical: u64, length: u64) -> Result<u64, WdfRuntimeError> {
+        self.dma
+            .decode_logical(logical, length)
+            .map_err(|_| WdfRuntimeError::InvalidState)
+    }
+
+    // --- WDFTIMER (§11) -------------------------------------------------------
+
+    /// `WdfTimerCreate` — create a WDFTIMER parented to `parent` (a device/queue).
+    pub fn create_timer(
+        &mut self,
+        parent: WdfHandle,
+        evt_timer: u64,
+    ) -> Result<WdfHandle, WdfRuntimeError> {
+        let timer = self.objects.create(WdfObjectType::WaitLock, Some(parent))?;
+        self.timers.insert(
+            timer.0,
+            TimerRec {
+                parent,
+                evt_timer,
+                running: false,
+                fired_count: 0,
+            },
+        );
+        Ok(timer)
+    }
+    /// `WdfTimerStart` — arm the timer.
+    pub fn timer_start(&mut self, timer: WdfHandle) {
+        if let Some(t) = self.timers.get_mut(&timer.0) {
+            t.running = true;
+        }
+    }
+    /// `WdfTimerStop` — cancel the timer.
+    pub fn timer_stop(&mut self, timer: WdfHandle) {
+        if let Some(t) = self.timers.get_mut(&timer.0) {
+            t.running = false;
+        }
+    }
+    /// `WdfTimerGetParentObject`.
+    pub fn timer_get_parent(&self, timer: WdfHandle) -> Option<WdfHandle> {
+        self.timers.get(&timer.0).map(|t| t.parent)
+    }
+    /// The timer expires: if running, clear the one-shot arming + return `EvtTimerFunc`.
+    pub fn timer_fire(&mut self, timer: WdfHandle) -> Option<u64> {
+        let t = self.timers.get_mut(&timer.0)?;
+        if !t.running {
+            return None;
+        }
+        t.running = false;
+        t.fired_count += 1;
+        Some(t.evt_timer)
+    }
+    pub fn timer_fired_count(&self, timer: WdfHandle) -> Option<u64> {
+        self.timers.get(&timer.0).map(|t| t.fired_count)
+    }
+
+    // --- WDFWORKITEM (§12) ----------------------------------------------------
+
+    /// `WdfWorkItemCreate` — create a WDFWORKITEM parented to `parent`.
+    pub fn create_workitem(
+        &mut self,
+        parent: WdfHandle,
+        evt_workitem: u64,
+    ) -> Result<WdfHandle, WdfRuntimeError> {
+        let wi = self.objects.create(WdfObjectType::WaitLock, Some(parent))?;
+        self.workitems.insert(
+            wi.0,
+            WorkItemRec {
+                parent,
+                evt_workitem,
+                queued: false,
+                ran_count: 0,
+            },
+        );
+        Ok(wi)
+    }
+    /// `WdfWorkItemEnqueue` — queue the work item (idempotent while queued, §12.3).
+    pub fn workitem_enqueue(&mut self, wi: WdfHandle) {
+        if let Some(w) = self.workitems.get_mut(&wi.0) {
+            w.queued = true;
+        }
+    }
+    /// `WdfWorkItemGetParentObject`.
+    pub fn workitem_get_parent(&self, wi: WdfHandle) -> Option<WdfHandle> {
+        self.workitems.get(&wi.0).map(|w| w.parent)
+    }
+    /// The work-item worker runs: if queued, dequeue + return `EvtWorkItem`.
+    pub fn workitem_run(&mut self, wi: WdfHandle) -> Option<u64> {
+        let w = self.workitems.get_mut(&wi.0)?;
+        if !w.queued {
+            return None;
+        }
+        w.queued = false;
+        w.ran_count += 1;
+        Some(w.evt_workitem)
+    }
+    pub fn workitem_ran_count(&self, wi: WdfHandle) -> Option<u64> {
+        self.workitems.get(&wi.0).map(|w| w.ran_count)
+    }
+
     /// `WdfObjectDelete` — delete an object + return the driver cleanup/destroy callbacks to
     /// run after the borrow releases (spec §7.3). Prunes any runtime side-state.
     pub fn delete_object(
         &mut self,
         handle: WdfHandle,
     ) -> Result<Vec<PendingCallback>, WdfRuntimeError> {
+        // If a device is going away, revoke its DMA domain (common buffers + adapters).
+        if self.devices.contains_key(&handle.0) {
+            self.dma.revoke_owner(Self::dma_owner(handle));
+        }
         let pending = self.objects.delete(handle)?;
         self.devices.remove(&handle.0);
         self.queues.remove(&handle.0);
         self.requests.remove(&handle.0);
+        self.interrupts.remove(&handle.0);
+        self.timers.remove(&handle.0);
+        self.workitems.remove(&handle.0);
+        let _ = self.dma.free_common_buffer(handle.0);
         Ok(pending)
     }
 
@@ -578,6 +839,68 @@ mod tests {
         let (cb, released) = rt.set_device_power(device, true).unwrap();
         assert_eq!(cb, 0xD0E);
         assert_eq!(released.len(), 1);
+    }
+
+    #[test]
+    fn interrupt_isr_dpc_flow() {
+        let mut rt = WdfRuntime::new();
+        rt.create_driver(1, 0).unwrap();
+        let init = rt.add_device(0);
+        let device = rt.create_device(init, 0xFD0).unwrap();
+        let cfg = WdfInterruptConfig {
+            evt_isr: 0x1C60,
+            evt_dpc: 0x1BA0,
+            ..Default::default()
+        };
+        let irq = rt.create_interrupt(device, cfg).unwrap();
+        assert_eq!(rt.interrupt_get_device(irq), Some(device));
+        // Inactive until connected (framework connects after PrepareHardware).
+        assert_eq!(rt.fire_interrupt(irq), None);
+        rt.connect_device_interrupts(device);
+        assert_eq!(rt.fire_interrupt(irq), Some(0x1C60)); // ISR runs
+        assert!(rt.interrupt_queue_dpc(irq)); // ISR latches DPC
+        assert_eq!(rt.interrupt_take_dpc(irq), Some(0x1BA0)); // DPC runs
+        assert_eq!(rt.interrupt_counts(irq), Some((1, 1)));
+        // D3 (disable) drops interrupts.
+        rt.interrupt_disable(irq);
+        assert_eq!(rt.fire_interrupt(irq), None);
+    }
+
+    #[test]
+    fn dma_enabler_common_buffer() {
+        let mut rt = WdfRuntime::new();
+        rt.create_driver(1, 0).unwrap();
+        let init = rt.add_device(0);
+        let device = rt.create_device(init, 0xFD0).unwrap();
+        let enabler = rt.create_dma_enabler(device, 4 /* SG64 */, 0x1000).unwrap();
+        assert_eq!(rt.dma_enabler_maximum_length(enabler), Some(0x1000));
+        let (cb, logical) = rt.create_common_buffer(enabler, 0x1000, 0x8_0000).unwrap();
+        assert_eq!(rt.common_buffer_virtual_address(cb), Some(0x8_0000));
+        assert_eq!(rt.common_buffer_logical_address(cb), Some(logical));
+        // The sim device decodes the logical address to the backing buffer.
+        assert_eq!(rt.dma_decode_logical(logical + 16, 4).unwrap(), 0x8_0010);
+    }
+
+    #[test]
+    fn timer_and_workitem() {
+        let mut rt = WdfRuntime::new();
+        rt.create_driver(1, 0).unwrap();
+        let init = rt.add_device(0);
+        let device = rt.create_device(init, 0xFD0).unwrap();
+        let timer = rt.create_timer(device, 0x2150).unwrap();
+        assert_eq!(rt.timer_get_parent(timer), Some(device));
+        assert_eq!(rt.timer_fire(timer), None); // not armed
+        rt.timer_start(timer);
+        assert_eq!(rt.timer_fire(timer), Some(0x2150));
+        assert_eq!(rt.timer_fired_count(timer), Some(1));
+        assert_eq!(rt.timer_fire(timer), None); // one-shot disarmed
+
+        let wi = rt.create_workitem(device, 0x21D0).unwrap();
+        assert_eq!(rt.workitem_get_parent(wi), Some(device));
+        assert_eq!(rt.workitem_run(wi), None); // not queued
+        rt.workitem_enqueue(wi);
+        assert_eq!(rt.workitem_run(wi), Some(0x21D0));
+        assert_eq!(rt.workitem_ran_count(wi), Some(1));
     }
 
     #[test]

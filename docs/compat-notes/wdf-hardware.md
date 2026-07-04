@@ -31,3 +31,22 @@ Enqueue=380 / Flush=382; WdfIoQueueRetrieveNextRequest=158; WdfDeviceGetDefaultQ
   (maps the buffer → logical address + returns `EvtProgramDma`), `complete_transaction_final`
   (releases the mapping, records bytes) (§10.3-§10.5). State guards reject out-of-order calls.
   3 tests.
+
+## WDF runtime hardware objects (implemented, Milestones 16.4/16.5/16.7 — `nt-wdf-runtime`)
+
+`WdfRuntime` gains the hardware-object management (over `nt-wdf-interrupt` + `nt-wdf-dma`):
+- Interrupt: `create_interrupt` (parented to device), `interrupt_get_device`,
+  `connect_device_interrupts` (framework auto-connect after PrepareHardware, §7.4),
+  `interrupt_enable/disable`, `fire_interrupt` (→ EvtInterruptIsr if active),
+  `interrupt_queue_dpc` / `interrupt_take_dpc` (→ EvtInterruptDpc), `interrupt_counts`.
+- DMA: `create_dma_enabler` (profile→adapter), `dma_enabler_maximum_length`,
+  `create_common_buffer` (→ handle + fake logical), `common_buffer_virtual/logical_address/
+  length`, `dma_decode_logical` (sim device lookup).
+- Timer: `create_timer`/`timer_start`/`timer_stop`/`timer_get_parent`/`timer_fire` (one-shot
+  → EvtTimerFunc)/`timer_fired_count`.
+- WorkItem: `create_workitem`/`workitem_enqueue`/`workitem_get_parent`/`workitem_run`
+  (→ EvtWorkItem)/`workitem_ran_count`.
+- `delete_object` revokes the device DMA domain + prunes interrupt/timer/workitem/common-buffer
+  side-state.
+
+3 new tests (interrupt ISR→DPC, DMA enabler+common buffer, timer+workitem). 32 WDF tests total.

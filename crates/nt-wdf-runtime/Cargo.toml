@@ -11,6 +11,9 @@ authors.workspace = true
 nt-wdf-object = { workspace = true }
 nt-wdf-queue = { workspace = true }
 nt-wdf-request = { workspace = true }
+nt-wdf-interrupt = { workspace = true }
+nt-wdf-dma = { workspace = true }
+nt-dma-manager = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
