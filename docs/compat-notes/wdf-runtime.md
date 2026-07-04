@@ -39,3 +39,27 @@ Authoritative headers: `references/windows-kits/10/Include/wdf/kmdf/1.15/`.
 - `nt-wdf-queue`: the WDFQUEUE dispatch policy — sequential (one in flight) / parallel (all) /
   manual (driver pulls via retrieve_next), with power-managed gating: a power-managed queue
   holds requests until D0 entry then releases per policy (spec §15.3-§15.4). 5 tests.
+
+## WDF runtime core (implemented, Milestones 15.3-15.5 — `nt-wdf-runtime`)
+
+`WdfRuntime` ties the object table + queues + requests into the KMDF vertical slice
+(spec §10-§16). Every method takes values the Driver Host extracted from driver memory
+(callback pointers, IOCTL codes, buffer address/length pairs) — no raw driver-pointer
+dereferences — and returns the callbacks to invoke + IRPs to complete, which the Host runs
+in driver context.
+
+- `create_driver` (WdfDriverCreate → WDFDRIVER + EvtDriverDeviceAdd storage);
+- `add_device` (AddDevice bridge → WDFDEVICE_INIT) + `set_init_io_type`/`_device_type`/
+  `_pnp_callbacks`; `create_device` (WdfDeviceCreate → WDFDEVICE parented to the driver,
+  consumes the init — reuse rejected, spec §11.2); `device_wdm_object`/`_pdo`/`_io_type`.
+- `create_queue` (WdfIoQueueCreate → WDFQUEUE parented to the device, optional default).
+- PnP/power bridge: `prepare_hardware`/`release_hardware` (START/REMOVE → Evt*Hardware),
+  `set_device_power` (D0/D3 → EvtDeviceD0Entry/Exit + releases power-managed queue requests).
+- Request path: `present_ioctl` (creates a WDFREQUEST, presents to the default queue,
+  returns the IoDispatch to run EvtIoDeviceControl now or None if held), `request_ref`
+  (buffer retrieval), `complete_request` (WdfRequestCompleteWithInformation → IRP+status+info
+  + next request the queue releases; deletes the request object).
+- `delete_object` cascades (device → its queues) + returns cleanup/destroy callbacks.
+
+4 tests incl. the full vertical slice (driver→device→queue→IOCTL→complete), sequential
+serialization, power-managed hold-until-D0, and delete cascade. 22 WDF unit tests total.

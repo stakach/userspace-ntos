@@ -1,0 +1,16 @@
+[package]
+name = "nt-wdf-runtime"
+description = "The KMDF/WDF runtime core: ties the object table, I/O queues, and requests into the driver→device→queue→request vertical slice. Implements the state side of WdfDriverCreate / WdfDeviceCreate / WdfIoQueueCreate / request presentation + completion, plus the PnP/power callback bridge, operating on values the Driver Host extracted from driver memory (no raw driver-pointer dereferences here). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-wdf-object = { workspace = true }
+nt-wdf-queue = { workspace = true }
+nt-wdf-request = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

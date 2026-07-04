@@ -35,6 +35,7 @@ members = [
     "crates/nt-wdf-types",
     "crates/nt-wdf-request",
     "crates/nt-wdf-queue",
+    "crates/nt-wdf-runtime",
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-resource-manager",
@@ -87,6 +88,7 @@ nt-wdf-object = { path = "crates/nt-wdf-object" }
 nt-wdf-types = { path = "crates/nt-wdf-types" }
 nt-wdf-request = { path = "crates/nt-wdf-request" }
 nt-wdf-queue = { path = "crates/nt-wdf-queue" }
+nt-wdf-runtime = { path = "crates/nt-wdf-runtime" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
