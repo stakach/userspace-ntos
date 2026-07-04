@@ -1,0 +1,40 @@
+# The PnP Manager isolated over SURT: a broker spawns a Driver Host child (loads
+# PnpMmioInterruptTest.sys, hosts the in-process HAL) and a PnP Manager child (owns
+# the canonical devnode state machine + fixture resources). The Driver Host drives
+# the AddDevice/START/REMOVE lifecycle and reports transitions over SURT, which the
+# isolated PnP Manager validates. (Milestone 12 — PnP service isolation.)
+[workspace]
+
+[package]
+name = "ntos-pnp-svc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-pnp-svc"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-hal-abi = { path = "../../crates/nt-hal-abi" }
+nt-resource-manager = { path = "../../crates/nt-resource-manager" }
+nt-register-access = { path = "../../crates/nt-register-access" }
+nt-sim-device = { path = "../../crates/nt-sim-device" }
+nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+nt-cm-resources = { path = "../../crates/nt-cm-resources" }
+nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
+nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
