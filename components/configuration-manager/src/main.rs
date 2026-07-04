@@ -448,6 +448,57 @@ fn run() {
         && pm.is_thread_signaled(sys) // terminated by process exit
         && !pm.is_process_signaled(p2); // unrelated process unaffected
     check(b"process_terminate_signal", term_ok);
+
+    // --- Security Reference Monitor: tokens + access check (spec §7-§9) -------
+    use nt_security::{
+        access_check, Ace, Acl, GenericMapping, ProcessorMode, SecurityDescriptor, Sid, AccessToken,
+        ACCESS_SYSTEM_SECURITY, READ_CONTROL, SYNCHRONIZE, WRITE_OWNER, SE_SECURITY, SE_TAKE_OWNERSHIP,
+    };
+    const FILE_READ: u32 = 0x1;
+    const FILE_WRITE: u32 = 0x2;
+    const MACHINE: u32 = 0x1234;
+    let map = GenericMapping {
+        generic_read: FILE_READ | READ_CONTROL | SYNCHRONIZE,
+        generic_write: FILE_WRITE | READ_CONTROL | SYNCHRONIZE,
+        generic_execute: READ_CONTROL | SYNCHRONIZE,
+        generic_all: FILE_READ | FILE_WRITE | READ_CONTROL | WRITE_OWNER,
+    };
+    // SIDs + SDDL string form.
+    check(b"security_wellknown_sids", Sid::administrators().to_sddl() == "S-1-5-32-544");
+
+    // DACL: deny Users write, then allow Everyone read+write (canonical order).
+    let sd = SecurityDescriptor {
+        owner: Some(Sid::local_account(MACHINE, 1000)),
+        dacl: Some(Acl::new(alloc::vec![
+            Ace::deny(Sid::users(), FILE_WRITE),
+            Ace::allow(Sid::everyone(), FILE_READ | FILE_WRITE),
+        ])),
+        ..Default::default()
+    };
+    let admin = AccessToken::admin(MACHINE);
+    let user = AccessToken::user(MACHINE);
+    // Admin (not in the deny-Users? admin IS in Users too) — check the user path: read granted, write denied.
+    let user_read = access_check(&sd, &user, FILE_READ, &map, ProcessorMode::UserMode).granted();
+    let user_write = access_check(&sd, &user, FILE_WRITE, &map, ProcessorMode::UserMode).granted();
+    check(b"security_deny_before_allow", user_read && !user_write);
+
+    // Owner gets READ_CONTROL even against an empty DACL; KernelMode bypasses the DACL.
+    let empty = SecurityDescriptor { owner: Some(user.user.clone()), dacl: Some(Acl::empty()), ..Default::default() };
+    let owner_rc = access_check(&empty, &user, READ_CONTROL, &map, ProcessorMode::UserMode).granted();
+    let kernel_bypass = access_check(&empty, &user, FILE_READ | FILE_WRITE, &map, ProcessorMode::KernelMode).granted();
+    check(b"security_owner_and_kernel", owner_rc && kernel_bypass);
+
+    // Privilege overrides: ACCESS_SYSTEM_SECURITY needs SeSecurityPrivilege (System has it, user
+    // doesn't); WRITE_OWNER via SeTakeOwnershipPrivilege (admin) against an empty DACL.
+    let sys_sec = access_check(&empty, &AccessToken::system(), ACCESS_SYSTEM_SECURITY, &map, ProcessorMode::UserMode);
+    let user_sec_denied = !access_check(&empty, &user, ACCESS_SYSTEM_SECURITY, &map, ProcessorMode::UserMode).granted();
+    let admin_wo = access_check(&empty, &admin, WRITE_OWNER, &map, ProcessorMode::UserMode);
+    check(
+        b"security_privilege_overrides",
+        sys_sec.granted() && sys_sec.privileges_used.contains(&SE_SECURITY)
+            && user_sec_denied
+            && admin_wo.granted() && admin_wo.privileges_used.contains(&SE_TAKE_OWNERSHIP),
+    );
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).

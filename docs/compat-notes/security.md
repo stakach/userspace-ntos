@@ -22,3 +22,12 @@ SIDs, tokens, security descriptors, and the access-check algorithm.
 - 8 unit tests: SID/SDDL, default tokens + privilege checks, allow ACE, deny-before-allow,
   null/empty DACL, owner rights + generic mapping, MAXIMUM_ALLOWED union, privilege overrides +
   kernel bypass.
+
+## Access checks in QEMU (implemented, Milestone 27 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the access-check algorithm bare-metal on
+seL4 (34/34 checks): well-known SID/SDDL formatting; a canonical DACL (deny Users write, allow
+Everyone read+write) where a standard user gets read but is denied write (deny-before-allow);
+owner READ_CONTROL against an empty DACL + KernelMode DACL bypass; and privilege overrides —
+ACCESS_SYSTEM_SECURITY granted to System (SeSecurityPrivilege) but denied to a user, and
+WRITE_OWNER granted to an admin via SeTakeOwnershipPrivilege.
