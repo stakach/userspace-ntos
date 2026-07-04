@@ -1,0 +1,11 @@
+[package]
+name = "nt-wdf-interrupt"
+description = "WDFINTERRUPT object: the ISR/DPC callback config, connect/enable/disable state, queue-DPC-for-ISR latching, and interrupt/DPC accounting. A hardware-interrupt wrapper over the HAL — an inactive (disabled/out-of-D0) interrupt drops injected interrupts. Pure state machine returning driver callback pointers for the Driver Host to invoke. no_std, no allocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

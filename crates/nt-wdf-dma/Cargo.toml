@@ -1,0 +1,15 @@
+[package]
+name = "nt-wdf-dma"
+description = "WDF DMA objects: WDFDMAENABLER (a DMA adapter wrapper), WDFCOMMONBUFFER (a common buffer with a fake logical address from the DMA Manager, never a host physical address), and WDFDMATRANSACTION (a one-segment map/execute/complete state machine over an MDL). Wraps nt-dma-manager + nt-mdl; keyed by WDF handle. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-dma-manager = { workspace = true }
+nt-mdl = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
