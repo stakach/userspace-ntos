@@ -1,0 +1,11 @@
+[package]
+name = "nt-config-manager"
+description = "The NT Configuration Manager registry authority: a case-insensitive registry key/value tree (REG_* value types, path-based open, root keys), plus service / devnode / device-interface records — the canonical configuration state drivers read via Zw*/WdfRegistry* and PnP/interface APIs. no_std + alloc, no raw pointers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
