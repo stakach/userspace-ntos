@@ -63,3 +63,29 @@ in driver context.
 
 4 tests incl. the full vertical slice (driver→device→queue→IOCTL→complete), sequential
 serialization, power-managed hold-until-D0, and delete cascade. 22 WDF unit tests total.
+
+## Driver Host WDF integration (implemented, Milestones 15.6-15.8 — `driver-host-wdf`)
+
+`components/driver-host-wdf` loads the real `KmdfBasicTest.sys` (KMDF 1.15, W^X + NX) and
+runs the entire framework vertical slice against the in-process `WdfRuntime`. **16/16 checks
+pass in QEMU, no #GP** — the first KMDF driver to run its framework lifecycle on rust-micro.
+
+- `WdfVersionBind` validates version {1,15}, publishes a 444-entry `WdfFunctions` table into
+  the driver's global, and hands back `WdfDriverGlobals`. The driver is `/guard:cf`, so every
+  WDF call goes through `__guard_dispatch_icall_fptr` (RVA 0x3068) — the loader points that
+  slot at a `jmp rax` stub (`global_asm!`).
+- 15 function-table thunks (WdfDriverCreate=116, WdfDeviceCreate=75, WdfIoQueueCreate=152,
+  WdfDeviceInitSet{IoType,DeviceType,Exclusive,PnpPowerEventCallbacks}, WdfDeviceCreateSymbolicLink,
+  WdfIoQueueGetDevice, WdfObjectGetTypedContextWorker, WdfRequestRetrieveInput/OutputBuffer,
+  WdfRequestCompleteWithInformation, WdfCmResourceListGetCount/GetDescriptor) — each reads the
+  driver's config struct via the `nt-wdf-types` offsets and calls into `WdfRuntime`.
+- Orchestration: FxDriverEntry → WdfDriverCreate; framework AddDevice → EvtDriverDeviceAdd →
+  device+context+symlink+default sequential power-managed queue; START → EvtDevicePrepareHardware
+  (builds a 1-memory-descriptor WDFCMRESLIST → MmMapIoSpace → reads MMIO[0]==`0x4B4D4446` 'KMDF');
+  D0 entry; IOCTLs PING (→'KMDF')/ECHO/GET_VERSION(0x00010000)/GET_STATE(prepared+powered)/
+  READ_REG32(MMIO[0]) via EvtIoDeviceControl → WdfRequestRetrieve*Buffer → CompleteWithInformation;
+  D0 exit → EvtDeviceD0Exit; ReleaseHardware; REMOVE (delete cascades device→queue).
+- The device context (0x20 bytes) is a real heap blob the driver reads/writes (Prepared@0x18,
+  D0Powered@0x19, RequestCount@0x1c), returned by the idx-202 context accessor.
+
+Milestone 15 complete: 6 host crates (28 unit tests) + this component (16/16 QEMU).
