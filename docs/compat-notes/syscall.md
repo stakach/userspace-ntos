@@ -21,3 +21,11 @@ Userland ABI). A per-profile service table + a dispatcher routing syscall number
 - 8 unit tests: service-table numbering, unknown-service rejection, arg-count validation, Nt-vs-Zw
   previous mode, end-to-end registry query, end-to-end process terminate, unimplemented-not-silent,
   user-probe ranges.
+
+## Syscall dispatch in QEMU (implemented, Milestone 28 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the native syscall dispatcher bare-metal on
+seL4 (36/36 checks): a `NativeSyscallDispatcher` (Test profile) with a handler wiring the
+component's ConfigManager — `NtQueryValueKey` dispatches to the registry and returns Answer=42 with
+PreviousMode=UserMode (the Nt* path), an unknown service number is rejected with
+STATUS_INVALID_SYSTEM_SERVICE, and a Zw* call runs as PreviousMode=KernelMode.

@@ -499,6 +499,65 @@ fn run() {
             && user_sec_denied
             && admin_wo.granted() && admin_wo.privileges_used.contains(&SE_TAKE_OWNERSHIP),
     );
+
+    // --- Native syscall dispatcher: userland ABI over the subsystems (spec §9) ----
+    use nt_syscall::{
+        NativeService, NativeServiceTable, NativeSyscallDispatcher, ProcessorMode as NtMode,
+        SyscallOrigin, STATUS_INVALID_SYSTEM_SERVICE, STATUS_SUCCESS as NT_SUCCESS,
+    };
+    let disp = NativeSyscallDispatcher::new(NativeServiceTable::test_profile());
+    let mut sh = DemoSyscalls { cm: &cm, params_key: params, last_mode: NtMode::KernelMode };
+    // NtQueryValueKey routes to the registry → Answer == 42; PreviousMode = UserMode (Nt* path).
+    let q = disp.dispatch_service(
+        NativeService::NtQueryValueKey,
+        &[0, 0, 0, 0],
+        &SyscallOrigin::new(4, 4, NtMode::UserMode),
+        &mut sh,
+    );
+    let query_ok = q.status == NT_SUCCESS
+        && q.output.len() >= 4
+        && u32::from_le_bytes([q.output[0], q.output[1], q.output[2], q.output[3]]) == 42
+        && sh.last_mode == NtMode::UserMode;
+    check(b"syscall_dispatch_registry", query_ok);
+
+    // An unknown service number is rejected; a Zw* call runs as PreviousMode = KernelMode (§8.4).
+    let unknown = disp.dispatch(9999, &[], &SyscallOrigin::new(4, 4, NtMode::UserMode), &mut sh);
+    disp.dispatch_service(NativeService::NtClose, &[1], &SyscallOrigin::new(4, 4, NtMode::KernelMode), &mut sh);
+    check(
+        b"syscall_unknown_and_mode",
+        unknown.status == STATUS_INVALID_SYSTEM_SERVICE && sh.last_mode == NtMode::KernelMode,
+    );
+}
+
+/// A minimal kernel-services layer wiring the native syscall dispatcher to the registry (spec §9.3).
+struct DemoSyscalls<'a> {
+    cm: &'a ConfigManager,
+    params_key: nt_config_manager::RegistryKeyId,
+    last_mode: nt_syscall::ProcessorMode,
+}
+
+impl nt_syscall::NativeSyscallHandler for DemoSyscalls<'_> {
+    fn handle(
+        &mut self,
+        ctx: &nt_syscall::NativeCallContext,
+        _args: &[u64],
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> u32 {
+        self.last_mode = ctx.previous_mode;
+        match ctx.service {
+            nt_syscall::NativeService::NtQueryValueKey => {
+                match self.cm.registry().query_dword(self.params_key, "Answer") {
+                    Some(v) => {
+                        out.extend_from_slice(&v.to_le_bytes());
+                        nt_syscall::STATUS_SUCCESS
+                    }
+                    None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            }
+            nt_syscall::NativeService::NtClose => nt_syscall::STATUS_SUCCESS,
+            _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed (spec §9.2)
+        }
+    }
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).
