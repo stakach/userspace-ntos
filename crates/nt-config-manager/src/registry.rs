@@ -91,7 +91,7 @@ pub fn encode_sz(s: &str) -> Vec<u8> {
     out
 }
 
-fn decode_utf16le(bytes: &[u8]) -> String {
+pub(crate) fn decode_utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))

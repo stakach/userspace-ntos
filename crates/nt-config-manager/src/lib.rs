@@ -15,11 +15,13 @@
 
 extern crate alloc;
 
+mod property;
 mod registry;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub use property::{device_property, devprop_type, DevPropKey, PropertyBag, PropertyValue};
 pub use registry::{encode_sz, Registry, RegistryKeyId, RegistryValue, RegistryValueType};
 
 pub const SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
@@ -55,6 +57,8 @@ pub struct DevnodeRecord {
     pub hardware_ids: Vec<String>,
     pub compatible_ids: Vec<String>,
     pub enum_key: RegistryKeyId,
+    /// PnP properties attached to this devnode (spec §11.5).
+    pub properties: PropertyBag,
 }
 
 /// A device interface record (spec §11.1).
@@ -208,8 +212,61 @@ impl ConfigManager {
             hardware_ids: hardware_ids.iter().map(|s| (*s).into()).collect(),
             compatible_ids: compatible_ids.iter().map(|s| (*s).into()).collect(),
             enum_key,
+            properties: PropertyBag::default(),
         });
         id
+    }
+
+    fn devnode_mut(&mut self, id: DevnodeId) -> Option<&mut DevnodeRecord> {
+        self.devnodes.iter_mut().find(|d| d.id == id)
+    }
+    fn devnode_by_id(&self, id: DevnodeId) -> Option<&DevnodeRecord> {
+        self.devnodes.iter().find(|d| d.id == id)
+    }
+
+    // --- PnP properties (spec §11) --------------------------------------------
+
+    /// `WdfDeviceAssignProperty` / `IoSetDevicePropertyData` — set a `DEVPROPKEY` property.
+    pub fn assign_devprop(
+        &mut self,
+        devnode: DevnodeId,
+        key: DevPropKey,
+        value: PropertyValue,
+    ) -> bool {
+        match self.devnode_mut(devnode) {
+            Some(d) => {
+                d.properties.set_devprop(key, value);
+                true
+            }
+            None => false,
+        }
+    }
+    /// `WdfDeviceQueryProperty` / `IoGetDevicePropertyData`.
+    pub fn query_devprop(&self, devnode: DevnodeId, key: &DevPropKey) -> Option<&PropertyValue> {
+        self.devnode_by_id(devnode)?.properties.get_devprop(key)
+    }
+    /// Set a legacy `DEVICE_REGISTRY_PROPERTY` (e.g. `FriendlyName`).
+    pub fn set_legacy_property(
+        &mut self,
+        devnode: DevnodeId,
+        property: u32,
+        value: PropertyValue,
+    ) -> bool {
+        match self.devnode_mut(devnode) {
+            Some(d) => {
+                d.properties.set_legacy(property, value);
+                true
+            }
+            None => false,
+        }
+    }
+    /// `IoGetDeviceProperty` — read a legacy `DEVICE_REGISTRY_PROPERTY`.
+    pub fn query_legacy_property(
+        &self,
+        devnode: DevnodeId,
+        property: u32,
+    ) -> Option<&PropertyValue> {
+        self.devnode_by_id(devnode)?.properties.get_legacy(property)
     }
 
     pub fn devnode(&self, instance_id: &str) -> Option<&DevnodeRecord> {
@@ -424,6 +481,43 @@ mod tests {
             cm.registry().query_string(key, "Service").as_deref(),
             Some("KmdfInterfaceRegistryTest")
         );
+    }
+
+    #[test]
+    fn pnp_properties() {
+        let mut cm = ConfigManager::new();
+        let dn = cm.register_devnode(r"ROOT\X\0000", Some("Svc"), None, &[], &[]);
+        // Legacy FriendlyName (WdfDeviceAssignProperty / IoGetDeviceProperty).
+        cm.set_legacy_property(
+            dn,
+            device_property::FRIENDLY_NAME,
+            PropertyValue::string("userspace-ntos KMDF Interface Registry Test Device"),
+        );
+        assert_eq!(
+            cm.query_legacy_property(dn, device_property::FRIENDLY_NAME)
+                .and_then(|v| v.as_string())
+                .as_deref(),
+            Some("userspace-ntos KMDF Interface Registry Test Device")
+        );
+        // A custom DEVPROPKEY (uint32).
+        let key = DevPropKey {
+            fmtid: [0xAB; 16],
+            pid: 2,
+        };
+        cm.assign_devprop(dn, key, PropertyValue::uint32(42));
+        assert_eq!(
+            cm.query_devprop(dn, &key).and_then(|v| v.as_uint32()),
+            Some(42)
+        );
+        assert!(cm
+            .query_devprop(
+                dn,
+                &DevPropKey {
+                    fmtid: [0; 16],
+                    pid: 1
+                }
+            )
+            .is_none());
     }
 
     #[test]
