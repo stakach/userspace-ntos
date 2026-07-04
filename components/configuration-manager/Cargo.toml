@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-config-store = { path = "../../crates/nt-config-store" }
 
 [profile.release]
 panic = "abort"

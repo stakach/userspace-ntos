@@ -17,7 +17,11 @@ mod allocator;
 use core::panic::PanicInfo;
 
 use nt_config_manager::{encode_sz, ConfigManager, RegistryValueType, DEVICE_CLASSES_PATH, SERVICES_PATH};
+use nt_config_store::{journal::Mutation, snapshot, MemoryStore, Persistence};
 use sel4_rt::*;
+
+const PARAMS_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Services\KmdfInterfaceRegistryTest\Parameters";
 
 const IFACE_GUID: &str = "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0001}";
 const CLASS_GUID: &str = "{4d36e97d-e325-11ce-bfc1-08002be10318}";
@@ -120,6 +124,47 @@ fn run() {
         cm.interfaces_by_guid(IFACE_GUID, true).is_empty()
             && cm.interfaces_by_guid(IFACE_GUID, false).len() == 1,
     );
+    cm.set_interface_state(iface, true); // re-enable for the persistence round-trip
+
+    // --- Persistence: the configuration survives a simulated restart (§18-§20) ---
+    let mut persistence = Persistence::new(MemoryStore::new());
+    // Graceful shutdown: write a snapshot of the whole configuration.
+    check(b"persistence_snapshot_written", persistence.compact(&cm).is_ok());
+    // A running driver journals a registry write (SeenByDriver=1) after the snapshot.
+    let journaled = persistence
+        .mutate(
+            &mut cm,
+            Mutation::SetValue {
+                path: PARAMS_PATH,
+                name: "SeenByDriver",
+                value_type: RegistryValueType::Dword,
+                data: &1u32.to_le_bytes(),
+            },
+        )
+        .is_ok();
+    check(b"persistence_journal_write", journaled);
+
+    // Crash + restart: boot a fresh engine from the same store (snapshot + journal replay).
+    persistence.store_mut().crash();
+    let store = core::mem::take(persistence.store_mut());
+    let survived = Persistence::new(store)
+        .boot()
+        .map(|r| {
+            let params = r.service_parameters_key("KmdfInterfaceRegistryTest").unwrap();
+            r.registry().query_dword(params, "Answer") == Some(42)
+                && r.registry().query_string(params, "Greeting").as_deref() == Some("hello registry")
+                && r.registry().query_dword(params, "SeenByDriver") == Some(1) // journaled write survived
+                && r.devnodes_for_service("KmdfInterfaceRegistryTest").len() == 1
+                && r.interfaces_by_guid(IFACE_GUID, true).len() == 1
+        })
+        .unwrap_or(false);
+    check(b"persistence_survives_restart", survived);
+
+    // A corrupted snapshot is rejected (checksum), not accepted or panicked (§9.1, §23.3).
+    let mut snap = snapshot::encode(&cm, 1, 0);
+    let last = snap.len() - 1;
+    snap[last] ^= 0xFF;
+    check(b"persistence_rejects_corruption", snapshot::parse_header(&snap).is_err());
 }
 
 #[no_mangle]

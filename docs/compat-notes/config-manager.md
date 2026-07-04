@@ -99,3 +99,12 @@ read bounds-checked (safe to parse from untrusted bytes).
 - 7 unit tests: snapshot round-trip, checksum/magic/truncation rejection, boot-replays-journal,
   compaction-truncates-journal, idempotent replay, torn-record ignored, snapshot-write-fault
   preserves the previous snapshot.
+
+## Persistence in QEMU (implemented, Milestone 19.7 — `configuration-manager`)
+
+The `configuration-manager` component now also proves persistence bare-metal on seL4 (13/13
+checks). After building + verifying the fixture, it: writes a snapshot (`compact`), journals a
+runtime `SeenByDriver=1` write, **crashes + reboots a fresh `Persistence` from the same store**
+(snapshot + journal replay), and verifies the whole configuration survived — Answer=42,
+Greeting, the journaled SeenByDriver=1, the devnode, and the enabled interface — then confirms a
+corrupted snapshot is rejected by checksum.
