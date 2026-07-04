@@ -22,3 +22,12 @@ native syscall dispatcher to the real subsystems + builds the PEB/TEB/KUSER_SHAR
 - nt-syscall gains NtQuerySystemInformation + NtQuerySystemTime services.
 - 5 unit tests: PEB/TEB layout offsets, KUSER version, host launch (process+thread+structs),
   dispatch across registry/memory/sysinfo/time, dispatch file create/write/read.
+
+## User Process Host in QEMU (implemented, Milestone 29 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the User Process Host bare-metal on seL4
+(38/38 checks): it builds a KernelServices layer (fresh ConfigManager + MemFs), launches a
+UserProcessHost — verifying the PEB (OSBuildNumber=22631), TEB (ClientId + PEB pointer at their
+real offsets), and KUSER_SHARED_DATA (NtMajorVersion=10) — then dispatches real syscalls through
+the wired handler: NtOpenKey→NtQueryValueKey returns Answer=42 (registry), NtQuerySystemTime
+returns the KUSER time, and NtAllocateVirtualMemory reserves a region (address space).

@@ -18,6 +18,7 @@ nt-address-space = { path = "../../crates/nt-address-space" }
 nt-process = { path = "../../crates/nt-process" }
 nt-security = { path = "../../crates/nt-security" }
 nt-syscall = { path = "../../crates/nt-syscall" }
+nt-user-host = { path = "../../crates/nt-user-host" }
 
 [profile.release]
 panic = "abort"

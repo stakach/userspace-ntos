@@ -527,6 +527,39 @@ fn run() {
         b"syscall_unknown_and_mode",
         unknown.status == STATUS_INVALID_SYSTEM_SERVICE && sh.last_mode == NtMode::KernelMode,
     );
+
+    // --- User Process Host: bootstrap a process + PEB/TEB/KUSER + real syscalls (spec §8-§16) ----
+    use nt_user_host::{kuser_off, peb_off, read_u32, read_u64, teb_off, KernelServices, UserProcessHost, WindowsProfile};
+    // Fresh subsystem state owned by the host's kernel-services layer.
+    let mut host_cm = ConfigManager::new();
+    host_cm.register_service("Svc", "svc.sys", None, None, 3, 1);
+    host_cm.set_service_parameter("Svc", "Answer", RegistryValueType::Dword, 42u32.to_le_bytes().to_vec());
+    let hpath = host_cm.registry().key_path(host_cm.service_parameters_key("Svc").unwrap()).unwrap();
+    let host_fs = nt_fs::FileSystem::new(nt_fs::MemFs::with_fixture());
+    let mut ks = KernelServices::new(WindowsProfile::windows11_23h2(), host_cm, host_fs, alloc::vec![hpath]);
+    ks.system_time_100ns = 0x01DA_0000_0000_0000;
+    let host = UserProcessHost::launch(&mut ks, "hosted.exe", 0x1_4000_1000);
+    // The PEB/TEB/KUSER carry the right version + linkage at their real offsets.
+    let struct_ok = read_u32(host.peb(), peb_off::OS_BUILD_NUMBER) == 22631
+        && read_u64(host.teb(), teb_off::PEB) == host.peb_va()
+        && read_u64(host.teb(), teb_off::CLIENT_ID_PROCESS) == host.process_id() as u64
+        && read_u32(host.kuser_shared_data(), kuser_off::NT_MAJOR_VERSION) == 10;
+    check(b"userhost_peb_teb_kuser", struct_ok);
+
+    // Real syscalls through the dispatcher reach the wired subsystems.
+    let hd = NativeSyscallDispatcher::new(NativeServiceTable::test_profile());
+    let o = SyscallOrigin::new(host.process_id(), host.main_thread_id(), NtMode::UserMode);
+    let open = hd.dispatch_service(NativeService::NtOpenKey, &[0, 0, 0], &o, &mut ks);
+    let kh = u64::from_le_bytes([open.output[0], open.output[1], open.output[2], open.output[3], open.output[4], open.output[5], open.output[6], open.output[7]]);
+    let q = hd.dispatch_service(NativeService::NtQueryValueKey, &[kh, 0, 0, 0], &o, &mut ks);
+    let time = hd.dispatch_service(NativeService::NtQuerySystemTime, &[0], &o, &mut ks);
+    let av = hd.dispatch_service(NativeService::NtAllocateVirtualMemory, &[0, 0, 0, 0x4000, 0, 4], &o, &mut ks);
+    let query_answer = u32::from_le_bytes([q.output[0], q.output[1], q.output[2], q.output[3]]);
+    let sys_time = u64::from_le_bytes([time.output[0], time.output[1], time.output[2], time.output[3], time.output[4], time.output[5], time.output[6], time.output[7]]);
+    check(
+        b"userhost_syscall_dispatch",
+        query_answer == 42 && sys_time == 0x01DA_0000_0000_0000 && av.status == NT_SUCCESS,
+    );
 }
 
 /// A minimal kernel-services layer wiring the native syscall dispatcher to the registry (spec §9.3).
