@@ -75,6 +75,9 @@ pub enum NativeService {
     // Security / token (§16.7)
     NtOpenProcessToken,
     NtAccessCheck,
+    // System information (§16.5, §7.1)
+    NtQuerySystemInformation,
+    NtQuerySystemTime,
 }
 
 impl NativeService {
@@ -108,6 +111,8 @@ impl NativeService {
             NtQueryInformationProcess => "NtQueryInformationProcess",
             NtOpenProcessToken => "NtOpenProcessToken",
             NtAccessCheck => "NtAccessCheck",
+            NtQuerySystemInformation => "NtQuerySystemInformation",
+            NtQuerySystemTime => "NtQuerySystemTime",
         }
     }
 
@@ -115,10 +120,11 @@ impl NativeService {
     pub fn arg_count(self) -> (u8, u8) {
         use NativeService::*;
         match self {
-            NtClose | NtTerminateThread => (1, 1),
+            NtClose | NtTerminateThread | NtQuerySystemTime => (1, 1),
             NtTerminateProcess | NtUnmapViewOfSection => (2, 2),
             NtOpenKey | NtCreateKey => (3, 3),
             NtQueryValueKey => (4, 6),
+            NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
             NtCreateFile => (8, 11),
             _ => (0, 16), // permissive for the rest in v0.1
@@ -153,6 +159,8 @@ impl NativeService {
         NativeService::NtQueryInformationProcess,
         NativeService::NtOpenProcessToken,
         NativeService::NtAccessCheck,
+        NativeService::NtQuerySystemInformation,
+        NativeService::NtQuerySystemTime,
     ];
 }
 

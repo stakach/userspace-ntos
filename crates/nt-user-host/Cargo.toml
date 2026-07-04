@@ -1,0 +1,19 @@
+[package]
+name = "nt-user-host"
+description = "NT User Process Host + official ntdll bootstrap: the Windows version profile, PEB/TEB/KUSER_SHARED_DATA byte-layout builders (key fields at real x64 offsets), a UserProcessHost that owns a process + its PEB/TEB/KUSER user VAs, and KernelServices — the NativeSyscallHandler that wires the native syscall dispatcher to the real subsystems (registry, filesystem, address space, process manager, KUSER time). no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-syscall = { workspace = true }
+nt-process = { workspace = true }
+nt-config-manager = { workspace = true }
+nt-fs = { workspace = true }
+nt-cache-manager = { workspace = true }
+nt-address-space = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
