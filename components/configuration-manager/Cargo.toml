@@ -10,6 +10,7 @@ sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-config-store = { path = "../../crates/nt-config-store" }
 nt-setupapi = { path = "../../crates/nt-setupapi" }
+nt-hive-core = { path = "../../crates/nt-hive-core" }
 
 [profile.release]
 panic = "abort"

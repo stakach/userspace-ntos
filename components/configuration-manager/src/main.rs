@@ -214,6 +214,39 @@ fn run() {
             && destroyed
             && sets.enum_device_interfaces(h, 0).is_none(), // stale after destroy
     );
+
+    // --- Hive Manager: SYSTEM hive survives a reboot (spec §16, §18) ---------
+    use nt_hive_core::{HiveKind, HiveLogOp, HiveManager, HiveMountTable, MemoryHiveIoProvider, RegistryValueType as HRegType};
+    // Mount table resolves CurrentControlSet through the SYSTEM hive (spec §8).
+    let mut mounts = HiveMountTable::new();
+    mounts.mount(nt_hive_core::SYSTEM_HIVE_PATH, 1);
+    let resolved = mounts.resolve(r"\Registry\Machine\System\CurrentControlSet\Services\Foo");
+    check(
+        b"hive_mount_resolves_currentcontrolset",
+        resolved.as_ref().map(|(h, r)| (*h, r.as_str()))
+            == Some((1, r"\ControlSet001\Services\Foo")),
+    );
+
+    let mut mgr = HiveManager::new(MemoryHiveIoProvider::new());
+    let mut hive = mgr.boot(HiveKind::System).unwrap(); // fresh (no image yet)
+    let svc = r"ControlSet001\Services\KmdfInterfaceRegistryTest\Parameters";
+    mgr.mutate(&mut hive, HiveLogOp::CreateKey { path: svc }).ok();
+    mgr.mutate(&mut hive, HiveLogOp::SetValue { path: svc, name: "Answer", value_type: HRegType::Dword, data: &42u32.to_le_bytes() }).ok();
+    mgr.flush(&mut hive).ok(); // checkpoint into the image, truncate log
+    // A driver write after the checkpoint (journaled to the log only).
+    mgr.mutate(&mut hive, HiveLogOp::SetValue { path: svc, name: "SeenByDriver", value_type: HRegType::Dword, data: &1u32.to_le_bytes() }).ok();
+
+    // Reboot: a fresh HiveManager over the same provider (image + replayed log).
+    let provider = mgr.into_provider();
+    let booted = HiveManager::new(provider).boot(HiveKind::System);
+    let hive_ok = booted
+        .map(|hv| {
+            let key = hv.open_key(svc).unwrap();
+            hv.query_dword(key, "Answer") == Some(42) // from the image
+                && hv.query_dword(key, "SeenByDriver") == Some(1) // from the replayed log
+        })
+        .unwrap_or(false);
+    check(b"hive_boot_survives_restart", hive_ok);
 }
 
 /// Decode the first NUL-terminated string of a `MULTI_SZ` (UTF-16LE code units).

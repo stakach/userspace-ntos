@@ -27,3 +27,13 @@ pluggable I/O provider.
 - 8 unit tests incl. create/open/set/query, CCS resolver (Services through CurrentControlSet),
   image round-trip + checksum/magic rejection, manager boot/mutate/flush survives restart, log
   replay idempotent + torn, image-write fault preserves previous, NtFile NotSupported.
+
+## Hive lifecycle in QEMU (implemented, Milestone 21 — `configuration-manager`)
+
+The `configuration-manager` component now also proves the hive lifecycle bare-metal on seL4
+(18/18 checks). It mounts a SYSTEM hive and confirms the mount table resolves
+`\Registry\Machine\System\CurrentControlSet\Services\Foo` → (SYSTEM, `\ControlSet001\Services\Foo`);
+then over a `HiveManager`/`MemoryHiveIoProvider` it creates a Services\…\Parameters key with
+Answer=42, `flush`es a checkpoint image, journals a post-checkpoint SeenByDriver=1 write, and
+**reboots a fresh HiveManager over the same provider** — verifying Answer=42 comes back from the
+image and SeenByDriver=1 from the replayed log.
