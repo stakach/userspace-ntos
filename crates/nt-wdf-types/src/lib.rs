@@ -57,6 +57,54 @@ pub const IDX_WDF_REQUEST_RETRIEVE_OUTPUT_BUFFER: usize = 270;
 pub const IDX_WDF_CM_RESOURCE_LIST_GET_COUNT: usize = 304;
 pub const IDX_WDF_CM_RESOURCE_LIST_GET_DESCRIPTOR: usize = 305;
 
+// KMDF hardware-extension indices (WDFINTERRUPT / WDFDMAENABLER / WDFCOMMONBUFFER /
+// WDFTIMER / WDFWORKITEM), KMDF 1.15.
+pub const IDX_WDF_COMMON_BUFFER_CREATE: usize = 21;
+pub const IDX_WDF_COMMON_BUFFER_GET_ALIGNED_VIRTUAL_ADDRESS: usize = 22;
+pub const IDX_WDF_COMMON_BUFFER_GET_ALIGNED_LOGICAL_ADDRESS: usize = 23;
+pub const IDX_WDF_COMMON_BUFFER_GET_LENGTH: usize = 24;
+pub const IDX_WDF_DMA_ENABLER_CREATE: usize = 94;
+pub const IDX_WDF_DMA_ENABLER_GET_MAXIMUM_LENGTH: usize = 95;
+pub const IDX_WDF_INTERRUPT_CREATE: usize = 141;
+pub const IDX_WDF_INTERRUPT_QUEUE_DPC_FOR_ISR: usize = 142;
+pub const IDX_WDF_INTERRUPT_ENABLE: usize = 146;
+pub const IDX_WDF_INTERRUPT_DISABLE: usize = 147;
+pub const IDX_WDF_INTERRUPT_GET_DEVICE: usize = 151;
+pub const IDX_WDF_TIMER_CREATE: usize = 318;
+pub const IDX_WDF_TIMER_START: usize = 319;
+pub const IDX_WDF_TIMER_STOP: usize = 320;
+pub const IDX_WDF_TIMER_GET_PARENT_OBJECT: usize = 321;
+pub const IDX_WDF_WORK_ITEM_CREATE: usize = 379;
+pub const IDX_WDF_WORK_ITEM_ENQUEUE: usize = 380;
+pub const IDX_WDF_WORK_ITEM_GET_PARENT_OBJECT: usize = 381;
+pub const IDX_WDF_WORK_ITEM_FLUSH: usize = 382;
+
+/// `WDF_INTERRUPT_CONFIG` (wdfinterrupt.h; Size 0x68).
+pub mod interrupt_config {
+    pub const EVT_INTERRUPT_ISR: u64 = 0x18;
+    pub const EVT_INTERRUPT_DPC: u64 = 0x20;
+    pub const EVT_INTERRUPT_ENABLE: u64 = 0x28;
+    pub const EVT_INTERRUPT_DISABLE: u64 = 0x30;
+    pub const AUTOMATIC_SERIALIZATION: u64 = 0x15;
+}
+
+/// `WDF_DMA_ENABLER_CONFIG` (wdfdmaenabler.h; Size 0x50).
+pub mod dma_enabler_config {
+    pub const PROFILE: u64 = 0x04;
+    pub const MAXIMUM_LENGTH: u64 = 0x08;
+}
+
+/// `WDF_TIMER_CONFIG` (wdftimer.h; Size 0x28).
+pub mod timer_config {
+    pub const EVT_TIMER_FUNC: u64 = 0x08;
+    pub const PERIOD: u64 = 0x10;
+}
+
+/// `WDF_WORKITEM_CONFIG` (wdfworkitem.h; Size 0x18).
+pub mod workitem_config {
+    pub const EVT_WORK_ITEM_FUNC: u64 = 0x08;
+}
+
 // --- WDF_DRIVER_CONFIG (wdfdriver.h; Size 0x20) ------------------------------
 
 pub mod driver_config {

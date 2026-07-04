@@ -50,3 +50,28 @@ Enqueue=380 / Flush=382; WdfIoQueueRetrieveNextRequest=158; WdfDeviceGetDefaultQ
   side-state.
 
 3 new tests (interrupt ISR→DPC, DMA enabler+common buffer, timer+workitem). 32 WDF tests total.
+
+## Driver Host WDF-HW integration (implemented, Milestones 16.4/16.8 — `driver-host-wdfhw`)
+
+`components/driver-host-wdfhw` loads the real `KmdfDmaInterruptTest.sys` and runs the full
+KMDF hardware-object lifecycle against the `WdfRuntime`. **19/19 checks pass in QEMU, no #GP**
+— on the first boot. Reuses the M15 WDF binding (WdfVersionBind + 444-entry table + `/guard:cf`
+jmp-rax dispatch) and adds 21 hardware thunks + an 8-register simulated DMA device.
+
+- EvtDeviceAdd: WdfDeviceCreate/SymLink/IoQueueCreate + WdfInterruptCreate + WdfTimerCreate +
+  WdfWorkItemCreate (all captured).
+- PrepareHardware: WDFCMRESLIST (memory descriptor) → MmMapIoSpace → MMIO[0]==`0x4B444D41`
+  ('KDMA') → WdfDmaEnablerCreate + WdfCommonBufferCreate; framework auto-connects the interrupt.
+- D0 entry → EvtDeviceD0Entry → WdfInterruptEnable (→ EvtInterruptEnable).
+- GET_ID / GET_INFO / READ_REG32 (immediate).
+- DMA roundtrip: IOCTL fills the common buffer + programs the sim DMA regs (LO/HI/LENGTH/
+  COMMAND=1); `run_sim_dma` decodes the common-buffer logical address, checksums it into RESULT,
+  sets STATUS bit0; `deliver_interrupt` → EvtInterruptIsr (checks STATUS, writes INT_ACK,
+  WdfInterruptQueueDpcForIsr, returns TRUE) → EvtInterruptDpc (reads RESULT,
+  WdfRequestCompleteWithInformation). Verified: checksum, interrupt count, ACK.
+- Timer/workitem IOCTLs pend, then `fire_timer` / `run_workitem` completes them.
+- D0 exit → WdfInterruptDisable (an injected interrupt is then dropped); ReleaseHardware
+  (WdfObjectDelete common buffer + enabler, MmUnmapIoSpace); REMOVE (WdfObjectDelete cascade).
+
+Milestone 16 complete: 3 new host crates + runtime extension (39 WDF unit tests total) + this
+component (19/19 QEMU).
