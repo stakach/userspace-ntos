@@ -40,6 +40,10 @@ const STACK_VADDR: u64 = 0x0000_0002_0010_0000;
 const CHILD_IPCBUF_VADDR: u64 = 0x0000_0002_0020_0000;
 const TEB_VADDR: u64 = 0x0000_0002_0030_0000; // the thread's TEB (%gs base)
 const PEB_VADDR: u64 = 0x0000_0002_0040_0000; // the process's PEB (referenced by the TEB)
+const LDR_VADDR: u64 = 0x0000_0002_0050_0000; // PEB_LDR_DATA (referenced by PEB->Ldr)
+const LDR_TRAMP_VADDR: u64 = 0x0000_0002_0060_0000; // trampoline for the LdrInitializeThunk thread
+const LDR_STACK_VADDR: u64 = 0x0000_0002_0070_0000;
+const LDR_IPCBUF_VADDR: u64 = 0x0000_0002_0080_0000;
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
 const RIGHTS_RW: u64 = 0b011; // read/write (for loading)
@@ -171,6 +175,27 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
 
+unsafe fn write_u32(va: u64, v: u32) {
+    core::ptr::write_volatile(va as *mut u32, v);
+}
+unsafe fn write_u64(va: u64, v: u64) {
+    core::ptr::write_volatile(va as *mut u64, v);
+}
+
+/// Spawn a user thread sharing the root's CSpace/VSpace at `entry` with `stack_top`, `arg0` in RDI,
+/// a fault endpoint (returned), an IPC buffer, and `%gs` = `gs_base`. Returns the fault endpoint.
+unsafe fn spawn_thread(entry: u64, stack_top: u64, arg0: u64, ipcbuf_va: u64, ipcbuf: u64, gs_base: u64) -> u64 {
+    let fault_ep = make_object(OBJ_ENDPOINT);
+    let tcb = make_object(OBJ_TCB);
+    let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
+    let _ = tcb_write_registers(tcb, entry, stack_top, arg0);
+    let _ = tcb_set_gs_base(tcb, gs_base);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    fault_ep
+}
+
 /// Build the trampoline: `mov rax, export_addr; call rax` (into the real mapped ntdll export), then
 /// read `%gs:[0x30]` (TEB.Self — the canonical ntdll self-reference) and report it via a real
 /// `SysSend(rdi = done_ep, mr0 = %gs:[0x30])` (a valid seL4 syscall). Reaching + resolving the GS
@@ -262,15 +287,31 @@ fn run() {
         let stack_top = STACK_VADDR + 0x1000 - 16;
         let ipcbuf = map_page(CHILD_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
 
-        // 2b. Build a Windows PEB + TEB + map them, so ntdll self-references resolve: the TEB
-        //     links `%gs:[0x60]` → PEB, and the trap thread's %gs base is set to the TEB below.
+        // 2b. Build the process/thread structures ntdll's loader reads: a PEB_LDR_DATA (empty but
+        //     initialised, circular lists) referenced by PEB->Ldr, a PEB (BeingDebugged=0,
+        //     ImageBaseAddress, Ldr), and a TEB linking %gs:[0x60] → PEB.
+        let _ldr_frame = map_page(LDR_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        write_u32(LDR_VADDR + 0x00, 0x58); // Length
+        write_u32(LDR_VADDR + 0x04, 1); // Initialized = TRUE
+        for head in [0x10u64, 0x20, 0x30] {
+            // InLoadOrder / InMemoryOrder / InInitializationOrder — empty circular LIST_ENTRYs.
+            write_u64(LDR_VADDR + head, LDR_VADDR + head); // Flink → self
+            write_u64(LDR_VADDR + head + 8, LDR_VADDR + head); // Blink → self
+        }
         let profile = WindowsProfile::windows7_sp1();
-        let peb = nt_user_host::build_peb(&profile, ntdll_base, 0, 0, 0);
+        // KUSER_SHARED_DATA at the Windows-fixed 0x7FFE0000 — the loader reads its version/tick
+        // fields early. (nt_user_host::KUSER_SHARED_DATA_VA.)
+        let kuser = nt_user_host::build_kuser_shared_data(&profile, services.system_time_100ns, 1);
+        let _kframe = map_page(0x7FFE_0000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        core::ptr::copy_nonoverlapping(kuser.as_ptr(), 0x7FFE_0000 as *mut u8, kuser.len().min(0x1000));
+        let peb = nt_user_host::build_peb(&profile, ntdll_base, LDR_VADDR, 0, 0);
         let _peb_frame = map_page(PEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         core::ptr::copy_nonoverlapping(peb.as_ptr(), PEB_VADDR as *mut u8, peb.len().min(0x1000));
         let teb = nt_user_host::build_teb(TEB_VADDR, PEB_VADDR, STACK_VADDR, stack_top, 4, 8);
-        let _teb_frame = map_page(TEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        core::ptr::copy_nonoverlapping(teb.as_ptr(), TEB_VADDR as *mut u8, teb.len().min(0x1000));
+        for p in 0..(teb.len() as u64).div_ceil(0x1000) {
+            let _ = map_page(TEB_VADDR + p * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        }
+        core::ptr::copy_nonoverlapping(teb.as_ptr(), TEB_VADDR as *mut u8, teb.len());
 
         // 3. Fault + done endpoints, and the trap thread (shares the root's CSpace/VSpace).
         let fault_ep = make_object(OBJ_ENDPOINT);
@@ -319,6 +360,50 @@ fn run() {
         // [TEB+0x60]) returned the PEB, reported here. It equalling PEB_VADDR proves the PEB is
         // wired into the TEB and real ntdll code resolves it.
         check(b"ntdll_peb_via_teb_resolves", reported == PEB_VADDR);
+
+        // --- Run the real ntdll loader init: LdrInitializeThunk → LdrpInitialize ---------------
+        // A fresh thread whose entry is a trampoline that `call`s the real LdrInitializeThunk in
+        // mapped ntdll. LdrpInitialize runs its prologue (reads the TEB, BeingDebugged, the loader
+        // lock, PEB->Ldr) then makes its first syscall. We catch the first fault to see how far the
+        // real loader code got: an UnknownSyscall means the prologue executed + it reached a
+        // syscall (the loader is running); the syscall number is that first Nt* call.
+        let thunk_rva = exports.iter().find(|e| e.name == "LdrInitializeThunk").unwrap().rva;
+        let thunk_addr = ntdll_base + thunk_rva as u64;
+        // Trampoline: xor ecx,ecx (CONTEXT* = null); mov rax, thunk; call rax; jmp $.
+        let mut lt = [0u8; 32];
+        lt[0..2].copy_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        lt[2..4].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+        lt[4..12].copy_from_slice(&thunk_addr.to_le_bytes());
+        lt[12..14].copy_from_slice(&[0xFF, 0xD0]); // call rax
+        lt[14..16].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+        let ltp = map_page(LDR_TRAMP_VADDR, RIGHTS_RW);
+        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 16);
+        let _ = page_unmap(ltp);
+        let _ = page_map(ltp, LDR_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
+        let lstack = map_page(LDR_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let _ = lstack;
+        let libuf = map_page(LDR_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let lfault = spawn_thread(
+            LDR_TRAMP_VADDR,
+            LDR_STACK_VADDR + 0x1000 - 16,
+            0,
+            LDR_IPCBUF_VADDR,
+            libuf,
+            TEB_VADDR,
+        );
+        print_str(b"  ... running real LdrInitializeThunk -> LdrpInitialize\n");
+        let (_lz, _lb, lmsginfo, lmr0) = ep_recv(lfault);
+        let llabel = lmsginfo >> 12;
+        // llabel 2 = UnknownSyscall (the loader's prologue ran + it made a syscall); lmr0 = RAX =
+        // the syscall number of that first Nt* call.
+        print_str(b"  LdrpInitialize first fault: label=");
+        debug_put_char(b'0' + (llabel % 10) as u8);
+        print_str(b" ssn=0x");
+        let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
+        debug_put_char(hex((lmr0 >> 4) & 0xf));
+        debug_put_char(hex(lmr0 & 0xf));
+        print_str(b"\n");
+        check(b"ldrpinitialize_prologue_ran_to_first_syscall", llabel == 2);
     }
 }
 

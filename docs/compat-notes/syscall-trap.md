@@ -109,3 +109,25 @@ The trampoline reads `%gs:[0x30]` **after** the export's syscall trap + resume a
 QEMU: `ntdll_teb_via_gs_resolves` passes — the reported `%gs:[0x30]` equals the TEB VA, proving
 `%gs` resolves to the thread's TEB and survives the full trap → service → resume cycle. Real ntdll
 code, in place, with a real TEB, trapping through the real seL4 fault path.
+
+## Running the loader: LdrpInitialize prologue → first syscall (implemented)
+
+With the TEB/PEB wired up, the component now runs the real ntdll loader entry. A second thread's
+trampoline `call`s the real `LdrInitializeThunk` (which calls the internal `LdrpInitialize`) in
+mapped ntdll `.text`. The minimal loader environment:
+- a `PEB_LDR_DATA` (Length, Initialized=1, three empty **circular** LIST_ENTRYs) referenced by
+  `PEB->Ldr`;
+- a PEB (BeingDebugged=0, ImageBaseAddress, Ldr);
+- the full TEB (0x1800 bytes, both pages) at `%gs`;
+- `KUSER_SHARED_DATA` mapped at the Windows-fixed `0x7FFE0000`;
+- ntdll's `.data` (the loader lock) mapped RW from the loaded image.
+
+The handler catches the thread's first fault to see how far the real loader code executed.
+
+QEMU: `ldrpinitialize_prologue_ran_to_first_syscall` passes — the first fault is an `UnknownSyscall`
+(label 2), i.e. LdrpInitialize's real code ran its whole prologue (TEB, BeingDebugged, the loader
+lock's `lock cmpxchg`, `PEB->Ldr`, KUSER_SHARED_DATA, TEB TLS fields) and reached its first `Nt*`
+syscall (ssn=0x16). Iteratively mapping what it faulted on (KUSER_SHARED_DATA at 0x7FFE0000, then the
+TEB's second page) walked the loader forward to that point. Servicing the loader's syscalls to run
+it to completion (which needs faithful out-params + full register preservation across the trap) is
+future work.
