@@ -860,25 +860,31 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
             }
         } else if ssn == s_qvm {
             // NtQueryVirtualMemory(_, BaseAddress=RDX, class=R8, buffer=R9, len=[sp+0x28],
-            // *retlen=[sp+0x30]). Class 0 = MemoryBasicInformation.
+            // *retlen=[sp+0x30]). Classify the region: an image (exe/ntdll) is MEM_IMAGE.
             let (base, class, buf) = (a2, a3, a4);
-            if class == 0 && buf != 0 {
-                // Report the region as a committed image view if the address is in the exe/ntdll,
-                // else a committed private region; both with a non-NULL AllocationBase.
-                let (alloc_base, mtype) = if base >= 0x1_4000_0000 && base < 0x1_4001_0000 {
-                    (0x1_4000_0000u64, 0x0100_0000u32) // MEM_IMAGE
-                } else if base >= 0x78e5_0000 && base < 0x78e5_0000 + 0x1a_a000 {
-                    (0x78e5_0000u64, 0x0100_0000u32)
+            let (alloc_base, mtype) = if base >= 0x1_4000_0000 && base < 0x1_4001_0000 {
+                (0x1_4000_0000u64, 0x0100_0000u32) // MEM_IMAGE
+            } else if base >= 0x78e5_0000 && base < 0x78e5_0000 + 0x1a_a000 {
+                (0x78e5_0000u64, 0x0100_0000u32)
+            } else {
+                (base & !0xFFFF, 0x0002_0000u32) // MEM_PRIVATE
+            };
+            if buf != 0 {
+                if class == 0 {
+                    // MEMORY_BASIC_INFORMATION (Type @ 0x28).
+                    write_u64(buf + 0x00, base & !0xFFF); // BaseAddress
+                    write_u64(buf + 0x08, alloc_base); // AllocationBase
+                    write_u32(buf + 0x10, 0x80); // AllocationProtect = PAGE_EXECUTE_WRITECOPY
+                    write_u64(buf + 0x18, 0x1000); // RegionSize
+                    write_u32(buf + 0x20, 0x1000); // State = MEM_COMMIT
+                    write_u32(buf + 0x24, 0x04); // Protect
+                    write_u32(buf + 0x28, mtype); // Type
                 } else {
-                    (base & !0xFFFF, 0x0002_0000u32) // MEM_PRIVATE
-                };
-                write_u64(buf + 0x00, base & !0xFFF); // BaseAddress
-                write_u64(buf + 0x08, alloc_base); // AllocationBase
-                write_u32(buf + 0x10, 0x80); // AllocationProtect = PAGE_EXECUTE_WRITECOPY
-                write_u64(buf + 0x18, 0x1000); // RegionSize
-                write_u32(buf + 0x20, 0x1000); // State = MEM_COMMIT
-                write_u32(buf + 0x24, 0x04); // Protect = PAGE_READWRITE
-                write_u32(buf + 0x28, mtype); // Type
+                    // The region-info class RtlLookupFunctionEntry's fallback uses when the inverted
+                    // function table is disabled: ImageBase/AllocationBase @ 0, Type @ 0xC.
+                    write_u64(buf + 0x00, alloc_base);
+                    write_u32(buf + 0x0c, mtype);
+                }
             }
             let retlen = read_u64(sp + 0x30);
             if retlen != 0 {
