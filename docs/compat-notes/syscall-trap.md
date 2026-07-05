@@ -89,3 +89,23 @@ copying an 11-byte stub:
 QEMU: `ntdll_parsed` + `ntdll_text_mapped_executable` + `ntdll_syscall_trapped` +
 `trapped_syscall_dispatched` + `export_resumed_clean_and_reported` — no page fault. ntdll's actual
 code, at its actual linked addresses, executes in place and traps through the real seL4 fault path.
+
+## TEB via %gs — ntdll self-references resolve (implemented)
+
+The trap thread now carries a real Windows **TEB** at its `%gs` base, so ntdll's self-references
+(`%gs:[0x30]` = TEB self, `%gs:[0x60]` = PEB) resolve — the last missing piece for running ntdll
+code that touches thread-local state.
+
+Kernel change (rust-micro): a per-thread user `%gs` base. `CpuContext` gains `gs_base`;
+`TCBSetTLSBase` gains a segment selector (`a3 != 0` → `%gs`, applied via `IA32_KERNEL_GS_BASE` so
+the return-to-user `swapgs` makes it the active `%gs` while the kernel keeps its per-CPU `%gs`); the
+gs base is restored alongside `fs_base` on **both** dispatch paths (the scheduler context switch and
+the syscall-tail next-thread dispatch), so it survives a fault-resume. `sel4-rt` gains
+`tcb_set_gs_base`.
+
+Component: builds a `nt_user_host::build_teb` TEB, maps it, and `tcb_set_gs_base(tcb, TEB_VADDR)`.
+The trampoline reads `%gs:[0x30]` **after** the export's syscall trap + resume and reports it.
+
+QEMU: `ntdll_teb_via_gs_resolves` passes — the reported `%gs:[0x30]` equals the TEB VA, proving
+`%gs` resolves to the thread's TEB and survives the full trap → service → resume cycle. Real ntdll
+code, in place, with a real TEB, trapping through the real seL4 fault path.

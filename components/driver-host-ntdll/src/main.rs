@@ -38,6 +38,8 @@ static NTDLL: &[u8] = include_bytes!("../../../references/ntdll.dll");
 const TRAMP_VADDR: u64 = 0x0000_0002_0000_0000; // the trampoline (entry)
 const STACK_VADDR: u64 = 0x0000_0002_0010_0000;
 const CHILD_IPCBUF_VADDR: u64 = 0x0000_0002_0020_0000;
+const TEB_VADDR: u64 = 0x0000_0002_0030_0000; // the thread's TEB (%gs base)
+const PEB_VADDR: u64 = 0x0000_0002_0040_0000; // the process's PEB (referenced by the TEB)
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
 const RIGHTS_RW: u64 = 0b011; // read/write (for loading)
@@ -170,20 +172,24 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
 }
 
 /// Build the trampoline: `mov rax, export_addr; call rax` (into the real mapped ntdll export), then
-/// report the returned RAX via a real `SysSend(rdi = done_ep, mr0 = rax)` (a valid seL4 syscall).
-fn build_trampoline(export_addr: u64) -> ([u8; 32], usize) {
-    let mut c = [0u8; 32];
+/// read `%gs:[0x30]` (TEB.Self — the canonical ntdll self-reference) and report it via a real
+/// `SysSend(rdi = done_ep, mr0 = %gs:[0x30])` (a valid seL4 syscall). Reaching + resolving the GS
+/// read proves the export resumed AND that `%gs` points at the thread's TEB.
+fn build_trampoline(export_addr: u64) -> ([u8; 48], usize) {
+    let mut c = [0u8; 48];
     c[0..2].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     c[2..10].copy_from_slice(&export_addr.to_le_bytes());
-    c[10..12].copy_from_slice(&[0xFF, 0xD0]); // call rax
-    c[12..15].copy_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
-    c[15] = 0xBE;
-    c[16..20].copy_from_slice(&1u32.to_le_bytes()); // mov esi, 1  (MessageInfo length 1)
-    c[20] = 0xBA;
-    c[21..25].copy_from_slice(&0xFFFF_FFFBu32.to_le_bytes()); // mov edx, -5 (SYS_SEND)
-    c[25..27].copy_from_slice(&[0x0F, 0x05]); // syscall
-    c[27..29].copy_from_slice(&[0xEB, 0xFE]); // jmp $
-    (c, 29)
+    c[10..12].copy_from_slice(&[0xFF, 0xD0]); // call rax (export: syscall traps → serviced → ret)
+    // mov rax, gs:[0x30]  — read TEB.Self AFTER the syscall trap+resume (proves %gs survives it).
+    c[12..21].copy_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00]);
+    c[21..24].copy_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
+    c[24] = 0xBE;
+    c[25..29].copy_from_slice(&1u32.to_le_bytes()); // mov esi, 1  (MessageInfo length 1)
+    c[29] = 0xBA;
+    c[30..34].copy_from_slice(&0xFFFF_FFFBu32.to_le_bytes()); // mov edx, -5 (SYS_SEND)
+    c[34..36].copy_from_slice(&[0x0F, 0x05]); // syscall
+    c[36..38].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+    (c, 38)
 }
 
 fn run() {
@@ -246,6 +252,12 @@ fn run() {
         let stack_top = STACK_VADDR + 0x1000 - 16;
         let ipcbuf = map_page(CHILD_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
 
+        // 2b. Build a Windows TEB + map it, so ntdll self-references (`%gs:[0x30]` = TEB self,
+        //     `%gs:[0x60]` = PEB) resolve. The trap thread's %gs base is set to the TEB below.
+        let teb = nt_user_host::build_teb(TEB_VADDR, PEB_VADDR, STACK_VADDR, stack_top, 4, 8);
+        let _teb_frame = map_page(TEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        core::ptr::copy_nonoverlapping(teb.as_ptr(), TEB_VADDR as *mut u8, teb.len().min(0x1000));
+
         // 3. Fault + done endpoints, and the trap thread (shares the root's CSpace/VSpace).
         let fault_ep = make_object(OBJ_ENDPOINT);
         let done_ep = make_object(OBJ_ENDPOINT);
@@ -253,6 +265,7 @@ fn run() {
         let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
         let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CHILD_IPCBUF_VADDR, ipcbuf, 0);
         let _ = tcb_write_registers(tcb, TRAMP_VADDR, stack_top, done_ep); // RDI = done_ep
+        let _ = tcb_set_gs_base(tcb, TEB_VADDR); // %gs → the TEB (Windows TLS anchor)
         attach_sched_context(tcb);
 
         // 4. Run it. The trampoline `call`s the real ntdll export; the export's `syscall` traps.
@@ -288,7 +301,9 @@ fn run() {
         set_reply_mr(5, done_ep); // RDI → done_ep (survives the reply into the trampoline)
         set_reply_mr(15, resume_ip); // FaultIP → the export's `ret`
         let (_b2, _mi2, reported) = reply_recv(done_ep, 16, REPORT_SENTINEL, 0, 0, 0);
-        check(b"export_resumed_clean_and_reported", reported == REPORT_SENTINEL);
+        // The trampoline resumed cleanly and reported %gs:[0x30] (TEB.Self) over IPC. It equalling
+        // TEB_VADDR proves %gs resolves to the thread's TEB — ntdll self-references work.
+        check(b"ntdll_teb_via_gs_resolves", reported == TEB_VADDR);
     }
 }
 
