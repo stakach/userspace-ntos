@@ -181,3 +181,24 @@ Rax@0x78…R15@0xF0), booting the thread into the exe. The exe then runs (`RtlGe
 `NtTerminateProcess`). QEMU: `ntcontinue_booted_exe_win7_version` — `booted=1`, exit code `0x06011DB1`
 = 6.1.7601: the real `NtContinue` booted a real Windows exe into its entry, and it terminated with the
 real Win7 version.
+
+## File/section + object-namespace syscalls; the loader runs deeper (partial merge)
+
+To push toward a single unbroken LdrpInitialize -> NtContinue -> entry, service_loop now services the
+loader's file, section, and object-namespace syscalls, backed by the in-memory image bytes:
+- **File**: NtOpenFile/NtCreateFile (open the exe/ntdll by path suffix -> handle + IoStatusBlock),
+  NtReadFile (copy bytes), NtQueryInformationFile (FileStandardInformation size),
+  NtQueryAttributesFile/NtQueryFullAttributesFile, NtClose (a small handle table).
+- **Section**: NtCreateSection (section handle backed by the file bytes), NtMapViewOfSection (returns
+  the already-mapped image base so the loader's view matches what we loaded).
+- **Object namespace**: NtOpenDirectoryObject/NtOpenSymbolicLinkObject (\KnownDlls + KnownDllPath ->
+  handles), NtQuerySymbolicLinkObject (returns C:\Windows\system32). Plus ProcessParameters gained
+  DllPath, which cleared the earlier STATUS_APP_INIT_FAILURE (0xC0000145 wrapping 0xC000000D).
+
+With these, the real LdrpInitializeProcess runs ~19-20 syscalls deep — through NLS init, process-heap
+creation, registry, system-info, and the full **object-namespace path resolution + KnownDlls** setup
+(no more hard error). It then faults building the in-memory **module list** (a NULL local where an
+LDR_DATA_TABLE_ENTRY/image structure should be) — the remaining piece is the rest of the NT-executive
+process-creation contract (module list + LdrpMapDll bookkeeping), which the file/section handlers are
+ready to serve once reached. The boot path itself (its terminating NtContinue) stays proven by phase B:
+`ntcontinue_booted_exe_win7_version` — the real NtContinue boots the exe, exit 0x06011DB1 = 6.1.7601.

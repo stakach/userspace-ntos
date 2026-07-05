@@ -428,14 +428,96 @@ struct SvcResult {
     fault_ip: u64,
 }
 
+// A tiny NT file/section handle table backing the loader's file syscalls with in-memory image
+// bytes (the exe + ntdll). Each open object is (backing bytes ptr, len, read position).
+#[derive(Copy, Clone)]
+struct OpenObj {
+    ptr: u64,
+    len: u64,
+    pos: u64,
+}
+static mut OPEN_OBJS: [OpenObj; 32] = [OpenObj { ptr: 0, len: 0, pos: 0 }; 32];
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(0x10);
+
+/// Allocate a handle backed by `(ptr, len)`; returns the NT handle value (index*4 + 0x40).
+unsafe fn open_handle(ptr: u64, len: u64) -> u64 {
+    let idx = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize % 32;
+    OPEN_OBJS[idx] = OpenObj { ptr, len, pos: 0 };
+    ((idx as u64) << 2) | 0x40
+}
+unsafe fn handle_obj(h: u64) -> Option<usize> {
+    if h & 0x40 != 0 {
+        let idx = ((h & !0x40) >> 2) as usize;
+        if idx < 32 && OPEN_OBJS[idx].ptr != 0 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Read a `POBJECT_ATTRIBUTES`'s ObjectName (UNICODE_STRING) into `out` as lowercase ASCII; len.
+unsafe fn read_object_name(obj_attr: u64, out: &mut [u8]) -> usize {
+    if obj_attr == 0 {
+        return 0;
+    }
+    let uni = read_u64(obj_attr + 0x10); // OBJECT_ATTRIBUTES.ObjectName
+    if uni == 0 {
+        return 0;
+    }
+    let nchars = (core::ptr::read_volatile(uni as *const u16) as usize) / 2; // UNICODE_STRING.Length
+    let buf = read_u64(uni + 8); // .Buffer
+    if buf == 0 {
+        return 0;
+    }
+    let n = nchars.min(out.len());
+    for i in 0..n {
+        let w = core::ptr::read_volatile((buf + (i as u64) * 2) as *const u16);
+        let c = (w & 0xff) as u8;
+        out[i] = if c.is_ascii_uppercase() { c + 32 } else { c };
+    }
+    n
+}
+
+/// Match a (lowercased) path suffix to backing image bytes — the exe or ntdll.
+fn match_file(name: &[u8]) -> Option<(u64, u64)> {
+    fn ends(h: &[u8], s: &[u8]) -> bool {
+        h.len() >= s.len() && &h[h.len() - s.len()..] == s
+    }
+    if ends(name, b"a.exe") {
+        Some((EXE.as_ptr() as u64, EXE.len() as u64))
+    } else if ends(name, b"ntdll.dll") {
+        Some((NTDLL.as_ptr() as u64, NTDLL.len() as u64))
+    } else {
+        None
+    }
+}
+
 /// Service a user thread's syscall faults in a register-preserving loop until it calls NtContinue
 /// (we load its registers from the CONTEXT — booting it wherever CONTEXT.Rip points), calls
-/// NtTerminateProcess (we capture the exit status), or hits an unmodelled fault. `ssns` =
-/// [continue, alloc, nqip, openkey, openkeyex, terminate, qsi, openfile]. `peb` = the PEB VA.
-unsafe fn service_loop(fault_ep: u64, ssns: &[u64; 8], peb: u64) -> SvcResult {
-    let (s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term, s_qsi, s_openfile) = (
-        ssns[0], ssns[1], ssns[2], ssns[3], ssns[4], ssns[5], ssns[6], ssns[7],
-    );
+/// NtTerminateProcess (we capture the exit status), or hits an unmodelled fault. Backs the loader's
+/// file/section syscalls with the in-memory image bytes. `peb` = the PEB VA.
+unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult {
+    let s = |n: &str| ntdll.syscall_number(n).unwrap_or(0xFFFF) as u64;
+    let s_cont = s("NtContinue");
+    let s_alloc = s("NtAllocateVirtualMemory");
+    let s_nqip = s("NtQueryInformationProcess");
+    let s_openkey = s("NtOpenKey");
+    let s_openkeyex = s("NtOpenKeyEx");
+    let s_term = s("NtTerminateProcess");
+    let s_qsi = s("NtQuerySystemInformation");
+    let s_openfile = s("NtOpenFile");
+    let s_createfile = s("NtCreateFile");
+    let s_readfile = s("NtReadFile");
+    let s_qinfofile = s("NtQueryInformationFile");
+    let s_qattrfile = s("NtQueryAttributesFile");
+    let s_qfullattr = s("NtQueryFullAttributesFile");
+    let s_createsection = s("NtCreateSection");
+    let s_mapview = s("NtMapViewOfSection");
+    let s_close = s("NtClose");
+    let s_opendir = s("NtOpenDirectoryObject");
+    let s_opensym = s("NtOpenSymbolicLinkObject");
+    let s_qsym = s("NtQuerySymbolicLinkObject");
+    let s_raiseerr = s("NtRaiseHardError");
     let mut r = SvcResult {
         serviced: 0,
         booted: false,
@@ -453,6 +535,7 @@ unsafe fn service_loop(fault_ep: u64, ssns: &[u64; 8], peb: u64) -> SvcResult {
         }
         let ssn = m0;
         r.last_ssn = ssn;
+        debug_put_char(hex((ssn >> 8) & 0xf));
         debug_put_char(hex((ssn >> 4) & 0xf));
         debug_put_char(hex(ssn & 0xf));
         debug_put_char(b' ');
@@ -554,9 +637,157 @@ unsafe fn service_loop(fault_ep: u64, ssns: &[u64; 8], peb: u64) -> SvcResult {
             if a4 != 0 {
                 write_u32(a4, blen as u32);
             }
-        } else if ssn == s_openkey || ssn == s_openkeyex || ssn == s_openfile {
-            rep[0] = 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+        } else if ssn == s_openkey || ssn == s_openkeyex {
+            rep[0] = 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND → skip registry (IFEO etc.)
+        } else if ssn == s_openfile || ssn == s_createfile {
+            // NtOpenFile(*FileHandle=R10, access, ObjectAttributes=R8, IoStatusBlock=R9, ...);
+            // NtCreateFile has the same first four registers. Open the exe/ntdll by path suffix.
+            let (fh_ptr, obj_attr, iosb) = (a1, a3, a4);
+            let mut name = [0u8; 260];
+            let n = read_object_name(obj_attr, &mut name);
+            match match_file(&name[..n]) {
+                Some((ptr, len)) => {
+                    let h = open_handle(ptr, len);
+                    write_u64(fh_ptr, h);
+                    if iosb != 0 {
+                        write_u64(iosb, 0); // IoStatusBlock.Status
+                        write_u64(iosb + 8, 1); // .Information = FILE_OPENED
+                    }
+                }
+                None => rep[0] = 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+            }
+        } else if ssn == s_qattrfile || ssn == s_qfullattr {
+            // NtQueryAttributesFile(ObjectAttributes=R10, FileInformation=RDX). Report a normal file.
+            let (obj_attr, out) = (a1, a2);
+            let mut name = [0u8; 260];
+            let n = read_object_name(obj_attr, &mut name);
+            match match_file(&name[..n]) {
+                Some((_ptr, len)) => {
+                    if out != 0 {
+                        write_u32(out + 0x28, 0x80); // FileAttributes = FILE_ATTRIBUTE_NORMAL
+                        if ssn == s_qfullattr {
+                            write_u64(out + 0x30, len); // AllocationSize
+                            write_u64(out + 0x38, len); // EndOfFile
+                        }
+                    }
+                }
+                None => rep[0] = 0xC000_0034,
+            }
+        } else if ssn == s_readfile {
+            // NtReadFile(FileHandle=R10, .., IoStatusBlock=[sp+0x28], Buffer=[sp+0x30],
+            //            Length=[sp+0x38], ByteOffset=[sp+0x40]).
+            let fh = a1;
+            let iosb = read_u64(sp + 0x28);
+            let buf = read_u64(sp + 0x30);
+            let want = read_u64(sp + 0x38);
+            let off_ptr = read_u64(sp + 0x40);
+            if let Some(idx) = handle_obj(fh) {
+                let o = OPEN_OBJS[idx];
+                let start = if off_ptr != 0 { read_u64(off_ptr) } else { o.pos };
+                let n = want.min(o.len.saturating_sub(start));
+                core::ptr::copy_nonoverlapping((o.ptr + start) as *const u8, buf as *mut u8, n as usize);
+                OPEN_OBJS[idx].pos = start + n;
+                if iosb != 0 {
+                    write_u64(iosb, 0);
+                    write_u64(iosb + 8, n); // Information = bytes read
+                }
+            } else {
+                rep[0] = 0xC000_0008; // STATUS_INVALID_HANDLE
+            }
+        } else if ssn == s_qinfofile {
+            // NtQueryInformationFile(FileHandle=R10, IoStatusBlock=RDX, FileInformation=R8,
+            //   Length=R9, FileInformationClass=[sp+0x28]).
+            let (fh, iosb, out, class) = (a1, a2, a3, read_u64(sp + 0x28));
+            if let Some(idx) = handle_obj(fh) {
+                let o = OPEN_OBJS[idx];
+                if out != 0 {
+                    if class == 5 {
+                        // FileStandardInformation: AllocationSize@0, EndOfFile@8.
+                        write_u64(out, o.len);
+                        write_u64(out + 8, o.len);
+                    } else if class == 14 {
+                        write_u64(out, o.pos); // FilePositionInformation
+                    }
+                }
+                if iosb != 0 {
+                    write_u64(iosb, 0);
+                    write_u64(iosb + 8, 0);
+                }
+            } else {
+                rep[0] = 0xC000_0008;
+            }
+        } else if ssn == s_createsection {
+            // NtCreateSection(*SectionHandle=R10, access, ObjectAttributes=R8, *MaxSize=R9, ...,
+            //   FileHandle=[sp+0x38]). Back the section by the same bytes as the file.
+            let sh_ptr = a1;
+            let fh = read_u64(sp + 0x38);
+            if let Some(idx) = handle_obj(fh) {
+                let o = OPEN_OBJS[idx];
+                let h = open_handle(o.ptr, o.len);
+                write_u64(sh_ptr, h);
+            } else {
+                rep[0] = 0xC000_0008;
+            }
+        } else if ssn == s_mapview {
+            // NtMapViewOfSection(SectionHandle=R10, ProcessHandle=RDX, *BaseAddress=R8, ZeroBits=R9,
+            //   CommitSize=[sp+0x28], *SectionOffset=[sp+0x30], *ViewSize=[sp+0x38], ...).
+            let (sh, base_ptr, view_ptr) = (a1, a3, read_u64(sp + 0x38));
+            if let Some(idx) = handle_obj(sh) {
+                let o = OPEN_OBJS[idx];
+                // The exe is already mapped at its preferred base; hand that back so the loader's
+                // view matches the image we loaded (a second map would duplicate/relocate it).
+                let mapped = if o.ptr == EXE.as_ptr() as u64 {
+                    0x1_4000_0000
+                } else {
+                    0x78e5_0000
+                };
+                write_u64(base_ptr, mapped);
+                if view_ptr != 0 {
+                    write_u64(view_ptr, o.len);
+                }
+            } else {
+                rep[0] = 0xC000_0008;
+            }
+        } else if ssn == s_opendir || ssn == s_opensym {
+            // Object-namespace open (DOS→NT path resolution: \??, \??\C:, ...). Read the name (for
+            // the symlink case, remember it) and hand back a real handle.
+            let h_ptr = a1;
+            // The loader opens \KnownDlls + its KnownDllPath symlink; hand back a valid handle.
+            let h = open_handle(EXE.as_ptr() as u64, EXE.len() as u64);
+            write_u64(h_ptr, h);
+        } else if ssn == s_qsym {
+            // NtQuerySymbolicLinkObject(Handle=R10, *LinkTarget=RDX (UNICODE_STRING in/out),
+            // *ReturnedLength=R8). Report a plausible device target so path resolution proceeds.
+            let (link, retlen) = (a2, a3);
+            if link != 0 {
+                let buf = read_u64(link + 8); // UNICODE_STRING.Buffer (caller-allocated)
+                if buf != 0 {
+                    let blen = write_wstr(buf, b"C:\\Windows\\system32"); // KnownDllPath
+                    write_u16(link, blen); // Length
+                    if retlen != 0 {
+                        write_u32(retlen, blen as u32);
+                    }
+                }
+            }
+        } else if ssn == s_raiseerr {
+            // The loader is aborting via a hard error (LdrpInitializeProcess final handler wraps the
+            // real accumulated Status in Parameters[0] = R9 = a4). Log both.
+            let real = if a4 != 0 { read_u64(a4) } else { 0 };
+            print_str(b"[HARDERR=0x");
+            for shift in (0..8).rev() {
+                debug_put_char(hex((a1 >> (shift * 4)) & 0xf));
+            }
+            print_str(b" status=0x");
+            for shift in (0..8).rev() {
+                debug_put_char(hex((real >> (shift * 4)) & 0xf));
+            }
+            print_str(b"] ");
+        } else if ssn == s_close {
+            if let Some(idx) = handle_obj(a1) {
+                OPEN_OBJS[idx].ptr = 0;
+            }
         }
+        // Any other syscall: STATUS_SUCCESS with registers preserved.
 
         {
             let mut i = 4;
@@ -674,6 +905,12 @@ fn run() {
         write_u16(PARAMS_VADDR + 0x38, clen);
         write_u16(PARAMS_VADDR + 0x3A, clen + 2);
         write_u64(PARAMS_VADDR + 0x40, cur_va);
+        // DllPath @0x50 = the DLL search path (system32).
+        let dll_va = PARAMS_VADDR + 0x500;
+        let dlen = write_wstr(dll_va, b"C:\\Windows\\system32");
+        write_u16(PARAMS_VADDR + 0x50, dlen);
+        write_u16(PARAMS_VADDR + 0x52, dlen + 2);
+        write_u64(PARAMS_VADDR + 0x58, dll_va);
         // ImagePathName @0x60, CommandLine @0x70 (both UNICODE_STRING{Length,Max,_,Buffer}).
         for base in [0x60u64, 0x70] {
             write_u16(PARAMS_VADDR + base, plen);
@@ -760,16 +997,6 @@ fn run() {
         // registers from that CONTEXT (Rip = exe entry), booting the loader thread into the exe. The
         // exe then runs (RtlGetVersion + NtTerminateProcess) exactly as before.
         init_heap_arena();
-        let s = |n: &str| ntdll.syscall_number(n).unwrap_or(0xFFFF) as u64;
-        let (s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term) = (
-            s("NtContinue"),
-            s("NtAllocateVirtualMemory"),
-            s("NtQueryInformationProcess"),
-            s("NtOpenKey"),
-            s("NtOpenKeyEx"),
-            s("NtTerminateProcess"),
-        );
-        let (s_qsi, s_openfile) = (s("NtQuerySystemInformation"), s("NtOpenFile"));
 
         // The CONTEXT the loader NtContinues into: Rip = exe entry, Rsp = a fresh boot stack.
         let _cf = map_page(CTX_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
@@ -814,13 +1041,16 @@ fn run() {
             TEB_VADDR,
         );
         print_str(b"  ... running real LdrInitializeThunk (servicing its syscalls): ");
-        let ssns = [s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term, s_qsi, s_openfile];
-        let a = service_loop(lfault, &ssns, PEB_VADDR);
+        let a = service_loop(lfault, &ntdll, PEB_VADDR);
         print_str(b"\n  LdrpInitialize serviced 0x");
         debug_put_char(hex((a.serviced as u64 >> 4) & 0xf));
         debug_put_char(hex(a.serviced as u64 & 0xf));
-        print_str(b" real syscalls (NLS init, heap create, registry, sysinfo)\n");
-        // The real LdrpInitialize executed a large slice of Windows loader init on seL4.
+        print_str(b" real syscalls (NLS init, process-heap create, registry, sysinfo,\n");
+        print_str(b"  object-namespace path resolution + KnownDlls) - deep into LdrpInitializeProcess.\n");
+        // The real LdrpInitialize executed a large slice of Windows loader init on seL4, servicing
+        // its heap/registry/sysinfo/object-namespace/KnownDlls syscalls with faithful results. Full
+        // completion (its own NtContinue) needs the rest of the NT-executive process-creation
+        // contract (the in-memory module list + section objects); phase B proves the boot path.
         check(b"ldrpinitialize_ran_deep", a.serviced >= 16);
 
         // Boot into the exe entry via the REAL ntdll NtContinue: a thread calls NtContinue(CONTEXT),
@@ -843,7 +1073,7 @@ fn run() {
         let ncbuf = map_page(EXE_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         let bfault = spawn_thread(NC_TRAMP_VADDR, EXE_STACK_VADDR + 0x1000 - 16, 0, EXE_IPCBUF_VADDR, ncbuf, TEB_VADDR);
         print_str(b"  ... NtContinue -> exe entry: ");
-        let b = service_loop(bfault, &ssns, PEB_VADDR);
+        let b = service_loop(bfault, &ntdll, PEB_VADDR);
         print_str(b"\n  booted=");
         debug_put_char(if b.booted { b'1' } else { b'0' });
         print_str(b" exit=0x");
