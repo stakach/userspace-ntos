@@ -924,6 +924,20 @@ fn run() {
         load_image(&pe, NTDLL, ntdll_base, frames, &mut NTDLL_FRAME_CAPS);
         check(b"ntdll_text_mapped_executable", true);
 
+        // Pre-populate ntdll's entry in RtlpInvertedFunctionTable (its exception-unwind lookup, in
+        // ntdll .data — RW after load_image). The loader does an early stack walk (RtlLookupFunction
+        // Entry) before it registers modules itself; with the table empty the lookup returns NULL and
+        // the walk NULL-derefs. Offsets are gdb-resolved for this Win7 SP1 ntdll: table @ +0x12F000
+        // {CurrentSize@0, Max@4, _@8, Entry[]@0x10}, entry {FunctionTable@0, ImageBase@8, SizeOfImage@
+        // 0x10, SizeOfTable@0x14}; init guard byte @ +0x12D089; .pdata @ +0x13B000 size 0x127BC.
+        let inv = ntdll_base + 0x12_f000;
+        core::ptr::write_volatile((ntdll_base + 0x12_d089) as *mut u8, 1); // init guard = done
+        write_u32(inv + 0x00, 1); // CurrentSize
+        write_u64(inv + 0x10, ntdll_base + 0x13_b000); // Entry[0].FunctionTable (.pdata)
+        write_u64(inv + 0x18, ntdll_base); // Entry[0].ImageBase
+        write_u32(inv + 0x20, pe.size_of_image()); // Entry[0].SizeOfImage
+        write_u32(inv + 0x24, 0x1_27bc); // Entry[0].SizeOfTable
+
         // 2. The trampoline (executable), a stack + IPC buffer.
         let tp = map_page(TRAMP_VADDR, RIGHTS_RW);
         core::ptr::copy_nonoverlapping(tramp.as_ptr(), TRAMP_VADDR as *mut u8, tramp_len);

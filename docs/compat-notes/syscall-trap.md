@@ -243,3 +243,21 @@ debugging. With it, the current fault resolves to: `0x78e8c966 mov (%rax),%r8d` 
 `0x23a80`) that's empty in this from-scratch environment. That's an ntdll-internal init dependency —
 the next layer to chase with gdb. Merge status: loader runs deeper still; boot path stays proven by
 phase B (real NtContinue → exe, exit 0x06011DB1).
+
+## gdb: the empty table is RtlpInvertedFunctionTable; pre-populated; fault advances
+
+Stepping into `0x27c20` with the gdb stub showed it's `RtlpLookupFunctionEntry` — a binary search over
+`RtlpInvertedFunctionTable` (the exception-unwind image table, 24-byte entries `{FunctionTable, ImageBase,
+SizeOfImage, SizeOfTable}`), and `CurrentSize`=**0**. The loader (fault fn `0x3c900`, called with
+`rcx`=&`LdrpInvertedFunctionTable`) does an early **stack walk** (`RtlLookupFunctionEntry` loop) *before*
+it registers ntdll in the table, so every lookup returns NULL and the walk NULL-derefs (`rbp` held
+`RtlRaiseException` — it was building an error/stack capture).
+
+Fix (in ntdll `.data`, RW after load): pre-populate ntdll's entry — `CurrentSize`=1 + `{.pdata VA,
+ntdll_base, SizeOfImage, .pdata size}` at gdb-resolved offsets (table @ +0x12F000, guard @ +0x12D089).
+gdb confirms it took: `CurrentSize` is now **3** (my ntdll entry at [0]; the loader appended two more
+itself — so the format is right and its own registration now runs). The fault **advanced**: it's now a
+lookup of **PC=0** — the loader's stack walk unwinds past our injected trampoline (which has no unwind
+info) into a zeroed stack slot. Next step: give the loader thread a proper unwind terminator (start it
+so the frame chain ends cleanly at a ntdll thread-start frame, rather than a raw `call` trampoline), or
+set RCX/RDX via a full TCB_WriteRegisters and start directly at `LdrInitializeThunk`.
