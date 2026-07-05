@@ -261,3 +261,25 @@ lookup of **PC=0** — the loader's stack walk unwinds past our injected trampol
 info) into a zeroed stack slot. Next step: give the loader thread a proper unwind terminator (start it
 so the frame chain ends cleanly at a ntdll thread-start frame, rather than a raw `call` trampoline), or
 set RCX/RDX via a full TCB_WriteRegisters and start directly at `LdrInitializeThunk`.
+
+## Trampoline removed (direct entry); the loader populates the inverted table itself
+
+The loader thread now starts **directly at `LdrInitializeThunk`** (RCX=Context, RDX=ntdll base) via a
+full `TCB_WriteRegisters` (`tcb_write_registers_full` / `spawn_thread_win64`) — no trampoline. A
+trampoline is a leaf with no unwind info; removing it is correct hygiene for the loader's exception
+machinery.
+
+That change (plus gdb) showed the earlier "empty table" diagnosis was incomplete: with the direct
+entry, the loader's own lazy-init **populates `RtlpInvertedFunctionTable` itself** — gdb shows
+`CurrentSize`=2 with a correct ntdll entry `{FunctionTable=.pdata VA 0x78f8b000, ImageBase=ntdll_base,
+SizeOfImage=0x1aa000, SizeOfTable=0x127bc}` and the exe entry. So the manual pre-population was
+unnecessary and has been removed.
+
+The remaining blocker is precisely characterised: fault fn `0x3c900` is a **critical-loader-functions
+validation loop** iterating a NULL-terminated table of ntdll function pointers (at `0x78f4fb68`),
+calling `RtlLookupFunctionEntry` on each and storing `{ImageBase, RUNTIME_FUNCTION*}`. For the first
+entry (PC `0x78e67910`, rva 0x17910) `RtlLookupFunctionEntry` returns **NULL and the loop derefs it** —
+even though gdb confirms the inverted table is correctly populated, ntdll's entry covers that PC, and
+ntdll's `.pdata` has a valid RUNTIME_FUNCTION (RF[881], Begin=0x17910). So the lookup's search
+execution is going wrong despite correct inputs — the next single-step target (its binary-search /
+`.pdata` count path), for a future gdb session.

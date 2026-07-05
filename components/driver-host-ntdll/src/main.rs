@@ -380,6 +380,43 @@ unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
     (badge, msginfo, mr0, mr1, mr2, mr3)
 }
 
+/// Full TCB_WriteRegisters: set RIP, RSP, RFLAGS, RCX, RDX (the Win64 entry args) via the upstream
+/// length>0 ABI. mr2=rip, mr3=rsp; msg[4..8] = rflags, rax, rbx, rcx, rdx (seL4_UserContext order).
+unsafe fn tcb_write_registers_full(tcb: u64, rip: u64, rsp: u64, arg_rcx: u64, arg_rdx: u64) {
+    set_reply_mr(4, 0x202); // rflags (IF + reserved)
+    set_reply_mr(5, 0); // rax
+    set_reply_mr(6, 0); // rbx
+    set_reply_mr(7, arg_rcx); // rcx
+    set_reply_mr(8, arg_rdx); // rdx
+    let msginfo = (LBL_TCB_WRITE_REGISTERS << 12) | 9; // length 9 (msg[0..8])
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") tcb,
+        in("rsi") msginfo,
+        in("r10") 0u64,  // mr0 = resume(0) | arch_flags(0)
+        in("r8") 7u64,   // mr1 = count (regs 0..6 = rip,rsp,rflags,rax,rbx,rcx,rdx)
+        in("r9") rip,    // mr2 = rip
+        in("r15") rsp,   // mr3 = rsp
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// Spawn a thread directly at a Win64 entry (`rip`) with `rcx`/`rdx` args and a proper stack whose
+/// top slot is 0, so an exception-unwind stack walk terminates at this frame. Returns the fault EP.
+unsafe fn spawn_thread_win64(rip: u64, stack_top: u64, rcx: u64, rdx: u64, ipcbuf_va: u64, ipcbuf: u64, gs_base: u64) -> u64 {
+    let fault_ep = make_object(OBJ_ENDPOINT);
+    let tcb = make_object(OBJ_TCB);
+    let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
+    tcb_write_registers_full(tcb, rip, stack_top, rcx, rdx);
+    let _ = tcb_set_gs_base(tcb, gs_base);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    fault_ep
+}
+
 /// Spawn a user thread sharing the root's CSpace/VSpace at `entry` with `stack_top`, `arg0` in RDI,
 /// a fault endpoint (returned), an IPC buffer, and `%gs` = `gs_base`. Returns the fault endpoint.
 unsafe fn spawn_thread(entry: u64, stack_top: u64, arg0: u64, ipcbuf_va: u64, ipcbuf: u64, gs_base: u64) -> u64 {
@@ -924,19 +961,6 @@ fn run() {
         load_image(&pe, NTDLL, ntdll_base, frames, &mut NTDLL_FRAME_CAPS);
         check(b"ntdll_text_mapped_executable", true);
 
-        // Pre-populate ntdll's entry in RtlpInvertedFunctionTable (its exception-unwind lookup, in
-        // ntdll .data — RW after load_image). The loader does an early stack walk (RtlLookupFunction
-        // Entry) before it registers modules itself; with the table empty the lookup returns NULL and
-        // the walk NULL-derefs. Offsets are gdb-resolved for this Win7 SP1 ntdll: table @ +0x12F000
-        // {CurrentSize@0, Max@4, _@8, Entry[]@0x10}, entry {FunctionTable@0, ImageBase@8, SizeOfImage@
-        // 0x10, SizeOfTable@0x14}; init guard byte @ +0x12D089; .pdata @ +0x13B000 size 0x127BC.
-        let inv = ntdll_base + 0x12_f000;
-        core::ptr::write_volatile((ntdll_base + 0x12_d089) as *mut u8, 1); // init guard = done
-        write_u32(inv + 0x00, 1); // CurrentSize
-        write_u64(inv + 0x10, ntdll_base + 0x13_b000); // Entry[0].FunctionTable (.pdata)
-        write_u64(inv + 0x18, ntdll_base); // Entry[0].ImageBase
-        write_u32(inv + 0x20, pe.size_of_image()); // Entry[0].SizeOfImage
-        write_u32(inv + 0x24, 0x1_27bc); // Entry[0].SizeOfTable
 
         // 2. The trampoline (executable), a stack + IPC buffer.
         let tp = map_page(TRAMP_VADDR, RIGHTS_RW);
@@ -1132,33 +1156,23 @@ fn run() {
         write_u64(CTX_VADDR + 0x98, boot_sp); // Rsp
         write_u64(CTX_VADDR + 0xF8, exe_entry); // Rip = the exe's AddressOfEntryPoint
 
-        // Loader thread trampoline. LdrInitializeThunk(Context=RCX, SystemArgument1=RDX, ...) passes
-        // SystemArgument1 through to LdrpInitializeProcess as SystemDllBase — the kernel puts ntdll's
-        // base there. So: `mov rcx, CTX; mov rdx, ntdll_base; mov rax, thunk; call rax`.
+        // Start the loader thread DIRECTLY at LdrInitializeThunk(Context=RCX, SystemArgument1=RDX)
+        // — no trampoline. A trampoline has no unwind info, so the loader's early exception-unwind
+        // stack walk would run past it into a zeroed stack slot (PC=0 fault). Entering ntdll directly
+        // makes LdrInitializeThunk the bottom frame; unwinding it reads [stack_top]=0 (zeroed frame),
+        // so the walk terminates cleanly. RCX/RDX are set via a full TCB_WriteRegisters.
         let thunk_rva = exports.iter().find(|e| e.name == "LdrInitializeThunk").unwrap().rva;
         let thunk_addr = ntdll_base + thunk_rva as u64;
-        let mut lt = [0u8; 40];
-        lt[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (CONTEXT*)
-        lt[2..10].copy_from_slice(&CTX_VADDR.to_le_bytes());
-        lt[10..12].copy_from_slice(&[0x48, 0xBA]); // mov rdx, imm64 (SystemArgument1 = ntdll base)
-        lt[12..20].copy_from_slice(&ntdll_base.to_le_bytes());
-        lt[20..22].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (LdrInitializeThunk)
-        lt[22..30].copy_from_slice(&thunk_addr.to_le_bytes());
-        lt[30..32].copy_from_slice(&[0xFF, 0xD0]); // call rax
-        lt[32..34].copy_from_slice(&[0xEB, 0xFE]); // jmp $
-        let ltp = map_page(LDR_TRAMP_VADDR, RIGHTS_RW);
-        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 34);
-        let _ = page_unmap(ltp);
-        let _ = page_map(ltp, LDR_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
         let _ls = map_page(LDR_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         for p in 1..4u64 {
             let _ = map_page(LDR_STACK_VADDR + p * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         }
         let libuf = map_page(LDR_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let lfault = spawn_thread(
-            LDR_TRAMP_VADDR,
+        let lfault = spawn_thread_win64(
+            thunk_addr,
             LDR_STACK_VADDR + 4 * 0x1000 - 0x100,
-            0,
+            CTX_VADDR,   // rcx = CONTEXT*
+            ntdll_base,  // rdx = SystemArgument1 (ntdll base)
             LDR_IPCBUF_VADDR,
             libuf,
             TEB_VADDR,
