@@ -32,21 +32,36 @@ reply slot 0=RAX=result, slot 15=FaultIP+2 to skip the syscall, slots preserved)
 The component is a standalone workspace and `include_bytes!`es the gitignored ntdll, so it builds
 only via its own `build.sh` (not the default workspace build).
 
-## Full round trip (implemented)
+## Clean round trip via a reporter trampoline (implemented)
 
-The demo now also **replies to the fault** so the stub resumes with the NTSTATUS and runs to
-completion — the complete NT syscall path:
+The trap thread's entry is now a small **trampoline** (hand-assembled machine code in the same
+executable page, ahead of the copied ntdll stub), so the stub returns cleanly with no page fault:
 
-6. The handler stages a reply message (register slots via the IPC buffer at `ipc_buffer + 8 + i*8`):
-   slot 0 (RAX) = the dispatch NTSTATUS, slot 15 (FaultIP) = `STUB_VADDR + 10` — the `ret` right after
-   the `syscall` (which sits at `STUB_VADDR + 8`); slots 4..15 = 0, and SP/RFLAGS are left untouched
-   (reply length 16, so the kernel preserves the saved values). It issues `SysReplyRecv` on the fault
-   endpoint (reply + wait for the next fault in one call).
-7. The stub **resumes** at its `ret` with RAX = NTSTATUS. The `ret` pops the (zeroed) stack top and
-   jumps to RIP 0 → a **user #PF at rip=0x0** — the expected, benign consequence that *proves the
-   stub executed past the syscall*. The handler receives this second fault and verifies it is a
-   VMFault (label ≠ 2), not another UnknownSyscall (which would mean the syscall re-executed).
+```
+trampoline:
+    call stub          ; pushes a return address, then runs the real ntdll stub
+    mov  r10, rax      ; report the returned NTSTATUS as message register 0
+    mov  esi, 1        ; MessageInfo: length 1
+    mov  edx, -5       ; SYS_SEND  (a VALID seL4 syscall — does not trap)
+    syscall            ; SysSend(rdi = done_ep, mr0 = rax) — report the result
+    jmp  $
+stub:  <real ntdll NtQuerySystemInformation bytes: mov r10,rcx; mov eax,0x33; syscall; ret>
+```
 
-`stub_resumed_after_syscall` passes; the `[user #PF: ... rip=0x0]` line in the log is the resume
-proof, not an error. ntdll's own instruction stream ran, trapped, was serviced by the NT
-personality, and resumed — the real syscall path end to end.
+Flow:
+1. The thread starts at the trampoline. `call stub` pushes a return address and enters the real
+   ntdll stub.
+2. The stub's `syscall` traps → UnknownSyscall fault → the handler recovers the SSN (RAX, `msg[0]`)
+   and dispatches it through the Windows-7 service table → NtQuerySystemInformation → subsystems.
+3. The handler **replies** (`SysReplyRecv`, length 16): slot 0 (RAX) = the result, slot 15 (FaultIP)
+   = the stub's `ret` (`STUB_VADDR + STUB_OFF + 10`), slot 5 (RDI) = `done_ep` (preserved for the
+   trampoline's Send); SP/RFLAGS are left untouched, so the `call`'s pushed return address is intact.
+4. The stub's `ret` returns to the trampoline (clean — the stack holds the pushed return address).
+5. The trampoline issues a **real seL4 `SysSend`** to `done_ep` reporting RAX. This is a valid seL4
+   syscall (number in RDX = -5), so it does *not* trap.
+6. The root receives the report on `done_ep` (the same `SysReplyRecv` that resumed the thread), and
+   confirms the value round-tripped.
+
+QEMU: `ntdll_parsed` + `ntdll_syscall_trapped` + `trapped_syscall_dispatched` +
+`stub_resumed_clean_and_reported` — **no page fault**. ntdll's real code runs, its syscall traps and
+is serviced, it resumes and returns, and reports its result — a clean NT syscall round trip on seL4.

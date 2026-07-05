@@ -42,6 +42,37 @@ const RIGHTS_RW: u64 = 0b011; // read/write, executable (for loading)
 const RIGHTS_RO_X: u64 = 0b010; // read-only, executable (the stub)
 const RIGHTS_RW_NX: u64 = 0b011 | PAGE_EXECUTE_NEVER;
 
+/// Offset of the real ntdll stub within the executable page (after the trampoline).
+const STUB_OFF: usize = 22;
+/// The value we inject into RAX in the fault reply — the "NTSTATUS" the stub returns to the
+/// trampoline, which reports it back so we can confirm the whole round trip carried our value.
+const REPORT_SENTINEL: u64 = 0x5EC0_FFEE;
+
+/// Build the trap thread's code page: a trampoline that `call`s the real ntdll `stub` (so the
+/// stub's `ret` returns cleanly), then reports RAX via a real seL4 `SysSend(rdi=done_ep, mr0=rax)`
+/// — a *valid* seL4 syscall, so it does not trap. `stub` is placed at [`STUB_OFF`].
+fn build_trap_code(stub: &[u8]) -> ([u8; 64], usize) {
+    let mut code = [0u8; 64];
+    // call stub (E8 rel32); the stub sits at STUB_OFF, the next instruction is at offset 5.
+    code[0] = 0xE8;
+    code[1..5].copy_from_slice(&((STUB_OFF as i32) - 5).to_le_bytes());
+    // mov r10, rax  — mr0 = the NTSTATUS the stub returned.
+    code[5..8].copy_from_slice(&[0x49, 0x89, 0xC2]);
+    // mov esi, 1    — MessageInfo: length 1, label 0.
+    code[8] = 0xBE;
+    code[9..13].copy_from_slice(&1u32.to_le_bytes());
+    // mov edx, -5   — SYS_SEND (the kernel reads the seL4 syscall number from RDX as i32).
+    code[13] = 0xBA;
+    code[14..18].copy_from_slice(&0xFFFF_FFFBu32.to_le_bytes());
+    // syscall       — real seL4 Send to done_ep (rdi), reporting RAX.
+    code[18..20].copy_from_slice(&[0x0F, 0x05]);
+    // jmp $         — spin after reporting.
+    code[20..22].copy_from_slice(&[0xEB, 0xFE]);
+    // The real ntdll syscall stub (mov r10,rcx; mov eax,<ssn>; syscall; ret).
+    code[STUB_OFF..STUB_OFF + stub.len()].copy_from_slice(stub);
+    (code, STUB_OFF + stub.len())
+}
+
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -152,29 +183,34 @@ fn run() {
     let pe = PeFile::parse(NTDLL).unwrap();
     let stub = pe.bytes_at_rva(export_rva, 16).unwrap();
 
+    let (code, code_len) = build_trap_code(stub);
+
     unsafe {
-        // 1. Map an executable page + copy ntdll's real stub bytes into it.
-        let code = map_page(STUB_VADDR, RIGHTS_RW);
-        core::ptr::copy_nonoverlapping(stub.as_ptr(), STUB_VADDR as *mut u8, stub.len());
+        // 1. Map an executable page + copy the trampoline + real ntdll stub into it.
+        let page = map_page(STUB_VADDR, RIGHTS_RW);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), STUB_VADDR as *mut u8, code_len);
         // Re-map read-only + executable (W^X) so the CPU can fetch + run it.
-        let _ = page_unmap(code);
-        let _ = page_map(code, STUB_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
+        let _ = page_unmap(page);
+        let _ = page_map(page, STUB_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
 
         // 2. Stack + IPC buffer for the trap thread.
         let _stack = map_page(STACK_VADDR, RIGHTS_RW_NX);
         let stack_top = STACK_VADDR + 0x1000 - 16;
         let ipcbuf = map_page(CHILD_IPCBUF_VADDR, RIGHTS_RW_NX);
 
-        // 3. A fault endpoint + the trap thread (shares the root's CSpace/VSpace).
+        // 3. A fault endpoint (for the syscall trap) + a done endpoint (for the trampoline's
+        //    result report) + the trap thread (shares the root's CSpace/VSpace).
         let fault_ep = make_object(OBJ_ENDPOINT);
+        let done_ep = make_object(OBJ_ENDPOINT);
         let tcb = make_object(OBJ_TCB);
         let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
         let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CHILD_IPCBUF_VADDR, ipcbuf, 0);
-        let _ = tcb_write_registers(tcb, STUB_VADDR, stack_top, 0);
+        // Entry = the trampoline (offset 0); RDI (arg0) = done_ep for its `SysSend`.
+        let _ = tcb_write_registers(tcb, STUB_VADDR, stack_top, done_ep);
         attach_sched_context(tcb);
 
-        // 4. Run it. The stub executes `mov r10,rcx; mov eax,0x33; syscall` — the syscall traps
-        //    into seL4, which raises an UnknownSyscall fault delivered to our fault endpoint.
+        // 4. Run it. The trampoline `call`s the stub; the stub's `mov eax,0x33; syscall` traps into
+        //    seL4, which raises an UnknownSyscall fault delivered to our fault endpoint.
         let _ = tcb_resume(tcb);
         print_str(b"  ... resumed trap thread; waiting for ntdll's syscall to trap\n");
         let (_z, _badge, msginfo, mr0) = ep_recv(fault_ep);
@@ -193,6 +229,7 @@ fn run() {
         } else {
             0
         };
+        let _ = result;
         check(
             b"trapped_syscall_dispatched",
             dispatcher.table().lookup(trapped_ssn as u32).map(|e| e.service)
@@ -200,21 +237,19 @@ fn run() {
                 && procs == 1,
         );
 
-        // 7. Complete the round trip: reply so the stub RESUMES with the NTSTATUS in RAX and
-        //    executes its `ret`. The `syscall` is at STUB_VADDR+8, so the resume IP is the `ret` at
-        //    STUB_VADDR+10 (reply register slot 15 = FaultIP). Slots 4..15 are staged to 0; the
-        //    saved SP/RFLAGS are preserved (we send length 16, so slots 16/17 are untouched).
+        // 7. Reply so the stub RESUMES with our value in RAX and runs its `ret` back into the
+        //    trampoline. The `syscall` is at STUB_OFF+8, so the resume IP is the `ret` at STUB_OFF+10
+        //    (reply slot 15 = FaultIP). Slot 5 = RDI = done_ep (preserved for the trampoline's Send);
+        //    slots 4/6..15 = 0; SP/RFLAGS are preserved (reply length 16). Then recv the trampoline's
+        //    clean result report on `done_ep` — no page fault.
         for i in 4..15 {
             set_reply_mr(i, 0);
         }
-        set_reply_mr(15, STUB_VADDR + 10); // FaultIP → the `ret` after the syscall
-        let ntstatus = result.status as u64; // RAX the stub returns to its caller
-        // ReplyRecv: resume the faulter + wait for its next fault (the `ret` jumps to [SP]=0 → #PF).
-        let (_b2, msginfo2, _mr0b) = reply_recv(fault_ep, 16, ntstatus, 0, 0, 0);
-        let label2 = msginfo2 >> 12;
-        // A *different* fault (VMFault, label != 2) proves the stub resumed past the syscall and ran
-        // `ret`; another UnknownSyscall (label 2) would mean it re-executed the syscall (no resume).
-        check(b"stub_resumed_after_syscall", label2 != 2);
+        set_reply_mr(5, done_ep); // RDI → done_ep (survives the reply into the trampoline)
+        set_reply_mr(15, STUB_VADDR + STUB_OFF as u64 + 10); // FaultIP → the `ret`
+        let (_b2, _mi2, reported) = reply_recv(done_ep, 16, REPORT_SENTINEL, 0, 0, 0);
+        // The trampoline reported RAX back over IPC: a clean resume (no fault) carrying our value.
+        check(b"stub_resumed_clean_and_reported", reported == REPORT_SENTINEL);
     }
 }
 
