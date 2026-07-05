@@ -5,6 +5,11 @@ name = "ntos-configuration-manager"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Embed + load the real Windows 7 references/ntdll.dll (gitignored, ~1.7MB) and drive its
+# syscall stubs bare-metal. Off by default so the standard build needs no external artifact.
+real-ntdll = []
+
 [dependencies]
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }

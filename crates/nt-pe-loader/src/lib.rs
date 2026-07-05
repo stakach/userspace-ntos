@@ -181,6 +181,13 @@ impl<'a> PeFile<'a> {
         exports::parse_exports(self.bytes, &self.headers, &self.sections)
     }
 
+    /// Read `len` raw file bytes at `rva` (via the section table), without materialising a full
+    /// mapped image — enough to inspect an export's code (e.g. a syscall stub).
+    pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&[u8]> {
+        let off = rva::rva_to_file_offset(&self.sections, rva).ok()?;
+        self.bytes.get(off..off + len)
+    }
+
     /// Parse the base-relocation table (spec §7.2).
     pub fn relocations(&self) -> Result<alloc::vec::Vec<Relocation>, PeError> {
         relocs::parse_relocations(self.bytes, &self.headers, &self.sections)

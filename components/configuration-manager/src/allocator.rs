@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 // The bump allocator never reclaims, and this component now exercises the whole config/storage
 // stack in one run (registry + persistence snapshots + hive images + MemFs files + cache pages),
-// so the cumulative high-water mark needs headroom.
+// so the cumulative high-water mark needs headroom. The `real-ntdll` demo parses the ntdll export
+// table (no full image map), so it stays within the same budget.
 const HEAP_SIZE: usize = 512 * 1024;
 
 #[repr(align(16))]

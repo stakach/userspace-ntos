@@ -560,6 +560,30 @@ fn run() {
         b"userhost_syscall_dispatch",
         query_answer == 42 && sys_time == 0x01DA_0000_0000_0000 && av.status == NT_SUCCESS,
     );
+
+    // --- The REAL unmodified Windows 7 ntdll.dll, loaded + driven bare-metal (feature-gated) -----
+    #[cfg(feature = "real-ntdll")]
+    {
+        // references/ntdll.dll is gitignored; embed it only when the feature is on.
+        let ntdll_bytes: &[u8] = include_bytes!("../../../references/ntdll.dll");
+        match nt_user_host::NtdllImage::load(ntdll_bytes, 0x1_8000_0000) {
+            Ok(img) => {
+                // The real image parsed: hundreds of syscall stubs, numbers = the Win7 SSDT.
+                let loaded_ok = img.syscall_stub_count() > 300
+                    && img.syscall_number("NtClose") == Some(0x0C)
+                    && img.syscall_number("NtQuerySystemInformation") == Some(0x33);
+                check(b"real_ntdll_loaded", loaded_ok);
+                // Execute the real NtQuerySystemInformation export stub — its own eax immediate
+                // (0x33) drives the dispatch through the wired subsystems.
+                let rd = NativeSyscallDispatcher::new(img.service_table());
+                let ro = SyscallOrigin::new(host.process_id(), host.main_thread_id(), NtMode::UserMode);
+                let si = img.invoke(&rd, "NtQuerySystemInformation", &[0, 0, 0, 0], &ro, &mut ks);
+                let procs = u32::from_le_bytes([si.output[0], si.output[1], si.output[2], si.output[3]]);
+                check(b"real_ntdll_stub_dispatch", si.status == NT_SUCCESS && procs == 1);
+            }
+            Err(_) => check(b"real_ntdll_loaded", false),
+        }
+    }
 }
 
 /// A minimal kernel-services layer wiring the native syscall dispatcher to the registry (spec §9.3).

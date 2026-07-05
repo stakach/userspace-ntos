@@ -12,7 +12,7 @@ cargo +nightly build \
   -Z unstable-options \
   -Z json-target-spec \
   --target triplet.json \
-  --release
+  --release "$@"
 
 mkdir -p ../../rust-micro/.tmp
 cp target/triplet/release/ntos-configuration-manager ../../rust-micro/.tmp/rootserver.elf

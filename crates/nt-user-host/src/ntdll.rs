@@ -8,7 +8,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use nt_pe_loader::{MappedImage, PeError, PeFile};
+use nt_pe_loader::{PeError, PeFile};
 use nt_syscall::{
     NativeService, NativeServiceTable, NativeSyscallDispatcher, NativeSyscallHandler,
     SyscallOrigin, SyscallResult, UserlandAbiProfile, STATUS_INVALID_SYSTEM_SERVICE,
@@ -22,19 +22,21 @@ pub struct NtdllExport {
     pub syscall_number: Option<u32>,
 }
 
-/// The loaded, laid-out, relocated official `ntdll.dll` (spec §14) + its syscall-stub map.
+/// The official `ntdll.dll`'s syscall-stub map (spec §13, §14). v0.1 extracts what the ABI needs
+/// — the `Nt*`/`Zw*` exports + their decoded syscall numbers — from the raw PE **without** eagerly
+/// materialising the full ~1.7 MiB mapped image (so it fits a memory-constrained host).
 pub struct NtdllImage {
-    image: MappedImage,
+    load_base: u64,
+    entry_point: u64,
+    size_of_image: u32,
     exports: Vec<NtdllExport>,
 }
 
-/// Decode a Windows x64 syscall stub at `rva` in the mapped image (`mov r10,rcx; mov eax,ssn;
-/// syscall`), returning the syscall number. `None` if the bytes aren't that stub shape.
-fn decode_syscall_number(image: &[u8], rva: u32) -> Option<u32> {
-    let o = rva as usize;
-    let b = image.get(o..o + 8)?;
+/// Decode a Windows x64 syscall stub (`mov r10,rcx; mov eax,ssn; syscall`) from its first bytes,
+/// returning the syscall number. `None` if the bytes aren't that stub shape.
+fn decode_syscall_number(b: &[u8]) -> Option<u32> {
     // 4C 8B D1 = mov r10, rcx ; B8 imm32 = mov eax, imm32
-    if b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 && b[3] == 0xB8 {
+    if b.len() >= 8 && b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 && b[3] == 0xB8 {
         Some(u32::from_le_bytes([b[4], b[5], b[6], b[7]]))
     } else {
         None
@@ -42,18 +44,14 @@ fn decode_syscall_number(image: &[u8], rva: u32) -> Option<u32> {
 }
 
 impl NtdllImage {
-    /// Load the real `ntdll` PE bytes at `load_base`: lay out + relocate the image, then decode
-    /// the syscall number from every `Nt*`/`Zw*` export stub.
+    /// Load the real `ntdll` PE bytes: parse the export table + decode the syscall number from each
+    /// `Nt*`/`Zw*` export stub, reading the stub bytes straight from the file (no full image map).
     pub fn load(bytes: &[u8], load_base: u64) -> Result<Self, PeError> {
         let pe = PeFile::parse(bytes)?;
-        let image = pe.map(load_base)?; // full section layout + base relocations
-        let load_delta = load_base.wrapping_sub(pe.image_base());
         let mut exports = Vec::new();
         for e in pe.exports()? {
             if e.name.starts_with("Nt") || e.name.starts_with("Zw") {
-                // The mapped image is relocated; the stub bytes live at the export RVA regardless.
-                let syscall_number = decode_syscall_number(&image.bytes, e.rva);
-                let _ = load_delta;
+                let syscall_number = pe.bytes_at_rva(e.rva, 8).and_then(decode_syscall_number);
                 exports.push(NtdllExport {
                     name: e.name,
                     rva: e.rva,
@@ -61,17 +59,22 @@ impl NtdllImage {
                 });
             }
         }
-        Ok(NtdllImage { image, exports })
+        Ok(NtdllImage {
+            load_base,
+            entry_point: load_base.wrapping_add(pe.entry_point_rva() as u64),
+            size_of_image: pe.size_of_image(),
+            exports,
+        })
     }
 
     pub fn load_base(&self) -> u64 {
-        self.image.load_base
+        self.load_base
     }
     pub fn entry_point(&self) -> u64 {
-        self.image.entry_point()
+        self.entry_point
     }
-    pub fn image_bytes(&self) -> &[u8] {
-        &self.image.bytes
+    pub fn size_of_image(&self) -> u32 {
+        self.size_of_image
     }
     /// The number of `Nt*`/`Zw*` exports that are real syscall stubs.
     pub fn syscall_stub_count(&self) -> usize {
@@ -104,10 +107,10 @@ impl NtdllImage {
         NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs)
     }
 
-    /// Execute the real `ntdll` export stub for `name`: read the loaded stub's own bytes, extract
-    /// the syscall number `eax` would be set to, and dispatch it through `dispatcher` — the exact
-    /// number the real instruction stream would trap with (spec §9.1). An export that isn't a
-    /// syscall stub returns `STATUS_INVALID_SYSTEM_SERVICE`.
+    /// Execute the real `ntdll` export stub for `name`: dispatch the syscall number decoded from
+    /// that stub's own bytes — the exact number the real instruction stream (`mov eax,<ssn>;
+    /// syscall`) would trap with (spec §9.1). An export that isn't a syscall stub returns
+    /// `STATUS_INVALID_SYSTEM_SERVICE`.
     pub fn invoke<H: NativeSyscallHandler>(
         &self,
         dispatcher: &NativeSyscallDispatcher,
@@ -116,10 +119,7 @@ impl NtdllImage {
         origin: &SyscallOrigin,
         handler: &mut H,
     ) -> SyscallResult {
-        match self
-            .export(name)
-            .and_then(|e| decode_syscall_number(&self.image.bytes, e.rva))
-        {
+        match self.export(name).and_then(|e| e.syscall_number) {
             Some(ssn) => dispatcher.dispatch(ssn, args, origin, handler),
             None => SyscallResult {
                 status: STATUS_INVALID_SYSTEM_SERVICE,
