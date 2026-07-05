@@ -47,6 +47,43 @@ fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The root's IPC buffer VA (from BootInfo) — used to stage reply message registers 4+.
+static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
+
+const SYS_REPLY_RECV: i64 = -2;
+
+/// Reply to the pending fault (resuming the faulter with the staged register message) and receive
+/// the next fault, in one `SysReplyRecv`. `reply_len` message registers are sent: `r0..r3` here,
+/// `4..reply_len` from the IPC buffer (which the caller must have written). Returns the next
+/// fault's `(badge, msginfo, mr0)`.
+unsafe fn reply_recv(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> (u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_REPLY_RECV as u64,
+        inout("rdi") recv_ep => badge,
+        inout("rsi") reply_len => msginfo, // MessageInfo: length in low bits, label 0 (restart)
+        inout("r10") r0 => mr0,
+        in("r8") r1,
+        in("r9") r2,
+        in("r15") r3,
+        lateout("rax") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+    (badge, msginfo, mr0)
+}
+
+/// Stage a reply message register (index `i >= 4`) into the IPC buffer, at `ipc_buffer + 8 + i*8`.
+unsafe fn set_reply_mr(i: usize, v: u64) {
+    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    let p = (base + 8 + (i as u64) * 8) as *mut u64;
+    core::ptr::write_volatile(p, v);
+}
+
 fn print_str(s: &[u8]) {
     for &b in s {
         debug_put_char(b);
@@ -162,6 +199,22 @@ fn run() {
                 == Some(NativeService::NtQuerySystemInformation)
                 && procs == 1,
         );
+
+        // 7. Complete the round trip: reply so the stub RESUMES with the NTSTATUS in RAX and
+        //    executes its `ret`. The `syscall` is at STUB_VADDR+8, so the resume IP is the `ret` at
+        //    STUB_VADDR+10 (reply register slot 15 = FaultIP). Slots 4..15 are staged to 0; the
+        //    saved SP/RFLAGS are preserved (we send length 16, so slots 16/17 are untouched).
+        for i in 4..15 {
+            set_reply_mr(i, 0);
+        }
+        set_reply_mr(15, STUB_VADDR + 10); // FaultIP → the `ret` after the syscall
+        let ntstatus = result.status as u64; // RAX the stub returns to its caller
+        // ReplyRecv: resume the faulter + wait for its next fault (the `ret` jumps to [SP]=0 → #PF).
+        let (_b2, msginfo2, _mr0b) = reply_recv(fault_ep, 16, ntstatus, 0, 0, 0);
+        let label2 = msginfo2 >> 12;
+        // A *different* fault (VMFault, label != 2) proves the stub resumed past the syscall and ran
+        // `ret`; another UnknownSyscall (label 2) would mean it re-executed the syscall (no resume).
+        check(b"stub_resumed_after_syscall", label2 != 2);
     }
 }
 
@@ -170,6 +223,7 @@ fn run() {
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
+    IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
 
     print_str(b"[ntos-ntdll] real seL4 syscall trap: ntdll executes itself\n");
     run();

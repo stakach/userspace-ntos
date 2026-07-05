@@ -31,3 +31,22 @@ the thread with the NTSTATUS result (that needs the 18-word register reply via t
 reply slot 0=RAX=result, slot 15=FaultIP+2 to skip the syscall, slots preserved) — a follow-up.
 The component is a standalone workspace and `include_bytes!`es the gitignored ntdll, so it builds
 only via its own `build.sh` (not the default workspace build).
+
+## Full round trip (implemented)
+
+The demo now also **replies to the fault** so the stub resumes with the NTSTATUS and runs to
+completion — the complete NT syscall path:
+
+6. The handler stages a reply message (register slots via the IPC buffer at `ipc_buffer + 8 + i*8`):
+   slot 0 (RAX) = the dispatch NTSTATUS, slot 15 (FaultIP) = `STUB_VADDR + 10` — the `ret` right after
+   the `syscall` (which sits at `STUB_VADDR + 8`); slots 4..15 = 0, and SP/RFLAGS are left untouched
+   (reply length 16, so the kernel preserves the saved values). It issues `SysReplyRecv` on the fault
+   endpoint (reply + wait for the next fault in one call).
+7. The stub **resumes** at its `ret` with RAX = NTSTATUS. The `ret` pops the (zeroed) stack top and
+   jumps to RIP 0 → a **user #PF at rip=0x0** — the expected, benign consequence that *proves the
+   stub executed past the syscall*. The handler receives this second fault and verifies it is a
+   VMFault (label ≠ 2), not another UnknownSyscall (which would mean the syscall re-executed).
+
+`stub_resumed_after_syscall` passes; the `[user #PF: ... rip=0x0]` line in the log is the resume
+proof, not an error. ntdll's own instruction stream ran, trapped, was serviced by the NT
+personality, and resumed — the real syscall path end to end.
