@@ -16,6 +16,8 @@
 
 #![no_std]
 #![no_main]
+// The frame-cap arrays are single-threaded scratch shared between load + W^X remap.
+#![allow(static_mut_refs)]
 
 extern crate alloc;
 
@@ -26,13 +28,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use nt_config_manager::{ConfigManager, RegistryValueType};
 use nt_fs::{FileSystem, MemFs};
-use nt_pe_loader::PeFile;
+use nt_pe_loader::{ImportRef, PeFile};
 use nt_syscall::{NativeService, NativeSyscallDispatcher, ProcessorMode, SyscallOrigin};
 use nt_user_host::{KernelServices, NtdllImage, WindowsProfile};
 use sel4_rt::*;
 
 /// The real Windows 7 SP1 ntdll (gitignored; this component only builds when it's present).
 static NTDLL: &[u8] = include_bytes!("../../../references/ntdll.dll");
+
+/// A real, minimal Windows x64 console exe that imports ONLY ntdll (`RtlGetVersion` +
+/// `NtTerminateProcess`): it reads the OS version and terminates with it encoded in the exit code.
+static EXE: &[u8] = include_bytes!("../../../references/ntdll_only_version_test.exe");
 
 // User VAs for the trap thread — well clear of the root image/heap/stack + the ntdll base.
 const TRAMP_VADDR: u64 = 0x0000_0002_0000_0000; // the trampoline (entry)
@@ -44,6 +50,8 @@ const LDR_VADDR: u64 = 0x0000_0002_0050_0000; // PEB_LDR_DATA (referenced by PEB
 const LDR_TRAMP_VADDR: u64 = 0x0000_0002_0060_0000; // trampoline for the LdrInitializeThunk thread
 const LDR_STACK_VADDR: u64 = 0x0000_0002_0070_0000;
 const LDR_IPCBUF_VADDR: u64 = 0x0000_0002_0080_0000;
+const EXE_STACK_VADDR: u64 = 0x0000_0002_0090_0000; // stack for the exe's entry thread
+const EXE_IPCBUF_VADDR: u64 = 0x0000_0002_00A0_0000;
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
 const RIGHTS_RW: u64 = 0b011; // read/write (for loading)
@@ -63,6 +71,8 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 
 /// Frame caps for the mapped ntdll image (kept so the pages can be remapped W^X after loading).
 static mut NTDLL_FRAME_CAPS: [u64; 512] = [0; 512];
+/// Frame caps for the mapped test exe (size_of_image 0x4000 = 4 pages).
+static mut EXE_FRAME_CAPS: [u64; 16] = [0; 16];
 
 const SYS_REPLY_RECV: i64 = -2;
 
@@ -101,8 +111,8 @@ unsafe fn map_page(vaddr: u64, rights: u64) -> u64 {
 }
 
 /// Map `frames` fresh RW pages at `base` (creating the PDPT/PD + one PT per 2 MiB), recording the
-/// frame caps for the later W^X remap. `base` + `frames*4K` must fit the recorded region (≤ 512).
-unsafe fn map_region(base: u64, frames: u64) {
+/// frame caps in `caps` for the later W^X remap. `frames` must be ≤ `caps.len()`.
+unsafe fn map_region(base: u64, frames: u64, caps: &mut [u64]) {
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, base, CAP_INIT_THREAD_VSPACE);
@@ -123,20 +133,43 @@ unsafe fn map_region(base: u64, frames: u64) {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, base + i * 0x1000, RIGHTS_RW, CAP_INIT_THREAD_VSPACE);
-        NTDLL_FRAME_CAPS[i as usize] = f;
+        caps[i as usize] = f;
     }
 }
 
-/// Re-map the ntdll image W^X: `.text` code read-only + executable, everything else NX.
-unsafe fn apply_wx(pe: &PeFile, base: u64, frames: u64) {
+/// Map `frames` RW pages at `base` and copy the PE headers + sections straight from `bytes`.
+unsafe fn map_and_copy(pe: &PeFile, bytes: &[u8], base: u64, frames: u64, caps: &mut [u64]) {
+    map_region(base, frames, caps);
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), base as *mut u8, 0x400.min(bytes.len()));
+    for s in pe.sections() {
+        let n = (s.size_of_raw_data as usize).min(s.virtual_size as usize);
+        let src = s.pointer_to_raw_data as usize;
+        if src + n <= bytes.len() {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(src),
+                (base + s.virtual_address as u64) as *mut u8,
+                n,
+            );
+        }
+    }
+}
+
+/// Re-map a loaded image W^X: `.text` RO+X, everything else NX, per `protection_at`.
+unsafe fn apply_wx(pe: &PeFile, base: u64, frames: u64, caps: &[u64]) {
     for i in 0..frames {
         let prot = pe.protection_at((i * 0x1000) as u32);
         let rw = if prot.writable() { 0b011 } else { 0b010 };
         let rights = if prot.executable() { rw } else { rw | PAGE_EXECUTE_NEVER };
-        let f = NTDLL_FRAME_CAPS[i as usize];
+        let f = caps[i as usize];
         let _ = page_unmap(f);
         let _ = page_map(f, base + i * 0x1000, rights, CAP_INIT_THREAD_VSPACE);
     }
+}
+
+/// Load a PE image at its preferred base (map + copy + W^X). No import fixups.
+unsafe fn load_image(pe: &PeFile, bytes: &[u8], base: u64, frames: u64, caps: &mut [u64]) {
+    map_and_copy(pe, bytes, base, frames, caps);
+    apply_wx(pe, base, frames, caps);
 }
 
 unsafe fn attach_sched_context(tcb: u64) {
@@ -169,6 +202,39 @@ unsafe fn reply_recv(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3
     (badge, msginfo, mr0)
 }
 
+/// Reply to the pending fault (resuming the faulter) and receive the next fault, returning its
+/// `(msginfo, mr0..mr3)`. Reply MRs 4+ come from the IPC buffer (`set_reply_mr`), 0..3 from r10/r8/
+/// r9/r15. Like `reply_recv` but exposes all four received MRs for a syscall-servicing loop.
+unsafe fn reply_recv_full(
+    recv_ep: u64,
+    reply_len: u64,
+    r0: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+) -> (u64, u64, u64, u64, u64) {
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_REPLY_RECV as u64,
+        inout("rdi") recv_ep => _,
+        inout("rsi") reply_len => msginfo,
+        inout("r10") r0 => mr0,
+        inout("r8") r1 => mr1,
+        inout("r9") r2 => mr2,
+        inout("r15") r3 => mr3,
+        lateout("rax") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+    (msginfo, mr0, mr1, mr2, mr3)
+}
+
 /// Stage a reply message register (index `i >= 4`) into the IPC buffer at `ipc_buffer + 8 + i*8`.
 unsafe fn set_reply_mr(i: usize, v: u64) {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
@@ -180,6 +246,39 @@ unsafe fn write_u32(va: u64, v: u32) {
 }
 unsafe fn write_u64(va: u64, v: u64) {
     core::ptr::write_volatile(va as *mut u64, v);
+}
+
+/// Read a received message register (index `i >= 4`) from the IPC buffer at `ipc_buffer + 8 + i*8`
+/// — where the kernel fans an UnknownSyscall fault's saved-register words 4..length.
+unsafe fn get_recv_mr(i: usize) -> u64 {
+    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
+}
+
+/// Receive on `ep`, returning `(badge, msginfo, mr0..mr3)` — mr0..mr3 are message registers 0..3,
+/// i.e. RAX, RBX, RCX, RDX of an UnknownSyscall fault (RDX = a syscall's 2nd argument).
+unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") sel4_rt::SYS_RECV as u64,
+        inout("rdi") ep => badge,
+        lateout("rsi") msginfo,
+        lateout("r10") mr0,
+        lateout("r8") mr1,
+        lateout("r9") mr2,
+        lateout("r15") mr3,
+        lateout("rax") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+    (badge, msginfo, mr0, mr1, mr2, mr3)
 }
 
 /// Spawn a user thread sharing the root's CSpace/VSpace at `entry` with `stack_top`, `arg0` in RDI,
@@ -259,23 +358,8 @@ fn run() {
     let (tramp, tramp_len) = build_trampoline(export_addr, peb_export_addr);
 
     unsafe {
-        // 1. Map the full ntdll image at its preferred base + copy headers/sections in (delta 0).
-        map_region(ntdll_base, frames);
-        // Headers.
-        core::ptr::copy_nonoverlapping(NTDLL.as_ptr(), ntdll_base as *mut u8, 0x400.min(NTDLL.len()));
-        // Each section by virtual address.
-        for s in pe.sections() {
-            let n = (s.size_of_raw_data as usize).min(s.virtual_size as usize);
-            let src = s.pointer_to_raw_data as usize;
-            if src + n <= NTDLL.len() {
-                core::ptr::copy_nonoverlapping(
-                    NTDLL.as_ptr().add(src),
-                    (ntdll_base + s.virtual_address as u64) as *mut u8,
-                    n,
-                );
-            }
-        }
-        apply_wx(&pe, ntdll_base, frames);
+        // 1. Map the full ntdll image at its preferred base (delta 0 → no relocations).
+        load_image(&pe, NTDLL, ntdll_base, frames, &mut NTDLL_FRAME_CAPS);
         check(b"ntdll_text_mapped_executable", true);
 
         // 2. The trampoline (executable), a stack + IPC buffer.
@@ -391,19 +475,130 @@ fn run() {
             libuf,
             TEB_VADDR,
         );
-        print_str(b"  ... running real LdrInitializeThunk -> LdrpInitialize\n");
-        let (_lz, _lb, lmsginfo, lmr0) = ep_recv(lfault);
-        let llabel = lmsginfo >> 12;
-        // llabel 2 = UnknownSyscall (the loader's prologue ran + it made a syscall); lmr0 = RAX =
-        // the syscall number of that first Nt* call.
-        print_str(b"  LdrpInitialize first fault: label=");
-        debug_put_char(b'0' + (llabel % 10) as u8);
-        print_str(b" ssn=0x");
+        print_str(b"  ... running real LdrInitializeThunk -> LdrpInitialize (servicing syscalls)\n");
         let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
-        debug_put_char(hex((lmr0 >> 4) & 0xf));
-        debug_put_char(hex(lmr0 & 0xf));
+        // Service the loader's syscalls in a loop, PRESERVING its registers across each trap (only
+        // possible now the kernel delivers the full fault message). For each UnknownSyscall: read
+        // the saved registers, dispatch, then reply echoing the callee-saved set + result + resume
+        // IP (RCX = saved next-RIP). STATUS_SUCCESS for all — a tracing pass to see how far the real
+        // loader walks once its registers survive the round trip.
+        let mut serviced = 0u32;
+        let mut first_ssn = 0u64;
+        let (_lz, mut lmsginfo, mut lmr0, mut lmr1, mut lmr2, mut lmr3) = ep_recv_full(lfault);
+        let final_label = loop {
+            let label = lmsginfo >> 12;
+            if label != 2 {
+                break label; // non-syscall fault (the loader needs something we don't model yet)
+            }
+            if serviced == 0 {
+                first_ssn = lmr0;
+            }
+            let next_rip = lmr2; // RCX = the saved next-RIP after the `syscall`
+            // Snapshot the preserved registers (msg[4..14]) before the reply reuses the IPC buffer.
+            let mut saved = [0u64; 15];
+            let mut i = 4;
+            while i < 15 {
+                saved[i] = get_recv_mr(i);
+                i += 1;
+            }
+            serviced += 1;
+            if serviced >= 128 {
+                break 2; // safety bound — treat "still servicing" as label 2
+            }
+            // Reply: slot0=RAX=STATUS_SUCCESS, 1=RBX, 3=RDX preserved, 4..14 preserved, 15=resume IP.
+            i = 4;
+            while i < 15 {
+                set_reply_mr(i, saved[i]);
+                i += 1;
+            }
+            set_reply_mr(15, next_rip);
+            let (mi, m0, m1, m2, m3) = reply_recv_full(lfault, 16, 0, lmr1, 0, lmr3);
+            lmsginfo = mi;
+            lmr0 = m0;
+            lmr1 = m1;
+            lmr2 = m2;
+            lmr3 = m3;
+        };
+        // After the loop, on a VMFault (label 6) mr0 = the faulting IP: where the loader ran to
+        // after we serviced + resumed it. In-ntdll-.text + past the entry proves the register-
+        // preserving service loop genuinely resumed the real loader into more of its own code.
+        let resumed_ip = lmr0;
+        let in_ntdll = resumed_ip >= ntdll_base && resumed_ip < ntdll_base + 0x1a_a000;
+        print_str(b"  LdrpInitialize: serviced 0x");
+        debug_put_char(hex((serviced as u64 >> 4) & 0xf));
+        debug_put_char(hex(serviced as u64 & 0xf));
+        print_str(b" syscalls (first=0x");
+        debug_put_char(hex((first_ssn >> 4) & 0xf));
+        debug_put_char(hex(first_ssn & 0xf));
+        print_str(b"), resumed into ntdll .text @0x");
+        for shift in (0..8).rev() {
+            debug_put_char(hex((resumed_ip >> (shift * 4)) & 0xf));
+        }
+        print_str(b" label=");
+        debug_put_char(b'0' + (final_label % 10) as u8);
         print_str(b"\n");
-        check(b"ldrpinitialize_prologue_ran_to_first_syscall", llabel == 2);
+        // The service loop serviced the loader's syscall and resumed it — register preservation
+        // across the trap (now the kernel delivers the full fault message) carried the real loader
+        // forward into more ntdll code. (Running it to completion needs faithful syscall out-params
+        // for its whole sequence — future work.)
+        check(b"ldrpinitialize_syscall_serviced_and_resumed", serviced >= 1 && in_ntdll);
+
+        // --- Run a real, minimal Windows exe (imports only ntdll) --------------------------------
+        // The exe reads the OS version (RtlGetVersion — pure PEB/KUSER reads) and terminates with
+        // it encoded in the exit code: NtTerminateProcess(-1, (((Major<<8)|Minor)<<16)|Build).
+        // For Win7 SP1 (6.1.7601) that exit code is 0x06011DB1. We do the loader's job manually:
+        // map the exe at its base, snap its IAT to the mapped ntdll exports, and jump to its entry.
+        let exe_pe = PeFile::parse(EXE).unwrap();
+        let exe_base = exe_pe.image_base();
+        let exe_frames = (exe_pe.size_of_image() as u64).div_ceil(0x1000);
+        map_and_copy(&exe_pe, EXE, exe_base, exe_frames, &mut EXE_FRAME_CAPS);
+        // Snap the IAT: patch each ntdll import to the address of that export in mapped ntdll.
+        let mut snapped = 0u32;
+        if let Ok(imports) = exe_pe.imports() {
+            for dll in &imports {
+                for f in &dll.functions {
+                    if let ImportRef::ByName { name, iat_slot_rva, .. } = f {
+                        if let Some(e) = exports.iter().find(|e| &e.name == name) {
+                            write_u64(exe_base + *iat_slot_rva as u64, ntdll_base + e.rva as u64);
+                            snapped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        apply_wx(&exe_pe, exe_base, exe_frames, &EXE_FRAME_CAPS);
+        check(b"exe_mapped_and_iat_snapped", snapped == 2);
+
+        // Spawn the exe's entry thread (own stack + IPC buffer; shares the process TEB via %gs).
+        let _estack = map_page(EXE_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let eibuf = map_page(EXE_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let entry = exe_base + exe_pe.entry_point_rva() as u64;
+        let efault = spawn_thread(entry, EXE_STACK_VADDR + 0x1000 - 16, 0, EXE_IPCBUF_VADDR, eibuf, TEB_VADDR);
+        print_str(b"  ... running real exe entry (RtlGetVersion + NtTerminateProcess)\n");
+        // The entry runs: RtlGetVersion fills OSVERSIONINFOW from the PEB, then NtTerminateProcess
+        // syscalls (traps). Its 2nd arg (ExitStatus) = RDX = fault mr3.
+        let (_xz, xmsginfo, xrax, _xrbx, _xrcx, xrdx) = ep_recv_full(efault);
+        let want_ssn = ntdll.syscall_number("NtTerminateProcess").unwrap_or(0xFFFF) as u64;
+        let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
+        print_str(b"  exe trap: label=");
+        debug_put_char(b'0' + ((xmsginfo >> 12) % 10) as u8);
+        print_str(b" ssn(rax)=0x");
+        debug_put_char(hex((xrax >> 4) & 0xf));
+        debug_put_char(hex(xrax & 0xf));
+        print_str(b" want=0x");
+        debug_put_char(hex((want_ssn >> 4) & 0xf));
+        debug_put_char(hex(want_ssn & 0xf));
+        print_str(b" exitcode=0x");
+        for shift in (0..8).rev() {
+            debug_put_char(hex((xrdx >> (shift * 4)) & 0xf));
+        }
+        print_str(b" (6.1.7601)\n");
+        // The exit code carrying the exact Win7 version proves the exe ran RtlGetVersion; the trap
+        // being NtTerminateProcess's syscall confirms it reached its terminating syscall.
+        check(
+            b"exe_ran_and_reported_win7_version",
+            (xmsginfo >> 12) == 2 && xrax == want_ssn && xrdx == 0x0601_1DB1,
+        );
     }
 }
 

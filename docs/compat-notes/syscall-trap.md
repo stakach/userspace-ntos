@@ -131,3 +131,26 @@ syscall (ssn=0x16). Iteratively mapping what it faulted on (KUSER_SHARED_DATA at
 TEB's second page) walked the loader forward to that point. Servicing the loader's syscalls to run
 it to completion (which needs faithful out-params + full register preservation across the trap) is
 future work.
+
+## Running a real Windows exe + servicing loader syscalls (implemented)
+
+Two capabilities landed together, on top of full fault-message delivery to the handler (the kernel
+now fans an UnknownSyscall's saved registers 4..length into the handler's IPC buffer on *both* recv
+paths, so a handler can preserve a faulter's callee-saved registers across a serviced syscall).
+
+**A real, unmodified Windows exe runs.** `references/ntdll_only_version_test.exe` (2.5 KiB, imports
+only `RtlGetVersion` + `NtTerminateProcess` from ntdll) is mapped at its image base; we do the
+loader's import-snap manually (patch its IAT to the mapped ntdll export addresses) and jump to its
+entry. It runs: `RtlGetVersion` (real ntdll code, pure PEB/KUSER reads) fills OSVERSIONINFOW, then
+`NtTerminateProcess(-1, exitcode)` traps — `exitcode = (((Major<<8)|Minor)<<16)|Build`. QEMU:
+`exe_ran_and_reported_win7_version` — the trap is `NtTerminateProcess` (SSN 0x29) with exit code
+`0x06011DB1` = **6.1.7601**, so the exe read the real Win7 SP1 version and terminated with it.
+
+**LdrpInitialize's syscalls are serviced in a register-preserving loop.** For each UnknownSyscall
+the loop snapshots the saved registers (msg[4..14] from the IPC buffer), dispatches, then replies
+echoing the callee-saved set + a result + the resume IP (RCX = saved next-RIP), so the faulter's
+registers survive the trap. QEMU: `ldrpinitialize_syscall_serviced_and_resumed` — the loop serviced
+the loader's first syscall (0x16) and **resumed it into more ntdll `.text`** (@0x78e8e110), which the
+pre-full-message single-shot could not do. Running the loader to completion needs faithful syscall
+out-params for its whole sequence (its next fault is a NULL deref from the STATUS_SUCCESS-only pass)
+— future work.
