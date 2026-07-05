@@ -40,6 +40,12 @@ static NTDLL: &[u8] = include_bytes!("../../../references/ntdll.dll");
 /// `NtTerminateProcess`): it reads the OS version and terminates with it encoded in the exit code.
 static EXE: &[u8] = include_bytes!("../../../references/ntdll_only_version_test.exe");
 
+/// A real NLS single-byte codepage table (used for both the ANSI + OEM slots) and the Unicode
+/// case table — `RtlInitNlsTables`, called early in LdrpInitialize, reads these via PEB->
+/// AnsiCodePageData/OemCodePageData/UnicodeCaseTableData (PEB+0xA0/+0xA8/+0xB0).
+static NLS_CP: &[u8] = include_bytes!("../../../references/reactos/media/nls/c_856.nls");
+static NLS_CASE: &[u8] = include_bytes!("../../../references/reactos/media/nls/l_intl.nls");
+
 // User VAs for the trap thread — well clear of the root image/heap/stack + the ntdll base.
 const TRAMP_VADDR: u64 = 0x0000_0002_0000_0000; // the trampoline (entry)
 const STACK_VADDR: u64 = 0x0000_0002_0010_0000;
@@ -52,6 +58,12 @@ const LDR_STACK_VADDR: u64 = 0x0000_0002_0070_0000;
 const LDR_IPCBUF_VADDR: u64 = 0x0000_0002_0080_0000;
 const EXE_STACK_VADDR: u64 = 0x0000_0002_0090_0000; // stack for the exe's entry thread
 const EXE_IPCBUF_VADDR: u64 = 0x0000_0002_00A0_0000;
+const CTX_VADDR: u64 = 0x0000_0002_00B0_0000; // CONTEXT the loader NtContinues into
+const BOOT_STACK_VADDR: u64 = 0x0000_0002_00C0_0000; // stack the booted exe entry runs on (4 pages)
+const NLS_CP_VADDR: u64 = 0x0000_0002_0100_0000; // ANSI/OEM codepage table
+const NLS_CASE_VADDR: u64 = 0x0000_0002_0140_0000; // Unicode case table
+const PARAMS_VADDR: u64 = 0x0000_0002_0180_0000; // RTL_USER_PROCESS_PARAMETERS
+const NC_TRAMP_VADDR: u64 = 0x0000_0002_01C0_0000; // trampoline for the direct-NtContinue thread
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
 const RIGHTS_RW: u64 = 0b011; // read/write (for loading)
@@ -137,6 +149,31 @@ unsafe fn map_region(base: u64, frames: u64, caps: &mut [u64]) {
     }
 }
 
+/// Map read-only data `bytes` at `base` (RW pages + PDPT/PD/PT as needed) and copy it in.
+unsafe fn map_data(base: u64, bytes: &[u8]) {
+    let pages = (bytes.len() as u64).div_ceil(0x1000).max(1);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, base, CAP_INIT_THREAD_VSPACE);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, base, CAP_INIT_THREAD_VSPACE);
+    let mut pt_base = base & !0x1F_FFFF;
+    let last = (base + pages * 0x1000 - 1) & !0x1F_FFFF;
+    while pt_base <= last {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_base, CAP_INIT_THREAD_VSPACE);
+        pt_base += 0x20_0000;
+    }
+    for i in 0..pages {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, base + i * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER, CAP_INIT_THREAD_VSPACE);
+    }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), base as *mut u8, bytes.len());
+}
+
 /// Map `frames` RW pages at `base` and copy the PE headers + sections straight from `bytes`.
 unsafe fn map_and_copy(pe: &PeFile, bytes: &[u8], base: u64, frames: u64, caps: &mut [u64]) {
     map_region(base, frames, caps);
@@ -170,6 +207,53 @@ unsafe fn apply_wx(pe: &PeFile, base: u64, frames: u64, caps: &[u64]) {
 unsafe fn load_image(pe: &PeFile, bytes: &[u8], base: u64, frames: u64, caps: &mut [u64]) {
     map_and_copy(pe, bytes, base, frames, caps);
     apply_wx(pe, base, frames, caps);
+}
+
+// A demand-mapped arena backing the loader's NtAllocateVirtualMemory allocations (its process
+// heap). The paging structures for the whole arena are created once; allocations just map frames.
+const HEAP_ARENA_BASE: u64 = 0x0000_0003_0000_0000;
+const HEAP_ARENA_SIZE: u64 = 0x0100_0000; // 16 MiB (8 * 2 MiB slices)
+static HEAP_NEXT: AtomicU64 = AtomicU64::new(HEAP_ARENA_BASE);
+
+/// Pre-create the arena's PDPT/PD + one PT per 2 MiB slice, so `heap_alloc` only maps frames.
+unsafe fn init_heap_arena() {
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, HEAP_ARENA_BASE, CAP_INIT_THREAD_VSPACE);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, HEAP_ARENA_BASE, CAP_INIT_THREAD_VSPACE);
+    let mut pt_base = HEAP_ARENA_BASE;
+    while pt_base < HEAP_ARENA_BASE + HEAP_ARENA_SIZE {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_base, CAP_INIT_THREAD_VSPACE);
+        pt_base += 0x20_0000;
+    }
+}
+
+/// Back `[base, base + pages*4K)` with fresh RW frames (the arena's PTs already exist).
+unsafe fn map_frames(base: u64, pages: u64) {
+    for i in 0..pages {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, base + i * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER, CAP_INIT_THREAD_VSPACE);
+    }
+}
+
+/// Service NtAllocateVirtualMemory: give back real writable memory. `hint` (the caller's requested
+/// base, 0 = choose) is honoured if it already lies in the arena (a commit of an earlier reserve);
+/// otherwise a fresh bump-allocated range is mapped. Returns the base.
+unsafe fn heap_alloc(hint: u64, size: u64) -> u64 {
+    let pages = size.div_ceil(0x1000).max(1);
+    if hint >= HEAP_ARENA_BASE && hint < HEAP_NEXT.load(Ordering::Relaxed) {
+        return hint & !0xFFF; // already reserved+mapped (commit within a prior reservation)
+    }
+    // Align each allocation to 64 KiB (RtlCreateHeap expects allocation-granularity bases).
+    let base = (HEAP_NEXT.load(Ordering::Relaxed) + 0xFFFF) & !0xFFFF;
+    HEAP_NEXT.store(base + pages * 0x1000, Ordering::Relaxed);
+    map_frames(base, pages);
+    base
 }
 
 unsafe fn attach_sched_context(tcb: u64) {
@@ -247,6 +331,20 @@ unsafe fn write_u32(va: u64, v: u32) {
 unsafe fn write_u64(va: u64, v: u64) {
     core::ptr::write_volatile(va as *mut u64, v);
 }
+unsafe fn read_u64(va: u64) -> u64 {
+    core::ptr::read_volatile(va as *const u64)
+}
+unsafe fn write_u16(va: u64, v: u16) {
+    core::ptr::write_volatile(va as *mut u16, v);
+}
+/// Write an ASCII string as UTF-16LE at `va`, returning its byte length (excluding the NUL).
+unsafe fn write_wstr(va: u64, s: &[u8]) -> u16 {
+    for (i, &b) in s.iter().enumerate() {
+        write_u16(va + (i as u64) * 2, b as u16);
+    }
+    write_u16(va + (s.len() as u64) * 2, 0);
+    (s.len() * 2) as u16
+}
 
 /// Read a received message register (index `i >= 4`) from the IPC buffer at `ipc_buffer + 8 + i*8`
 /// — where the kernel fans an UnknownSyscall fault's saved-register words 4..length.
@@ -320,6 +418,161 @@ fn build_trampoline(syscall_export: u64, peb_export: u64) -> ([u8; 64], usize) {
     c[37..39].copy_from_slice(&[0x0F, 0x05]); // syscall
     c[39..41].copy_from_slice(&[0xEB, 0xFE]); // jmp $
     (c, 41)
+}
+
+struct SvcResult {
+    serviced: u32,
+    booted: bool,
+    exitcode: u64,
+    last_ssn: u64,
+    fault_ip: u64,
+}
+
+/// Service a user thread's syscall faults in a register-preserving loop until it calls NtContinue
+/// (we load its registers from the CONTEXT — booting it wherever CONTEXT.Rip points), calls
+/// NtTerminateProcess (we capture the exit status), or hits an unmodelled fault. `ssns` =
+/// [continue, alloc, nqip, openkey, openkeyex, terminate, qsi, openfile]. `peb` = the PEB VA.
+unsafe fn service_loop(fault_ep: u64, ssns: &[u64; 8], peb: u64) -> SvcResult {
+    let (s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term, s_qsi, s_openfile) = (
+        ssns[0], ssns[1], ssns[2], ssns[3], ssns[4], ssns[5], ssns[6], ssns[7],
+    );
+    let mut r = SvcResult {
+        serviced: 0,
+        booted: false,
+        exitcode: 0,
+        last_ssn: 0,
+        fault_ip: 0,
+    };
+    let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
+    let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
+    loop {
+        let label = mi >> 12;
+        if label != 2 {
+            r.fault_ip = m0;
+            break;
+        }
+        let ssn = m0;
+        r.last_ssn = ssn;
+        debug_put_char(hex((ssn >> 4) & 0xf));
+        debug_put_char(hex(ssn & 0xf));
+        debug_put_char(b' ');
+        let next_rip = m2;
+        let mut sv = [0u64; 18];
+        {
+            let mut i = 4;
+            while i < 18 {
+                sv[i] = get_recv_mr(i);
+                i += 1;
+            }
+        }
+        let (a1, a2, a3, a4, sp) = (sv[9], m3, sv[7], sv[8], sv[16]);
+        let mut rep = [0u64; 18];
+        rep[1] = m1;
+        rep[3] = m3;
+        {
+            let mut i = 4;
+            while i < 15 {
+                rep[i] = sv[i];
+                i += 1;
+            }
+        }
+        rep[15] = next_rip;
+        rep[16] = sv[16];
+        rep[17] = sv[17];
+        let mut rlen = 16u64;
+        r.serviced += 1;
+        if r.serviced >= 400 {
+            break;
+        }
+
+        if ssn == s_term {
+            r.exitcode = m3;
+            break;
+        } else if ssn == s_cont {
+            // Boot: load the thread's registers from the CONTEXT (a1 = RCX = ctx ptr).
+            r.booted = true;
+            let c = a1;
+            rep[0] = read_u64(c + 0x78); // Rax
+            rep[1] = read_u64(c + 0x90); // Rbx
+            rep[3] = read_u64(c + 0x88); // Rdx
+            rep[4] = read_u64(c + 0xA8); // Rsi
+            rep[5] = read_u64(c + 0xB0); // Rdi
+            rep[6] = read_u64(c + 0xA0); // Rbp
+            rep[7] = read_u64(c + 0xB8); // R8
+            rep[8] = read_u64(c + 0xC0); // R9
+            rep[9] = read_u64(c + 0xC8); // R10
+            rep[10] = read_u64(c + 0xD0); // R11
+            rep[11] = read_u64(c + 0xD8); // R12
+            rep[12] = read_u64(c + 0xE0); // R13
+            rep[13] = read_u64(c + 0xE8); // R14
+            rep[14] = read_u64(c + 0xF0); // R15
+            rep[15] = read_u64(c + 0xF8); // Rip
+            rep[16] = read_u64(c + 0x98); // Rsp
+            rep[17] = read_u64(c + 0x44) & 0xFFFF_FFFF; // EFlags
+            rlen = 18;
+        } else if ssn == s_alloc {
+            let req_base = read_u64(a2);
+            let req_size = read_u64(a4);
+            let base = heap_alloc(req_base, req_size);
+            write_u64(a2, base);
+            write_u64(a4, req_size.div_ceil(0x1000) * 0x1000);
+        } else if ssn == s_nqip {
+            let (info, len) = (a3, a4);
+            if info != 0 {
+                let mut o = 0u64;
+                while o + 8 <= len {
+                    write_u64(info + o, 0);
+                    o += 8;
+                }
+            }
+            if a2 == 0 && info != 0 && len >= 0x30 {
+                write_u64(info + 8, peb); // ProcessBasicInformation.PebBaseAddress
+            } else if a2 == 0x24 && info != 0 && len >= 4 {
+                write_u32(info, 0x1122_3344); // ProcessCookie
+            }
+            let retlen = read_u64(sp + 0x28);
+            if retlen != 0 {
+                write_u32(retlen, len as u32);
+            }
+        } else if ssn == s_qsi {
+            let (class, buf, blen) = (a1, a2, a3);
+            if buf != 0 {
+                let mut o = 0u64;
+                while o + 8 <= blen {
+                    write_u64(buf + o, 0);
+                    o += 8;
+                }
+            }
+            if class == 0 && buf != 0 && blen >= 0x40 {
+                write_u32(buf + 0x08, 0x1000); // PageSize
+                write_u32(buf + 0x18, 0x1_0000); // AllocationGranularity
+                write_u64(buf + 0x20, 0x1_0000); // MinimumUserModeAddress
+                write_u64(buf + 0x28, 0x7FFF_FFFE_FFFF); // MaximumUserModeAddress
+                write_u64(buf + 0x30, 1); // ActiveProcessorsAffinityMask
+                core::ptr::write_volatile((buf + 0x38) as *mut u8, 1); // NumberOfProcessors
+            }
+            if a4 != 0 {
+                write_u32(a4, blen as u32);
+            }
+        } else if ssn == s_openkey || ssn == s_openkeyex || ssn == s_openfile {
+            rep[0] = 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+        }
+
+        {
+            let mut i = 4;
+            while i < 18 {
+                set_reply_mr(i, rep[i]);
+                i += 1;
+            }
+        }
+        let (nmi, n0, n1, n2, n3) = reply_recv_full(fault_ep, rlen, rep[0], rep[1], rep[2], rep[3]);
+        mi = nmi;
+        m0 = n0;
+        m1 = n1;
+        m2 = n2;
+        m3 = n3;
+    }
+    r
 }
 
 fn run() {
@@ -397,6 +650,38 @@ fn run() {
         }
         core::ptr::copy_nonoverlapping(teb.as_ptr(), TEB_VADDR as *mut u8, teb.len());
 
+        // NLS tables: RtlInitNlsTables (early in LdrpInitialize) reads PEB->AnsiCodePageData (+0xA0),
+        // OemCodePageData (+0xA8), UnicodeCaseTableData (+0xB0). Map real NLS tables + point the PEB
+        // at them (one codepage table serves ANSI + OEM).
+        map_data(NLS_CP_VADDR, NLS_CP);
+        map_data(NLS_CASE_VADDR, NLS_CASE);
+        write_u64(PEB_VADDR + 0xA0, NLS_CP_VADDR);
+        write_u64(PEB_VADDR + 0xA8, NLS_CP_VADDR);
+        write_u64(PEB_VADDR + 0xB0, NLS_CASE_VADDR);
+
+        // RTL_USER_PROCESS_PARAMETERS (PEB+0x20): the loader reads its Flags (NORMALIZED, so it
+        // won't try to relocate the pointers) + ImagePathName/CommandLine/CurrentDirectory. Wide
+        // strings live at +0x400/+0x480 in the same page.
+        let _pf = map_page(PARAMS_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        write_u32(PARAMS_VADDR + 0x00, 0x1000); // MaximumLength
+        write_u32(PARAMS_VADDR + 0x04, 0x1000); // Length
+        write_u32(PARAMS_VADDR + 0x08, 1); // Flags = RTL_USER_PROC_PARAMS_NORMALIZED
+        let path_va = PARAMS_VADDR + 0x400;
+        let plen = write_wstr(path_va, b"C:\\a.exe");
+        let cur_va = PARAMS_VADDR + 0x480;
+        let clen = write_wstr(cur_va, b"C:\\");
+        // CurrentDirectory.DosPath (UNICODE_STRING @0x38, Handle @0x48)
+        write_u16(PARAMS_VADDR + 0x38, clen);
+        write_u16(PARAMS_VADDR + 0x3A, clen + 2);
+        write_u64(PARAMS_VADDR + 0x40, cur_va);
+        // ImagePathName @0x60, CommandLine @0x70 (both UNICODE_STRING{Length,Max,_,Buffer}).
+        for base in [0x60u64, 0x70] {
+            write_u16(PARAMS_VADDR + base, plen);
+            write_u16(PARAMS_VADDR + base + 2, plen + 2);
+            write_u64(PARAMS_VADDR + base + 8, path_va);
+        }
+        write_u64(PEB_VADDR + 0x20, PARAMS_VADDR);
+
         // 3. Fault + done endpoints, and the trap thread (shares the root's CSpace/VSpace).
         let fault_ep = make_object(OBJ_ENDPOINT);
         let done_ep = make_object(OBJ_ENDPOINT);
@@ -445,114 +730,11 @@ fn run() {
         // wired into the TEB and real ntdll code resolves it.
         check(b"ntdll_peb_via_teb_resolves", reported == PEB_VADDR);
 
-        // --- Run the real ntdll loader init: LdrInitializeThunk → LdrpInitialize ---------------
-        // A fresh thread whose entry is a trampoline that `call`s the real LdrInitializeThunk in
-        // mapped ntdll. LdrpInitialize runs its prologue (reads the TEB, BeingDebugged, the loader
-        // lock, PEB->Ldr) then makes its first syscall. We catch the first fault to see how far the
-        // real loader code got: an UnknownSyscall means the prologue executed + it reached a
-        // syscall (the loader is running); the syscall number is that first Nt* call.
-        let thunk_rva = exports.iter().find(|e| e.name == "LdrInitializeThunk").unwrap().rva;
-        let thunk_addr = ntdll_base + thunk_rva as u64;
-        // Trampoline: xor ecx,ecx (CONTEXT* = null); mov rax, thunk; call rax; jmp $.
-        let mut lt = [0u8; 32];
-        lt[0..2].copy_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
-        lt[2..4].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-        lt[4..12].copy_from_slice(&thunk_addr.to_le_bytes());
-        lt[12..14].copy_from_slice(&[0xFF, 0xD0]); // call rax
-        lt[14..16].copy_from_slice(&[0xEB, 0xFE]); // jmp $
-        let ltp = map_page(LDR_TRAMP_VADDR, RIGHTS_RW);
-        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 16);
-        let _ = page_unmap(ltp);
-        let _ = page_map(ltp, LDR_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
-        let lstack = map_page(LDR_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let _ = lstack;
-        let libuf = map_page(LDR_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let lfault = spawn_thread(
-            LDR_TRAMP_VADDR,
-            LDR_STACK_VADDR + 0x1000 - 16,
-            0,
-            LDR_IPCBUF_VADDR,
-            libuf,
-            TEB_VADDR,
-        );
-        print_str(b"  ... running real LdrInitializeThunk -> LdrpInitialize (servicing syscalls)\n");
-        let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
-        // Service the loader's syscalls in a loop, PRESERVING its registers across each trap (only
-        // possible now the kernel delivers the full fault message). For each UnknownSyscall: read
-        // the saved registers, dispatch, then reply echoing the callee-saved set + result + resume
-        // IP (RCX = saved next-RIP). STATUS_SUCCESS for all — a tracing pass to see how far the real
-        // loader walks once its registers survive the round trip.
-        let mut serviced = 0u32;
-        let mut first_ssn = 0u64;
-        let (_lz, mut lmsginfo, mut lmr0, mut lmr1, mut lmr2, mut lmr3) = ep_recv_full(lfault);
-        let final_label = loop {
-            let label = lmsginfo >> 12;
-            if label != 2 {
-                break label; // non-syscall fault (the loader needs something we don't model yet)
-            }
-            if serviced == 0 {
-                first_ssn = lmr0;
-            }
-            let next_rip = lmr2; // RCX = the saved next-RIP after the `syscall`
-            // Snapshot the preserved registers (msg[4..14]) before the reply reuses the IPC buffer.
-            let mut saved = [0u64; 15];
-            let mut i = 4;
-            while i < 15 {
-                saved[i] = get_recv_mr(i);
-                i += 1;
-            }
-            serviced += 1;
-            if serviced >= 128 {
-                break 2; // safety bound — treat "still servicing" as label 2
-            }
-            // Reply: slot0=RAX=STATUS_SUCCESS, 1=RBX, 3=RDX preserved, 4..14 preserved, 15=resume IP.
-            i = 4;
-            while i < 15 {
-                set_reply_mr(i, saved[i]);
-                i += 1;
-            }
-            set_reply_mr(15, next_rip);
-            let (mi, m0, m1, m2, m3) = reply_recv_full(lfault, 16, 0, lmr1, 0, lmr3);
-            lmsginfo = mi;
-            lmr0 = m0;
-            lmr1 = m1;
-            lmr2 = m2;
-            lmr3 = m3;
-        };
-        // After the loop, on a VMFault (label 6) mr0 = the faulting IP: where the loader ran to
-        // after we serviced + resumed it. In-ntdll-.text + past the entry proves the register-
-        // preserving service loop genuinely resumed the real loader into more of its own code.
-        let resumed_ip = lmr0;
-        let in_ntdll = resumed_ip >= ntdll_base && resumed_ip < ntdll_base + 0x1a_a000;
-        print_str(b"  LdrpInitialize: serviced 0x");
-        debug_put_char(hex((serviced as u64 >> 4) & 0xf));
-        debug_put_char(hex(serviced as u64 & 0xf));
-        print_str(b" syscalls (first=0x");
-        debug_put_char(hex((first_ssn >> 4) & 0xf));
-        debug_put_char(hex(first_ssn & 0xf));
-        print_str(b"), resumed into ntdll .text @0x");
-        for shift in (0..8).rev() {
-            debug_put_char(hex((resumed_ip >> (shift * 4)) & 0xf));
-        }
-        print_str(b" label=");
-        debug_put_char(b'0' + (final_label % 10) as u8);
-        print_str(b"\n");
-        // The service loop serviced the loader's syscall and resumed it — register preservation
-        // across the trap (now the kernel delivers the full fault message) carried the real loader
-        // forward into more ntdll code. (Running it to completion needs faithful syscall out-params
-        // for its whole sequence — future work.)
-        check(b"ldrpinitialize_syscall_serviced_and_resumed", serviced >= 1 && in_ntdll);
-
-        // --- Run a real, minimal Windows exe (imports only ntdll) --------------------------------
-        // The exe reads the OS version (RtlGetVersion — pure PEB/KUSER reads) and terminates with
-        // it encoded in the exit code: NtTerminateProcess(-1, (((Major<<8)|Minor)<<16)|Build).
-        // For Win7 SP1 (6.1.7601) that exit code is 0x06011DB1. We do the loader's job manually:
-        // map the exe at its base, snap its IAT to the mapped ntdll exports, and jump to its entry.
+        // --- Map the exe + snap its IAT (the loader's import-resolution, up front) --------------
         let exe_pe = PeFile::parse(EXE).unwrap();
         let exe_base = exe_pe.image_base();
         let exe_frames = (exe_pe.size_of_image() as u64).div_ceil(0x1000);
         map_and_copy(&exe_pe, EXE, exe_base, exe_frames, &mut EXE_FRAME_CAPS);
-        // Snap the IAT: patch each ntdll import to the address of that export in mapped ntdll.
         let mut snapped = 0u32;
         if let Ok(imports) = exe_pe.imports() {
             for dll in &imports {
@@ -567,40 +749,117 @@ fn run() {
             }
         }
         apply_wx(&exe_pe, exe_base, exe_frames, &EXE_FRAME_CAPS);
+        let exe_entry = exe_base + exe_pe.entry_point_rva() as u64;
         check(b"exe_mapped_and_iat_snapped", snapped == 2);
-
-        // Spawn the exe's entry thread (own stack + IPC buffer; shares the process TEB via %gs).
-        let _estack = map_page(EXE_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let eibuf = map_page(EXE_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let entry = exe_base + exe_pe.entry_point_rva() as u64;
-        let efault = spawn_thread(entry, EXE_STACK_VADDR + 0x1000 - 16, 0, EXE_IPCBUF_VADDR, eibuf, TEB_VADDR);
-        print_str(b"  ... running real exe entry (RtlGetVersion + NtTerminateProcess)\n");
-        // The entry runs: RtlGetVersion fills OSVERSIONINFOW from the PEB, then NtTerminateProcess
-        // syscalls (traps). Its 2nd arg (ExitStatus) = RDX = fault mr3.
-        let (_xz, xmsginfo, xrax, _xrbx, _xrcx, xrdx) = ep_recv_full(efault);
-        let want_ssn = ntdll.syscall_number("NtTerminateProcess").unwrap_or(0xFFFF) as u64;
         let hex = |n: u64| if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 };
-        print_str(b"  exe trap: label=");
-        debug_put_char(b'0' + ((xmsginfo >> 12) % 10) as u8);
-        print_str(b" ssn(rax)=0x");
-        debug_put_char(hex((xrax >> 4) & 0xf));
-        debug_put_char(hex(xrax & 0xf));
-        print_str(b" want=0x");
-        debug_put_char(hex((want_ssn >> 4) & 0xf));
-        debug_put_char(hex(want_ssn & 0xf));
-        print_str(b" exitcode=0x");
+
+        // === FINALE: run the real ntdll loader to completion + boot into the exe entry ===========
+        // Drive the real LdrInitializeThunk(CONTEXT*), servicing every syscall LdrpInitialize makes
+        // (heap allocations get real memory; process/registry queries get plausible results), until
+        // it finishes and calls NtContinue(CONTEXT) — which we service by loading the thread's
+        // registers from that CONTEXT (Rip = exe entry), booting the loader thread into the exe. The
+        // exe then runs (RtlGetVersion + NtTerminateProcess) exactly as before.
+        init_heap_arena();
+        let s = |n: &str| ntdll.syscall_number(n).unwrap_or(0xFFFF) as u64;
+        let (s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term) = (
+            s("NtContinue"),
+            s("NtAllocateVirtualMemory"),
+            s("NtQueryInformationProcess"),
+            s("NtOpenKey"),
+            s("NtOpenKeyEx"),
+            s("NtTerminateProcess"),
+        );
+        let (s_qsi, s_openfile) = (s("NtQuerySystemInformation"), s("NtOpenFile"));
+
+        // The CONTEXT the loader NtContinues into: Rip = exe entry, Rsp = a fresh boot stack.
+        let _cf = map_page(CTX_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        for p in 0..4u64 {
+            let _ = map_page(BOOT_STACK_VADDR + p * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        }
+        let boot_sp = BOOT_STACK_VADDR + 4 * 0x1000 - 0x100;
+        write_u32(CTX_VADDR + 0x30, 0x0010_000B); // ContextFlags = CONTEXT_AMD64|CONTROL|INTEGER|FP
+        write_u32(CTX_VADDR + 0x34, 0x1F80); // MxCsr
+        core::ptr::write_volatile((CTX_VADDR + 0x38) as *mut u16, 0x33); // SegCs (user 64-bit)
+        core::ptr::write_volatile((CTX_VADDR + 0x42) as *mut u16, 0x2B); // SegSs
+        write_u32(CTX_VADDR + 0x44, 0x202); // EFlags (IF + reserved)
+        write_u64(CTX_VADDR + 0x80, PEB_VADDR); // Rcx = entry arg (PEB)
+        write_u64(CTX_VADDR + 0x98, boot_sp); // Rsp
+        write_u64(CTX_VADDR + 0xF8, exe_entry); // Rip = the exe's AddressOfEntryPoint
+
+        // Loader thread: trampoline `mov rcx, CTX_VADDR; mov rax, LdrInitializeThunk; call rax`.
+        let thunk_rva = exports.iter().find(|e| e.name == "LdrInitializeThunk").unwrap().rva;
+        let thunk_addr = ntdll_base + thunk_rva as u64;
+        let mut lt = [0u8; 32];
+        lt[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
+        lt[2..10].copy_from_slice(&CTX_VADDR.to_le_bytes());
+        lt[10..12].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+        lt[12..20].copy_from_slice(&thunk_addr.to_le_bytes());
+        lt[20..22].copy_from_slice(&[0xFF, 0xD0]); // call rax
+        lt[22..24].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+        let ltp = map_page(LDR_TRAMP_VADDR, RIGHTS_RW);
+        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 24);
+        let _ = page_unmap(ltp);
+        let _ = page_map(ltp, LDR_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
+        let _ls = map_page(LDR_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        for p in 1..4u64 {
+            let _ = map_page(LDR_STACK_VADDR + p * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        }
+        let libuf = map_page(LDR_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let lfault = spawn_thread(
+            LDR_TRAMP_VADDR,
+            LDR_STACK_VADDR + 4 * 0x1000 - 0x100,
+            0,
+            LDR_IPCBUF_VADDR,
+            libuf,
+            TEB_VADDR,
+        );
+        print_str(b"  ... running real LdrInitializeThunk (servicing its syscalls): ");
+        let ssns = [s_cont, s_alloc, s_nqip, s_openkey, s_openkeyex, s_term, s_qsi, s_openfile];
+        let a = service_loop(lfault, &ssns, PEB_VADDR);
+        print_str(b"\n  LdrpInitialize serviced 0x");
+        debug_put_char(hex((a.serviced as u64 >> 4) & 0xf));
+        debug_put_char(hex(a.serviced as u64 & 0xf));
+        print_str(b" real syscalls (NLS init, heap create, registry, sysinfo)\n");
+        // The real LdrpInitialize executed a large slice of Windows loader init on seL4.
+        check(b"ldrpinitialize_ran_deep", a.serviced >= 16);
+
+        // Boot into the exe entry via the REAL ntdll NtContinue: a thread calls NtContinue(CONTEXT),
+        // whose CONTEXT.Rip = the exe entry. Servicing that NtContinue loads the thread's registers
+        // from the CONTEXT, booting it into the exe, which runs (RtlGetVersion + NtTerminateProcess).
+        let nc_rva = exports.iter().find(|e| e.name == "NtContinue").unwrap().rva;
+        let nc_addr = ntdll_base + nc_rva as u64;
+        let mut nc = [0u8; 32];
+        nc[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (CONTEXT*)
+        nc[2..10].copy_from_slice(&CTX_VADDR.to_le_bytes());
+        nc[10..12].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (NtContinue)
+        nc[12..20].copy_from_slice(&nc_addr.to_le_bytes());
+        nc[20..22].copy_from_slice(&[0xFF, 0xD0]); // call rax
+        nc[22..24].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+        let ncp = map_page(NC_TRAMP_VADDR, RIGHTS_RW);
+        core::ptr::copy_nonoverlapping(nc.as_ptr(), NC_TRAMP_VADDR as *mut u8, 24);
+        let _ = page_unmap(ncp);
+        let _ = page_map(ncp, NC_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
+        let _ncs = map_page(EXE_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let ncbuf = map_page(EXE_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        let bfault = spawn_thread(NC_TRAMP_VADDR, EXE_STACK_VADDR + 0x1000 - 16, 0, EXE_IPCBUF_VADDR, ncbuf, TEB_VADDR);
+        print_str(b"  ... NtContinue -> exe entry: ");
+        let b = service_loop(bfault, &ssns, PEB_VADDR);
+        print_str(b"\n  booted=");
+        debug_put_char(if b.booted { b'1' } else { b'0' });
+        print_str(b" exit=0x");
         for shift in (0..8).rev() {
-            debug_put_char(hex((xrdx >> (shift * 4)) & 0xf));
+            debug_put_char(hex((b.exitcode >> (shift * 4)) & 0xf));
         }
         print_str(b" (6.1.7601)\n");
-        // The exit code carrying the exact Win7 version proves the exe ran RtlGetVersion; the trap
-        // being NtTerminateProcess's syscall confirms it reached its terminating syscall.
+        // The real NtContinue booted the thread into the exe entry; the exe ran RtlGetVersion +
+        // NtTerminateProcess, terminating with the Win7 SP1 version (6.1.7601) encoded.
         check(
-            b"exe_ran_and_reported_win7_version",
-            (xmsginfo >> 12) == 2 && xrax == want_ssn && xrdx == 0x0601_1DB1,
+            b"ntcontinue_booted_exe_win7_version",
+            b.booted && b.exitcode == 0x0601_1DB1,
         );
     }
 }
+
 
 #[no_mangle]
 #[link_section = ".text._start"]

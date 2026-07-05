@@ -154,3 +154,30 @@ the loader's first syscall (0x16) and **resumed it into more ntdll `.text`** (@0
 pre-full-message single-shot could not do. Running the loader to completion needs faithful syscall
 out-params for its whole sequence (its next fault is a NULL deref from the STATUS_SUCCESS-only pass)
 — future work.
+
+## Running LdrpInitialize deep + booting the exe via real NtContinue (implemented)
+
+Two phases, both driving real ntdll through the register-preserving service loop
+(`service_loop`), which for each `UnknownSyscall` snapshots the saved registers, services the
+syscall, and replies echoing the callee-saved set + result + resume IP.
+
+**Phase A — the real loader runs deep.** The trap thread's trampoline `call`s the real
+`LdrInitializeThunk(CONTEXT*)`. The service loop gives its syscalls faithful results:
+`NtAllocateVirtualMemory` returns real 64 KiB-aligned mapped memory (a demand-mapped 16 MiB arena);
+`NtQuerySystemInformation(SystemBasicInformation)` fills PageSize/AllocationGranularity/CPU count;
+`NtQueryInformationProcess` fills PebBaseAddress/ProcessCookie; `NtOpenKey`/`NtOpenFile` return
+`STATUS_OBJECT_NAME_NOT_FOUND`. The environment needed to get this far: NLS tables (real
+`c_856.nls` + `l_intl.nls`) wired into PEB->Ansi/Oem/UnicodeCaseTableData; a `RTL_USER_PROCESS_PARAMETERS`
+(Flags=NORMALIZED, ImagePathName/CommandLine/CurrentDirectory) at PEB->ProcessParameters. QEMU:
+`ldrpinitialize_ran_deep` — the real `LdrpInitialize` executes ~20 syscalls (NLS init, process-heap
+creation, registry + system-info queries) before it needs real file/section I/O + a full module list
+to continue (a filesystem subsystem — future work).
+
+**Phase B — boot the exe via the real NtContinue.** `LdrInitializeThunk` finishes by calling
+`NtContinue(CONTEXT)` to jump to the process entry. We prove that boot path directly: a thread `call`s
+the real `NtContinue` with a CONTEXT whose `Rip` = the exe entry, `Rsp` = a fresh stack. Servicing that
+`NtContinue` loads the thread's registers from the CONTEXT (x64 CONTEXT offsets: Rip@0xF8, Rsp@0x98,
+Rax@0x78…R15@0xF0), booting the thread into the exe. The exe then runs (`RtlGetVersion` +
+`NtTerminateProcess`). QEMU: `ntcontinue_booted_exe_win7_version` — `booted=1`, exit code `0x06011DB1`
+= 6.1.7601: the real `NtContinue` booted a real Windows exe into its entry, and it terminated with the
+real Win7 version.
