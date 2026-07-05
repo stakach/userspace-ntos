@@ -175,21 +175,27 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
 /// read `%gs:[0x30]` (TEB.Self — the canonical ntdll self-reference) and report it via a real
 /// `SysSend(rdi = done_ep, mr0 = %gs:[0x30])` (a valid seL4 syscall). Reaching + resolving the GS
 /// read proves the export resumed AND that `%gs` points at the thread's TEB.
-fn build_trampoline(export_addr: u64) -> ([u8; 48], usize) {
-    let mut c = [0u8; 48];
-    c[0..2].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    c[2..10].copy_from_slice(&export_addr.to_le_bytes());
-    c[10..12].copy_from_slice(&[0xFF, 0xD0]); // call rax (export: syscall traps → serviced → ret)
-    // mov rax, gs:[0x30]  — read TEB.Self AFTER the syscall trap+resume (proves %gs survives it).
-    c[12..21].copy_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00]);
-    c[21..24].copy_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
-    c[24] = 0xBE;
-    c[25..29].copy_from_slice(&1u32.to_le_bytes()); // mov esi, 1  (MessageInfo length 1)
-    c[29] = 0xBA;
-    c[30..34].copy_from_slice(&0xFFFF_FFFBu32.to_le_bytes()); // mov edx, -5 (SYS_SEND)
-    c[34..36].copy_from_slice(&[0x0F, 0x05]); // syscall
-    c[36..38].copy_from_slice(&[0xEB, 0xFE]); // jmp $
-    (c, 38)
+/// Build the trampoline: `call syscall_export` (the real ntdll `NtQuerySystemInformation`, whose
+/// `syscall` traps + is serviced), then `call peb_export` (the real `RtlGetCurrentPeb`, which
+/// resolves the PEB through `%gs:[0x30]` → `[TEB+0x60]`), then report that PEB pointer via a real
+/// `SysSend(rdi = done_ep, mr0 = PEB)`. Reaching + resolving both proves the syscall round trip AND
+/// that the TEB/PEB are wired so real ntdll code finds them.
+fn build_trampoline(syscall_export: u64, peb_export: u64) -> ([u8; 64], usize) {
+    let mut c = [0u8; 64];
+    c[0..2].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64  (NtQuerySystemInformation)
+    c[2..10].copy_from_slice(&syscall_export.to_le_bytes());
+    c[10..12].copy_from_slice(&[0xFF, 0xD0]); // call rax (syscall traps → serviced → resume → ret)
+    c[12..14].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64  (RtlGetCurrentPeb)
+    c[14..22].copy_from_slice(&peb_export.to_le_bytes());
+    c[22..24].copy_from_slice(&[0xFF, 0xD0]); // call rax (RtlGetCurrentPeb → rax = PEB)
+    c[24..27].copy_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax  (report the PEB)
+    c[27] = 0xBE;
+    c[28..32].copy_from_slice(&1u32.to_le_bytes()); // mov esi, 1  (MessageInfo length 1)
+    c[32] = 0xBA;
+    c[33..37].copy_from_slice(&0xFFFF_FFFBu32.to_le_bytes()); // mov edx, -5 (SYS_SEND)
+    c[37..39].copy_from_slice(&[0x0F, 0x05]); // syscall
+    c[39..41].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+    (c, 41)
 }
 
 fn run() {
@@ -210,7 +216,10 @@ fn run() {
     };
     let ntdll = NtdllImage::load(NTDLL, pe.image_base()).unwrap();
     let want_ssn = ntdll.syscall_number("NtQuerySystemInformation").unwrap_or(0xFFFF);
-    let export_rva = ntdll.export("NtQuerySystemInformation").unwrap().rva;
+    // RtlGetCurrentPeb isn't an Nt*/Zw* stub, so look both RVAs up in the full export table.
+    let exports = pe.exports().unwrap();
+    let export_rva = exports.iter().find(|e| e.name == "NtQuerySystemInformation").unwrap().rva;
+    let peb_rva = exports.iter().find(|e| e.name == "RtlGetCurrentPeb").unwrap().rva;
     check(b"ntdll_parsed", ntdll.syscall_stub_count() > 300 && want_ssn == 0x33);
 
     // The real export stub's `ret` (resume IP) = the instruction after its `syscall` (0F 05).
@@ -218,10 +227,11 @@ fn run() {
     let syscall_off = stub.windows(2).position(|w| w == [0x0F, 0x05]).unwrap_or(8);
     let ntdll_base = pe.image_base();
     let export_addr = ntdll_base + export_rva as u64;
+    let peb_export_addr = ntdll_base + peb_rva as u64;
     let resume_ip = export_addr + (syscall_off as u64) + 2;
 
     let frames = (pe.size_of_image() as u64).div_ceil(0x1000);
-    let (tramp, tramp_len) = build_trampoline(export_addr);
+    let (tramp, tramp_len) = build_trampoline(export_addr, peb_export_addr);
 
     unsafe {
         // 1. Map the full ntdll image at its preferred base + copy headers/sections in (delta 0).
@@ -252,8 +262,12 @@ fn run() {
         let stack_top = STACK_VADDR + 0x1000 - 16;
         let ipcbuf = map_page(CHILD_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
 
-        // 2b. Build a Windows TEB + map it, so ntdll self-references (`%gs:[0x30]` = TEB self,
-        //     `%gs:[0x60]` = PEB) resolve. The trap thread's %gs base is set to the TEB below.
+        // 2b. Build a Windows PEB + TEB + map them, so ntdll self-references resolve: the TEB
+        //     links `%gs:[0x60]` → PEB, and the trap thread's %gs base is set to the TEB below.
+        let profile = WindowsProfile::windows7_sp1();
+        let peb = nt_user_host::build_peb(&profile, ntdll_base, 0, 0, 0);
+        let _peb_frame = map_page(PEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
+        core::ptr::copy_nonoverlapping(peb.as_ptr(), PEB_VADDR as *mut u8, peb.len().min(0x1000));
         let teb = nt_user_host::build_teb(TEB_VADDR, PEB_VADDR, STACK_VADDR, stack_top, 4, 8);
         let _teb_frame = map_page(TEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         core::ptr::copy_nonoverlapping(teb.as_ptr(), TEB_VADDR as *mut u8, teb.len().min(0x1000));
@@ -301,9 +315,10 @@ fn run() {
         set_reply_mr(5, done_ep); // RDI → done_ep (survives the reply into the trampoline)
         set_reply_mr(15, resume_ip); // FaultIP → the export's `ret`
         let (_b2, _mi2, reported) = reply_recv(done_ep, 16, REPORT_SENTINEL, 0, 0, 0);
-        // The trampoline resumed cleanly and reported %gs:[0x30] (TEB.Self) over IPC. It equalling
-        // TEB_VADDR proves %gs resolves to the thread's TEB — ntdll self-references work.
-        check(b"ntdll_teb_via_gs_resolves", reported == TEB_VADDR);
+        // The export resumed cleanly, then the real RtlGetCurrentPeb (which reads %gs:[0x30] →
+        // [TEB+0x60]) returned the PEB, reported here. It equalling PEB_VADDR proves the PEB is
+        // wired into the TEB and real ntdll code resolves it.
+        check(b"ntdll_peb_via_teb_resolves", reported == PEB_VADDR);
     }
 }
 
