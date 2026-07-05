@@ -228,6 +228,16 @@ impl ConfigManager {
         self.devnode_by_id(id).map(|d| d.enum_key)
     }
 
+    /// The `Service` value of a devnode — the driver service the PnP Manager binds to it.
+    pub fn devnode_service(&self, id: DevnodeId) -> Option<&str> {
+        self.devnode_by_id(id).and_then(|d| d.service.as_deref())
+    }
+
+    /// A devnode's `HardwareID` list (the `BusQueryHardwareIDs` answer).
+    pub fn devnode_hardware_ids(&self, id: DevnodeId) -> Option<&[String]> {
+        self.devnode_by_id(id).map(|d| d.hardware_ids.as_slice())
+    }
+
     // --- PnP properties (spec §11) --------------------------------------------
 
     /// `WdfDeviceAssignProperty` / `IoSetDevicePropertyData` — set a `DEVPROPKEY` property.

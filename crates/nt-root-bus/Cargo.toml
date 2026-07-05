@@ -1,0 +1,11 @@
+[package]
+name = "nt-root-bus"
+description = "Synthetic root/PDO bus for the NT PnP Manager: creates physical device objects for fixture devnodes and answers the bus queries (IRP_MN_QUERY_ID device/hardware/compatible/instance IDs, IRP_MN_QUERY_CAPABILITIES). Wide-string + double-null multi-SZ encoding. no_std + alloc, no seL4 dependency, no raw pointers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

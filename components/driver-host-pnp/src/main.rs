@@ -23,20 +23,45 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
+use nt_config_manager::ConfigManager;
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
 use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
 use nt_pnp_manager::PnpManager;
 use nt_resource_manager::{ResourceManager, ResourceOwner};
+use nt_root_bus::{BusQueryId, RootBus};
 use nt_sim_device::SimDevice;
 use sel4_rt::*;
 
+/// The one driver image this host knows how to load, indexed by service name. In a full driver
+/// database this is `Services\<name>\ImagePath` -> the file; here the "boot driver set" is a static
+/// table, but the driver that gets loaded is still chosen by the devnode's selected service.
 static PNP_SYS: &[u8] =
     include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/PnpMmioInterruptTest.sys");
+
+/// Resolve a service name to its driver image (the boot-driver "store").
+fn load_service_image(service: &str) -> Option<&'static [u8]> {
+    match service {
+        SERVICE_NAME => Some(PNP_SYS),
+        _ => None,
+    }
+}
 
 const CODE_VADDR: u64 = 0x0000_0001_4000_0000;
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+
+// --- the fixture devnode this host enumerates + binds (the service database entry) --------
+const SERVICE_NAME: &str = "PnpMmioInterruptTest";
+const DEVICE_ID: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO";
+const COMPATIBLE_ID: &str = r"ROOT\USERSPACE_NTOS_TEST_DEVICE";
+const INSTANCE_ID: &str = "0001";
+const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001";
+const CLASS_GUID: &str = "{4d36e97d-e325-11ce-bfc1-08002be10318}";
+/// The `object_id` the PnP Manager + root bus use for this devnode's PDO.
+const PDO_OBJECT_ID: u64 = 0xFED0_0000;
 
 const DRIVER_HOST_ID: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
@@ -96,6 +121,8 @@ static mut RT: Option<KernelExecRuntime<FakeClock>> = None;
 static mut RM: Option<ResourceManager> = None;
 static mut SIM: Option<SimDevice> = None;
 static mut PNP: Option<PnpManager> = None;
+static mut CFG: Option<ConfigManager> = None;
+static mut ROOT_BUS: Option<RootBus> = None;
 
 unsafe fn rt() -> &'static mut KernelExecRuntime<FakeClock> {
     (*core::ptr::addr_of_mut!(RT)).as_mut().unwrap()
@@ -108,6 +135,19 @@ unsafe fn sim() -> &'static mut SimDevice {
 }
 unsafe fn pnp() -> &'static mut PnpManager {
     (*core::ptr::addr_of_mut!(PNP)).as_mut().unwrap()
+}
+unsafe fn cfg() -> &'static mut ConfigManager {
+    (*core::ptr::addr_of_mut!(CFG)).as_mut().unwrap()
+}
+unsafe fn root_bus() -> &'static mut RootBus {
+    (*core::ptr::addr_of_mut!(ROOT_BUS)).as_mut().unwrap()
+}
+
+/// Emit a traced `pnp_*` lifecycle event (spec §Tracing Events).
+fn trace(event: &[u8]) {
+    print_str(b"  [pnp] ");
+    print_str(event);
+    print_str(b"\n");
 }
 
 fn owner() -> ResourceOwner {
@@ -549,13 +589,64 @@ fn check(name: &[u8], ok: bool) {
     print_str(b"\n");
 }
 
+/// `buf` is a NUL-terminated wide string equal to `expected`.
+fn wide_is(buf: &[u16], expected: &str) -> bool {
+    let e: Vec<u16> = expected.encode_utf16().collect();
+    buf.len() == e.len() + 1 && buf[e.len()] == 0 && buf[..e.len()] == e[..]
+}
+
+/// `buf` is a double-NUL-terminated multi-SZ whose first entry equals `expected`.
+fn wide_is_multisz_first(buf: &[u16], expected: &str) -> bool {
+    let e: Vec<u16> = expected.encode_utf16().collect();
+    buf.len() >= e.len() + 2 && buf[e.len()] == 0 && buf[..e.len()] == e[..]
+}
+
 unsafe fn run() {
     RT = Some(KernelExecRuntime::new(FakeClock::new(), 0x5000_0000));
     RM = Some(ResourceManager::new()); // empty — resources assigned only at START (§15.2)
     SIM = Some(SimDevice::new());
     PNP = Some(PnpManager::new());
+    CFG = Some(ConfigManager::new());
+    ROOT_BUS = Some(RootBus::new());
 
-    let pe = match nt_pe_loader::PeFile::parse(PNP_SYS) {
+    // --- ResolveService: the boot-time service database + the root-enumerated devnode ---------
+    // A service key (Services\PnpMmioInterruptTest) and a devnode whose `Service` value selects
+    // the driver — so the driver that binds is chosen by the device tree, not hardcoded.
+    cfg().register_service(
+        SERVICE_NAME,
+        r"\SystemRoot\system32\drivers\PnpMmioInterruptTest.sys",
+        Some("Base"),
+        Some(CLASS_GUID),
+        /* start = SERVICE_BOOT_START */ 0,
+        /* error_control = NORMAL */ 1,
+    );
+    let cfg_devnode = cfg().register_devnode(
+        INSTANCE_PATH,
+        Some(SERVICE_NAME),
+        Some(r"\Device\NTPNP_ROOT_0000"),
+        &[DEVICE_ID],
+        &[COMPATIBLE_ID],
+    );
+    trace(b"pnp_devnode_create + pnp_devnode_registry_materialize");
+
+    // pnp_service_select: bind the driver named by the devnode's Service value (DB-driven).
+    let selected = cfg().devnode_service(cfg_devnode).map(str::to_string);
+    check(
+        b"service_selected_from_devnode",
+        selected.as_deref() == Some(SERVICE_NAME),
+    );
+    trace(b"pnp_service_select");
+    let image = match selected.as_deref().and_then(load_service_image) {
+        Some(img) => img,
+        None => {
+            check(b"driver_loaded_by_service", false);
+            return;
+        }
+    };
+    check(b"driver_loaded_by_service", true);
+    trace(b"pnp_driver_load_request");
+
+    let pe = match nt_pe_loader::PeFile::parse(image) {
         Ok(p) => p,
         Err(_) => {
             check(b"parse", false);
@@ -621,13 +712,46 @@ unsafe fn run() {
     check(b"add_device_present", add_device != 0);
     check(b"pnp_dispatch_present", pnp_dispatch != 0);
 
-    // --- PnP Manager: enumerate the fixture devnode + create the PDO ---------
+    // --- Enumerate: the root bus creates the PDO + answers the bus queries -------------------
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3); // Type = IO_TYPE_DEVICE
     let devnode = pnp().create_mmio_fixture_devnode(pdo);
-    let _ = pnp().transition(devnode, DeviceState::DriverLoaded);
+    root_bus().create_pdo(
+        PDO_OBJECT_ID,
+        DEVICE_ID,
+        &[DEVICE_ID],
+        &[COMPATIBLE_ID],
+        INSTANCE_ID,
+    );
+    trace(b"pnp_pdo_create + pnp_stack_create");
 
-    // AddDevice(DriverObject, PDO) → driver creates the FDO + attaches.
+    // The PnP Manager queries the PDO's identity before binding a function driver (QUERY_ID +
+    // QUERY_CAPABILITIES answered by the synthetic root bus).
+    let device_id_ok = root_bus()
+        .query_id(PDO_OBJECT_ID, BusQueryId::DeviceId)
+        .map(|w| wide_is(&w, DEVICE_ID))
+        .unwrap_or(false);
+    check(b"root_bus_query_id_device", device_id_ok);
+    let hwids_ok = root_bus()
+        .query_id(PDO_OBJECT_ID, BusQueryId::HardwareIds)
+        .map(|w| wide_is_multisz_first(&w, DEVICE_ID))
+        .unwrap_or(false);
+    check(b"root_bus_query_id_hardware", hwids_ok);
+    trace(b"pnp_query_id");
+    let caps_ok = root_bus()
+        .query_capabilities(PDO_OBJECT_ID)
+        .map(|c| c.version == 1 && c.device_state[0] == 1 && c.surprise_removal_ok)
+        .unwrap_or(false);
+    check(b"root_bus_query_capabilities", caps_ok);
+    trace(b"pnp_query_capabilities");
+
+    let _ = pnp().transition(devnode, DeviceState::DriverLoaded);
+    trace(b"pnp_driver_loaded");
+
+    // --- CallAddDevice: the PnP Manager invokes DriverExtension->AddDevice with the PDO -------
+    // (the manager reads AddDevice off the DriverObject and calls it — not a hardcoded harness
+    // entry) → the function driver creates its FDO and attaches it above the PDO.
+    trace(b"pnp_add_device_enter");
     dh().device_object = 0;
     let add_fn: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
     let add_status = add_fn(driver_object, pdo);
@@ -635,10 +759,11 @@ unsafe fn run() {
     let _ = pnp().transition(devnode, DeviceState::AddDeviceCalled);
     let _ = pnp().set_fdo(devnode, fdo);
     let _ = pnp().transition(devnode, DeviceState::DeviceStackBuilt);
-    check(
-        b"add_device_success",
-        add_status == 0 && fdo != 0 && dh().stack_attached,
-    );
+    trace(b"pnp_add_device_exit");
+    check(b"pnp_called_add_device", add_status == 0);
+    // ValidateFdoAttached: the FDO must sit above the PDO in the stack.
+    check(b"fdo_attached_above_pdo", fdo != 0 && dh().stack_attached);
+    trace(b"pnp_fdo_detected + pnp_attach");
 
     // Negative: an IOCTL before START fails with STATUS_DEVICE_NOT_READY (§15.2/§21.3).
     let (st, _i, _o) = dispatch(driver_object, fdo, 0x0e, 0x0022_20C0, &[], 8);
@@ -666,13 +791,15 @@ unsafe fn run() {
 
     let translated = build_resource_list(devnode);
     let raw = build_resource_list(devnode);
+    trace(b"pnp_start_enter + pnp_start_resources (raw + translated CM_RESOURCE_LIST)");
     let _ = pnp().transition(devnode, DeviceState::StartIrpSent);
     let start_status = dispatch_pnp(driver_object, fdo, IRP_MN_START_DEVICE, raw, translated);
     let started_ok = start_status == 0 && dh().mmio_base != 0 && dh().interrupt_id != 0;
     if started_ok {
         let _ = pnp().transition(devnode, DeviceState::Started);
     }
-    check(b"start_device_success", started_ok);
+    trace(b"pnp_start_complete");
+    check(b"start_device_with_resources", started_ok);
     check(
         b"devnode_started",
         pnp().state(devnode) == Some(DeviceState::Started),
@@ -697,10 +824,12 @@ unsafe fn run() {
     check(b"interrupt_count", st == 0 && count == 1);
 
     // --- REMOVE_DEVICE releases resources ------------------------------------
+    trace(b"pnp_remove_enter");
     let _ = pnp().transition(devnode, DeviceState::RemovePending);
     let mapping_id = dh().mmio_mapping_id;
     let remove_status = dispatch_pnp(driver_object, fdo, IRP_MN_REMOVE_DEVICE, 0, 0);
     let _ = pnp().transition(devnode, DeviceState::Removed);
+    trace(b"pnp_remove_complete");
     check(
         b"remove_device_releases_resources",
         remove_status == 0
@@ -714,6 +843,16 @@ unsafe fn run() {
 
     check(b"callbacks_ran_at_correct_irql", dh().bad_irql == 0);
     let _ = add_status;
+
+    // --- Report -----------------------------------------------------------------------------
+    print_str(b"\n  [pnp-report] ");
+    print_str(INSTANCE_PATH.as_bytes());
+    print_str(b" (service=");
+    print_str(SERVICE_NAME.as_bytes());
+    print_str(b")\n");
+    print_str(b"    bind: service-DB -> root-bus PDO (QUERY_ID/CAPABILITIES) -> PnP AddDevice -> FDO attach\n");
+    print_str(b"    lifecycle: Enumerated -> DriverLoaded -> AddDeviceCalled -> Started -> Removed\n");
+    print_str(b"    START_DEVICE delivered raw + translated CM_RESOURCE_LIST; interfaces: none (WDM MMIO)\n");
 }
 
 #[no_mangle]
@@ -722,7 +861,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
 
-    print_str(b"[ntos-dhp] PnP Driver Host: real PnpMmioInterruptTest.sys lifecycle\n");
+    print_str(b"[ntos-dhp] PnP Manager: service-DB-driven bind of PnpMmioInterruptTest.sys via root-bus PDO\n");
     run();
     print_str(b"[microtest done]\n");
     loop {

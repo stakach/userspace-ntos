@@ -28,6 +28,8 @@ nt-sim-device = { path = "../../crates/nt-sim-device" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-root-bus = { path = "../../crates/nt-root-bus" }
 
 [profile.release]
 panic = "abort"

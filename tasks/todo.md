@@ -1,61 +1,48 @@
-# Milestone: KMDF Loader-Compat bring-up (KmdfLoaderCompatTest.sys, KMDF 1.15)
+# Milestone: PnP-Manager-driven driver binding (WDM path) — increment 1
 
-New spec: NT Driver Loading + KMDF Binding Compat. New driver in the artifact:
-`KmdfLoaderCompatTest.sys` (KMDF 1.15). All 10 drivers are staged in fixtures/
-(9 are rebuilds of existing; this one is new).
+Spec: NT PnP Driver Binding + Devnode Lifecycle. User chose: WDM first (PnpMmioInterruptTest),
+lowest risk (driver-host-pnp already runs the WDM PnP lifecycle as a direct harness).
 
-## What already exists (reuse, don't rebuild)
-- nt-pe-loader: PE64 map + DIR64/ABSOLUTE relocations + IAT list.
-- nt-compat-exports: ntoskrnl/hal export table + statuses.
-- nt-wdf-runtime/types: WdfVersionBind + 444-entry WdfFunctions table (hardcoded 1.15).
-- driver-host-{wdf,wdfhw,direg}: load real KMDF 1.15 .sys end-to-end (include_bytes).
-- nt-config-manager: ServiceRecord{name,image_path,type,start,...} — but no loader reads it.
+## Transition this increment delivers
+From "harness hardcodes the driver + calls AddDevice inline" TO "the PnP Manager binds from a
+service database + drives the lifecycle through a real root-bus PDO", with traced state transitions.
 
-## What the new driver + spec need (the increment)
-The driver calls, in order: WdfVersionBind(0x1eb5) -> WdfVersionBindClass(0x21be)
--> WdfVersionUnbindClass(0x22bc) -> WdfVersionUnbind(0x1dfd), DbgPrintEx traces.
-Existing components implement WdfVersionBind only; version mismatch returns
-STATUS_UNSUCCESSFUL (not STATUS_REVISION_MISMATCH). Class bind/unbind not implemented.
+## What exists (reuse)
+- nt-pnp-manager: 14-state devnode FSM + ResourceAssignment (create_mmio_fixture_devnode, transition).
+- nt-config-manager: DevnodeRecord (service, hardware/compatible IDs) + register_devnode/register_service.
+- nt-cm-resources: CM_RESOURCE_LIST build. nt-pnp-abi: IRP_MJ_PNP + IRP_MN_* constants.
+- driver-host-pnp: loads PnpMmioInterruptTest, DriverEntry sets DriverExtension->AddDevice +
+  MajorFunction[IRP_MJ_PNP]; harness calls AddDevice + dispatch_pnp(START/REMOVE); IoAttach/MmMapIoSpace/
+  IoConnectInterrupt via ResourceManager. IoCallDriver simulated. PDO = plain blob. No QUERY ops.
 
-## Plan (scoped increment — advance the spec via the new driver)
-- [ ] 1. Stage KmdfLoaderCompatTest.sys in fixtures (done) + accessor.
-- [ ] 2. Service-key-driven load: seed a ServiceRecord (name, ImagePath, Type=1,
-        Start=3, KmdfLibraryVersion=1.15) in nt-config-manager; the component
-        resolves the driver via the service key (reads ImagePath/type/version)
-        instead of hardcoding — image bytes still come from the fixture.
-- [ ] 3. WDFLDR binding surface for the new driver: WdfVersionBind (with
-        STATUS_REVISION_MISMATCH on real mismatch), WdfVersionBindClass +
-        WdfVersionUnbindClass (class-library bind, new), WdfVersionUnbind.
-- [ ] 4. New component `driver-host-loadercompat`: load via service key ->
-        map/reloc/patch IAT -> DriverObject+RegistryPath -> DriverEntry ->
-        full bind cycle -> assert the bind-only acceptance (bind called, 1.15
-        negotiated, function table returned, class bind/unbind ok, clean unbind).
-- [ ] 5. Compat trace: emit the spec's bind events (wdf_version_bind_enter/exit,
-        wdf_function_table_created, wdf_class_bind, driver_load_request, ...) to
-        serial as a structured summary (no filesystem in a bare-metal component).
-- [ ] 6. build.sh + run script; verify in QEMU; commit; update memory.
+## Genuinely new (this increment)
+- [ ] 1. nt-root-bus (NEW host-testable crate): a synthetic root PDO — create_pdo(device_id, hw_ids,
+        compat_ids, instance_id, caps); query_id(pdo, kind) -> wide string / double-null multi-sz for
+        BusQueryDeviceID/HardwareIDs/CompatibleIDs/InstanceID; query_capabilities(pdo) -> DEVICE_CAPABILITIES.
+- [ ] 2. Service-database-driven bind: component registers the service (PnpMmioInterruptTest) + a devnode
+        (service=..., device_id=ROOT\..., hw/compat IDs, resources) in nt-config-manager; resolve the
+        service FROM the devnode; load the driver named by the service (a service->image table) — prove
+        the driver-to-load is DB-derived, not hardcoded.
+- [ ] 3. Refactor driver-host-pnp run() into a PnP-Manager sequence: Enumerate (create root-bus PDO,
+        QUERY_ID it) -> ServiceSelected -> DriverLoaded -> PnP calls DriverExtension->AddDevice ->
+        FdoAttached (verify FDO above PDO) -> StartPending (START_DEVICE raw+translated CM_RESOURCE_LIST)
+        -> Started -> REMOVE teardown. Each step logs a traced pnp_* event.
+- [ ] 4. I/O gating retained (IOCTL before start -> NOT_READY; works after Started); REMOVE releases
+        resources; traced pnp_state_transition events + a serial compat-report.
+- [ ] 5. Acceptance checks: service_selected_from_devnode, root_bus_query_id, root_bus_query_caps,
+        pnp_called_add_device, fdo_attached_above_pdo, start_device_with_resources, remove_teardown.
+- [ ] 6. Build + run in QEMU; commit; docs/compat-notes; memory.
 
-## Explicitly NOT in this increment
-- The spec's ~10 proposed new crates (nt-driver-loader/service/image/...): reuse
-  existing crates; refactor into new crates only if it pays off later.
-- Full compat-report JSON+MD files (bare-metal has no FS) -> serial summary.
-- Re-running the 9 rebuilt drivers (existing components already cover them).
+## Deferred (later increments)
+KMDF WDF AddDevice bridge (increment 2 -> the spec's KMDF acceptance); STOP/SURPRISE_REMOVE; full
+QUERY-minor set + QUERY_DEVICE_RELATIONS; device-interface present-after-start (KMDF); pnpctl; the
+other ~10 proposed crates (fold into nt-pnp-manager/nt-root-bus for now); user-mode interface open.
 
-## Review (done 2026-07-05)
-All 6 plan steps complete. New component `driver-host-loadercompat` loads the real KMDF 1.15
-`KmdfLoaderCompatTest.sys` through a service-key-driven path. 7 PASS / 0 FAIL, 185 kernel checks:
-  resolve_service, map_image, resolve_imports, driver_entry_success,
-  wdf_version_bind_called, kmdf_1_15_negotiated, driver_entry_reached_wdf_driver_create.
-
-Flow proven: ResolveService (\Registry\...\Services\KmdfLoaderCompatTest, Type=1/Start=3/ImagePath)
--> MapImage (PE64, W^X) -> ResolveImports (ntoskrnl RtlInitUnicodeString/RtlCopyUnicodeString/wcslen/
-DbgPrintEx + wdfldr WdfVersionBind/BindClass/UnbindClass/Unbind) -> CFG dispatch/check fixups (rva
-0x3058/0x3050 from the load-config) -> DriverEntry -> FxStubInitTypes -> WdfVersionBind (1.15,
-published 444-entry table) -> FxStubBindClasses (empty class section -> no WdfVersionBindClass) ->
-real DriverEntry -> WdfDriverCreate (index 116, captured EvtDriverDeviceAdd=rva 0x1070) -> SUCCESS.
-Serial compat-report emitted (WdfVersionBind=1, WdfDriverCreate=1, 0 stub hits).
-
-Key finding: this driver imports WdfVersionBindClass (KMDF stub always does) but its class-bind
-section is empty, so it is never called — the class-bind + unbind path is IMPLEMENTED and ready but
-not exercised by this fixture. New this component vs the device hosts: service-key-driven load,
-STATUS_REVISION_MISMATCH version negotiation, class-library bind surface, serial compat trace/report.
+## Review (increment 1 done 2026-07-06)
+Steps 1-5 complete. driver-host-pnp is now PnP-Manager-driven from the service database.
+23 PASS / 0 FAIL + 185 kernel checks, no faults. New checks:
+  service_selected_from_devnode, driver_loaded_by_service, root_bus_query_id_device,
+  root_bus_query_id_hardware, root_bus_query_capabilities, pnp_called_add_device,
+  fdo_attached_above_pdo, start_device_with_resources (+ existing gating/interrupt/remove).
+New nt-root-bus crate (4 host tests); nt-config-manager devnode_service/devnode_hardware_ids accessors.
+Traced pnp_* events + a compat report. Next: KMDF WDF AddDevice bridge (increment 2 -> spec acceptance).
