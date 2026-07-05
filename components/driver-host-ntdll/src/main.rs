@@ -64,6 +64,7 @@ const NLS_CP_VADDR: u64 = 0x0000_0002_0100_0000; // ANSI/OEM codepage table
 const NLS_CASE_VADDR: u64 = 0x0000_0002_0140_0000; // Unicode case table
 const PARAMS_VADDR: u64 = 0x0000_0002_0180_0000; // RTL_USER_PROCESS_PARAMETERS
 const NC_TRAMP_VADDR: u64 = 0x0000_0002_01C0_0000; // trampoline for the direct-NtContinue thread
+const LDRENT_VADDR: u64 = 0x0000_0002_0200_0000; // LDR_DATA_TABLE_ENTRYs + their name strings
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
 const RIGHTS_RW: u64 = 0b011; // read/write (for loading)
@@ -418,6 +419,56 @@ fn build_trampoline(syscall_export: u64, peb_export: u64) -> ([u8; 64], usize) {
     c[37..39].copy_from_slice(&[0x0F, 0x05]); // syscall
     c[39..41].copy_from_slice(&[0xEB, 0xFE]); // jmp $
     (c, 41)
+}
+
+/// Fill an `LDR_DATA_TABLE_ENTRY` at `va` (x64 layout) for a loaded image. `name` is written as
+/// UTF-16 at `name_va`; both FullDllName + BaseDllName point at it (BaseDllName = the tail after the
+/// last `\`). Links are zeroed here and wired by `link_list`.
+unsafe fn build_ldr_entry(
+    va: u64,
+    dllbase: u64,
+    entrypoint: u64,
+    size_of_image: u64,
+    name_va: u64,
+    name: &[u8],
+    is_dll: bool,
+) {
+    for o in (0..0x120u64).step_by(8) {
+        write_u64(va + o, 0);
+    }
+    let full_len = write_wstr(name_va, name);
+    let base_off = name.iter().rposition(|&c| c == b'\\').map_or(0, |i| i + 1);
+    let base_va = name_va + (base_off as u64) * 2;
+    let base_len = ((name.len() - base_off) * 2) as u16;
+    write_u64(va + 0x30, dllbase);
+    write_u64(va + 0x38, entrypoint);
+    write_u64(va + 0x40, size_of_image);
+    write_u16(va + 0x48, full_len); // FullDllName.Length
+    write_u16(va + 0x4A, full_len + 2); // .MaximumLength
+    write_u64(va + 0x50, name_va); // .Buffer
+    write_u16(va + 0x58, base_len); // BaseDllName.Length
+    write_u16(va + 0x5A, base_len + 2);
+    write_u64(va + 0x60, base_va); // .Buffer
+    // Flags: LDRP_IMAGE_DLL(0x4) | LDRP_ENTRY_PROCESSED(0x4000) | LDRP_PROCESS_ATTACH_CALLED(0x80000).
+    let flags = 0x0008_4000u32 | if is_dll { 0x4 } else { 0 };
+    write_u32(va + 0x68, flags);
+    write_u16(va + 0x6C, 0xFFFF); // ObsoleteLoadCount = LDR_STATIC (never unload)
+}
+
+/// Wire a circular doubly-linked list: `head` (a LIST_ENTRY) ↔ each entry's LIST_ENTRY at
+/// `+link_off`, in order. Entry pointers are the LDR entry base VAs.
+unsafe fn link_list(head: u64, link_off: u64, entries: &[u64]) {
+    let node = |i: usize| entries[i] + link_off;
+    let n = entries.len();
+    // head.Flink = first node; head.Blink = last node.
+    write_u64(head, node(0));
+    write_u64(head + 8, node(n - 1));
+    for i in 0..n {
+        let prev = if i == 0 { head } else { node(i - 1) };
+        let next = if i == n - 1 { head } else { node(i + 1) };
+        write_u64(node(i), next); // Flink
+        write_u64(node(i) + 8, prev); // Blink
+    }
 }
 
 struct SvcResult {
@@ -861,11 +912,37 @@ fn run() {
         let _ldr_frame = map_page(LDR_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         write_u32(LDR_VADDR + 0x00, 0x58); // Length
         write_u32(LDR_VADDR + 0x04, 1); // Initialized = TRUE
-        for head in [0x10u64, 0x20, 0x30] {
-            // InLoadOrder / InMemoryOrder / InInitializationOrder — empty circular LIST_ENTRYs.
-            write_u64(LDR_VADDR + head, LDR_VADDR + head); // Flink → self
-            write_u64(LDR_VADDR + head + 8, LDR_VADDR + head); // Blink → self
+        // Build LDR_DATA_TABLE_ENTRYs for the exe + ntdll (both already mapped) and link them into
+        // the three module lists, so the loader finds them in memory instead of loading from disk.
+        let exe_pe0 = PeFile::parse(EXE).unwrap();
+        let exe_base0 = exe_pe0.image_base();
+        for p in 0..2u64 {
+            let _ = map_page(LDRENT_VADDR + p * 0x1000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         }
+        let (exe_ent, ntdll_ent) = (LDRENT_VADDR, LDRENT_VADDR + 0x200);
+        build_ldr_entry(
+            exe_ent,
+            exe_base0,
+            exe_base0 + exe_pe0.entry_point_rva() as u64,
+            exe_pe0.size_of_image() as u64,
+            LDRENT_VADDR + 0x400,
+            b"C:\\a.exe",
+            false,
+        );
+        build_ldr_entry(
+            ntdll_ent,
+            ntdll_base,
+            ntdll_base + pe.entry_point_rva() as u64,
+            pe.size_of_image() as u64,
+            LDRENT_VADDR + 0x500,
+            b"C:\\Windows\\system32\\ntdll.dll",
+            true,
+        );
+        // InLoadOrder(+0) + InMemoryOrder(+0x10) hold [exe, ntdll]; InInitializationOrder(+0x20)
+        // holds [ntdll] (the exe isn't DLL-initialised — it's entered via NtContinue).
+        link_list(LDR_VADDR + 0x10, 0x00, &[exe_ent, ntdll_ent]);
+        link_list(LDR_VADDR + 0x20, 0x10, &[exe_ent, ntdll_ent]);
+        link_list(LDR_VADDR + 0x30, 0x20, &[ntdll_ent]);
         let profile = WindowsProfile::windows7_sp1();
         // KUSER_SHARED_DATA at the Windows-fixed 0x7FFE0000 — the loader reads its version/tick
         // fields early. (nt_user_host::KUSER_SHARED_DATA_VA.)

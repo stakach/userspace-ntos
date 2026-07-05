@@ -202,3 +202,21 @@ LDR_DATA_TABLE_ENTRY/image structure should be) — the remaining piece is the r
 process-creation contract (module list + LdrpMapDll bookkeeping), which the file/section handlers are
 ready to serve once reached. The boot path itself (its terminating NtContinue) stays proven by phase B:
 `ntcontinue_booted_exe_win7_version` — the real NtContinue boots the exe, exit 0x06011DB1 = 6.1.7601.
+
+## In-memory module list built (merge still blocked on loader-internal state)
+
+The component now builds real `LDR_DATA_TABLE_ENTRY`s for the exe + ntdll — DllBase, EntryPoint,
+SizeOfImage, FullDllName/BaseDllName, Flags (LDRP_IMAGE_DLL|ENTRY_PROCESSED|PROCESS_ATTACH_CALLED),
+static LoadCount — and links them into `PEB_LDR_DATA`'s three lists (InLoadOrder + InMemoryOrder =
+[exe, ntdll]; InInitializationOrder = [ntdll]).
+
+This is the correct structure and is needed for later import resolution, but it did **not** move the
+loader past its current fault (`0x78e8ed33`: it allocates a 0xE0-byte LDR entry, then reads
+`FullDllName.Buffer` (+0x50) of a *different*, NULL entry held in a stack local). The reason: at this
+stage `LdrpInitializeProcess` manages its module data through its **own** internal state — the loader
+hash table (`LdrpHashTable`) and the `LdrpImageEntry`/`LdrpNtDllDataTableEntry` globals it populates
+as it creates the entries — not a list injected from outside. The NULL local is loader-internal state
+that an earlier step leaves unset in this from-scratch environment; isolating which step needs
+instruction-level debugging (a gdb stub on the loader thread), not serial print-tracing. The merge
+therefore remains at: phase A runs the real loader deep (through NLS/heap/registry/sysinfo/object-
+namespace/KnownDlls), phase B boots the exe via the real NtContinue.
