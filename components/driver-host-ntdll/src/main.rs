@@ -55,14 +55,11 @@ const PEB_VADDR: u64 = 0x0000_0002_0040_0000; // the process's PEB (referenced b
 const LDR_VADDR: u64 = 0x0000_0002_0050_0000; // PEB_LDR_DATA (referenced by PEB->Ldr)
 const LDR_STACK_VADDR: u64 = 0x0000_0002_0070_0000;
 const LDR_IPCBUF_VADDR: u64 = 0x0000_0002_0080_0000;
-const EXE_STACK_VADDR: u64 = 0x0000_0002_0090_0000; // stack for the exe's entry thread
-const EXE_IPCBUF_VADDR: u64 = 0x0000_0002_00A0_0000;
 const CTX_VADDR: u64 = 0x0000_0002_00B0_0000; // CONTEXT the loader NtContinues into
 const BOOT_STACK_VADDR: u64 = 0x0000_0002_00C0_0000; // stack the booted exe entry runs on (4 pages)
 const NLS_CP_VADDR: u64 = 0x0000_0002_0100_0000; // ANSI/OEM codepage table
 const NLS_CASE_VADDR: u64 = 0x0000_0002_0140_0000; // Unicode case table
 const PARAMS_VADDR: u64 = 0x0000_0002_0180_0000; // RTL_USER_PROCESS_PARAMETERS
-const NC_TRAMP_VADDR: u64 = 0x0000_0002_01C0_0000; // trampoline for the direct-NtContinue thread
 const LDRENT_VADDR: u64 = 0x0000_0002_0200_0000; // LDR_DATA_TABLE_ENTRYs + their name strings
 
 // Page rights (bit0=write, bit1=read, bit2=PAGE_EXECUTE_NEVER).
@@ -410,20 +407,6 @@ unsafe fn spawn_thread_win64(rip: u64, stack_top: u64, rcx: u64, rdx: u64, ipcbu
     let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
     tcb_write_registers_full(tcb, rip, stack_top, rcx, rdx);
-    let _ = tcb_set_gs_base(tcb, gs_base);
-    attach_sched_context(tcb);
-    let _ = tcb_resume(tcb);
-    fault_ep
-}
-
-/// Spawn a user thread sharing the root's CSpace/VSpace at `entry` with `stack_top`, `arg0` in RDI,
-/// a fault endpoint (returned), an IPC buffer, and `%gs` = `gs_base`. Returns the fault endpoint.
-unsafe fn spawn_thread(entry: u64, stack_top: u64, arg0: u64, ipcbuf_va: u64, ipcbuf: u64, gs_base: u64) -> u64 {
-    let fault_ep = make_object(OBJ_ENDPOINT);
-    let tcb = make_object(OBJ_TCB);
-    let _ = tcb_set_space(tcb, fault_ep, CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
-    let _ = tcb_write_registers(tcb, entry, stack_top, arg0);
     let _ = tcb_set_gs_base(tcb, gs_base);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
@@ -1280,40 +1263,6 @@ fn run() {
             a.booted && a.exitcode == 0x0601_1DB1,
         );
 
-        // Boot into the exe entry via the REAL ntdll NtContinue: a thread calls NtContinue(CONTEXT),
-        // whose CONTEXT.Rip = the exe entry. Servicing that NtContinue loads the thread's registers
-        // from the CONTEXT, booting it into the exe, which runs (RtlGetVersion + NtTerminateProcess).
-        let nc_rva = exports.iter().find(|e| e.name == "NtContinue").unwrap().rva;
-        let nc_addr = ntdll_base + nc_rva as u64;
-        let mut nc = [0u8; 32];
-        nc[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (CONTEXT*)
-        nc[2..10].copy_from_slice(&CTX_VADDR.to_le_bytes());
-        nc[10..12].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (NtContinue)
-        nc[12..20].copy_from_slice(&nc_addr.to_le_bytes());
-        nc[20..22].copy_from_slice(&[0xFF, 0xD0]); // call rax
-        nc[22..24].copy_from_slice(&[0xEB, 0xFE]); // jmp $
-        let ncp = map_page(NC_TRAMP_VADDR, RIGHTS_RW);
-        core::ptr::copy_nonoverlapping(nc.as_ptr(), NC_TRAMP_VADDR as *mut u8, 24);
-        let _ = page_unmap(ncp);
-        let _ = page_map(ncp, NC_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
-        let _ncs = map_page(EXE_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let ncbuf = map_page(EXE_IPCBUF_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
-        let bfault = spawn_thread(NC_TRAMP_VADDR, EXE_STACK_VADDR + 0x1000 - 16, 0, EXE_IPCBUF_VADDR, ncbuf, TEB_VADDR);
-        print_str(b"  ... NtContinue -> exe entry: ");
-        let b = service_loop(bfault, &ntdll, PEB_VADDR);
-        print_str(b"\n  booted=");
-        debug_put_char(if b.booted { b'1' } else { b'0' });
-        print_str(b" exit=0x");
-        for shift in (0..8).rev() {
-            debug_put_char(hex((b.exitcode >> (shift * 4)) & 0xf));
-        }
-        print_str(b" (6.1.7601)\n");
-        // The real NtContinue booted the thread into the exe entry; the exe ran RtlGetVersion +
-        // NtTerminateProcess, terminating with the Win7 SP1 version (6.1.7601) encoded.
-        check(
-            b"ntcontinue_booted_exe_win7_version",
-            b.booted && b.exitcode == 0x0601_1DB1,
-        );
     }
 }
 
