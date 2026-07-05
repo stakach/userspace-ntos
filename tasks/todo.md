@@ -65,3 +65,11 @@ and forwards the IRP down to the root-bus PDO (root_bus.dispatch_pnp) which star
 29 PASS / 0 FAIL + 185 kernel. New: start_device_irp_dispatched_through_stack (IRP completed +
 PDO started), remove_device_irp_dispatched_through_stack (PDO stopped). nt-root-bus: Pdo.started +
 dispatch_pnp + pdo_started (5 tests). prepare_hardware_and_d0_entry now driven by the IRP path.
+
+## Increment 4 done (2026-07-06): WDM PnP IRP-through-stack (symmetry with KMDF)
+driver-host-pnp's IofCallDriver now routes the forwarded PnP IRP to the root-bus PDO instead of
+simulating success. The real PnpMmioInterruptTest FDO forwards START/REMOVE down the stack ->
+root_bus.dispatch_pnp(PDO) starts/stops the PDO. dh().pdo (bottom of stack) + dh().pnp_minor (in-flight
+minor, stashed by dispatch_pnp). 25 PASS / 0 FAIL + 185 kernel. New: start_device_irp_reached_pdo,
+remove_device_irp_reached_pdo. Now BOTH WDM (driver-host-pnp) + KMDF (driver-host-direg) dispatch PnP
+IRPs through a real FDO->PDO device stack with the synthetic root bus at the bottom.

@@ -167,6 +167,8 @@ struct DhState {
     isr_context: u64,
     stack_attached: bool,
     bad_irql: u32,
+    pdo: u64,       // the root-bus PDO device object (bottom of the stack)
+    pnp_minor: u8,  // the PnP minor of the IRP currently in flight
 }
 
 static mut DH: DhState = DhState {
@@ -182,6 +184,8 @@ static mut DH: DhState = DhState {
     isr_context: 0,
     stack_attached: false,
     bad_irql: 0,
+    pdo: 0,
+    pnp_minor: 0,
 };
 
 fn dh() -> &'static mut DhState {
@@ -267,17 +271,23 @@ extern "win64" fn ntos_io_detach_device(_lower: u64) {
     dh().stack_attached = false;
 }
 
-/// `IofCallDriver(DeviceObject, Irp)` — for v0.1 the lower device (PDO / root bus)
-/// completes the forwarded PnP IRP with success (spec §12.3). Returns
-/// `STATUS_SUCCESS` (not pending) so the driver's synchronous forward proceeds.
-extern "win64" fn ntos_iof_call_driver(_device: u64, irp: u64) -> i32 {
-    if irp != 0 {
-        // SAFETY: `irp` is an IRP we built; IoStatus.Status@48.
-        unsafe {
-            core::ptr::write_unaligned((irp + 48) as *mut i32, 0);
+/// `IofCallDriver(DeviceObject, Irp)` — pass the IRP down the device stack. When the FDO forwards a
+/// PnP IRP to the lower device (the root-bus PDO returned by `IoAttachDeviceToDeviceStack`), it is
+/// dispatched to the synthetic bus, which starts/stops the PDO and completes it (spec §12.3).
+extern "win64" fn ntos_iof_call_driver(device: u64, irp: u64) -> i32 {
+    // SAFETY: `irp` is an IRP we built (IoStatus.Status@48); `device` is a device-object pointer.
+    unsafe {
+        let status = if device != 0 && device == dh().pdo {
+            // Bottom of the stack: the synthetic root bus handles this PnP minor.
+            root_bus().dispatch_pnp(PDO_OBJECT_ID, dh().pnp_minor)
+        } else {
+            0
+        };
+        if irp != 0 {
+            core::ptr::write_unaligned((irp + 48) as *mut i32, status);
         }
+        status
     }
-    0
 }
 
 extern "win64" fn ntos_iof_complete_request(irp: *const u8, _priority: i8) {
@@ -544,6 +554,7 @@ unsafe fn dispatch_pnp(
 
     dh().completed = false;
     dh().last_status = 0;
+    dh().pnp_minor = minor; // so IofCallDriver can dispatch the forwarded IRP to the root-bus PDO
     rt().mark_irp_pending(irp, 0x1b00 | minor as u64);
 
     let routine =
@@ -715,6 +726,7 @@ unsafe fn run() {
     // --- Enumerate: the root bus creates the PDO + answers the bus queries -------------------
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3); // Type = IO_TYPE_DEVICE
+    dh().pdo = pdo; // the bottom of the device stack (root-bus PDO the FDO forwards IRPs to)
     let devnode = pnp().create_mmio_fixture_devnode(pdo);
     root_bus().create_pdo(
         PDO_OBJECT_ID,
@@ -800,6 +812,11 @@ unsafe fn run() {
     }
     trace(b"pnp_start_complete");
     check(b"start_device_with_resources", started_ok);
+    // The START IRP travelled FDO -> PDO: the driver forwarded it down and the root-bus PDO started.
+    check(
+        b"start_device_irp_reached_pdo",
+        root_bus().pdo_started(PDO_OBJECT_ID),
+    );
     check(
         b"devnode_started",
         pnp().state(devnode) == Some(DeviceState::Started),
@@ -835,6 +852,11 @@ unsafe fn run() {
         remove_status == 0
             && !rm().mapping_valid(mapping_id)
             && rm().inject_vector(INT_VECTOR).is_none(),
+    );
+    // The REMOVE IRP travelled FDO -> PDO: the root-bus PDO is stopped.
+    check(
+        b"remove_device_irp_reached_pdo",
+        !root_bus().pdo_started(PDO_OBJECT_ID),
     );
     check(
         b"devnode_removed",
