@@ -1,8 +1,9 @@
 # Real seL4 syscall trap — ntdll executes itself
 
-`components/driver-host-ntdll` demonstrates the **real** syscall path: a real Windows 7 ntdll
-syscall stub's own `syscall` instruction traps into the seL4 kernel, and the NT native syscall
-dispatcher services it — no interpretation.
+`components/driver-host-ntdll` demonstrates the **real** syscall path: the full real Windows 7
+ntdll image is mapped executable in place, a user thread `call`s a real ntdll export, and that
+export's own `syscall` instruction traps into the seL4 kernel where the NT native syscall
+dispatcher services it — no interpretation, no copied stub.
 
 ## How it works
 1. The root task copies the **real** `NtQuerySystemInformation` stub bytes straight out of
@@ -65,3 +66,26 @@ Flow:
 QEMU: `ntdll_parsed` + `ntdll_syscall_trapped` + `trapped_syscall_dispatched` +
 `stub_resumed_clean_and_reported` — **no page fault**. ntdll's real code runs, its syscall traps and
 is serviced, it resumes and returns, and reports its result — a clean NT syscall round trip on seL4.
+
+## Full ntdll `.text` mapped, jump to a real export (implemented)
+
+The demo now maps the **entire real ntdll image** and calls a real export in place, rather than
+copying an 11-byte stub:
+
+1. `map_region` maps `size_of_image` (426 pages, ~1.7 MiB) fresh RW frames at ntdll's **preferred
+   base** `0x78e50000` — the whole image fits one 2 MiB slice, so one PT — creating the PDPT/PD/PT.
+   Because it's the preferred base, **no relocations** are needed.
+2. The headers + every section are copied section-by-section straight from the `include_bytes!`
+   `.rodata` into the mapped VSpace (no 1.7 MiB `pe.map()` allocation — it wouldn't fit the heap).
+3. `apply_wx` re-maps each page by `PeFile::protection_at`: `.text` → read-only + executable,
+   everything else → NX. No page is both writable and executable.
+4. The trap thread's trampoline is `mov rax, <ntdll_base + export_rva>; call rax; <report>`. The
+   `call rax` jumps into the **real `NtQuerySystemInformation` in mapped ntdll `.text`**, at its
+   linked address. Its `syscall` (found by scanning the stub for `0F 05`) traps; the resume IP is
+   that `syscall` + 2 (the export's own `ret`).
+5. Everything else is as before: trap → dispatch → reply (RAX = result, FaultIP = the export's
+   `ret`, RDI = done_ep) → the export returns into the trampoline → `SysSend` reports the result.
+
+QEMU: `ntdll_parsed` + `ntdll_text_mapped_executable` + `ntdll_syscall_trapped` +
+`trapped_syscall_dispatched` + `export_resumed_clean_and_reported` — no page fault. ntdll's actual
+code, at its actual linked addresses, executes in place and traps through the real seL4 fault path.
