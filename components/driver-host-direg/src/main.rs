@@ -36,7 +36,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use nt_config_manager::{DevPropKey, PropertyValue};
-use nt_pnp_abi::DeviceState;
+use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
 use nt_pnp_manager::PnpManager;
 use nt_root_bus::{BusQueryId, RootBus};
 use nt_wdf_object::WdfHandle;
@@ -150,6 +150,112 @@ fn trace(event: &[u8]) {
 fn wide_is(buf: &[u16], expected: &str) -> bool {
     let e: Vec<u16> = expected.encode_utf16().collect();
     buf.len() == e.len() + 1 && buf[e.len()] == 0 && buf[..e.len()] == e[..]
+}
+
+// --- PnP IRP dispatch through the device stack -------------------------------
+// The KMDF START/REMOVE path is a real IRP that travels FDO -> PDO: the PnP Manager builds an
+// IRP_MJ_PNP and calls IoCallDriver on the stack top; the FDO's framework PnP dispatch runs the
+// driver callbacks and forwards the IRP down to the root-bus PDO, which completes it.
+
+/// Whether the framework PnP dispatch ran the driver's `EvtDevicePrepareHardware` / `EvtDeviceD0Entry`.
+static PREPARE_HW_CALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static D0_ENTRY_CALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// IRP layout (component-local): major@0, minor@1, raw@8, translated@16, IoStatus.Status@0x30.
+const IRP_MINOR: u64 = 1;
+const IRP_RAW_RES: u64 = 8;
+const IRP_TRANSLATED_RES: u64 = 16;
+const IRP_STATUS: u64 = 0x30;
+
+/// Build an `IRP_MJ_PNP` request with `minor` and the raw/translated resource lists.
+unsafe fn build_pnp_irp(minor: u8, raw: u64, translated: u64) -> u64 {
+    let irp = alloc_blob();
+    core::ptr::write_unaligned(irp as *mut u8, IRP_MJ_PNP);
+    core::ptr::write_unaligned((irp + IRP_MINOR) as *mut u8, minor);
+    core::ptr::write_unaligned((irp + IRP_RAW_RES) as *mut u64, raw);
+    core::ptr::write_unaligned((irp + IRP_TRANSLATED_RES) as *mut u64, translated);
+    core::ptr::write_unaligned((irp + IRP_STATUS) as *mut i32, STATUS_PENDING);
+    irp
+}
+
+fn irp_status(irp: u64) -> i32 {
+    // SAFETY: `irp` is one of our IRP blobs.
+    unsafe { core::ptr::read_unaligned((irp + IRP_STATUS) as *const i32) }
+}
+
+unsafe fn complete_irp(irp: u64, status: i32) -> i32 {
+    core::ptr::write_unaligned((irp + IRP_STATUS) as *mut i32, status);
+    status
+}
+
+const STATUS_PENDING: i32 = 0x0000_0103;
+
+/// `IoCallDriver(device, irp)` — dispatch to the device's PnP handler. The bottom of the stack is
+/// the synthetic root-bus PDO; every other device dispatches through its owning
+/// `DriverObject->MajorFunction[IRP_MJ_PNP]` (installed by `WdfDriverCreate`).
+unsafe fn io_call_driver(device: u64, irp: u64) -> i32 {
+    if device == PDO_OBJECT_ID {
+        let minor = core::ptr::read_unaligned((irp + IRP_MINOR) as *const u8);
+        let st = root_bus().dispatch_pnp(PDO_OBJECT_ID, minor);
+        return complete_irp(irp, st);
+    }
+    let drv = host().driver_object;
+    let routine =
+        core::ptr::read_unaligned((drv + 112 + IRP_MJ_PNP as u64 * 8) as *const u64);
+    if routine == 0 {
+        return complete_irp(irp, STATUS_UNSUCCESSFUL);
+    }
+    let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(routine as *const ());
+    f(device, irp)
+}
+
+/// `FxDevicePnpDispatch` — the framework PnP handler `WdfDriverCreate` installs into
+/// `DriverObject->MajorFunction[IRP_MJ_PNP]`. On START it starts the lower stack, runs
+/// `EvtDevicePrepareHardware` + `EvtDeviceD0Entry`, and completes; on REMOVE it forwards down.
+extern "win64" fn fx_device_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
+    // SAFETY: single-threaded; the WDF runtime + host state are initialized.
+    unsafe {
+        let minor = core::ptr::read_unaligned((irp + IRP_MINOR) as *const u8);
+        let device = WdfHandle(fdo);
+        match minor {
+            IRP_MN_START_DEVICE => {
+                trace(b"fx_device_pnp_dispatch: IRP_MN_START_DEVICE");
+                // Start the lower stack first (the bus PDO), then prepare hardware + power up.
+                let lower = io_call_driver(PDO_OBJECT_ID, irp);
+                if lower != 0 {
+                    return complete_irp(irp, lower);
+                }
+                let translated = core::ptr::read_unaligned((irp + IRP_TRANSLATED_RES) as *const u64);
+                let prepare = wdf().prepare_hardware(device).unwrap_or(0);
+                let ps = if prepare != 0 {
+                    PREPARE_HW_CALLED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    call3(prepare, fdo, translated, translated)
+                } else {
+                    0
+                };
+                let d0 = wdf().set_device_power(device, true).map(|(e, _)| e).unwrap_or(0);
+                let ds = if d0 != 0 {
+                    D0_ENTRY_CALLED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    call2(d0, fdo, 1)
+                } else {
+                    0
+                };
+                complete_irp(irp, if ps == 0 && ds == 0 { STATUS_SUCCESS } else { STATUS_UNSUCCESSFUL })
+            }
+            IRP_MN_REMOVE_DEVICE => {
+                trace(b"fx_device_pnp_dispatch: IRP_MN_REMOVE_DEVICE");
+                // The FDO's release work (interface disable + device delete) is done by the PnP
+                // Manager after the IRP returns; here we forward the removal down to the PDO.
+                let _ = io_call_driver(PDO_OBJECT_ID, irp);
+                complete_irp(irp, STATUS_SUCCESS)
+            }
+            _ => {
+                let lower = io_call_driver(PDO_OBJECT_ID, irp);
+                complete_irp(irp, lower)
+            }
+        }
+    }
 }
 
 /// The 444-entry WDF function-pointer table `WdfVersionBind` publishes to the driver.
@@ -353,6 +459,12 @@ extern "win64" fn wdf_driver_create(
                         wdm_add_device_bridge as usize as u64,
                     );
                 }
+                // Install the framework PnP dispatch into MajorFunction[IRP_MJ_PNP] so PnP IRPs sent
+                // to a device in this driver's stack are handled by the framework (FxDevicePnpDispatch).
+                core::ptr::write_unaligned(
+                    (driver_object + 112 + IRP_MJ_PNP as u64 * 8) as *mut u64,
+                    fx_device_pnp_dispatch as usize as u64,
+                );
                 STATUS_SUCCESS
             }
             Err(_) => STATUS_UNSUCCESSFUL,
@@ -1306,30 +1418,30 @@ unsafe fn run() {
             == Some(42),
     );
 
-    // --- START_DEVICE → EvtDevicePrepareHardware + D0 entry -------------------
+    // --- START_DEVICE: a real IRP dispatched through the device stack ------------------------
+    // The PnP Manager builds IRP_MN_START_DEVICE with the raw + translated resource lists and calls
+    // IoCallDriver on the stack top (the FDO). The framework PnP dispatch runs EvtDevicePrepareHardware
+    // + EvtDeviceD0Entry and forwards the IRP down to the root-bus PDO, which completes it.
     let res_list = build_resource_list();
-    let prepare = wdf().prepare_hardware(device).unwrap_or(0);
-    let prep_status = if prepare != 0 {
-        call3(prepare, device.0, res_list, res_list)
-    } else {
-        0
-    };
-    let (d0_entry, _r) = wdf().set_device_power(device, true).unwrap();
-    let d0_status = if d0_entry != 0 {
-        call2(d0_entry, device.0, 1)
-    } else {
-        0
-    };
+    trace(b"pnp_start_enter + pnp_start_resources");
+    let _ = pnp().transition(devnode_pnp, DeviceState::ResourcesAssigned);
+    let _ = pnp().transition(devnode_pnp, DeviceState::StartIrpSent);
+    let start_irp = build_pnp_irp(IRP_MN_START_DEVICE, res_list, res_list);
+    let start_status = io_call_driver(device.0, start_irp);
+    check(
+        b"start_device_irp_dispatched_through_stack",
+        start_status == STATUS_SUCCESS
+            && irp_status(start_irp) == STATUS_SUCCESS
+            && root_bus().pdo_started(PDO_OBJECT_ID),
+    );
     check(
         b"prepare_hardware_and_d0_entry",
-        prep_status == 0 && d0_status == 0,
+        PREPARE_HW_CALLED.load(core::sync::atomic::Ordering::Relaxed)
+            && D0_ENTRY_CALLED.load(core::sync::atomic::Ordering::Relaxed),
     );
 
     // START succeeded: drive the devnode to Started and enable the interface
     // (IoSetDeviceInterfaceState(TRUE)) — now, and only now, is the interface present.
-    trace(b"pnp_start_enter + pnp_start_resources");
-    let _ = pnp().transition(devnode_pnp, DeviceState::ResourcesAssigned);
-    let _ = pnp().transition(devnode_pnp, DeviceState::StartIrpSent);
     let _ = pnp().transition(devnode_pnp, DeviceState::Started);
     wdf().set_device_interface_state(device, IFACE_GUID, true);
     trace(b"pnp_start_complete + pnp_interface_enabled");
@@ -1397,6 +1509,15 @@ unsafe fn run() {
     // device delete — verify the interface is disabled + the device object itself is gone.)
     trace(b"pnp_query_remove_enter + pnp_remove_enter");
     let _ = pnp().transition(devnode_pnp, DeviceState::RemovePending);
+    // Dispatch a real IRP_MN_REMOVE_DEVICE through the stack (FDO -> PDO); the bus stops the PDO.
+    let remove_irp = build_pnp_irp(IRP_MN_REMOVE_DEVICE, 0, 0);
+    let remove_status = io_call_driver(device.0, remove_irp);
+    check(
+        b"remove_device_irp_dispatched_through_stack",
+        remove_status == STATUS_SUCCESS
+            && irp_status(remove_irp) == STATUS_SUCCESS
+            && !root_bus().pdo_started(PDO_OBJECT_ID),
+    );
     wdf().set_device_interface_state(device, IFACE_GUID, false);
     let iface_disabled = wdf()
         .config()

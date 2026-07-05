@@ -103,7 +103,19 @@ pub struct Pdo {
     pub instance_id: String,
     /// `IRP_MN_QUERY_CAPABILITIES`.
     pub capabilities: DeviceCapabilities,
+    /// Whether the bus has started this PDO (set by `IRP_MN_START_DEVICE` reaching the bottom of
+    /// the device stack, cleared by `IRP_MN_REMOVE_DEVICE`).
+    pub started: bool,
 }
+
+/// `NTSTATUS` the PDO's PnP dispatch returns.
+const STATUS_SUCCESS: i32 = 0;
+const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
+
+/// `IRP_MN_START_DEVICE` — the bus PDO's start minor.
+pub const IRP_MN_START_DEVICE: u8 = 0x00;
+/// `IRP_MN_REMOVE_DEVICE` — the bus PDO's remove minor.
+pub const IRP_MN_REMOVE_DEVICE: u8 = 0x02;
 
 /// The synthetic root bus: a table of PDOs it has enumerated.
 #[derive(Default)]
@@ -134,6 +146,7 @@ impl RootBus {
             compatible_ids: compatible_ids.iter().map(|s| (*s).into()).collect(),
             instance_id: instance_id.into(),
             capabilities: DeviceCapabilities::root_default(),
+            started: false,
         });
         object_id
     }
@@ -169,6 +182,26 @@ impl RootBus {
     /// Answer `IRP_MN_QUERY_CAPABILITIES` for a PDO.
     pub fn query_capabilities(&self, object_id: u64) -> Option<&DeviceCapabilities> {
         self.pdo(object_id).map(|p| &p.capabilities)
+    }
+
+    /// The PDO's PnP dispatch — the bottom of the device stack. A function driver's framework PnP
+    /// handler forwards `IRP_MN_START_DEVICE` / `IRP_MN_REMOVE_DEVICE` down to here; the bus starts
+    /// or stops the PDO and completes the IRP. Returns the `NTSTATUS`.
+    pub fn dispatch_pnp(&mut self, object_id: u64, minor: u8) -> i32 {
+        let Some(pdo) = self.pdos.iter_mut().find(|p| p.object_id == object_id) else {
+            return STATUS_NO_SUCH_DEVICE;
+        };
+        match minor {
+            IRP_MN_START_DEVICE => pdo.started = true,
+            IRP_MN_REMOVE_DEVICE => pdo.started = false,
+            _ => {}
+        }
+        STATUS_SUCCESS
+    }
+
+    /// Whether the bus has started this PDO.
+    pub fn pdo_started(&self, object_id: u64) -> bool {
+        self.pdo(object_id).map(|p| p.started).unwrap_or(false)
     }
 }
 
@@ -244,5 +277,16 @@ mod tests {
         let b = bus();
         assert!(b.query_id(0xDEAD, BusQueryId::DeviceId).is_none());
         assert!(b.query_capabilities(0xDEAD).is_none());
+    }
+
+    #[test]
+    fn pdo_start_remove_dispatch() {
+        let mut b = bus();
+        assert!(!b.pdo_started(0xFED0_0000));
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE), 0);
+        assert!(b.pdo_started(0xFED0_0000));
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_REMOVE_DEVICE), 0);
+        assert!(!b.pdo_started(0xFED0_0000));
+        assert_ne!(b.dispatch_pnp(0xDEAD, IRP_MN_START_DEVICE), 0); // unknown PDO
     }
 }

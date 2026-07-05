@@ -56,3 +56,12 @@ device_queue, fdo_attached_above_pdo, interface_not_present_before_start, devnod
 present, devnode_removed. Trace: pnp_add_device_enter -> wdf_add_device_bridge_enter ->
 wdf_evt_driver_device_add_enter. nt-pnp-manager: added create_devnode (no-resource devnode).
 This hits the spec's KMDF acceptance (PnP-called AddDevice via WDF bridge, interface after start).
+
+## Increment 3 done (2026-07-06): real PnP IRP dispatch through the device stack (KMDF)
+START/REMOVE are now real IRP_MJ_PNP IRPs traveling FDO -> PDO, not direct framework calls.
+WdfDriverCreate installs fx_device_pnp_dispatch into DriverObject->MajorFunction[IRP_MJ_PNP]; PnP
+builds the IRP + IoCallDriver(FDO) -> the framework dispatch runs EvtDevicePrepareHardware + D0Entry
+and forwards the IRP down to the root-bus PDO (root_bus.dispatch_pnp) which starts/completes it.
+29 PASS / 0 FAIL + 185 kernel. New: start_device_irp_dispatched_through_stack (IRP completed +
+PDO started), remove_device_irp_dispatched_through_stack (PDO stopped). nt-root-bus: Pdo.started +
+dispatch_pnp + pdo_started (5 tests). prepare_hardware_and_d0_entry now driven by the IRP path.
