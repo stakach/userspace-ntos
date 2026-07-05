@@ -53,15 +53,77 @@ const CODE_VADDR: u64 = 0x0000_0001_4000_0000;
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
-// --- the fixture devnode this host enumerates + binds (the service database entry) --------
+// --- the primary fixture devnode this host actually binds (its driver is in the store) ----
 const SERVICE_NAME: &str = "PnpMmioInterruptTest";
 const DEVICE_ID: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO";
 const COMPATIBLE_ID: &str = r"ROOT\USERSPACE_NTOS_TEST_DEVICE";
 const INSTANCE_ID: &str = "0001";
 const INSTANCE_PATH: &str = r"ROOT\USERSPACE_NTOS_PNP_MMIO\0001";
 const CLASS_GUID: &str = "{4d36e97d-e325-11ce-bfc1-08002be10318}";
-/// The `object_id` the PnP Manager + root bus use for this devnode's PDO.
+/// The `object_id` the PnP Manager + root bus use for the primary devnode's PDO.
 const PDO_OBJECT_ID: u64 = 0xFED0_0000;
+
+/// A root-enumerated fixture devnode (a child of the synthetic ROOT bus).
+struct Fixture {
+    instance_path: &'static str,
+    service: &'static str,
+    device_id: &'static str,
+    compatible_id: &'static str,
+    instance_id: &'static str,
+    image_path: &'static str,
+    pdo_object_id: u64,
+}
+
+/// The device tree the ROOT bus enumerates. `FIXTURES[0]` (PnpMmioInterruptTest) is the one whose
+/// driver image this host has in its store, so it fully binds + starts; the rest are enumerated,
+/// registered, and service-resolved as children of the tree (their drivers live in other hosts).
+const FIXTURES: &[Fixture] = &[
+    Fixture {
+        instance_path: INSTANCE_PATH,
+        service: SERVICE_NAME,
+        device_id: DEVICE_ID,
+        compatible_id: COMPATIBLE_ID,
+        instance_id: INSTANCE_ID,
+        image_path: r"\SystemRoot\system32\drivers\PnpMmioInterruptTest.sys",
+        pdo_object_id: PDO_OBJECT_ID,
+    },
+    Fixture {
+        instance_path: r"ROOT\USERSPACE_NTOS_MMIO\0001",
+        service: "MmioInterruptTest",
+        device_id: r"ROOT\USERSPACE_NTOS_MMIO",
+        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
+        instance_id: "0001",
+        image_path: r"\SystemRoot\system32\drivers\MmioInterruptTest.sys",
+        pdo_object_id: 0xFED0_1000,
+    },
+    Fixture {
+        instance_path: r"ROOT\USERSPACE_NTOS_POWER\0001",
+        service: "PowerPnpMmioTest",
+        device_id: r"ROOT\USERSPACE_NTOS_POWER",
+        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
+        instance_id: "0001",
+        image_path: r"\SystemRoot\system32\drivers\PowerPnpMmioTest.sys",
+        pdo_object_id: 0xFED0_2000,
+    },
+    Fixture {
+        instance_path: r"ROOT\USERSPACE_NTOS_DMA\0001",
+        service: "DmaPnpPowerTest",
+        device_id: r"ROOT\USERSPACE_NTOS_DMA",
+        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
+        instance_id: "0001",
+        image_path: r"\SystemRoot\system32\drivers\DmaPnpPowerTest.sys",
+        pdo_object_id: 0xFED0_3000,
+    },
+    Fixture {
+        instance_path: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST\0001",
+        service: "KmdfInterfaceRegistryTest",
+        device_id: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST",
+        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
+        instance_id: "0001",
+        image_path: r"\SystemRoot\system32\drivers\KmdfInterfaceRegistryTest.sys",
+        pdo_object_id: 0xFED0_4000,
+    },
+];
 
 const DRIVER_HOST_ID: u64 = 1;
 const DEVICE_OBJECT_ID: u64 = 10;
@@ -620,33 +682,78 @@ unsafe fn run() {
     CFG = Some(ConfigManager::new());
     ROOT_BUS = Some(RootBus::new());
 
-    // --- ResolveService: the boot-time service database + the root-enumerated devnode ---------
-    // A service key (Services\PnpMmioInterruptTest) and a devnode whose `Service` value selects
-    // the driver — so the driver that binds is chosen by the device tree, not hardcoded.
-    cfg().register_service(
-        SERVICE_NAME,
-        r"\SystemRoot\system32\drivers\PnpMmioInterruptTest.sys",
-        Some("Base"),
-        Some(CLASS_GUID),
-        /* start = SERVICE_BOOT_START */ 0,
-        /* error_control = NORMAL */ 1,
-    );
-    let cfg_devnode = cfg().register_devnode(
-        INSTANCE_PATH,
-        Some(SERVICE_NAME),
-        Some(r"\Device\NTPNP_ROOT_0000"),
-        &[DEVICE_ID],
-        &[COMPATIBLE_ID],
-    );
-    trace(b"pnp_devnode_create + pnp_devnode_registry_materialize");
+    // --- ResolveService: seed the boot service database + the root-enumerated device tree -------
+    // Register a service key + an Enum\ devnode per fixture, and have the ROOT bus create a child
+    // PDO for each. The driver each devnode binds is chosen by its `Service` value — the device
+    // tree drives binding, not a hardcoded image.
+    let mut cfg_devnodes: Vec<u64> = Vec::new();
+    for fx in FIXTURES {
+        cfg().register_service(
+            fx.service,
+            fx.image_path,
+            Some("Base"),
+            Some(CLASS_GUID),
+            /* start = SERVICE_BOOT_START */ 0,
+            /* error_control = NORMAL */ 1,
+        );
+        let dn = cfg().register_devnode(
+            fx.instance_path,
+            Some(fx.service),
+            None,
+            &[fx.device_id],
+            &[fx.compatible_id],
+        );
+        root_bus().create_pdo(
+            fx.pdo_object_id,
+            fx.device_id,
+            &[fx.device_id],
+            &[fx.compatible_id],
+            fx.instance_id,
+        );
+        cfg_devnodes.push(dn);
+    }
+    trace(b"pnp_devnode_create (x N) + pnp_devnode_registry_materialize");
 
-    // pnp_service_select: bind the driver named by the devnode's Service value (DB-driven).
-    let selected = cfg().devnode_service(cfg_devnode).map(str::to_string);
+    // --- Enumerate the tree: IRP_MN_QUERY_DEVICE_RELATIONS(BusRelations) -------------------------
+    let children = root_bus().query_device_relations();
+    check(
+        b"bus_relations_lists_all_children",
+        children.len() == FIXTURES.len(),
+    );
+    trace(b"pnp_query_relations (BusRelations)");
+    print_str(b"  [device-tree] \\Device\\RootBus\n");
+    let mut resolved = 0usize;
+    let mut bindable = 0usize;
+    for (fx, &dn) in FIXTURES.iter().zip(cfg_devnodes.iter()) {
+        // pnp_service_select: each child's driver is named by its devnode Service value.
+        let svc_ok = cfg().devnode_service(dn) == Some(fx.service);
+        if svc_ok {
+            resolved += 1;
+        }
+        let has_driver = load_service_image(fx.service).is_some();
+        if has_driver {
+            bindable += 1;
+        }
+        print_str(b"    - ");
+        print_str(fx.instance_path.as_bytes());
+        print_str(b"  service=");
+        print_str(fx.service.as_bytes());
+        print_str(if has_driver {
+            b"  [driver in store -> bind]\n"
+        } else {
+            b"  [enumerated; driver in another host]\n"
+        });
+    }
+    check(b"device_tree_services_resolved", resolved == FIXTURES.len());
+    check(b"device_tree_has_bindable_driver", bindable >= 1);
+    trace(b"pnp_service_select");
+
+    // --- The primary child (FIXTURES[0]) has its driver in the store: bind + start it -----------
+    let selected = cfg().devnode_service(cfg_devnodes[0]).map(str::to_string);
     check(
         b"service_selected_from_devnode",
         selected.as_deref() == Some(SERVICE_NAME),
     );
-    trace(b"pnp_service_select");
     let image = match selected.as_deref().and_then(load_service_image) {
         Some(img) => img,
         None => {
@@ -723,18 +830,11 @@ unsafe fn run() {
     check(b"add_device_present", add_device != 0);
     check(b"pnp_dispatch_present", pnp_dispatch != 0);
 
-    // --- Enumerate: the root bus creates the PDO + answers the bus queries -------------------
+    // --- Bind the primary child: its PDO (created above) is the bottom of the device stack ------
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3); // Type = IO_TYPE_DEVICE
-    dh().pdo = pdo; // the bottom of the device stack (root-bus PDO the FDO forwards IRPs to)
+    dh().pdo = pdo; // the device object the FDO forwards IRPs to (the primary child's PDO)
     let devnode = pnp().create_mmio_fixture_devnode(pdo);
-    root_bus().create_pdo(
-        PDO_OBJECT_ID,
-        DEVICE_ID,
-        &[DEVICE_ID],
-        &[COMPATIBLE_ID],
-        INSTANCE_ID,
-    );
     trace(b"pnp_pdo_create + pnp_stack_create");
 
     // The PnP Manager queries the PDO's identity before binding a function driver (QUERY_ID +

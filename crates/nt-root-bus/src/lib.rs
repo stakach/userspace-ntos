@@ -184,6 +184,12 @@ impl RootBus {
         self.pdo(object_id).map(|p| &p.capabilities)
     }
 
+    /// Answer `IRP_MN_QUERY_DEVICE_RELATIONS(BusRelations)`: the object IDs of every child PDO the
+    /// bus has enumerated — the root of the device tree reporting its children.
+    pub fn query_device_relations(&self) -> Vec<u64> {
+        self.pdos.iter().map(|p| p.object_id).collect()
+    }
+
     /// The PDO's PnP dispatch — the bottom of the device stack. A function driver's framework PnP
     /// handler forwards `IRP_MN_START_DEVICE` / `IRP_MN_REMOVE_DEVICE` down to here; the bus starts
     /// or stops the PDO and completes the IRP. Returns the `NTSTATUS`.
@@ -277,6 +283,17 @@ mod tests {
         let b = bus();
         assert!(b.query_id(0xDEAD, BusQueryId::DeviceId).is_none());
         assert!(b.query_capabilities(0xDEAD).is_none());
+    }
+
+    #[test]
+    fn bus_relations_lists_all_children() {
+        let mut b = RootBus::new();
+        b.create_pdo(0x1000, r"ROOT\A", &[r"ROOT\A"], &[], "0001");
+        b.create_pdo(0x2000, r"ROOT\B", &[r"ROOT\B"], &[], "0001");
+        b.create_pdo(0x3000, r"ROOT\C", &[r"ROOT\C"], &[], "0001");
+        let rel = b.query_device_relations();
+        assert_eq!(rel, alloc::vec![0x1000, 0x2000, 0x3000]);
+        assert_eq!(b.len(), 3);
     }
 
     #[test]

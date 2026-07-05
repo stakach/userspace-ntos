@@ -73,3 +73,12 @@ root_bus.dispatch_pnp(PDO) starts/stops the PDO. dh().pdo (bottom of stack) + dh
 minor, stashed by dispatch_pnp). 25 PASS / 0 FAIL + 185 kernel. New: start_device_irp_reached_pdo,
 remove_device_irp_reached_pdo. Now BOTH WDM (driver-host-pnp) + KMDF (driver-host-direg) dispatch PnP
 IRPs through a real FDO->PDO device stack with the synthetic root bus at the bottom.
+
+## Increment 5 done (2026-07-06): enumerate all fixture devnodes as a real device tree
+driver-host-pnp now enumerates a 5-child device tree under \Device\RootBus (a FIXTURES table:
+PnpMmioInterruptTest + MmioInterruptTest + PowerPnpMmioTest + DmaPnpPowerTest + KmdfInterfaceRegistry
+Test). Each registered as a service + Enum\ devnode + a root-bus child PDO. QUERY_DEVICE_RELATIONS
+(BusRelations) returns all children; each service is resolved from its devnode; the primary (driver
+in store) binds+starts through the full IRP-through-stack lifecycle. 28 PASS / 0 FAIL + 185 kernel.
+New: bus_relations_lists_all_children, device_tree_services_resolved, device_tree_has_bindable_driver.
+nt-root-bus: query_device_relations() (6 tests).
