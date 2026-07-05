@@ -536,14 +536,14 @@ fn run() {
     host_cm.set_service_parameter("Svc", "Answer", RegistryValueType::Dword, 42u32.to_le_bytes().to_vec());
     let hpath = host_cm.registry().key_path(host_cm.service_parameters_key("Svc").unwrap()).unwrap();
     let host_fs = nt_fs::FileSystem::new(nt_fs::MemFs::with_fixture());
-    let mut ks = KernelServices::new(WindowsProfile::windows11_23h2(), host_cm, host_fs, alloc::vec![hpath]);
+    let mut ks = KernelServices::new(WindowsProfile::windows7_sp1(), host_cm, host_fs, alloc::vec![hpath]);
     ks.system_time_100ns = 0x01DA_0000_0000_0000;
     let host = UserProcessHost::launch(&mut ks, "hosted.exe", 0x1_4000_1000);
     // The PEB/TEB/KUSER carry the right version + linkage at their real offsets.
-    let struct_ok = read_u32(host.peb(), peb_off::OS_BUILD_NUMBER) == 22631
+    let struct_ok = read_u32(host.peb(), peb_off::OS_BUILD_NUMBER) == 7601
         && read_u64(host.teb(), teb_off::PEB) == host.peb_va()
         && read_u64(host.teb(), teb_off::CLIENT_ID_PROCESS) == host.process_id() as u64
-        && read_u32(host.kuser_shared_data(), kuser_off::NT_MAJOR_VERSION) == 10;
+        && read_u32(host.kuser_shared_data(), kuser_off::NT_MAJOR_VERSION) == 6;
     check(b"userhost_peb_teb_kuser", struct_ok);
 
     // Real syscalls through the dispatcher reach the wired subsystems.
