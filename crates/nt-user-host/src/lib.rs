@@ -10,11 +10,13 @@
 
 extern crate alloc;
 
+mod ntdll;
 mod profile;
 mod services;
 
 use alloc::vec::Vec;
 
+pub use ntdll::{NtdllExport, NtdllImage};
 pub use profile::{
     build_kuser_shared_data, build_peb, build_teb, kuser_off, peb_off, read_u32, read_u64, teb_off,
     WindowsProfile, KUSER_SHARED_DATA_VA,

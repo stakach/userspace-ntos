@@ -31,3 +31,22 @@ UserProcessHost — verifying the PEB (OSBuildNumber=22631), TEB (ClientId + PEB
 real offsets), and KUSER_SHARED_DATA (NtMajorVersion=10) — then dispatches real syscalls through
 the wired handler: NtOpenKey→NtQueryValueKey returns Answer=42 (registry), NtQuerySystemTime
 returns the KUSER time, and NtAllocateVirtualMemory reserves a region (address space).
+
+## Windows 7 pin + driving the real ntdll (implemented)
+
+The v0.1 profile is pinned to **Windows 7 SP1** (NT 6.1, build 7601) to avoid the NT 6.3+ ABI
+complexity, and the host now loads + drives the *real* unmodified `references/ntdll.dll`:
+
+- `nt-pe-loader` gained export-table parsing (`PeFile::exports` → name/RVA/ordinal).
+- `nt-syscall`: `UserlandAbiProfile::Windows7` + `NativeServiceTable::from_numbers` (a table keyed
+  by real syscall numbers, not sequential test numbers).
+- `nt-user-host::NtdllImage`: loads the official ntdll as a PE image (layout + relocations),
+  decodes the syscall number from each `Nt*`/`Zw*` stub's own bytes (`mov r10,rcx; mov eax,<ssn>;
+  syscall`), and builds the Windows-7 service table keyed by those real numbers.
+  `NtdllImage::invoke` executes a real export stub the way the CPU would — reads the loaded stub,
+  takes the `eax` immediate, dispatches it.
+- Integration tests (skipped when `references/ntdll.dll` is absent): the real ntdll has 400 syscall
+  stubs; the numbers match the known Win7 SP1 x64 SSDT (NtClose=0x0C, NtOpenKey=0x0F,
+  NtQueryValueKey=0x14, NtQuerySystemInformation=0x33, NtWaitForSingleObject=0x01); and executing
+  the real `NtOpenKey`/`NtQueryValueKey`/`NtQuerySystemInformation` stubs dispatches end-to-end
+  through the wired subsystems (registry Answer=42, NumberOfProcessors).

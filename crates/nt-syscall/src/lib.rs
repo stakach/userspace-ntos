@@ -35,6 +35,8 @@ pub enum ProcessorMode {
 pub enum UserlandAbiProfile {
     /// A stable, deterministic profile for tests (sequential service numbers).
     Test,
+    /// Windows 7 SP1 (NT 6.1) — the v0.1 pinned target, numbers captured from its `ntdll`.
+    Windows7,
     /// A Windows-11-shaped profile (numbers TBD from a captured ntdll).
     Windows11,
 }
@@ -202,6 +204,32 @@ impl NativeServiceTable {
         }
         NativeServiceTable {
             profile: UserlandAbiProfile::Test,
+            by_number,
+            by_service,
+        }
+    }
+
+    /// Build a table keyed by real syscall numbers (spec §3.3, §6.3) — e.g. the numbers extracted
+    /// from a captured `ntdll`'s syscall stubs. Each `(service, number)` pair uses the service's
+    /// own arg-count bounds. Later pairs overwrite earlier ones for the same number/service.
+    pub fn from_numbers(profile: UserlandAbiProfile, pairs: &[(NativeService, u32)]) -> Self {
+        let mut by_number = BTreeMap::new();
+        let mut by_service = BTreeMap::new();
+        for &(service, number) in pairs {
+            let (min_args, max_args) = service.arg_count();
+            by_number.insert(
+                number,
+                NativeServiceEntry {
+                    number,
+                    service,
+                    min_args,
+                    max_args,
+                },
+            );
+            by_service.insert(service, number);
+        }
+        NativeServiceTable {
+            profile,
             by_number,
             by_service,
         }

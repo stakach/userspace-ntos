@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-syscall = { workspace = true }
+nt-pe-loader = { workspace = true }
 nt-process = { workspace = true }
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
@@ -17,3 +18,8 @@ nt-address-space = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[dev-dependencies]
+nt-config-manager = { workspace = true }
+nt-fs = { workspace = true }
+nt-syscall = { workspace = true }

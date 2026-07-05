@@ -11,12 +11,14 @@
 
 extern crate alloc;
 
+mod exports;
 mod headers;
 mod image;
 mod imports;
 mod relocs;
 mod rva;
 
+pub use exports::ExportedSymbol;
 pub use headers::{DataDirectory, Headers, Section};
 pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
@@ -172,6 +174,11 @@ impl<'a> PeFile<'a> {
     /// module with its named/ordinal functions + IAT slot RVAs.
     pub fn imports(&self) -> Result<alloc::vec::Vec<ImportedDll>, PeError> {
         imports::parse_imports(self.bytes, &self.headers, &self.sections)
+    }
+
+    /// Parse the export directory (spec §13.6). Returns the module's named exports with RVAs.
+    pub fn exports(&self) -> Result<alloc::vec::Vec<ExportedSymbol>, PeError> {
+        exports::parse_exports(self.bytes, &self.headers, &self.sections)
     }
 
     /// Parse the base-relocation table (spec §7.2).

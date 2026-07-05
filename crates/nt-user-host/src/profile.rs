@@ -17,7 +17,20 @@ pub struct WindowsProfile {
 }
 
 impl WindowsProfile {
-    /// Windows 11 23H2 (build 22631), the v0.1 target profile.
+    /// Windows 7 SP1 (NT 6.1, build 7601) — the v0.1 pinned target profile (avoids the NT 6.3+
+    /// ABI complexity; matches `references/ntdll.dll`).
+    pub fn windows7_sp1() -> Self {
+        WindowsProfile {
+            os_major: 6,
+            os_minor: 1,
+            os_build: 7601,
+            platform_id: 2,  // VER_PLATFORM_WIN32_NT
+            product_type: 1, // NtProductWinNt
+            number_of_processors: 1,
+        }
+    }
+
+    /// Windows 11 23H2 (build 22631) — a later profile, not the v0.1 target.
     pub fn windows11_23h2() -> Self {
         WindowsProfile {
             os_major: 10,
