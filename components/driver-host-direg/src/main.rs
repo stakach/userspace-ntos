@@ -34,7 +34,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use nt_config_manager::{DevPropKey, PropertyValue};
+use nt_pnp_abi::DeviceState;
+use nt_pnp_manager::PnpManager;
+use nt_root_bus::{BusQueryId, RootBus};
 use nt_wdf_object::WdfHandle;
 use nt_wdf_queue::DispatchType;
 use nt_wdf_request::RequestBuffers;
@@ -55,6 +59,12 @@ const PING_MAGIC: u32 = 0x4946_4B4D; // "MKFI" — the driver's PING signature
 const IFACE_GUID: &str = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";
 const SERVICE_NAME: &str = "KmdfInterfaceRegistryTest";
 const DEVNODE_INSTANCE: &str = r"Root\KmdfInterfaceRegistryTest\0000";
+// The root-enumerated devnode this host binds (the service database entry).
+const DEVICE_ID: &str = r"ROOT\KMDF_INTERFACE_REGISTRY_TEST";
+const COMPATIBLE_ID: &str = r"ROOT\USERSPACE_NTOS_TEST_DEVICE";
+const INSTANCE_ID: &str = "0000";
+/// The `object_id` the PnP Manager + root bus use for this devnode's PDO.
+const PDO_OBJECT_ID: u64 = 0xFED1_0000;
 
 const IOCTL_PING: u32 = 0x0022_2200;
 const IOCTL_GET_CONFIG: u32 = 0x0022_2204;
@@ -118,6 +128,28 @@ unsafe fn apply_wx(pe: &nt_pe_loader::PeFile, frames: u64) {
 static mut WDF: Option<WdfRuntime> = None;
 unsafe fn wdf() -> &'static mut WdfRuntime {
     (*core::ptr::addr_of_mut!(WDF)).as_mut().unwrap()
+}
+
+static mut PNP: Option<PnpManager> = None;
+static mut ROOT_BUS: Option<RootBus> = None;
+unsafe fn pnp() -> &'static mut PnpManager {
+    (*core::ptr::addr_of_mut!(PNP)).as_mut().unwrap()
+}
+unsafe fn root_bus() -> &'static mut RootBus {
+    (*core::ptr::addr_of_mut!(ROOT_BUS)).as_mut().unwrap()
+}
+
+/// Emit a traced `pnp_*` lifecycle event.
+fn trace(event: &[u8]) {
+    print_str(b"  [pnp] ");
+    print_str(event);
+    print_str(b"\n");
+}
+
+/// `buf` is a NUL-terminated wide string equal to `expected`.
+fn wide_is(buf: &[u16], expected: &str) -> bool {
+    let e: Vec<u16> = expected.encode_utf16().collect();
+    buf.len() == e.len() + 1 && buf[e.len()] == 0 && buf[..e.len()] == e[..]
 }
 
 /// The 444-entry WDF function-pointer table `WdfVersionBind` publishes to the driver.
@@ -269,6 +301,31 @@ extern "win64" fn ntos_wdf_version_unbind_class(_a: u64, _b: u64, _c: u64) {}
 // --- WDF function-table thunks (each takes WdfDriverGlobals in rcx) ----------
 
 /// `WdfDriverCreate(Globals, DriverObject, RegistryPath, Attributes, Config, Driver)`.
+/// The WDM `AddDevice` bridge KMDF installs into `DriverObject->DriverExtension->AddDevice`. The
+/// PnP Manager calls this with the enumerated PDO; it allocates a `WDFDEVICE_INIT` and invokes the
+/// driver's `EvtDriverDeviceAdd(Driver, DeviceInit)`, which calls `WdfDeviceCreate` to build + attach
+/// the FDO. This is the bridge that lets a PnP-called `AddDevice` reach the KMDF framework.
+extern "win64" fn wdm_add_device_bridge(_driver_object: u64, pdo: u64) -> i32 {
+    trace(b"wdf_add_device_bridge_enter");
+    // SAFETY: single-threaded root task; the WDF runtime + host state are initialized.
+    unsafe {
+        let evt = wdf().evt_device_add();
+        if evt == 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        let init_id = wdf().add_device(pdo);
+        let device_init_blob = alloc_blob();
+        core::ptr::write_unaligned(device_init_blob as *mut u64, init_id as u64);
+        host().device_init_blob = device_init_blob;
+        let Some(driver) = wdf().driver() else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        trace(b"wdf_evt_driver_device_add_enter");
+        // EvtDriverDeviceAdd(Driver, DeviceInit) -> the driver calls WdfDeviceCreate.
+        call2(evt, driver.0, device_init_blob)
+    }
+}
+
 extern "win64" fn wdf_driver_create(
     _globals: u64,
     driver_object: u64,
@@ -286,6 +343,15 @@ extern "win64" fn wdf_driver_create(
             Ok(d) => {
                 if !driver_out.is_null() {
                     core::ptr::write_unaligned(driver_out, d.0);
+                }
+                // Install the WDM AddDevice bridge into DriverExtension->AddDevice (@ ext+8) so a
+                // PnP-driven AddDevice reaches EvtDriverDeviceAdd through the framework.
+                let driver_ext = core::ptr::read_unaligned((driver_object + 48) as *const u64);
+                if driver_ext != 0 {
+                    core::ptr::write_unaligned(
+                        (driver_ext + 8) as *mut u64,
+                        wdm_add_device_bridge as usize as u64,
+                    );
                 }
                 STATUS_SUCCESS
             }
@@ -1020,6 +1086,8 @@ static LAST_INFO: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn run() {
     WDF = Some(WdfRuntime::new());
+    PNP = Some(PnpManager::new());
+    ROOT_BUS = Some(RootBus::new());
     install_function_table();
 
     // --- Seed the Configuration Manager fixture (spec §21 / RE §9) ------------
@@ -1127,19 +1195,57 @@ unsafe fn run() {
 
     let evt_device_add = wdf().evt_device_add();
     check(b"evt_device_add_registered", evt_device_add != 0);
-
-    // --- Framework AddDevice → EvtDriverDeviceAdd -----------------------------
-    let init_id = wdf().add_device(0xFED0_0000 /* PDO */);
-    let device_init_blob = alloc_blob();
-    core::ptr::write_unaligned(device_init_blob as *mut u64, init_id as u64);
-    host().device_init_blob = device_init_blob;
-    let driver = wdf().driver().unwrap();
-    let add_status = call2(evt_device_add, driver.0, device_init_blob);
-    let device = nt_wdf_object::WdfHandle(host().device);
+    // WdfDriverCreate installed the WDM AddDevice bridge into DriverExtension->AddDevice (@ ext+8).
+    let driver_ext = core::ptr::read_unaligned((driver_object + 48) as *const u64);
+    let add_device = core::ptr::read_unaligned((driver_ext + 8) as *const u64);
     check(
-        b"evt_device_add_created_device_queue",
+        b"wdf_add_device_bridge_installed",
+        add_device == wdm_add_device_bridge as usize as u64,
+    );
+
+    // --- Enumerate: the root bus creates the PDO + answers the bus queries ---------
+    let devnode_pnp = pnp().create_devnode(PDO_OBJECT_ID);
+    root_bus().create_pdo(
+        PDO_OBJECT_ID,
+        DEVICE_ID,
+        &[DEVICE_ID],
+        &[COMPATIBLE_ID],
+        INSTANCE_ID,
+    );
+    trace(b"pnp_pdo_create + pnp_stack_create");
+    let query_id_ok = root_bus()
+        .query_id(PDO_OBJECT_ID, BusQueryId::DeviceId)
+        .map(|w| wide_is(&w, DEVICE_ID))
+        .unwrap_or(false);
+    check(b"root_bus_query_id_device", query_id_ok);
+    let caps_ok = root_bus()
+        .query_capabilities(PDO_OBJECT_ID)
+        .map(|c| c.version == 1 && c.device_state[0] == 1)
+        .unwrap_or(false);
+    check(b"root_bus_query_capabilities", caps_ok);
+    trace(b"pnp_query_id + pnp_query_capabilities");
+    let _ = pnp().transition(devnode_pnp, DeviceState::DriverLoaded);
+    trace(b"pnp_driver_loaded");
+
+    // --- CallAddDevice: the PnP Manager invokes DriverExtension->AddDevice (the WDF bridge) with
+    // the PDO -> EvtDriverDeviceAdd -> WdfDeviceCreate builds + attaches the FDO. --------------
+    trace(b"pnp_add_device_enter");
+    let add_fn: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
+    let add_status = add_fn(driver_object, PDO_OBJECT_ID);
+    trace(b"pnp_add_device_exit");
+    let device = nt_wdf_object::WdfHandle(host().device);
+    let _ = pnp().transition(devnode_pnp, DeviceState::AddDeviceCalled);
+    let _ = pnp().set_fdo(devnode_pnp, host().device);
+    let _ = pnp().transition(devnode_pnp, DeviceState::DeviceStackBuilt);
+    check(
+        b"pnp_add_device_created_device_queue",
         add_status == 0 && host().device != 0 && host().queue != 0,
     );
+    check(
+        b"fdo_attached_above_pdo",
+        pnp().fdo(devnode_pnp) == Some(host().device),
+    );
+    trace(b"pnp_fdo_detected + pnp_attach");
 
     // EvtDeviceAdd ran the registry helpers: read Answer=42/Greeting, wrote SeenByDriver=1 +
     // DeviceSeenByDriver=1 + RuntimeValue=0 (RE §3).
@@ -1162,11 +1268,20 @@ unsafe fn run() {
             == Some(1),
     );
 
-    // EvtDeviceAdd created the device interface + assigned properties (RE §4-§5).
+    // EvtDeviceAdd registered the device interface + assigned properties (RE §4-§5). Per PnP an
+    // interface becomes present only on a successful START, so gate its enabled state on the
+    // devnode's Started transition (below) rather than leaving it live from AddDevice.
     check(
-        b"device_interface_created",
-        wdf().device_interface_link(device, IFACE_GUID).is_some()
-            && wdf().config().interfaces_by_guid(IFACE_GUID, true).len() == 1,
+        b"device_interface_registered",
+        wdf().device_interface_link(device, IFACE_GUID).is_some(),
+    );
+    wdf().set_device_interface_state(device, IFACE_GUID, false);
+    check(
+        b"interface_not_present_before_start",
+        wdf()
+            .config()
+            .interfaces_by_guid(IFACE_GUID, true)
+            .is_empty(),
     );
     check(
         b"friendly_name_property_assigned",
@@ -1208,6 +1323,20 @@ unsafe fn run() {
     check(
         b"prepare_hardware_and_d0_entry",
         prep_status == 0 && d0_status == 0,
+    );
+
+    // START succeeded: drive the devnode to Started and enable the interface
+    // (IoSetDeviceInterfaceState(TRUE)) — now, and only now, is the interface present.
+    trace(b"pnp_start_enter + pnp_start_resources");
+    let _ = pnp().transition(devnode_pnp, DeviceState::ResourcesAssigned);
+    let _ = pnp().transition(devnode_pnp, DeviceState::StartIrpSent);
+    let _ = pnp().transition(devnode_pnp, DeviceState::Started);
+    wdf().set_device_interface_state(device, IFACE_GUID, true);
+    trace(b"pnp_start_complete + pnp_interface_enabled");
+    check(
+        b"devnode_started_interface_present",
+        pnp().state(devnode_pnp) == Some(DeviceState::Started)
+            && wdf().config().interfaces_by_guid(IFACE_GUID, true).len() == 1,
     );
 
     // --- IOCTLs (RE §7) -------------------------------------------------------
@@ -1263,9 +1392,11 @@ unsafe fn run() {
         st == 0 && info == 4 && out[0] == 0xDE && out[3] == 0xEF,
     );
 
-    // --- REMOVE: interface disabled, device object deleted --------------------
+    // --- REMOVE_DEVICE: PnP tears the stack down; interface disabled, device object deleted ----
     // (WDFKEY/WDFSTRING objects are driver-scoped in KMDF, so they legitimately outlive the
     // device delete — verify the interface is disabled + the device object itself is gone.)
+    trace(b"pnp_query_remove_enter + pnp_remove_enter");
+    let _ = pnp().transition(devnode_pnp, DeviceState::RemovePending);
     wdf().set_device_interface_state(device, IFACE_GUID, false);
     let iface_disabled = wdf()
         .config()
@@ -1273,10 +1404,29 @@ unsafe fn run() {
         .is_empty();
     let deleted = wdf().delete_object(device).is_ok();
     let device_gone = wdf().prepare_hardware(device).is_err();
+    let _ = pnp().transition(devnode_pnp, DeviceState::Removed);
+    trace(b"pnp_interface_disabled + pnp_remove_complete");
     check(
         b"remove_disables_interface_deletes_device",
         iface_disabled && deleted && device_gone,
     );
+    check(
+        b"devnode_removed",
+        pnp().state(devnode_pnp) == Some(DeviceState::Removed),
+    );
+
+    // --- Report -----------------------------------------------------------------------------
+    print_str(b"\n  [pnp-report] ");
+    print_str(DEVICE_ID.as_bytes());
+    print_str(b"\\");
+    print_str(INSTANCE_ID.as_bytes());
+    print_str(b" (service=");
+    print_str(SERVICE_NAME.as_bytes());
+    print_str(b", KMDF 1.15)\n");
+    print_str(b"    bind: service-DB -> root-bus PDO (QUERY_ID/CAPABILITIES) -> PnP AddDevice via\n");
+    print_str(b"          WDF bridge -> EvtDriverDeviceAdd -> WdfDeviceCreate (FDO)\n");
+    print_str(b"    lifecycle: Enumerated -> DriverLoaded -> AddDeviceCalled -> Started -> Removed\n");
+    print_str(b"    interface present only after START; IOCTL smoke ok; clean REMOVE teardown\n");
 }
 
 /// Decode `count` UTF-16LE code units from `out` starting at byte `offset`.
@@ -1299,7 +1449,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
 
-    print_str(b"[ntos-dhi] WDF Driver Host: real KmdfInterfaceRegistryTest.sys (registry/interface/property)\n");
+    print_str(b"[ntos-dhi] KMDF PnP Driver Host: PnP-driven bind of KmdfInterfaceRegistryTest.sys via the WDF AddDevice bridge\n");
     run();
     print_str(b"[microtest done]\n");
     loop {

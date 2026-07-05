@@ -46,3 +46,13 @@ Steps 1-5 complete. driver-host-pnp is now PnP-Manager-driven from the service d
   fdo_attached_above_pdo, start_device_with_resources (+ existing gating/interrupt/remove).
 New nt-root-bus crate (4 host tests); nt-config-manager devnode_service/devnode_hardware_ids accessors.
 Traced pnp_* events + a compat report. Next: KMDF WDF AddDevice bridge (increment 2 -> spec acceptance).
+
+## Increment 2 done (2026-07-06): KMDF WDF AddDevice bridge
+Evolved driver-host-direg from a direct KMDF host to PnP-Manager-driven with the WDF AddDevice
+bridge. WdfDriverCreate installs wdm_add_device_bridge into DriverExtension->AddDevice; PnP calls it
+-> EvtDriverDeviceAdd -> WdfDeviceCreate -> FDO. 27 PASS / 0 FAIL + 185 kernel. New checks:
+wdf_add_device_bridge_installed, root_bus_query_id_device/capabilities, pnp_add_device_created_
+device_queue, fdo_attached_above_pdo, interface_not_present_before_start, devnode_started_interface_
+present, devnode_removed. Trace: pnp_add_device_enter -> wdf_add_device_bridge_enter ->
+wdf_evt_driver_device_add_enter. nt-pnp-manager: added create_devnode (no-resource devnode).
+This hits the spec's KMDF acceptance (PnP-called AddDevice via WDF bridge, interface after start).

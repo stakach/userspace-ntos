@@ -124,6 +124,32 @@ impl PnpManager {
         id
     }
 
+    /// Enumerate a devnode with no assigned resources (a device whose function driver needs no
+    /// hardware — e.g. a registry/interface KMDF device). Created in state `Enumerated`.
+    pub fn create_devnode(&mut self, pdo_object_id: u64) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let generation = self.next_gen;
+        self.next_gen += 1;
+        self.devnodes.push(Devnode {
+            id,
+            generation,
+            state: DeviceState::Enumerated,
+            pdo_object_id,
+            fdo_object_id: 0,
+            driver_id: 0,
+            resources: ResourceAssignment {
+                mem_start: 0,
+                mem_length: 0,
+                int_vector: 0,
+                int_level: 0,
+                int_affinity: 0,
+                int_latched: false,
+            },
+        });
+        id
+    }
+
     pub fn state(&self, id: u64) -> Option<DeviceState> {
         self.find(id).map(|d| d.state)
     }
