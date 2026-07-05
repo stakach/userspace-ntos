@@ -1,0 +1,34 @@
+# ntdll syscall-trap demo as a seL4 component: maps a real Windows 7 ntdll syscall
+# stub EXECUTABLE in the root VSpace, spawns a user thread with a fault endpoint, and
+# lets the stub's own `syscall` instruction trap into the kernel → UnknownSyscall fault
+# → the NT syscall dispatcher. Requires references/ntdll.dll (gitignored). Own workspace.
+[workspace]
+
+[package]
+name = "ntos-driver-host-ntdll"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host-ntdll"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-syscall = { path = "../../crates/nt-syscall" }
+nt-user-host = { path = "../../crates/nt-user-host" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-fs = { path = "../../crates/nt-fs" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
