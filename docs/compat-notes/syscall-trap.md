@@ -283,3 +283,22 @@ even though gdb confirms the inverted table is correctly populated, ntdll's entr
 ntdll's `.pdata` has a valid RUNTIME_FUNCTION (RF[881], Begin=0x17910). So the lookup's search
 execution is going wrong despite correct inputs — the next single-step target (its binary-search /
 `.pdata` count path), for a future gdb session.
+
+## MERGE COMPLETE: the real loader runs to completion + NtContinues into the exe
+
+`loader_completed_and_booted_exe_win7` passes: the real `LdrpInitialize` (started directly at
+`LdrInitializeThunk` with RCX=Context/RDX=ntdll base) runs to **completion** — servicing ~32 real
+syscalls (NLS init, process-heap creation, registry, system-info, object-namespace path resolution,
+KnownDlls, the critical-loader-functions validation, and import snapping) — then calls its **own
+`NtContinue`** to boot into the exe entry. The booted exe runs `RtlGetVersion` + `NtTerminateProcess`,
+terminating with `0x06011DB1` = **6.1.7601**. The two phases are now merged into one unbroken path.
+
+Last pieces that closed it, each gdb-diagnosed:
+- **`NtQueryVirtualMemory` region-info class** (Type=MEM_IMAGE @ buffer+0xC) — the inverted-function-
+  table fallback for `RtlLookupFunctionEntry`, unblocking the critical-functions loop.
+- **`NtOpenSection`** returning a handle (KnownDlls check).
+- **Exe subsystem → NATIVE**: the exe imports only ntdll but was marked CUI; ntdll's loader would
+  load kernel32/kernelbase for a Win32 app (ldrinit.c:1881, which we don't have → STATUS_DLL_NOT_FOUND).
+  Patching the mapped image's Subsystem to `IMAGE_SUBSYSTEM_NATIVE` makes the loader skip them.
+- **Real `NtProtectVirtualMemory`**: actually re-maps the exe/ntdll pages (the loader makes the IAT
+  writable before snapping imports); previously a no-op, so the IAT write faulted.

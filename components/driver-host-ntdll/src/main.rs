@@ -53,7 +53,6 @@ const CHILD_IPCBUF_VADDR: u64 = 0x0000_0002_0020_0000;
 const TEB_VADDR: u64 = 0x0000_0002_0030_0000; // the thread's TEB (%gs base)
 const PEB_VADDR: u64 = 0x0000_0002_0040_0000; // the process's PEB (referenced by the TEB)
 const LDR_VADDR: u64 = 0x0000_0002_0050_0000; // PEB_LDR_DATA (referenced by PEB->Ldr)
-const LDR_TRAMP_VADDR: u64 = 0x0000_0002_0060_0000; // trampoline for the LdrInitializeThunk thread
 const LDR_STACK_VADDR: u64 = 0x0000_0002_0070_0000;
 const LDR_IPCBUF_VADDR: u64 = 0x0000_0002_0080_0000;
 const EXE_STACK_VADDR: u64 = 0x0000_0002_0090_0000; // stack for the exe's entry thread
@@ -508,6 +507,35 @@ unsafe fn link_list(head: u64, link_off: u64, entries: &[u64]) {
     }
 }
 
+/// The frame cap backing a mapped VA in the exe or ntdll image (for re-protecting it), if any.
+unsafe fn frame_cap_for(va: u64) -> Option<u64> {
+    if (0x1_4000_0000..0x1_4000_0000 + 16 * 0x1000).contains(&va) {
+        let i = ((va - 0x1_4000_0000) / 0x1000) as usize;
+        if EXE_FRAME_CAPS[i] != 0 {
+            return Some(EXE_FRAME_CAPS[i]);
+        }
+    } else if (0x78e5_0000..0x78e5_0000 + 512 * 0x1000).contains(&va) {
+        let i = ((va - 0x78e5_0000) / 0x1000) as usize;
+        if i < 512 && NTDLL_FRAME_CAPS[i] != 0 {
+            return Some(NTDLL_FRAME_CAPS[i]);
+        }
+    }
+    None
+}
+
+/// Convert a Win32 PAGE_* protection to seL4 frame rights (bit0=W, bit1=R, |NX).
+fn prot_to_rights(newprot: u64) -> u64 {
+    let p = newprot & 0xFF;
+    let writable = p & (0x04 | 0x08 | 0x40 | 0x80) != 0; // RW | WRITECOPY | EXEC_RW | EXEC_WC
+    let exec = p & (0x10 | 0x20 | 0x40 | 0x80) != 0;
+    let base = if writable { 0b011 } else { 0b010 };
+    if exec {
+        base
+    } else {
+        base | PAGE_EXECUTE_NEVER
+    }
+}
+
 struct SvcResult {
     serviced: u32,
     booted: bool,
@@ -600,7 +628,9 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
     let s_qattrfile = s("NtQueryAttributesFile");
     let s_qfullattr = s("NtQueryFullAttributesFile");
     let s_createsection = s("NtCreateSection");
+    let s_opensection = s("NtOpenSection");
     let s_mapview = s("NtMapViewOfSection");
+    let s_protect = s("NtProtectVirtualMemory");
     let s_close = s("NtClose");
     let s_opendir = s("NtOpenDirectoryObject");
     let s_opensym = s("NtOpenSymbolicLinkObject");
@@ -745,6 +775,20 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
                 }
                 None => rep[0] = 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
             }
+        } else if ssn == s_opensection {
+            // NtOpenSection(*SectionHandle=R10, access, ObjectAttributes=R8). The loader opens
+            // \KnownDlls\<name> to check for a pre-mapped known DLL. Back it with the matching image
+            // (ntdll's KnownDll section = the mapped ntdll); NtMapViewOfSection hands back its base.
+            let (sh_ptr, obj_attr) = (a1, a3);
+            let mut name = [0u8; 260];
+            let n = read_object_name(obj_attr, &mut name);
+            print_str(b"[sect ");
+            print_str(&name[..n]);
+            print_str(b"] ");
+            match match_file(&name[..n]) {
+                Some((ptr, len)) => write_u64(sh_ptr, open_handle(ptr, len)),
+                None => rep[0] = 0xC000_0034, // not a KnownDll → loader loads it normally
+            }
         } else if ssn == s_qattrfile || ssn == s_qfullattr {
             // NtQueryAttributesFile(ObjectAttributes=R10, FileInformation=RDX). Report a normal file.
             let (obj_attr, out) = (a1, a2);
@@ -858,6 +902,30 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
                     }
                 }
             }
+        } else if ssn == s_protect {
+            // NtProtectVirtualMemory(_, *BaseAddress=RDX, *Size=R8, NewProtect=R9, *OldProtect=
+            // [sp+0x28]). The loader makes the exe's IAT writable before snapping imports — actually
+            // re-map the affected exe/ntdll pages to the requested protection.
+            let (base_ptr, size_ptr, newprot) = (a2, a3, a4);
+            let base = read_u64(base_ptr);
+            let size = read_u64(size_ptr);
+            let rights = prot_to_rights(newprot);
+            let start = base & !0xFFF;
+            let end = (base + size + 0xFFF) & !0xFFF;
+            let mut va = start;
+            while va < end {
+                if let Some(cap) = frame_cap_for(va) {
+                    let _ = page_unmap(cap);
+                    let _ = page_map(cap, va, rights, CAP_INIT_THREAD_VSPACE);
+                }
+                va += 0x1000;
+            }
+            let oldprot = read_u64(sp + 0x28);
+            if oldprot != 0 {
+                write_u32(oldprot, 0x02); // OldProtect = PAGE_READONLY
+            }
+            write_u64(base_ptr, start);
+            write_u64(size_ptr, end - start);
         } else if ssn == s_qvm {
             // NtQueryVirtualMemory(_, BaseAddress=RDX, class=R8, buffer=R9, len=[sp+0x28],
             // *retlen=[sp+0x30]). Classify the region: an image (exe/ntdll) is MEM_IMAGE.
@@ -1121,6 +1189,12 @@ fn run() {
         let exe_base = exe_pe.image_base();
         let exe_frames = (exe_pe.size_of_image() as u64).div_ceil(0x1000);
         map_and_copy(&exe_pe, EXE, exe_base, exe_frames, &mut EXE_FRAME_CAPS);
+        // The exe imports ONLY ntdll but is marked CUI (Win32). ntdll's loader loads kernel32 +
+        // kernelbase for any GUI/CUI subsystem app (ldrinit.c:1881), which we don't have — it aborts
+        // with STATUS_DLL_NOT_FOUND. The exe is effectively native, so patch the mapped image's
+        // Subsystem (opt header +0x44) to IMAGE_SUBSYSTEM_NATIVE (1) → the loader skips kernel32.
+        let e_lfanew = u32::from_le_bytes([EXE[0x3c], EXE[0x3d], EXE[0x3e], EXE[0x3f]]) as u64;
+        write_u16(exe_base + e_lfanew + 0x18 + 0x44, 1); // Subsystem = NATIVE
         let mut snapped = 0u32;
         if let Ok(imports) = exe_pe.imports() {
             for dll in &imports {
@@ -1188,13 +1262,23 @@ fn run() {
         print_str(b"\n  LdrpInitialize serviced 0x");
         debug_put_char(hex((a.serviced as u64 >> 4) & 0xf));
         debug_put_char(hex(a.serviced as u64 & 0xf));
-        print_str(b" real syscalls (NLS init, process-heap create, registry, sysinfo,\n");
-        print_str(b"  object-namespace path resolution + KnownDlls) - deep into LdrpInitializeProcess.\n");
-        // The real LdrpInitialize executed a large slice of Windows loader init on seL4, servicing
-        // its heap/registry/sysinfo/object-namespace/KnownDlls syscalls with faithful results. Full
-        // completion (its own NtContinue) needs the rest of the NT-executive process-creation
-        // contract (the in-memory module list + section objects); phase B proves the boot path.
+        print_str(b" real syscalls, then NtContinue'd into the exe entry: booted=");
+        debug_put_char(if a.booted { b'1' } else { b'0' });
+        print_str(b" exit=0x");
+        for shift in (0..8).rev() {
+            debug_put_char(hex((a.exitcode >> (shift * 4)) & 0xf));
+        }
+        print_str(b" (6.1.7601)\n");
+        // THE MERGE: the real LdrpInitialize ran to completion — NLS init, process-heap creation,
+        // registry, system-info, object-namespace path resolution, KnownDlls, the critical-loader-
+        // functions validation, and import snapping (making the IAT writable via NtProtectVirtualMemory)
+        // — then called its OWN NtContinue to boot into the exe entry, and the exe ran RtlGetVersion +
+        // NtTerminateProcess, terminating with the real Win7 SP1 version (0x06011DB1 = 6.1.7601).
         check(b"ldrpinitialize_ran_deep", a.serviced >= 16);
+        check(
+            b"loader_completed_and_booted_exe_win7",
+            a.booted && a.exitcode == 0x0601_1DB1,
+        );
 
         // Boot into the exe entry via the REAL ntdll NtContinue: a thread calls NtContinue(CONTEXT),
         // whose CONTEXT.Rip = the exe entry. Servicing that NtContinue loads the thread's registers
