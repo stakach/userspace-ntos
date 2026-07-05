@@ -220,3 +220,26 @@ that an earlier step leaves unset in this from-scratch environment; isolating wh
 instruction-level debugging (a gdb stub on the loader thread), not serial print-tracing. The merge
 therefore remains at: phase A runs the real loader deep (through NLS/heap/registry/sysinfo/object-
 namespace/KnownDlls), phase B boots the exe via the real NtContinue.
+
+## SystemDllBase (RDX) fix + gdb stub; loader gets past LDR-entry creation
+
+Two things moved the merge forward materially:
+
+**The RDX fix (the big one).** Reading the real NT5 source (`references/nt5/base/ntdll/ldrinit.c`,
+much closer to Win7 than ReactOS) showed `LdrpInitializeProcess(Context, SystemDllBase=SystemArgument1,
+...)` and that `SystemArgument1` is the **2nd argument (RDX)** the kernel passes to `LdrInitializeThunk`
+= ntdll's own base. My trampoline set RCX (Context) but not RDX, so `SystemDllBase`=0 →
+`LdrpAllocateDataTableEntry(0)` → `RtlImageNtHeader(0)`=NULL → Win7 reads `NtHeaders->OptionalHeader.
+SizeOfImage` (`NtHeaders+0x50`) → the `[NULL+0x50]` fault (cr2=0x50) that blocked us for many
+iterations. Fix: `mov rdx, ntdll_base` in the loader trampoline (+ set `PEB->ImageBaseAddress` to the
+exe base so `LdrpImageEntry` is built from the exe). The loader now creates both LDR entries and runs
+past that point; also added a faithful `NtQueryVirtualMemory` (MEMORY_BASIC_INFORMATION).
+
+**A gdb stub (`scripts/run-gdb.sh`).** Boots the image with QEMU `-s -S` (gdb stub, halted) and drives
+`lldb --batch` to break at a VA and dump registers/stack/disasm — the durable tool for this depth of
+debugging. With it, the current fault resolves to: `0x78e8c966 mov (%rax),%r8d` with `rax=0`, where
+`rax` is the NULL return of an internal chain `fault_fn -> 0x27d30 -> 0x27c20`, and `0x27c20` reads a
+**lazily-initialised ntdll global table** (count in `.data`, init guard in `.rdata`, RtlRunOnce init
+`0x23a80`) that's empty in this from-scratch environment. That's an ntdll-internal init dependency —
+the next layer to chase with gdb. Merge status: loader runs deeper still; boot path stays proven by
+phase B (real NtContinue → exe, exit 0x06011DB1).

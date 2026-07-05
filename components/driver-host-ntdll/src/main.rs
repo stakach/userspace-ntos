@@ -569,6 +569,7 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
     let s_opensym = s("NtOpenSymbolicLinkObject");
     let s_qsym = s("NtQuerySymbolicLinkObject");
     let s_raiseerr = s("NtRaiseHardError");
+    let s_qvm = s("NtQueryVirtualMemory");
     let mut r = SvcResult {
         serviced: 0,
         booted: false,
@@ -820,6 +821,32 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
                     }
                 }
             }
+        } else if ssn == s_qvm {
+            // NtQueryVirtualMemory(_, BaseAddress=RDX, class=R8, buffer=R9, len=[sp+0x28],
+            // *retlen=[sp+0x30]). Class 0 = MemoryBasicInformation.
+            let (base, class, buf) = (a2, a3, a4);
+            if class == 0 && buf != 0 {
+                // Report the region as a committed image view if the address is in the exe/ntdll,
+                // else a committed private region; both with a non-NULL AllocationBase.
+                let (alloc_base, mtype) = if base >= 0x1_4000_0000 && base < 0x1_4001_0000 {
+                    (0x1_4000_0000u64, 0x0100_0000u32) // MEM_IMAGE
+                } else if base >= 0x78e5_0000 && base < 0x78e5_0000 + 0x1a_a000 {
+                    (0x78e5_0000u64, 0x0100_0000u32)
+                } else {
+                    (base & !0xFFFF, 0x0002_0000u32) // MEM_PRIVATE
+                };
+                write_u64(buf + 0x00, base & !0xFFF); // BaseAddress
+                write_u64(buf + 0x08, alloc_base); // AllocationBase
+                write_u32(buf + 0x10, 0x80); // AllocationProtect = PAGE_EXECUTE_WRITECOPY
+                write_u64(buf + 0x18, 0x1000); // RegionSize
+                write_u32(buf + 0x20, 0x1000); // State = MEM_COMMIT
+                write_u32(buf + 0x24, 0x04); // Protect = PAGE_READWRITE
+                write_u32(buf + 0x28, mtype); // Type
+            }
+            let retlen = read_u64(sp + 0x30);
+            if retlen != 0 {
+                write_u32(retlen, 0x30);
+            }
         } else if ssn == s_raiseerr {
             // The loader is aborting via a hard error (LdrpInitializeProcess final handler wraps the
             // real accumulated Status in Parameters[0] = R9 = a4). Log both.
@@ -949,7 +976,8 @@ fn run() {
         let kuser = nt_user_host::build_kuser_shared_data(&profile, services.system_time_100ns, 1);
         let _kframe = map_page(0x7FFE_0000, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         core::ptr::copy_nonoverlapping(kuser.as_ptr(), 0x7FFE_0000 as *mut u8, kuser.len().min(0x1000));
-        let peb = nt_user_host::build_peb(&profile, ntdll_base, LDR_VADDR, 0, 0);
+        // PEB->ImageBaseAddress is the MAIN image = the exe (the loader builds LdrpImageEntry from it).
+        let peb = nt_user_host::build_peb(&profile, exe_base0, LDR_VADDR, 0, 0);
         let _peb_frame = map_page(PEB_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
         core::ptr::copy_nonoverlapping(peb.as_ptr(), PEB_VADDR as *mut u8, peb.len().min(0x1000));
         let teb = nt_user_host::build_teb(TEB_VADDR, PEB_VADDR, STACK_VADDR, stack_top, 4, 8);
@@ -1090,18 +1118,22 @@ fn run() {
         write_u64(CTX_VADDR + 0x98, boot_sp); // Rsp
         write_u64(CTX_VADDR + 0xF8, exe_entry); // Rip = the exe's AddressOfEntryPoint
 
-        // Loader thread: trampoline `mov rcx, CTX_VADDR; mov rax, LdrInitializeThunk; call rax`.
+        // Loader thread trampoline. LdrInitializeThunk(Context=RCX, SystemArgument1=RDX, ...) passes
+        // SystemArgument1 through to LdrpInitializeProcess as SystemDllBase — the kernel puts ntdll's
+        // base there. So: `mov rcx, CTX; mov rdx, ntdll_base; mov rax, thunk; call rax`.
         let thunk_rva = exports.iter().find(|e| e.name == "LdrInitializeThunk").unwrap().rva;
         let thunk_addr = ntdll_base + thunk_rva as u64;
-        let mut lt = [0u8; 32];
-        lt[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
+        let mut lt = [0u8; 40];
+        lt[0..2].copy_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (CONTEXT*)
         lt[2..10].copy_from_slice(&CTX_VADDR.to_le_bytes());
-        lt[10..12].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-        lt[12..20].copy_from_slice(&thunk_addr.to_le_bytes());
-        lt[20..22].copy_from_slice(&[0xFF, 0xD0]); // call rax
-        lt[22..24].copy_from_slice(&[0xEB, 0xFE]); // jmp $
+        lt[10..12].copy_from_slice(&[0x48, 0xBA]); // mov rdx, imm64 (SystemArgument1 = ntdll base)
+        lt[12..20].copy_from_slice(&ntdll_base.to_le_bytes());
+        lt[20..22].copy_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (LdrInitializeThunk)
+        lt[22..30].copy_from_slice(&thunk_addr.to_le_bytes());
+        lt[30..32].copy_from_slice(&[0xFF, 0xD0]); // call rax
+        lt[32..34].copy_from_slice(&[0xEB, 0xFE]); // jmp $
         let ltp = map_page(LDR_TRAMP_VADDR, RIGHTS_RW);
-        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 24);
+        core::ptr::copy_nonoverlapping(lt.as_ptr(), LDR_TRAMP_VADDR as *mut u8, 34);
         let _ = page_unmap(ltp);
         let _ = page_map(ltp, LDR_TRAMP_VADDR, RIGHTS_RO_X, CAP_INIT_THREAD_VSPACE);
         let _ls = map_page(LDR_STACK_VADDR, RIGHTS_RW | PAGE_EXECUTE_NEVER);
