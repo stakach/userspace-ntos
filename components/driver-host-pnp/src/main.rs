@@ -29,7 +29,10 @@ use alloc::vec::Vec;
 use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
 use nt_config_manager::ConfigManager;
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
-use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
+use nt_pnp_abi::{
+    DeviceState, IRP_MJ_PNP, IRP_MN_CANCEL_STOP_DEVICE, IRP_MN_QUERY_STOP_DEVICE,
+    IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL,
+};
 use nt_pnp_manager::PnpManager;
 use nt_resource_manager::{ResourceManager, ResourceOwner};
 use nt_root_bus::{BusQueryId, RootBus};
@@ -1390,16 +1393,70 @@ unsafe fn run() {
     let count = core::ptr::read_unaligned(out.as_ptr() as *const u32);
     check(b"interrupt_count", st == 0 && count == 1);
 
-    // --- REMOVE_DEVICE releases resources ------------------------------------
-    trace(b"pnp_remove_enter");
+    // --- STOP negotiation: QUERY_STOP -> CANCEL_STOP keeps the device running ------------------
+    // A proposed stop the PnP Manager then cancels: the device returns to Started and keeps working.
+    trace(b"pnp_query_stop + pnp_cancel_stop");
+    let _ = dispatch_pnp(driver_object, fdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::QueryStopPending);
+    let cancel_status = dispatch_pnp(driver_object, fdo, IRP_MN_CANCEL_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::Started);
+    let (st, _i, out) = dispatch(driver_object, fdo, 0x0e, 0x0022_20C0, &[], 8); // GET_ID
+    let id = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(
+        b"cancel_stop_keeps_device_started",
+        cancel_status == 0
+            && pnp().state(devnode) == Some(DeviceState::Started)
+            && st == 0
+            && id == 0x4d4d_494f,
+    );
+
+    // --- STOP: QUERY_STOP -> STOP_DEVICE quiesces the device -----------------------------------
+    trace(b"pnp_stop_enter");
+    let _ = dispatch_pnp(driver_object, fdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::QueryStopPending);
+    let stop_status = dispatch_pnp(driver_object, fdo, IRP_MN_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::Stopped);
+    trace(b"pnp_stop_complete");
+    check(
+        b"stop_device_quiesces",
+        stop_status == 0
+            && pnp().state(devnode) == Some(DeviceState::Stopped)
+            && !root_bus().pdo_started(PDO_OBJECT_ID),
+    );
+
+    // --- Restart: a fresh START IRP resumes the stopped device --------------------------------
+    trace(b"pnp_restart_enter");
+    let translated = build_resource_list(devnode);
+    let raw = build_resource_list(devnode);
+    let _ = pnp().transition(devnode, DeviceState::StartIrpSent);
+    let restart_status = dispatch_pnp(driver_object, fdo, IRP_MN_START_DEVICE, raw, translated);
+    if restart_status == 0 {
+        let _ = pnp().transition(devnode, DeviceState::Started);
+    }
+    let (st, _i, out) = dispatch(driver_object, fdo, 0x0e, 0x0022_20C0, &[], 8); // GET_ID
+    let id = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(
+        b"restart_after_stop_resumes",
+        restart_status == 0
+            && pnp().state(devnode) == Some(DeviceState::Started)
+            && root_bus().pdo_started(PDO_OBJECT_ID)
+            && st == 0
+            && id == 0x4d4d_494f,
+    );
+
+    // --- SURPRISE_REMOVAL -> REMOVE_DEVICE releases resources ----------------------------------
+    // The unexpected-removal path: SURPRISE_REMOVAL (no QUERY_REMOVE), then REMOVE tears down.
+    trace(b"pnp_surprise_removal_enter");
+    let surprise_status = dispatch_pnp(driver_object, fdo, IRP_MN_SURPRISE_REMOVAL, 0, 0);
     let _ = pnp().transition(devnode, DeviceState::RemovePending);
     let mapping_id = dh().mmio_mapping_id;
     let remove_status = dispatch_pnp(driver_object, fdo, IRP_MN_REMOVE_DEVICE, 0, 0);
     let _ = pnp().transition(devnode, DeviceState::Removed);
     trace(b"pnp_remove_complete");
     check(
-        b"remove_device_releases_resources",
-        remove_status == 0
+        b"surprise_removal_then_remove_releases_resources",
+        surprise_status == 0
+            && remove_status == 0
             && !rm().mapping_valid(mapping_id)
             && rm().inject_vector(INT_VECTOR).is_none(),
     );

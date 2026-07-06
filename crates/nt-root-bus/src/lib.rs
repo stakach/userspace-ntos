@@ -116,6 +116,14 @@ const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
 pub const IRP_MN_START_DEVICE: u8 = 0x00;
 /// `IRP_MN_REMOVE_DEVICE` — the bus PDO's remove minor.
 pub const IRP_MN_REMOVE_DEVICE: u8 = 0x02;
+/// `IRP_MN_STOP_DEVICE` — quiesce the PDO (a query/cancel-stop precede it).
+pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
+/// `IRP_MN_QUERY_STOP_DEVICE` — may the device be stopped? (the bus always allows it).
+pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
+/// `IRP_MN_CANCEL_STOP_DEVICE` — a proposed stop was cancelled.
+pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
+/// `IRP_MN_SURPRISE_REMOVAL` — the device was removed unexpectedly.
+pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
 /// The synthetic root bus: a table of PDOs it has enumerated.
 #[derive(Default)]
@@ -199,7 +207,12 @@ impl RootBus {
         };
         match minor {
             IRP_MN_START_DEVICE => pdo.started = true,
-            IRP_MN_REMOVE_DEVICE => pdo.started = false,
+            // STOP / REMOVE / SURPRISE_REMOVAL all quiesce the PDO; QUERY_STOP + CANCEL_STOP are
+            // pure negotiation the bus always allows without changing state.
+            IRP_MN_STOP_DEVICE | IRP_MN_REMOVE_DEVICE | IRP_MN_SURPRISE_REMOVAL => {
+                pdo.started = false
+            }
+            IRP_MN_QUERY_STOP_DEVICE | IRP_MN_CANCEL_STOP_DEVICE => {}
             _ => {}
         }
         STATUS_SUCCESS
@@ -305,5 +318,23 @@ mod tests {
         assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_REMOVE_DEVICE), 0);
         assert!(!b.pdo_started(0xFED0_0000));
         assert_ne!(b.dispatch_pnp(0xDEAD, IRP_MN_START_DEVICE), 0); // unknown PDO
+    }
+
+    #[test]
+    fn pdo_stop_and_surprise_dispatch() {
+        let mut b = bus();
+        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
+        // query-stop + cancel-stop are pure negotiation: still started.
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_QUERY_STOP_DEVICE), 0);
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_CANCEL_STOP_DEVICE), 0);
+        assert!(b.pdo_started(0xFED0_0000));
+        // stop quiesces; restart resumes.
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_STOP_DEVICE), 0);
+        assert!(!b.pdo_started(0xFED0_0000));
+        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
+        assert!(b.pdo_started(0xFED0_0000));
+        // surprise removal quiesces.
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_SURPRISE_REMOVAL), 0);
+        assert!(!b.pdo_started(0xFED0_0000));
     }
 }
