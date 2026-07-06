@@ -194,7 +194,6 @@ static mut RT: Option<KernelExecRuntime<FakeClock>> = None;
 static mut RM: Option<ResourceManager> = None;
 static mut SIM: Option<SimDevice> = None;
 static mut PNP: Option<PnpManager> = None;
-static mut CFG: Option<ConfigManager> = None;
 static mut ROOT_BUS: Option<RootBus> = None;
 
 unsafe fn rt() -> &'static mut KernelExecRuntime<FakeClock> {
@@ -209,8 +208,10 @@ unsafe fn sim() -> &'static mut SimDevice {
 unsafe fn pnp() -> &'static mut PnpManager {
     (*core::ptr::addr_of_mut!(PNP)).as_mut().unwrap()
 }
+/// The single Configuration Manager for this host — the one owned by the shared WDF runtime, so the
+/// WDM device-tree enumeration + the KMDF WDF registry path share one service/devnode database.
 unsafe fn cfg() -> &'static mut ConfigManager {
-    (*core::ptr::addr_of_mut!(CFG)).as_mut().unwrap()
+    nt_wdf_kmdf::config_mut()
 }
 unsafe fn root_bus() -> &'static mut RootBus {
     (*core::ptr::addr_of_mut!(ROOT_BUS)).as_mut().unwrap()
@@ -901,13 +902,12 @@ unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64, mem_base: u6
 /// service DB, DriverEntry -> WdfVersionBind -> WdfDriverCreate (AddDevice bridge), PnP calls the
 /// bridge -> EvtDriverDeviceAdd (full: WdfDeviceCreate + registry params + device interface + I/O
 /// queue) -> START through the FDO -> PDO stack (EvtDevicePrepareHardware + EvtDeviceD0Entry).
-unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
-    nt_wdf_kmdf::init();
-    // Seed the WDF runtime's Configuration Manager: the service + its Parameters (Answer=42,
-    // Greeting="hello registry") + a devnode — what KmdfInterfaceRegistryTest reads/writes.
+unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, cfg_devnode: u64, base: u64) -> bool {
+    // The service + devnode are already in the shared Configuration Manager (the tree enumeration).
+    // Add the KMDF Parameters (Answer=42, Greeting="hello registry") the driver reads/writes, and
+    // point the WDF runtime at this service + its devnode.
     {
         let cm = nt_wdf_kmdf::config_mut();
-        cm.register_service(fx.service, fx.image_path, Some("System"), Some(CLASS_GUID), 3, 1);
         cm.set_service_parameter(
             fx.service,
             "Answer",
@@ -921,14 +921,7 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
             nt_config_manager::encode_sz("hello registry"),
         );
     }
-    let kdevnode = nt_wdf_kmdf::config_mut().register_devnode(
-        fx.instance_path,
-        Some(fx.service),
-        Some(r"\Device\NTPNP_ROOT_0002"),
-        &[fx.device_id],
-        &[fx.compatible_id],
-    );
-    nt_wdf_kmdf::set_devnode(kdevnode);
+    nt_wdf_kmdf::set_devnode(cfg_devnode);
     nt_wdf_kmdf::set_driver_service(fx.service);
 
     CURRENT.store(2, Ordering::Relaxed);
@@ -1077,8 +1070,10 @@ unsafe fn run() {
     RM = Some(ResourceManager::new()); // empty — resources assigned only at START (§15.2)
     SIM = Some(SimDevice::new());
     PNP = Some(PnpManager::new());
-    CFG = Some(ConfigManager::new());
     ROOT_BUS = Some(RootBus::new());
+    // The shared WDF runtime owns the single Configuration Manager (see cfg()); init it once here so
+    // the WDM device-tree enumeration + the KMDF WDF registry path use the same service/devnode DB.
+    nt_wdf_kmdf::init();
 
     // --- ResolveService: seed the boot service database + the root-enumerated device tree -------
     // Register a service key + an Enum\ devnode per fixture, and have the ROOT bus create a child
@@ -1351,7 +1346,7 @@ unsafe fn run() {
     // The WDF runtime coexists with the WDM export surface: WdfVersionBind -> WdfDriverCreate ->
     // (WDM AddDevice bridge) -> EvtDriverDeviceAdd -> WdfDeviceCreate, then START through the stack.
     trace(b"pnp_kmdf_family_bind (KmdfInterfaceRegistryTest, via nt-wdf-kmdf)");
-    let kmdf_started = bind_kmdf(&FIXTURES[2], pnp_devnodes[2], KMDF_CODE_VADDR);
+    let kmdf_started = bind_kmdf(&FIXTURES[2], pnp_devnodes[2], cfg_devnodes[2], KMDF_CODE_VADDR);
     CURRENT.store(0, Ordering::Relaxed); // restore device 0 for the primary's IOCTLs below
     // A KMDF driver bound to Started alongside the two WDM drivers, through the shared nt-wdf-kmdf
     // runtime: WdfVersionBind (1.15) -> WdfDriverCreate -> AddDevice bridge -> full EvtDriverDeviceAdd
