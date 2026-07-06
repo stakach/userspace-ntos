@@ -925,6 +925,43 @@ pub fn init() {
     }
 }
 
+// --- UMDF v2 hosting --------------------------------------------------------
+// A UMDF v2 driver runs OUT of process (or in an isolated host). Unlike KMDF (the
+// driver calls WdfVersionBind itself), the host writes the WdfFunctions table + the
+// WdfDriverGlobals pointer into two image globals, then calls DriverEntry directly.
+// The function-table INDICES differ from KMDF — e.g. WdfDriverCreate is 57, not 116
+// (reverse-engineered from a real UMDF 2.0 driver) — so we publish a SEPARATE table
+// with the same shared thunks installed at the UMDF v2 positions.
+static mut UMDF2_FUNCTIONS: [u64; 512] = [0; 512];
+static mut UMDF2_GLOBALS: [u8; 64] = [0; 64];
+
+/// UMDF v2 `WDFFUNCENUM` index of `WdfDriverCreate` (KMDF's is 116).
+const UMDF2_IDX_WDF_DRIVER_CREATE: usize = 57;
+
+/// Ensure the shared runtime exists and install the shared WDF thunks at their UMDF v2
+/// table indices. Call once before hosting a UMDF v2 driver.
+pub fn umdf2_prepare() {
+    // SAFETY: single-threaded root task; called once before any UMDF driver runs.
+    unsafe {
+        if (*core::ptr::addr_of!(WDF)).is_none() {
+            WDF = Some(WdfRuntime::new());
+        }
+        let t = &mut *core::ptr::addr_of_mut!(UMDF2_FUNCTIONS);
+        t[UMDF2_IDX_WDF_DRIVER_CREATE] = wdf_driver_create as usize as u64;
+    }
+}
+
+/// Pointer to the UMDF v2 function table — write into the driver image's `WdfFunctions`
+/// global before calling its `DriverEntry`.
+pub fn umdf2_functions_ptr() -> u64 {
+    core::ptr::addr_of!(UMDF2_FUNCTIONS) as u64
+}
+/// Pointer to the UMDF v2 driver globals — write into the driver image's `WdfDriverGlobals`
+/// global before calling its `DriverEntry`.
+pub fn umdf2_globals_ptr() -> u64 {
+    core::ptr::addr_of!(UMDF2_GLOBALS) as u64
+}
+
 /// The Configuration Manager (for seeding the service DB + devnode + parameter fixtures).
 pub fn config_mut() -> &'static mut ConfigManager {
     wdf().config_mut()

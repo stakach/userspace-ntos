@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "ntos-driver-host-umdf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host-umdf"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
+nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+codegen-units = 1
