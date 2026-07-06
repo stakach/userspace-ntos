@@ -1,0 +1,11 @@
+[package]
+name = "nt-driver-supervisor"
+description = "The isolated-driver health/restart policy: given crash + healthy-checkpoint events for a driver running in its own process, decide restart (with exponential backoff) vs disable (a crash-loop that never stays up). Pure no_std logic so the driver-host can supervise every driver uniformly and userspace can read/act on the disable state. Host-unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

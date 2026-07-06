@@ -184,6 +184,21 @@ impl ConfigManager {
         self.registry.set_value(key, value_name, value_type, data)
     }
 
+    /// Set a DWORD on a service's own key (e.g. `Start`, `CrashCount`) — used by the
+    /// driver supervisor to record a crash-looping driver's disabled state where a
+    /// user-mode tool (or the PnP manager) can read + act on it. Creates the service
+    /// key if it doesn't exist yet.
+    pub fn set_service_dword(&mut self, service: &str, value_name: &str, value: u32) {
+        let key = self.registry.create_key(&service_path(service));
+        self.registry.set_dword(key, value_name, value);
+    }
+
+    /// Read a DWORD from a service's own key (creates the key if absent → `None`).
+    pub fn service_dword(&mut self, service: &str, value_name: &str) -> Option<u32> {
+        let key = self.registry.create_key(&service_path(service));
+        self.registry.query_dword(key, value_name)
+    }
+
     // --- devnodes (spec §10) --------------------------------------------------
 
     /// Register a devnode: create `Enum\<InstanceId>` + stamp the standard values, link it to

@@ -52,7 +52,9 @@ fn park() -> ! {
 /// the driver's caps seeded into its CNode.
 #[no_mangle]
 #[link_section = ".text._start"]
-unsafe extern "C" fn _start(_arg0: u64) -> ! {
+unsafe extern "C" fn _start(arg0: u64) -> ! {
+    let profile = arg_profile(arg0);
+    let attempt = arg_attempt(arg0);
     print_str(b"    [um-driver] isolated driver process up (separate binary)\n");
 
     let mut sq = match Producer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
@@ -94,9 +96,7 @@ unsafe extern "C" fn _start(_arg0: u64) -> ! {
             true
         }
     });
-    let mut passed = 0u64;
     if open_status == STATUS_SUCCESS && fdo != 0 {
-        passed += 1;
         print_str(b"    [um-driver] opened device interface over ring\n");
     }
 
@@ -124,19 +124,31 @@ unsafe extern "C" fn _start(_arg0: u64) -> ! {
     });
     let magic = core::ptr::read_volatile(REP_DATA_VADDR as *const u32);
     if ping_status == STATUS_SUCCESS && magic == KMDF_PING_MAGIC {
-        passed += 1;
         print_str(b"    [um-driver] IOCTL ping over ring returned device magic\n");
     }
 
-    // Report the verdict to the NT-kernel side, THEN crash.
-    let _ = ep_send_one(CT_RESULT, passed);
-
-    // Simulated driver bug: a wild write. Because this driver runs in its own
-    // VSpace with a fault endpoint routed to the NT kernel, the kernel catches the
-    // fault instead of bluescreening — only this isolated process dies.
-    print_str(b"    [um-driver] crashing (simulated driver bug)\n");
-    core::ptr::write_volatile(0xDEAD_0000 as *mut u64, 0);
-    park()
+    // Fate is set by the supervisor's profile + attempt (see nt_um_abi):
+    //   PROFILE_RECOVER      → crash on attempt 0, then run healthy (recovery demo)
+    //   PROFILE_ALWAYS_CRASH → crash every time (crash-loop → backoff → disable)
+    let stay_healthy = match profile {
+        PROFILE_RECOVER => attempt >= 1,
+        _ => false,
+    };
+    if stay_healthy {
+        // Reached a healthy uptime checkpoint. Report it to the NT-kernel side over
+        // the unified supervisor endpoint (a labelled Send — the kernel distinguishes
+        // it from a fault by the message label), then run stably.
+        print_str(b"    [um-driver] reached healthy checkpoint; running stably\n");
+        syscall5(SYS_SEND, CT_FAULT, (OP_HEALTHY as u64) << 12, 0, 0, 0);
+        park()
+    } else {
+        // Simulated driver bug: a wild write. Because this driver runs in its own
+        // VSpace with a fault endpoint routed to the NT kernel, the kernel catches the
+        // fault instead of bluescreening — only this isolated process dies.
+        print_str(b"    [um-driver] crashing (simulated driver bug)\n");
+        core::ptr::write_volatile(0xDEAD_0000 as *mut u64, 0);
+        park()
+    }
 }
 
 #[panic_handler]

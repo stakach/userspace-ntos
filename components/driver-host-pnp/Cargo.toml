@@ -35,6 +35,8 @@ nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }
 nt-wdf-request = { path = "../../crates/nt-wdf-request" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-um-abi = { path = "../../crates/nt-um-abi" }
+nt-driver-supervisor = { path = "../../crates/nt-driver-supervisor" }
 nt-root-bus = { path = "../../crates/nt-root-bus" }
 
 [profile.release]

@@ -1637,18 +1637,55 @@ unsafe fn run() {
         opened_fdo != 0 && st == 0 && info == 4 && ping == KMDF_PING_MAGIC,
     );
 
-    // --- Genuine cross-VSpace client: an ISOLATED component (own CSpace/VSpace) opens the KMDF
-    // child's device interface + issues an IOCTL entirely over a SURT ring, mediated by this host.
-    trace(b"kmdf_surt_xvspace_client (spawn isolated component -> open interface -> IOCTL over ring -> crash)");
-    let (srv_open_ok, srv_ioctl_ok, client_verdict, driver_fault_caught) =
-        run_surt_interface_client();
-    check(b"surt_open_interface_over_ring", srv_open_ok);
-    check(b"surt_ioctl_ping_over_ring", srv_ioctl_ok);
-    check(b"surt_xvspace_client_verdict_all_passed", client_verdict == 2);
-    // The isolated driver deliberately crashed; the kernel caught the fault on its
-    // fault endpoint and kept running — no bluescreen. (If it had NOT survived, we'd
-    // never reach the checks below and the microtest would hang.)
-    check(b"isolated_driver_fault_caught_by_kernel", driver_fault_caught);
+    // --- Isolated-driver reliability: each driver runs as a SEPARATE binary in its own
+    // VSpace, reaching the device only over the SURT reflector ring. When it crashes, the
+    // kernel catches the fault (no bluescreen) and the supervisor restarts it with
+    // exponential backoff — or, for a crash loop that never stays up, disables it and
+    // records the state in the registry so userspace can investigate.
+    cfg().register_service(
+        UM_SERVICE,
+        r"\SystemRoot\system32\drivers\um-driver.sys",
+        Some("System"),
+        Some(CLASS_GUID),
+        3,
+        1,
+    );
+
+    // The reflector transport is created once and shared by both supervised drivers.
+    let reflector = make_reflector();
+
+    // Scenario 1: an isolated driver that crashes once, is RESTARTED, and recovers.
+    trace(b"isolated_driver_restart (separate binary: crash -> restart -> recover)");
+    let r1 = supervise_isolated_driver(&reflector, nt_um_abi::PROFILE_RECOVER);
+    check(b"surt_open_interface_over_ring", r1.open_ok);
+    check(b"surt_ioctl_ping_over_ring", r1.ioctl_ok);
+    check(b"isolated_driver_fault_caught_by_kernel", r1.fault_caught);
+    check(
+        b"isolated_driver_restarted_and_recovered",
+        r1.restarts >= 1 && r1.recovered && !r1.disabled,
+    );
+
+    // Scenario 2: a crash-looping driver → exponential backoff → disabled (registry flag).
+    trace(b"isolated_driver_crash_loop (restart x2 with backoff -> disable)");
+    let r2 = supervise_isolated_driver(&reflector, nt_um_abi::PROFILE_ALWAYS_CRASH);
+    check(
+        b"isolated_driver_exponential_backoff",
+        r2.backoff0 == 10 && r2.backoff1 == 20,
+    );
+    check(
+        b"crash_loop_driver_disabled",
+        r2.disabled && r2.total_crashes == 3 && r2.restarts == 2,
+    );
+    // The disable state is in the registry (SERVICE_DISABLED = 4 + crash count), where a
+    // user-mode tool or the PnP manager can see it and keep the driver off.
+    let start = cfg().service_dword(UM_SERVICE, "Start");
+    let crashes = cfg().service_dword(UM_SERVICE, "CrashCount");
+    check(
+        b"disable_flag_recorded_in_registry",
+        start == Some(4) && crashes == Some(3),
+    );
+    // We reached here after 5 isolated-driver crashes across two drivers — the kernel
+    // survived every one. (A hang above would prove the opposite.)
     check(b"nt_kernel_survives_driver_crash", true);
 
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
@@ -1885,95 +1922,45 @@ unsafe fn su_build_um_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> (u64, u
     (pml4, img.entry)
 }
 
-/// Spawn the isolated client (own CSpace/VSpace) and serve its two ring requests
-/// (OP_OPEN + OP_IOCTL) by mediating them through the shared nt-wdf-kmdf runtime,
-/// then catch its deliberate crash on the fault endpoint. Returns
-/// `(server_open_ok, server_ioctl_ok, client_verdict, driver_fault_caught)`.
-unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
-    // Shared objects — the broker (root task) owns the untyped, so it creates them.
-    let n_sub = su_make_object(OBJ_NOTIFICATION);
-    let n_comp = su_make_object(OBJ_NOTIFICATION);
-    let result_ep = su_make_object(OBJ_ENDPOINT);
-    // The isolated driver's FAULT ENDPOINT: if it crashes, the kernel delivers the
-    // fault here (a blocking Call) instead of taking the system down — the NT-kernel
-    // side (this root task) receives it and survives. Resolved in the setter's
-    // cspace by TCB_SetSpace, so the isolated driver never needs it in its own CNode.
-    let fault_ep = su_make_object(OBJ_ENDPOINT);
-    let f_sub = su_alloc_frame();
-    let f_comp = su_alloc_frame();
-    let f_req = su_alloc_frame();
-    let f_rep = su_alloc_frame();
+unsafe fn seed_client_cnode(cnode: u64, dest_slot: u64, src: u64) {
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, dest_slot, src, 0);
+}
 
-    // Map the frames into the SERVER (root) VSpace + lay out both ring headers up
-    // front, so both sides just `attach` (no producer/consumer init race).
-    su_map_surt_frames(CAP_INIT_THREAD_VSPACE, f_sub, f_comp, f_req, f_rep);
-    let cfg_sub = RingConfig {
-        queue_len: QLEN,
-        ring_id: 1,
-        feature_flags: feature::REQUIRED_V0_1,
-        role: role::PRODUCER,
-    };
-    let _ = init_ring::<SurtSqe>(SUB_RING_VADDR as *mut u8, RING_LEN, &cfg_sub);
-    let cfg_comp = RingConfig {
-        queue_len: QLEN,
-        ring_id: 2,
-        feature_flags: feature::REQUIRED_V0_1,
-        role: role::PRODUCER,
-    };
-    let _ = init_ring::<SurtCqe>(COMP_RING_VADDR as *mut u8, RING_LEN, &cfg_comp);
+/// The service the isolated driver is registered under (where the supervisor records
+/// its crash state so userspace / the PnP manager can see + disable it).
+const UM_SERVICE: &str = "UmIsolatedDriver";
 
-    // A frame/notification cap serves one CSpace/VSpace; make a second cap per object for the client.
-    let n_sub_c = su_copy_cap(n_sub);
-    let n_comp_c = su_copy_cap(n_comp);
-    let result_c = su_copy_cap(result_ep);
-    let f_sub_c = su_copy_cap(f_sub);
-    let f_comp_c = su_copy_cap(f_comp);
-    let f_req_c = su_copy_cap(f_req);
-    let f_rep_c = su_copy_cap(f_rep);
+/// Outcome of supervising one isolated driver across its restart lifecycle.
+#[derive(Default)]
+struct SupervisorReport {
+    open_ok: bool,     // the driver reached the device over the ring (first life)
+    ioctl_ok: bool,    // the driver IOCTL'd the device over the ring (first life)
+    fault_caught: bool, // at least one crash was caught by the kernel
+    restarts: u32,     // how many times the driver was restarted
+    recovered: bool,   // the driver eventually stayed up (healthy checkpoint)
+    disabled: bool,    // the driver crash-looped and was disabled
+    total_crashes: u32,
+    backoff0: u64, // backoff before the 1st restart
+    backoff1: u64, // backoff before the 2nd restart
+}
 
-    // Spawn the isolated client.
-    let (pml4, um_entry) = su_build_um_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
-    let ipcbuf = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
-    let _ = page_map(ipcbuf, CLIENT_IPCBUF_VADDR, RW_NX, pml4);
-    let raw_cn = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw_cn);
-    let cnode = alloc_slot();
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw_cn, CN_GUARD_BADGE);
-    let fault_ep_c = su_copy_cap(fault_ep); // the client's own cap to the fault endpoint
-    seed_client_cnode(cnode, CT_PML4, pml4);
-    seed_client_cnode(cnode, CT_N_SUB, n_sub_c);
-    seed_client_cnode(cnode, CT_N_COMP, n_comp_c);
-    seed_client_cnode(cnode, CT_RESULT, result_c);
-    seed_client_cnode(cnode, CT_FAULT, fault_ep_c);
-    let tcb = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    // Route this driver's faults to CT_FAULT (resolved in ITS cspace) → the fault
-    // endpoint the NT-kernel side (this root task) waits on.
-    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
-    let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, um_entry, stack_top, 0);
-    let _ = tcb_set_priority(tcb, 100);
-    su_attach_sched_context(tcb);
-    let _ = tcb_resume(tcb);
-
-    // Serve exactly the client's two requests, mediating each through the runtime.
+/// Serve the isolated driver's two reflector requests (OP_OPEN + OP_IOCTL) for one
+/// life, mediating each through the shared nt-wdf-kmdf runtime. Returns whether each
+/// resolved against the real device.
+unsafe fn serve_reflector_life(n_sub: u64, n_comp: u64, kfdo: u64) -> (bool, bool) {
     let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
         Ok(c) => c,
-        Err(_) => return (false, false, 0, false),
+        Err(_) => return (false, false),
     };
     let mut completions = match Producer::<SurtCqe>::attach(COMP_RING_VADDR as *mut u8, RING_LEN) {
         Ok(p) => p,
-        Err(_) => return (false, false, 0, false),
+        Err(_) => return (false, false),
     };
     let wait_requests = Sel4Notify::new(&ENV, n_sub);
     let signal_completion = Sel4Notify::new(&ENV, n_comp);
-    let kfdo = nt_wdf_kmdf::device();
-
     let mut served = 0u32;
-    let mut srv_open_ok = false;
-    let mut srv_ioctl_ok = false;
+    let mut open_ok = false;
+    let mut ioctl_ok = false;
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         let mut cqe = SurtCqe {
             request_id: sqe.request_id,
@@ -1993,7 +1980,7 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
                     cqe.status = STATUS_SUCCESS;
                     cqe.information = bytes.len() as u64;
                     cqe.detail0 = fdo;
-                    srv_open_ok = fdo != 0 && fdo == kfdo;
+                    open_ok = fdo != 0 && fdo == kfdo;
                 } else {
                     cqe.status = STATUS_UNSUCCESSFUL;
                 }
@@ -2009,7 +1996,7 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
                 cqe.information = 4;
                 cqe.detail0 = info;
                 let magic = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-                srv_ioctl_ok = st == STATUS_SUCCESS && info == 4 && magic == KMDF_PING_MAGIC;
+                ioctl_ok = st == STATUS_SUCCESS && info == 4 && magic == KMDF_PING_MAGIC;
             }
             _ => cqe.status = STATUS_UNSUCCESSFUL,
         }
@@ -2020,28 +2007,159 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
         served += 1;
         served < 2
     });
-
-    // The client (in its own VSpace) reports how many of its two checks passed.
-    let (_r, _b, _i, verdict) = ep_recv(result_ep);
-
-    // Now catch the isolated driver's deliberate crash. The kernel delivers the fault
-    // to fault_ep as a blocking Call; the faulter is left dead-blocked while we survive.
-    // The message label is the seL4 fault type (6 = VMFault); mr0 is the faulting IP.
-    let (_z, _badge, fault_info, fault_ip) = ep_recv(fault_ep);
-    let fault_type = fault_info >> 12; // endpoint.rs: msg_info = (label << 12) | length
-    let driver_fault_caught = fault_type == 6; // seL4_Fault_VMFault
-    print_str(b"    [nt-kernel] caught isolated-driver fault: type=");
-    print_u64(fault_type);
-    print_str(b" ip=");
-    print_u64(fault_ip);
-    print_str(b" -- driver process dead, kernel alive (no bluescreen)\n");
-    // Deliberately do NOT reply: the crashed driver stays dead. A real NT kernel would
-    // now tear it down / restart it; here we simply continue, proving liveness.
-    (srv_open_ok, srv_ioctl_ok, verdict, driver_fault_caught)
+    (open_ok, ioctl_ok)
 }
 
-unsafe fn seed_client_cnode(cnode: u64, dest_slot: u64, src: u64) {
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, dest_slot, src, 0);
+/// The reflector transport shared by every supervised driver: the two ring frames +
+/// two data frames (mapped once in the root/server VSpace), the two notifications, and
+/// the unified supervisor endpoint (faults + health reports).
+struct Reflector {
+    n_sub: u64,
+    n_comp: u64,
+    sup_ep: u64,
+    f_sub: u64,
+    f_comp: u64,
+    f_req: u64,
+    f_rep: u64,
+}
+
+/// Create the reflector transport once and map its frames into the root/server VSpace.
+/// Shared across every supervised driver (each driver maps its own copies of the frames).
+unsafe fn make_reflector() -> Reflector {
+    let n_sub = su_make_object(OBJ_NOTIFICATION);
+    let n_comp = su_make_object(OBJ_NOTIFICATION);
+    // The single endpoint carries BOTH the driver's faults (kernel-delivered) and its
+    // health reports (driver-sent) — the message label distinguishes them.
+    let sup_ep = su_make_object(OBJ_ENDPOINT);
+    let f_sub = su_alloc_frame();
+    let f_comp = su_alloc_frame();
+    let f_req = su_alloc_frame();
+    let f_rep = su_alloc_frame();
+    su_map_surt_frames(CAP_INIT_THREAD_VSPACE, f_sub, f_comp, f_req, f_rep);
+    Reflector { n_sub, n_comp, sup_ep, f_sub, f_comp, f_req, f_rep }
+}
+
+/// Supervise one isolated driver across its whole crash/restart lifecycle. The driver
+/// runs in its OWN VSpace/CNode; each life it reaches the device over the shared
+/// reflector ring, then either crashes (fault delivered to the unified supervisor
+/// endpoint) or reports a healthy checkpoint (OP_HEALTHY on the same endpoint). The
+/// supervisor applies the restart policy: restart with exponential backoff, or — for a
+/// driver that never stays up — DISABLE it (record the state in the registry so
+/// userspace can see + act on it). No infinite crash loop.
+unsafe fn supervise_isolated_driver(r: &Reflector, profile: u8) -> SupervisorReport {
+    use nt_driver_supervisor::{Action, DriverHealth, Policy};
+
+    let (n_sub, n_comp, sup_ep) = (r.n_sub, r.n_comp, r.sup_ep);
+
+    // Build this driver's OWN VSpace (from the um ELF) + CNode, seeded with its caps
+    // (copies of the shared reflector objects). A per-driver VSpace keeps a recovered
+    // driver's parked thread from colliding with the next driver's stack.
+    let n_sub_c = su_copy_cap(n_sub);
+    let n_comp_c = su_copy_cap(n_comp);
+    let sup_ep_c = su_copy_cap(sup_ep);
+    let f_sub_c = su_copy_cap(r.f_sub);
+    let f_comp_c = su_copy_cap(r.f_comp);
+    let f_req_c = su_copy_cap(r.f_req);
+    let f_rep_c = su_copy_cap(r.f_rep);
+    let (pml4, um_entry) = su_build_um_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, CLIENT_IPCBUF_VADDR, RW_NX, pml4);
+    let raw_cn = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw_cn);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw_cn, CN_GUARD_BADGE);
+    seed_client_cnode(cnode, CT_PML4, pml4);
+    seed_client_cnode(cnode, CT_N_SUB, n_sub_c);
+    seed_client_cnode(cnode, CT_N_COMP, n_comp_c);
+    seed_client_cnode(cnode, CT_FAULT, sup_ep_c);
+
+    let policy = Policy::default_policy();
+    let mut health = DriverHealth::default();
+    let mut report = SupervisorReport::default();
+    let kfdo = nt_wdf_kmdf::device();
+    let mut attempt: u8 = 0;
+    let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
+
+    loop {
+        // Fresh ring headers each life (a crash can leave the rings mid-protocol).
+        let cfg_sub = RingConfig {
+            queue_len: QLEN,
+            ring_id: 1,
+            feature_flags: feature::REQUIRED_V0_1,
+            role: role::PRODUCER,
+        };
+        let _ = init_ring::<SurtSqe>(SUB_RING_VADDR as *mut u8, RING_LEN, &cfg_sub);
+        let cfg_comp = RingConfig {
+            queue_len: QLEN,
+            ring_id: 2,
+            feature_flags: feature::REQUIRED_V0_1,
+            role: role::PRODUCER,
+        };
+        let _ = init_ring::<SurtCqe>(COMP_RING_VADDR as *mut u8, RING_LEN, &cfg_comp);
+
+        // Spin a fresh TCB for this life (the previous one is dead-blocked in its fault).
+        let tcb = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+        let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
+        let _ = tcb_write_registers(tcb, um_entry, stack_top, nt_um_abi::make_arg(profile, attempt));
+        let _ = tcb_set_priority(tcb, 100);
+        su_attach_sched_context(tcb);
+        let _ = tcb_resume(tcb);
+
+        // Serve the driver's device access for this life.
+        let (open_ok, ioctl_ok) = serve_reflector_life(n_sub, n_comp, kfdo);
+        if attempt == 0 {
+            report.open_ok = open_ok;
+            report.ioctl_ok = ioctl_ok;
+        }
+
+        // Wait for the life's outcome on the unified endpoint: a fault (kernel-delivered,
+        // label = seL4 fault type) or a health report (driver-sent, label = OP_HEALTHY).
+        let (_z, _b, msg_info, _ip) = ep_recv(sup_ep);
+        let label = msg_info >> 12;
+        if label == nt_um_abi::OP_HEALTHY as u64 {
+            let _ = health.on_healthy();
+            report.recovered = true;
+            print_str(b"    [nt-kernel] isolated driver reached healthy checkpoint (stable)\n");
+            break;
+        }
+
+        // The driver crashed. The kernel caught the fault (label 6 = VMFault) — no
+        // bluescreen. Consult the restart policy.
+        report.fault_caught = true;
+        match health.on_rapid_crash(&policy) {
+            Action::Restart { backoff } => {
+                if report.restarts == 0 {
+                    report.backoff0 = backoff;
+                } else if report.restarts == 1 {
+                    report.backoff1 = backoff;
+                }
+                report.restarts = health.restarts;
+                print_str(b"    [nt-kernel] isolated driver crashed; restarting (backoff=");
+                print_u64(backoff);
+                print_str(b" ticks)\n");
+                attempt = attempt.wrapping_add(1);
+                // A real deployment would delay `backoff` ticks here before respawning.
+                continue;
+            }
+            Action::Disable => {
+                report.disabled = true;
+                report.total_crashes = health.total_crashes;
+                // Record the disabled state in the registry (SERVICE_DISABLED = 4) +
+                // the crash count, so a user-mode tool / the PnP manager sees it.
+                cfg().set_service_dword(UM_SERVICE, "Start", 4);
+                cfg().set_service_dword(UM_SERVICE, "CrashCount", health.total_crashes);
+                print_str(b"    [nt-kernel] isolated driver crash-looped ");
+                print_u64(health.total_crashes as u64);
+                print_str(b"x; DISABLED (registry Start=4) -- userspace can investigate\n");
+                break;
+            }
+            Action::Recovered => break,
+        }
+    }
+    report
 }
 
 #[no_mangle]
