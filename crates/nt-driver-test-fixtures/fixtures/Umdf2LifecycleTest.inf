@@ -1,0 +1,62 @@
+; Umdf2LifecycleTest.inf - UMDF v2 lifecycle test driver
+; Synthetic/root-enumerated test package for userspace-ntos bring-up.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Sample
+ClassGuid={78A1C341-4539-11d3-B88D-00C04FAD5171}
+Provider=%ProviderName%
+DriverVer=07/06/2026,2.0.0.0
+CatalogFile=Umdf2LifecycleTest.cat
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=Device_Install, Root\UMDF2_LIFECYCLE_TEST
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+Umdf2LifecycleTest.dll = 1
+
+[DestinationDirs]
+UMDF_CopyFiles=12,UMDF
+
+[Device_Install.NT]
+CopyFiles=UMDF_CopyFiles
+
+[UMDF_CopyFiles]
+Umdf2LifecycleTest.dll
+
+[Device_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WUDFRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[Device_Install.NT.Wdf]
+UmdfService=Umdf2LifecycleTest,Umdf2LifecycleTest_Install
+UmdfServiceOrder=Umdf2LifecycleTest
+
+[Umdf2LifecycleTest_Install]
+UmdfLibraryVersion=2.0
+ServiceBinary=%12%\UMDF\Umdf2LifecycleTest.dll
+
+[Device_Install.NT.HW]
+AddReg=Device_Parameters
+
+[Device_Parameters]
+HKR,Parameters,Answer,0x00010001,42
+
+[Strings]
+ProviderName="Place Technology"
+ManufacturerName="Place Technology"
+DeviceName="UMDF2 Lifecycle Test Device"
+DiskName="UMDF2 Lifecycle Test Install Disk"
+WUDFRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
