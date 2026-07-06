@@ -674,6 +674,27 @@ fn wide_is_multisz_first(buf: &[u16], expected: &str) -> bool {
     buf.len() >= e.len() + 2 && buf[e.len()] == 0 && buf[..e.len()] == e[..]
 }
 
+/// A short label for a devnode's PnP lifecycle state, for the device-tree report.
+fn state_label(s: Option<DeviceState>) -> &'static [u8] {
+    match s {
+        Some(DeviceState::Uninitialized) => b"Uninitialized",
+        Some(DeviceState::Enumerated) => b"Enumerated",
+        Some(DeviceState::DriverLoaded) => b"DriverLoaded",
+        Some(DeviceState::AddDeviceCalled) => b"AddDeviceCalled",
+        Some(DeviceState::DeviceStackBuilt) => b"DeviceStackBuilt",
+        Some(DeviceState::ResourcesAssigned) => b"ResourcesAssigned",
+        Some(DeviceState::StartIrpSent) => b"StartIrpSent",
+        Some(DeviceState::Started) => b"Started",
+        Some(DeviceState::QueryStopPending) => b"QueryStopPending",
+        Some(DeviceState::Stopped) => b"Stopped",
+        Some(DeviceState::QueryRemovePending) => b"QueryRemovePending",
+        Some(DeviceState::RemovePending) => b"RemovePending",
+        Some(DeviceState::Removed) => b"Removed",
+        Some(DeviceState::Failed) => b"Failed",
+        None => b"?",
+    }
+}
+
 unsafe fn run() {
     RT = Some(KernelExecRuntime::new(FakeClock::new(), 0x5000_0000));
     RM = Some(ResourceManager::new()); // empty — resources assigned only at START (§15.2)
@@ -724,6 +745,7 @@ unsafe fn run() {
     print_str(b"  [device-tree] \\Device\\RootBus\n");
     let mut resolved = 0usize;
     let mut bindable = 0usize;
+    let mut pnp_devnodes: Vec<u64> = Vec::new();
     for (fx, &dn) in FIXTURES.iter().zip(cfg_devnodes.iter()) {
         // pnp_service_select: each child's driver is named by its devnode Service value.
         let svc_ok = cfg().devnode_service(dn) == Some(fx.service);
@@ -734,18 +756,25 @@ unsafe fn run() {
         if has_driver {
             bindable += 1;
         }
+        // Give every child a PnP Manager state entry (starts Enumerated).
+        let pdn = pnp().create_mmio_fixture_devnode(fx.pdo_object_id);
+        pnp_devnodes.push(pdn);
         print_str(b"    - ");
         print_str(fx.instance_path.as_bytes());
         print_str(b"  service=");
         print_str(fx.service.as_bytes());
-        print_str(if has_driver {
-            b"  [driver in store -> bind]\n"
-        } else {
-            b"  [enumerated; driver in another host]\n"
-        });
+        print_str(b"  state=");
+        print_str(state_label(pnp().state(pdn)));
+        print_str(if has_driver { b"  [bind]\n" } else { b"\n" });
     }
     check(b"device_tree_services_resolved", resolved == FIXTURES.len());
     check(b"device_tree_has_bindable_driver", bindable >= 1);
+    check(
+        b"device_tree_all_children_enumerated",
+        pnp_devnodes
+            .iter()
+            .all(|&d| pnp().state(d) == Some(DeviceState::Enumerated)),
+    );
     trace(b"pnp_service_select");
 
     // --- The primary child (FIXTURES[0]) has its driver in the store: bind + start it -----------
@@ -830,11 +859,11 @@ unsafe fn run() {
     check(b"add_device_present", add_device != 0);
     check(b"pnp_dispatch_present", pnp_dispatch != 0);
 
-    // --- Bind the primary child: its PDO (created above) is the bottom of the device stack ------
+    // --- Bind the primary child: reuse its tree devnode; its PDO is the bottom of the stack -----
+    let devnode = pnp_devnodes[0];
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3); // Type = IO_TYPE_DEVICE
     dh().pdo = pdo; // the device object the FDO forwards IRPs to (the primary child's PDO)
-    let devnode = pnp().create_mmio_fixture_devnode(pdo);
     trace(b"pnp_pdo_create + pnp_stack_create");
 
     // The PnP Manager queries the PDO's identity before binding a function driver (QUERY_ID +
@@ -920,6 +949,23 @@ unsafe fn run() {
     check(
         b"devnode_started",
         pnp().state(devnode) == Some(DeviceState::Started),
+    );
+
+    // --- Live device-tree state snapshot: the primary is Started, its siblings still Enumerated --
+    print_str(b"  [device-tree live] \\Device\\RootBus\n");
+    for (fx, &pdn) in FIXTURES.iter().zip(pnp_devnodes.iter()) {
+        print_str(b"    - ");
+        print_str(fx.instance_path.as_bytes());
+        print_str(b"  state=");
+        print_str(state_label(pnp().state(pdn)));
+        print_str(b"\n");
+    }
+    check(
+        b"device_tree_live_states",
+        pnp().state(pnp_devnodes[0]) == Some(DeviceState::Started)
+            && pnp_devnodes[1..]
+                .iter()
+                .all(|&d| pnp().state(d) == Some(DeviceState::Enumerated)),
     );
 
     // --- device works after Started -----------------------------------------

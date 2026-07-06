@@ -82,3 +82,10 @@ Test). Each registered as a service + Enum\ devnode + a root-bus child PDO. QUER
 in store) binds+starts through the full IRP-through-stack lifecycle. 28 PASS / 0 FAIL + 185 kernel.
 New: bus_relations_lists_all_children, device_tree_services_resolved, device_tree_has_bindable_driver.
 nt-root-bus: query_device_relations() (6 tests).
+
+## Increment 6 done (2026-07-06): live PnP-Manager state per tree child
+Every device-tree child now has a PnP Manager state entry (not just the primary). The enumerate loop
+creates a pnp devnode per fixture (all Enumerated); the primary reuses pnp_devnodes[0] for the bind
+and advances to Started. Live-tree snapshot shows per-child state. 30 PASS / 0 FAIL + 185 kernel.
+New: device_tree_all_children_enumerated (all 5 Enumerated), device_tree_live_states (primary Started,
+siblings Enumerated). state_label() DeviceState->str helper.
