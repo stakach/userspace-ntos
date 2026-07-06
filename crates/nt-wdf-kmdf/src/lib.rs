@@ -953,6 +953,15 @@ pub fn queue() -> u64 {
 pub fn driver() -> Option<u64> {
     wdf().driver().map(|d| d.0)
 }
+
+/// User-mode "open by interface": resolve the first enabled device interface of `guid` to
+/// `(symbolic link, WDFDEVICE)` — what `CreateFile(symbolic_link)` would open. `None` if no enabled
+/// interface of that GUID exists (device stopped/removed → interfaces disabled).
+pub fn open_interface(guid: &str) -> Option<(String, u64)> {
+    wdf()
+        .open_device_interface(guid)
+        .map(|(link, dev)| (link, dev.0))
+}
 /// The driver's captured `EvtDriverDeviceAdd`.
 pub fn evt_device_add() -> u64 {
     wdf().evt_device_add()

@@ -878,6 +878,23 @@ impl WdfRuntime {
             .map(|i| i.symbolic_link.clone())
     }
 
+    /// A user-mode "open by interface": find the first *enabled* device interface of `guid` (as a
+    /// client would via `SetupDiEnumDeviceInterfaces`) and resolve it to `(symbolic link, WDFDEVICE)`
+    /// — what `CreateFile(symbolic_link)` would open. `None` if no enabled interface of that GUID
+    /// exists (e.g. the device is stopped/removed and its interfaces are disabled).
+    pub fn open_device_interface(&self, guid: &str) -> Option<(alloc::string::String, WdfHandle)> {
+        let iface = self.config.interfaces_by_guid(guid, true).into_iter().next()?;
+        let link = iface.symbolic_link.clone();
+        // Resolve the interface's devnode back to the device object it belongs to (the I/O manager
+        // resolves the symbolic link to the device stack's top FDO).
+        let device = self
+            .device_devnodes
+            .iter()
+            .find(|(_, dn)| **dn == iface.devnode)
+            .map(|(d, _)| WdfHandle(*d))?;
+        Some((link, device))
+    }
+
     // --- PnP properties (spec §11) --------------------------------------------
 
     /// `WdfDeviceAssignProperty` — set a `DEVPROPKEY` property on the device's devnode.

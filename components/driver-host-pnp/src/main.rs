@@ -593,8 +593,12 @@ extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
                 call2(d0exit, fdo, 0);
             }
             let _ = ntos_iof_call_driver(dh().pdo, irp);
+        } else if minor == IRP_MN_SURPRISE_REMOVAL {
+            // Disable the device interface so user-mode opens fail immediately, then forward down.
+            nt_wdf_kmdf::wdf().set_device_interface_state(device, KMDF_IFACE_GUID, false);
+            let _ = ntos_iof_call_driver(dh().pdo, irp);
         } else {
-            // QUERY_STOP / CANCEL_STOP / SURPRISE_REMOVAL: forward down (pure PnP negotiation).
+            // QUERY_STOP / CANCEL_STOP: forward down (pure PnP negotiation).
             let _ = ntos_iof_call_driver(dh().pdo, irp);
         }
         core::ptr::write_unaligned((irp + 48) as *mut i32, 0);
@@ -603,6 +607,8 @@ extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
 }
 
 // The KMDF device's IOCTL interface (KmdfInterfaceRegistryTest).
+/// The device interface class the KMDF child registers (WdfDeviceCreateDeviceInterface).
+const KMDF_IFACE_GUID: &str = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";
 const KMDF_PING_MAGIC: u32 = 0x4946_4B4D; // "MKFI"
 const KMDF_IOCTL_PING: u32 = 0x0022_2200;
 const KMDF_IOCTL_GET_CONFIG: u32 = 0x0022_2204; // Answer@0xc
@@ -1602,6 +1608,29 @@ unsafe fn run() {
         st == 0 && info == 4 && &out[..4] == echo_in,
     );
 
+    // --- User-mode device-interface open: a client with no FDO handle enumerates the interface
+    // class by GUID (SetupDiEnumDeviceInterfaces), resolves the symbolic link to the device
+    // (CreateFile), and issues DeviceIoControl through the opened handle.
+    trace(b"kmdf_usermode_interface_open (enumerate GUID -> resolve symlink -> open -> IOCTL)");
+    let opened = nt_wdf_kmdf::open_interface(KMDF_IFACE_GUID);
+    let (iface_link, opened_fdo) = opened.unwrap_or((alloc::string::String::new(), 0));
+    print_str(b"    [kmdf] interface symlink: ");
+    print_str(iface_link.as_bytes());
+    print_str(b"\n");
+    check(
+        b"kmdf_interface_enumerated_and_resolved",
+        iface_link.starts_with(r"\??\")
+            && iface_link.contains(KMDF_IFACE_GUID) // the interface-class GUID is in the symlink
+            && opened_fdo == kfdo, // resolves to the KMDF child's device object
+    );
+    // DeviceIoControl through the *opened* handle (not the direct FDO) -> the driver's EvtIoDeviceControl.
+    let (st, info, out) = run_kmdf_ioctl(opened_fdo, KMDF_IOCTL_PING, &[], 4);
+    let ping = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(
+        b"kmdf_interface_open_ioctl_ping",
+        opened_fdo != 0 && st == 0 && info == 4 && ping == KMDF_PING_MAGIC,
+    );
+
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
     let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
     let _ = pnp().transition(kdevnode, DeviceState::QueryStopPending);
@@ -1641,6 +1670,11 @@ unsafe fn run() {
             && kremove == 0
             && pnp().state(kdevnode) == Some(DeviceState::Removed)
             && !root_bus().pdo_started(kpdo),
+    );
+    // The surprise-removal disabled the device interface: a user-mode open now finds nothing.
+    check(
+        b"kmdf_interface_gone_after_surprise",
+        nt_wdf_kmdf::open_interface(KMDF_IFACE_GUID).is_none(),
     );
     CURRENT.store(0, Ordering::Relaxed);
 
