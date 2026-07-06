@@ -16,6 +16,8 @@ nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-wdf-request = { path = "../../crates/nt-wdf-request" }
+nt-wdf-object = { path = "../../crates/nt-wdf-object" }
 
 [profile.release]
 panic = "abort"

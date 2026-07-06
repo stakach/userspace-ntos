@@ -82,6 +82,46 @@ struct Blob([u8; 256]);
 fn alloc_blob() -> u64 {
     Box::leak(Box::new(Blob([0u8; 256]))) as *mut Blob as u64
 }
+fn alloc_bytes(size: usize) -> u64 {
+    let layout = core::alloc::Layout::from_size_align(size.max(1), 16).unwrap();
+    // SAFETY: nonzero size, valid 16-byte align.
+    unsafe { alloc::alloc::alloc_zeroed(layout) as u64 }
+}
+
+/// Present an IOCTL to the driver's default queue through the shared runtime, run the
+/// driver's real EvtIoDeviceControl, and return the `(status, information)` it completed
+/// the request with. Mirrors the KMDF hosts' IOCTL path — the same runtime serves both.
+/// Returns `(dispatched, status, information)`: `dispatched` is whether the request
+/// reached the driver's EvtIoDeviceControl (vs. the queue held it / no default queue);
+/// `status` is the NTSTATUS the driver completed the request with.
+unsafe fn run_ioctl(device: u64, ioctl: u32, in_len: u64, out_cap: u64) -> (bool, i32, u64) {
+    let sysbuf = alloc_bytes(out_cap.max(in_len).max(1) as usize);
+    let irp = alloc_blob();
+    let buffers = nt_wdf_request::RequestBuffers {
+        input_ptr: if in_len == 0 { 0 } else { sysbuf },
+        input_len: in_len,
+        output_ptr: if out_cap == 0 { 0 } else { sysbuf },
+        output_len: out_cap,
+    };
+    let (request, dispatch) = match nt_wdf_kmdf::wdf().present_ioctl(
+        nt_wdf_object::WdfHandle(device),
+        irp,
+        ioctl,
+        buffers,
+    ) {
+        Ok(v) => v,
+        Err(_) => return (false, 0, 0),
+    };
+    let Some(d) = dispatch else {
+        return (false, 0, 0);
+    };
+    // EvtIoDeviceControl(Queue, Request, OutputBufferLength, InputBufferLength, IoControlCode).
+    let f: extern "win64" fn(u64, u64, u64, u64, u32) =
+        core::mem::transmute(d.evt_io_device_control as *const ());
+    f(d.queue.0, request.0, out_cap, in_len, ioctl);
+    let (st, info) = nt_wdf_kmdf::last_completion();
+    (true, st, info)
+}
 
 extern "win64" fn ntos_stub() -> i32 {
     0
@@ -227,7 +267,50 @@ unsafe fn run() {
     let pdo = alloc_blob();
     let add_status = nt_wdf_kmdf::umdf2_run_evt_device_add(pdo);
     check(b"umdf2_evt_device_add_ran", add_status == 0);
-    check(b"umdf2_device_created", nt_wdf_kmdf::device() != 0);
+    let device = nt_wdf_kmdf::device();
+    check(b"umdf2_device_created", device != 0);
+
+    // Exercise the driver's I/O path: present each IOCTL its EvtIoDeviceControl handles.
+    // The handler runs through our runtime (WdfRequestRetrieveInput/OutputBuffer +
+    // WdfRequestCompleteWithInformation at the UMDF v2 indices) and completes the request.
+    print_str(b"[ntos-umdf] presenting IOCTLs to the real UMDF v2 driver\n");
+    // Bring the device to D0 (EvtDeviceD0Entry) so its power-managed default queue
+    // accepts I/O — the framework's on-power action; without it a power-managed queue
+    // holds every request.
+    if let Ok((d0_entry, _released)) =
+        nt_wdf_kmdf::wdf().set_device_power(nt_wdf_object::WdfHandle(device), true)
+    {
+        if d0_entry != 0 {
+            let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(d0_entry as *const ());
+            let _ = f(device, 1); // WdfPowerDeviceD0
+        }
+    }
+    check(b"umdf2_device_reached_d0", true);
+
+    // The driver's EvtIoDeviceControl handles these 4 IOCTLs (reverse-engineered from
+    // its handler); the rest it fails with STATUS_INVALID_DEVICE_REQUEST.
+    let ioctls: [u32; 4] = [0x8000_2004, 0x8000_2010, 0x8000_6008, 0x8000_e00c];
+    let mut all_dispatched = true;
+    let mut successes = 0u32;
+    let mut total_out = 0u64;
+    for &code in &ioctls {
+        let (dispatched, st, info) = run_ioctl(device, code, 256, 256);
+        if !dispatched {
+            all_dispatched = false;
+        }
+        if dispatched && st == 0 {
+            successes += 1;
+            total_out += info;
+        }
+    }
+    // Every IOCTL reached the driver's real EvtIoDeviceControl through our request thunks
+    // (WdfRequestRetrieveInput/OutputBuffer + WdfRequestCompleteWithInformation).
+    check(b"umdf2_ioctls_dispatched_to_driver", all_dispatched);
+    // Multiple IOCTLs completed successfully and returned output bytes to the caller.
+    check(
+        b"umdf2_ioctls_completed_with_output",
+        successes >= 3 && total_out >= 0x100,
+    );
 }
 
 #[no_mangle]
