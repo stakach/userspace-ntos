@@ -1688,6 +1688,17 @@ unsafe fn run() {
     // survived every one. (A hang above would prove the opposite.)
     check(b"nt_kernel_survives_driver_crash", true);
 
+    // Scenario 3: a REAL UMDF v2 driver hosted in a fully isolated process. The isolated
+    // host loads Umdf2LifecycleTest.dll into its own VSpace and runs its whole lifecycle
+    // (DriverEntry + EvtDeviceAdd + device create + IOCTL) locally — under the same
+    // supervisor, so a driver crash would be caught rather than fatal.
+    trace(b"isolated_umdf_host (real UMDF v2 driver's lifecycle in its own process)");
+    let (umdf_stages, umdf_crashed) = supervise_umdf_host(&reflector);
+    check(
+        b"isolated_umdf_driver_hosted_full_lifecycle",
+        !umdf_crashed && umdf_stages >= 5,
+    );
+
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
     let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
     let _ = pnp().transition(kdevnode, DeviceState::QueryStopPending);
@@ -1919,6 +1930,15 @@ unsafe fn su_build_um_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> (u64, u
     let _ = page_map(comp, COMP_RING_VADDR, RW_NX, pml4);
     let _ = page_map(req, REQ_DATA_VADDR, RW_NX, pml4);
     let _ = page_map(rep, REP_DATA_VADDR, RW_NX, pml4);
+    // A read/write/EXECUTE window for the isolated host to load + run a real UMDF v2
+    // driver image (PROFILE_HOST_UMDF). The isolated host has no untyped, so it can't
+    // make memory executable itself — we provide the window. (W^X relaxed for the hosted
+    // driver image; the isolation boundary is the separate VSpace + the fault endpoint.)
+    for i in 0..nt_um_abi::UMDF_DLL_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, nt_um_abi::UMDF_DLL_VADDR + i * 0x1000, /* RWX */ 3, pml4);
+    }
     (pml4, img.entry)
 }
 
@@ -2160,6 +2180,58 @@ unsafe fn supervise_isolated_driver(r: &Reflector, profile: u8) -> SupervisorRep
         }
     }
     report
+}
+
+/// Spawn the isolated host with the UMDF-hosting profile: it loads + runs a REAL UMDF v2
+/// driver's full lifecycle inside its own VSpace, then reports how many stages passed on
+/// the supervisor endpoint (OP_HEALTHY + count), or crashes (caught as a fault). Returns
+/// `(stages_passed, crashed)`.
+unsafe fn supervise_umdf_host(r: &Reflector) -> (u64, bool) {
+    let sup_ep = r.sup_ep;
+    let n_sub_c = su_copy_cap(r.n_sub);
+    let n_comp_c = su_copy_cap(r.n_comp);
+    let sup_ep_c = su_copy_cap(sup_ep);
+    let f_sub_c = su_copy_cap(r.f_sub);
+    let f_comp_c = su_copy_cap(r.f_comp);
+    let f_req_c = su_copy_cap(r.f_req);
+    let f_rep_c = su_copy_cap(r.f_rep);
+    let (pml4, um_entry) = su_build_um_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, CLIENT_IPCBUF_VADDR, RW_NX, pml4);
+    let raw_cn = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw_cn);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw_cn, CN_GUARD_BADGE);
+    seed_client_cnode(cnode, CT_PML4, pml4);
+    seed_client_cnode(cnode, CT_N_SUB, n_sub_c);
+    seed_client_cnode(cnode, CT_N_COMP, n_comp_c);
+    seed_client_cnode(cnode, CT_FAULT, sup_ep_c);
+
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(
+        tcb,
+        um_entry,
+        stack_top,
+        nt_um_abi::make_arg(nt_um_abi::PROFILE_HOST_UMDF, 0),
+    );
+    let _ = tcb_set_priority(tcb, 100);
+    su_attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+
+    // Wait for the isolated host's outcome: OP_HEALTHY (+ stage count in mr0) if the UMDF
+    // driver's lifecycle ran, or a fault (the driver crashed — the kernel survives).
+    let (_z, _b, msg_info, mr0) = ep_recv(sup_ep);
+    let label = msg_info >> 12;
+    if label == nt_um_abi::OP_HEALTHY as u64 {
+        (mr0, false)
+    } else {
+        (0, true) // crashed (VMFault etc.)
+    }
 }
 
 #[no_mangle]

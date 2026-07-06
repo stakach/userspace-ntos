@@ -66,6 +66,18 @@ pub const fn make_arg(profile: u8, attempt: u8) -> u64 {
 pub const PROFILE_ALWAYS_CRASH: u8 = 0;
 /// Profile: crash once (attempt 0), then run healthy (proves restart recovery + counter reset).
 pub const PROFILE_RECOVER: u8 = 1;
+/// Profile: host a REAL UMDF v2 driver's full lifecycle inside this isolated process
+/// (DriverEntry + EvtDeviceAdd + device create + IOCTLs), then report health. The driver
+/// runs entirely in the isolated VSpace; a crash is caught by the supervisor.
+pub const PROFILE_HOST_UMDF: u8 = 2;
+
+/// Where the parent maps a read/write/EXECUTE window for the isolated host to load the
+/// UMDF v2 driver image into (the isolated host has no untyped, so it can't make memory
+/// executable itself — the parent provides the RWX window). Inside the host's own PT,
+/// past its image.
+pub const UMDF_DLL_VADDR: u64 = 0x0000_0100_0098_0000;
+/// Frames of the RWX driver-image window (covers the DLL's SizeOfImage 0xd000 + slack).
+pub const UMDF_DLL_FRAMES: u64 = 16;
 
 // --- KMDF device-interface identifiers (the device the driver reaches) -------
 pub const KMDF_IFACE_GUID: &str = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";

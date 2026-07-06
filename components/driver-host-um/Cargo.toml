@@ -17,6 +17,13 @@ path = "src/main.rs"
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
 surt-sel4 = "0.1"
 nt-um-abi = { path = "../../crates/nt-um-abi" }
+# For hosting a real UMDF v2 driver inside this isolated process (PROFILE_HOST_UMDF).
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
+nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
+nt-wdf-request = { path = "../../crates/nt-wdf-request" }
+nt-wdf-object = { path = "../../crates/nt-wdf-object" }
 
 [profile.release]
 panic = "abort"
