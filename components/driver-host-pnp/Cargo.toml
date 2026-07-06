@@ -29,6 +29,9 @@ nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
+nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
+nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
+nt-wdf-object = { path = "../../crates/nt-wdf-object" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-root-bus = { path = "../../crates/nt-root-bus" }
 

@@ -34,7 +34,6 @@ use nt_pnp_manager::PnpManager;
 use nt_resource_manager::{ResourceManager, ResourceOwner};
 use nt_root_bus::{BusQueryId, RootBus};
 use nt_sim_device::SimDevice;
-use nt_wdf_types as wt;
 use sel4_rt::*;
 
 /// The driver images this host has in its store, indexed by service name. In a full driver database
@@ -45,14 +44,14 @@ static PNP_SYS: &[u8] =
 static POWER_SYS: &[u8] =
     include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/PowerPnpMmioTest.sys");
 static KMDF_SYS: &[u8] =
-    include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/KmdfLoaderCompatTest.sys");
+    include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/KmdfInterfaceRegistryTest.sys");
 
 /// Resolve a service name to its driver image (the boot-driver "store").
 fn load_service_image(service: &str) -> Option<&'static [u8]> {
     match service {
         "PnpMmioInterruptTest" => Some(PNP_SYS),
         "PowerPnpMmioTest" => Some(POWER_SYS),
-        "KmdfLoaderCompatTest" => Some(KMDF_SYS),
+        "KmdfInterfaceRegistryTest" => Some(KMDF_SYS),
         _ => None,
     }
 }
@@ -63,8 +62,8 @@ const SECOND_CODE_VADDR: u64 = 0x0000_0001_6000_0000;
 /// The base the KMDF driver's image is mapped at (device slot 2).
 const KMDF_CODE_VADDR: u64 = 0x0000_0001_8000_0000;
 /// KmdfLoaderCompatTest's Control Flow Guard dispatch/check pointer slots (its load-config dir).
-const KMDF_CFG_DISPATCH_RVA: u64 = 0x3058;
-const KMDF_CFG_CHECK_RVA: u64 = 0x3050;
+const KMDF_CFG_DISPATCH_RVA: u64 = 0x3068;
+const KMDF_CFG_CHECK_RVA: u64 = 0x3060;
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
@@ -112,12 +111,12 @@ const FIXTURES: &[Fixture] = &[
         pdo_object_id: 0xFED0_1000,
     },
     Fixture {
-        instance_path: r"ROOT\KMDF_LOADER_COMPAT_TEST\0001",
-        service: "KmdfLoaderCompatTest",
-        device_id: r"ROOT\KMDF_LOADER_COMPAT_TEST",
+        instance_path: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST\0001",
+        service: "KmdfInterfaceRegistryTest",
+        device_id: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST",
         compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
         instance_id: "0001",
-        image_path: r"\SystemRoot\system32\drivers\KmdfLoaderCompatTest.sys",
+        image_path: r"\SystemRoot\system32\drivers\KmdfInterfaceRegistryTest.sys",
         pdo_object_id: 0xFED0_2000,
     },
     Fixture {
@@ -130,12 +129,12 @@ const FIXTURES: &[Fixture] = &[
         pdo_object_id: 0xFED0_3000,
     },
     Fixture {
-        instance_path: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST\0001",
-        service: "KmdfInterfaceRegistryTest",
-        device_id: r"ROOT\KMDF_INTERFACE_REGISTRY_TEST",
+        instance_path: r"ROOT\KMDF_LOADER_COMPAT_TEST\0001",
+        service: "KmdfLoaderCompatTest",
+        device_id: r"ROOT\KMDF_LOADER_COMPAT_TEST",
         compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
         instance_id: "0001",
-        image_path: r"\SystemRoot\system32\drivers\KmdfInterfaceRegistryTest.sys",
+        image_path: r"\SystemRoot\system32\drivers\KmdfLoaderCompatTest.sys",
         pdo_object_id: 0xFED0_4000,
     },
 ];
@@ -521,205 +520,69 @@ extern "win64" fn ntos_po_set_power_state(_device: u64, _typ: u32, state: u32) -
 /// `PoStartNextPowerIrp(Irp)` — legacy power-queue bookkeeping; a no-op here.
 extern "win64" fn ntos_po_start_next_power_irp(_irp: u64) {}
 
-// --- KMDF (WDF) family: a second driver *model* bound in the same host -------------------------
-// The minimal loader-compat KMDF driver's DriverEntry runs the framework stub -> WdfVersionBind
-// (negotiate 1.15, publish the function table) -> WdfDriverCreate installs the WDM AddDevice bridge
-// + the framework PnP dispatch. PnP calls the bridge -> EvtDriverDeviceAdd -> WdfDeviceInit setters
-// + WdfDeviceCreate builds the FDO. START forwards down the stack -> Started.
+// --- KMDF (WDF) family: bound through the shared nt-wdf-kmdf crate -----------------------------
+// The WDF runtime (WdfVersionBind, the 32 thunks, WdfDriverCreate, the AddDevice bridge, the full
+// device/registry/interface/queue surface) lives in nt-wdf-kmdf. This component owns only the
+// framework PnP dispatch (tied to its device stack) + the resource list for EvtDevicePrepareHardware.
 
-static mut WDF_FUNCTIONS: [u64; 444] = [0; 444];
-static mut WDF_GLOBALS: [u8; 64] = [0; 64];
-static mut KEVT_DEVICE_ADD: u64 = 0; // the KMDF driver's captured EvtDriverDeviceAdd
-static mut KDRIVER: u64 = 0xD11D_0000_0000_0001; // an opaque WDFDRIVER handle
-static mut KCONTEXT: u64 = 0; // the KMDF device's typed context (allocated by WdfDeviceCreate)
+static KMDF_PREPARE_HW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static KMDF_D0_ENTRY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-const S_OK: i32 = 0;
-const S_FAIL: i32 = 0xC000_0001u32 as i32;
-const S_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
-
-// The KMDF driver is Control-Flow-Guard-enabled; its indirect calls go through
-// __guard_dispatch_icall_fptr (target in rax). Point dispatch at `jmp rax`, check at `ret`.
-core::arch::global_asm!(
-    ".globl kmdf_cfg_dispatch",
-    "kmdf_cfg_dispatch:",
-    "jmp rax",
-    ".globl kmdf_cfg_check",
-    "kmdf_cfg_check:",
-    "ret",
-);
-extern "win64" {
-    fn kmdf_cfg_dispatch();
-    fn kmdf_cfg_check();
+unsafe fn call2(fp: u64, a: u64, b: u64) -> i32 {
+    let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(fp as *const ());
+    f(a, b)
+}
+unsafe fn call3(fp: u64, a: u64, b: u64, c: u64) -> i32 {
+    let f: extern "win64" fn(u64, u64, u64) -> i32 = core::mem::transmute(fp as *const ());
+    f(a, b, c)
 }
 
-extern "win64" fn wdf_traced_entry() -> i32 {
-    S_OK
-}
-extern "win64" fn wdf_noop() {}
-/// A WDF function that reports failure, so the driver's EvtDeviceAdd unwinds gracefully at a call
-/// whose full behaviour needs the complete WDF device runtime (device interface / I/O queue).
-extern "win64" fn wdf_fail() -> i32 {
-    S_FAIL
+/// A WDFCMRESLIST blob (count@0, descriptors@8 = 20 bytes each) with one memory descriptor — what
+/// EvtDevicePrepareHardware reads via WdfCmResourceListGetCount / GetDescriptor.
+unsafe fn kmdf_build_res_list() -> u64 {
+    let list = alloc_blob();
+    core::ptr::write_unaligned(list as *mut u32, 1); // count
+    let desc = list + 8;
+    core::ptr::write_unaligned(desc as *mut u8, 3); // CmResourceTypeMemory
+    core::ptr::write_unaligned((desc + 4) as *mut u64, 0xFED0_0000); // u.Memory.Start
+    core::ptr::write_unaligned((desc + 12) as *mut u32, 0x1000); // u.Memory.Length
+    list
 }
 
-/// `WdfVersionBind(DriverObject, RegistryPath, BindInfo, *Globals)` — negotiate KMDF 1.15 + publish
-/// the function table + globals.
-extern "win64" fn ntos_wdf_version_bind(_d: u64, _r: u64, bind_info: u64, globals_out: *mut u64) -> i32 {
-    // SAFETY: `bind_info` is the driver's WDF_BIND_INFO; `globals_out` its globals slot.
+/// The KMDF framework PnP dispatch (installed into the KMDF DRIVER_OBJECT's MajorFunction[IRP_MJ_PNP]
+/// by bind_kmdf). START runs EvtDevicePrepareHardware + EvtDeviceD0Entry through the shared runtime
+/// and forwards the IRP down to the root-bus PDO; other minors just forward down.
+extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
+    // SAFETY: single-threaded; dh() is device slot 2 (KMDF); the WDF runtime is initialized.
     unsafe {
-        let major = core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MAJOR) as *const u32);
-        let minor = core::ptr::read_unaligned((bind_info + wt::bind_info::VERSION_MINOR) as *const u32);
-        if major != wt::WDF_KMDF_VERSION_MAJOR || minor > wt::WDF_KMDF_VERSION_MINOR {
-            return S_REVISION_MISMATCH;
+        let minor = dh().pnp_minor;
+        let device = nt_wdf_object::WdfHandle(fdo);
+        if minor == IRP_MN_START_DEVICE {
+            let _ = ntos_iof_call_driver(dh().pdo, irp); // start the lower stack (the PDO)
+            let res = kmdf_build_res_list();
+            let prepare = nt_wdf_kmdf::wdf().prepare_hardware(device).unwrap_or(0);
+            if prepare != 0 {
+                KMDF_PREPARE_HW.store(true, Ordering::Relaxed);
+                call3(prepare, fdo, res, res);
+            }
+            let d0 = nt_wdf_kmdf::wdf()
+                .set_device_power(device, true)
+                .map(|(e, _)| e)
+                .unwrap_or(0);
+            if d0 != 0 {
+                KMDF_D0_ENTRY.store(true, Ordering::Relaxed);
+                call2(d0, fdo, 1);
+            }
+        } else {
+            let _ = ntos_iof_call_driver(dh().pdo, irp);
         }
-        let ftpp = core::ptr::read_unaligned((bind_info + wt::bind_info::FUNC_TABLE) as *const u64);
-        if ftpp != 0 {
-            core::ptr::write_unaligned(ftpp as *mut u64, core::ptr::addr_of!(WDF_FUNCTIONS) as u64);
-        }
-        if !globals_out.is_null() {
-            core::ptr::write_unaligned(globals_out, core::ptr::addr_of_mut!(WDF_GLOBALS) as u64);
-        }
+        core::ptr::write_unaligned((irp + 48) as *mut i32, 0);
     }
-    S_OK
-}
-extern "win64" fn ntos_wdf_version_unbind(_a: u64, _b: u64, _c: u64) -> i32 {
-    S_OK
-}
-extern "win64" fn ntos_wdf_version_bind_class(_a: u64, _b: u64, _c: u64) -> i32 {
-    S_OK
-}
-extern "win64" fn ntos_wdf_version_unbind_class(_a: u64, _b: u64, _c: u64) {}
-
-/// `WdfDriverCreate(Globals, DriverObject, RegistryPath, Attributes, Config, *Driver)` — capture
-/// EvtDriverDeviceAdd + install the WDM AddDevice bridge + framework PnP dispatch.
-extern "win64" fn wdf_driver_create(_g: u64, driver_object: u64, _r: u64, _a: u64, config: u64, driver_out: *mut u64) -> i32 {
-    // SAFETY: `config` is the driver's WDF_DRIVER_CONFIG; `driver_object` its DRIVER_OBJECT.
-    unsafe {
-        KEVT_DEVICE_ADD = core::ptr::read_unaligned((config + wt::driver_config::EVT_DRIVER_DEVICE_ADD) as *const u64);
-        let ext = core::ptr::read_unaligned((driver_object + 48) as *const u64);
-        if ext != 0 {
-            core::ptr::write_unaligned((ext + 8) as *mut u64, kmdf_add_device_bridge as usize as u64);
-        }
-        core::ptr::write_unaligned(
-            (driver_object + 112 + IRP_MJ_PNP as u64 * 8) as *mut u64,
-            kmdf_fx_pnp_dispatch as usize as u64,
-        );
-        if !driver_out.is_null() {
-            core::ptr::write_unaligned(driver_out, KDRIVER);
-        }
-    }
-    S_OK
-}
-
-/// `WdfDeviceCreate(Globals, *DeviceInit, Attributes, *Device)` — build the FDO + attach it above
-/// the KMDF device's PDO.
-extern "win64" fn wdf_device_create(_g: u64, _init: u64, _a: u64, device_out: *mut u64) -> i32 {
-    // SAFETY: single-threaded; `device_out` is the driver's WDFDEVICE slot.
-    unsafe {
-        let fdo = alloc_blob();
-        core::ptr::write_unaligned(fdo as *mut i16, 3); // IO_TYPE_DEVICE
-        dh().device_object = fdo;
-        dh().stack_attached = true; // the framework attaches the FDO above the PDO
-        // Allocate the device's typed context (WdfObjectGetTypedContext returns it below). The
-        // 512-byte blob covers the driver's 0x158-byte context.
-        KCONTEXT = alloc_blob();
-        if !device_out.is_null() {
-            core::ptr::write_unaligned(device_out, fdo);
-        }
-    }
-    S_OK
-}
-
-/// `WdfObjectGetTypedContextWorker(Globals, Handle, TypeInfo)` — the per-object typed context the
-/// driver initializes after WdfDeviceCreate.
-extern "win64" fn wdf_object_get_typed_context(_g: u64, _handle: u64, _type: u64) -> u64 {
-    // SAFETY: single-threaded; KCONTEXT was allocated by WdfDeviceCreate.
-    unsafe { KCONTEXT }
-}
-
-/// The WDM AddDevice bridge for the KMDF family: PnP calls it with the PDO -> EvtDriverDeviceAdd.
-extern "win64" fn kmdf_add_device_bridge(_drv: u64, _pdo: u64) -> i32 {
-    // SAFETY: single-threaded; KEVT_DEVICE_ADD was captured by WdfDriverCreate.
-    unsafe {
-        if KEVT_DEVICE_ADD == 0 {
-            return S_FAIL;
-        }
-        let device_init = alloc_blob();
-        let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(KEVT_DEVICE_ADD as *const ());
-        f(KDRIVER, device_init) // EvtDriverDeviceAdd(Driver, DeviceInit)
-    }
-}
-
-/// The KMDF framework PnP dispatch (MajorFunction[IRP_MJ_PNP]). This minimal driver registers no
-/// EvtDevicePrepareHardware, so START/REMOVE just forward down to the PDO and complete.
-extern "win64" fn kmdf_fx_pnp_dispatch(_fdo: u64, irp: u64) -> i32 {
-    // SAFETY: `irp` is an IRP we built (IoStatus.Status@48).
-    unsafe {
-        let _ = ntos_iof_call_driver(dh().pdo, irp);
-        core::ptr::write_unaligned((irp + 48) as *mut i32, S_OK);
-    }
-    S_OK
-}
-
-unsafe fn install_function_table() {
-    for e in (*core::ptr::addr_of_mut!(WDF_FUNCTIONS)).iter_mut() {
-        *e = wdf_traced_entry as usize as u64;
-    }
-    WDF_FUNCTIONS[wt::IDX_WDF_DRIVER_CREATE] = wdf_driver_create as usize as u64;
-    WDF_FUNCTIONS[wt::IDX_WDF_DEVICE_CREATE] = wdf_device_create as usize as u64;
-    WDF_FUNCTIONS[wt::IDX_WDF_OBJECT_GET_TYPED_CONTEXT_WORKER] =
-        wdf_object_get_typed_context as usize as u64;
-    WDF_FUNCTIONS[55] = wdf_noop as usize as u64; // WdfDeviceInitSetPnpPowerEventCallbacks
-    WDF_FUNCTIONS[61] = wdf_noop as usize as u64; // WdfDeviceInitSetIoType
-    WDF_FUNCTIONS[62] = wdf_noop as usize as u64; // WdfDeviceInitSetExclusive
-    WDF_FUNCTIONS[66] = wdf_noop as usize as u64; // WdfDeviceInitSetDeviceType
-    WDF_FUNCTIONS[67] = wdf_noop as usize as u64; // WdfDeviceInitSetCharacteristics
-    // These need direg's full WDF device runtime (registry / interface / I/O queue); reporting
-    // failure makes the loader-compat driver's EvtDeviceAdd unwind cleanly after WdfDeviceCreate.
-    WDF_FUNCTIONS[119] = wdf_fail as usize as u64; // WdfDriverOpenParametersRegistryKey
-    WDF_FUNCTIONS[77] = wdf_fail as usize as u64; // WdfDeviceCreateDeviceInterface
-    WDF_FUNCTIONS[152] = wdf_fail as usize as u64; // WdfIoQueueCreate
-}
-
-/// `wcslen(s)` — the KMDF stub uses it; count wide chars to the NUL.
-extern "win64" fn ntos_wcslen(s: *const u16) -> u64 {
-    // SAFETY: `s` is a NUL-terminated wide string.
-    unsafe {
-        if s.is_null() {
-            return 0;
-        }
-        let mut n = 0u64;
-        while *s.add(n as usize) != 0 {
-            n += 1;
-        }
-        n
-    }
-}
-extern "win64" fn ntos_rtl_copy_unicode_string(dest: *mut u8, src: *const u8) {
-    // SAFETY: both are UNICODE_STRING projections (Length@0, Buffer@8).
-    unsafe {
-        if dest.is_null() || src.is_null() {
-            return;
-        }
-        let len = core::ptr::read_unaligned(src as *const u16);
-        let buf = core::ptr::read_unaligned((src as *const u64).add(1));
-        core::ptr::write_unaligned(dest as *mut u16, len);
-        core::ptr::write_unaligned((dest as *mut u64).add(1), buf);
-    }
-}
-extern "win64" fn ntos_dbg_print_ex(_a: u32, _b: u32, _fmt: *const u8, _c: u64) -> u32 {
     0
 }
 
 fn export_addr(name: &str) -> u64 {
     match name {
-        "WdfVersionBind" => ntos_wdf_version_bind as usize as u64,
-        "WdfVersionUnbind" => ntos_wdf_version_unbind as usize as u64,
-        "WdfVersionBindClass" => ntos_wdf_version_bind_class as usize as u64,
-        "WdfVersionUnbindClass" => ntos_wdf_version_unbind_class as usize as u64,
-        "RtlCopyUnicodeString" => ntos_rtl_copy_unicode_string as usize as u64,
-        "wcslen" => ntos_wcslen as usize as u64,
-        "DbgPrintEx" => ntos_dbg_print_ex as usize as u64,
         "PoCallDriver" => ntos_po_call_driver as usize as u64,
         "PoSetPowerState" => ntos_po_set_power_state as usize as u64,
         "PoStartNextPowerIrp" => ntos_po_start_next_power_irp as usize as u64,
@@ -1033,11 +896,41 @@ unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64, mem_base: u6
     started
 }
 
-/// Load + PnP-bind a KMDF driver (a second driver *family*) in this same host, in device slot 2:
-/// map its image, DriverEntry -> WdfVersionBind -> WdfDriverCreate (installs the AddDevice bridge),
-/// PnP calls the bridge -> EvtDriverDeviceAdd -> WdfDeviceCreate (FDO), START through the stack.
+/// Load + PnP-bind a KMDF driver (a second driver *family*) in this same host, in device slot 2,
+/// through the shared nt-wdf-kmdf runtime — all the way to Started: init the runtime, seed its
+/// service DB, DriverEntry -> WdfVersionBind -> WdfDriverCreate (AddDevice bridge), PnP calls the
+/// bridge -> EvtDriverDeviceAdd (full: WdfDeviceCreate + registry params + device interface + I/O
+/// queue) -> START through the FDO -> PDO stack (EvtDevicePrepareHardware + EvtDeviceD0Entry).
 unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
-    install_function_table();
+    nt_wdf_kmdf::init();
+    // Seed the WDF runtime's Configuration Manager: the service + its Parameters (Answer=42,
+    // Greeting="hello registry") + a devnode — what KmdfInterfaceRegistryTest reads/writes.
+    {
+        let cm = nt_wdf_kmdf::config_mut();
+        cm.register_service(fx.service, fx.image_path, Some("System"), Some(CLASS_GUID), 3, 1);
+        cm.set_service_parameter(
+            fx.service,
+            "Answer",
+            nt_config_manager::RegistryValueType::Dword,
+            42u32.to_le_bytes().to_vec(),
+        );
+        cm.set_service_parameter(
+            fx.service,
+            "Greeting",
+            nt_config_manager::RegistryValueType::Sz,
+            nt_config_manager::encode_sz("hello registry"),
+        );
+    }
+    let kdevnode = nt_wdf_kmdf::config_mut().register_devnode(
+        fx.instance_path,
+        Some(fx.service),
+        Some(r"\Device\NTPNP_ROOT_0002"),
+        &[fx.device_id],
+        &[fx.compatible_id],
+    );
+    nt_wdf_kmdf::set_devnode(kdevnode);
+    nt_wdf_kmdf::set_driver_service(fx.service);
+
     CURRENT.store(2, Ordering::Relaxed);
     let d = dh();
     d.pdo_object_id = fx.pdo_object_id;
@@ -1064,6 +957,7 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
     for (i, b) in mapped.bytes.iter().enumerate() {
         core::ptr::write_volatile(dst.add(i), *b);
     }
+    // Resolve the KMDF driver's imports through the shared WDF crate (WDFLDR + core ntoskrnl).
     if let Ok(imports) = pe.imports() {
         for dll in &imports {
             for f in &dll.functions {
@@ -1071,23 +965,18 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
                     name, iat_slot_rva, ..
                 } = f
                 {
-                    core::ptr::write_unaligned(
-                        (base + *iat_slot_rva as u64) as *mut u64,
-                        export_addr(name),
-                    );
+                    let addr = nt_wdf_kmdf::export_addr(name).unwrap_or_else(|| export_addr(name));
+                    core::ptr::write_unaligned((base + *iat_slot_rva as u64) as *mut u64, addr);
                 }
             }
         }
     }
-    // CFG fixup (before W^X seals .rdata): dispatch -> `jmp rax`, check -> `ret`.
+    // CFG fixup (before W^X seals .rdata): the shared crate's `jmp rax` dispatch + a `ret` check.
     core::ptr::write_unaligned(
         (base + KMDF_CFG_DISPATCH_RVA) as *mut u64,
-        kmdf_cfg_dispatch as usize as u64,
+        nt_wdf_kmdf::cfg_dispatch_addr(),
     );
-    core::ptr::write_unaligned(
-        (base + KMDF_CFG_CHECK_RVA) as *mut u64,
-        kmdf_cfg_check as usize as u64,
-    );
+    core::ptr::write_unaligned((base + KMDF_CFG_CHECK_RVA) as *mut u64, nt_wdf_kmdf::cfg_dispatch_addr());
     pe.seed_security_cookie(base);
     apply_wx(&pe, base, frames);
 
@@ -1103,34 +992,45 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, base: u64) -> bool {
     if de(driver_object, reg_path) != 0 {
         return false;
     }
-    print_str(b"    [kmdf] DriverEntry ok\n");
+    // Install the component's framework PnP dispatch into MajorFunction[IRP_MJ_PNP] (the crate owns
+    // the AddDevice bridge; the PnP dispatch is tied to this component's device stack).
+    core::ptr::write_unaligned(
+        (driver_object + 112 + IRP_MJ_PNP as u64 * 8) as *mut u64,
+        kmdf_fx_pnp_dispatch as usize as u64,
+    );
     let add_device = core::ptr::read_unaligned((driver_ext + 8) as *const u64);
-    if add_device != kmdf_add_device_bridge as usize as u64 {
+    if add_device != nt_wdf_kmdf::add_device_bridge_addr() {
         return false;
     }
 
-    // PnP: create the PDO, call the AddDevice bridge -> EvtDriverDeviceAdd -> WdfDeviceCreate (FDO).
+    // PnP calls the AddDevice bridge -> EvtDriverDeviceAdd (full device/registry/interface/queue).
     let pdo = alloc_blob();
     core::ptr::write_unaligned(pdo as *mut i16, 3);
     dh().pdo = pdo;
     let _ = pnp().transition(pnp_devnode, DeviceState::DriverLoaded);
-    dh().device_object = 0;
     let add_fn: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
-    let _add_status = add_fn(driver_object, pdo);
-    let fdo = dh().device_object;
-    print_str(b"    [kmdf] EvtDriverDeviceAdd -> WdfDeviceCreate FDO=");
-    debug_put_char(if fdo != 0 { b'1' } else { b'0' });
-    print_str(b"\n");
-    // The KMDF family bound far enough to prove the WDF runtime coexists with the WDM export surface
-    // in one host: WdfVersionBind (1.15) + WdfDriverCreate + the AddDevice bridge + EvtDriverDeviceAdd
-    // + WdfDeviceCreate (FDO). This driver's *full* EvtDeviceAdd (registry parameters + device
-    // interface + I/O queue) needs direg's complete WDF device runtime, so it unwinds after the FDO.
-    if fdo == 0 {
+    let add_status = add_fn(driver_object, pdo);
+    let fdo = nt_wdf_kmdf::device();
+    if add_status != 0 || fdo == 0 {
         return false;
     }
     let _ = pnp().transition(pnp_devnode, DeviceState::AddDeviceCalled);
     let _ = pnp().set_fdo(pnp_devnode, fdo);
-    true
+    let _ = pnp().transition(pnp_devnode, DeviceState::DeviceStackBuilt);
+    let _ = pnp().transition(pnp_devnode, DeviceState::ResourcesAssigned);
+    let _ = pnp().transition(pnp_devnode, DeviceState::StartIrpSent);
+
+    // START through the FDO -> PDO stack: the framework dispatch runs EvtDevicePrepareHardware +
+    // EvtDeviceD0Entry, forwards the IRP down to the root-bus PDO, and the devnode reaches Started.
+    let start_status = dispatch_pnp(driver_object, fdo, IRP_MN_START_DEVICE, 0, 0);
+    let started = start_status == 0
+        && KMDF_PREPARE_HW.load(Ordering::Relaxed)
+        && KMDF_D0_ENTRY.load(Ordering::Relaxed)
+        && root_bus().pdo_started(fx.pdo_object_id);
+    if started {
+        let _ = pnp().transition(pnp_devnode, DeviceState::Started);
+    }
+    started
 }
 
 fn check(name: &[u8], ok: bool) {
@@ -1450,14 +1350,15 @@ unsafe fn run() {
     // --- Bind a KMDF driver (a second driver FAMILY) in this same WDM host -----------------------
     // The WDF runtime coexists with the WDM export surface: WdfVersionBind -> WdfDriverCreate ->
     // (WDM AddDevice bridge) -> EvtDriverDeviceAdd -> WdfDeviceCreate, then START through the stack.
-    trace(b"pnp_kmdf_family_bind (KmdfLoaderCompatTest)");
-    let kmdf_bound = bind_kmdf(&FIXTURES[2], pnp_devnodes[2], KMDF_CODE_VADDR);
+    trace(b"pnp_kmdf_family_bind (KmdfInterfaceRegistryTest, via nt-wdf-kmdf)");
+    let kmdf_started = bind_kmdf(&FIXTURES[2], pnp_devnodes[2], KMDF_CODE_VADDR);
     CURRENT.store(0, Ordering::Relaxed); // restore device 0 for the primary's IOCTLs below
-    // The WDF runtime coexists with the WDM export surface in one host: the KMDF driver bound
-    // through WdfVersionBind (1.15) + WdfDriverCreate + the AddDevice bridge + WdfDeviceCreate (FDO).
-    check(b"kmdf_family_binds_alongside_wdm", kmdf_bound);
+    // A KMDF driver bound to Started alongside the two WDM drivers, through the shared nt-wdf-kmdf
+    // runtime: WdfVersionBind (1.15) -> WdfDriverCreate -> AddDevice bridge -> full EvtDriverDeviceAdd
+    // (WdfDeviceCreate + registry params + device interface + I/O queue) -> START (PrepareHardware+D0).
+    check(b"kmdf_family_started_alongside_wdm", kmdf_started);
 
-    // --- Live device-tree state snapshot: TWO WDM Started + ONE KMDF FDO-created -----------------
+    // --- Live device-tree state snapshot: THREE children Started (2 WDM + 1 KMDF) ----------------
     print_str(b"  [device-tree live] \\Device\\RootBus\n");
     for (fx, &pdn) in FIXTURES.iter().zip(pnp_devnodes.iter()) {
         print_str(b"    - ");
@@ -1467,10 +1368,10 @@ unsafe fn run() {
         print_str(b"\n");
     }
     check(
-        b"two_wdm_started_plus_kmdf_bound",
+        b"three_children_started_two_families",
         pnp().state(pnp_devnodes[0]) == Some(DeviceState::Started)
             && pnp().state(pnp_devnodes[1]) == Some(DeviceState::Started)
-            && pnp().state(pnp_devnodes[2]) == Some(DeviceState::AddDeviceCalled)
+            && pnp().state(pnp_devnodes[2]) == Some(DeviceState::Started)
             && pnp_devnodes[3..]
                 .iter()
                 .all(|&d| pnp().state(d) == Some(DeviceState::Enumerated)),

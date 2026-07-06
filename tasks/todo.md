@@ -112,3 +112,13 @@ WdfDeviceCreateDeviceInterface/WdfIoQueueCreate report failure -> EvtDeviceAdd u
 the FDO. 32 PASS / 0 FAIL + 185 kernel. New: kmdf_family_binds_alongside_wdm, two_wdm_started_plus_
 kmdf_bound. Fixes: CODE_FRAME_CAPS [[u64;16];3], HEAP 128K->1M (3 drivers' pe.map). KMDF child reaches
 AddDeviceCalled (FDO created); full Started for KMDF is direg's runtime.
+
+## Increment 9 done (2026-07-06): KMDF child to Started via the shared nt-wdf-kmdf crate
+driver-host-pnp's KMDF child (KmdfInterfaceRegistryTest, FIXTURES[2]) now reaches Started through the
+shared crate: bind_kmdf uses nt_wdf_kmdf::{init, config_mut (seed service + Answer=42/Greeting + devnode),
+export_addr, cfg_dispatch_addr, add_device_bridge_addr, device, set_devnode, set_driver_service, wdf}.
+Full EvtDeviceAdd (WdfDeviceCreate + registry params + device interface + I/O queue) runs via the crate;
+the component's kmdf_fx_pnp_dispatch (MajorFunction[IRP_MJ_PNP]) drives START (prepare_hardware + D0 via
+nt_wdf_kmdf::wdf(), forward down to PDO). 32 PASS / 0 FAIL + 185 kernel. THREE children Started in one
+host, TWO families: PnpMmioInterruptTest (WDM) + PowerPnpMmioTest (WDM) + KmdfInterfaceRegistryTest (KMDF).
+The crate is now consumed by both direg (29/29) and driver-host-pnp (KMDF to Started) — factoring complete.
