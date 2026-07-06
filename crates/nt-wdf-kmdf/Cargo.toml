@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "nt-wdf-kmdf"
+description = "The KMDF (WDF framework) host surface as a shared crate: the extern \"win64\" WDF function-table thunks, WdfVersionBind + the WDM AddDevice bridge, over a crate-global WdfRuntime + ConfigManager. x86_64-only (Microsoft x64 ABI). Consumed by the seL4 driver-host components."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+nt-wdf-runtime = { path = "../nt-wdf-runtime" }
+nt-wdf-types = { path = "../nt-wdf-types" }
+nt-wdf-object = { path = "../nt-wdf-object" }
+nt-wdf-queue = { path = "../nt-wdf-queue" }
+nt-wdf-request = { path = "../nt-wdf-request" }
+nt-config-manager = { path = "../nt-config-manager" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+codegen-units = 1
