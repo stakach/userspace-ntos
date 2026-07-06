@@ -114,8 +114,12 @@ const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
 
 /// `IRP_MN_START_DEVICE` — the bus PDO's start minor.
 pub const IRP_MN_START_DEVICE: u8 = 0x00;
+/// `IRP_MN_QUERY_REMOVE_DEVICE` — may the device be removed? (the bus always allows it).
+pub const IRP_MN_QUERY_REMOVE_DEVICE: u8 = 0x01;
 /// `IRP_MN_REMOVE_DEVICE` — the bus PDO's remove minor.
 pub const IRP_MN_REMOVE_DEVICE: u8 = 0x02;
+/// `IRP_MN_CANCEL_REMOVE_DEVICE` — a proposed remove was cancelled.
+pub const IRP_MN_CANCEL_REMOVE_DEVICE: u8 = 0x03;
 /// `IRP_MN_STOP_DEVICE` — quiesce the PDO (a query/cancel-stop precede it).
 pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
 /// `IRP_MN_QUERY_STOP_DEVICE` — may the device be stopped? (the bus always allows it).
@@ -212,7 +216,11 @@ impl RootBus {
             IRP_MN_STOP_DEVICE | IRP_MN_REMOVE_DEVICE | IRP_MN_SURPRISE_REMOVAL => {
                 pdo.started = false
             }
-            IRP_MN_QUERY_STOP_DEVICE | IRP_MN_CANCEL_STOP_DEVICE => {}
+            // Query/cancel of a proposed stop or remove is pure negotiation the bus always allows.
+            IRP_MN_QUERY_STOP_DEVICE
+            | IRP_MN_CANCEL_STOP_DEVICE
+            | IRP_MN_QUERY_REMOVE_DEVICE
+            | IRP_MN_CANCEL_REMOVE_DEVICE => {}
             _ => {}
         }
         STATUS_SUCCESS
@@ -332,6 +340,11 @@ mod tests {
         assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_STOP_DEVICE), 0);
         assert!(!b.pdo_started(0xFED0_0000));
         b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
+        assert!(b.pdo_started(0xFED0_0000));
+        // query-remove + cancel-remove are pure negotiation: still started.
+        b.dispatch_pnp(0xFED0_0000, IRP_MN_START_DEVICE);
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_QUERY_REMOVE_DEVICE), 0);
+        assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_CANCEL_REMOVE_DEVICE), 0);
         assert!(b.pdo_started(0xFED0_0000));
         // surprise removal quiesces.
         assert_eq!(b.dispatch_pnp(0xFED0_0000, IRP_MN_SURPRISE_REMOVAL), 0);

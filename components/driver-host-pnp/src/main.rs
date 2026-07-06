@@ -30,8 +30,9 @@ use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
 use nt_config_manager::ConfigManager;
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
 use nt_pnp_abi::{
-    DeviceState, IRP_MJ_PNP, IRP_MN_CANCEL_STOP_DEVICE, IRP_MN_QUERY_STOP_DEVICE,
-    IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL,
+    DeviceState, IRP_MJ_PNP, IRP_MN_CANCEL_REMOVE_DEVICE, IRP_MN_CANCEL_STOP_DEVICE,
+    IRP_MN_QUERY_REMOVE_DEVICE, IRP_MN_QUERY_STOP_DEVICE, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE,
+    IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL,
 };
 use nt_pnp_manager::PnpManager;
 use nt_resource_manager::{ResourceManager, ResourceOwner};
@@ -531,6 +532,10 @@ extern "win64" fn ntos_po_start_next_power_irp(_irp: u64) {}
 
 static KMDF_PREPARE_HW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static KMDF_D0_ENTRY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether the framework ran the driver's EvtDeviceD0Exit (D3 power-down) on STOP/REMOVE.
+static KMDF_D0_EXIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The KMDF DRIVER_OBJECT (component-owned; the post-Started stop/surprise flow dispatches to it).
+static KMDF_DRV_OBJECT: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn call2(fp: u64, a: u64, b: u64) -> i32 {
     let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(fp as *const ());
@@ -577,7 +582,19 @@ extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
                 KMDF_D0_ENTRY.store(true, Ordering::Relaxed);
                 call2(d0, fdo, 1);
             }
+        } else if minor == IRP_MN_STOP_DEVICE || minor == IRP_MN_REMOVE_DEVICE {
+            // Power the device down (EvtDeviceD0Exit / D3) then forward the IRP down to the PDO.
+            let d0exit = nt_wdf_kmdf::wdf()
+                .set_device_power(device, false)
+                .map(|(e, _)| e)
+                .unwrap_or(0);
+            if d0exit != 0 {
+                KMDF_D0_EXIT.store(true, Ordering::Relaxed);
+                call2(d0exit, fdo, 0);
+            }
+            let _ = ntos_iof_call_driver(dh().pdo, irp);
         } else {
+            // QUERY_STOP / CANCEL_STOP / SURPRISE_REMOVAL: forward down (pure PnP negotiation).
             let _ = ntos_iof_call_driver(dh().pdo, irp);
         }
         core::ptr::write_unaligned((irp + 48) as *mut i32, 0);
@@ -994,6 +1011,7 @@ unsafe fn bind_kmdf(fx: &Fixture, pnp_devnode: u64, cfg_devnode: u64, base: u64)
         (driver_object + 112 + IRP_MJ_PNP as u64 * 8) as *mut u64,
         kmdf_fx_pnp_dispatch as usize as u64,
     );
+    KMDF_DRV_OBJECT.store(driver_object, Ordering::Relaxed);
     let add_device = core::ptr::read_unaligned((driver_ext + 8) as *const u64);
     if add_device != nt_wdf_kmdf::add_device_bridge_addr() {
         return false;
@@ -1410,6 +1428,25 @@ unsafe fn run() {
             && id == 0x4d4d_494f,
     );
 
+    // --- REMOVE negotiation: QUERY_REMOVE -> CANCEL_REMOVE keeps the device running ------------
+    // A proposed remove the PnP Manager then cancels (e.g. a rebalance the user vetoes): the device
+    // returns to Started and keeps working, its resources untouched.
+    trace(b"pnp_query_remove + pnp_cancel_remove");
+    let _ = dispatch_pnp(driver_object, fdo, IRP_MN_QUERY_REMOVE_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::QueryRemovePending);
+    let cancel_rm_status = dispatch_pnp(driver_object, fdo, IRP_MN_CANCEL_REMOVE_DEVICE, 0, 0);
+    let _ = pnp().transition(devnode, DeviceState::Started);
+    let (st, _i, out) = dispatch(driver_object, fdo, 0x0e, 0x0022_20C0, &[], 8); // GET_ID
+    let id = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(
+        b"cancel_remove_keeps_device_started",
+        cancel_rm_status == 0
+            && pnp().state(devnode) == Some(DeviceState::Started)
+            && root_bus().pdo_started(PDO_OBJECT_ID)
+            && st == 0
+            && id == 0x4d4d_494f,
+    );
+
     // --- STOP: QUERY_STOP -> STOP_DEVICE quiesces the device -----------------------------------
     trace(b"pnp_stop_enter");
     let _ = dispatch_pnp(driver_object, fdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
@@ -1472,6 +1509,58 @@ unsafe fn run() {
 
     check(b"callbacks_ran_at_correct_irql", dh().bad_irql == 0);
     let _ = add_status;
+
+    // --- KMDF child: STOP / restart / SURPRISE_REMOVAL through the shared runtime ---------------
+    // The KMDF device (slot 2, Started earlier) now runs the same stop + surprise paths, with the
+    // framework driving EvtDeviceD0Exit (D3) on stop/remove + EvtDeviceD0Entry on restart via
+    // nt-wdf-kmdf — the whole PnP lifecycle across two driver families.
+    CURRENT.store(2, Ordering::Relaxed);
+    let kdrv = KMDF_DRV_OBJECT.load(Ordering::Relaxed);
+    let kfdo = nt_wdf_kmdf::device();
+    let kdevnode = pnp_devnodes[2];
+    let kpdo = FIXTURES[2].pdo_object_id;
+
+    trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
+    let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(kdevnode, DeviceState::QueryStopPending);
+    let kstop = dispatch_pnp(kdrv, kfdo, IRP_MN_STOP_DEVICE, 0, 0);
+    let _ = pnp().transition(kdevnode, DeviceState::Stopped);
+    check(
+        b"kmdf_stop_device_quiesces",
+        kstop == 0
+            && pnp().state(kdevnode) == Some(DeviceState::Stopped)
+            && !root_bus().pdo_started(kpdo)
+            && KMDF_D0_EXIT.load(Ordering::Relaxed),
+    );
+
+    trace(b"kmdf_restart (EvtDeviceD0Entry)");
+    KMDF_D0_ENTRY.store(false, Ordering::Relaxed);
+    let _ = pnp().transition(kdevnode, DeviceState::StartIrpSent);
+    let krestart = dispatch_pnp(kdrv, kfdo, IRP_MN_START_DEVICE, 0, 0);
+    if krestart == 0 {
+        let _ = pnp().transition(kdevnode, DeviceState::Started);
+    }
+    check(
+        b"kmdf_restart_after_stop_resumes",
+        krestart == 0
+            && pnp().state(kdevnode) == Some(DeviceState::Started)
+            && root_bus().pdo_started(kpdo)
+            && KMDF_D0_ENTRY.load(Ordering::Relaxed),
+    );
+
+    trace(b"kmdf_surprise_removal + kmdf_remove");
+    let ksurprise = dispatch_pnp(kdrv, kfdo, IRP_MN_SURPRISE_REMOVAL, 0, 0);
+    let _ = pnp().transition(kdevnode, DeviceState::RemovePending);
+    let kremove = dispatch_pnp(kdrv, kfdo, IRP_MN_REMOVE_DEVICE, 0, 0);
+    let _ = pnp().transition(kdevnode, DeviceState::Removed);
+    check(
+        b"kmdf_surprise_removal_then_remove",
+        ksurprise == 0
+            && kremove == 0
+            && pnp().state(kdevnode) == Some(DeviceState::Removed)
+            && !root_bus().pdo_started(kpdo),
+    );
+    CURRENT.store(0, Ordering::Relaxed);
 
     // --- Report -----------------------------------------------------------------------------
     print_str(b"\n  [pnp-report] ");
