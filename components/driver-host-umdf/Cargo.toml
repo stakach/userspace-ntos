@@ -15,6 +15,7 @@ sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
+nt-config-manager = { path = "../../crates/nt-config-manager" }
 
 [profile.release]
 panic = "abort"

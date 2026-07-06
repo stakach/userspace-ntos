@@ -190,6 +190,44 @@ unsafe fn run() {
         b"umdf2_evt_device_add_captured",
         nt_wdf_kmdf::wdf().evt_device_add() != 0,
     );
+
+    // Seed the driver's service registry so its EvtDeviceAdd can open its Parameters
+    // key (WdfDriverOpenParametersRegistryKey + WdfRegistryQuery/AssignULong).
+    {
+        let cm = nt_wdf_kmdf::config_mut();
+        cm.register_service(
+            "Umdf2LifecycleTest",
+            "Umdf2LifecycleTest.dll",
+            Some("System"),
+            Some("{4d36e97d-e325-11ce-bfc1-08002be10318}"),
+            3,
+            1,
+        );
+        cm.set_service_parameter(
+            "Umdf2LifecycleTest",
+            "TestValue",
+            nt_config_manager::RegistryValueType::Dword,
+            1u32.to_le_bytes().to_vec(),
+        );
+    }
+    let devnode = nt_wdf_kmdf::config_mut().register_devnode(
+        r"Root\UMDF2_LIFECYCLE_TEST\0000",
+        Some("Umdf2LifecycleTest"),
+        Some(r"\Device\NTPNP_ROOT_0005"),
+        &[r"Root\UMDF2_LIFECYCLE_TEST"],
+        &[],
+    );
+    nt_wdf_kmdf::set_devnode(devnode);
+    nt_wdf_kmdf::wdf().set_driver_service("Umdf2LifecycleTest");
+
+    // Run the real UMDF v2 driver's EvtDeviceAdd: it creates the device (WdfDeviceCreate),
+    // reads/writes its registry Parameters, and creates a device interface — all dispatched
+    // through our function table at the UMDF v2 indices.
+    print_str(b"[ntos-umdf] running real UMDF v2 EvtDeviceAdd\n");
+    let pdo = alloc_blob();
+    let add_status = nt_wdf_kmdf::umdf2_run_evt_device_add(pdo);
+    check(b"umdf2_evt_device_add_ran", add_status == 0);
+    check(b"umdf2_device_created", nt_wdf_kmdf::device() != 0);
 }
 
 #[no_mangle]

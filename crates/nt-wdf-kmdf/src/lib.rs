@@ -935,8 +935,24 @@ pub fn init() {
 static mut UMDF2_FUNCTIONS: [u64; 512] = [0; 512];
 static mut UMDF2_GLOBALS: [u8; 64] = [0; 64];
 
-/// UMDF v2 `WDFFUNCENUM` index of `WdfDriverCreate` (KMDF's is 116).
-const UMDF2_IDX_WDF_DRIVER_CREATE: usize = 57;
+// UMDF v2 `WDFFUNCENUM` indices (from microsoft/Windows-Driver-Frameworks
+// src/publicinc/wdf/umdf/2.x/wdffuncenum.h) — they differ from KMDF's, so the shared
+// thunks are installed at these positions when hosting a UMDF v2 driver.
+const UMDF2_IDX_DEVICE_INIT_SET_PNP_POWER_EVENT_CALLBACKS: usize = 19;
+const UMDF2_IDX_DEVICE_INIT_SET_IO_TYPE: usize = 22;
+const UMDF2_IDX_DEVICE_CREATE: usize = 25;
+const UMDF2_IDX_DEVICE_CREATE_DEVICE_INTERFACE: usize = 27;
+const UMDF2_IDX_DRIVER_CREATE: usize = 57;
+const UMDF2_IDX_DRIVER_OPEN_PARAMETERS_REGISTRY_KEY: usize = 59;
+const UMDF2_IDX_IO_QUEUE_CREATE: usize = 85;
+const UMDF2_IDX_IO_QUEUE_GET_DEVICE: usize = 90;
+const UMDF2_IDX_OBJECT_GET_TYPED_CONTEXT_WORKER: usize = 123;
+const UMDF2_IDX_REGISTRY_CLOSE: usize = 133;
+const UMDF2_IDX_REGISTRY_QUERY_ULONG: usize = 141;
+const UMDF2_IDX_REGISTRY_ASSIGN_ULONG: usize = 147;
+const UMDF2_IDX_REQUEST_COMPLETE_WITH_INFORMATION: usize = 164;
+const UMDF2_IDX_REQUEST_RETRIEVE_INPUT_BUFFER: usize = 168;
+const UMDF2_IDX_REQUEST_RETRIEVE_OUTPUT_BUFFER: usize = 169;
 
 /// Ensure the shared runtime exists and install the shared WDF thunks at their UMDF v2
 /// table indices. Call once before hosting a UMDF v2 driver.
@@ -947,7 +963,55 @@ pub fn umdf2_prepare() {
             WDF = Some(WdfRuntime::new());
         }
         let t = &mut *core::ptr::addr_of_mut!(UMDF2_FUNCTIONS);
-        t[UMDF2_IDX_WDF_DRIVER_CREATE] = wdf_driver_create as usize as u64;
+        let mut set = |idx: usize, fp: u64| t[idx] = fp;
+        set(UMDF2_IDX_DRIVER_CREATE, wdf_driver_create as usize as u64);
+        set(
+            UMDF2_IDX_DEVICE_INIT_SET_PNP_POWER_EVENT_CALLBACKS,
+            wdf_device_init_set_pnp_power_callbacks as usize as u64,
+        );
+        set(
+            UMDF2_IDX_DEVICE_INIT_SET_IO_TYPE,
+            wdf_device_init_set_io_type as usize as u64,
+        );
+        set(UMDF2_IDX_DEVICE_CREATE, wdf_device_create as usize as u64);
+        set(
+            UMDF2_IDX_DEVICE_CREATE_DEVICE_INTERFACE,
+            wdf_device_create_device_interface as usize as u64,
+        );
+        set(
+            UMDF2_IDX_DRIVER_OPEN_PARAMETERS_REGISTRY_KEY,
+            wdf_driver_open_parameters_registry_key as usize as u64,
+        );
+        set(UMDF2_IDX_IO_QUEUE_CREATE, wdf_io_queue_create as usize as u64);
+        set(
+            UMDF2_IDX_IO_QUEUE_GET_DEVICE,
+            wdf_io_queue_get_device as usize as u64,
+        );
+        set(
+            UMDF2_IDX_OBJECT_GET_TYPED_CONTEXT_WORKER,
+            wdf_object_get_typed_context as usize as u64,
+        );
+        set(UMDF2_IDX_REGISTRY_CLOSE, wdf_registry_close as usize as u64);
+        set(
+            UMDF2_IDX_REGISTRY_QUERY_ULONG,
+            wdf_registry_query_ulong as usize as u64,
+        );
+        set(
+            UMDF2_IDX_REGISTRY_ASSIGN_ULONG,
+            wdf_registry_assign_ulong as usize as u64,
+        );
+        set(
+            UMDF2_IDX_REQUEST_COMPLETE_WITH_INFORMATION,
+            wdf_request_complete_with_information as usize as u64,
+        );
+        set(
+            UMDF2_IDX_REQUEST_RETRIEVE_INPUT_BUFFER,
+            wdf_request_retrieve_input_buffer as usize as u64,
+        );
+        set(
+            UMDF2_IDX_REQUEST_RETRIEVE_OUTPUT_BUFFER,
+            wdf_request_retrieve_output_buffer as usize as u64,
+        );
     }
 }
 
@@ -989,6 +1053,27 @@ pub fn queue() -> u64 {
 /// The created WDFDRIVER handle, if any.
 pub fn driver() -> Option<u64> {
     wdf().driver().map(|d| d.0)
+}
+
+/// Invoke a hosted driver's captured `EvtDriverDeviceAdd` once with a synthetic
+/// device-init (out-of-process UMDF v2 hosting has no PDO-driven AddDevice). Returns the
+/// callback's status; the created WDFDEVICE is then available via [`device()`].
+pub fn umdf2_run_evt_device_add(pdo: u64) -> i32 {
+    // SAFETY: single-threaded; the runtime is initialized and a driver was created.
+    unsafe {
+        let evt = wdf().evt_device_add();
+        let Some(driver) = wdf().driver() else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        if evt == 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        let init_id = wdf().add_device(pdo);
+        let device_init_blob = alloc_blob();
+        core::ptr::write_unaligned(device_init_blob as *mut u64, init_id as u64);
+        host().device_init_blob = device_init_blob;
+        call2(evt, driver.0, device_init_blob)
+    }
 }
 
 /// User-mode "open by interface": resolve the first enabled device interface of `guid` to
