@@ -32,6 +32,7 @@ nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
 nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }
+nt-wdf-request = { path = "../../crates/nt-wdf-request" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-root-bus = { path = "../../crates/nt-root-bus" }
 

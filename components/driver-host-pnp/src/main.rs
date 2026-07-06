@@ -602,6 +602,59 @@ extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
     0
 }
 
+// The KMDF device's IOCTL interface (KmdfInterfaceRegistryTest).
+const KMDF_PING_MAGIC: u32 = 0x4946_4B4D; // "MKFI"
+const KMDF_IOCTL_PING: u32 = 0x0022_2200;
+const KMDF_IOCTL_GET_CONFIG: u32 = 0x0022_2204; // Answer@0xc
+const KMDF_IOCTL_GET_GREETING: u32 = 0x0022_220C; // wchar greeting @ offset 4
+const KMDF_IOCTL_ECHO: u32 = 0x0022_2218;
+
+/// A zeroed heap buffer of `size` bytes (the IOCTL system buffer).
+fn alloc_bytes(size: usize) -> u64 {
+    let layout = core::alloc::Layout::from_size_align(size.max(1), 16).unwrap();
+    // SAFETY: nonzero size, valid 16-byte align.
+    unsafe { alloc::alloc::alloc_zeroed(layout) as u64 }
+}
+
+/// Present an IOCTL to the KMDF device's default queue through the shared runtime, run the driver's
+/// EvtIoDeviceControl, and read back `(status, information, output bytes)`. Mirrors direg's run_ioctl
+/// but drives the *same* shared nt-wdf-kmdf runtime from this WDM host.
+unsafe fn run_kmdf_ioctl(device: u64, ioctl: u32, input: &[u8], out_cap: u64) -> (i32, u64, [u8; 64]) {
+    let sysbuf = alloc_bytes(out_cap.max(input.len() as u64).max(1) as usize);
+    for (i, b) in input.iter().enumerate() {
+        core::ptr::write_volatile((sysbuf + i as u64) as *mut u8, *b);
+    }
+    let irp = alloc_blob();
+    let buffers = nt_wdf_request::RequestBuffers {
+        input_ptr: if input.is_empty() { 0 } else { sysbuf },
+        input_len: input.len() as u64,
+        output_ptr: if out_cap == 0 { 0 } else { sysbuf },
+        output_len: out_cap,
+    };
+    let (request, dispatch) = match nt_wdf_kmdf::wdf().present_ioctl(
+        nt_wdf_object::WdfHandle(device),
+        irp,
+        ioctl,
+        buffers,
+    ) {
+        Ok(v) => v,
+        Err(_) => return (i32::MIN, 0, [0u8; 64]),
+    };
+    let Some(d) = dispatch else {
+        return (i32::MIN, 0, [0u8; 64]);
+    };
+    // EvtIoDeviceControl(Queue, Request, OutputBufferLength, InputBufferLength, IoControlCode).
+    let f: extern "win64" fn(u64, u64, u64, u64, u32) =
+        core::mem::transmute(d.evt_io_device_control as *const ());
+    f(d.queue.0, request.0, out_cap, input.len() as u64, ioctl);
+    let mut out = [0u8; 64];
+    for (i, o) in out.iter_mut().enumerate().take(out_cap.min(64) as usize) {
+        *o = core::ptr::read_volatile((sysbuf + i as u64) as *const u8);
+    }
+    let (status, info) = nt_wdf_kmdf::last_completion();
+    (status, info, out)
+}
+
 fn export_addr(name: &str) -> u64 {
     match name {
         "PoCallDriver" => ntos_po_call_driver as usize as u64,
@@ -1519,6 +1572,35 @@ unsafe fn run() {
     let kfdo = nt_wdf_kmdf::device();
     let kdevnode = pnp_devnodes[2];
     let kpdo = FIXTURES[2].pdo_object_id;
+
+    // --- KMDF IOCTL smoke: present_ioctl -> the driver's EvtIoDeviceControl via the shared runtime.
+    trace(b"kmdf_ioctl_smoke (PING / GET_CONFIG / GET_GREETING / ECHO)");
+    let (st, info, out) = run_kmdf_ioctl(kfdo, KMDF_IOCTL_PING, &[], 4);
+    let ping = core::ptr::read_unaligned(out.as_ptr() as *const u32);
+    check(b"kmdf_ioctl_ping", st == 0 && info == 4 && ping == KMDF_PING_MAGIC);
+
+    // GET_CONFIG: the driver reports its state; Answer@0xc is the registry Parameter it read (42).
+    let (st, _i, out) = run_kmdf_ioctl(kfdo, KMDF_IOCTL_GET_CONFIG, &[], 0x2c);
+    let answer = core::ptr::read_unaligned(out.as_ptr().add(0xc) as *const u32);
+    check(b"kmdf_ioctl_get_config_answer_42", st == 0 && answer == 42);
+
+    // GET_GREETING: a wide "hello registry" (the registry Parameter) at offset 4.
+    let (st, _i, out) = run_kmdf_ioctl(kfdo, KMDF_IOCTL_GET_GREETING, &[], 0x20c);
+    let expected: Vec<u16> = "hello registry".encode_utf16().collect();
+    let mut greeting_ok = st == 0;
+    for (i, w) in expected.iter().enumerate() {
+        let ch = out[4 + i * 2] as u16 | ((out[4 + i * 2 + 1] as u16) << 8);
+        greeting_ok &= ch == *w;
+    }
+    check(b"kmdf_ioctl_get_greeting", greeting_ok);
+
+    // ECHO: the driver copies the input buffer back to the output buffer.
+    let echo_in = &[0xDEu8, 0xAD, 0xBE, 0xEF];
+    let (st, info, out) = run_kmdf_ioctl(kfdo, KMDF_IOCTL_ECHO, echo_in, 4);
+    check(
+        b"kmdf_ioctl_echo",
+        st == 0 && info == 4 && &out[..4] == echo_in,
+    );
 
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
     let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
