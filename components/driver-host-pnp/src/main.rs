@@ -14,6 +14,7 @@
 
 #![no_std]
 #![no_main]
+#![allow(function_casts_as_integer)]
 
 extern crate alloc;
 
@@ -35,21 +36,26 @@ use nt_root_bus::{BusQueryId, RootBus};
 use nt_sim_device::SimDevice;
 use sel4_rt::*;
 
-/// The one driver image this host knows how to load, indexed by service name. In a full driver
-/// database this is `Services\<name>\ImagePath` -> the file; here the "boot driver set" is a static
-/// table, but the driver that gets loaded is still chosen by the devnode's selected service.
+/// The driver images this host has in its store, indexed by service name. In a full driver database
+/// this is `Services\<name>\ImagePath` -> the file; here the "boot driver set" is a static table,
+/// but the driver each devnode binds is still chosen by its selected service.
 static PNP_SYS: &[u8] =
     include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/PnpMmioInterruptTest.sys");
+static POWER_SYS: &[u8] =
+    include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/PowerPnpMmioTest.sys");
 
 /// Resolve a service name to its driver image (the boot-driver "store").
 fn load_service_image(service: &str) -> Option<&'static [u8]> {
     match service {
-        SERVICE_NAME => Some(PNP_SYS),
+        "PnpMmioInterruptTest" => Some(PNP_SYS),
+        "PowerPnpMmioTest" => Some(POWER_SYS),
         _ => None,
     }
 }
 
 const CODE_VADDR: u64 = 0x0000_0001_4000_0000;
+/// The base the second bound driver's image is mapped at (device slot 1).
+const SECOND_CODE_VADDR: u64 = 0x0000_0001_6000_0000;
 const STATUS_PENDING: i32 = 0x0000_0103;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
@@ -88,21 +94,21 @@ const FIXTURES: &[Fixture] = &[
         pdo_object_id: PDO_OBJECT_ID,
     },
     Fixture {
-        instance_path: r"ROOT\USERSPACE_NTOS_MMIO\0001",
-        service: "MmioInterruptTest",
-        device_id: r"ROOT\USERSPACE_NTOS_MMIO",
-        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
-        instance_id: "0001",
-        image_path: r"\SystemRoot\system32\drivers\MmioInterruptTest.sys",
-        pdo_object_id: 0xFED0_1000,
-    },
-    Fixture {
         instance_path: r"ROOT\USERSPACE_NTOS_POWER\0001",
         service: "PowerPnpMmioTest",
         device_id: r"ROOT\USERSPACE_NTOS_POWER",
         compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
         instance_id: "0001",
         image_path: r"\SystemRoot\system32\drivers\PowerPnpMmioTest.sys",
+        pdo_object_id: 0xFED0_1000,
+    },
+    Fixture {
+        instance_path: r"ROOT\USERSPACE_NTOS_MMIO\0001",
+        service: "MmioInterruptTest",
+        device_id: r"ROOT\USERSPACE_NTOS_MMIO",
+        compatible_id: r"ROOT\USERSPACE_NTOS_TEST_DEVICE",
+        instance_id: "0001",
+        image_path: r"\SystemRoot\system32\drivers\MmioInterruptTest.sys",
         pdo_object_id: 0xFED0_2000,
     },
     Fixture {
@@ -137,9 +143,10 @@ fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
 
-static mut CODE_FRAME_CAPS: [u64; 16] = [0; 16];
+static mut CODE_FRAME_CAPS: [[u64; 16]; 2] = [[0; 16]; 2];
 
 unsafe fn map_region(base: u64, frames: u64) {
+    let cur = CURRENT.load(Ordering::Relaxed);
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
@@ -152,28 +159,24 @@ unsafe fn map_region(base: u64, frames: u64) {
     for i in 0..frames {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(
-            f,
-            base + i * 0x1000,
-            /* RW */ 3,
-            CAP_INIT_THREAD_VSPACE,
-        );
-        CODE_FRAME_CAPS[i as usize] = f;
+        let _ = page_map(f, base + i * 0x1000, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+        CODE_FRAME_CAPS[cur][i as usize] = f;
     }
 }
 
-unsafe fn apply_wx(pe: &nt_pe_loader::PeFile, frames: u64) {
+unsafe fn apply_wx(pe: &nt_pe_loader::PeFile, base: u64, frames: u64) {
+    let cur = CURRENT.load(Ordering::Relaxed);
     for i in 0..frames {
         let prot = pe.protection_at((i * 0x1000) as u32);
-        let base = if prot.writable() { 3 } else { 2 };
+        let bits = if prot.writable() { 3 } else { 2 };
         let rights = if prot.executable() {
-            base
+            bits
         } else {
-            base | PAGE_EXECUTE_NEVER
+            bits | PAGE_EXECUTE_NEVER
         };
-        let f = CODE_FRAME_CAPS[i as usize];
+        let f = CODE_FRAME_CAPS[cur][i as usize];
         let _ = page_unmap(f);
-        let _ = page_map(f, CODE_VADDR + i * 0x1000, rights, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(f, base + i * 0x1000, rights, CAP_INIT_THREAD_VSPACE);
     }
 }
 
@@ -213,7 +216,7 @@ fn trace(event: &[u8]) {
 }
 
 fn owner() -> ResourceOwner {
-    ResourceOwner::new(DRIVER_HOST_ID, DEVICE_OBJECT_ID)
+    ResourceOwner::new(DRIVER_HOST_ID, dh().device_owner_id)
 }
 
 struct DhState {
@@ -229,30 +232,47 @@ struct DhState {
     isr_context: u64,
     stack_attached: bool,
     bad_irql: u32,
-    pdo: u64,       // the root-bus PDO device object (bottom of the stack)
-    pnp_minor: u8,  // the PnP minor of the IRP currently in flight
+    pdo: u64,              // the root-bus PDO device object (bottom of the stack)
+    pnp_minor: u8,         // the PnP minor of the IRP currently in flight
+    pdo_object_id: u64,    // the root-bus PDO identity for this device
+    device_owner_id: u64,  // the ResourceManager owner id for this device
+    code_base: u64,        // the VA the driver image is mapped at
+    int_resource_id: u64,  // the ResourceManager interrupt-resource id for this device
 }
 
-static mut DH: DhState = DhState {
-    device_object: 0,
-    completed: false,
-    last_status: 0,
-    last_info: 0,
-    mmio_base: 0,
-    mmio_mapping_id: 0,
-    interrupt_id: 0,
-    interrupt_projection: 0,
-    isr_routine: 0,
-    isr_context: 0,
-    stack_attached: false,
-    bad_irql: 0,
-    pdo: 0,
-    pnp_minor: 0,
-};
+impl DhState {
+    const fn new() -> Self {
+        DhState {
+            device_object: 0,
+            completed: false,
+            last_status: 0,
+            last_info: 0,
+            mmio_base: 0,
+            mmio_mapping_id: 0,
+            interrupt_id: 0,
+            interrupt_projection: 0,
+            isr_routine: 0,
+            isr_context: 0,
+            stack_attached: false,
+            bad_irql: 0,
+            pdo: 0,
+            pnp_minor: 0,
+            pdo_object_id: 0,
+            device_owner_id: 0,
+            code_base: 0,
+            int_resource_id: INT_RESOURCE_ID,
+        }
+    }
+}
+
+/// Per-device driver-host state (one slot per bound driver). `CURRENT` selects the device the
+/// compatibility exports read/write — set before invoking a driver's callbacks.
+static mut DH: [DhState; 2] = [DhState::new(), DhState::new()];
+static CURRENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 fn dh() -> &'static mut DhState {
-    // SAFETY: single-threaded root task; .bss is writable.
-    unsafe { &mut *core::ptr::addr_of_mut!(DH) }
+    // SAFETY: single-threaded root task; .bss is writable; CURRENT in 0..2.
+    unsafe { &mut (*core::ptr::addr_of_mut!(DH))[CURRENT.load(Ordering::Relaxed)] }
 }
 
 #[repr(C, align(16))]
@@ -340,8 +360,8 @@ extern "win64" fn ntos_iof_call_driver(device: u64, irp: u64) -> i32 {
     // SAFETY: `irp` is an IRP we built (IoStatus.Status@48); `device` is a device-object pointer.
     unsafe {
         let status = if device != 0 && device == dh().pdo {
-            // Bottom of the stack: the synthetic root bus handles this PnP minor.
-            root_bus().dispatch_pnp(PDO_OBJECT_ID, dh().pnp_minor)
+            // Bottom of the stack: the synthetic root bus handles this PnP minor for this device.
+            root_bus().dispatch_pnp(dh().pdo_object_id, dh().pnp_minor)
         } else {
             0
         };
@@ -407,7 +427,8 @@ extern "win64" fn ntos_io_connect_interrupt(
 ) -> i32 {
     // SAFETY: single-threaded service access.
     unsafe {
-        match rm().connect_interrupt(owner(), INT_RESOURCE_ID, service_routine, service_context) {
+        match rm().connect_interrupt(owner(), dh().int_resource_id, service_routine, service_context)
+        {
             Ok(interrupt_id) => {
                 let proj = alloc_blob();
                 core::ptr::write_unaligned(proj as *mut u64, interrupt_id);
@@ -478,8 +499,24 @@ extern "win64" fn ntos_stub() -> i32 {
 }
 
 #[allow(function_casts_as_integer)]
+/// `PoCallDriver(DeviceObject, Irp)` — modern behaviour is `IoCallDriver` (forward the power IRP
+/// down the stack).
+extern "win64" fn ntos_po_call_driver(device: u64, irp: u64) -> i32 {
+    ntos_iof_call_driver(device, irp)
+}
+/// `PoSetPowerState(DeviceObject, Type, State)` — the driver reports its observed power state; we
+/// echo it back (the value the driver expects on return).
+extern "win64" fn ntos_po_set_power_state(_device: u64, _typ: u32, state: u32) -> u32 {
+    state
+}
+/// `PoStartNextPowerIrp(Irp)` — legacy power-queue bookkeeping; a no-op here.
+extern "win64" fn ntos_po_start_next_power_irp(_irp: u64) {}
+
 fn export_addr(name: &str) -> u64 {
     match name {
+        "PoCallDriver" => ntos_po_call_driver as usize as u64,
+        "PoSetPowerState" => ntos_po_set_power_state as usize as u64,
+        "PoStartNextPowerIrp" => ntos_po_start_next_power_irp as usize as u64,
         "RtlInitUnicodeString" => ntos_rtl_init_unicode_string as usize as u64,
         "IoCreateDevice" => ntos_io_create_device as usize as u64,
         "IoCreateSymbolicLink" | "IoDeleteDevice" | "IoDeleteSymbolicLink" => {
@@ -656,6 +693,140 @@ unsafe fn build_resource_list(devnode: u64) -> u64 {
     buf
 }
 
+/// Build a translated `CM_RESOURCE_LIST` with explicit memory + interrupt resources (for a second
+/// device whose resources must not collide with the first).
+unsafe fn build_resource_list_explicit(mem_start: u64, mem_length: u32, vector: u32) -> u64 {
+    let buf = alloc_blob();
+    let slice = core::slice::from_raw_parts_mut(buf as *mut u8, 64);
+    let _ = nt_cm_resources::build_memory_interrupt_list(
+        slice,
+        0,
+        MemoryDescriptor {
+            start: mem_start,
+            length: mem_length,
+            flags: 0,
+            share: nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        },
+        InterruptDescriptor {
+            level: vector,
+            vector,
+            affinity: 1,
+            flags: nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
+            share: nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+        },
+    );
+    buf
+}
+
+/// Load + PnP-bind a second real driver in this host: map its image at `base` (device slot 1), run
+/// DriverEntry, call `DriverExtension->AddDevice` with its PDO, assign distinct resources, and send
+/// `IRP_MN_START_DEVICE` through the stack. Returns whether it reached Started.
+unsafe fn bind_secondary(fx: &Fixture, pnp_devnode: u64, base: u64, mem_base: u64, vector: u32) -> bool {
+    CURRENT.store(1, Ordering::Relaxed);
+    let d = dh();
+    d.pdo_object_id = fx.pdo_object_id;
+    d.device_owner_id = 20;
+    d.code_base = base;
+    d.device_object = 0;
+    d.stack_attached = false;
+    d.mmio_base = 0;
+    d.int_resource_id = INT_RESOURCE_ID + 1;
+
+    let image = match load_service_image(fx.service) {
+        Some(i) => i,
+        None => return false,
+    };
+    let pe = match nt_pe_loader::PeFile::parse(image) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let frames = (pe.size_of_image() as u64).div_ceil(0x1000);
+    map_region(base, frames);
+    let mapped = match pe.map(base) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let dst = base as *mut u8;
+    for (i, b) in mapped.bytes.iter().enumerate() {
+        core::ptr::write_volatile(dst.add(i), *b);
+    }
+    if let Ok(imports) = pe.imports() {
+        for dll in &imports {
+            for f in &dll.functions {
+                if let nt_pe_loader::ImportRef::ByName {
+                    name, iat_slot_rva, ..
+                } = f
+                {
+                    core::ptr::write_unaligned(
+                        (base + *iat_slot_rva as u64) as *mut u64,
+                        export_addr(name),
+                    );
+                }
+            }
+        }
+    }
+    pe.seed_security_cookie(base);
+    apply_wx(&pe, base, frames);
+
+    // DRIVER_OBJECT + DriverExtension, DriverEntry (sets AddDevice + MajorFunction[IRP_MJ_PNP]).
+    let driver_object = alloc_blob();
+    core::ptr::write_unaligned(driver_object as *mut i16, 4);
+    core::ptr::write_unaligned((driver_object + 2) as *mut i16, 336);
+    let driver_ext = alloc_blob();
+    core::ptr::write_unaligned((driver_object + 48) as *mut u64, driver_ext);
+    let reg_path = Box::leak(Box::new([0u8; 16])) as *mut u8 as u64;
+    let entry = base + pe.entry_point_rva() as u64;
+    let driver_entry: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
+    if driver_entry(driver_object, reg_path) != 0 {
+        return false;
+    }
+    let add_device = core::ptr::read_unaligned((driver_ext + 8) as *const u64);
+    if add_device == 0 {
+        return false;
+    }
+
+    // AddDevice(DriverObject, PDO) -> FDO.
+    let pdo = alloc_blob();
+    core::ptr::write_unaligned(pdo as *mut i16, 3);
+    dh().pdo = pdo;
+    let _ = pnp().transition(pnp_devnode, DeviceState::DriverLoaded);
+    dh().device_object = 0;
+    let add_fn: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
+    let add_status = add_fn(driver_object, pdo);
+    let fdo = dh().device_object;
+    if add_status != 0 || fdo == 0 {
+        return false;
+    }
+    let _ = pnp().transition(pnp_devnode, DeviceState::AddDeviceCalled);
+    let _ = pnp().set_fdo(pnp_devnode, fdo);
+    let _ = pnp().transition(pnp_devnode, DeviceState::DeviceStackBuilt);
+
+    // Assign distinct resources, then START through the stack.
+    rm().assign_memory(
+        owner(),
+        MEM_RESOURCE_ID + 1,
+        mem_base,
+        mem_base,
+        0x1000,
+        nt_hal_abi::MM_NON_CACHED,
+        nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
+    );
+    rm().assign_interrupt(owner(), INT_RESOURCE_ID + 1, vector, vector as u8, 1, 0);
+    let _ = pnp().transition(pnp_devnode, DeviceState::ResourcesAssigned);
+    let translated = build_resource_list_explicit(mem_base, 0x1000, vector);
+    let raw = build_resource_list_explicit(mem_base, 0x1000, vector);
+    let _ = pnp().transition(pnp_devnode, DeviceState::StartIrpSent);
+    let start_status = dispatch_pnp(driver_object, fdo, IRP_MN_START_DEVICE, raw, translated);
+    let started = start_status == 0
+        && dh().mmio_base != 0
+        && dh().interrupt_id != 0
+        && root_bus().pdo_started(fx.pdo_object_id);
+    if started {
+        let _ = pnp().transition(pnp_devnode, DeviceState::Started);
+    }
+    started
+}
+
 fn check(name: &[u8], ok: bool) {
     print_str(if ok { b"  PASS " } else { b"  FAIL " });
     print_str(name);
@@ -793,6 +964,12 @@ unsafe fn run() {
     check(b"driver_loaded_by_service", true);
     trace(b"pnp_driver_load_request");
 
+    // The primary binds in device slot 0 (mapped at CODE_VADDR, PDO FIXTURES[0], owner 10).
+    CURRENT.store(0, Ordering::Relaxed);
+    dh().pdo_object_id = FIXTURES[0].pdo_object_id;
+    dh().device_owner_id = DEVICE_OBJECT_ID;
+    dh().code_base = CODE_VADDR;
+
     let pe = match nt_pe_loader::PeFile::parse(image) {
         Ok(p) => p,
         Err(_) => {
@@ -837,7 +1014,7 @@ unsafe fn run() {
 
     // Seed a valid /GS cookie (top 16 bits zero — see nt_pe_loader::SECURITY_COOKIE_SEED).
     pe.seed_security_cookie(CODE_VADDR);
-    apply_wx(&pe, frames);
+    apply_wx(&pe, CODE_VADDR, frames);
     check(b"w_xor_x", true);
 
     // DRIVER_OBJECT + DriverExtension (DriverExtension@48, AddDevice@8).
@@ -951,7 +1128,21 @@ unsafe fn run() {
         pnp().state(devnode) == Some(DeviceState::Started),
     );
 
-    // --- Live device-tree state snapshot: the primary is Started, its siblings still Enumerated --
+    // --- Bind a SECOND real driver (FIXTURES[1] = PowerPnpMmioTest) in this same host -----------
+    // A distinct image mapped at its own base (device slot 1), distinct resources (MMIO 0x20000000,
+    // vector 6), bound through the same PnP path -> two real drivers Started in one host.
+    trace(b"pnp_second_driver_bind (PowerPnpMmioTest)");
+    let second_started = bind_secondary(
+        &FIXTURES[1],
+        pnp_devnodes[1],
+        SECOND_CODE_VADDR,
+        0x2000_0000,
+        6,
+    );
+    CURRENT.store(0, Ordering::Relaxed); // restore device 0 for the primary's IOCTLs below
+    check(b"second_driver_bound_and_started", second_started);
+
+    // --- Live device-tree state snapshot: TWO children Started, the rest Enumerated -------------
     print_str(b"  [device-tree live] \\Device\\RootBus\n");
     for (fx, &pdn) in FIXTURES.iter().zip(pnp_devnodes.iter()) {
         print_str(b"    - ");
@@ -961,9 +1152,10 @@ unsafe fn run() {
         print_str(b"\n");
     }
     check(
-        b"device_tree_live_states",
+        b"device_tree_two_children_started",
         pnp().state(pnp_devnodes[0]) == Some(DeviceState::Started)
-            && pnp_devnodes[1..]
+            && pnp().state(pnp_devnodes[1]) == Some(DeviceState::Started)
+            && pnp_devnodes[2..]
                 .iter()
                 .all(|&d| pnp().state(d) == Some(DeviceState::Enumerated)),
     );

@@ -89,3 +89,13 @@ creates a pnp devnode per fixture (all Enumerated); the primary reuses pnp_devno
 and advances to Started. Live-tree snapshot shows per-child state. 30 PASS / 0 FAIL + 185 kernel.
 New: device_tree_all_children_enumerated (all 5 Enumerated), device_tree_live_states (primary Started,
 siblings Enumerated). state_label() DeviceState->str helper.
+
+## Increment 7 done (2026-07-06): TWO real drivers bound + Started in one host
+driver-host-pnp now loads + binds TWO distinct driver binaries: PnpMmioInterruptTest (device 0 @
+0x140000000) + PowerPnpMmioTest (device 1 @ 0x160000000), both reaching Started. Per-device state
+(DH[2] + CURRENT index; per-device pdo_object_id/device_owner_id/code_base/int_resource_id), two
+mapped bases, distinct resources (MMIO 0x10000000/vec5 vs 0x20000000/vec6). Added Po* export stubs
+(PoCallDriver/PoSetPowerState/PoStartNextPowerIrp). bind_secondary() does the core lifecycle. Live
+tree: two children Started, rest Enumerated. 31 PASS / 0 FAIL + 185 kernel. New: second_driver_bound_
+and_started, device_tree_two_children_started. KEY BUG fixed: ntos_io_connect_interrupt hardcoded
+INT_RESOURCE_ID -> per-device int_resource_id (the 2nd driver's interrupt was assigned as +1).
