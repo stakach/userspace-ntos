@@ -1634,11 +1634,17 @@ unsafe fn run() {
 
     // --- Genuine cross-VSpace client: an ISOLATED component (own CSpace/VSpace) opens the KMDF
     // child's device interface + issues an IOCTL entirely over a SURT ring, mediated by this host.
-    trace(b"kmdf_surt_xvspace_client (spawn isolated component -> open interface -> IOCTL over ring)");
-    let (srv_open_ok, srv_ioctl_ok, client_verdict) = run_surt_interface_client();
+    trace(b"kmdf_surt_xvspace_client (spawn isolated component -> open interface -> IOCTL over ring -> crash)");
+    let (srv_open_ok, srv_ioctl_ok, client_verdict, driver_fault_caught) =
+        run_surt_interface_client();
     check(b"surt_open_interface_over_ring", srv_open_ok);
     check(b"surt_ioctl_ping_over_ring", srv_ioctl_ok);
     check(b"surt_xvspace_client_verdict_all_passed", client_verdict == 2);
+    // The isolated driver deliberately crashed; the kernel caught the fault on its
+    // fault endpoint and kept running — no bluescreen. (If it had NOT survived, we'd
+    // never reach the checks below and the microtest would hang.)
+    check(b"isolated_driver_fault_caught_by_kernel", driver_fault_caught);
+    check(b"nt_kernel_survives_driver_crash", true);
 
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
     let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
@@ -1752,6 +1758,10 @@ pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
 pub const CT_RESULT: u64 = 5;
+// The isolated driver's own cptr to its fault endpoint. The kernel's legacy
+// TCBSetSpace resolves the fault-handler cptr in the FAULTER's cspace, so the fault
+// EP must live in the client's CNode (a second cap to the root's fault endpoint).
+pub const CT_FAULT: u64 = 6;
 const CN_RADIX: u32 = 5;
 const CN_GUARD_BADGE: u64 = 59;
 
@@ -1847,13 +1857,19 @@ unsafe fn su_build_client_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64
 }
 
 /// Spawn the isolated client (own CSpace/VSpace) and serve its two ring requests
-/// (OP_OPEN + OP_IOCTL) by mediating them through the shared nt-wdf-kmdf runtime.
-/// Returns `(server_open_ok, server_ioctl_ok, client_verdict)`.
-unsafe fn run_surt_interface_client() -> (bool, bool, u64) {
+/// (OP_OPEN + OP_IOCTL) by mediating them through the shared nt-wdf-kmdf runtime,
+/// then catch its deliberate crash on the fault endpoint. Returns
+/// `(server_open_ok, server_ioctl_ok, client_verdict, driver_fault_caught)`.
+unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
     // Shared objects — the broker (root task) owns the untyped, so it creates them.
     let n_sub = su_make_object(OBJ_NOTIFICATION);
     let n_comp = su_make_object(OBJ_NOTIFICATION);
     let result_ep = su_make_object(OBJ_ENDPOINT);
+    // The isolated driver's FAULT ENDPOINT: if it crashes, the kernel delivers the
+    // fault here (a blocking Call) instead of taking the system down — the NT-kernel
+    // side (this root task) receives it and survives. Resolved in the setter's
+    // cspace by TCB_SetSpace, so the isolated driver never needs it in its own CNode.
+    let fault_ep = su_make_object(OBJ_ENDPOINT);
     let f_sub = su_alloc_frame();
     let f_comp = su_alloc_frame();
     let f_req = su_alloc_frame();
@@ -1895,13 +1911,17 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64) {
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw_cn);
     let cnode = alloc_slot();
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw_cn, CN_GUARD_BADGE);
+    let fault_ep_c = su_copy_cap(fault_ep); // the client's own cap to the fault endpoint
     seed_client_cnode(cnode, CT_PML4, pml4);
     seed_client_cnode(cnode, CT_N_SUB, n_sub_c);
     seed_client_cnode(cnode, CT_N_COMP, n_comp_c);
     seed_client_cnode(cnode, CT_RESULT, result_c);
+    seed_client_cnode(cnode, CT_FAULT, fault_ep_c);
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    let _ = tcb_set_space(tcb, 0, cnode, pml4);
+    // Route this driver's faults to CT_FAULT (resolved in ITS cspace) → the fault
+    // endpoint the NT-kernel side (this root task) waits on.
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, surt_client::client_entry as u64, stack_top, 0);
@@ -1912,11 +1932,11 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64) {
     // Serve exactly the client's two requests, mediating each through the runtime.
     let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
         Ok(c) => c,
-        Err(_) => return (false, false, 0),
+        Err(_) => return (false, false, 0, false),
     };
     let mut completions = match Producer::<SurtCqe>::attach(COMP_RING_VADDR as *mut u8, RING_LEN) {
         Ok(p) => p,
-        Err(_) => return (false, false, 0),
+        Err(_) => return (false, false, 0, false),
     };
     let wait_requests = Sel4Notify::new(&ENV, n_sub);
     let signal_completion = Sel4Notify::new(&ENV, n_comp);
@@ -1974,7 +1994,21 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64) {
 
     // The client (in its own VSpace) reports how many of its two checks passed.
     let (_r, _b, _i, verdict) = ep_recv(result_ep);
-    (srv_open_ok, srv_ioctl_ok, verdict)
+
+    // Now catch the isolated driver's deliberate crash. The kernel delivers the fault
+    // to fault_ep as a blocking Call; the faulter is left dead-blocked while we survive.
+    // The message label is the seL4 fault type (6 = VMFault); mr0 is the faulting IP.
+    let (_z, _badge, fault_info, fault_ip) = ep_recv(fault_ep);
+    let fault_type = fault_info >> 12; // endpoint.rs: msg_info = (label << 12) | length
+    let driver_fault_caught = fault_type == 6; // seL4_Fault_VMFault
+    print_str(b"    [nt-kernel] caught isolated-driver fault: type=");
+    print_u64(fault_type);
+    print_str(b" ip=");
+    print_u64(fault_ip);
+    print_str(b" -- driver process dead, kernel alive (no bluescreen)\n");
+    // Deliberately do NOT reply: the crashed driver stays dead. A real NT kernel would
+    // now tear it down / restart it; here we simply continue, proving liveness.
+    (srv_open_ok, srv_ioctl_ok, verdict, driver_fault_caught)
 }
 
 unsafe fn seed_client_cnode(cnode: u64, dest_slot: u64, src: u64) {

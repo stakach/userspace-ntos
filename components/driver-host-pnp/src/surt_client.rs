@@ -131,5 +131,12 @@ pub unsafe extern "C" fn client_entry() -> ! {
     );
 
     let _ = ep_send_one(CT_RESULT, passed);
+
+    // Crash-survival demo: deliberately fault (a wild write — the kind of bug that
+    // bluescreens Windows). Because this driver runs in its OWN VSpace with a fault
+    // endpoint routed to the NT kernel, the kernel catches the fault and survives;
+    // only this isolated driver process dies. Control never returns from the write.
+    print_str(b"    [surt-client] deliberately faulting (simulated driver crash)\n");
+    core::ptr::write_volatile(0xDEAD_0000 as *mut u64, 0);
     park()
 }

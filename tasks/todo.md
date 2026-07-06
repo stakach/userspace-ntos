@@ -132,3 +132,19 @@ device touch. New: src/surt_client.rs (alloc-free client_entry), SURT broker/ser
 _client), surt-sel4="0.1" dep. Protocol: OP_OPEN(guid)->detail0=fdo+rep=symlink, OP_IOCTL(user_data=fdo,
 req=[ioctl])->rep=output. 3 checks: surt_open_interface_over_ring, surt_ioctl_ping_over_ring,
 surt_xvspace_client_verdict_all_passed. First QEMU run clean, no #PF/hang.
+
+## MILESTONE (started 2026-07-06): Isolated-driver NT kernel — crash-survivable, no bluescreens
+Vision (user): isolate ALL drivers (WDM/KMDF/UMDF) into their own seL4 processes; the driver-host is
+the "NT kernel" (WDF runtime + device model + hardware caps) reached over the SURT reflector ring; a
+driver crash is caught on a fault endpoint — the kernel survives (no bluescreen). Reuse nt-pe-loader +
+nt-wdf-kmdf + the ring for both driver styles; the only difference is in-process vs out-of-process.
+
+- [ ] Part A — Crash survival: give the isolated driver component a FAULT ENDPOINT (tcb_set_space
+      fault_ep). It does its ring work (open interface + IOCTL), then deliberately faults. The NT-kernel
+      side (driver-host root task) catches the fault via ep_recv on the fault EP, decodes it (fault
+      type + address), reports "isolated driver crashed, kernel survived", and continues run() (proving
+      liveness). Checks: driver_fault_caught_by_kernel, kernel_survives_driver_crash.
+- [ ] Part B — Fully separate binary: port kernel src/elf.rs into a userspace loader; separate driver-
+      host-um crate -> own ELF, embedded + loaded by driver-host-pnp into a PRIVATE VSpace (own image).
+      Re-run ring + crash-survival from the separate binary.
+- [ ] Later: load a real KMDF/UMDF driver in the isolated host via nt-pe-loader; restart-after-crash.
