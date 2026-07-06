@@ -22,6 +22,7 @@ nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-request = { path = "../../crates/nt-wdf-request" }
 nt-wdf-queue = { path = "../../crates/nt-wdf-queue" }
 nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
+nt-wdf-kmdf = { path = "../../crates/nt-wdf-kmdf" }
 nt-config-manager = { path = "../../crates/nt-config-manager" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
