@@ -11,7 +11,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{addr_of_mut, null_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 128 * 1024;
+const HEAP_SIZE: usize = 1024 * 1024;
 
 #[repr(align(16))]
 #[allow(dead_code)] // accessed only via a raw pointer (`addr_of_mut!`)

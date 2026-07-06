@@ -99,3 +99,16 @@ mapped bases, distinct resources (MMIO 0x10000000/vec5 vs 0x20000000/vec6). Adde
 tree: two children Started, rest Enumerated. 31 PASS / 0 FAIL + 185 kernel. New: second_driver_bound_
 and_started, device_tree_two_children_started. KEY BUG fixed: ntos_io_connect_interrupt hardcoded
 INT_RESOURCE_ID -> per-device int_resource_id (the 2nd driver's interrupt was assigned as +1).
+
+## Increment 8 done (2026-07-06): KMDF driver as a SECOND FAMILY in the WDM host
+driver-host-pnp now binds a KMDF driver (KmdfLoaderCompatTest, device slot 2 @0x180000000) alongside
+the two WDM drivers, proving the WDF runtime coexists with the WDM export surface in one host. Added
+a minimal WDF surface: WdfVersionBind (negotiate 1.15) + 444-entry function table + WdfDriverCreate
+(installs the WDM AddDevice bridge + framework PnP dispatch) + WdfDeviceCreate (FDO) + WdfObjectGet
+TypedContextWorker (context) + the WdfDeviceInit setters + CFG fixup. PnP calls the bridge ->
+EvtDriverDeviceAdd -> WdfDeviceCreate (FDO). This driver's FULL EvtDeviceAdd (registry params + device
+interface + I/O queue) needs direg's complete WDF runtime, so WdfDriverOpenParametersRegistryKey/
+WdfDeviceCreateDeviceInterface/WdfIoQueueCreate report failure -> EvtDeviceAdd unwinds cleanly after
+the FDO. 32 PASS / 0 FAIL + 185 kernel. New: kmdf_family_binds_alongside_wdm, two_wdm_started_plus_
+kmdf_bound. Fixes: CODE_FRAME_CAPS [[u64;16];3], HEAP 128K->1M (3 drivers' pe.map). KMDF child reaches
+AddDeviceCalled (FDO created); full Started for KMDF is direg's runtime.
