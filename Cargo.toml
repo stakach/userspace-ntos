@@ -53,6 +53,7 @@ members = [
     "crates/nt-power-manager",
     "crates/nt-pnp-manager",
     "crates/nt-root-bus",
+    "crates/nt-um-abi",
     "crates/nt-resource-manager",
     "crates/nt-register-access",
     "crates/nt-sim-device",
@@ -121,6 +122,7 @@ nt-user-host = { path = "crates/nt-user-host" }
 nt-power-manager = { path = "crates/nt-power-manager" }
 nt-pnp-manager = { path = "crates/nt-pnp-manager" }
 nt-root-bus = { path = "crates/nt-root-bus" }
+nt-um-abi = { path = "crates/nt-um-abi" }
 nt-resource-manager = { path = "crates/nt-resource-manager" }
 nt-register-access = { path = "crates/nt-register-access" }
 nt-sim-device = { path = "crates/nt-sim-device" }

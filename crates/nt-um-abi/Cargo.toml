@@ -1,0 +1,11 @@
+[package]
+name = "nt-um-abi"
+description = "Shared ABI between the driver-host 'NT kernel' (server) and an out-of-process, isolated driver-host-um driver component (client): the SURT reflector ring vaddrs, ring/data frame layout, protocol opcodes, the client's CNode cptr slots, and the KMDF device-interface identifiers used across the address-space boundary. no_std, no deps — the single source of truth both binaries compile against."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

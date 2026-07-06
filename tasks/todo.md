@@ -148,3 +148,14 @@ nt-wdf-kmdf + the ring for both driver styles; the only difference is in-process
       host-um crate -> own ELF, embedded + loaded by driver-host-pnp into a PRIVATE VSpace (own image).
       Re-run ring + crash-survival from the separate binary.
 - [ ] Later: load a real KMDF/UMDF driver in the isolated host via nt-pe-loader; restart-after-crash.
+
+## Part B + Restart/health milestone (started 2026-07-06)
+- [ ] Part B: fully separate binary. nt-um-abi crate (shared ABI consts); src/elf_loader.rs (port
+      kernel elf.rs); components/driver-host-um (own ELF @0x1_0090_0000); driver-host-pnp loads its
+      PT_LOAD segments into a private VSpace + spawns; build.sh builds um first.
+- [ ] Restart supervisor (nt-driver-supervisor crate, host-tested): on caught fault, restart the
+      driver; exponential backoff (BASE<<n) on repeated rapid crashes; "healthy uptime" = the driver
+      reached a health checkpoint over the ring (crash-before-health = rapid crash); after MAX_RAPID
+      consecutive rapid crashes -> DISABLE: write a flag to the service's ConfigManager registry
+      (Start=4 / CrashCount) so userspace can see/disable it; no infinite crash loop. QEMU demo shows
+      restart + backoff + disable-in-registry; unit tests cover health-reset + backoff + threshold.

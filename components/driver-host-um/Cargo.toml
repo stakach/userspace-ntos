@@ -1,0 +1,25 @@
+# The isolated, out-of-process user-mode driver component: its OWN ELF, loaded by
+# driver-host-pnp (the "NT kernel") into a private VSpace. Reaches the device only
+# over the SURT reflector ring; a genuinely separate binary. Standalone workspace.
+[workspace]
+
+[package]
+name = "ntos-driver-host-um"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-driver-host-um"
+path = "src/main.rs"
+
+[dependencies]
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
+nt-um-abi = { path = "../../crates/nt-um-abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+codegen-units = 1

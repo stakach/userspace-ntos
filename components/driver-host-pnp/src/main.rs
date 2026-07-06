@@ -19,7 +19,12 @@
 extern crate alloc;
 
 mod allocator;
-mod surt_client;
+mod elf_loader;
+
+/// The isolated user-mode driver's OWN ELF (a separate binary), embedded so the
+/// driver-host can load it into a private VSpace. Produced by driver-host-um/build.sh
+/// and staged by build.sh before this crate compiles.
+static UM_DRIVER_ELF: &[u8] = include_bytes!("../um-driver.elf");
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1736,10 +1741,9 @@ impl Sel4Env for KernelEnv {
 }
 pub static ENV: KernelEnv = KernelEnv;
 
-// Component image base (the link base — the client maps the shared image here).
-pub const IMAGE_BASE: u64 = 0x0000_0100_0040_0000;
-// A dedicated 2 MiB PT well clear of the image (~1.3 MiB from IMAGE_BASE) and the
-// driver images (0x1_4000_0000+): the SURT ring/data frames, client stack + IPC buffer.
+// A dedicated 2 MiB PT well clear of the kernel image and the driver images
+// (0x1_4000_0000+): the SURT ring/data frames, the isolated driver's stack + IPC
+// buffer, and its own ELF image (linked at UM_IMAGE_BASE = SURT_BASE + 0x100000).
 const SURT_BASE: u64 = 0x0000_0100_0080_0000;
 pub const SUB_RING_VADDR: u64 = SURT_BASE;
 pub const COMP_RING_VADDR: u64 = SURT_BASE + 0x1000;
@@ -1773,8 +1777,6 @@ pub const OP_IOCTL: u16 = 2; // user_data = device handle, req = [ioctl:u32]; re
 pub const STATUS_SUCCESS: i32 = 0;
 pub const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
 
-static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
-static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn su_alloc_frame() -> u64 {
     let s = alloc_slot();
@@ -1817,33 +1819,60 @@ unsafe fn su_map_surt_frames(vspace: u64, sub: u64, comp: u64, req: u64, rep: u6
     let _ = page_map(rep, REP_DATA_VADDR, RW_NX, vspace);
 }
 
-/// Build the isolated client's VSpace: the shared image frames read-only + executable
-/// (own PT at `IMAGE_BASE`), then a second PT at `SURT_BASE` with the stack + the four
-/// shared frames. Returns the client's PML4.
-unsafe fn su_build_client_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
-    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
-    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+/// A root-vspace scratch page for staging the isolated driver's ELF segment frames
+/// before they are mapped (with W^X rights) into the driver's own VSpace.
+const SEG_SCRATCH_VADDR: u64 = SURT_BASE + 0x5000;
+
+/// Build the isolated driver's VSpace by loading its OWN ELF (`UM_DRIVER_ELF`) into
+/// PRIVATE frames at its linked vaddrs, plus the stack + the four shared reflector
+/// frames. One PT at `SURT_BASE` covers the rings/stack (0x…80_xxxx) and the driver
+/// image (0x…90_xxxx). Returns `(pml4, entry_point)` — `(0, 0)` if the ELF is bad.
+unsafe fn su_build_um_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> (u64, u64) {
+    let img = match elf_loader::parse(UM_DRIVER_ELF) {
+        Ok(i) => i,
+        Err(_) => return (0, 0),
+    };
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    // Image region PT (0x1_0040_0000) — shared image frames, read-only + executable.
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt_img = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt_img);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt_img, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
-    for i in 0..img_count {
-        let cp = alloc_slot();
-        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
-        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, SURT_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, SURT_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, SURT_BASE, pml4);
+
+    // Load each PT_LOAD segment into private frames at its linked vaddr, honouring W^X.
+    for seg in img.load_segments() {
+        let frames = seg.mem_size.div_ceil(0x1000);
+        for i in 0..frames {
+            let f = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+            // Stage the frame in the root's VSpace: zero it, then copy this frame's
+            // file bytes (memsz > filesz tail stays zero — the .bss of the segment).
+            let _ = page_map(f, SEG_SCRATCH_VADDR, 3, CAP_INIT_THREAD_VSPACE);
+            let dst = SEG_SCRATCH_VADDR as *mut u8;
+            for j in 0..0x1000usize {
+                core::ptr::write_volatile(dst.add(j), 0);
+            }
+            let frame_off = i * 0x1000;
+            for j in 0..0x1000u64 {
+                let seg_off = frame_off + j;
+                if seg_off < seg.file_size {
+                    let b = UM_DRIVER_ELF[(seg.file_off + seg_off) as usize];
+                    core::ptr::write_volatile(dst.add(j as usize), b);
+                }
+            }
+            let _ = page_unmap(f);
+            let base = if seg.writable() { 3 } else { 2 };
+            let rights = if seg.executable() { base } else { base | PAGE_EXECUTE_NEVER };
+            let _ = page_map(f, seg.vaddr + frame_off, rights, pml4);
+        }
     }
-    // SURT region PT (0x1_0080_0000) — private stack + the four shared frames.
-    let pt_surt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt_surt);
-    let _ = paging_struct_map(pt_surt, LBL_X86_PAGE_TABLE_MAP, SURT_BASE, pml4);
+
+    // Private stack + the four shared reflector frames (RW, non-executable).
     for i in 0..CLIENT_STACK_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
@@ -1853,7 +1882,7 @@ unsafe fn su_build_client_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64
     let _ = page_map(comp, COMP_RING_VADDR, RW_NX, pml4);
     let _ = page_map(req, REQ_DATA_VADDR, RW_NX, pml4);
     let _ = page_map(rep, REP_DATA_VADDR, RW_NX, pml4);
-    pml4
+    (pml4, img.entry)
 }
 
 /// Spawn the isolated client (own CSpace/VSpace) and serve its two ring requests
@@ -1903,7 +1932,7 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
     let f_rep_c = su_copy_cap(f_rep);
 
     // Spawn the isolated client.
-    let pml4 = su_build_client_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
+    let (pml4, um_entry) = su_build_um_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
     let _ = page_map(ipcbuf, CLIENT_IPCBUF_VADDR, RW_NX, pml4);
@@ -1924,7 +1953,7 @@ unsafe fn run_surt_interface_client() -> (bool, bool, u64, bool) {
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, surt_client::client_entry as u64, stack_top, 0);
+    let _ = tcb_write_registers(tcb, um_entry, stack_top, 0);
     let _ = tcb_set_priority(tcb, 100);
     su_attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
@@ -2020,10 +2049,6 @@ unsafe fn seed_client_cnode(cnode: u64, dest_slot: u64, src: u64) {
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
-    // The shared image frames (mapped read-only into the spawned SURT client's VSpace).
-    let img = bi.user_image_frames;
-    IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
-    IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
 
     print_str(b"[ntos-dhp] PnP Manager: service-DB-driven bind of PnpMmioInterruptTest.sys via root-bus PDO\n");
     run();
