@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
 nt-status = { path = "../../crates/nt-status" }
 nt-kernel-abi = { path = "../../crates/nt-kernel-abi" }
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }

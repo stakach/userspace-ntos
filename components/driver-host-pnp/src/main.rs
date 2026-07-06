@@ -19,6 +19,7 @@
 extern crate alloc;
 
 mod allocator;
+mod surt_client;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -608,9 +609,9 @@ extern "win64" fn kmdf_fx_pnp_dispatch(fdo: u64, irp: u64) -> i32 {
 
 // The KMDF device's IOCTL interface (KmdfInterfaceRegistryTest).
 /// The device interface class the KMDF child registers (WdfDeviceCreateDeviceInterface).
-const KMDF_IFACE_GUID: &str = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";
-const KMDF_PING_MAGIC: u32 = 0x4946_4B4D; // "MKFI"
-const KMDF_IOCTL_PING: u32 = 0x0022_2200;
+pub const KMDF_IFACE_GUID: &str = "{9a7b0b24-6e57-4c51-ad3c-6d9f5f0e0001}";
+pub const KMDF_PING_MAGIC: u32 = 0x4946_4B4D; // "MKFI"
+pub const KMDF_IOCTL_PING: u32 = 0x0022_2200;
 const KMDF_IOCTL_GET_CONFIG: u32 = 0x0022_2204; // Answer@0xc
 const KMDF_IOCTL_GET_GREETING: u32 = 0x0022_220C; // wchar greeting @ offset 4
 const KMDF_IOCTL_ECHO: u32 = 0x0022_2218;
@@ -1631,6 +1632,14 @@ unsafe fn run() {
         opened_fdo != 0 && st == 0 && info == 4 && ping == KMDF_PING_MAGIC,
     );
 
+    // --- Genuine cross-VSpace client: an ISOLATED component (own CSpace/VSpace) opens the KMDF
+    // child's device interface + issues an IOCTL entirely over a SURT ring, mediated by this host.
+    trace(b"kmdf_surt_xvspace_client (spawn isolated component -> open interface -> IOCTL over ring)");
+    let (srv_open_ok, srv_ioctl_ok, client_verdict) = run_surt_interface_client();
+    check(b"surt_open_interface_over_ring", srv_open_ok);
+    check(b"surt_ioctl_ping_over_ring", srv_ioctl_ok);
+    check(b"surt_xvspace_client_verdict_all_passed", client_verdict == 2);
+
     trace(b"kmdf_query_stop + kmdf_stop (EvtDeviceD0Exit / D3)");
     let _ = dispatch_pnp(kdrv, kfdo, IRP_MN_QUERY_STOP_DEVICE, 0, 0);
     let _ = pnp().transition(kdevnode, DeviceState::QueryStopPending);
@@ -1689,11 +1698,298 @@ unsafe fn run() {
     print_str(b"    START_DEVICE delivered raw + translated CM_RESOURCE_LIST; interfaces: none (WDM MMIO)\n");
 }
 
+// ============================================================================
+// Cross-VSpace SURT client: a genuinely isolated component (its own CSpace +
+// VSpace) opens the KMDF child's device interface and issues an IOCTL entirely
+// over a SURT ring. The driver-host root task is the SERVER (it hosts the KMDF
+// device + the shared nt-wdf-kmdf runtime); it spawns ONE isolated client and
+// mediates every device touch over the ring — the client has no access to the
+// WDF runtime, the Configuration Manager, or the device object. (See
+// components/object-service for the two-spawned-component variant.)
+// ============================================================================
+
+use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
+use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
+use surt_sel4::{drain_blocking, CPtr, Sel4Env, Sel4Notify};
+
+/// SURT's wakeup contract: signal a notification / wait on it (two seL4 syscalls).
+pub struct KernelEnv;
+impl Sel4Env for KernelEnv {
+    fn signal(&self, ntfn: CPtr) {
+        // SAFETY: `ntfn` is a Notification cap; Send length 0 is seL4_Signal.
+        unsafe {
+            syscall5(SYS_SEND, ntfn, 0, 0, 0, 0);
+        }
+    }
+    fn wait(&self, ntfn: CPtr) {
+        // SAFETY: `ntfn` is a Notification cap; Recv is seL4_Wait (badge discarded).
+        unsafe {
+            let _ = ep_recv(ntfn);
+        }
+    }
+}
+pub static ENV: KernelEnv = KernelEnv;
+
+// Component image base (the link base — the client maps the shared image here).
+pub const IMAGE_BASE: u64 = 0x0000_0100_0040_0000;
+// A dedicated 2 MiB PT well clear of the image (~1.3 MiB from IMAGE_BASE) and the
+// driver images (0x1_4000_0000+): the SURT ring/data frames, client stack + IPC buffer.
+const SURT_BASE: u64 = 0x0000_0100_0080_0000;
+pub const SUB_RING_VADDR: u64 = SURT_BASE;
+pub const COMP_RING_VADDR: u64 = SURT_BASE + 0x1000;
+pub const REQ_DATA_VADDR: u64 = SURT_BASE + 0x2000;
+pub const REP_DATA_VADDR: u64 = SURT_BASE + 0x3000;
+const CLIENT_STACK_BASE: u64 = SURT_BASE + 0x8000;
+const CLIENT_STACK_FRAMES: u64 = 4; // 16 KiB
+const CLIENT_IPCBUF_VADDR: u64 = SURT_BASE + 0xF000;
+pub const RING_LEN: usize = 4096;
+const QLEN: u32 = 8;
+/// Read/write, non-executable — the rights for every data region (rings, stack, ipcbuf).
+const RW_NX: u64 = 3 | PAGE_EXECUTE_NEVER;
+
+// The client's own CNode slots (radix-5, guard-59 → direct indexing).
+pub const CT_PML4: u64 = 2;
+pub const CT_N_SUB: u64 = 3;
+pub const CT_N_COMP: u64 = 4;
+pub const CT_RESULT: u64 = 5;
+const CN_RADIX: u32 = 5;
+const CN_GUARD_BADGE: u64 = 59;
+
+/// Ring protocol: opcodes the client sends in `SurtSqe.opcode`.
+pub const OP_OPEN: u16 = 1; // req = interface GUID (utf8); reply = symlink, detail0 = device handle
+pub const OP_IOCTL: u16 = 2; // user_data = device handle, req = [ioctl:u32]; reply = output bytes
+
+/// `NTSTATUS` values the ring protocol carries in `SurtCqe.status`.
+pub const STATUS_SUCCESS: i32 = 0;
+pub const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
+
+static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
+static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn su_alloc_frame() -> u64 {
+    let s = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
+    s
+}
+unsafe fn su_make_object(obj: u64) -> u64 {
+    let s = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
+    s
+}
+unsafe fn su_copy_cap(src: u64) -> u64 {
+    let d = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, d, src, 0);
+    d
+}
+unsafe fn su_attach_sched_context(tcb: u64) {
+    let sc = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
+    let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 10, 10);
+    let _ = sched_context_bind(sc, tcb);
+}
+
+/// Build the SURT PT at `SURT_BASE` in `vspace` and map the four given frame caps
+/// RW-NX at the ring/data vaddrs. Paging-struct maps that hit an existing PDPT/PD
+/// (the server's own vspace) error out harmlessly.
+unsafe fn su_map_surt_frames(vspace: u64, sub: u64, comp: u64, req: u64, rep: u64) {
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, SURT_BASE, vspace);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, SURT_BASE, vspace);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, SURT_BASE, vspace);
+    let _ = page_map(sub, SUB_RING_VADDR, RW_NX, vspace);
+    let _ = page_map(comp, COMP_RING_VADDR, RW_NX, vspace);
+    let _ = page_map(req, REQ_DATA_VADDR, RW_NX, vspace);
+    let _ = page_map(rep, REP_DATA_VADDR, RW_NX, vspace);
+}
+
+/// Build the isolated client's VSpace: the shared image frames read-only + executable
+/// (own PT at `IMAGE_BASE`), then a second PT at `SURT_BASE` with the stack + the four
+/// shared frames. Returns the client's PML4.
+unsafe fn su_build_client_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    // Image region PT (0x1_0040_0000) — shared image frames, read-only + executable.
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt_img = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt_img);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt_img, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    // SURT region PT (0x1_0080_0000) — private stack + the four shared frames.
+    let pt_surt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt_surt);
+    let _ = paging_struct_map(pt_surt, LBL_X86_PAGE_TABLE_MAP, SURT_BASE, pml4);
+    for i in 0..CLIENT_STACK_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, CLIENT_STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let _ = page_map(sub, SUB_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(comp, COMP_RING_VADDR, RW_NX, pml4);
+    let _ = page_map(req, REQ_DATA_VADDR, RW_NX, pml4);
+    let _ = page_map(rep, REP_DATA_VADDR, RW_NX, pml4);
+    pml4
+}
+
+/// Spawn the isolated client (own CSpace/VSpace) and serve its two ring requests
+/// (OP_OPEN + OP_IOCTL) by mediating them through the shared nt-wdf-kmdf runtime.
+/// Returns `(server_open_ok, server_ioctl_ok, client_verdict)`.
+unsafe fn run_surt_interface_client() -> (bool, bool, u64) {
+    // Shared objects — the broker (root task) owns the untyped, so it creates them.
+    let n_sub = su_make_object(OBJ_NOTIFICATION);
+    let n_comp = su_make_object(OBJ_NOTIFICATION);
+    let result_ep = su_make_object(OBJ_ENDPOINT);
+    let f_sub = su_alloc_frame();
+    let f_comp = su_alloc_frame();
+    let f_req = su_alloc_frame();
+    let f_rep = su_alloc_frame();
+
+    // Map the frames into the SERVER (root) VSpace + lay out both ring headers up
+    // front, so both sides just `attach` (no producer/consumer init race).
+    su_map_surt_frames(CAP_INIT_THREAD_VSPACE, f_sub, f_comp, f_req, f_rep);
+    let cfg_sub = RingConfig {
+        queue_len: QLEN,
+        ring_id: 1,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    let _ = init_ring::<SurtSqe>(SUB_RING_VADDR as *mut u8, RING_LEN, &cfg_sub);
+    let cfg_comp = RingConfig {
+        queue_len: QLEN,
+        ring_id: 2,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    let _ = init_ring::<SurtCqe>(COMP_RING_VADDR as *mut u8, RING_LEN, &cfg_comp);
+
+    // A frame/notification cap serves one CSpace/VSpace; make a second cap per object for the client.
+    let n_sub_c = su_copy_cap(n_sub);
+    let n_comp_c = su_copy_cap(n_comp);
+    let result_c = su_copy_cap(result_ep);
+    let f_sub_c = su_copy_cap(f_sub);
+    let f_comp_c = su_copy_cap(f_comp);
+    let f_req_c = su_copy_cap(f_req);
+    let f_rep_c = su_copy_cap(f_rep);
+
+    // Spawn the isolated client.
+    let pml4 = su_build_client_vspace(f_sub_c, f_comp_c, f_req_c, f_rep_c);
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, CLIENT_IPCBUF_VADDR, RW_NX, pml4);
+    let raw_cn = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw_cn);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw_cn, CN_GUARD_BADGE);
+    seed_client_cnode(cnode, CT_PML4, pml4);
+    seed_client_cnode(cnode, CT_N_SUB, n_sub_c);
+    seed_client_cnode(cnode, CT_N_COMP, n_comp_c);
+    seed_client_cnode(cnode, CT_RESULT, result_c);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, 0, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CLIENT_IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = CLIENT_STACK_BASE + CLIENT_STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, surt_client::client_entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    su_attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+
+    // Serve exactly the client's two requests, mediating each through the runtime.
+    let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
+        Ok(c) => c,
+        Err(_) => return (false, false, 0),
+    };
+    let mut completions = match Producer::<SurtCqe>::attach(COMP_RING_VADDR as *mut u8, RING_LEN) {
+        Ok(p) => p,
+        Err(_) => return (false, false, 0),
+    };
+    let wait_requests = Sel4Notify::new(&ENV, n_sub);
+    let signal_completion = Sel4Notify::new(&ENV, n_comp);
+    let kfdo = nt_wdf_kmdf::device();
+
+    let mut served = 0u32;
+    let mut srv_open_ok = false;
+    let mut srv_ioctl_ok = false;
+    let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
+        let mut cqe = SurtCqe {
+            request_id: sqe.request_id,
+            ..Default::default()
+        };
+        match sqe.opcode {
+            OP_OPEN => {
+                let guid_bytes =
+                    core::slice::from_raw_parts(REQ_DATA_VADDR as *const u8, sqe.len as usize);
+                let guid = core::str::from_utf8(guid_bytes).unwrap_or("");
+                if let Some((link, fdo)) = nt_wdf_kmdf::open_interface(guid) {
+                    let bytes = link.as_bytes();
+                    let dst = REP_DATA_VADDR as *mut u8;
+                    for (i, b) in bytes.iter().enumerate() {
+                        core::ptr::write_volatile(dst.add(i), *b);
+                    }
+                    cqe.status = STATUS_SUCCESS;
+                    cqe.information = bytes.len() as u64;
+                    cqe.detail0 = fdo;
+                    srv_open_ok = fdo != 0 && fdo == kfdo;
+                } else {
+                    cqe.status = STATUS_UNSUCCESSFUL;
+                }
+            }
+            OP_IOCTL => {
+                let ioctl = core::ptr::read_unaligned(REQ_DATA_VADDR as *const u32);
+                let (st, info, out) = run_kmdf_ioctl(sqe.user_data, ioctl, &[], 4);
+                let dst = REP_DATA_VADDR as *mut u8;
+                for (i, b) in out.iter().enumerate().take(4) {
+                    core::ptr::write_volatile(dst.add(i), *b);
+                }
+                cqe.status = st;
+                cqe.information = 4;
+                cqe.detail0 = info;
+                let magic = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+                srv_ioctl_ok = st == STATUS_SUCCESS && info == 4 && magic == KMDF_PING_MAGIC;
+            }
+            _ => cqe.status = STATUS_UNSUCCESSFUL,
+        }
+        while completions.try_push(cqe).is_err() {
+            yield_now();
+        }
+        let _ = completions.notify_consumer(&signal_completion);
+        served += 1;
+        served < 2
+    });
+
+    // The client (in its own VSpace) reports how many of its two checks passed.
+    let (_r, _b, _i, verdict) = ep_recv(result_ep);
+    (srv_open_ok, srv_ioctl_ok, verdict)
+}
+
+unsafe fn seed_client_cnode(cnode: u64, dest_slot: u64, src: u64) {
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, dest_slot, src, 0);
+}
+
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
+    // The shared image frames (mapped read-only into the spawned SURT client's VSpace).
+    let img = bi.user_image_frames;
+    IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
+    IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
 
     print_str(b"[ntos-dhp] PnP Manager: service-DB-driven bind of PnpMmioInterruptTest.sys via root-bus PDO\n");
     run();

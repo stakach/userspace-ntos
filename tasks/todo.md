@@ -122,3 +122,13 @@ the component's kmdf_fx_pnp_dispatch (MajorFunction[IRP_MJ_PNP]) drives START (p
 nt_wdf_kmdf::wdf(), forward down to PDO). 32 PASS / 0 FAIL + 185 kernel. THREE children Started in one
 host, TWO families: PnpMmioInterruptTest (WDM) + PowerPnpMmioTest (WDM) + KmdfInterfaceRegistryTest (KMDF).
 The crate is now consumed by both direg (29/29) and driver-host-pnp (KMDF to Started) — factoring complete.
+
+## Cross-VSpace SURT client done (2026-07-06): 49 PASS
+A genuinely isolated seL4 component (own CSpace/VSpace, spawned by the driver-host root task) opens
+the KMDF child's device interface + issues an IOCTL entirely over a SURT ring. Server = the root task
+(hosts the KMDF device + shared nt-wdf-kmdf runtime); it spawns ONE isolated client and mediates every
+device touch. New: src/surt_client.rs (alloc-free client_entry), SURT broker/server block in main.rs
+(KernelEnv, vaddr layout at 0x1_0080_0000, su_* cap helpers, su_build_client_vspace, run_surt_interface
+_client), surt-sel4="0.1" dep. Protocol: OP_OPEN(guid)->detail0=fdo+rep=symlink, OP_IOCTL(user_data=fdo,
+req=[ioctl])->rep=output. 3 checks: surt_open_interface_over_ring, surt_ioctl_ping_over_ring,
+surt_xvspace_client_verdict_all_passed. First QEMU run clean, no #PF/hang.
