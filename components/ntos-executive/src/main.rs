@@ -89,6 +89,8 @@ pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
 pub const HPET_VADDR: u64 = 0x0000_0100_005E_0000;
+/// Where the executive maps a real PCI device's BAR (P1 capstone — the e1000e NIC).
+pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
@@ -1266,6 +1268,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut count = 0u64;
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
+    let (mut nic_bar0, mut nic_irq, mut found_nic) = (0u32, 0u32, false);
     for dev in 0..32u8 {
         for func in 0..8u8 {
             let vd = pci_read32(pci_io, 0, dev, func, 0x00);
@@ -1301,6 +1304,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
                 storage_irq = irq;
             }
+            // A network controller (class 0x02) — the e1000e NIC we drive as the
+            // P1 capstone (its MMIO BAR0 + interrupt line).
+            if (class >> 24) == 0x02 {
+                found_nic = true;
+                nic_bar0 = bar0;
+                nic_irq = irq;
+            }
         }
     }
     print_str(b"[ntos-exec] PCI devices on bus 0 = ");
@@ -1316,9 +1326,39 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
+    // --- P1 CAPSTONE: drive the real e1000e NIC. Map its enumerated BAR0 as a
+    // device frame and read a live device register — a real driver path touching
+    // real (QEMU-emulated) network hardware, not a mock.
+    if found_nic {
+        let nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
+        print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000e NIC BAR0 ");
+        print_hex(nic_mmio as u32);
+        print_str(b" (irq ");
+        print_u64(nic_irq as u64);
+        print_str(b")\n");
+        let nic_mapped = claim_device_page(bi, nic_mmio, NIC_VADDR);
+        check(b"exec_nic_bar_mapped", nic_mapped, &mut passed);
+        if nic_mapped {
+            // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
+            let ctrl = core::ptr::read_volatile((NIC_VADDR + 0x00) as *const u32);
+            let status = core::ptr::read_volatile((NIC_VADDR + 0x08) as *const u32);
+            print_str(b"[ntos-exec] e1000e CTRL=");
+            print_hex(ctrl);
+            print_str(b" STATUS=");
+            print_hex(status);
+            print_str(b"\n");
+            // A live NIC returns a real value — not 0xFFFFFFFF (unmapped MMIO) or 0.
+            check(
+                b"exec_nic_mmio_status_live",
+                status != 0xFFFF_FFFF && status != 0,
+                &mut passed,
+            );
+        }
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/31 executive->isolated-service checks passed]\n");
+    print_str(b"/33 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
