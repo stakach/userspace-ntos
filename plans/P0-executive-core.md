@@ -10,7 +10,7 @@ carried by `driver-host-pnp`.
 single, small, well‑understood broker/loader — the seL4 analogue of the boot
 executive — rather than growing one driver host into everything.
 
-## Status: in progress (increments 1–3 landed — c2e904f, 44d95bf, db7edac+448673c)
+## Status: in progress (increments 1–5 landed — c2e904f, 44d95bf, db7edac+448673c, 3edd34c, b054569)
 
 ## Background (what already exists to reuse)
 - `object-service` already spawns **two isolated components over SURT** with cap
@@ -42,12 +42,23 @@ executive — rather than growing one driver host into everything.
       drives it (5 checks: ping/create/open/set/query DWORD). Refactored the
       transport into a reusable `RingChannel` (per-channel req/rep vaddrs) + ObChan/
       CmChan wrappers. **16/16 in QEMU.**
-- [ ] **Route registry syscalls through the front-end:** add SSN_CM_* to the user
-      thread → route to the Cm service (NtCreateKey/NtSetValueKey/NtQueryValueKey).
+- [x] **Third service — I/O Manager (3edd34c):** `nt_io_server::IoServer` (over an
+      embedded Object Manager + mock driver) runs as the executive's third isolated
+      service over its own ring pair (0x58-0x5B). The executive drives open/write
+      "hello"/read/close on `\??\Test0`. `RingChannel` extended for `IoReply`'s
+      `flags` + u64 `information`. **21/21 in QEMU.** (Unblocks P2 storage/file.)
+- [x] **Route registry syscalls through the front-end (b054569):** the user thread
+      issues SSN_CM_SET_DWORD/SSN_CM_QUERY_DWORD → the executive routes to the
+      isolated Cm service. Syscall-set DWORD=42 is independently visible. The front-
+      end now dispatches to **two** isolated services. **22/22 in QEMU.**
 - [ ] **Component-launch manifest:** generalize the ad-hoc spawn into a static
       table (which service ELFs, caps, ring peers) — least-privilege per component.
-- [ ] **Third service — I/O Manager:** `nt-io-abi/-server/-client` already exist;
-      compose it (unblocks P2 storage/file path).
+      (The three services are stamped out by copy-paste today; factor the ring-set
+      + spawn + client-attach into one `stand_up_service(entry, vaddrs)` helper.)
+- [ ] **Real NtCreateKey/NtSetValueKey/NtQueryValueKey ABI:** the syscall route uses
+      fixed keys + scalar args today. Wire the real Nt* arg marshalling (copyin the
+      OBJECT_ATTRIBUTES/UNICODE_STRING/KEY_VALUE from user memory) — pairs with the
+      real ntdll syscall path already proven in `driver-host-ntdll`.
 - [ ] **Migrate the driver-host broker role:** fold `driver-host-pnp`'s broker/
       supervisor duties under `ntos-executive` (later, once services land).
 

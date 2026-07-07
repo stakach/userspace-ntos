@@ -351,3 +351,10 @@ findings). A step is not "done" until the plan reflects it.
   ReactOS kernel‑mode drivers (host each isolated), not drop them — only
   freeldr/ntoskrnl/hal are removed. Using + supporting as many pre‑built ReactOS
   kernel drivers as possible is a first‑class goal (§0 strengthened to match).
+- **2026-07-07** — **P0 continued (3edd34c, b054569).** (4) Composed the **I/O
+  Manager** as the executive's third isolated service (open/write/read/close a
+  device over SURT). (5) Routed **native registry syscalls** through the front-end
+  to the isolated Cm service (syscall-set DWORD=42 independently visible). The
+  executive now composes **three** isolated services (Ob + Cm + Io) and the native
+  front-end dispatches to two of them. **22/22 in QEMU.** The I/O service unblocks
+  P2 (storage → filesystem → real data).
