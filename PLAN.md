@@ -358,3 +358,11 @@ findings). A step is not "done" until the plan reflects it.
   executive now composes **three** isolated services (Ob + Cm + Io) and the native
   front-end dispatches to two of them. **22/22 in QEMU.** The I/O service unblocks
   P2 (storage → filesystem → real data).
+- **2026-07-07** — **P0 hardening (fc73302, 5420b9f).** Factored the triplicated
+  service spawn into one `stand_up_service()` component-launch primitive. Added
+  pointer-based syscall args: the isolated user thread builds a real x64
+  `UNICODE_STRING` in a shared arg frame (same vaddr in both VSpaces) and the
+  executive **copies the path in** (bounds-checked like a kernel probe) to route a
+  real `create_directory` — the copyin the real `Nt*` path needs. **23/23 in QEMU.**
+  P0 executive core is functionally complete; remaining items are P3-adjacent
+  (real ntdll SSNs + OBJECT_ATTRIBUTES) and the driver-host broker migration.

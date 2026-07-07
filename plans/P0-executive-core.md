@@ -56,10 +56,14 @@ executive — rather than growing one driver host into everything.
       -> RingChannel` helper; adding a service is one call + wrapping the channel in
       its client. (A fully data-driven manifest would need trait objects for the
       heterogeneous clients — deferred; the helper captures the reusable part.)
-- [ ] **Real NtCreateKey/NtSetValueKey/NtQueryValueKey ABI:** the syscall route uses
-      fixed keys + scalar args today. Wire the real Nt* arg marshalling (copyin the
-      OBJECT_ATTRIBUTES/UNICODE_STRING/KEY_VALUE from user memory) — pairs with the
-      real ntdll syscall path already proven in `driver-host-ntdll`.
+- [x] **Pointer-based arg copyin (5420b9f):** the front-end now copies in a real x64
+      `UNICODE_STRING` (Buffer pointer) from a shared arg frame mapped at the same
+      vaddr in both the executive + the isolated user thread, bounds-checked like a
+      kernel probe, and routes a real `create_directory` with the user's path. 23/23.
+- [ ] **Real ntdll syscall numbers + OBJECT_ATTRIBUTES:** swap the placeholder SSNs
+      for the real ntdll SSNs and wrap the `UNICODE_STRING` in an `OBJECT_ATTRIBUTES`,
+      so a real isolated ntdll process (as in `driver-host-ntdll`) drives this path
+      unchanged. (P3 territory — the copyin mechanism is now in place.)
 - [ ] **Migrate the driver-host broker role:** fold `driver-host-pnp`'s broker/
       supervisor duties under `ntos-executive` (later, once services land).
 
