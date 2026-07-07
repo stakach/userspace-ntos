@@ -1,0 +1,16 @@
+[package]
+name = "nt-config-server"
+description = "Transport-agnostic NT Configuration Manager (registry) service dispatcher: decode/validate a wire request (nt-config-abi) and drive the nt-config-manager core (create/open key, set/query DWORD), returning a CmReply. Wraps the registry authority behind SURT so it can run as an isolated service. no_std + alloc; host-unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-config-abi = { workspace = true }
+nt-config-manager = { workspace = true }
+nt-status = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

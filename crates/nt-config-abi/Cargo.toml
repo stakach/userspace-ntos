@@ -1,0 +1,11 @@
+[package]
+name = "nt-config-abi"
+description = "Fixed-layout SURT wire ABI for the NT Configuration Manager (registry) service: opcodes (ping/create_key/open_key/set_dword/query_dword) + request/reply structs (repr(C), fixed-width, UTF-16 key/value names, no raw pointers). Shared by nt-config-server (decoder) + nt-config-client (encoder). no_std."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

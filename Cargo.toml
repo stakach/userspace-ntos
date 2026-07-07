@@ -39,6 +39,9 @@ members = [
     "crates/nt-wdf-interrupt",
     "crates/nt-wdf-dma",
     "crates/nt-config-manager",
+    "crates/nt-config-client",
+    "crates/nt-config-server",
+    "crates/nt-config-abi",
     "crates/nt-config-store",
     "crates/nt-setupapi",
     "crates/nt-hive-core",
@@ -109,6 +112,9 @@ nt-wdf-runtime = { path = "crates/nt-wdf-runtime" }
 nt-wdf-interrupt = { path = "crates/nt-wdf-interrupt" }
 nt-wdf-dma = { path = "crates/nt-wdf-dma" }
 nt-config-manager = { path = "crates/nt-config-manager" }
+nt-config-client = { path = "crates/nt-config-client" }
+nt-config-server = { path = "crates/nt-config-server" }
+nt-config-abi = { path = "crates/nt-config-abi" }
 nt-config-store = { path = "crates/nt-config-store" }
 nt-setupapi = { path = "crates/nt-setupapi" }
 nt-hive-core = { path = "crates/nt-hive-core" }

@@ -1,0 +1,17 @@
+[package]
+name = "nt-config-client"
+description = "Ergonomic client stub for the NT Configuration Manager (registry) service: encodes requests / decodes replies over a pluggable Backend (SURT rings in the kernel, in-process in tests). Methods: ping, create_key, open_key, set_dword, query_dword. no_std + alloc; host-unit-tested end-to-end against nt-config-server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-config-abi = { workspace = true }
+
+[dev-dependencies]
+nt-config-server = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
