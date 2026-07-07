@@ -389,3 +389,11 @@ findings). A step is not "done" until the plan reflects it.
   executive can now hand a real device's MMIO + IRQ to an isolated driver host — the
   P1 foundation. Remaining P1: reflector-forward the IRQ to a host ISR/DPC, the Ack
   path, port I/O + PCI BAR/IRQ enumeration, DMA; then a real device (e.g. `-device edu`).
+- **2026-07-07** — **P1 IRQ → isolated driver host (f67753a).** The real interrupt
+  now crosses into a separate ISOLATED ISR component (own VSpace/CSpace, least-
+  privilege — only the notification caps): executive binds the IRQ-handler cap to a
+  badged notification, transfers a cap to an `isr.rs` host whose thread wakes on the
+  real IRQ and signals back (badge 0x80). Executive must *block* (priority 255) to
+  let the priority-100 host run. **27/27 in QEMU.** The `IRQ → driver-host ISR` path.
+  Remaining P1: `IRQHandler::Ack` (repeat/level IRQs), DPC/ring forward, port I/O +
+  PCI BAR/IRQ enumeration, DMA; then a real *device* IRQ.

@@ -32,9 +32,15 @@ real DMA (contiguous buffers + physical addresses + MDLs).
       receives the **real interrupt** (badge 0x40 via non-blocking `SysNBRecv`).
       Findings: `ioapic_issue_irq_handler()` hand-builds the 7-word + extra-cap
       invocation (label 64; mr3=pin in r15; mr4..6 at IPC words 5-7; dest CNode at
-      word 122; depth 64). **Still TODO:** forward the IRQ to a driver host's ISR/DPC
-      over the reflector, the Ack path (`IRQHandler::Ack`) for repeat/level IRQs, and
-      `IoConnectInterrupt`/`WdfInterruptCreate` binding a real *device* (not timer) IRQ.
+      word 122; depth 64). **IRQ now reaches an isolated driver host (f67753a):** the
+      executive binds the IRQ-handler cap to a badged notification and transfers ONLY
+      a cap to that notification to a separate isolated ISR component (`spawn_isr` /
+      `isr.rs`, its own VSpace/CSpace, least-privilege); the ISR thread wakes on the
+      real interrupt and signals back (badge 0x80). The executive must *block* (not
+      spin) to yield to the priority-100 host — it runs at priority 255. **Still
+      TODO:** the Ack path (`IRQHandler::Ack`) for repeat/level IRQs, forward the ISR
+      wake into a DPC/ring, and `IoConnectInterrupt`/`WdfInterruptCreate` on a real
+      *device* (not timer) IRQ.
 - [ ] **Real timer/clock:** LAPIC timer as the system clock; `KeQueryPerformance
       Counter` / interrupt time / `KeQuerySystemTime`; one-shot + periodic timers
       for `KeSetTimer`/WDF timers. (rust-micro already uses LAPIC as its clock.)
