@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: not started
+## Status: in progress — real MMIO landed (3984164)
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -19,10 +19,12 @@ real DMA (contiguous buffers + physical addresses + MDLs).
   INTERRUPT family) and device untyped/frames.
 
 ## Tasks
-- [ ] **Real MMIO:** the executive/HAL retypes device untyped → frame caps for a
-      device BAR and maps them into the owning driver host's VSpace (uncached).
-      `MmMapIoSpace` in a host resolves to a real mapped BAR. Replace `nt-sim-device`
-      on the real path (keep it for unit tests).
+- [x] **Real MMIO — first proof (3984164):** the executive retypes a real device
+      untyped (HPET, 0xFED00000 — kernel exposes IOAPIC/HPET/LAPIC MMIO as device
+      untypeds) into a device frame + maps it (kernel makes device frames uncached),
+      and reads the real HPET GCAP_ID register = 0x8086A201 (VENDOR_ID 0x8086). This
+      is the `claim_device_page()` mechanism; next, hand a BAR window to an isolated
+      driver host + wire `MmMapIoSpace`, and enumerate real BARs via PCI (still TODO).
 - [ ] **Real interrupts:** HAL gets the device's IRQ handler cap, binds it to a
       notification, and forwards to the driver host's ISR/DPC over the reflector
       (or a dedicated IRQ ring). `IoConnectInterrupt` / `WdfInterruptCreate`

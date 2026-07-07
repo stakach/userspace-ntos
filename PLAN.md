@@ -317,8 +317,7 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
 priorities, changelog) **and** its phase sub‑plan (check off tasks, record
 findings). A step is not "done" until the plan reflects it.
 
-- **Status:** `P0 functionally complete` (broker migration deferred) · `P1 not
-  started` · `P2 not started` · `P3 not started` · `P4–P7 stub`. (Foundational
+- **Status:** `P0 functionally complete` (broker migration deferred) · `P1 in progress` (real MMIO) · `P2 not started` · `P3 not started` · `P4–P7 stub`. (Foundational
   crates for all phases largely exist; phases are about making them *real + composed
   + booted*.)
 - **How to update:** edit the gap table (§5) priorities as reality shifts; move a
@@ -375,3 +374,11 @@ findings). A step is not "done" until the plan reflects it.
   post-P1/P2** so it targets a stable service shape. **Next: P1 (real hardware)** —
   the biggest gap; note "real" = real seL4 frame/MMIO + IRQ-handler caps to a
   QEMU-emulated device, not a different emulator (QEMU/emulation stays the dev path).
+- **2026-07-07** — **P1 started (3984164): real MMIO.** The executive claims the
+  HPET's device memory (a real device untyped from BootInfo) as a device frame,
+  maps it uncached, and reads the real GCAP_ID register (VENDOR_ID 0x8086). This is
+  the `claim_device_page()` mechanism — the executive owning + handing out real MMIO.
+  Kernel finding: it exposes IOAPIC/HPET/LAPIC MMIO as device untypeds, and
+  `X86IRQIssueIRQHandlerIOAPIC` really does program the IOAPIC RTE (the interrupt.rs
+  "not wired yet" comment is stale). Next P1 increment: an IRQ-handler cap for a real
+  interrupt (in progress).
