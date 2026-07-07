@@ -18,9 +18,11 @@ components**. Drivers run in their **own processes**, supervised and
 crash‑contained (no bluescreens; restart/backoff/disable per
 `nt-driver-supervisor`).
 
-**Driver compatibility (broad, not narrow):** we **keep and host most ReactOS
-kernel‑mode `.sys` drivers** — but each runs in its **own isolated process**, not
-in the kernel's address space. **Any driver that uses the official interfaces**
+**Driver compatibility (broad, not narrow) — a first‑class goal:** we **keep and
+host as many pre‑built ReactOS kernel‑mode `.sys` drivers as possible** — each in
+its **own isolated process**, not in the kernel's address space. Maximizing the set
+of supported stock drivers is an explicit objective (prefer hosting the real
+ReactOS driver over reimplementing it). **Any driver that uses the official interfaces**
 (the WDM DDI — `Io*`/`Ke*`/`Mm*`/`Ex*`/`Po*`, IRPs, dispatch routines — or KMDF /
 UMDF v2) works, because those drivers only ever call documented functions that our
 per‑host NT runtime serves (`nt-kernel-exec` / `nt-driver-runtime` /
@@ -295,10 +297,17 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
    from there ReactOS's own user space (csrss, services, …) runs unchanged.
 4. **Two image profiles:** (a) **dev/e2e** image with test specs baked in;
    (b) **integration** image = kernel + executive + ReactOS user‑space volume.
-5. **Integration recipe:** take a ReactOS `bootcd`/`livecd`, drop `freeldr` +
-   `ntoskrnl.exe` + `hal.dll` + kernel‑mode drivers from the boot set, keep the
-   user‑space files, and produce a bootable disk that boots **our** kernel and
-   **their** user space. Scripted under `scripts/`.
+5. **Integration recipe:** take a ReactOS `bootcd`/`livecd` and remove from the
+   boot set **only** `freeldr` + `ntoskrnl.exe` + `hal.dll` (the three we replace).
+   **Keep the ReactOS kernel‑mode drivers** — every pre‑built `.sys` we can — and
+   host each in an isolated driver host (WDM/KMDF/UMDF v2 over the reflector). Keep
+   all user‑space files too. Produce a bootable disk that boots **our** kernel and
+   runs **their** user space + **their** drivers (isolated). Scripted under
+   `scripts/`. A boot‑driver manifest maps each `Services\*` kernel driver to an
+   isolated host; the goal is to **use and support as many pre‑built ReactOS kernel
+   drivers as possible** — only drivers needing in‑kernel shared‑address‑space /
+   undocumented access (AV/anti‑cheat/rootkit/internal‑structure filters) are
+   expected to fail, tracked in `docs/compat-notes/`.
 
 ---
 
@@ -338,3 +347,7 @@ findings). A step is not "done" until the plan reflects it.
   Cm as the executive's **second isolated service** over its own ring pair.
   **16/16 in QEMU** (8 Ob + 5 Cm + 3 syscall). The executive now composes multiple
   isolated executive services + a working native syscall trap front-end.
+- **2026-07-07** — Fixed §9 (user): the image recipe must **keep and host** the
+  ReactOS kernel‑mode drivers (host each isolated), not drop them — only
+  freeldr/ntoskrnl/hal are removed. Using + supporting as many pre‑built ReactOS
+  kernel drivers as possible is a first‑class goal (§0 strengthened to match).
