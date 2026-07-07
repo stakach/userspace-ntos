@@ -308,7 +308,7 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
 priorities, changelog) **and** its phase sub‑plan (check off tasks, record
 findings). A step is not "done" until the plan reflects it.
 
-- **Status:** `P0 not started` · `P1 not started` · `P2 not started` ·
+- **Status:** `P0 in progress` · `P1 not started` · `P2 not started` ·
   `P3 not started` · `P4–P7 stub`. (Foundational crates for all phases largely
   exist; phases are about making them *real + composed + booted*.)
 - **How to update:** edit the gap table (§5) priorities as reality shifts; move a
@@ -326,3 +326,8 @@ findings). A step is not "done" until the plan reflects it.
   per-host runtime serves. Only undocumented / in-kernel-shared-address-space
   drivers (AV/anti-cheat/rootkit/internal-structure filters) are unsupported.
   Updated §0 + P7 (keep the `.sys` files, host them; don't strip kernel drivers).
+- **2026-07-07** — **P0 started (commit c2e904f).** `components/ntos-executive/`
+  stands up the **Object Manager as an isolated service** and drives the full OB
+  namespace over SURT from the executive front-end (8/8 in QEMU). Finding: only
+  Ob is SURT-ized today; Cm has no `-abi/-server/-client` (in-process) → next P0
+  steps: native syscall front-end routing Ob `Nt*` over SURT, and SURT-ize Cm.

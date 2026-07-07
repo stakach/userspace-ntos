@@ -10,7 +10,7 @@ carried by `driver-host-pnp`.
 single, small, well‑understood broker/loader — the seL4 analogue of the boot
 executive — rather than growing one driver host into everything.
 
-## Status: not started
+## Status: in progress (increment 1 landed — commit c2e904f)
 
 ## Background (what already exists to reuse)
 - `object-service` already spawns **two isolated components over SURT** with cap
@@ -21,24 +21,27 @@ executive — rather than growing one driver host into everything.
 - `nt-*-abi` + `nt-*-server`/`-client` exist for Ob, Io, HAL, PnP, Power, DMA.
 
 ## Tasks
-- [ ] **Extract the broker** from `driver-host-pnp` into `components/ntos-executive/`:
-      slot allocator, `su_map_*`, `su_build_*_vspace`, `su_copy_cap`, cnode/tcb
-      spawn, fault‑endpoint wiring, SURT ring setup + `init_ring`. (Move, don't
-      reinvent — port the proven code.)
-- [ ] **Component-launch table:** the executive reads a static manifest (which
-      service/driver-host ELFs to spawn, what caps each gets, which rings connect
-      to which peers). Least-privilege: each component gets only its caps.
-- [ ] **SURT wiring generalized:** a helper to create a ring pair + 2 ntfns + data
-      frames and connect two named components as producer/consumer (from the
-      `object-service` init pattern).
-- [ ] **Native syscall front-end:** a trap handler component (or executive thread)
-      that receives `Nt*` from userland and marshals to the owning service over
-      SURT. Start with a stub that routes 2–3 calls (e.g. `NtCreateKey`,
-      `NtQueryValueKey` → Cm; `NtCreateFile` → Io) end-to-end.
-- [ ] **Two services as separate components:** stand up **Ob** and **Io** (or Cm)
-      as their own components under the executive, not embedded — talking over
-      SURT, each with host-tested cores behind them.
-- [ ] `scripts/run-executive.sh` + a component microtest spec.
+- [x] **`components/ntos-executive/` root task** — spawn machinery in place
+      (`build_service_vspace` / `spawn_service` / `map_own_heap` / ring init +
+      cap copy), reusing `object-service`'s proven pattern. (commit c2e904f)
+- [x] **SURT wiring:** the executive creates a ring pair + 2 ntfns + data frames,
+      maps them in its own VSpace, `init_ring`s both, spawns a service seeded with
+      the copies — and drives it as the front-end. (c2e904f)
+- [x] **One service isolated + driven by the executive:** the **Object Manager**
+      runs as its own component; the executive round-trips the full OB namespace
+      script over SURT. 8/8 in QEMU. (c2e904f)
+- [ ] **Native syscall front-end:** route real `Nt*` traps (mechanism proven in
+      `driver-host-ntdll`: user `syscall` → seL4 UnknownSyscall fault →
+      `NativeSyscallDispatcher::dispatch`) to the owning service over SURT. Start
+      with 2–3 Ob calls (`NtCreateDirectoryObject`/create/lookup/close).
+- [ ] **Second isolated service:** add a second service under the executive.
+      **Cm/registry needs SURT-izing first** (see finding below) — do that, or add
+      Io (already has `nt-io-abi/-server/-client`), whichever unblocks the syscall
+      front-end demo.
+- [ ] **Component-launch manifest:** generalize the ad-hoc spawn into a static
+      table (which service ELFs, caps, ring peers) — least-privilege per component.
+- [ ] **Migrate the driver-host broker role:** fold `driver-host-pnp`'s broker/
+      supervisor duties under `ntos-executive` (later, once services land).
 
 ## Design decisions to record here as they're made
 - Manifest format (static Rust table vs. a small on-disk descriptor).
@@ -59,4 +62,21 @@ executive front‑end → Cm component (own VSpace) → returns a handle;
 SURT.
 
 ## Notes / findings
-_(append as work proceeds)_
+- **Only the Object Manager is fully SURT-ized today** (`nt-object-abi` +
+  `-server` + `-client`, opcodes 0x2000–0x20ff, `ObReply{status,information,
+  detail0,detail1}`). **Cm/registry, Io, Ob's own component, all currently run
+  IN-PROCESS** (`configuration-manager`, `object-manager`, `io-manager`
+  components use a `Direct` backend, no SURT split). Io *does* have
+  `nt-io-abi/-server/-client`; Cm does **not** have an abi/server/client — that's
+  the gap to close before the syscall front-end can route registry calls.
+- **Syscall trap mechanism already exists** (`driver-host-ntdll`): real ntdll
+  thread `syscall` → seL4 UnknownSyscall fault (label 2) → SSN in mr0 →
+  `NativeSyscallDispatcher::dispatch(ssn, args, origin, handler)` → `set_reply_mr`
+  + `reply_recv`. The front-end task is to make that `handler` marshal to the
+  isolated services over SURT instead of calling in-process cores.
+- **Executive-as-front-end works cleanly:** the root task maps the rings + its own
+  heap in its VSpace and runs `ObjectClient` directly — no separate client
+  component needed. This is the shape to keep.
+- **Next concrete step:** wire the native front-end to route a few Ob `Nt*` calls
+  to the isolated Ob service (reuses everything above); in parallel, stand up
+  `nt-config-abi/-server/-client` so Cm can isolate + join the executive.
