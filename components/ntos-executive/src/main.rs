@@ -84,6 +84,10 @@ pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
 /// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
 /// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
 pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
+/// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
+/// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
+pub const HPET_PADDR: u64 = 0xFED0_0000;
+pub const HPET_VADDR: u64 = 0x0000_0100_005E_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
@@ -814,6 +818,25 @@ unsafe fn stand_up_service(
     }
 }
 
+/// Claim a real device MMIO page (P1): find the device untyped in BootInfo whose
+/// paddr matches `paddr`, retype a device frame from it, and map it at `vaddr` in the
+/// executive's VSpace (the kernel makes device frames uncacheable). Returns whether
+/// the device untyped was found + mapped. This is how the executive, which owns the
+/// hardware caps, hands real MMIO to itself (and later to isolated driver hosts).
+unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
+    let count = bi.untyped.end - bi.untyped.start;
+    for i in 0..count {
+        let d = bi.untyped_list[i as usize];
+        if d.is_device == 1 && d.paddr == paddr {
+            let frame = alloc_slot();
+            let _ = untyped_retype(bi.untyped.start + i, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
+            let _ = page_map(frame, vaddr, RW_NX, CAP_INIT_THREAD_VSPACE);
+            return true;
+        }
+    }
+    false
+}
+
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
@@ -952,9 +975,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
+    // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
+    // BootInfo) as a frame cap, map it, and read a real hardware register — proving
+    // the mapping hits real device memory, not RAM.
+    print_str(b"[ntos-exec] P1: claiming real HPET MMIO (0xFED00000) as a device frame\n");
+    let mmio_mapped = claim_device_page(bi, HPET_PADDR, HPET_VADDR);
+    check(b"exec_hpet_device_untyped_mapped", mmio_mapped, &mut passed);
+    if mmio_mapped {
+        // HPET General Capabilities + ID (offset 0): bits [31:16] = VENDOR_ID.
+        let gcap = core::ptr::read_volatile(HPET_VADDR as *const u32);
+        print_str(b"[ntos-exec] HPET GCAP_ID low dword = ");
+        print_u64(gcap as u64);
+        print_str(b" (vendor ");
+        print_u64((gcap >> 16) as u64);
+        print_str(b")\n");
+        // QEMU's HPET reports the Intel vendor id 0x8086 (= 32902).
+        check(b"exec_hpet_mmio_vendor_intel", (gcap >> 16) == 0x8086, &mut passed);
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/23 executive->isolated-service checks passed]\n");
+    print_str(b"/25 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
