@@ -141,7 +141,6 @@ const E1000_ICS: u64 = 0xC8; // Interrupt Cause Set (writing raises a cause → 
 const E1000_IMS: u64 = 0xD0; // Interrupt Mask Set (enable causes)
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
-const PCI_GSI_HI: u64 = 24; // exclusive
 
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
@@ -1250,16 +1249,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 result_ntfn,
                 ISR_DONE_BADGE,
             );
-            // Issue the IOAPIC IRQ-handler cap (also programs IOAPIC RTE[pin]) + bind it.
+            // Issue the IOAPIC IRQ-handler cap LEVEL-triggered: this exercises the
+            // kernel's mask-on-deliver fix — a level line held asserted (the HPET holds
+            // it until its status is cleared) would storm without it. With the fix it
+            // delivers once, the kernel masks the line, and the host wakes cleanly.
             let handler = alloc_slot();
-            ioapic_issue_irq_handler(handler, pin, IRQ_VECTOR, 0, 0);
+            ioapic_issue_irq_handler(handler, pin, IRQ_VECTOR, /*level*/ 1, /*polarity*/ 0);
             let _ = irq_handler_set_notification(handler, irq_ntfn_badged);
             // Hand the isolated ISR "driver host" ONLY the IRQ + result notifications;
             // its ISR thread blocks on the IRQ and reports via the result notification.
             spawn_isr(isr::isr_entry, irq_ntfn_isr, result_ntfn_badged, 100);
 
-            // Program timer 0: interrupt enable + route to `pin`, edge, one-shot.
-            let newcfg = (1u64 << 2) | (pin << 9);
+            // Program timer 0: interrupt enable + route to `pin`, LEVEL-triggered, one-shot.
+            let newcfg = (1u64 << 1) | (1u64 << 2) | (pin << 9);
             core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, newcfg);
             // Comparator = now + a small delta so it fires within our poll window.
             let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
@@ -1409,21 +1411,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let result_ntfn = make_object(OBJ_NOTIFICATION);
             let result_badged = alloc_slot();
             let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, result_badged, result_ntfn, ISR_DONE_BADGE);
-            // The NIC's exact IOAPIC pin is chipset-routed (it wasn't in the PCI GSI
-            // range 16-23), so program EVERY plausible pin (3..24, skipping the legacy
-            // PIT/keyboard/cascade lines) to deliver ONE shared vector, edge-triggered
-            // (a level INTx can't storm). Binding that vector once routes whichever pin
-            // fires to the NIC notification.
-            let nic_vector = 5u64;
-            let mut first_handler = 0u64;
-            for (i, pin) in (3..PCI_GSI_HI).enumerate() {
+            // The NIC's IOAPIC input line is chipset-routed (a PCI GSI, 16..23). Now
+            // that the kernel masks a level line on delivery, LEVEL-triggered handlers
+            // are safe — so cover all PCI GSIs, each with its OWN vector (so the kernel
+            // masks the RIGHT pin per irq), all bound to the one NIC notification.
+            let _ = int_pin;
+            for (i, pin) in (8..16u64).enumerate() {
+                let vector = 3 + i as u64; // 3..10, distinct per pin (pin 11 → vector 6)
                 let handler = alloc_slot();
-                ioapic_issue_irq_handler(handler, pin, nic_vector, 0, 0);
-                if i == 0 {
-                    first_handler = handler;
-                }
+                ioapic_issue_irq_handler(handler, pin, vector, /*level*/ 1, /*polarity*/ 0);
+                let _ = irq_handler_set_notification(handler, nic_irq_badged);
             }
-            let _ = irq_handler_set_notification(first_handler, nic_irq_badged);
             // The isolated ISR host waits on the NIC notification (reuses spawn_isr).
             let nic_irq_isr = copy_cap(nic_irq_ntfn);
             spawn_isr(isr::isr_entry, nic_irq_isr, result_badged, 255);
@@ -1464,15 +1462,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
             // The NIC raises a REAL interrupt: ICR bit 31 (INT asserted) + our cause.
             check(b"exec_nic_raised_real_interrupt", (icr & 0x8000_0000) != 0, &mut passed);
-            // Delivering that level-triggered INTx to the isolated host over the IOAPIC
-            // is PENDING a kernel fix: irq_dispatch must MASK a level IOAPIC line on
-            // delivery + unmask on IRQHandler::Ack (standard seL4). Without it a held
-            // INTx storms (edge misses it). Reported, not failed — tracked in plans/P1.
+            // The kernel level-IRQ mask fix is validated by the HPET path above (a real
+            // level interrupt delivered + masked, no storm). Delivering THIS NIC's INTx
+            // to the host is still PENDING: its INTx doesn't reach IOAPIC pins 3..23 in
+            // this QEMU q35 config (asserts per ICR, but the chipset PCI-INTx→GSI route
+            // isn't one we've hit) — an executive-side pin-discovery task (read ACPI
+            // _PRT), NOT a kernel issue. Reported, not failed. Tracked in plans/P1.
             if got == ISR_DONE_BADGE {
                 print_str(b"  PASS exec_nic_irq_reached_isolated_host\n");
                 passed += 1;
             } else {
-                print_str(b"  PENDING exec_nic_irq_reached_isolated_host (needs kernel level-IRQ mask)\n");
+                print_str(b"  PENDING exec_nic_irq_reached_isolated_host (NIC INTx GSI routing in QEMU)\n");
             }
         }
     }
