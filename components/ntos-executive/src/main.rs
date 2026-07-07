@@ -79,6 +79,10 @@ pub const IO_COMP_VADDR: u64 = 0x0000_0100_0059_0000;
 pub const IO_REQ_VADDR: u64 = 0x0000_0100_005A_0000;
 pub const IO_REP_VADDR: u64 = 0x0000_0100_005B_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
+/// A per-user-thread syscall argument frame, mapped at the SAME vaddr in both the
+/// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
+/// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
+pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
@@ -105,6 +109,8 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 // these stand in for the ntdll SSNs a real user process would trap with).
 const SSN_OB_CREATE_DIR: u64 = 0x0100; // arg1 = directory index → \Device\Syscall<n>
 const SSN_OB_LOOKUP_DIR: u64 = 0x0101; // arg1 = directory index
+const SSN_OB_CREATE_BYNAME: u64 = 0x0102; // arg1 = *UNICODE_STRING (a user-supplied path)
+const SSN_OB_LOOKUP_BYNAME: u64 = 0x0103; // arg1 = *UNICODE_STRING
 const SSN_CM_SET_DWORD: u64 = 0x0110; // arg1 = value → REG_KEY\Answer  (stands in for NtSetValueKey)
 const SSN_CM_QUERY_DWORD: u64 = 0x0111; // returns REG_KEY\Answer      (stands in for NtQueryValueKey)
 const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
@@ -400,6 +406,41 @@ fn path_for(i: u64) -> &'static str {
     }
 }
 
+/// The x64 `UNICODE_STRING` a user thread passes to a name-based syscall: a 16-byte
+/// header (4 bytes of tail padding before the 8-byte `Buffer`) + UTF-16LE chars the
+/// `Buffer` points at. Both live in the shared arg frame (same vaddr in both VSpaces).
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NtUnicodeString {
+    length: u16,         // bytes of the name (excluding NUL)
+    maximum_length: u16, // capacity in bytes
+    _pad: u32,
+    buffer: u64, // vaddr of the UTF-16 chars (into the shared arg frame)
+}
+
+/// Copyin a user-supplied path from a `UNICODE_STRING` at `ptr`. Probes like a real
+/// kernel: both the header and the `Buffer` range must lie inside the one shared arg
+/// frame `[SYSARG_VADDR, SYSARG_VADDR + 4096)` — a hostile user can't steer the read
+/// at executive memory. Returns the decoded path.
+unsafe fn copyin_user_path(ptr: u64) -> Option<alloc::string::String> {
+    let frame_lo = SYSARG_VADDR;
+    let frame_hi = SYSARG_VADDR + 0x1000;
+    let hdr = core::mem::size_of::<NtUnicodeString>() as u64;
+    if ptr < frame_lo || ptr.checked_add(hdr)? > frame_hi {
+        return None;
+    }
+    let us = core::ptr::read_unaligned(ptr as *const NtUnicodeString);
+    let len = us.length as u64;
+    if len % 2 != 0 || len > 1024 || us.buffer < frame_lo || us.buffer.checked_add(len)? > frame_hi {
+        return None;
+    }
+    let mut units = Vec::with_capacity((len / 2) as usize);
+    for i in 0..(len / 2) {
+        units.push(core::ptr::read_unaligned((us.buffer + i * 2) as *const u16));
+    }
+    Some(alloc::string::String::from_utf16_lossy(&units))
+}
+
 /// A raw native syscall from the isolated user thread: SSN in RAX, arg1 in R10
 /// (the Windows x64 convention — RCX is clobbered by `syscall`), result in RAX.
 unsafe fn native_syscall(ssn: u64, arg1: u64) -> u64 {
@@ -419,14 +460,44 @@ unsafe fn native_syscall(ssn: u64, arg1: u64) -> u64 {
 #[no_mangle]
 #[link_section = ".text.user_entry"]
 pub unsafe extern "C" fn user_entry() -> ! {
-    // Object Manager route.
+    // Object Manager route (scalar args — fixed paths by index).
     let r0 = native_syscall(SSN_OB_CREATE_DIR, 0);
     let r0b = native_syscall(SSN_OB_LOOKUP_DIR, 0);
     let r1 = native_syscall(SSN_OB_CREATE_DIR, 1);
+
+    // Object Manager route (pointer arg — a real user-supplied UNICODE_STRING path,
+    // built in the shared arg frame). Header at offset 0, UTF-16 chars at offset 16.
+    let name: &[u8] = b"\\Device\\FromUserString";
+    let name_off = 16u64;
+    for (i, &ch) in name.iter().enumerate() {
+        core::ptr::write_volatile(
+            (SYSARG_VADDR + name_off + (i as u64) * 2) as *mut u16,
+            ch as u16,
+        );
+    }
+    core::ptr::write_unaligned(
+        SYSARG_VADDR as *mut NtUnicodeString,
+        NtUnicodeString {
+            length: (name.len() * 2) as u16,
+            maximum_length: (name.len() * 2) as u16,
+            _pad: 0,
+            buffer: SYSARG_VADDR + name_off,
+        },
+    );
+    let created = native_syscall(SSN_OB_CREATE_BYNAME, SYSARG_VADDR);
+    let found = native_syscall(SSN_OB_LOOKUP_BYNAME, SYSARG_VADDR);
+
     // Configuration Manager (registry) route — set then read back a DWORD.
     let set_ok = native_syscall(SSN_CM_SET_DWORD, 42);
     let val = native_syscall(SSN_CM_QUERY_DWORD, 0);
-    let ok = r0 == 1 && r0b == 1 && r1 == 1 && set_ok == 1 && val == 42;
+
+    let ok = r0 == 1
+        && r0b == 1
+        && r1 == 1
+        && created == 1
+        && found == 1
+        && set_ok == 1
+        && val == 42;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -434,7 +505,7 @@ pub unsafe extern "C" fn user_entry() -> ! {
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
 /// its own CNode holding a cap to `fault_ep_c`, and its faults routed there (the
 /// kernel's legacy TCBSetSpace resolves the fault cptr in the FAULTER's cspace).
-unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64) {
+unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64, sysarg_c: u64) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
@@ -461,6 +532,8 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64)
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // The shared syscall-arg frame, at the SAME vaddr as in the executive.
+    let _ = page_map(sysarg_c, SYSARG_VADDR, RW_NX, pml4);
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
@@ -527,6 +600,17 @@ where
                     _ => 0,
                 }
             }
+            SSN_OB_CREATE_BYNAME => match copyin_user_path(arg1) {
+                Some(path) => match client.create_directory(&path, true) {
+                    Ok(_) => 1,
+                    Err(_) => 0,
+                },
+                None => 0,
+            },
+            SSN_OB_LOOKUP_BYNAME => match copyin_user_path(arg1) {
+                Some(path) if client.lookup(&path, true).is_ok() => 1,
+                _ => 0,
+            },
             SSN_CM_SET_DWORD => match cm.set_dword(REG_KEY, "Answer", arg1 as u32) {
                 Ok(()) => 1,
                 Err(_) => 0,
@@ -744,14 +828,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"[ntos-exec] spawning an isolated user thread; routing its native syscalls to Ob\n");
     let user_fault_ep = make_object(OBJ_ENDPOINT);
     let user_fault_ep_c = copy_cap(user_fault_ep);
-    spawn_user_thread(user_entry, user_fault_ep_c);
+    // The shared syscall-arg frame: mapped at SYSARG_VADDR in the executive AND (via
+    // the cap copy) at the same vaddr in the user thread — so a user UNICODE_STRING's
+    // Buffer pointer resolves in both address spaces.
+    let sysarg = alloc_frame();
+    let _ = page_map(sysarg, SYSARG_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg));
     let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm);
-    check(b"exec_syscall_frontend_serviced", serviced >= 5, &mut passed);
+    check(b"exec_syscall_frontend_serviced", serviced >= 7, &mut passed);
     check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
     // The directory the user created via a syscall is visible in the isolated Ob service.
     check(
         b"exec_syscall_created_dir_visible",
         c.lookup(path_for(0), true).is_ok(),
+        &mut passed,
+    );
+    // The user-supplied UNICODE_STRING path (copyin'd from the shared frame) created a
+    // real object visible in the isolated Ob service.
+    check(
+        b"exec_syscall_byname_path_visible",
+        c.lookup("\\Device\\FromUserString", true).is_ok(),
         &mut passed,
     );
     // The DWORD the user set via a registry syscall is visible in the isolated Cm service.
@@ -763,7 +859,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/22 executive->isolated-service checks passed]\n");
+    print_str(b"/23 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
