@@ -424,3 +424,13 @@ findings). A step is not "done" until the plan reflects it.
   user #PF. Fixed structurally: one module‑level `DEVICE_UTS` builds both. This is
   what made the first two mapping attempts #PF identically. Next P1: take the NIC's
   IRQ + generate a real NIC interrupt (ICS/IMS/ICR) into an isolated host; then Ack + DMA.
+- **2026-07-07** — **P1 full-device loop (8d2ef7b): NIC raises a real interrupt;
+  INTx delivery blocked on a kernel gap.** The executive enables INTx + raises a real
+  e1000e interrupt (`ICR=0x80000001`, bit 31 asserted; Interrupt Pin = 1). But
+  delivering that level‑triggered INTx to an isolated host over the IOAPIC doesn't
+  work: `irq_dispatch` only EOIs — it never masks the IOAPIC line and won't reschedule
+  to an equal‑priority woken thread — so a level INTx storms (edge misses it).
+  **Kernel fix needed (Principle 6):** mask a level IOAPIC line on delivery + unmask on
+  `IRQHandler::Ack` (per‑irq pin+trigger tracking), then a single handler on the NIC's
+  GSI. Unblocks all PCI INTx drivers. Reported PENDING, not a suite failure. 34/34 QEMU.
+  **Next: this kernel level‑IRQ‑mask fix.**

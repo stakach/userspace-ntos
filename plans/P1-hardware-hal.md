@@ -97,3 +97,19 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   Its earlier #PF was the SAME DEVICE_UTS drift bug, not a gap‑consume bug — the
   gap‑consume logic itself was never disproven and can be revived when a general PCI
   window is exposed. Per‑BAR untypeds are enough meanwhile.
+- **Full-device loop (8d2ef7b): the NIC raises a REAL interrupt, but INTx delivery to
+  an isolated host is BLOCKED on a kernel gap.** Proven: the executive enables INTx
+  (PCI Command: clear Interrupt‑Disable, set Bus Master), unmasks a cause (IMS) and
+  raises it (ICS); the NIC asserts a real interrupt — `ICR=0x80000001` (bit 31 = INT
+  asserted). Interrupt Pin = 1 (INTA). **KERNEL GAP (needs a proper fix per PLAN §1
+  Principle 6):** `rust-micro/src/arch/x86_64/interrupts.rs::irq_dispatch` only calls
+  `pic::eoi(irq)` — it NEVER masks the IOAPIC line, and `swap_iretq_context_if_
+  preempted` won't switch to an equal‑priority (255) woken thread. So a level‑
+  triggered PCI INTx (held asserted until the driver reads ICR) **storms** the CPU,
+  and edge mode misses a level source. **The fix (standard seL4):** track per‑irq the
+  IOAPIC pin + trigger mode (add to `IrqEntry`, set in `issue_x86_irq_handler`), MASK
+  the pin in `handle_interrupt` when level‑triggered, and UNMASK it in
+  `IRQHandler::Ack` (`ioapic.rs` needs `mask_pin`/`unmask_pin`). Then use a single
+  handler on the NIC's exact GSI (q35: `16 + ((slot+pin) % 8)` → 00:2.0 INTA ≈ GSI 18)
+  with `level=1`, and the isolated host reads ICR to re‑arm. This unblocks ALL PCI
+  INTx drivers, not just the NIC — do it next.
