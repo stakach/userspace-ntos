@@ -21,6 +21,7 @@ pub use sel4_rt::*;
 
 mod allocator;
 mod cm_server;
+mod io_server;
 mod server;
 
 use core::panic::PanicInfo;
@@ -30,9 +31,11 @@ use alloc::vec::Vec;
 
 use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
+use nt_io_abi::wire::IoReply;
+use nt_io_client::IoClient;
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
-use nt_types::{AccessMask, ObjectId};
+use nt_types::{AccessMask, HandleValue, ObjectId};
 use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
 use surt_sel4::{drain_blocking, CPtr, Sel4Env, Sel4Notify};
@@ -70,6 +73,11 @@ pub const CM_SUB_VADDR: u64 = 0x0000_0100_0054_0000;
 pub const CM_COMP_VADDR: u64 = 0x0000_0100_0055_0000;
 pub const CM_REQ_VADDR: u64 = 0x0000_0100_0056_0000;
 pub const CM_REP_VADDR: u64 = 0x0000_0100_0057_0000;
+// A THIRD ring set — the executive's side of the I/O Manager service.
+pub const IO_SUB_VADDR: u64 = 0x0000_0100_0058_0000;
+pub const IO_COMP_VADDR: u64 = 0x0000_0100_0059_0000;
+pub const IO_REQ_VADDR: u64 = 0x0000_0100_005A_0000;
+pub const IO_REP_VADDR: u64 = 0x0000_0100_005B_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 
@@ -230,8 +238,8 @@ struct RingChannel<'a> {
 impl RingChannel<'_> {
     /// One synchronous request/reply: stage `in_buf` in the request frame, push the
     /// SQE, wait for the matching completion, copy the reply payload out. Returns
-    /// `(status, information, detail0, detail1)`.
-    fn raw(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> (i32, u32, u64, u64) {
+    /// `(status, flags, information, detail0, detail1)`.
+    fn raw(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> (i32, u32, u64, u64, u64) {
         // SAFETY: single request in flight; the ring push/pop orders these writes.
         unsafe {
             let dst = self.req_vaddr as *mut u8;
@@ -252,16 +260,16 @@ impl RingChannel<'_> {
             yield_now();
         }
         let _ = self.sq.notify_consumer(&self.signal);
-        let mut out = (0i32, 0u32, 0u64, 0u64);
+        let mut out = (0i32, 0u32, 0u64, 0u64, 0u64);
         let _ = drain_blocking(&mut self.cq, &self.wait, |cqe: &SurtCqe| {
             if cqe.request_id == id {
-                out = (cqe.status, cqe.information as u32, cqe.detail0, cqe.detail1);
+                out = (cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1);
                 false
             } else {
                 true
             }
         });
-        let n = (out.1 as usize).min(out_buf.len());
+        let n = (out.2 as usize).min(out_buf.len());
         // SAFETY: reply frame holds `n` result bytes.
         unsafe {
             let src = self.rep_vaddr as *const u8;
@@ -277,10 +285,10 @@ impl RingChannel<'_> {
 struct ObChan<'a>(RingChannel<'a>);
 impl nt_object_client::Backend for ObChan<'_> {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> ObReply {
-        let (status, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        let (status, _flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
         ObReply {
             status,
-            information,
+            information: information as u32,
             detail0,
             detail1,
         }
@@ -291,9 +299,24 @@ impl nt_object_client::Backend for ObChan<'_> {
 struct CmChan<'a>(RingChannel<'a>);
 impl nt_config_client::Backend for CmChan<'_> {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
-        let (status, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        let (status, _flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
         CmReply {
             status,
+            information: information as u32,
+            detail0,
+            detail1,
+        }
+    }
+}
+
+/// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).
+struct IoChan<'a>(RingChannel<'a>);
+impl nt_io_client::Backend for IoChan<'_> {
+    fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> IoReply {
+        let (status, flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        IoReply {
+            status,
+            flags,
             information,
             detail0,
             detail1,
@@ -692,6 +715,71 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
+    // --- Third isolated service: the I/O Manager over SURT (open/read/write/close a
+    // device backed by a mock driver + an embedded Object Manager, in its own VSpace).
+    print_str(b"[ntos-exec] spawning the I/O Manager as a third isolated service\n");
+    let io_n_sub = make_object(OBJ_NOTIFICATION);
+    let io_n_comp = make_object(OBJ_NOTIFICATION);
+    let io_f_sub = alloc_frame();
+    let io_f_comp = alloc_frame();
+    let io_f_req = alloc_frame();
+    let io_f_rep = alloc_frame();
+    let _ = page_map(io_f_sub, IO_SUB_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(io_f_comp, IO_COMP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(io_f_req, IO_REQ_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(io_f_rep, IO_REP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = init_ring::<SurtSqe>(IO_SUB_VADDR as *mut u8, RING_LEN, &cfg_sub);
+    let _ = init_ring::<SurtCqe>(IO_COMP_VADDR as *mut u8, RING_LEN, &cfg_comp);
+    let io_n_sub_c = copy_cap(io_n_sub);
+    let io_n_comp_c = copy_cap(io_n_comp);
+    let io_f_sub_c = copy_cap(io_f_sub);
+    let io_f_comp_c = copy_cap(io_f_comp);
+    let io_f_req_c = copy_cap(io_f_req);
+    let io_f_rep_c = copy_cap(io_f_rep);
+    spawn_service(
+        io_server::io_server_entry,
+        &[(CT_N_SUB, io_n_sub_c), (CT_N_COMP, io_n_comp_c)],
+        io_f_sub_c,
+        io_f_comp_c,
+        io_f_req_c,
+        io_f_rep_c,
+    );
+    let io_sq = match Producer::<SurtSqe>::attach(IO_SUB_VADDR as *mut u8, RING_LEN) {
+        Ok(p) => p,
+        Err(_) => park(),
+    };
+    let io_cq = match Consumer::<SurtCqe>::attach(IO_COMP_VADDR as *mut u8, RING_LEN) {
+        Ok(q) => q,
+        Err(_) => park(),
+    };
+    let mut io = IoClient::new(IoChan(RingChannel {
+        sq: io_sq,
+        cq: io_cq,
+        signal: Sel4Notify::new(&ENV, io_n_sub),
+        wait: Sel4Notify::new(&ENV, io_n_comp),
+        req_vaddr: IO_REQ_VADDR,
+        rep_vaddr: IO_REP_VADDR,
+        next_id: 1,
+    }));
+    check(b"exec_io_ping", io.ping().is_success(), &mut passed);
+    let io_handle = io.open(
+        "\\??\\Test0",
+        AccessMask::GENERIC_READ | AccessMask::GENERIC_WRITE,
+        0,
+        0,
+        0,
+    );
+    check(b"exec_io_open", io_handle.is_ok(), &mut passed);
+    let ih = io_handle.unwrap_or(HandleValue::NULL);
+    check(b"exec_io_write", io.write(ih, 0, b"hello") == Ok(5), &mut passed);
+    let mut io_out = [0u8; 8];
+    check(
+        b"exec_io_read",
+        matches!(io.read(ih, 0, &mut io_out), Ok(5)) && &io_out[..5] == b"hello",
+        &mut passed,
+    );
+    check(b"exec_io_close", io.close(ih).is_ok(), &mut passed);
+
     // --- Native syscall front-end: an isolated USER thread traps `syscall`s; the
     // executive routes each to the isolated Ob service over SURT and replies so the
     // user resumes. User -> executive front-end -> isolated service -> reply.
@@ -711,7 +799,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/16 executive->isolated-service checks passed]\n");
+    print_str(b"/21 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

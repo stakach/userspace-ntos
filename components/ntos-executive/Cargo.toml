@@ -27,6 +27,10 @@ nt-object-client = { path = "../../crates/nt-object-client" }
 nt-config-abi = { path = "../../crates/nt-config-abi" }
 nt-config-server = { path = "../../crates/nt-config-server" }
 nt-config-client = { path = "../../crates/nt-config-client" }
+nt-io-abi = { path = "../../crates/nt-io-abi" }
+nt-io-manager = { path = "../../crates/nt-io-manager", features = ["object-manager"] }
+nt-io-server = { path = "../../crates/nt-io-server", features = ["object-manager"] }
+nt-io-client = { path = "../../crates/nt-io-client" }
 
 [profile.release]
 panic = "abort"
