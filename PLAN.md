@@ -61,6 +61,14 @@ ReactOS's UMDFv1 drivers.
 5. **Custom builds carry the tests.** End‑to‑end scenarios compile into
    dedicated **custom kernel builds** behind feature flags; production images
    omit them.
+6. **Fix kernel (rust-micro) bugs at the source, early.** When bringing up a new
+   capability surfaces a microkernel bug, **root‑cause and fix it in rust-micro
+   immediately** rather than working around it in userspace. Kernel bugs compound:
+   a wrong cap, a drifted table, or a silent failure will bite later work in
+   harder‑to‑diagnose ways. Prefer structural fixes that make the bug class
+   impossible (single source of truth, invariants) over point patches. Record the
+   root cause + fix in the changelog and memory. *(Example: the `DEVICE_UTS` vs
+   `BootInfo.untypedList` drift — see the 2026‑07‑07 capstone entry.)*
 
 ---
 
@@ -405,3 +413,14 @@ findings). A step is not "done" until the plan reflects it.
   hand a real device to a driver host now exist (device-frame + IRQ-handler + IOPort
   caps + enumeration). Remaining P1: turn a captured (BAR, IRQ) into caps for an
   isolated host + a real `CM_RESOURCE_LIST`; `IRQHandler::Ack`; DMA.
+- **2026-07-07** — **P1 CAPSTONE: drove the real e1000e NIC (executive 8c12853,
+  kernel c6c5bd5).** Mapped the NIC's real MMIO BAR0 (0x81060000) as a device frame
+  and read live registers: CTRL=0x00140241, STATUS=0x00080283 (Link‑Up, Full‑Duplex,
+  1000 Mbps). **33/33 in QEMU.** Root‑caused + fixed a genuine **kernel bug** on the
+  way (per Principle 6): the device‑untyped set was declared twice — `DEVICE_UTS`
+  (stamps the CSpace caps) and a hand‑written `empty_untypeds[]` (builds
+  `BootInfo.untypedList`) — and they drifted, so an advertised device untyped aliased
+  a user‑image‑frame slot → retype gave a bad cap → the frame map silently failed →
+  user #PF. Fixed structurally: one module‑level `DEVICE_UTS` builds both. This is
+  what made the first two mapping attempts #PF identically. Next P1: take the NIC's
+  IRQ + generate a real NIC interrupt (ICS/IMS/ICR) into an isolated host; then Ack + DMA.

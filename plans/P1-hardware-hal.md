@@ -78,4 +78,22 @@ test device; the driver writes an MMIO command, the device raises an IRQ, the
 host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
 
 ## Notes / findings
-_(append as work proceeds)_
+- **P1 CAPSTONE done (executive 8c12853, kernel c6c5bd5):** drove the real e1000e NIC
+  — mapped its MMIO BAR0 (0x81060000) + read live CTRL/STATUS (0x00140241 /
+  0x00080283 = Link‑Up, Full‑Duplex, 1000 Mbps). Composes device‑frame + IOPort caps
+  + PCI enumeration into a real driver reading a real device. 33/33 QEMU.
+- **KERNEL BUG fixed (per PLAN §1 Principle 6):** device untypeds were declared twice
+  in `rust-micro/src/rootserver.rs` — `DEVICE_UTS` (stamps CSpace caps) vs a hand‑
+  written `empty_untypeds[]` (builds `BootInfo.untypedList`). They drifted when I
+  added the NIC BAR, so the advertised NIC untyped aliased a user‑image‑frame slot →
+  retype yielded a bad cap → frame map failed silently → user #PF. **This is why BOTH
+  the gap‑consume and exact‑untyped mapping attempts #PF'd identically.** Fixed
+  structurally: one module‑level `DEVICE_UTS` builds both lists, `untyped_count =
+  1 + DEVICE_UTS.len()`. Lesson: a userspace #PF on a freshly‑mapped device frame,
+  where the mapping "succeeded", almost always means the untyped cap is bad — check
+  the kernel's cap‑placement vs BootInfo metadata FIRST.
+- Deferred: `claim_device_bar()` gap‑consume (map a BAR at an offset inside a larger
+  PCI‑window device untyped) was removed in favor of an exact per‑BAR device untyped.
+  Its earlier #PF was the SAME DEVICE_UTS drift bug, not a gap‑consume bug — the
+  gap‑consume logic itself was never disproven and can be revived when a general PCI
+  window is exposed. Per‑BAR untypeds are enough meanwhile.
