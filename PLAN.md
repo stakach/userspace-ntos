@@ -459,3 +459,11 @@ findings). A step is not "done" until the plan reflects it.
   path, NIC MMIO + interrupt assertion); only the device-specific last mile remains.
   35/35 QEMU. This has been an extensive investigation — recommend pausing the NIC
   interrupt loop and moving to another P1 item (DMA) unless the last mile is a priority.
+- **2026-07-08** — **Confirmed BOTH QEMU q35 NICs are dead ends for IRQ delivery
+  (9172b78).** Tried the e1000 (82540, `-nic model=e1000`): maps fine (live NIC) but
+  QEMU's e1000 model has NO MSI capability (INTx-only), and INTx isn't routed to the
+  IOAPIC. So: e1000e = MSI-X-native (plain MSI dead), e1000 = INTx-only (routing dead).
+  The NIC interrupt loop's last mile needs **MSI-X** (BAR table + IVAR + extended regs
+  + another device untyped) or a **purpose-built device** (`-device edu`, or a virtio
+  device). PAUSING it here — all general/architectural pieces are proven; this is a
+  device-specific detail. Next P1: **DMA** (or MSI-X later if the NIC IRQ is a priority).
