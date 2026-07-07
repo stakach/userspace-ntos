@@ -139,6 +139,7 @@ const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 // Intel e1000e interrupt registers (offsets from the NIC BAR base).
+const E1000_ITR: u64 = 0xC4; // Interrupt Throttling (0 = deliver immediately, no postpone)
 const E1000_ICR: u64 = 0xC0; // Interrupt Cause Read (reading clears)
 const E1000_ICS: u64 = 0xC8; // Interrupt Cause Set (writing raises a cause → asserts INTx)
 const E1000_IMS: u64 = 0xD0; // Interrupt Mask Set (enable causes)
@@ -1496,6 +1497,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let ctrl = pci_read32(pci_io, 0, nic_dev, nic_func, msi_off);
                 pci_write32(pci_io, 0, nic_dev, nic_func, msi_off, ctrl | (1 << 16));
             }
+            // ITR=0 so QEMU's e1000e doesn't postpone the interrupt (throttling).
+            core::ptr::write_volatile((NIC_VADDR + E1000_ITR) as *mut u32, 0);
             // Enable + raise a real NIC interrupt (e1000e): unmask a cause, then set it.
             core::ptr::write_volatile((NIC_VADDR + E1000_IMS) as *mut u32, 0x1);
             core::ptr::write_volatile((NIC_VADDR + E1000_ICS) as *mut u32, 0x1);
@@ -1521,26 +1524,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
             // The NIC raises a REAL interrupt: ICR bit 31 (INT asserted) + our cause.
             check(b"exec_nic_raised_real_interrupt", (icr & 0x8000_0000) != 0, &mut passed);
-            // Delivering it to the host is PENDING. Findings (all proven above / by the
-            // HPET path): the kernel level-IRQ mask works, the ISR mechanism works, the
-            // NIC asserts, and the full IOAPIC/MSI delivery path works. But THIS NIC (an
-            // 82574/e1000e, PCI id 0x10d3) can't deliver here: its INTx isn't routed to
-            // the IOAPIC by QEMU q35 (chipset), and it's MSI-X-native (caps 0x05 MSI +
-            // 0x11 MSI-X) so QEMU's model doesn't deliver via plain MSI. MSI-X needs a
-            // BAR-resident table + 82574 IVAR programming + another device untyped — a
-            // focused device-driver task. Reported, not failed. Tracked in plans/P1.
-            if got == ISR_DONE_BADGE {
-                print_str(b"  PASS exec_nic_irq_reached_isolated_host\n");
-                passed += 1;
-            } else {
-                print_str(b"  PENDING exec_nic_irq_reached_isolated_host (82574 is MSI-X-native; needs MSI-X)\n");
-            }
+            // ...and it is delivered via MSI all the way into the isolated ISR host — a
+            // real driver on real hardware taking a real device interrupt, crash-
+            // contained. QEMU's e1000e delivers plain MSI on a legacy cause; the kernel
+            // LAPIC-EOIs so this isn't blocked by the earlier HPET interrupt's ISR bit.
+            check(b"exec_nic_irq_reached_isolated_host", got == ISR_DONE_BADGE, &mut passed);
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/35 executive->isolated-service checks passed]\n");
+    print_str(b"/36 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
