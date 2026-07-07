@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 
 mod allocator;
+mod cm_server;
 mod server;
 
 use core::panic::PanicInfo;
@@ -27,8 +28,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
+use nt_config_abi::CmReply;
+use nt_config_client::ConfigClient;
 use nt_object_abi::ObReply;
-use nt_object_client::{Backend, ObjectClient};
+use nt_object_client::ObjectClient;
 use nt_types::{AccessMask, ObjectId};
 use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
@@ -60,6 +63,13 @@ pub const SUB_RING_VADDR: u64 = 0x0000_0100_0050_0000;
 pub const COMP_RING_VADDR: u64 = 0x0000_0100_0051_0000;
 pub const REQ_DATA_VADDR: u64 = 0x0000_0100_0052_0000;
 pub const REP_DATA_VADDR: u64 = 0x0000_0100_0053_0000;
+// A SECOND ring set — the executive's side of the Configuration Manager service.
+// (Each spawned service maps ITS frames at the shared SUB/COMP/REQ/REP vaddrs above
+// in its own VSpace; the executive maps each service's frames at distinct vaddrs.)
+pub const CM_SUB_VADDR: u64 = 0x0000_0100_0054_0000;
+pub const CM_COMP_VADDR: u64 = 0x0000_0100_0055_0000;
+pub const CM_REQ_VADDR: u64 = 0x0000_0100_0056_0000;
+pub const CM_REP_VADDR: u64 = 0x0000_0100_0057_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 
@@ -206,18 +216,25 @@ unsafe fn spawn_service(
 // --- The executive's front-end: an ObjectClient over the SURT ring to the
 // isolated Object Manager service. -------------------------------------------
 
-struct SurtBackend<'a> {
+/// One request/reply SURT channel to an isolated service, parameterized by its data
+/// frame vaddrs — so the executive can hold several (one per service).
+struct RingChannel<'a> {
     sq: Producer<SurtSqe>,
     cq: Consumer<SurtCqe>,
-    signal_request: Sel4Notify<'a, KernelEnv>,
-    wait_completion: Sel4Notify<'a, KernelEnv>,
+    signal: Sel4Notify<'a, KernelEnv>,
+    wait: Sel4Notify<'a, KernelEnv>,
+    req_vaddr: u64,
+    rep_vaddr: u64,
     next_id: u64,
 }
-impl Backend for SurtBackend<'_> {
-    fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> ObReply {
+impl RingChannel<'_> {
+    /// One synchronous request/reply: stage `in_buf` in the request frame, push the
+    /// SQE, wait for the matching completion, copy the reply payload out. Returns
+    /// `(status, information, detail0, detail1)`.
+    fn raw(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> (i32, u32, u64, u64) {
         // SAFETY: single request in flight; the ring push/pop orders these writes.
         unsafe {
-            let dst = REQ_DATA_VADDR as *mut u8;
+            let dst = self.req_vaddr as *mut u8;
             for (i, b) in in_buf.iter().enumerate() {
                 core::ptr::write_volatile(dst.add(i), *b);
             }
@@ -234,30 +251,53 @@ impl Backend for SurtBackend<'_> {
         while self.sq.try_push(sqe).is_err() {
             yield_now();
         }
-        let _ = self.sq.notify_consumer(&self.signal_request);
-        let mut reply = ObReply::default();
-        let _ = drain_blocking(&mut self.cq, &self.wait_completion, |cqe: &SurtCqe| {
+        let _ = self.sq.notify_consumer(&self.signal);
+        let mut out = (0i32, 0u32, 0u64, 0u64);
+        let _ = drain_blocking(&mut self.cq, &self.wait, |cqe: &SurtCqe| {
             if cqe.request_id == id {
-                reply = ObReply {
-                    status: cqe.status,
-                    information: cqe.information as u32,
-                    detail0: cqe.detail0,
-                    detail1: cqe.detail1,
-                };
+                out = (cqe.status, cqe.information as u32, cqe.detail0, cqe.detail1);
                 false
             } else {
                 true
             }
         });
-        let n = (reply.information as usize).min(out_buf.len());
+        let n = (out.1 as usize).min(out_buf.len());
         // SAFETY: reply frame holds `n` result bytes.
         unsafe {
-            let src = REP_DATA_VADDR as *const u8;
+            let src = self.rep_vaddr as *const u8;
             for (i, slot) in out_buf.iter_mut().enumerate().take(n) {
                 *slot = core::ptr::read_volatile(src.add(i));
             }
         }
-        reply
+        out
+    }
+}
+
+/// The Object Manager transport wrapper.
+struct ObChan<'a>(RingChannel<'a>);
+impl nt_object_client::Backend for ObChan<'_> {
+    fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> ObReply {
+        let (status, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        ObReply {
+            status,
+            information,
+            detail0,
+            detail1,
+        }
+    }
+}
+
+/// The Configuration Manager transport wrapper.
+struct CmChan<'a>(RingChannel<'a>);
+impl nt_config_client::Backend for CmChan<'_> {
+    fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let (status, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        CmReply {
+            status,
+            information,
+            detail0,
+            detail1,
+        }
     }
 }
 
@@ -409,7 +449,7 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64)
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`. Returns
 /// `(serviced, verdict)`.
-unsafe fn service_user_syscalls<B: Backend>(
+unsafe fn service_user_syscalls<B: nt_object_client::Backend>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
 ) -> (u64, u64) {
@@ -556,13 +596,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         Ok(c) => c,
         Err(_) => park(),
     };
-    let mut c = ObjectClient::new(SurtBackend {
+    let mut c = ObjectClient::new(ObChan(RingChannel {
         sq,
         cq,
-        signal_request: Sel4Notify::new(&ENV, n_sub),
-        wait_completion: Sel4Notify::new(&ENV, n_comp),
+        signal: Sel4Notify::new(&ENV, n_sub),
+        wait: Sel4Notify::new(&ENV, n_comp),
+        req_vaddr: REQ_DATA_VADDR,
+        rep_vaddr: REP_DATA_VADDR,
         next_id: 1,
-    });
+    }));
 
     let mut passed = 0u64;
     check(b"exec_ob_ping", c.ping().is_success(), &mut passed);
@@ -594,6 +636,62 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         Err(_) => check(b"exec_ob_close_handle", false, &mut passed),
     }
 
+    // --- Second isolated service: the Configuration Manager (registry) over SURT.
+    print_str(b"[ntos-exec] spawning the Configuration Manager as a second isolated service\n");
+    let cm_n_sub = make_object(OBJ_NOTIFICATION);
+    let cm_n_comp = make_object(OBJ_NOTIFICATION);
+    let cm_f_sub = alloc_frame();
+    let cm_f_comp = alloc_frame();
+    let cm_f_req = alloc_frame();
+    let cm_f_rep = alloc_frame();
+    let _ = page_map(cm_f_sub, CM_SUB_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(cm_f_comp, CM_COMP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(cm_f_req, CM_REQ_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(cm_f_rep, CM_REP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = init_ring::<SurtSqe>(CM_SUB_VADDR as *mut u8, RING_LEN, &cfg_sub);
+    let _ = init_ring::<SurtCqe>(CM_COMP_VADDR as *mut u8, RING_LEN, &cfg_comp);
+    let cm_n_sub_c = copy_cap(cm_n_sub);
+    let cm_n_comp_c = copy_cap(cm_n_comp);
+    let cm_f_sub_c = copy_cap(cm_f_sub);
+    let cm_f_comp_c = copy_cap(cm_f_comp);
+    let cm_f_req_c = copy_cap(cm_f_req);
+    let cm_f_rep_c = copy_cap(cm_f_rep);
+    spawn_service(
+        cm_server::cm_server_entry,
+        &[(CT_N_SUB, cm_n_sub_c), (CT_N_COMP, cm_n_comp_c)],
+        cm_f_sub_c,
+        cm_f_comp_c,
+        cm_f_req_c,
+        cm_f_rep_c,
+    );
+    let cm_sq = match Producer::<SurtSqe>::attach(CM_SUB_VADDR as *mut u8, RING_LEN) {
+        Ok(p) => p,
+        Err(_) => park(),
+    };
+    let cm_cq = match Consumer::<SurtCqe>::attach(CM_COMP_VADDR as *mut u8, RING_LEN) {
+        Ok(q) => q,
+        Err(_) => park(),
+    };
+    let mut cm = ConfigClient::new(CmChan(RingChannel {
+        sq: cm_sq,
+        cq: cm_cq,
+        signal: Sel4Notify::new(&ENV, cm_n_sub),
+        wait: Sel4Notify::new(&ENV, cm_n_comp),
+        req_vaddr: CM_REQ_VADDR,
+        rep_vaddr: CM_REP_VADDR,
+        next_id: 1,
+    }));
+    let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
+    check(b"exec_cm_ping", cm.ping(), &mut passed);
+    check(b"exec_cm_create_key", cm.create_key(svc_key).is_ok(), &mut passed);
+    check(b"exec_cm_open_key", cm.open_key(svc_key), &mut passed);
+    check(b"exec_cm_set_dword", cm.set_dword(svc_key, "Start", 3).is_ok(), &mut passed);
+    check(
+        b"exec_cm_query_dword",
+        cm.query_dword(svc_key, "Start") == Ok(3),
+        &mut passed,
+    );
+
     // --- Native syscall front-end: an isolated USER thread traps `syscall`s; the
     // executive routes each to the isolated Ob service over SURT and replies so the
     // user resumes. User -> executive front-end -> isolated service -> reply.
@@ -613,7 +711,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/11 executive->isolated-service checks passed]\n");
+    print_str(b"/16 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
