@@ -25,6 +25,13 @@ real DMA (contiguous buffers + physical addresses + MDLs).
       and reads the real HPET GCAP_ID register = 0x8086A201 (VENDOR_ID 0x8086). This
       is the `claim_device_page()` mechanism; next, hand a BAR window to an isolated
       driver host + wire `MmMapIoSpace`, and enumerate real BARs via PCI (still TODO).
+- [x] **Level-triggered IOAPIC IRQ mask — KERNEL FIX (rust-micro 5f62279):** the
+      kernel now MASKS a level IOAPIC line on delivery + UNMASKS on `IRQHandler::Ack`
+      (per-irq pin/trigger tracking in `IrqEntry`; `ioapic::mask_pin`/`unmask_pin`).
+      Before, `irq_dispatch` only EOI'd, so a held level source (PCI INTx) stormed the
+      CPU. Validated: the executive's HPET IRQ path, reconfigured level-triggered, now
+      delivers once into an isolated ISR host with no storm (would hang without it).
+      **This unblocks all PCI INTx drivers.** 34/34.
 - [x] **Real interrupts — first proof (0e96454):** the executive programs HPET
       timer 0 for a one-shot routed to an IOAPIC pin (23), issues an
       `X86IRQIssueIRQHandlerIOAPIC` cap (which programs IOAPIC RTE[pin] →
@@ -113,3 +120,14 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   handler on the NIC's exact GSI (q35: `16 + ((slot+pin) % 8)` → 00:2.0 INTA ≈ GSI 18)
   with `level=1`, and the isolated host reads ICR to re‑arm. This unblocks ALL PCI
   INTx drivers, not just the NIC — do it next.
+- **UPDATE (rust-micro 5f62279 + 70085be): the kernel level-IRQ-mask fix is DONE and
+  VALIDATED** (via a level-triggered HPET interrupt → isolated ISR host, no storm).
+  BUT the e1000e NIC INTx delivery is STILL pending — and it turned out NOT to be the
+  masking (that's fixed) but the **IOAPIC pin/route**: the NIC asserts INTA
+  (`ICR=0x80000001`, Interrupt Pin = 1) yet its INTx reaches **none** of IOAPIC pins
+  3..23 that were tried (edge + level, both polarities, single + multi-pin). QEMU q35
+  routes PCI INTx→GSI via the chipset, and without parsing the **ACPI `_PRT`** we
+  can't know the exact GSI for 00:2.0. **Next for the NIC loop:** parse the ACPI DSDT
+  `_PRT` (or the MADT interrupt-source-overrides) to get the device→GSI mapping, then
+  a single level-triggered handler on that GSI completes the loop (the kernel + host
+  machinery are all ready). This is an executive-side task, not a kernel one.

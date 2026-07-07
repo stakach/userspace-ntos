@@ -434,3 +434,11 @@ findings). A step is not "done" until the plan reflects it.
   `IRQHandler::Ack` (per‑irq pin+trigger tracking), then a single handler on the NIC's
   GSI. Unblocks all PCI INTx drivers. Reported PENDING, not a suite failure. 34/34 QEMU.
   **Next: this kernel level‑IRQ‑mask fix.**
+- **2026-07-07** — **P1 kernel level-IRQ-mask fix DONE + validated (rust-micro
+  5f62279, executive 70085be).** The kernel now masks a level IOAPIC line on delivery
+  + unmasks on `IRQHandler::Ack` (per Principle 6) — unblocks all PCI INTx drivers.
+  Validated with a level-triggered HPET interrupt into an isolated ISR host (no storm;
+  would hang without the fix). 34/34. The e1000e NIC full loop's remaining blocker is
+  now purely executive-side: the NIC asserts INTA but its INTx doesn't reach any tried
+  IOAPIC GSI (3..23) — QEMU q35 chipset PCI-INTx routing needs the ACPI `_PRT` parsed
+  to get 00:2.0's exact GSI. Next: parse `_PRT`, then a single level handler completes it.
