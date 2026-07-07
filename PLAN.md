@@ -317,9 +317,10 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
 priorities, changelog) **and** its phase sub‑plan (check off tasks, record
 findings). A step is not "done" until the plan reflects it.
 
-- **Status:** `P0 in progress` · `P1 not started` · `P2 not started` ·
-  `P3 not started` · `P4–P7 stub`. (Foundational crates for all phases largely
-  exist; phases are about making them *real + composed + booted*.)
+- **Status:** `P0 functionally complete` (broker migration deferred) · `P1 not
+  started` · `P2 not started` · `P3 not started` · `P4–P7 stub`. (Foundational
+  crates for all phases largely exist; phases are about making them *real + composed
+  + booted*.)
 - **How to update:** edit the gap table (§5) priorities as reality shifts; move a
   phase's status; append to the changelog below with date + commit.
 
@@ -366,3 +367,11 @@ findings). A step is not "done" until the plan reflects it.
   real `create_directory` — the copyin the real `Nt*` path needs. **23/23 in QEMU.**
   P0 executive core is functionally complete; remaining items are P3-adjacent
   (real ntdll SSNs + OBJECT_ATTRIBUTES) and the driver-host broker migration.
+- **2026-07-07** — **P0 complete (4c962c7).** The registry syscall route now uses
+  the real Win7 ntdll SSN numbers (via `nt_syscall::NativeServiceTable`) + a real x64
+  `OBJECT_ATTRIBUTES` copied in + decoded — the ABI a real ntdll process speaks.
+  **P0 is functionally done** (23/23 QEMU); the only remaining P0 item — folding the
+  `driver-host-pnp` broker role under the executive — is intentionally **deferred to
+  post-P1/P2** so it targets a stable service shape. **Next: P1 (real hardware)** —
+  the biggest gap; note "real" = real seL4 frame/MMIO + IRQ-handler caps to a
+  QEMU-emulated device, not a different emulator (QEMU/emulation stays the dev path).

@@ -10,7 +10,11 @@ carried by `driver-host-pnp`.
 single, small, well‑understood broker/loader — the seL4 analogue of the boot
 executive — rather than growing one driver host into everything.
 
-## Status: in progress (increments 1–5 landed — c2e904f, 44d95bf, db7edac+448673c, 3edd34c, b054569)
+## Status: functionally complete (broker migration deferred to post-P1/P2)
+Increments: c2e904f, 44d95bf, db7edac+448673c, 3edd34c, b054569, fc73302, 5420b9f, 4c962c7.
+`ntos-executive` composes **three isolated services** (Ob + Cm + Io) over SURT + a native syscall
+front-end (real ntdll SSNs + OBJECT_ATTRIBUTES for the registry route). **23/23 QEMU**
+(`scripts/run-executive.sh`). Only the driver-host broker migration remains, intentionally deferred.
 
 ## Background (what already exists to reuse)
 - `object-service` already spawns **two isolated components over SURT** with cap
@@ -60,18 +64,39 @@ executive — rather than growing one driver host into everything.
       `UNICODE_STRING` (Buffer pointer) from a shared arg frame mapped at the same
       vaddr in both the executive + the isolated user thread, bounds-checked like a
       kernel probe, and routes a real `create_directory` with the user's path. 23/23.
-- [ ] **Real ntdll syscall numbers + OBJECT_ATTRIBUTES:** swap the placeholder SSNs
-      for the real ntdll SSNs and wrap the `UNICODE_STRING` in an `OBJECT_ATTRIBUTES`,
-      so a real isolated ntdll process (as in `driver-host-ntdll`) drives this path
-      unchanged. (P3 territory — the copyin mechanism is now in place.)
-- [ ] **Migrate the driver-host broker role:** fold `driver-host-pnp`'s broker/
-      supervisor duties under `ntos-executive` (later, once services land).
+- [x] **Real ntdll SSNs + OBJECT_ATTRIBUTES (4c962c7):** the registry syscall route
+      now uses the real Win7 SP1 ntdll SSN numbers classified through
+      `nt_syscall::NativeServiceTable` → `NativeService`, and a real x64
+      `OBJECT_ATTRIBUTES` copied in + decoded into `nt_types::ObjectAttributes`
+      (bounds-checked). `NtCreateKey/NtSetValueKey/NtQueryValueKey` → isolated Cm.
+      The ABI the executive speaks is now real; only the user *stub* is synthetic
+      (the real-ntdll trap path is proven in `driver-host-ntdll`). 23/23.
+- [~] **Migrate the driver-host broker role — DEFERRED (post-services).** Folding
+      `driver-host-pnp`'s broker/supervisor duties under `ntos-executive` is invasive
+      and premature while the service set is still growing; `driver-host-pnp` works
+      today. Do it once P1/P2 land the storage + a couple of real driver hosts, so
+      the migration targets a stable shape rather than a moving one.
 
 ## Design decisions to record here as they're made
-- Manifest format (static Rust table vs. a small on-disk descriptor).
-- Where Mm/Ps trusted shims live (Tier 1 vs Tier 2) — they touch microkernel
-  VSpace/TCB directly; likely a thin Tier‑1 shim + a Tier‑2 policy service.
-- Cap-transfer story for handles that cross services (an Ob handle used by Io).
+- **Executive = broker + front-end in one root task** (decided): the root task maps
+  each service's rings in its own VSpace and drives the clients directly — no
+  separate front-end component. Clean and proven.
+- **One `RingChannel` per service, distinct vaddrs in the executive** (decided): each
+  spawned service maps its frames at the shared SUB/COMP/REQ/REP vaddrs in its *own*
+  VSpace; the executive maps each service's frames at distinct vaddrs (Ob 0x50-53,
+  Cm 0x54-57, Io 0x58-5B). Rings are frame-relative so different vaddrs are fine.
+- **`stand_up_service()` is the launch primitive** (decided): a full data-driven
+  manifest is deferred — the heterogeneous client types (ObjectClient/ConfigClient/
+  IoClient) don't unify without trait objects, and the helper already removes the
+  duplication. Revisit if/when services are loaded from ELFs on disk.
+- **Syscall args cross via a shared arg frame at a common vaddr** (decided): a
+  per-user-thread frame mapped at `SYSARG_VADDR` in both VSpaces, so a real
+  `OBJECT_ATTRIBUTES`/`UNICODE_STRING` pointer resolves in both; the executive
+  copyin-probes it (must lie inside the frame). Real arbitrary-user-memory copyin
+  (walking the user's page tables) is a later refinement, needed once processes
+  allocate their own memory (P3).
+- Still open: where Mm/Ps trusted shims live (Tier 1 vs Tier 2); cap-transfer for
+  handles that cross services (an Ob handle used by Io).
 
 ## Exit criteria
 - `ntos-executive` boots on rust-micro, spawns **Ob + Io (or Cm)** as separate
