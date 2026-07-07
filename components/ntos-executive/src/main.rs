@@ -70,12 +70,24 @@ const QLEN: u32 = 8;
 /// Read/write, non-executable — data regions (heap, stack, rings, buffers).
 const RW_NX: u64 = 3 | PAGE_EXECUTE_NEVER;
 
-// A spawned service's own CNode cptrs.
+// A spawned component's own CNode cptrs.
 pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
+pub const CT_FAULT: u64 = 6; // a user thread's own cap to its fault endpoint
 const CN_RADIX: u32 = 5;
 const CN_GUARD_BADGE: u64 = 59;
+
+// `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
+const SYS_REPLY_RECV: i64 = -2;
+/// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
+static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
+
+// The native "syscall" numbers the isolated user thread issues (we own both sides;
+// these stand in for the ntdll SSNs a real user process would trap with).
+const SSN_OB_CREATE_DIR: u64 = 0x0100; // arg1 = directory index → \Device\Syscall<n>
+const SSN_OB_LOOKUP_DIR: u64 = 0x0101; // arg1 = directory index
+const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
 
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
@@ -249,6 +261,212 @@ impl Backend for SurtBackend<'_> {
     }
 }
 
+// --- Native syscall trap front-end -----------------------------------------
+// The executive catches a user thread's `syscall` (delivered as a seL4
+// UnknownSyscall fault), routes it to the owning isolated service over SURT, and
+// replies register-accurately so the user resumes past the syscall. (Trap/reply
+// mechanics ported from driver-host-ntdll, which services real ntdll.)
+
+/// Receive an UnknownSyscall fault: `(badge, msginfo, mr0..mr3)` = RAX(SSN), RBX,
+/// RCX(=return IP), RDX. Saved regs 4+ land in this thread's IPC buffer.
+unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_RECV as u64,
+        inout("rdi") ep => badge,
+        lateout("rsi") msginfo,
+        lateout("r10") mr0,
+        lateout("r8") mr1,
+        lateout("r9") mr2,
+        lateout("r15") mr3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (badge, msginfo, mr0, mr1, mr2, mr3)
+}
+
+/// Reply to the pending fault (resume the faulter with the staged registers) + recv
+/// the next fault. `r0..r3` → reply MRs 0..3 (RAX,RBX,RCX,RDX); MRs 4+ from `set_reply_mr`.
+unsafe fn reply_recv_full(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> (u64, u64, u64, u64, u64) {
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_REPLY_RECV as u64,
+        inout("rdi") recv_ep => _,
+        inout("rsi") reply_len => msginfo,
+        inout("r10") r0 => mr0,
+        inout("r8") r1 => mr1,
+        inout("r9") r2 => mr2,
+        inout("r15") r3 => mr3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (msginfo, mr0, mr1, mr2, mr3)
+}
+
+unsafe fn set_reply_mr(i: usize, v: u64) {
+    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
+}
+unsafe fn get_recv_mr(i: usize) -> u64 {
+    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
+}
+
+/// The fixed object path for a syscall's directory index.
+fn path_for(i: u64) -> &'static str {
+    match i {
+        0 => "\\Device\\Syscall0",
+        1 => "\\Device\\Syscall1",
+        _ => "\\Device\\SyscallX",
+    }
+}
+
+/// A raw native syscall from the isolated user thread: SSN in RAX, arg1 in R10
+/// (the Windows x64 convention — RCX is clobbered by `syscall`), result in RAX.
+unsafe fn ob_syscall(ssn: u64, arg1: u64) -> u64 {
+    let ret: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rax") ssn => ret,
+        in("r10") arg1,
+        lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    ret
+}
+
+/// The isolated user thread: a separate VSpace/CSpace with no access to the Object
+/// Manager — it reaches objects only by trapping `syscall`s the executive services.
+#[no_mangle]
+#[link_section = ".text.user_entry"]
+pub unsafe extern "C" fn user_entry() -> ! {
+    let r0 = ob_syscall(SSN_OB_CREATE_DIR, 0);
+    let r0b = ob_syscall(SSN_OB_LOOKUP_DIR, 0);
+    let r1 = ob_syscall(SSN_OB_CREATE_DIR, 1);
+    let ok = r0 == 1 && r0b == 1 && r1 == 1;
+    let _ = ob_syscall(SSN_DONE, ok as u64);
+    park()
+}
+
+/// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
+/// its own CNode holding a cap to `fault_ep_c`, and its faults routed there (the
+/// kernel's legacy TCBSetSpace resolves the fault cptr in the FAULTER's cspace).
+unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64) {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    for i in 0..STACK_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+}
+
+/// Run the native-syscall service loop for the isolated user thread, routing each
+/// Ob syscall to the isolated Object Manager service via `client`. Returns
+/// `(serviced, verdict)`.
+unsafe fn service_user_syscalls<B: Backend>(
+    user_fault_ep: u64,
+    client: &mut ObjectClient<B>,
+) -> (u64, u64) {
+    let mut created: [Option<ObjectId>; 2] = [None, None];
+    let mut serviced = 0u64;
+    let mut verdict = 0u64;
+    let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
+    loop {
+        if (mi >> 12) != 2 {
+            break; // not an UnknownSyscall — stop
+        }
+        let ssn = m0;
+        let arg1 = get_recv_mr(9); // R10
+        if ssn == SSN_DONE {
+            verdict = arg1;
+            break; // leave the faulter blocked; test is done
+        }
+        let resume_ip = m2; // RCX = return address saved by `syscall`
+        let sp = get_recv_mr(16);
+        let flags = get_recv_mr(17);
+        let result = match ssn {
+            SSN_OB_CREATE_DIR => {
+                let i = arg1 as usize;
+                match client.create_directory(path_for(arg1), true) {
+                    Ok(id) => {
+                        if i < 2 {
+                            created[i] = Some(id);
+                        }
+                        1
+                    }
+                    Err(_) => 0,
+                }
+            }
+            SSN_OB_LOOKUP_DIR => {
+                let i = arg1 as usize;
+                match client.lookup(path_for(arg1), true) {
+                    Ok(id) if i < 2 && created[i] == Some(id) => 1,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
+        serviced += 1;
+        // Reply: RAX = result, resume at the return IP, preserve SP/FLAGS.
+        set_reply_mr(15, resume_ip);
+        set_reply_mr(16, sp);
+        set_reply_mr(17, flags);
+        let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(user_fault_ep, 18, result, m1, 0, m3);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    (serviced, verdict)
+}
+
 fn check(name: &[u8], ok: bool, passed: &mut u64) {
     if ok {
         print_str(b"  PASS ");
@@ -271,6 +489,7 @@ fn park() -> ! {
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
+    IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
     IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
@@ -375,9 +594,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         Err(_) => check(b"exec_ob_close_handle", false, &mut passed),
     }
 
+    // --- Native syscall front-end: an isolated USER thread traps `syscall`s; the
+    // executive routes each to the isolated Ob service over SURT and replies so the
+    // user resumes. User -> executive front-end -> isolated service -> reply.
+    print_str(b"[ntos-exec] spawning an isolated user thread; routing its native syscalls to Ob\n");
+    let user_fault_ep = make_object(OBJ_ENDPOINT);
+    let user_fault_ep_c = copy_cap(user_fault_ep);
+    spawn_user_thread(user_entry, user_fault_ep_c);
+    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c);
+    check(b"exec_syscall_frontend_serviced", serviced >= 3, &mut passed);
+    check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
+    // The directory the user created via a syscall is visible in the isolated Ob service.
+    check(
+        b"exec_syscall_created_dir_visible",
+        c.lookup(path_for(0), true).is_ok(),
+        &mut passed,
+    );
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/8 executive->isolated-Ob-service checks passed]\n");
+    print_str(b"/11 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
