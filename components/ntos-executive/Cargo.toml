@@ -1,0 +1,37 @@
+# The NT Object Manager as TWO isolated seL4 components (client + server) talking
+# over SURT rings, brokered by the rootserver. Standalone bare-metal crate (own
+# workspace + custom target); staged as the kernel rootserver by build.sh.
+[workspace]
+
+[package]
+name = "ntos-executive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ntos-executive"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel ABI + SURT transport.
+sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }
+surt-sel4 = "0.1"
+# The NT object-manager stack (built no_std + alloc here).
+nt-status = { path = "../../crates/nt-status" }
+nt-types = { path = "../../crates/nt-types" }
+nt-object-abi = { path = "../../crates/nt-object-abi" }
+nt-object-manager = { path = "../../crates/nt-object-manager" }
+nt-object-server = { path = "../../crates/nt-object-server" }
+nt-object-client = { path = "../../crates/nt-object-client" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = false
+debug = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
