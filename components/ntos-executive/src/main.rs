@@ -22,6 +22,7 @@ pub use sel4_rt::*;
 mod allocator;
 mod cm_server;
 mod io_server;
+mod isr;
 mod server;
 
 use core::panic::PanicInfo;
@@ -102,13 +103,15 @@ pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
 pub const CT_FAULT: u64 = 6; // a user thread's own cap to its fault endpoint
+pub const CT_IRQ_NTFN: u64 = 3; // the ISR host's cap to the IRQ notification
+pub const CT_RESULT_NTFN: u64 = 4; // the ISR host's cap to the result notification
 const CN_RADIX: u32 = 5;
 const CN_GUARD_BADGE: u64 = 59;
+/// Badge the isolated ISR host signals after it handles the interrupt.
+const ISR_DONE_BADGE: u64 = 0x80;
 
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
-/// `SysNBRecv` — non-blocking receive/poll on a notification (returns badge 0 if idle).
-const SYS_NB_RECV: i64 = -8;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
@@ -453,20 +456,6 @@ unsafe fn ioapic_issue_irq_handler(dest_slot: u64, pin: u64) {
     );
 }
 
-/// Non-blocking poll of a notification: returns the pending badge (0 if not signalled).
-unsafe fn nb_recv(ntfn: u64) -> u64 {
-    let badge: u64;
-    core::arch::asm!(
-        "syscall",
-        in("rdx") SYS_NB_RECV as u64,
-        inout("rdi") ntfn => badge,
-        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-    badge
-}
-
 /// The fixed object path for a syscall's directory index.
 fn path_for(i: u64) -> &'static str {
     match i {
@@ -684,6 +673,55 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64,
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+}
+
+/// Spawn the isolated ISR "driver host" (P1): its own VSpace (image RO + stack + IPC
+/// buffer) and a CNode holding ONLY a cap to the IRQ notification + the result
+/// notification — least privilege. Its thread (`isr_entry`) blocks on the IRQ
+/// notification and, when the real interrupt fires, signals the result notification.
+unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64, result_cap: u64) {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    for i in 0..STACK_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IRQ_NTFN, irq_cap, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_RESULT_NTFN, result_cap, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, 0, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
@@ -1070,21 +1108,37 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(IRQ_VECTOR);
             print_str(b"\n");
 
-            // A badged notification so a delivered IRQ (badge != 0) is unambiguous.
-            let ntfn = make_object(OBJ_NOTIFICATION);
-            let ntfn_badged = alloc_slot();
+            // The IRQ notification (bound to the handler; the ISR host waits on it) +
+            // the result notification (the ISR host signals it). Badged so signals are
+            // unambiguous when polled.
+            let irq_ntfn = make_object(OBJ_NOTIFICATION);
+            let irq_ntfn_badged = alloc_slot();
             let _ = syscall5(
                 SYS_SEND,
                 CAP_INIT_THREAD_CNODE,
                 LBL_CNODE_MINT << 12,
-                ntfn_badged,
-                ntfn,
+                irq_ntfn_badged,
+                irq_ntfn,
                 IRQ_BADGE,
             );
-            // Issue the IOAPIC IRQ-handler cap (also programs IOAPIC RTE[pin]).
+            let irq_ntfn_isr = copy_cap(irq_ntfn); // the isolated ISR host waits on this
+            let result_ntfn = make_object(OBJ_NOTIFICATION);
+            let result_ntfn_badged = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND,
+                CAP_INIT_THREAD_CNODE,
+                LBL_CNODE_MINT << 12,
+                result_ntfn_badged,
+                result_ntfn,
+                ISR_DONE_BADGE,
+            );
+            // Issue the IOAPIC IRQ-handler cap (also programs IOAPIC RTE[pin]) + bind it.
             let handler = alloc_slot();
             ioapic_issue_irq_handler(handler, pin);
-            let _ = irq_handler_set_notification(handler, ntfn_badged);
+            let _ = irq_handler_set_notification(handler, irq_ntfn_badged);
+            // Hand the isolated ISR "driver host" ONLY the IRQ + result notifications;
+            // its ISR thread blocks on the IRQ and reports via the result notification.
+            spawn_isr(isr::isr_entry, irq_ntfn_isr, result_ntfn_badged);
 
             // Program timer 0: interrupt enable + route to `pin`, edge, one-shot.
             let newcfg = (1u64 << 2) | (pin << 9);
@@ -1099,19 +1153,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let gc = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
             core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, gc | 1);
 
-            // Poll for the interrupt (bounded, non-blocking — a misfire fails cleanly).
-            let mut got = 0u64;
-            for _ in 0..3_000_000u64 {
-                let b = nb_recv(ntfn);
-                if b != 0 {
-                    got = b;
-                    break;
-                }
-            }
-            print_str(b"[ntos-exec] IRQ notification badge = ");
+            // Block on the RESULT notification. The executive is priority 255, so it
+            // must BLOCK (not spin) to yield the CPU to the priority-100 ISR host —
+            // which then waits on the IRQ and, when the real interrupt fires, signals
+            // us back. (Same pattern as the SURT service waits; the timer delivery is
+            // proven, so this returns rather than hangs.)
+            let (_z, got, _s, _m) = ep_recv(result_ntfn);
+            print_str(b"[ntos-exec] isolated ISR host reported badge = ");
             print_u64(got);
             print_str(b"\n");
-            check(b"exec_hpet_real_interrupt_delivered", got == IRQ_BADGE, &mut passed);
+            check(
+                b"exec_hpet_irq_reached_isolated_isr",
+                got == ISR_DONE_BADGE,
+                &mut passed,
+            );
         }
     }
 
