@@ -145,3 +145,18 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   (label 65 — already in the kernel; no IOAPIC pin, no masking needed since MSI is
   edge-like), bind a notification. The MSI write to the LAPIC bypasses the IOAPIC +
   chipset INTx routing entirely. This closes the loop where INTx can't.
+- **UPDATE (c1395ae): plain MSI also doesn't deliver — the NIC is MSI-X-native.** The
+  MSI path was implemented (`msi_issue_irq_handler`, cap walk, program address/data,
+  enable). The NIC's caps: PM(0x01)@0xC8, **MSI(0x05)@0xD0**, PCIe(0x10)@0xE0,
+  **MSI-X(0x11)@0xA0**. Plain MSI still yields no delivery: the 82574/e1000e (id
+  0x10d3) is MSI-X-native, and QEMU's `e1000e` model routes via MSI-X (or INTx), not
+  plain MSI. **To actually close the NIC loop → MSI-X:** read the MSI-X table
+  BAR/offset (cap 0x11 + config 0xA4), map that BAR (needs another exact device
+  untyped in `DEVICE_UTS`), program MSI-X table entry 0 (addr 0xFEE00000, data
+  vector+0x20, unmask), program the 82574 IVAR (0x1700+) to route the cause to MSI-X
+  vector 0, enable MSI-X (control bit 15), trigger via the extended interrupt regs
+  (EIMS 0x1524 / EICS 0x1520). A focused device-driver task. **Simpler alternative:**
+  use the `e1000` (82540) NIC (`-nic model=e1000` — plain MSI works) or a `-device edu`
+  test device, if we're willing to touch the shared QEMU cmdline. **Everything general
+  is proven** (kernel mask fix, delivery path, NIC MMIO + assertion); only this
+  device-specific last mile remains.

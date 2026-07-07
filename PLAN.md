@@ -450,3 +450,12 @@ findings). A step is not "done" until the plan reflects it.
   this default NIC's INTx to the IOAPIC. Real fix = **MSI** (bypasses the IOAPIC +
   chipset; kernel `X86IRQIssueIRQHandlerMSI` exists). The kernel level-IRQ-mask fix
   (the valuable, general result) stands DONE + validated. 34/34 QEMU.
+- **2026-07-08** — **NIC MSI attempt (c1395ae): plain MSI doesn't deliver either — the
+  NIC is MSI-X-native.** Implemented the MSI path; found the NIC's caps (MSI 0x05 +
+  MSI-X 0x11). The 82574/e1000e (id 0x10d3) routes via MSI-X (or INTx) in QEMU, not
+  plain MSI. Closing the loop needs MSI-X (BAR-resident table + 82574 IVAR + extended
+  regs) — a focused device-driver task — OR a simpler NIC (`-nic model=e1000`, plain
+  MSI) / `-device edu`. Everything general is proven (kernel mask fix, full delivery
+  path, NIC MMIO + interrupt assertion); only the device-specific last mile remains.
+  35/35 QEMU. This has been an extensive investigation — recommend pausing the NIC
+  interrupt loop and moving to another P1 item (DMA) unless the last mile is a priority.
