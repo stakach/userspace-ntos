@@ -1411,13 +1411,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let result_ntfn = make_object(OBJ_NOTIFICATION);
             let result_badged = alloc_slot();
             let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, result_badged, result_ntfn, ISR_DONE_BADGE);
-            // The NIC's IOAPIC input line is chipset-routed (a PCI GSI, 16..23). Now
-            // that the kernel masks a level line on delivery, LEVEL-triggered handlers
-            // are safe — so cover all PCI GSIs, each with its OWN vector (so the kernel
-            // masks the RIGHT pin per irq), all bound to the one NIC notification.
+            // NOTE (finding): the kernel level-IRQ mask is validated (HPET, above), the
+            // ISR mechanism works, and the NIC asserts INTA (ICR bit 31) — yet an
+            // EXHAUSTIVE scan of every IOAPIC pin 0..23 (edge + level, both polarities,
+            // distinct vectors) never delivers. So this isn't GSI discovery (the ACPI
+            // _PRT wouldn't help): QEMU q35 isn't routing THIS NIC's INTx to the IOAPIC
+            // at all — a chipset PCI-INTx routing detail. The realistic path is MSI
+            // (the e1000e supports it; a memory write to the LAPIC bypasses the IOAPIC
+            // + chipset INTx routing entirely). Keeping a level-triggered handler on the
+            // canonical PCI GSIs 16..23 for when the routing is enabled.
             let _ = int_pin;
-            for (i, pin) in (8..16u64).enumerate() {
-                let vector = 3 + i as u64; // 3..10, distinct per pin (pin 11 → vector 6)
+            for (i, pin) in (16..24u64).enumerate() {
+                let vector = 3 + i as u64; // 3..10, distinct per pin
                 let handler = alloc_slot();
                 ioapic_issue_irq_handler(handler, pin, vector, /*level*/ 1, /*polarity*/ 0);
                 let _ = irq_handler_set_notification(handler, nic_irq_badged);
