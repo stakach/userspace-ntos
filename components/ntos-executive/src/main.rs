@@ -105,7 +105,12 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 // these stand in for the ntdll SSNs a real user process would trap with).
 const SSN_OB_CREATE_DIR: u64 = 0x0100; // arg1 = directory index → \Device\Syscall<n>
 const SSN_OB_LOOKUP_DIR: u64 = 0x0101; // arg1 = directory index
+const SSN_CM_SET_DWORD: u64 = 0x0110; // arg1 = value → REG_KEY\Answer  (stands in for NtSetValueKey)
+const SSN_CM_QUERY_DWORD: u64 = 0x0111; // returns REG_KEY\Answer      (stands in for NtQueryValueKey)
 const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
+
+/// The fixed registry key the syscall front-end reads/writes for the Cm route.
+const REG_KEY: &str = r"\Registry\Machine\System\CurrentControlSet\Services\FromSyscall";
 
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
@@ -397,7 +402,7 @@ fn path_for(i: u64) -> &'static str {
 
 /// A raw native syscall from the isolated user thread: SSN in RAX, arg1 in R10
 /// (the Windows x64 convention — RCX is clobbered by `syscall`), result in RAX.
-unsafe fn ob_syscall(ssn: u64, arg1: u64) -> u64 {
+unsafe fn native_syscall(ssn: u64, arg1: u64) -> u64 {
     let ret: u64;
     core::arch::asm!(
         "syscall",
@@ -414,11 +419,15 @@ unsafe fn ob_syscall(ssn: u64, arg1: u64) -> u64 {
 #[no_mangle]
 #[link_section = ".text.user_entry"]
 pub unsafe extern "C" fn user_entry() -> ! {
-    let r0 = ob_syscall(SSN_OB_CREATE_DIR, 0);
-    let r0b = ob_syscall(SSN_OB_LOOKUP_DIR, 0);
-    let r1 = ob_syscall(SSN_OB_CREATE_DIR, 1);
-    let ok = r0 == 1 && r0b == 1 && r1 == 1;
-    let _ = ob_syscall(SSN_DONE, ok as u64);
+    // Object Manager route.
+    let r0 = native_syscall(SSN_OB_CREATE_DIR, 0);
+    let r0b = native_syscall(SSN_OB_LOOKUP_DIR, 0);
+    let r1 = native_syscall(SSN_OB_CREATE_DIR, 1);
+    // Configuration Manager (registry) route — set then read back a DWORD.
+    let set_ok = native_syscall(SSN_CM_SET_DWORD, 42);
+    let val = native_syscall(SSN_CM_QUERY_DWORD, 0);
+    let ok = r0 == 1 && r0b == 1 && r1 == 1 && set_ok == 1 && val == 42;
+    let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
 
@@ -472,10 +481,15 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64)
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`. Returns
 /// `(serviced, verdict)`.
-unsafe fn service_user_syscalls<B: nt_object_client::Backend>(
+unsafe fn service_user_syscalls<B, CB>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
-) -> (u64, u64) {
+    cm: &mut ConfigClient<CB>,
+) -> (u64, u64)
+where
+    B: nt_object_client::Backend,
+    CB: nt_config_client::Backend,
+{
     let mut created: [Option<ObjectId>; 2] = [None, None];
     let mut serviced = 0u64;
     let mut verdict = 0u64;
@@ -513,6 +527,14 @@ unsafe fn service_user_syscalls<B: nt_object_client::Backend>(
                     _ => 0,
                 }
             }
+            SSN_CM_SET_DWORD => match cm.set_dword(REG_KEY, "Answer", arg1 as u32) {
+                Ok(()) => 1,
+                Err(_) => 0,
+            },
+            SSN_CM_QUERY_DWORD => match cm.query_dword(REG_KEY, "Answer") {
+                Ok(v) => v as u64,
+                Err(_) => 0,
+            },
             _ => 0,
         };
         serviced += 1;
@@ -787,8 +809,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let user_fault_ep = make_object(OBJ_ENDPOINT);
     let user_fault_ep_c = copy_cap(user_fault_ep);
     spawn_user_thread(user_entry, user_fault_ep_c);
-    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c);
-    check(b"exec_syscall_frontend_serviced", serviced >= 3, &mut passed);
+    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm);
+    check(b"exec_syscall_frontend_serviced", serviced >= 5, &mut passed);
     check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
     // The directory the user created via a syscall is visible in the isolated Ob service.
     check(
@@ -796,10 +818,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         c.lookup(path_for(0), true).is_ok(),
         &mut passed,
     );
+    // The DWORD the user set via a registry syscall is visible in the isolated Cm service.
+    check(
+        b"exec_syscall_registry_value_visible",
+        cm.query_dword(REG_KEY, "Answer") == Ok(42),
+        &mut passed,
+    );
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/21 executive->isolated-service checks passed]\n");
+    print_str(b"/22 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
