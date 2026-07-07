@@ -24,6 +24,7 @@ nt-object-abi = { path = "../../crates/nt-object-abi" }
 nt-object-manager = { path = "../../crates/nt-object-manager" }
 nt-object-server = { path = "../../crates/nt-object-server" }
 nt-object-client = { path = "../../crates/nt-object-client" }
+nt-syscall = { path = "../../crates/nt-syscall" }
 nt-config-abi = { path = "../../crates/nt-config-abi" }
 nt-config-server = { path = "../../crates/nt-config-server" }
 nt-config-client = { path = "../../crates/nt-config-client" }

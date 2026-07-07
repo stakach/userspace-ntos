@@ -35,7 +35,8 @@ use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
-use nt_types::{AccessMask, HandleValue, ObjectId};
+use nt_syscall::{NativeService, NativeServiceTable, UserlandAbiProfile};
+use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectAttributes, ObjectId, UnicodeString};
 use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
 use surt_sel4::{drain_blocking, CPtr, Sel4Env, Sel4Notify};
@@ -105,14 +106,20 @@ const SYS_REPLY_RECV: i64 = -2;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 
-// The native "syscall" numbers the isolated user thread issues (we own both sides;
-// these stand in for the ntdll SSNs a real user process would trap with).
+// Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
+// `NativeService` classification via `NativeServiceTable`; a real isolated ntdll
+// process registers its own numbers the same way (from_numbers(ntdll.syscall_number)).
+const NT_CREATE_KEY: u64 = 0x1D; // NtCreateKey(*OBJECT_ATTRIBUTES)
+const NT_QUERY_VALUE_KEY: u64 = 0x18; // NtQueryValueKey(*OBJECT_ATTRIBUTES) → value in RAX
+const NT_SET_VALUE_KEY: u64 = 0x5D; // NtSetValueKey(*OBJECT_ATTRIBUTES, value in RDX)
+
+// The Object Manager namespace ops aren't in the `NativeService` enum (a niche
+// syscall surface), so they keep synthetic numbers — but now carry a real
+// OBJECT_ATTRIBUTES for the by-name variants.
 const SSN_OB_CREATE_DIR: u64 = 0x0100; // arg1 = directory index → \Device\Syscall<n>
 const SSN_OB_LOOKUP_DIR: u64 = 0x0101; // arg1 = directory index
-const SSN_OB_CREATE_BYNAME: u64 = 0x0102; // arg1 = *UNICODE_STRING (a user-supplied path)
-const SSN_OB_LOOKUP_BYNAME: u64 = 0x0103; // arg1 = *UNICODE_STRING
-const SSN_CM_SET_DWORD: u64 = 0x0110; // arg1 = value → REG_KEY\Answer  (stands in for NtSetValueKey)
-const SSN_CM_QUERY_DWORD: u64 = 0x0111; // returns REG_KEY\Answer      (stands in for NtQueryValueKey)
+const SSN_OB_CREATE_BYNAME: u64 = 0x0102; // arg1 = *OBJECT_ATTRIBUTES (a user-supplied path)
+const SSN_OB_LOOKUP_BYNAME: u64 = 0x0103; // arg1 = *OBJECT_ATTRIBUTES
 const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
 
 /// The fixed registry key the syscall front-end reads/writes for the Cm route.
@@ -441,14 +448,65 @@ unsafe fn copyin_user_path(ptr: u64) -> Option<alloc::string::String> {
     Some(alloc::string::String::from_utf16_lossy(&units))
 }
 
+/// The x64 `OBJECT_ATTRIBUTES` a create/open syscall carries (48 bytes): `Length`,
+/// `RootDirectory`, `ObjectName` (→ `UNICODE_STRING`), `Attributes`, and two security
+/// pointers we don't use yet. Built by the user in the shared arg frame.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RawObjectAttributes {
+    length: u32,
+    _pad0: u32,
+    root_directory: u64,
+    object_name: u64, // *UNICODE_STRING
+    attributes: u32,
+    _pad1: u32,
+    security_descriptor: u64,
+    security_qos: u64,
+}
+
+/// Copyin + decode a user `OBJECT_ATTRIBUTES` at `ptr` into the kernel-side
+/// [`ObjectAttributes`]. Probes the header + follows `ObjectName` through the same
+/// bounds-checked path copyin — exactly what a real `Nt*` create/open does with the
+/// pointer a real ntdll passes.
+unsafe fn copyin_object_attributes(ptr: u64) -> Option<ObjectAttributes> {
+    let hdr = core::mem::size_of::<RawObjectAttributes>() as u64;
+    if ptr < SYSARG_VADDR || ptr.checked_add(hdr)? > SYSARG_VADDR + 0x1000 {
+        return None;
+    }
+    let raw = core::ptr::read_unaligned(ptr as *const RawObjectAttributes);
+    let object_name = if raw.object_name == 0 {
+        None
+    } else {
+        Some(UnicodeString::from_str(&copyin_user_path(raw.object_name)?))
+    };
+    Some(ObjectAttributes {
+        root_directory: None,
+        object_name,
+        attributes: ObjAttrFlags::from_bits_truncate(raw.attributes),
+    })
+}
+
+/// The absolute NT path an `OBJECT_ATTRIBUTES` names (this cut ignores RootDirectory).
+fn oa_path(oa: &ObjectAttributes) -> Option<alloc::string::String> {
+    oa.object_name
+        .as_ref()
+        .map(|n| alloc::string::String::from_utf16_lossy(n.as_units()))
+}
+
 /// A raw native syscall from the isolated user thread: SSN in RAX, arg1 in R10
 /// (the Windows x64 convention — RCX is clobbered by `syscall`), result in RAX.
 unsafe fn native_syscall(ssn: u64, arg1: u64) -> u64 {
+    native_syscall2(ssn, arg1, 0)
+}
+
+/// Like [`native_syscall`] but with a 2nd arg in RDX (Windows x64 convention).
+unsafe fn native_syscall2(ssn: u64, arg1: u64, arg2: u64) -> u64 {
     let ret: u64;
     core::arch::asm!(
         "syscall",
         inout("rax") ssn => ret,
         in("r10") arg1,
+        in("rdx") arg2,
         lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -459,44 +517,64 @@ unsafe fn native_syscall(ssn: u64, arg1: u64) -> u64 {
 /// Manager — it reaches objects only by trapping `syscall`s the executive services.
 #[no_mangle]
 #[link_section = ".text.user_entry"]
+/// Build a real x64 `OBJECT_ATTRIBUTES` naming `name` in the shared arg frame:
+/// header @ 0 → `UNICODE_STRING` @ 48 → UTF-16 chars @ 64. Returns the OA pointer.
+unsafe fn write_object_attributes(name: &[u8]) -> u64 {
+    let oa_v = SYSARG_VADDR;
+    let us_v = SYSARG_VADDR + 48;
+    let buf_v = SYSARG_VADDR + 64;
+    for (i, &ch) in name.iter().enumerate() {
+        core::ptr::write_volatile((buf_v + (i as u64) * 2) as *mut u16, ch as u16);
+    }
+    core::ptr::write_unaligned(
+        us_v as *mut NtUnicodeString,
+        NtUnicodeString {
+            length: (name.len() * 2) as u16,
+            maximum_length: (name.len() * 2) as u16,
+            _pad: 0,
+            buffer: buf_v,
+        },
+    );
+    core::ptr::write_unaligned(
+        oa_v as *mut RawObjectAttributes,
+        RawObjectAttributes {
+            length: 48,
+            _pad0: 0,
+            root_directory: 0,
+            object_name: us_v,
+            attributes: 0,
+            _pad1: 0,
+            security_descriptor: 0,
+            security_qos: 0,
+        },
+    );
+    oa_v
+}
+
 pub unsafe extern "C" fn user_entry() -> ! {
     // Object Manager route (scalar args — fixed paths by index).
     let r0 = native_syscall(SSN_OB_CREATE_DIR, 0);
     let r0b = native_syscall(SSN_OB_LOOKUP_DIR, 0);
     let r1 = native_syscall(SSN_OB_CREATE_DIR, 1);
 
-    // Object Manager route (pointer arg — a real user-supplied UNICODE_STRING path,
-    // built in the shared arg frame). Header at offset 0, UTF-16 chars at offset 16.
-    let name: &[u8] = b"\\Device\\FromUserString";
-    let name_off = 16u64;
-    for (i, &ch) in name.iter().enumerate() {
-        core::ptr::write_volatile(
-            (SYSARG_VADDR + name_off + (i as u64) * 2) as *mut u16,
-            ch as u16,
-        );
-    }
-    core::ptr::write_unaligned(
-        SYSARG_VADDR as *mut NtUnicodeString,
-        NtUnicodeString {
-            length: (name.len() * 2) as u16,
-            maximum_length: (name.len() * 2) as u16,
-            _pad: 0,
-            buffer: SYSARG_VADDR + name_off,
-        },
-    );
-    let created = native_syscall(SSN_OB_CREATE_BYNAME, SYSARG_VADDR);
-    let found = native_syscall(SSN_OB_LOOKUP_BYNAME, SYSARG_VADDR);
+    // Object Manager route (pointer arg — a real OBJECT_ATTRIBUTES in the shared frame).
+    let oa = write_object_attributes(b"\\Device\\FromUserString");
+    let created = native_syscall(SSN_OB_CREATE_BYNAME, oa);
+    let found = native_syscall(SSN_OB_LOOKUP_BYNAME, oa);
 
-    // Configuration Manager (registry) route — set then read back a DWORD.
-    let set_ok = native_syscall(SSN_CM_SET_DWORD, 42);
-    let val = native_syscall(SSN_CM_QUERY_DWORD, 0);
+    // Registry route — REAL ntdll SSNs + a real OBJECT_ATTRIBUTES naming the key.
+    let key_oa = write_object_attributes(REG_KEY.as_bytes());
+    let ck = native_syscall(NT_CREATE_KEY, key_oa);
+    let sk = native_syscall2(NT_SET_VALUE_KEY, key_oa, 42);
+    let val = native_syscall(NT_QUERY_VALUE_KEY, key_oa);
 
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
         && created == 1
         && found == 1
-        && set_ok == 1
+        && ck == 1
+        && sk == 1
         && val == 42;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
@@ -563,6 +641,17 @@ where
     B: nt_object_client::Backend,
     CB: nt_config_client::Backend,
 {
+    // The real NT service table: maps the trapped SSN → a `NativeService`. A real
+    // ntdll process would register its own numbers here (from its syscall stubs).
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[
+            (NativeService::NtCreateKey, NT_CREATE_KEY as u32),
+            (NativeService::NtSetValueKey, NT_SET_VALUE_KEY as u32),
+            (NativeService::NtQueryValueKey, NT_QUERY_VALUE_KEY as u32),
+        ],
+    );
+
     let mut created: [Option<ObjectId>; 2] = [None, None];
     let mut serviced = 0u64;
     let mut verdict = 0u64;
@@ -572,7 +661,8 @@ where
             break; // not an UnknownSyscall — stop
         }
         let ssn = m0;
-        let arg1 = get_recv_mr(9); // R10
+        let arg1 = get_recv_mr(9); // R10 = arg1
+        let arg2 = m3; // RDX = arg2
         if ssn == SSN_DONE {
             verdict = arg1;
             break; // leave the faulter blocked; test is done
@@ -580,46 +670,51 @@ where
         let resume_ip = m2; // RCX = return address saved by `syscall`
         let sp = get_recv_mr(16);
         let flags = get_recv_mr(17);
-        let result = match ssn {
-            SSN_OB_CREATE_DIR => {
-                let i = arg1 as usize;
-                match client.create_directory(path_for(arg1), true) {
-                    Ok(id) => {
-                        if i < 2 {
-                            created[i] = Some(id);
-                        }
-                        1
-                    }
-                    Err(_) => 0,
+        // Registry syscalls go through the real service table + a real OBJECT_ATTRIBUTES.
+        let result = if let Some(entry) = table.lookup(ssn as u32) {
+            let key = copyin_object_attributes(arg1).as_ref().and_then(oa_path);
+            match (entry.service, key) {
+                (NativeService::NtCreateKey, Some(k)) => cm.create_key(&k).map(|_| 1).unwrap_or(0),
+                (NativeService::NtSetValueKey, Some(k)) => {
+                    cm.set_dword(&k, "Answer", arg2 as u32).map(|_| 1).unwrap_or(0)
                 }
-            }
-            SSN_OB_LOOKUP_DIR => {
-                let i = arg1 as usize;
-                match client.lookup(path_for(arg1), true) {
-                    Ok(id) if i < 2 && created[i] == Some(id) => 1,
-                    _ => 0,
+                (NativeService::NtQueryValueKey, Some(k)) => {
+                    cm.query_dword(&k, "Answer").map(|v| v as u64).unwrap_or(0)
                 }
-            }
-            SSN_OB_CREATE_BYNAME => match copyin_user_path(arg1) {
-                Some(path) => match client.create_directory(&path, true) {
-                    Ok(_) => 1,
-                    Err(_) => 0,
-                },
-                None => 0,
-            },
-            SSN_OB_LOOKUP_BYNAME => match copyin_user_path(arg1) {
-                Some(path) if client.lookup(&path, true).is_ok() => 1,
                 _ => 0,
-            },
-            SSN_CM_SET_DWORD => match cm.set_dword(REG_KEY, "Answer", arg1 as u32) {
-                Ok(()) => 1,
-                Err(_) => 0,
-            },
-            SSN_CM_QUERY_DWORD => match cm.query_dword(REG_KEY, "Answer") {
-                Ok(v) => v as u64,
-                Err(_) => 0,
-            },
-            _ => 0,
+            }
+        } else {
+            match ssn {
+                SSN_OB_CREATE_DIR => {
+                    let i = arg1 as usize;
+                    match client.create_directory(path_for(arg1), true) {
+                        Ok(id) => {
+                            if i < 2 {
+                                created[i] = Some(id);
+                            }
+                            1
+                        }
+                        Err(_) => 0,
+                    }
+                }
+                SSN_OB_LOOKUP_DIR => {
+                    let i = arg1 as usize;
+                    match client.lookup(path_for(arg1), true) {
+                        Ok(id) if i < 2 && created[i] == Some(id) => 1,
+                        _ => 0,
+                    }
+                }
+                // Object create/open by a real OBJECT_ATTRIBUTES pointer.
+                SSN_OB_CREATE_BYNAME => match copyin_object_attributes(arg1).as_ref().and_then(oa_path) {
+                    Some(path) => client.create_directory(&path, true).map(|_| 1).unwrap_or(0),
+                    None => 0,
+                },
+                SSN_OB_LOOKUP_BYNAME => match copyin_object_attributes(arg1).as_ref().and_then(oa_path) {
+                    Some(path) if client.lookup(&path, true).is_ok() => 1,
+                    _ => 0,
+                },
+                _ => 0,
+            }
         };
         serviced += 1;
         // Reply: RAX = result, resume at the return IP, preserve SP/FLAGS.
