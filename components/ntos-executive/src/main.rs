@@ -569,6 +569,72 @@ fn park() -> ! {
     }
 }
 
+/// Stand up one isolated service (the component-launch primitive): create its ring
+/// set (2 notifications + 4 frames), map the frames in the executive's own VSpace at
+/// `[sub_v, comp_v, req_v, rep_v]` + lay out both ring headers, spawn the service at
+/// `entry` seeded with cap copies, and return the executive-side [`RingChannel`] to
+/// drive it. Adding a service is now one call + wrapping the channel in its client.
+unsafe fn stand_up_service(
+    entry: unsafe extern "C" fn() -> !,
+    sub_v: u64,
+    comp_v: u64,
+    req_v: u64,
+    rep_v: u64,
+) -> RingChannel<'static> {
+    let n_sub = make_object(OBJ_NOTIFICATION);
+    let n_comp = make_object(OBJ_NOTIFICATION);
+    let f_sub = alloc_frame();
+    let f_comp = alloc_frame();
+    let f_req = alloc_frame();
+    let f_rep = alloc_frame();
+    // Map the four frames into the executive's own VSpace + lay out both ring headers
+    // (broker-init, so the spawned service just attaches — no producer/consumer race).
+    let _ = page_map(f_sub, sub_v, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(f_comp, comp_v, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(f_req, req_v, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(f_rep, rep_v, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let cfg_sub = RingConfig {
+        queue_len: QLEN,
+        ring_id: 1,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    let cfg_comp = RingConfig {
+        queue_len: QLEN,
+        ring_id: 2,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    let _ = init_ring::<SurtSqe>(sub_v as *mut u8, RING_LEN, &cfg_sub);
+    let _ = init_ring::<SurtCqe>(comp_v as *mut u8, RING_LEN, &cfg_comp);
+    // The service maps its own cap copies at the shared vaddrs in its own VSpace.
+    spawn_service(
+        entry,
+        &[(CT_N_SUB, copy_cap(n_sub)), (CT_N_COMP, copy_cap(n_comp))],
+        copy_cap(f_sub),
+        copy_cap(f_comp),
+        copy_cap(f_req),
+        copy_cap(f_rep),
+    );
+    let sq = match Producer::<SurtSqe>::attach(sub_v as *mut u8, RING_LEN) {
+        Ok(p) => p,
+        Err(_) => park(),
+    };
+    let cq = match Consumer::<SurtCqe>::attach(comp_v as *mut u8, RING_LEN) {
+        Ok(q) => q,
+        Err(_) => park(),
+    };
+    RingChannel {
+        sq,
+        cq,
+        signal: Sel4Notify::new(&ENV, n_sub),
+        wait: Sel4Notify::new(&ENV, n_comp),
+        req_vaddr: req_v,
+        rep_vaddr: rep_v,
+        next_id: 1,
+    }
+}
+
 #[no_mangle]
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
@@ -581,75 +647,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n");
 
-    // The executive front-end allocates (ObjectClient), so give it its own heap.
+    // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
 
-    // Shared reflector objects (the executive owns the untyped).
-    let n_sub = make_object(OBJ_NOTIFICATION);
-    let n_comp = make_object(OBJ_NOTIFICATION);
-    let f_sub = alloc_frame();
-    let f_comp = alloc_frame();
-    let f_req = alloc_frame();
-    let f_rep = alloc_frame();
-
-    // Map the four frames into the EXECUTIVE's own VSpace (front-end side) + lay
-    // out both ring headers, so the spawned service just attaches.
-    let _ = page_map(f_sub, SUB_RING_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(f_comp, COMP_RING_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(f_req, REQ_DATA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(f_rep, REP_DATA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let cfg_sub = RingConfig {
-        queue_len: QLEN,
-        ring_id: 1,
-        feature_flags: feature::REQUIRED_V0_1,
-        role: role::PRODUCER,
-    };
-    let _ = init_ring::<SurtSqe>(SUB_RING_VADDR as *mut u8, RING_LEN, &cfg_sub);
-    let cfg_comp = RingConfig {
-        queue_len: QLEN,
-        ring_id: 2,
-        feature_flags: feature::REQUIRED_V0_1,
-        role: role::PRODUCER,
-    };
-    let _ = init_ring::<SurtCqe>(COMP_RING_VADDR as *mut u8, RING_LEN, &cfg_comp);
-
-    // Second caps for the service's own CSpace/VSpace.
-    let n_sub_c = copy_cap(n_sub);
-    let n_comp_c = copy_cap(n_comp);
-    let f_sub_c = copy_cap(f_sub);
-    let f_comp_c = copy_cap(f_comp);
-    let f_req_c = copy_cap(f_req);
-    let f_rep_c = copy_cap(f_rep);
-
-    // Spawn the Object Manager service (isolated): it waits on N_SUB, signals N_COMP.
-    spawn_service(
+    // Object Manager: stand it up as an isolated service + drive it as the front-end.
+    let mut c = ObjectClient::new(ObChan(stand_up_service(
         server::server_entry,
-        &[(CT_N_SUB, n_sub_c), (CT_N_COMP, n_comp_c)],
-        f_sub_c,
-        f_comp_c,
-        f_req_c,
-        f_rep_c,
-    );
-
-    // The executive front-end drives the isolated service over SURT (it signals
-    // N_SUB, waits N_COMP) — a real Object Manager stack across an isolation boundary.
-    let sq = match Producer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
-        Ok(p) => p,
-        Err(_) => park(),
-    };
-    let cq = match Consumer::<SurtCqe>::attach(COMP_RING_VADDR as *mut u8, RING_LEN) {
-        Ok(c) => c,
-        Err(_) => park(),
-    };
-    let mut c = ObjectClient::new(ObChan(RingChannel {
-        sq,
-        cq,
-        signal: Sel4Notify::new(&ENV, n_sub),
-        wait: Sel4Notify::new(&ENV, n_comp),
-        req_vaddr: REQ_DATA_VADDR,
-        rep_vaddr: REP_DATA_VADDR,
-        next_id: 1,
-    }));
+        SUB_RING_VADDR,
+        COMP_RING_VADDR,
+        REQ_DATA_VADDR,
+        REP_DATA_VADDR,
+    )));
 
     let mut passed = 0u64;
     check(b"exec_ob_ping", c.ping().is_success(), &mut passed);
@@ -683,49 +691,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // --- Second isolated service: the Configuration Manager (registry) over SURT.
     print_str(b"[ntos-exec] spawning the Configuration Manager as a second isolated service\n");
-    let cm_n_sub = make_object(OBJ_NOTIFICATION);
-    let cm_n_comp = make_object(OBJ_NOTIFICATION);
-    let cm_f_sub = alloc_frame();
-    let cm_f_comp = alloc_frame();
-    let cm_f_req = alloc_frame();
-    let cm_f_rep = alloc_frame();
-    let _ = page_map(cm_f_sub, CM_SUB_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(cm_f_comp, CM_COMP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(cm_f_req, CM_REQ_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(cm_f_rep, CM_REP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = init_ring::<SurtSqe>(CM_SUB_VADDR as *mut u8, RING_LEN, &cfg_sub);
-    let _ = init_ring::<SurtCqe>(CM_COMP_VADDR as *mut u8, RING_LEN, &cfg_comp);
-    let cm_n_sub_c = copy_cap(cm_n_sub);
-    let cm_n_comp_c = copy_cap(cm_n_comp);
-    let cm_f_sub_c = copy_cap(cm_f_sub);
-    let cm_f_comp_c = copy_cap(cm_f_comp);
-    let cm_f_req_c = copy_cap(cm_f_req);
-    let cm_f_rep_c = copy_cap(cm_f_rep);
-    spawn_service(
+    let mut cm = ConfigClient::new(CmChan(stand_up_service(
         cm_server::cm_server_entry,
-        &[(CT_N_SUB, cm_n_sub_c), (CT_N_COMP, cm_n_comp_c)],
-        cm_f_sub_c,
-        cm_f_comp_c,
-        cm_f_req_c,
-        cm_f_rep_c,
-    );
-    let cm_sq = match Producer::<SurtSqe>::attach(CM_SUB_VADDR as *mut u8, RING_LEN) {
-        Ok(p) => p,
-        Err(_) => park(),
-    };
-    let cm_cq = match Consumer::<SurtCqe>::attach(CM_COMP_VADDR as *mut u8, RING_LEN) {
-        Ok(q) => q,
-        Err(_) => park(),
-    };
-    let mut cm = ConfigClient::new(CmChan(RingChannel {
-        sq: cm_sq,
-        cq: cm_cq,
-        signal: Sel4Notify::new(&ENV, cm_n_sub),
-        wait: Sel4Notify::new(&ENV, cm_n_comp),
-        req_vaddr: CM_REQ_VADDR,
-        rep_vaddr: CM_REP_VADDR,
-        next_id: 1,
-    }));
+        CM_SUB_VADDR,
+        CM_COMP_VADDR,
+        CM_REQ_VADDR,
+        CM_REP_VADDR,
+    )));
     let svc_key = r"\Registry\Machine\System\CurrentControlSet\Services\Demo";
     check(b"exec_cm_ping", cm.ping(), &mut passed);
     check(b"exec_cm_create_key", cm.create_key(svc_key).is_ok(), &mut passed);
@@ -740,49 +712,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // --- Third isolated service: the I/O Manager over SURT (open/read/write/close a
     // device backed by a mock driver + an embedded Object Manager, in its own VSpace).
     print_str(b"[ntos-exec] spawning the I/O Manager as a third isolated service\n");
-    let io_n_sub = make_object(OBJ_NOTIFICATION);
-    let io_n_comp = make_object(OBJ_NOTIFICATION);
-    let io_f_sub = alloc_frame();
-    let io_f_comp = alloc_frame();
-    let io_f_req = alloc_frame();
-    let io_f_rep = alloc_frame();
-    let _ = page_map(io_f_sub, IO_SUB_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(io_f_comp, IO_COMP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(io_f_req, IO_REQ_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = page_map(io_f_rep, IO_REP_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let _ = init_ring::<SurtSqe>(IO_SUB_VADDR as *mut u8, RING_LEN, &cfg_sub);
-    let _ = init_ring::<SurtCqe>(IO_COMP_VADDR as *mut u8, RING_LEN, &cfg_comp);
-    let io_n_sub_c = copy_cap(io_n_sub);
-    let io_n_comp_c = copy_cap(io_n_comp);
-    let io_f_sub_c = copy_cap(io_f_sub);
-    let io_f_comp_c = copy_cap(io_f_comp);
-    let io_f_req_c = copy_cap(io_f_req);
-    let io_f_rep_c = copy_cap(io_f_rep);
-    spawn_service(
+    let mut io = IoClient::new(IoChan(stand_up_service(
         io_server::io_server_entry,
-        &[(CT_N_SUB, io_n_sub_c), (CT_N_COMP, io_n_comp_c)],
-        io_f_sub_c,
-        io_f_comp_c,
-        io_f_req_c,
-        io_f_rep_c,
-    );
-    let io_sq = match Producer::<SurtSqe>::attach(IO_SUB_VADDR as *mut u8, RING_LEN) {
-        Ok(p) => p,
-        Err(_) => park(),
-    };
-    let io_cq = match Consumer::<SurtCqe>::attach(IO_COMP_VADDR as *mut u8, RING_LEN) {
-        Ok(q) => q,
-        Err(_) => park(),
-    };
-    let mut io = IoClient::new(IoChan(RingChannel {
-        sq: io_sq,
-        cq: io_cq,
-        signal: Sel4Notify::new(&ENV, io_n_sub),
-        wait: Sel4Notify::new(&ENV, io_n_comp),
-        req_vaddr: IO_REQ_VADDR,
-        rep_vaddr: IO_REP_VADDR,
-        next_id: 1,
-    }));
+        IO_SUB_VADDR,
+        IO_COMP_VADDR,
+        IO_REQ_VADDR,
+        IO_REP_VADDR,
+    )));
     check(b"exec_io_ping", io.ping().is_success(), &mut passed);
     let io_handle = io.open(
         "\\??\\Test0",
