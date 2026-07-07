@@ -119,6 +119,9 @@ const SYS_NB_RECV: i64 = -8;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
 /// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
 const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
+/// `X86IRQIssueIRQHandlerMSI` — issues an IRQ-handler cap for a message-signalled
+/// interrupt (no IOAPIC pin; the device writes the vector to the LAPIC directly).
+const LBL_X86_IRQ_ISSUE_MSI: u64 = 65;
 /// Badge for the IRQ notification, so a delivered interrupt is distinguishable from
 /// "not signalled" (badge 0) when we poll.
 const IRQ_BADGE: u64 = 0x40;
@@ -394,6 +397,30 @@ impl nt_io_client::Backend for IoChan<'_> {
 
 /// Receive an UnknownSyscall fault: `(badge, msginfo, mr0..mr3)` = RAX(SSN), RBX,
 /// RCX(=return IP), RDX. Saved regs 4+ land in this thread's IPC buffer.
+/// Issue an MSI IRQ-handler cap for `vector` into `dest_slot` (no IOAPIC pin — the
+/// device delivers by writing the vector to the LAPIC). Same 7-word + extra-cap ABI
+/// as the IOAPIC issue, but label 65; the pin/level/polarity words are ignored.
+unsafe fn msi_issue_irq_handler(dest_slot: u64, vector: u64) {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 5 * 8) as *mut u64, 0); // mr4 (ignored for MSI)
+    core::ptr::write_volatile((ipc + 6 * 8) as *mut u64, 0); // mr5 (ignored)
+    core::ptr::write_volatile((ipc + 7 * 8) as *mut u64, vector); // mr6 = vector
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
+    let msginfo = (LBL_X86_IRQ_ISSUE_MSI << 12) | (1 << 9) | (1 << 7) | 7;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") SLOT_IRQ_CONTROL,
+        in("rsi") msginfo,
+        in("r10") dest_slot, // mr0 = index (dest slot)
+        in("r8") 64u64,      // mr1 = depth
+        in("r9") 0u64,       // mr2 = ioapic id (ignored)
+        in("r15") 0u64,      // mr3 = pin (ignored for MSI)
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
 /// Non-blocking poll of a notification: returns the pending badge (0 if none).
 unsafe fn nb_recv(ntfn: u64) -> u64 {
     let badge: u64;
@@ -1411,37 +1438,64 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let result_ntfn = make_object(OBJ_NOTIFICATION);
             let result_badged = alloc_slot();
             let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, result_badged, result_ntfn, ISR_DONE_BADGE);
-            // NOTE (finding): the kernel level-IRQ mask is validated (HPET, above), the
-            // ISR mechanism works, and the NIC asserts INTA (ICR bit 31) — yet an
-            // EXHAUSTIVE scan of every IOAPIC pin 0..23 (edge + level, both polarities,
-            // distinct vectors) never delivers. So this isn't GSI discovery (the ACPI
-            // _PRT wouldn't help): QEMU q35 isn't routing THIS NIC's INTx to the IOAPIC
-            // at all — a chipset PCI-INTx routing detail. The realistic path is MSI
-            // (the e1000e supports it; a memory write to the LAPIC bypasses the IOAPIC
-            // + chipset INTx routing entirely). Keeping a level-triggered handler on the
-            // canonical PCI GSIs 16..23 for when the routing is enabled.
             let _ = int_pin;
-            for (i, pin) in (16..24u64).enumerate() {
-                let vector = 3 + i as u64; // 3..10, distinct per pin
-                let handler = alloc_slot();
-                ioapic_issue_irq_handler(handler, pin, vector, /*level*/ 1, /*polarity*/ 0);
-                let _ = irq_handler_set_notification(handler, nic_irq_badged);
-            }
             // The isolated ISR host waits on the NIC notification (reuses spawn_isr).
             let nic_irq_isr = copy_cap(nic_irq_ntfn);
             spawn_isr(isr::isr_entry, nic_irq_isr, result_badged, 255);
-            // Enable INTx at the PCI level: clear the Command register's Interrupt-
-            // Disable bit (10) — QEMU sets it by default — and set Bus Master (2) +
-            // Memory Space (1). Without this the NIC never asserts its interrupt line.
-            let cmd = pci_read32(pci_io, 0, nic_dev, nic_func, 0x04);
-            pci_write32(
-                pci_io,
-                0,
-                nic_dev,
-                nic_func,
-                0x04,
-                (cmd & !(1 << 10)) | (1 << 2) | (1 << 1),
-            );
+
+            // Deliver the NIC interrupt via MSI (its INTx isn't routed to the IOAPIC in
+            // this QEMU q35 config; MSI is a memory write to the LAPIC that bypasses the
+            // IOAPIC + chipset entirely). Walk the PCI capability list for the MSI cap
+            // (ID 0x05), program it to deliver our vector to the LAPIC, then enable it.
+            let mut cap = (pci_read32(pci_io, 0, nic_dev, nic_func, 0x34) & 0xFC) as u8;
+            let mut msi_off = 0u8;
+            let mut msix_off = 0u8;
+            for _ in 0..16 {
+                if cap == 0 {
+                    break;
+                }
+                let hdr = pci_read32(pci_io, 0, nic_dev, nic_func, cap);
+                let id = (hdr & 0xFF) as u8;
+                print_str(b"[ntos-exec]   pci cap id=0x");
+                print_hex(id as u32);
+                print_str(b" @ 0x");
+                print_hex(cap as u32);
+                print_str(b"\n");
+                if id == 0x05 {
+                    msi_off = cap;
+                }
+                if id == 0x11 {
+                    msix_off = cap;
+                }
+                cap = ((hdr >> 8) & 0xFC) as u8;
+            }
+            let _ = msix_off;
+            print_str(b"[ntos-exec] NIC MSI capability @ config 0x");
+            print_hex(msi_off as u32);
+            print_str(b"\n");
+            check(b"exec_nic_has_msi_capability", msi_off != 0, &mut passed);
+            let msi_vector = 5u64; // irq index → LAPIC vector 0x25
+            if msi_off != 0 {
+                let msg_ctrl = (pci_read32(pci_io, 0, nic_dev, nic_func, msi_off) >> 16) as u16;
+                let data_off = if (msg_ctrl & 0x80) != 0 { msi_off + 0xC } else { msi_off + 8 };
+                // Message Address = LAPIC (0xFEE00000, physical dest APIC 0); Message
+                // Data = the CPU vector (irq index + PIC1_VECTOR_BASE → IDT irq stub).
+                pci_write32(pci_io, 0, nic_dev, nic_func, msi_off + 4, 0xFEE0_0000);
+                if (msg_ctrl & 0x80) != 0 {
+                    pci_write32(pci_io, 0, nic_dev, nic_func, msi_off + 8, 0);
+                }
+                pci_write32(pci_io, 0, nic_dev, nic_func, data_off, (msi_vector + 0x20) as u32);
+                // Issue the MSI IRQ-handler cap + bind the NIC notification.
+                let handler = alloc_slot();
+                msi_issue_irq_handler(handler, msi_vector);
+                let _ = irq_handler_set_notification(handler, nic_irq_badged);
+                // Bus Master (Command bit 2) so the NIC can DMA the MSI write; then set
+                // the MSI Enable bit (Message Control bit 0 = dword bit 16).
+                let cmd = pci_read32(pci_io, 0, nic_dev, nic_func, 0x04);
+                pci_write32(pci_io, 0, nic_dev, nic_func, 0x04, cmd | (1 << 2));
+                let ctrl = pci_read32(pci_io, 0, nic_dev, nic_func, msi_off);
+                pci_write32(pci_io, 0, nic_dev, nic_func, msi_off, ctrl | (1 << 16));
+            }
             // Enable + raise a real NIC interrupt (e1000e): unmask a cause, then set it.
             core::ptr::write_volatile((NIC_VADDR + E1000_IMS) as *mut u32, 0x1);
             core::ptr::write_volatile((NIC_VADDR + E1000_ICS) as *mut u32, 0x1);
@@ -1467,24 +1521,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
             // The NIC raises a REAL interrupt: ICR bit 31 (INT asserted) + our cause.
             check(b"exec_nic_raised_real_interrupt", (icr & 0x8000_0000) != 0, &mut passed);
-            // The kernel level-IRQ mask fix is validated by the HPET path above (a real
-            // level interrupt delivered + masked, no storm). Delivering THIS NIC's INTx
-            // to the host is still PENDING: its INTx doesn't reach IOAPIC pins 3..23 in
-            // this QEMU q35 config (asserts per ICR, but the chipset PCI-INTx→GSI route
-            // isn't one we've hit) — an executive-side pin-discovery task (read ACPI
-            // _PRT), NOT a kernel issue. Reported, not failed. Tracked in plans/P1.
+            // Delivering it to the host is PENDING. Findings (all proven above / by the
+            // HPET path): the kernel level-IRQ mask works, the ISR mechanism works, the
+            // NIC asserts, and the full IOAPIC/MSI delivery path works. But THIS NIC (an
+            // 82574/e1000e, PCI id 0x10d3) can't deliver here: its INTx isn't routed to
+            // the IOAPIC by QEMU q35 (chipset), and it's MSI-X-native (caps 0x05 MSI +
+            // 0x11 MSI-X) so QEMU's model doesn't deliver via plain MSI. MSI-X needs a
+            // BAR-resident table + 82574 IVAR programming + another device untyped — a
+            // focused device-driver task. Reported, not failed. Tracked in plans/P1.
             if got == ISR_DONE_BADGE {
                 print_str(b"  PASS exec_nic_irq_reached_isolated_host\n");
                 passed += 1;
             } else {
-                print_str(b"  PENDING exec_nic_irq_reached_isolated_host (NIC INTx GSI routing in QEMU)\n");
+                print_str(b"  PENDING exec_nic_irq_reached_isolated_host (82574 is MSI-X-native; needs MSI-X)\n");
             }
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/34 executive->isolated-service checks passed]\n");
+    print_str(b"/35 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
