@@ -107,6 +107,23 @@ const CN_GUARD_BADGE: u64 = 59;
 
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
+/// `SysNBRecv` — non-blocking receive/poll on a notification (returns badge 0 if idle).
+const SYS_NB_RECV: i64 = -8;
+/// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
+/// programs the IOAPIC redirection-table entry for `pin` → vector+PIC1_VECTOR_BASE.
+const LBL_X86_IRQ_ISSUE_IOAPIC: u64 = 64;
+/// Badge for the IRQ notification, so a delivered interrupt is distinguishable from
+/// "not signalled" (badge 0) when we poll.
+const IRQ_BADGE: u64 = 0x40;
+/// The user-visible IRQ/vector (a legacy-range stub the kernel routes through
+/// irq{V}_entry → handle_interrupt(V)); the HPET's IOAPIC pin is chosen separately.
+const IRQ_VECTOR: u64 = 11;
+
+// HPET register offsets (from the mapped MMIO base).
+const HPET_GEN_CONF: u64 = 0x10;
+const HPET_MAIN_COUNTER: u64 = 0xF0;
+const HPET_T0_CONFIG: u64 = 0x100;
+const HPET_T0_COMPARATOR: u64 = 0x108;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 
@@ -406,6 +423,48 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
 unsafe fn get_recv_mr(i: usize) -> u64 {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
+}
+
+/// Issue an IRQ-handler cap for a real IOAPIC `pin`, delivering `IRQ_VECTOR`, into
+/// `dest_slot` of the executive's root CNode. This is `X86IRQIssueIRQHandlerIOAPIC`:
+/// a 7-word message (msg_regs[0..6]) + one extra cap (the dest CNode root). mr0..2 go
+/// in registers, mr3 (pin) in r15, mr4..6 in the IPC buffer, the extra cap at IPC
+/// word 122. The kernel also programs IOAPIC RTE[pin] → pin fires vector+0x20.
+unsafe fn ioapic_issue_irq_handler(dest_slot: u64, pin: u64) {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 5 * 8) as *mut u64, 0); // mr4 = level    (edge)
+    core::ptr::write_volatile((ipc + 6 * 8) as *mut u64, 0); // mr5 = polarity (active-high)
+    core::ptr::write_volatile((ipc + 7 * 8) as *mut u64, IRQ_VECTOR); // mr6 = vector
+    // caps_or_badges[0] = the dest CNode root (resolved in the caller's cspace).
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
+    // msginfo: label=64, capsUnwrapped=1, extraCaps=1, length=7.
+    let msginfo = (LBL_X86_IRQ_ISSUE_IOAPIC << 12) | (1 << 9) | (1 << 7) | 7;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") SLOT_IRQ_CONTROL,
+        in("rsi") msginfo,
+        in("r10") dest_slot, // mr0 = index (dest slot)
+        in("r8") 64u64,      // mr1 = depth (init CNode: guard=0, so depth 64 resolves the slot)
+        in("r9") 0u64,       // mr2 = ioapic id (ignored)
+        in("r15") pin,       // mr3 = pin
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// Non-blocking poll of a notification: returns the pending badge (0 if not signalled).
+unsafe fn nb_recv(ntfn: u64) -> u64 {
+    let badge: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_NB_RECV as u64,
+        inout("rdi") ntfn => badge,
+        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    badge
 }
 
 /// The fixed object path for a syscall's directory index.
@@ -993,9 +1052,72 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         check(b"exec_hpet_mmio_vendor_intel", (gcap >> 16) == 0x8086, &mut passed);
     }
 
+    // --- P1: a real hardware interrupt. Program HPET timer 0 for a one-shot, route
+    // it to an IOAPIC pin, get an IRQ-handler cap for that pin (which programs the
+    // IOAPIC RTE), bind a badged notification, arm the timer, and confirm the real
+    // interrupt is delivered. Poll non-blocking so a misfire fails, never hangs.
+    if mmio_mapped {
+        print_str(b"[ntos-exec] P1: arming HPET timer 0 -> IOAPIC IRQ-handler cap -> notification\n");
+        // Timer 0's INT_ROUTE_CAP (config bits [63:32]) = the IOAPIC pins it may drive.
+        let t0cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+        let route_cap = (t0cfg >> 32) as u32;
+        check(b"exec_hpet_irq_route_cap_nonzero", route_cap != 0, &mut passed);
+        if route_cap != 0 {
+            let pin = (31 - route_cap.leading_zeros()) as u64; // highest allowed pin
+            print_str(b"[ntos-exec] HPET timer0 IOAPIC pin = ");
+            print_u64(pin);
+            print_str(b", vector = ");
+            print_u64(IRQ_VECTOR);
+            print_str(b"\n");
+
+            // A badged notification so a delivered IRQ (badge != 0) is unambiguous.
+            let ntfn = make_object(OBJ_NOTIFICATION);
+            let ntfn_badged = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND,
+                CAP_INIT_THREAD_CNODE,
+                LBL_CNODE_MINT << 12,
+                ntfn_badged,
+                ntfn,
+                IRQ_BADGE,
+            );
+            // Issue the IOAPIC IRQ-handler cap (also programs IOAPIC RTE[pin]).
+            let handler = alloc_slot();
+            ioapic_issue_irq_handler(handler, pin);
+            let _ = irq_handler_set_notification(handler, ntfn_badged);
+
+            // Program timer 0: interrupt enable + route to `pin`, edge, one-shot.
+            let newcfg = (1u64 << 2) | (pin << 9);
+            core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, newcfg);
+            // Comparator = now + a small delta so it fires within our poll window.
+            let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+            core::ptr::write_volatile(
+                (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
+                now.wrapping_add(0x20000),
+            );
+            // Enable the HPET main counter (GEN_CONF bit 0).
+            let gc = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
+            core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, gc | 1);
+
+            // Poll for the interrupt (bounded, non-blocking — a misfire fails cleanly).
+            let mut got = 0u64;
+            for _ in 0..3_000_000u64 {
+                let b = nb_recv(ntfn);
+                if b != 0 {
+                    got = b;
+                    break;
+                }
+            }
+            print_str(b"[ntos-exec] IRQ notification badge = ");
+            print_u64(got);
+            print_str(b"\n");
+            check(b"exec_hpet_real_interrupt_delivered", got == IRQ_BADGE, &mut passed);
+        }
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/25 executive->isolated-service checks passed]\n");
+    print_str(b"/27 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
