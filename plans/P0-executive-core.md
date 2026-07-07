@@ -10,7 +10,7 @@ carried by `driver-host-pnp`.
 single, small, well‑understood broker/loader — the seL4 analogue of the boot
 executive — rather than growing one driver host into everything.
 
-## Status: in progress (increment 1 landed — commit c2e904f)
+## Status: in progress (increments 1–3 landed — c2e904f, 44d95bf, db7edac+448673c)
 
 ## Background (what already exists to reuse)
 - `object-service` already spawns **two isolated components over SURT** with cap
@@ -30,16 +30,24 @@ executive — rather than growing one driver host into everything.
 - [x] **One service isolated + driven by the executive:** the **Object Manager**
       runs as its own component; the executive round-trips the full OB namespace
       script over SURT. 8/8 in QEMU. (c2e904f)
-- [ ] **Native syscall front-end:** route real `Nt*` traps (mechanism proven in
-      `driver-host-ntdll`: user `syscall` → seL4 UnknownSyscall fault →
-      `NativeSyscallDispatcher::dispatch`) to the owning service over SURT. Start
-      with 2–3 Ob calls (`NtCreateDirectoryObject`/create/lookup/close).
-- [ ] **Second isolated service:** add a second service under the executive.
-      **Cm/registry needs SURT-izing first** (see finding below) — do that, or add
-      Io (already has `nt-io-abi/-server/-client`), whichever unblocks the syscall
-      front-end demo.
+- [x] **Native syscall front-end (44d95bf):** an isolated USER thread (own VSpace/
+      CSpace) traps `syscall`s → seL4 UnknownSyscall fault → executive catches +
+      routes to the isolated Ob service over SURT + replies register-accurately so
+      the user resumes. 3 syscalls serviced across the boundary; verdict + created-
+      dir-visible checks pass. Trap/reply mechanics ported from `driver-host-ntdll`.
+- [x] **SURT-ize Cm (db7edac):** new `nt-config-abi/-server/-client` (ping/create_
+      key/open_key/set_dword/query_dword), host-tested end-to-end (3 tests).
+- [x] **Second isolated service (448673c):** the Configuration Manager runs as the
+      executive's second isolated service over its own ring pair; the executive
+      drives it (5 checks: ping/create/open/set/query DWORD). Refactored the
+      transport into a reusable `RingChannel` (per-channel req/rep vaddrs) + ObChan/
+      CmChan wrappers. **16/16 in QEMU.**
+- [ ] **Route registry syscalls through the front-end:** add SSN_CM_* to the user
+      thread → route to the Cm service (NtCreateKey/NtSetValueKey/NtQueryValueKey).
 - [ ] **Component-launch manifest:** generalize the ad-hoc spawn into a static
       table (which service ELFs, caps, ring peers) — least-privilege per component.
+- [ ] **Third service — I/O Manager:** `nt-io-abi/-server/-client` already exist;
+      compose it (unblocks P2 storage/file path).
 - [ ] **Migrate the driver-host broker role:** fold `driver-host-pnp`'s broker/
       supervisor duties under `ntos-executive` (later, once services land).
 

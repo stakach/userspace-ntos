@@ -331,3 +331,10 @@ findings). A step is not "done" until the plan reflects it.
   namespace over SURT from the executive front-end (8/8 in QEMU). Finding: only
   Ob is SURT-ized today; Cm has no `-abi/-server/-client` (in-process) → next P0
   steps: native syscall front-end routing Ob `Nt*` over SURT, and SURT-ize Cm.
+- **2026-07-07** — **P0 continued (44d95bf, db7edac, 448673c).** (1) Native syscall
+  front-end: an isolated user thread's `syscall`s are caught (UnknownSyscall fault)
+  and routed to the isolated Ob service over SURT, reply-resumed register-accurately.
+  (2) SURT-ized Cm: new `nt-config-abi/-server/-client` (host-tested). (3) Composed
+  Cm as the executive's **second isolated service** over its own ring pair.
+  **16/16 in QEMU** (8 Ob + 5 Cm + 3 syscall). The executive now composes multiple
+  isolated executive services + a working native syscall trap front-end.
