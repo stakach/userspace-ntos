@@ -51,10 +51,11 @@ executive — rather than growing one driver host into everything.
       issues SSN_CM_SET_DWORD/SSN_CM_QUERY_DWORD → the executive routes to the
       isolated Cm service. Syscall-set DWORD=42 is independently visible. The front-
       end now dispatches to **two** isolated services. **22/22 in QEMU.**
-- [ ] **Component-launch manifest:** generalize the ad-hoc spawn into a static
-      table (which service ELFs, caps, ring peers) — least-privilege per component.
-      (The three services are stamped out by copy-paste today; factor the ring-set
-      + spawn + client-attach into one `stand_up_service(entry, vaddrs)` helper.)
+- [x] **Component-launch primitive (fc73302):** the three copy-pasted service
+      blocks collapsed into one `stand_up_service(entry, sub/comp/req/rep vaddrs)
+      -> RingChannel` helper; adding a service is one call + wrapping the channel in
+      its client. (A fully data-driven manifest would need trait objects for the
+      heterogeneous clients — deferred; the helper captures the reusable part.)
 - [ ] **Real NtCreateKey/NtSetValueKey/NtQueryValueKey ABI:** the syscall route uses
       fixed keys + scalar args today. Wire the real Nt* arg marshalling (copyin the
       OBJECT_ATTRIBUTES/UNICODE_STRING/KEY_VALUE from user memory) — pairs with the
