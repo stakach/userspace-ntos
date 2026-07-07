@@ -44,14 +44,20 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 - [ ] **Real timer/clock:** LAPIC timer as the system clock; `KeQueryPerformance
       Counter` / interrupt time / `KeQuerySystemTime`; one-shot + periodic timers
       for `KeSetTimer`/WDF timers. (rust-micro already uses LAPIC as its clock.)
-- [ ] **Real port I/O:** seL4 x86 IO‑port caps → `READ_PORT_*`/`WRITE_PORT_*`
-      (needed for legacy IDE/PIC/8042).
+- [x] **Real port I/O (112c3d1):** the executive mints an x86 IOPort cap from the
+      singleton IOPortControl (slot 7) and does real `in`/`out` (In32 via SysCall →
+      value in reply mr0; Out32 via SysSend). Used to drive PCI config space; the
+      same path serves `READ_PORT_*`/`WRITE_PORT_*` for legacy IDE/PIC/8042.
 - [ ] **Real DMA:** contiguous "common buffer" allocation with a real physical
       address; MDLs describing real pages; scatter/gather list build. Cache
       coherence assumptions documented (QEMU is coherent; note real-HW caveats).
-- [ ] **Resource assignment from real hardware:** PnP/HAL enumerate a real device's
-      BARs + IRQ (PCI config space) and hand a `CM_RESOURCE_LIST` to the driver at
-      START — real values, not fixtures.
+- [~] **Resource assignment from real hardware — enumeration done (112c3d1):**
+      `pci_read32()` walks bus 0 and reads real vendor/device/class/BARs/IRQ. Found 7
+      devices incl. an Intel e1000e NIC (MMIO BAR0=0x81060000, IRQ 11) and two ICH9
+      AHCI controllers (class 0x010601, ABAR/BAR5=0x81084000, IRQ 10). **Still TODO:**
+      turn a captured (BAR, IRQ) into device-frame + IRQ-handler caps for an isolated
+      host and hand it a real `CM_RESOURCE_LIST` at START (combine with the MMIO + IRQ
+      increments — the mechanisms all exist now).
 
 ## Test drivers (build in `stakach/ntdriver` as needed)
 - Reuse `mmio_interrupt_test_driver`, `kmdf_dma_interrupt_test_driver`,

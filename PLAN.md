@@ -397,3 +397,11 @@ findings). A step is not "done" until the plan reflects it.
   let the priority-100 host run. **27/27 in QEMU.** The `IRQ → driver-host ISR` path.
   Remaining P1: `IRQHandler::Ack` (repeat/level IRQs), DPC/ring forward, port I/O +
   PCI BAR/IRQ enumeration, DMA; then a real *device* IRQ.
+- **2026-07-07** — **P1 PCI enumeration (112c3d1).** Real x86 port I/O: the executive
+  mints an IOPort cap (from IOPortControl slot 7) and walks PCI bus 0, reading real
+  vendor/device/class/BARs/IRQ. Found 7 devices — q35 MCH, QEMU VGA, an **Intel
+  e1000e NIC** (MMIO BAR0=0x81060000, IRQ 11) and two **ICH9 AHCI** controllers
+  (ABAR=0x81084000, IRQ 10), ISA bridge, SMBus. **31/31 in QEMU.** All the pieces to
+  hand a real device to a driver host now exist (device-frame + IRQ-handler + IOPort
+  caps + enumeration). Remaining P1: turn a captured (BAR, IRQ) into caps for an
+  isolated host + a real `CM_RESOURCE_LIST`; `IRQHandler::Ack`; DMA.
