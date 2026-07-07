@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: in progress — real MMIO landed (3984164)
+## Status: in progress — real MMIO (3984164) + real IRQ (0e96454) landed
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -25,10 +25,16 @@ real DMA (contiguous buffers + physical addresses + MDLs).
       and reads the real HPET GCAP_ID register = 0x8086A201 (VENDOR_ID 0x8086). This
       is the `claim_device_page()` mechanism; next, hand a BAR window to an isolated
       driver host + wire `MmMapIoSpace`, and enumerate real BARs via PCI (still TODO).
-- [ ] **Real interrupts:** HAL gets the device's IRQ handler cap, binds it to a
-      notification, and forwards to the driver host's ISR/DPC over the reflector
-      (or a dedicated IRQ ring). `IoConnectInterrupt` / `WdfInterruptCreate`
-      deliver a real QEMU device interrupt. Ack path back to the kernel.
+- [x] **Real interrupts — first proof (0e96454):** the executive programs HPET
+      timer 0 for a one-shot routed to an IOAPIC pin (23), issues an
+      `X86IRQIssueIRQHandlerIOAPIC` cap (which programs IOAPIC RTE[pin] →
+      vector+PIC1_VECTOR_BASE), binds a **badged** notification, arms the timer, and
+      receives the **real interrupt** (badge 0x40 via non-blocking `SysNBRecv`).
+      Findings: `ioapic_issue_irq_handler()` hand-builds the 7-word + extra-cap
+      invocation (label 64; mr3=pin in r15; mr4..6 at IPC words 5-7; dest CNode at
+      word 122; depth 64). **Still TODO:** forward the IRQ to a driver host's ISR/DPC
+      over the reflector, the Ack path (`IRQHandler::Ack`) for repeat/level IRQs, and
+      `IoConnectInterrupt`/`WdfInterruptCreate` binding a real *device* (not timer) IRQ.
 - [ ] **Real timer/clock:** LAPIC timer as the system clock; `KeQueryPerformance
       Counter` / interrupt time / `KeQuerySystemTime`; one-shot + periodic timers
       for `KeSetTimer`/WDF timers. (rust-micro already uses LAPIC as its clock.)

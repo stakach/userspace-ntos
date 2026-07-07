@@ -382,3 +382,10 @@ findings). A step is not "done" until the plan reflects it.
   `X86IRQIssueIRQHandlerIOAPIC` really does program the IOAPIC RTE (the interrupt.rs
   "not wired yet" comment is stale). Next P1 increment: an IRQ-handler cap for a real
   interrupt (in progress).
+- **2026-07-07** — **P1 real interrupt (0e96454).** The executive programs HPET
+  timer 0 for a one-shot → IOAPIC pin 23 → issues an `X86IRQIssueIRQHandlerIOAPIC`
+  cap (programs the IOAPIC RTE) → binds a badged notification → receives the **real
+  hardware interrupt** (badge 0x40, non-blocking poll). **27/27 in QEMU.** The
+  executive can now hand a real device's MMIO + IRQ to an isolated driver host — the
+  P1 foundation. Remaining P1: reflector-forward the IRQ to a host ISR/DPC, the Ack
+  path, port I/O + PCI BAR/IRQ enumeration, DMA; then a real device (e.g. `-device edu`).
