@@ -131,3 +131,17 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   `_PRT` (or the MADT interrupt-source-overrides) to get the device→GSI mapping, then
   a single level-triggered handler on that GSI completes the loop (the kernel + host
   machinery are all ready). This is an executive-side task, not a kernel one.
+- **RESOLUTION of the NIC-INTx investigation (c9a442d): the `_PRT` won't close the loop
+  — use MSI.** An EXHAUSTIVE scan (every IOAPIC pin 0..23, edge + level, both
+  polarities, distinct vectors, all done=1 thanks to the mask fix) delivers NOTHING,
+  while: (a) the kernel level-mask fix is validated (level HPET), (b) the ISR
+  mechanism is validated (HPET delivered via the NIC's exact priority-255 + nb_recv
+  path), (c) the NIC asserts INTA (ICR=0x80000001). So it is NOT GSI discovery — the
+  single IOAPIC covers GSI 0..23 and the scan exhausted it; the `_PRT` would only give
+  a GSI in that same range. QEMU q35 isn't routing this default NIC's INTx to the
+  IOAPIC. **NEXT (the real path): MSI.** The 82574/e1000e supports it; program the
+  NIC's MSI capability (walk PCI caps for ID 0x05 → Message Address 0xFEE00000, Message
+  Data = vector+0x20, set the MSI-enable bit), issue `X86IRQIssueIRQHandlerMSI`
+  (label 65 — already in the kernel; no IOAPIC pin, no masking needed since MSI is
+  edge-like), bind a notification. The MSI write to the LAPIC bypasses the IOAPIC +
+  chipset INTx routing entirely. This closes the loop where INTx can't.

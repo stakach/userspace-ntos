@@ -442,3 +442,11 @@ findings). A step is not "done" until the plan reflects it.
   now purely executive-side: the NIC asserts INTA but its INTx doesn't reach any tried
   IOAPIC GSI (3..23) — QEMU q35 chipset PCI-INTx routing needs the ACPI `_PRT` parsed
   to get 00:2.0's exact GSI. Next: parse `_PRT`, then a single level handler completes it.
+- **2026-07-07** — **NIC-INTx investigation resolved (c9a442d): the `_PRT` won't help;
+  MSI is the path.** An exhaustive scan of every IOAPIC pin 0..23 (edge+level, both
+  polarities) delivers nothing, while the kernel mask fix + the ISR mechanism are both
+  validated (level HPET) and the NIC asserts INTA (ICR=0x80000001). So it is NOT GSI
+  discovery — the one IOAPIC covers 0..23, already exhausted. QEMU q35 isn't routing
+  this default NIC's INTx to the IOAPIC. Real fix = **MSI** (bypasses the IOAPIC +
+  chipset; kernel `X86IRQIssueIRQHandlerMSI` exists). The kernel level-IRQ-mask fix
+  (the valuable, general result) stands DONE + validated. 34/34 QEMU.
