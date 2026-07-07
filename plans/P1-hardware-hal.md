@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: in progress — real MMIO (3984164) + real IRQ (0e96454) landed
+## Status: in progress — real MMIO + real IRQ + FULL-DEVICE LOOP CLOSED (real NIC MSI → isolated host, 0f8a27e)
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -160,3 +160,19 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   test device, if we're willing to touch the shared QEMU cmdline. **Everything general
   is proven** (kernel mask fix, delivery path, NIC MMIO + assertion); only this
   device-specific last mile remains.
+- **2026-07-08 — FULL-DEVICE LOOP CLOSED (kernel 59898cb + executive 0f8a27e). 36/36.**
+  A real e1000e NIC interrupt is delivered via **MSI** all the way into an **isolated
+  ISR driver host**. A multi-agent investigation found the REAL root cause — a KERNEL
+  BUG, not a device/QEMU issue: **`irq_dispatch` never sent a LAPIC EOI** (only the
+  vestigial 8259 `pic::eoi`). In APIC mode every IRQ arrives via the LAPIC, so the
+  first device IRQ (the HPET) left a stuck in-service bit that **blocked every later
+  device IRQ in the same priority class** — which is why BOTH the exhaustive INTx scan
+  AND MSI failed. Fix: `super::lapic::eoi()` in irq_dispatch. The MSI was correct all
+  along (QEMU's e1000e delivers plain MSI on a legacy cause; 64-bit cap → Data @ 0xDC;
+  ITR=0 to avoid throttling). This also unblocks repeated device interrupts generally,
+  and means INTx would likely work now too (not needed — MSI is cleaner).
+- **Secondary kernel bug found (agent 3), fix next per Principle 6:** the IOAPIC's
+  **GSI base** from the MADT is parsed but discarded — `program_redirection` assumes
+  `pin == GSI`. Latent on QEMU q35 (base=0) but wrong on any platform with a nonzero
+  base. Store `IOAPIC_GSI_BASE` and subtract it. (Cosmetic: the MSI issue path doesn't
+  call `set_ioapic_route` — harmless, MSI has no pin to mask.)

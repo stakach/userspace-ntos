@@ -459,6 +459,16 @@ findings). A step is not "done" until the plan reflects it.
   path, NIC MMIO + interrupt assertion); only the device-specific last mile remains.
   35/35 QEMU. This has been an extensive investigation — recommend pausing the NIC
   interrupt loop and moving to another P1 item (DMA) unless the last mile is a priority.
+- **2026-07-08** — **NIC IRQ loop CLOSED; it WAS a kernel bug (kernel 59898cb, exec
+  0f8a27e). 36/36.** A real e1000e interrupt is delivered via MSI into an isolated ISR
+  host. A 4-agent parallel investigation root-caused it: **irq_dispatch never sent a
+  LAPIC EOI**, so the first device IRQ (HPET) left a stuck LAPIC in-service bit that
+  blocked every later same-priority device IRQ — which is why the exhaustive INTx scan
+  AND plain MSI both failed. The MSI was correct all along (QEMU e1000e does plain MSI
+  on a legacy cause). Also fixed a secondary latent kernel bug (190d49f): the IOAPIC
+  GSI base was parsed then ignored. Both pushed. Lesson: burning cycles chasing a
+  "device/QEMU" dead end can mask a kernel bug — the multi-agent sweep found it fast.
+  Next: **DMA**.
 - **2026-07-08** — **Confirmed BOTH QEMU q35 NICs are dead ends for IRQ delivery
   (9172b78).** Tried the e1000 (82540, `-nic model=e1000`): maps fine (live NIC) but
   QEMU's e1000 model has NO MSI capability (INTx-only), and INTx isn't routed to the
