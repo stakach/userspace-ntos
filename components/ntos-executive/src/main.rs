@@ -122,6 +122,15 @@ const IRQ_BADGE: u64 = 0x40;
 /// irq{V}_entry → handle_interrupt(V)); the HPET's IOAPIC pin is chosen separately.
 const IRQ_VECTOR: u64 = 11;
 
+// x86 I/O-port invocation labels + the IOPortControl cap slot (canonical slot 7).
+const SLOT_IO_PORT_CONTROL: u64 = 7;
+const LBL_IOPORT_CONTROL_ISSUE: u64 = 57;
+const LBL_IOPORT_IN32: u64 = 60;
+const LBL_IOPORT_OUT32: u64 = 63;
+// PCI configuration-space access ports (0xCF8 address, 0xCFC data).
+const PCI_CONFIG_ADDR: u16 = 0xCF8;
+const PCI_CONFIG_DATA: u16 = 0xCFC;
+
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
 const HPET_MAIN_COUNTER: u64 = 0xF0;
@@ -832,6 +841,15 @@ where
     (serviced, verdict)
 }
 
+/// Print `0x` + 8 hex digits (for PCI IDs / BARs).
+fn print_hex(v: u32) {
+    print_str(b"0x");
+    for i in (0..8).rev() {
+        let nib = ((v >> (i * 4)) & 0xf) as u8;
+        debug_put_char(if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) });
+    }
+}
+
 fn check(name: &[u8], ok: bool, passed: &mut u64) {
     if ok {
         print_str(b"  PASS ");
@@ -932,6 +950,69 @@ unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
         }
     }
     false
+}
+
+/// Issue an x86 I/O-port cap for the inclusive window `[first, last]` into
+/// `dest_slot` of the executive's root CNode (from the singleton IOPortControl cap).
+/// ABI: mr0=first, mr1=last, mr2=dest_index, mr3=dest_depth, extra cap = dest CNode.
+unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
+    let msginfo = (LBL_IOPORT_CONTROL_ISSUE << 12) | (1 << 9) | (1 << 7) | 4;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") SLOT_IO_PORT_CONTROL,
+        in("rsi") msginfo,
+        in("r10") first as u64,     // mr0 = first_port
+        in("r8") last as u64,       // mr1 = last_port
+        in("r9") dest_slot,         // mr2 = dest_index
+        in("r15") 64u64,            // mr3 = dest_depth (init CNode guard=0 → depth 64)
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// `out dx, eax` via an I/O-port cap (no reply).
+unsafe fn io_out32(ioport: u64, port: u16, value: u32) {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") ioport,
+        in("rsi") (LBL_IOPORT_OUT32 << 12) | 2,
+        in("r10") port as u64,      // mr0 = port
+        in("r8") value as u64,      // mr1 = value
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// `in eax, dx` via an I/O-port cap — invoked with SysCall; the read value comes
+/// back as the reply's mr0 (r10).
+unsafe fn io_in32(ioport: u64, port: u16) -> u32 {
+    let value: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        inout("rdi") ioport => _,
+        inout("rsi") ((LBL_IOPORT_IN32 << 12) | 1) => _,
+        inout("r10") port as u64 => value, // mr0 in = port; reply mr0 = value
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    value as u32
+}
+
+/// Read a 32-bit PCI configuration register (mechanism #1: 0xCF8 address / 0xCFC data).
+unsafe fn pci_read32(ioport: u64, bus: u8, dev: u8, func: u8, reg: u8) -> u32 {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((reg as u32) & 0xFC);
+    io_out32(ioport, PCI_CONFIG_ADDR, addr);
+    io_in32(ioport, PCI_CONFIG_DATA)
 }
 
 #[no_mangle]
@@ -1170,9 +1251,74 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // --- P1: PCI enumeration via real x86 port I/O. Get an I/O-port cap for the PCI
+    // config ports, walk bus 0, and read each device's vendor/device/class/BAR0/IRQ —
+    // the discovery step that finds a real device (its BAR + IRQ) to hand to a host.
+    print_str(b"[ntos-exec] P1: enumerating PCI bus 0 via port I/O (0xCF8/0xCFC)\n");
+    let pci_io = alloc_slot();
+    issue_ioport_cap(pci_io, PCI_CONFIG_ADDR, PCI_CONFIG_DATA + 3); // 0xCF8..=0xCFF
+    // Host bridge 00:00.0 — reading its vendor id proves port I/O + config access work.
+    let hb = pci_read32(pci_io, 0, 0, 0, 0x00);
+    let hb_vendor = (hb & 0xFFFF) as u16;
+    check(b"exec_pci_portio_reads_config", hb_vendor != 0xFFFF, &mut passed);
+    check(b"exec_pci_host_bridge_intel", hb_vendor == 0x8086, &mut passed);
+
+    let mut count = 0u64;
+    let mut found_storage = false;
+    let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            let vd = pci_read32(pci_io, 0, dev, func, 0x00);
+            let vendor = (vd & 0xFFFF) as u16;
+            if vendor == 0xFFFF {
+                if func == 0 {
+                    break; // no function 0 → device absent
+                }
+                continue;
+            }
+            count += 1;
+            let device = (vd >> 16) as u16;
+            let class = pci_read32(pci_io, 0, dev, func, 0x08); // [class][sub][progif][rev]
+            let bar0 = pci_read32(pci_io, 0, dev, func, 0x10);
+            let irq = pci_read32(pci_io, 0, dev, func, 0x3C) & 0xFF;
+            print_str(b"  pci 0:");
+            print_u64(dev as u64);
+            print_str(b".");
+            print_u64(func as u64);
+            print_str(b" id=");
+            print_hex(((device as u32) << 16) | vendor as u32);
+            print_str(b" class=");
+            print_hex(class >> 8);
+            print_str(b" bar0=");
+            print_hex(bar0);
+            print_str(b" irq=");
+            print_u64(irq as u64);
+            print_str(b"\n");
+            // A mass-storage controller (class 0x01) — a real device with a BAR + IRQ
+            // we can hand to an isolated driver host next (AHCI ABAR = BAR5).
+            if (class >> 24) == 0x01 {
+                found_storage = true;
+                storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
+                storage_irq = irq;
+            }
+        }
+    }
+    print_str(b"[ntos-exec] PCI devices on bus 0 = ");
+    print_u64(count);
+    print_str(b"\n");
+    check(b"exec_pci_found_multiple_devices", count >= 2, &mut passed);
+    check(b"exec_pci_found_storage_controller", found_storage, &mut passed);
+    if found_storage {
+        print_str(b"[ntos-exec] storage controller ABAR(BAR5)=");
+        print_hex(storage_bar5);
+        print_str(b" irq=");
+        print_u64(storage_irq as u64);
+        print_str(b" (a real device to hand an isolated driver host)\n");
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/27 executive->isolated-service checks passed]\n");
+    print_str(b"/31 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
