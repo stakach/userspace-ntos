@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: in progress — real MMIO + real IRQ (NIC MSI → isolated host) + real DMA (e1000e TX, 9ba612b). Next: DMA Phase 2 (VT-d confinement)
+## Status: in progress — real MMIO + real IRQ (NIC MSI → isolated host) + real DMA, identity (Phase 1) AND VT-d-confined (Phase 2, 9286864). 41/41.
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -188,3 +188,15 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   (root slot 8, badge `(domain<<16)|rid`, e1000e rid 0x10), `X86PageMapIO` (label 53) the
   DMA frame to an IOVA, set GCMD TE, program the NIC with the IOVA → a driver DMA outside
   its granted frames faults. Kernel machinery already exists (`iommu.rs`, `map_io_page`).
+- **2026-07-08 — DMA Phase 2 DONE (kernel 0bc3d83 + executive 9286864). 41/41.** The
+  e1000e's DMA is now **confined by the VT-d IOMMU** to only the frame it was granted.
+  Kernel change: `vtd_init` still leaves TE off, but `iommu::enable_translation()` is
+  called **lazily** on the first IO-space context install (so Phase 1 identity DMA keeps
+  working, then TE flips on). Executive: mint device IOSpace cap (`CNodeMint` badge
+  `(domain<<16)|rid`) → build a **4-level IO page-table hierarchy** (`X86IOPageTableMap`
+  ×4 — a 4-level IOPT needs 4 tables, not 3: the walk starts at levels_remaining=3 and
+  `MapIO` must reach level 0) → map a **copy** of the DMA frame at an IOVA
+  (`X86PageMapIO`; original stays VSpace-mapped) → reprogram the NIC to address memory
+  by IOVA → DD writes back ⇒ VT-d translated IOVA→frame. Checks
+  `exec_nic_iopt_hierarchy_built`/`_dma_frame_io_mapped`/`_confined_dma`. **The isolation
+  hole is closed: a rogue/buggy driver can no longer DMA over arbitrary RAM.**

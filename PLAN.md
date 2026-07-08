@@ -475,6 +475,13 @@ findings). A step is not "done" until the plan reflects it.
   (agent, from e1000e_core.c): TX gated on TARC0 bit10 (0x3840, not TXDCTL); DD byte at
   descriptor +12 (not +14). No kernel change. Next: DMA Phase 2 = VT-d confinement (mint
   IOSpace cap + X86PageMapIO the frame to an IOVA + set TE → rogue DMA faults).
+- **2026-07-08** — **DMA Phase 2 DONE (kernel 0bc3d83 + exec 9286864). 41/41.** e1000e
+  DMA is now CONFINED by the VT-d IOMMU. Kernel: lazy TE-enable on first IO context (so
+  Phase 1 identity DMA still works, then translation flips on). Exec: mint device IOSpace
+  cap, build a 4-level IO page-table hierarchy (X86IOPageTableMap ×4), map a copy of the
+  DMA frame at an IOVA (X86PageMapIO), reprogram the NIC to use the IOVA → DD writes back
+  ⇒ VT-d translated IOVA→frame. A driver can now only DMA into frames it was granted; a
+  rogue DMA faults. The big driver-isolation hole (DMA) is closed.
 - **2026-07-08** — **Confirmed BOTH QEMU q35 NICs are dead ends for IRQ delivery
   (9172b78).** Tried the e1000 (82540, `-nic model=e1000`): maps fine (live NIC) but
   QEMU's e1000 model has NO MSI capability (INTx-only), and INTx isn't routed to the
