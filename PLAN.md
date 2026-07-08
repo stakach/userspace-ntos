@@ -585,3 +585,11 @@ findings). A step is not "done" until the plan reflects it.
   user pml4 cap so service_user_syscalls can map on demand. Checks: exec_nt_alloc_vm_base /
   _readback / exec_nt_query_time_monotonic. Begins P3 item 10. Next P3: NtFreeVirtualMemory +
   VAD tracking; sync objects + wait dispatcher; then load a real PE (PEB/TEB) toward smss.exe.
+- **2026-07-08** — **P3 sync objects (exec e436be4). 67/67.** The isolated user process can
+  create events + wait on them with real NT KEVENT semantics (reusing nt-kernel-exec's
+  EventStore): NtCreateEvent (Notification/Synchronization + initial), NtSetEvent, NtResetEvent,
+  NtWaitForSingleObject (poll → OBJECT_0=0 / TIMEOUT=0x102). Verified: Synchronization event =
+  [TIMEOUT,OBJECT_0,TIMEOUT] (auto-reset consumes the signal), Notification event =
+  [OBJECT_0,OBJECT_0,TIMEOUT] (manual until reset). P3 item 11. Checks: exec_nt_event_sync_autoreset
+  / _manual_reset. Next P3: a blocking wait dispatcher (item 14 — a 2nd thread signals while the
+  1st blocks), then load a real PE with PEB/TEB (nt-user-host/nt-pe-loader) toward smss.exe.
