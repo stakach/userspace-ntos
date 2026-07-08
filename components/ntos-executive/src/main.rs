@@ -1356,6 +1356,83 @@ unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sect
     0xFF // timeout
 }
 
+/// FAT32 filesystem geometry parsed from the volume's BPB (sector 0), plus the AHCI handles
+/// needed to read further sectors. All reads go through `ahci_read_sector` into the shared
+/// data buffer at `AHCI_DMA_VADDR + 0x800` — so a caller MUST consume one sector's bytes
+/// before triggering the next read.
+#[derive(Clone, Copy)]
+struct Fat32 {
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    bps: u32,        // bytes per sector
+    spc: u32,        // sectors per cluster
+    fat_start: u32,  // first FAT sector
+    data_start: u32, // first data sector (cluster 2)
+    root_cl: u32,    // root directory cluster
+}
+
+/// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
+unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
+    ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64);
+    (fs.dma_vaddr + 0x800) as *const u8
+}
+
+/// First disk sector of a cluster.
+fn fat_cluster_sector(fs: &Fat32, cluster: u32) -> u32 {
+    fs.data_start + (cluster - 2) * fs.spc
+}
+
+/// Follow the FAT: next cluster after `cluster` (>= 0x0FFF_FFF8 means end-of-chain).
+unsafe fn fat_next(fs: &Fat32, cluster: u32) -> u32 {
+    let byte = cluster * 4;
+    let sec = fs.fat_start + byte / fs.bps;
+    let off = (byte % fs.bps) as u64;
+    let p = fat_read_sector(fs, sec);
+    (core::ptr::read_unaligned(p.add(off as usize) as *const u32)) & 0x0FFF_FFFF
+}
+
+/// Scan directory `dir_cluster` (following its cluster chain) for the 8.3 name `name11`
+/// (11 bytes, space-padded). Returns (first_cluster, size_bytes, attr). LFN / deleted /
+/// volume-label / free entries are skipped. Extracts the entry before any further reads.
+unsafe fn dir_find(fs: &Fat32, dir_cluster: u32, name11: &[u8; 11]) -> Option<(u32, u32, u8)> {
+    let mut cl = dir_cluster;
+    while cl >= 2 && cl < 0x0FFF_FFF8 {
+        for s in 0..fs.spc {
+            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
+            for e in 0..(fs.bps as usize / 32) {
+                let ent = p.add(e * 32);
+                let first = *ent;
+                if first == 0x00 {
+                    return None; // end of directory
+                }
+                if first == 0xE5 {
+                    continue; // deleted
+                }
+                let attr = *ent.add(0x0B);
+                if attr == 0x0F || (attr & 0x08) != 0 {
+                    continue; // LFN fragment or volume label
+                }
+                let mut matches = true;
+                for i in 0..11 {
+                    if *ent.add(i) != name11[i] {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    let hi = core::ptr::read_unaligned(ent.add(0x14) as *const u16) as u32;
+                    let lo = core::ptr::read_unaligned(ent.add(0x1A) as *const u16) as u32;
+                    let size = core::ptr::read_unaligned(ent.add(0x1C) as *const u32);
+                    return Some(((hi << 16) | lo, size, attr));
+                }
+            }
+        }
+        cl = fat_next(fs, cl); // overwrites the buffer — fine, we're done with this cluster
+    }
+    None
+}
+
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
 /// toward `io_address`. Returns the invocation error label (0 = success). The first call
 /// for a device installs the context root (and lazily enables VT-d translation).
@@ -1810,6 +1887,92 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (tfd & 0x89) == 0 && nonzero && sig == 0xAA55,
                 &mut passed,
             );
+
+            // --- P2 filesystem: read a real FILE through the FAT32 volume on this disk.
+            // Sector 0 (the BPB) is still in the buffer from the read above. Parse it,
+            // then navigate root → BOOTBOOT → INITRD and read the file's first cluster.
+            let bp = |o: u64| core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800 + o) as *const u8);
+            let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
+            let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
+            let bps = bp16(0x0B);
+            let spc = bp(0x0D) as u32;
+            let reserved = bp16(0x0E);
+            let nfats = bp(0x10) as u32;
+            let spf32 = bp32(0x24);
+            let root_cl = bp32(0x2C);
+            let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
+            print_str(b"[ntos-exec] FAT32 bps=");
+            print_u64(bps as u64);
+            print_str(b" spc=");
+            print_u64(spc as u64);
+            print_str(b" reserved=");
+            print_u64(reserved as u64);
+            print_str(b" nfats=");
+            print_u64(nfats as u64);
+            print_str(b" spf=");
+            print_u64(spf32 as u64);
+            print_str(b"\n");
+            check(b"exec_fat32_bpb_ok", bps == 512 && spc >= 1 && is_fat32, &mut passed);
+            if bps == 512 && spc >= 1 {
+                let fs = Fat32 {
+                    ahci_vaddr: AHCI_VADDR,
+                    dma_vaddr: AHCI_DMA_VADDR,
+                    dma_paddr,
+                    bps,
+                    spc,
+                    fat_start: reserved,
+                    data_start: reserved + nfats * spf32,
+                    root_cl,
+                };
+                // List the root directory (8.3 names) — a real directory read.
+                print_str(b"[ntos-exec] root dir:");
+                let rp = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl));
+                for e in 0..(fs.bps as usize / 32) {
+                    let ent = rp.add(e * 32);
+                    if *ent == 0x00 {
+                        break;
+                    }
+                    let attr = *ent.add(0x0B);
+                    if *ent == 0xE5 || attr == 0x0F || (attr & 0x08) != 0 {
+                        continue;
+                    }
+                    debug_put_char(b' ');
+                    for i in 0..11 {
+                        let c = *ent.add(i);
+                        if c != b' ' {
+                            debug_put_char(c);
+                        }
+                    }
+                }
+                print_str(b"\n");
+                let have_efi = dir_find(&fs, fs.root_cl, b"EFI        ").is_some();
+                let bootboot = dir_find(&fs, fs.root_cl, b"BOOTBOOT   ");
+                check(b"exec_fat32_root_dir", have_efi && bootboot.is_some(), &mut passed);
+                // Navigate BOOTBOOT/ → INITRD, then read the file's first cluster.
+                let mut read_ok = false;
+                if let Some((bb_cl, _, _)) = bootboot {
+                    if let Some((initrd_cl, initrd_size, _)) = dir_find(&fs, bb_cl, b"INITRD     ") {
+                        let fp = fat_read_sector(&fs, fat_cluster_sector(&fs, initrd_cl));
+                        let mut nz = false;
+                        for i in 0..512usize {
+                            if *fp.add(i) != 0 {
+                                nz = true;
+                                break;
+                            }
+                        }
+                        print_str(b"[ntos-exec] BOOTBOOT/INITRD cluster=");
+                        print_u64(initrd_cl as u64);
+                        print_str(b" size=");
+                        print_u64(initrd_size as u64);
+                        print_str(b" first8=0x");
+                        print_hex(core::ptr::read_unaligned(fp as *const u32));
+                        print_hex(core::ptr::read_unaligned(fp.add(4) as *const u32));
+                        print_str(b"\n");
+                        read_ok = initrd_size > 0 && nz;
+                    }
+                }
+                check(b"exec_fat32_read_file", read_ok, &mut passed);
+            }
         }
     }
 
@@ -2293,7 +2456,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/54 executive->isolated-service checks passed]\n");
+    print_str(b"/57 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
