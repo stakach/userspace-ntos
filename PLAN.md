@@ -569,3 +569,12 @@ findings). A step is not "done" until the plan reflects it.
   after the NIC block (installing the AHCI context turns TE on globally, which would block the
   NIC's Phase-1 identity DMA). Both NIC + AHCI now run confined DMA. No kernel change. Next P2:
   registry hives over the FS (read + parse a real hive from the disk).
+- **2026-07-08** — **P2 COMPLETE — registry hive read off the disk (exec 47c9dc9 + kernel
+  ae58471). 62/62.** A real NT registry hive (nt-hive-core image) is generated at build time
+  (crates/nt-hive-core/src/bin/gen_hive.rs) + placed on the boot disk as SYSTEM.DAT; the
+  isolated VT-d-confined storage host reads it off the FAT32 FS (new fat_read_file), and the
+  executive's Config Manager decode_image()s it + reads ControlSet001\Services\NtosTest\Answer
+  = 42 back. Full disk->volume->FS->registry chain, end to end. Checks:
+  exec_storage_host_read_hive / exec_cm_hive_decoded / exec_cm_hive_answer_42.
+  **P2 (storage + filesystem + real registry) DONE.** Next: P3 (native syscall breadth +
+  run a real PE), or load the hive into nt-config-manager's mount table + serve Nt*Key.
