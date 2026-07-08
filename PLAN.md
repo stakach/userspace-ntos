@@ -490,3 +490,13 @@ findings). A step is not "done" until the plan reflects it.
   + another device untyped) or a **purpose-built device** (`-device edu`, or a virtio
   device). PAUSING it here — all general/architectural pieces are proven; this is a
   device-specific detail. Next P1: **DMA** (or MSI-X later if the NIC IRQ is a priority).
+- **2026-07-08** — **Real Windows `.sys` hosted through the START path (74287ae). 45/45.**
+  An unmodified MSVC-compiled WDM driver (PnpMmioInterruptTest.sys) runs crash-contained
+  in the isolated seL4 host: the executive PE-loads it (nt-pe-loader) + patches its imports
+  to ntoskrnl stubs wired to reality (MmMapIoSpace → the real e1000e BAR); the host calls
+  DriverEntry → AddDevice → IRP_MN_START_DEVICE with our real CM_RESOURCE_LIST, and the
+  driver's START handler runs + does real MMIO. Its START returns a device-mismatch status
+  (real device is an e1000e, not the driver's test device) — noted honestly. The core NT
+  driver-hosting goal (a real .sys binary driving real hardware, isolated) is demonstrated.
+  Follow-ons: deliver a real MSI to the driver's ISR, DMA via the confined buffer, KMDF
+  (the full nt-wdf-* surface).
