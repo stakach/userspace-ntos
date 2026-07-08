@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: in progress — real MMIO + real IRQ (NIC MSI → isolated host) + real DMA, identity (Phase 1) AND VT-d-confined (Phase 2, 9286864). 41/41.
+## Status: P1 capstone reached — an isolated driver host, handed a CM_RESOURCE_LIST + confined DMA buffer at START, drives the real e1000e (MMIO + IRQ + VT-d-confined DMA) from its own CSpace/VSpace (25454e7). 42/42.
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -200,3 +200,14 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   by IOVA → DD writes back ⇒ VT-d translated IOVA→frame. Checks
   `exec_nic_iopt_hierarchy_built`/`_dma_frame_io_mapped`/`_confined_dma`. **The isolation
   hole is closed: a rogue/buggy driver can no longer DMA over arbitrary RAM.**
+- **2026-07-08 — P1 CAPSTONE: driver-host-at-START (executive 25454e7). 42/42.** The
+  executive (PnP + HAL) hands an ISOLATED driver host a real NT `CM_RESOURCE_LIST`
+  (memory + interrupt, via `nt-cm-resources`) + a VT-d-confined common DMA buffer at
+  START, and the host drives the e1000e from its own CSpace/VSpace: parses the resource
+  list, reads NIC MMIO through its granted BAR, runs a confined DMA TX (addresses memory
+  by the granted IOVA → VT-d maps it to one frame), reports its verdict
+  (`exec_driver_host_drove_nic`). The seL4 analogue of KMDF START_DEVICE. `spawn_driver_host`
+  builds the VSpace/CSpace + maps the granted resources (BAR at NIC_VADDR, common buffer
+  at DMA_VADDR, resource frame at RESLIST_VADDR) + seeds IRQ/result/fault caps. Scheduling
+  bug fixed: a done ISR host spinning on yield_now at high prio starved the lower-prio
+  driver host — `isr.rs` now parks on a blocking wait.
