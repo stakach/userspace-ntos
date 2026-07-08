@@ -922,6 +922,7 @@ unsafe fn spawn_kmdf_host(
     prio: u64,
     kmdf_pe_base: u64,
     shared_frame: u64,
+    nic_bar_base: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -969,6 +970,14 @@ unsafe fn spawn_kmdf_host(
     }
     let sh = copy_cap(shared_frame);
     let _ = page_map(sh, kmdf_host::KMDF_SHARED_VADDR, RW_NX, pml4);
+    // The REAL e1000e NIC BAR (4 pages, aliased from the executive's caps) at NIC_VADDR —
+    // the KMDF driver reaches real hardware via MmMapIoSpace → NIC_VADDR.
+    if nic_bar_base != 0 {
+        for i in 0..4u64 {
+            let cp = copy_cap(nic_bar_base + i);
+            let _ = page_map(cp, NIC_VADDR + i * 0x1000, RW_NX, pml4);
+        }
+    }
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -1672,6 +1681,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // --- P1 CAPSTONE: drive the real e1000e NIC. Map its enumerated BAR0 as a
     // device frame and read a live device register — a real driver path touching
     // real (QEMU-emulated) network hardware, not a mock.
+    let mut kmdf_nic_bar_base = 0u64; // the real NIC BAR caps, handed to the KMDF host below
     if found_nic {
         let nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
         print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000e NIC BAR0 ");
@@ -1683,6 +1693,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // regs, page 3 (offset 0x3000) has the TX descriptor registers (0x3800..0x3828).
         let nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
         check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
+        kmdf_nic_bar_base = nic_bar_base; // hand the real BAR to the KMDF host later
         if nic_bar_base != 0 {
             // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
             let ctrl = core::ptr::read_volatile((NIC_VADDR + 0x00) as *const u32);
@@ -2086,6 +2097,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let _ = page_map(kmdf_shared, kmdf_host::KMDF_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile(kmdf_host::KMDF_SHARED_VADDR as *mut u64, kmdf_entry as u64);
         core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *mut u32, 0);
+        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *mut u32, 0);
         print_str(b"[ntos-exec] pre-loaded KmdfBasicTest.sys; FxDriverEntry rva=");
         print_hex(kmdf_entry);
         print_str(b"\n");
@@ -2107,6 +2119,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             100,
             kmdf_pe_base,
             kmdf_shared,
+            kmdf_nic_bar_base,
         );
         let _ = kmdf_fault;
         let (_z, _b, _s, _m) = ep_recv(kmdf_result);
@@ -2116,14 +2129,36 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b"\n");
         check(b"exec_kmdf_driver_create", (kv & 1) != 0, &mut passed);
         check(b"exec_kmdf_adddevice_queue", (kv & 2) != 0, &mut passed);
-        check(b"exec_kmdf_prepare_hw", (kv & 4) != 0, &mut passed);
+        // bit 4 now = the driver's PrepareHardware mapped the REAL NIC BAR + read + rejected
+        // a real register (not its 'KMDF' test HW) — a real KMDF driver reaching real HW.
+        check(b"exec_kmdf_prepare_hw_read_real_nic", (kv & 4) != 0, &mut passed);
         check(b"exec_kmdf_ioctl", (kv & 8) != 0, &mut passed);
         check(b"exec_kmdf_remove", (kv & 16) != 0, &mut passed);
+        // The KMDF driver, in EvtDevicePrepareHardware, mapped the REAL e1000e BAR
+        // (MmMapIoSpace → NIC_VADDR) and its READ_REG32 IOCTL returned register 0 (CTRL).
+        // Verify it matches a direct read of the same live register — a real KMDF driver
+        // reaching real hardware through the WDF stack.
+        let kmdf_ctrl = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *const u32);
+        let direct_ctrl = if kmdf_nic_bar_base != 0 {
+            core::ptr::read_volatile(NIC_VADDR as *const u32)
+        } else {
+            0
+        };
+        print_str(b"[ntos-exec] KMDF driver read real NIC CTRL=0x");
+        print_hex(kmdf_ctrl);
+        print_str(b" (direct read=0x");
+        print_hex(direct_ctrl);
+        print_str(b")\n");
+        check(
+            b"exec_kmdf_read_real_nic",
+            kmdf_ctrl != 0 && kmdf_ctrl != 0xFFFF_FFFF && kmdf_ctrl == direct_ctrl,
+            &mut passed,
+        );
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/50 executive->isolated-service checks passed]\n");
+    print_str(b"/51 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

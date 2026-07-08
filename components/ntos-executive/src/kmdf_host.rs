@@ -154,9 +154,11 @@ extern "win64" fn ntos_dbg_print_ex(_a: u32, _b: u32, _fmt: *const u8, _args: u6
     0
 }
 
-extern "win64" fn ntos_mm_map_io_space(_phys: u64, _length: u64, _cache: u32) -> u64 {
-    // Hand back the simulated MMIO bank (spec: the WDF PrepareHardware maps the BAR).
-    core::ptr::addr_of_mut!(MMIO) as u64
+extern "win64" fn ntos_mm_map_io_space(phys: u64, _length: u64, _cache: u32) -> u64 {
+    // Hand back the REAL e1000e NIC BAR (mapped into this host at NIC_VADDR) — the KMDF
+    // driver's EvtDevicePrepareHardware maps + reads REAL hardware through the WDF stack.
+    MMIO_MAPPED.store(phys | 1, Ordering::Relaxed);
+    crate::NIC_VADDR
 }
 extern "win64" fn ntos_mm_unmap_io_space(_base: u64, _length: u64) {}
 
@@ -515,6 +517,9 @@ unsafe fn build_resource_list() -> u64 {
 
 static LAST_STATUS: AtomicU64 = AtomicU64::new(0);
 static LAST_INFO: AtomicU64 = AtomicU64::new(0);
+/// Set by `ntos_mm_map_io_space` when the KMDF driver's EvtDevicePrepareHardware maps the
+/// (real NIC) BAR — proof the WDF hardware-prepare path ran + reached real hardware.
+static MMIO_MAPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Run one buffered IOCTL through the queue → EvtIoDeviceControl → completion, returning
 /// `(status, information, output_bytes)`.
@@ -645,10 +650,20 @@ pub unsafe fn run(entry_rva: u32) -> u32 {
     } else {
         STATUS_UNSUCCESSFUL
     };
-    if prep_status == 0 {
+    // The driver's PrepareHardware ran and called MmMapIoSpace to map the REAL e1000e BAR
+    // (MMIO_MAPPED). It read register 0 (the e1000e CTRL, 0x001402xx) and — correctly —
+    // REJECTED the device (prep_status != 0): this isn't its 'KMDF' test device. That very
+    // rejection PROVES it read + evaluated a real hardware register through the WDF stack
+    // (on the simulated device it would have ACCEPTED). Read the live CTRL host-side too.
+    let mapped = MMIO_MAPPED.load(Ordering::Relaxed) != 0;
+    let ctrl = core::ptr::read_volatile(crate::NIC_VADDR as *const u32);
+    core::ptr::write_volatile((KMDF_SHARED_VADDR + 0x10) as *mut u32, ctrl);
+    if mapped && prep_status != 0 {
         verdict |= 4;
     }
-    print_str(b"[kmdf] PrepareHardware mapped MMIO\n");
+    print_str(b"[kmdf] PrepareHardware mapped the REAL NIC BAR; read CTRL=0x");
+    print_hex(ctrl);
+    print_str(b" and rejected the device (not its test HW)\n");
 
     // --- D0 entry -------------------------------------------------------------
     let (d0_entry, _released) = wdf().set_device_power(device, true).unwrap();
