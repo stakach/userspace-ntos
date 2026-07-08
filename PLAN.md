@@ -545,3 +545,11 @@ findings). A step is not "done" until the plan reflects it.
   the disk, not the empty built-in @00:31.2); TFD=0x50 = success; QEMU DET=1 = present. Next
   P2: confine AHCI DMA via VT-d + move the read into an isolated storage host; then
   partition/volume → FS → hives.
+- **2026-07-08** — **P2 filesystem — read a real FILE off the boot disk (exec 4896dd0). 57/57.**
+  A small FAT32 reader in the executive (fat_read_sector/fat_next/dir_find over the AHCI
+  block read) parses the BPB, lists the real root dir (EFI BOOTBOOT NVVARS), navigates
+  root → BOOTBOOT → INITRD via directory entries + FAT cluster chains, and reads the file
+  (BOOTBOOT/INITRD, cluster 208, 11,865,600 bytes, real ASCII) — the very boot bundle BOOTBOOT
+  loads. Disk is a FAT32 superfloppy so roadmap item 7 (partition) is N/A; this is item 8
+  (read a real FS volume). No kernel change. Next P2: confine AHCI DMA via VT-d + move the
+  storage stack into an isolated host; then registry hives.
