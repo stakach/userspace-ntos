@@ -561,3 +561,11 @@ findings). A step is not "done" until the plan reflects it.
   (Bus Master, claim caps, spawn, verify). Item 6 ("storage driver in an isolated host") now
   complete in its full isolated form. Next P2: confine the AHCI DMA via VT-d; then registry
   hives over the FS.
+- **2026-07-08** — **P2 storage DMA VT-d-CONFINED (exec d54ddd2). 59/59.** The isolated
+  storage host's AHCI DMA now goes through the VT-d IOMMU: the executive mints an IO-space cap
+  for the AHCI rid (00:3.0 → 0x18) in its own domain, builds a 4-level IOPT, and maps the DMA
+  frame at AHCI_IOVA (0x1000); the host addresses memory by IOVA, so a rogue DMA faults in HW.
+  Reuses the NIC Phase-2 machinery (SLOT_IO_SPACE, iopt_map/map_io). The storage block moved
+  after the NIC block (installing the AHCI context turns TE on globally, which would block the
+  NIC's Phase-1 identity DMA). Both NIC + AHCI now run confined DMA. No kernel change. Next P2:
+  registry hives over the FS (read + parse a real hive from the disk).
