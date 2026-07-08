@@ -14,7 +14,10 @@ pub unsafe extern "C" fn isr_entry() -> ! {
     let _ = ep_recv(CT_IRQ_NTFN);
     // Report by signalling the (badged) result notification the executive polls.
     let _ = syscall5(SYS_SEND, CT_RESULT_NTFN, 0, 0, 0, 0);
+    // Park by BLOCKING on the IRQ notification (which won't fire again) rather than
+    // spinning on yield_now — a high-priority spin here would starve every lower-priority
+    // thread (e.g. a driver host the executive spawns afterwards).
     loop {
-        yield_now();
+        let _ = ep_recv(CT_IRQ_NTFN);
     }
 }

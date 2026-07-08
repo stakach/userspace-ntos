@@ -22,6 +22,7 @@ pub use sel4_rt::*;
 mod allocator;
 mod cm_server;
 mod io_server;
+mod driver_host;
 mod isr;
 mod server;
 
@@ -169,6 +170,11 @@ const SLOT_IO_SPACE: u64 = 8; // seL4_CapIOSpace — the master IO-space cap in 
 /// IOVA we grant the NIC for its DMA frame. The NIC is programmed with this address; VT-d
 /// translates it to the frame's real paddr. Any DMA outside the granted frame faults.
 const NIC_IOVA: u64 = 0x1000;
+/// Driver-host VSpace: where the executive maps the CM_RESOURCE_LIST + common-buffer
+/// descriptor (also mapped at the same vaddr in the host, aliasing the frame).
+pub const RESLIST_VADDR: u64 = 0x0000_0100_005F_D000;
+/// The MSI vector we bind for the NIC interrupt (matches the NIC IRQ section).
+const NIC_MSI_VECTOR: u64 = 5;
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 
@@ -818,6 +824,79 @@ unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64, result_cap
     let _ = tcb_resume(tcb);
 }
 
+/// Spawn an isolated PnP driver host: a fresh VSpace/CSpace, plus — mapped into its
+/// VSpace — the granted device resources: the NIC BAR (`bar_base`..+4 pages at
+/// `NIC_VADDR`), a confined common DMA buffer (`dma_frame` at `DMA_VADDR`), and the
+/// resource frame (`reslist_frame` at `RESLIST_VADDR`) holding the CM_RESOURCE_LIST. The
+/// host gets caps only to the IRQ + result notifications. Device frames are aliased via
+/// `copy_cap`, so the same physical pages are also mapped in the executive.
+unsafe fn spawn_driver_host(
+    entry: unsafe extern "C" fn() -> !,
+    irq_cap: u64,
+    result_cap: u64,
+    fault_ep: u64,
+    prio: u64,
+    bar_base: u64,
+    dma_frame: u64,
+    reslist_frame: u64,
+) {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    for i in 0..STACK_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // Granted device resources, mapped into the host's VSpace (all within the image PT):
+    //   the 4 NIC BAR pages at NIC_VADDR, the confined DMA buffer at DMA_VADDR, and the
+    //   resource frame at RESLIST_VADDR. Each is a copy aliasing the executive's frame.
+    for i in 0..4u64 {
+        let cp = copy_cap(bar_base + i);
+        let _ = page_map(cp, NIC_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    let dma_cp = copy_cap(dma_frame);
+    let _ = page_map(dma_cp, DMA_VADDR, RW_NX, pml4);
+    let res_cp = copy_cap(reslist_frame);
+    let _ = page_map(res_cp, RESLIST_VADDR, RW_NX, pml4);
+
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_IRQ_NTFN, irq_cap, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_RESULT_NTFN, result_cap, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, prio);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+}
+
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`. Returns
 /// `(serviced, verdict)`.
@@ -1018,7 +1097,7 @@ unsafe fn stand_up_service(
 /// the device untyped was found + mapped. This is how the executive, which owns the
 /// hardware caps, hands real MMIO to itself (and later to isolated driver hosts).
 unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
-    claim_device_pages(bi, paddr, vaddr, 1)
+    claim_device_pages(bi, paddr, vaddr, 1) != 0
 }
 
 /// Map the first `n` 4 KiB pages of the device MMIO region whose untyped base is
@@ -1026,20 +1105,27 @@ unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
 /// hand out consecutive physical frames, so page p lands at `paddr + p*0x1000` mapped
 /// at `vaddr + p*0x1000` — i.e. an identity-offset window over the BAR. Needed for the
 /// e1000e, whose TX descriptor registers sit at BAR offset 0x3800 (the 4th page).
-unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> bool {
+/// Returns the cap slot of the FIRST mapped BAR frame (0 if not found). The `n` frames
+/// occupy consecutive slots, so a caller can `copy_cap(base + p)` to alias a page (e.g.
+/// to map the BAR into an isolated driver host's VSpace too).
+unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> u64 {
     let count = bi.untyped.end - bi.untyped.start;
     for i in 0..count {
         let d = bi.untyped_list[i as usize];
         if d.is_device == 1 && d.paddr == paddr {
+            let mut base = 0u64;
             for p in 0..n {
                 let frame = alloc_slot();
+                if p == 0 {
+                    base = frame;
+                }
                 let _ = untyped_retype(bi.untyped.start + i, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
                 let _ = page_map(frame, vaddr + p * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
-            return true;
+            return base;
         }
     }
-    false
+    0
 }
 
 /// Issue an x86 I/O-port cap for the inclusive window `[first, last]` into
@@ -1504,9 +1590,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b")\n");
         // Map the first 4 pages (16 KiB) of the BAR: page 0 has CTRL/STATUS/interrupt
         // regs, page 3 (offset 0x3000) has the TX descriptor registers (0x3800..0x3828).
-        let nic_mapped = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
-        check(b"exec_nic_bar_mapped", nic_mapped, &mut passed);
-        if nic_mapped {
+        let nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
+        check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
+        if nic_bar_base != 0 {
             // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
             let ctrl = core::ptr::read_volatile((NIC_VADDR + 0x00) as *const u32);
             let status = core::ptr::read_volatile((NIC_VADDR + 0x08) as *const u32);
@@ -1767,12 +1853,85 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_hex(dd2 as u32);
             print_str(b" (DD=1 => NIC DMA went through VT-d: IOVA -> frame)\n");
             check(b"exec_nic_confined_dma", dd2 & 0x1 != 0, &mut passed);
+
+            // ---- DRIVER HOST AT START: the executive, acting as the PnP manager + HAL,
+            // hands an ISOLATED driver host a real NT CM_RESOURCE_LIST (MMIO + interrupt)
+            // and a VT-d-confined common DMA buffer, then lets it drive the NIC (MMIO +
+            // confined DMA) entirely from its own CSpace/VSpace — the seL4 analogue of a
+            // KMDF driver's START_DEVICE. A fault or rogue DMA is contained in the host.
+            print_str(b"[ntos-exec] driver host: START with CM_RESOURCE_LIST + confined DMA buffer\n");
+            // Resource frame: mapped here (to fill it) and, via a copy, in the host.
+            let reslist_frame = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, reslist_frame);
+            let _ = page_map(reslist_frame, RESLIST_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            {
+                use nt_cm_resources::*;
+                let buf =
+                    core::slice::from_raw_parts_mut(RESLIST_VADDR as *mut u8, MEMORY_INTERRUPT_LIST_SIZE);
+                let _ = build_memory_interrupt_list(
+                    buf,
+                    0, // bus 0
+                    MemoryDescriptor {
+                        start: NIC_VADDR, // the host's MMIO window (already mapped for it)
+                        length: 0x4000,
+                        flags: CM_RESOURCE_MEMORY_READ_WRITE,
+                        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                    },
+                    InterruptDescriptor {
+                        level: NIC_MSI_VECTOR as u32,
+                        vector: NIC_MSI_VECTOR as u32,
+                        affinity: 1,
+                        flags: CM_RESOURCE_INTERRUPT_LATCHED,
+                        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+                    },
+                );
+            }
+            // Common-buffer descriptor (the DMA adapter's AllocateCommonBuffer result):
+            // CPU virtual address, device logical address (IOVA), length.
+            core::ptr::write_volatile((RESLIST_VADDR + 0x100) as *mut u64, DMA_VADDR);
+            core::ptr::write_volatile((RESLIST_VADDR + 0x108) as *mut u64, NIC_IOVA);
+            core::ptr::write_volatile((RESLIST_VADDR + 0x110) as *mut u64, 0x1000u64);
+            core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, 0); // clear verdict
+            // A fresh badged result notification the host signals when it's done.
+            let dh_result = make_object(OBJ_NOTIFICATION);
+            let dh_result_badged = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND,
+                CAP_INIT_THREAD_CNODE,
+                LBL_CNODE_MINT << 12,
+                dh_result_badged,
+                dh_result,
+                ISR_DONE_BADGE,
+            );
+            // Hand the host a cap to the NIC's IRQ notification too (full resource grant).
+            let dh_irq = copy_cap(nic_irq_ntfn);
+            let dh_fault = make_object(OBJ_ENDPOINT);
+            spawn_driver_host(
+                driver_host::driver_host_entry,
+                dh_irq,
+                dh_result_badged,
+                dh_fault,
+                100,
+                nic_bar_base,
+                dma_frame,
+                reslist_frame,
+            );
+            let _ = dh_fault; // a fault EP so a host fault is contained cleanly, not silent
+            // The host always signals when done; read back its verdict from the shared frame.
+            let (_z, dhb, _s, _m) = ep_recv(dh_result);
+            let dh_verdict = core::ptr::read_volatile((RESLIST_VADDR + 0x200) as *const u8);
+            print_str(b"[ntos-exec] driver host signalled badge=");
+            print_u64(dhb);
+            print_str(b" verdict=");
+            print_u64(dh_verdict as u64);
+            print_str(b"\n");
+            check(b"exec_driver_host_drove_nic", dh_verdict == 1, &mut passed);
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/41 executive->isolated-service checks passed]\n");
+    print_str(b"/42 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
