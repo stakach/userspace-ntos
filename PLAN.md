@@ -500,3 +500,11 @@ findings). A step is not "done" until the plan reflects it.
   driver-hosting goal (a real .sys binary driving real hardware, isolated) is demonstrated.
   Follow-ons: deliver a real MSI to the driver's ISR, DMA via the confined buffer, KMDF
   (the full nt-wdf-* surface).
+- **2026-07-08** — **Real KMDF driver hosted through the FULL WDF lifecycle (d16be90). 50/50.**
+  KmdfBasicTest.sys runs crash-contained in a separate isolated seL4 host: DriverEntry →
+  WdfDriverCreate → AddDevice → WdfDeviceCreate/WdfIoQueueCreate → EvtDevicePrepareHardware
+  → D0Entry → IOCTLs → REMOVE (verdict 0x1f). The MODERN Windows driver framework runs on
+  the microkernel. Ported driver-host-wdf's WDF surface into kmdf_host.rs; spawn_kmdf_host
+  maps image-RW + a heap + the KMDF PE + a big stack. Software-only. CAVEAT: shared RW image
+  (private-copy isolation = hardening follow-on). Both WDM (real hardware) and KMDF driver
+  models now host real .sys binaries on rust-micro.
