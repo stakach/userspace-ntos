@@ -553,3 +553,11 @@ findings). A step is not "done" until the plan reflects it.
   loads. Disk is a FAT32 superfloppy so roadmap item 7 (partition) is N/A; this is item 8
   (read a real FS volume). No kernel change. Next P2: confine AHCI DMA via VT-d + move the
   storage stack into an isolated host; then registry hives.
+- **2026-07-08** — **P2 storage ISOLATED (exec 4f2367c). 57/57.** Moved the whole storage
+  stack (AHCI bring-up + sector read + FAT32 FS + BOOTBOOT/INITRD read) out of the trusted
+  executive into a crash-contained storage host (own CSpace/VSpace) — new src/storage_host.rs
+  + storage_probe (crate-scope) + spawn_storage_host (RO image; granted ONLY the AHCI BAR +
+  DMA frame + a shared word; no PCI-config access). The executive is now the Tier-1 broker
+  (Bus Master, claim caps, spawn, verify). Item 6 ("storage driver in an isolated host") now
+  complete in its full isolated form. Next P2: confine the AHCI DMA via VT-d; then registry
+  hives over the FS.
