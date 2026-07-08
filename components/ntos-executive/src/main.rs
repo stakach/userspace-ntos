@@ -93,6 +93,10 @@ pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
 /// A second shared frame, for the blocking-wait demo's two threads (mapped at SYSARG_VADDR in
 /// each of them) — read by the executive at this vaddr (its own view of the same frame).
 pub const SYSARG2_VADDR: u64 = 0x0000_0100_005D_1000;
+/// Where a loaded real PE's image is mapped in its user VSpace (inside the one 2 MiB PT with
+/// the stack/sysarg/ipcbuf), and the executive's scratch region to write the code first.
+pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
+pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
@@ -855,6 +859,115 @@ pub unsafe extern "C" fn signaler_entry() -> ! {
     let _ = native_syscall(SSN_SET_WAKE, BLOCK_EVENT_KEY);
     let _ = native_syscall(SSN_DONE_B, 0);
     park()
+}
+
+/// The user process's code for the minimal real PE: NtQuerySystemTime -> SSN_DONE(with the
+/// returned time in r10) -> park. Position-independent (only syscalls + a rel8 loop), so it
+/// runs correctly at any load base.
+const PE_STUB: &[u8] = &[
+    0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 0x57  (NtQuerySystemTime SSN)
+    0x0F, 0x05, // syscall  -> rax = time
+    0x49, 0x89, 0xC2, // mov r10, rax
+    0x48, 0xC7, 0xC0, 0xFF, 0x01, 0x00, 0x00, // mov rax, 0x1FF  (SSN_DONE)
+    0x0F, 0x05, // syscall  -> verdict = r10 = time
+    0xEB, 0xFE, // jmp $  (park)
+];
+
+/// Build a minimal PE32+/x86_64 image: one `.text` section (`text`) at RVA 0x1000, entry
+/// there, `Subsystem = NATIVE`, no imports/relocs. Mirrors nt-pe-loader's own test builder
+/// (crates/nt-pe-loader/tests/parse.rs) — a real PE the loader parses + maps.
+unsafe fn build_min_pe(text: &[u8], image_base: u64) -> alloc::vec::Vec<u8> {
+    const NT_OFF: usize = 0x40;
+    const OPT_OFF: usize = 0x58;
+    const SECTION_TABLE: usize = 0x148;
+    const FILE_ALIGN: usize = 0x200;
+    let align = |n: usize, a: usize| (n + a - 1) & !(a - 1);
+    let size_of_headers = align(SECTION_TABLE + 40, FILE_ALIGN);
+    let raw_off = size_of_headers;
+    let raw_sz = align(text.len().max(1), FILE_ALIGN);
+    let mut b = alloc::vec![0u8; raw_off + raw_sz];
+    let pu16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let pu32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let pu64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    pu16(&mut b, 0, 0x5A4D); // MZ
+    pu32(&mut b, 0x3C, NT_OFF as u32);
+    pu32(&mut b, NT_OFF, 0x0000_4550); // PE\0\0
+    pu16(&mut b, NT_OFF + 4, 0x8664); // machine AMD64
+    pu16(&mut b, NT_OFF + 6, 1); // NumberOfSections
+    pu16(&mut b, NT_OFF + 4 + 16, 240); // SizeOfOptionalHeader
+    pu16(&mut b, NT_OFF + 4 + 18, 0x0002); // EXECUTABLE_IMAGE
+    pu16(&mut b, OPT_OFF, 0x020b); // PE32+ magic
+    pu32(&mut b, OPT_OFF + 16, 0x1000); // AddressOfEntryPoint (RVA)
+    pu64(&mut b, OPT_OFF + 24, image_base);
+    pu32(&mut b, OPT_OFF + 32, 0x1000); // SectionAlignment
+    pu32(&mut b, OPT_OFF + 36, FILE_ALIGN as u32);
+    pu32(&mut b, OPT_OFF + 56, 0x2000); // SizeOfImage
+    pu32(&mut b, OPT_OFF + 60, size_of_headers as u32);
+    pu16(&mut b, OPT_OFF + 68, 1); // Subsystem: NATIVE
+    pu32(&mut b, OPT_OFF + 108, 16); // NumberOfRvaAndSizes
+    let se = SECTION_TABLE;
+    b[se..se + 8].copy_from_slice(b".text\0\0\0");
+    pu32(&mut b, se + 8, text.len() as u32); // VirtualSize
+    pu32(&mut b, se + 12, 0x1000); // VirtualAddress
+    pu32(&mut b, se + 16, raw_sz as u32); // SizeOfRawData
+    pu32(&mut b, se + 20, raw_off as u32); // PointerToRawData
+    pu32(&mut b, se + 36, 0x6000_0020); // CODE | EXECUTE | READ
+    b[raw_off..raw_off + text.len()].copy_from_slice(text);
+    b
+}
+
+/// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
+/// is written into fresh frames (via an executive scratch mapping) and mapped RX at
+/// PE_LOAD_BASE in the new VSpace; execution starts at the PE entry point. Returns the pml4.
+unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, sysarg_c: u64) -> u64 {
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // Map the PE image: write the bytes into fresh frames via an executive scratch mapping,
+    // then map each frame RX (rights=2 — W^X) at PE_LOAD_BASE in the new VSpace.
+    let pages = (mapped.bytes.len() + 0xFFF) / 0x1000;
+    for i in 0..pages {
+        let f = alloc_frame();
+        let _ = page_map(f, PE_SCRATCH_VADDR + i as u64 * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        for j in 0..0x1000usize {
+            let src = i * 0x1000 + j;
+            let byte = if src < mapped.bytes.len() { mapped.bytes[src] } else { 0 };
+            core::ptr::write_volatile((PE_SCRATCH_VADDR + src as u64) as *mut u8, byte);
+        }
+        let cp = copy_cap(f);
+        let _ = page_map(cp, PE_LOAD_BASE + i as u64 * 0x1000, /* RX */ 2, pml4);
+    }
+    for i in 0..STACK_FRAMES {
+        let f = alloc_frame();
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_frame();
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let _ = page_map(sysarg_c, SYSARG_VADDR, RW_NX, pml4);
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, mapped.entry_point(), stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    pml4
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -2225,6 +2338,37 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(b"exec_blocking_wait_woken", bw_second == 0, &mut passed);
     check(b"exec_blocking_wait_ordered", bw_handoff == 0xB0B, &mut passed);
 
+    // --- P3 REAL PE: construct a minimal real PE (a native-syscall stub as .text), load it
+    // via nt-pe-loader (parse + map), and run it in an isolated process — the real PE-load
+    // path, not hand-written code in the executive image. The stub does NtQuerySystemTime +
+    // reports the result via SSN_DONE, so we see a real syscall come back through a loaded PE.
+    print_str(b"[ntos-exec] P3: loading + running a real PE via nt-pe-loader\n");
+    let pe_bytes = build_min_pe(PE_STUB, PE_LOAD_BASE);
+    let (mut pe_loaded, mut pe_serviced, mut pe_verdict) = (false, 0u64, 0u64);
+    if let Ok(pe) = nt_pe_loader::PeFile::parse(&pe_bytes) {
+        if let Ok(mapped) = pe.map(PE_LOAD_BASE) {
+            pe_loaded = mapped.entry_point() == PE_LOAD_BASE + 0x1000;
+            let pe_fault = make_object(OBJ_ENDPOINT);
+            let pe_fault_c = copy_cap(pe_fault);
+            let pe_sysarg = alloc_frame();
+            let pe_pml4 = spawn_pe_thread(&mapped, pe_fault_c, pe_sysarg);
+            let (srv, verdict) = service_user_syscalls(pe_fault, &mut c, &mut cm, pe_pml4);
+            pe_serviced = srv;
+            pe_verdict = verdict;
+        }
+    }
+    print_str(b"[ntos-exec] real PE: loaded=");
+    print_u64(pe_loaded as u64);
+    print_str(b" serviced=");
+    print_u64(pe_serviced);
+    print_str(b" verdict(NtQuerySystemTime)=0x");
+    print_hex((pe_verdict >> 32) as u32);
+    print_hex(pe_verdict as u32);
+    print_str(b"\n");
+    check(b"exec_real_pe_loaded", pe_loaded, &mut passed);
+    check(b"exec_real_pe_ran", pe_serviced >= 1, &mut passed);
+    check(b"exec_real_pe_syscall", pe_verdict != 0, &mut passed);
+
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
     // the mapping hits real device memory, not RAM.
@@ -3012,7 +3156,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/70 executive->isolated-service checks passed]\n");
+    print_str(b"/73 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
