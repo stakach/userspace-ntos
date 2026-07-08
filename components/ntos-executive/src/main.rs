@@ -92,6 +92,12 @@ pub const HPET_VADDR: u64 = 0x0000_0100_005E_0000;
 /// Where the executive maps a real PCI device's BAR (P1 capstone — the e1000e NIC).
 pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
+/// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
+/// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
+/// straight to this frame's physical address. Kept just past IPCBUF so it stays inside
+/// the same 2 MiB page table as every other runtime mapping (0x40_0000..0x5F_FFFF) — a
+/// vaddr in the next 2 MiB region would need a PT this vspace doesn't have.
+pub const DMA_VADDR: u64 = 0x0000_0100_005F_C000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -143,6 +149,17 @@ const E1000_ITR: u64 = 0xC4; // Interrupt Throttling (0 = deliver immediately, n
 const E1000_ICR: u64 = 0xC0; // Interrupt Cause Read (reading clears)
 const E1000_ICS: u64 = 0xC8; // Interrupt Cause Set (writing raises a cause → asserts INTx)
 const E1000_IMS: u64 = 0xD0; // Interrupt Mask Set (enable causes)
+// e1000e transmit-DMA registers (offsets from the NIC BAR base).
+const E1000_TCTL: u64 = 0x0400; // Transmit Control (bit0 EN, bit1 PSP)
+const E1000_TDBAL: u64 = 0x3800; // TX descriptor ring base, low 32 (a physical addr)
+const E1000_TDBAH: u64 = 0x3804; // TX descriptor ring base, high 32
+const E1000_TDLEN: u64 = 0x3808; // TX descriptor ring length in bytes (128-byte aligned)
+const E1000_TDH: u64 = 0x3810; // TX descriptor head (NIC advances)
+const E1000_TDT: u64 = 0x3818; // TX descriptor tail (we advance to hand off descriptors)
+const E1000_TARC0: u64 = 0x3840; // TX arbitration counter, queue 0 (bit10 = engine ENABLE)
+
+/// `X86Page::GetAddress` invocation label — returns a frame cap's physical address.
+const LBL_X86_PAGE_GET_ADDRESS: u64 = 54;
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 
@@ -992,13 +1009,24 @@ unsafe fn stand_up_service(
 /// the device untyped was found + mapped. This is how the executive, which owns the
 /// hardware caps, hands real MMIO to itself (and later to isolated driver hosts).
 unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
+    claim_device_pages(bi, paddr, vaddr, 1)
+}
+
+/// Map the first `n` 4 KiB pages of the device MMIO region whose untyped base is
+/// `paddr`, at consecutive vaddrs from `vaddr`. Consecutive retypes from one untyped
+/// hand out consecutive physical frames, so page p lands at `paddr + p*0x1000` mapped
+/// at `vaddr + p*0x1000` — i.e. an identity-offset window over the BAR. Needed for the
+/// e1000e, whose TX descriptor registers sit at BAR offset 0x3800 (the 4th page).
+unsafe fn claim_device_pages(bi: &BootInfo, paddr: u64, vaddr: u64, n: u64) -> bool {
     let count = bi.untyped.end - bi.untyped.start;
     for i in 0..count {
         let d = bi.untyped_list[i as usize];
         if d.is_device == 1 && d.paddr == paddr {
-            let frame = alloc_slot();
-            let _ = untyped_retype(bi.untyped.start + i, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
-            let _ = page_map(frame, vaddr, RW_NX, CAP_INIT_THREAD_VSPACE);
+            for p in 0..n {
+                let frame = alloc_slot();
+                let _ = untyped_retype(bi.untyped.start + i, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
+                let _ = page_map(frame, vaddr + p * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             return true;
         }
     }
@@ -1042,6 +1070,24 @@ unsafe fn io_out32(ioport: u64, port: u16, value: u32) {
 
 /// `in eax, dx` via an I/O-port cap — invoked with SysCall; the read value comes
 /// back as the reply's mr0 (r10).
+/// Invoke `X86Page::GetAddress` on a frame cap and return its physical address. The
+/// kernel writes the paddr into reply msg_reg[0], which lands in r10 on return (same
+/// reply-register convention `io_in32` relies on). No message args.
+unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
+    let paddr: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        inout("rdi") frame_cap => _,
+        inout("rsi") (LBL_X86_PAGE_GET_ADDRESS << 12) => _,
+        out("r10") paddr, // reply mr0 = physical address
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    paddr
+}
+
 unsafe fn io_in32(ioport: u64, port: u16) -> u32 {
     let value: u64;
     core::arch::asm!(
@@ -1404,7 +1450,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (irq ");
         print_u64(nic_irq as u64);
         print_str(b")\n");
-        let nic_mapped = claim_device_page(bi, nic_mmio, NIC_VADDR);
+        // Map the first 4 pages (16 KiB) of the BAR: page 0 has CTRL/STATUS/interrupt
+        // regs, page 3 (offset 0x3000) has the TX descriptor registers (0x3800..0x3828).
+        let nic_mapped = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
         check(b"exec_nic_bar_mapped", nic_mapped, &mut passed);
         if nic_mapped {
             // Intel e1000e register file: CTRL @ 0x00, STATUS @ 0x08.
@@ -1529,12 +1577,84 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // contained. QEMU's e1000e delivers plain MSI on a legacy cause; the kernel
             // LAPIC-EOIs so this isn't blocked by the earlier HPET interrupt's ISR bit.
             check(b"exec_nic_irq_reached_isolated_host", got == ISR_DONE_BADGE, &mut passed);
+
+            // ---- DMA: prove the NIC does REAL DMA to memory the executive allocates.
+            // Build a TX descriptor ring + packet buffer in a normal RAM frame, learn its
+            // physical address (VT-d translation is off → identity), point the e1000e TX
+            // engine at it, kick the tail, and watch the NIC DMA-write the descriptor-DONE
+            // bit back. DD=1 ⇒ the NIC DMA-read the ring + buffer and DMA-wrote the status.
+            print_str(b"[ntos-exec] DMA: real e1000e TX DMA to an executive-owned frame\n");
+            // Bus Master (Command bit 2) + Memory Space (bit 1) — DMA needs BME (idempotent
+            // with the MSI setup above, but assert it so DMA doesn't depend on that path).
+            let cmd = pci_read32(pci_io, 0, nic_dev, nic_func, 0x04);
+            pci_write32(pci_io, 0, nic_dev, nic_func, 0x04, cmd | (1 << 2) | (1 << 1));
+
+            let dma_frame = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
+            let _ = page_map(dma_frame, DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let dma_paddr = get_frame_paddr(dma_frame);
+            print_str(b"[ntos-exec] DMA frame paddr=");
+            print_hex((dma_paddr >> 32) as u32);
+            print_hex(dma_paddr as u32);
+            print_str(b"\n");
+            check(
+                b"exec_frame_get_paddr",
+                dma_paddr != 0 && (dma_paddr & 0xFFF) == 0,
+                &mut passed,
+            );
+
+            // Frame layout: TX ring at offset 0 (8 legacy descriptors = 128 bytes, meeting
+            // the TDLEN 128-byte-alignment rule; we use descriptor 0), packet at 0x200.
+            const RING_OFF: u64 = 0x0;
+            const PKT_OFF: u64 = 0x200;
+            const PKT_LEN: u16 = 64;
+            for i in 0..PKT_LEN as u64 {
+                core::ptr::write_volatile((DMA_VADDR + PKT_OFF + i) as *mut u8, 0xA5);
+            }
+            // Legacy TX descriptor 0 (16 bytes): buffer_addr[0..7], length[8..9], CSO[10],
+            // CMD[11]=EOP|RS, STA[12] (NIC writes DD here), CSS[13], special[14..15].
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF) as *mut u64, dma_paddr + PKT_OFF);
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 8) as *mut u16, PKT_LEN);
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 10) as *mut u8, 0); // CSO
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 11) as *mut u8, 0x09); // CMD = EOP | RS
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 12) as *mut u8, 0); // STA (NIC writes DD)
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 13) as *mut u8, 0); // CSS
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 14) as *mut u16, 0); // special
+
+            // Point the TX engine at the ring's PHYSICAL address, enable TX, arm queue 0,
+            // then kick. QEMU's e1000e gates TX on TARC0 bit 10 (E1000_TARC_ENABLE) — not
+            // TXDCTL — so without it a TDT write silently does nothing.
+            let ring_paddr = dma_paddr + RING_OFF;
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAL) as *mut u32, ring_paddr as u32);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAH) as *mut u32, (ring_paddr >> 32) as u32);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDLEN) as *mut u32, 128);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TCTL) as *mut u32, 0x0004_00F3); // EN|PSP|CT|COLD
+            let tarc0 = core::ptr::read_volatile((NIC_VADDR + E1000_TARC0) as *const u32);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TARC0) as *mut u32, tarc0 | (1 << 10));
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1); // hand off descriptor 0
+
+            // Poll the descriptor's STA byte (offset +12) for DD (bit 0) — set by the NIC
+            // via DMA once it has processed the descriptor.
+            let mut dd = 0u8;
+            for _ in 0..2_000_000u64 {
+                dd = core::ptr::read_volatile((DMA_VADDR + RING_OFF + 12) as *const u8);
+                if dd & 0x1 != 0 {
+                    break;
+                }
+                yield_now();
+            }
+            print_str(b"[ntos-exec] TX descriptor STA=0x");
+            print_hex(dd as u32);
+            print_str(b" (DD=1 => NIC DMA-read the ring+buffer and DMA-wrote status)\n");
+            check(b"exec_nic_tx_dma_writeback", dd & 0x1 != 0, &mut passed);
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/36 executive->isolated-service checks passed]\n");
+    print_str(b"/38 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
