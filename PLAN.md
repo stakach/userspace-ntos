@@ -578,3 +578,10 @@ findings). A step is not "done" until the plan reflects it.
   exec_storage_host_read_hive / exec_cm_hive_decoded / exec_cm_hive_answer_42.
   **P2 (storage + filesystem + real registry) DONE.** Next: P3 (native syscall breadth +
   run a real PE), or load the hive into nt-config-manager's mount table + serve Nt*Key.
+- **2026-07-08** — **P3 STARTED — native syscall breadth (exec 8af289c). 65/65.** The isolated
+  user thread now makes its first REAL memory + clock syscalls: NtAllocateVirtualMemory (the
+  executive Mm maps a real frame into the thread's VSpace at USER_ALLOC_BASE; the thread writes
+  + reads it back) and NtQuerySystemTime (rdtsc — monotonic). spawn_user_thread returns the
+  user pml4 cap so service_user_syscalls can map on demand. Checks: exec_nt_alloc_vm_base /
+  _readback / exec_nt_query_time_monotonic. Begins P3 item 10. Next P3: NtFreeVirtualMemory +
+  VAD tracking; sync objects + wait dispatcher; then load a real PE (PEB/TEB) toward smss.exe.
