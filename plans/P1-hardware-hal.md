@@ -8,7 +8,7 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 **Why:** everything above (storage, FS, registry) needs real device I/O. Today
 `nt-sim-device` + fake MMIO stand in; drivers "work" against a model, not metal.
 
-## Status: in progress — real MMIO + real IRQ + FULL-DEVICE LOOP CLOSED (real NIC MSI → isolated host, 0f8a27e)
+## Status: in progress — real MMIO + real IRQ (NIC MSI → isolated host) + real DMA (e1000e TX, 9ba612b). Next: DMA Phase 2 (VT-d confinement)
 
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
@@ -175,4 +175,16 @@ host's ISR runs and completes; a DMA common-buffer round-trip moves bytes.
   **GSI base** from the MADT is parsed but discarded — `program_redirection` assumes
   `pin == GSI`. Latent on QEMU q35 (base=0) but wrong on any platform with a nonzero
   base. Store `IOAPIC_GSI_BASE` and subtract it. (Cosmetic: the MSI issue path doesn't
-  call `set_ioapic_route` — harmless, MSI has no pin to mask.)
+  call `set_ioapic_route` — harmless, MSI has no pin to mask.) — **DONE (190d49f).**
+- **2026-07-08 — DMA Phase 1 DONE (executive 9ba612b). 38/38.** Real e1000e TX DMA to a
+  frame the executive allocated: `X86PageGetAddress` (label 54) gives the frame's paddr
+  (VT-d TE off → identity), a legacy TX descriptor ring + buffer is built in it, the TX
+  engine is pointed at the ring's paddr, and the NIC DMA-writes the descriptor DONE bit
+  back (`exec_frame_get_paddr`, `exec_nic_tx_dma_writeback`). Enablers: `get_frame_paddr`,
+  `claim_device_pages` (the e1000e TX regs are at BAR offset 0x3800 → map ≥4 BAR pages).
+  QEMU quirks (agent, from `e1000e_core.c`): TX engine is gated on **TARC0 bit 10**
+  (`0x3840`, not TXDCTL); legacy descriptor status/DD byte is at **offset +12** (not +14).
+  No kernel change. **NEXT — DMA Phase 2 (VT-d confinement):** mint a device IOSpace cap
+  (root slot 8, badge `(domain<<16)|rid`, e1000e rid 0x10), `X86PageMapIO` (label 53) the
+  DMA frame to an IOVA, set GCMD TE, program the NIC with the IOVA → a driver DMA outside
+  its granted frames faults. Kernel machinery already exists (`iommu.rs`, `map_io_page`).
