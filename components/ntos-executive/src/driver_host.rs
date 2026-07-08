@@ -80,6 +80,17 @@ pub unsafe extern "C" fn driver_host_entry() -> ! {
         }
     }
 
+    // Now host a REAL Windows .sys driver in this same isolated host: read the pre-loaded
+    // DriverEntry RVA + the NIC BAR paddr the executive left in the resource frame, then
+    // drive DriverEntry → AddDevice → IRP_MN_START_DEVICE against the real NIC.
+    let sys_entry = core::ptr::read_volatile((RESLIST_VADDR + 0x300) as *const u64) as u32;
+    let bar_paddr = core::ptr::read_volatile((RESLIST_VADDR + 0x308) as *const u64);
+    let sys_verdict = crate::driver_pe::sys_start(sys_entry, bar_paddr);
+    core::ptr::write_volatile((RESLIST_VADDR + 0x210) as *mut u8, sys_verdict);
+    print_str(b"[driver-host] hosted real PnpMmioInterruptTest.sys: verdict bits=0x");
+    print_hex(sys_verdict as u32);
+    print_str(b"\n");
+
     // Report the verdict into the shared resource frame, then signal the executive.
     core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, verdict);
     let _ = syscall5(SYS_SEND, CT_RESULT_NTFN, 0, 0, 0, 0);

@@ -34,6 +34,8 @@ nt-io-server = { path = "../../crates/nt-io-server", features = ["object-manager
 nt-io-client = { path = "../../crates/nt-io-client" }
 # Real NT CM_RESOURCE_LIST encoding — the resources PnP hands a driver at START.
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
+# PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 
 [profile.release]
 panic = "abort"

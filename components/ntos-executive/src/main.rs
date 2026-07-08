@@ -23,6 +23,7 @@ mod allocator;
 mod cm_server;
 mod io_server;
 mod driver_host;
+mod driver_pe;
 mod isr;
 mod server;
 
@@ -839,6 +840,8 @@ unsafe fn spawn_driver_host(
     bar_base: u64,
     dma_frame: u64,
     reslist_frame: u64,
+    pe_base: u64,
+    arena_base: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -877,6 +880,15 @@ unsafe fn spawn_driver_host(
     let _ = page_map(dma_cp, DMA_VADDR, RW_NX, pml4);
     let res_cp = copy_cap(reslist_frame);
     let _ = page_map(res_cp, RESLIST_VADDR, RW_NX, pml4);
+    // The pre-loaded real .sys image (R+W+X — W^X hardening deferred) + its RW arena.
+    for i in 0..driver_pe::PE_FRAMES {
+        let cp = copy_cap(pe_base + i);
+        let _ = page_map(cp, driver_pe::CODE_VA + i * 0x1000, /* RWX */ 3, pml4);
+    }
+    for i in 0..driver_pe::ARENA_FRAMES {
+        let cp = copy_cap(arena_base + i);
+        let _ = page_map(cp, driver_pe::ARENA_VADDR + i * 0x1000, RW_NX, pml4);
+    }
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -1892,6 +1904,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             core::ptr::write_volatile((RESLIST_VADDR + 0x108) as *mut u64, NIC_IOVA);
             core::ptr::write_volatile((RESLIST_VADDR + 0x110) as *mut u64, 0x1000u64);
             core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, 0); // clear verdict
+            core::ptr::write_volatile((RESLIST_VADDR + 0x210) as *mut u8, 0); // clear .sys verdict
+            // Pre-load the REAL .sys driver (the executive owns the heap): map its image
+            // frames RW here, parse/map/relocate/patch-IAT to our stubs, then hand the same
+            // frames to the host R+X. Also a RW arena for the driver's host-side state.
+            let mut pe_base = 0u64;
+            for i in 0..driver_pe::PE_FRAMES {
+                let f = alloc_slot();
+                if i == 0 {
+                    pe_base = f;
+                }
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+                let _ = page_map(f, driver_pe::CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            let sys_entry = driver_pe::load_into().unwrap_or(0);
+            let mut arena_base = 0u64;
+            for i in 0..driver_pe::ARENA_FRAMES {
+                let f = alloc_slot();
+                if i == 0 {
+                    arena_base = f;
+                }
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+                let _ = page_map(f, driver_pe::ARENA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            core::ptr::write_volatile((RESLIST_VADDR + 0x300) as *mut u64, sys_entry as u64);
+            core::ptr::write_volatile((RESLIST_VADDR + 0x308) as *mut u64, nic_mmio);
+            print_str(b"[ntos-exec] pre-loaded real PnpMmioInterruptTest.sys; DriverEntry rva=");
+            print_hex(sys_entry);
+            print_str(b"\n");
             // A fresh badged result notification the host signals when it's done.
             let dh_result = make_object(OBJ_NOTIFICATION);
             let dh_result_badged = alloc_slot();
@@ -1915,6 +1955,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nic_bar_base,
                 dma_frame,
                 reslist_frame,
+                pe_base,
+                arena_base,
             );
             let _ = dh_fault; // a fault EP so a host fault is contained cleanly, not silent
             // The host always signals when done; read back its verdict from the shared frame.
@@ -1926,12 +1968,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(dh_verdict as u64);
             print_str(b"\n");
             check(b"exec_driver_host_drove_nic", dh_verdict == 1, &mut passed);
+            // ...and a REAL Windows .sys driver binary ran in that same isolated host,
+            // driven through DriverEntry → AddDevice → IRP_MN_START_DEVICE with our real
+            // CM_RESOURCE_LIST, reaching the real NIC via MmMapIoSpace.
+            let sys_v = core::ptr::read_volatile((RESLIST_VADDR + 0x210) as *const u8);
+            print_str(b"[ntos-exec] hosted real .sys verdict bits=0x");
+            print_hex(sys_v as u32);
+            print_str(b"\n");
+            check(b"exec_sys_driver_entry_ok", (sys_v & 1) != 0, &mut passed);
+            check(b"exec_sys_adddevice_built_fdo", (sys_v & 2) != 0, &mut passed);
+            check(b"exec_sys_start_reached_real_nic", (sys_v & 8) != 0, &mut passed);
+            if (sys_v & 4) == 0 {
+                print_str(b"[ntos-exec]   note: the driver's START handler ran + did real MMIO,\n");
+                print_str(b"[ntos-exec]   then returned a device-specific status (the real device\n");
+                print_str(b"[ntos-exec]   is an e1000e NIC, not this driver's own test device).\n");
+            }
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/42 executive->isolated-service checks passed]\n");
+    print_str(b"/45 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
