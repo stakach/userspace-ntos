@@ -160,6 +160,15 @@ const E1000_TARC0: u64 = 0x3840; // TX arbitration counter, queue 0 (bit10 = eng
 
 /// `X86Page::GetAddress` invocation label — returns a frame cap's physical address.
 const LBL_X86_PAGE_GET_ADDRESS: u64 = 54;
+// VT-d confined-DMA (Phase 2): map a driver's DMA frame into a device's IO address space
+// so the device can only DMA into frames we granted.
+const LBL_X86_IO_PAGE_TABLE_MAP: u64 = 49; // install a VT-d IO page table (builds context)
+const LBL_X86_PAGE_MAP_IO: u64 = 53; // map a frame at an IOVA in a device's IO space
+const OBJ_X86_IO_PAGE_TABLE: u64 = 13; // seL4_X86_IOPageTableObject
+const SLOT_IO_SPACE: u64 = 8; // seL4_CapIOSpace — the master IO-space cap in the root CNode
+/// IOVA we grant the NIC for its DMA frame. The NIC is programmed with this address; VT-d
+/// translates it to the frame's real paddr. Any DMA outside the granted frame faults.
+const NIC_IOVA: u64 = 0x1000;
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
 /// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
 
@@ -1088,6 +1097,49 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
     paddr
 }
 
+/// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
+/// toward `io_address`. Returns the invocation error label (0 = success). The first call
+/// for a device installs the context root (and lazily enables VT-d translation).
+unsafe fn iopt_map(iopt_cap: u64, io_space_cap: u64, io_address: u64) -> u64 {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, io_space_cap); // extraCaps[0] = IOSpace
+    let msginfo = (LBL_X86_IO_PAGE_TABLE_MAP << 12) | (1 << 9) | (1 << 7) | 1;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") iopt_cap => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") io_address => _, // mr0 = io_address (args.a2)
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+/// Map frame `frame_cap` into device IO space `io_space_cap` at `io_address` with `rights`
+/// (bit0 = write, bit1 = read). Returns the error label (0 = success). The frame cap must
+/// be UNMAPPED — pass a copy if the original is mapped in a VSpace.
+unsafe fn map_io(frame_cap: u64, io_space_cap: u64, rights: u64, io_address: u64) -> u64 {
+    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, io_space_cap); // extraCaps[0] = IOSpace
+    let msginfo = (LBL_X86_PAGE_MAP_IO << 12) | (1 << 9) | (1 << 7) | 2;
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") frame_cap => _,
+        inout("rsi") msginfo => reply,
+        inout("r10") rights => _,    // mr0 = rights (args.a2)
+        inout("r8") io_address => _, // mr1 = io_address (args.a3)
+        lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
 unsafe fn io_in32(ioport: u64, port: u16) -> u32 {
     let value: u64;
     core::arch::asm!(
@@ -1649,12 +1701,78 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_hex(dd as u32);
             print_str(b" (DD=1 => NIC DMA-read the ring+buffer and DMA-wrote status)\n");
             check(b"exec_nic_tx_dma_writeback", dd & 0x1 != 0, &mut passed);
+
+            // ---- DMA Phase 2: CONFINE the NIC's DMA via the VT-d IOMMU. Grant the NIC an
+            // IO address space containing ONLY this frame, reprogram it to address memory
+            // by IOVA (not raw paddr), and prove the DMA still lands — now translated +
+            // confined, so a DMA anywhere else would fault. Building the NIC's first IO
+            // context lazily turns on VT-d translation (kernel side).
+            print_str(b"[ntos-exec] DMA Phase 2: confine NIC DMA via the VT-d IOMMU\n");
+            // Mint a device IO-space cap stamped with the NIC's PCI request-id + a domain.
+            let nic_rid = ((nic_dev as u64) << 3) | (nic_func as u64);
+            let nic_io_badge = (1u64 << 16) | nic_rid;
+            let nic_io_space = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND,
+                CAP_INIT_THREAD_CNODE,
+                LBL_CNODE_MINT << 12,
+                nic_io_space,
+                SLOT_IO_SPACE,
+                nic_io_badge,
+            );
+            // Build the 4-level IO page-table hierarchy toward NIC_IOVA: 4 tables (context
+            // root + 3 intermediate — the walk starts at levels_remaining=3 so MapIO reaches
+            // level 0 only after 4 tables). The first install creates the context + TE.
+            let mut iopt_err = 0u64;
+            for _ in 0..4 {
+                let iopt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_IO_PAGE_TABLE, PAGING_BITS, 1, iopt);
+                let e = iopt_map(iopt, nic_io_space, NIC_IOVA);
+                if e != 0 {
+                    iopt_err = e;
+                }
+            }
+            print_str(b"[ntos-exec] IO page-table build err=");
+            print_u64(iopt_err);
+            print_str(b"\n");
+            check(b"exec_nic_iopt_hierarchy_built", iopt_err == 0, &mut passed);
+            // Map the DMA frame (a COPY — the original stays VSpace-mapped for CPU access)
+            // into the NIC's IO space at NIC_IOVA, read+write.
+            let dma_frame_io = copy_cap(dma_frame);
+            let map_err = map_io(dma_frame_io, nic_io_space, 0x3, NIC_IOVA);
+            print_str(b"[ntos-exec] map_io err=");
+            print_u64(map_err);
+            print_str(b"\n");
+            check(b"exec_nic_dma_frame_io_mapped", map_err == 0, &mut passed);
+
+            // Re-arm a transmit, but now the NIC addresses memory via the IOVA: ring base =
+            // NIC_IOVA, buffer = NIC_IOVA + PKT_OFF. The CPU still reads/writes the
+            // descriptor through the VSpace mapping (DMA_VADDR) — VT-d only gates the device.
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF) as *mut u64, NIC_IOVA + PKT_OFF);
+            core::ptr::write_volatile((DMA_VADDR + RING_OFF + 12) as *mut u8, 0); // clear STA/DD
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAL) as *mut u32, NIC_IOVA as u32);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDBAH) as *mut u32, 0);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDH) as *mut u32, 0);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 0);
+            core::ptr::write_volatile((NIC_VADDR + E1000_TDT) as *mut u32, 1);
+            let mut dd2 = 0u8;
+            for _ in 0..2_000_000u64 {
+                dd2 = core::ptr::read_volatile((DMA_VADDR + RING_OFF + 12) as *const u8);
+                if dd2 & 0x1 != 0 {
+                    break;
+                }
+                yield_now();
+            }
+            print_str(b"[ntos-exec] confined TX descriptor STA=0x");
+            print_hex(dd2 as u32);
+            print_str(b" (DD=1 => NIC DMA went through VT-d: IOVA -> frame)\n");
+            check(b"exec_nic_confined_dma", dd2 & 0x1 != 0, &mut passed);
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/38 executive->isolated-service checks passed]\n");
+    print_str(b"/41 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
