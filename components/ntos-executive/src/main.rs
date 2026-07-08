@@ -206,6 +206,12 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 const NT_CREATE_KEY: u64 = 0x1D; // NtCreateKey(*OBJECT_ATTRIBUTES)
 const NT_QUERY_VALUE_KEY: u64 = 0x18; // NtQueryValueKey(*OBJECT_ATTRIBUTES) → value in RAX
 const NT_SET_VALUE_KEY: u64 = 0x5D; // NtSetValueKey(*OBJECT_ATTRIBUTES, value in RDX)
+const NT_ALLOCATE_VM: u64 = 0x15; // NtAllocateVirtualMemory(size in R10) → base in RAX
+const NT_QUERY_SYSTEM_TIME: u64 = 0x57; // NtQuerySystemTime() → HPET counter in RAX
+/// Where the executive backs NtAllocateVirtualMemory for the user thread — inside its
+/// existing 2 MiB image PT (image ends ~0x41_0000, stack at 0x5C_0000), so mapping needs no
+/// new page table.
+pub const USER_ALLOC_BASE: u64 = 0x0000_0100_0050_0000;
 
 // The Object Manager namespace ops aren't in the `NativeService` enum (a niche
 // syscall surface), so they keep synthetic numbers — but now carry a real
@@ -728,6 +734,25 @@ pub unsafe extern "C" fn user_entry() -> ! {
     let sk = native_syscall2(NT_SET_VALUE_KEY, key_oa, 42);
     let val = native_syscall(NT_QUERY_VALUE_KEY, key_oa);
 
+    // P3: allocate virtual memory via a native syscall — the executive (Mm) maps a real
+    // frame into this thread's VSpace — then prove it's usable by writing + reading it back.
+    let vm = native_syscall(NT_ALLOCATE_VM, 0x1000);
+    let pat = 0xDEAD_BEEF_CAFE_BABEu64;
+    let readback = if vm != 0 {
+        core::ptr::write_volatile(vm as *mut u64, pat);
+        core::ptr::read_volatile(vm as *const u64) == pat
+    } else {
+        false
+    };
+    // P3: query the system clock twice — should be non-zero + monotonic.
+    let t1 = native_syscall(NT_QUERY_SYSTEM_TIME, 0);
+    let t2 = native_syscall(NT_QUERY_SYSTEM_TIME, 0);
+    // Publish raw results to the shared sysarg frame for the executive to verify.
+    core::ptr::write_volatile((SYSARG_VADDR + 0x400) as *mut u64, vm);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x408) as *mut u64, readback as u64);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x410) as *mut u64, t1);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x418) as *mut u64, t2);
+
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
@@ -735,7 +760,11 @@ pub unsafe extern "C" fn user_entry() -> ! {
         && found == 1
         && ck == 1
         && sk == 1
-        && val == 42;
+        && val == 42
+        && vm != 0
+        && readback
+        && t1 != 0
+        && t2 >= t1;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -743,7 +772,7 @@ pub unsafe extern "C" fn user_entry() -> ! {
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
 /// its own CNode holding a cap to `fault_ep_c`, and its faults routed there (the
 /// kernel's legacy TCBSetSpace resolves the fault cptr in the FAULTER's cspace).
-unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64, sysarg_c: u64) {
+unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64, sysarg_c: u64) -> u64 {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
@@ -787,6 +816,7 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64,
     let _ = tcb_set_priority(tcb, 100);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
+    pml4 // the executive keeps this cap to map on-demand NtAllocateVirtualMemory frames
 }
 
 /// Spawn the isolated ISR "driver host" (P1): its own VSpace (image RO + stack + IPC
@@ -1077,13 +1107,18 @@ unsafe fn spawn_storage_host(
     let _ = tcb_resume(tcb);
 }
 
+/// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
+static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
+
 /// Run the native-syscall service loop for the isolated user thread, routing each
-/// Ob syscall to the isolated Object Manager service via `client`. Returns
+/// Ob syscall to the isolated Object Manager service via `client`, backing
+/// NtAllocateVirtualMemory with real frames mapped into `user_pml4`. Returns
 /// `(serviced, verdict)`.
 unsafe fn service_user_syscalls<B, CB>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
     cm: &mut ConfigClient<CB>,
+    user_pml4: u64,
 ) -> (u64, u64)
 where
     B: nt_object_client::Backend,
@@ -1097,6 +1132,8 @@ where
             (NativeService::NtCreateKey, NT_CREATE_KEY as u32),
             (NativeService::NtSetValueKey, NT_SET_VALUE_KEY as u32),
             (NativeService::NtQueryValueKey, NT_QUERY_VALUE_KEY as u32),
+            (NativeService::NtAllocateVirtualMemory, NT_ALLOCATE_VM as u32),
+            (NativeService::NtQuerySystemTime, NT_QUERY_SYSTEM_TIME as u32),
         ],
     );
 
@@ -1120,15 +1157,42 @@ where
         let flags = get_recv_mr(17);
         // Registry syscalls go through the real service table + a real OBJECT_ATTRIBUTES.
         let result = if let Some(entry) = table.lookup(ssn as u32) {
-            let key = copyin_object_attributes(arg1).as_ref().and_then(oa_path);
-            match (entry.service, key) {
-                (NativeService::NtCreateKey, Some(k)) => cm.create_key(&k).map(|_| 1).unwrap_or(0),
-                (NativeService::NtSetValueKey, Some(k)) => {
-                    cm.set_dword(&k, "Answer", arg2 as u32).map(|_| 1).unwrap_or(0)
+            match entry.service {
+                // Registry syscalls resolve a real OBJECT_ATTRIBUTES key.
+                NativeService::NtCreateKey => copyin_object_attributes(arg1)
+                    .as_ref()
+                    .and_then(oa_path)
+                    .and_then(|k| cm.create_key(&k).ok())
+                    .map(|_| 1)
+                    .unwrap_or(0),
+                NativeService::NtSetValueKey => copyin_object_attributes(arg1)
+                    .as_ref()
+                    .and_then(oa_path)
+                    .and_then(|k| cm.set_dword(&k, "Answer", arg2 as u32).ok())
+                    .map(|_| 1)
+                    .unwrap_or(0),
+                NativeService::NtQueryValueKey => copyin_object_attributes(arg1)
+                    .as_ref()
+                    .and_then(oa_path)
+                    .and_then(|k| cm.query_dword(&k, "Answer").ok())
+                    .map(|v| v as u64)
+                    .unwrap_or(0),
+                // P3 VM: back the request with real frames mapped into the user's VSpace at
+                // the next bump vaddr, and return the base (arg1 = size in bytes).
+                NativeService::NtAllocateVirtualMemory => {
+                    let size = if arg1 == 0 { 0x1000 } else { arg1 };
+                    let pages = (size + 0xFFF) / 0x1000;
+                    let base = NEXT_USER_VADDR.fetch_add(pages * 0x1000, Ordering::Relaxed);
+                    for i in 0..pages {
+                        let f = alloc_slot();
+                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+                        let _ = page_map(f, base + i * 0x1000, RW_NX, user_pml4);
+                    }
+                    base
                 }
-                (NativeService::NtQueryValueKey, Some(k)) => {
-                    cm.query_dword(&k, "Answer").map(|v| v as u64).unwrap_or(0)
-                }
+                // P3 clock: the CPU timestamp counter — a real monotonic time source that
+                // needs no device mapping (the HPET isn't mapped yet at this point).
+                NativeService::NtQuerySystemTime => core::arch::x86_64::_rdtsc(),
                 _ => 0,
             }
         } else {
@@ -1864,9 +1928,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // Buffer pointer resolves in both address spaces.
     let sysarg = alloc_frame();
     let _ = page_map(sysarg, SYSARG_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg));
-    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm);
-    check(b"exec_syscall_frontend_serviced", serviced >= 7, &mut passed);
+    let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg));
+    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm, user_pml4);
+    check(b"exec_syscall_frontend_serviced", serviced >= 10, &mut passed);
     check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
     // The directory the user created via a syscall is visible in the isolated Ob service.
     check(
@@ -1887,6 +1951,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         cm.query_dword(REG_KEY, "Answer") == Ok(42),
         &mut passed,
     );
+
+    // --- P3: the user thread's first REAL memory + clock syscalls. It called
+    // NtAllocateVirtualMemory (the executive mapped a real frame into its VSpace), wrote +
+    // read back a pattern, and queried NtQuerySystemTime twice. Verify the published results.
+    let vm_base = core::ptr::read_volatile((SYSARG_VADDR + 0x400) as *const u64);
+    let vm_readback = core::ptr::read_volatile((SYSARG_VADDR + 0x408) as *const u64);
+    let ut1 = core::ptr::read_volatile((SYSARG_VADDR + 0x410) as *const u64);
+    let ut2 = core::ptr::read_volatile((SYSARG_VADDR + 0x418) as *const u64);
+    print_str(b"[ntos-exec] user NtAllocateVirtualMemory base=0x");
+    print_hex((vm_base >> 32) as u32);
+    print_hex(vm_base as u32);
+    print_str(b" readback=");
+    print_u64(vm_readback);
+    print_str(b" NtQuerySystemTime t1=0x");
+    print_hex(ut1 as u32);
+    print_str(b" t2=0x");
+    print_hex(ut2 as u32);
+    print_str(b"\n");
+    check(
+        b"exec_nt_alloc_vm_base",
+        vm_base >= USER_ALLOC_BASE && vm_base < USER_ALLOC_BASE + 0x0020_0000,
+        &mut passed,
+    );
+    check(b"exec_nt_alloc_vm_readback", vm_readback == 1, &mut passed);
+    check(b"exec_nt_query_time_monotonic", ut1 != 0 && ut2 >= ut1, &mut passed);
 
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
@@ -2675,7 +2764,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/62 executive->isolated-service checks passed]\n");
+    print_str(b"/65 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
