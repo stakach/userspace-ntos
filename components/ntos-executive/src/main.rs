@@ -94,6 +94,10 @@ pub const HPET_PADDR: u64 = 0xFED0_0000;
 pub const HPET_VADDR: u64 = 0x0000_0100_005E_0000;
 /// Where the executive maps a real PCI device's BAR (P1 capstone — the e1000e NIC).
 pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
+/// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
+/// the sector data buffer (both just past the NIC's 4-page BAR, before IPCBUF).
+pub const AHCI_VADDR: u64 = 0x0000_0100_005F_4000;
+pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_005F_5000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 /// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
 /// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
@@ -1283,6 +1287,75 @@ unsafe fn get_frame_paddr(frame_cap: u64) -> u64 {
     paddr
 }
 
+/// Bring up AHCI port 0 and READ one 512-byte sector (`sector`) into the DMA frame at
+/// `dma_vaddr + 0x800` (paddr `dma_paddr + 0x800`) via ATA READ DMA EXT. All AHCI DMA
+/// structures live in one 4 KiB frame: Command List @0 (1 KiB-aligned), FIS Rx @0x400
+/// (256-aligned), Command Table @0x500 (128-aligned), data buffer @0x800. Returns the
+/// port Task File Data low byte after completion (0 = success; 0xFF = timeout). READ ONLY.
+unsafe fn ahci_read_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sector: u64) -> u32 {
+    let port = ahci_vaddr + 0x100; // port 0 register set
+    let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
+    let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
+    // Enable AHCI mode (GHC.AE bit 31).
+    let ghc = core::ptr::read_volatile((ahci_vaddr + 0x04) as *const u32);
+    core::ptr::write_volatile((ahci_vaddr + 0x04) as *mut u32, ghc | (1 << 31));
+    // Stop the port: clear ST (bit 0) + FRE (bit 4); wait CR (bit 15) + FR (bit 14) clear.
+    pw(0x18, pr(0x18) & !((1 << 0) | (1 << 4)));
+    for _ in 0..1_000_000u64 {
+        if pr(0x18) & ((1 << 15) | (1 << 14)) == 0 {
+            break;
+        }
+        yield_now();
+    }
+    // Zero the command list + FIS + command table region, then program the bases.
+    for i in 0..(0x800u64 / 8) {
+        core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
+    }
+    pw(0x00, dma_paddr as u32); // PxCLB  (command list @ +0)
+    pw(0x04, (dma_paddr >> 32) as u32); // PxCLBU
+    pw(0x08, (dma_paddr + 0x400) as u32); // PxFB (FIS rx @ +0x400)
+    pw(0x0C, (dma_paddr >> 32) as u32); // PxFBU
+    // Start FRE, then ST.
+    pw(0x18, pr(0x18) | (1 << 4));
+    yield_now();
+    pw(0x18, pr(0x18) | (1 << 0));
+    pw(0x10, 0xFFFF_FFFF); // clear PxIS
+
+    // Command Table @ dma+0x500: H2D Register FIS (READ DMA EXT) + PRDT[0].
+    let ct = dma_vaddr + 0x500;
+    let cb = |o: u64, v: u8| core::ptr::write_volatile((ct + o) as *mut u8, v);
+    cb(0, 0x27); // FIS type = Register H2D
+    cb(1, 0x80); // C = 1 (command), PMPort 0
+    cb(2, 0x25); // command = READ DMA EXT
+    cb(4, sector as u8); // LBA 7:0
+    cb(5, (sector >> 8) as u8); // LBA 15:8
+    cb(6, (sector >> 16) as u8); // LBA 23:16
+    cb(7, 0x40); // device = LBA48
+    cb(8, (sector >> 24) as u8); // LBA 31:24
+    cb(9, (sector >> 32) as u8); // LBA 39:32
+    cb(10, (sector >> 40) as u8); // LBA 47:40
+    core::ptr::write_volatile((ct + 12) as *mut u16, 1); // count = 1 sector
+    // PRDT[0] @ ct + 0x80.
+    core::ptr::write_volatile((ct + 0x80) as *mut u32, (dma_paddr + 0x800) as u32); // DBA
+    core::ptr::write_volatile((ct + 0x84) as *mut u32, (dma_paddr >> 32) as u32); // DBAU
+    core::ptr::write_volatile((ct + 0x8C) as *mut u32, 511 | (1 << 31)); // DBC = 512 B | IOC
+
+    // Command Header slot 0 @ dma+0. DW0 = CFL(5) | PRDTL(1)<<16; CTBA @ +8.
+    core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 16));
+    core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32); // CTBA
+    core::ptr::write_volatile((dma_vaddr + 12) as *mut u32, (dma_paddr >> 32) as u32); // CTBAU
+
+    // Issue command slot 0 (PxCI bit 0) + poll for completion.
+    pw(0x38, 1);
+    for _ in 0..5_000_000u64 {
+        if pr(0x38) & 1 == 0 {
+            return pr(0x20) & 0xFF; // PxTFD low byte (0 = success)
+        }
+        yield_now();
+    }
+    0xFF // timeout
+}
+
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
 /// toward `io_address`. Returns the invocation error label (0 = success). The first call
 /// for a device installs the context root (and lazily enables VT-d translation).
@@ -1617,6 +1690,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut count = 0u64;
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
+    let (mut storage_dev, mut storage_func) = (0u8, 0u8);
     let (mut nic_bar0, mut nic_irq, mut found_nic) = (0u32, 0u32, false);
     let (mut nic_dev, mut nic_func) = (0u8, 0u8);
     for dev in 0..32u8 {
@@ -1647,12 +1721,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b" irq=");
             print_u64(irq as u64);
             print_str(b"\n");
-            // A mass-storage controller (class 0x01) — a real device with a BAR + IRQ
-            // we can hand to an isolated driver host next (AHCI ABAR = BAR5).
-            if (class >> 24) == 0x01 {
+            // First AHCI SATA controller (class 0x0106). On q35 the boot disk is on the
+            // add-in `-device ahci` at a low slot (00:3.0); the built-in ICH9 SATA (00:31.2)
+            // is empty — so first-wins picks the one with the disk. ABAR = BAR5.
+            if (class >> 8) == 0x01_0601 && !found_storage {
                 found_storage = true;
                 storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
                 storage_irq = irq;
+                storage_dev = dev;
+                storage_func = func;
             }
             // A network controller (class 0x02) — the e1000e NIC we drive as the
             // P1 capstone (its MMIO BAR0 + interrupt line).
@@ -1676,6 +1753,64 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" irq=");
         print_u64(storage_irq as u64);
         print_str(b" (a real device to hand an isolated driver host)\n");
+    }
+
+    // --- P2: real block I/O. Bring up the AHCI controller (boot disk on port 0) and READ
+    // sector 0 off the real disk via READ DMA EXT — the disk end of the disk→volume→FS→
+    // registry chain. Runs BEFORE the NIC block so VT-d translation is still OFF (identity
+    // DMA); the HBA DMAs straight to our frame's physical address. READ ONLY.
+    if found_storage {
+        let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
+        print_str(b"[ntos-exec] P2: AHCI ABAR=");
+        print_hex(ahci_bar as u32);
+        print_str(b" dev=");
+        print_u64(storage_dev as u64);
+        print_str(b"\n");
+        // Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
+        let cmd = pci_read32(pci_io, 0, storage_dev, storage_func, 0x04);
+        pci_write32(pci_io, 0, storage_dev, storage_func, 0x04, cmd | (1 << 2) | (1 << 1));
+        let mapped = claim_device_page(bi, ahci_bar, AHCI_VADDR);
+        check(b"exec_ahci_abar_mapped", mapped, &mut passed);
+        if mapped {
+            let dma_frame = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
+            let _ = page_map(dma_frame, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let dma_paddr = get_frame_paddr(dma_frame);
+            // Port 0 device present? PxSSTS DET field [11:8] == 3 (present + PHY up).
+            let ssts = core::ptr::read_volatile((AHCI_VADDR + 0x100 + 0x28) as *const u32);
+            let det = (ssts >> 8) & 0xF;
+            print_str(b"[ntos-exec] AHCI port0 SSTS.DET=");
+            print_u64(det as u64);
+            print_str(b"\n");
+            check(b"exec_ahci_port0_device_present", det != 0, &mut passed);
+            // Read sector 0 (the boot sector) via a real READ DMA EXT.
+            let tfd = ahci_read_sector(AHCI_VADDR, AHCI_DMA_VADDR, dma_paddr, 0);
+            let db = |i: u64| core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800 + i) as *const u8);
+            let mut nonzero = false;
+            for i in 0..512u64 {
+                if db(i) != 0 {
+                    nonzero = true;
+                    break;
+                }
+            }
+            let sig = (db(510) as u16) | ((db(511) as u16) << 8);
+            print_str(b"[ntos-exec] AHCI read sector0 TFD=0x");
+            print_hex(tfd);
+            print_str(b" sig=0x");
+            print_hex(sig as u32);
+            print_str(b" bytes[0..8]=0x");
+            print_hex(core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800) as *const u32));
+            print_hex(core::ptr::read_volatile((AHCI_DMA_VADDR + 0x804) as *const u32));
+            print_str(b"\n");
+            // Proof of real block I/O: the command completed with no error (BSY/DRQ/ERR all
+            // clear), real data landed in the zeroed buffer, AND it's the MBR boot signature
+            // (byte 510=0x55, 511=0xAA → little-endian 0xAA55).
+            check(
+                b"exec_ahci_read_sector0",
+                (tfd & 0x89) == 0 && nonzero && sig == 0xAA55,
+                &mut passed,
+            );
+        }
     }
 
     // --- P1 CAPSTONE: drive the real e1000e NIC. Map its enumerated BAR0 as a
@@ -2158,7 +2293,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/51 executive->isolated-service checks passed]\n");
+    print_str(b"/54 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
