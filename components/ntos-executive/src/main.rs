@@ -90,6 +90,9 @@ pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
 /// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
 /// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
 pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
+/// A second shared frame, for the blocking-wait demo's two threads (mapped at SYSARG_VADDR in
+/// each of them) — read by the executive at this vaddr (its own view of the same frame).
+pub const SYSARG2_VADDR: u64 = 0x0000_0100_005D_1000;
 /// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
@@ -127,6 +130,7 @@ pub const CT_PML4: u64 = 2;
 pub const CT_N_SUB: u64 = 3;
 pub const CT_N_COMP: u64 = 4;
 pub const CT_FAULT: u64 = 6; // a user thread's own cap to its fault endpoint
+pub const CT_WAIT_NTFN: u64 = 7; // a waiter thread's cap to the wait notification it parks on
 pub const CT_IRQ_NTFN: u64 = 3; // the ISR host's cap to the IRQ notification
 pub const CT_RESULT_NTFN: u64 = 4; // the ISR host's cap to the result notification
 const CN_RADIX: u32 = 5;
@@ -226,6 +230,12 @@ const SSN_CREATE_EVENT: u64 = 0x0200; // arg1 = kind (0=Notification, 1=Synchron
 const SSN_SET_EVENT: u64 = 0x0201; // arg1 = event handle → previous state in RAX
 const SSN_RESET_EVENT: u64 = 0x0202; // arg1 = event handle → previous state in RAX
 const SSN_WAIT: u64 = 0x0203; // arg1 = handle → 0 (WAIT_OBJECT_0) or 0x102 (WAIT_TIMEOUT)
+// P3 blocking wait dispatcher — a waiter thread parks on an event until a signaler wakes it.
+const SSN_WAIT_BLOCK: u64 = 0x0210; // waiter: arg1 = event → 0 (signaled) or 0x102 (must block)
+const SSN_SET_WAKE: u64 = 0x0211; // signaler: arg1 = event → set it + signal the wait notification
+const SSN_DONE_A: u64 = 0x0212; // waiter reports done
+const SSN_DONE_B: u64 = 0x0213; // signaler reports done
+const BLOCK_EVENT_KEY: u64 = 0x9000; // the fixed event both threads reference
 const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
 
 /// The fixed registry key the syscall front-end reads/writes for the Cm route.
@@ -677,9 +687,14 @@ unsafe fn native_syscall2(ssn: u64, arg1: u64, arg2: u64) -> u64 {
     core::arch::asm!(
         "syscall",
         inout("rax") ssn => ret,
-        in("r10") arg1,
-        in("rdx") arg2,
+        // r10/rdx carry the args in, but the fault->reply path may leave them changed, so
+        // declare them clobbered (=> _) rather than `in` (which implies preserved). Likewise
+        // the other MR registers the reply may touch — else the compiler reuses stale values
+        // (a wild write / #PF after a syscall that parks in between).
+        inout("r10") arg1 => _,
+        inout("rdx") arg2 => _,
         lateout("rcx") _, lateout("r11") _,
+        lateout("r8") _, lateout("r9") _, lateout("r15") _,
         options(nostack),
     );
     ret
@@ -802,10 +817,56 @@ pub unsafe extern "C" fn user_entry() -> ! {
     park()
 }
 
+/// P3 blocking wait — the WAITER. Waits on a non-signaled event; the executive tells it to
+/// block, so it PARKS on the wait notification (a real block) until the signaler wakes it,
+/// then re-waits (now satisfied) and reads the signaler's handoff marker.
+#[no_mangle]
+#[link_section = ".text.waiter_entry"]
+pub unsafe extern "C" fn waiter_entry() -> ! {
+    let w_first = native_syscall(SSN_WAIT_BLOCK, BLOCK_EVENT_KEY);
+    // Persist w_first to memory NOW — before the park below, which can clobber registers.
+    core::ptr::write_volatile((SYSARG_VADDR + 0x510) as *mut u64, w_first);
+    // Publish "the waiter has taken its first wait" so the signaler only sets the event AFTER
+    // this (making the first wait deterministically observe a non-signaled event).
+    core::ptr::write_volatile((SYSARG_VADDR + 0x528) as *mut u64, 1);
+    if w_first != 0 {
+        let _ = ep_recv(CT_WAIT_NTFN); // block until the signaler wakes us
+    }
+    let w_second = native_syscall(SSN_WAIT_BLOCK, BLOCK_EVENT_KEY);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x518) as *mut u64, w_second);
+    // We could only observe the signaler's marker if we truly blocked until it ran.
+    let handoff = core::ptr::read_volatile((SYSARG_VADDR + 0x500) as *const u64);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x520) as *mut u64, handoff);
+    let _ = native_syscall(SSN_DONE_A, 0);
+    park()
+}
+
+/// P3 blocking wait — the SIGNALER. Publishes a handoff marker, then sets + wakes the event.
+/// Because the waiter is parked, it wakes only after this runs — and reads the marker.
+#[no_mangle]
+#[link_section = ".text.signaler_entry"]
+pub unsafe extern "C" fn signaler_entry() -> ! {
+    // Wait (yielding) until the waiter has taken its first, blocking wait — so our set lands
+    // AFTER it, and the waiter genuinely parks rather than seeing a pre-signaled event.
+    while core::ptr::read_volatile((SYSARG_VADDR + 0x528) as *const u64) == 0 {
+        yield_now();
+    }
+    core::ptr::write_volatile((SYSARG_VADDR + 0x500) as *mut u64, 0xB0B);
+    let _ = native_syscall(SSN_SET_WAKE, BLOCK_EVENT_KEY);
+    let _ = native_syscall(SSN_DONE_B, 0);
+    park()
+}
+
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
 /// its own CNode holding a cap to `fault_ep_c`, and its faults routed there (the
 /// kernel's legacy TCBSetSpace resolves the fault cptr in the FAULTER's cspace).
-unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64, sysarg_c: u64) -> u64 {
+unsafe fn spawn_user_thread(
+    entry: unsafe extern "C" fn() -> !,
+    fault_ep_c: u64,
+    sysarg_c: u64,
+    prio: u64,
+    extra_ntfn: u64,
+) -> u64 {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
@@ -840,13 +901,17 @@ unsafe fn spawn_user_thread(entry: unsafe extern "C" fn() -> !, fault_ep_c: u64,
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    // A waiter thread gets a cap to the notification it parks on; others don't (least priv).
+    if extra_ntfn != 0 {
+        let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_WAIT_NTFN, extra_ntfn, 0);
+    }
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
-    let _ = tcb_set_priority(tcb, 100);
+    let _ = tcb_set_priority(tcb, prio);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4 // the executive keeps this cap to map on-demand NtAllocateVirtualMemory frames
@@ -1298,6 +1363,75 @@ where
         m3 = nm3;
     }
     (serviced, verdict)
+}
+
+/// Service the blocking-wait demo: two threads (waiter + signaler) fault here, dispatched by
+/// SSN. A WAIT_BLOCK on a non-signaled event returns "block" (the waiter then parks on
+/// `wait_ntfn`); a SET_WAKE sets the event AND signals `wait_ntfn` to wake the parked waiter.
+/// Runs until both threads report done; returns (w_first, w_second, handoff) from the shared
+/// frame. Every reply is immediate (paired with the next recv), so the single `reply_to`
+/// slot is never asked to hold two — no cap-based reply needed.
+unsafe fn service_blocking_wait(fault_ep: u64, wait_ntfn: u64) -> (u64, u64, u64) {
+    let mut events = EventStore::new();
+    let irql = IrqlState::new();
+    events.initialize(BLOCK_EVENT_KEY, EventKind::Notification, false);
+    let (mut a_done, mut b_done) = (false, false);
+    // NB: MR1 maps to the faulter's RBX; it MUST be echoed back in every reply or the
+    // faulter's RBX is zeroed (a callee-saved reg the compiler relies on → wild writes).
+    let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
+    loop {
+        if (mi >> 12) != 2 {
+            break; // not an UnknownSyscall
+        }
+        let ssn = m0;
+        let arg1 = get_recv_mr(9);
+        if ssn == SSN_DONE_A || ssn == SSN_DONE_B {
+            if ssn == SSN_DONE_A {
+                a_done = true;
+            } else {
+                b_done = true;
+            }
+            if a_done && b_done {
+                break; // leave both faulters blocked; the demo is done
+            }
+            // Don't reply to the done thread; just recv the next fault.
+            let (_z2, nmi, nm0, nm1, nm2, nm3) = ep_recv_full(fault_ep);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
+            continue;
+        }
+        let resume_ip = m2;
+        let sp = get_recv_mr(16);
+        let flags = get_recv_mr(17);
+        let result = match ssn {
+            SSN_WAIT_BLOCK => match events.poll(arg1, &irql) {
+                WaitResult::Signaled => 0, // WAIT_OBJECT_0
+                _ => 0x102,                // not signaled → the waiter must block
+            },
+            SSN_SET_WAKE => {
+                events.set(arg1);
+                let _ = syscall5(SYS_SEND, wait_ntfn, 0, 0, 0, 0); // wake the parked waiter
+                1
+            }
+            _ => 0,
+        };
+        set_reply_mr(15, resume_ip);
+        set_reply_mr(16, sp);
+        set_reply_mr(17, flags);
+        let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 18, result, m1, 0, m3);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    let w_first = core::ptr::read_volatile((SYSARG2_VADDR + 0x510) as *const u64);
+    let w_second = core::ptr::read_volatile((SYSARG2_VADDR + 0x518) as *const u64);
+    let handoff = core::ptr::read_volatile((SYSARG2_VADDR + 0x520) as *const u64);
+    (w_first, w_second, handoff)
 }
 
 /// Print `0x` + 8 hex digits (for PCI IDs / BARs).
@@ -1985,7 +2119,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // Buffer pointer resolves in both address spaces.
     let sysarg = alloc_frame();
     let _ = page_map(sysarg, SYSARG_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg));
+    let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
     let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm, user_pml4);
     check(b"exec_syscall_frontend_serviced", serviced >= 10, &mut passed);
     check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
@@ -2065,6 +2199,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         em1 == 0 && em2 == 0 && em3 == 0x102,
         &mut passed,
     );
+
+    // --- P3 blocking wait dispatcher: a WAITER thread PARKS on an event until a separate
+    // SIGNALER thread wakes it — a real cross-thread block, not a poll. The waiter (prio 150)
+    // runs + parks first; the signaler (100) publishes a handoff marker then sets+wakes the
+    // event; the waiter could only observe the marker by having blocked until the signaler ran.
+    print_str(b"[ntos-exec] P3: blocking wait - waiter parks on an event, signaler wakes it\n");
+    let bw_fault = make_object(OBJ_ENDPOINT);
+    let wait_ntfn = make_object(OBJ_NOTIFICATION);
+    let sysarg2 = alloc_frame();
+    let _ = page_map(sysarg2, SYSARG2_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((SYSARG2_VADDR + 0x500) as *mut u64, 0);
+    core::ptr::write_volatile((SYSARG2_VADDR + 0x528) as *mut u64, 0); // parking flag
+    let _ = spawn_user_thread(waiter_entry, copy_cap(bw_fault), copy_cap(sysarg2), 150, wait_ntfn);
+    let _ = spawn_user_thread(signaler_entry, copy_cap(bw_fault), copy_cap(sysarg2), 100, 0);
+    let (bw_first, bw_second, bw_handoff) = service_blocking_wait(bw_fault, wait_ntfn);
+    print_str(b"[ntos-exec] blocking wait: w_first=");
+    print_u64(bw_first);
+    print_str(b" w_second=");
+    print_u64(bw_second);
+    print_str(b" handoff=0x");
+    print_hex(bw_handoff as u32);
+    print_str(b"\n");
+    check(b"exec_blocking_wait_parked", bw_first == 0x102, &mut passed);
+    check(b"exec_blocking_wait_woken", bw_second == 0, &mut passed);
+    check(b"exec_blocking_wait_ordered", bw_handoff == 0xB0B, &mut passed);
 
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
@@ -2853,7 +3012,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/67 executive->isolated-service checks passed]\n");
+    print_str(b"/70 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
