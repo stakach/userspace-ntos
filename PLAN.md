@@ -536,3 +536,12 @@ findings). A step is not "done" until the plan reflects it.
   in an isolated host over the QEMU AHCI controller we already enumerate: `storage
   controller ABAR(BAR5)`) is the natural next step — it reuses the proven driver-hosting +
   real-hardware machinery and starts the disk → volume → FS → registry chain.
+- **2026-07-08** — **P2 STARTED — real block I/O (kernel ecaceef + exec 639e356). 54/54.**
+  The executive brings up the boot-disk AHCI controller (00:3.0) and reads sector 0 via a
+  real ATA READ DMA EXT — command list + H2D FIS + PRDT in a DMA frame (identity DMA, runs
+  before the NIC's VT-d TE enable), poll PxCI, check PxTFD. Got the real MBR (sig 0xAA55 +
+  boot-sector bytes) off the disk the kernel boots from — reusing the NIC MMIO+DMA machinery.
+  Lessons: two AHCI controllers on q35 (the add-in `-device ahci` @00:3.0 ABAR 0x81085000 has
+  the disk, not the empty built-in @00:31.2); TFD=0x50 = success; QEMU DET=1 = present. Next
+  P2: confine AHCI DMA via VT-d + move the read into an isolated storage host; then
+  partition/volume → FS → hives.
