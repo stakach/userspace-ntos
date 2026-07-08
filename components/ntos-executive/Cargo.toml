@@ -36,6 +36,12 @@ nt-io-client = { path = "../../crates/nt-io-client" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+# KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
+nt-wdf-types = { path = "../../crates/nt-wdf-types" }
+nt-wdf-object = { path = "../../crates/nt-wdf-object" }
+nt-wdf-request = { path = "../../crates/nt-wdf-request" }
+nt-wdf-queue = { path = "../../crates/nt-wdf-queue" }
+nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 
 [profile.release]
 panic = "abort"

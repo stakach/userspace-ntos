@@ -25,6 +25,7 @@ mod io_server;
 mod driver_host;
 mod driver_pe;
 mod isr;
+mod kmdf_host;
 mod server;
 
 use core::panic::PanicInfo;
@@ -903,6 +904,84 @@ unsafe fn spawn_driver_host(
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, prio);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+}
+
+/// Spawn an isolated KMDF driver host. Like `spawn_isr` but with what a real KMDF driver
+/// + the WDF runtime need: the host image mapped RW (the 444-entry WDF function table +
+/// globals live in `.bss`), a heap (WdfRuntime + every Wdf*Create allocate), the pre-loaded
+/// KMDF PE image (RWX), and a shared word (DriverEntry rva in, verdict out). A bigger stack
+/// for the deep driver→thunk→runtime call chains. Software-only — no device resources.
+unsafe fn spawn_kmdf_host(
+    entry: unsafe extern "C" fn() -> !,
+    result_cap: u64,
+    fault_ep: u64,
+    prio: u64,
+    kmdf_pe_base: u64,
+    shared_frame: u64,
+) {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let stack_frames = 16u64; // 64 KiB — WDF call chains are deep
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // Image mapped RW (rights=3 → RWX): the WDF function table + globals live in `.bss`
+    // and this host must WRITE them. NOTE: these are the executive's SHARED image frames,
+    // so — unlike the RO-image hosts — a buggy KMDF host could scribble on the executive's
+    // code/data. Acceptable here (the host runs to completion before the executive resumes,
+    // and a correct host writes only its own WDF statics); tightening to a private image
+    // copy is a hardening follow-on.
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RWX */ 3, pml4);
+    }
+    // Heap for the WDF runtime; retype-zeroed frames give bump counter 0 (no init).
+    for i in 0..allocator::HEAP_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
+    }
+    for i in 0..stack_frames {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // The pre-loaded KMDF PE image (RWX) + the shared word (RW, entry rva / verdict).
+    for i in 0..kmdf_host::KMDF_PE_FRAMES {
+        let cp = copy_cap(kmdf_pe_base + i);
+        let _ = page_map(cp, kmdf_host::KMDF_CODE_VA + i * 0x1000, /* RWX */ 3, pml4);
+    }
+    let sh = copy_cap(shared_frame);
+    let _ = page_map(sh, kmdf_host::KMDF_SHARED_VADDR, RW_NX, pml4);
+
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_RESULT_NTFN, result_cap, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + stack_frames * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, prio);
     attach_sched_context(tcb);
@@ -1986,9 +2065,65 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // ---- KMDF DRIVER HOST: host a real KMDF driver (KmdfBasicTest.sys) through the FULL
+    // WDF lifecycle (DriverEntry → WdfDriverCreate → AddDevice → EvtDevicePrepareHardware
+    // → D0Entry → IOCTLs → REMOVE) in a SEPARATE isolated host — the MODERN Windows driver
+    // framework, crash-contained on the microkernel. Software-only (simulated MMIO).
+    {
+        print_str(b"[ntos-exec] KMDF host: loading real KmdfBasicTest.sys\n");
+        let mut kmdf_pe_base = 0u64;
+        for i in 0..kmdf_host::KMDF_PE_FRAMES {
+            let f = alloc_slot();
+            if i == 0 {
+                kmdf_pe_base = f;
+            }
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+            let _ = page_map(f, kmdf_host::KMDF_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        let kmdf_entry = kmdf_host::load_into().unwrap_or(0);
+        let kmdf_shared = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, kmdf_shared);
+        let _ = page_map(kmdf_shared, kmdf_host::KMDF_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile(kmdf_host::KMDF_SHARED_VADDR as *mut u64, kmdf_entry as u64);
+        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *mut u32, 0);
+        print_str(b"[ntos-exec] pre-loaded KmdfBasicTest.sys; FxDriverEntry rva=");
+        print_hex(kmdf_entry);
+        print_str(b"\n");
+        let kmdf_result = make_object(OBJ_NOTIFICATION);
+        let kmdf_result_badged = alloc_slot();
+        let _ = syscall5(
+            SYS_SEND,
+            CAP_INIT_THREAD_CNODE,
+            LBL_CNODE_MINT << 12,
+            kmdf_result_badged,
+            kmdf_result,
+            ISR_DONE_BADGE,
+        );
+        let kmdf_fault = make_object(OBJ_ENDPOINT);
+        spawn_kmdf_host(
+            kmdf_host::kmdf_host_entry,
+            kmdf_result_badged,
+            kmdf_fault,
+            100,
+            kmdf_pe_base,
+            kmdf_shared,
+        );
+        let _ = kmdf_fault;
+        let (_z, _b, _s, _m) = ep_recv(kmdf_result);
+        let kv = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *const u32);
+        print_str(b"[ntos-exec] KMDF host lifecycle verdict bits=0x");
+        print_hex(kv);
+        print_str(b"\n");
+        check(b"exec_kmdf_driver_create", (kv & 1) != 0, &mut passed);
+        check(b"exec_kmdf_adddevice_queue", (kv & 2) != 0, &mut passed);
+        check(b"exec_kmdf_prepare_hw", (kv & 4) != 0, &mut passed);
+        check(b"exec_kmdf_ioctl", (kv & 8) != 0, &mut passed);
+        check(b"exec_kmdf_remove", (kv & 16) != 0, &mut passed);
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/45 executive->isolated-service checks passed]\n");
+    print_str(b"/50 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

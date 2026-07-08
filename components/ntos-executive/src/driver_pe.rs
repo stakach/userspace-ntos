@@ -19,7 +19,7 @@ pub static SYS_BYTES: &[u8] =
 /// Where the PE image is mapped (R+W+X) in BOTH the executive (to load it) and the host
 /// (to run it) — same vaddr so the relocation base matches. Free in both VSpaces (below
 /// the exec heap at 0x48_0000), within the host's single 2 MiB PT.
-pub const CODE_VA: u64 = 0x0000_0100_0044_0000;
+pub const CODE_VA: u64 = 0x0000_0100_004A_0000;
 /// A RW "guest arena" mapped in both — holds all mutable host state (`.bss` is RO in the
 /// host) + the blobs the stubs allocate (DRIVER_OBJECT, device objects, IRP, ...).
 pub const ARENA_VADDR: u64 = 0x0000_0100_005F_E000;
