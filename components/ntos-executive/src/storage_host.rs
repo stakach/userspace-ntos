@@ -1,0 +1,37 @@
+//! An isolated **storage** driver host (P2). A separate VSpace/CSpace granted ONLY the AHCI
+//! BAR + a DMA frame + a shared word by the executive (Tier-1 broker). It brings up the AHCI
+//! controller and reads real sectors + a real file (BOOTBOOT/INITRD) off the boot disk
+//! entirely from isolation — a fault or rogue DMA is contained here, not in the executive.
+//! The executive already enabled PCI Bus Master; this host has no PCI-config access.
+//!
+//! Cap layout (all in this host's own VSpace):
+//!   * `AHCI_VADDR`           — the AHCI ABAR MMIO (granted BAR frame)
+//!   * `AHCI_DMA_VADDR`       — the DMA frame (command list + FIS + command table + data)
+//!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8, INITRD cluster @0x10, size @0x14 out
+
+use crate::*;
+
+#[no_mangle]
+#[link_section = ".text.storage_host_entry"]
+pub unsafe extern "C" fn storage_host_entry() -> ! {
+    // The executive left the DMA frame's physical address in the shared word — this host has
+    // no X86PageGetAddress path of its own (least privilege).
+    let dma_paddr = core::ptr::read_volatile(STORAGE_SHARED_VADDR as *const u64);
+    print_str(b"[storage-host] START: driving AHCI from isolation (dma_paddr=0x");
+    print_hex((dma_paddr >> 32) as u32);
+    print_hex(dma_paddr as u32);
+    print_str(b")\n");
+
+    // The entire storage stack — AHCI bring-up, sector-0 MBR read, FAT32 parse, root-dir
+    // listing, and BOOTBOOT/INITRD read — runs here in the isolated host's VSpace.
+    let (verdict, cluster, size) = storage_probe(AHCI_VADDR, AHCI_DMA_VADDR, dma_paddr);
+
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, verdict);
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x10) as *mut u32, cluster);
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x14) as *mut u32, size);
+    print_str(b"[storage-host] done: verdict bits=0x");
+    print_hex(verdict);
+    print_str(b"\n");
+    let _ = syscall5(SYS_SEND, CT_RESULT_NTFN, 0, 0, 0, 0);
+    park();
+}

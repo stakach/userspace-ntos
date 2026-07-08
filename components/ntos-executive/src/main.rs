@@ -27,6 +27,7 @@ mod driver_pe;
 mod isr;
 mod kmdf_host;
 mod server;
+mod storage_host;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -98,6 +99,9 @@ pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
 /// the sector data buffer (both just past the NIC's 4-page BAR, before IPCBUF).
 pub const AHCI_VADDR: u64 = 0x0000_0100_005F_4000;
 pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_005F_5000;
+/// Shared word between the executive (broker) and the isolated storage host: `dma_paddr`
+/// in @0; verdict (u32) @8, INITRD cluster @0x10, size @0x14 out.
+pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 /// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
 /// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
@@ -1001,6 +1005,74 @@ unsafe fn spawn_kmdf_host(
     let _ = tcb_resume(tcb);
 }
 
+/// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a
+/// DMA frame + a shared word, so it drives the disk entirely from its own VSpace. The
+/// executive (Tier-1 broker) has already enabled Bus Master; the host gets no PCI-config
+/// access. `shared` carries `dma_paddr` in (@0) and the verdict + INITRD info out.
+unsafe fn spawn_storage_host(
+    entry: unsafe extern "C" fn() -> !,
+    result_cap: u64,
+    fault_ep: u64,
+    prio: u64,
+    ahci_bar_frame: u64,
+    dma_frame: u64,
+    shared_frame: u64,
+) {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // Image mapped READ-ONLY (rights=2) — the storage path writes no statics, so the host
+    // cannot scribble on the executive's shared code/data.
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    for i in 0..STACK_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // Granted device resources (each a copy aliasing the executive's frame): the AHCI BAR
+    // (1 page) at AHCI_VADDR, the DMA frame at AHCI_DMA_VADDR, the shared word.
+    let bar_cp = copy_cap(ahci_bar_frame);
+    let _ = page_map(bar_cp, AHCI_VADDR, RW_NX, pml4);
+    let dma_cp = copy_cap(dma_frame);
+    let _ = page_map(dma_cp, AHCI_DMA_VADDR, RW_NX, pml4);
+    let sh_cp = copy_cap(shared_frame);
+    let _ = page_map(sh_cp, STORAGE_SHARED_VADDR, RW_NX, pml4);
+
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_RESULT_NTFN, result_cap, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, prio);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+}
+
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`. Returns
 /// `(serviced, verdict)`.
@@ -1433,6 +1505,122 @@ unsafe fn dir_find(fs: &Fat32, dir_cluster: u32, name11: &[u8; 11]) -> Option<(u
     None
 }
 
+/// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
+/// sector 0 (MBR), parse the FAT32 volume, list the root directory, and read
+/// BOOTBOOT/INITRD. Returns (verdict, initrd_cluster, initrd_size). Verdict bits:
+/// 1 = port present + MBR (0xAA55), 2 = FAT32 BPB ok, 4 = root lists EFI+BOOTBOOT,
+/// 8 = INITRD read (size>0, non-zero). READ ONLY. AHCI BAR @ `ahci_vaddr`, DMA @ `dma_vaddr`
+/// (paddr `dma_paddr`) — all in the caller's VSpace.
+unsafe fn storage_probe(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> (u32, u32, u32) {
+    let mut verdict = 0u32;
+    // Port 0 present? PxSSTS DET [11:8] != 0.
+    let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
+    let det = (ssts >> 8) & 0xF;
+    // Read sector 0 (the MBR / VBR) via a real READ DMA EXT.
+    let tfd = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    let db = |i: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + i) as *const u8);
+    let sig = (db(510) as u16) | ((db(511) as u16) << 8);
+    print_str(b"[storage-host] AHCI DET=");
+    print_u64(det as u64);
+    print_str(b" TFD=0x");
+    print_hex(tfd);
+    print_str(b" sig=0x");
+    print_hex(sig as u32);
+    print_str(b"\n");
+    if det != 0 && (tfd & 0x89) == 0 && sig == 0xAA55 {
+        verdict |= 1;
+    }
+    // Parse the BPB (sector 0 is still in the buffer).
+    let bp = |o: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + o) as *const u8);
+    let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
+    let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
+    let bps = bp16(0x0B);
+    let spc = bp(0x0D) as u32;
+    let reserved = bp16(0x0E);
+    let nfats = bp(0x10) as u32;
+    let spf32 = bp32(0x24);
+    let root_cl = bp32(0x2C);
+    let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
+    print_str(b"[storage-host] FAT32 bps=");
+    print_u64(bps as u64);
+    print_str(b" spc=");
+    print_u64(spc as u64);
+    print_str(b" reserved=");
+    print_u64(reserved as u64);
+    print_str(b" nfats=");
+    print_u64(nfats as u64);
+    print_str(b" spf=");
+    print_u64(spf32 as u64);
+    print_str(b"\n");
+    let (mut cluster, mut size) = (0u32, 0u32);
+    if bps == 512 && spc >= 1 && is_fat32 {
+        verdict |= 2;
+        let fs = Fat32 {
+            ahci_vaddr,
+            dma_vaddr,
+            dma_paddr,
+            bps,
+            spc,
+            fat_start: reserved,
+            data_start: reserved + nfats * spf32,
+            root_cl,
+        };
+        // List the root directory (a real directory read).
+        print_str(b"[storage-host] root dir:");
+        let rp = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl));
+        for e in 0..(fs.bps as usize / 32) {
+            let ent = rp.add(e * 32);
+            if *ent == 0x00 {
+                break;
+            }
+            let attr = *ent.add(0x0B);
+            if *ent == 0xE5 || attr == 0x0F || (attr & 0x08) != 0 {
+                continue;
+            }
+            debug_put_char(b' ');
+            for i in 0..11 {
+                let c = *ent.add(i);
+                if c != b' ' {
+                    debug_put_char(c);
+                }
+            }
+        }
+        print_str(b"\n");
+        let have_efi = dir_find(&fs, fs.root_cl, b"EFI        ").is_some();
+        let bootboot = dir_find(&fs, fs.root_cl, b"BOOTBOOT   ");
+        if have_efi && bootboot.is_some() {
+            verdict |= 4;
+        }
+        // Navigate BOOTBOOT/ → INITRD, then read the file's first cluster.
+        if let Some((bb_cl, _, _)) = bootboot {
+            if let Some((initrd_cl, initrd_size, _)) = dir_find(&fs, bb_cl, b"INITRD     ") {
+                let fp = fat_read_sector(&fs, fat_cluster_sector(&fs, initrd_cl));
+                let mut nz = false;
+                for i in 0..512usize {
+                    if *fp.add(i) != 0 {
+                        nz = true;
+                        break;
+                    }
+                }
+                print_str(b"[storage-host] BOOTBOOT/INITRD cluster=");
+                print_u64(initrd_cl as u64);
+                print_str(b" size=");
+                print_u64(initrd_size as u64);
+                print_str(b" first8=0x");
+                print_hex(core::ptr::read_unaligned(fp as *const u32));
+                print_hex(core::ptr::read_unaligned(fp.add(4) as *const u32));
+                print_str(b"\n");
+                cluster = initrd_cl;
+                size = initrd_size;
+                if initrd_size > 0 && nz {
+                    verdict |= 8;
+                }
+            }
+        }
+    }
+    (verdict, cluster, size)
+}
+
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
 /// toward `io_address`. Returns the invocation error label (0 = success). The first call
 /// for a device installs the context root (and lazily enables VT-d translation).
@@ -1832,147 +2020,72 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
-    // --- P2: real block I/O. Bring up the AHCI controller (boot disk on port 0) and READ
-    // sector 0 off the real disk via READ DMA EXT — the disk end of the disk→volume→FS→
-    // registry chain. Runs BEFORE the NIC block so VT-d translation is still OFF (identity
-    // DMA); the HBA DMAs straight to our frame's physical address. READ ONLY.
+    // --- P2: real block I/O, now in an ISOLATED host. The executive is the Tier-1 broker —
+    // it enables Bus Master, claims the AHCI BAR + a DMA frame, and hands ONLY those caps to
+    // an isolated storage host that drives the disk from its OWN VSpace (a fault or rogue DMA
+    // is contained there). Runs BEFORE the NIC block so VT-d translation is still OFF
+    // (identity DMA). READ ONLY.
     if found_storage {
         let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
         print_str(b"[ntos-exec] P2: AHCI ABAR=");
         print_hex(ahci_bar as u32);
         print_str(b" dev=");
         print_u64(storage_dev as u64);
-        print_str(b"\n");
-        // Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
+        print_str(b" -> isolated storage host\n");
+        // Enable Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
         let cmd = pci_read32(pci_io, 0, storage_dev, storage_func, 0x04);
         pci_write32(pci_io, 0, storage_dev, storage_func, 0x04, cmd | (1 << 2) | (1 << 1));
-        let mapped = claim_device_page(bi, ahci_bar, AHCI_VADDR);
-        check(b"exec_ahci_abar_mapped", mapped, &mut passed);
-        if mapped {
+        // Claim the ABAR as a device frame CAP (to grant a copy to the host).
+        let ahci_frame = claim_device_pages(bi, ahci_bar, AHCI_VADDR, 1);
+        check(b"exec_ahci_abar_claimed", ahci_frame != 0, &mut passed);
+        if ahci_frame != 0 {
+            // A DMA frame for the host's AHCI structures + data buffer. Not mapped in the
+            // executive — we only need its physical address (X86PageGetAddress).
             let dma_frame = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
-            let _ = page_map(dma_frame, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let dma_paddr = get_frame_paddr(dma_frame);
-            // Port 0 device present? PxSSTS DET field [11:8] == 3 (present + PHY up).
-            let ssts = core::ptr::read_volatile((AHCI_VADDR + 0x100 + 0x28) as *const u32);
-            let det = (ssts >> 8) & 0xF;
-            print_str(b"[ntos-exec] AHCI port0 SSTS.DET=");
-            print_u64(det as u64);
-            print_str(b"\n");
-            check(b"exec_ahci_port0_device_present", det != 0, &mut passed);
-            // Read sector 0 (the boot sector) via a real READ DMA EXT.
-            let tfd = ahci_read_sector(AHCI_VADDR, AHCI_DMA_VADDR, dma_paddr, 0);
-            let db = |i: u64| core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800 + i) as *const u8);
-            let mut nonzero = false;
-            for i in 0..512u64 {
-                if db(i) != 0 {
-                    nonzero = true;
-                    break;
-                }
-            }
-            let sig = (db(510) as u16) | ((db(511) as u16) << 8);
-            print_str(b"[ntos-exec] AHCI read sector0 TFD=0x");
-            print_hex(tfd);
-            print_str(b" sig=0x");
-            print_hex(sig as u32);
-            print_str(b" bytes[0..8]=0x");
-            print_hex(core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800) as *const u32));
-            print_hex(core::ptr::read_volatile((AHCI_DMA_VADDR + 0x804) as *const u32));
-            print_str(b"\n");
-            // Proof of real block I/O: the command completed with no error (BSY/DRQ/ERR all
-            // clear), real data landed in the zeroed buffer, AND it's the MBR boot signature
-            // (byte 510=0x55, 511=0xAA → little-endian 0xAA55).
-            check(
-                b"exec_ahci_read_sector0",
-                (tfd & 0x89) == 0 && nonzero && sig == 0xAA55,
-                &mut passed,
+            // A shared word: dma_paddr in, verdict + INITRD info out. Mapped in the executive
+            // (to seed dma_paddr) and a copy handed to the host.
+            let shared = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, shared);
+            let sh_exec = copy_cap(shared);
+            let _ = page_map(sh_exec, STORAGE_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            core::ptr::write_volatile(STORAGE_SHARED_VADDR as *mut u64, dma_paddr);
+            core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, 0);
+            // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
+            // the result, yielding the CPU to it) and wait for its report.
+            let sresult = make_object(OBJ_NOTIFICATION);
+            let sresult_badged = alloc_slot();
+            let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, sresult_badged, sresult, ISR_DONE_BADGE);
+            let sfault = make_object(OBJ_ENDPOINT);
+            spawn_storage_host(
+                storage_host::storage_host_entry,
+                sresult_badged,
+                sfault,
+                100,
+                ahci_frame,
+                dma_frame,
+                shared,
             );
-
-            // --- P2 filesystem: read a real FILE through the FAT32 volume on this disk.
-            // Sector 0 (the BPB) is still in the buffer from the read above. Parse it,
-            // then navigate root → BOOTBOOT → INITRD and read the file's first cluster.
-            let bp = |o: u64| core::ptr::read_volatile((AHCI_DMA_VADDR + 0x800 + o) as *const u8);
-            let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
-            let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
-            let bps = bp16(0x0B);
-            let spc = bp(0x0D) as u32;
-            let reserved = bp16(0x0E);
-            let nfats = bp(0x10) as u32;
-            let spf32 = bp32(0x24);
-            let root_cl = bp32(0x2C);
-            let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
-            print_str(b"[ntos-exec] FAT32 bps=");
-            print_u64(bps as u64);
-            print_str(b" spc=");
-            print_u64(spc as u64);
-            print_str(b" reserved=");
-            print_u64(reserved as u64);
-            print_str(b" nfats=");
-            print_u64(nfats as u64);
-            print_str(b" spf=");
-            print_u64(spf32 as u64);
+            let _ = sfault;
+            let (_z, _b, _s, _m) = ep_recv(sresult);
+            let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
+            let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
+            let size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x14) as *const u32);
+            print_str(b"[ntos-exec] isolated storage host reported verdict=0x");
+            print_hex(verdict);
+            print_str(b" INITRD cluster=");
+            print_u64(cluster as u64);
+            print_str(b" size=");
+            print_u64(size as u64);
             print_str(b"\n");
-            check(b"exec_fat32_bpb_ok", bps == 512 && spc >= 1 && is_fat32, &mut passed);
-            if bps == 512 && spc >= 1 {
-                let fs = Fat32 {
-                    ahci_vaddr: AHCI_VADDR,
-                    dma_vaddr: AHCI_DMA_VADDR,
-                    dma_paddr,
-                    bps,
-                    spc,
-                    fat_start: reserved,
-                    data_start: reserved + nfats * spf32,
-                    root_cl,
-                };
-                // List the root directory (8.3 names) — a real directory read.
-                print_str(b"[ntos-exec] root dir:");
-                let rp = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl));
-                for e in 0..(fs.bps as usize / 32) {
-                    let ent = rp.add(e * 32);
-                    if *ent == 0x00 {
-                        break;
-                    }
-                    let attr = *ent.add(0x0B);
-                    if *ent == 0xE5 || attr == 0x0F || (attr & 0x08) != 0 {
-                        continue;
-                    }
-                    debug_put_char(b' ');
-                    for i in 0..11 {
-                        let c = *ent.add(i);
-                        if c != b' ' {
-                            debug_put_char(c);
-                        }
-                    }
-                }
-                print_str(b"\n");
-                let have_efi = dir_find(&fs, fs.root_cl, b"EFI        ").is_some();
-                let bootboot = dir_find(&fs, fs.root_cl, b"BOOTBOOT   ");
-                check(b"exec_fat32_root_dir", have_efi && bootboot.is_some(), &mut passed);
-                // Navigate BOOTBOOT/ → INITRD, then read the file's first cluster.
-                let mut read_ok = false;
-                if let Some((bb_cl, _, _)) = bootboot {
-                    if let Some((initrd_cl, initrd_size, _)) = dir_find(&fs, bb_cl, b"INITRD     ") {
-                        let fp = fat_read_sector(&fs, fat_cluster_sector(&fs, initrd_cl));
-                        let mut nz = false;
-                        for i in 0..512usize {
-                            if *fp.add(i) != 0 {
-                                nz = true;
-                                break;
-                            }
-                        }
-                        print_str(b"[ntos-exec] BOOTBOOT/INITRD cluster=");
-                        print_u64(initrd_cl as u64);
-                        print_str(b" size=");
-                        print_u64(initrd_size as u64);
-                        print_str(b" first8=0x");
-                        print_hex(core::ptr::read_unaligned(fp as *const u32));
-                        print_hex(core::ptr::read_unaligned(fp.add(4) as *const u32));
-                        print_str(b"\n");
-                        read_ok = initrd_size > 0 && nz;
-                    }
-                }
-                check(b"exec_fat32_read_file", read_ok, &mut passed);
-            }
+            // The host ran to completion in isolation and reached the disk through the
+            // granted caps only. Verdict bits: 1=MBR, 2=FAT32 BPB, 4=root dir, 8=file read.
+            check(b"exec_storage_host_reported", verdict != 0, &mut passed);
+            check(b"exec_storage_host_mbr", (verdict & 1) != 0, &mut passed);
+            check(b"exec_storage_host_fat32", (verdict & 2) != 0, &mut passed);
+            check(b"exec_storage_host_root_dir", (verdict & 4) != 0, &mut passed);
+            check(b"exec_storage_host_read_file", (verdict & 8) != 0, &mut passed);
         }
     }
 
