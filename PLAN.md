@@ -601,3 +601,12 @@ findings). A step is not "done" until the plan reflects it.
   Works within the kernel's single reply_to model (the block lives in the waiter, not a
   deferred reply). LESSON: fault-reply MR1 = the faulter's RBX; echo m1 (not 0) or wild #PF.
   Next P3: NtFreeVirtualMemory + VAD; then load a real PE with PEB/TEB toward smss.exe (item 13).
+- **2026-07-09** — **P3 real PE loaded + run (exec f3a4927). 73/73.** Begins item 13 (the P3
+  exit): a real PE FILE loaded via nt-pe-loader (parse + map) + executed in an isolated
+  process, not hand-written code. build_min_pe constructs a minimal PE32+ (Subsystem=NATIVE,
+  one .text) whose code is a 23-byte native-syscall stub (NtQuerySystemTime -> SSN_DONE ->
+  park); spawn_pe_thread maps it RX at PE_LOAD_BASE + starts at the entry; a real syscall
+  (rdtsc) comes back through the loaded PE (verdict=0xdf026888). No MSVC/committed binary
+  (built in-memory, fresh-clone-safe). Checks: exec_real_pe_loaded/_ran/_syscall. Next P3:
+  PEB/TEB/KUSER (nt-user-host) so PE code reads its environment; imports/IAT; then a
+  larger/real PE toward smss.exe.
