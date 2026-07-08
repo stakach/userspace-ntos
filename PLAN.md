@@ -508,3 +508,10 @@ findings). A step is not "done" until the plan reflects it.
   maps image-RW + a heap + the KMDF PE + a big stack. Software-only. CAVEAT: shared RW image
   (private-copy isolation = hardening follow-on). Both WDM (real hardware) and KMDF driver
   models now host real .sys binaries on rust-micro.
+- **2026-07-08** — **KMDF driver WIRED TO THE REAL e1000e NIC (3e066ea). 51/51.** The KMDF
+  host points the driver's WDF hardware surface at the real NIC BAR: its
+  EvtDevicePrepareHardware, via WdfCmResourceList → MmMapIoSpace, maps the real e1000e and
+  reads register 0 (CTRL=0x00140241), then correctly REJECTS the device (not its test HW) —
+  the accept-vs-reject difference proves it read a real register through WDF. Verified: the
+  CTRL matches the executive's direct read. A real KMDF driver reaching real hardware,
+  isolated.
