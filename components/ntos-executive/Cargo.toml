@@ -36,6 +36,8 @@ nt-io-client = { path = "../../crates/nt-io-client" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+# Registry hive model + image codec — the Config Manager decodes a real hive read off the FS.
+nt-hive-core = { path = "../../crates/nt-hive-core" }
 # KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }

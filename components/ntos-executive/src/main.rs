@@ -1509,13 +1509,42 @@ unsafe fn dir_find(fs: &Fat32, dir_cluster: u32, name11: &[u8; 11]) -> Option<(u
     None
 }
 
+/// Read a whole file (up to `size` bytes) from `first_cluster` into `dest_vaddr`, following
+/// the FAT cluster chain. Each cluster is read via the AHCI into the shared data buffer, then
+/// copied out to `dest_vaddr + offset` BEFORE the next read (which — incl. `fat_next` —
+/// overwrites the buffer). Returns the number of bytes written.
+unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, dest_vaddr: u64) -> u32 {
+    let mut cl = first_cluster;
+    let mut written = 0u32;
+    while cl >= 2 && cl < 0x0FFF_FFF8 && written < size {
+        for s in 0..fs.spc {
+            if written >= size {
+                break;
+            }
+            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
+            let n = core::cmp::min(fs.bps, size - written);
+            for i in 0..n as u64 {
+                core::ptr::write_volatile((dest_vaddr + written as u64 + i) as *mut u8, *p.add(i as usize));
+            }
+            written += n;
+        }
+        cl = fat_next(fs, cl);
+    }
+    written
+}
+
 /// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
-/// sector 0 (MBR), parse the FAT32 volume, list the root directory, and read
-/// BOOTBOOT/INITRD. Returns (verdict, initrd_cluster, initrd_size). Verdict bits:
-/// 1 = port present + MBR (0xAA55), 2 = FAT32 BPB ok, 4 = root lists EFI+BOOTBOOT,
-/// 8 = INITRD read (size>0, non-zero). READ ONLY. AHCI BAR @ `ahci_vaddr`, DMA @ `dma_vaddr`
-/// (paddr `dma_paddr`) — all in the caller's VSpace.
-unsafe fn storage_probe(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> (u32, u32, u32) {
+/// sector 0 (MBR), parse the FAT32 volume, list the root directory, read BOOTBOOT/INITRD, and
+/// read the registry hive `SYSTEM.DAT` into `hive_dest`. Returns (verdict, initrd_cluster,
+/// initrd_size, hive_size). Verdict bits: 1 = port present + MBR (0xAA55), 2 = FAT32 BPB ok,
+/// 4 = root lists EFI+BOOTBOOT, 8 = INITRD read, 0x10 = SYSTEM.DAT read. READ ONLY. AHCI BAR
+/// @ `ahci_vaddr`, DMA @ `dma_vaddr` (device addr `dma_paddr`) — all in the caller's VSpace.
+unsafe fn storage_probe(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    hive_dest: u64,
+) -> (u32, u32, u32, u32) {
     let mut verdict = 0u32;
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
@@ -1556,7 +1585,7 @@ unsafe fn storage_probe(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> (u32
     print_str(b" spf=");
     print_u64(spf32 as u64);
     print_str(b"\n");
-    let (mut cluster, mut size) = (0u32, 0u32);
+    let (mut cluster, mut size, mut hive_size) = (0u32, 0u32, 0u32);
     if bps == 512 && spc >= 1 && is_fat32 {
         verdict |= 2;
         let fs = Fat32 {
@@ -1621,8 +1650,24 @@ unsafe fn storage_probe(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> (u32
                 }
             }
         }
+        // Read the registry hive SYSTEM.DAT off the root into `hive_dest` (a real file read
+        // through the FS, feeding the Config Manager).
+        if let Some((hive_cl, hsize, _)) = dir_find(&fs, fs.root_cl, b"SYSTEM  DAT") {
+            let got = fat_read_file(&fs, hive_cl, hsize, hive_dest);
+            print_str(b"[storage-host] SYSTEM.DAT cluster=");
+            print_u64(hive_cl as u64);
+            print_str(b" size=");
+            print_u64(hsize as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == hsize && hsize > 0 {
+                hive_size = hsize;
+                verdict |= 0x10;
+            }
+        }
     }
-    (verdict, cluster, size)
+    (verdict, cluster, size, hive_size)
 }
 
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
@@ -2595,12 +2640,42 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"exec_storage_host_fat32", (verdict & 2) != 0, &mut passed);
             check(b"exec_storage_host_root_dir", (verdict & 4) != 0, &mut passed);
             check(b"exec_storage_host_confined_read_file", (verdict & 8) != 0, &mut passed);
+            check(b"exec_storage_host_read_hive", (verdict & 0x10) != 0, &mut passed);
+
+            // --- P2 finale: the Config Manager parses the registry hive the isolated storage
+            // host read off the FS (an nt-hive-core image at STORAGE_SHARED_VADDR+0x100) and
+            // reads a known value back — disk -> volume -> FS -> REGISTRY, end to end.
+            let hive_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32);
+            let hive_bytes = core::slice::from_raw_parts(
+                (STORAGE_SHARED_VADDR + 0x100) as *const u8,
+                hive_size as usize,
+            );
+            match nt_hive_core::decode_image(hive_bytes) {
+                Ok(hive) => {
+                    print_str(b"[ntos-exec] Config Manager decoded hive (");
+                    print_u64(hive_size as u64);
+                    print_str(b" bytes)\n");
+                    check(b"exec_cm_hive_decoded", true, &mut passed);
+                    let answer = hive
+                        .open_key("ControlSet001\\Services\\NtosTest")
+                        .and_then(|k| hive.query_dword(k, "Answer"));
+                    print_str(b"[ntos-exec] hive ControlSet001\\Services\\NtosTest\\Answer = ");
+                    print_u64(answer.unwrap_or(0) as u64);
+                    print_str(b"\n");
+                    check(b"exec_cm_hive_answer_42", answer == Some(42), &mut passed);
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] hive decode FAILED\n");
+                    check(b"exec_cm_hive_decoded", false, &mut passed);
+                    check(b"exec_cm_hive_answer_42", false, &mut passed);
+                }
+            }
         }
     }
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/59 executive->isolated-service checks passed]\n");
+    print_str(b"/62 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

@@ -23,12 +23,16 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
     print_str(b")\n");
 
     // The entire storage stack — AHCI bring-up, sector-0 MBR read, FAT32 parse, root-dir
-    // listing, and BOOTBOOT/INITRD read — runs here in the isolated host's VSpace.
-    let (verdict, cluster, size) = storage_probe(AHCI_VADDR, AHCI_DMA_VADDR, dma_paddr);
+    // listing, BOOTBOOT/INITRD read, and the SYSTEM.DAT registry hive read — runs here in the
+    // isolated host's VSpace. The hive lands in the shared frame at +0x100 (past the metadata)
+    // for the executive's Config Manager to parse.
+    let (verdict, cluster, size, hive_size) =
+        storage_probe(AHCI_VADDR, AHCI_DMA_VADDR, dma_paddr, STORAGE_SHARED_VADDR + 0x100);
 
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, verdict);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x10) as *mut u32, cluster);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x14) as *mut u32, size);
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x18) as *mut u32, hive_size);
     print_str(b"[storage-host] done: verdict bits=0x");
     print_hex(verdict);
     print_str(b"\n");
