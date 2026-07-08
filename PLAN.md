@@ -593,3 +593,11 @@ findings). A step is not "done" until the plan reflects it.
   [OBJECT_0,OBJECT_0,TIMEOUT] (manual until reset). P3 item 11. Checks: exec_nt_event_sync_autoreset
   / _manual_reset. Next P3: a blocking wait dispatcher (item 14 — a 2nd thread signals while the
   1st blocks), then load a real PE with PEB/TEB (nt-user-host/nt-pe-loader) toward smss.exe.
+- **2026-07-09** — **P3 blocking wait dispatcher (exec cf24f5d). 70/70.** A real cross-thread
+  block (item 14): a WAITER thread parks on a notification (ep_recv, ISR-host pattern) when
+  NtWaitForSingleObject finds a non-signaled event; a separate SIGNALER thread's NtSetEvent
+  makes the executive signal the notification + wake it. Verified w_first=0x102 (parked),
+  w_second=0 (woken), handoff=0xB0B (read the signaler's marker → truly blocked until it ran).
+  Works within the kernel's single reply_to model (the block lives in the waiter, not a
+  deferred reply). LESSON: fault-reply MR1 = the faulter's RBX; echo m1 (not 0) or wild #PF.
+  Next P3: NtFreeVirtualMemory + VAD; then load a real PE with PEB/TEB toward smss.exe (item 13).
