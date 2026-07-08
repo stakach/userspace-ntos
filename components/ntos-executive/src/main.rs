@@ -99,9 +99,13 @@ pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
 /// the sector data buffer (both just past the NIC's 4-page BAR, before IPCBUF).
 pub const AHCI_VADDR: u64 = 0x0000_0100_005F_4000;
 pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_005F_5000;
-/// Shared word between the executive (broker) and the isolated storage host: `dma_paddr`
-/// in @0; verdict (u32) @8, INITRD cluster @0x10, size @0x14 out.
+/// Shared word between the executive (broker) and the isolated storage host: the AHCI's
+/// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
+/// INITRD cluster @0x10, size @0x14 out.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
+/// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
+/// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
+pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
 /// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
 /// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
@@ -2020,74 +2024,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
-    // --- P2: real block I/O, now in an ISOLATED host. The executive is the Tier-1 broker —
-    // it enables Bus Master, claims the AHCI BAR + a DMA frame, and hands ONLY those caps to
-    // an isolated storage host that drives the disk from its OWN VSpace (a fault or rogue DMA
-    // is contained there). Runs BEFORE the NIC block so VT-d translation is still OFF
-    // (identity DMA). READ ONLY.
-    if found_storage {
-        let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
-        print_str(b"[ntos-exec] P2: AHCI ABAR=");
-        print_hex(ahci_bar as u32);
-        print_str(b" dev=");
-        print_u64(storage_dev as u64);
-        print_str(b" -> isolated storage host\n");
-        // Enable Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
-        let cmd = pci_read32(pci_io, 0, storage_dev, storage_func, 0x04);
-        pci_write32(pci_io, 0, storage_dev, storage_func, 0x04, cmd | (1 << 2) | (1 << 1));
-        // Claim the ABAR as a device frame CAP (to grant a copy to the host).
-        let ahci_frame = claim_device_pages(bi, ahci_bar, AHCI_VADDR, 1);
-        check(b"exec_ahci_abar_claimed", ahci_frame != 0, &mut passed);
-        if ahci_frame != 0 {
-            // A DMA frame for the host's AHCI structures + data buffer. Not mapped in the
-            // executive — we only need its physical address (X86PageGetAddress).
-            let dma_frame = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
-            let dma_paddr = get_frame_paddr(dma_frame);
-            // A shared word: dma_paddr in, verdict + INITRD info out. Mapped in the executive
-            // (to seed dma_paddr) and a copy handed to the host.
-            let shared = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, shared);
-            let sh_exec = copy_cap(shared);
-            let _ = page_map(sh_exec, STORAGE_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-            core::ptr::write_volatile(STORAGE_SHARED_VADDR as *mut u64, dma_paddr);
-            core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, 0);
-            // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
-            // the result, yielding the CPU to it) and wait for its report.
-            let sresult = make_object(OBJ_NOTIFICATION);
-            let sresult_badged = alloc_slot();
-            let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, sresult_badged, sresult, ISR_DONE_BADGE);
-            let sfault = make_object(OBJ_ENDPOINT);
-            spawn_storage_host(
-                storage_host::storage_host_entry,
-                sresult_badged,
-                sfault,
-                100,
-                ahci_frame,
-                dma_frame,
-                shared,
-            );
-            let _ = sfault;
-            let (_z, _b, _s, _m) = ep_recv(sresult);
-            let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
-            let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
-            let size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x14) as *const u32);
-            print_str(b"[ntos-exec] isolated storage host reported verdict=0x");
-            print_hex(verdict);
-            print_str(b" INITRD cluster=");
-            print_u64(cluster as u64);
-            print_str(b" size=");
-            print_u64(size as u64);
-            print_str(b"\n");
-            // The host ran to completion in isolation and reached the disk through the
-            // granted caps only. Verdict bits: 1=MBR, 2=FAT32 BPB, 4=root dir, 8=file read.
-            check(b"exec_storage_host_reported", verdict != 0, &mut passed);
-            check(b"exec_storage_host_mbr", (verdict & 1) != 0, &mut passed);
-            check(b"exec_storage_host_fat32", (verdict & 2) != 0, &mut passed);
-            check(b"exec_storage_host_root_dir", (verdict & 4) != 0, &mut passed);
-            check(b"exec_storage_host_read_file", (verdict & 8) != 0, &mut passed);
-        }
-    }
 
     // --- P1 CAPSTONE: drive the real e1000e NIC. Map its enumerated BAR0 as a
     // device frame and read a live device register — a real driver path touching
@@ -2567,9 +2503,104 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
+    // --- P2: real block I/O in an ISOLATED host with VT-d-CONFINED DMA. The executive is the
+    // Tier-1 broker: it enables Bus Master, claims the AHCI BAR + a DMA frame, gives the AHCI
+    // its OWN VT-d IO context (the DMA frame mapped at an IOVA — the device can reach NOTHING
+    // else), and hands the isolated storage host only those caps. The host drives the disk
+    // from its own VSpace, addressing memory by IOVA. Runs AFTER the NIC block so VT-d
+    // translation is already ON (the NIC's Phase-2 turned it on); the AHCI just adds its
+    // own context. READ ONLY.
+    if found_storage {
+        let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
+        print_str(b"[ntos-exec] P2: AHCI ABAR=");
+        print_hex(ahci_bar as u32);
+        print_str(b" dev=");
+        print_u64(storage_dev as u64);
+        print_str(b" -> isolated storage host (VT-d confined)\n");
+        // Enable Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
+        let cmd = pci_read32(pci_io, 0, storage_dev, storage_func, 0x04);
+        pci_write32(pci_io, 0, storage_dev, storage_func, 0x04, cmd | (1 << 2) | (1 << 1));
+        let ahci_frame = claim_device_pages(bi, ahci_bar, AHCI_VADDR, 1);
+        check(b"exec_ahci_abar_claimed", ahci_frame != 0, &mut passed);
+        if ahci_frame != 0 {
+            // The DMA frame: AHCI command list + FIS + command table + the data buffer.
+            let dma_frame = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
+            // ---- CONFINE the AHCI's DMA via the VT-d IOMMU. Mint an IO-space cap stamped
+            // with the AHCI's PCI request-id (00:3.0 -> rid 0x18) + its own domain, build the
+            // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA frame there.
+            // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
+            let ahci_rid = ((storage_dev as u64) << 3) | (storage_func as u64);
+            let ahci_io_badge = (2u64 << 16) | ahci_rid; // domain 2 (the NIC uses domain 1)
+            let ahci_io_space = alloc_slot();
+            let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, ahci_io_space, SLOT_IO_SPACE, ahci_io_badge);
+            let mut iopt_err = 0u64;
+            for _ in 0..4 {
+                let iopt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_IO_PAGE_TABLE, PAGING_BITS, 1, iopt);
+                let e = iopt_map(iopt, ahci_io_space, AHCI_IOVA);
+                if e != 0 {
+                    iopt_err = e;
+                }
+            }
+            print_str(b"[ntos-exec] AHCI IO page-table build err=");
+            print_u64(iopt_err);
+            print_str(b"\n");
+            check(b"exec_ahci_iopt_hierarchy_built", iopt_err == 0, &mut passed);
+            let dma_frame_io = copy_cap(dma_frame);
+            let map_err = map_io(dma_frame_io, ahci_io_space, 0x3, AHCI_IOVA);
+            print_str(b"[ntos-exec] AHCI map_io err=");
+            print_u64(map_err);
+            print_str(b"\n");
+            check(b"exec_ahci_dma_frame_io_mapped", map_err == 0, &mut passed);
+            // Shared word: the AHCI's DEVICE address — now the IOVA (VT-d maps it to the
+            // frame) — in @0; verdict + INITRD info out.
+            let shared = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, shared);
+            let sh_exec = copy_cap(shared);
+            let _ = page_map(sh_exec, STORAGE_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            core::ptr::write_volatile(STORAGE_SHARED_VADDR as *mut u64, AHCI_IOVA);
+            core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, 0);
+            // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
+            // the result, yielding the CPU to it) and wait for its report.
+            let sresult = make_object(OBJ_NOTIFICATION);
+            let sresult_badged = alloc_slot();
+            let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, sresult_badged, sresult, ISR_DONE_BADGE);
+            let sfault = make_object(OBJ_ENDPOINT);
+            spawn_storage_host(
+                storage_host::storage_host_entry,
+                sresult_badged,
+                sfault,
+                100,
+                ahci_frame,
+                dma_frame,
+                shared,
+            );
+            let _ = sfault;
+            let (_z, _b, _s, _m) = ep_recv(sresult);
+            let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
+            let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
+            let size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x14) as *const u32);
+            print_str(b"[ntos-exec] isolated storage host reported verdict=0x");
+            print_hex(verdict);
+            print_str(b" INITRD cluster=");
+            print_u64(cluster as u64);
+            print_str(b" size=");
+            print_u64(size as u64);
+            print_str(b"\n");
+            // The host reached the disk through granted caps only, and EVERY AHCI DMA went
+            // through VT-d (IOVA -> frame). Verdict bits: 1=MBR, 2=FAT32, 4=root, 8=file.
+            check(b"exec_storage_host_reported", verdict != 0, &mut passed);
+            check(b"exec_storage_host_mbr", (verdict & 1) != 0, &mut passed);
+            check(b"exec_storage_host_fat32", (verdict & 2) != 0, &mut passed);
+            check(b"exec_storage_host_root_dir", (verdict & 4) != 0, &mut passed);
+            check(b"exec_storage_host_confined_read_file", (verdict & 8) != 0, &mut passed);
+        }
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/57 executive->isolated-service checks passed]\n");
+    print_str(b"/59 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
