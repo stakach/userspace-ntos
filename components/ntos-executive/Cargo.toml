@@ -38,6 +38,8 @@ nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Registry hive model + image codec — the Config Manager decodes a real hive read off the FS.
 nt-hive-core = { path = "../../crates/nt-hive-core" }
+# Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls.
+nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
 # KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }

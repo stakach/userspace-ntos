@@ -38,6 +38,7 @@ use nt_config_abi::CmReply;
 use nt_config_client::ConfigClient;
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
+use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
 use nt_syscall::{NativeService, NativeServiceTable, UserlandAbiProfile};
@@ -220,6 +221,11 @@ const SSN_OB_CREATE_DIR: u64 = 0x0100; // arg1 = directory index → \Device\Sys
 const SSN_OB_LOOKUP_DIR: u64 = 0x0101; // arg1 = directory index
 const SSN_OB_CREATE_BYNAME: u64 = 0x0102; // arg1 = *OBJECT_ATTRIBUTES (a user-supplied path)
 const SSN_OB_LOOKUP_BYNAME: u64 = 0x0103; // arg1 = *OBJECT_ATTRIBUTES
+// P3 sync objects (custom SSNs; real KEVENT semantics via nt-kernel-exec EventStore).
+const SSN_CREATE_EVENT: u64 = 0x0200; // arg1 = kind (0=Notification, 1=Synchronization), arg2 = initial
+const SSN_SET_EVENT: u64 = 0x0201; // arg1 = event handle → previous state in RAX
+const SSN_RESET_EVENT: u64 = 0x0202; // arg1 = event handle → previous state in RAX
+const SSN_WAIT: u64 = 0x0203; // arg1 = handle → 0 (WAIT_OBJECT_0) or 0x102 (WAIT_TIMEOUT)
 const SSN_DONE: u64 = 0x01FF; // arg1 = verdict (1 = all passed)
 
 /// The fixed registry key the syscall front-end reads/writes for the Cm route.
@@ -753,6 +759,27 @@ pub unsafe extern "C" fn user_entry() -> ! {
     core::ptr::write_volatile((SYSARG_VADDR + 0x410) as *mut u64, t1);
     core::ptr::write_volatile((SYSARG_VADDR + 0x418) as *mut u64, t2);
 
+    // P3 sync objects: a Synchronization (auto-reset) event — wait times out, a set satisfies
+    // one wait, and the auto-reset then re-arms it (the next wait times out again).
+    let ev = native_syscall2(SSN_CREATE_EVENT, 1, 0);
+    let w1 = native_syscall(SSN_WAIT, ev); // not signaled → TIMEOUT (0x102)
+    let _ = native_syscall(SSN_SET_EVENT, ev);
+    let w2 = native_syscall(SSN_WAIT, ev); // signaled → OBJECT_0 (0), auto-reset consumes it
+    let w3 = native_syscall(SSN_WAIT, ev); // consumed → TIMEOUT (0x102)
+    // A Notification (manual-reset) event — a set stays signaled across waits until reset.
+    let ev2 = native_syscall2(SSN_CREATE_EVENT, 0, 0);
+    let _ = native_syscall(SSN_SET_EVENT, ev2);
+    let m1 = native_syscall(SSN_WAIT, ev2); // OBJECT_0
+    let m2 = native_syscall(SSN_WAIT, ev2); // still OBJECT_0 (manual-reset)
+    let _ = native_syscall(SSN_RESET_EVENT, ev2);
+    let m3 = native_syscall(SSN_WAIT, ev2); // TIMEOUT
+    core::ptr::write_volatile((SYSARG_VADDR + 0x420) as *mut u64, w1);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x428) as *mut u64, w2);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x430) as *mut u64, w3);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x438) as *mut u64, m1);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x440) as *mut u64, m2);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x448) as *mut u64, m3);
+
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
@@ -764,7 +791,13 @@ pub unsafe extern "C" fn user_entry() -> ! {
         && vm != 0
         && readback
         && t1 != 0
-        && t2 >= t1;
+        && t2 >= t1
+        && w1 == 0x102
+        && w2 == 0
+        && w3 == 0x102
+        && m1 == 0
+        && m2 == 0
+        && m3 == 0x102;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -1138,6 +1171,11 @@ where
     );
 
     let mut created: [Option<ObjectId>; 2] = [None, None];
+    // P3 sync objects: the real KEVENT state machine, plus a passive-level IRQL (waits are
+    // allowed) and a bump handle allocator.
+    let mut events = EventStore::new();
+    let irql = IrqlState::new();
+    let mut next_ev = 0x1000u64;
     let mut serviced = 0u64;
     let mut verdict = 0u64;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
@@ -1224,6 +1262,25 @@ where
                 SSN_OB_LOOKUP_BYNAME => match copyin_object_attributes(arg1).as_ref().and_then(oa_path) {
                     Some(path) if client.lookup(&path, true).is_ok() => 1,
                     _ => 0,
+                },
+                // P3 synchronization objects — real KEVENT semantics via the EventStore.
+                SSN_CREATE_EVENT => {
+                    let kind = if arg1 == 1 {
+                        EventKind::Synchronization // auto-reset
+                    } else {
+                        EventKind::Notification // manual-reset
+                    };
+                    let h = next_ev;
+                    next_ev += 8;
+                    events.initialize(h, kind, arg2 != 0);
+                    h
+                }
+                SSN_SET_EVENT => events.set(arg1) as u64, // returns previous state
+                SSN_RESET_EVENT => events.reset(arg1) as u64,
+                SSN_WAIT => match events.poll(arg1, &irql) {
+                    WaitResult::Signaled => 0,      // WAIT_OBJECT_0
+                    WaitResult::TimedOut => 0x102,  // STATUS_TIMEOUT / WAIT_TIMEOUT
+                    WaitResult::BadIrql => 0xC000_0001, // STATUS_UNSUCCESSFUL
                 },
                 _ => 0,
             }
@@ -1976,6 +2033,38 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     );
     check(b"exec_nt_alloc_vm_readback", vm_readback == 1, &mut passed);
     check(b"exec_nt_query_time_monotonic", ut1 != 0 && ut2 >= ut1, &mut passed);
+
+    // P3 sync objects: the user thread exercised a Synchronization (auto-reset) + a
+    // Notification (manual-reset) event through NtWaitForSingleObject.
+    let ew1 = core::ptr::read_volatile((SYSARG_VADDR + 0x420) as *const u64);
+    let ew2 = core::ptr::read_volatile((SYSARG_VADDR + 0x428) as *const u64);
+    let ew3 = core::ptr::read_volatile((SYSARG_VADDR + 0x430) as *const u64);
+    let em1 = core::ptr::read_volatile((SYSARG_VADDR + 0x438) as *const u64);
+    let em2 = core::ptr::read_volatile((SYSARG_VADDR + 0x440) as *const u64);
+    let em3 = core::ptr::read_volatile((SYSARG_VADDR + 0x448) as *const u64);
+    print_str(b"[ntos-exec] user event waits: sync[");
+    print_u64(ew1);
+    print_str(b",");
+    print_u64(ew2);
+    print_str(b",");
+    print_u64(ew3);
+    print_str(b"] manual[");
+    print_u64(em1);
+    print_str(b",");
+    print_u64(em2);
+    print_str(b",");
+    print_u64(em3);
+    print_str(b"] (0=OBJECT_0, 258=TIMEOUT)\n");
+    check(
+        b"exec_nt_event_sync_autoreset",
+        ew1 == 0x102 && ew2 == 0 && ew3 == 0x102,
+        &mut passed,
+    );
+    check(
+        b"exec_nt_event_manual_reset",
+        em1 == 0 && em2 == 0 && em3 == 0x102,
+        &mut passed,
+    );
 
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
@@ -2764,7 +2853,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/65 executive->isolated-service checks passed]\n");
+    print_str(b"/67 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
