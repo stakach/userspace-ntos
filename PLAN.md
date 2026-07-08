@@ -331,7 +331,7 @@ findings). A step is not "done" until the plan reflects it.
 - **Status:** `P0 functionally complete` (broker migration deferred) · **`P1
   COMPLETE`** (real MMIO + IRQ/MSI + DMA incl. VT-d-confined + port I/O; **real WDM
   AND KMDF `.sys` drivers hosted in isolated components, reaching the real e1000e**) ·
-  **`P2 next`** (storage → FS → registry) · `P3 not started` · `P4–P7 stub`.
+  **`P2 COMPLETE`** (storage → FS → registry: AHCI block I/O, FAT32, isolated+VT-d-confined host, hive read) · `P3 not started` · `P4–P7 stub`.
   (Foundational crates for all phases largely exist; phases are about making them
   *real + composed + booted*.)
 - **Network drivers (NDIS miniport / NetAdapterCx): DEFERRED — not on the critical
