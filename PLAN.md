@@ -207,9 +207,12 @@ own E2E test. Phases can overlap; the critical path is P0→P1→P2→P3.
   over SURT, with the native front‑end routing a handful of `Nt*` calls.
 
 - **P1 — Real hardware (HAL/IRQ/DMA/timer/port)** → [`plans/P1-hardware-hal.md`]
-  Replace simulation with real MMIO frame caps, IRQ handler caps, LAPIC clock,
-  IO‑port caps, real DMA. *Exit:* a real KMDF/WDM driver in an isolated host
-  toggles a real QEMU device's MMIO and takes a real interrupt end‑to‑end.
+  **✅ COMPLETE.** Real MMIO frame caps, IRQ handler caps (MSI → isolated host),
+  LAPIC clock, IO‑port caps, real DMA (identity **and** VT-d-confined). Exit met and
+  exceeded: real **WDM** *and* **KMDF** `.sys` drivers run in isolated hosts and reach
+  the real e1000e — WDM via the PnP START path (MMIO + confined DMA), KMDF via the full
+  WDF lifecycle + `EvtDevicePrepareHardware` reading a real NIC register. Kernel bugs
+  fixed at source along the way: LAPIC EOI, IOAPIC GSI-base, lazy VT-d TE.
 
 - **P2 — Storage + filesystem + real registry** → [`plans/P2-storage-fs-registry.md`]
   Boot‑time disk → storage driver (isolated) → partition/volume → real FS →
@@ -325,9 +328,19 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
 priorities, changelog) **and** its phase sub‑plan (check off tasks, record
 findings). A step is not "done" until the plan reflects it.
 
-- **Status:** `P0 functionally complete` (broker migration deferred) · `P1 in progress` (real MMIO) · `P2 not started` · `P3 not started` · `P4–P7 stub`. (Foundational
-  crates for all phases largely exist; phases are about making them *real + composed
-  + booted*.)
+- **Status:** `P0 functionally complete` (broker migration deferred) · **`P1
+  COMPLETE`** (real MMIO + IRQ/MSI + DMA incl. VT-d-confined + port I/O; **real WDM
+  AND KMDF `.sys` drivers hosted in isolated components, reaching the real e1000e**) ·
+  **`P2 next`** (storage → FS → registry) · `P3 not started` · `P4–P7 stub`.
+  (Foundational crates for all phases largely exist; phases are about making them
+  *real + composed + booted*.)
+- **Network drivers (NDIS miniport / NetAdapterCx): DEFERRED — not on the critical
+  path.** Stock/ReactOS NIC drivers are **NDIS** (e.g. the Intel PRO/1000 e1e6232e.sys
+  is NDIS 6.2); hosting them needs a full NDIS runtime (~53 ndis.sys functions + the
+  MiniportInitializeEx/NetBufferList lifecycle) — a large, network-specific project.
+  **NetAdapterCx** is the modern path and would build on our working KMDF runtime as a
+  WDF class extension, but far fewer stock drivers use it. Revisit when networking is a
+  goal; the driver-hosting *capability* (WDM + KMDF, on real hardware) is already proven.
 - **How to update:** edit the gap table (§5) priorities as reality shifts; move a
   phase's status; append to the changelog below with date + commit.
 
@@ -515,3 +528,11 @@ findings). A step is not "done" until the plan reflects it.
   the accept-vs-reject difference proves it read a real register through WDF. Verified: the
   CTRL matches the executive's direct read. A real KMDF driver reaching real hardware,
   isolated.
+- **2026-07-08** — **P1 COMPLETE → P2 next.** The full P1 vertical is done: real MMIO,
+  IRQ/MSI, DMA (identity + VT-d-confined), port I/O, plus real WDM AND KMDF `.sys` drivers
+  hosted in isolated components reaching the real e1000e (executive microtest 51/51).
+  Decision: **NDIS miniport / NetAdapterCx DEFERRED** (large network-specific runtimes, off
+  the critical path — see the Status note). **Next: P2 — Storage.** Item 6 (a storage driver
+  in an isolated host over the QEMU AHCI controller we already enumerate: `storage
+  controller ABAR(BAR5)`) is the natural next step — it reuses the proven driver-hosting +
+  real-hardware machinery and starts the disk → volume → FS → registry chain.
