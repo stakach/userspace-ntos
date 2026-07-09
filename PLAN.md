@@ -625,3 +625,12 @@ findings). A step is not "done" until the plan reflects it.
   then GS->TEB->PEB->ImageBase. Check: exec_pe_imports_resolved. Fix: env/ntdll scratch must
   sit past the PE image pages (collision zeroed the TEB). Next P3: load a larger/real PE
   (real ntdll + smss.exe) toward the P3 exit.
+- **2026-07-09** — **P3 sections — NtCreateSection + NtMapViewOfSection (exec 4c1e90d). 77/77.**
+  The load vehicle for images/DLLs (how smss maps ntdll/csrss). A user thread creates a section
+  + maps it as TWO views (0x501000, 0x502000), writes view1 + reads view2 back the same value —
+  the views alias the same backing frame (real section semantics). Checks: exec_nt_section_views
+  / _aliased. Direction (user-chosen): build the load-vehicle machinery with synthetic PEs first
+  (NtCreateSection/MapView, then NtCreateThreadEx), then plug in real ReactOS ntdll/smss binaries
+  (fetch/extract at build, fresh-clone-safe). NOTE: real SSNs come FROM a real ntdll (no
+  hardcoded Win7 table); nt-user-host already runs real ntdll host-side. Next: NtCreateThreadEx;
+  then file-backed SEC_IMAGE + demand paging; then load a real ReactOS binary via sections.
