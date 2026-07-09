@@ -228,6 +228,7 @@ const NT_ALLOCATE_VM: u64 = 0x15; // NtAllocateVirtualMemory(size in R10) → ba
 const NT_QUERY_SYSTEM_TIME: u64 = 0x57; // NtQuerySystemTime() → HPET counter in RAX
 const NT_CREATE_SECTION: u64 = 0x47; // NtCreateSection(size in R10) → section handle in RAX
 const NT_MAP_VIEW: u64 = 0x25; // NtMapViewOfSection(section handle in R10) → view base VA in RAX
+const NT_CREATE_THREAD: u64 = 0xA5; // NtCreateThreadEx(start routine in R10) → thread handle in RAX
 /// Where the executive backs NtAllocateVirtualMemory for the user thread — inside its
 /// existing 2 MiB image PT (image ends ~0x41_0000, stack at 0x5C_0000), so mapping needs no
 /// new page table.
@@ -753,6 +754,15 @@ unsafe fn write_object_attributes(name: &[u8]) -> u64 {
     oa_v
 }
 
+/// A second thread the user process creates via NtCreateThreadEx. It runs in the PARENT's
+/// VSpace (sharing its mappings), writes a marker the parent observes, then yields forever.
+pub unsafe extern "C" fn thread2_entry() -> ! {
+    core::ptr::write_volatile((SYSARG_VADDR + 0x468) as *mut u64, 0x7EAD2);
+    loop {
+        yield_now();
+    }
+}
+
 pub unsafe extern "C" fn user_entry() -> ! {
     // Object Manager route (scalar args — fixed paths by index).
     let r0 = native_syscall(SSN_OB_CREATE_DIR, 0);
@@ -826,6 +836,21 @@ pub unsafe extern "C" fn user_entry() -> ! {
     core::ptr::write_volatile((SYSARG_VADDR + 0x458) as *mut u64, sv2);
     core::ptr::write_volatile((SYSARG_VADDR + 0x460) as *mut u64, sec_alias as u64);
 
+    // P3 NtCreateThreadEx: create a SECOND thread in this process; it runs concurrently in our
+    // VSpace and writes a marker we then observe (proving a real independent thread).
+    core::ptr::write_volatile((SYSARG_VADDR + 0x468) as *mut u64, 0);
+    let th = native_syscall(NT_CREATE_THREAD, thread2_entry as u64);
+    let mut tmarker = 0u64;
+    for _ in 0..2_000_000u64 {
+        tmarker = core::ptr::read_volatile((SYSARG_VADDR + 0x468) as *const u64);
+        if tmarker != 0 {
+            break;
+        }
+        yield_now();
+    }
+    core::ptr::write_volatile((SYSARG_VADDR + 0x470) as *mut u64, th);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x478) as *mut u64, tmarker);
+
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
@@ -846,7 +871,9 @@ pub unsafe extern "C" fn user_entry() -> ! {
         && m3 == 0x102
         && sv1 != 0
         && sv2 != 0
-        && sec_alias;
+        && sec_alias
+        && th != 0
+        && tmarker == 0x7EAD2;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -1150,6 +1177,35 @@ unsafe fn spawn_user_thread(
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4 // the executive keeps this cap to map on-demand NtAllocateVirtualMemory frames
+}
+
+/// Create a NEW thread in an EXISTING VSpace `pml4` (NtCreateThreadEx): a fresh stack + IPC
+/// buffer + CNode (fault ep) at bumped user vaddrs, starting at `entry`. The thread shares the
+/// caller's address space (so it sees the caller's mappings). Returns the TCB cap.
+unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
+    let stack_base = NEXT_USER_VADDR.fetch_add(0x4000, Ordering::Relaxed);
+    for i in 0..4u64 {
+        let _ = page_map(alloc_frame(), stack_base + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf_va = NEXT_USER_VADDR.fetch_add(0x1000, Ordering::Relaxed);
+    let ipcbuf = alloc_frame();
+    let _ = page_map(ipcbuf, ipcbuf_va, RW_NX, pml4);
+    let fault_ep = make_object(OBJ_ENDPOINT);
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(fault_ep), 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
+    let _ = tcb_write_registers(tcb, entry, stack_base + 0x4000 - 16, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    tcb
 }
 
 /// Spawn the isolated ISR "driver host" (P1): its own VSpace (image RO + stack + IPC
@@ -1469,6 +1525,7 @@ where
             (NativeService::NtQuerySystemTime, NT_QUERY_SYSTEM_TIME as u32),
             (NativeService::NtCreateSection, NT_CREATE_SECTION as u32),
             (NativeService::NtMapViewOfSection, NT_MAP_VIEW as u32),
+            (NativeService::NtCreateThreadEx, NT_CREATE_THREAD as u32),
         ],
     );
 
@@ -1563,6 +1620,12 @@ where
                     } else {
                         0
                     }
+                }
+                // Create a new thread in the CALLER's VSpace at start routine `arg1` (the way
+                // RtlCreateUserProcess/smss launch a process's main thread). Returns a handle.
+                NativeService::NtCreateThreadEx => {
+                    let _tcb = spawn_thread_in(user_pml4, arg1);
+                    1 // handle
                 }
                 _ => 0,
             }
@@ -2488,6 +2551,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     );
     check(b"exec_nt_section_aliased", sec_alias == 1, &mut passed);
 
+    // --- P3 NtCreateThreadEx: the user process created a SECOND thread in its own VSpace; that
+    // thread ran concurrently and wrote its marker (proving a real independent thread — the way
+    // a process launches its main thread / smss launches csrss).
+    let th = core::ptr::read_volatile((SYSARG_VADDR + 0x470) as *const u64);
+    let t2 = core::ptr::read_volatile((SYSARG_VADDR + 0x478) as *const u64);
+    print_str(b"[ntos-exec] NtCreateThreadEx handle=");
+    print_u64(th);
+    print_str(b" second-thread marker=0x");
+    print_hex(t2 as u32);
+    print_str(b"\n");
+    check(b"exec_nt_create_thread", th != 0, &mut passed);
+    check(b"exec_nt_second_thread_ran", t2 == 0x7EAD2, &mut passed);
+
     // --- P3 blocking wait dispatcher: a WAITER thread PARKS on an event until a separate
     // SIGNALER thread wakes it — a real cross-thread block, not a poll. The waiter (prio 150)
     // runs + parks first; the signaler (100) publishes a handoff marker then sets+wakes the
@@ -3370,7 +3446,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/77 executive->isolated-service checks passed]\n");
+    print_str(b"/79 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
