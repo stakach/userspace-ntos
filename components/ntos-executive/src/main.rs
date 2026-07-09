@@ -1468,10 +1468,11 @@ unsafe fn service_sec_image(
     let mut ntfaults = 0u64;
     let mut stop_ssn = 0u64;
     let mut iters = 0u64;
+    let mut dbgsvc = 0u64;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
-        if iters > 4000 {
+        if iters > 3000 {
             stop = m1;
             break;
         }
@@ -1494,6 +1495,7 @@ unsafe fn service_sec_image(
                         m2 = nm2;
                         m3 = nm3;
                         skipped = true;
+                        dbgsvc += 1;
                     }
                 }
             }
@@ -1612,6 +1614,23 @@ unsafe fn service_sec_image(
         stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
         break;
     }
+    print_str(b"[sec-stop] label=");
+    print_u64(mi >> 12);
+    print_str(b" m0=0x");
+    print_hex((m0 >> 32) as u32);
+    print_hex(m0 as u32);
+    print_str(b" m1=0x");
+    print_hex((m1 >> 32) as u32);
+    print_hex(m1 as u32);
+    print_str(b" exc#=");
+    print_u64(m3);
+    print_str(b" code=0x");
+    print_hex(get_recv_mr(4) as u32);
+    print_str(b" iters=");
+    print_u64(iters);
+    print_str(b" dbgsvc=");
+    print_u64(dbgsvc);
+    print_str(b"\n");
     (verdict, faults, first, stop, ntfaults, stop_ssn)
 }
 
