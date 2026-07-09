@@ -120,6 +120,11 @@ pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_005F_5000;
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
 /// INITRD cluster @0x10, size @0x14 out.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
+/// A multi-frame file buffer shared between the executive and the storage host: the host reads
+/// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
+/// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
+pub const FILEBUF_VADDR: u64 = 0x0000_0100_0060_0000; // its own PT (0x40-0x60 is crowded)
+pub const FILEBUF_FRAMES: u64 = 32;
 /// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
@@ -1593,6 +1598,7 @@ unsafe fn spawn_storage_host(
     ahci_bar_frame: u64,
     dma_frame: u64,
     shared_frame: u64,
+    filebuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -1630,6 +1636,16 @@ unsafe fn spawn_storage_host(
     let _ = page_map(dma_cp, AHCI_DMA_VADDR, RW_NX, pml4);
     let sh_cp = copy_cap(shared_frame);
     let _ = page_map(sh_cp, STORAGE_SHARED_VADDR, RW_NX, pml4);
+    // The shared file buffer (a run of FILEBUF_FRAMES consecutive frame caps), mapped
+    // contiguously so the host can read a whole PE off disk into it for the executive to parse.
+    // FILEBUF_VADDR is a fresh 2 MiB region in the host's VSpace too — give it its own PT.
+    let fb_pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, fb_pt);
+    let _ = paging_struct_map(fb_pt, LBL_X86_PAGE_TABLE_MAP, FILEBUF_VADDR, pml4);
+    for i in 0..FILEBUF_FRAMES {
+        let fb_cp = copy_cap(filebuf_start + i);
+        let _ = page_map(fb_cp, FILEBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -2327,7 +2343,8 @@ unsafe fn storage_probe(
     dma_vaddr: u64,
     dma_paddr: u64,
     hive_dest: u64,
-) -> (u32, u32, u32, u32) {
+    smss_dest: u64,
+) -> (u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
@@ -2368,7 +2385,7 @@ unsafe fn storage_probe(
     print_str(b" spf=");
     print_u64(spf32 as u64);
     print_str(b"\n");
-    let (mut cluster, mut size, mut hive_size) = (0u32, 0u32, 0u32);
+    let (mut cluster, mut size, mut hive_size, mut smss_size) = (0u32, 0u32, 0u32, 0u32);
     if bps == 512 && spc >= 1 && is_fat32 {
         verdict |= 2;
         let fs = Fat32 {
@@ -2449,8 +2466,26 @@ unsafe fn storage_probe(
                 verdict |= 0x10;
             }
         }
+        // Read the real ReactOS SMSS.EXE off the root into `smss_dest` (up to the file buffer's
+        // capacity) — a real x64 PE for the executive to load via SEC_IMAGE.
+        if let Some((smss_cl, ssize, _)) = dir_find(&fs, fs.root_cl, b"SMSS    EXE") {
+            let cap = (FILEBUF_FRAMES * 0x1000) as u32;
+            let want = if ssize < cap { ssize } else { cap };
+            let got = fat_read_file(&fs, smss_cl, want, smss_dest);
+            print_str(b"[storage-host] SMSS.EXE cluster=");
+            print_u64(smss_cl as u64);
+            print_str(b" size=");
+            print_u64(ssize as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && ssize > 0 {
+                smss_size = ssize;
+                verdict |= 0x20;
+            }
+        }
     }
-    (verdict, cluster, size, hive_size)
+    (verdict, cluster, size, hive_size, smss_size)
 }
 
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
@@ -3641,6 +3676,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let _ = page_map(sh_exec, STORAGE_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             core::ptr::write_volatile(STORAGE_SHARED_VADDR as *mut u64, AHCI_IOVA);
             core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, 0);
+            // The shared file buffer: FILEBUF_FRAMES consecutive frames, mapped contiguously in
+            // the executive (to parse the PE) and in the host (to read it off disk into).
+            // FILEBUF_VADDR is a fresh 2 MiB region — give it its own page table.
+            let fb_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, fb_pt);
+            let _ = paging_struct_map(fb_pt, LBL_X86_PAGE_TABLE_MAP, FILEBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+            let fb_start = alloc_frame();
+            for _ in 1..FILEBUF_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..FILEBUF_FRAMES {
+                let _ = page_map(copy_cap(fb_start + i), FILEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -3655,6 +3703,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 ahci_frame,
                 dma_frame,
                 shared,
+                fb_start,
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
@@ -3746,9 +3795,69 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
+    // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
+    // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
+    // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
+    // Windows-family binary flowing through the machinery we built.
+    let smss_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x20) as *const u32);
+    if found_storage && smss_size > 0 {
+        let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
+        match nt_pe_loader::PeFile::parse(smss) {
+            Ok(pe) => {
+                let nsec = pe.sections().len();
+                let entry = pe.entry_point_rva();
+                let mut imports_ntdll = false;
+                if let Ok(imps) = pe.imports() {
+                    for dll in &imps {
+                        if dll.name.eq_ignore_ascii_case("ntdll.dll") {
+                            imports_ntdll = true;
+                        }
+                    }
+                }
+                // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
+                // translation and compare to the file's .text raw bytes. Match => our loader
+                // maps a real 6-section x64 binary correctly.
+                let scratch = STORAGE_SHARED_VADDR + 0x5000;
+                let _ = page_map(alloc_frame(), scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let _ = fill_image_page(&pe, 0x1000, scratch);
+                let mut fill_ok = false;
+                if let Some(t) = pe.sections().iter().find(|s| s.virtual_address == 0x1000) {
+                    let raw = t.pointer_to_raw_data as u64;
+                    fill_ok = true;
+                    for j in 0..64u64 {
+                        let a = core::ptr::read_volatile((scratch + j) as *const u8);
+                        let b = core::ptr::read_volatile((FILEBUF_VADDR + raw + j) as *const u8);
+                        if a != b {
+                            fill_ok = false;
+                            break;
+                        }
+                    }
+                }
+                print_str(b"[ntos-exec] REAL ReactOS smss.exe loaded: PE32+ x64, sections=");
+                print_u64(nsec as u64);
+                print_str(b" entry=0x");
+                print_hex(entry);
+                print_str(b" imports_ntdll=");
+                print_u64(imports_ntdll as u64);
+                print_str(b" sec_image_fill_ok=");
+                print_u64(fill_ok as u64);
+                print_str(b"\n");
+                check(b"exec_reactos_smss_parsed", nsec == 6 && entry == 0x12ee0, &mut passed);
+                check(b"exec_reactos_smss_imports_ntdll", imports_ntdll, &mut passed);
+                check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
+            }
+            Err(_) => {
+                print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
+                check(b"exec_reactos_smss_parsed", false, &mut passed);
+                check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
+                check(b"exec_reactos_sec_image_fill", false, &mut passed);
+            }
+        }
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/84 executive->isolated-service checks passed]\n");
+    print_str(b"/87 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
