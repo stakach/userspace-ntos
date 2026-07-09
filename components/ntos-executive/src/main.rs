@@ -114,6 +114,16 @@ pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
 pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
+/// ntdll's NtQueryVirtualMemory SSN (LdrpInitialize queries the region at [TEB+0x10] early).
+pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
+/// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
+pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
+/// ntdll's NtOpenKey SSN (LdrpInitialize opens IFEO/options; we have no registry → not-found).
+pub const SSN_NT_OPEN_KEY: u64 = 125;
+/// ntdll's NtQueryValueKey SSN (registry value lookups; not-found → LdrpInitialize uses defaults).
+pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
+/// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
+pub const SSN_NT_PROTECT_VM: u64 = 143;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1281,14 +1291,19 @@ unsafe fn spawn_sec_image(
         // TEB: self @0x30, PEB @0x60.
         let teb = alloc_frame();
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
-        core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA);
-        core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
+        core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA); // NtTib.Self
+        core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA); // ProcessEnvironmentBlock
+        // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
+        // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
+        core::ptr::write_volatile((scr + 0x08) as *mut u64, STACK_BASE + STACK_FRAMES * 0x1000);
+        core::ptr::write_volatile((scr + 0x10) as *mut u64, STACK_BASE);
         let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
         // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second (zeroed) page.
         let _ = page_map(alloc_frame(), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile((scr + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
         // Heap process-list array (what LdrpInitializeProcess sets up before the first
         // RtlCreateHeap). Without it RtlpAddHeapToProcessList (heapuser.c:38) hits
@@ -1304,42 +1319,43 @@ unsafe fn spawn_sec_image(
         // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
         let params = alloc_frame();
         let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
-        // Trampoline: call ntdll's real RtlCreateHeap(HEAP_GROWABLE, 0, 0x10000, 0x10000, 0, 0)
-        // — its NtQuerySystemInformation + NtAllocateVirtualMemory syscalls are serviced by the
-        // executive — store the returned heap into PEB->ProcessHeap, then report the heap handle
-        // via SSN_DONE. This BOUNDS the demo to the proven milestone: real ReactOS ntdll runs the
-        // full RtlCreateHeap (crossing the heap boundary) and returns a non-null heap handle.
-        // NEXT FRONTIER: jumping to smss's real entry (RCX=PEB) runs on, but ntdll+0x63ff1 then
-        // spins walking a heap free-list off corrupt pointers (our stub NtAllocateVirtualMemory
-        // doesn't yet model the segment/UCR bookkeeping the allocator expects) — servicing that
-        // faithfully + smss's Nt* cascade (NtOpenKey/NtCreateEvent/NtCreatePort/LPC) is the next
-        // step. Reporting here keeps the executive suite terminating (a real-entry jump spins
-        // forever with no fault/syscall, so the service loop's recv never wakes).
+        // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
+        // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
+        // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
+        let kpdpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, kpdpt);
+        let kpd = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, kpd);
+        let kpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, kpt);
+        let _ = paging_struct_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
+        let _ = paging_struct_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
+        let _ = paging_struct_map(kpt, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
+        let _ = page_map(alloc_frame(), KUSER_VA, RW_NX, pml4);
+        // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
+        // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
+        // TEB/PEB/KUSER, NtQueryVirtualMemory, creates the process heap (RtlCreateHeap itself),
+        // builds the loader module list, then NtContinue's to the image entry. RCX = a CONTEXT
+        // record (which LdrpInitialize eventually resumes to reach smss's entry). We point it at a
+        // zeroed slot in the PEB page tail for now; the Nt* cascade LdrpInitialize issues is
+        // serviced by the executive (NtQueryVirtualMemory added; more to come). The entry runs
+        // with RSP 16-aligned, so `call` gives LdrpInitialize a correctly-aligned frame.
+        let _ = pe.entry_point_rva();
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
         let mut tb = alloc::vec::Vec::new();
-        // sub 0x40 (not 0x38) keeps RSP 16-aligned before the call — the x64 ABI requires it,
-        // and RtlCaptureContext's `movaps` into a stack CONTEXT #GPs on a misaligned frame.
-        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 0x40
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0  Lock
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0  Parameters
-        tb.extend_from_slice(&[0xB9, 0x02, 0, 0, 0]); // mov ecx, 2  Flags=HEAP_GROWABLE
-        tb.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  HeapBase=0
-        tb.extend_from_slice(&[0x41, 0xB8, 0x00, 0x00, 0x01, 0x00]); // mov r8d, 0x10000  ReserveSize
-        tb.extend_from_slice(&[0x41, 0xB9, 0x00, 0x00, 0x01, 0x00]); // mov r9d, 0x10000  CommitSize
-        tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(NTDLL_BASE + 0x183f0).to_le_bytes()); // movabs rax, RtlCreateHeap
-        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 0x40
+        // Reserve 0x20 shadow space so LdrpInitialize's register-arg spills ([rsp+0x8..0x20]) land
+        // WITHIN the stack, not above its top. RSP starts 16-aligned; sub 0x20 keeps it aligned so
+        // the `call` gives LdrpInitialize the ABI-correct (rsp ≡ 8 mod 16) frame.
+        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
         tb.extend_from_slice(&[0x48, 0xB9]);
-        tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
-        tb.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]); // mov [rcx+0x30], rax  PEB->ProcessHeap
-        // Report the heap handle (rax) as the SSN_DONE verdict — proves RtlCreateHeap returned.
-        let _ = pe.entry_point_rva(); // (real-entry jump is the next frontier — see comment above)
-        tb.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax  (arg1 = heap handle)
-        tb.extend_from_slice(&[0xB8, 0xFF, 0x01, 0x00, 0x00]); // mov eax, 0x1FF (SSN_DONE)
-        tb.extend_from_slice(&[0x0F, 0x05]); // syscall
-        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $ (park)
+        tb.extend_from_slice(&(SMSS_PEB_VA + 0x900).to_le_bytes()); // movabs rcx, Context (placeholder)
+        tb.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (SystemArgument1)
+        tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
+        tb.extend_from_slice(&[0x48, 0xB8]);
+        tb.extend_from_slice(&(NTDLL_BASE + 0x8e70).to_le_bytes()); // movabs rax, LdrpInitialize
+        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $ (LdrpInitialize should NtContinue, not return)
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -1611,6 +1627,49 @@ unsafe fn service_sec_image(
                     smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
                     smss_stack_write(retlen_ptr, 0x40);
                 }
+            } else if m0 == SSN_NT_QUERY_VIRTUAL_MEM {
+                // NtQueryVirtualMemory(Process, BaseAddress, Class, Buffer, Len, *RetLen).
+                // LdrpInitialize queries MemoryBasicInformation (class 0) for [TEB+0x10]. Return a
+                // plausible committed private region (buffer is a stack local → stack mirror).
+                let base = m3; // RDX = BaseAddress
+                let buf = get_recv_mr(8); // R9 = MemoryInformation buffer
+                let retlen_ptr = smss_stack_read(sp + 0x30); // arg6 = *ReturnLength (stack slot)
+                smss_stack_write(buf + 0x00, base & !0xFFFu64); // BaseAddress
+                smss_stack_write(buf + 0x08, base & !0xFFFFu64); // AllocationBase
+                smss_stack_write(buf + 0x10, 0x04); // AllocationProtect = PAGE_READWRITE
+                smss_stack_write(buf + 0x18, 0x10000); // RegionSize
+                smss_stack_write(buf + 0x20, 0x1000 | (0x04u64 << 32)); // State=MEM_COMMIT, Protect=RW
+                smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
+                if retlen_ptr != 0 {
+                    smss_stack_write(retlen_ptr, 0x30);
+                }
+            } else if m0 == SSN_NT_QUERY_INFO_PROCESS {
+                // NtQueryInformationProcess(Handle, Class, Buffer, Len, *RetLen). Class in RDX.
+                let class = m3; // ProcessInformationClass
+                let buf = get_recv_mr(7); // R8 = ProcessInformation buffer (a stack local)
+                if class == 36 {
+                    // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
+                    // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
+                    smss_stack_write(buf, 0x1a2b_3c4d);
+                } else {
+                    handled = false;
+                    result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
+                }
+            } else if m0 == SSN_NT_OPEN_KEY {
+                // NtOpenKey(KeyHandle, Access, ObjectAttributes). No registry for the process →
+                // STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize skips IFEO/GlobalFlag/options.
+                result = 0xC0000034;
+            } else if m0 == SSN_NT_QUERY_VALUE_KEY {
+                // NtQueryValueKey — no registry → value not found; LdrpInitialize uses defaults.
+                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+            } else if m0 == SSN_NT_PROTECT_VM {
+                // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
+                // model per-page protection changes yet — report success and hand back a plausible
+                // previous protection so LdrpInitialize's protect/restore pairs proceed.
+                let oldprot_ptr = smss_stack_read(sp + 0x28); // arg5 = *OldAccessProtection
+                if oldprot_ptr != 0 {
+                    smss_stack_write(oldprot_ptr, 0x04); // PAGE_READWRITE
+                }
             } else {
                 handled = false;
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
@@ -1649,6 +1708,8 @@ unsafe fn service_sec_image(
     print_u64(iters);
     print_str(b" dbgsvc=");
     print_u64(dbgsvc);
+    print_str(b" stop_ssn=");
+    print_u64(stop_ssn);
     print_str(b"\n");
     (verdict, faults, first, stop, ntfaults, stop_ssn)
 }
@@ -4343,42 +4404,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(heap_verdict as u32);
                     print_str(b"\n");
                     let _ = (sfirst, sssn, heap_verdict);
-                    // Real ntdll RtlCreateHeap ran deep enough to issue BOTH its heap-backing
-                    // syscalls — NtAllocateVirtualMemory RESERVE then COMMIT — which the executive
-                    // serviced (allocating + committing real frames). Two serviced allocs prove the
-                    // heap got real reserved+committed memory from an isolated ReactOS binary.
-                    // With the PEB ProcessHeaps array initialised, RtlpAddHeapToProcessList
-                    // (heapuser.c:38) no longer ASSERTs, and RtlCreateHeap runs past it +
-                    // ZwQuerySystemInformation (SystemBasicInformation) before derailing deeper in
-                    // (RtlCreateHeap+0x4a3) on further uninitialised loader state — the loop then
-                    // breaks naturally on the first Nt* syscall we don't service. NEXT FRONTIER:
-                    // real ntdll LdrpInitialize so the loader globals/cookie are valid.
-                    check(
-                        b"exec_reactos_heap_reserve_commit_serviced",
-                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
-                        &mut passed,
-                    );
-                    // The env trampoline made a real NtAllocateVirtualMemory syscall through
-                    // ntdll that the executive's dispatcher serviced (allocate + copyout).
-                    check(
-                        b"exec_reactos_ntalloc_serviced",
-                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 1,
-                        &mut passed,
-                    );
+                    // The trampoline now enters ntdll's REAL loader init, LdrpInitialize
+                    // (ntdll+0x8e70). It runs deep into process bring-up — reads TEB/PEB/KUSER,
+                    // NtQueryVirtualMemory, NtQueryInformationProcess(ProcessCookie), NtOpenKey +
+                    // NtQueryValueKey (IFEO/options → not-found), NtProtectVirtualMemory,
+                    // RtlImageNtHeader on smss's own image (checking Subsystem==NATIVE) — all
+                    // serviced by the executive, demand-loading ~33 ntdll pages. It currently stops
+                    // in a CRT/locale-style string routine (ntdll+0x63dc0) called with a bad context
+                    // pointer — the next blocker on the way to LdrpInitializeProcess's RtlCreateHeap
+                    // and the image entry hand-off.
                     check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
-                    // After the syscall, smss runs its real startup (skips RtlAssert, runs
-                    // RtlNormalizeProcessParams) until a deeper env gap (the null process heap).
+                    // LdrpInitialize executes deep loader init (demand-loading many ntdll pages),
+                    // not merely entering — proves the real loader-init path is running.
+                    check(b"exec_reactos_ldrinit_runs_deep", sfaults >= 25, &mut passed);
+                    // RtlImageNtHeader (in LdrpInitializeProcess) demand-faulted smss's OWN image
+                    // header — at least one fault outside ntdll — proving loader init inspects the
+                    // real ReactOS binary (PEB->ImageBaseAddress) and read past the null derefs.
                     check(
-                        b"exec_reactos_smss_ran_past_null_deref",
-                        ntfaults >= 2 && sstop != 0x0000_0100_24bc_8350,
+                        b"exec_reactos_ldrinit_reads_image",
+                        sfaults > ntfaults && sstop != 0x0000_0100_24bc_8350,
                         &mut passed,
                     );
                 } else {
-                    check(b"exec_reactos_ntalloc_serviced", false, &mut passed);
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
-                    check(b"exec_reactos_smss_ran_past_null_deref", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_runs_deep", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_reads_image", false, &mut passed);
                 }
             }
             Err(_) => {
@@ -4392,7 +4444,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/93 executive->isolated-service checks passed]\n");
+    print_str(b"/92 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
