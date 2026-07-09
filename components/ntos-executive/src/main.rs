@@ -851,6 +851,19 @@ pub unsafe extern "C" fn user_entry() -> ! {
     core::ptr::write_volatile((SYSARG_VADDR + 0x470) as *mut u64, th);
     core::ptr::write_volatile((SYSARG_VADDR + 0x478) as *mut u64, tmarker);
 
+    // P3 demand paging: a FILE-BACKED section (arg2=1). NtMapViewOfSection RESERVES the view
+    // VA without mapping the page; the first read below triggers a VMFault the executive
+    // demand-pages in from the backing file — so the read returns the file's payload.
+    let dsec = native_syscall2(NT_CREATE_SECTION, 0x1000, 1);
+    let dview = native_syscall(NT_MAP_VIEW, dsec);
+    let dpaged = if dview != 0 {
+        core::ptr::read_volatile(dview as *const u64) // fault-in happens HERE
+    } else {
+        0
+    };
+    core::ptr::write_volatile((SYSARG_VADDR + 0x480) as *mut u64, dview);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x488) as *mut u64, dpaged);
+
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
@@ -873,7 +886,9 @@ pub unsafe extern "C" fn user_entry() -> ! {
         && sv2 != 0
         && sec_alias
         && th != 0
-        && tmarker == 0x7EAD2;
+        && tmarker == 0x7EAD2
+        && dview != 0
+        && dpaged == 0xDEAD_FACE_CAFE_F00D;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -1498,16 +1513,19 @@ unsafe fn spawn_storage_host(
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).
 static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
+/// How many VMFaults (page faults) the service loop demand-paged in for the user thread.
+static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
-/// NtAllocateVirtualMemory with real frames mapped into `user_pml4`. Returns
-/// `(serviced, verdict)`.
+/// NtAllocateVirtualMemory with real frames mapped into `user_pml4`, and demand-paging
+/// file-backed section views (backed by `file_frame`) on VMFault. Returns `(serviced, verdict)`.
 unsafe fn service_user_syscalls<B, CB>(
     user_fault_ep: u64,
     client: &mut ObjectClient<B>,
     cm: &mut ConfigClient<CB>,
     user_pml4: u64,
+    file_frame: u64,
 ) -> (u64, u64)
 where
     B: nt_object_client::Backend,
@@ -1539,11 +1557,35 @@ where
     // 1-based index. NtMapViewOfSection maps a COPY of the frame into the user VSpace, so two
     // views of one section alias the same backing (the defining section property).
     let mut sec_frames = [0u64; 8];
+    let mut sec_demand = [false; 8]; // file-backed (demand-paged) vs anonymous (eager)
     let mut sec_count = 0usize;
+    // Demand-paged views awaiting fault-in: (page-aligned view base, backing frame cap).
+    let mut views = [(0u64, 0u64); 8];
+    let mut view_count = 0usize;
     let mut serviced = 0u64;
     let mut verdict = 0u64;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
     loop {
+        // A VMFault (page fault, label 6) from the user thread: demand-page the faulting page
+        // of a file-backed section view. The fault address is in MR1; the reply RESTARTS the
+        // faulting instruction (no register writeback), so re-run it once the page is present.
+        if (mi >> 12) == 6 {
+            let page = m1 & !0xFFFu64;
+            for v in 0..view_count {
+                if views[v].0 == page {
+                    let _ = page_map(copy_cap(views[v].1), page, RW_NX, user_pml4);
+                    DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(user_fault_ep, 0, 0, 0, 0, 0);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
+            continue;
+        }
         if (mi >> 12) != 2 {
             break; // not an UnknownSyscall — stop
         }
@@ -1598,24 +1640,41 @@ where
                 // Create a section: allocate a backing frame (arg1 = size, 1 page here) and
                 // return a 1-based handle. The load vehicle for images/DLLs.
                 NativeService::NtCreateSection => {
+                    // arg2 == 1 → a FILE-BACKED (demand-paged) section, backed by `file_frame`;
+                    // else an anonymous section (a fresh frame, mapped eagerly).
                     if sec_count < sec_frames.len() {
-                        let f = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-                        sec_frames[sec_count] = f;
+                        if arg2 == 1 {
+                            sec_frames[sec_count] = file_frame;
+                            sec_demand[sec_count] = true;
+                        } else {
+                            let f = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+                            sec_frames[sec_count] = f;
+                            sec_demand[sec_count] = false;
+                        }
                         sec_count += 1;
                         sec_count as u64 // handle
                     } else {
                         0
                     }
                 }
-                // Map a view: map a COPY of the section's frame into the user VSpace at the
-                // next bump vaddr; two views of one section alias the same backing frame.
+                // Map a view. Anonymous: map the section frame eagerly (two views alias the
+                // same backing). File-backed: RESERVE the view VA (page tables present, page
+                // absent) and record it — the page faults in on first access (demand paging).
                 NativeService::NtMapViewOfSection => {
                     let h = arg1 as usize;
                     if h >= 1 && h <= sec_count {
                         let base = NEXT_USER_VADDR.fetch_add(0x1000, Ordering::Relaxed);
-                        let cp = copy_cap(sec_frames[h - 1]);
-                        let _ = page_map(cp, base, RW_NX, user_pml4);
+                        if sec_demand[h - 1] {
+                            if view_count < views.len() {
+                                views[view_count] = (base, sec_frames[h - 1]);
+                                view_count += 1;
+                            }
+                            // deliberately NOT mapped — the page faults in on access.
+                        } else {
+                            let cp = copy_cap(sec_frames[h - 1]);
+                            let _ = page_map(cp, base, RW_NX, user_pml4);
+                        }
                         base
                     } else {
                         0
@@ -2450,8 +2509,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // Buffer pointer resolves in both address spaces.
     let sysarg = alloc_frame();
     let _ = page_map(sysarg, SYSARG_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    // A "file" frame backing a demand-paged section: fill it (via an executive scratch mapping)
+    // with a recognizable payload. (Sourcing this frame from a real disk file via the P2
+    // storage host is the next composition — the demand-paging mechanism is identical.)
+    let ff = alloc_frame();
+    let _ = page_map(ff, STORAGE_SHARED_VADDR + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x2000) as *mut u64, 0xDEAD_FACE_CAFE_F00D);
     let user_pml4 = spawn_user_thread(user_entry, user_fault_ep_c, copy_cap(sysarg), 100, 0);
-    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm, user_pml4);
+    let (serviced, verdict) = service_user_syscalls(user_fault_ep, &mut c, &mut cm, user_pml4, ff);
     check(b"exec_syscall_frontend_serviced", serviced >= 10, &mut passed);
     check(b"exec_syscall_user_verdict_passed", verdict == 1, &mut passed);
     // The directory the user created via a syscall is visible in the isolated Ob service.
@@ -2564,6 +2629,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(b"exec_nt_create_thread", th != 0, &mut passed);
     check(b"exec_nt_second_thread_ran", t2 == 0x7EAD2, &mut passed);
 
+    // --- P3 demand paging: the user thread mapped a file-backed section view (VA reserved, page
+    // NOT mapped) and read it; the read #PF'd, the executive faulted the page in from the
+    // backing file, and the read returned the file's payload (0xDEADFACECAFEF00D).
+    let dview = core::ptr::read_volatile((SYSARG_VADDR + 0x480) as *const u64);
+    let dpaged = core::ptr::read_volatile((SYSARG_VADDR + 0x488) as *const u64);
+    let dfaults = DEMAND_FAULTS.load(Ordering::Relaxed);
+    print_str(b"[ntos-exec] demand-paged view=0x");
+    print_hex(dview as u32);
+    print_str(b" read=0x");
+    print_hex((dpaged >> 32) as u32);
+    print_hex(dpaged as u32);
+    print_str(b" VMFaults serviced=");
+    print_u64(dfaults);
+    print_str(b"\n");
+    check(b"exec_demand_page_faulted", dfaults >= 1, &mut passed);
+    check(
+        b"exec_demand_page_content",
+        dpaged == 0xDEAD_FACE_CAFE_F00D,
+        &mut passed,
+    );
+
     // --- P3 blocking wait dispatcher: a WAITER thread PARKS on an event until a separate
     // SIGNALER thread wakes it — a real cross-thread block, not a poll. The waiter (prio 150)
     // runs + parks first; the signaler (100) publishes a handoff marker then sets+wakes the
@@ -2638,7 +2724,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let pe_fault_c = copy_cap(pe_fault);
             let pe_sysarg = alloc_frame();
             let pe_pml4 = spawn_pe_thread(&mapped, pe_fault_c, pe_sysarg);
-            let (srv, verdict) = service_user_syscalls(pe_fault, &mut c, &mut cm, pe_pml4);
+            let (srv, verdict) = service_user_syscalls(pe_fault, &mut c, &mut cm, pe_pml4, 0);
             pe_serviced = srv;
             pe_verdict = verdict;
         }
@@ -3446,7 +3532,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/79 executive->isolated-service checks passed]\n");
+    print_str(b"/81 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
