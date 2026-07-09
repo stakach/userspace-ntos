@@ -763,6 +763,21 @@ pub unsafe extern "C" fn thread2_entry() -> ! {
     }
 }
 
+/// A "loader" thread: maps a demand-paged, FILE-BACKED section whose backing is a REAL file
+/// read off the disk (the SYSTEM.DAT hive), faults its first page IN, and reports the word it
+/// read (the hive's `UNTHIVE1` magic) as its verdict — a section sourced from a real disk file.
+pub unsafe extern "C" fn loader_entry() -> ! {
+    let sec = native_syscall2(NT_CREATE_SECTION, 0x1000, 1); // file-backed = the disk hive frame
+    let view = native_syscall(NT_MAP_VIEW, sec);
+    let magic = if view != 0 {
+        core::ptr::read_volatile(view as *const u64) // the page is demand-paged IN right here
+    } else {
+        0
+    };
+    let _ = native_syscall(SSN_DONE, magic);
+    park()
+}
+
 pub unsafe extern "C" fn user_entry() -> ! {
     // Object Manager route (scalar args — fixed paths by index).
     let r0 = native_syscall(SSN_OB_CREATE_DIR, 0);
@@ -3530,9 +3545,47 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // --- P3: source a demand-paged section from a REAL disk file. The storage host read
+    // SYSTEM.DAT (the hive) off the FAT32 disk into the shared frame; copy it into a file
+    // frame, then a loader thread maps it as a demand-paged file-backed section and faults its
+    // first page IN — so a page of a real on-disk file arrives in the process only when touched.
+    let hive_len = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x18) as *const u32);
+    if found_storage && hive_len > 0 {
+        // Copy the disk hive (shared frame @+0x100) into a dedicated file frame. The hive is
+        // only `hive_len` bytes — don't read off the end of the 1-page shared frame. ldff is
+        // retype-zeroed, so the rest stays 0.
+        let ldff = alloc_frame();
+        let _ = page_map(ldff, STORAGE_SHARED_VADDR + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let n = (hive_len as u64).min(0xF00);
+        for i in 0..n {
+            let b = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x100 + i) as *const u8);
+            core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x3000 + i) as *mut u8, b);
+        }
+        let ld_fault = make_object(OBJ_ENDPOINT);
+        let ld_fault_c = copy_cap(ld_fault);
+        let ld_sysarg = alloc_frame();
+        let faults_before = DEMAND_FAULTS.load(Ordering::Relaxed);
+        let ld_pml4 = spawn_user_thread(loader_entry, ld_fault_c, copy_cap(ld_sysarg), 100, 0);
+        let (_srv, ld_magic) = service_user_syscalls(ld_fault, &mut c, &mut cm, ld_pml4, ldff);
+        let ld_faults = DEMAND_FAULTS.load(Ordering::Relaxed) - faults_before;
+        print_str(b"[ntos-exec] loader demand-paged the disk hive: magic=0x");
+        print_hex((ld_magic >> 32) as u32);
+        print_hex(ld_magic as u32);
+        print_str(b" (UNTHIVE1) faults=");
+        print_u64(ld_faults);
+        print_str(b"\n");
+        // The loader read the hive's UNTHIVE1 magic via a page fault from a section backed by
+        // the real on-disk SYSTEM.DAT.
+        check(
+            b"exec_disk_section_demand_paged",
+            ld_magic == 0x3145_5649_4854_4E55 && ld_faults >= 1,
+            &mut passed,
+        );
+    }
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/81 executive->isolated-service checks passed]\n");
+    print_str(b"/82 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
