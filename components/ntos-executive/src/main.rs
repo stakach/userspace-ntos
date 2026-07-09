@@ -1302,7 +1302,9 @@ unsafe fn spawn_sec_image(
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
         let mut tb = alloc::vec::Vec::new();
-        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+        // sub 0x40 (not 0x38) keeps RSP 16-aligned before the call — the x64 ABI requires it,
+        // and RtlCaptureContext's `movaps` into a stack CONTEXT #GPs on a misaligned frame.
+        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 0x40
         tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0  Lock
         tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0  Parameters
         tb.extend_from_slice(&[0xB9, 0x02, 0, 0, 0]); // mov ecx, 2  Flags=HEAP_GROWABLE
@@ -1312,7 +1314,7 @@ unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0xB8]);
         tb.extend_from_slice(&(NTDLL_BASE + 0x183f0).to_le_bytes()); // movabs rax, RtlCreateHeap
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 0x40
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
         tb.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]); // mov [rcx+0x30], rax  PEB->ProcessHeap
@@ -1374,6 +1376,59 @@ unsafe fn pe_byte_at_rva(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u8> {
         }
     }
     None
+}
+
+/// File offset of image RVA `rva`, via the section table.
+unsafe fn rva_to_file(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u64> {
+    for s in pe.sections() {
+        let vend = s.virtual_address + s.virtual_size.max(s.size_of_raw_data);
+        if rva >= s.virtual_address && rva < vend {
+            return Some((s.pointer_to_raw_data + (rva - s.virtual_address)) as u64);
+        }
+    }
+    None
+}
+
+/// Apply base relocations to a PE's RAW bytes in `buf` for a load at `load_base` (delta =
+/// load_base - preferred image base). We SEC_IMAGE-load by copying raw section bytes, so ntdll's
+/// absolute .data pointers (list heads etc.) must be fixed up here or they point at the
+/// preferred base. Only IMAGE_REL_BASED_DIR64 (x64) is needed.
+unsafe fn apply_relocations_to_buf(pe: &nt_pe_loader::PeFile, buf: u64, load_base: u64) {
+    let e = core::ptr::read_volatile((buf + 0x3c) as *const u32) as u64;
+    let image_base = core::ptr::read_volatile((buf + e + 24 + 24) as *const u64);
+    let delta = load_base.wrapping_sub(image_base);
+    if delta == 0 {
+        return;
+    }
+    let reloc_rva = core::ptr::read_volatile((buf + e + 24 + 112 + 5 * 8) as *const u32);
+    let reloc_size = core::ptr::read_volatile((buf + e + 24 + 112 + 5 * 8 + 4) as *const u32);
+    if reloc_rva == 0 || reloc_size == 0 {
+        return;
+    }
+    let base_off = match rva_to_file(pe, reloc_rva) {
+        Some(o) => o,
+        None => return,
+    };
+    let mut off = 0u64;
+    while off + 8 <= reloc_size as u64 {
+        let page_rva = core::ptr::read_volatile((buf + base_off + off) as *const u32);
+        let block_size = core::ptr::read_volatile((buf + base_off + off + 4) as *const u32);
+        if block_size < 8 {
+            break;
+        }
+        let n = (block_size - 8) / 2;
+        for i in 0..n as u64 {
+            let entry = core::ptr::read_volatile((buf + base_off + off + 8 + i * 2) as *const u16);
+            if (entry >> 12) == 10 {
+                let target_rva = page_rva + (entry & 0xFFF) as u32;
+                if let Some(tf) = rva_to_file(pe, target_rva) {
+                    let v = core::ptr::read_volatile((buf + tf) as *const u64);
+                    core::ptr::write_volatile((buf + tf) as *mut u64, v.wrapping_add(delta));
+                }
+            }
+        }
+        off += block_size as u64;
+    }
 }
 
 /// The page-aligned virtual extent of a PE image (end of its highest section).
@@ -4138,6 +4193,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
         match nt_pe_loader::PeFile::parse(smss) {
             Ok(pe) => {
+                // Fix up smss's absolute pointers for its load at PE_LOAD_BASE (before the IAT
+                // patch, which overwrites the import thunks anyway).
+                apply_relocations_to_buf(&pe, FILEBUF_VADDR, PE_LOAD_BASE);
                 let nsec = pe.sections().len();
                 let entry = pe.entry_point_rva();
                 let mut imports_ntdll = false;
@@ -4215,6 +4273,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
+                    // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
+                    // absolute self-pointers at the preferred base otherwise.
+                    apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
