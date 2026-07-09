@@ -124,6 +124,15 @@ pub const SSN_NT_OPEN_KEY: u64 = 125;
 pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
 /// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
 pub const SSN_NT_PROTECT_VM: u64 = 143;
+/// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
+pub const SSN_NT_QUERY_DEFAULT_LOCALE: u64 = 149;
+/// No-op-success syscalls: NtFreeVirtualMemory (bump allocator never frees),
+/// NtSetInformationThread/Process (attributes we don't model).
+pub const SSN_NT_FREE_VM: u64 = 87;
+pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
+pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
+/// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
+pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1508,6 +1517,10 @@ unsafe fn service_sec_image(
     let mut stop_ssn = 0u64;
     let mut iters = 0u64;
     let mut dbgsvc = 0u64;
+    // page VA filled at each fault index → its persistent executive scratch is
+    // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
+    // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
+    let mut filled_pages = [0u64; 96];
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
@@ -1570,6 +1583,9 @@ unsafe fn service_sec_image(
             let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
             let rights = fill_image_page(tpe, rva, scratch);
             let _ = page_map(copy_cap(f), page, rights, pml4);
+            if (faults as usize) < filled_pages.len() {
+                filled_pages[faults as usize] = page;
+            }
             faults += 1;
             let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
             mi = nmi;
@@ -1659,9 +1675,10 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
-            } else if m0 == SSN_NT_OPEN_KEY {
-                // NtOpenKey(KeyHandle, Access, ObjectAttributes). No registry for the process →
-                // STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize skips IFEO/GlobalFlag/options.
+            } else if m0 == SSN_NT_OPEN_KEY || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT {
+                // NtOpenKey / NtOpenDirectoryObject. No registry or object namespace →
+                // STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize skips IFEO/options and falls back
+                // from \KnownDlls to normal (disk) DLL loading.
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
                 // NtQueryValueKey — no registry → value not found; LdrpInitialize uses defaults.
@@ -1674,6 +1691,44 @@ unsafe fn service_sec_image(
                 if oldprot_ptr != 0 {
                     smss_stack_write(oldprot_ptr, 0x04); // PAGE_READWRITE
                 }
+            } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
+                // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the
+                // output, which ntdll points at one of its own .data GLOBALS (not the stack) — so
+                // copy out through the target image page's persistent executive scratch mapping,
+                // demand-filling the page first if LdrpInitialize hasn't touched it yet.
+                let out = m3; // RDX = *DefaultLocaleId
+                let pg = out & !0xFFFu64;
+                let mut idx = usize::MAX;
+                for i in 0..(faults as usize).min(filled_pages.len()) {
+                    if filled_pages[i] == pg { idx = i; break; }
+                }
+                if idx == usize::MAX && (faults as usize) < filled_pages.len() {
+                    let (base, tpe) = if pg >= PE_LOAD_BASE && pg < img_end {
+                        (PE_LOAD_BASE, pe)
+                    } else if nt_base != 0 && pg >= nt_base && pg < nt_end {
+                        (nt_base, ntdll.unwrap().1)
+                    } else { (0u64, pe) };
+                    if base != 0 {
+                        let scratch = scratch_base + faults * 0x1000;
+                        let f = alloc_frame();
+                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                        let rights = fill_image_page(tpe, (pg - base) as u32, scratch);
+                        let _ = page_map(copy_cap(f), pg, rights, pml4);
+                        filled_pages[faults as usize] = pg;
+                        idx = faults as usize;
+                        faults += 1;
+                    }
+                }
+                if idx != usize::MAX {
+                    core::ptr::write_volatile(
+                        (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
+                }
+            } else if m0 == SSN_NT_FREE_VM
+                || m0 == SSN_NT_SET_INFO_THREAD
+                || m0 == SSN_NT_SET_INFO_PROCESS
+            {
+                // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator) and
+                // don't model thread/process attribute sets.
             } else {
                 handled = false;
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
@@ -1714,6 +1769,17 @@ unsafe fn service_sec_image(
     print_u64(dbgsvc);
     print_str(b" stop_ssn=");
     print_u64(stop_ssn);
+    // NtRaiseHardError(190): decode the status (R10), Parameters[0], and the caller ([rsp]).
+    // Guarded to this case — get_recv_mr(16)/(8) only hold a valid smss stack ptr here.
+    if stop_ssn == 190 {
+        print_str(b" r10=0x");
+        print_hex((get_recv_mr(9) >> 32) as u32);
+        print_hex(get_recv_mr(9) as u32);
+        print_str(b" param0=0x");
+        print_hex(smss_stack_read(get_recv_mr(8)) as u32);
+        print_str(b" caller=0x");
+        print_hex(smss_stack_read(get_recv_mr(16)) as u32);
+    }
     print_str(b"\n");
     (verdict, faults, first, stop, ntfaults, stop_ssn)
 }
