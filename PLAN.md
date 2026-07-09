@@ -682,3 +682,12 @@ findings). A step is not "done" until the plan reflects it.
   _imports_ntdll / _sec_image_fill. NOTE: ReactOS stable is x86 (PE32, rejected); the x64
   (amd64/MSVC) livecd gives loadable PE32+ binaries. Next: demand-page the real binary via
   SEC_IMAGE from disk (spawn_sec_image on the disk bytes); eventually run it (needs imports/env).
+- **2026-07-09** — **P3 LIVE SEC_IMAGE — real ReactOS smss.exe EXECUTES, demand-paged from
+  disk (exec 7a515b6). 89/89.** The real binary RUNS: spawn_sec_image starts the disk-read
+  smss.exe at its entry (0x12ee0), image VA only reserved; service_sec_image faults each .text
+  page in LIVE per RVA as the CPU fetches. smss runs its real x64 prologue; first fault =
+  instruction-fetch at PE_LOAD_BASE+0x12ee0 (execution began), 2 pages fault in, stops safely at
+  its first unresolved ntdll import (out-of-image jump to 0x18820). service_sec_image gained a
+  scratch_base param + safe-stop (out-of-image / non-VMFault / 16-fault cap). Checks:
+  exec_reactos_smss_live_executed / _live_paged. Next: resolve smss's ntdll imports (load
+  ros-ntdll too + wire the IAT) + a process env so it runs past 0x18820; then LPC (P4).
