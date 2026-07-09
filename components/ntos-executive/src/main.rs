@@ -1057,6 +1057,21 @@ unsafe fn build_pe_text() -> alloc::vec::Vec<u8> {
     t
 }
 
+/// The `.text` for the SEC_IMAGE demo PE: read a magic from `.rdata` (RVA 0x2000 — a second
+/// section faulted in on its own access) and report it via SSN_DONE. No stack/env use — proves
+/// the process ran from a demand-paged `.text` AND its `.rdata` faulted in at the right offset.
+unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x48, 0xB8]); // movabs rax, .rdata VA
+    t.extend_from_slice(&(PE_LOAD_BASE + 0x2000).to_le_bytes());
+    t.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]  (read .rdata magic)
+    t.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax    (arg1 = magic)
+    t.extend_from_slice(&[0xB8, 0xFF, 0x01, 0x00, 0x00]); // mov eax, 0x1FF (SSN_DONE)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $  (park)
+    t
+}
+
 /// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
 /// is written into fresh frames (via an executive scratch mapping) and mapped RX at
 /// PE_LOAD_BASE in the new VSpace; execution starts at the PE entry point. Returns the pml4.
@@ -1147,6 +1162,114 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4
+}
+
+/// Fill one page of a SEC_IMAGE view at `rva` from the PE FILE, translating RVA -> file offset
+/// per the PE layout: the headers page comes from file offset 0; each section's pages come from
+/// its `pointer_to_raw_data` (BSS beyond `size_of_raw_data` stays zero). Returns the page rights
+/// (RX for executable sections, RW_NX otherwise). This is the memory-efficient image mapping:
+/// only touched pages are ever materialized (vs pre-building the whole mapped image).
+unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 {
+    for j in 0..0x1000u64 {
+        core::ptr::write_volatile((dst + j) as *mut u8, 0);
+    }
+    let file = pe.bytes();
+    let put = |off: u32, avail: u32| {
+        for j in 0..avail.min(0x1000) as usize {
+            let b = file.get(off as usize + j).copied().unwrap_or(0);
+            core::ptr::write_volatile((dst + j as u64) as *mut u8, b);
+        }
+    };
+    let soh = pe.headers().size_of_headers;
+    let page_up = |n: u32| (n + 0xFFF) & !0xFFFu32;
+    if rva < page_up(soh) {
+        put(rva, soh.saturating_sub(rva)); // headers: file offset == rva
+        return RW_NX;
+    }
+    for s in pe.sections() {
+        if rva >= s.virtual_address && rva < s.virtual_address + page_up(s.virtual_size) {
+            let in_sec = rva - s.virtual_address;
+            if in_sec < s.size_of_raw_data {
+                put(s.pointer_to_raw_data + in_sec, s.size_of_raw_data - in_sec);
+            }
+            return if s.is_executable() { 2 /* RX */ } else { RW_NX };
+        }
+    }
+    RW_NX // gap between sections — a zero page
+}
+
+/// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables
+/// present, image pages ABSENT), map a stack + IPC buffer, and start the entry point. The image
+/// pages fault in on demand (service_sec_image fills each by RVA). Returns the pml4.
+unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64) -> u64 {
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    // The image VA's page tables — but NOT the image pages. Touching the image faults in.
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    for i in 0..STACK_FRAMES {
+        let f = alloc_frame();
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_frame();
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, PE_LOAD_BASE + pe.entry_point_rva() as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    pml4
+}
+
+/// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
+/// the PE file; on SSN_DONE, capture the verdict. Returns (verdict, vmfaults serviced).
+unsafe fn service_sec_image(fault_ep: u64, pml4: u64, pe: &nt_pe_loader::PeFile) -> (u64, u64) {
+    let mut verdict = 0u64;
+    let mut faults = 0u64;
+    let (_z, mut mi, mut m0, mut m1, _m2, _m3) = ep_recv_full(fault_ep);
+    loop {
+        if (mi >> 12) == 6 {
+            let page = m1 & !0xFFFu64;
+            let rva = (page - PE_LOAD_BASE) as u32;
+            let scratch = STORAGE_SHARED_VADDR + 0x4000 + faults * 0x1000;
+            let f = alloc_frame();
+            let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let rights = fill_image_page(pe, rva, scratch);
+            let _ = page_map(copy_cap(f), page, rights, pml4);
+            faults += 1;
+            let (nmi, nm0, nm1, _nm2, _nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            continue;
+        }
+        if (mi >> 12) != 2 {
+            break;
+        }
+        if m0 == SSN_DONE {
+            verdict = get_recv_mr(9); // R10 = arg1
+            break;
+        }
+        break;
+    }
+    (verdict, faults)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -2760,6 +2883,46 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // The PE's import table was parsed + the IAT slot resolved to the provided ntdll stub.
     check(b"exec_pe_imports_resolved", imports_ok, &mut passed);
 
+    // --- P3 SEC_IMAGE: demand-load a PE via image sections. Unlike the eager load above, the
+    // image VA is only RESERVED — each page faults in BY RVA from the PE file (headers @ file 0,
+    // .text from raw 0x200, .rdata from raw 0x400; RVA != raw). The .text reads a magic from
+    // .rdata (a second section, faulted in on its own access) and reports it — a real PE runs
+    // with pages arriving only as touched, from their correct file offsets. This is how a real
+    // ntdll/smss will load: memory-efficient, only touched pages materialized.
+    print_str(b"[ntos-exec] P3: demand-loading a PE via SEC_IMAGE (pages fault in by RVA)\n");
+    let sec_magic = 0x5EC1_1A6E_D15C_0DE5u64;
+    let si_text = build_sec_image_text();
+    let si_rdata = sec_magic.to_le_bytes();
+    let si_bytes = build_pe(
+        PE_LOAD_BASE,
+        0x1000,
+        0x3000,
+        &[
+            (b".text\0\0\0", 0x1000, 0x6000_0020, &si_text),
+            (b".rdata\0\0", 0x2000, 0x4000_0040, &si_rdata),
+        ],
+        &[],
+    );
+    let (mut si_verdict, mut si_faults) = (0u64, 0u64);
+    if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
+        let si_fault = make_object(OBJ_ENDPOINT);
+        let si_fault_c = copy_cap(si_fault);
+        let pml4 = spawn_sec_image(&pe, si_fault_c);
+        let (v, f) = service_sec_image(si_fault, pml4, &pe);
+        si_verdict = v;
+        si_faults = f;
+    }
+    print_str(b"[ntos-exec] SEC_IMAGE: PE ran demand-paged, read .rdata magic=0x");
+    print_hex((si_verdict >> 32) as u32);
+    print_hex(si_verdict as u32);
+    print_str(b" pages-faulted-in=");
+    print_u64(si_faults);
+    print_str(b"\n");
+    // The PE executed from a demand-paged .text (RVA 0x1000 <- raw 0x200) AND read a magic from
+    // a demand-paged .rdata (RVA 0x2000 <- raw 0x400): RVA->file translation on fault works.
+    check(b"exec_sec_image_demand_loaded", si_verdict == sec_magic, &mut passed);
+    check(b"exec_sec_image_two_sections", si_faults >= 2, &mut passed);
+
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
     // the mapping hits real device memory, not RAM.
@@ -3585,7 +3748,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/82 executive->isolated-service checks passed]\n");
+    print_str(b"/84 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
