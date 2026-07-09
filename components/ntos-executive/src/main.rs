@@ -1328,10 +1328,43 @@ unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0xEC) as *mut u32, 16);
         core::ptr::write_volatile((scr + 0x1000 + 0xF0) as *mut u64, SMSS_PEB_VA + 0x800);
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
-        // Process parameters: a zeroed page is a valid un-normalized RTL_USER_PROCESS_PARAMETERS
-        // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
+        // Process parameters: a real RTL_USER_PROCESS_PARAMETERS. LdrpInitializeProcess reads
+        // DllPath (@0x50) and requires DllPath.Length > 0 (else "Error while retrieving buffer for
+        // %wZ" → STATUS_INVALID_PARAMETER → APP_INIT_FAILURE). Build it in executive scratch
+        // (scr+0x3000), populate the UNICODE_STRINGs (Buffers point at SMSS_PARAMS_VA tail), then
+        // map into smss. x64 layout: MaximumLength@0x00, Length@0x04, CurrentDirectory.DosPath@0x38,
+        // DllPath@0x50, ImagePathName@0x60, CommandLine@0x70 (each UNICODE_STRING = Len,MaxLen,_,Buf).
         let params = alloc_frame();
-        let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
+        let pp = scr + 0x3000;
+        let _ = page_map(params, pp, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile((pp + 0x00) as *mut u32, 0x1000); // MaximumLength
+        core::ptr::write_volatile((pp + 0x04) as *mut u32, 0x1000); // Length
+        // Flags = RTL_USER_PROCESS_PARAMETERS_NORMALIZED (0x1): our UNICODE_STRING Buffers are
+        // absolute pointers, so RtlNormalizeProcessParams must NOT add the base to them (it would
+        // otherwise double them → 2*SMSS_PARAMS_VA + off, a wild pointer).
+        core::ptr::write_volatile((pp + 0x08) as *mut u32, 0x1);
+        // write `s` as UTF-16LE at scratch VA `dst`; return byte length.
+        let wstr = |dst: u64, s: &[u8]| -> u16 {
+            for (i, &c) in s.iter().enumerate() {
+                core::ptr::write_volatile((dst + i as u64 * 2) as *mut u8, c);
+                core::ptr::write_volatile((dst + i as u64 * 2 + 1) as *mut u8, 0);
+            }
+            (s.len() * 2) as u16
+        };
+        // (unicode_string field offset, scratch buffer offset, smss buffer VA offset, text)
+        let ustrs: [(u64, u64, &[u8]); 4] = [
+            (0x38, 0x300, b"C:\\Windows"),                       // CurrentDirectory.DosPath
+            (0x50, 0x340, b"C:\\Windows\\System32"),             // DllPath
+            (0x60, 0x3A0, b"\\SystemRoot\\System32\\smss.exe"),  // ImagePathName
+            (0x70, 0x420, b"smss.exe"),                          // CommandLine
+        ];
+        for (foff, boff, text) in ustrs {
+            let len = wstr(pp + boff, text);
+            core::ptr::write_volatile((pp + foff) as *mut u16, len); // Length
+            core::ptr::write_volatile((pp + foff + 2) as *mut u16, len + 2); // MaximumLength
+            core::ptr::write_volatile((pp + foff + 8) as *mut u64, SMSS_PARAMS_VA + boff); // Buffer
+        }
+        let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
         // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
