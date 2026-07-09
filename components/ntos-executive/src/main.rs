@@ -1284,10 +1284,14 @@ unsafe fn spawn_sec_image(
     // that loads RCX=PEB then jumps to the entry (the entry expects RCX = PEB). Each page is
     // written via an executive scratch mapping, then mapped into the process VSpace.
     let entry = if setup_env {
-        // A scratch region in the FILEBUF page table (0x60-0x80), well past FILEBUF's frames and
-        // the service fault scratch — verified present + free in the executive's own VSpace
-        // (STORAGE_SHARED+0x6000 was NOT — the frames stayed zeroed, so the trampoline ran as 0).
-        let scr = 0x0000_0100_006E_0000u64;
+        // A scratch region in the FILEBUF page table (0x60-0x80) to build the env pages. MUST be
+        // past the service demand-fault scratch, which runs from 0x6C_0000 up by one page per
+        // fault (0x6C_0000 + fault*0x1000). With up to 96 faults that reaches 0x72_0000, so the OLD
+        // 0x6E_0000 collided at fault #32 (LdrpInitialize's deep page count) — page_map(f,0x6E_0000)
+        // then failed because 0x6E_0000 was still mapped to the TEB frame, the fill wrote real
+        // bytes into the TEB (not the fresh frame), and the fresh frame stayed zero → the ntdll
+        // page mapped as zeros. 0x74_0000 is clear of the whole scratch span.
+        let scr = 0x0000_0100_0074_0000u64;
         // TEB: self @0x30, PEB @0x60.
         let teb = alloc_frame();
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -4418,6 +4422,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // LdrpInitialize executes deep loader init (demand-loading many ntdll pages),
                     // not merely entering — proves the real loader-init path is running.
                     check(b"exec_reactos_ldrinit_runs_deep", sfaults >= 25, &mut passed);
+                    // LdrpInitializeProcess reached RtlCreateHeap and created the process heap —
+                    // both its NtAllocateVirtualMemory reserve+commit serviced by the executive.
+                    check(
+                        b"exec_reactos_ldrinit_creates_heap",
+                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
+                        &mut passed,
+                    );
                     // RtlImageNtHeader (in LdrpInitializeProcess) demand-faulted smss's OWN image
                     // header — at least one fault outside ntdll — proving loader init inspects the
                     // real ReactOS binary (PEB->ImageBaseAddress) and read past the null derefs.
@@ -4430,6 +4441,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
                     check(b"exec_reactos_ldrinit_runs_deep", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_creates_heap", false, &mut passed);
                     check(b"exec_reactos_ldrinit_reads_image", false, &mut passed);
                 }
             }
@@ -4444,7 +4456,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/92 executive->isolated-service checks passed]\n");
+    print_str(b"/93 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
