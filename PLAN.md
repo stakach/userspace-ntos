@@ -659,3 +659,14 @@ findings). A step is not "done" until the plan reflects it.
   Next: SEC_IMAGE (PE-image RVA layout on fault so a real PE loads); then the ReactOS-binary
   pipeline (fetch/extract at build) + load a real ntdll/smss via demand-paged image sections +
   a heap bump.
+- **2026-07-09** — **P3 SEC_IMAGE — demand-load a PE, pages fault in by RVA (exec 9331c27).
+  84/84.** The real image-loading path, memory-efficient (only touched pages materialized).
+  spawn_sec_image reserves the image VA (PTs present, pages absent) + starts the entry;
+  service_sec_image fills each VMFault page BY RVA from the PE file (fill_image_page: headers @
+  file 0, sections from pointer_to_raw_data, BSS zeroed, RX vs RW_NX) via nt-pe-loader
+  pe.sections(). Demo PE (.text RVA 0x1000<-raw 0x200, .rdata RVA 0x2000<-raw 0x400) starts at
+  .text (instruction-fetch fault->raw 0x200), reads a magic from .rdata (read fault->raw 0x400),
+  reports it via SSN_DONE — magic returns exactly over 2 faults (RVA->file translation correct).
+  Checks: exec_sec_image_demand_loaded / _two_sections. This is how a real ntdll/smss loads.
+  Next: the ReactOS-binary pipeline (fetch/extract ntdll/smss at build, fresh-clone-safe) +
+  load a real binary via SEC_IMAGE + a heap bump (2 MB image won't fit the 128 KiB heap).
