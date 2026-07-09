@@ -105,6 +105,13 @@ pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
 pub const SMSS_PEB_VA: u64 = 0x0000_0100_0058_0000;
 pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0059_0000;
 pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
+/// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
+/// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
+pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0068_0000;
+/// Where the executive backs NtAllocateVirtualMemory for the process (its own PT).
+pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
+/// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
+pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1243,9 +1250,20 @@ unsafe fn spawn_sec_image(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
         let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
     }
+    if setup_env {
+        // Reserve a page table for the region the executive backs NtAllocateVirtualMemory in.
+        let apt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
+        let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, SMSS_ALLOC_VA, pml4);
+    }
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
-        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+        let _ = page_map(copy_cap(f), STACK_BASE + i * 0x1000, RW_NX, pml4);
+        // Mirror the stack into the executive so it can read/write a syscall's stack-based
+        // pointer args (copyin/copyout).
+        if setup_env {
+            let _ = page_map(copy_cap(f), SMSS_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
     }
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
@@ -1273,18 +1291,32 @@ unsafe fn spawn_sec_image(
         // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
         let params = alloc_frame();
         let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
-        // Trampoline: movabs rcx, PEB; movabs rax, entry; jmp rax.
+        // Trampoline: make a real NtAllocateVirtualMemory syscall through ntdll (serviced by
+        // the executive), write to the returned memory to prove it's mapped, then load RCX=PEB
+        // and jump to the entry. This exercises the syscall dispatcher before the entry runs.
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
-        let mut tb = [0u8; 22];
-        tb[0] = 0x48;
-        tb[1] = 0xB9;
-        tb[2..10].copy_from_slice(&SMSS_PEB_VA.to_le_bytes());
-        tb[10] = 0x48;
-        tb[11] = 0xB8;
-        tb[12..20].copy_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes());
-        tb[20] = 0xFF;
-        tb[21] = 0xE0;
+        let mut tb = alloc::vec::Vec::new();
+        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x50]); // sub rsp, 0x50
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // mov qword [rsp+0x40],0  Base
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48, 0x00, 0x20, 0, 0]); // [rsp+0x48]=0x2000  Size
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x30, 0, 0]); // [rsp+0x20]=0x3000  AllocType
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x04, 0, 0, 0]); // [rsp+0x28]=4  Protect
+        tb.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1  ProcessHandle
+        tb.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x40]); // lea rdx, [rsp+0x40]  &Base
+        tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  ZeroBits
+        tb.extend_from_slice(&[0x4C, 0x8D, 0x4C, 0x24, 0x48]); // lea r9, [rsp+0x48]  &Size
+        tb.extend_from_slice(&[0x48, 0xB8]);
+        tb.extend_from_slice(&(NTDLL_BASE + 0x5d826).to_le_bytes()); // movabs rax, NtAllocateVirtualMemory
+        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        tb.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx, [rsp+0x40]  allocated base
+        tb.extend_from_slice(&[0xC7, 0x01, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rcx], 0x5A5A5A5A
+        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x50]); // add rsp, 0x50
+        tb.extend_from_slice(&[0x48, 0xB9]);
+        tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
+        tb.extend_from_slice(&[0x48, 0xB8]);
+        tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
+        tb.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -1312,6 +1344,22 @@ unsafe fn spawn_sec_image(
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4
+}
+
+/// Read a u64 from a SEC_IMAGE process's stack VA (a syscall's pointer arg) via the executive's
+/// stack mirror. Returns 0 if the VA isn't in the mirrored stack range.
+unsafe fn smss_stack_read(stack_va: u64) -> u64 {
+    if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+        core::ptr::read_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *const u64)
+    } else {
+        0
+    }
+}
+/// Write a u64 to a SEC_IMAGE process's stack VA via the mirror (copyout).
+unsafe fn smss_stack_write(stack_va: u64, v: u64) {
+    if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *mut u64, v);
+    }
 }
 
 /// The page-aligned virtual extent of a PE image (end of its highest section).
@@ -1350,7 +1398,7 @@ unsafe fn service_sec_image(
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
     let mut stop_ssn = 0u64;
-    let (_z, mut mi, mut m0, mut m1, _m2, _m3) = ep_recv_full(fault_ep);
+    let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         if (mi >> 12) == 6 {
             let addr = m1;
@@ -1379,20 +1427,53 @@ unsafe fn service_sec_image(
             let rights = fill_image_page(tpe, rva, scratch);
             let _ = page_map(copy_cap(f), page, rights, pml4);
             faults += 1;
-            let (nmi, nm0, nm1, _nm2, _nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
+            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
             continue;
         }
         if (mi >> 12) == 2 {
-            // A native `syscall`. SSN_DONE is our test sentinel; any other SSN means smss (via
-            // ntdll) reached a REAL Nt* system call — record it as the stop reason.
+            // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
+            // sentinel; otherwise it's a REAL Nt* system call to service.
             if m0 == SSN_DONE {
                 verdict = get_recv_mr(9); // R10 = arg1
-            } else {
-                stop_ssn = m0;
+                break;
             }
+            if m0 == SSN_NT_ALLOCATE_VM {
+                // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
+                // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size. Back it with
+                // fresh frames at a bump address; copyout *Base + *Size via the stack mirror.
+                let base_ptr = m3; // RDX
+                let size_ptr = get_recv_mr(8); // R9
+                let resume_ip = m2; // RCX = syscall return address
+                let sp = get_recv_mr(16);
+                let flags = get_recv_mr(17);
+                let want = smss_stack_read(size_ptr);
+                let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
+                let alloc_base = NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed);
+                let mut p = 0u64;
+                while p < rounded {
+                    let _ = page_map(alloc_frame(), alloc_base + p, RW_NX, pml4);
+                    p += 0x1000;
+                }
+                smss_stack_write(base_ptr, alloc_base);
+                smss_stack_write(size_ptr, rounded);
+                NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
+                set_reply_mr(15, resume_ip);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+                let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 18, 0, m1, 0, m3);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
+            stop_ssn = m0; // an Nt* syscall we don't service yet — stop
             break;
         }
         stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
@@ -1802,6 +1883,10 @@ unsafe fn spawn_storage_host(
 static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
 /// How many VMFaults (page faults) the service loop demand-paged in for the user thread.
 static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Bump allocator for NtAllocateVirtualMemory backing a SEC_IMAGE process.
+static NEXT_SMSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
+/// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
+static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
@@ -4072,29 +4157,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" stop=0x");
                     print_hex((sstop >> 32) as u32);
                     print_hex(sstop as u32);
-                    print_str(b" reached_ntdll_syscall_ssn=0x");
-                    print_hex(sssn as u32);
+                    print_str(b" ntalloc_serviced=");
+                    print_u64(NTALLOC_SERVICED.load(Ordering::Relaxed));
                     print_str(b"\n");
+                    let _ = (sfirst, sssn);
+                    // The env trampoline made a real NtAllocateVirtualMemory syscall through
+                    // ntdll that the executive's dispatcher serviced (allocate + copyout).
                     check(
-                        b"exec_reactos_smss_live_executed",
-                        sfirst == PE_LOAD_BASE + 0x12ee0,
+                        b"exec_reactos_ntalloc_serviced",
+                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
-                    // With a valid PEB, smss skips the RtlAssert/null-deref path (old stop
-                    // 0x24bc8350): it runs RtlNormalizeProcessParams (which returns) and
-                    // continues through MORE ntdll pages (3 vs 1) into its real startup, until a
-                    // deeper env gap (a null-struct deref at 0x74). sssn is captured for the day
-                    // smss reaches a real Nt* syscall.
-                    let _ = sssn;
+                    // After the syscall, smss runs its real startup (skips RtlAssert, runs
+                    // RtlNormalizeProcessParams) until a deeper env gap (the null process heap).
                     check(
                         b"exec_reactos_smss_ran_past_null_deref",
                         ntfaults >= 2 && sstop != 0x0000_0100_24bc_8350,
                         &mut passed,
                     );
                 } else {
-                    check(b"exec_reactos_smss_live_executed", false, &mut passed);
+                    check(b"exec_reactos_ntalloc_serviced", false, &mut passed);
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
                     check(b"exec_reactos_smss_ran_past_null_deref", false, &mut passed);
