@@ -670,3 +670,15 @@ findings). A step is not "done" until the plan reflects it.
   Checks: exec_sec_image_demand_loaded / _two_sections. This is how a real ntdll/smss loads.
   Next: the ReactOS-binary pipeline (fetch/extract ntdll/smss at build, fresh-clone-safe) +
   load a real binary via SEC_IMAGE + a heap bump (2 MB image won't fit the 128 KiB heap).
+- **2026-07-09** — **P3 ReactOS-binary pipeline — a REAL ReactOS x64 binary in the machinery
+  (exec 0d34f09 + rust-micro 0a3c309). 87/87.** First real Windows-family binary end to end:
+  a genuine, redistributable ReactOS x64 smss.exe flows disk -> isolated storage host ->
+  nt-pe-loader parse -> SEC_IMAGE validation. scripts/fetch_reactos.sh fetches a ReactOS x64
+  livecd (curl + bsdtar; no 7z/cabextract needed) + extracts ntdll.dll/smss.exe to .tmp/reactos/
+  (cached, never committed); make_image.sh mcopies them to ::SMSS.EXE/::NTDLL.DLL (guarded).
+  The storage host reads SMSS.EXE into a 32-frame shared FILEBUF (own PT at 0x60 — 0x50 collided
+  with the SURT rings); the executive parses it (PE32+ x64, 6 sections, entry 0x12ee0, imports
+  ntdll.dll) + validates fill_image_page against it. Checks: exec_reactos_smss_parsed /
+  _imports_ntdll / _sec_image_fill. NOTE: ReactOS stable is x86 (PE32, rejected); the x64
+  (amd64/MSVC) livecd gives loadable PE32+ binaries. Next: demand-page the real binary via
+  SEC_IMAGE from disk (spawn_sec_image on the disk bytes); eventually run it (needs imports/env).
