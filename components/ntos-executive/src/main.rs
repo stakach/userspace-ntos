@@ -112,6 +112,8 @@ pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0068_0000;
 pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
+/// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
+pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1282,6 +1284,8 @@ unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA);
         core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
         let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
+        // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second (zeroed) page.
+        let _ = page_map(alloc_frame(), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -1291,32 +1295,30 @@ unsafe fn spawn_sec_image(
         // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
         let params = alloc_frame();
         let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
-        // Trampoline: make a real NtAllocateVirtualMemory syscall through ntdll (serviced by
-        // the executive), write to the returned memory to prove it's mapped, then load RCX=PEB
-        // and jump to the entry. This exercises the syscall dispatcher before the entry runs.
+        // Trampoline: call ntdll's real RtlCreateHeap(HEAP_GROWABLE, 0, 0x10000, 0x10000, 0, 0)
+        // — its NtQuerySystemInformation + NtAllocateVirtualMemory syscalls are serviced by the
+        // executive — store the returned heap into PEB->ProcessHeap, then jump to smss's entry
+        // (RCX=PEB) so smss's RtlAllocateHeap has a real heap and runs past the 0x74 gap.
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
         let mut tb = alloc::vec::Vec::new();
-        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x50]); // sub rsp, 0x50
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // mov qword [rsp+0x40],0  Base
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48, 0x00, 0x20, 0, 0]); // [rsp+0x48]=0x2000  Size
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x30, 0, 0]); // [rsp+0x20]=0x3000  AllocType
-        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x04, 0, 0, 0]); // [rsp+0x28]=4  Protect
-        tb.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1  ProcessHandle
-        tb.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x40]); // lea rdx, [rsp+0x40]  &Base
-        tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  ZeroBits
-        tb.extend_from_slice(&[0x4C, 0x8D, 0x4C, 0x24, 0x48]); // lea r9, [rsp+0x48]  &Size
+        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // [rsp+0x20]=0  Lock
+        tb.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // [rsp+0x28]=0  Parameters
+        tb.extend_from_slice(&[0xB9, 0x02, 0, 0, 0]); // mov ecx, 2  Flags=HEAP_GROWABLE
+        tb.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  HeapBase=0
+        tb.extend_from_slice(&[0x41, 0xB8, 0x00, 0x00, 0x01, 0x00]); // mov r8d, 0x10000  ReserveSize
+        tb.extend_from_slice(&[0x41, 0xB9, 0x00, 0x00, 0x01, 0x00]); // mov r9d, 0x10000  CommitSize
         tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(NTDLL_BASE + 0x5d826).to_le_bytes()); // movabs rax, NtAllocateVirtualMemory
+        tb.extend_from_slice(&(NTDLL_BASE + 0x183f0).to_le_bytes()); // movabs rax, RtlCreateHeap
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-        tb.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x40]); // mov rcx, [rsp+0x40]  allocated base
-        tb.extend_from_slice(&[0xC7, 0x01, 0x5A, 0x5A, 0x5A, 0x5A]); // mov dword [rcx], 0x5A5A5A5A
-        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x50]); // add rsp, 0x50
+        tb.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
+        tb.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]); // mov [rcx+0x30], rax  PEB->ProcessHeap
         tb.extend_from_slice(&[0x48, 0xB8]);
         tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
-        tb.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+        tb.extend_from_slice(&[0xFF, 0xE0]); // jmp rax (RCX still = PEB)
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -1362,6 +1364,18 @@ unsafe fn smss_stack_write(stack_va: u64, v: u64) {
     }
 }
 
+/// The file byte at image RVA `rva` (translated via the section table). For reading a faulting
+/// instruction's opcode from the mapped PE.
+unsafe fn pe_byte_at_rva(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u8> {
+    for s in pe.sections() {
+        if rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size {
+            let off = (s.pointer_to_raw_data + (rva - s.virtual_address)) as usize;
+            return pe.bytes().get(off).copied();
+        }
+    }
+    None
+}
+
 /// The page-aligned virtual extent of a PE image (end of its highest section).
 unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
     let mut ext = 0u32;
@@ -1398,8 +1412,42 @@ unsafe fn service_sec_image(
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
     let mut stop_ssn = 0u64;
+    let mut iters = 0u64;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
+        iters += 1;
+        if iters > 4000 {
+            stop = m1;
+            break;
+        }
+        // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
+        // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
+        // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
+        if (mi >> 12) == 3 {
+            // UserException delivery: m0=FaultIP, m1=SP, m2=FLAGS, m3=Number, mr4=Code. The
+            // reply sets IP/SP/FLAGS (length 3); the general registers are preserved.
+            let fip = m0;
+            let mut skipped = false;
+            if let Some((nb, npe)) = ntdll {
+                if fip >= nb && fip < nb + image_extent(npe) {
+                    if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
+                        // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
+                        let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 3, fip + 3, m1, m2, 0);
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        skipped = true;
+                    }
+                }
+            }
+            if skipped {
+                continue;
+            }
+            stop = fip;
+            break;
+        }
         if (mi >> 12) == 6 {
             let addr = m1;
             if faults == 0 {
@@ -1416,7 +1464,7 @@ unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 64 {
+            if faults >= 96 {
                 stop = addr;
                 break;
             }
@@ -1442,39 +1490,69 @@ unsafe fn service_sec_image(
                 verdict = get_recv_mr(9); // R10 = arg1
                 break;
             }
+            let resume_ip = m2; // RCX = syscall return address
+            let sp = get_recv_mr(16);
+            let flags = get_recv_mr(17);
+            let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
+            let mut handled = true;
             if m0 == SSN_NT_ALLOCATE_VM {
                 // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
-                // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size. Back it with
-                // fresh frames at a bump address; copyout *Base + *Size via the stack mirror.
+                // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size, [sp+0x28]=Type.
+                // RESERVE (base in==0) picks a bump base; COMMIT maps frames at the base.
                 let base_ptr = m3; // RDX
                 let size_ptr = get_recv_mr(8); // R9
-                let resume_ip = m2; // RCX = syscall return address
-                let sp = get_recv_mr(16);
-                let flags = get_recv_mr(17);
+                let alloc_type = smss_stack_read(sp + 0x28);
+                let base_in = smss_stack_read(base_ptr);
                 let want = smss_stack_read(size_ptr);
                 let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
-                let alloc_base = NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed);
-                let mut p = 0u64;
-                while p < rounded {
-                    let _ = page_map(alloc_frame(), alloc_base + p, RW_NX, pml4);
-                    p += 0x1000;
+                let base = if base_in != 0 {
+                    base_in
+                } else {
+                    NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                };
+                if alloc_type & 0x1000 != 0 {
+                    // MEM_COMMIT — back it with real frames.
+                    let mut p = 0u64;
+                    while p < rounded {
+                        let _ = page_map(alloc_frame(), base + p, RW_NX, pml4);
+                        p += 0x1000;
+                    }
                 }
-                smss_stack_write(base_ptr, alloc_base);
+                smss_stack_write(base_ptr, base);
                 smss_stack_write(size_ptr, rounded);
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-                set_reply_mr(15, resume_ip);
-                set_reply_mr(16, sp);
-                set_reply_mr(17, flags);
-                let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 18, 0, m1, 0, m3);
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
+            } else if m0 == SSN_NT_QUERY_SYSTEM_INFO {
+                // NtQuerySystemInformation(Class, Buffer, Len, *RetLen). RtlCreateHeap needs
+                // SystemBasicInformation (class 0): PageSize, AllocationGranularity, and the
+                // user-mode address range. Copyout the fields it reads.
+                let class = get_recv_mr(9); // R10 = SystemInformationClass
+                let buf = m3; // RDX = SystemInformation buffer
+                let retlen_ptr = get_recv_mr(8); // R9 = *ReturnLength (4th arg, a register)
+                if class == 0 {
+                    smss_stack_write(buf + 0x08, 0x1000); // PageSize
+                    smss_stack_write(buf + 0x18, 0x10000); // AllocationGranularity
+                    smss_stack_write(buf + 0x20, 0x10000); // MinimumUserModeAddress
+                    smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
+                    smss_stack_write(retlen_ptr, 0x40);
+                }
+            } else {
+                handled = false;
+                result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
             }
-            stop_ssn = m0; // an Nt* syscall we don't service yet — stop
-            break;
+            if !handled {
+                stop_ssn = m0; // an Nt* syscall we don't service yet — stop
+                break;
+            }
+            set_reply_mr(15, resume_ip);
+            set_reply_mr(16, sp);
+            set_reply_mr(17, flags);
+            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 18, result, m1, 0, m3);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
+            continue;
         }
         stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
         break;
@@ -4140,11 +4218,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
+                    // Scratch at 0x6C — past FILEBUF (0x60), the stack mirror (0x68), in the
+                    // FILEBUF PT; up to the 96-fault cap fits before 0x80.
                     let (_v, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         pml4,
                         &pe,
-                        0x0000_0100_0062_0000,
+                        0x0000_0100_006C_0000,
                         Some((NTDLL_BASE, &ntdll_pe)),
                     );
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
