@@ -103,6 +103,9 @@ pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 pub const TEB_VA: u64 = 0x0000_0100_0057_0000;
 pub const PEB_VA: u64 = 0x0000_0100_0058_0000;
 pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
+/// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is
+/// resolved to point here, so the PE calls named ntdll functions like real Windows code.
+pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
@@ -867,38 +870,38 @@ pub unsafe extern "C" fn signaler_entry() -> ! {
     park()
 }
 
-/// The user process's code for the loaded real PE. It does a serviced syscall
-/// (NtQuerySystemTime) and then walks its Windows environment exactly as ntdll would:
-/// `GS:[0x30]` (TEB self) -> `[TEB+0x60]` (PEB) -> `[PEB+0x10]` (ImageBaseAddress), touches
-/// KUSER_SHARED_DATA at 0x7FFE0000 (faults if unmapped), and reports the image base via
-/// SSN_DONE. Position-independent (syscalls, GS-relative, a rel8 loop).
-const PE_STUB: &[u8] = &[
+/// The provided "ntdll" stub for NtQuerySystemTime: `mov rax,0x57; syscall; ret`. Mapped RX
+/// at NTDLL_VA; the PE's IAT is resolved to point here, so the PE calls it like real code.
+const NTDLL_STUB: &[u8] = &[
     0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 0x57  (NtQuerySystemTime)
     0x0F, 0x05, // syscall
-    0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, // mov rax, gs:[0x30]  (TEB self)
-    0x48, 0x8B, 0x40, 0x60, // mov rax, [rax+0x60]  (PEB)
-    0x48, 0x8B, 0x40, 0x10, // mov rax, [rax+0x10]  (ImageBaseAddress)
-    0x49, 0x89, 0xC2, // mov r10, rax  (report the image base)
-    0x48, 0xB9, 0x00, 0x00, 0xFE, 0x7F, 0x00, 0x00, 0x00, 0x00, // movabs rcx, 0x7FFE0000
-    0x48, 0x8B, 0x09, // mov rcx, [rcx]  (touch KUSER_SHARED_DATA)
-    0x48, 0xC7, 0xC0, 0xFF, 0x01, 0x00, 0x00, // mov rax, 0x1FF  (SSN_DONE)
-    0x0F, 0x05, // syscall  -> verdict = r10 = image base
-    0xEB, 0xFE, // jmp $  (park)
+    0xC3, // ret
 ];
 
-/// Build a minimal PE32+/x86_64 image: one `.text` section (`text`) at RVA 0x1000, entry
-/// there, `Subsystem = NATIVE`, no imports/relocs. Mirrors nt-pe-loader's own test builder
-/// (crates/nt-pe-loader/tests/parse.rs) — a real PE the loader parses + maps.
-unsafe fn build_min_pe(text: &[u8], image_base: u64) -> alloc::vec::Vec<u8> {
+/// Build a PE32+/x86_64 image. `sections` = (name8, va, chars, data); `dirs` = (index, rva,
+/// size). Mirrors nt-pe-loader's own test builder (crates/nt-pe-loader/tests/parse.rs).
+unsafe fn build_pe(
+    image_base: u64,
+    entry_rva: u32,
+    size_of_image: u32,
+    sections: &[(&[u8; 8], u32, u32, &[u8])],
+    dirs: &[(usize, u32, u32)],
+) -> alloc::vec::Vec<u8> {
     const NT_OFF: usize = 0x40;
     const OPT_OFF: usize = 0x58;
     const SECTION_TABLE: usize = 0x148;
     const FILE_ALIGN: usize = 0x200;
     let align = |n: usize, a: usize| (n + a - 1) & !(a - 1);
-    let size_of_headers = align(SECTION_TABLE + 40, FILE_ALIGN);
-    let raw_off = size_of_headers;
-    let raw_sz = align(text.len().max(1), FILE_ALIGN);
-    let mut b = alloc::vec![0u8; raw_off + raw_sz];
+    let n = sections.len();
+    let size_of_headers = align(SECTION_TABLE + n * 40, FILE_ALIGN);
+    let mut raw_off = size_of_headers;
+    let mut raws = alloc::vec::Vec::new();
+    for s in sections {
+        let sz = align(s.3.len().max(1), FILE_ALIGN);
+        raws.push((raw_off, sz));
+        raw_off += sz;
+    }
+    let mut b = alloc::vec![0u8; raw_off];
     let pu16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
     let pu32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
     let pu64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
@@ -906,27 +909,74 @@ unsafe fn build_min_pe(text: &[u8], image_base: u64) -> alloc::vec::Vec<u8> {
     pu32(&mut b, 0x3C, NT_OFF as u32);
     pu32(&mut b, NT_OFF, 0x0000_4550); // PE\0\0
     pu16(&mut b, NT_OFF + 4, 0x8664); // machine AMD64
-    pu16(&mut b, NT_OFF + 6, 1); // NumberOfSections
+    pu16(&mut b, NT_OFF + 6, n as u16); // NumberOfSections
     pu16(&mut b, NT_OFF + 4 + 16, 240); // SizeOfOptionalHeader
     pu16(&mut b, NT_OFF + 4 + 18, 0x0002); // EXECUTABLE_IMAGE
     pu16(&mut b, OPT_OFF, 0x020b); // PE32+ magic
-    pu32(&mut b, OPT_OFF + 16, 0x1000); // AddressOfEntryPoint (RVA)
+    pu32(&mut b, OPT_OFF + 16, entry_rva);
     pu64(&mut b, OPT_OFF + 24, image_base);
     pu32(&mut b, OPT_OFF + 32, 0x1000); // SectionAlignment
     pu32(&mut b, OPT_OFF + 36, FILE_ALIGN as u32);
-    pu32(&mut b, OPT_OFF + 56, 0x2000); // SizeOfImage
+    pu32(&mut b, OPT_OFF + 56, size_of_image);
     pu32(&mut b, OPT_OFF + 60, size_of_headers as u32);
     pu16(&mut b, OPT_OFF + 68, 1); // Subsystem: NATIVE
     pu32(&mut b, OPT_OFF + 108, 16); // NumberOfRvaAndSizes
-    let se = SECTION_TABLE;
-    b[se..se + 8].copy_from_slice(b".text\0\0\0");
-    pu32(&mut b, se + 8, text.len() as u32); // VirtualSize
-    pu32(&mut b, se + 12, 0x1000); // VirtualAddress
-    pu32(&mut b, se + 16, raw_sz as u32); // SizeOfRawData
-    pu32(&mut b, se + 20, raw_off as u32); // PointerToRawData
-    pu32(&mut b, se + 36, 0x6000_0020); // CODE | EXECUTE | READ
-    b[raw_off..raw_off + text.len()].copy_from_slice(text);
+    for &(idx, rva, size) in dirs {
+        pu32(&mut b, OPT_OFF + 112 + idx * 8, rva);
+        pu32(&mut b, OPT_OFF + 112 + idx * 8 + 4, size);
+    }
+    for (i, s) in sections.iter().enumerate() {
+        let se = SECTION_TABLE + i * 40;
+        b[se..se + 8].copy_from_slice(s.0);
+        pu32(&mut b, se + 8, s.3.len() as u32); // VirtualSize
+        pu32(&mut b, se + 12, s.1); // VirtualAddress
+        pu32(&mut b, se + 16, raws[i].1 as u32); // SizeOfRawData
+        pu32(&mut b, se + 20, raws[i].0 as u32); // PointerToRawData
+        pu32(&mut b, se + 36, s.2); // Characteristics
+        b[raws[i].0..raws[i].0 + s.3.len()].copy_from_slice(s.3);
+    }
     b
+}
+
+/// The `.rdata` import table (section VA 0x2000): imports `ntdll.dll!NtQuerySystemTime`; the
+/// IAT (FirstThunk) slot is at RVA 0x2038. Mirrors nt-pe-loader's `imports_are_listed` test.
+unsafe fn build_import_table() -> alloc::vec::Vec<u8> {
+    let base = 0x2000u32;
+    let mut d = alloc::vec![0u8; 0x80];
+    let p32 = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let p64 = |d: &mut [u8], o: usize, v: u64| d[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    // descriptor 0: OriginalFirstThunk@0, Name@0x0C, FirstThunk@0x10 (descriptor 1 = null).
+    p32(&mut d, 0x00, base + 0x28); // ILT
+    p32(&mut d, 0x0C, base + 0x48); // Name
+    p32(&mut d, 0x10, base + 0x38); // IAT (FirstThunk) -> slot RVA 0x2038
+    p64(&mut d, 0x28, (base + 0x58) as u64); // ILT thunk -> IMAGE_IMPORT_BY_NAME
+    p64(&mut d, 0x38, (base + 0x58) as u64); // IAT thunk (patched at load)
+    d[0x48..0x48 + 10].copy_from_slice(b"ntdll.dll\0");
+    // IMAGE_IMPORT_BY_NAME: hint(0) + name.
+    d[0x5A..0x5A + 18].copy_from_slice(b"NtQuerySystemTime\0");
+    d
+}
+
+/// The PE `.text` code: `call [IAT:NtQuerySystemTime]` (the imported ntdll function), then
+/// walk the Windows environment (GS:[0x30]->TEB->[+0x60]->PEB->[+0x10]->ImageBase), touch
+/// KUSER, and report the image base via SSN_DONE. Uses the stack (the call) + GS-relative.
+unsafe fn build_pe_text() -> alloc::vec::Vec<u8> {
+    let iat_va = PE_LOAD_BASE + 0x2038;
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x48, 0xB8]); // movabs rax, IAT_VA
+    t.extend_from_slice(&iat_va.to_le_bytes());
+    t.extend_from_slice(&[0xFF, 0x10]); // call [rax]  (NtQuerySystemTime via the IAT)
+    t.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00]); // mov rax, gs:[0x30]
+    t.extend_from_slice(&[0x48, 0x8B, 0x40, 0x60]); // mov rax, [rax+0x60]  (PEB)
+    t.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10]  (ImageBase)
+    t.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
+    t.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, KUSER_VA
+    t.extend_from_slice(&KUSER_VA.to_le_bytes());
+    t.extend_from_slice(&[0x48, 0x8B, 0x09]); // mov rcx, [rcx]  (touch KUSER)
+    t.extend_from_slice(&[0x48, 0xC7, 0xC0, 0xFF, 0x01, 0x00, 0x00]); // mov rax, 0x1FF (SSN_DONE)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $  (park)
+    t
 }
 
 /// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
@@ -969,14 +1019,17 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     // --- Windows process environment: TEB + PEB (in the PE's PT) + KUSER_SHARED_DATA (its
     // own PT chain at the fixed low VA). Each frame is written via an executive scratch
     // mapping (past the PE code) then mapped into the PE VSpace at its VA.
+    // Env/ntdll scratch pages sit PAST the PE image pages (which use scratch 0..pages) so
+    // they never collide with them.
+    let env_scratch = PE_SCRATCH_VADDR + pages as u64 * 0x1000;
     let teb = alloc_frame();
-    let _ = page_map(teb, PE_SCRATCH_VADDR + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x2000 + 0x30) as *mut u64, TEB_VA); // TEB self
-    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x2000 + 0x60) as *mut u64, PEB_VA); // ProcessEnvironmentBlock
+    let _ = page_map(teb, env_scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((env_scratch + 0x30) as *mut u64, TEB_VA); // TEB self
+    core::ptr::write_volatile((env_scratch + 0x60) as *mut u64, PEB_VA); // ProcessEnvironmentBlock
     let _ = page_map(copy_cap(teb), TEB_VA, RW_NX, pml4);
     let peb = alloc_frame();
-    let _ = page_map(peb, PE_SCRATCH_VADDR + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x3000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
+    let _ = page_map(peb, env_scratch + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
     let _ = page_map(copy_cap(peb), PEB_VA, RW_NX, pml4);
     // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0], vs the image at PML4[2]) — a fresh PT chain.
     let pdpt2 = alloc_slot();
@@ -990,6 +1043,13 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
     let kuser = alloc_frame(); // zeroed; the stub only touches it (proves the fixed VA maps)
     let _ = page_map(kuser, KUSER_VA, RW_NX, pml4);
+    // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
+    let ntdll = alloc_frame();
+    let _ = page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    for (j, &byte) in NTDLL_STUB.iter().enumerate() {
+        core::ptr::write_volatile((env_scratch + 0x2000 + j as u64) as *mut u8, byte);
+    }
+    let _ = page_map(copy_cap(ntdll), NTDLL_VA, /* RX */ 2, pml4);
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -2383,12 +2443,47 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // via nt-pe-loader (parse + map), and run it in an isolated process — the real PE-load
     // path, not hand-written code in the executive image. The stub does NtQuerySystemTime +
     // reports the result via SSN_DONE, so we see a real syscall come back through a loaded PE.
-    print_str(b"[ntos-exec] P3: loading + running a real PE via nt-pe-loader\n");
-    let pe_bytes = build_min_pe(PE_STUB, PE_LOAD_BASE);
-    let (mut pe_loaded, mut pe_serviced, mut pe_verdict) = (false, 0u64, 0u64);
+    print_str(b"[ntos-exec] P3: loading a real PE that imports ntdll.dll!NtQuerySystemTime\n");
+    let text = build_pe_text();
+    let idata = build_import_table();
+    let pe_bytes = build_pe(
+        PE_LOAD_BASE,
+        0x1000,
+        0x3000,
+        &[
+            (b".text\0\0\0", 0x1000, 0x6000_0020, &text),
+            (b".rdata\0\0", 0x2000, 0x4000_0040, &idata),
+        ],
+        &[(1, 0x2000, 40)],
+    );
+    let (mut pe_loaded, mut pe_serviced, mut pe_verdict, mut imports_ok) = (false, 0u64, 0u64, false);
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&pe_bytes) {
-        if let Ok(mapped) = pe.map(PE_LOAD_BASE) {
+        // Resolve the import table: find ntdll.dll!NtQuerySystemTime + its IAT slot RVA.
+        let mut slot = 0u32;
+        if let Ok(imps) = pe.imports() {
+            for dll in &imps {
+                for f in &dll.functions {
+                    if let nt_pe_loader::ImportRef::ByName { name, iat_slot_rva, .. } = f {
+                        if name == "NtQuerySystemTime" && dll.name.eq_ignore_ascii_case("ntdll.dll") {
+                            slot = *iat_slot_rva;
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(mut mapped) = pe.map(PE_LOAD_BASE) {
             pe_loaded = mapped.entry_point() == PE_LOAD_BASE + 0x1000;
+            if slot != 0 {
+                let _ = mapped.patch_iat(slot, NTDLL_VA);
+                let mut sb = [0u8; 8];
+                sb.copy_from_slice(&mapped.bytes[slot as usize..slot as usize + 8]);
+                imports_ok = slot == 0x2038 && u64::from_le_bytes(sb) == NTDLL_VA;
+            }
+            print_str(b"[ntos-exec] PE imports ntdll.dll!NtQuerySystemTime -> IAT slot 0x");
+            print_hex(slot);
+            print_str(b" patched=");
+            print_u64(imports_ok as u64);
+            print_str(b"\n");
             let pe_fault = make_object(OBJ_ENDPOINT);
             let pe_fault_c = copy_cap(pe_fault);
             let pe_sysarg = alloc_frame();
@@ -2409,10 +2504,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(b"exec_real_pe_loaded", pe_loaded, &mut passed);
     check(b"exec_real_pe_ran", pe_serviced >= 1, &mut passed);
     check(b"exec_real_pe_syscall", pe_verdict != 0, &mut passed);
-    // The PE resolved GS:[0x30]->TEB->[+0x60]->PEB->[+0x10]->ImageBaseAddress to its real load
-    // base, and touched KUSER_SHARED_DATA at 0x7FFE0000 without faulting — a real Windows
-    // process environment.
+    // GS->TEB->PEB->ImageBase resolved AND (before it) the IAT call to the ntdll stub ran.
     check(b"exec_pe_env_imagebase", pe_verdict == PE_LOAD_BASE, &mut passed);
+    // The PE's import table was parsed + the IAT slot resolved to the provided ntdll stub.
+    check(b"exec_pe_imports_resolved", imports_ok, &mut passed);
 
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
@@ -3201,7 +3296,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/74 executive->isolated-service checks passed]\n");
+    print_str(b"/75 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
