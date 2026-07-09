@@ -617,3 +617,11 @@ findings). A step is not "done" until the plan reflects it.
   GS:[0x30]->TEB->[+0x60]->PEB->[+0x10]->ImageBase (= PE_LOAD_BASE) + touches KUSER + reports
   it. Verified verdict == PE_LOAD_BASE. Check: exec_pe_env_imagebase. Next P3: imports/IAT so
   real ntdll code resolves + runs; then a larger/real PE toward smss.exe.
+- **2026-07-09** — **P3 imports/IAT (exec 144e9cd). 75/75.** The loaded PE now imports
+  ntdll.dll!NtQuerySystemTime + calls it through the IAT, like real Windows code. build_pe
+  (generalized) emits a 2-section PE (.text call [IAT] + env walk; .rdata import table, IAT
+  slot 0x2038); the executive imports()+map+patch_iat's the slot to a provided ntdll stub
+  (mov rax,0x57;syscall;ret) mapped RX at NTDLL_VA; the PE does call [IAT]->stub->syscall->ret
+  then GS->TEB->PEB->ImageBase. Check: exec_pe_imports_resolved. Fix: env/ntdll scratch must
+  sit past the PE image pages (collision zeroed the TEB). Next P3: load a larger/real PE
+  (real ntdll + smss.exe) toward the P3 exit.
