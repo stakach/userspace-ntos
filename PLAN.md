@@ -723,3 +723,14 @@ findings). A step is not "done" until the plan reflects it.
   env-build exec scratch must be present in the exec's OWN VSpace (0x5f_c bad -> zeroed
   trampoline -> #PF cr2=0; moved to the FILEBUF PT 0x6e). Next: fill the deeper env (0x74);
   then LPC (P4).
+- **2026-07-09** — **P3 syscall dispatcher — service a real ntdll NtAllocateVirtualMemory (exec
+  79c85f7). 92/92.** The foundation for running a real process: service_sec_image now dispatches
+  native Nt* syscalls, not just page faults. On a `syscall` (UnknownSyscall, RAX=SSN), it routes
+  by SSN; for NtAllocateVirtualMemory (SSN 0x12) it reads the pointer args from the process's
+  stack via a MIRROR (smss's stack frames mapped at SMSS_STACK_MIRROR_VA for copyin/copyout),
+  backs it with frames at SMSS_ALLOC_VA (own PT), copyout *Base/*Size, replies STATUS_SUCCESS +
+  resumes past the syscall. smss's env trampoline makes a real NtAllocateVirtualMemory call
+  through ntdll (first fault = ntdll stub 0x85d826), writes to the returned memory, then runs
+  smss's startup to the null-heap stop at 0x74. Check: exec_reactos_ntalloc_serviced. Next:
+  service NtQuerySystemInformation + a 2nd NtAllocateVirtualMemory so ntdll's real RtlCreateHeap
+  (rva 0x183f0) runs -> a real process heap -> smss past 0x74; then more Nt* + LPC (P4).
