@@ -702,3 +702,13 @@ findings). A step is not "done" until the plan reflects it.
   exec_reactos_imports_resolved / _smss_import_resolved_call. Next: map ntdll at NTDLL_BASE
   (SEC_IMAGE demand) so smss's call executes real ntdll code + returns; then a process env
   (PEB/params); then LPC (P4).
+- **2026-07-09** — **P3 map ntdll — smss calls into real ntdll, ntdll code EXECUTES (exec
+  d1a3a1a). 91/91.** smss's resolved ntdll calls now execute. The storage host reads the real
+  975 KiB ros-ntdll.dll off disk (verdict 0x80) into a 240-frame buffer (own PT @0xA0); the
+  executive demand-maps it at NTDLL_BASE in smss's VSpace. spawn_sec_image reserves a 2nd
+  image's PT; service_sec_image is MULTI-IMAGE (routes each VMFault to smss[0x56] or ntdll[0x80]
+  by range, fills from that PE by RVA). smss runs its prologue (2 pages), then calls
+  RtlNormalizeProcessParams via the resolved IAT (NTDLL_BASE+0x48f00) -> ntdll's .text faults in
+  and REAL NTDLL CODE EXECUTES; it runs until ntdll derefs the null process params -> safe stop
+  (0x24bc8350). Check: exec_reactos_smss_calls_into_ntdll. Next: a process env (PEB +
+  RTL_USER_PROCESS_PARAMETERS in RCX) so ntdll runs past the null deref; then LPC (P4).
