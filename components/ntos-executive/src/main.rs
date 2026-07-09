@@ -97,6 +97,12 @@ pub const SYSARG2_VADDR: u64 = 0x0000_0100_005D_1000;
 /// the stack/sysarg/ipcbuf), and the executive's scratch region to write the code first.
 pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
+/// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
+/// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
+/// TEB_VA so `GS:[0x30]` is the TEB self-pointer (NtCurrentTeb).
+pub const TEB_VA: u64 = 0x0000_0100_0057_0000;
+pub const PEB_VA: u64 = 0x0000_0100_0058_0000;
+pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
 /// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
@@ -861,15 +867,22 @@ pub unsafe extern "C" fn signaler_entry() -> ! {
     park()
 }
 
-/// The user process's code for the minimal real PE: NtQuerySystemTime -> SSN_DONE(with the
-/// returned time in r10) -> park. Position-independent (only syscalls + a rel8 loop), so it
-/// runs correctly at any load base.
+/// The user process's code for the loaded real PE. It does a serviced syscall
+/// (NtQuerySystemTime) and then walks its Windows environment exactly as ntdll would:
+/// `GS:[0x30]` (TEB self) -> `[TEB+0x60]` (PEB) -> `[PEB+0x10]` (ImageBaseAddress), touches
+/// KUSER_SHARED_DATA at 0x7FFE0000 (faults if unmapped), and reports the image base via
+/// SSN_DONE. Position-independent (syscalls, GS-relative, a rel8 loop).
 const PE_STUB: &[u8] = &[
-    0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 0x57  (NtQuerySystemTime SSN)
-    0x0F, 0x05, // syscall  -> rax = time
-    0x49, 0x89, 0xC2, // mov r10, rax
+    0x48, 0xC7, 0xC0, 0x57, 0x00, 0x00, 0x00, // mov rax, 0x57  (NtQuerySystemTime)
+    0x0F, 0x05, // syscall
+    0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, // mov rax, gs:[0x30]  (TEB self)
+    0x48, 0x8B, 0x40, 0x60, // mov rax, [rax+0x60]  (PEB)
+    0x48, 0x8B, 0x40, 0x10, // mov rax, [rax+0x10]  (ImageBaseAddress)
+    0x49, 0x89, 0xC2, // mov r10, rax  (report the image base)
+    0x48, 0xB9, 0x00, 0x00, 0xFE, 0x7F, 0x00, 0x00, 0x00, 0x00, // movabs rcx, 0x7FFE0000
+    0x48, 0x8B, 0x09, // mov rcx, [rcx]  (touch KUSER_SHARED_DATA)
     0x48, 0xC7, 0xC0, 0xFF, 0x01, 0x00, 0x00, // mov rax, 0x1FF  (SSN_DONE)
-    0x0F, 0x05, // syscall  -> verdict = r10 = time
+    0x0F, 0x05, // syscall  -> verdict = r10 = image base
     0xEB, 0xFE, // jmp $  (park)
 ];
 
@@ -952,6 +965,32 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
     let _ = page_map(sysarg_c, SYSARG_VADDR, RW_NX, pml4);
+
+    // --- Windows process environment: TEB + PEB (in the PE's PT) + KUSER_SHARED_DATA (its
+    // own PT chain at the fixed low VA). Each frame is written via an executive scratch
+    // mapping (past the PE code) then mapped into the PE VSpace at its VA.
+    let teb = alloc_frame();
+    let _ = page_map(teb, PE_SCRATCH_VADDR + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x2000 + 0x30) as *mut u64, TEB_VA); // TEB self
+    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x2000 + 0x60) as *mut u64, PEB_VA); // ProcessEnvironmentBlock
+    let _ = page_map(copy_cap(teb), TEB_VA, RW_NX, pml4);
+    let peb = alloc_frame();
+    let _ = page_map(peb, PE_SCRATCH_VADDR + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((PE_SCRATCH_VADDR + 0x3000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
+    let _ = page_map(copy_cap(peb), PEB_VA, RW_NX, pml4);
+    // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0], vs the image at PML4[2]) — a fresh PT chain.
+    let pdpt2 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt2);
+    let pd2 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd2);
+    let pt2 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt2);
+    let _ = paging_struct_map(pdpt2, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
+    let _ = paging_struct_map(pd2, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
+    let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
+    let kuser = alloc_frame(); // zeroed; the stub only touches it (proves the fixed VA maps)
+    let _ = page_map(kuser, KUSER_VA, RW_NX, pml4);
+
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
@@ -964,6 +1003,8 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, mapped.entry_point(), stack_top, 0);
+    // The Windows TEB anchor: GS base = TEB_VA, so the PE's `GS:[0x30]` is the TEB self-pointer.
+    let _ = tcb_set_gs_base(tcb, TEB_VA);
     let _ = tcb_set_priority(tcb, 100);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
@@ -2361,13 +2402,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(pe_loaded as u64);
     print_str(b" serviced=");
     print_u64(pe_serviced);
-    print_str(b" verdict(NtQuerySystemTime)=0x");
+    print_str(b" walked GS->TEB->PEB->ImageBase=0x");
     print_hex((pe_verdict >> 32) as u32);
     print_hex(pe_verdict as u32);
     print_str(b"\n");
     check(b"exec_real_pe_loaded", pe_loaded, &mut passed);
     check(b"exec_real_pe_ran", pe_serviced >= 1, &mut passed);
     check(b"exec_real_pe_syscall", pe_verdict != 0, &mut passed);
+    // The PE resolved GS:[0x30]->TEB->[+0x60]->PEB->[+0x10]->ImageBaseAddress to its real load
+    // base, and touched KUSER_SHARED_DATA at 0x7FFE0000 without faulting — a real Windows
+    // process environment.
+    check(b"exec_pe_env_imagebase", pe_verdict == PE_LOAD_BASE, &mut passed);
 
     // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
     // BootInfo) as a frame cap, map it, and read a real hardware register — proving
@@ -3156,7 +3201,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/73 executive->isolated-service checks passed]\n");
+    print_str(b"/74 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
