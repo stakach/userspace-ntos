@@ -691,3 +691,14 @@ findings). A step is not "done" until the plan reflects it.
   scratch_base param + safe-stop (out-of-image / non-VMFault / 16-fault cap). Checks:
   exec_reactos_smss_live_executed / _live_paged. Next: resolve smss's ntdll imports (load
   ros-ntdll too + wire the IAT) + a process env so it runs past 0x18820; then LPC (P4).
+- **2026-07-09** — **P3 resolve smss's ntdll imports (exec 611d23f + rust-micro 79c947a).
+  91/91.** All 103 of smss's ntdll imports resolved. gen_reactos_imports.py (build-time)
+  parses the real smss + ntdll -> imports.bin ((iat_file_offset, export_rva) x103); the storage
+  host reads ::IMPORTS.BIN off disk; the executive patches smss's IAT in the file buffer (slot
+  := NTDLL_BASE + export_rva). Re-running smss live, its first ntdll call
+  (RtlNormalizeProcessParams) now jumps to NTDLL_BASE+0x48f00 (0x84_8f00, the RESOLVED real
+  ntdll address) instead of the unresolved thunk 0x18820. (Build-time resolution because parsing
+  ntdll's 1372 exports at runtime overflows the 128 KiB exec heap.) Checks:
+  exec_reactos_imports_resolved / _smss_import_resolved_call. Next: map ntdll at NTDLL_BASE
+  (SEC_IMAGE demand) so smss's call executes real ntdll code + returns; then a process env
+  (PEB/params); then LPC (P4).
