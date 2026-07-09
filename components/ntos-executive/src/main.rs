@@ -96,6 +96,9 @@ pub const SYSARG2_VADDR: u64 = 0x0000_0100_005D_1000;
 /// Where a loaded real PE's image is mapped in its user VSpace (inside the one 2 MiB PT with
 /// the stack/sysarg/ipcbuf), and the executive's scratch region to write the code first.
 pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
+/// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
+/// NTDLL_BASE + each import's export RVA.
+pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -2369,7 +2372,8 @@ unsafe fn storage_probe(
     dma_paddr: u64,
     hive_dest: u64,
     smss_dest: u64,
-) -> (u32, u32, u32, u32, u32) {
+    imports_dest: u64,
+) -> (u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
@@ -2410,7 +2414,8 @@ unsafe fn storage_probe(
     print_str(b" spf=");
     print_u64(spf32 as u64);
     print_str(b"\n");
-    let (mut cluster, mut size, mut hive_size, mut smss_size) = (0u32, 0u32, 0u32, 0u32);
+    let (mut cluster, mut size, mut hive_size, mut smss_size, mut imports_size) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
     if bps == 512 && spc >= 1 && is_fat32 {
         verdict |= 2;
         let fs = Fat32 {
@@ -2509,8 +2514,16 @@ unsafe fn storage_probe(
                 verdict |= 0x20;
             }
         }
+        // The build-time import-resolution table (imports.bin), read into `imports_dest`.
+        if let Some((ic, isz, _)) = dir_find(&fs, fs.root_cl, b"IMPORTS BIN") {
+            let got = fat_read_file(&fs, ic, isz, imports_dest);
+            if got == isz && isz > 0 {
+                imports_size = isz;
+                verdict |= 0x40;
+            }
+        }
     }
-    (verdict, cluster, size, hive_size, smss_size)
+    (verdict, cluster, size, hive_size, smss_size, imports_size)
 }
 
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
@@ -3871,6 +3884,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_smss_imports_ntdll", imports_ntdll, &mut passed);
                 check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
 
+                // Resolve smss's ntdll imports: apply the build-time patch table (imports.bin,
+                // read off disk into STORAGE_SHARED+0x800) to smss's IAT in the file buffer —
+                // each slot := NTDLL_BASE + the import's real ntdll export RVA. So smss's ntdll
+                // calls now target real ntdll addresses instead of unresolved file thunks.
+                let imports_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
+                let mut resolved = 0u32;
+                if imports_size >= 4 {
+                    let count = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x800) as *const u32);
+                    for i in 0..count as u64 {
+                        let ent = STORAGE_SHARED_VADDR + 0x804 + i * 8;
+                        let off = core::ptr::read_volatile(ent as *const u32) as u64;
+                        let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
+                        core::ptr::write_volatile((FILEBUF_VADDR + off) as *mut u64, NTDLL_BASE + rva);
+                        resolved += 1;
+                    }
+                }
+                let rnpp = core::ptr::read_volatile((FILEBUF_VADDR + 0x13330) as *const u64);
+                print_str(b"[ntos-exec] resolved ");
+                print_u64(resolved as u64);
+                print_str(b" smss ntdll imports; IAT[RtlNormalizeProcessParams]=0x");
+                print_hex((rnpp >> 32) as u32);
+                print_hex(rnpp as u32);
+                print_str(b"\n");
+                check(b"exec_reactos_imports_resolved", resolved == 103, &mut passed);
+
                 // LIVE SEC_IMAGE LOAD: spawn the real smss via spawn_sec_image (image VA only
                 // RESERVED) and let it START EXECUTING at its entry — its .text pages fault in
                 // LIVE, per RVA, from the disk-read bytes. It runs its real x64 prologue
@@ -3899,6 +3937,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     &mut passed,
                 );
                 check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
+                // With the IAT resolved, smss's first ntdll call now targets the REAL resolved
+                // address NTDLL_BASE + RtlNormalizeProcessParams's export RVA (0x48f00), i.e.
+                // 0x84_8f00 — not the unresolved file thunk 0x18820. (It stops there because
+                // ntdll isn't mapped yet — that's the next step.)
+                check(
+                    b"exec_reactos_smss_import_resolved_call",
+                    sstop == NTDLL_BASE + 0x48f00,
+                    &mut passed,
+                );
             }
             Err(_) => {
                 print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
@@ -3911,7 +3958,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/89 executive->isolated-service checks passed]\n");
+    print_str(b"/91 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

@@ -26,12 +26,13 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
     // listing, BOOTBOOT/INITRD read, and the SYSTEM.DAT registry hive read — runs here in the
     // isolated host's VSpace. The hive lands in the shared frame at +0x100 (past the metadata)
     // for the executive's Config Manager to parse.
-    let (verdict, cluster, size, hive_size, smss_size) = storage_probe(
+    let (verdict, cluster, size, hive_size, smss_size, imports_size) = storage_probe(
         AHCI_VADDR,
         AHCI_DMA_VADDR,
         dma_paddr,
         STORAGE_SHARED_VADDR + 0x100,
         FILEBUF_VADDR,
+        STORAGE_SHARED_VADDR + 0x800,
     );
 
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, verdict);
@@ -39,6 +40,7 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x14) as *mut u32, size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x18) as *mut u32, hive_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x20) as *mut u32, smss_size);
+    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x24) as *mut u32, imports_size);
     print_str(b"[storage-host] done: verdict bits=0x");
     print_hex(verdict);
     print_str(b"\n");
