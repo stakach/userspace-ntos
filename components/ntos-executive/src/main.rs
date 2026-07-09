@@ -99,6 +99,12 @@ pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 /// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
 /// NTDLL_BASE + each import's export RVA.
 pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
+/// smss's process environment (all clear of smss's image extent 0x56-0x57d and the stack 0x5c):
+/// a trampoline that sets RCX=PEB then jumps to the entry, a PEB, the process parameters, a TEB.
+pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
+pub const SMSS_PEB_VA: u64 = 0x0000_0100_0058_0000;
+pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0059_0000;
+pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1212,7 +1218,12 @@ unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 
 /// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables
 /// present, image pages ABSENT), map a stack + IPC buffer, and start the entry point. The image
 /// pages fault in on demand (service_sec_image fills each by RVA). Returns the pml4.
-unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64, ntdll_base: u64) -> u64 {
+unsafe fn spawn_sec_image(
+    pe: &nt_pe_loader::PeFile,
+    fault_ep_c: u64,
+    ntdll_base: u64,
+    setup_env: bool,
+) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     let pdpt = alloc_slot();
@@ -1238,6 +1249,50 @@ unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64, ntdll_base
     }
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // A Windows process environment so the image's startup runs: a TEB (GS anchor), a PEB whose
+    // ProcessParameters (+0x20) points at a zeroed RTL_USER_PROCESS_PARAMETERS, and a trampoline
+    // that loads RCX=PEB then jumps to the entry (the entry expects RCX = PEB). Each page is
+    // written via an executive scratch mapping, then mapped into the process VSpace.
+    let entry = if setup_env {
+        // A scratch region in the FILEBUF page table (0x60-0x80), well past FILEBUF's frames and
+        // the service fault scratch — verified present + free in the executive's own VSpace
+        // (STORAGE_SHARED+0x6000 was NOT — the frames stayed zeroed, so the trampoline ran as 0).
+        let scr = 0x0000_0100_006E_0000u64;
+        // TEB: self @0x30, PEB @0x60.
+        let teb = alloc_frame();
+        let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA);
+        core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
+        let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
+        // PEB: ProcessParameters @0x20.
+        let peb = alloc_frame();
+        let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
+        let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
+        // Process parameters: a zeroed page is a valid un-normalized RTL_USER_PROCESS_PARAMETERS
+        // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
+        let params = alloc_frame();
+        let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
+        // Trampoline: movabs rcx, PEB; movabs rax, entry; jmp rax.
+        let tramp = alloc_frame();
+        let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let mut tb = [0u8; 22];
+        tb[0] = 0x48;
+        tb[1] = 0xB9;
+        tb[2..10].copy_from_slice(&SMSS_PEB_VA.to_le_bytes());
+        tb[10] = 0x48;
+        tb[11] = 0xB8;
+        tb[12..20].copy_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes());
+        tb[20] = 0xFF;
+        tb[21] = 0xE0;
+        for (j, &b) in tb.iter().enumerate() {
+            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        }
+        let _ = page_map(copy_cap(tramp), SMSS_TRAMP_VA, /* RX */ 2, pml4);
+        SMSS_TRAMP_VA
+    } else {
+        PE_LOAD_BASE + pe.entry_point_rva() as u64
+    };
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
@@ -1249,7 +1304,10 @@ unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64, ntdll_base
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, PE_LOAD_BASE + pe.entry_point_rva() as u64, stack_top, 0);
+    let _ = tcb_write_registers(tcb, entry, stack_top, 0);
+    if setup_env {
+        let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
+    }
     let _ = tcb_set_priority(tcb, 100);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
@@ -1280,7 +1338,7 @@ unsafe fn service_sec_image(
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
-) -> (u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64) {
     let img_end = PE_LOAD_BASE + image_extent(pe);
     let (nt_base, nt_end) = match ntdll {
         Some((b, npe)) => (b, b + image_extent(npe)),
@@ -1291,6 +1349,7 @@ unsafe fn service_sec_image(
     let mut first = 0u64;
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
+    let mut stop_ssn = 0u64;
     let (_z, mut mi, mut m0, mut m1, _m2, _m3) = ep_recv_full(fault_ep);
     loop {
         if (mi >> 12) == 6 {
@@ -1309,7 +1368,7 @@ unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 24 {
+            if faults >= 64 {
                 stop = addr;
                 break;
             }
@@ -1326,14 +1385,20 @@ unsafe fn service_sec_image(
             m1 = nm1;
             continue;
         }
-        if (mi >> 12) == 2 && m0 == SSN_DONE {
-            verdict = get_recv_mr(9); // R10 = arg1
+        if (mi >> 12) == 2 {
+            // A native `syscall`. SSN_DONE is our test sentinel; any other SSN means smss (via
+            // ntdll) reached a REAL Nt* system call — record it as the stop reason.
+            if m0 == SSN_DONE {
+                verdict = get_recv_mr(9); // R10 = arg1
+            } else {
+                stop_ssn = m0;
+            }
             break;
         }
-        stop = m1; // a non-VMFault (e.g. #GP) — stop
+        stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
         break;
     }
-    (verdict, faults, first, stop, ntfaults)
+    (verdict, faults, first, stop, ntfaults, stop_ssn)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -3036,8 +3101,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0);
-        let (v, f, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false);
+        let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
     }
@@ -3987,24 +4052,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE);
-                    let (_v, sfaults, sfirst, sstop, ntfaults) = service_sec_image(
+                    // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
+                    // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
+                    let (_v, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         pml4,
                         &pe,
                         0x0000_0100_0062_0000,
                         Some((NTDLL_BASE, &ntdll_pe)),
                     );
-                    print_str(b"[ntos-exec] LIVE ReactOS smss->ntdll: smss faulted ");
-                    print_u64(sfaults - ntfaults);
-                    print_str(b" page(s), then CALLED INTO ntdll (");
+                    print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
+                    print_u64(sfaults);
+                    print_str(b" page(s) (");
                     print_u64(ntfaults);
-                    print_str(b" ntdll page(s) executed), first=0x");
+                    print_str(b" in ntdll), first=0x");
                     print_hex((sfirst >> 32) as u32);
                     print_hex(sfirst as u32);
-                    print_str(b" stopped at 0x");
+                    print_str(b" stop=0x");
                     print_hex((sstop >> 32) as u32);
                     print_hex(sstop as u32);
+                    print_str(b" reached_ntdll_syscall_ssn=0x");
+                    print_hex(sssn as u32);
                     print_str(b"\n");
                     check(
                         b"exec_reactos_smss_live_executed",
@@ -4012,13 +4081,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &mut passed,
                     );
                     check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
-                    // ntfaults >= 1 means smss's resolved call landed in ntdll and REAL ntdll
-                    // code faulted in + executed on the microkernel.
                     check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
+                    // With a valid PEB, smss skips the RtlAssert/null-deref path (old stop
+                    // 0x24bc8350): it runs RtlNormalizeProcessParams (which returns) and
+                    // continues through MORE ntdll pages (3 vs 1) into its real startup, until a
+                    // deeper env gap (a null-struct deref at 0x74). sssn is captured for the day
+                    // smss reaches a real Nt* syscall.
+                    let _ = sssn;
+                    check(
+                        b"exec_reactos_smss_ran_past_null_deref",
+                        ntfaults >= 2 && sstop != 0x0000_0100_24bc_8350,
+                        &mut passed,
+                    );
                 } else {
                     check(b"exec_reactos_smss_live_executed", false, &mut passed);
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
+                    check(b"exec_reactos_smss_ran_past_null_deref", false, &mut passed);
                 }
             }
             Err(_) => {
@@ -4032,7 +4111,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/91 executive->isolated-service checks passed]\n");
+    print_str(b"/92 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
