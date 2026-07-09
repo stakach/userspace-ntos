@@ -610,3 +610,10 @@ findings). A step is not "done" until the plan reflects it.
   (built in-memory, fresh-clone-safe). Checks: exec_real_pe_loaded/_ran/_syscall. Next P3:
   PEB/TEB/KUSER (nt-user-host) so PE code reads its environment; imports/IAT; then a
   larger/real PE toward smss.exe.
+- **2026-07-09** — **P3 PEB/TEB/KUSER for the loaded PE (exec d32aa81). 74/74.** The loaded PE
+  now has a real Windows process environment + walks it as ntdll does: spawn_pe_thread maps a
+  TEB (self@0x30, PEB@0x60), PEB (ImageBase@0x10) in the PE's PT + KUSER_SHARED_DATA at the
+  fixed 0x7FFE0000 (own PT chain) + sets GS base = TEB_VA (tcb_set_gs_base). The stub reads
+  GS:[0x30]->TEB->[+0x60]->PEB->[+0x10]->ImageBase (= PE_LOAD_BASE) + touches KUSER + reports
+  it. Verified verdict == PE_LOAD_BASE. Check: exec_pe_env_imagebase. Next P3: imports/IAT so
+  real ntdll code resolves + runs; then a larger/real PE toward smss.exe.
