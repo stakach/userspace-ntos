@@ -641,3 +641,12 @@ findings). A step is not "done" until the plan reflects it.
   Checks: exec_nt_create_thread / _second_thread_ran. Load-vehicle machinery (sections +
   threads) now in place. Next: file-backed SEC_IMAGE + demand paging (map a real image from
   disk, fault it in); then the ReactOS-binary pipeline + load a real ntdll/smss via sections.
+- **2026-07-09** — **P3 demand paging — file-backed section VMFault fault-in (exec d8213d2).
+  81/81.** The executive handles VMFaults (page faults, label 6, addr in MR1) to demand-page
+  file-backed section views. NtCreateSection(arg2=1) = file-backed; NtMapViewOfSection reserves
+  the VA (no page map); the first access #PFs; the loop page_maps the backing frame + replies
+  length-0 to RESTART. The user reads the demand-paged view + gets the file payload; 1 VMFault
+  serviced. Checks: exec_demand_page_faulted / _content. File frame executive-prepared (disk
+  sourcing via the P2 storage host is the next composition). Next: source the section from a
+  real disk file (storage host) + PE-image (SEC_IMAGE) layout; then the ReactOS-binary pipeline
+  + load a real ntdll/smss via demand-paged image sections + a heap bump.
