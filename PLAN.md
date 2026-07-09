@@ -650,3 +650,12 @@ findings). A step is not "done" until the plan reflects it.
   sourcing via the P2 storage host is the next composition). Next: source the section from a
   real disk file (storage host) + PE-image (SEC_IMAGE) layout; then the ReactOS-binary pipeline
   + load a real ntdll/smss via demand-paged image sections + a heap bump.
+- **2026-07-09** — **P3 demand-paged section from a REAL disk file (exec 7538436). 82/82.**
+  Composes demand paging + the P2 storage host: the storage host reads SYSTEM.DAT (the hive)
+  off the FAT32 disk; the executive copies it into a file frame; a loader thread maps it as a
+  demand-paged file-backed section + faults its first page in, reading UNTHIVE1
+  (0x3145564948544E55) via a single VMFault. Full path: disk file -> storage host -> file frame
+  -> file-backed section -> fault-in -> real on-disk bytes. Check: exec_disk_section_demand_paged.
+  Next: SEC_IMAGE (PE-image RVA layout on fault so a real PE loads); then the ReactOS-binary
+  pipeline (fetch/extract at build) + load a real ntdll/smss via demand-paged image sections +
+  a heap bump.
