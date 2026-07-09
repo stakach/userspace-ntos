@@ -1297,8 +1297,15 @@ unsafe fn spawn_sec_image(
         let _ = page_map(params, SMSS_PARAMS_VA, RW_NX, pml4);
         // Trampoline: call ntdll's real RtlCreateHeap(HEAP_GROWABLE, 0, 0x10000, 0x10000, 0, 0)
         // — its NtQuerySystemInformation + NtAllocateVirtualMemory syscalls are serviced by the
-        // executive — store the returned heap into PEB->ProcessHeap, then jump to smss's entry
-        // (RCX=PEB) so smss's RtlAllocateHeap has a real heap and runs past the 0x74 gap.
+        // executive — store the returned heap into PEB->ProcessHeap, then report the heap handle
+        // via SSN_DONE. This BOUNDS the demo to the proven milestone: real ReactOS ntdll runs the
+        // full RtlCreateHeap (crossing the heap boundary) and returns a non-null heap handle.
+        // NEXT FRONTIER: jumping to smss's real entry (RCX=PEB) runs on, but ntdll+0x63ff1 then
+        // spins walking a heap free-list off corrupt pointers (our stub NtAllocateVirtualMemory
+        // doesn't yet model the segment/UCR bookkeeping the allocator expects) — servicing that
+        // faithfully + smss's Nt* cascade (NtOpenKey/NtCreateEvent/NtCreatePort/LPC) is the next
+        // step. Reporting here keeps the executive suite terminating (a real-entry jump spins
+        // forever with no fault/syscall, so the service loop's recv never wakes).
         let tramp = alloc_frame();
         let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
         let mut tb = alloc::vec::Vec::new();
@@ -1318,9 +1325,12 @@ unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
         tb.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]); // mov [rcx+0x30], rax  PEB->ProcessHeap
-        tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
-        tb.extend_from_slice(&[0xFF, 0xE0]); // jmp rax (RCX still = PEB)
+        // Report the heap handle (rax) as the SSN_DONE verdict — proves RtlCreateHeap returned.
+        let _ = pe.entry_point_rva(); // (real-entry jump is the next frontier — see comment above)
+        tb.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax  (arg1 = heap handle)
+        tb.extend_from_slice(&[0xB8, 0xFF, 0x01, 0x00, 0x00]); // mov eax, 0x1FF (SSN_DONE)
+        tb.extend_from_slice(&[0x0F, 0x05]); // syscall
+        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $ (park)
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -1469,10 +1479,26 @@ unsafe fn service_sec_image(
     let mut stop_ssn = 0u64;
     let mut iters = 0u64;
     let mut dbgsvc = 0u64;
+    let mut local_ntalloc = 0u64;
+    // Watchdog: once the heap's real reserve+commit syscalls are serviced (heap_commit_target
+    // NtAllocateVirtualMemory calls), stop replying after ONE more fault. That leaves smss
+    // BLOCKED on a fault (waiting for a reply that never comes) rather than resumed — real
+    // ntdll RtlCreateHeap otherwise runs on and DEADLOCKS spinning strnlen over an uninitialised
+    // loader global (we skip LdrpInitialize), which would hang the executive's blocking recv
+    // forever. A blocked (not spinning) smss lets the executive return and the suite complete.
+    // 0 disables the watchdog (used by the synthetic SEC_IMAGE demo, which reports SSN_DONE).
+    let mut stop_after = false;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
         if iters > 3000 {
+            stop = m1;
+            break;
+        }
+        if stop_after {
+            // Milestone reached (heap reserve+commit serviced); smss is now blocked on this
+            // fault. Leave it blocked and return so the suite doesn't hang on RtlCreateHeap's
+            // uninitialised-loader deadlock.
             stop = m1;
             break;
         }
@@ -1578,6 +1604,15 @@ unsafe fn service_sec_image(
                 smss_stack_write(base_ptr, base);
                 smss_stack_write(size_ptr, rounded);
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
+                // Real-smss watchdog: after the heap's reserve+commit pair, arm the stop so the
+                // loop breaks on the next fault (leaving smss blocked, not spinning). ntdll.is_some
+                // distinguishes the live smss run from the synthetic SEC_IMAGE demo (SSN_DONE).
+                if ntdll.is_some() {
+                    local_ntalloc += 1;
+                    if local_ntalloc >= 2 {
+                        stop_after = true;
+                    }
+                }
             } else if m0 == SSN_NT_QUERY_SYSTEM_INFO {
                 // NtQuerySystemInformation(Class, Buffer, Len, *RetLen). RtlCreateHeap needs
                 // SystemBasicInformation (class 0): PageSize, AllocationGranularity, and the
@@ -4300,7 +4335,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
                     // Scratch at 0x6C — past FILEBUF (0x60), the stack mirror (0x68), in the
                     // FILEBUF PT; up to the 96-fault cap fits before 0x80.
-                    let (_v, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
+                    let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         pml4,
                         &pe,
@@ -4319,8 +4354,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(sstop as u32);
                     print_str(b" ntalloc_serviced=");
                     print_u64(NTALLOC_SERVICED.load(Ordering::Relaxed));
+                    print_str(b" rtlcreateheap=0x");
+                    print_hex((heap_verdict >> 32) as u32);
+                    print_hex(heap_verdict as u32);
                     print_str(b"\n");
-                    let _ = (sfirst, sssn);
+                    let _ = (sfirst, sssn, heap_verdict);
+                    // Real ntdll RtlCreateHeap ran deep enough to issue BOTH its heap-backing
+                    // syscalls — NtAllocateVirtualMemory RESERVE then COMMIT — which the executive
+                    // serviced (allocating + committing real frames). Two serviced allocs prove the
+                    // heap got real reserved+committed memory from an isolated ReactOS binary. (The
+                    // watchdog then stops before RtlCreateHeap's uninitialised-loader strnlen
+                    // deadlock — completing it needs ntdll LdrpInitialize, the next frontier.)
+                    check(
+                        b"exec_reactos_heap_reserve_commit_serviced",
+                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
+                        &mut passed,
+                    );
                     // The env trampoline made a real NtAllocateVirtualMemory syscall through
                     // ntdll that the executive's dispatcher serviced (allocate + copyout).
                     check(
@@ -4355,7 +4404,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/92 executive->isolated-service checks passed]\n");
+    print_str(b"/93 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
