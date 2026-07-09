@@ -712,3 +712,14 @@ findings). A step is not "done" until the plan reflects it.
   and REAL NTDLL CODE EXECUTES; it runs until ntdll derefs the null process params -> safe stop
   (0x24bc8350). Check: exec_reactos_smss_calls_into_ntdll. Next: a process env (PEB +
   RTL_USER_PROCESS_PARAMETERS in RCX) so ntdll runs past the null deref; then LPC (P4).
+- **2026-07-09** — **P3 process env — smss runs past the null deref (exec d14ddec). 92/92.**
+  smss's entry NtProcessStartup(PPEB Peb) checks RCX (the PEB) for null -> RtlAssert path
+  (old wild stop 0x24bc8350). spawn_sec_image(setup_env=true) builds a Windows process env:
+  a TEB (GS: self@0x30, PEB@0x60), a PEB (ProcessParameters@0x20 -> a zeroed-valid
+  RTL_USER_PROCESS_PARAMETERS), + a trampoline (movabs rcx,PEB; jmp entry). smss now skips the
+  assert, runs RtlNormalizeProcessParams (returns), + continues through 3 ntdll pages (vs 1) +
+  more of its own code into its real startup -> stops at a NEW deeper env gap (null-struct
+  deref at 0x74, ntdll rip 0x81793a). Check: exec_reactos_smss_ran_past_null_deref. LESSON: the
+  env-build exec scratch must be present in the exec's OWN VSpace (0x5f_c bad -> zeroed
+  trampoline -> #PF cr2=0; moved to the FILEBUF PT 0x6e). Next: fill the deeper env (0x74);
+  then LPC (P4).
