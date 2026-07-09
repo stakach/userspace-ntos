@@ -128,6 +128,9 @@ pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
 pub const FILEBUF_VADDR: u64 = 0x0000_0100_0060_0000; // its own PT (0x40-0x60 is crowded)
 pub const FILEBUF_FRAMES: u64 = 32;
+/// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
+pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_00A0_0000;
+pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
 /// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
@@ -1209,7 +1212,7 @@ unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 
 /// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables
 /// present, image pages ABSENT), map a stack + IPC buffer, and start the entry point. The image
 /// pages fault in on demand (service_sec_image fills each by RVA). Returns the pml4.
-unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64) -> u64 {
+unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64, ntdll_base: u64) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     let pdpt = alloc_slot();
@@ -1222,6 +1225,13 @@ unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64) -> u64 {
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
+    // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
+    if ntdll_base != 0 {
+        let npt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
+        let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, ntdll_base, pml4);
+    }
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
         let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
@@ -1246,18 +1256,8 @@ unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64) -> u64 {
     pml4
 }
 
-/// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
-/// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
-/// SAFE STOP for a real binary whose imports aren't resolved: stop (don't loop) on the first
-/// fault OUTSIDE the image extent (an unresolved ntdll call), a non-VMFault (e.g. #GP), or a
-/// fault cap. Returns (verdict, vmfaults serviced, first fault addr, stop addr).
-unsafe fn service_sec_image(
-    fault_ep: u64,
-    pml4: u64,
-    pe: &nt_pe_loader::PeFile,
-    scratch_base: u64,
-) -> (u64, u64, u64, u64) {
-    // Image extent = end of the highest section, page-aligned.
+/// The page-aligned virtual extent of a PE image (end of its highest section).
+unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
     let mut ext = 0u32;
     for s in pe.sections() {
         let e = s.virtual_address.wrapping_add(s.virtual_size);
@@ -1265,11 +1265,32 @@ unsafe fn service_sec_image(
             ext = e;
         }
     }
-    let img_end = PE_LOAD_BASE + (((ext + 0xFFF) & !0xFFF) as u64);
+    ((ext + 0xFFF) & !0xFFF) as u64
+}
+
+/// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
+/// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
+/// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
+/// at `(base, pe)` — so smss's resolved ntdll calls fault ntdll's pages in and EXECUTE. SAFE
+/// STOP: halt (don't loop) on a fault outside BOTH images (a null deref / bad address), a
+/// non-VMFault (#GP), or a fault cap. Returns (verdict, faults, first, stop, ntdll_faults).
+unsafe fn service_sec_image(
+    fault_ep: u64,
+    pml4: u64,
+    pe: &nt_pe_loader::PeFile,
+    scratch_base: u64,
+    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+) -> (u64, u64, u64, u64, u64) {
+    let img_end = PE_LOAD_BASE + image_extent(pe);
+    let (nt_base, nt_end) = match ntdll {
+        Some((b, npe)) => (b, b + image_extent(npe)),
+        None => (0, 0),
+    };
     let mut verdict = 0u64;
     let mut faults = 0u64;
     let mut first = 0u64;
     let mut stop = 0u64;
+    let mut ntfaults = 0u64;
     let (_z, mut mi, mut m0, mut m1, _m2, _m3) = ep_recv_full(fault_ep);
     loop {
         if (mi >> 12) == 6 {
@@ -1278,15 +1299,25 @@ unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
-            if page < PE_LOAD_BASE || page >= img_end || faults >= 16 {
-                stop = addr; // out of the image (unresolved import) or fault cap — stop safely
+            // Route to whichever image contains the faulting page.
+            let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
+                (PE_LOAD_BASE, pe)
+            } else if nt_base != 0 && page >= nt_base && page < nt_end {
+                ntfaults += 1;
+                (nt_base, ntdll.unwrap().1)
+            } else {
+                stop = addr; // outside both images (unresolved / null deref) — stop safely
+                break;
+            };
+            if faults >= 24 {
+                stop = addr;
                 break;
             }
-            let rva = (page - PE_LOAD_BASE) as u32;
+            let rva = (page - base) as u32;
             let scratch = scratch_base + faults * 0x1000;
             let f = alloc_frame();
             let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-            let rights = fill_image_page(pe, rva, scratch);
+            let rights = fill_image_page(tpe, rva, scratch);
             let _ = page_map(copy_cap(f), page, rights, pml4);
             faults += 1;
             let (nmi, nm0, nm1, _nm2, _nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
@@ -1299,10 +1330,10 @@ unsafe fn service_sec_image(
             verdict = get_recv_mr(9); // R10 = arg1
             break;
         }
-        stop = m1; // a non-VMFault (e.g. #GP from an unset GS) — stop
+        stop = m1; // a non-VMFault (e.g. #GP) — stop
         break;
     }
-    (verdict, faults, first, stop)
+    (verdict, faults, first, stop, ntfaults)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -1627,6 +1658,7 @@ unsafe fn spawn_storage_host(
     dma_frame: u64,
     shared_frame: u64,
     filebuf_start: u64,
+    ntdllbuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -1673,6 +1705,14 @@ unsafe fn spawn_storage_host(
     for i in 0..FILEBUF_FRAMES {
         let fb_cp = copy_cap(filebuf_start + i);
         let _ = page_map(fb_cp, FILEBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    // The ntdll buffer (its own PT), same pattern.
+    let nb_pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nb_pt);
+    let _ = paging_struct_map(nb_pt, LBL_X86_PAGE_TABLE_MAP, NTDLLBUF_VADDR, pml4);
+    for i in 0..NTDLLBUF_FRAMES {
+        let nb_cp = copy_cap(ntdllbuf_start + i);
+        let _ = page_map(nb_cp, NTDLLBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
 
     let raw = alloc_slot();
@@ -2373,7 +2413,8 @@ unsafe fn storage_probe(
     hive_dest: u64,
     smss_dest: u64,
     imports_dest: u64,
-) -> (u32, u32, u32, u32, u32, u32) {
+    ntdll_dest: u64,
+) -> (u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
@@ -2414,8 +2455,8 @@ unsafe fn storage_probe(
     print_str(b" spf=");
     print_u64(spf32 as u64);
     print_str(b"\n");
-    let (mut cluster, mut size, mut hive_size, mut smss_size, mut imports_size) =
-        (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut cluster, mut size, mut hive_size, mut smss_size, mut imports_size, mut ntdll_size) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
     if bps == 512 && spc >= 1 && is_fat32 {
         verdict |= 2;
         let fs = Fat32 {
@@ -2522,8 +2563,23 @@ unsafe fn storage_probe(
                 verdict |= 0x40;
             }
         }
+        // The real ReactOS ntdll.dll (~975 KiB) into `ntdll_dest` — smss's imports resolve here.
+        if let Some((nc, nsz, _)) = dir_find(&fs, fs.root_cl, b"NTDLL   DLL") {
+            let cap = (NTDLLBUF_FRAMES * 0x1000) as u32;
+            let want = if nsz < cap { nsz } else { cap };
+            let got = fat_read_file(&fs, nc, want, ntdll_dest);
+            print_str(b"[storage-host] NTDLL.DLL size=");
+            print_u64(nsz as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && nsz > 0 {
+                ntdll_size = nsz;
+                verdict |= 0x80;
+            }
+        }
     }
-    (verdict, cluster, size, hive_size, smss_size, imports_size)
+    (verdict, cluster, size, hive_size, smss_size, imports_size, ntdll_size)
 }
 
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
@@ -2980,8 +3036,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c);
-        let (v, f, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0);
+        let (v, f, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
     }
@@ -3727,6 +3783,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..FILEBUF_FRAMES {
                 let _ = page_map(copy_cap(fb_start + i), FILEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // The ntdll buffer (240 frames, its own PT), mapped in the executive too.
+            let nb_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nb_pt);
+            let _ = paging_struct_map(nb_pt, LBL_X86_PAGE_TABLE_MAP, NTDLLBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+            let nb_start = alloc_frame();
+            for _ in 1..NTDLLBUF_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..NTDLLBUF_FRAMES {
+                let _ = page_map(copy_cap(nb_start + i), NTDLLBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -3742,6 +3809,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 dma_frame,
                 shared,
                 fb_start,
+                nb_start,
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
@@ -3909,43 +3977,49 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 check(b"exec_reactos_imports_resolved", resolved == 103, &mut passed);
 
-                // LIVE SEC_IMAGE LOAD: spawn the real smss via spawn_sec_image (image VA only
-                // RESERVED) and let it START EXECUTING at its entry — its .text pages fault in
-                // LIVE, per RVA, from the disk-read bytes. It runs its real x64 prologue
-                // (mov [rsp+8],rcx; sub rsp,0xf8; ...) then stops safely at its first
-                // unresolved ntdll call (an out-of-image fault). Scratch at 0x62 (past FILEBUF).
+                // LIVE SEC_IMAGE LOAD with ntdll MAPPED: spawn smss (image VA reserved) AND
+                // demand-map the disk-read ntdll.dll at NTDLL_BASE. smss executes its entry, its
+                // .text faults in live, then it calls RtlNormalizeProcessParams via the resolved
+                // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
+                // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
+                let ntdll_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
+                let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);
-                let pml4 = spawn_sec_image(&pe, si_fault_c);
-                let (_v, sfaults, sfirst, sstop) =
-                    service_sec_image(si_fault, pml4, &pe, 0x0000_0100_0062_0000);
-                print_str(b"[ntos-exec] LIVE ReactOS smss executed from entry: faulted in ");
-                print_u64(sfaults);
-                print_str(b" page(s), first=0x");
-                print_hex((sfirst >> 32) as u32);
-                print_hex(sfirst as u32);
-                print_str(b" stopped at 0x");
-                print_hex((sstop >> 32) as u32);
-                print_hex(sstop as u32);
-                print_str(b"\n");
-                // The FIRST fault is the entry instruction itself (PE_LOAD_BASE+0x12ee0),
-                // fetched from a demand-paged .text page: real ReactOS smss code began
-                // executing, live-loaded from disk via SEC_IMAGE.
-                check(
-                    b"exec_reactos_smss_live_executed",
-                    sfirst == PE_LOAD_BASE + 0x12ee0,
-                    &mut passed,
-                );
-                check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
-                // With the IAT resolved, smss's first ntdll call now targets the REAL resolved
-                // address NTDLL_BASE + RtlNormalizeProcessParams's export RVA (0x48f00), i.e.
-                // 0x84_8f00 — not the unresolved file thunk 0x18820. (It stops there because
-                // ntdll isn't mapped yet — that's the next step.)
-                check(
-                    b"exec_reactos_smss_import_resolved_call",
-                    sstop == NTDLL_BASE + 0x48f00,
-                    &mut passed,
-                );
+                if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE);
+                    let (_v, sfaults, sfirst, sstop, ntfaults) = service_sec_image(
+                        si_fault,
+                        pml4,
+                        &pe,
+                        0x0000_0100_0062_0000,
+                        Some((NTDLL_BASE, &ntdll_pe)),
+                    );
+                    print_str(b"[ntos-exec] LIVE ReactOS smss->ntdll: smss faulted ");
+                    print_u64(sfaults - ntfaults);
+                    print_str(b" page(s), then CALLED INTO ntdll (");
+                    print_u64(ntfaults);
+                    print_str(b" ntdll page(s) executed), first=0x");
+                    print_hex((sfirst >> 32) as u32);
+                    print_hex(sfirst as u32);
+                    print_str(b" stopped at 0x");
+                    print_hex((sstop >> 32) as u32);
+                    print_hex(sstop as u32);
+                    print_str(b"\n");
+                    check(
+                        b"exec_reactos_smss_live_executed",
+                        sfirst == PE_LOAD_BASE + 0x12ee0,
+                        &mut passed,
+                    );
+                    check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
+                    // ntfaults >= 1 means smss's resolved call landed in ntdll and REAL ntdll
+                    // code faulted in + executed on the microkernel.
+                    check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
+                } else {
+                    check(b"exec_reactos_smss_live_executed", false, &mut passed);
+                    check(b"exec_reactos_smss_live_paged", false, &mut passed);
+                    check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
+                }
             }
             Err(_) => {
                 print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
