@@ -734,3 +734,12 @@ findings). A step is not "done" until the plan reflects it.
   smss's startup to the null-heap stop at 0x74. Check: exec_reactos_ntalloc_serviced. Next:
   service NtQuerySystemInformation + a 2nd NtAllocateVirtualMemory so ntdll's real RtlCreateHeap
   (rva 0x183f0) runs -> a real process heap -> smss past 0x74; then more Nt* + LPC (P4).
+- **2026-07-09** — **P3 RtlCreateHeap in progress (exec 594ab1c). 92/92, iterative.** smss's
+  trampoline calls ntdll's real RtlCreateHeap; the executive services NtQuerySystemInformation
+  (0xb5) + 2x NtAllocateVirtualMemory (RESERVE/COMMIT) + emulates the debug-build int 0x2d
+  (DebugService) as a no-op. TWO MAJOR FIXES: base relocations (apply_relocations_to_buf: raw
+  .data pointers held the preferred base 0x7ffb70000000) + ABI stack alignment (sub rsp,0x40 so
+  RtlCaptureContext's movaps doesn't #GP). RtlCreateHeap runs 32 ntdll pages deep, allocates +
+  formats the heap, then hits a control-flow-to-stack stop at 0x5c3818 (SEH/DebugService nuance).
+  NEXT: instrument 0x5c3818, finish RtlCreateHeap -> PEB->ProcessHeap -> smss past 0x74. NOTE:
+  the x64 livecd is a DEBUG build (int 0x2d/DPRINT everywhere); a release build would be cleaner.
