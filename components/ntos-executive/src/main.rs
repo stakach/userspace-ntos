@@ -1290,6 +1290,15 @@ unsafe fn spawn_sec_image(
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((scr + 0x1000 + 0x20) as *mut u64, SMSS_PARAMS_VA);
+        // Heap process-list array (what LdrpInitializeProcess sets up before the first
+        // RtlCreateHeap). Without it RtlpAddHeapToProcessList (heapuser.c:38) hits
+        // `NumberOfHeaps == MaximumNumberOfHeaps` (0 == 0) → ASSERT(FALSE) and, since we answer
+        // the debug prompt "Ignore", loops forever. Point ProcessHeaps at a small array in the
+        // unused tail of the PEB page and cap at 16. x64 PEB: NumberOfHeaps@0xE8,
+        // MaximumNumberOfHeaps@0xEC, ProcessHeaps@0xF0.
+        core::ptr::write_volatile((scr + 0x1000 + 0xE8) as *mut u32, 0);
+        core::ptr::write_volatile((scr + 0x1000 + 0xEC) as *mut u32, 16);
+        core::ptr::write_volatile((scr + 0x1000 + 0xF0) as *mut u64, SMSS_PEB_VA + 0x800);
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
         // Process parameters: a zeroed page is a valid un-normalized RTL_USER_PROCESS_PARAMETERS
         // (Flags=0, every UNICODE_STRING Buffer NULL — RtlNormalizeProcessParams no-ops + returns).
@@ -1479,26 +1488,10 @@ unsafe fn service_sec_image(
     let mut stop_ssn = 0u64;
     let mut iters = 0u64;
     let mut dbgsvc = 0u64;
-    let mut local_ntalloc = 0u64;
-    // Watchdog: once the heap's real reserve+commit syscalls are serviced (heap_commit_target
-    // NtAllocateVirtualMemory calls), stop replying after ONE more fault. That leaves smss
-    // BLOCKED on a fault (waiting for a reply that never comes) rather than resumed — real
-    // ntdll RtlCreateHeap otherwise runs on and DEADLOCKS spinning strnlen over an uninitialised
-    // loader global (we skip LdrpInitialize), which would hang the executive's blocking recv
-    // forever. A blocked (not spinning) smss lets the executive return and the suite complete.
-    // 0 disables the watchdog (used by the synthetic SEC_IMAGE demo, which reports SSN_DONE).
-    let mut stop_after = false;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
         if iters > 3000 {
-            stop = m1;
-            break;
-        }
-        if stop_after {
-            // Milestone reached (heap reserve+commit serviced); smss is now blocked on this
-            // fault. Leave it blocked and return so the suite doesn't hang on RtlCreateHeap's
-            // uninitialised-loader deadlock.
             stop = m1;
             break;
         }
@@ -1604,15 +1597,6 @@ unsafe fn service_sec_image(
                 smss_stack_write(base_ptr, base);
                 smss_stack_write(size_ptr, rounded);
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-                // Real-smss watchdog: after the heap's reserve+commit pair, arm the stop so the
-                // loop breaks on the next fault (leaving smss blocked, not spinning). ntdll.is_some
-                // distinguishes the live smss run from the synthetic SEC_IMAGE demo (SSN_DONE).
-                if ntdll.is_some() {
-                    local_ntalloc += 1;
-                    if local_ntalloc >= 2 {
-                        stop_after = true;
-                    }
-                }
             } else if m0 == SSN_NT_QUERY_SYSTEM_INFO {
                 // NtQuerySystemInformation(Class, Buffer, Len, *RetLen). RtlCreateHeap needs
                 // SystemBasicInformation (class 0): PageSize, AllocationGranularity, and the
@@ -4362,9 +4346,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // Real ntdll RtlCreateHeap ran deep enough to issue BOTH its heap-backing
                     // syscalls — NtAllocateVirtualMemory RESERVE then COMMIT — which the executive
                     // serviced (allocating + committing real frames). Two serviced allocs prove the
-                    // heap got real reserved+committed memory from an isolated ReactOS binary. (The
-                    // watchdog then stops before RtlCreateHeap's uninitialised-loader strnlen
-                    // deadlock — completing it needs ntdll LdrpInitialize, the next frontier.)
+                    // heap got real reserved+committed memory from an isolated ReactOS binary.
+                    // With the PEB ProcessHeaps array initialised, RtlpAddHeapToProcessList
+                    // (heapuser.c:38) no longer ASSERTs, and RtlCreateHeap runs past it +
+                    // ZwQuerySystemInformation (SystemBasicInformation) before derailing deeper in
+                    // (RtlCreateHeap+0x4a3) on further uninitialised loader state — the loop then
+                    // breaks naturally on the first Nt* syscall we don't service. NEXT FRONTIER:
+                    // real ntdll LdrpInitialize so the loader globals/cookie are valid.
                     check(
                         b"exec_reactos_heap_reserve_commit_serviced",
                         NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
