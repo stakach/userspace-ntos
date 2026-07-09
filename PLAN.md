@@ -634,3 +634,10 @@ findings). A step is not "done" until the plan reflects it.
   (fetch/extract at build, fresh-clone-safe). NOTE: real SSNs come FROM a real ntdll (no
   hardcoded Win7 table); nt-user-host already runs real ntdll host-side. Next: NtCreateThreadEx;
   then file-backed SEC_IMAGE + demand paging; then load a real ReactOS binary via sections.
+- **2026-07-09** — **P3 NtCreateThreadEx (exec 93743d4). 79/79.** A process can create a new
+  thread (what RtlCreateUserProcess/smss does). spawn_thread_in(pml4, entry) makes a thread in
+  an EXISTING VSpace (fresh stack/ipcbuf/CNode, shares the caller's mappings). A user thread
+  creates a 2nd thread that runs concurrently + writes a marker (0x7EAD2) the parent observes.
+  Checks: exec_nt_create_thread / _second_thread_ran. Load-vehicle machinery (sections +
+  threads) now in place. Next: file-backed SEC_IMAGE + demand paging (map a real image from
+  disk, fault it in); then the ReactOS-binary pipeline + load a real ntdll/smss via sections.
