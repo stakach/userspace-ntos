@@ -226,6 +226,8 @@ const NT_QUERY_VALUE_KEY: u64 = 0x18; // NtQueryValueKey(*OBJECT_ATTRIBUTES) →
 const NT_SET_VALUE_KEY: u64 = 0x5D; // NtSetValueKey(*OBJECT_ATTRIBUTES, value in RDX)
 const NT_ALLOCATE_VM: u64 = 0x15; // NtAllocateVirtualMemory(size in R10) → base in RAX
 const NT_QUERY_SYSTEM_TIME: u64 = 0x57; // NtQuerySystemTime() → HPET counter in RAX
+const NT_CREATE_SECTION: u64 = 0x47; // NtCreateSection(size in R10) → section handle in RAX
+const NT_MAP_VIEW: u64 = 0x25; // NtMapViewOfSection(section handle in R10) → view base VA in RAX
 /// Where the executive backs NtAllocateVirtualMemory for the user thread — inside its
 /// existing 2 MiB image PT (image ends ~0x41_0000, stack at 0x5C_0000), so mapping needs no
 /// new page table.
@@ -808,6 +810,22 @@ pub unsafe extern "C" fn user_entry() -> ! {
     core::ptr::write_volatile((SYSARG_VADDR + 0x440) as *mut u64, m2);
     core::ptr::write_volatile((SYSARG_VADDR + 0x448) as *mut u64, m3);
 
+    // P3 sections: create a section, map it as TWO views, write one + read the other — they
+    // alias the same backing frame (the defining section property; the load vehicle for DLLs).
+    let sec = native_syscall(NT_CREATE_SECTION, 0x1000);
+    let sv1 = native_syscall(NT_MAP_VIEW, sec);
+    let sv2 = native_syscall(NT_MAP_VIEW, sec);
+    let smagic = 0x5EC7_10A5_ED00_1234u64;
+    let sec_alias = if sv1 != 0 && sv2 != 0 {
+        core::ptr::write_volatile(sv1 as *mut u64, smagic);
+        core::ptr::read_volatile(sv2 as *const u64) == smagic
+    } else {
+        false
+    };
+    core::ptr::write_volatile((SYSARG_VADDR + 0x450) as *mut u64, sv1);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x458) as *mut u64, sv2);
+    core::ptr::write_volatile((SYSARG_VADDR + 0x460) as *mut u64, sec_alias as u64);
+
     let ok = r0 == 1
         && r0b == 1
         && r1 == 1
@@ -825,7 +843,10 @@ pub unsafe extern "C" fn user_entry() -> ! {
         && w3 == 0x102
         && m1 == 0
         && m2 == 0
-        && m3 == 0x102;
+        && m3 == 0x102
+        && sv1 != 0
+        && sv2 != 0
+        && sec_alias;
     let _ = native_syscall(SSN_DONE, ok as u64);
     park()
 }
@@ -1446,6 +1467,8 @@ where
             (NativeService::NtQueryValueKey, NT_QUERY_VALUE_KEY as u32),
             (NativeService::NtAllocateVirtualMemory, NT_ALLOCATE_VM as u32),
             (NativeService::NtQuerySystemTime, NT_QUERY_SYSTEM_TIME as u32),
+            (NativeService::NtCreateSection, NT_CREATE_SECTION as u32),
+            (NativeService::NtMapViewOfSection, NT_MAP_VIEW as u32),
         ],
     );
 
@@ -1455,6 +1478,11 @@ where
     let mut events = EventStore::new();
     let irql = IrqlState::new();
     let mut next_ev = 0x1000u64;
+    // Section objects: each entry is the backing frame cap (a 1-page section). A handle is a
+    // 1-based index. NtMapViewOfSection maps a COPY of the frame into the user VSpace, so two
+    // views of one section alias the same backing (the defining section property).
+    let mut sec_frames = [0u64; 8];
+    let mut sec_count = 0usize;
     let mut serviced = 0u64;
     let mut verdict = 0u64;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(user_fault_ep);
@@ -1510,6 +1538,32 @@ where
                 // P3 clock: the CPU timestamp counter — a real monotonic time source that
                 // needs no device mapping (the HPET isn't mapped yet at this point).
                 NativeService::NtQuerySystemTime => core::arch::x86_64::_rdtsc(),
+                // Create a section: allocate a backing frame (arg1 = size, 1 page here) and
+                // return a 1-based handle. The load vehicle for images/DLLs.
+                NativeService::NtCreateSection => {
+                    if sec_count < sec_frames.len() {
+                        let f = alloc_slot();
+                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+                        sec_frames[sec_count] = f;
+                        sec_count += 1;
+                        sec_count as u64 // handle
+                    } else {
+                        0
+                    }
+                }
+                // Map a view: map a COPY of the section's frame into the user VSpace at the
+                // next bump vaddr; two views of one section alias the same backing frame.
+                NativeService::NtMapViewOfSection => {
+                    let h = arg1 as usize;
+                    if h >= 1 && h <= sec_count {
+                        let base = NEXT_USER_VADDR.fetch_add(0x1000, Ordering::Relaxed);
+                        let cp = copy_cap(sec_frames[h - 1]);
+                        let _ = page_map(cp, base, RW_NX, user_pml4);
+                        base
+                    } else {
+                        0
+                    }
+                }
                 _ => 0,
             }
         } else {
@@ -2414,6 +2468,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
 
+    // --- P3 sections: the user thread created a section + mapped it as two views, and wrote
+    // one view + read the other. Two views of one section alias the same backing frame — the
+    // real section property, and the load vehicle for image/DLL mapping (toward smss).
+    let sv1 = core::ptr::read_volatile((SYSARG_VADDR + 0x450) as *const u64);
+    let sv2 = core::ptr::read_volatile((SYSARG_VADDR + 0x458) as *const u64);
+    let sec_alias = core::ptr::read_volatile((SYSARG_VADDR + 0x460) as *const u64);
+    print_str(b"[ntos-exec] section views v1=0x");
+    print_hex(sv1 as u32);
+    print_str(b" v2=0x");
+    print_hex(sv2 as u32);
+    print_str(b" aliased=");
+    print_u64(sec_alias);
+    print_str(b"\n");
+    check(
+        b"exec_nt_section_views",
+        sv1 != 0 && sv2 != 0 && sv1 != sv2,
+        &mut passed,
+    );
+    check(b"exec_nt_section_aliased", sec_alias == 1, &mut passed);
+
     // --- P3 blocking wait dispatcher: a WAITER thread PARKS on an event until a separate
     // SIGNALER thread wakes it — a real cross-thread block, not a poll. The waiter (prio 150)
     // runs + parks first; the signaler (100) publishes a handoff marker then sets+wakes the
@@ -3296,7 +3370,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/75 executive->isolated-service checks passed]\n");
+    print_str(b"/77 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
