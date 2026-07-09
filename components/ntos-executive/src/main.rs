@@ -1244,16 +1244,43 @@ unsafe fn spawn_sec_image(pe: &nt_pe_loader::PeFile, fault_ep_c: u64) -> u64 {
 }
 
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
-/// the PE file; on SSN_DONE, capture the verdict. Returns (verdict, vmfaults serviced).
-unsafe fn service_sec_image(fault_ep: u64, pml4: u64, pe: &nt_pe_loader::PeFile) -> (u64, u64) {
+/// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
+/// SAFE STOP for a real binary whose imports aren't resolved: stop (don't loop) on the first
+/// fault OUTSIDE the image extent (an unresolved ntdll call), a non-VMFault (e.g. #GP), or a
+/// fault cap. Returns (verdict, vmfaults serviced, first fault addr, stop addr).
+unsafe fn service_sec_image(
+    fault_ep: u64,
+    pml4: u64,
+    pe: &nt_pe_loader::PeFile,
+    scratch_base: u64,
+) -> (u64, u64, u64, u64) {
+    // Image extent = end of the highest section, page-aligned.
+    let mut ext = 0u32;
+    for s in pe.sections() {
+        let e = s.virtual_address.wrapping_add(s.virtual_size);
+        if e > ext {
+            ext = e;
+        }
+    }
+    let img_end = PE_LOAD_BASE + (((ext + 0xFFF) & !0xFFF) as u64);
     let mut verdict = 0u64;
     let mut faults = 0u64;
+    let mut first = 0u64;
+    let mut stop = 0u64;
     let (_z, mut mi, mut m0, mut m1, _m2, _m3) = ep_recv_full(fault_ep);
     loop {
         if (mi >> 12) == 6 {
-            let page = m1 & !0xFFFu64;
+            let addr = m1;
+            if faults == 0 {
+                first = addr;
+            }
+            let page = addr & !0xFFFu64;
+            if page < PE_LOAD_BASE || page >= img_end || faults >= 16 {
+                stop = addr; // out of the image (unresolved import) or fault cap — stop safely
+                break;
+            }
             let rva = (page - PE_LOAD_BASE) as u32;
-            let scratch = STORAGE_SHARED_VADDR + 0x4000 + faults * 0x1000;
+            let scratch = scratch_base + faults * 0x1000;
             let f = alloc_frame();
             let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
             let rights = fill_image_page(pe, rva, scratch);
@@ -1265,16 +1292,14 @@ unsafe fn service_sec_image(fault_ep: u64, pml4: u64, pe: &nt_pe_loader::PeFile)
             m1 = nm1;
             continue;
         }
-        if (mi >> 12) != 2 {
-            break;
-        }
-        if m0 == SSN_DONE {
+        if (mi >> 12) == 2 && m0 == SSN_DONE {
             verdict = get_recv_mr(9); // R10 = arg1
             break;
         }
+        stop = m1; // a non-VMFault (e.g. #GP from an unset GS) — stop
         break;
     }
-    (verdict, faults)
+    (verdict, faults, first, stop)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -2943,7 +2968,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
         let pml4 = spawn_sec_image(&pe, si_fault_c);
-        let (v, f) = service_sec_image(si_fault, pml4, &pe);
+        let (v, f, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000);
         si_verdict = v;
         si_faults = f;
     }
@@ -3845,6 +3870,35 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_smss_parsed", nsec == 6 && entry == 0x12ee0, &mut passed);
                 check(b"exec_reactos_smss_imports_ntdll", imports_ntdll, &mut passed);
                 check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
+
+                // LIVE SEC_IMAGE LOAD: spawn the real smss via spawn_sec_image (image VA only
+                // RESERVED) and let it START EXECUTING at its entry — its .text pages fault in
+                // LIVE, per RVA, from the disk-read bytes. It runs its real x64 prologue
+                // (mov [rsp+8],rcx; sub rsp,0xf8; ...) then stops safely at its first
+                // unresolved ntdll call (an out-of-image fault). Scratch at 0x62 (past FILEBUF).
+                let si_fault = make_object(OBJ_ENDPOINT);
+                let si_fault_c = copy_cap(si_fault);
+                let pml4 = spawn_sec_image(&pe, si_fault_c);
+                let (_v, sfaults, sfirst, sstop) =
+                    service_sec_image(si_fault, pml4, &pe, 0x0000_0100_0062_0000);
+                print_str(b"[ntos-exec] LIVE ReactOS smss executed from entry: faulted in ");
+                print_u64(sfaults);
+                print_str(b" page(s), first=0x");
+                print_hex((sfirst >> 32) as u32);
+                print_hex(sfirst as u32);
+                print_str(b" stopped at 0x");
+                print_hex((sstop >> 32) as u32);
+                print_hex(sstop as u32);
+                print_str(b"\n");
+                // The FIRST fault is the entry instruction itself (PE_LOAD_BASE+0x12ee0),
+                // fetched from a demand-paged .text page: real ReactOS smss code began
+                // executing, live-loaded from disk via SEC_IMAGE.
+                check(
+                    b"exec_reactos_smss_live_executed",
+                    sfirst == PE_LOAD_BASE + 0x12ee0,
+                    &mut passed,
+                );
+                check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
             }
             Err(_) => {
                 print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
@@ -3857,7 +3911,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/87 executive->isolated-service checks passed]\n");
+    print_str(b"/89 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
