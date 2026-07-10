@@ -1,0 +1,13 @@
+[package]
+name = "nt-hive-regf"
+description = "Read-only parser for the real Windows/ReactOS on-disk registry hive binary format (regf base block, hbin bins, nk/vk/lf/lh/li/ri cells). Loads a live-CD SYSTEM hive so the NT registry is served from real data. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

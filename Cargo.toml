@@ -45,6 +45,7 @@ members = [
     "crates/nt-config-store",
     "crates/nt-setupapi",
     "crates/nt-hive-core",
+    "crates/nt-hive-regf",
     "crates/nt-fs",
     "crates/nt-cache-manager",
     "crates/nt-memory-manager",
