@@ -160,6 +160,9 @@ pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
+/// NtCreateDirectoryObject — SmpInit creates object-namespace directories (\Windows, \KnownDlls,
+/// \??/DosDevices, …). Out handle in RCX; faked until the object manager lands.
+pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
 /// NtClose — no handle table modelled, so closing a (fake) handle is a no-op success.
 pub const SSN_NT_CLOSE: u64 = 27;
 /// Security-token SSNs SmpInit hits. NtOpenThreadToken → STATUS_NO_TOKEN (no impersonation token,
@@ -1621,6 +1624,21 @@ unsafe fn smss_read_unicode(buffer_va: u64, byte_len: u16) -> alloc::vec::Vec<u1
     }
     out
 }
+/// Copy in a UNICODE_STRING at `ustr_va` (x64 {u16 Length, u16 MaximumLength, u32 pad, u64 Buffer})
+/// and return its UTF-16 code units. (For NtQueryValueKey's ValueName — used once IMAGE copyin
+/// lets us reach the .rdata name buffers.)
+#[allow(dead_code)]
+unsafe fn smss_read_ustr(ustr_va: u64) -> alloc::vec::Vec<u16> {
+    if ustr_va == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let mut lm = [0u8; 2];
+    let mut bp = [0u8; 8];
+    if !smss_copyin(ustr_va, &mut lm) || !smss_copyin(ustr_va + 8, &mut bp) {
+        return alloc::vec::Vec::new();
+    }
+    smss_read_unicode(u64::from_le_bytes(bp), u16::from_le_bytes(lm))
+}
 /// Copy in an OBJECT_ATTRIBUTES.ObjectName (x64: ObjectName PUNICODE_STRING @ +0x10; UNICODE_STRING
 /// = {u16 Length, u16 MaximumLength, u32 pad, u64 Buffer}) and return the name as UTF-16 units.
 unsafe fn smss_read_objattr_name(oa_va: u64) -> alloc::vec::Vec<u16> {
@@ -1794,14 +1812,30 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtOpenKey(*KeyHandle[0], DesiredAccess[1], ObjectAttributes[2]). Copy in the object
             // name from smss, resolve it in the SYSTEM hive, hand back a handle (copyout to arg0).
             NativeService::NtOpenKey => unsafe {
-                let name16 = smss_read_objattr_name(args[2]);
+                // OBJECT_ATTRIBUTES: RootDirectory @+8, ObjectName @+0x10. RtlQueryRegistryValues
+                // opens subkeys RELATIVE to an already-open key (RootDirectory = its handle,
+                // ObjectName = a leaf like "Environment"), so honour RootDirectory.
+                let oa = args[2];
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
                 let mut path = alloc::string::String::new();
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
                         path.push(c);
                     }
                 }
-                match self.resolve_key(&path) {
+                let cell = if root_dir >= KEY_HANDLE_BASE {
+                    let idx = (root_dir - KEY_HANDLE_BASE) as usize;
+                    match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
+                        (Some(h), Some(parent)) => h.open_key_from(parent, &path),
+                        _ => None,
+                    }
+                } else {
+                    self.resolve_key(&path)
+                };
+                match cell {
                     Some(cell) => {
                         self.key_handles.push(cell);
                         let h = KEY_HANDLE_BASE + (self.key_handles.len() as u64 - 1);
@@ -2047,6 +2081,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_CREATE_THREAD
                 || m0 == SSN_NT_CREATE_EVENT
                 || m0 == SSN_NT_CREATE_SECTION
+                || m0 == SSN_NT_CREATE_DIRECTORY_OBJECT
             {
                 // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events,
                 // sections). Each takes the out handle in RCX (arg1). Hand back a fresh fake handle
@@ -2072,7 +2107,9 @@ unsafe fn service_sec_image(
                 // real registry handler above.)
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
-                // NtQueryValueKey — no registry → value not found; LdrpInitialize uses defaults.
+                // NtQueryValueKey — not-found → RtlQueryRegistryValues uses defaults. Returning real
+                // values needs IMAGE copyin (the value NAME is a static string in smss's .rdata,
+                // which the stack+heap mirror doesn't cover) — the next GuestMemory increment.
                 result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
             } else if m0 == SSN_NT_PROTECT_VM {
                 // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
