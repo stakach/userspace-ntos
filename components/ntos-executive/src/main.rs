@@ -41,7 +41,10 @@ use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
-use nt_syscall::{NativeService, NativeServiceTable, UserlandAbiProfile};
+use nt_syscall::{
+    NativeCallContext, NativeService, NativeServiceTable, NativeSyscallDispatcher,
+    NativeSyscallHandler, ProcessorMode, SyscallOrigin, UserlandAbiProfile,
+};
 use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectAttributes, ObjectId, UnicodeString};
 use surt_sel4::surt_core::surt_abi::{feature, role, SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{init_ring, Consumer, Producer, RingConfig};
@@ -1646,6 +1649,40 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
     ((ext + 0xFFF) & !0xFFF) as u64
 }
 
+/// The real NT syscall handler the dispatcher routes to (`nt_syscall::NativeSyscallHandler`).
+/// This is the seam that replaces the ad-hoc broker: syscalls whose SSN is in the service table
+/// are dispatched HERE (real subsystems), and everything else falls back to the broker match —
+/// so syscalls migrate from fake to real one family at a time while the tree stays green. v0.1
+/// covers only the trivial object calls; the registry family (real OBJECT_ATTRIBUTES copyin +
+/// a real hive) lands next, then process/section/token/port against the smss trace.
+struct ExecNtHandler {
+    // (subsystem managers — hive, handle table, … — land here as families come online)
+}
+impl ExecNtHandler {
+    fn new() -> Self {
+        ExecNtHandler {}
+    }
+}
+impl NativeSyscallHandler for ExecNtHandler {
+    fn handle(&mut self, ctx: &NativeCallContext, _args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
+        match ctx.service {
+            // No handle table modelled yet → closing a handle is a success (matches the broker).
+            NativeService::NtClose => 0, // STATUS_SUCCESS
+            _ => 0xC000_0002,            // STATUS_NOT_IMPLEMENTED — never silently succeed
+        }
+    }
+}
+
+/// Build the service table mapping smss's ntdll SSNs -> NativeService, for ONLY the services the
+/// real handler implements. `table.lookup(ssn).is_some()` is the routing switch: present -> real
+/// dispatcher, absent -> broker fallback. Grows as each syscall family is implemented for real.
+fn build_nt_table() -> NativeServiceTable {
+    NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtClose, SSN_NT_CLOSE as u32)],
+    )
+}
+
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
 /// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
 /// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
@@ -1682,6 +1719,10 @@ unsafe fn service_sec_image(
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections), so the
     // Session Manager's SmpInit keeps flowing. Each create hands out a fresh value.
     let mut next_handle = FAKE_HANDLE;
+    // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
+    // to the broker match below.
+    let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
+    let mut nt_handler = ExecNtHandler::new();
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
@@ -1770,7 +1811,17 @@ unsafe fn service_sec_image(
             let flags = get_recv_mr(17);
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
             let mut handled = true;
-            if m0 == SSN_NT_ALLOCATE_VM {
+            // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
+            // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
+            // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
+            // args (sized to the service's max) — pointer/stack args come with the copyin layer.
+            if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
+                let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
+                let regs = [get_recv_mr(2), m3, get_recv_mr(7), get_recv_mr(8)];
+                let n = (entry.max_args as usize).min(4);
+                let res = nt_dispatcher.dispatch(m0 as u32, &regs[..n], &origin, &mut nt_handler);
+                result = res.status as u64;
+            } else if m0 == SSN_NT_ALLOCATE_VM {
                 // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
                 // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size, [sp+0x28]=Type.
                 // RESERVE (base in==0) picks a bump base; COMMIT maps frames at the base.
@@ -1924,7 +1975,6 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_TEST_ALERT
                 || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
                 || m0 == SSN_NT_CREATE_KEYED_EVENT
-                || m0 == SSN_NT_CLOSE
                 || m0 == SSN_NT_ADJUST_PRIV_TOKEN
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
