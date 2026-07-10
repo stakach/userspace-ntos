@@ -2018,7 +2018,10 @@ unsafe fn service_sec_image(
             // args (sized to the service's max) — pointer/stack args come with the copyin layer.
             if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
                 let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
-                let regs = [get_recv_mr(2), m3, get_recv_mr(7), get_recv_mr(8)];
+                // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
+                // syscall return address), arg2=RDX, arg3=R8, arg4=R9. RDX rides in m3; R10/R8/R9
+                // come from the IPC buffer (MR>=4).
+                let regs = [get_recv_mr(9), m3, get_recv_mr(7), get_recv_mr(8)];
                 let n = (entry.max_args as usize).min(4);
                 let res = nt_dispatcher.dispatch(m0 as u32, &regs[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
