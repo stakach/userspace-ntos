@@ -126,6 +126,10 @@ pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
 pub const SSN_NT_QUERY_DEFAULT_LOCALE: u64 = 149;
+/// ntdll's NtQueryDebugFilterState SSN. DbgPrintEx(component,...) suppresses its message unless
+/// this returns (NTSTATUS)TRUE=1 (rtl/debug.c:66). Returning 1 unmasks the SXS/LDR component
+/// traces so we can see *which* internal loader step fails (otherwise only DPRINT1/-1 shows).
+pub const SSN_NT_QUERY_DEBUG_FILTER_STATE: u64 = 148;
 /// No-op-success syscalls: NtFreeVirtualMemory (bump allocator never frees),
 /// NtSetInformationThread/Process (attributes we don't model).
 pub const SSN_NT_FREE_VM: u64 = 87;
@@ -133,6 +137,13 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
 pub const SSN_NT_TEST_ALERT: u64 = 268;
+/// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
+/// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
+pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
+// NEXT FRONTIER: SSN 289 = NtCreateKeyedEvent (RtlpInitializeKeyedEvent, ldrinit.c:2436). We stop
+// cleanly here for now — servicing it as bare success lets smss march into NtContinue (SSN 34) and
+// keyed-event waits it isn't yet set up for, so the process runs off into unmapped code. Handling
+// that chain (real keyed-event + NtContinue into smss's entry CONTEXT) is the next milestone.
 /// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
@@ -1351,6 +1362,15 @@ unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x18) as *mut u32, 0); // Flags
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
+        // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
+        // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
+        // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
+        // ..., alloc=FALSE) (e.g. ntdll+0xf05e). With MaximumLength=0 that returns
+        // STATUS_BUFFER_OVERFLOW (0x80000005), which propagates out of LdrpWalkImportDescriptor and
+        // fails process init. Set MaximumLength = 261*sizeof(WCHAR) = 522 and point Buffer at the
+        // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
+        core::ptr::write_volatile((scr + 0x5000 + 0x25a) as *mut u16, 522); // MaximumLength
+        core::ptr::write_volatile((scr + 0x5000 + 0x260) as *mut u64, SMSS_TEB_VA + 0x1268); // Buffer
         let _ = page_map(copy_cap(teb2), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
@@ -1626,7 +1646,10 @@ unsafe fn service_sec_image(
     // page VA filled at each fault index → its persistent executive scratch is
     // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
     // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
-    let mut filled_pages = [0u64; 96];
+    let mut filled_pages = [0u64; 256];
+    // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
+    let mut ssn_ring = [0u16; 32];
+    let mut ssn_ri = 0usize;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
@@ -1679,7 +1702,7 @@ unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 96 {
+            if faults >= 256 {
                 stop = addr;
                 break;
             }
@@ -1708,6 +1731,8 @@ unsafe fn service_sec_image(
                 verdict = get_recv_mr(9); // R10 = arg1
                 break;
             }
+            ssn_ring[ssn_ri % 32] = m0 as u16;
+            ssn_ri += 1;
             let resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
@@ -1836,10 +1861,16 @@ unsafe fn service_sec_image(
                     core::ptr::write_volatile(
                         (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
                 }
+            } else if m0 == SSN_NT_QUERY_DEBUG_FILTER_STATE {
+                // Return TRUE so ntdll's DbgPrintEx does not filter out component traces
+                // (rtl/debug.c:66 compares the result against (NTSTATUS)TRUE=1). Unmasks the
+                // SXS/LDR loader diagnostics that pinpoint the failing internal step.
+                result = 1;
             } else if m0 == SSN_NT_FREE_VM
                 || m0 == SSN_NT_SET_INFO_THREAD
                 || m0 == SSN_NT_SET_INFO_PROCESS
                 || m0 == SSN_NT_TEST_ALERT
+                || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator) and
                 // don't model thread/process attribute sets.
@@ -1883,6 +1914,13 @@ unsafe fn service_sec_image(
     print_u64(dbgsvc);
     print_str(b" stop_ssn=");
     print_u64(stop_ssn);
+    // Dump the last serviced SSNs in chronological order (oldest first).
+    print_str(b" ssns:");
+    let ring_n = if ssn_ri < 32 { 0 } else { ssn_ri - 32 };
+    for k in ring_n..ssn_ri {
+        print_str(b" ");
+        print_u64(ssn_ring[k % 32] as u64);
+    }
     // NtRaiseHardError(190): decode the status (R10), Parameters[0], and the caller ([rsp]).
     // Guarded to this case — get_recv_mr(16)/(8) only hold a valid smss stack ptr here.
     if stop_ssn == 190 {
