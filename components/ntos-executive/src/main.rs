@@ -2751,7 +2751,10 @@ unsafe fn service_sec_image(
                     n
                 };
                 let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
-                if smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32 {
+                // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
+                // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
+                let is_csrss = nb[..nlen].windows(5).any(|w| w == b"csrss");
+                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
                     next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
@@ -2763,8 +2766,26 @@ unsafe fn service_sec_image(
                     result = 0xC0000034; // no filesystem yet → not found (smss skips / uses defaults)
                 }
             } else if m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
-                // No filesystem yet → STATUS_OBJECT_NAME_NOT_FOUND.
-                result = 0xC0000034;
+                // NtQueryAttributesFile(*OBJECT_ATTRIBUTES[R10], *FILE_BASIC_INFORMATION[RDX]).
+                // RtlDosSearchPath_U probes for csrss.exe here (SmpParseCommandLine). Report it
+                // EXISTS (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set;
+                // everything else → not-found so the loader's manifest probes keep failing.
+                let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
+                let mut nb = [0u8; 96];
+                let mut nlen = 0;
+                for &w in &name16 {
+                    if nlen >= nb.len() {
+                        break;
+                    }
+                    nb[nlen] = (w as u8).to_ascii_lowercase();
+                    nlen += 1;
+                }
+                if nb[..nlen].windows(5).any(|w| w == b"csrss") {
+                    // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
+                    smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
+                } else {
+                    result = 0xC0000034;
+                }
             } else if m0 == SSN_NT_PROTECT_VM {
                 // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
                 // model per-page protection changes yet — report success and hand back a plausible
