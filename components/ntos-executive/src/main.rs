@@ -120,6 +120,11 @@ pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 /// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
 pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0090_0000;
 pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early heap
+/// The executive's mirror of smss's demand-filled IMAGE pages, so smss_copyin can read static
+/// pointer args (registry value/subkey names in .rdata, etc.) from the process image. Sits just
+/// below the heap mirror and SHARES its 0x80-0xA0 page table (no extra PT).
+pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_0080_0000;
+pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 KiB)
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -165,6 +170,9 @@ pub const SSN_NT_CREATE_SECTION: u64 = 52;
 pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
 /// NtClose — no handle table modelled, so closing a (fake) handle is a no-op success.
 pub const SSN_NT_CLOSE: u64 = 27;
+/// NtDeleteValueKey — smss deletes SAFEBOOT_OPTION from \Session Manager\Environment (sminit.c:2321).
+/// Registry writes aren't modelled (the regf hive is read-only) → best-effort no-op success.
+pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// Security-token SSNs SmpInit hits. NtOpenThreadToken → STATUS_NO_TOKEN (no impersonation token,
 /// the normal case → caller falls back to the process token). NtOpenProcessToken → fake token
 /// handle (out in R8). A real token/SID model is a later milestone.
@@ -1584,6 +1592,10 @@ unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
         Some(SMSS_STACK_MIRROR_VA + (va - STACK_BASE))
     } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA))
+    } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
+        // Image .rdata/.data — only valid once the page has been demand-faulted (smss reads a
+        // static string, faulting+mirroring its page, before passing it to a syscall).
+        Some(IMAGE_MIRROR_VA + (va - PE_LOAD_BASE))
     } else {
         None
     }
@@ -1965,6 +1977,15 @@ unsafe fn service_sec_image(
             let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
             let rights = fill_image_page(tpe, rva, scratch);
             let _ = page_map(copy_cap(f), page, rights, pml4);
+            // Mirror the main-image page into the executive so smss_copyin can read static-string
+            // args (registry value/subkey names in .rdata) from smss's image. (Shares the heap
+            // mirror's PT; the map is a no-op for non-setup_env SEC_IMAGE spawns.)
+            if base == PE_LOAD_BASE {
+                let off = page - PE_LOAD_BASE;
+                if off < IMAGE_MIRROR_WINDOW {
+                    let _ = page_map(copy_cap(f), IMAGE_MIRROR_VA + off, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+            }
             if (faults as usize) < filled_pages.len() {
                 filled_pages[faults as usize] = page;
             }
@@ -2107,10 +2128,7 @@ unsafe fn service_sec_image(
                 // real registry handler above.)
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
-                // NtQueryValueKey — not-found → RtlQueryRegistryValues uses defaults. Returning real
-                // values needs IMAGE copyin (the value NAME is a static string in smss's .rdata,
-                // which the stack+heap mirror doesn't cover) — the next GuestMemory increment.
-                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND — defaults used
             } else if m0 == SSN_NT_PROTECT_VM {
                 // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
                 // model per-page protection changes yet — report success and hand back a plausible
@@ -2165,6 +2183,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
                 || m0 == SSN_NT_CREATE_KEYED_EVENT
                 || m0 == SSN_NT_ADJUST_PRIV_TOKEN
+                || m0 == SSN_NT_DELETE_VALUE_KEY
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
