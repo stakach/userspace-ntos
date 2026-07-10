@@ -12,7 +12,9 @@ use core::ptr::{null_mut, read_volatile, write_volatile};
 
 /// Base of the RW heap region the broker maps into each component.
 pub const HEAP_BASE: usize = 0x0000_0100_0048_0000;
-/// Heap size in 4 KiB frames (128 KiB).
+/// Heap size in 4 KiB frames (128 KiB). Shared by the executive and every spawned service (same
+/// binary); growing it costs extra frames/slots per component and exhausts the boot resource
+/// budget, so the executive instead reclaims per-syscall transients (mark/reset) to fit.
 pub const HEAP_FRAMES: u64 = 32;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;

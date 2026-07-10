@@ -186,8 +186,15 @@ pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// A distinctive fake handle we hand back for objects we don't yet model (ports, events, …), so it
 /// is recognisable in traces and never collides with a real (small) handle index.
 pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
-/// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
+/// ntdll's NtOpenDirectoryObject SSN (SmpInit opens \?? for DosDevices; served by the object ns).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
+/// NtCreateSymbolicLinkObject SSN (SmpInit creates the drive-letter links in \??). SSN = sysfuncs
+/// line 55 − 1.
+pub const SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT: u64 = 54;
+/// NtMakeTemporaryObject SSN (SmpInit clears OBJ_PERMANENT on a colliding link). sysfuncs 111 − 1.
+pub const SSN_NT_MAKE_TEMPORARY_OBJECT: u64 = 110;
+/// NtOpenSymbolicLinkObject SSN (SmpInit opens a link after DosDevices). sysfuncs 134 − 1.
+pub const SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT: u64 = 133;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
 pub const SSN_NT_OPEN_FILE: u64 = 122;
 /// ntdll's NtQueryAttributesFile SSN (LdrpInitialize probes a file's existence; no FS → not-found).
@@ -1772,6 +1779,41 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
 /// Base for registry key handles the handler hands out (index into `key_handles`, offset so it
 /// never looks like a small/null handle).
 const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
+/// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
+const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
+
+/// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
+/// allocation, so the backing `Vec` (pre-reserved below the per-syscall heap mark) never
+/// reallocates and survives the bump-heap reset. Enough for SmpInit's DosDevices bring-up:
+/// directories (`\`, `\??`, …) and the drive-letter symbolic links it creates in `\??`.
+#[derive(Clone, Copy)]
+struct ObjEntry {
+    name: [u8; 40],   // leaf name, lowercased ASCII (len in name_len)
+    name_len: u8,
+    parent: u8,       // index of the parent directory; 0xFF = the root itself
+    kind: u8,         // 0 = directory, 1 = symbolic link
+    target: [u8; 40], // symbolic-link target (kind == 1)
+    target_len: u8,
+}
+impl ObjEntry {
+    fn dir(name: &[u8], parent: u8) -> Self {
+        let mut e = ObjEntry {
+            name: [0; 40],
+            name_len: 0,
+            parent,
+            kind: 0,
+            target: [0; 40],
+            target_len: 0,
+        };
+        let n = name.len().min(40);
+        e.name[..n].copy_from_slice(&name[..n]);
+        e.name_len = n as u8;
+        e
+    }
+    fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
 
 /// Build a KEY_VALUE_*_INFORMATION structure (NtQueryValueKey/NtEnumerateValueKey out buffer) for
 /// the given class: 0 = Basic {TitleIndex,Type,NameLength,Name}, 2 = Partial
@@ -1824,6 +1866,9 @@ struct ExecNtHandler {
     /// the executive heap is small). None if the hive wasn't staged on the disk.
     hive: Option<RegfHive<'static>>,
     key_handles: alloc::vec::Vec<KeyRef>,
+    /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
+    /// like `key_handles`; entries are inline (no nested heap) so pushes never reallocate.
+    obj_ns: alloc::vec::Vec<ObjEntry>,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -1847,7 +1892,109 @@ impl ExecNtHandler {
             // reset. Opens are deduped (below), so a bounded set of distinct keys
             // never exceeds this.
             key_handles: alloc::vec::Vec::with_capacity(256),
+            obj_ns: {
+                let mut v = alloc::vec::Vec::with_capacity(48);
+                v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
+                // The standard top-level directories the object manager pre-creates. SmpInit opens
+                // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
+                // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
+                // Names are stored folded (lowercase), matching obj lookups.
+                for d in [
+                    b"??".as_slice(),
+                    b"device",
+                    b"global??",
+                    b"knowndlls",
+                    b"basenamedobjects",
+                    b"sessions",
+                    b"dosdevices",
+                    b"windows",
+                    b"objecttypes",
+                    b"driver",
+                    b"filesystem",
+                    b"security",
+                ] {
+                    v.push(ObjEntry::dir(d, 0));
+                }
+                v
+            },
         }
+    }
+    /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
+    /// returns the filled length. Non-ASCII code units are truncated to their low byte.
+    fn fold_name(name16: &[u16], out: &mut [u8]) -> usize {
+        let mut n = 0;
+        for &w in name16 {
+            if n >= out.len() {
+                break;
+            }
+            out[n] = (w as u8).to_ascii_lowercase();
+            n += 1;
+        }
+        n
+    }
+    /// Resolve an object path to an `obj_ns` index. A path starting with `\` walks from the root;
+    /// otherwise it is relative to `root_idx` (an already-open directory, e.g. an OA RootDirectory).
+    /// Empty leading components (from the leading `\`) are skipped.
+    fn obj_resolve(&self, path: &[u8], root_idx: usize) -> Option<usize> {
+        let mut cur = if path.first() == Some(&b'\\') {
+            0
+        } else {
+            root_idx
+        };
+        for comp in path.split(|&c| c == b'\\') {
+            if comp.is_empty() {
+                continue;
+            }
+            cur = self.obj_child(cur, comp)?;
+        }
+        Some(cur)
+    }
+    /// Find a direct child of directory `parent` whose (folded) name matches `leaf`.
+    fn obj_child(&self, parent: usize, leaf: &[u8]) -> Option<usize> {
+        self.obj_ns
+            .iter()
+            .position(|e| e.parent as usize == parent && e.name() == leaf)
+    }
+    /// Insert a child (dir or symlink) under `parent`, or return the existing one (OPENIF/name
+    /// collision → reuse). Returns the index, or None if the table is at capacity.
+    fn obj_insert(&mut self, parent: usize, leaf: &[u8], kind: u8, target: &[u8]) -> Option<usize> {
+        if let Some(i) = self.obj_child(parent, leaf) {
+            return Some(i);
+        }
+        if self.obj_ns.len() >= self.obj_ns.capacity() {
+            return None;
+        }
+        let mut e = ObjEntry::dir(leaf, parent as u8);
+        e.kind = kind;
+        if kind == 1 {
+            let t = target.len().min(40);
+            e.target[..t].copy_from_slice(&target[..t]);
+            e.target_len = t as u8;
+        }
+        self.obj_ns.push(e);
+        Some(self.obj_ns.len() - 1)
+    }
+    /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
+    /// resolve the parent from all but the last component, then insert the leaf. Existing → reused.
+    fn obj_create(&mut self, path: &[u8], root_idx: usize, kind: u8, target: &[u8]) -> Option<usize> {
+        let (parent_path, leaf) = match path.iter().rposition(|&c| c == b'\\') {
+            Some(p) => (&path[..p], &path[p + 1..]),
+            None => (&[][..], path),
+        };
+        let parent = if parent_path.iter().all(|&c| c == b'\\') {
+            // No real parent component: root if the path was absolute, else the supplied root.
+            if path.first() == Some(&b'\\') {
+                0
+            } else {
+                root_idx
+            }
+        } else {
+            self.obj_resolve(parent_path, root_idx)?
+        };
+        if leaf.is_empty() {
+            return Some(parent);
+        }
+        self.obj_insert(parent, leaf, kind, target)
     }
     /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a key node in the SYSTEM hive:
     /// apply the CurrentControlSet alias (the hive has ControlSet001, not the kernel-synthesized
@@ -2222,7 +2369,6 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_CREATE_THREAD
                 || m0 == SSN_NT_CREATE_EVENT
                 || m0 == SSN_NT_CREATE_SECTION
-                || m0 == SSN_NT_CREATE_DIRECTORY_OBJECT
             {
                 // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events,
                 // sections). Each takes the out handle in RCX (arg1). Hand back a fresh fake handle
@@ -2240,12 +2386,93 @@ unsafe fn service_sec_image(
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
             } else if m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
-                || m0 == SSN_NT_OPEN_FILE
-                || m0 == SSN_NT_QUERY_ATTRIBUTES_FILE
+                || m0 == SSN_NT_CREATE_DIRECTORY_OBJECT
             {
-                // NtOpenDirectoryObject / NtOpenFile / NtQueryAttributesFile — no object namespace
-                // or filesystem yet → STATUS_OBJECT_NAME_NOT_FOUND. (NtOpenKey now goes through the
-                // real registry handler above.)
+                // NtOpen/CreateDirectoryObject(*Handle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES
+                // [R8]). Resolve/insert in the executive's object namespace and hand back a real
+                // handle so SmpInit can open \?? and create the DosDevices links under it.
+                let out = get_recv_mr(9); // R10 = *Handle (arg0)
+                let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES (arg2)
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                let idx = if m0 == SSN_NT_CREATE_DIRECTORY_OBJECT {
+                    nt_handler.obj_create(&nbuf[..nlen], root_idx, 0, &[])
+                } else {
+                    nt_handler.obj_resolve(&nbuf[..nlen], root_idx)
+                };
+                match idx {
+                    Some(i) => smss_stack_write(out, OBJ_HANDLE_BASE + i as u64),
+                    None => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            } else if m0 == SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT {
+                // NtCreateSymbolicLinkObject(*Handle[R10], access[RDX], *OA[R8], *LinkTarget[R9]).
+                // SmpInit creates the drive-letter links in \?? (OA.RootDirectory = the \?? handle).
+                let out = get_recv_mr(9); // R10
+                let oa = get_recv_mr(7); // R8
+                let tgt = get_recv_mr(8); // R9 = PUNICODE_STRING target
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
+                let target16 = smss_read_ustr(tgt);
+                let mut tbuf = [0u8; 40]; // keep the target's case (it's a device path)
+                let mut tl = 0;
+                for &w in &target16 {
+                    if tl >= tbuf.len() {
+                        break;
+                    }
+                    tbuf[tl] = w as u8;
+                    tl += 1;
+                }
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                match nt_handler.obj_create(&nbuf[..nlen], root_idx, 1, &tbuf[..tl]) {
+                    Some(i) => smss_stack_write(out, OBJ_HANDLE_BASE + i as u64),
+                    None => result = 0xC0000034,
+                }
+            } else if m0 == SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT {
+                // NtOpenSymbolicLinkObject(*Handle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8]).
+                // Resolve the named object in the namespace; hand back a handle if it exists.
+                let out = get_recv_mr(9); // R10
+                let oa = get_recv_mr(7); // R8
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                match nt_handler.obj_resolve(&nbuf[..nlen], root_idx) {
+                    // Only an actual symbolic link opens here; a directory match is a miss (smss's
+                    // SmpTranslateSystemPartitionInformation only wants drive-letter links in \??).
+                    Some(i) if nt_handler.obj_ns[i].kind == 1 => {
+                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64)
+                    }
+                    _ => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            } else if m0 == SSN_NT_MAKE_TEMPORARY_OBJECT {
+                // Clears OBJ_PERMANENT on a link SmpInit re-creates; we don't track permanence.
+                // Success no-op.
+            } else if m0 == SSN_NT_OPEN_FILE || m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
+                // No filesystem object namespace yet → STATUS_OBJECT_NAME_NOT_FOUND.
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
                 result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND — defaults used
