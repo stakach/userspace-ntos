@@ -171,6 +171,21 @@ pub const FILEBUF_FRAMES: u64 = 32;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_00A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
+/// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
+/// NTDLLBUF page table's 2 MiB region (0xA0_0000-0xC0_0000, past NTDLLBUF's 0xA0-0xB0), so they
+/// need no extra PT. spawn_sec_image later shares these frames into smss + points the PEB NLS
+/// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
+pub const NLS_ANSI_VADDR: u64 = 0x0000_0100_00B0_0000; // c_1252.nls (66082 B = 17 pages)
+pub const NLS_ANSI_FRAMES: u64 = 20;
+pub const NLS_OEM_VADDR: u64 = 0x0000_0100_00B2_0000; // c_437.nls (66594 B = 17 pages)
+pub const NLS_OEM_FRAMES: u64 = 20;
+pub const NLS_CASE_VADDR: u64 = 0x0000_0100_00B4_0000; // l_intl.nls (4870 B = 2 pages)
+pub const NLS_CASE_FRAMES: u64 = 4;
+/// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
+/// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
+pub const NLS_SMSS_ANSI_VA: u64 = 0x0000_0100_00E0_0000;
+pub const NLS_SMSS_OEM_VA: u64 = 0x0000_0100_00E2_0000;
+pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
 /// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
@@ -1333,7 +1348,29 @@ unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0xE8) as *mut u32, 0);
         core::ptr::write_volatile((scr + 0x1000 + 0xEC) as *mut u32, 16);
         core::ptr::write_volatile((scr + 0x1000 + 0xF0) as *mut u64, SMSS_PEB_VA + 0x800);
+        // NLS code-page data pointers — LdrpInitializeProcess (ntdll+0x9e81) reads these and
+        // passes them to RtlInitNlsTables, which builds the WideChar<->MultiByte tables
+        // RtlUnicodeToMultiByteN needs (else it indexes a null table). x64 PEB (verified from the
+        // disasm reading [PEB+0xa0/0xa8/0xb0]): AnsiCodePageData@0xA0, OemCodePageData@0xA8,
+        // UnicodeCaseTableData@0xB0.
+        core::ptr::write_volatile((scr + 0x1000 + 0xA0) as *mut u64, NLS_SMSS_ANSI_VA);
+        core::ptr::write_volatile((scr + 0x1000 + 0xA8) as *mut u64, NLS_SMSS_OEM_VA);
+        core::ptr::write_volatile((scr + 0x1000 + 0xB0) as *mut u64, NLS_SMSS_CASE_VA);
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
+        // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
+        // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).
+        let nls_pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nls_pt);
+        let _ = paging_struct_map(nls_pt, LBL_X86_PAGE_TABLE_MAP, NLS_SMSS_ANSI_VA, pml4);
+        for (start, va, frames) in [
+            (NLS_ANSI_START.load(Ordering::Relaxed), NLS_SMSS_ANSI_VA, NLS_ANSI_FRAMES),
+            (NLS_OEM_START.load(Ordering::Relaxed), NLS_SMSS_OEM_VA, NLS_OEM_FRAMES),
+            (NLS_CASE_START.load(Ordering::Relaxed), NLS_SMSS_CASE_VA, NLS_CASE_FRAMES),
+        ] {
+            for i in 0..frames {
+                let _ = page_map(copy_cap(start + i), va + i * 0x1000, RW_NX, pml4);
+            }
+        }
         // Process parameters: a real RTL_USER_PROCESS_PARAMETERS. LdrpInitializeProcess reads
         // DllPath (@0x50) and requires DllPath.Length > 0 (else "Error while retrieving buffer for
         // %wZ" → STATUS_INVALID_PARAMETER → APP_INIT_FAILURE). Build it in executive scratch
@@ -2166,6 +2203,9 @@ unsafe fn spawn_storage_host(
     shared_frame: u64,
     filebuf_start: u64,
     ntdllbuf_start: u64,
+    nls_ansi_start: u64,
+    nls_oem_start: u64,
+    nls_case_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -2221,6 +2261,16 @@ unsafe fn spawn_storage_host(
         let nb_cp = copy_cap(ntdllbuf_start + i);
         let _ = page_map(nb_cp, NTDLLBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
+    for (start, vaddr, frames) in [
+        (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
+        (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
+        (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
+    ] {
+        for i in 0..frames {
+            let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, pml4);
+        }
+    }
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -2248,6 +2298,14 @@ static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 static NEXT_SMSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
+/// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can
+/// share the c_1252/c_437/l_intl frames into smss and point the PEB NLS fields at them.
+static NLS_ANSI_START: AtomicU64 = AtomicU64::new(0);
+static NLS_OEM_START: AtomicU64 = AtomicU64::new(0);
+static NLS_CASE_START: AtomicU64 = AtomicU64::new(0);
+static NLS_ANSI_SIZE: AtomicU64 = AtomicU64::new(0);
+static NLS_OEM_SIZE: AtomicU64 = AtomicU64::new(0);
+static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
@@ -2925,8 +2983,12 @@ unsafe fn storage_probe(
     smss_dest: u64,
     imports_dest: u64,
     ntdll_dest: u64,
-) -> (u32, u32, u32, u32, u32, u32, u32) {
+    nls_ansi_dest: u64,
+    nls_oem_dest: u64,
+    nls_case_dest: u64,
+) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
+    let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
     let det = (ssts >> 8) & 0xF;
@@ -3089,8 +3151,33 @@ unsafe fn storage_probe(
                 verdict |= 0x80;
             }
         }
+        // NLS code-page tables — c_1252 (ANSI), c_437 (OEM), l_intl (Unicode case).
+        for (name, dest, frames, out) in [
+            (b"C_1252  NLS", nls_ansi_dest, NLS_ANSI_FRAMES, &mut nls_ansi_size),
+            (b"C_437   NLS", nls_oem_dest, NLS_OEM_FRAMES, &mut nls_oem_size),
+            (b"L_INTL  NLS", nls_case_dest, NLS_CASE_FRAMES, &mut nls_case_size),
+        ] {
+            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+                let cap = (frames * 0x1000) as u32;
+                let want = if sz < cap { sz } else { cap };
+                let got = fat_read_file(&fs, c, want, dest);
+                print_str(b"[storage-host] NLS ");
+                for &ch in name { debug_put_char(ch); }
+                print_str(b" size=");
+                print_u64(sz as u64);
+                print_str(b" read=");
+                print_u64(got as u64);
+                print_str(b"\n");
+                if got == want && sz > 0 {
+                    *out = sz;
+                }
+            }
+        }
     }
-    (verdict, cluster, size, hive_size, smss_size, imports_size, ntdll_size)
+    (
+        verdict, cluster, size, hive_size, smss_size, imports_size, ntdll_size,
+        nls_ansi_size, nls_oem_size, nls_case_size,
+    )
 }
 
 /// Install a VT-d IO page table `iopt_cap` into device IO space `io_space_cap`, walking
@@ -4305,6 +4392,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..NTDLLBUF_FRAMES {
                 let _ = page_map(copy_cap(nb_start + i), NTDLLBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
+            // in the executive too, and remember their cap bases for spawn_sec_image to share into
+            // smss.
+            let mut nls_starts = [0u64; 3];
+            for (k, (vaddr, frames)) in [
+                (NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
+                (NLS_OEM_VADDR, NLS_OEM_FRAMES),
+                (NLS_CASE_VADDR, NLS_CASE_FRAMES),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let start = alloc_frame();
+                for _ in 1..frames {
+                    let _ = alloc_frame();
+                }
+                for i in 0..frames {
+                    let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+                nls_starts[k] = start;
+            }
+            NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
+            NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
+            NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -4321,10 +4432,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 shared,
                 fb_start,
                 nb_start,
+                nls_starts[0],
+                nls_starts[1],
+                nls_starts[2],
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
             let verdict = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 8) as *const u32);
+            // Capture the NLS table sizes the host reported.
+            NLS_ANSI_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x2c) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            NLS_OEM_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x30) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            NLS_CASE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x34) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
             let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
             let size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x14) as *const u32);
             print_str(b"[ntos-exec] isolated storage host reported verdict=0x");
