@@ -2485,6 +2485,12 @@ unsafe fn service_sec_image(
                     // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
                     smss_stack_write(buf, 0x1a2b_3c4d);
                 } else {
+                    // class 23 = ProcessDeviceMap (drive-letter bitmap): smss uses it in
+                    // SmpCreatePagingFiles to enumerate volumes for the paging file. Handling it
+                    // draws smss into the pagefile/volume subsystem (SmpGetVolumeDescriptors), which
+                    // asserts BootVolumeFound and loops without real volumes — a separate frontier
+                    // (needs NtOpenFile on \??\C:, NtQueryVolumeInformationFile). Leave unserviced
+                    // for now: smss stops cleanly here instead of looping.
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
