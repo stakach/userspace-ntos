@@ -133,6 +133,10 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
+/// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
+pub const SSN_NT_OPEN_FILE: u64 = 122;
+/// ntdll's NtQueryAttributesFile SSN (LdrpInitialize probes a file's existence; no FS → not-found).
+pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -1712,10 +1716,15 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
-            } else if m0 == SSN_NT_OPEN_KEY || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT {
-                // NtOpenKey / NtOpenDirectoryObject. No registry or object namespace →
-                // STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize skips IFEO/options and falls back
-                // from \KnownDlls to normal (disk) DLL loading.
+            } else if m0 == SSN_NT_OPEN_KEY
+                || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
+                || m0 == SSN_NT_OPEN_FILE
+                || m0 == SSN_NT_QUERY_ATTRIBUTES_FILE
+            {
+                // NtOpenKey / NtOpenDirectoryObject / NtOpenFile. No registry, object namespace,
+                // or filesystem for the process → STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize
+                // skips IFEO/options, falls back from \KnownDlls, and skips an optional
+                // DLL/manifest file open.
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
                 // NtQueryValueKey — no registry → value not found; LdrpInitialize uses defaults.
