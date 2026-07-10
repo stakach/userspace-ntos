@@ -195,6 +195,8 @@ pub const SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT: u64 = 54;
 pub const SSN_NT_MAKE_TEMPORARY_OBJECT: u64 = 110;
 /// NtOpenSymbolicLinkObject SSN (SmpInit opens a link after DosDevices). sysfuncs 134 − 1.
 pub const SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT: u64 = 133;
+/// NtDisplayString SSN (smss prints a boot/status string). sysfuncs 71 − 1. Routed to serial.
+pub const SSN_NT_DISPLAY_STRING: u64 = 70;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
 pub const SSN_NT_OPEN_FILE: u64 = 122;
 /// ntdll's NtQueryAttributesFile SSN (LdrpInitialize probes a file's existence; no FS → not-found).
@@ -2468,6 +2470,20 @@ unsafe fn service_sec_image(
                     }
                     _ => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
+            } else if m0 == SSN_NT_DISPLAY_STRING {
+                // NtDisplayString(*String[R10] = PUNICODE_STRING). smss prints boot/status text;
+                // route it to the serial console so we can see what the Session Manager reports.
+                let s16 = smss_read_ustr(get_recv_mr(9));
+                print_str(b"[smss] ");
+                for &w in &s16 {
+                    let b = w as u8;
+                    debug_put_char(if (0x20..0x7f).contains(&b) || b == b'\n' {
+                        b
+                    } else {
+                        b'.'
+                    });
+                }
+                print_str(b"\n");
             } else if m0 == SSN_NT_MAKE_TEMPORARY_OBJECT {
                 // Clears OBJ_PERMANENT on a link SmpInit re-creates; we don't track permanence.
                 // Success no-op.
