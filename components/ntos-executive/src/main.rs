@@ -1331,9 +1331,27 @@ unsafe fn spawn_sec_image(
         // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
         core::ptr::write_volatile((scr + 0x08) as *mut u64, STACK_BASE + STACK_FRAMES * 0x1000);
         core::ptr::write_volatile((scr + 0x10) as *mut u64, STACK_BASE);
+        // TEB->ActivationContextStackPointer (x64 TEB+0x2C8): the loader's actctx code
+        // (RtlGetActiveActivationContext / RtlActivateActivationContextUnsafeFast, via fn
+        // ntdll+0x10430 for the process default actctx) dereferences this. Point it at an EMPTY
+        // ACTIVATION_CONTEXT_STACK laid out in the 2nd TEB page: ActiveFrame@0x00=NULL,
+        // FrameListCache@0x08 = a self-referential empty LIST_ENTRY, Flags@0x18=0,
+        // NextCookieSequenceNumber@0x1C=1, StackId@0x20=1.
+        let acs_va = SMSS_TEB_VA + 0x1800; // in the 2nd TEB page
+        core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
         let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
-        // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second (zeroed) page.
-        let _ = page_map(alloc_frame(), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
+        // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second page holding the
+        // ACTIVATION_CONTEXT_STACK (written via scratch, then shared into smss).
+        let teb2 = alloc_frame();
+        let _ = page_map(teb2, scr + 0x5000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let acs = scr + 0x5000 + 0x800; // matches acs_va's page offset (0x1800 & 0xFFF = 0x800)
+        core::ptr::write_volatile((acs + 0x00) as *mut u64, 0); // ActiveFrame = NULL
+        core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08); // FrameListCache.Flink = self
+        core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08); // FrameListCache.Blink = self
+        core::ptr::write_volatile((acs + 0x18) as *mut u32, 0); // Flags
+        core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
+        core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
+        let _ = page_map(copy_cap(teb2), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -4567,6 +4585,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // Fix up smss's absolute pointers for its load at PE_LOAD_BASE (before the IAT
                 // patch, which overwrites the import thunks anyway).
                 apply_relocations_to_buf(&pe, FILEBUF_VADDR, PE_LOAD_BASE);
+                // Now that the code is relocated to PE_LOAD_BASE, PATCH the header's
+                // OptionalHeader.ImageBase to PE_LOAD_BASE too. smss's preferred base is
+                // 0x140000000; without this, ntdll sees ImageBaseAddress(PE_LOAD_BASE) != the
+                // header's preferred base and tries to RELOCATE THE EXE — but ReactOS's EXE-reloc
+                // path (ldrinit.c:2409) is UNIMPLEMENTED and returns STATUS_INVALID_IMAGE_FORMAT.
+                // Setting the header field = load base makes ntdll treat it as already-at-preferred
+                // (no relocation). OptionalHeader.ImageBase @ NtHeaders(FILEBUF+e_lfanew)+0x30.
+                let e_lfanew = core::ptr::read_volatile((FILEBUF_VADDR + 0x3c) as *const u32) as u64;
+                core::ptr::write_volatile(
+                    (FILEBUF_VADDR + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
                 let nsec = pe.sections().len();
                 let entry = pe.entry_point_rva();
                 let mut imports_ntdll = false;
