@@ -1875,6 +1875,22 @@ unsafe fn service_sec_image(
         print_hex(smss_stack_read(get_recv_mr(8)) as u32);
         print_str(b" caller=0x");
         print_hex(smss_stack_read(get_recv_mr(16)) as u32);
+        // Scan the stack for ntdll return addresses to reconstruct the call chain that produced
+        // the failure status.
+        let sp = get_recv_mr(16);
+        print_str(b" chain:");
+        let mut shown = 0;
+        for i in 0..96u64 {
+            let v = smss_stack_read(sp + i * 8);
+            if v >= NTDLL_BASE && v < NTDLL_BASE + 0xf4000 {
+                print_str(b" 0x");
+                print_hex((v - NTDLL_BASE) as u32);
+                shown += 1;
+                if shown >= 12 {
+                    break;
+                }
+            }
+        }
     }
     print_str(b"\n");
     (verdict, faults, first, stop, ntfaults, stop_ssn)
