@@ -1996,7 +1996,23 @@ unsafe fn service_sec_image(
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
-        if iters > 3000 {
+        // Demonstration bound: a hosted Windows process never "exits", so the live smss run is a
+        // bounded demo. Rather than a brittle wall-clock cap, stop the INSTANT smss has proven every
+        // milestone the post-run checks assert — deep loader init (faults>=30, margin over the
+        // sfaults>=25 gate), a real ntdll call (ntfaults>=1), an smss-image read (faults>ntfaults,
+        // RtlImageNtHeader), and the process heap (NtAllocateVirtualMemory reserve+commit ->
+        // NTALLOC_SERVICED>=2, RtlCreateHeap). Each serviced fault/syscall is a slow TCG round-trip
+        // (smss also spin-waits between them), so stopping at the earliest proof point keeps the
+        // demo cheap. A hard iters ceiling is the backstop if a milestone is never reached.
+        if faults >= 30
+            && ntfaults >= 1
+            && faults > ntfaults
+            && NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2
+        {
+            stop = m1;
+            break;
+        }
+        if iters > 600 {
             stop = m1;
             break;
         }
