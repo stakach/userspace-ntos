@@ -144,6 +144,17 @@ pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
 /// NULL GlobalKeyedEventHandle makes ntdll use the non-keyed critical-section wait path. This is
 /// the last loader syscall before LdrpInitialize returns and the trampoline enters smss's entry.
 pub const SSN_NT_CREATE_KEYED_EVENT: u64 = 289;
+/// SmpInit object-creation SSNs (all take the out handle in RCX): NtCreatePort creates \SmApiPort,
+/// NtCreateThread the SM API-loop thread, plus events + sections. Faked with distinct handles.
+pub const SSN_NT_CREATE_PORT: u64 = 48;
+pub const SSN_NT_CREATE_THREAD: u64 = 55;
+pub const SSN_NT_CREATE_EVENT: u64 = 37;
+pub const SSN_NT_CREATE_SECTION: u64 = 52;
+/// NtClose — no handle table modelled, so closing a (fake) handle is a no-op success.
+pub const SSN_NT_CLOSE: u64 = 27;
+/// A distinctive fake handle we hand back for objects we don't yet model (ports, events, …), so it
+/// is recognisable in traces and never collides with a real (small) handle index.
+pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
 /// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
@@ -1660,6 +1671,9 @@ unsafe fn service_sec_image(
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
     let mut ssn_ri = 0usize;
+    // Distinct fake handles for objects we don't model yet (ports/threads/events/sections), so the
+    // Session Manager's SmpInit keeps flowing. Each create hands out a fresh value.
+    let mut next_handle = FAKE_HANDLE;
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         iters += 1;
@@ -1816,6 +1830,18 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
+            } else if m0 == SSN_NT_CREATE_PORT
+                || m0 == SSN_NT_CREATE_THREAD
+                || m0 == SSN_NT_CREATE_EVENT
+                || m0 == SSN_NT_CREATE_SECTION
+            {
+                // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events,
+                // sections). Each takes the out handle in RCX (arg1). Hand back a fresh fake handle
+                // so the Session Manager keeps initialising — real LPC / thread / section objects
+                // are later milestones. NtCreateThread's new thread does NOT actually run yet.
+                let out = get_recv_mr(2); // RCX = *Handle
+                smss_stack_write(out, next_handle);
+                next_handle += 1;
             } else if m0 == SSN_NT_OPEN_KEY
                 || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
                 || m0 == SSN_NT_OPEN_FILE
@@ -1882,9 +1908,11 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_TEST_ALERT
                 || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
                 || m0 == SSN_NT_CREATE_KEYED_EVENT
+                || m0 == SSN_NT_CLOSE
             {
-                // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator) and
-                // don't model thread/process attribute sets.
+                // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
+                // model thread/process attribute sets, and don't model a handle table (NtClose of a
+                // fake handle is a no-op).
             } else {
                 handled = false;
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
