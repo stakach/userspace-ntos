@@ -159,6 +159,9 @@ pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
 /// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
 pub const SSN_NT_TEST_ALERT: u64 = 268;
+/// NtInitializeRegistry — smss tells the Config Manager it's safe to enable registry writes
+/// (sminit.c:2429, CM_BOOT_FLAG_SMSS). We don't model CM write-enable → no-op success.
+pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
 /// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
 /// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
 pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
@@ -2720,6 +2723,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_CREATE_KEYED_EVENT
                 || m0 == SSN_NT_ADJUST_PRIV_TOKEN
                 || m0 == SSN_NT_DELETE_VALUE_KEY
+                || m0 == SSN_NT_INITIALIZE_REGISTRY
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
