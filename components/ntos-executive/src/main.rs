@@ -165,6 +165,9 @@ pub const SSN_NT_INITIALIZE_REGISTRY: u64 = 96;
 /// NtSetValueKey — smss writes registry values after CM write-enable. Our regf hive is read-only
 /// and we don't persist, so → no-op success (the write "succeeds" but isn't recorded).
 pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
+/// NtSetSystemInformation — smss sets system-wide config in SmpInit (priority separation, etc.).
+/// We don't model system-info classes → no-op success so bring-up proceeds.
+pub const SSN_NT_SET_SYSTEM_INFORMATION: u64 = 249;
 /// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
 /// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
 pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
@@ -2819,6 +2822,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_DELETE_VALUE_KEY
                 || m0 == SSN_NT_INITIALIZE_REGISTRY
                 || m0 == SSN_NT_SET_VALUE_KEY
+                || m0 == SSN_NT_SET_SYSTEM_INFORMATION
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
