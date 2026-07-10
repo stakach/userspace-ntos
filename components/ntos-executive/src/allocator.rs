@@ -42,3 +42,24 @@ unsafe impl GlobalAlloc for Bump {
 
 #[global_allocator]
 static ALLOC: Bump = Bump;
+
+/// Current bump offset — a heap "high-water mark".
+///
+/// The bump allocator never reclaims on `dealloc`, so a hot loop that allocates
+/// transient `Vec`/`String` per iteration (e.g. servicing thousands of registry
+/// syscalls) walks the counter to `END` and the next alloc fails. A caller that
+/// knows a region of work allocates only *transient* objects can snapshot the
+/// mark before it and [`reset_to`] after, reclaiming everything allocated in
+/// between. SAFETY CONTRACT: nothing allocated after the mark may still be live
+/// when `reset_to` runs (it would be handed out again).
+pub fn mark() -> usize {
+    unsafe { read_volatile(CTR as *const usize) }
+}
+
+/// Rewind the bump counter to a [`mark`], reclaiming everything allocated since.
+///
+/// # Safety
+/// All allocations made after `m` must be dead (unreferenced) at this point.
+pub unsafe fn reset_to(m: usize) {
+    write_volatile(CTR as *mut usize, m);
+}

@@ -1841,7 +1841,12 @@ impl ExecNtHandler {
         };
         ExecNtHandler {
             hive,
-            key_handles: alloc::vec::Vec::new(),
+            // Reserve up front so the backing buffer is allocated BELOW the heap
+            // mark taken in service_sec_image and never reallocates during the
+            // smss loop — its address stays stable across the per-syscall bump
+            // reset. Opens are deduped (below), so a bounded set of distinct keys
+            // never exceeds this.
+            key_handles: alloc::vec::Vec::with_capacity(256),
         }
     }
     /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a key node in the SYSTEM hive:
@@ -1896,8 +1901,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 match cell {
                     Some(cell) => {
-                        self.key_handles.push(cell);
-                        let h = KEY_HANDLE_BASE + (self.key_handles.len() as u64 - 1);
+                        // Dedup: smss reopens the same keys in a loop and NtClose is a no-op, so
+                        // return the existing handle for a known cell instead of growing the table
+                        // unboundedly (which would reallocate its buffer above the heap mark and
+                        // get clobbered by the per-syscall bump reset).
+                        let idx = match self.key_handles.iter().position(|&c| c == cell) {
+                            Some(i) => i,
+                            None => {
+                                self.key_handles.push(cell);
+                                self.key_handles.len() - 1
+                            }
+                        };
+                        let h = KEY_HANDLE_BASE + idx as u64;
                         smss_copyout(args[0], &h.to_le_bytes());
                         0 // STATUS_SUCCESS
                     }
@@ -1993,26 +2008,26 @@ unsafe fn service_sec_image(
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = ExecNtHandler::new();
+    // Heap high-water mark taken AFTER all persistent state (the service table + the
+    // pre-reserved key_handles buffer) is allocated. Each smss syscall we service allocates
+    // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
+    // reclamation a few hundred registry syscalls exhaust the 128 KiB heap and the executive
+    // panics. Rewinding to this mark each iteration reclaims all per-syscall transients while
+    // leaving the persistent state (below the mark) intact.
+    let heap_mark = allocator::mark();
     let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
+        // SAFETY: every allocation made past `heap_mark` belongs to the previous iteration's
+        // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
+        unsafe { allocator::reset_to(heap_mark) };
         iters += 1;
-        // Demonstration bound: a hosted Windows process never "exits", so the live smss run is a
-        // bounded demo. Rather than a brittle wall-clock cap, stop the INSTANT smss has proven every
-        // milestone the post-run checks assert — deep loader init (faults>=30, margin over the
-        // sfaults>=25 gate), a real ntdll call (ntfaults>=1), an smss-image read (faults>ntfaults,
-        // RtlImageNtHeader), and the process heap (NtAllocateVirtualMemory reserve+commit ->
-        // NTALLOC_SERVICED>=2, RtlCreateHeap). Each serviced fault/syscall is a slow TCG round-trip
-        // (smss also spin-waits between them), so stopping at the earliest proof point keeps the
-        // demo cheap. A hard iters ceiling is the backstop if a milestone is never reached.
-        if faults >= 30
-            && ntfaults >= 1
-            && faults > ntfaults
-            && NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2
-        {
-            stop = m1;
-            break;
-        }
-        if iters > 600 {
+        // With the per-syscall heap reset above, smss now runs all the way through the ntdll
+        // loader + Session Manager SmpInit — enumerating its real registry (NtOpenKey/
+        // NtEnumerateValueKey/NtClose) — to a NATURAL stop: SmpInit fails at the missing \??
+        // DosDevices object namespace and smss winds down into an unserviced syscall (stop_ssn),
+        // ~290 iters, a few seconds. This ceiling is only a safety backstop against a future
+        // genuine infinite loop; the run stops well before it.
+        if iters > 3000 {
             stop = m1;
             break;
         }
@@ -5252,6 +5267,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    // Dump the panic site (file:line) after the '!' marker: a bare '!' + park is
+    // indistinguishable from a userspace spin over the serial console (it cost a
+    // long debugging detour once — a heap-exhaustion panic mid-smss-service read
+    // as an smss spin). The location makes the next one a one-line diagnosis.
     debug_put_char(b'!');
+    if let Some(loc) = _info.location() {
+        debug_put_char(b'@');
+        for &b in loc.file().as_bytes() {
+            debug_put_char(b);
+        }
+        debug_put_char(b':');
+        let mut n = loc.line();
+        let mut buf = [b'0'; 10];
+        let mut i = 10;
+        if n == 0 {
+            debug_put_char(b'0');
+        }
+        while n > 0 && i > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        for &b in &buf[i..] {
+            debug_put_char(b);
+        }
+        debug_put_char(b'\n');
+    }
     park()
 }
