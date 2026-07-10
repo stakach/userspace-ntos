@@ -41,6 +41,7 @@ use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
+use nt_hive_core::{apply_ccs_alias, CellId, Hive, HiveKind};
 use nt_syscall::{
     NativeCallContext, NativeService, NativeServiceTable, NativeSyscallDispatcher,
     NativeSyscallHandler, ProcessorMode, SyscallOrigin, UserlandAbiProfile,
@@ -113,6 +114,11 @@ pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0068_0000;
 /// Where the executive backs NtAllocateVirtualMemory for the process (its own PT).
 pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
+/// The executive's mirror of the first window of smss's heap (SMSS_ALLOC_VA). A userspace broker
+/// can't walk smss's page tables, so `smss_copyin` reads syscall pointer args (e.g. a loader-built
+/// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
+pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0090_0000;
+pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early heap
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -1330,6 +1336,10 @@ unsafe fn spawn_sec_image(
         let apt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
         let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, SMSS_ALLOC_VA, pml4);
+        // Reserve a PT in the EXECUTIVE's own VSpace for the heap copyin mirror window.
+        let hpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
+        let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, SMSS_HEAP_MIRROR_VA, CAP_INIT_THREAD_VSPACE);
     }
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
@@ -1557,6 +1567,72 @@ unsafe fn smss_stack_read(stack_va: u64) -> u64 {
         0
     }
 }
+/// Translate a SEC_IMAGE process VA to its executive mirror VA (stack or heap window), or None if
+/// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
+/// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
+unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
+    if va >= STACK_BASE && va + len <= STACK_BASE + STACK_FRAMES * 0x1000 {
+        Some(SMSS_STACK_MIRROR_VA + (va - STACK_BASE))
+    } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        Some(SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA))
+    } else {
+        None
+    }
+}
+/// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
+/// Returns false if the range isn't mirror-backed.
+unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
+    match smss_mirror(va, dst.len() as u64) {
+        Some(m) => {
+            core::ptr::copy_nonoverlapping(m as *const u8, dst.as_mut_ptr(), dst.len());
+            true
+        }
+        None => false,
+    }
+}
+/// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
+/// Returns false if the range isn't mirror-backed.
+unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
+    match smss_mirror(va, src.len() as u64) {
+        Some(m) => {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), m as *mut u8, src.len());
+            true
+        }
+        None => false,
+    }
+}
+/// Read a UTF-16LE UNICODE_STRING (given its byte Length + Buffer VA) from smss into a UTF-16
+/// code-unit Vec. Caps at 1024 code units. Empty on any copyin failure.
+unsafe fn smss_read_unicode(buffer_va: u64, byte_len: u16) -> alloc::vec::Vec<u16> {
+    let n = ((byte_len as usize) / 2).min(1024);
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for i in 0..n {
+        let mut w = [0u8; 2];
+        if !smss_copyin(buffer_va + (i as u64) * 2, &mut w) {
+            break;
+        }
+        out.push(u16::from_le_bytes(w));
+    }
+    out
+}
+/// Copy in an OBJECT_ATTRIBUTES.ObjectName (x64: ObjectName PUNICODE_STRING @ +0x10; UNICODE_STRING
+/// = {u16 Length, u16 MaximumLength, u32 pad, u64 Buffer}) and return the name as UTF-16 units.
+unsafe fn smss_read_objattr_name(oa_va: u64) -> alloc::vec::Vec<u16> {
+    let mut p = [0u8; 8];
+    if !smss_copyin(oa_va + 0x10, &mut p) {
+        return alloc::vec::Vec::new();
+    }
+    let objname = u64::from_le_bytes(p);
+    if objname == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let mut lm = [0u8; 2];
+    let mut bp = [0u8; 8];
+    if !smss_copyin(objname, &mut lm) || !smss_copyin(objname + 8, &mut bp) {
+        return alloc::vec::Vec::new();
+    }
+    smss_read_unicode(u64::from_le_bytes(bp), u16::from_le_bytes(lm))
+}
 /// Write a u64 to a SEC_IMAGE process's stack VA via the mirror (copyout).
 unsafe fn smss_stack_write(stack_va: u64, v: u64) {
     if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
@@ -1655,20 +1731,70 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
 /// so syscalls migrate from fake to real one family at a time while the tree stays green. v0.1
 /// covers only the trivial object calls; the registry family (real OBJECT_ATTRIBUTES copyin +
 /// a real hive) lands next, then process/section/token/port against the smss trace.
+/// Base for registry key handles the handler hands out (index into `key_handles`, offset so it
+/// never looks like a small/null handle).
+const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
+
 struct ExecNtHandler {
-    // (subsystem managers — hive, handle table, … — land here as families come online)
+    /// The SYSTEM hive (root = \Registry\Machine\System). Seeded in-memory for now; step 3 loads a
+    /// real live-CD hive via the regf parser.
+    hive: Hive,
+    key_handles: alloc::vec::Vec<CellId>,
 }
 impl ExecNtHandler {
     fn new() -> Self {
-        ExecNtHandler {}
+        let mut hive = Hive::new(HiveKind::System);
+        // Seed the Session Manager config key smss's SmpInit reads (sminit.c:2328,
+        // RtlQueryRegistryValues(RTL_REGISTRY_CONTROL,"Session Manager")).
+        hive.create_key("ControlSet001\\Control\\Session Manager");
+        ExecNtHandler {
+            hive,
+            key_handles: alloc::vec::Vec::new(),
+        }
+    }
+    /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a cell in the SYSTEM hive,
+    /// applying the CurrentControlSet alias and stripping the hive's mount prefix.
+    fn resolve_key(&self, full_path: &str) -> Option<CellId> {
+        let aliased = apply_ccs_alias(full_path);
+        let comps: alloc::vec::Vec<&str> =
+            aliased.split('\\').filter(|c| !c.is_empty()).collect();
+        if comps.len() >= 3
+            && comps[0].eq_ignore_ascii_case("Registry")
+            && comps[1].eq_ignore_ascii_case("Machine")
+            && comps[2].eq_ignore_ascii_case("System")
+        {
+            self.hive.open_key(&comps[3..].join("\\"))
+        } else {
+            None
+        }
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
-    fn handle(&mut self, ctx: &NativeCallContext, _args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
+    fn handle(&mut self, ctx: &NativeCallContext, args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
         match ctx.service {
             // No handle table modelled yet → closing a handle is a success (matches the broker).
             NativeService::NtClose => 0, // STATUS_SUCCESS
-            _ => 0xC000_0002,            // STATUS_NOT_IMPLEMENTED — never silently succeed
+            // NtOpenKey(*KeyHandle[0], DesiredAccess[1], ObjectAttributes[2]). Copy in the object
+            // name from smss, resolve it in the SYSTEM hive, hand back a handle (copyout to arg0).
+            NativeService::NtOpenKey => unsafe {
+                let name16 = smss_read_objattr_name(args[2]);
+                let mut path = alloc::string::String::new();
+                for &w in &name16 {
+                    if let Some(c) = char::from_u32(w as u32) {
+                        path.push(c);
+                    }
+                }
+                match self.resolve_key(&path) {
+                    Some(cell) => {
+                        self.key_handles.push(cell);
+                        let h = KEY_HANDLE_BASE + (self.key_handles.len() as u64 - 1);
+                        smss_copyout(args[0], &h.to_le_bytes());
+                        0 // STATUS_SUCCESS
+                    }
+                    None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
+            _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
 }
@@ -1679,7 +1805,10 @@ impl NativeSyscallHandler for ExecNtHandler {
 fn build_nt_table() -> NativeServiceTable {
     NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,
-        &[(NativeService::NtClose, SSN_NT_CLOSE as u32)],
+        &[
+            (NativeService::NtClose, SSN_NT_CLOSE as u32),
+            (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
+        ],
     )
 }
 
@@ -1840,7 +1969,15 @@ unsafe fn service_sec_image(
                     // MEM_COMMIT — back it with real frames.
                     let mut p = 0u64;
                     while p < rounded {
-                        let _ = page_map(alloc_frame(), base + p, RW_NX, pml4);
+                        let f = alloc_frame();
+                        let _ = page_map(f, base + p, RW_NX, pml4);
+                        // Mirror the first heap window into the executive so smss_copyin can read
+                        // heap-resident pointer args (registry key paths, etc.).
+                        let va = base + p;
+                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+                            let _ = page_map(copy_cap(f),
+                                SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
+                        }
                         p += 0x1000;
                     }
                 }
@@ -1909,15 +2046,13 @@ unsafe fn service_sec_image(
                 let out = get_recv_mr(7); // R8
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
-            } else if m0 == SSN_NT_OPEN_KEY
-                || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
+            } else if m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
                 || m0 == SSN_NT_OPEN_FILE
                 || m0 == SSN_NT_QUERY_ATTRIBUTES_FILE
             {
-                // NtOpenKey / NtOpenDirectoryObject / NtOpenFile. No registry, object namespace,
-                // or filesystem for the process → STATUS_OBJECT_NAME_NOT_FOUND so LdrpInitialize
-                // skips IFEO/options, falls back from \KnownDlls, and skips an optional
-                // DLL/manifest file open.
+                // NtOpenDirectoryObject / NtOpenFile / NtQueryAttributesFile — no object namespace
+                // or filesystem yet → STATUS_OBJECT_NAME_NOT_FOUND. (NtOpenKey now goes through the
+                // real registry handler above.)
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
                 // NtQueryValueKey — no registry → value not found; LdrpInitialize uses defaults.
