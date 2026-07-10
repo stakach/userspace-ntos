@@ -137,6 +137,8 @@ pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
 pub const SSN_NT_OPEN_KEY: u64 = 125;
 /// ntdll's NtQueryValueKey SSN (registry value lookups; not-found → LdrpInitialize uses defaults).
 pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
+/// ntdll's NtEnumerateValueKey SSN (SmpInit enumerates Environment/DOS-Devices values by index).
+pub const SSN_NT_ENUM_VALUE_KEY: u64 = 77;
 /// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
@@ -1771,6 +1773,51 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
 /// never looks like a small/null handle).
 const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 
+/// Build a KEY_VALUE_*_INFORMATION structure (NtQueryValueKey/NtEnumerateValueKey out buffer) for
+/// the given class: 0 = Basic {TitleIndex,Type,NameLength,Name}, 2 = Partial
+/// {TitleIndex,Type,DataLength,Data}, 1/other = Full {TitleIndex,Type,DataOffset,DataLength,
+/// NameLength,Name,[pad],Data}. Name is UTF-16LE.
+fn build_key_value_info(class: u64, name: &str, ty: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
+    let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
+    let nb = name16.len() * 2;
+    let mut b = alloc::vec::Vec::new();
+    match class {
+        0 => {
+            // KeyValueBasicInformation
+            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
+            b.extend_from_slice(&ty.to_le_bytes()); // Type
+            b.extend_from_slice(&(nb as u32).to_le_bytes()); // NameLength
+            for &w in &name16 {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        2 => {
+            // KeyValuePartialInformation
+            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
+            b.extend_from_slice(&ty.to_le_bytes()); // Type
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
+            b.extend_from_slice(data);
+        }
+        _ => {
+            // KeyValueFullInformation
+            let data_off = ((0x14 + nb) + 7) & !7; // 8-align the data
+            b.extend_from_slice(&0u32.to_le_bytes()); // TitleIndex
+            b.extend_from_slice(&ty.to_le_bytes()); // Type
+            b.extend_from_slice(&(data_off as u32).to_le_bytes()); // DataOffset
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // DataLength
+            b.extend_from_slice(&(nb as u32).to_le_bytes()); // NameLength
+            for &w in &name16 {
+                b.extend_from_slice(&w.to_le_bytes());
+            }
+            while b.len() < data_off {
+                b.push(0);
+            }
+            b.extend_from_slice(data);
+        }
+    }
+    b
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -1857,6 +1904,36 @@ impl NativeSyscallHandler for ExecNtHandler {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
+            // NtEnumerateValueKey(KeyHandle[0], Index[1], InfoClass[2], KeyValueInfo[3], Length[4],
+            // *ResultLength[5]). Enumerate the value at Index from the real hive + copy the
+            // KEY_VALUE_*_INFORMATION out; SmpInit reads the Environment/DOS-Devices/etc. values.
+            NativeService::NtEnumerateValueKey => unsafe {
+                let hive = match self.hive.as_ref() {
+                    Some(h) => h,
+                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                };
+                let key = match self
+                    .key_handles
+                    .get(args[0].wrapping_sub(KEY_HANDLE_BASE) as usize)
+                    .copied()
+                {
+                    Some(k) => k,
+                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                };
+                match hive.value_by_index(key, args[1] as usize) {
+                    None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
+                    Some((name, ty, data)) => {
+                        let info = build_key_value_info(args[2], &name, ty, &data);
+                        smss_copyout(args[5], &(info.len() as u32).to_le_bytes()); // *ResultLength
+                        if info.len() > args[4] as usize {
+                            0x8000_0005 // STATUS_BUFFER_OVERFLOW
+                        } else {
+                            smss_copyout(args[3], &info);
+                            0 // STATUS_SUCCESS
+                        }
+                    }
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -1871,6 +1948,7 @@ fn build_nt_table() -> NativeServiceTable {
         &[
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
+            (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
         ],
     )
 }
@@ -2019,11 +2097,19 @@ unsafe fn service_sec_image(
             if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
                 let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
                 // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
-                // syscall return address), arg2=RDX, arg3=R8, arg4=R9. RDX rides in m3; R10/R8/R9
-                // come from the IPC buffer (MR>=4).
-                let regs = [get_recv_mr(9), m3, get_recv_mr(7), get_recv_mr(8)];
-                let n = (entry.max_args as usize).min(4);
-                let res = nt_dispatcher.dispatch(m0 as u32, &regs[..n], &origin, &mut nt_handler);
+                // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
+                // stack at [rsp+0x28], [rsp+0x30], … RDX rides in m3; R8/R9/R10 + the stack come
+                // from the IPC buffer / stack mirror.
+                let mut argv = [0u64; 16];
+                argv[0] = get_recv_mr(9); // R10
+                argv[1] = m3; // RDX
+                argv[2] = get_recv_mr(7); // R8
+                argv[3] = get_recv_mr(8); // R9
+                let n = (entry.max_args as usize).min(16);
+                for i in 4..n {
+                    argv[i] = smss_stack_read(sp + 0x28 + (i as u64 - 4) * 8);
+                }
+                let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
             } else if m0 == SSN_NT_ALLOCATE_VM {
                 // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,

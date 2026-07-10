@@ -246,6 +246,41 @@ impl<'a> RegfHive<'a> {
         self.value_data(vk)
     }
 
+    /// The original-case (unfolded) name of a value cell — for enumeration output.
+    fn value_name_raw(&self, vk: u32) -> Option<String> {
+        let b = self.cell_body(vk)?;
+        if b.get(0..2)? != b"vk" {
+            return None;
+        }
+        let name_len = u16le(b, 0x02)? as usize;
+        if name_len == 0 {
+            return Some(String::new());
+        }
+        let flags = u16le(b, 0x10)?;
+        let raw = b.get(0x14..0x14 + name_len)?;
+        let mut s = String::new();
+        if flags & 1 != 0 {
+            for &c in raw {
+                s.push(c as char); // COMP_NAME: Latin-1
+            }
+        } else {
+            for pair in raw.chunks_exact(2) {
+                if let Some(c) = char::from_u32(u16::from_le_bytes([pair[0], pair[1]]) as u32) {
+                    s.push(c);
+                }
+            }
+        }
+        Some(s)
+    }
+
+    /// Enumerate the value at `index` under `nk`: `(name, reg_type, data_bytes)` in stored order.
+    pub fn value_by_index(&self, nk: KeyRef, index: usize) -> Option<(String, u32, Vec<u8>)> {
+        let (_, vk) = self.values(nk).into_iter().nth(index)?;
+        let name = self.value_name_raw(vk)?;
+        let (ty, data) = self.value_data(vk)?;
+        Some((name, ty, data))
+    }
+
     fn value_data(&self, vk: u32) -> Option<(u32, Vec<u8>)> {
         let b = self.cell_body(vk)?;
         let data_len_raw = u32le(b, 0x04)?;
