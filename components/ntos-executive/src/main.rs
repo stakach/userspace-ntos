@@ -2608,8 +2608,46 @@ unsafe fn service_sec_image(
             } else if m0 == SSN_NT_MAKE_TEMPORARY_OBJECT {
                 // Clears OBJ_PERMANENT on a link SmpInit re-creates; we don't track permanence.
                 // Success no-op.
-            } else if m0 == SSN_NT_OPEN_FILE || m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
-                // No filesystem object namespace yet → STATUS_OBJECT_NAME_NOT_FOUND.
+            } else if m0 == SSN_NT_OPEN_FILE {
+                // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
+                // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
+                // SmpCreateInitialSession opens %SystemRoot%\system32 as a DIRECTORY
+                // (FILE_DIRECTORY_FILE) before creating the KnownDllPath symlink + looping KnownDLLs.
+                // Hand back a directory handle so it proceeds; a plain FILE open (an individual
+                // KnownDLL) still fails → smss `continue`s past each DLL and completes the loop.
+                const FILE_DIRECTORY_FILE: u64 = 0x01;
+                // Succeed ONLY for SmpInit's KnownDLL directory open (…\system32). The loader's
+                // actctx/manifest opens (individual .manifest FILES, and the \??\C:\Windows SxS
+                // search directory) must keep failing so ntdll falls back to its defaults and
+                // proceeds to SmpInit — otherwise we divert the loader down the SxS path. Match the
+                // (folded) object name against "system32".
+                let name16 = smss_read_objattr_name(get_recv_mr(7));
+                let mut nb = [0u8; 96];
+                let nlen = {
+                    let mut n = 0;
+                    for &w in &name16 {
+                        if n >= nb.len() {
+                            break;
+                        }
+                        nb[n] = (w as u8).to_ascii_lowercase();
+                        n += 1;
+                    }
+                    n
+                };
+                let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
+                if smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32 {
+                    smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
+                    next_handle += 1;
+                    let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
+                    if iosb != 0 {
+                        smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
+                        smss_stack_write(iosb + 8, 1); // Information = FILE_OPENED
+                    }
+                } else {
+                    result = 0xC0000034; // no filesystem yet → not found (smss skips / uses defaults)
+                }
+            } else if m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
+                // No filesystem yet → STATUS_OBJECT_NAME_NOT_FOUND.
                 result = 0xC0000034;
             } else if m0 == SSN_NT_QUERY_VALUE_KEY {
                 result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND — defaults used
