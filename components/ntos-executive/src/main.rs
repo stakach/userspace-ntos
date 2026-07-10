@@ -152,6 +152,14 @@ pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtClose — no handle table modelled, so closing a (fake) handle is a no-op success.
 pub const SSN_NT_CLOSE: u64 = 27;
+/// Security-token SSNs SmpInit hits. NtOpenThreadToken → STATUS_NO_TOKEN (no impersonation token,
+/// the normal case → caller falls back to the process token). NtOpenProcessToken → fake token
+/// handle (out in R8). A real token/SID model is a later milestone.
+pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
+pub const SSN_NT_OPEN_PROCESS_TOKEN: u64 = 129;
+/// NtAdjustPrivilegesToken — smss enables privileges it needs (SeTcb/SeLoadDriver/…). We don't
+/// model token privileges → no-op success (the enable "succeeds").
+pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// A distinctive fake handle we hand back for objects we don't yet model (ports, events, …), so it
 /// is recognisable in traces and never collides with a real (small) handle index.
 pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
@@ -1842,6 +1850,14 @@ unsafe fn service_sec_image(
                 let out = get_recv_mr(2); // RCX = *Handle
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
+            } else if m0 == SSN_NT_OPEN_THREAD_TOKEN {
+                // No impersonation token → STATUS_NO_TOKEN; the caller falls back to the process one.
+                result = 0xC000007C;
+            } else if m0 == SSN_NT_OPEN_PROCESS_TOKEN {
+                // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
+                let out = get_recv_mr(7); // R8
+                smss_stack_write(out, next_handle);
+                next_handle += 1;
             } else if m0 == SSN_NT_OPEN_KEY
                 || m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
                 || m0 == SSN_NT_OPEN_FILE
@@ -1909,6 +1925,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
                 || m0 == SSN_NT_CREATE_KEYED_EVENT
                 || m0 == SSN_NT_CLOSE
+                || m0 == SSN_NT_ADJUST_PRIV_TOKEN
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
