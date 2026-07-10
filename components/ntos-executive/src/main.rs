@@ -412,6 +412,65 @@ unsafe fn copy_cap(src: u64) -> u64 {
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, d, src, 0);
     d
 }
+
+// --- SYS_CALL variants that RETURN the invocation error label (0 = success) ---
+// The SYS_SEND helpers above are fire-and-forget: a failed retype/copy/map is invisible, so a
+// resource exhaustion (or a bad precondition) silently leaves a page unmapped/zero. These mirror
+// the same register layout via seL4_Call and hand back the reply's error label so callers can
+// detect and react. The reply's message-info comes back in rsi; its label is `reply >> 12`.
+unsafe fn untyped_retype_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
+    let size_num = ((bits as u64) << 32) | (num as u64);
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") untyped => _,
+        inout("rsi") LBL_UNTYPED_RETYPE << 12 => reply,
+        inout("r10") obj => _,
+        inout("r8") size_num => _,
+        inout("r9") dest => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
+    let d = alloc_slot();
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_THREAD_CNODE => _,
+        inout("rsi") LBL_CNODE_COPY << 12 => reply,
+        inout("r10") d => _,
+        inout("r8") src => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (d, reply >> 12)
+}
+unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") frame => _,
+        inout("rsi") LBL_X86_PAGE_MAP << 12 => reply,
+        inout("r10") vaddr => _,
+        inout("r8") rights => _,
+        inout("r9") vspace => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// Allocate a fresh 4 KiB frame, returning (slot, retype-error-label).
+unsafe fn alloc_frame_r() -> (u64, u64) {
+    let s = alloc_slot();
+    let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
+    (s, e)
+}
 unsafe fn make_object(obj: u64) -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
@@ -2272,12 +2331,31 @@ unsafe fn service_sec_image(
             }
             let rva = (page - base) as u32;
             let scratch = scratch_base + faults * 0x1000;
-            let f = alloc_frame();
-            let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let (f, fe) = alloc_frame_r();
+            let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
             let rights = fill_image_page(tpe, rva, scratch);
-            // DIAG: trace ntdll fills near RtlAdjustPrivilege's page (RVA 0x6c000) — is it filled
-            // with code or zero? Logs the fill's first byte + the byte at page-offset 0xe30.
-            let _ = page_map(copy_cap(f), page, rights, pml4);
+            let (cc, ce) = copy_cap_r(f);
+            let me = page_map_r(cc, page, rights, pml4);
+            // Surface a silently-failed demand-page map (the bug that leaves smss executing a zero
+            // ntdll page): log the error label of each invocation so the failing one is visible.
+            if fe != 0 || se != 0 || ce != 0 || me != 0 {
+                print_str(b"[map-fail] rva=0x");
+                print_hex(rva);
+                print_str(b" retype=");
+                print_u64(fe);
+                print_str(b" smap=");
+                print_u64(se);
+                print_str(b" copy=");
+                print_u64(ce);
+                print_str(b" map=");
+                print_u64(me);
+                print_str(b" scratch=0x");
+                print_hex((scratch >> 32) as u32);
+                print_hex(scratch as u32);
+                print_str(b" faults=");
+                print_u64(faults);
+                print_str(b"\n");
+            }
             // Mirror the main-image page into the executive so smss_copyin can read static-string
             // args (registry value/subkey names in .rdata) from smss's image. (Shares the heap
             // mirror's PT; the map is a no-op for non-setup_env SEC_IMAGE spawns.)
@@ -5472,13 +5550,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
-                    // Scratch at 0x6C — past FILEBUF (0x60), the stack mirror (0x68), in the
-                    // FILEBUF PT; up to the 96-fault cap fits before 0x80.
+                    // Demand-fault scratch: each filled image/ntdll page keeps a persistent
+                    // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
+                    // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
+                    // PT and collided with the env buffer at 0x74 after ~128 faults — smss runs far
+                    // deeper into ntdll now, so give it an ISOLATED range with its own page tables
+                    // (8 PTs = 4096 pages) that can't collide with any other executive mapping.
+                    const SCRATCH_BASE: u64 = 0x0000_0100_0100_0000;
+                    for k in 0..8u64 {
+                        let pt = alloc_slot();
+                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                        let _ = paging_struct_map(
+                            pt,
+                            LBL_X86_PAGE_TABLE_MAP,
+                            SCRATCH_BASE + k * 0x20_0000,
+                            CAP_INIT_THREAD_VSPACE,
+                        );
+                    }
                     let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         pml4,
                         &pe,
-                        0x0000_0100_006C_0000,
+                        SCRATCH_BASE,
                         Some((NTDLL_BASE, &ntdll_pe)),
                     );
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
