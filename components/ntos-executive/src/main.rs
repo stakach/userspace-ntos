@@ -91,6 +91,11 @@ pub const IO_COMP_VADDR: u64 = 0x0000_0100_0059_0000;
 pub const IO_REQ_VADDR: u64 = 0x0000_0100_005A_0000;
 pub const IO_REP_VADDR: u64 = 0x0000_0100_005B_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
+/// Floor for on-demand stack growth: a fault in [STACK_GROWTH_FLOOR, STACK_BASE) commits a fresh
+/// page and restarts (Windows guard-page style), so smss's stack grows past the 16 KiB initial
+/// commit instead of crashing. Bounded above IO_REP_VADDR (0x5B_0000) so growth never collides
+/// with the env mappings below. ~60 KiB of growth room; ~76 KiB total stack.
+pub const STACK_GROWTH_FLOOR: u64 = 0x0000_0100_005B_1000;
 /// A per-user-thread syscall argument frame, mapped at the SAME vaddr in both the
 /// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
 /// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
@@ -2215,6 +2220,22 @@ unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
+            // Dynamic stack growth (Windows guard-page style): a fault just below the committed
+            // stack commits a fresh zeroed page and restarts, so smss's stack grows on demand
+            // instead of crashing at the 16 KiB initial commit. Bounded by STACK_GROWTH_FLOOR so it
+            // never runs into the env mappings below.
+            if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
+                let f = alloc_frame();
+                let _ = page_map(f, page, RW_NX, pml4);
+                faults += 1;
+                let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             // Route to whichever image contains the faulting page.
             let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
                 (PE_LOAD_BASE, pe)
@@ -2222,6 +2243,26 @@ unsafe fn service_sec_image(
                 ntfaults += 1;
                 (nt_base, ntdll.unwrap().1)
             } else {
+                // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
+                // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
+                print_str(b"[vmf-out] ip=0x");
+                print_hex((m0 >> 32) as u32);
+                print_hex(m0 as u32);
+                print_str(b" addr=0x");
+                print_hex((addr >> 32) as u32);
+                print_hex(addr as u32);
+                print_str(b" pf=");
+                print_u64(m2);
+                print_str(b" fsr=");
+                print_u64(m3);
+                print_str(b" img_end=0x");
+                print_hex((img_end >> 32) as u32);
+                print_hex(img_end as u32);
+                print_str(b" stack=[0x");
+                print_hex(STACK_BASE as u32);
+                print_str(b"..0x");
+                print_hex((STACK_BASE + STACK_FRAMES * 0x1000) as u32);
+                print_str(b")\n");
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
@@ -2234,6 +2275,8 @@ unsafe fn service_sec_image(
             let f = alloc_frame();
             let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
             let rights = fill_image_page(tpe, rva, scratch);
+            // DIAG: trace ntdll fills near RtlAdjustPrivilege's page (RVA 0x6c000) — is it filled
+            // with code or zero? Logs the fill's first byte + the byte at page-offset 0xe30.
             let _ = page_map(copy_cap(f), page, rights, pml4);
             // Mirror the main-image page into the executive so smss_copyin can read static-string
             // args (registry value/subkey names in .rdata) from smss's image. (Shares the heap
