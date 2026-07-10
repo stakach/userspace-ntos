@@ -27,10 +27,10 @@ use alloc::vec::Vec;
 
 const HBIN_BASE: usize = 0x1000;
 
-/// A parsed, read-only `regf` hive owning its raw bytes. Keys are referred to by their
-/// hbin-relative cell offset (`KeyRef`).
-pub struct RegfHive {
-    data: Vec<u8>,
+/// A parsed, read-only `regf` hive borrowing its raw bytes (no copy — the hive image is large and
+/// mapped once). Keys are referred to by their hbin-relative cell offset (`KeyRef`).
+pub struct RegfHive<'a> {
+    data: &'a [u8],
     root: u32,
 }
 
@@ -50,14 +50,14 @@ fn i32le(b: &[u8], off: usize) -> Option<i32> {
         .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-impl RegfHive {
+impl<'a> RegfHive<'a> {
     /// Validate the base block and locate the root key node. Returns `None` if the bytes aren't a
     /// well-formed `regf` hive whose root cell is an `nk`.
-    pub fn new(data: Vec<u8>) -> Option<RegfHive> {
+    pub fn new(data: &'a [u8]) -> Option<RegfHive<'a>> {
         if data.len() < HBIN_BASE + 0x20 || &data[0..4] != b"regf" {
             return None;
         }
-        let root = u32le(&data, 0x24)?;
+        let root = u32le(data, 0x24)?;
         let hive = RegfHive { data, root };
         if hive.cell_body(root)?.get(0..2)? != b"nk" {
             return None;
@@ -73,7 +73,7 @@ impl RegfHive {
     /// The cell body (after the 4-byte signed size) at a hbin-relative `offset`, bounds-checked.
     fn cell_body(&self, offset: u32) -> Option<&[u8]> {
         let fo = HBIN_BASE.checked_add(offset as usize)?;
-        let size = i32le(&self.data, fo)?;
+        let size = i32le(self.data, fo)?;
         let len = (size.unsigned_abs() as usize).max(4);
         self.data.get(fo + 4..fo + len)
     }
@@ -279,20 +279,16 @@ fn fold(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn load(path: &str) -> Option<RegfHive> {
-        let bytes = std::fs::read(path).ok()?;
-        RegfHive::new(bytes)
-    }
-
     #[test]
     fn reactos_system_hive_session_manager() {
-        let hive = match load("/tmp/ros-system.hiv") {
-            Some(h) => h,
-            None => {
+        let bytes = match std::fs::read("/tmp/ros-system.hiv") {
+            Ok(b) => b,
+            Err(_) => {
                 eprintln!("skip: /tmp/ros-system.hiv not present");
                 return;
             }
         };
+        let hive = RegfHive::new(&bytes).expect("valid regf hive");
         // The exact key smss's SmpInit reads (sminit.c:2328), after the CurrentControlSet alias.
         let sm = hive
             .open_key("ControlSet001\\Control\\Session Manager")
@@ -316,17 +312,19 @@ mod tests {
     fn windows_hiv_fixture_parses() {
         // A tiny real Windows hive shipped in references/ — validates base block + root nk.
         let path = "../../references/windows-kits/10/Assessment and Deployment Kit/Deployment Tools/amd64/DISM/WofAdk.hiv";
-        if let Some(hive) = load(path) {
-            // Root must be an nk; enumerating its subkeys must not panic / must stay in-bounds.
-            let _ = hive.subkeys(hive.root());
-        } else {
-            eprintln!("skip: WofAdk.hiv fixture not present");
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let hive = RegfHive::new(&bytes).expect("valid regf hive");
+                // Root must be an nk; enumerating subkeys must stay in-bounds / not panic.
+                let _ = hive.subkeys(hive.root());
+            }
+            Err(_) => eprintln!("skip: WofAdk.hiv fixture not present"),
         }
     }
 
     #[test]
     fn rejects_non_regf() {
-        assert!(RegfHive::new(vec![0u8; 0x2000]).is_none());
-        assert!(RegfHive::new(b"not a hive".to_vec()).is_none());
+        assert!(RegfHive::new(&[0u8; 0x2000]).is_none());
+        assert!(RegfHive::new(b"not a hive").is_none());
     }
 }

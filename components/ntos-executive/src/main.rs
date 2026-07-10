@@ -41,7 +41,8 @@ use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
-use nt_hive_core::{apply_ccs_alias, CellId, Hive, HiveKind};
+use nt_hive_core::apply_ccs_alias;
+use nt_hive_regf::{KeyRef, RegfHive};
 use nt_syscall::{
     NativeCallContext, NativeService, NativeServiceTable, NativeSyscallDispatcher,
     NativeSyscallHandler, ProcessorMode, SyscallOrigin, UserlandAbiProfile,
@@ -220,6 +221,11 @@ pub const NLS_OEM_VADDR: u64 = 0x0000_0100_00B2_0000; // c_437.nls (66594 B = 17
 pub const NLS_OEM_FRAMES: u64 = 20;
 pub const NLS_CASE_VADDR: u64 = 0x0000_0100_00B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
+/// The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by the
+/// isolated storage host into these shared frames; the executive parses it with nt-hive-regf so
+/// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
+pub const HIVEBUF_VADDR: u64 = 0x0000_0100_00B5_0000;
+pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
 /// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
 pub const NLS_SMSS_ANSI_VA: u64 = 0x0000_0100_00E0_0000;
@@ -1736,25 +1742,36 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
 const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 
 struct ExecNtHandler {
-    /// The SYSTEM hive (root = \Registry\Machine\System). Seeded in-memory for now; step 3 loads a
-    /// real live-CD hive via the regf parser.
-    hive: Hive,
-    key_handles: alloc::vec::Vec<CellId>,
+    /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
+    /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
+    /// the executive heap is small). None if the hive wasn't staged on the disk.
+    hive: Option<RegfHive<'static>>,
+    key_handles: alloc::vec::Vec<KeyRef>,
 }
 impl ExecNtHandler {
     fn new() -> Self {
-        let mut hive = Hive::new(HiveKind::System);
-        // Seed the Session Manager config key smss's SmpInit reads (sminit.c:2328,
-        // RtlQueryRegistryValues(RTL_REGISTRY_CONTROL,"Session Manager")).
-        hive.create_key("ControlSet001\\Control\\Session Manager");
+        // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
+        // ::ROSSYS.HIV; REAL_HIVE_SIZE is its reported byte length (0 if unstaged → None).
+        let hive = unsafe {
+            let n = REAL_HIVE_SIZE.load(Ordering::Relaxed) as usize;
+            if n == 0 {
+                None
+            } else {
+                let bytes: &'static [u8] =
+                    core::slice::from_raw_parts(HIVEBUF_VADDR as *const u8, n);
+                RegfHive::new(bytes)
+            }
+        };
         ExecNtHandler {
             hive,
             key_handles: alloc::vec::Vec::new(),
         }
     }
-    /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a cell in the SYSTEM hive,
-    /// applying the CurrentControlSet alias and stripping the hive's mount prefix.
-    fn resolve_key(&self, full_path: &str) -> Option<CellId> {
+    /// Resolve a full NT key path (`\Registry\Machine\System\…`) to a key node in the SYSTEM hive:
+    /// apply the CurrentControlSet alias (the hive has ControlSet001, not the kernel-synthesized
+    /// CurrentControlSet symlink) + strip the hive's mount prefix.
+    fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
+        let hive = self.hive.as_ref()?;
         let aliased = apply_ccs_alias(full_path);
         let comps: alloc::vec::Vec<&str> =
             aliased.split('\\').filter(|c| !c.is_empty()).collect();
@@ -1763,7 +1780,7 @@ impl ExecNtHandler {
             && comps[1].eq_ignore_ascii_case("Machine")
             && comps[2].eq_ignore_ascii_case("System")
         {
-            self.hive.open_key(&comps[3..].join("\\"))
+            hive.open_key(&comps[3..].join("\\"))
         } else {
             None
         }
@@ -2519,6 +2536,7 @@ unsafe fn spawn_storage_host(
     nls_ansi_start: u64,
     nls_oem_start: u64,
     nls_case_start: u64,
+    hivebuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -2574,11 +2592,12 @@ unsafe fn spawn_storage_host(
         let nb_cp = copy_cap(ntdllbuf_start + i);
         let _ = page_map(nb_cp, NTDLLBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
-    // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
+    // The NLS + SYSTEM-hive buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
     for (start, vaddr, frames) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
+        (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
     ] {
         for i in 0..frames {
             let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, pml4);
@@ -2619,6 +2638,9 @@ static NLS_CASE_START: AtomicU64 = AtomicU64::new(0);
 static NLS_ANSI_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_OEM_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base + byte size of the real SYSTEM hive the storage host read into HIVEBUF.
+static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
+static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
@@ -3484,6 +3506,21 @@ unsafe fn storage_probe(
                 if got == want && sz > 0 {
                     *out = sz;
                 }
+            }
+        }
+        // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
+        // size at STORAGE_SHARED+0x38 so the executive can nt-hive-regf-parse it for smss.
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"ROSSYS  HIV") {
+            let cap = (HIVEBUF_FRAMES * 0x1000) as u32;
+            let want = if sz < cap { sz } else { cap };
+            let got = fat_read_file(&fs, c, want, HIVEBUF_VADDR);
+            print_str(b"[storage-host] ROSSYS.HIV size=");
+            print_u64(sz as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && sz > 0 {
+                core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x38) as *mut u32, sz);
             }
         }
     }
@@ -4729,6 +4766,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
+            // The real SYSTEM hive buffer (64 frames, shares the 0xA0-0xC0 PT), mapped in the
+            // executive; the same frames are granted to the storage host in spawn_storage_host.
+            let hivebuf_start = alloc_frame();
+            for _ in 1..HIVEBUF_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..HIVEBUF_FRAMES {
+                let _ = page_map(copy_cap(hivebuf_start + i), HIVEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            HIVEBUF_START.store(hivebuf_start, Ordering::Relaxed);
             // Spawn the isolated storage host (prio 100; the executive is 255 and BLOCKS on
             // the result, yielding the CPU to it) and wait for its report.
             let sresult = make_object(OBJ_NOTIFICATION);
@@ -4748,6 +4795,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nls_starts[0],
                 nls_starts[1],
                 nls_starts[2],
+                hivebuf_start,
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
@@ -4763,6 +4811,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             NLS_CASE_SIZE.store(
                 core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x34) as *const u32) as u64,
+                Ordering::Relaxed,
+            );
+            // The real SYSTEM hive size the storage host read into HIVEBUF (reported @+0x38).
+            REAL_HIVE_SIZE.store(
+                core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x38) as *const u32) as u64,
                 Ordering::Relaxed,
             );
             let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
