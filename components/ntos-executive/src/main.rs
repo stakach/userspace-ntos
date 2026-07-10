@@ -2484,13 +2484,21 @@ unsafe fn service_sec_image(
                     // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
                     // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
                     smss_stack_write(buf, 0x1a2b_3c4d);
+                } else if class == 23 {
+                    // ProcessDeviceMap — PROCESS_DEVICEMAP_INFORMATION.Query { ULONG DriveMap;
+                    // UCHAR DriveType[32] }. SmpCreatePagingFiles enumerates volumes from this. An
+                    // EMPTY drive map (no drives) → SmpGetVolumeDescriptors finds no boot volume,
+                    // its BootVolumeFound assert fires once (RtlAssert now Ignores + returns), it
+                    // returns an error, and SmpCreatePagingFiles' (ignored) return lets smss proceed
+                    // WITHOUT a paging file. A real volume/disk subsystem is a later step.
+                    for k in 0..(36u64 / 4) {
+                        smss_stack_write32(buf + k * 4, 0);
+                    }
+                    let retlen = smss_stack_read(sp + 0x28); // arg4 = *ReturnLength
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 36);
+                    }
                 } else {
-                    // class 23 = ProcessDeviceMap (drive-letter bitmap): smss uses it in
-                    // SmpCreatePagingFiles to enumerate volumes for the paging file. Handling it
-                    // draws smss into the pagefile/volume subsystem (SmpGetVolumeDescriptors), which
-                    // asserts BootVolumeFound and loops without real volumes — a separate frontier
-                    // (needs NtOpenFile on \??\C:, NtQueryVolumeInformationFile). Leave unserviced
-                    // for now: smss stops cleanly here instead of looping.
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
