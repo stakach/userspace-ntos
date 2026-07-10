@@ -1851,6 +1851,32 @@ unsafe fn image_extent(pe: &nt_pe_loader::PeFile) -> u64 {
 /// Base for registry key handles the handler hands out (index into `key_handles`, offset so it
 /// never looks like a small/null handle).
 const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
+/// Sentinel `KeyRef` for the synthesized `\Registry\Machine\Hardware\…\CentralProcessor\0` key
+/// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
+/// cell offset, so it never collides with a hive key.
+const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
+
+/// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
+/// for SmpInit's PROCESSOR_IDENTIFIER build (Identifier + VendorIdentifier, both REG_SZ).
+fn synth_cpu_value(name_lc: &str) -> Option<(u32, alloc::vec::Vec<u16>)> {
+    const REG_SZ: u32 = 1;
+    let s: &str = match name_lc {
+        "identifier" => "Intel64 Family 6 Model 60 Stepping 3",
+        "vendoridentifier" => "GenuineIntel",
+        _ => return None,
+    };
+    let mut d: alloc::vec::Vec<u16> = s.encode_utf16().collect();
+    d.push(0); // REG_SZ is NUL-terminated
+    Some((REG_SZ, d))
+}
+/// UTF-16 code units → little-endian bytes (registry value data is stored/copied as bytes).
+fn utf16_bytes(d16: &[u16]) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec::Vec::with_capacity(d16.len() * 2);
+    for &w in d16 {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    b
+}
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
 const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
 
@@ -2072,19 +2098,31 @@ impl ExecNtHandler {
     /// apply the CurrentControlSet alias (the hive has ControlSet001, not the kernel-synthesized
     /// CurrentControlSet symlink) + strip the hive's mount prefix.
     fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
-        let hive = self.hive.as_ref()?;
         let aliased = apply_ccs_alias(full_path);
         let comps: alloc::vec::Vec<&str> =
             aliased.split('\\').filter(|c| !c.is_empty()).collect();
-        if comps.len() >= 3
-            && comps[0].eq_ignore_ascii_case("Registry")
-            && comps[1].eq_ignore_ascii_case("Machine")
-            && comps[2].eq_ignore_ascii_case("System")
+        if comps.len() < 3
+            || !comps[0].eq_ignore_ascii_case("Registry")
+            || !comps[1].eq_ignore_ascii_case("Machine")
         {
-            hive.open_key(&comps[3..].join("\\"))
-        } else {
-            None
+            return None;
         }
+        if comps[2].eq_ignore_ascii_case("System") {
+            return self.hive.as_ref()?.open_key(&comps[3..].join("\\"));
+        }
+        // The kernel's volatile HARDWARE hive isn't on disk. Synthesize the one key smss's SmpInit
+        // reads: \Registry\Machine\Hardware\Description\System\CentralProcessor\0 (CPU identifier).
+        let ci = |i: usize, s: &str| comps.get(i).map_or(false, |c| c.eq_ignore_ascii_case(s));
+        if comps.len() == 7
+            && ci(2, "Hardware")
+            && ci(3, "Description")
+            && ci(4, "System")
+            && ci(5, "CentralProcessor")
+            && ci(6, "0")
+        {
+            return Some(SYNTH_CPU_KEY);
+        }
+        None
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
@@ -2154,11 +2192,65 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(k) => k,
                     None => return 0xC000_0008, // STATUS_INVALID_HANDLE
                 };
-                match hive.value_by_index(key, args[1] as usize) {
+                let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
+                    if key == SYNTH_CPU_KEY {
+                        // The synthetic CPU key has 2 values (Identifier, VendorIdentifier).
+                        let entry = match args[1] {
+                            0 => Some(("Identifier", "identifier")),
+                            1 => Some(("VendorIdentifier", "vendoridentifier")),
+                            _ => None,
+                        };
+                        entry.and_then(|(nm, lc)| {
+                            synth_cpu_value(lc)
+                                .map(|(ty, d16)| (alloc::string::String::from(nm), ty, utf16_bytes(&d16)))
+                        })
+                    } else {
+                        hive.value_by_index(key, args[1] as usize)
+                    };
+                match byname {
                     None => 0x8000_001A, // STATUS_NO_MORE_ENTRIES
                     Some((name, ty, data)) => {
                         let info = build_key_value_info(args[2], &name, ty, &data);
                         smss_copyout(args[5], &(info.len() as u32).to_le_bytes()); // *ResultLength
+                        if info.len() > args[4] as usize {
+                            0x8000_0005 // STATUS_BUFFER_OVERFLOW
+                        } else {
+                            smss_copyout(args[3], &info);
+                            0 // STATUS_SUCCESS
+                        }
+                    }
+                }
+            },
+            // NtQueryValueKey(KeyHandle[0], *ValueName[1], InfoClass[2], KeyValueInfo[3], Length[4],
+            // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the synthetic CPU
+            // key to build PROCESSOR_IDENTIFIER. Real-hive values by name → not-found (smss defaults).
+            NativeService::NtQueryValueKey => unsafe {
+                let key = match self
+                    .key_handles
+                    .get(args[0].wrapping_sub(KEY_HANDLE_BASE) as usize)
+                    .copied()
+                {
+                    Some(k) => k,
+                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                };
+                let name16 = smss_read_ustr(args[1]);
+                let mut name_lc = alloc::string::String::new();
+                for &w in &name16 {
+                    if let Some(c) = char::from_u32(w as u32) {
+                        name_lc.push(c.to_ascii_lowercase());
+                    }
+                }
+                let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
+                    synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
+                } else {
+                    None // real-hive value-by-name not modelled yet
+                };
+                match val {
+                    None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
+                    Some((ty, data)) => {
+                        // KeyValuePartialInformation (class 2) carries no name.
+                        let info = build_key_value_info(args[2], "", ty, &data);
+                        smss_copyout(args[5], &(info.len() as u32).to_le_bytes());
                         if info.len() > args[4] as usize {
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
@@ -2183,6 +2275,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
+            (NativeService::NtQueryValueKey, SSN_NT_QUERY_VALUE_KEY as u32),
         ],
     )
 }
@@ -2669,8 +2762,6 @@ unsafe fn service_sec_image(
             } else if m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
                 // No filesystem yet → STATUS_OBJECT_NAME_NOT_FOUND.
                 result = 0xC0000034;
-            } else if m0 == SSN_NT_QUERY_VALUE_KEY {
-                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND — defaults used
             } else if m0 == SSN_NT_PROTECT_VM {
                 // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
                 // model per-page protection changes yet — report success and hand back a plausible
