@@ -1396,7 +1396,11 @@ unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&(SMSS_PEB_VA + 0x900).to_le_bytes()); // movabs rcx, Context (placeholder)
-        tb.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx  (SystemArgument1)
+        // SystemArgument1 (RDX) = the ntdll base — LdrpInitializeProcess builds ntdll's
+        // LDR_DATA_TABLE_ENTRY from it (the kernel passes it via the initial APC). RDX=0 left the
+        // ntdll DllBase null → LdrpAllocateModuleEntry(RtlImageNtHeader(0)=0) returned null.
+        tb.extend_from_slice(&[0x48, 0xBA]);
+        tb.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // movabs rdx, NTDLL_BASE
         tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         tb.extend_from_slice(&[0x48, 0xB8]);
         tb.extend_from_slice(&(NTDLL_BASE + 0x8e70).to_le_bytes()); // movabs rax, LdrpInitialize
