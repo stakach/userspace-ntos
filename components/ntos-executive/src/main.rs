@@ -131,6 +131,8 @@ pub const SSN_NT_QUERY_DEFAULT_LOCALE: u64 = 149;
 pub const SSN_NT_FREE_VM: u64 = 87;
 pub const SSN_NT_SET_INFO_THREAD: u64 = 238;
 pub const SSN_NT_SET_INFO_PROCESS: u64 = 237;
+/// ntdll's NtTestAlert SSN (LdrpInitialize drains pending APCs before the image entry).
+pub const SSN_NT_TEST_ALERT: u64 = 268;
 /// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
@@ -1455,6 +1457,14 @@ unsafe fn smss_stack_write(stack_va: u64, v: u64) {
     }
 }
 
+/// Write a 32-bit value to a stack VA (via the mirror). Use for DWORD out-params (e.g. an
+/// NtProtectVirtualMemory *OldProtect) — an 8-byte write would clobber the adjacent local.
+unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
+    if stack_va >= STACK_BASE && stack_va + 4 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *mut u32, v);
+    }
+}
+
 /// The file byte at image RVA `rva` (translated via the section table). For reading a faulting
 /// instruction's opcode from the mapped PE.
 unsafe fn pe_byte_at_rva(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u8> {
@@ -1735,7 +1745,9 @@ unsafe fn service_sec_image(
                 // previous protection so LdrpInitialize's protect/restore pairs proceed.
                 let oldprot_ptr = smss_stack_read(sp + 0x28); // arg5 = *OldAccessProtection
                 if oldprot_ptr != 0 {
-                    smss_stack_write(oldprot_ptr, 0x04); // PAGE_READWRITE
+                    // DWORD write: OldProtect is a ULONG; an 8-byte write clobbers the caller's
+                    // adjacent local (in LdrpSetProtection that is the section-header pointer).
+                    smss_stack_write32(oldprot_ptr, 0x04); // PAGE_READWRITE
                 }
             } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
                 // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the
@@ -1772,6 +1784,7 @@ unsafe fn service_sec_image(
             } else if m0 == SSN_NT_FREE_VM
                 || m0 == SSN_NT_SET_INFO_THREAD
                 || m0 == SSN_NT_SET_INFO_PROCESS
+                || m0 == SSN_NT_TEST_ALERT
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator) and
                 // don't model thread/process attribute sets.
