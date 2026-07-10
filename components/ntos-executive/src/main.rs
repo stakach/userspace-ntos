@@ -140,10 +140,10 @@ pub const SSN_NT_TEST_ALERT: u64 = 268;
 /// ntdll's NtFlushInstructionCache SSN — the loader flushes the icache after patching code
 /// (IAT snap / relocation). A no-op under TCG (no separate icache to flush).
 pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
-// NEXT FRONTIER: SSN 289 = NtCreateKeyedEvent (RtlpInitializeKeyedEvent, ldrinit.c:2436). We stop
-// cleanly here for now — servicing it as bare success lets smss march into NtContinue (SSN 34) and
-// keyed-event waits it isn't yet set up for, so the process runs off into unmapped code. Handling
-// that chain (real keyed-event + NtContinue into smss's entry CONTEXT) is the next milestone.
+/// ntdll's NtCreateKeyedEvent SSN (RtlpInitializeKeyedEvent, ldrinit.c:2436). Bare success — a
+/// NULL GlobalKeyedEventHandle makes ntdll use the non-keyed critical-section wait path. This is
+/// the last loader syscall before LdrpInitialize returns and the trampoline enters smss's entry.
+pub const SSN_NT_CREATE_KEYED_EVENT: u64 = 289;
 /// ntdll's NtOpenDirectoryObject SSN (LdrpInitialize opens \KnownDlls; none → not-found).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
 /// ntdll's NtOpenFile SSN (LdrpInitialize opens a DLL/manifest file; no FS → not-found).
@@ -1485,8 +1485,18 @@ unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         tb.extend_from_slice(&[0x48, 0xB8]);
         tb.extend_from_slice(&(NTDLL_BASE + 0x8e70).to_le_bytes()); // movabs rax, LdrpInitialize
-        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $ (LdrpInitialize should NtContinue, not return)
+        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (runs the whole loader, then RETURNS here)
+        // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
+        // Windows KiUserApcDispatcher would then NtContinue to the image entry; we have no APC
+        // dispatcher, so chain straight to smss's native entry (NtProcessStartup) with RCX=PEB.
+        // `call` (not jmp) gives the entry the ABI-correct rsp≡8(mod16); the entry never returns
+        // (it ends in NtTerminateProcess), and the trailing jmp$ is a safety net if it does.
+        tb.extend_from_slice(&[0x48, 0xB9]);
+        tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
+        tb.extend_from_slice(&[0x48, 0xB8]);
+        tb.extend_from_slice(&(PE_LOAD_BASE + pe.entry_point_rva() as u64).to_le_bytes()); // movabs rax, entry
+        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (enter smss)
+        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -1871,6 +1881,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_SET_INFO_PROCESS
                 || m0 == SSN_NT_TEST_ALERT
                 || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
+                || m0 == SSN_NT_CREATE_KEYED_EVENT
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator) and
                 // don't model thread/process attribute sets.
