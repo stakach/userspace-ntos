@@ -239,6 +239,8 @@ pub const SSN_NT_DISPLAY_STRING: u64 = 70;
 pub const SSN_NT_OPEN_FILE: u64 = 122;
 /// ntdll's NtQueryAttributesFile SSN (LdrpInitialize probes a file's existence; no FS → not-found).
 pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
+/// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
+pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -4065,6 +4067,43 @@ unsafe fn service_sec_image(
                     }
                     result = 0xC0000034;
                 }
+            } else if m0 == SSN_NT_QUERY_VOLUME_INFO_FILE {
+                // NtQueryVolumeInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FsInformation[R8],
+                //   Length[R9], FsInformationClass[sp+0x28]). CsrServerInitialization probes a file
+                //   handle's volume. We have no real FS; return the most conservative plausible answer.
+                let iosb = m3; // RDX = *IO_STATUS_BLOCK { Status@+0, Information@+8 }
+                let buf = get_recv_mr(7); // R8 = FsInformation
+                let len = get_recv_mr(8); // R9 = Length
+                let class = smss_stack_read(sp + 0x28); // arg4 = FsInformationClass
+                let mut info_bytes: u64 = 0;
+                if class == 4 {
+                    // FileFsDeviceInformation { DeviceType(u32), Characteristics(u32) }.
+                    // DeviceType=FILE_DEVICE_DISK(7), Characteristics=0.
+                    csrss_out_write(buf, 0x0000_0000_0000_0007, &mut filled_pages, &mut faults,
+                        scratch_base, &reg, &dll_pes, pml4);
+                    info_bytes = 8;
+                } else {
+                    // Unknown class: log it, zero what fits (up to 32 bytes) and report success so
+                    // CsrServerInitialization proceeds without a real volume subsystem.
+                    print_str(b"[ntos-exec] NtQueryVolumeInformationFile class=");
+                    print_u64(class);
+                    print_str(b" len=");
+                    print_u64(len);
+                    print_str(b"\n");
+                    let n = (len.min(32) / 8) as u64;
+                    for k in 0..n {
+                        csrss_out_write(buf + k * 8, 0, &mut filled_pages, &mut faults,
+                            scratch_base, &reg, &dll_pes, pml4);
+                    }
+                    info_bytes = len.min(32);
+                }
+                if iosb != 0 {
+                    csrss_out_write(iosb, 0, &mut filled_pages, &mut faults, scratch_base,
+                        &reg, &dll_pes, pml4); // Status = STATUS_SUCCESS
+                    csrss_out_write(iosb + 8, info_bytes, &mut filled_pages, &mut faults,
+                        scratch_base, &reg, &dll_pes, pml4); // Information = bytes written
+                }
+                result = 0;
             } else if m0 == SSN_NT_PROTECT_VM {
                 // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
                 // model per-page protection changes yet — report success and hand back a plausible
