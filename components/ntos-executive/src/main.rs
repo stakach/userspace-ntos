@@ -2651,13 +2651,17 @@ unsafe fn service_sec_image(
     } else {
         None
     };
-    // basesrv.dll + winsrv.dll are STAGED + parsed, ready for the DLL load-path. Loading them via the
-    // same NtOpenFile→NtCreateSection→NtQuerySection→NtMapViewOfSection→demand-page path as csrsrv
-    // works, BUT winsrv (~400 KiB → ~100 pages) plus basesrv overflows the root CNode slot budget
-    // (each demand-page consumes a frame + copy-caps; copy_cap fails past the CNode) → the executive
-    // itself faults. That needs a bigger root CNode (boot cnode_size_bits/CNODE_RADIX) or slot
-    // recycling in the demand-page path before the ServerDll load can be enabled.
-    let _ = (&basesrv_pe, &winsrv_pe);
+    // csrss's dynamically-loaded ServerDlls (CsrLoadServerDll): basesrv.dll + winsrv.dll. Same load
+    // path as csrsrv — NtOpenFile → NtCreateSection → NtQuerySection → NtMapViewOfSection →
+    // demand-page — mapped at distinct low bases (the loader relocates them, as it does csrsrv, since
+    // they're DLLs). Index 0 = basesrv, 1 = winsrv; pe by index = basesrv_pe / winsrv_pe. (winsrv is
+    // ~100 pages — the root CNode is now an XL page under the extern-rootserver kernel, so the extra
+    // demand-page caps fit.)
+    const SRV_BASES: [u64; 2] = [0x0000_0000_8100_0000, 0x0000_0000_8200_0000];
+    let srv_names: [&[u8]; 2] = [b"basesrv", b"winsrv"];
+    let mut srv_fh: [u64; 2] = [0, 0];
+    let mut srv_sh: [u64; 2] = [0, 0];
+    let mut srv_mapped: [bool; 2] = [false, false];
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -2815,6 +2819,20 @@ unsafe fn service_sec_image(
                 // csrss's csrsrv.dll, mapped at CSRSRV_BASE by NtMapViewOfSection — demand-page it
                 // from csrsrv_pe (its ImageBase == CSRSRV_BASE, so no relocation).
                 (csrsrv_base, csrsrv_pe.as_ref().unwrap())
+            } else if pi == 1
+                && srv_mapped[0]
+                && page >= SRV_BASES[0]
+                && page < SRV_BASES[0] + image_extent(basesrv_pe.as_ref().unwrap())
+            {
+                // csrss's basesrv.dll ServerDll — demand-page from basesrv_pe (loader relocates it).
+                (SRV_BASES[0], basesrv_pe.as_ref().unwrap())
+            } else if pi == 1
+                && srv_mapped[1]
+                && page >= SRV_BASES[1]
+                && page < SRV_BASES[1] + image_extent(winsrv_pe.as_ref().unwrap())
+            {
+                // csrss's winsrv.dll ServerDll — demand-page from winsrv_pe (loader relocates it).
+                (SRV_BASES[1], winsrv_pe.as_ref().unwrap())
             } else {
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
@@ -2839,7 +2857,7 @@ unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 256 {
+            if faults >= 512 {
                 stop = addr;
                 break;
             }
@@ -3058,6 +3076,16 @@ unsafe fn service_sec_image(
                     print_hex(next_handle as u32);
                     print_str(b"\n");
                 }
+                for i in 0..2 {
+                    if srv_fh[i] != 0 && sec_file == srv_fh[i] {
+                        srv_sh[i] = next_handle;
+                        print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                        print_str(srv_names[i]);
+                        print_str(b" -> handle 0x");
+                        print_hex(next_handle as u32);
+                        print_str(b"\n");
+                    }
+                }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
                 // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
                 if sec_file == 0 && badge == CSRSS_BADGE && csrss_anon_section_handle == 0 {
@@ -3106,6 +3134,33 @@ unsafe fn service_sec_image(
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection csrsrv.dll -> base 0x80000000\n");
                     // result = 0 (SUCCESS)
+                } else if let Some(i) = (0..2).find(|&i| srv_sh[i] != 0 && sect == srv_sh[i]) {
+                    // A ServerDll (basesrv/winsrv): map at its distinct low base; the loader relocates
+                    // it (DLL). Reserve a PT (the PD under 0x8000_0000's PDPT already exists from
+                    // csrsrv). The fault router demand-pages it from its pe.
+                    let pe_i = if i == 0 { &basesrv_pe } else { &winsrv_pe };
+                    if let Some(cpe) = pe_i.as_ref() {
+                        if !srv_mapped[i] {
+                            let pt = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, SRV_BASES[i], pml4);
+                            srv_mapped[i] = true;
+                        }
+                        let ext = image_extent(cpe);
+                        csrss_out_write(get_recv_mr(7), SRV_BASES[i], &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                        let vs_ptr = smss_stack_read(sp + 0x38);
+                        if vs_ptr != 0 {
+                            csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                        }
+                        print_str(b"[ntos-exec] NtMapViewOfSection ");
+                        print_str(srv_names[i]);
+                        print_str(b" -> base 0x");
+                        print_hex(SRV_BASES[i] as u32);
+                        print_str(b"\n");
+                    } else {
+                        handled = false;
+                        result = 0xC0000002;
+                    }
                 } else if csrss_anon_section_handle != 0 && sect == csrss_anon_section_handle {
                     // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
                     // (page tables only) and let the fault router demand-page zero frames on touch.
@@ -3198,8 +3253,12 @@ unsafe fn service_sec_image(
                 // CSRSRV_BASE) vs the csrss.exe section (an EXE at PE_LOAD_BASE). Wrong info here (e.g.
                 // an EXE's for the DLL) → the loader rejects it with STATUS_INVALID_IMAGE_FORMAT.
                 let is_csrsrv = csrsrv_section_handle != 0 && sect == csrsrv_section_handle;
+                let srv_qi = (0..2).find(|&i| srv_sh[i] != 0 && sect == srv_sh[i]);
                 let sel: Option<(&nt_pe_loader::PeFile, u64, bool)> = if is_csrsrv {
                     csrsrv_pe.as_ref().map(|p| (p, CSRSRV_BASE, true))
+                } else if let Some(i) = srv_qi {
+                    let pe_i = if i == 0 { &basesrv_pe } else { &winsrv_pe };
+                    pe_i.as_ref().map(|p| (p, SRV_BASES[i], true))
                 } else {
                     csrss_pe.as_ref().map(|p| (p, PE_LOAD_BASE, false))
                 };
@@ -3422,13 +3481,29 @@ unsafe fn service_sec_image(
                 // csrss's loader opens csrsrv.dll (its static import) to map it. Distinct from "csrss"
                 // (position 4 differs), so the two matches don't collide.
                 let is_csrsrv = !is_sxs && nb[..nlen].windows(6).any(|w| w == b"csrsrv");
-                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss || is_csrsrv {
+                // csrss's dynamic ServerDlls (basesrv/winsrv) — same treatment.
+                let srv_i = if is_sxs {
+                    None
+                } else {
+                    (0..2).find(|&i| {
+                        let n = srv_names[i];
+                        nb[..nlen].windows(n.len()).any(|w| w == n)
+                    })
+                };
+                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
+                    || is_csrss
+                    || is_csrsrv
+                    || srv_i.is_some()
+                {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
                     if is_csrss {
                         csrss_file_handle = next_handle; // remember it for NtCreateSection
                     }
                     if is_csrsrv {
                         csrsrv_file_handle = next_handle; // remember it for NtCreateSection
+                    }
+                    if let Some(i) = srv_i {
+                        srv_fh[i] = next_handle;
                     }
                     next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
@@ -3459,9 +3534,15 @@ unsafe fn service_sec_image(
                 let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
+                let is_srv = !is_sxs
+                    && (0..2).any(|i| {
+                        let n = srv_names[i];
+                        nb[..nlen].windows(n.len()).any(|w| w == n)
+                    });
                 if !is_sxs
                     && (nb[..nlen].windows(5).any(|w| w == b"csrss")
-                        || nb[..nlen].windows(6).any(|w| w == b"csrsrv"))
+                        || nb[..nlen].windows(6).any(|w| w == b"csrsrv")
+                        || is_srv)
                 {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
@@ -3528,6 +3609,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_SET_SYSTEM_INFORMATION
                 || m0 == 277 // NtUnmapViewOfSection — no-op (we never reclaim a mapped view yet)
                 || m0 == 246 // NtSetSecurityObject — no-op (we don't model per-object security)
+                || m0 == 236 // NtSetInformationObject — no-op (handle-attr sets we don't model)
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
@@ -3568,7 +3650,9 @@ unsafe fn service_sec_image(
         print_hex(pfirst[1] as u32);
         print_str(b"\n");
     }
-    print_str(b"[sec-stop] badge=");
+    print_str(b"[sec-stop] NEXT_SLOT=");
+    print_u64(NEXT_SLOT.load(Ordering::Relaxed));
+    print_str(b"\n[sec-stop] badge=");
     print_u64(badge);
     print_str(b" (");
     print_str(if badge == CSRSS_BADGE { b"csrss" } else { b"smss" });
