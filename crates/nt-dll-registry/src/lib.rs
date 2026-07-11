@@ -115,13 +115,19 @@ impl Registry {
 
     /// Resolve a (possibly full-path, any-case) object name to a registered DLL index. Returns
     /// `None` for an SxS probe or an unregistered name. Matches the DLL stem as a substring of the
-    /// lowercased name (registration order breaks ties). The caller passes a lowercased-ASCII fold
-    /// of the UTF-16 object name.
+    /// lowercased name; when several stems match, the **longest** wins — so `kernel32_vista.dll`
+    /// resolves to the `kernel32_vista` entry, not `kernel32` (whose stem is also a substring).
+    /// The caller passes a lowercased-ASCII fold of the UTF-16 object name.
     pub fn resolve_name(&self, name: &[u8]) -> Option<usize> {
         if Self::is_sxs_probe(name) {
             return None;
         }
-        self.dlls.iter().position(|d| contains(name, d.name))
+        self.dlls
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| contains(name, d.name))
+            .max_by_key(|(_, d)| d.name.len())
+            .map(|(i, _)| i)
     }
 
     /// Record the NtOpenFile handle for DLL `i`.
@@ -250,6 +256,25 @@ mod tests {
         // The caller folds case before calling; a bare uppercase stem won't match (by design —
         // resolve_name is the pure substring step over already-lowercased input).
         assert_eq!(r.resolve_name(b"csrsrv"), Some(0));
+    }
+
+    #[test]
+    fn longest_stem_wins_over_substring_collision() {
+        // ReactOS ships kernel32_vista.dll / advapi32_vista.dll whose stems SUPERSET the base names
+        // ("kernel32_vista.dll" contains "kernel32"). Longest-match must pick the specific entry
+        // regardless of registration order.
+        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        r.register(b"kernel32", 0x2A_8000, 0x1000); // base name registered FIRST
+        r.register(b"kernel32_vista", 0x8000, 0x2000);
+        r.register(b"advapi32_vista", 0x5A00, 0x3000);
+        r.register(b"advapi32", 0x7_1E00, 0x4000);
+        let k = r.resolve_name(b"\\systemroot\\system32\\kernel32_vista.dll").unwrap();
+        assert_eq!(r.name(k), b"kernel32_vista");
+        let a = r.resolve_name(b"advapi32_vista.dll").unwrap();
+        assert_eq!(r.name(a), b"advapi32_vista");
+        // The base names still resolve to themselves (they don't contain the longer stems).
+        assert_eq!(r.name(r.resolve_name(b"kernel32.dll").unwrap()), b"kernel32");
+        assert_eq!(r.name(r.resolve_name(b"advapi32.dll").unwrap()), b"advapi32");
     }
 
     #[test]
