@@ -464,6 +464,42 @@ static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
+
+// --- Shared executable-page cache (generic DLL loader) --------------------------------------------
+// A DLL's RX (text) page is identical across processes — each DLL is loaded at a fixed system-wide
+// base and (for the ServerDlls) pre-relocated, so no per-process relocation touches its code. So we
+// fill each such page ONCE into a frame and map THAT frame read-only into every process that faults
+// it — real Windows image sharing (fewer frames, one fill). Keyed by page VA (base+rva). Frames
+// persist for the run (no process teardown yet). Accessed via raw pointers to avoid the
+// static_mut_refs lint; single-threaded executive, so no races.
+const DLL_CACHE_CAP: usize = 4096;
+static mut DLL_CACHE_VA: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
+static mut DLL_CACHE_FR: [u64; DLL_CACHE_CAP] = [0; DLL_CACHE_CAP];
+static mut DLL_CACHE_N: usize = 0;
+static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
+/// The shared frame cap for page VA `va`, or 0 if not yet cached.
+unsafe fn dll_cache_get(va: u64) -> u64 {
+    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
+    let vas = core::ptr::addr_of!(DLL_CACHE_VA) as *const u64;
+    let frs = core::ptr::addr_of!(DLL_CACHE_FR) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == va {
+            return core::ptr::read(frs.add(i));
+        }
+    }
+    0
+}
+/// Record the shared frame `fr` for page VA `va` (once, on first fill).
+unsafe fn dll_cache_put(va: u64, fr: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N));
+    if n < DLL_CACHE_CAP {
+        let vas = core::ptr::addr_of_mut!(DLL_CACHE_VA) as *mut u64;
+        let frs = core::ptr::addr_of_mut!(DLL_CACHE_FR) as *mut u64;
+        core::ptr::write(vas.add(n), va);
+        core::ptr::write(frs.add(n), fr);
+        core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), n + 1);
+    }
+}
 unsafe fn alloc_frame() -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
@@ -1462,6 +1498,22 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
 /// its `pointer_to_raw_data` (BSS beyond `size_of_raw_data` stays zero). Returns the page rights
 /// (RX for executable sections, RW_NX otherwise). This is the memory-efficient image mapping:
 /// only touched pages are ever materialized (vs pre-building the whole mapped image).
+/// The mapping rights `fill_image_page` WOULD return for `rva`, WITHOUT filling — RX (2) for an
+/// executable section, RW_NX otherwise (headers/rdata/data/gaps). Lets the fault router classify a
+/// page before deciding whether it's a shareable text page (RX) or a per-process page.
+unsafe fn page_rights(pe: &nt_pe_loader::PeFile, rva: u32) -> u64 {
+    let soh = pe.headers().size_of_headers;
+    let page_up = |n: u32| (n + 0xFFF) & !0xFFFu32;
+    if rva < page_up(soh) {
+        return RW_NX; // headers
+    }
+    for s in pe.sections() {
+        if rva >= s.virtual_address && rva < s.virtual_address + page_up(s.virtual_size) {
+            return if s.is_executable() { 2 /* RX */ } else { RW_NX };
+        }
+    }
+    RW_NX // gap
+}
 unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 {
     for j in 0..0x1000u64 {
         core::ptr::write_volatile((dst + j) as *mut u8, 0);
@@ -2862,46 +2914,66 @@ unsafe fn service_sec_image(
                 break;
             }
             let rva = (page - base) as u32;
-            let scratch = scratch_base + faults * 0x1000;
-            let (f, fe) = alloc_frame_r();
-            let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-            let rights = fill_image_page(tpe, rva, scratch);
-            let (cc, ce) = copy_cap_r(f);
+            // SHAREABLE = a registered DLL's executable text (not the per-process main image at
+            // PE_LOAD_BASE, and an RX page). Such a page is byte-identical across processes (each DLL
+            // is loaded at a fixed base + pre-relocated), so it's filled ONCE into a frame and that
+            // frame is mapped READ-ONLY (RX) into every process that faults it — real image sharing.
+            let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
+            let cached = if shareable { dll_cache_get(page) } else { 0 };
+            let (frame, rights) = if cached != 0 {
+                DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
+                (cached, 2u64) // shared text → RX, no fill, no fresh frame
+            } else {
+                // MISS (shared, first process) or a per-process page: fill a fresh frame.
+                let scratch = scratch_base + faults * 0x1000;
+                let (f, fe) = alloc_frame_r();
+                let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let r = fill_image_page(tpe, rva, scratch);
+                if fe != 0 || se != 0 {
+                    print_str(b"[map-fail] rva=0x");
+                    print_hex(rva);
+                    print_str(b" retype=");
+                    print_u64(fe);
+                    print_str(b" smap=");
+                    print_u64(se);
+                    print_str(b" faults=");
+                    print_u64(faults);
+                    print_str(b"\n");
+                }
+                if shareable {
+                    dll_cache_put(page, f); // this frame becomes the shared copy for all processes
+                } else {
+                    // Per-process page (main image, or DLL headers/rdata/data/IAT): record it for
+                    // copy-out via its scratch alias, and mirror the main image so smss_copyin can
+                    // read static-string args from .rdata.
+                    if (faults as usize) < filled_pages.len() {
+                        filled_pages[faults as usize] = page;
+                    }
+                    if base == PE_LOAD_BASE {
+                        let off = page - PE_LOAD_BASE;
+                        if off < IMAGE_MIRROR_WINDOW {
+                            let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+                            let _ = page_map(copy_cap(f), mirror + off, RW_NX, CAP_INIT_THREAD_VSPACE);
+                        }
+                    }
+                }
+                faults += 1; // a fill consumed a scratch slot; shared HITs do not
+                (f, if shareable { 2 } else { r })
+            };
+            // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
+            let (cc, ce) = copy_cap_r(frame);
             let me = page_map_r(cc, page, rights, pml4);
-            // Surface a silently-failed demand-page map (the bug that leaves smss executing a zero
-            // ntdll page): log the error label of each invocation so the failing one is visible.
-            if fe != 0 || se != 0 || ce != 0 || me != 0 {
-                print_str(b"[map-fail] rva=0x");
-                print_hex(rva);
-                print_str(b" retype=");
-                print_u64(fe);
-                print_str(b" smap=");
-                print_u64(se);
+            if ce != 0 || me != 0 {
+                print_str(b"[map-fail] va=0x");
+                print_hex(page as u32);
                 print_str(b" copy=");
                 print_u64(ce);
                 print_str(b" map=");
                 print_u64(me);
-                print_str(b" scratch=0x");
-                print_hex((scratch >> 32) as u32);
-                print_hex(scratch as u32);
-                print_str(b" faults=");
-                print_u64(faults);
+                print_str(b" shared=");
+                print_u64(shareable as u64);
                 print_str(b"\n");
             }
-            // Mirror the main-image page into the executive so smss_copyin can read static-string
-            // args (registry value/subkey names in .rdata) from smss's image. (Shares the heap
-            // mirror's PT; the map is a no-op for non-setup_env SEC_IMAGE spawns.)
-            if base == PE_LOAD_BASE {
-                let off = page - PE_LOAD_BASE;
-                if off < IMAGE_MIRROR_WINDOW {
-                    let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-                    let _ = page_map(copy_cap(f), mirror + off, RW_NX, CAP_INIT_THREAD_VSPACE);
-                }
-            }
-            if (faults as usize) < filled_pages.len() {
-                filled_pages[faults as usize] = page;
-            }
-            faults += 1;
             pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
             badge = nb;
@@ -3664,6 +3736,10 @@ unsafe fn service_sec_image(
     }
     print_str(b"[sec-stop] NEXT_SLOT=");
     print_u64(NEXT_SLOT.load(Ordering::Relaxed));
+    print_str(b" shared_frames=");
+    print_u64(core::ptr::read(core::ptr::addr_of!(DLL_CACHE_N)) as u64);
+    print_str(b" shared_hits=");
+    print_u64(DLL_SHARED_HITS.load(Ordering::Relaxed));
     print_str(b"\n[sec-stop] badge=");
     print_u64(badge);
     print_str(b" (");
