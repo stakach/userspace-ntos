@@ -4020,6 +4020,15 @@ unsafe fn service_sec_image(
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                 } else {
+                    // DIAG: log the not-found probes from csrss — a DllMain probes 5 files before
+                    // failing init; we need to know which are load-bearing.
+                    if badge == CSRSS_BADGE {
+                        print_str(b"[ntos-exec] NtQueryAttributesFile(csrss) not-found: \"");
+                        for &w in name16.iter().take(96) {
+                            debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
+                        }
+                        print_str(b"\"\n");
+                    }
                     result = 0xC0000034;
                 }
             } else if m0 == SSN_NT_PROTECT_VM {
