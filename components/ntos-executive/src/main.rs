@@ -181,6 +181,9 @@ pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
+/// NtCreateProcess — smss spawns csrss from the SEC_IMAGE section (SmpExecuteImage). Not serviced
+/// yet (the real spawn is the next step) — a diagnostic verifies the file→section→process chain.
+pub const SSN_NT_CREATE_PROCESS: u64 = 49;
 /// NtCreateDirectoryObject — SmpInit creates object-namespace directories (\Windows, \KnownDlls,
 /// \??/DosDevices, …). Out handle in RCX; faked until the object manager lands.
 pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
@@ -244,6 +247,10 @@ pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
 pub const FILEBUF_VADDR: u64 = 0x0000_0100_0060_0000; // its own PT (0x40-0x60 is crowded)
 pub const FILEBUF_FRAMES: u64 = 32;
+/// csrss.exe (~7 KiB) is staged into the FILEBUF tail, past smss.exe (~99 KiB) but well within the
+/// 128 KiB buffer — no separate buffer needed. The storage host reads it here and writes its size
+/// to STORAGE_SHARED+0x3c; the executive parses the PE from FILEBUF_VADDR+CSRSS_FILEBUF_OFFSET.
+pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 KiB smss
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_00A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -2319,6 +2326,35 @@ unsafe fn service_sec_image(
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections), so the
     // Session Manager's SmpInit keeps flowing. Each create hands out a fresh value.
     let mut next_handle = FAKE_HANDLE;
+    // Track the handles smss uses to launch csrss.exe: the file handle it opens (NtOpenFile), and
+    // the SEC_IMAGE section it creates from it (NtCreateSection). NtCreateProcess (next step) will
+    // spawn the real process from the section. Parse the staged csrss PE up front to prove it's
+    // available (FILEBUF tail; size at STORAGE_SHARED+0x3c).
+    let mut csrss_file_handle = 0u64;
+    let mut csrss_section_handle = 0u64;
+    // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
+    // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
+    if ntdll.is_some() {
+        let csz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x3c) as *const u32) as usize;
+        if csz > 0 {
+            let bytes = core::slice::from_raw_parts(
+                (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET) as *const u8,
+                csz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(cpe) => {
+                    print_str(b"[ntos-exec] staged csrss.exe: ");
+                    print_u64(csz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(cpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(cpe.entry_point_rva());
+                    print_str(b"\n");
+                }
+                Err(_) => print_str(b"[ntos-exec] staged csrss.exe: PARSE FAILED\n"),
+            }
+        }
+    }
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -2607,15 +2643,45 @@ unsafe fn service_sec_image(
             } else if m0 == SSN_NT_CREATE_PORT
                 || m0 == SSN_NT_CREATE_THREAD
                 || m0 == SSN_NT_CREATE_EVENT
-                || m0 == SSN_NT_CREATE_SECTION
             {
-                // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events,
-                // sections). Each takes the out handle in RCX (arg1). Hand back a fresh fake handle
-                // so the Session Manager keeps initialising — real LPC / thread / section objects
-                // are later milestones. NtCreateThread's new thread does NOT actually run yet.
+                // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events).
+                // Each takes the out handle in RCX (arg1). Hand back a fresh fake handle so the
+                // Session Manager keeps initialising — real LPC / thread objects are later steps.
+                // (The RCX slot is stale but these handles are never checked by smss.)
                 let out = get_recv_mr(2); // RCX = *Handle
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
+            } else if m0 == SSN_NT_CREATE_SECTION {
+                // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
+                // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
+                // Unlike the other creates, smss USES the section handle (NtCreateProcess), so write
+                // it to the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record
+                // the handle so NtCreateProcess can spawn the real csrss image from it.
+                let out = get_recv_mr(9); // R10 = *SectionHandle
+                smss_stack_write(out, next_handle);
+                if csrss_file_handle != 0 && smss_stack_read(sp + 0x38) == csrss_file_handle {
+                    csrss_section_handle = next_handle;
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
+                    print_hex((next_handle >> 32) as u32);
+                    print_hex(next_handle as u32);
+                    print_str(b"\n");
+                }
+                next_handle += 1;
+            } else if m0 == SSN_NT_CREATE_PROCESS {
+                // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
+                // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Verify the launch chain:
+                // is the section the csrss image section we tracked? Spawning the real process is
+                // the next step, so still stop here.
+                let sect = smss_stack_read(sp + 0x30);
+                print_str(b"[ntos-exec] NtCreateProcess section=0x");
+                print_hex(sect as u32);
+                if csrss_section_handle != 0 && sect == csrss_section_handle {
+                    print_str(b" == csrss SEC_IMAGE section (file->section->process chain OK)\n");
+                } else {
+                    print_str(b" (not the csrss section)\n");
+                }
+                handled = false; // real process spawn not implemented yet -> clean stop
+                result = 0xC0000002;
             } else if m0 == SSN_NT_OPEN_THREAD_TOKEN {
                 // No impersonation token → STATUS_NO_TOKEN; the caller falls back to the process one.
                 result = 0xC000007C;
@@ -2756,6 +2822,9 @@ unsafe fn service_sec_image(
                 let is_csrss = nb[..nlen].windows(5).any(|w| w == b"csrss");
                 if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
+                    if is_csrss {
+                        csrss_file_handle = next_handle; // remember it for NtCreateSection
+                    }
                     next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                     if iosb != 0 {
@@ -4177,6 +4246,17 @@ unsafe fn storage_probe(
             if got == want && ssize > 0 {
                 smss_size = ssize;
                 verdict |= 0x20;
+            }
+        }
+        // csrss.exe — the Win32 subsystem launcher smss starts. Staged into the FILEBUF tail (past
+        // smss), its size reported at STORAGE_SHARED+0x3c. Only if it fits clear of smss.
+        if let Some((cc, csz, _)) = dir_find(&fs, fs.root_cl, b"CSRSS   EXE") {
+            let cap = (FILEBUF_FRAMES * 0x1000) as u32 - CSRSS_FILEBUF_OFFSET as u32;
+            if csz > 0 && csz <= cap && smss_size <= CSRSS_FILEBUF_OFFSET as u32 {
+                let got = fat_read_file(&fs, cc, csz, smss_dest + CSRSS_FILEBUF_OFFSET);
+                if got == csz {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x3c) as *mut u32, csz);
+                }
             }
         }
         // The build-time import-resolution table (imports.bin), read into `imports_dest`.
