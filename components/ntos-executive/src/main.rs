@@ -213,6 +213,9 @@ pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
 /// handle (out in R8). A real token/SID model is a later milestone.
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
 pub const SSN_NT_OPEN_PROCESS_TOKEN: u64 = 129;
+/// NtQueryInformationToken — csrss's CsrServerInitialization queries its process token (identity,
+/// session, statistics) after opening it. Class in RDX; TOKEN_* struct copied out to R8.
+pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
 /// NtAdjustPrivilegesToken — smss enables privileges it needs (SeTcb/SeLoadDriver/…). We don't
 /// model token privileges → no-op success (the enable "succeeds").
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
@@ -3028,6 +3031,45 @@ unsafe fn service_sec_image(
                 let out = get_recv_mr(7); // R8
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
+            } else if m0 == SSN_NT_QUERY_INFO_TOKEN {
+                // NtQueryInformationToken(TokenHandle[R10], class[RDX], buf[R8], len[R9],
+                // *RetLen[sp+0x28]). csrss runs as Local System (S-1-5-18); serve the classes its
+                // CsrServerInitialization needs. Callers use the 2-call pattern: len=0 → return the
+                // required size + STATUS_BUFFER_TOO_SMALL, then re-query with an allocated buffer.
+                let class = m3;
+                let buf = get_recv_mr(7); // R8 = TokenInformation
+                let len = get_recv_mr(8); // R9 = TokenInformationLength
+                let retlen_ptr = smss_stack_read(sp + 0x28); // arg4 = *ReturnLength
+                match class {
+                    1 | 5 => {
+                        // TokenUser(1)/TokenPrimaryGroup(5): {PSID Sid/Group; ULONG Attributes;} + the
+                        // SID data. S-1-5-18 = SID{Rev=1,Count=1,IdAuth=NT(5),SubAuth[0]=18} = 12 B.
+                        let needed: u32 = 0x1C; // 16 (SID_AND_ATTRIBUTES) + 12 (SID)
+                        if len < needed as u64 {
+                            if let Some(m) = smss_mirror(retlen_ptr, 4) {
+                                core::ptr::write_volatile(m as *mut u32, needed);
+                            }
+                            result = 0xC000_0023; // STATUS_BUFFER_TOO_SMALL
+                        } else if let Some(m) = smss_mirror(buf, needed as u64) {
+                            core::ptr::write_volatile((m + 0x00) as *mut u64, buf + 0x10); // Sid → +0x10
+                            core::ptr::write_volatile((m + 0x08) as *mut u32, 0); // Attributes
+                            core::ptr::write_volatile((m + 0x10) as *mut u64, 0x0500_0000_0000_0101); // Rev,Cnt,IdAuth
+                            core::ptr::write_volatile((m + 0x18) as *mut u32, 18); // SubAuthority[0]
+                            if let Some(rl) = smss_mirror(retlen_ptr, 4) {
+                                core::ptr::write_volatile(rl as *mut u32, needed);
+                            }
+                        } else {
+                            result = 0xC000_0023;
+                        }
+                    }
+                    _ => {
+                        print_str(b"[ntos-exec] NtQueryInformationToken class=");
+                        print_u64(class);
+                        print_str(b" (unhandled)\n");
+                        handled = false;
+                        result = 0xC0000002;
+                    }
+                }
             } else if m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
                 || m0 == SSN_NT_CREATE_DIRECTORY_OBJECT
             {
@@ -3273,6 +3315,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_SET_VALUE_KEY
                 || m0 == SSN_NT_SET_SYSTEM_INFORMATION
                 || m0 == 277 // NtUnmapViewOfSection — no-op (we never reclaim a mapped view yet)
+                || m0 == 246 // NtSetSecurityObject — no-op (we don't model per-object security)
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
