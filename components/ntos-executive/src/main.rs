@@ -1809,6 +1809,19 @@ unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
         None => false,
     }
 }
+/// The executive's writable scratch mirror of an already demand-paged csrss page (any region:
+/// image, ntdll, csrsrv .data, …), so a syscall handler can copy OUT an out-param that doesn't live
+/// in the stack/heap/image mirrors. Returns the executive VA aliasing `va`, or None if `va`'s page
+/// hasn't been faulted in (so isn't in `filled_pages`).
+unsafe fn scratch_for(va: u64, filled_pages: &[u64], nfilled: usize, scratch_base: u64) -> Option<u64> {
+    let page = va & !0xFFFu64;
+    for i in 0..nfilled.min(filled_pages.len()) {
+        if filled_pages[i] == page {
+            return Some(scratch_base + i as u64 * 0x1000 + (va & 0xFFF));
+        }
+    }
+    None
+}
 /// Read a UTF-16LE UNICODE_STRING (given its byte Length + Buffer VA) from smss into a UTF-16
 /// code-unit Vec. Caps at 1024 code units. Empty on any copyin failure.
 unsafe fn smss_read_unicode(buffer_va: u64, byte_len: u16) -> alloc::vec::Vec<u16> {
@@ -2439,6 +2452,13 @@ unsafe fn service_sec_image(
     let mut csrsrv_section_handle = 0u64;
     let mut csrsrv_base = 0u64;
     const CSRSRV_BASE: u64 = 0x0000_0000_8000_0000;
+    // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
+    // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
+    // demand-pages ZERO frames into it (commit-on-touch).
+    let mut csrss_anon_section_handle = 0u64;
+    let mut csrss_anon_base = 0u64;
+    let mut csrss_anon_size = 0u64;
+    const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
     // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
     // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
     let csrss_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
@@ -2628,6 +2648,25 @@ unsafe fn service_sec_image(
             // instead of crashing at the 16 KiB initial commit. Bounded by STACK_GROWTH_FLOOR so it
             // never runs into the env mappings below.
             if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
+                let f = alloc_frame();
+                let _ = page_map(f, page, RW_NX, pml4);
+                faults += 1;
+                pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
+            // csrss's anonymous section (CSR shared memory): commit a ZERO frame on touch.
+            if pi == 1
+                && csrss_anon_base != 0
+                && page >= csrss_anon_base
+                && page < csrss_anon_base + ((csrss_anon_size + 0xFFF) & !0xFFFu64)
+            {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
                 faults += 1;
@@ -2882,7 +2921,36 @@ unsafe fn service_sec_image(
                 // it to the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record
                 // the handle so NtCreateProcess can spawn the real csrss image from it.
                 let out = get_recv_mr(9); // R10 = *SectionHandle
-                smss_stack_write(out, next_handle);
+                // *SectionHandle can live outside the stack/heap/image mirrors — e.g. a csrsrv global
+                // (csrss stores the CSR section handle in csrsrv .data at ~0x8001xxxx). Write via the
+                // right mirror; if it's a demand-paged csrsrv page not yet faulted, fill it first.
+                if !smss_copyout(out, &next_handle.to_le_bytes()) {
+                    let out_page = out & !0xFFFu64;
+                    let mut sva = scratch_for(out, &filled_pages, faults as usize, scratch_base);
+                    if sva.is_none()
+                        && csrsrv_base != 0
+                        && csrsrv_pe.is_some()
+                        && out_page >= csrsrv_base
+                        && out_page < csrsrv_base + image_extent(csrsrv_pe.as_ref().unwrap())
+                        && (faults as usize) < filled_pages.len()
+                    {
+                        let scratch = scratch_base + faults * 0x1000;
+                        let f = alloc_frame();
+                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                        let rights = fill_image_page(
+                            csrsrv_pe.as_ref().unwrap(),
+                            (out_page - csrsrv_base) as u32,
+                            scratch,
+                        );
+                        let _ = page_map(copy_cap(f), out_page, rights, pml4);
+                        filled_pages[faults as usize] = out_page;
+                        sva = Some(scratch + (out & 0xFFF));
+                        faults += 1;
+                    }
+                    if let Some(m) = sva {
+                        core::ptr::write_volatile(m as *mut u64, next_handle);
+                    }
+                }
                 let sec_file = smss_stack_read(sp + 0x38);
                 if csrss_file_handle != 0 && sec_file == csrss_file_handle {
                     csrss_section_handle = next_handle;
@@ -2894,6 +2962,25 @@ unsafe fn service_sec_image(
                 if csrsrv_file_handle != 0 && sec_file == csrsrv_file_handle {
                     csrsrv_section_handle = next_handle;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrsrv.dll -> handle 0x");
+                    print_hex(next_handle as u32);
+                    print_str(b"\n");
+                }
+                // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
+                // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
+                if sec_file == 0 && badge == CSRSS_BADGE && csrss_anon_section_handle == 0 {
+                    let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
+                    let size = if let Some(m) = smss_mirror(maxsize_ptr, 8) {
+                        core::ptr::read_volatile(m as *const u64)
+                    } else {
+                        0
+                    };
+                    csrss_anon_section_handle = next_handle;
+                    // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
+                    // window (demand-paged on touch, so unused pages cost nothing).
+                    csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
+                    print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
+                    print_hex(csrss_anon_size as u32);
+                    print_str(b" -> handle 0x");
                     print_hex(next_handle as u32);
                     print_str(b"\n");
                 }
@@ -2924,6 +3011,35 @@ unsafe fn service_sec_image(
                         smss_stack_write(vs_ptr, image_extent(csrsrv_pe.as_ref().unwrap()));
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection csrsrv.dll -> base 0x80000000\n");
+                    // result = 0 (SUCCESS)
+                } else if csrss_anon_section_handle != 0 && sect == csrss_anon_section_handle {
+                    // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
+                    // (page tables only) and let the fault router demand-page zero frames on touch.
+                    if csrss_anon_base == 0 {
+                        let npts = ((csrss_anon_size + 0x1F_FFFF) / 0x20_0000).max(1);
+                        let mut k = 0u64;
+                        while k < npts {
+                            let pt = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                            let _ = paging_struct_map(
+                                pt,
+                                LBL_X86_PAGE_TABLE_MAP,
+                                CSRSS_ANON_BASE + k * 0x20_0000,
+                                pml4,
+                            );
+                            k += 1;
+                        }
+                        csrss_anon_base = CSRSS_ANON_BASE;
+                    }
+                    smss_stack_write(get_recv_mr(7), csrss_anon_base); // *BaseAddress
+                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    if vs_ptr != 0 {
+                        smss_stack_write(vs_ptr, csrss_anon_size);
+                    }
+                    print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
+                    print_hex((csrss_anon_base >> 32) as u32);
+                    print_hex(csrss_anon_base as u32);
+                    print_str(b"\n");
                     // result = 0 (SUCCESS)
                 } else {
                     handled = false; // other sections not modeled
