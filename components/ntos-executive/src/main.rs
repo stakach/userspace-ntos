@@ -283,11 +283,19 @@ pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv
 /// The Win32 client stack (kernel32 ~2.66 MiB + user32 ~1.12 MiB + gdi32 ~326 KiB) that winsrv.dll
 /// statically imports. These are too large for the SRVBUF, so they get their own fresh 6 MiB region
 /// (3 PTs), dual-mapped host<->exec like SRVBUF. Sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
-pub const WIN32BUF_VADDR: u64 = 0x0000_0100_0500_0000; // fresh 6 MiB region (3 PTs), past SRVBUF
-pub const WIN32BUF_FRAMES: u64 = 1536; // 6 MiB — holds kernel32 + user32 + gdi32
+pub const WIN32BUF_VADDR: u64 = 0x0000_0100_0500_0000; // fresh 8 MiB region (4 PTs), past SRVBUF
+pub const WIN32BUF_FRAMES: u64 = 2048; // 8 MiB — kernel32+user32+gdi32 + Win32 deps
 pub const KERNEL32_WIN32BUF_OFFSET: u64 = 0x0;       // kernel32 ~2.66 MiB
 pub const USER32_WIN32BUF_OFFSET: u64 = 0x2C0000;    // user32 ~1.12 MiB (clear of kernel32)
 pub const GDI32_WIN32BUF_OFFSET: u64 = 0x400000;     // gdi32 ~326 KiB (clear of user32)
+// winsrv's transitive import closure (7 DLLs, ~1.77 MiB) — sizes at STORAGE_SHARED +0x58..+0x70.
+pub const RPCRT4_WIN32BUF_OFFSET: u64 = 0x460000;         // rpcrt4 ~617 KiB
+pub const MSVCRT_WIN32BUF_OFFSET: u64 = 0x500000;         // msvcrt ~581 KiB
+pub const ADVAPI32_WIN32BUF_OFFSET: u64 = 0x5A0000;       // advapi32 ~455 KiB
+pub const WS2_32_WIN32BUF_OFFSET: u64 = 0x620000;         // ws2_32 ~93 KiB
+pub const KERNEL32_VISTA_WIN32BUF_OFFSET: u64 = 0x640000; // kernel32_vista ~32 KiB
+pub const ADVAPI32_VISTA_WIN32BUF_OFFSET: u64 = 0x650000; // advapi32_vista ~23 KiB
+pub const WS2HELP_WIN32BUF_OFFSET: u64 = 0x660000;        // ws2help ~14 KiB
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -2802,6 +2810,223 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    let rpcrt4_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x58) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged rpcrt4.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged rpcrt4.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let msvcrt_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x5c) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged msvcrt.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged msvcrt.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let advapi32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x60) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged advapi32.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged advapi32.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let ws2_32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x64) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged ws2_32.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged ws2_32.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let kernel32_vista_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x68) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + KERNEL32_VISTA_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged kernel32_vista.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged kernel32_vista.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let advapi32_vista_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x6c) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged advapi32_vista.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged advapi32_vista.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let ws2help_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x70) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged ws2help.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged ws2help.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -2811,11 +3036,16 @@ unsafe fn service_sec_image(
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
     // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
     // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; 6] =
-        [&csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe];
-    let dll_seed: [&[u8]; 6] = [b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32"];
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; 13] = [
+        &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
+        &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
+    ];
+    let dll_seed: [&[u8]; 13] = [
+        b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
+        b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help",
+    ];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..6 {
+    for i in 0..13 {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
@@ -4253,8 +4483,8 @@ unsafe fn spawn_storage_host(
         let sb_cp = copy_cap(srvbuf_start + i);
         let _ = page_map(sb_cp, SRVBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
-    // The Win32 client-stack buffer (kernel32+user32+gdi32, 3 PTs), mapped into the host too.
-    for p in 0..3u64 {
+    // The Win32 client-stack buffer (kernel32+user32+gdi32 + Win32 deps, 4 PTs), mapped into the host too.
+    for p in 0..4u64 {
         let wpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
         let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WIN32BUF_VADDR + p * 0x20_0000, pml4);
@@ -5193,12 +5423,20 @@ unsafe fn storage_probe(
                 }
             }
         }
-        // The Win32 client stack (kernel32/user32/gdi32) — winsrv.dll's static imports. Staged into
-        // the WIN32BUF (its own 6 MiB region), sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
+        // The Win32 client stack (kernel32/user32/gdi32) + winsrv's transitive import closure
+        // (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders + ws2help) — staged into the WIN32BUF
+        // (its own 8 MiB region), sizes reported at STORAGE_SHARED +0x4c..+0x70.
         for (name, off, shoff, cap) in [
             (b"KERNEL32DLL", KERNEL32_WIN32BUF_OFFSET, 0x4cu64, USER32_WIN32BUF_OFFSET),
             (b"USER32  DLL", USER32_WIN32BUF_OFFSET, 0x50, GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET),
-            (b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, WIN32BUF_FRAMES * 0x1000 - GDI32_WIN32BUF_OFFSET),
+            (b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, RPCRT4_WIN32BUF_OFFSET - GDI32_WIN32BUF_OFFSET),
+            (b"RPCRT4  DLL", RPCRT4_WIN32BUF_OFFSET, 0x58, MSVCRT_WIN32BUF_OFFSET - RPCRT4_WIN32BUF_OFFSET),
+            (b"MSVCRT  DLL", MSVCRT_WIN32BUF_OFFSET, 0x5c, ADVAPI32_WIN32BUF_OFFSET - MSVCRT_WIN32BUF_OFFSET),
+            (b"ADVAPI32DLL", ADVAPI32_WIN32BUF_OFFSET, 0x60, WS2_32_WIN32BUF_OFFSET - ADVAPI32_WIN32BUF_OFFSET),
+            (b"WS2_32  DLL", WS2_32_WIN32BUF_OFFSET, 0x64, KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET),
+            (b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
+            (b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
+            (b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, WIN32BUF_FRAMES * 0x1000 - WS2HELP_WIN32BUF_OFFSET),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 if sz > 0 && (sz as u64) <= cap {
@@ -6503,9 +6741,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..SRVBUF_FRAMES {
                 let _ = page_map(copy_cap(srvbuf_start + i), SRVBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
-            // The Win32 client-stack buffer (kernel32+user32+gdi32, 3 PTs), mapped in the executive too so
-            // it can parse them for the csrss loader's Win32 imports.
-            for p in 0..3u64 {
+            // The Win32 client-stack buffer (kernel32+user32+gdi32 + Win32 deps, 4 PTs), mapped in the
+            // executive too so it can parse them for the csrss loader's Win32 imports.
+            for p in 0..4u64 {
                 let wpt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
                 let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WIN32BUF_VADDR + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
