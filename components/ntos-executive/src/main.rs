@@ -1759,7 +1759,39 @@ unsafe fn spawn_sec_image(
             core::ptr::write_volatile((pp + foff + 2) as *mut u16, len + 2); // MaximumLength
             core::ptr::write_volatile((pp + foff + 8) as *mut u64, SMSS_PARAMS_VA + boff); // Buffer
         }
+        // Environment block (RTL_USER_PROCESS_PARAMETERS+0x80). kernel32's init walks this as a
+        // list of UTF-16LE `NAME=VALUE` strings, each wide-NUL-terminated, the block ended by an
+        // empty entry (a lone wide NUL). A NULL Environment makes kernel32 wcslen(NULL) and #PF at
+        // addr 2 (verified: kernel32+0x93c4 `movzx eax,[rax]`). Real Windows always supplies one.
+        // The csrss command line is long (~200+ chars at pp+0x480), so put the environment in its
+        // OWN page (SMSS_PARAMS_VA+0x1000 — the next page in the same 2 MiB PT, no new PT needed).
+        let env_frame = alloc_frame();
+        let env_scr = scr + 0x4000;
+        let _ = page_map(env_frame, env_scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        {
+            let mut off: u64 = 0;
+            for var in [
+                b"SystemRoot=C:\\Windows".as_slice(),
+                b"SystemDrive=C:".as_slice(),
+                b"windir=C:\\Windows".as_slice(),
+                b"Path=C:\\Windows\\System32;C:\\Windows".as_slice(),
+            ] {
+                let len = wstr(env_scr + off, var);
+                off += len as u64;
+                core::ptr::write_volatile((env_scr + off) as *mut u16, 0); // wide NUL terminator
+                off += 2;
+            }
+            core::ptr::write_volatile((env_scr + off) as *mut u16, 0); // final empty entry
+            off += 2;
+            // EnvironmentSize (RTL_USER_PROCESS_PARAMETERS+0x3F0, SIZE_T on x64). ntdll's
+            // param/env duplication (RtlCreateProcessParametersEx) copies EnvironmentSize bytes
+            // via memmove (ntdll+0x5e420); if it is 0 the copy loop overruns past the env page and
+            // #PFs (kernel32/ntdll env walk). Set it to the full block length incl. terminator.
+            core::ptr::write_volatile((pp + 0x3F0) as *mut u64, off);
+        }
+        core::ptr::write_volatile((pp + 0x80) as *mut u64, SMSS_PARAMS_VA + 0x1000); // Environment
         let _ = page_map(copy_cap(params), SMSS_PARAMS_VA, RW_NX, pml4);
+        let _ = page_map(copy_cap(env_frame), SMSS_PARAMS_VA + 0x1000, RW_NX, pml4);
         // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0] — a fresh PT chain; the image is PML4[2]).
         // LdrpInitialize reads it early (e.g. 0x7FFE0274); an unmapped read would #PF. A zeroed
         // page satisfies the early reads (a real cookie/NtGlobalFlag can be filled in later).
@@ -3481,10 +3513,20 @@ unsafe fn service_sec_image(
                 let base = m3; // RDX = BaseAddress
                 let buf = get_recv_mr(8); // R9 = MemoryInformation buffer
                 let retlen_ptr = smss_stack_read(sp + 0x30); // arg6 = *ReturnLength (stack slot)
-                smss_stack_write(buf + 0x00, base & !0xFFFu64); // BaseAddress
-                smss_stack_write(buf + 0x08, base & !0xFFFFu64); // AllocationBase
+                let page = base & !0xFFFu64;
+                // The process env block lives in a SINGLE mapped page at SMSS_PARAMS_VA+0x1000; the
+                // page after it is unmapped (its natural 64 KiB region can't be extended — the TEB
+                // sits at +0x10000). ntdll's env duplication in LdrpInitializeProcess queries this
+                // region then memmoves RegionSize bytes from Environment (ntdll+0x5e420); a 0x10000
+                // RegionSize overruns the env page and #PFs at ntdll+0x5e478. Report the true 1-page
+                // region so the copy stays in bounds. Other queries keep the 64 KiB default.
+                let is_env = page == SMSS_PARAMS_VA + 0x1000;
+                let region = if is_env { 0x1000u64 } else { 0x10000u64 };
+                let alloc_base = if is_env { page } else { base & !0xFFFFu64 };
+                smss_stack_write(buf + 0x00, page); // BaseAddress
+                smss_stack_write(buf + 0x08, alloc_base); // AllocationBase
                 smss_stack_write(buf + 0x10, 0x04); // AllocationProtect = PAGE_READWRITE
-                smss_stack_write(buf + 0x18, 0x10000); // RegionSize
+                smss_stack_write(buf + 0x18, region); // RegionSize
                 smss_stack_write(buf + 0x20, 0x1000 | (0x04u64 << 32)); // State=MEM_COMMIT, Protect=RW
                 smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
                 if retlen_ptr != 0 {
