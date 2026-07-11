@@ -38,6 +38,7 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
         STORAGE_SHARED_VADDR + 0x800,
         NTDLLBUF_VADDR,
         SRVBUF_VADDR,
+        WIN32BUF_VADDR,
         NLS_ANSI_VADDR,
         NLS_OEM_VADDR,
         NLS_CASE_VADDR,

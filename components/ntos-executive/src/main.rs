@@ -280,6 +280,14 @@ pub const SRVBUF_VADDR: u64 = 0x0000_0100_0400_0000;
 pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
 pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
 pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv (~50 KiB)
+/// The Win32 client stack (kernel32 ~2.66 MiB + user32 ~1.12 MiB + gdi32 ~326 KiB) that winsrv.dll
+/// statically imports. These are too large for the SRVBUF, so they get their own fresh 6 MiB region
+/// (3 PTs), dual-mapped host<->exec like SRVBUF. Sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
+pub const WIN32BUF_VADDR: u64 = 0x0000_0100_0500_0000; // fresh 6 MiB region (3 PTs), past SRVBUF
+pub const WIN32BUF_FRAMES: u64 = 1536; // 6 MiB — holds kernel32 + user32 + gdi32
+pub const KERNEL32_WIN32BUF_OFFSET: u64 = 0x0;       // kernel32 ~2.66 MiB
+pub const USER32_WIN32BUF_OFFSET: u64 = 0x2C0000;    // user32 ~1.12 MiB (clear of kernel32)
+pub const GDI32_WIN32BUF_OFFSET: u64 = 0x400000;     // gdi32 ~326 KiB (clear of user32)
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -2698,6 +2706,102 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    // The Win32 client stack (kernel32/user32/gdi32) — winsrv.dll's static imports. Parsed from the
+    // WIN32BUF (sizes at STORAGE_SHARED +0x4c/+0x50/+0x54, bytes at WIN32BUF_VADDR + each offset);
+    // registered below so csrss's loader can resolve + demand-page them.
+    let kernel32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let ksz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x4c) as *const u32) as usize;
+        if ksz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET) as *const u8,
+                ksz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(kpe) => {
+                    print_str(b"[ntos-exec] staged kernel32.dll: ");
+                    print_u64(ksz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(kpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(kpe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(kpe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(kpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged kernel32.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let user32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let usz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x50) as *const u32) as usize;
+        if usz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET) as *const u8,
+                usz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(upe) => {
+                    print_str(b"[ntos-exec] staged user32.dll: ");
+                    print_u64(usz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(upe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(upe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(upe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(upe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged user32.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let gdi32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let gsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x54) as *const u32) as usize;
+        if gsz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET) as *const u8,
+                gsz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(gpe) => {
+                    print_str(b"[ntos-exec] staged gdi32.dll: ");
+                    print_u64(gsz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(gpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(gpe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(gpe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(gpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged gdi32.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -2707,10 +2811,11 @@ unsafe fn service_sec_image(
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
     // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
     // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; 3] = [&csrsrv_pe, &basesrv_pe, &winsrv_pe];
-    let dll_seed: [&[u8]; 3] = [b"csrsrv", b"basesrv", b"winsrv"];
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; 6] =
+        [&csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe];
+    let dll_seed: [&[u8]; 6] = [b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32"];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..3 {
+    for i in 0..6 {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
@@ -2895,7 +3000,7 @@ unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 512 {
+            if faults >= 2000 {
                 stop = addr;
                 break;
             }
@@ -3529,10 +3634,14 @@ unsafe fn service_sec_image(
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
                 let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv): the
-                // registry resolves the (folded) name to a DLL index and rejects SxS probes itself.
-                // "csrsrv" is distinct from the "csrss" match (position 4 differs), so no collision.
-                let dll_i = reg.resolve_name(&nb[..nlen]);
+                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
+                // Win32 client stack (kernel32/user32/gdi32): the registry resolves the (folded) name
+                // to a DLL index and rejects SxS probes itself. "csrsrv" is distinct from the "csrss"
+                // match (position 4 differs), so no collision.
+                // SCOPED TO csrss (badge): smss's SmpInit enumerates the KnownDLLs — which now include
+                // kernel32/user32/gdi32 — and those opens MUST keep failing so smss skips them and
+                // proceeds to launch csrss. Only csrss's loader should resolve these DLLs.
+                let dll_i = if badge == CSRSS_BADGE { reg.resolve_name(&nb[..nlen]) } else { None };
                 if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
                     || is_csrss
                     || dll_i.is_some()
@@ -3573,7 +3682,10 @@ unsafe fn service_sec_image(
                 // so the loader doesn't take the .Local\ redirection or a manifest path.
                 let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
                 let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                if is_csrss || reg.resolve_name(&nb[..nlen]).is_some() {
+                // The registry-DLL "EXISTS" answer is scoped to csrss (see NtOpenFile) so smss's
+                // KnownDLLs probes for kernel32/user32/gdi32 keep failing and it launches csrss.
+                let dll_exists = badge == CSRSS_BADGE && reg.resolve_name(&nb[..nlen]).is_some();
+                if is_csrss || dll_exists {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                 } else {
@@ -4073,6 +4185,7 @@ unsafe fn spawn_storage_host(
     filebuf_start: u64,
     ntdllbuf_start: u64,
     srvbuf_start: u64,
+    win32buf_start: u64,
     nls_ansi_start: u64,
     nls_oem_start: u64,
     nls_case_start: u64,
@@ -4139,6 +4252,16 @@ unsafe fn spawn_storage_host(
     for i in 0..SRVBUF_FRAMES {
         let sb_cp = copy_cap(srvbuf_start + i);
         let _ = page_map(sb_cp, SRVBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    // The Win32 client-stack buffer (kernel32+user32+gdi32, 3 PTs), mapped into the host too.
+    for p in 0..3u64 {
+        let wpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
+        let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WIN32BUF_VADDR + p * 0x20_0000, pml4);
+    }
+    for i in 0..WIN32BUF_FRAMES {
+        let wb_cp = copy_cap(win32buf_start + i);
+        let _ = page_map(wb_cp, WIN32BUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
     // The NLS + SYSTEM-hive buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
     for (start, vaddr, frames) in [
@@ -4872,6 +4995,7 @@ unsafe fn storage_probe(
     imports_dest: u64,
     ntdll_dest: u64,
     srvbuf_dest: u64,
+    win32buf_dest: u64,
     nls_ansi_dest: u64,
     nls_oem_dest: u64,
     nls_case_dest: u64,
@@ -5066,6 +5190,25 @@ unsafe fn storage_probe(
                     print_str(b"[storage-host] WINSRV.DLL size=");
                     print_u64(sz as u64);
                     print_str(b"\n");
+                }
+            }
+        }
+        // The Win32 client stack (kernel32/user32/gdi32) — winsrv.dll's static imports. Staged into
+        // the WIN32BUF (its own 6 MiB region), sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
+        for (name, off, shoff, cap) in [
+            (b"KERNEL32DLL", KERNEL32_WIN32BUF_OFFSET, 0x4cu64, USER32_WIN32BUF_OFFSET),
+            (b"USER32  DLL", USER32_WIN32BUF_OFFSET, 0x50, GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET),
+            (b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, WIN32BUF_FRAMES * 0x1000 - GDI32_WIN32BUF_OFFSET),
+        ] {
+            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+                if sz > 0 && (sz as u64) <= cap {
+                    let got = fat_read_file(&fs, c, sz, win32buf_dest + off);
+                    if got == sz {
+                        core::ptr::write_volatile((STORAGE_SHARED_VADDR + shoff) as *mut u32, sz);
+                        print_str(b"[storage-host] ");
+                        for &ch in name { debug_put_char(ch); }
+                        print_str(b" size="); print_u64(sz as u64); print_str(b"\n");
+                    }
                 }
             }
         }
@@ -6360,6 +6503,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..SRVBUF_FRAMES {
                 let _ = page_map(copy_cap(srvbuf_start + i), SRVBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // The Win32 client-stack buffer (kernel32+user32+gdi32, 3 PTs), mapped in the executive too so
+            // it can parse them for the csrss loader's Win32 imports.
+            for p in 0..3u64 {
+                let wpt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
+                let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WIN32BUF_VADDR + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+            }
+            let win32buf_start = alloc_frame();
+            for _ in 1..WIN32BUF_FRAMES { let _ = alloc_frame(); }
+            for i in 0..WIN32BUF_FRAMES {
+                let _ = page_map(copy_cap(win32buf_start + i), WIN32BUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
             // in the executive too, and remember their cap bases for spawn_sec_image to share into
             // smss.
@@ -6411,6 +6566,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 fb_start,
                 nb_start,
                 srvbuf_start,
+                win32buf_start,
                 nls_starts[0],
                 nls_starts[1],
                 nls_starts[2],
