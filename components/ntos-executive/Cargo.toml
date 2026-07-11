@@ -36,6 +36,8 @@ nt-io-client = { path = "../../crates/nt-io-client" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+# Generic DLL registry — host-tested name/handle/VA decisions for demand-loaded shared-text DLLs.
+nt-dll-registry = { path = "../../crates/nt-dll-registry" }
 # Registry hive model + image codec — the Config Manager decodes a real hive read off the FS.
 nt-hive-core = { path = "../../crates/nt-hive-core" }
 # Read-only regf parser — serves smss's registry from the REAL ReactOS SYSTEM hive read off disk.

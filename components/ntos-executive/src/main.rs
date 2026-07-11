@@ -1892,8 +1892,8 @@ unsafe fn csrss_out_write(
     filled_pages: &mut [u64; 256],
     faults: &mut u64,
     scratch_base: u64,
-    csrsrv_base: u64,
-    csrsrv_pe: &Option<nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
     pml4: u64,
 ) {
     if smss_copyout(va, &val.to_le_bytes()) {
@@ -1901,22 +1901,22 @@ unsafe fn csrss_out_write(
     }
     let page = va & !0xFFFu64;
     let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
-    if sva.is_none()
-        && csrsrv_base != 0
-        && csrsrv_pe.is_some()
-        && page >= csrsrv_base
-        && page < csrsrv_base + image_extent(csrsrv_pe.as_ref().unwrap())
-        && (*faults as usize) < filled_pages.len()
-    {
-        let scratch = scratch_base + *faults * 0x1000;
-        let f = alloc_frame();
-        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-        let rights =
-            fill_image_page(csrsrv_pe.as_ref().unwrap(), (page - csrsrv_base) as u32, scratch);
-        let _ = page_map(copy_cap(f), page, rights, pml4);
-        filled_pages[*faults as usize] = page;
-        sva = Some(scratch + (va & 0xFFF));
-        *faults += 1;
+    // A not-yet-faulted page that belongs to a mapped registry DLL (e.g. a csrsrv/basesrv .data
+    // global): demand-fill it from that DLL's PE so the write lands (a silent miss leaves a
+    // load-bearing handle/base NULL → later NULL-deref).
+    if sva.is_none() && (*faults as usize) < filled_pages.len() {
+        if let Some((i, rva)) = reg.dll_for_page(page) {
+            if let Some(pe) = dll_pes[i].as_ref() {
+                let scratch = scratch_base + *faults * 0x1000;
+                let f = alloc_frame();
+                let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let rights = fill_image_page(pe, rva, scratch);
+                let _ = page_map(copy_cap(f), page, rights, pml4);
+                filled_pages[*faults as usize] = page;
+                sva = Some(scratch + (va & 0xFFF));
+                *faults += 1;
+            }
+        }
     }
     if let Some(m) = sva {
         core::ptr::write_volatile(m as *mut u64, val);
@@ -2544,14 +2544,10 @@ unsafe fn service_sec_image(
     let mut csrss_file_handle = 0u64;
     let mut csrss_section_handle = 0u64;
     let mut csrss_process_handle = 0u64;
-    // csrss's csrsrv.dll load: the file handle (NtOpenFile), the SEC_IMAGE section (NtCreateSection),
-    // and the base NtMapViewOfSection maps csrsrv at in csrss's VSpace (0 until mapped). The fault
-    // router demand-pages csrsrv there from csrsrv_pe. CSRSRV_BASE = csrsrv's preferred ImageBase
-    // (0x80000000) so the loader needs no relocation.
-    let mut csrsrv_file_handle = 0u64;
-    let mut csrsrv_section_handle = 0u64;
-    let mut csrsrv_base = 0u64;
-    const CSRSRV_BASE: u64 = 0x0000_0000_8000_0000;
+    // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
+    // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
+    // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
+    let mut dll_pd_created = false;
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -2636,7 +2632,6 @@ unsafe fn service_sec_image(
     } else {
         None
     };
-    let _ = &csrsrv_pe; // consumed by the DLL load-path (STAGE 2: section/map/reloc/imports)
     // basesrv.dll — csrss's ServerDll=basesrv. Parsed from the SRVBUF (size at STORAGE_SHARED+0x44,
     // bytes at SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET); consumed by the csrss ServerDll load path.
     let basesrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
@@ -2703,17 +2698,25 @@ unsafe fn service_sec_image(
     } else {
         None
     };
-    // csrss's dynamically-loaded ServerDlls (CsrLoadServerDll): basesrv.dll + winsrv.dll. Same load
-    // path as csrsrv — NtOpenFile → NtCreateSection → NtQuerySection → NtMapViewOfSection →
-    // demand-page — mapped at distinct low bases (the loader relocates them, as it does csrsrv, since
-    // they're DLLs). Index 0 = basesrv, 1 = winsrv; pe by index = basesrv_pe / winsrv_pe. (winsrv is
-    // ~100 pages — the root CNode is now an XL page under the extern-rootserver kernel, so the extra
-    // demand-page caps fit.)
-    const SRV_BASES: [u64; 2] = [0x0000_0000_8100_0000, 0x0000_0000_8200_0000];
-    let srv_names: [&[u8]; 2] = [b"basesrv", b"winsrv"];
-    let mut srv_fh: [u64; 2] = [0, 0];
-    let mut srv_sh: [u64; 2] = [0, 0];
-    let mut srv_mapped: [bool; 2] = [false, false];
+    // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
+    // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
+    // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
+    // csrsrv (registered first) keeps 0x8000_0000 = its preferred ImageBase so the loader never
+    // relocates it (its text is byte-identical and shared read-only). All slots share the 1 GiB
+    // 0x8000_0000 PDPT range. Load-flow DECISIONS (name/handle/VA lookups + SECTION_IMAGE_INFORMATION)
+    // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
+    // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
+    // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; 3] = [&csrsrv_pe, &basesrv_pe, &winsrv_pe];
+    let dll_seed: [&[u8]; 3] = [b"csrsrv", b"basesrv", b"winsrv"];
+    let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
+    for i in 0..3 {
+        let (sz, ent) = dll_pes[i]
+            .as_ref()
+            .map(|p| (image_extent(p), p.entry_point_rva()))
+            .unwrap_or((0, 0));
+        reg.register(dll_seed[i], sz, ent);
+    }
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -2863,28 +2866,11 @@ unsafe fn service_sec_image(
             } else if nt_base != 0 && page >= nt_base && page < nt_end {
                 ntfaults += 1;
                 (nt_base, ntdll.unwrap().1)
-            } else if pi == 1
-                && csrsrv_base != 0
-                && page >= csrsrv_base
-                && page < csrsrv_base + image_extent(csrsrv_pe.as_ref().unwrap())
-            {
-                // csrss's csrsrv.dll, mapped at CSRSRV_BASE by NtMapViewOfSection — demand-page it
-                // from csrsrv_pe (its ImageBase == CSRSRV_BASE, so no relocation).
-                (csrsrv_base, csrsrv_pe.as_ref().unwrap())
-            } else if pi == 1
-                && srv_mapped[0]
-                && page >= SRV_BASES[0]
-                && page < SRV_BASES[0] + image_extent(basesrv_pe.as_ref().unwrap())
-            {
-                // csrss's basesrv.dll ServerDll — demand-page from basesrv_pe (loader relocates it).
-                (SRV_BASES[0], basesrv_pe.as_ref().unwrap())
-            } else if pi == 1
-                && srv_mapped[1]
-                && page >= SRV_BASES[1]
-                && page < SRV_BASES[1] + image_extent(winsrv_pe.as_ref().unwrap())
-            {
-                // csrss's winsrv.dll ServerDll — demand-page from winsrv_pe (loader relocates it).
-                (SRV_BASES[1], winsrv_pe.as_ref().unwrap())
+            } else if let Some((i, _)) = if pi == 1 { reg.dll_for_page(page) } else { None } {
+                // A mapped registry DLL (csrsrv/basesrv/winsrv) in csrss's VSpace — demand-page it
+                // from that DLL's parsed PE. csrsrv sits at its preferred ImageBase (no relocation);
+                // the ServerDlls are loader-relocated. The registry resolves which one owns the page.
+                (reg.base(i), dll_pes[i].as_ref().unwrap())
             } else {
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
@@ -3145,7 +3131,7 @@ unsafe fn service_sec_image(
                 // the handle so NtCreateProcess can spawn the real csrss image from it.
                 let out = get_recv_mr(9); // R10 = *SectionHandle
                 // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
-                csrss_out_write(out, next_handle, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                csrss_out_write(out, next_handle, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                 let sec_file = smss_stack_read(sp + 0x38);
                 if csrss_file_handle != 0 && sec_file == csrss_file_handle {
                     csrss_section_handle = next_handle;
@@ -3154,21 +3140,14 @@ unsafe fn service_sec_image(
                     print_hex(next_handle as u32);
                     print_str(b"\n");
                 }
-                if csrsrv_file_handle != 0 && sec_file == csrsrv_file_handle {
-                    csrsrv_section_handle = next_handle;
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrsrv.dll -> handle 0x");
+                // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
+                if let Some(i) = reg.index_for_file(sec_file) {
+                    reg.set_section_handle(i, next_handle);
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                    print_str(reg.name(i));
+                    print_str(b" -> handle 0x");
                     print_hex(next_handle as u32);
                     print_str(b"\n");
-                }
-                for i in 0..2 {
-                    if srv_fh[i] != 0 && sec_file == srv_fh[i] {
-                        srv_sh[i] = next_handle;
-                        print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                        print_str(srv_names[i]);
-                        print_str(b" -> handle 0x");
-                        print_hex(next_handle as u32);
-                        print_str(b"\n");
-                    }
                 }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
                 // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
@@ -3197,50 +3176,38 @@ unsafe fn service_sec_image(
                 // (CSRSRV_BASE = 0x80000000) so no relocation is needed; the fault router then
                 // demand-pages it from csrsrv_pe and the loader resolves csrss's IAT against it.
                 let sect = get_recv_mr(9);
-                if csrsrv_section_handle != 0 && sect == csrsrv_section_handle && csrsrv_pe.is_some() {
-                    if csrsrv_base == 0 {
-                        // Reserve the VA in csrss's VSpace: a PD + PT under PML4[0]'s PDPT (created
-                        // for KUSER at 0x7FFE0000; 0x80000000 is a different PDPT slot). csrsrv is
-                        // ~65 KiB, so one PT (2 MiB) covers it.
-                        let pd = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-                        let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, CSRSRV_BASE, pml4);
-                        let pt = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, CSRSRV_BASE, pml4);
-                        csrsrv_base = CSRSRV_BASE;
-                    }
-                    let ext = image_extent(csrsrv_pe.as_ref().unwrap());
-                    csrss_out_write(get_recv_mr(7), CSRSRV_BASE, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4); // *BaseAddress
-                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
-                    if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
-                    }
-                    print_str(b"[ntos-exec] NtMapViewOfSection csrsrv.dll -> base 0x80000000\n");
-                    // result = 0 (SUCCESS)
-                } else if let Some(i) = (0..2).find(|&i| srv_sh[i] != 0 && sect == srv_sh[i]) {
-                    // A ServerDll (basesrv/winsrv): map at its distinct low base; the loader relocates
-                    // it (DLL). Reserve a PT (the PD under 0x8000_0000's PDPT already exists from
-                    // csrsrv). The fault router demand-pages it from its pe.
-                    let pe_i = if i == 0 { &basesrv_pe } else { &winsrv_pe };
-                    if let Some(cpe) = pe_i.as_ref() {
-                        if !srv_mapped[i] {
+                if let Some(i) = reg.index_for_section(sect) {
+                    // A registry DLL (csrsrv/basesrv/winsrv). Reserve its VA range, hand back its base
+                    // + view size, and let the fault router demand-page it from its PE. All DLL slots
+                    // share the 0x8000_0000 1 GiB PDPT range, so the PD is created once (first mapped
+                    // DLL) and each DLL gets its own PT. csrsrv sits at its preferred ImageBase (no
+                    // relocation); the ServerDlls are loader-relocated.
+                    if let Some(cpe) = dll_pes[i].as_ref() {
+                        let dbase = reg.base(i);
+                        if !reg.is_mapped(i) {
+                            if !dll_pd_created {
+                                let pd = alloc_slot();
+                                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+                                let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, dbase, pml4);
+                                dll_pd_created = true;
+                            }
                             let pt = alloc_slot();
                             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, SRV_BASES[i], pml4);
-                            srv_mapped[i] = true;
+                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, dbase, pml4);
+                            reg.set_mapped(i);
                         }
                         let ext = image_extent(cpe);
-                        csrss_out_write(get_recv_mr(7), SRV_BASES[i], &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
-                        let vs_ptr = smss_stack_read(sp + 0x38);
+                        csrss_out_write(get_recv_mr(7), dbase, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4); // *BaseAddress
+                        let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                         if vs_ptr != 0 {
-                            csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                            csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                         }
                         print_str(b"[ntos-exec] NtMapViewOfSection ");
-                        print_str(srv_names[i]);
+                        print_str(reg.name(i));
                         print_str(b" -> base 0x");
-                        print_hex(SRV_BASES[i] as u32);
+                        print_hex(dbase as u32);
                         print_str(b"\n");
+                        // result = 0 (SUCCESS)
                     } else {
                         handled = false;
                         result = 0xC0000002;
@@ -3266,10 +3233,10 @@ unsafe fn service_sec_image(
                     }
                     // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
                     // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
-                    csrss_out_write(get_recv_mr(7), csrss_anon_base, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                    csrss_out_write(get_recv_mr(7), csrss_anon_base, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                     let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                     if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, csrss_anon_size, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
+                        csrss_out_write(vs_ptr, csrss_anon_size, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
                     print_hex((csrss_anon_base >> 32) as u32);
@@ -3333,43 +3300,43 @@ unsafe fn service_sec_image(
                 let class = m3;
                 let buf = get_recv_mr(7); // R8
                 let sect = get_recv_mr(9); // R10 = SectionHandle
-                // Pick the image this section is a view of: the csrsrv.dll section (a DLL, loaded at
-                // CSRSRV_BASE) vs the csrss.exe section (an EXE at PE_LOAD_BASE). Wrong info here (e.g.
-                // an EXE's for the DLL) → the loader rejects it with STATUS_INVALID_IMAGE_FORMAT.
-                let is_csrsrv = csrsrv_section_handle != 0 && sect == csrsrv_section_handle;
-                let srv_qi = (0..2).find(|&i| srv_sh[i] != 0 && sect == srv_sh[i]);
-                let sel: Option<(&nt_pe_loader::PeFile, u64, bool)> = if is_csrsrv {
-                    csrsrv_pe.as_ref().map(|p| (p, CSRSRV_BASE, true))
-                } else if let Some(i) = srv_qi {
-                    let pe_i = if i == 0 { &basesrv_pe } else { &winsrv_pe };
-                    pe_i.as_ref().map(|p| (p, SRV_BASES[i], true))
+                // Pick the image this section is a view of: a registry DLL (csrsrv/basesrv/winsrv, a
+                // DLL at its registry base) vs the csrss.exe section (an EXE at PE_LOAD_BASE). Wrong
+                // info here (e.g. an EXE's for a DLL) → the loader rejects it (INVALID_IMAGE_FORMAT).
+                // nt-dll-registry synthesises the DLL structs; the EXE uses the same host-tested helper.
+                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(sect) {
+                    reg.image_info(i).map(|b| (b, reg.name(i)))
+                } else if csrss_section_handle != 0 && sect == csrss_section_handle {
+                    csrss_pe.as_ref().map(|p| {
+                        (
+                            nt_dll_registry::image_info(
+                                PE_LOAD_BASE,
+                                p.entry_point_rva(),
+                                p.size_of_image(),
+                                false,
+                            ),
+                            b"csrss.exe" as &[u8],
+                        )
+                    })
                 } else {
-                    csrss_pe.as_ref().map(|p| (p, PE_LOAD_BASE, false))
+                    None
                 };
-                if class == 1 && sel.is_some() {
-                    let (cpe, load_base, is_dll) = sel.unwrap();
-                    let entry = load_base + cpe.entry_point_rva() as u64;
-                    // ImageCharacteristics: EXECUTABLE|LARGE_ADDRESS_AWARE, + DLL (0x2000) for csrsrv.
-                    let img_char: u64 = if is_dll { 0x2022 } else { 0x0022 };
-                    smss_stack_write(buf + 0x00, entry); // TransferAddress (entry VA)
-                    smss_stack_write(buf + 0x08, 0); // ZeroBits + pad
-                    smss_stack_write(buf + 0x10, 0x10_0000); // MaximumStackSize (1 MiB)
-                    smss_stack_write(buf + 0x18, 0x1_0000); // CommittedStackSize (64 KiB)
-                    smss_stack_write(buf + 0x20, 1); // SubSystemType=NATIVE(1) | SubSystemVersion=0
-                    // @0x28 OSVersion(u32) | @0x2c ImageCharacteristics(u16) | @0x2e DllChars(u16)
-                    smss_stack_write(buf + 0x28, img_char << 32);
-                    // @0x30 Machine=0x8664 (u16) | @0x32 ImageContainsCode=1 (u8) | @0x34 LoaderFlags
-                    smss_stack_write(buf + 0x30, 0x8664 | (1u64 << 16));
-                    smss_stack_write(buf + 0x38, cpe.size_of_image() as u64); // ImageFileSize|CheckSum
+                if class == 1 && info.is_some() {
+                    let (bytes, who) = info.unwrap();
+                    // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
+                    for k in 0..8 {
+                        let mut w = [0u8; 8];
+                        w.copy_from_slice(&bytes[k * 8..k * 8 + 8]);
+                        smss_stack_write(buf + (k as u64) * 8, u64::from_le_bytes(w));
+                    }
                     let rl = smss_stack_read(sp + 0x28); // arg4 = *ResultLength
                     if rl != 0 {
                         smss_stack_write(rl, 64);
                     }
-                    print_str(if is_dll {
-                        b"[ntos-exec] NtQuerySection csrsrv.dll entry=0x" as &[u8]
-                    } else {
-                        b"[ntos-exec] NtQuerySection csrss.exe entry=0x" as &[u8]
-                    });
+                    let entry = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    print_str(b"[ntos-exec] NtQuerySection ");
+                    print_str(who);
+                    print_str(b" entry=0x");
                     print_hex((entry >> 32) as u32);
                     print_hex(entry as u32);
                     print_str(b"\n");
@@ -3562,32 +3529,20 @@ unsafe fn service_sec_image(
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
                 let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                // csrss's loader opens csrsrv.dll (its static import) to map it. Distinct from "csrss"
-                // (position 4 differs), so the two matches don't collide.
-                let is_csrsrv = !is_sxs && nb[..nlen].windows(6).any(|w| w == b"csrsrv");
-                // csrss's dynamic ServerDlls (basesrv/winsrv) — same treatment.
-                let srv_i = if is_sxs {
-                    None
-                } else {
-                    (0..2).find(|&i| {
-                        let n = srv_names[i];
-                        nb[..nlen].windows(n.len()).any(|w| w == n)
-                    })
-                };
+                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv): the
+                // registry resolves the (folded) name to a DLL index and rejects SxS probes itself.
+                // "csrsrv" is distinct from the "csrss" match (position 4 differs), so no collision.
+                let dll_i = reg.resolve_name(&nb[..nlen]);
                 if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
                     || is_csrss
-                    || is_csrsrv
-                    || srv_i.is_some()
+                    || dll_i.is_some()
                 {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
                     if is_csrss {
                         csrss_file_handle = next_handle; // remember it for NtCreateSection
                     }
-                    if is_csrsrv {
-                        csrsrv_file_handle = next_handle; // remember it for NtCreateSection
-                    }
-                    if let Some(i) = srv_i {
-                        srv_fh[i] = next_handle;
+                    if let Some(i) = dll_i {
+                        reg.set_file_handle(i, next_handle); // remember it for NtCreateSection
                     }
                     next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
@@ -3613,21 +3568,12 @@ unsafe fn service_sec_image(
                     nb[nlen] = (w as u8).to_ascii_lowercase();
                     nlen += 1;
                 }
-                // Reject SxS/actctx probes so the loader doesn't take the .Local\ redirection or a
-                // manifest path — it should use the plain System32 search.
-                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
-                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
-                    || nb[..nlen].windows(7).any(|w| w == b".config");
-                let is_srv = !is_sxs
-                    && (0..2).any(|i| {
-                        let n = srv_names[i];
-                        nb[..nlen].windows(n.len()).any(|w| w == n)
-                    });
-                if !is_sxs
-                    && (nb[..nlen].windows(5).any(|w| w == b"csrss")
-                        || nb[..nlen].windows(6).any(|w| w == b"csrsrv")
-                        || is_srv)
-                {
+                // Report EXISTS for csrss.exe + any registry DLL (csrsrv/basesrv/winsrv). The registry
+                // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
+                // so the loader doesn't take the .Local\ redirection or a manifest path.
+                let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
+                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                if is_csrss || reg.resolve_name(&nb[..nlen]).is_some() {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                 } else {

@@ -64,6 +64,7 @@ members = [
     "crates/nt-sim-device",
     "crates/nt-driver-runtime",
     "crates/nt-driver-test-fixtures",
+    "crates/nt-dll-registry",
     "tools/driver-import-report",
 ]
 exclude = [
