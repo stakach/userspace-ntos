@@ -2332,12 +2332,13 @@ unsafe fn service_sec_image(
     // available (FILEBUF tail; size at STORAGE_SHARED+0x3c).
     let mut csrss_file_handle = 0u64;
     let mut csrss_section_handle = 0u64;
+    let mut csrss_process_handle = 0u64;
     // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
     // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
-    if ntdll.is_some() {
+    let csrss_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
         let csz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x3c) as *const u32) as usize;
         if csz > 0 {
-            let bytes = core::slice::from_raw_parts(
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
                 (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET) as *const u8,
                 csz,
             );
@@ -2350,11 +2351,19 @@ unsafe fn service_sec_image(
                     print_str(b" entry=0x");
                     print_hex(cpe.entry_point_rva());
                     print_str(b"\n");
+                    Some(cpe)
                 }
-                Err(_) => print_str(b"[ntos-exec] staged csrss.exe: PARSE FAILED\n"),
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged csrss.exe: PARSE FAILED\n");
+                    None
+                }
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -2669,19 +2678,28 @@ unsafe fn service_sec_image(
                 next_handle += 1;
             } else if m0 == SSN_NT_CREATE_PROCESS {
                 // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
-                // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Verify the launch chain:
-                // is the section the csrss image section we tracked? Spawning the real process is
-                // the next step, so still stop here.
+                // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Spawn a REAL second SEC_IMAGE
+                // process from the tracked csrss section: its own VSpace + the csrss image + ntdll,
+                // via spawn_sec_image. Its thread starts and faults to its OWN fault EP, which is not
+                // serviced yet (the multiplexed 2-process loop is the next step) — so it just blocks
+                // on its first page, while smss gets a real process handle and proceeds.
                 let sect = smss_stack_read(sp + 0x30);
-                print_str(b"[ntos-exec] NtCreateProcess section=0x");
-                print_hex(sect as u32);
-                if csrss_section_handle != 0 && sect == csrss_section_handle {
-                    print_str(b" == csrss SEC_IMAGE section (file->section->process chain OK)\n");
+                if csrss_section_handle != 0 && sect == csrss_section_handle && csrss_pe.is_some() {
+                    let cf = make_object(OBJ_ENDPOINT);
+                    let cf_c = copy_cap(cf);
+                    let _cpml4 = spawn_sec_image(csrss_pe.as_ref().unwrap(), cf_c, NTDLL_BASE, true);
+                    csrss_process_handle = next_handle;
+                    smss_stack_write(get_recv_mr(9), next_handle); // *ProcessHandle (R10)
+                    next_handle += 1;
+                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss SEC_IMAGE process -> 0x");
+                    print_hex((csrss_process_handle >> 32) as u32);
+                    print_hex(csrss_process_handle as u32);
+                    print_str(b" (blocks on its first fault; 2-proc service loop is next)\n");
+                    // result stays 0 (SUCCESS)
                 } else {
-                    print_str(b" (not the csrss section)\n");
+                    handled = false; // not the csrss section / not staged -> clean stop
+                    result = 0xC0000002;
                 }
-                handled = false; // real process spawn not implemented yet -> clean stop
-                result = 0xC0000002;
             } else if m0 == SSN_NT_OPEN_THREAD_TOKEN {
                 // No impersonation token → STATUS_NO_TOKEN; the caller falls back to the process one.
                 result = 0xC000007C;
@@ -2938,6 +2956,11 @@ unsafe fn service_sec_image(
         }
         stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
         break;
+    }
+    if csrss_process_handle != 0 {
+        print_str(b"[sec-stop] (csrss process was spawned, handle 0x");
+        print_hex(csrss_process_handle as u32);
+        print_str(b")\n");
     }
     print_str(b"[sec-stop] label=");
     print_u64(mi >> 12);
