@@ -1745,6 +1745,13 @@ unsafe fn spawn_sec_image(
         let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
     }
     let _ = tcb_set_priority(tcb, prio);
+    // Mark this a HOSTED thread: the kernel turns EVERY `syscall` it issues into an UnknownSyscall
+    // fault to the executive, never a native seL4 dispatch. Without this, NT syscalls whose arg2
+    // (RDX) collides with a seL4 syscall number are misdispatched by the kernel and never reach us —
+    // e.g. NtMapViewOfSection passes ProcessHandle = NtCurrentProcess() = -1 in RDX, and the kernel
+    // reads RDX as the syscall number where -1 == SysCall, so the map silently never faults here.
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4
@@ -2447,6 +2454,18 @@ unsafe fn service_sec_image(
                     print_str(b" entry=0x");
                     print_hex(cpe.entry_point_rva());
                     print_str(b"\n");
+                    // Relocate csrss.exe to its load base (PE_LOAD_BASE) + patch its header's
+                    // OptionalHeader.ImageBase to match — exactly as the LIVE smss path does — so ntdll
+                    // doesn't try to RELOCATE THE EXE (ldrinit.c:2409, the EXE-reloc path, is
+                    // UNIMPLEMENTED in ReactOS and returns STATUS_INVALID_IMAGE_FORMAT).
+                    apply_relocations_to_buf(&cpe, FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET, PE_LOAD_BASE);
+                    let e_lfanew = core::ptr::read_volatile(
+                        (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET + 0x3c) as *const u32,
+                    ) as u64;
+                    core::ptr::write_volatile(
+                        (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET + e_lfanew + 0x30) as *mut u64,
+                        PE_LOAD_BASE,
+                    );
                     Some(cpe)
                 }
                 Err(_) => {
@@ -3138,14 +3157,17 @@ unsafe fn service_sec_image(
                 let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
                 // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
                 // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
-                // Reject the SxS ".local" probe (csrss.exe.local): matching it makes the loader take
-                // the .Local\ DLL-redirection path (…\csrss.exe.Local\csrsrv.dll) and fail there,
-                // instead of the normal System32 search where we actually map csrsrv.
-                let is_local = nb[..nlen].windows(6).any(|w| w == b".local");
-                let is_csrss = !is_local && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // Reject SxS/actctx probes (csrss.exe.local, csrss.exe.manifest, *.config): matching
+                // them diverts the loader into DLL-redirection / manifest parsing instead of the
+                // normal System32 search where we actually map csrsrv. ".local" also triggers the
+                // .Local\ redirection (…\csrss.exe.Local\csrsrv.dll).
+                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
+                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
+                    || nb[..nlen].windows(7).any(|w| w == b".config");
+                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
                 // csrss's loader opens csrsrv.dll (its static import) to map it. Distinct from "csrss"
                 // (position 4 differs), so the two matches don't collide.
-                let is_csrsrv = !is_local && nb[..nlen].windows(6).any(|w| w == b"csrsrv");
+                let is_csrsrv = !is_sxs && nb[..nlen].windows(6).any(|w| w == b"csrsrv");
                 if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss || is_csrsrv {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
                     if is_csrss {
@@ -3178,9 +3200,12 @@ unsafe fn service_sec_image(
                     nb[nlen] = (w as u8).to_ascii_lowercase();
                     nlen += 1;
                 }
-                // Reject the ".local" SxS probe so the loader doesn't take the .Local\ redirection.
-                let is_local = nb[..nlen].windows(6).any(|w| w == b".local");
-                if !is_local
+                // Reject SxS/actctx probes so the loader doesn't take the .Local\ redirection or a
+                // manifest path — it should use the plain System32 search.
+                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
+                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
+                    || nb[..nlen].windows(7).any(|w| w == b".config");
+                if !is_sxs
                     && (nb[..nlen].windows(5).any(|w| w == b"csrss")
                         || nb[..nlen].windows(6).any(|w| w == b"csrsrv"))
                 {
