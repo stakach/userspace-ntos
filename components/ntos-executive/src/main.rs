@@ -273,6 +273,13 @@ pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 
 /// csrsrv.dll (~65 KiB) — csrss.exe's static-import Server DLL — is staged further into the FILEBUF
 /// (past smss+csrss), size reported at STORAGE_SHARED+0x40. The loader needs it or DLL_NOT_FOUND.
 pub const CSRSRV_FILEBUF_OFFSET: u64 = 0x20000; // 128 KiB in — clear of csrss (ends ~111 KiB)
+/// basesrv.dll (~50 KiB) + winsrv.dll (~400 KiB) — csrss's dynamically-loaded ServerDlls — don't fit
+/// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec like
+/// NTDLLBUF. basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
+pub const SRVBUF_VADDR: u64 = 0x0000_0100_0400_0000;
+pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
+pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
+pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv (~50 KiB)
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -2578,6 +2585,79 @@ unsafe fn service_sec_image(
         None
     };
     let _ = &csrsrv_pe; // consumed by the DLL load-path (STAGE 2: section/map/reloc/imports)
+    // basesrv.dll — csrss's ServerDll=basesrv. Parsed from the SRVBUF (size at STORAGE_SHARED+0x44,
+    // bytes at SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET); consumed by the csrss ServerDll load path.
+    let basesrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let bsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x44) as *const u32) as usize;
+        if bsz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET) as *const u8,
+                bsz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(bpe) => {
+                    print_str(b"[ntos-exec] staged basesrv.dll: ");
+                    print_u64(bsz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(bpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(bpe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(bpe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(bpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged basesrv.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // winsrv.dll — csrss's ServerDll=winsrv. Parsed from the SRVBUF (size at STORAGE_SHARED+0x48,
+    // bytes at SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET); consumed by the csrss ServerDll load path.
+    let winsrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let wsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x48) as *const u32) as usize;
+        if wsz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET) as *const u8,
+                wsz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(wpe) => {
+                    print_str(b"[ntos-exec] staged winsrv.dll: ");
+                    print_u64(wsz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(wpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(wpe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(wpe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(wpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged winsrv.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // basesrv.dll + winsrv.dll are STAGED + parsed, ready for the DLL load-path. Loading them via the
+    // same NtOpenFile→NtCreateSection→NtQuerySection→NtMapViewOfSection→demand-page path as csrsrv
+    // works, BUT winsrv (~400 KiB → ~100 pages) plus basesrv overflows the root CNode slot budget
+    // (each demand-page consumes a frame + copy-caps; copy_cap fails past the CNode) → the executive
+    // itself faults. That needs a bigger root CNode (boot cnode_size_bits/CNODE_RADIX) or slot
+    // recycling in the demand-page path before the ServerDll load can be enabled.
+    let _ = (&basesrv_pe, &winsrv_pe);
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -3874,6 +3954,7 @@ unsafe fn spawn_storage_host(
     shared_frame: u64,
     filebuf_start: u64,
     ntdllbuf_start: u64,
+    srvbuf_start: u64,
     nls_ansi_start: u64,
     nls_oem_start: u64,
     nls_case_start: u64,
@@ -3932,6 +4013,14 @@ unsafe fn spawn_storage_host(
     for i in 0..NTDLLBUF_FRAMES {
         let nb_cp = copy_cap(ntdllbuf_start + i);
         let _ = page_map(nb_cp, NTDLLBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    // The server-DLL buffer (basesrv.dll + winsrv.dll, its own PT), same pattern.
+    let sb_pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, sb_pt);
+    let _ = paging_struct_map(sb_pt, LBL_X86_PAGE_TABLE_MAP, SRVBUF_VADDR, pml4);
+    for i in 0..SRVBUF_FRAMES {
+        let sb_cp = copy_cap(srvbuf_start + i);
+        let _ = page_map(sb_cp, SRVBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
     // The NLS + SYSTEM-hive buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
     for (start, vaddr, frames) in [
@@ -4664,6 +4753,7 @@ unsafe fn storage_probe(
     smss_dest: u64,
     imports_dest: u64,
     ntdll_dest: u64,
+    srvbuf_dest: u64,
     nls_ansi_dest: u64,
     nls_oem_dest: u64,
     nls_case_dest: u64,
@@ -4831,6 +4921,32 @@ unsafe fn storage_probe(
                     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x40) as *mut u32, rsz);
                     print_str(b"[storage-host] CSRSRV.DLL size=");
                     print_u64(rsz as u64);
+                    print_str(b"\n");
+                }
+            }
+        }
+        // basesrv.dll — csrss's ServerDll=basesrv. Staged into the SRVBUF (offset 0), size at
+        // STORAGE_SHARED+0x44; the executive parses+maps it into csrss's VSpace on the DLL load.
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"BASESRV DLL") {
+            if sz > 0 && sz <= (WINSRV_SRVBUF_OFFSET as u32) {
+                let got = fat_read_file(&fs, c, sz, srvbuf_dest + BASESRV_SRVBUF_OFFSET);
+                if got == sz {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x44) as *mut u32, sz);
+                    print_str(b"[storage-host] BASESRV.DLL size=");
+                    print_u64(sz as u64);
+                    print_str(b"\n");
+                }
+            }
+        }
+        // winsrv.dll — csrss's ServerDll=winsrv. Staged into the SRVBUF (past basesrv, +0x10000),
+        // size at STORAGE_SHARED+0x48; the executive parses+maps it into csrss's VSpace.
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WINSRV  DLL") {
+            if sz > 0 && sz <= ((SRVBUF_FRAMES * 0x1000) as u32 - WINSRV_SRVBUF_OFFSET as u32) {
+                let got = fat_read_file(&fs, c, sz, srvbuf_dest + WINSRV_SRVBUF_OFFSET);
+                if got == sz {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x48) as *mut u32, sz);
+                    print_str(b"[storage-host] WINSRV.DLL size=");
+                    print_u64(sz as u64);
                     print_str(b"\n");
                 }
             }
@@ -6114,6 +6230,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..NTDLLBUF_FRAMES {
                 let _ = page_map(copy_cap(nb_start + i), NTDLLBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // The server-DLL buffer (basesrv.dll + winsrv.dll, its own PT), mapped in the executive
+            // too so it can parse them for the csrss ServerDll load path.
+            let sb_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, sb_pt);
+            let _ = paging_struct_map(sb_pt, LBL_X86_PAGE_TABLE_MAP, SRVBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+            let srvbuf_start = alloc_frame();
+            for _ in 1..SRVBUF_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..SRVBUF_FRAMES {
+                let _ = page_map(copy_cap(srvbuf_start + i), SRVBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
             // in the executive too, and remember their cap bases for spawn_sec_image to share into
             // smss.
@@ -6164,6 +6292,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 shared,
                 fb_start,
                 nb_start,
+                srvbuf_start,
                 nls_starts[0],
                 nls_starts[1],
                 nls_starts[2],
