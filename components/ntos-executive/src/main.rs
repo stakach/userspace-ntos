@@ -1464,6 +1464,7 @@ unsafe fn spawn_sec_image(
     ntdll_base: u64,
     setup_env: bool,
     prio: u64,
+    scr_base: u64,
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
@@ -1517,7 +1518,13 @@ unsafe fn spawn_sec_image(
         // then failed because 0x6E_0000 was still mapped to the TEB frame, the fill wrote real
         // bytes into the TEB (not the fresh frame), and the fresh frame stayed zero → the ntdll
         // page mapped as zeros. 0x74_0000 is clear of the whole scratch span.
-        let scr = 0x0000_0100_0074_0000u64;
+        //
+        // These executive scratch mappings (scr+0x0/0x1000/0x2000/0x3000/0x5000) are NEVER unmapped
+        // — they only exist to populate the frames before copy_cap'ing them into the process. So a
+        // SECOND spawn (csrss) MUST use a distinct scr_base (both fit in the FILEBUF PT 0x60-0x80),
+        // or its env writes would land in the first process's still-mapped frames and leave csrss's
+        // env pages zero → a null-deref in its trampoline.
+        let scr = scr_base;
         // TEB: self @0x30, PEB @0x60.
         let teb = alloc_frame();
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -2767,12 +2774,13 @@ unsafe fn service_sec_image(
                     // service EP tagged with that badge, so this loop multiplexes it against smss.
                     let cf_c = mint_badged(fault_ep, CSRSS_BADGE);
                     let cpe = csrss_pe.as_ref().unwrap();
-                    // Priority 100 (== smss). At equal priority csrss doesn't preempt, so it only
-                    // runs once smss blocks (e.g. waiting on csrss) — the natural NT flow. (A brief
-                    // prio-101 experiment confirmed the multiplex mechanism: csrss's fault reaches
-                    // THIS loop badge-routed. But 101 starves smss's own LIVE-run checks, and csrss's
-                    // env is corrupted by a spawn_sec_image scratch collision — both fixed next.)
-                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 100);
+                    // Priority 101 (above smss's 100) so csrss actually gets scheduled: at equal
+                    // priority smss + the executive ping-pong and csrss never runs. csrss preempts
+                    // when runnable but blocks on every demand-fault (serviced by THIS loop, badge 2),
+                    // which hands smss its turns — so both make progress and smss's own checks still
+                    // pass. csrss uses a DISTINCT env-build scratch (0x78_0000, vs smss's 0x74_0000)
+                    // so its trampoline/PEB/params frames aren't clobbered by smss's still-mapped ones.
+                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000);
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     pml4s[1] = cpml4;
@@ -3146,7 +3154,10 @@ unsafe fn service_sec_image(
         }
     }
     print_str(b"\n");
-    (verdict, faults, first, stop, ntfaults, stop_ssn)
+    // Report smss's (slot 0) own fault stats regardless of which process stopped the loop — csrss
+    // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
+    // exec_reactos_smss_* checks are about smss specifically. csrss's counts are in the sec-stop line.
+    (verdict, pfaults[0], pfirst[0], stop, pntfaults[0], stop_ssn)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -4934,7 +4945,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000);
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -5959,7 +5970,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100);
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
