@@ -1822,6 +1822,47 @@ unsafe fn scratch_for(va: u64, filled_pages: &[u64], nfilled: usize, scratch_bas
     }
     None
 }
+/// Write a u64 OUT-param to a csrss VA that may live ANYWHERE in its VSpace — not just the
+/// stack/heap/image mirrors, but also a csrsrv .data global (~0x8001xxxx). Tries the mirrors
+/// (smss_copyout), then an already-faulted page's scratch alias, then — for a not-yet-faulted csrsrv
+/// page — demand-fills it and writes. csrss stores load-bearing handles/bases here (the CSR section
+/// handle, CsrSrvSharedSectionBase), so a silent miss leaves them NULL and later NULL-derefs.
+unsafe fn csrss_out_write(
+    va: u64,
+    val: u64,
+    filled_pages: &mut [u64; 256],
+    faults: &mut u64,
+    scratch_base: u64,
+    csrsrv_base: u64,
+    csrsrv_pe: &Option<nt_pe_loader::PeFile>,
+    pml4: u64,
+) {
+    if smss_copyout(va, &val.to_le_bytes()) {
+        return;
+    }
+    let page = va & !0xFFFu64;
+    let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
+    if sva.is_none()
+        && csrsrv_base != 0
+        && csrsrv_pe.is_some()
+        && page >= csrsrv_base
+        && page < csrsrv_base + image_extent(csrsrv_pe.as_ref().unwrap())
+        && (*faults as usize) < filled_pages.len()
+    {
+        let scratch = scratch_base + *faults * 0x1000;
+        let f = alloc_frame();
+        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let rights =
+            fill_image_page(csrsrv_pe.as_ref().unwrap(), (page - csrsrv_base) as u32, scratch);
+        let _ = page_map(copy_cap(f), page, rights, pml4);
+        filled_pages[*faults as usize] = page;
+        sva = Some(scratch + (va & 0xFFF));
+        *faults += 1;
+    }
+    if let Some(m) = sva {
+        core::ptr::write_volatile(m as *mut u64, val);
+    }
+}
 /// Read a UTF-16LE UNICODE_STRING (given its byte Length + Buffer VA) from smss into a UTF-16
 /// code-unit Vec. Caps at 1024 code units. Empty on any copyin failure.
 unsafe fn smss_read_unicode(buffer_va: u64, byte_len: u16) -> alloc::vec::Vec<u16> {
@@ -2921,36 +2962,8 @@ unsafe fn service_sec_image(
                 // it to the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record
                 // the handle so NtCreateProcess can spawn the real csrss image from it.
                 let out = get_recv_mr(9); // R10 = *SectionHandle
-                // *SectionHandle can live outside the stack/heap/image mirrors — e.g. a csrsrv global
-                // (csrss stores the CSR section handle in csrsrv .data at ~0x8001xxxx). Write via the
-                // right mirror; if it's a demand-paged csrsrv page not yet faulted, fill it first.
-                if !smss_copyout(out, &next_handle.to_le_bytes()) {
-                    let out_page = out & !0xFFFu64;
-                    let mut sva = scratch_for(out, &filled_pages, faults as usize, scratch_base);
-                    if sva.is_none()
-                        && csrsrv_base != 0
-                        && csrsrv_pe.is_some()
-                        && out_page >= csrsrv_base
-                        && out_page < csrsrv_base + image_extent(csrsrv_pe.as_ref().unwrap())
-                        && (faults as usize) < filled_pages.len()
-                    {
-                        let scratch = scratch_base + faults * 0x1000;
-                        let f = alloc_frame();
-                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                        let rights = fill_image_page(
-                            csrsrv_pe.as_ref().unwrap(),
-                            (out_page - csrsrv_base) as u32,
-                            scratch,
-                        );
-                        let _ = page_map(copy_cap(f), out_page, rights, pml4);
-                        filled_pages[faults as usize] = out_page;
-                        sva = Some(scratch + (out & 0xFFF));
-                        faults += 1;
-                    }
-                    if let Some(m) = sva {
-                        core::ptr::write_volatile(m as *mut u64, next_handle);
-                    }
-                }
+                // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
+                csrss_out_write(out, next_handle, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
                 let sec_file = smss_stack_read(sp + 0x38);
                 if csrss_file_handle != 0 && sec_file == csrss_file_handle {
                     csrss_section_handle = next_handle;
@@ -3005,10 +3018,11 @@ unsafe fn service_sec_image(
                         let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, CSRSRV_BASE, pml4);
                         csrsrv_base = CSRSRV_BASE;
                     }
-                    smss_stack_write(get_recv_mr(7), CSRSRV_BASE); // *BaseAddress
+                    let ext = image_extent(csrsrv_pe.as_ref().unwrap());
+                    csrss_out_write(get_recv_mr(7), CSRSRV_BASE, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4); // *BaseAddress
                     let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                     if vs_ptr != 0 {
-                        smss_stack_write(vs_ptr, image_extent(csrsrv_pe.as_ref().unwrap()));
+                        csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection csrsrv.dll -> base 0x80000000\n");
                     // result = 0 (SUCCESS)
@@ -3031,10 +3045,12 @@ unsafe fn service_sec_image(
                         }
                         csrss_anon_base = CSRSS_ANON_BASE;
                     }
-                    smss_stack_write(get_recv_mr(7), csrss_anon_base); // *BaseAddress
+                    // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
+                    // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
+                    csrss_out_write(get_recv_mr(7), csrss_anon_base, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
                     let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
                     if vs_ptr != 0 {
-                        smss_stack_write(vs_ptr, csrss_anon_size);
+                        csrss_out_write(vs_ptr, csrss_anon_size, &mut filled_pages, &mut faults, scratch_base, csrsrv_base, &csrsrv_pe, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
                     print_hex((csrss_anon_base >> 32) as u32);
