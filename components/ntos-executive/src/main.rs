@@ -194,6 +194,8 @@ pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
+/// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
+pub const SSN_NT_OPEN_SECTION: u64 = 131;
 /// NtCreateProcess — smss spawns csrss from the SEC_IMAGE section (SmpExecuteImage). Not serviced
 /// yet (the real spawn is the next step) — a diagnostic verifies the file→section→process chain.
 pub const SSN_NT_CREATE_PROCESS: u64 = 49;
@@ -3490,6 +3492,18 @@ unsafe fn service_sec_image(
                 let out = get_recv_mr(2); // RCX = *Handle
                 smss_stack_write(out, next_handle);
                 next_handle += 1;
+            } else if m0 == SSN_NT_OPEN_SECTION {
+                // NtOpenSection(*SectionHandle[R10], DesiredAccess[RDX], *ObjectAttributes[R8]).
+                // CsrServerInitialization opens named sections. Log the requested name (folded to
+                // printable ASCII) and return NOT_FOUND for now, so we can see which section csrss
+                // wants before deciding whether it's load-bearing.
+                let name16 = smss_read_objattr_name(get_recv_mr(7)); // R8 = *ObjectAttributes
+                print_str(b"[ntos-exec] NtOpenSection name=\"");
+                for &w in name16.iter().take(96) {
+                    debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
+                }
+                print_str(b"\"\n");
+                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
             } else if m0 == SSN_NT_CREATE_SECTION {
                 // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
                 // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
