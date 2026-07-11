@@ -1485,6 +1485,8 @@ unsafe fn spawn_sec_image(
     prio: u64,
     scr_base: u64,
     stack_mirror: u64,
+    image_path: &[u8],
+    cmd_line: &[u8],
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
@@ -1644,12 +1646,14 @@ unsafe fn spawn_sec_image(
             }
             (s.len() * 2) as u16
         };
-        // (unicode_string field offset, scratch buffer offset, smss buffer VA offset, text)
+        // (unicode_string field offset, scratch buffer offset, smss buffer VA offset, text).
+        // ImagePathName + CommandLine are per-process (smss vs csrss) — the loader derives the DLL
+        // search + the ".local" SxS probe from ImagePathName, and the image's entry parses CommandLine.
         let ustrs: [(u64, u64, &[u8]); 4] = [
-            (0x38, 0x300, b"C:\\Windows"),                       // CurrentDirectory.DosPath
-            (0x50, 0x340, b"C:\\Windows\\System32"),             // DllPath
-            (0x60, 0x3A0, b"\\SystemRoot\\System32\\smss.exe"),  // ImagePathName
-            (0x70, 0x420, b"smss.exe"),                          // CommandLine
+            (0x38, 0x300, b"C:\\Windows"),           // CurrentDirectory.DosPath
+            (0x50, 0x340, b"C:\\Windows\\System32"), // DllPath
+            (0x60, 0x3A0, image_path),               // ImagePathName
+            (0x70, 0x480, cmd_line),                 // CommandLine
         ];
         for (foff, boff, text) in ustrs {
             let len = wstr(pp + boff, text);
@@ -2855,7 +2859,15 @@ unsafe fn service_sec_image(
                     // which hands smss its turns — so both make progress and smss's own checks still
                     // pass. csrss uses a DISTINCT env-build scratch (0x78_0000, vs smss's 0x74_0000)
                     // so its trampoline/PEB/params frames aren't clobbered by smss's still-mapped ones.
-                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000, CSRSS_STACK_MIRROR_VA);
+                    // csrss's OWN process parameters (not smss's): its System32 image path drives
+                    // the loader's DLL search + ".local" SxS probe, and its Server command line
+                    // (ObjectDirectory/ServerDll=…) is what csrss.exe's entry parses once loaded.
+                    const CSRSS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\csrss.exe";
+                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ServerDll=csrsrv ProfileControl=Off MaxRequestThreads=16";
+                    let cpml4 = spawn_sec_image(
+                        cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000,
+                        CSRSS_STACK_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
+                    );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     pml4s[1] = cpml4;
@@ -5050,7 +5062,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -6075,7 +6087,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA);
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
