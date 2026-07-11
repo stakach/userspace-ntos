@@ -149,6 +149,8 @@ pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 /// ntdll's NtQueryVirtualMemory SSN (LdrpInitialize queries the region at [TEB+0x10] early).
 pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
+/// ntdll's NtQuerySystemTime SSN (csrss init reads the clock during CsrServerInitialization).
+pub const SSN_NT_QUERY_SYSTEM_TIME_SVC: u64 = 182;
 /// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
 pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
 /// ntdll's NtOpenKey SSN (LdrpInitialize opens IFEO/options; we have no registry → not-found).
@@ -3506,6 +3508,23 @@ unsafe fn service_sec_image(
                     smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
                     smss_stack_write(retlen_ptr, 0x40);
                 }
+            } else if m0 == SSN_NT_QUERY_SYSTEM_TIME_SVC {
+                // NtQuerySystemTime(PLARGE_INTEGER SystemTime). arg0=R10=SystemTime out-ptr. Return
+                // a non-zero, monotonic 64-bit clock (kernel HPET counter) so csrss's init timing
+                // is plausible. csrss's out-ptr is an arbitrary VA → csrss_out_write; smss's is a
+                // stack local → smss_stack_write.
+                let out = get_recv_mr(9); // R10 = SystemTime
+                // Read a monotonic clock DIRECTLY (rdtsc) — do NOT call native_syscall here: that
+                // issues a raw `syscall` from the executive (the rootserver, which has no fault
+                // handler), so an unrecognised number faults as UnknownSyscall and the kernel
+                // suspends the executive (deadlocking the fault loop). rdtsc is a plain instruction,
+                // always valid in ring 3, giving a non-zero monotonic value for csrss init timing.
+                let now = core::arch::x86_64::_rdtsc();
+                if badge == CSRSS_BADGE {
+                    csrss_out_write(out, now, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
+                } else {
+                    smss_stack_write(out, now);
+                }
             } else if m0 == SSN_NT_QUERY_VIRTUAL_MEM {
                 // NtQueryVirtualMemory(Process, BaseAddress, Class, Buffer, Len, *RetLen).
                 // LdrpInitialize queries MemoryBasicInformation (class 0) for [TEB+0x10]. Return a
@@ -4116,7 +4135,10 @@ unsafe fn service_sec_image(
                 let iosb = m3; // RDX = *IO_STATUS_BLOCK { Status@+0, Information@+8 }
                 let buf = get_recv_mr(7); // R8 = FsInformation
                 let len = get_recv_mr(8); // R9 = Length
-                let class = smss_stack_read(sp + 0x28); // arg4 = FsInformationClass
+                // FsInformationClass is a ULONG (32-bit enum); the 8-byte stack slot carries stack
+                // garbage in its high dword, so mask to 32 bits (else `class == 4` never matches and
+                // csrss gets a zeroed FileFsDeviceInformation → a bad path → thread suspend).
+                let class = smss_stack_read(sp + 0x28) & 0xFFFF_FFFF; // arg4 = FsInformationClass
                 let mut info_bytes: u64 = 0;
                 if class == 4 {
                     // FileFsDeviceInformation { DeviceType(u32), Characteristics(u32) }.
