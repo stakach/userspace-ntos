@@ -3052,6 +3052,38 @@ unsafe fn service_sec_image(
             .unwrap_or((0, 0));
         reg.register(dll_seed[i], sz, ent);
     }
+    // Pre-relocate each registry DLL to its fixed registry base + patch OptionalHeader.ImageBase to
+    // match. Our fake NtMapViewOfSection does NOT relocate SEC_IMAGE views — real Windows relocates
+    // an image section in the kernel at map time, so ntdll's loader trusts it's done and skips its own
+    // relocation. So WE must relocate, or a DLL that dereferences an absolute pointer during init
+    // faults (advapi32_vista read an un-relocated ImageBase+0x7000). Relocating to a FIXED base also
+    // makes each DLL's executable text byte-identical across processes → correctly shared read-only.
+    // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
+    // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
+    // ImageBase == mapped base and doesn't double-relocate.
+    let dll_buf_va: [u64; 13] = [
+        FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET,
+        SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET,
+        SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET,
+        WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + KERNEL32_VISTA_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET,
+    ];
+    for i in 0..13 {
+        if let Some(pe) = dll_pes[i].as_ref() {
+            let base = reg.base(i);
+            apply_relocations_to_buf(pe, dll_buf_va[i], base);
+            let e_lfanew = core::ptr::read_volatile((dll_buf_va[i] + 0x3c) as *const u32) as u64;
+            core::ptr::write_volatile((dll_buf_va[i] + e_lfanew + 0x30) as *mut u64, base);
+        }
+    }
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
