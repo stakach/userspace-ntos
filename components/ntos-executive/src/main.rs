@@ -254,6 +254,13 @@ pub const FILEBUF_FRAMES: u64 = 32;
 /// 128 KiB buffer — no separate buffer needed. The storage host reads it here and writes its size
 /// to STORAGE_SHARED+0x3c; the executive parses the PE from FILEBUF_VADDR+CSRSS_FILEBUF_OFFSET.
 pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 KiB smss
+/// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
+/// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
+pub const CSRSS_BADGE: u64 = 2;
+/// csrss's demand-fault scratch region in the executive's VSpace — a non-overlapping window inside
+/// smss's already-mapped 8-PT scratch range (smss uses [0x1_0100_0000 .. +256 pages]; PT k=4 backs
+/// this), so no extra page tables are needed.
+pub const CSRSS_SCRATCH_BASE: u64 = 0x0000_0100_0180_0000;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_00A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -429,6 +436,14 @@ unsafe fn alloc_frame() -> u64 {
 unsafe fn copy_cap(src: u64) -> u64 {
     let d = alloc_slot();
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, d, src, 0);
+    d
+}
+/// Mint a copy of `src` carrying `badge`. For an endpoint cap, the badge is delivered to the
+/// receiver on every message/fault sent through it — the 2-process service loop mints each hosted
+/// thread's fault cap with a distinct badge so it can tell whose fault this is.
+unsafe fn mint_badged(src: u64, badge: u64) -> u64 {
+    let d = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, d, src, badge);
     d
 }
 
@@ -779,6 +794,32 @@ unsafe fn reply_recv_full(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u6
         options(nostack),
     );
     (msginfo, mr0, mr1, mr2, mr3)
+}
+
+/// Like [`reply_recv_full`] but also returns the RECEIVED cap's badge (rdi on return). The
+/// 2-process service loop mints each hosted thread's fault-endpoint cap with a distinct badge
+/// (smss=0, csrss=CSRSS_BADGE) so it can tell whose fault/syscall this is and select that
+/// process's VSpace/image/scratch state.
+unsafe fn reply_recv_badge(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_REPLY_RECV as u64,
+        inout("rdi") recv_ep => badge,
+        inout("rsi") reply_len => msginfo,
+        inout("r10") r0 => mr0,
+        inout("r8") r1 => mr1,
+        inout("r9") r2 => mr2,
+        inout("r15") r3 => mr3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (badge, msginfo, mr0, mr1, mr2, mr3)
 }
 
 unsafe fn set_reply_mr(i: usize, v: u64) {
@@ -1422,6 +1463,7 @@ unsafe fn spawn_sec_image(
     fault_ep_c: u64,
     ntdll_base: u64,
     setup_env: bool,
+    prio: u64,
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
@@ -1663,7 +1705,7 @@ unsafe fn spawn_sec_image(
     if setup_env {
         let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
     }
-    let _ = tcb_set_priority(tcb, 100);
+    let _ = tcb_set_priority(tcb, prio);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4
@@ -2378,7 +2420,21 @@ unsafe fn service_sec_image(
     // panics. Rewinding to this mark each iteration reclaims all per-syscall transients while
     // leaving the persistent state (below the mark) intact.
     let heap_mark = allocator::mark();
-    let (_z, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
+    // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
+    // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
+    // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
+    // is filled in when NtCreateProcess spawns it; until then only slot 0 (smss) is live. The `mut`
+    // working locals (pml4/scratch_base/img_end/pe via shadowing, faults/first/ntfaults/filled_pages)
+    // are LOADED from these at the top of each iteration and SAVED back before each recv, so the
+    // ~30 body references stay unchanged.
+    let mut pml4s = [pml4, 0u64];
+    let mut scratch_bases = [scratch_base, 0u64];
+    let mut img_ends = [img_end, 0u64];
+    let mut pfaults = [0u64; 2];
+    let mut pfirst = [0u64; 2];
+    let mut pntfaults = [0u64; 2];
+    let mut pfilled = [[0u64; 256]; 2];
+    let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
     loop {
         // SAFETY: every allocation made past `heap_mark` belongs to the previous iteration's
         // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
@@ -2394,6 +2450,19 @@ unsafe fn service_sec_image(
             stop = m1;
             break;
         }
+        // Select the hosted process this fault/syscall came from (0 = smss, CSRSS_BADGE = csrss) and
+        // LOAD its state into the working locals. pml4/scratch_base/img_end/pe are immutable per
+        // process (shadow the params); faults/first/ntfaults/filled_pages are mutable (SAVED back
+        // before every recv below).
+        let pi = if badge == CSRSS_BADGE { 1 } else { 0 };
+        let pml4 = pml4s[pi];
+        let scratch_base = scratch_bases[pi];
+        let img_end = img_ends[pi];
+        let pe: &nt_pe_loader::PeFile = if pi == 1 { csrss_pe.as_ref().unwrap() } else { pe };
+        faults = pfaults[pi];
+        first = pfirst[pi];
+        ntfaults = pntfaults[pi];
+        filled_pages = pfilled[pi];
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
         // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
@@ -2406,7 +2475,9 @@ unsafe fn service_sec_image(
                 if fip >= nb && fip < nb + image_extent(npe) {
                     if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
                         // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
-                        let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 3, fip + 3, m1, m2, 0);
+                        pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 3, fip + 3, m1, m2, 0);
+                        badge = nb;
                         mi = nmi;
                         m0 = nm0;
                         m1 = nm1;
@@ -2437,7 +2508,9 @@ unsafe fn service_sec_image(
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
                 faults += 1;
-                let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
+                pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                badge = nb;
                 mi = nmi;
                 m0 = nm0;
                 m1 = nm1;
@@ -2519,7 +2592,9 @@ unsafe fn service_sec_image(
                 filled_pages[faults as usize] = page;
             }
             faults += 1;
-            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
+            pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+            badge = nb;
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -2688,16 +2763,28 @@ unsafe fn service_sec_image(
                 // on its first page, while smss gets a real process handle and proceeds.
                 let sect = smss_stack_read(sp + 0x30);
                 if csrss_section_handle != 0 && sect == csrss_section_handle && csrss_pe.is_some() {
-                    let cf = make_object(OBJ_ENDPOINT);
-                    let cf_c = copy_cap(cf);
-                    let _cpml4 = spawn_sec_image(csrss_pe.as_ref().unwrap(), cf_c, NTDLL_BASE, true);
+                    // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
+                    // service EP tagged with that badge, so this loop multiplexes it against smss.
+                    let cf_c = mint_badged(fault_ep, CSRSS_BADGE);
+                    let cpe = csrss_pe.as_ref().unwrap();
+                    // Priority 100 (== smss). At equal priority csrss doesn't preempt, so it only
+                    // runs once smss blocks (e.g. waiting on csrss) — the natural NT flow. (A brief
+                    // prio-101 experiment confirmed the multiplex mechanism: csrss's fault reaches
+                    // THIS loop badge-routed. But 101 starves smss's own LIVE-run checks, and csrss's
+                    // env is corrupted by a spawn_sec_image scratch collision — both fixed next.)
+                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 100);
+                    // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
+                    // ITS VSpace/image and a private scratch window.
+                    pml4s[1] = cpml4;
+                    img_ends[1] = PE_LOAD_BASE + image_extent(cpe);
+                    scratch_bases[1] = CSRSS_SCRATCH_BASE;
                     csrss_process_handle = next_handle;
                     smss_stack_write(get_recv_mr(9), next_handle); // *ProcessHandle (R10)
                     next_handle += 1;
-                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss SEC_IMAGE process -> 0x");
+                    print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
-                    print_str(b" (blocks on its first fault; 2-proc service loop is next)\n");
+                    print_str(b"; its faults now multiplexed into this loop\n");
                     // result stays 0 (SUCCESS)
                 } else {
                     handled = false; // not the csrss section / not staged -> clean stop
@@ -2981,7 +3068,9 @@ unsafe fn service_sec_image(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 18, result, m1, 0, m3);
+            pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 18, result, m1, 0, m3);
+            badge = nb;
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -2993,9 +3082,16 @@ unsafe fn service_sec_image(
         break;
     }
     if csrss_process_handle != 0 {
-        print_str(b"[sec-stop] (csrss process was spawned, handle 0x");
+        print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
         print_hex(csrss_process_handle as u32);
-        print_str(b")\n");
+        print_str(b"; demand-paged ");
+        print_u64(pfaults[1]);
+        print_str(b" page(s) (");
+        print_u64(pntfaults[1]);
+        print_str(b" in ntdll), first fault=0x");
+        print_hex((pfirst[1] >> 32) as u32);
+        print_hex(pfirst[1] as u32);
+        print_str(b"\n");
     }
     print_str(b"[sec-stop] label=");
     print_u64(mi >> 12);
@@ -4838,7 +4934,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100);
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -5863,7 +5959,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true);
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
