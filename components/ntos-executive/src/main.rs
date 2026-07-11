@@ -4065,10 +4065,13 @@ unsafe fn service_sec_image(
                         (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
                 }
             } else if m0 == SSN_NT_QUERY_DEBUG_FILTER_STATE {
-                // Return TRUE so ntdll's DbgPrintEx does not filter out component traces
-                // (rtl/debug.c:66 compares the result against (NTSTATUS)TRUE=1). Unmasks the
-                // SXS/LDR loader diagnostics that pinpoint the failing internal step.
-                result = 1;
+                // Return FALSE (filter disabled) — the state of a machine with no kernel debugger
+                // attached, where DbgPrintEx suppresses the message and returns without formatting
+                // it. We returned TRUE earlier to unmask the SXS/LDR loader diagnostics, but the DLL
+                // load phase is done; keeping it TRUE now makes ntdll format a DbgPrint message whose
+                // string pointer is a null-relative garbage value in our partial process env (a
+                // strnlen over 0x100 → VMFault). Suppressing the trace is the correct no-op.
+                result = 0;
             } else if m0 == SSN_NT_FREE_VM
                 || m0 == SSN_NT_SET_INFO_THREAD
                 || m0 == SSN_NT_SET_INFO_PROCESS
