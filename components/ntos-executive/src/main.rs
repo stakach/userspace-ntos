@@ -135,6 +135,10 @@ pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early
 /// below the heap mirror and SHARES its 0x80-0xA0 page table (no extra PT).
 pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_0080_0000;
 pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 KiB)
+/// csrss's own image mirror — its loader reads import-descriptor DLL names ("csrsrv.dll") from its
+/// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
+/// (inside the NTDLLBUF page table, 0xA0-0xC0). ACTIVE_IMAGE_MIRROR selects by the current badge.
+pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_00B0_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -393,6 +397,9 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 /// The 2-process service loop sets this at the top of each iteration (smss vs csrss) so the shared
 /// smss_stack_read/write helpers read+write the RIGHT process's stack.
 static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
+/// Executive image-mirror base for the process currently being serviced (smss vs csrss), so the
+/// shared copyin path reads import-descriptor DLL names etc. from the RIGHT process's image.
+static ACTIVE_IMAGE_MIRROR: AtomicU64 = AtomicU64::new(IMAGE_MIRROR_VA);
 
 // Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
 // `NativeService` classification via `NativeServiceTable`; a real isolated ntdll
@@ -1750,9 +1757,10 @@ unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
     } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA))
     } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
-        // Image .rdata/.data — only valid once the page has been demand-faulted (smss reads a
-        // static string, faulting+mirroring its page, before passing it to a syscall).
-        Some(IMAGE_MIRROR_VA + (va - PE_LOAD_BASE))
+        // Image .rdata/.idata/.data — only valid once the page has been demand-faulted (the process
+        // reads a static string, faulting+mirroring its page, before passing it to a syscall). Uses
+        // the ACTIVE process's image mirror so csrss's import-descriptor names read from ITS image.
+        Some(ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed) + (va - PE_LOAD_BASE))
     } else {
         None
     }
@@ -2466,7 +2474,7 @@ unsafe fn service_sec_image(
     } else {
         None
     };
-    let _ = &csrsrv_pe; // consumed by the DLL load-path (STAGE 2)
+    let _ = &csrsrv_pe; // consumed by the DLL load-path (STAGE 2: section/map/reloc/imports)
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -2518,6 +2526,10 @@ unsafe fn service_sec_image(
         // own stack, not the other process's.
         ACTIVE_STACK_MIRROR.store(
             if pi == 1 { CSRSS_STACK_MIRROR_VA } else { SMSS_STACK_MIRROR_VA },
+            Ordering::Relaxed,
+        );
+        ACTIVE_IMAGE_MIRROR.store(
+            if pi == 1 { CSRSS_IMAGE_MIRROR_VA } else { IMAGE_MIRROR_VA },
             Ordering::Relaxed,
         );
         let pml4 = pml4s[pi];
@@ -2650,7 +2662,8 @@ unsafe fn service_sec_image(
             if base == PE_LOAD_BASE {
                 let off = page - PE_LOAD_BASE;
                 if off < IMAGE_MIRROR_WINDOW {
-                    let _ = page_map(copy_cap(f), IMAGE_MIRROR_VA + off, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+                    let _ = page_map(copy_cap(f), mirror + off, RW_NX, CAP_INIT_THREAD_VSPACE);
                 }
             }
             if (faults as usize) < filled_pages.len() {
@@ -3030,11 +3043,15 @@ unsafe fn service_sec_image(
                 // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
                 // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
                 let is_csrss = nb[..nlen].windows(5).any(|w| w == b"csrss");
-                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss {
+                // csrss's loader opens csrsrv.dll (its static import) to map it. Distinct from "csrss"
+                // (position 4 differs), so the two matches don't collide.
+                let is_csrsrv = nb[..nlen].windows(6).any(|w| w == b"csrsrv");
+                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32) || is_csrss || is_csrsrv {
                     smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
                     if is_csrss {
                         csrss_file_handle = next_handle; // remember it for NtCreateSection
                     }
+                    // (is_csrsrv: STAGE 2 will track this handle for NtCreateSection + NtMapViewOfSection)
                     next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                     if iosb != 0 {
@@ -3059,7 +3076,9 @@ unsafe fn service_sec_image(
                     nb[nlen] = (w as u8).to_ascii_lowercase();
                     nlen += 1;
                 }
-                if nb[..nlen].windows(5).any(|w| w == b"csrss") {
+                if nb[..nlen].windows(5).any(|w| w == b"csrss")
+                    || nb[..nlen].windows(6).any(|w| w == b"csrsrv")
+                {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                 } else {
