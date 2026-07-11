@@ -3824,7 +3824,19 @@ unsafe fn service_sec_image(
                     // the loader's DLL search + ".local" SxS probe, and its Server command line
                     // (ObjectDirectory/ServerDll=…) is what csrss.exe's entry parses once loaded.
                     const CSRSS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\csrss.exe";
-                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ServerDll=csrsrv ProfileControl=Off MaxRequestThreads=16";
+                    // TEMP (Phase 0b): drop the two `ServerDll=winsrv:...` entries. winsrv is the
+                    // Win32 GUI server; its UserServerDllInitialization issues win32k NtUser/NtGdi
+                    // syscalls (SSN >= 0x1000) that we have no graphics subsystem to service — a
+                    // benign-success stub makes it null-deref the fake HWND/HDESK return. Skipping
+                    // winsrv makes CsrParseServerCommandLine load only basesrv + csrsrv (neither
+                    // touches win32k) so csrss reaches csrsrv's CsrApiPortInitialize / \SmApiPort +
+                    // the SM<->CSR handshake, which csrsrv owns independently of winsrv. Real winsrv
+                    // init returns once win32k is hosted (Phase 2).
+                    // (`ServerDll=csrsrv` is NOT listed: csrsrv is ServerDll index 0, loaded
+                    // implicitly by CsrServerInitialization itself. Listing it fails CsrLoadServerDll
+                    // with STATUS_INVALID_PARAMETER — it has no ServerId. The real ReactOS command
+                    // line omits it too; it was only masked before by winsrv crashing first.)
+                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
