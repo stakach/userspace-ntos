@@ -298,6 +298,7 @@ pub const WS2_32_WIN32BUF_OFFSET: u64 = 0x620000;         // ws2_32 ~93 KiB
 pub const KERNEL32_VISTA_WIN32BUF_OFFSET: u64 = 0x640000; // kernel32_vista ~32 KiB
 pub const ADVAPI32_VISTA_WIN32BUF_OFFSET: u64 = 0x650000; // advapi32_vista ~23 KiB
 pub const WS2HELP_WIN32BUF_OFFSET: u64 = 0x660000;        // ws2help ~14 KiB
+pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000;    // ntdll_vista ~56 KiB (ends 0x67E000)
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -3040,6 +3041,37 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    let ntdll_vista_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x78) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + NTDLL_VISTA_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged ntdll_vista.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(pe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged ntdll_vista.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -3049,16 +3081,17 @@ unsafe fn service_sec_image(
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
     // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
     // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; 13] = [
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; 14] = [
         &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
         &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
+        &ntdll_vista_pe,
     ];
-    let dll_seed: [&[u8]; 13] = [
+    let dll_seed: [&[u8]; 14] = [
         b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
-        b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help",
+        b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help", b"ntdll_vista",
     ];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..13 {
+    for i in 0..14 {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
@@ -3074,7 +3107,7 @@ unsafe fn service_sec_image(
     // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
     // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
     // ImageBase == mapped base and doesn't double-relocate.
-    let dll_buf_va: [u64; 13] = [
+    let dll_buf_va: [u64; 14] = [
         FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET,
         SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET,
         SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET,
@@ -3088,8 +3121,9 @@ unsafe fn service_sec_image(
         WIN32BUF_VADDR + KERNEL32_VISTA_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + NTDLL_VISTA_WIN32BUF_OFFSET,
     ];
-    for i in 0..13 {
+    for i in 0..14 {
         if let Some(pe) = dll_pes[i].as_ref() {
             let base = reg.base(i);
             apply_relocations_to_buf(pe, dll_buf_va[i], base);
@@ -3661,7 +3695,7 @@ unsafe fn service_sec_image(
                     // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
                     // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
                     // DLL loads already created), then hand back *BaseAddress / *ViewSize.
-                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_8D00_0000;
+                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_A000_0000;
                     let nls_start = NLS_20127_START.load(Ordering::Relaxed);
                     let nls_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32) as u64;
                     let npages = (nls_size + 0xFFF) / 0x1000;
@@ -3677,7 +3711,7 @@ unsafe fn service_sec_image(
                     if vs_ptr != 0 {
                         csrss_out_write(vs_ptr, nls_size, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                     }
-                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0x8D000000\n");
+                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
                     // result = 0 (SUCCESS)
                 } else {
                     handled = false; // other sections not modeled
@@ -5553,7 +5587,8 @@ unsafe fn storage_probe(
             (b"WS2_32  DLL", WS2_32_WIN32BUF_OFFSET, 0x64, KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET),
             (b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
             (b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
-            (b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, WIN32BUF_FRAMES * 0x1000 - WS2HELP_WIN32BUF_OFFSET),
+            (b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET),
+            (b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, WIN32BUF_FRAMES * 0x1000 - NTDLL_VISTA_WIN32BUF_OFFSET),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 if sz > 0 && (sz as u64) <= cap {
