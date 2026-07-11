@@ -254,11 +254,14 @@ pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
 /// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
 pub const FILEBUF_VADDR: u64 = 0x0000_0100_0060_0000; // its own PT (0x40-0x60 is crowded)
-pub const FILEBUF_FRAMES: u64 = 32;
+pub const FILEBUF_FRAMES: u64 = 64; // 256 KiB — holds smss + csrss + csrsrv, still one 2 MiB PT
 /// csrss.exe (~7 KiB) is staged into the FILEBUF tail, past smss.exe (~99 KiB) but well within the
-/// 128 KiB buffer — no separate buffer needed. The storage host reads it here and writes its size
+/// buffer — no separate buffer needed. The storage host reads it here and writes its size
 /// to STORAGE_SHARED+0x3c; the executive parses the PE from FILEBUF_VADDR+CSRSS_FILEBUF_OFFSET.
 pub const CSRSS_FILEBUF_OFFSET: u64 = 0x1A000; // 104 KiB in — clear of a ~99 KiB smss
+/// csrsrv.dll (~65 KiB) — csrss.exe's static-import Server DLL — is staged further into the FILEBUF
+/// (past smss+csrss), size reported at STORAGE_SHARED+0x40. The loader needs it or DLL_NOT_FOUND.
+pub const CSRSRV_FILEBUF_OFFSET: u64 = 0x20000; // 128 KiB in — clear of csrss (ends ~111 KiB)
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -2429,6 +2432,41 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
+    // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
+    // csrsrv) maps it into csrss's VSpace and demand-pages it from here so csrss's imports resolve.
+    let csrsrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let rsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x40) as *const u32) as usize;
+        if rsz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET) as *const u8,
+                rsz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(rpe) => {
+                    print_str(b"[ntos-exec] staged csrsrv.dll: ");
+                    print_u64(rsz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(rpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(rpe.entry_point_rva());
+                    print_str(b" imgbase=0x");
+                    print_hex(rpe.image_base() as u32);
+                    print_str(b"\n");
+                    Some(rpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged csrsrv.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _ = &csrsrv_pe; // consumed by the DLL load-path (STAGE 2)
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -4449,11 +4487,26 @@ unsafe fn storage_probe(
         // csrss.exe — the Win32 subsystem launcher smss starts. Staged into the FILEBUF tail (past
         // smss), its size reported at STORAGE_SHARED+0x3c. Only if it fits clear of smss.
         if let Some((cc, csz, _)) = dir_find(&fs, fs.root_cl, b"CSRSS   EXE") {
-            let cap = (FILEBUF_FRAMES * 0x1000) as u32 - CSRSS_FILEBUF_OFFSET as u32;
+            let cap = CSRSRV_FILEBUF_OFFSET as u32 - CSRSS_FILEBUF_OFFSET as u32;
             if csz > 0 && csz <= cap && smss_size <= CSRSS_FILEBUF_OFFSET as u32 {
                 let got = fat_read_file(&fs, cc, csz, smss_dest + CSRSS_FILEBUF_OFFSET);
                 if got == csz {
                     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x3c) as *mut u32, csz);
+                }
+            }
+        }
+        // csrsrv.dll — csrss.exe's static-import Server DLL. Staged further into the FILEBUF (past
+        // csrss), size at STORAGE_SHARED+0x40. The executive maps it into csrss's VSpace on the DLL
+        // load so csrss's imports resolve (else STATUS_DLL_NOT_FOUND).
+        if let Some((rc, rsz, _)) = dir_find(&fs, fs.root_cl, b"CSRSRV  DLL") {
+            let cap = (FILEBUF_FRAMES * 0x1000) as u32 - CSRSRV_FILEBUF_OFFSET as u32;
+            if rsz > 0 && rsz <= cap {
+                let got = fat_read_file(&fs, rc, rsz, smss_dest + CSRSRV_FILEBUF_OFFSET);
+                if got == rsz {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x40) as *mut u32, rsz);
+                    print_str(b"[storage-host] CSRSRV.DLL size=");
+                    print_u64(rsz as u64);
+                    print_str(b"\n");
                 }
             }
         }
