@@ -4243,6 +4243,41 @@ unsafe fn service_sec_image(
                     core::ptr::write_volatile(
                         (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
                 }
+            } else if badge == CSRSS_BADGE && m0 == 281 {
+                // NtWaitForSingleObject(Handle[R10], Alertable[RDX], *Timeout[R8]). csrsrv's
+                // CsrApiPortInitialize creates the API-port worker thread (NtCreateThread 55 +
+                // NtResumeThread 214) then waits on its startup event for the worker to signal it's
+                // listening. We don't model the worker thread, so return STATUS_WAIT_0 (0) so the
+                // main init thread proceeds past the rendezvous to CsrSbApiPortInitialize /
+                // SmConnectToSm. (smss never issues SSN 281; scoped to csrss to keep its bring-up.)
+                result = 0;
+            } else if m0 == 170 {
+                // NtQueryObject(Handle[R10], class[RDX], buf[R8], len[R9], *RetLen[sp+0x28]).
+                // DIAGNOSTIC: log the handle + class so we can see what CsrApiPortInitialize queries
+                // after creating its API port + worker thread. Return zeroed buffer + retlen for now.
+                let class = m3;
+                let handle = get_recv_mr(9);
+                let buf = get_recv_mr(7);
+                let len = get_recv_mr(8);
+                let retlen_ptr = smss_stack_read(sp + 0x28);
+                print_str(b"[ntos-exec] NtQueryObject handle=0x");
+                print_hex(handle as u32);
+                print_str(b" class=");
+                print_u64(class);
+                print_str(b" len=");
+                print_u64(len);
+                print_str(b"\n");
+                if len > 0 {
+                    if let Some(m) = smss_mirror(buf, len.min(64)) {
+                        for i in 0..len.min(64) { core::ptr::write_volatile((m + i) as *mut u8, 0); }
+                    }
+                }
+                if retlen_ptr != 0 {
+                    if let Some(m) = smss_mirror(retlen_ptr, 4) {
+                        core::ptr::write_volatile(m as *mut u32, 0);
+                    }
+                }
+                result = 0;
             } else if m0 == SSN_NT_QUERY_DEBUG_FILTER_STATE {
                 // Return FALSE (filter disabled) — the state of a machine with no kernel debugger
                 // attached, where DbgPrintEx suppresses the message and returns without formatting
@@ -4264,6 +4299,7 @@ unsafe fn service_sec_image(
                 || m0 == SSN_NT_SET_SYSTEM_INFORMATION
                 || m0 == 277 // NtUnmapViewOfSection — no-op (we never reclaim a mapped view yet)
                 || m0 == 246 // NtSetSecurityObject — no-op (we don't model per-object security)
+                || m0 == 214 // NtResumeThread — no-op (CSR API-port worker thread not modeled)
                 || m0 == 236 // NtSetInformationObject — no-op (handle-attr sets we don't model)
             {
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
