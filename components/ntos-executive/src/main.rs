@@ -318,6 +318,13 @@ pub const NLS_OEM_VADDR: u64 = 0x0000_0100_00B2_0000; // c_437.nls (66594 B = 17
 pub const NLS_OEM_FRAMES: u64 = 20;
 pub const NLS_CASE_VADDR: u64 = 0x0000_0100_00B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
+/// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
+/// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NTDLLBUF 0xA0-0xC0 page table so it
+/// needs no extra PT. Placed at 0xB9_0000 — PAST HIVEBUF (0xB5_0000 + 64 frames = 0xB9_0000); the
+/// task's suggested 0xB6_0000 collides with the SYSTEM-hive buffer. Runs to 0xBD_0000, clear of
+/// the 0xC0_0000 region end.
+pub const NLS_20127_VADDR: u64 = 0x0000_0100_00B9_0000;
+pub const NLS_20127_FRAMES: u64 = 20;
 /// The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by the
 /// isolated storage host into these shared frames; the executive parses it with nt-hive-regf so
 /// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
@@ -2572,6 +2579,10 @@ unsafe fn service_sec_image(
     let mut csrss_anon_section_handle = 0u64;
     let mut csrss_anon_base = 0u64;
     let mut csrss_anon_size = 0u64;
+    // The named NLS section \Nls\NlsSectionCP20127 (US-ASCII code-page table) csrss's Win32 client
+    // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
+    // staged c_20127.nls frames into csrss.
+    let mut nls_section_handle = 0u64;
     const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
     // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
     // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
@@ -3503,7 +3514,29 @@ unsafe fn service_sec_image(
                     debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
                 }
                 print_str(b"\"\n");
-                result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+                // Fold the name to lowercase ASCII (like NtOpenFile) and provide the US-ASCII NLS
+                // code-page section \Nls\NlsSectionCP20127 — csrss's Win32 client stack maps it during
+                // a DllMain; a NOT_FOUND here → STATUS_DLL_INIT_FAILED.
+                let mut nb = [0u8; 96];
+                let mut nlen = 0;
+                for &w in &name16 {
+                    if nlen >= nb.len() {
+                        break;
+                    }
+                    nb[nlen] = (w as u8).to_ascii_lowercase();
+                    nlen += 1;
+                }
+                if nb[..nlen].windows(17).any(|w| w == b"nlssectioncp20127") {
+                    smss_stack_write(get_recv_mr(9), next_handle); // R10 = *SectionHandle
+                    nls_section_handle = next_handle;
+                    next_handle += 1;
+                    print_str(b"[ntos-exec] NtOpenSection NlsCP20127 -> handle 0x");
+                    print_hex(nls_section_handle as u32);
+                    print_str(b"\n");
+                    // result stays 0 (SUCCESS)
+                } else {
+                    result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+                }
             } else if m0 == SSN_NT_CREATE_SECTION {
                 // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
                 // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
@@ -3623,6 +3656,28 @@ unsafe fn service_sec_image(
                     print_hex((csrss_anon_base >> 32) as u32);
                     print_hex(csrss_anon_base as u32);
                     print_str(b"\n");
+                    // result = 0 (SUCCESS)
+                } else if nls_section_handle != 0 && sect == nls_section_handle {
+                    // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
+                    // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
+                    // DLL loads already created), then hand back *BaseAddress / *ViewSize.
+                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_8D00_0000;
+                    let nls_start = NLS_20127_START.load(Ordering::Relaxed);
+                    let nls_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32) as u64;
+                    let npages = (nls_size + 0xFFF) / 0x1000;
+                    // Reserve one PT (the DLL PD already covers this 1 GiB PDPT slot).
+                    let pt = alloc_slot();
+                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, NLS_SECTION_CSRSS_VA, pml4);
+                    for i in 0..npages {
+                        let _ = page_map(copy_cap(nls_start + i), NLS_SECTION_CSRSS_VA + i * 0x1000, RW_NX, pml4);
+                    }
+                    csrss_out_write(get_recv_mr(7), NLS_SECTION_CSRSS_VA, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4); // *BaseAddress
+                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    if vs_ptr != 0 {
+                        csrss_out_write(vs_ptr, nls_size, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
+                    }
+                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0x8D000000\n");
                     // result = 0 (SUCCESS)
                 } else {
                     handled = false; // other sections not modeled
@@ -4465,6 +4520,7 @@ unsafe fn spawn_storage_host(
     nls_ansi_start: u64,
     nls_oem_start: u64,
     nls_case_start: u64,
+    nls20127_start: u64,
     hivebuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
@@ -4544,6 +4600,7 @@ unsafe fn spawn_storage_host(
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
+        (nls20127_start, NLS_20127_VADDR, NLS_20127_FRAMES),
         (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
     ] {
         for i in 0..frames {
@@ -4587,6 +4644,7 @@ static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 static NLS_ANSI_START: AtomicU64 = AtomicU64::new(0);
 static NLS_OEM_START: AtomicU64 = AtomicU64::new(0);
 static NLS_CASE_START: AtomicU64 = AtomicU64::new(0);
+static NLS_20127_START: AtomicU64 = AtomicU64::new(0);
 static NLS_ANSI_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_OEM_SIZE: AtomicU64 = AtomicU64::new(0);
 static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
@@ -5275,6 +5333,7 @@ unsafe fn storage_probe(
     nls_ansi_dest: u64,
     nls_oem_dest: u64,
     nls_case_dest: u64,
+    nls20127_dest: u64,
 ) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
@@ -5539,6 +5598,22 @@ unsafe fn storage_probe(
                 if got == want && sz > 0 {
                     *out = sz;
                 }
+            }
+        }
+        // c_20127.nls (US-ASCII CP20127) into `nls20127_dest`; report its size at STORAGE_SHARED+0x74
+        // (a direct write like the DLL size reads, so it doesn't need a tuple return slot). csrss maps
+        // the named section \Nls\NlsSectionCP20127 from this during a DllMain.
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"C_20127 NLS") {
+            let cap = (NLS_20127_FRAMES * 0x1000) as u32;
+            let want = if sz < cap { sz } else { cap };
+            let got = fat_read_file(&fs, c, want, nls20127_dest);
+            print_str(b"[storage-host] NLS C_20127 NLS size=");
+            print_u64(sz as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && sz > 0 {
+                core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x74) as *mut u32, sz);
             }
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
@@ -6823,6 +6898,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
+            // c_20127.nls (US-ASCII CP20127) — also shares the NTDLLBUF 0xA0-0xC0 PT (at 0xB9_0000,
+            // past HIVEBUF), so map its contiguous frame run in the executive with no extra PT.
+            let nls20127_start = alloc_frame();
+            for _ in 1..NLS_20127_FRAMES {
+                let _ = alloc_frame();
+            }
+            for i in 0..NLS_20127_FRAMES {
+                let _ = page_map(copy_cap(nls20127_start + i), NLS_20127_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            NLS_20127_START.store(nls20127_start, Ordering::Relaxed);
             // The real SYSTEM hive buffer (64 frames, shares the 0xA0-0xC0 PT), mapped in the
             // executive; the same frames are granted to the storage host in spawn_storage_host.
             let hivebuf_start = alloc_frame();
@@ -6854,6 +6939,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nls_starts[0],
                 nls_starts[1],
                 nls_starts[2],
+                nls20127_start,
                 hivebuf_start,
             );
             let _ = sfault;
