@@ -184,6 +184,9 @@ pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtCreateProcess — smss spawns csrss from the SEC_IMAGE section (SmpExecuteImage). Not serviced
 /// yet (the real spawn is the next step) — a diagnostic verifies the file→section→process chain.
 pub const SSN_NT_CREATE_PROCESS: u64 = 49;
+/// NtQuerySection — RtlCreateUserProcess reads SectionImageInformation (entry/stack/subsystem)
+/// from the csrss image section between NtCreateProcess and creating the initial thread.
+pub const SSN_NT_QUERY_SECTION: u64 = 175;
 /// NtCreateDirectoryObject — SmpInit creates object-namespace directories (\Windows, \KnownDlls,
 /// \??/DosDevices, …). Out handle in RCX; faked until the object manager lands.
 pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
@@ -2698,6 +2701,38 @@ unsafe fn service_sec_image(
                     // result stays 0 (SUCCESS)
                 } else {
                     handled = false; // not the csrss section / not staged -> clean stop
+                    result = 0xC0000002;
+                }
+            } else if m0 == SSN_NT_QUERY_SECTION {
+                // NtQuerySection(SectionHandle[R10], class[RDX], buf[R8], len[R9], *ResultLen[sp+0x28]).
+                // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's
+                // entry point, stack sizes + subsystem before creating the initial thread. Return a
+                // 64-byte SECTION_IMAGE_INFORMATION derived from the parsed csrss PE.
+                let class = m3;
+                let buf = get_recv_mr(7); // R8
+                if class == 1 && csrss_pe.is_some() {
+                    let cpe = csrss_pe.as_ref().unwrap();
+                    let entry = PE_LOAD_BASE + cpe.entry_point_rva() as u64;
+                    smss_stack_write(buf + 0x00, entry); // TransferAddress (entry VA)
+                    smss_stack_write(buf + 0x08, 0); // ZeroBits + pad
+                    smss_stack_write(buf + 0x10, 0x10_0000); // MaximumStackSize (1 MiB)
+                    smss_stack_write(buf + 0x18, 0x1_0000); // CommittedStackSize (64 KiB)
+                    smss_stack_write(buf + 0x20, 1); // SubSystemType=NATIVE(1) | SubSystemVersion=0
+                    smss_stack_write(buf + 0x28, 0); // OSVersion | ImageCharacteristics | DllChars
+                    // @0x30 Machine=0x8664 (u16) | @0x32 ImageContainsCode=1 (u8) | @0x34 LoaderFlags
+                    smss_stack_write(buf + 0x30, 0x8664 | (1u64 << 16));
+                    smss_stack_write(buf + 0x38, cpe.size_of_image() as u64); // ImageFileSize|CheckSum
+                    let rl = smss_stack_read(sp + 0x28); // arg4 = *ResultLength
+                    if rl != 0 {
+                        smss_stack_write(rl, 64);
+                    }
+                    print_str(b"[ntos-exec] NtQuerySection(SectionImageInformation) csrss entry=0x");
+                    print_hex((entry >> 32) as u32);
+                    print_hex(entry as u32);
+                    print_str(b"\n");
+                    // result stays 0 (SUCCESS)
+                } else {
+                    handled = false;
                     result = 0xC0000002;
                 }
             } else if m0 == SSN_NT_OPEN_THREAD_TOKEN {
