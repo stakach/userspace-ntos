@@ -3024,6 +3024,13 @@ unsafe fn service_sec_image(
                     // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
                     // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
                     smss_stack_write(buf, 0x1a2b_3c4d);
+                } else if class == 28 {
+                    // ProcessLUIDDeviceMapsEnabled — a ULONG BOOL. Not enabled → 0.
+                    smss_stack_write32(buf, 0);
+                    let retlen = smss_stack_read(sp + 0x28);
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 4);
+                    }
                 } else if class == 23 {
                     // ProcessDeviceMap — PROCESS_DEVICEMAP_INFORMATION.Query { ULONG DriveMap;
                     // UCHAR DriveType[32] }. SmpCreatePagingFiles enumerates volumes from this. An
@@ -3039,6 +3046,11 @@ unsafe fn service_sec_image(
                         smss_stack_write32(retlen, 36);
                     }
                 } else {
+                    print_str(b"[ntos-exec] NtQueryInformationProcess class=");
+                    print_u64(class);
+                    print_str(b" len=");
+                    print_u64(get_recv_mr(8));
+                    print_str(b"\n");
                     handled = false;
                     result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
