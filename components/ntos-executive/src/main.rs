@@ -151,6 +151,8 @@ pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
 /// ntdll's NtQuerySystemTime SSN (csrss init reads the clock during CsrServerInitialization).
 pub const SSN_NT_QUERY_SYSTEM_TIME_SVC: u64 = 182;
+/// ntdll's NtQueryPerformanceCounter SSN (csrss init seeds timing / RNG from the perf counter).
+pub const SSN_NT_QUERY_PERF_COUNTER: u64 = 173;
 /// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
 pub const SSN_NT_QUERY_INFO_PROCESS: u64 = 161;
 /// ntdll's NtOpenKey SSN (LdrpInitialize opens IFEO/options; we have no registry → not-found).
@@ -3524,6 +3526,25 @@ unsafe fn service_sec_image(
                     csrss_out_write(out, now, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                 } else {
                     smss_stack_write(out, now);
+                }
+            } else if m0 == SSN_NT_QUERY_PERF_COUNTER {
+                // NtQueryPerformanceCounter(*PerformanceCounter[R10], *PerformanceFrequency[RDX]).
+                // The frequency out-ptr is optional (may be NULL). Return a monotonic rdtsc counter
+                // and a plausible fixed frequency; csrss's init only needs non-zero monotonic values.
+                let ctr_ptr = get_recv_mr(9); // R10 = *PerformanceCounter
+                let freq_ptr = m3; // RDX = *PerformanceFrequency (optional)
+                let now = core::arch::x86_64::_rdtsc();
+                let freq = 1_000_000_000u64; // 1 GHz — plausible TSC frequency
+                if badge == CSRSS_BADGE {
+                    csrss_out_write(ctr_ptr, now, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
+                    if freq_ptr != 0 {
+                        csrss_out_write(freq_ptr, freq, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
+                    }
+                } else {
+                    smss_stack_write(ctr_ptr, now);
+                    if freq_ptr != 0 {
+                        smss_stack_write(freq_ptr, freq);
+                    }
                 }
             } else if m0 == SSN_NT_QUERY_VIRTUAL_MEM {
                 // NtQueryVirtualMemory(Process, BaseAddress, Class, Buffer, Len, *RetLen).
