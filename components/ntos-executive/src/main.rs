@@ -118,6 +118,11 @@ pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
 /// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
 /// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0068_0000;
+/// The 2nd hosted process (csrss) needs its OWN executive stack mirror: its syscall out-params
+/// (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) must be written to ITS stack, not smss's.
+/// Adjacent to smss's mirror, in the same FILEBUF page table. ACTIVE_STACK_MIRROR selects between
+/// them by the current fault badge.
+pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0069_0000;
 /// Where the executive backs NtAllocateVirtualMemory for the process (its own PT).
 pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 /// The executive's mirror of the first window of smss's heap (SMSS_ALLOC_VA). A userspace broker
@@ -381,6 +386,10 @@ const HPET_T0_CONFIG: u64 = 0x100;
 const HPET_T0_COMPARATOR: u64 = 0x108;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
+/// The executive stack-mirror base for the process whose fault/syscall is currently being serviced.
+/// The 2-process service loop sets this at the top of each iteration (smss vs csrss) so the shared
+/// smss_stack_read/write helpers read+write the RIGHT process's stack.
+static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
 
 // Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
 // `NativeService` classification via `NativeServiceTable`; a real isolated ntdll
@@ -1465,6 +1474,7 @@ unsafe fn spawn_sec_image(
     setup_env: bool,
     prio: u64,
     scr_base: u64,
+    stack_mirror: u64,
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
@@ -1501,7 +1511,7 @@ unsafe fn spawn_sec_image(
         // Mirror the stack into the executive so it can read/write a syscall's stack-based
         // pointer args (copyin/copyout).
         if setup_env {
-            let _ = page_map(copy_cap(f), SMSS_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let _ = page_map(copy_cap(f), stack_mirror + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
         }
     }
     let ipcbuf = alloc_frame();
@@ -1722,7 +1732,8 @@ unsafe fn spawn_sec_image(
 /// stack mirror. Returns 0 if the VA isn't in the mirrored stack range.
 unsafe fn smss_stack_read(stack_va: u64) -> u64 {
     if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
-        core::ptr::read_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *const u64)
+        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+        core::ptr::read_volatile((mirror + (stack_va - STACK_BASE)) as *const u64)
     } else {
         0
     }
@@ -1732,7 +1743,7 @@ unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
 unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
     if va >= STACK_BASE && va + len <= STACK_BASE + STACK_FRAMES * 0x1000 {
-        Some(SMSS_STACK_MIRROR_VA + (va - STACK_BASE))
+        Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - STACK_BASE))
     } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA))
     } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
@@ -1815,7 +1826,8 @@ unsafe fn smss_read_objattr_name(oa_va: u64) -> alloc::vec::Vec<u16> {
 /// Write a u64 to a SEC_IMAGE process's stack VA via the mirror (copyout).
 unsafe fn smss_stack_write(stack_va: u64, v: u64) {
     if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *mut u64, v);
+        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u64, v);
     }
 }
 
@@ -1823,7 +1835,8 @@ unsafe fn smss_stack_write(stack_va: u64, v: u64) {
 /// NtProtectVirtualMemory *OldProtect) — an 8-byte write would clobber the adjacent local.
 unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
     if stack_va >= STACK_BASE && stack_va + 4 <= STACK_BASE + STACK_FRAMES * 0x1000 {
-        core::ptr::write_volatile((SMSS_STACK_MIRROR_VA + (stack_va - STACK_BASE)) as *mut u32, v);
+        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u32, v);
     }
 }
 
@@ -2462,6 +2475,13 @@ unsafe fn service_sec_image(
         // process (shadow the params); faults/first/ntfaults/filled_pages are mutable (SAVED back
         // before every recv below).
         let pi = if badge == CSRSS_BADGE { 1 } else { 0 };
+        // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
+        // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
+        // own stack, not the other process's.
+        ACTIVE_STACK_MIRROR.store(
+            if pi == 1 { CSRSS_STACK_MIRROR_VA } else { SMSS_STACK_MIRROR_VA },
+            Ordering::Relaxed,
+        );
         let pml4 = pml4s[pi];
         let scratch_base = scratch_bases[pi];
         let img_end = img_ends[pi];
@@ -2656,6 +2676,8 @@ unsafe fn service_sec_image(
                 let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
                 let base = if base_in != 0 {
                     base_in
+                } else if pi == 1 {
+                    NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else {
                     NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 };
@@ -2666,9 +2688,11 @@ unsafe fn service_sec_image(
                         let f = alloc_frame();
                         let _ = page_map(f, base + p, RW_NX, pml4);
                         // Mirror the first heap window into the executive so smss_copyin can read
-                        // heap-resident pointer args (registry key paths, etc.).
+                        // heap-resident pointer args (registry key paths, etc.). Only for smss (pi 0):
+                        // csrss shares the VA but a different VSpace — mirroring it would clobber
+                        // smss's heap mirror. csrss gets its own mirror when it needs heap copyin.
                         let va = base + p;
-                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+                        if pi == 0 && va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
                             let _ = page_map(copy_cap(f),
                                 SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
                         }
@@ -2780,7 +2804,7 @@ unsafe fn service_sec_image(
                     // which hands smss its turns — so both make progress and smss's own checks still
                     // pass. csrss uses a DISTINCT env-build scratch (0x78_0000, vs smss's 0x74_0000)
                     // so its trampoline/PEB/params frames aren't clobbered by smss's still-mapped ones.
-                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000);
+                    let cpml4 = spawn_sec_image(cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000, CSRSS_STACK_MIRROR_VA);
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     pml4s[1] = cpml4;
@@ -3101,7 +3125,11 @@ unsafe fn service_sec_image(
         print_hex(pfirst[1] as u32);
         print_str(b"\n");
     }
-    print_str(b"[sec-stop] label=");
+    print_str(b"[sec-stop] badge=");
+    print_u64(badge);
+    print_str(b" (");
+    print_str(if badge == CSRSS_BADGE { b"csrss" } else { b"smss" });
+    print_str(b") label=");
     print_u64(mi >> 12);
     print_str(b" m0=0x");
     print_hex((m0 >> 32) as u32);
@@ -3578,6 +3606,11 @@ static NEXT_USER_VADDR: AtomicU64 = AtomicU64::new(USER_ALLOC_BASE);
 static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Bump allocator for NtAllocateVirtualMemory backing a SEC_IMAGE process.
 static NEXT_SMSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
+/// csrss's OWN NtAllocateVirtualMemory bump — a SEPARATE counter from smss's so smss's allocations
+/// don't push csrss's heap base past the single alloc page table spawn_sec_image maps. Both start at
+/// SMSS_ALLOC_VA: the two processes have independent VSpaces, so the same VA (with each's own PT) is
+/// fine, and csrss's heap then lands low, within its mapped PT.
+static NEXT_CSRSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 /// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can
@@ -4945,7 +4978,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000);
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA);
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -5970,7 +6003,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000);
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
