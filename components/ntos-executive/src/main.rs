@@ -130,6 +130,10 @@ pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 /// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
 pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0090_0000;
 pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early heap
+/// csrss's own heap mirror — its loader builds DLL search paths ("…\csrsrv.dll") on its heap, which
+/// the executive must read from CSRSS's heap, not smss's. 2 MiB at 0x200_0000 (past the fill-scratch
+/// region 0x100-0x200, its own PT). ACTIVE_HEAP_MIRROR selects by the current badge.
+pub const CSRSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0200_0000;
 /// The executive's mirror of smss's demand-filled IMAGE pages, so smss_copyin can read static
 /// pointer args (registry value/subkey names in .rdata, etc.) from the process image. Sits just
 /// below the heap mirror and SHARES its 0x80-0xA0 page table (no extra PT).
@@ -400,6 +404,9 @@ static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
 /// Executive image-mirror base for the process currently being serviced (smss vs csrss), so the
 /// shared copyin path reads import-descriptor DLL names etc. from the RIGHT process's image.
 static ACTIVE_IMAGE_MIRROR: AtomicU64 = AtomicU64::new(IMAGE_MIRROR_VA);
+/// Executive heap-mirror base for the process currently being serviced, so the copyin path reads
+/// heap-resident syscall args (the loader's built-up DLL search paths) from the RIGHT process's heap.
+static ACTIVE_HEAP_MIRROR: AtomicU64 = AtomicU64::new(SMSS_HEAP_MIRROR_VA);
 
 // Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
 // `NativeService` classification via `NativeServiceTable`; a real isolated ntdll
@@ -1485,6 +1492,7 @@ unsafe fn spawn_sec_image(
     prio: u64,
     scr_base: u64,
     stack_mirror: u64,
+    heap_mirror: u64,
     image_path: &[u8],
     cmd_line: &[u8],
 ) -> u64 {
@@ -1515,7 +1523,7 @@ unsafe fn spawn_sec_image(
         // Reserve a PT in the EXECUTIVE's own VSpace for the heap copyin mirror window.
         let hpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
-        let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, SMSS_HEAP_MIRROR_VA, CAP_INIT_THREAD_VSPACE);
+        let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, heap_mirror, CAP_INIT_THREAD_VSPACE);
     }
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
@@ -1759,7 +1767,7 @@ unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
     if va >= STACK_BASE && va + len <= STACK_BASE + STACK_FRAMES * 0x1000 {
         Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - STACK_BASE))
     } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        Some(SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA))
+        Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
     } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
         // Image .rdata/.idata/.data — only valid once the page has been demand-faulted (the process
         // reads a static string, faulting+mirroring its page, before passing it to a syscall). Uses
@@ -2536,6 +2544,10 @@ unsafe fn service_sec_image(
             if pi == 1 { CSRSS_IMAGE_MIRROR_VA } else { IMAGE_MIRROR_VA },
             Ordering::Relaxed,
         );
+        ACTIVE_HEAP_MIRROR.store(
+            if pi == 1 { CSRSS_HEAP_MIRROR_VA } else { SMSS_HEAP_MIRROR_VA },
+            Ordering::Relaxed,
+        );
         let pml4 = pml4s[pi];
         let scratch_base = scratch_bases[pi];
         let img_end = img_ends[pi];
@@ -2743,13 +2755,14 @@ unsafe fn service_sec_image(
                         let f = alloc_frame();
                         let _ = page_map(f, base + p, RW_NX, pml4);
                         // Mirror the first heap window into the executive so smss_copyin can read
-                        // heap-resident pointer args (registry key paths, etc.). Only for smss (pi 0):
-                        // csrss shares the VA but a different VSpace — mirroring it would clobber
-                        // smss's heap mirror. csrss gets its own mirror when it needs heap copyin.
+                        // heap-resident pointer args (registry key paths, the loader's DLL search
+                        // paths). Into the ACTIVE process's heap mirror (smss vs csrss) — they share
+                        // the heap VA but live in different VSpaces, so each gets its own mirror.
                         let va = base + p;
-                        if pi == 0 && va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+                            let mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
                             let _ = page_map(copy_cap(f),
-                                SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
+                                mirror + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
                         }
                         p += 0x1000;
                     }
@@ -2866,7 +2879,7 @@ unsafe fn service_sec_image(
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ServerDll=csrsrv ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000,
-                        CSRSS_STACK_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
+                        CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
@@ -5062,7 +5075,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -6087,7 +6100,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
