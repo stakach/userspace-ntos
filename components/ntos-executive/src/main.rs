@@ -3327,6 +3327,23 @@ unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
+            // ROBUSTNESS (gate-safety): a genuine NULL/low deref (addr < 64 KiB) is never a
+            // demand-fillable region (image/DLL/scratch/stack/anon all live far above) — it's an
+            // unrecoverable client fault (e.g. user32's UserClientDllInitialize deref of a still-null
+            // gSharedInfo). Map it and we hand the faulter a zero page → it silently spins on the bad
+            // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
+            // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
+            if addr < 0x10000 {
+                print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
+                print_hex((m0 >> 32) as u32);
+                print_hex(m0 as u32);
+                print_str(b" addr=0x");
+                print_hex((addr >> 32) as u32);
+                print_hex(addr as u32);
+                print_str(b" (dll_rva = ip - dll_base; user32@0x84000000, gdi32@0x85000000)\n");
+                stop = addr;
+                break;
+            }
             // Dynamic stack growth (Windows guard-page style): a fault just below the committed
             // stack commits a fresh zeroed page and restarts, so smss's stack grows on demand
             // instead of crashing at the 16 KiB initial commit. Bounded by STACK_GROWTH_FLOOR so it
@@ -3888,22 +3905,20 @@ unsafe fn service_sec_image(
                     // implicitly by CsrServerInitialization itself. Listing it fails CsrLoadServerDll
                     // with STATUS_INVALID_PARAMETER — it has no ServerId. The real ReactOS command
                     // line omits it too; it was only masked before by winsrv crashing first.)
-                    // Milestone C status: the win32k SSN>=0x1000 forward is WIRED (see the
-                    // service_sec_image arm) and the win32k component comes up + parks in its
-                    // dispatch loop BEFORE csrss spawns, so a routed NtUserInitialize is live.
-                    // BUT re-enabling `ServerDll=winsrv:...` here (verified working: winsrv + the
-                    // full 14-DLL Win32 client stack — csrsrv/basesrv/winsrv/kernel32/user32/gdi32/
-                    // advapi32/rpcrt4/msvcrt/ws2_32/… — all LOAD + MAP into csrss) walls INSIDE the
-                    // client-stack load, BEFORE winsrv's UserServerDllInitialization runs: user32's
-                    // DllMain (`UserClientDllInitialize`, user32 RVA 0x45ac0) null-derefs a client-
-                    // shared win32k connection global (`mov rax,[user32+0xc4da0]; mov rcx,[rax]` with
-                    // rax==NULL) — the client-side win32k connection (gSharedInfo / USER handle-table /
-                    // USERCONNECT shared-section) hasn't been populated. That is a substantial NEW
-                    // grind (the Win32 client↔win32k connection) that precedes NtUserInitialize, and
-                    // the executive's csrss fault loop currently HANGS on it (does not cleanly stop).
-                    // So winsrv stays OUT until that grind lands; the routing infra + win32k ordering
-                    // remain in place so re-enabling is a one-line change once user32 client init runs.
-                    // (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
+                    // Milestone C — winsrv DEFERRED pending the gSharedInfo grind (routing + marshaling
+                    // infra is IN PLACE; re-enabling is the one-line ServerDll add below). With winsrv
+                    // ON, csrsrv loads the full 14-DLL Win32 client stack and user32's DllMain `Init`
+                    // (dllmain.c:410) calls **NtUserProcessConnect(NtCurrentProcess(), USERCONNECT*, 0x240)**
+                    // = win32k SSN 0x10FA. The executive's SSN>=0x1000 forward arm ROUTES it (translating
+                    // NtCurrentProcess()==-1 → the hosted client handle + marshaling the 0x240 USERCONNECT
+                    // buffer through the shared ARG frame). BUT win32k's real NtUserProcessConnect handler
+                    // then CPU-SPINS (zero faults, never signals done) — with the real ulVersion=USER_VERSION
+                    // input it takes the FULL connect path that fills UserCon->siClient (gSharedInfo: psi +
+                    // aheList handle table) from win32k's shared section, which isn't set up as a
+                    // client-mappable section yet. Completing that (win32k produces a real USERCONNECT +
+                    // executive maps win32k's gSharedInfo shared section RO into csrss + user32 derefs
+                    // gHandleTable->handles) is the NEXT grind. Until then winsrv stays OUT so the gate is
+                    // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
@@ -4381,13 +4396,44 @@ unsafe fn service_sec_image(
                 // hosted client's W32PROCESS (attached during DriverEntry bring-up). Scalar + handle
                 // args ride the registers exactly as the native x64 syscall passed them (arg1=R10,
                 // arg2=RDX, arg3=R8, arg4=R9); pointer/buffer args are marshaled per SSN as needed.
-                let (st, ok) = win32k_dispatch(
-                    m0,
-                    get_recv_mr(9), // rcx <- R10 (syscall arg1)
-                    m3,             // rdx <- RDX (arg2)
-                    get_recv_mr(7), // r8  <- R8  (arg3)
-                    get_recv_mr(8), // r9  <- R9  (arg4)
-                );
+                let a0 = get_recv_mr(9); // R10 = arg1
+                let a1 = m3; // RDX = arg2
+                let a2 = get_recv_mr(7); // R8 = arg3
+                let a3 = get_recv_mr(8); // R9 = arg4
+                // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
+                // hosted client's process via the synthetic handle the DriverEntry attach used.
+                let d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_host::FAKE_PROCESS_HANDLE } else { a0 };
+                // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
+                // buffer is a csrss user pointer (its stack) NOT mapped in win32k's VSpace — passing it
+                // raw makes win32k's handler fault/spin on an address win32k_dispatch can't resolve.
+                // Copy csrss's input buffer into the shared ARG frame (mapped in BOTH), dispatch with
+                // the ARG-frame pointer, then copy win32k's out-params (the USERCONNECT) back to csrss.
+                let has_buf = m0 == win32k_host::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
+                let (d_a1, blen) = if has_buf {
+                    let arg = win32k_host::WIN32K_ARG_VADDR;
+                    let n = a2.min(win32k_host::WIN32K_ARG_FRAMES * 0x1000);
+                    core::ptr::write_bytes(arg as *mut u8, 0, (win32k_host::WIN32K_ARG_FRAMES * 0x1000) as usize);
+                    let mut off = 0u64;
+                    while off + 8 <= n {
+                        core::ptr::write_volatile((arg + off) as *mut u64, smss_stack_read(a1 + off));
+                        off += 8;
+                    }
+                    (arg, n)
+                } else {
+                    (a1, 0)
+                };
+                print_str(b"[win32k-svc] csrss -> SSN 0x");
+                print_hex(m0 as u32);
+                print_str(b" (dispatch)\n");
+                let (st, ok) = win32k_dispatch(m0, d_a0, d_a1, a2, a3);
+                if has_buf && ok {
+                    let arg = win32k_host::WIN32K_ARG_VADDR;
+                    let mut off = 0u64;
+                    while off + 8 <= blen {
+                        smss_stack_write(a1 + off, core::ptr::read_volatile((arg + off) as *const u64));
+                        off += 8;
+                    }
+                }
                 print_str(b"[win32k-svc] csrss SSN 0x");
                 print_hex(m0 as u32);
                 print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
@@ -5097,6 +5143,19 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let addr = m1;
             let in_image =
                 addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+            if demand < 60 {
+                print_str(b"[w32disp] fault #");
+                print_u64(demand);
+                print_str(b" ip=0x");
+                print_hex((m0 >> 32) as u32);
+                print_hex(m0 as u32);
+                print_str(b" RVA=0x");
+                print_hex(m0.wrapping_sub(code_va) as u32);
+                print_str(b" addr=0x");
+                print_hex((addr >> 32) as u32);
+                print_hex(addr as u32);
+                print_str(b"\n");
+            }
             if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
                 return (0xC000_0001u32 as i32, false);
             }

@@ -56,7 +56,7 @@ const PH_W32PROCESS_VA: u64 = WIN32K_DATA_VADDR + 0x6000;
 /// The per-thread W32THREAD placeholder (page 7).
 const PH_W32THREAD_VA: u64 = WIN32K_DATA_VADDR + 0x7000;
 /// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
-const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
+pub const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
 /// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers
 /// bump-allocate from (counter at +0, data at +0x1000). win32k creates its session heap + maps
 /// several ~1 MiB session views; give it 16 MiB. Its own 8 PT window (0x0740_0000..0x0840_0000).
