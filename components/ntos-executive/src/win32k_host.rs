@@ -1869,6 +1869,22 @@ unsafe fn setup_dispatch_context() {
     write_volatile((PH_EPROCESS_VA + 0x20) as *mut u64, q); // [EPROCESS+0x20] = Q
     write_volatile((q + 0x80) as *mut u64, zstr); // [Q+0x80] = empty wide string ptr
     write_volatile(zstr as *mut u16, 0);
+
+    // win32k's IntCbAllocateMemory (callback.c:44) does
+    // `InsertTailList(&W32Thread->W32CallbackListHead, &Mem->ListEntry)` in the desktop-init callback
+    // tail (co_IntSetWndIcons). In the CHECKED build InsertTailList calls RtlpCheckListEntry which
+    // derefs the head's Flink; our W32THREAD is a zeroed placeholder so Flink==NULL → null-deref at
+    // RVA 0x24c66. Real win32k initializes this in InitThreadCallback (main.c:497
+    // `InitializeListHead(&ptiCurrent->W32CallbackListHead)`). Offset confirmed by disasm of
+    // IntCbAllocateMemory (RVA 0x4aa86: `add rcx, 0x2e8; call InsertTailList`). Make it a real empty
+    // list head (Flink=Blink=&head) — the authentic InitializeListHead.
+    let w32thread = {
+        let t = read_volatile(SLOT_W32THREAD as *const u64);
+        if t == 0 { PH_W32THREAD_VA } else { t }
+    };
+    let cb_head = w32thread + 0x2e8;
+    write_volatile(cb_head as *mut u64, cb_head); // Flink = &head
+    write_volatile((cb_head + 8) as *mut u64, cb_head); // Blink = &head
 }
 
 /// Load the staged system font (arial.ttf at [`FONTBUF_VADDR`]) into win32k via
