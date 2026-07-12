@@ -38,6 +38,9 @@ nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Generic DLL registry — host-tested name/handle/VA decisions for demand-loaded shared-text DLLs.
 nt-dll-registry = { path = "../../crates/nt-dll-registry" }
+# The driver-visible ntoskrnl/hal export table + win32k import surface + SSDT recorder — the
+# load-time contract the win32k.sys prototype resolves its imports against.
+nt-compat-exports = { path = "../../crates/nt-compat-exports" }
 # Registry hive model + image codec — the Config Manager decodes a real hive read off the FS.
 nt-hive-core = { path = "../../crates/nt-hive-core" }
 # Read-only regf parser — serves smss's registry from the REAL ReactOS SYSTEM hive read off disk.

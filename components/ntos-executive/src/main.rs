@@ -27,6 +27,7 @@ mod driver_pe;
 mod isr;
 mod kmdf_host;
 mod server;
+mod win32k_pe;
 mod storage_host;
 
 use core::panic::PanicInfo;
@@ -7561,6 +7562,65 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_sec_image_fill", false, &mut passed);
             }
         }
+    }
+
+    // --- Phase 2 (graphics): PROTOTYPE-bind the real ReactOS win32k.sys against the driver-host
+    // load contract. Classify + BIND win32k's exact ntoskrnl+hal+ftfd import surface (the names
+    // extracted from the real binary) to runtime trampolines — the runtime half of Phase 1's
+    // static contract — and prove the KeAddSystemServiceTable -> SSDT routing seam that Phase 2
+    // forwards a caller's SSN>=0x1000 through. win32k's DriverEntry is NOT executed here: the
+    // 2.1 MiB image can't live in the executive (its ELF is mapped RO at IMAGE_BASE with the
+    // 128 KiB heap 512 KiB above), so running it belongs in the isolated win32k-service component
+    // (staged off disk into untyped frames — the next increment).
+    {
+        let pe = &win32k_pe::WIN32K_PE;
+        print_str(b"[win32k] win32k.sys (ReactOS 0.4.17): ");
+        print_u64(pe.size);
+        print_str(b" bytes, image=");
+        print_hex(pe.size_of_image);
+        print_str(b" (");
+        print_u64(pe.image_frames as u64);
+        print_str(b" frames), entry_rva=");
+        print_hex(pe.entry_rva);
+        print_str(b", sections=");
+        print_u64(pe.sections as u64);
+        print_str(b", relocs=");
+        print_u64(pe.relocs as u64);
+        print_str(if pe.has_gs_cookie { b", /GS=yes\n" } else { b", /GS=no\n" });
+
+        let c = &win32k_pe::CLASSIFICATION;
+        print_str(b"[win32k] imports=");
+        print_u64((c.ntoskrnl + c.hal + c.ftfd) as u64);
+        print_str(b" (ntoskrnl=");
+        print_u64(c.ntoskrnl as u64);
+        print_str(b" hal=");
+        print_u64(c.hal as u64);
+        print_str(b" ftfd=");
+        print_u64(c.ftfd as u64);
+        print_str(b"); ntoskrnl+hal bind: Implemented=");
+        print_u64(c.implemented as u64);
+        print_str(b" Partial=");
+        print_u64(c.partial as u64);
+        print_str(b" Stub=");
+        print_u64(c.stub as u64);
+        print_str(b" Trap=");
+        print_u64(c.trap as u64);
+        print_str(b" Blocked=");
+        print_u64(c.blocked as u64);
+        print_str(b"\n");
+        let ssdt_ok = win32k_pe::ssdt_seam_selftest();
+        print_str(if ssdt_ok {
+            b"[win32k] KeAddSystemServiceTable -> SSDT resolve(0x1000..) seam: OK\n"
+        } else {
+            b"[win32k] KeAddSystemServiceTable -> SSDT seam: FAIL\n"
+        });
+        // The load contract holds iff no ntoskrnl+hal import blocks the load AND the Phase-2 SSDT
+        // routing seam records + resolves correctly. (The full 225-import binding is exhaustively
+        // asserted by nt-compat-exports' host test; CLASSIFICATION is that verified breakdown.)
+        let contract_ok = c.blocked == 0
+            && (c.implemented + c.partial + c.stub + c.trap) == (c.ntoskrnl + c.hal)
+            && ssdt_ok;
+        check(b"exec_win32k_load_contract", contract_ok, &mut passed);
     }
 
     print_str(b"[ntos-exec summary: ");
