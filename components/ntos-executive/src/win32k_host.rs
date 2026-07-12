@@ -1363,77 +1363,74 @@ unsafe fn patch_eng_device_io_control() {
     write_volatile((va + 11) as *mut u8, 0xE0);
 }
 
-// --- FIRST LIGHT: desktop-background paint on the live screen DC -------------------------------
-
-/// RVA of the two tail calls in `co_IntInitializeDesktopGraphics` (winsta.c:329-355):
-/// `call co_IntLoadDefaultCursors` (0x4d750) then `call co_IntSetWndIcons` (0x4d810). The cursor
-/// routine walls at a not-yet-built win32k->client `KeUserModeCallback` bridge (null-derefs its unset
-/// OutputBuffer at RVA 0x4d7eb), and the icon/menu/show-desktop tail cascades into uninitialized-
-/// structure null-derefs. But the screen DC + primary surface are ALREADY created by this point
-/// (IntGdiCreateDC + IntCreatePrimarySurface, lines 278/286), so we skip the tail.
-const CO_INIT_DESKTOP_TAIL_RVA: u64 = 0xfcdff;
-/// The routine's epilogue (`add rsp,0xd8; pop rdi; pop rsi; ret`) — the target of the injected jmp.
-const CO_INIT_DESKTOP_EPILOGUE_RVA: u64 = 0xfcf28;
-
-/// Patch `co_IntInitializeDesktopGraphics` to RETURN TRUE right after UserAttachMonitor, skipping the
-/// cursor/icon/menu/show-desktop tail (which needs the KeUserModeCallback client bridge — a separate
-/// subsystem, the next arc). Overwrites the two tail calls at RVA 0xfcdff (10 bytes) with
-/// `mov eax,1; jmp <epilogue>`. Runs in `load_into` while win32k is mapped RW in the executive. The
-/// host then paints the desktop background directly on the live screen DC (`paint_screen_dc`).
-unsafe fn patch_skip_cursor_tail() {
-    let p = WIN32K_CODE_VA + CO_INIT_DESKTOP_TAIL_RVA;
-    // mov eax, 1  (B8 01 00 00 00)
-    write_volatile(p as *mut u8, 0xB8);
-    write_unaligned((p + 1) as *mut u32, 1);
-    // jmp rel32 -> epilogue  (E9 rel32); the jmp is at p+5, len 5, so next insn RVA = tail + 10.
-    write_volatile((p + 5) as *mut u8, 0xE9);
-    let next = CO_INIT_DESKTOP_TAIL_RVA + 10;
-    let rel = (CO_INIT_DESKTOP_EPILOGUE_RVA as i64 - next as i64) as i32;
-    write_unaligned((p + 6) as *mut i32, rel);
-}
-
-/// RVA of the `ScreenDeviceContext` global (desktop.c:53) — holds the live screen HDC. Store site is
-/// in `co_IntInitializeDesktopGraphics` at RVA 0xfcb94 (`mov [rip+0x10e995], rax` after IntGdiCreateDC).
-pub const SCREEN_DC_RVA: u64 = 0x20b530;
-// NtGdi service RVAs, read from win32k's registered 740-entry SSDT (indices from w32ksvc64.h; verified
-// idx 0x25a -> RVA 0xc41a0 == NtUserInitialize).
-const NT_GDI_CREATE_SOLID_BRUSH_RVA: u64 = 0x1cba20; // GdiCreateSolidBrush, idx 0xbc
-const NT_GDI_SELECT_BRUSH_RVA: u64 = 0x111ca0; // GdiSelectBrush, idx 0x202
-const NT_GDI_PAT_BLT_RVA: u64 = 0x107190; // GdiPatBlt, idx 0x59
-
-/// FIRST LIGHT: drive win32k's REAL GDI to paint the desktop background on the live screen DC. The
-/// screen DC + primary surface exist (co_IntInitializeDesktopGraphics ran through IntCreatePrimarySurface;
-/// the cursor/icon/menu tail is patched out — see `patch_skip_cursor_tail`). Create a solid brush,
-/// select it into ScreenDeviceContext, and PatBlt the whole 1024x768 screen — NtGdiPatBlt -> GDI ->
-/// framebuf's DrvBitBlt -> the BOOTBOOT framebuffer at WIN32K_FB_VA. Mirrors IntPaintDesktop's doPatBlt
-/// fill (desktop.c:2080-2082) but on our own solid brush (the desktop window/class brush needs the
-/// window manager, not yet up). This is the real win32k+framebuf pipeline writing real pixels.
-unsafe fn paint_screen_dc() {
-    let hdc = read_volatile((WIN32K_CODE_VA + SCREEN_DC_RVA) as *const u64);
-    print_str(b"[win32k-host] paint_screen_dc: ScreenDeviceContext hdc=0x");
-    print_hex(hdc as u32);
-    print_str(b"\n");
-    if hdc == 0 {
-        return;
+// --- win32k -> client user-mode callback bridge (KeUserModeCallback) --------------------------
+//
+// `NTSTATUS KeUserModeCallback(ULONG ApiNumber, PVOID InputBuffer, ULONG InputLength,
+//                              PVOID *OutputBuffer, PULONG OutputLength)`
+//
+// win32k's desktop-init tail (co_IntInitializeDesktopGraphics, winsta.c:329-335) calls back into the
+// user32 CLIENT via this ntoskrnl export for cursor/icon/menu resource setup:
+//   ApiNumber 3  USER32_CALLBACK_LOADDEFAULTCURSORS (co_IntLoadDefaultCursors) → *Out = &HCURSOR
+//   ApiNumber 11 USER32_CALLBACK_SETWNDICONS        (co_IntSetWndIcons)        → *Out = SETWNDICONS_CALLBACK_ARGUMENTS
+//   ApiNumber 15 USER32_CALLBACK_SETOBM             (co_IntSetupOBM/MenuInit)  → *Out = SETOBM_CALLBACK_ARGUMENTS
+// In real Windows the callback runs user32's KiUserCallbackDispatcher on the CLIENT stack; our win32k
+// is a separate component. Each of these init callbacks returns a structure of HANDLES that win32k
+// tolerates all-NULL (IntLoadSystenIcons(NULL)/RtlCopyMemory of zeros are safe no-ops), so we
+// SYNTHESIZE structurally-valid, zeroed output here (a real IAT CALL/return — no RIP redirect
+// needed). This is the callback EFFECT faithfully: a client that found no custom resources.
+//
+// Contract: allocate a zeroed output buffer sized to max(caller's *OutputLength, InputLength, 8),
+// point *OutputBuffer at it, set *OutputLength, return STATUS_SUCCESS. (The caller pre-seeds
+// *OutputLength with the exact struct size it will RtlMoveMemory back, so honour it.)
+const USER32_CB_LOADDEFAULTCURSORS: u32 = 3;
+extern "win64" fn s_ke_user_mode_callback(
+    api: u32,
+    _input: u64,
+    input_len: u32,
+    out_buf: *mut u64,
+    out_len: *mut u32,
+) -> i32 {
+    unsafe {
+        let want = if out_len.is_null() { 0 } else { read_volatile(out_len) };
+        let mut size = want as u64;
+        if (input_len as u64) > size {
+            size = input_len as u64;
+        }
+        if size < 8 {
+            size = 8;
+        }
+        // Round up for safety headroom (some client dispatchers over-copy).
+        size = (size + 15) & !15;
+        let buf = pool_alloc(size);
+        print_str(b"[win32k-host] KeUserModeCallback api=");
+        print_hex(api);
+        print_str(b" inlen=0x");
+        print_hex(input_len);
+        print_str(b" outlen=0x");
+        print_hex(want);
+        print_str(b" -> buf=0x");
+        print_hex(buf as u32);
+        print_str(b"\n");
+        if buf == 0 {
+            return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+        }
+        // Zero the buffer (all-NULL handles: gDesktopCursor=NULL, icons=NULL, oembmi=0 — safe).
+        let mut i = 0u64;
+        while i < size {
+            write_volatile((buf + i) as *mut u64, 0);
+            i += 8;
+        }
+        // LOADDEFAULTCURSORS: *ResultPointer must be an HCURSOR* → first 8 bytes = the HCURSOR (NULL).
+        // (Already zeroed; the buffer itself is the &HCURSOR win32k reads via `mov rax,[rax]`.)
+        let _ = api == USER32_CB_LOADDEFAULTCURSORS;
+        if !out_buf.is_null() {
+            write_volatile(out_buf, buf);
+        }
+        if !out_len.is_null() {
+            write_volatile(out_len, size as u32);
+        }
+        0 // STATUS_SUCCESS
     }
-    // Classic desktop teal. COLORREF is 0x00BBGGRR: RGB(0,128,128) = 0x00808000.
-    const DESKTOP_COLORREF: u64 = 0x0080_8000;
-    let create: extern "win64" fn(u64, u64) -> u64 =
-        core::mem::transmute((WIN32K_CODE_VA + NT_GDI_CREATE_SOLID_BRUSH_RVA) as *const ());
-    let brush = create(DESKTOP_COLORREF, 0);
-    print_str(b"[win32k-host] NtGdiCreateSolidBrush -> 0x");
-    print_hex(brush as u32);
-    print_str(b"\n");
-    let select: extern "win64" fn(u64, u64) -> u64 =
-        core::mem::transmute((WIN32K_CODE_VA + NT_GDI_SELECT_BRUSH_RVA) as *const ());
-    let _prev = select(hdc, brush);
-    let patblt: extern "win64" fn(u64, i32, i32, i32, i32, u32) -> i32 =
-        core::mem::transmute((WIN32K_CODE_VA + NT_GDI_PAT_BLT_RVA) as *const ());
-    const PATCOPY: u32 = 0x00F0_0021;
-    let r = patblt(hdc, 0, 0, 1024, 768, PATCOPY);
-    print_str(b"[win32k-host] NtGdiPatBlt(0,0,1024,768,PATCOPY) -> 0x");
-    print_hex(r as u32);
-    print_str(b"\n");
 }
 
 /// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
@@ -1496,6 +1493,8 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlMultiByteToUnicodeN" => s_rtl_multibyte_to_unicode_n as usize as u64,
         "wcslen" => s_wcslen as usize as u64,
         "_wcsnicmp" | "wcsnicmp" => s_wcsnicmp as usize as u64,
+        // win32k -> client user-mode callback bridge (cursor/icon/menu resource setup)
+        "KeUserModeCallback" => s_ke_user_mode_callback as usize as u64,
         // SSDT registration
         "KeAddSystemServiceTable" => s_ke_add_system_service_table as usize as u64,
         // debug print
@@ -1714,9 +1713,11 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
     // calls AND win32k's own internal miniport IOCTLs route to us — no real DeviceObject needed).
     patch_eng_device_io_control();
 
-    // FIRST LIGHT: make co_IntInitializeDesktopGraphics return after the screen DC + primary surface
-    // exist, skipping the cursor/icon/menu tail that walls on the unbuilt KeUserModeCallback bridge.
-    patch_skip_cursor_tail();
+    // NOTE: the FIRST-LIGHT binary patch (`patch_skip_cursor_tail`) that made
+    // co_IntInitializeDesktopGraphics return early — skipping the cursor/icon/menu/show-desktop tail —
+    // is REMOVED. The real `KeUserModeCallback` bridge (`s_ke_user_mode_callback`) now services the
+    // cursor/icon/menu client callbacks, so the tail runs its FULL natural flow through
+    // co_IntShowDesktop / IntPaintDesktop (the authentic desktop-background paint).
 
     Some(entry_rva)
 }
@@ -1957,10 +1958,10 @@ unsafe fn dispatch_loop() -> ! {
             print_str(b"[win32k-host] co_IntInitializeDesktopGraphics returned 0x");
             print_hex(r as u32);
             print_str(b"\n");
-            // FIRST LIGHT: the screen DC + primary surface now exist (the cursor/icon/menu tail is
-            // patched out). Paint the desktop background directly on the live screen DC = real pixels
-            // through win32k's GDI + framebuf onto the BOOTBOOT framebuffer.
-            paint_screen_dc();
+            // The FULL natural tail now runs (KeUserModeCallback bridge services the cursor/icon/menu
+            // callbacks) -> co_IntShowDesktop -> IntPaintDesktop paints the desktop background
+            // AUTHENTICALLY through win32k's own GDI + framebuf onto the BOOTBOOT framebuffer. The
+            // direct-NtGdi first-light fill (`paint_screen_dc`) is removed.
             r
         } else {
             dispatch_ssn(ssn, a0, a1, a2, a3)
