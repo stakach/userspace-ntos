@@ -74,6 +74,26 @@ pub const WIN32K_SENTINEL_VADDR: u64 = 0x0000_0100_0719_0000;
 pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
 pub const WIN32K_ARG_FRAMES: u64 = 4;
 
+/// The csrss-side VA where win32k's global USER heap arena ([`WIN32K_HEAP_VADDR`] — where gpsi, the
+/// USER handle table `gHandleTable`, and the handle-entry array all live, being `UserHeapAlloc`ed)
+/// is RO-mapped so the Win32 client stack (user32/gdi32) can read the SHAREDINFO the USERCONNECT's
+/// `siClient` pointers name. A full 16 MiB window ([`WIN32K_HEAP_FRAMES`]), 2-MiB-aligned, sitting
+/// in the free gap between csrss's DLL region (ends ~0x8a00_0000) and its NLS section (0xA000_0000).
+/// The executive's connect marshaling rewrites the `siClient` pointers + `ulSharedDelta` to this
+/// base (server→client delta = `WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`).
+pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9000_0000;
+
+// USERCONNECT / SHAREDINFO x64 field offsets (references/reactos win32ss/include/ntuser.h): a
+// USERCONNECT is { ULONG ulVersion; ULONG ulCurrentVersion; DWORD dwDispatchCount; SHAREDINFO
+// siClient; } with siClient (8-byte aligned) at +0x10, and SHAREDINFO = { PSERVERINFO psi; PVOID
+// aheList; PVOID pDispInfo; ULONG_PTR ulSharedDelta; ... }. NtUserProcessConnect fills these with
+// SERVER pointers (shifted by W32Process->HeapMappings delta = 0 in this single-AS host); the
+// executive rewrites them to CSRSS_W32_SHARED_VA-relative client pointers before copy-out.
+pub const UC_SI_PSI: u64 = 0x10; // SHAREDINFO.psi
+pub const UC_SI_AHELIST: u64 = 0x18; // SHAREDINFO.aheList
+pub const UC_SI_PDISPINFO: u64 = 0x20; // SHAREDINFO.pDispInfo
+pub const UC_SI_DELTA: u64 = 0x28; // SHAREDINFO.ulSharedDelta
+
 const POOL_DATA_OFF: u64 = 0x1000;
 
 // shared-page offsets

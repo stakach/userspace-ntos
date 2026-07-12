@@ -4006,7 +4006,7 @@ unsafe fn service_sec_image(
                     // executive maps win32k's gSharedInfo shared section RO into csrss + user32 derefs
                     // gHandleTable->handles) is the NEXT grind. Until then winsrv stays OUT so the gate is
                     // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
-                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ProfileControl=Off MaxRequestThreads=16";
+                    const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
@@ -4516,6 +4516,34 @@ unsafe fn service_sec_image(
                 let (st, ok) = win32k_dispatch(m0, d_a0, d_a1, a2, a3);
                 if has_buf && ok {
                     let arg = win32k_host::WIN32K_ARG_VADDR;
+                    // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the
+                    // USERCONNECT's siClient with pointers into its OWN session-space USER heap
+                    // (gpsi / gHandleTable / the handle-entry array — all `UserHeapAlloc`ed), which
+                    // is NOT mapped in csrss → user32's DllMain `Init` faults dereferencing
+                    // gSharedInfo.aheList->handles. RO-map that heap arena into csrss and rewrite the
+                    // siClient pointers (+ ulSharedDelta) to the csrss-relative client addresses so
+                    // the client reads valid memory. delta = server(win32k) − client(csrss).
+                    let delta = map_win32k_heap_into_csrss(pml4);
+                    let heap_lo = win32k_host::WIN32K_HEAP_VADDR;
+                    let heap_hi = heap_lo + win32k_host::WIN32K_HEAP_FRAMES * 0x1000;
+                    // The handler's own shift (0 in this single-AS host; be robust anyway): recover
+                    // the raw server VA before applying our delta.
+                    let hd = core::ptr::read_volatile((arg + win32k_host::UC_SI_DELTA) as *const u64);
+                    for off in [win32k_host::UC_SI_PSI, win32k_host::UC_SI_AHELIST] {
+                        let client = core::ptr::read_volatile((arg + off) as *const u64);
+                        if client != 0 {
+                            let server = client.wrapping_add(hd);
+                            if server >= heap_lo && server < heap_hi {
+                                core::ptr::write_volatile(
+                                    (arg + off) as *mut u64,
+                                    server.wrapping_sub(delta),
+                                );
+                            }
+                        }
+                    }
+                    core::ptr::write_volatile((arg + win32k_host::UC_SI_DELTA) as *mut u64, delta);
+                    core::ptr::write_volatile((arg + win32k_host::UC_SI_PDISPINFO) as *mut u64, 0);
+                    // Copy the fixed-up USERCONNECT back to csrss's stack.
                     let mut off = 0u64;
                     while off + 8 <= blen {
                         smss_stack_write(a1 + off, core::ptr::read_volatile((arg + off) as *const u64));
@@ -5210,6 +5238,57 @@ static WIN32K_TCB: AtomicU64 = AtomicU64::new(0);
 /// dispatch signal), so `win32k_dispatch` can drive its persistent service loop from anywhere.
 static WIN32K_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap cptr base of win32k's global USER heap arena (`heap_base`, WIN32K_HEAP_FRAMES
+/// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
+/// GUI client's VSpace (the gSharedInfo client-mapping).
+static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+/// 0 until win32k's USER heap arena has been RO-mapped into csrss (one-time; guards re-mapping on a
+/// second NtUserProcessConnect from the same client).
+static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// RO-map win32k's global USER heap arena ([`win32k_host::WIN32K_HEAP_VADDR`], where gpsi /
+/// gHandleTable / the USER handle-entry array live) into the caller's (csrss's) VSpace at
+/// [`win32k_host::CSRSS_W32_SHARED_VA`], so the Win32 client can dereference the SHAREDINFO the
+/// USERCONNECT points at. Maps a fresh copy of each arena frame RO+NX (win32k keeps its own RW
+/// copy — coherent shared memory). One-time (guarded). Returns the server→client delta
+/// (`WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`) the marshaling applies to the siClient pointers.
+unsafe fn map_win32k_heap_into_csrss(pml4: u64) -> u64 {
+    let delta = win32k_host::WIN32K_HEAP_VADDR - win32k_host::CSRSS_W32_SHARED_VA;
+    if WIN32K_CLIENT_MAPPED.swap(1, Ordering::Relaxed) != 0 {
+        return delta; // already mapped
+    }
+    let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
+    if heap_base == 0 {
+        return delta;
+    }
+    const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER; // read-only, non-executable
+    let frames = win32k_host::WIN32K_HEAP_FRAMES;
+    // The 1 GiB PD covering 0x8000_0000..0xC000_0000 already exists in csrss (its DLL region shares
+    // it). The CSRSS_W32_SHARED_VA window is fresh, so allocate + map one page table per 2 MiB
+    // sub-range UP FRONT — deterministic, because the SYS_SEND `page_map` is fire-and-forget and
+    // can't report a missing-PT error to drive a retry.
+    for p in 0..(frames + 511) / 512 {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            win32k_host::CSRSS_W32_SHARED_VA + p * 0x20_0000,
+            pml4,
+        );
+    }
+    for i in 0..frames {
+        let cp = copy_cap(heap_base + i);
+        let _ = page_map(cp, win32k_host::CSRSS_W32_SHARED_VA + i * 0x1000, RO_NX, pml4);
+    }
+    print_str(b"[win32k-svc] RO-mapped win32k USER heap into csrss @0x");
+    print_hex(win32k_host::CSRSS_W32_SHARED_VA as u32);
+    print_str(b" (delta=0x");
+    print_hex((delta >> 32) as u32);
+    print_hex(delta as u32);
+    print_str(b")\n");
+    delta
+}
 
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
 /// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
@@ -5257,6 +5336,12 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let addr = m1;
             let in_image =
                 addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+            // A foreign CLIENT pointer: win32k's own demand-pageable VAs are all in its component
+            // window (>= 0x100_0000_0000); anything below is a csrss/user32/gdi32 user pointer the
+            // handler dereferenced directly. A zero page would feed win32k WRONG data, so this is an
+            // un-demand-mappable wall — it needs explicit cross-AS arg marshaling for that SSN (like
+            // NtUserProcessConnect). Stop cleanly on the FIRST such fault (don't spin to DEMAND_CAP).
+            let foreign = addr < 0x0000_0100_0000_0000;
             if demand < 60 {
                 print_str(b"[w32disp] fault #");
                 print_u64(demand);
@@ -5268,9 +5353,12 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
                 print_str(b" addr=0x");
                 print_hex((addr >> 32) as u32);
                 print_hex(addr as u32);
+                if foreign {
+                    print_str(b" (FOREIGN client ptr - needs marshaling)");
+                }
                 print_str(b"\n");
             }
-            if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
+            if addr < 0x10000 || in_image || foreign || demand >= DEMAND_CAP {
                 return (0xC000_0001u32 as i32, false);
             }
             let page = addr & !0xFFF;
@@ -7928,9 +8016,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_ARG_FRAMES { let _ = alloc_frame(); }
-            // The win32k session-heap arena (host-only; the executive doesn't map it).
+            // The win32k session-heap arena (host-only; the executive doesn't map it). Retain the
+            // frame-cap base so the connect marshaling can RO-map the global USER heap into a GUI
+            // client's VSpace (the gSharedInfo client-mapping).
             let heap_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
+            WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
             // The pool-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718).
             let ppt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
