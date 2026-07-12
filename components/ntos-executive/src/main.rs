@@ -318,6 +318,13 @@ pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000;    // ntdll_vista ~56 KiB
 /// off disk into here; the executive parses+loads it into the win32k-service component.
 pub const WIN32KBUF_VADDR: u64 = 0x0000_0100_0600_0000;
 pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_image
+/// Raw dxg.sys / dxgthk.sys staging buffers (DirectX kernel driver + thunk table). Own 2 MiB PTs
+/// past WIN32KBUF (0x0600..0x0622) and clear of WIN32K_CODE_VA (0x0680, mapped in the executive too).
+/// dxg.sys=33,728 B (16 frames), dxgthk.sys=11,200 B (8 frames); one PT each.
+pub const DXGBUF_VADDR: u64 = 0x0000_0100_0630_0000;
+pub const DXGBUF_FRAMES: u64 = 16;
+pub const DXGTHKBUF_VADDR: u64 = 0x0000_0100_0650_0000;
+pub const DXGTHKBUF_FRAMES: u64 = 8;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -5239,6 +5246,18 @@ unsafe fn spawn_storage_host(
         let kb_cp = copy_cap(win32kbuf_start + i);
         let _ = page_map(kb_cp, WIN32KBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // The raw dxg.sys / dxgthk.sys staging buffers (one PT each), mapped into the host too.
+    for (start, vaddr, frames) in [
+        (DXGBUF_START.load(Ordering::Relaxed), DXGBUF_VADDR, DXGBUF_FRAMES),
+        (DXGTHKBUF_START.load(Ordering::Relaxed), DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
+    ] {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, pml4);
+        for i in 0..frames {
+            let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, pml4);
+        }
+    }
     // The NLS + SYSTEM-hive buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
     for (start, vaddr, frames) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
@@ -5297,6 +5316,9 @@ static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
+/// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
+static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
+static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -6546,6 +6568,28 @@ unsafe fn storage_probe(
             print_str(b"\n");
             if got == want && sz > 0 {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x7c) as *mut u32, sz);
+            }
+        }
+        // dxg.sys + dxgthk.sys (DirectX kernel driver + thunk table) into their own buffers; sizes
+        // reported at STORAGE_SHARED+0x80 / +0x84 so the executive can host them into win32k.
+        for (name, dest, cap_frames, off) in [
+            (b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
+            (b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
+        ] {
+            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+                let cap = (cap_frames * 0x1000) as u32;
+                let want = if sz < cap { sz } else { cap };
+                let got = fat_read_file(&fs, c, want, dest);
+                print_str(b"[storage-host] ");
+                print_str(name);
+                print_str(b" size=");
+                print_u64(sz as u64);
+                print_str(b" read=");
+                print_u64(got as u64);
+                print_str(b"\n");
+                if got == want && sz > 0 {
+                    core::ptr::write_volatile((STORAGE_SHARED_VADDR + off) as *mut u32, sz);
+                }
             }
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
@@ -7950,6 +7994,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(copy_cap(win32kbuf_start + i), WIN32KBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             WIN32KBUF_START.store(win32kbuf_start, Ordering::Relaxed);
+            // The raw dxg.sys / dxgthk.sys buffers (one PT each), mapped in the executive too so it
+            // can parse+load them into win32k's VSpace (DirectX driver hosting).
+            for (st_static, vaddr, frames) in [
+                (&DXGBUF_START, DXGBUF_VADDR, DXGBUF_FRAMES),
+                (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
+            ] {
+                let pt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, vaddr, CAP_INIT_THREAD_VSPACE);
+                let start = alloc_frame();
+                for _ in 1..frames { let _ = alloc_frame(); }
+                for i in 0..frames {
+                    let _ = page_map(copy_cap(start + i), vaddr + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                }
+                st_static.store(start, Ordering::Relaxed);
+            }
             // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
             // in the executive too, and remember their cap bases for spawn_sec_image to share into
             // smss.
