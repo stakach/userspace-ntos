@@ -15,8 +15,15 @@ extern crate alloc;
 mod hal;
 mod ntoskrnl;
 mod registry;
+pub mod rtl;
+pub mod ssdt;
+pub mod win32k;
 
 pub use registry::{ExportRegistry, ImportCheck, ImportOutcome, ImportReport};
+pub use ssdt::{
+    ServiceTable, ServiceTableRegistry, WIN32K_SERVICE_BASE, WIN32K_SERVICE_TABLE_INDEX,
+};
+pub use win32k::{WIN32K_FTFD_IMPORTS, WIN32K_HAL_IMPORTS, WIN32K_NTOSKRNL_IMPORTS};
 
 /// The v0.1 compatibility status of an export (spec §7.3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

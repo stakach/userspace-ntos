@@ -4,7 +4,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::{hal, ntoskrnl, ExportDescriptor, ExportStatus};
+use crate::{hal, ntoskrnl, win32k, ExportDescriptor, ExportStatus};
 
 /// The outcome of resolving one imported symbol.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -38,8 +38,14 @@ pub struct ExportRegistry {
 impl ExportRegistry {
     /// Build the registry from the static `ntoskrnl` + `hal` tables.
     pub fn new() -> Self {
-        let mut entries = Vec::with_capacity(ntoskrnl::NTOSKRNL.len() + hal::HAL.len());
-        for d in ntoskrnl::NTOSKRNL.iter().chain(hal::HAL.iter()) {
+        let mut entries = Vec::with_capacity(
+            ntoskrnl::NTOSKRNL.len() + win32k::WIN32K_NTOSKRNL.len() + hal::HAL.len(),
+        );
+        for d in ntoskrnl::NTOSKRNL
+            .iter()
+            .chain(win32k::WIN32K_NTOSKRNL.iter())
+            .chain(hal::HAL.iter())
+        {
             entries.push(Entry {
                 desc: d,
                 trampoline: None,
@@ -215,6 +221,61 @@ mod tests {
         );
         // Unknown export cannot be bound.
         assert!(!reg.set_trampoline("ntoskrnl.exe", "Nope", 1));
+    }
+
+    #[test]
+    fn win32k_full_import_surface_resolves_and_loads() {
+        let reg = ExportRegistry::new();
+        // Every ntoskrnl.exe import win32k.sys names must resolve to an
+        // Available export (never Missing, never Blocked — the load must not
+        // fail-fast on any of win32k's 224 ntoskrnl imports).
+        let mut missing = std::vec::Vec::new();
+        let mut blocked = std::vec::Vec::new();
+        for name in crate::WIN32K_NTOSKRNL_IMPORTS {
+            match reg.resolve("ntoskrnl.exe", name) {
+                ImportOutcome::Available(_) => {}
+                ImportOutcome::Missing => missing.push(*name),
+                ImportOutcome::Blocked => blocked.push(*name),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "unresolved ntoskrnl imports: {missing:?}"
+        );
+        assert!(
+            blocked.is_empty(),
+            "load-blocking ntoskrnl imports: {blocked:?}"
+        );
+
+        // hal.dll import(s).
+        for name in crate::WIN32K_HAL_IMPORTS {
+            assert!(
+                reg.resolve("hal.dll", name).loads(),
+                "hal.dll import {name} does not resolve"
+            );
+        }
+
+        // The whole (dll, name) set is runnable as a single report.
+        let all: std::vec::Vec<(&str, &str)> = crate::WIN32K_NTOSKRNL_IMPORTS
+            .iter()
+            .map(|n| ("ntoskrnl.exe", *n))
+            .chain(crate::WIN32K_HAL_IMPORTS.iter().map(|n| ("hal.dll", *n)))
+            .collect();
+        let report = reg.check(all);
+        assert!(report.runnable(), "win32k import set is not runnable");
+        assert_eq!(report.blocking().count(), 0);
+    }
+
+    #[test]
+    fn win32k_import_lists_have_expected_counts() {
+        assert_eq!(crate::WIN32K_NTOSKRNL_IMPORTS.len(), 224);
+        assert_eq!(crate::WIN32K_HAL_IMPORTS.len(), 1);
+        assert_eq!(crate::WIN32K_FTFD_IMPORTS.len(), 34);
+        // No duplicate names within the ntoskrnl import list.
+        let mut seen = std::collections::BTreeSet::new();
+        for n in crate::WIN32K_NTOSKRNL_IMPORTS {
+            assert!(seen.insert(*n), "duplicate win32k import {n}");
+        }
     }
 
     #[test]

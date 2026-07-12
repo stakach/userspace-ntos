@@ -108,6 +108,12 @@ pub struct NtProcess {
     pub main_thread: Option<ThreadId>,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
+    /// Opaque `W32PROCESS` pointer parked by win32k via `PsSetProcessWin32Process`
+    /// (read back with `PsGetProcessWin32Process`). `None` until win32k attaches.
+    pub win32_process: Option<u64>,
+    /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
+    /// `PsGetProcessWin32WindowStation`).
+    pub win32_window_station: Option<u64>,
     handles: BTreeMap<Handle, HandleEntry>,
     next_handle: u32,
 }
@@ -135,6 +141,26 @@ pub struct NtThread {
     pub is_system_thread: bool,
     pub exit_status: Option<u32>,
     pub suspend_count: u32,
+    /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
+    /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
+    pub win32_thread: Option<u64>,
+}
+
+/// The win32k per-system callout function pointers registered via
+/// `PsEstablishWin32Callouts` (spec §7.4). win32k passes a `WIN32_CALLOUTS_FPNS`
+/// structure at init; the executive parks its address (and the couple of
+/// callouts it drives synchronously on process/thread create) so Phase 2 can
+/// invoke them. All fields are raw kernel pointers (`0` = not supplied).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Win32Callouts {
+    /// Address of the `WIN32_CALLOUTS_FPNS` structure win32k supplied.
+    pub table: u64,
+    /// `ProcessCallout` — run on process create/destroy.
+    pub process_callout: u64,
+    /// `ThreadCallout` — run on thread create/destroy.
+    pub thread_callout: u64,
+    /// `GlobalAtomTableCallout` — returns the per-session atom table.
+    pub global_atom_callout: u64,
 }
 
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
@@ -146,6 +172,8 @@ pub struct ProcessManager {
     next_pid: u32,
     next_tid: u32,
     next_asid: u32,
+    /// win32k's registered callouts (`PsEstablishWin32Callouts`), once attached.
+    win32_callouts: Option<Win32Callouts>,
 }
 
 impl ProcessManager {
@@ -235,6 +263,8 @@ impl ProcessManager {
                 main_thread: None,
                 state,
                 exit_status: None,
+                win32_process: None,
+                win32_window_station: None,
                 handles: BTreeMap::new(),
                 next_handle: 4,
             },
@@ -285,9 +315,81 @@ impl ProcessManager {
                 is_system_thread,
                 exit_status: None,
                 suspend_count: 0,
+                win32_thread: None,
             },
         );
         Ok(tid)
+    }
+
+    // --- win32k per-process/thread context slots (spec §7.4) -----------------
+    //
+    // win32k parks an opaque `W32PROCESS`/`W32THREAD` pointer on each hosted
+    // process/thread and reads it back on every NtUser/NtGdi call. These are
+    // pure pointer slots — the executive stores what win32k hands it and returns
+    // it verbatim; it never dereferences the value.
+
+    /// `PsSetProcessWin32Process`: park win32k's `W32PROCESS` pointer on `pid`.
+    /// Returns `false` for an unknown process.
+    pub fn set_process_win32(&mut self, pid: ProcessId, win32process: u64) -> bool {
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.win32_process = (win32process != 0).then_some(win32process);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `PsGetProcessWin32Process`: read back the parked `W32PROCESS` pointer
+    /// (`0`/`None` if win32k has not attached to `pid`).
+    pub fn process_win32(&self, pid: ProcessId) -> Option<u64> {
+        self.processes.get(&pid).and_then(|p| p.win32_process)
+    }
+
+    /// `PsSetThreadWin32Thread`: park win32k's `W32THREAD` pointer on `tid`.
+    pub fn set_thread_win32(&mut self, tid: ThreadId, win32thread: u64) -> bool {
+        match self.threads.get_mut(&tid) {
+            Some(t) => {
+                t.win32_thread = (win32thread != 0).then_some(win32thread);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `PsGetThreadWin32Thread`: read back the parked `W32THREAD` pointer.
+    pub fn thread_win32(&self, tid: ThreadId) -> Option<u64> {
+        self.threads.get(&tid).and_then(|t| t.win32_thread)
+    }
+
+    /// `PsSetProcessWindowStation`: bind a `WINDOWSTATION` to `pid`.
+    pub fn set_process_window_station(&mut self, pid: ProcessId, window_station: u64) -> bool {
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.win32_window_station = (window_station != 0).then_some(window_station);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `PsGetProcessWin32WindowStation`: read back the bound `WINDOWSTATION`.
+    pub fn process_window_station(&self, pid: ProcessId) -> Option<u64> {
+        self.processes
+            .get(&pid)
+            .and_then(|p| p.win32_window_station)
+    }
+
+    /// `PsEstablishWin32Callouts`: record win32k's callout table. win32k calls
+    /// this exactly once at `win32k!DriverEntry`. Returns the previous
+    /// registration (`None` on the first, expected, call).
+    pub fn establish_win32_callouts(&mut self, callouts: Win32Callouts) -> Option<Win32Callouts> {
+        self.win32_callouts.replace(callouts)
+    }
+
+    /// The registered win32k callouts, if `PsEstablishWin32Callouts` has run.
+    pub fn win32_callouts(&self) -> Option<Win32Callouts> {
+        self.win32_callouts
     }
 
     pub fn client_id(&self, tid: ThreadId) -> Option<ClientId> {

@@ -93,7 +93,13 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("IoAllocateMdl", Unsupported, ""),
     e("MmProbeAndLockPages", Unsupported, ""),
     e("MmUnlockPages", Unsupported, ""),
-    e("IoBuildDeviceIoControlRequest", Unsupported, ""),
+    // win32k.sys imports this; soften from load-blocking to fail-loud so win32k
+    // (and drivers) still load, trapping only if the IRP-build path is reached.
+    e(
+        "IoBuildDeviceIoControlRequest",
+        TrapIfCalled,
+        "IRP-building not modelled on the host; traps if called",
+    ),
     e("IoCallDriver", Unsupported, ""),
     e("IoAttachDeviceToDeviceStack", Unsupported, ""),
     e("IoDetachDevice", Unsupported, ""),

@@ -125,3 +125,55 @@ fn invalid_image_rejected() {
         Err(STATUS_INVALID_IMAGE_FORMAT)
     );
 }
+
+#[test]
+fn win32_process_thread_context_slots() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("winlogon.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+
+    // Slots start empty — win32k has not attached yet.
+    assert_eq!(pm.process_win32(pid), None);
+    assert_eq!(pm.thread_win32(tid), None);
+    assert_eq!(pm.process_window_station(pid), None);
+
+    // win32k parks its opaque W32PROCESS / W32THREAD pointers.
+    assert!(pm.set_process_win32(pid, 0xFFFF_9E00_1234_0000));
+    assert!(pm.set_thread_win32(tid, 0xFFFF_9E00_5678_0000));
+    assert!(pm.set_process_window_station(pid, 0xFFFF_9E00_9ABC_0000));
+    assert_eq!(pm.process_win32(pid), Some(0xFFFF_9E00_1234_0000));
+    assert_eq!(pm.thread_win32(tid), Some(0xFFFF_9E00_5678_0000));
+    assert_eq!(pm.process_window_station(pid), Some(0xFFFF_9E00_9ABC_0000));
+
+    // Setting NULL clears the slot (win32k detaches on process/thread teardown).
+    assert!(pm.set_process_win32(pid, 0));
+    assert_eq!(pm.process_win32(pid), None);
+
+    // Unknown pid/tid is rejected, not a panic.
+    assert!(!pm.set_process_win32(9999, 1));
+    assert!(!pm.set_thread_win32(9999, 1));
+    assert_eq!(pm.process_win32(9999), None);
+    assert_eq!(pm.thread_win32(9999), None);
+}
+
+#[test]
+fn win32_callouts_established_once() {
+    let mut pm = ProcessManager::new();
+    assert_eq!(pm.win32_callouts(), None);
+    let c = Win32Callouts {
+        table: 0xFFFF_F800_0020_0000,
+        process_callout: 0xFFFF_F800_0020_1000,
+        thread_callout: 0xFFFF_F800_0020_2000,
+        global_atom_callout: 0xFFFF_F800_0020_3000,
+    };
+    // First establish returns no prior registration.
+    assert_eq!(pm.establish_win32_callouts(c), None);
+    assert_eq!(pm.win32_callouts(), Some(c));
+    // A re-establish returns the prior table (win32k only calls once).
+    let c2 = Win32Callouts {
+        table: 0xDEAD,
+        ..Default::default()
+    };
+    assert_eq!(pm.establish_win32_callouts(c2), Some(c));
+    assert_eq!(pm.win32_callouts(), Some(c2));
+}
