@@ -72,39 +72,45 @@ impl Sel4Env for KernelEnv {
 }
 pub static ENV: KernelEnv = KernelEnv;
 
-// Component vaddr layout — all inside the one 2 MiB PT of each component. These
-// vaddrs are used in BOTH the executive's own VSpace (front-end side) and each
-// spawned service's VSpace (they map their own copies of the same frames).
+// Relocated "cluster" vaddr layout — all inside ONE 2 MiB page table at WORK_CLUSTER_BASE
+// (0x1040_0000, 256 MiB past IMAGE_BASE), well clear of the 64 MiB ELF reserve. These vaddrs are
+// used in BOTH the executive's own VSpace (front-end side) and each spawned service's VSpace (they
+// map their own copies of the same frames). Low 21 bits preserve the old intra-2 MiB offsets, so
+// every "same 2 MiB PT" relationship is unchanged — only the PT moved out from under the ELF.
 pub const IMAGE_BASE: u64 = 0x0000_0100_0040_0000;
-pub const SUB_RING_VADDR: u64 = 0x0000_0100_0050_0000;
-pub const COMP_RING_VADDR: u64 = 0x0000_0100_0051_0000;
-pub const REQ_DATA_VADDR: u64 = 0x0000_0100_0052_0000;
-pub const REP_DATA_VADDR: u64 = 0x0000_0100_0053_0000;
+/// Base of the relocated shared working-VA cluster (rings, stack, IPC buffer, sysarg, device MMIO,
+/// driver code/arena). One 2 MiB page table covers [WORK_CLUSTER_BASE, +0x20_0000); every
+/// executive-image VSpace (and the executive's own) builds it via `map_cluster_pt`.
+pub const WORK_CLUSTER_BASE: u64 = 0x0000_0100_1040_0000;
+pub const SUB_RING_VADDR: u64 = 0x0000_0100_1050_0000;
+pub const COMP_RING_VADDR: u64 = 0x0000_0100_1051_0000;
+pub const REQ_DATA_VADDR: u64 = 0x0000_0100_1052_0000;
+pub const REP_DATA_VADDR: u64 = 0x0000_0100_1053_0000;
 // A SECOND ring set — the executive's side of the Configuration Manager service.
 // (Each spawned service maps ITS frames at the shared SUB/COMP/REQ/REP vaddrs above
 // in its own VSpace; the executive maps each service's frames at distinct vaddrs.)
-pub const CM_SUB_VADDR: u64 = 0x0000_0100_0054_0000;
-pub const CM_COMP_VADDR: u64 = 0x0000_0100_0055_0000;
-pub const CM_REQ_VADDR: u64 = 0x0000_0100_0056_0000;
-pub const CM_REP_VADDR: u64 = 0x0000_0100_0057_0000;
+pub const CM_SUB_VADDR: u64 = 0x0000_0100_1054_0000;
+pub const CM_COMP_VADDR: u64 = 0x0000_0100_1055_0000;
+pub const CM_REQ_VADDR: u64 = 0x0000_0100_1056_0000;
+pub const CM_REP_VADDR: u64 = 0x0000_0100_1057_0000;
 // A THIRD ring set — the executive's side of the I/O Manager service.
-pub const IO_SUB_VADDR: u64 = 0x0000_0100_0058_0000;
-pub const IO_COMP_VADDR: u64 = 0x0000_0100_0059_0000;
-pub const IO_REQ_VADDR: u64 = 0x0000_0100_005A_0000;
-pub const IO_REP_VADDR: u64 = 0x0000_0100_005B_0000;
-pub const STACK_BASE: u64 = 0x0000_0100_005C_0000;
+pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
+pub const IO_COMP_VADDR: u64 = 0x0000_0100_1059_0000;
+pub const IO_REQ_VADDR: u64 = 0x0000_0100_105A_0000;
+pub const IO_REP_VADDR: u64 = 0x0000_0100_105B_0000;
+pub const STACK_BASE: u64 = 0x0000_0100_105C_0000;
 /// Floor for on-demand stack growth: a fault in [STACK_GROWTH_FLOOR, STACK_BASE) commits a fresh
 /// page and restarts (Windows guard-page style), so smss's stack grows past the 16 KiB initial
-/// commit instead of crashing. Bounded above IO_REP_VADDR (0x5B_0000) so growth never collides
+/// commit instead of crashing. Bounded above IO_REP_VADDR (…5B_0000) so growth never collides
 /// with the env mappings below. ~60 KiB of growth room; ~76 KiB total stack.
-pub const STACK_GROWTH_FLOOR: u64 = 0x0000_0100_005B_1000;
+pub const STACK_GROWTH_FLOOR: u64 = 0x0000_0100_105B_1000;
 /// A per-user-thread syscall argument frame, mapped at the SAME vaddr in both the
 /// executive and the user thread — so a `UNICODE_STRING` whose `Buffer` points into
 /// it is valid in both address spaces (the copyin path for pointer-based `Nt*` args).
-pub const SYSARG_VADDR: u64 = 0x0000_0100_005D_0000;
+pub const SYSARG_VADDR: u64 = 0x0000_0100_105D_0000;
 /// A second shared frame, for the blocking-wait demo's two threads (mapped at SYSARG_VADDR in
 /// each of them) — read by the executive at this vaddr (its own view of the same frame).
-pub const SYSARG2_VADDR: u64 = 0x0000_0100_005D_1000;
+pub const SYSARG2_VADDR: u64 = 0x0000_0100_105D_1000;
 /// Where a loaded real PE's image is mapped in its user VSpace (inside the one 2 MiB PT with
 /// the stack/sysarg/ipcbuf), and the executive's scratch region to write the code first.
 pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
@@ -119,32 +125,32 @@ pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0059_0000;
 pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
 /// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
 /// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
-pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0068_0000;
+pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
 /// The 2nd hosted process (csrss) needs its OWN executive stack mirror: its syscall out-params
 /// (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) must be written to ITS stack, not smss's.
 /// Adjacent to smss's mirror, in the same FILEBUF page table. ACTIVE_STACK_MIRROR selects between
 /// them by the current fault badge.
-pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_0069_0000;
+pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1069_0000;
 /// Where the executive backs NtAllocateVirtualMemory for the process (its own PT).
 pub const SMSS_ALLOC_VA: u64 = 0x0000_0100_00C0_0000;
 /// The executive's mirror of the first window of smss's heap (SMSS_ALLOC_VA). A userspace broker
 /// can't walk smss's page tables, so `smss_copyin` reads syscall pointer args (e.g. a loader-built
 /// registry key path) from the same frames it mapped, through this parallel mapping. Own PT.
-pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0090_0000;
+pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_1090_0000;
 pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early heap
 /// csrss's own heap mirror — its loader builds DLL search paths ("…\csrsrv.dll") on its heap, which
 /// the executive must read from CSRSS's heap, not smss's. 2 MiB at 0x200_0000 (past the fill-scratch
 /// region 0x100-0x200, its own PT). ACTIVE_HEAP_MIRROR selects by the current badge.
-pub const CSRSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_0200_0000;
+pub const CSRSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_1200_0000;
 /// The executive's mirror of smss's demand-filled IMAGE pages, so smss_copyin can read static
 /// pointer args (registry value/subkey names in .rdata, etc.) from the process image. Sits just
 /// below the heap mirror and SHARES its 0x80-0xA0 page table (no extra PT).
-pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_0080_0000;
+pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_1080_0000;
 pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 KiB)
 /// csrss's own image mirror — its loader reads import-descriptor DLL names ("csrsrv.dll") from its
 /// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
 /// (inside the NTDLLBUF page table, 0xA0-0xC0). ACTIVE_IMAGE_MIRROR selects by the current badge.
-pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_00B0_0000;
+pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -247,7 +253,7 @@ pub const SSN_NT_OPEN_FILE: u64 = 122;
 pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
-pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_0052_0000;
+pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
 /// TEB_VA so `GS:[0x30]` is the TEB self-pointer (NtCurrentTeb).
@@ -260,21 +266,21 @@ pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
 /// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
 pub const HPET_PADDR: u64 = 0xFED0_0000;
-pub const HPET_VADDR: u64 = 0x0000_0100_005E_0000;
+pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
 /// Where the executive maps a real PCI device's BAR (P1 capstone — the e1000e NIC).
-pub const NIC_VADDR: u64 = 0x0000_0100_005F_0000;
+pub const NIC_VADDR: u64 = 0x0000_0100_105F_0000;
 /// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
 /// the sector data buffer (both just past the NIC's 4-page BAR, before IPCBUF).
-pub const AHCI_VADDR: u64 = 0x0000_0100_005F_4000;
-pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_005F_5000;
+pub const AHCI_VADDR: u64 = 0x0000_0100_105F_4000;
+pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// Shared word between the executive (broker) and the isolated storage host: the AHCI's
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
 /// INITRD cluster @0x10, size @0x14 out.
-pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_005F_6000;
+pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_105F_6000;
 /// A multi-frame file buffer shared between the executive and the storage host: the host reads
 /// a real PE (ReactOS SMSS.EXE) off the disk into it, and the executive parses it there. 32
 /// frames (128 KiB) at a fresh 2 MiB region, contiguous in both VSpaces (one shared PT).
-pub const FILEBUF_VADDR: u64 = 0x0000_0100_0060_0000; // its own PT (0x40-0x60 is crowded)
+pub const FILEBUF_VADDR: u64 = 0x0000_0100_1060_0000; // its own PT, just past the cluster region
 pub const FILEBUF_FRAMES: u64 = 64; // 256 KiB — holds smss + csrss + csrsrv, still one 2 MiB PT
 /// csrss.exe (~7 KiB) is staged into the FILEBUF tail, past smss.exe (~99 KiB) but well within the
 /// buffer — no separate buffer needed. The storage host reads it here and writes its size
@@ -286,7 +292,7 @@ pub const CSRSRV_FILEBUF_OFFSET: u64 = 0x20000; // 128 KiB in — clear of csrss
 /// basesrv.dll (~50 KiB) + winsrv.dll (~400 KiB) — csrss's dynamically-loaded ServerDlls — don't fit
 /// in FILEBUF, so they get their own 512 KiB buffer (its own 2 MiB PT), dual-mapped host<->exec like
 /// NTDLLBUF. basesrv at offset 0, winsrv at +0x10000; sizes reported at STORAGE_SHARED +0x44 / +0x48.
-pub const SRVBUF_VADDR: u64 = 0x0000_0100_0400_0000;
+pub const SRVBUF_VADDR: u64 = 0x0000_0100_1400_0000;
 pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
 pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
 pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv (~50 KiB)
@@ -316,33 +322,33 @@ pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_i
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
 /// csrss's demand-fault scratch region in the executive's VSpace — a non-overlapping window inside
-/// smss's already-mapped 8-PT scratch range (smss uses [0x1_0100_0000 .. +256 pages]; PT k=4 backs
+/// smss's already-mapped 8-PT scratch range (smss uses [0x1_1100_0000 .. +256 pages]; PT k=4 backs
 /// this), so no extra page tables are needed.
-pub const CSRSS_SCRATCH_BASE: u64 = 0x0000_0100_0180_0000;
+pub const CSRSS_SCRATCH_BASE: u64 = 0x0000_0100_1180_0000;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
-pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_00A0_0000;
+pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// NTDLLBUF page table's 2 MiB region (0xA0_0000-0xC0_0000, past NTDLLBUF's 0xA0-0xB0), so they
 /// need no extra PT. spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
-pub const NLS_ANSI_VADDR: u64 = 0x0000_0100_00B0_0000; // c_1252.nls (66082 B = 17 pages)
+pub const NLS_ANSI_VADDR: u64 = 0x0000_0100_10B0_0000; // c_1252.nls (66082 B = 17 pages)
 pub const NLS_ANSI_FRAMES: u64 = 20;
-pub const NLS_OEM_VADDR: u64 = 0x0000_0100_00B2_0000; // c_437.nls (66594 B = 17 pages)
+pub const NLS_OEM_VADDR: u64 = 0x0000_0100_10B2_0000; // c_437.nls (66594 B = 17 pages)
 pub const NLS_OEM_FRAMES: u64 = 20;
-pub const NLS_CASE_VADDR: u64 = 0x0000_0100_00B4_0000; // l_intl.nls (4870 B = 2 pages)
+pub const NLS_CASE_VADDR: u64 = 0x0000_0100_10B4_0000; // l_intl.nls (4870 B = 2 pages)
 pub const NLS_CASE_FRAMES: u64 = 4;
 /// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
 /// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NTDLLBUF 0xA0-0xC0 page table so it
 /// needs no extra PT. Placed at 0xB9_0000 — PAST HIVEBUF (0xB5_0000 + 64 frames = 0xB9_0000); the
 /// task's suggested 0xB6_0000 collides with the SYSTEM-hive buffer. Runs to 0xBD_0000, clear of
 /// the 0xC0_0000 region end.
-pub const NLS_20127_VADDR: u64 = 0x0000_0100_00B9_0000;
+pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
 pub const NLS_20127_FRAMES: u64 = 20;
 /// The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by the
 /// isolated storage host into these shared frames; the executive parses it with nt-hive-regf so
 /// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
-pub const HIVEBUF_VADDR: u64 = 0x0000_0100_00B5_0000;
+pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
 pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
 /// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
@@ -352,13 +358,13 @@ pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
 /// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
 /// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
 pub const AHCI_IOVA: u64 = 0x1000;
-pub const IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
+pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 /// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
 /// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
 /// straight to this frame's physical address. Kept just past IPCBUF so it stays inside
 /// the same 2 MiB page table as every other runtime mapping (0x40_0000..0x5F_FFFF) — a
 /// vaddr in the next 2 MiB region would need a PT this vspace doesn't have.
-pub const DMA_VADDR: u64 = 0x0000_0100_005F_C000;
+pub const DMA_VADDR: u64 = 0x0000_0100_105F_C000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -433,7 +439,7 @@ const SLOT_IO_SPACE: u64 = 8; // seL4_CapIOSpace — the master IO-space cap in 
 const NIC_IOVA: u64 = 0x1000;
 /// Driver-host VSpace: where the executive maps the CM_RESOURCE_LIST + common-buffer
 /// descriptor (also mapped at the same vaddr in the host, aliasing the frame).
-pub const RESLIST_VADDR: u64 = 0x0000_0100_005F_D000;
+pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
 /// The MSI vector we bind for the NIC interrupt (matches the NIC IRQ section).
 const NIC_MSI_VECTOR: u64 = 5;
 /// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
@@ -468,10 +474,10 @@ const NT_QUERY_SYSTEM_TIME: u64 = 0x57; // NtQuerySystemTime() → HPET counter 
 const NT_CREATE_SECTION: u64 = 0x47; // NtCreateSection(size in R10) → section handle in RAX
 const NT_MAP_VIEW: u64 = 0x25; // NtMapViewOfSection(section handle in R10) → view base VA in RAX
 const NT_CREATE_THREAD: u64 = 0xA5; // NtCreateThreadEx(start routine in R10) → thread handle in RAX
-/// Where the executive backs NtAllocateVirtualMemory for the user thread — inside its
-/// existing 2 MiB image PT (image ends ~0x41_0000, stack at 0x5C_0000), so mapping needs no
-/// new page table.
-pub const USER_ALLOC_BASE: u64 = 0x0000_0100_0050_0000;
+/// Where the executive backs NtAllocateVirtualMemory for the user thread — inside the relocated
+/// cluster PT (WORK_CLUSTER_BASE), which spawn_user_thread builds; the 2 MiB alloc window
+/// [USER_ALLOC_BASE, +0x20_0000) stays within it, so mapping needs no new page table.
+pub const USER_ALLOC_BASE: u64 = 0x0000_0100_1050_0000;
 
 // The Object Manager namespace ops aren't in the `NativeService` enum (a niche
 // syscall surface), so they keep synthetic numbers — but now carry a real
@@ -628,9 +634,51 @@ unsafe fn attach_sched_context(tcb: u64) {
     let _ = sched_context_bind(sc, tcb);
 }
 
-/// Map the executive's OWN heap (so its front-end can allocate). The root image's
-/// `.bss` is fixed at boot; the allocator's arena lives at `HEAP_BASE` past it.
+/// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
+/// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to
+/// piggyback the image's 2 MiB PT; now that the working VAs moved high (out of the 64 MiB ELF
+/// reserve) it needs its own PT in every executive-image VSpace and in the executive's own.
+unsafe fn map_cluster_pt(pml4: u64) {
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
+}
+
+/// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The generous heap
+/// is 512 frames = exactly one 2 MiB PT.
+unsafe fn map_heap_pt(pml4: u64) {
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, allocator::HEAP_BASE as u64, pml4);
+}
+
+/// Build the standard executive-image paging skeleton in `pml4`: pdpt + pd for the image's 1 GiB
+/// slot, one PT per 2 MiB of image (so the ELF can grow into its 64 MiB reserve), and the
+/// relocated cluster PT. Callers then map the image frames + any region-specific buffer PTs. The
+/// pd is 1 GiB-granular, so it also covers the cluster / heap / buffer PTs (all < 512 MiB).
+unsafe fn map_image_skeleton(pml4: u64, img_count: u64) {
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    // One PT per 2 MiB of image (512 4 KiB pages each). `.max(1)` keeps at least one even for a
+    // trivially small image.
+    let npt = ((img_count + 511) / 512).max(1);
+    for k in 0..npt {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE + k * 0x20_0000, pml4);
+    }
+    map_cluster_pt(pml4);
+}
+
+/// Map the executive's OWN heap (so its front-end can allocate). Builds the heap PT first (the
+/// heap is relocated far above the image, so — unlike before — the kernel's ELF PTs don't cover
+/// it), then maps all HEAP_FRAMES at the relocated `HEAP_BASE`.
 unsafe fn map_own_heap() {
+    map_heap_pt(CAP_INIT_THREAD_VSPACE);
     for i in 0..allocator::HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
@@ -650,21 +698,14 @@ unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64) -> u64 {
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
+    map_heap_pt(pml4);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
         let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
     }
-    for i in 0..allocator::HEAP_FRAMES {
+    for i in 0..allocator::SERVICE_HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
@@ -1455,6 +1496,8 @@ unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, s
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // The stack / IPC buffer / sysarg frame live in the relocated cluster region.
+    map_cluster_pt(pml4);
     // Map the PE image: write the bytes into fresh frames via an executive scratch mapping,
     // then map each frame RX (rights=2 — W^X) at PE_LOAD_BASE in the new VSpace.
     let pages = (mapped.bytes.len() + 0xFFF) / 0x1000;
@@ -1609,6 +1652,8 @@ unsafe fn spawn_sec_image(
     let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
+    map_cluster_pt(pml4);
     // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if ntdll_base != 0 {
@@ -3845,7 +3890,7 @@ unsafe fn service_sec_image(
                     // line omits it too; it was only masked before by winsrv crashing first.)
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
-                        cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_0078_0000,
+                        cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
@@ -4431,15 +4476,7 @@ unsafe fn spawn_user_thread(
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
@@ -4515,15 +4552,7 @@ unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64, result_cap
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
@@ -4577,15 +4606,7 @@ unsafe fn spawn_driver_host(
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
@@ -4599,7 +4620,7 @@ unsafe fn spawn_driver_host(
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
-    // Granted device resources, mapped into the host's VSpace (all within the image PT):
+    // Granted device resources, mapped into the host's VSpace (all within the cluster PT):
     //   the 4 NIC BAR pages at NIC_VADDR, the confined DMA buffer at DMA_VADDR, and the
     //   resource frame at RESLIST_VADDR. Each is a copy aliasing the executive's frame.
     for i in 0..4u64 {
@@ -4658,15 +4679,8 @@ unsafe fn spawn_kmdf_host(
     let stack_frames = 16u64; // 64 KiB — WDF call chains are deep
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
+    map_heap_pt(pml4);
     // Image mapped RW (rights=3 → RWX): the WDF function table + globals live in `.bss`
     // and this host must WRITE them. NOTE: these are the executive's SHARED image frames,
     // so — unlike the RO-image hosts — a buggy KMDF host could scribble on the executive's
@@ -4679,7 +4693,7 @@ unsafe fn spawn_kmdf_host(
         let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RWX */ 3, pml4);
     }
     // Heap for the WDF runtime; retype-zeroed frames give bump counter 0 (no init).
-    for i in 0..allocator::HEAP_FRAMES {
+    for i in 0..allocator::SERVICE_HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
@@ -4751,22 +4765,15 @@ unsafe fn spawn_win32k_host(
     let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
+    map_heap_pt(pml4);
     // Executive image RWX (the trampolines + statics the host calls into live in it).
     for i in 0..img_count {
         let cp = alloc_slot();
         let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
         let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RWX */ 3, pml4);
     }
-    for i in 0..allocator::HEAP_FRAMES {
+    for i in 0..allocator::SERVICE_HEAP_FRAMES {
         let f = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
@@ -4879,15 +4886,7 @@ unsafe fn spawn_storage_host(
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
-    let pdpt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
-    let pd = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-    let pt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
-    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    map_image_skeleton(pml4, img_count);
     // Image mapped READ-ONLY (rights=2) — the storage path writes no statics, so the host
     // cannot scribble on the executive's shared code/data.
     for i in 0..img_count {
@@ -6202,6 +6201,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n");
 
+    // The executive's own working VAs (rings, sysarg, device MMIO, driver code/arena) were
+    // relocated out of the 64 MiB ELF reserve into the shared cluster region; the kernel's ELF
+    // page tables no longer cover them, so build the cluster PT in the executive's own VSpace.
+    map_cluster_pt(CAP_INIT_THREAD_VSPACE);
+
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
 
@@ -6564,7 +6568,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -7742,14 +7746,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_0074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
                     // PT and collided with the env buffer at 0x74 after ~128 faults — smss runs far
                     // deeper into ntdll now, so give it an ISOLATED range with its own page tables
                     // (8 PTs = 4096 pages) that can't collide with any other executive mapping.
-                    const SCRATCH_BASE: u64 = 0x0000_0100_0100_0000;
+                    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
                     for k in 0..8u64 {
                         let pt = alloc_slot();
                         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);

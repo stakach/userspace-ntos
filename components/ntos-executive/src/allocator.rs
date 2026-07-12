@@ -15,11 +15,22 @@ use core::ptr::{null_mut, read_volatile, write_volatile};
 /// float RIGHT AFTER the loaded image; the release profile is size-optimised so the image stays
 /// well below this base (if it grows into the aux zone the RO extra-BootInfo page can land on
 /// HEAP_BASE and `map_own_heap`'s RW map silently fails → first heap write faults RO at 0x480000).
-pub const HEAP_BASE: usize = 0x0000_0100_0048_0000;
-/// Heap size in 4 KiB frames (128 KiB). Shared by the executive and every spawned service (same
-/// binary); growing it costs extra frames/slots per component and exhausts the boot resource
-/// budget, so the executive instead reclaims per-syscall transients (mark/reset) to fit.
-pub const HEAP_FRAMES: u64 = 32;
+/// Relocated FAR above the executive ELF (its own dedicated 2 MiB page table at 0x2000_0000 =
+/// 256 MiB past IMAGE_BASE), so the ELF + rootserver aux pages (which float RIGHT AFTER the loaded
+/// image) have the full 64 MiB reserve to grow into without ever reaching the heap. It used to sit
+/// only 512 KiB above IMAGE_BASE, so a growing image pushed the RO extra-BootInfo aux page onto
+/// HEAP_BASE and the first heap write faulted RO at 0x480000.
+pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
+/// Heap size in 4 KiB frames — the allocator's hard cap. Now that the VA layout is roomy, the
+/// executive gets a generous 2 MiB (was a cramped 128 KiB that OOM'd during registry enum, forcing
+/// per-syscall mark/reset). Spawned services map only [`SERVICE_HEAP_FRAMES`] to spare the boot
+/// frame budget; they never allocate near this cap.
+pub const HEAP_FRAMES: u64 = 512;
+/// Heap frames mapped into a spawned service's VSpace. Kept equal to [`HEAP_FRAMES`] so a service's
+/// allocator END always matches its mapped frames (over-allocation returns null, never faults). If
+/// the boot frame budget ever gets tight, drop this to a smaller value (services are lightweight —
+/// the old shared 32-frame heap sufficed) at the cost of that null-vs-fault guarantee.
+pub const SERVICE_HEAP_FRAMES: u64 = 512;
 
 const HEAP_SIZE: usize = (HEAP_FRAMES as usize) * 0x1000;
 const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap

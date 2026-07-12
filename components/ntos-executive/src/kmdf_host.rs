@@ -36,9 +36,9 @@ pub static SYS_BYTES: &[u8] =
 
 /// Where the KMDF PE image is mapped (in BOTH the executive to load it, and the host
 /// to run it) — same vaddr so the relocation base matches.
-pub const KMDF_CODE_VA: u64 = 0x0000_0100_004D_0000;
+pub const KMDF_CODE_VA: u64 = 0x0000_0100_104D_0000;
 /// Shared handoff page (executive writes `entry_rva` at +0; host writes the verdict at +8).
-pub const KMDF_SHARED_VADDR: u64 = 0x0000_0100_004C_0000;
+pub const KMDF_SHARED_VADDR: u64 = 0x0000_0100_104C_0000;
 /// Frame count for the KMDF PE image (size ~0x7000 -> 8 pages with margin).
 pub const KMDF_PE_FRAMES: u64 = 8;
 /// The `__guard_dispatch_icall_fptr` slot (RVA 0x3068) — the CFG indirect-call trampoline
