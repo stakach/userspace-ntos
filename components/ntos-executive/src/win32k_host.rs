@@ -1178,7 +1178,35 @@ unsafe fn recv_req() {
 /// ready/done signal (the FIRST one is the "DriverEntry+attach done" signal the bring-up loop waits
 /// for), Recv the next request, then resolve the SSN through the registered SSDT and invoke the
 /// handler in this component's context (GS=KPCR / session heap). Never returns.
+/// Build the "current process/thread" context win32k's INLINED accessors read during a dispatch —
+/// distinct from the bring-up attach phase (which is happy with a zeroed KPCR: its optional
+/// environment getter early-returns STATUS_NOT_FOUND when `gs:[0x30]==0`). During a routed dispatch,
+/// win32k reads the current process the inlined way: `proc = [[gs:0x30] + 0x60]` (KPCR.Used_Self →
+/// current EPROCESS) and then walks it — `UserCreateWinstaDirectory` reads `proc->SessionId@0x2c0`
+/// (want 0 → session-0 winsta path) while the process-env getter walks `proc[+0x20] → [+0x80]` (a
+/// wide param string). Model the WHOLE chain against the same fake EPROCESS the import trampoline
+/// (`s_current_process`) returns, so gs-inlined and trampoline resolution agree:
+///   gs:[0x30] (KPCR.Used_Self) = KPCR self; [KPCR+0x60] = PH_EPROCESS; PH_EPROCESS.SessionId(0x2c0)=0;
+///   PH_EPROCESS[+0x20] = Q (non-null, else the env getter faults — it has no NULL check there);
+///   Q[+0x80] = an empty wide string (first WCHAR 0 → getter returns cleanly).
+/// One coherent context covers every csrss dispatch (single client, session 0); a multi-session model
+/// would swap PH_EPROCESS/PH_ETHREAD per caller here.
+unsafe fn setup_dispatch_context() {
+    let q = PH_EPROCESS_VA + 0x900; // a zeroed sub-region used as PH_EPROCESS[+0x20]
+    let zstr = PH_EPROCESS_VA + 0xA00; // empty wide string (WCHAR 0, already zeroed)
+    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA); // KPCR.Used_Self = self
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, PH_EPROCESS_VA); // [Used_Self+0x60] = EPROCESS
+    write_volatile((PH_EPROCESS_VA + 0x2c0) as *mut u32, 0); // SessionId = 0
+    write_volatile((PH_EPROCESS_VA + 0x20) as *mut u64, q); // [EPROCESS+0x20] = Q
+    write_volatile((q + 0x80) as *mut u64, zstr); // [Q+0x80] = empty wide string ptr
+    write_volatile(zstr as *mut u16, 0);
+}
+
 unsafe fn dispatch_loop() -> ! {
+    // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
+    // attach already ran with a zeroed KPCR (its happy path); every dispatch below runs as the
+    // current (csrss) process so win32k's inlined IoGetCurrentProcess/SessionId resolve.
+    setup_dispatch_context();
     loop {
         send_done();
         recv_req();

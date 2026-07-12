@@ -18,10 +18,19 @@
 - [x] 6. KPCR CurrentThread (gs:[0x188]=PH_ETHREAD) → font-mutex assert passes; ZwOpenFile→FAIL → IntLoadSystemFonts skips
 - [x] InitFontSupport PASSES; InitializeGreCSRSS returns TRUE; NtUserInitialize → UserInitialize
 
-## Result (gate 106/93, winsrv ON)
-InitFontSupport passes. Next wall = UserCreateWinstaDirectory (RVA 0xfc2f0, called at 0xc43a5),
-the function IMMEDIATELY BEFORE InitVideo (0x6e0b0). It null-derefs the inlined
-PsGetCurrentProcessSessionId = [[gs:0x30]+0x60]->SessionId@0x2c0 because the fake KPCR's
-self-pointer (gs:[0x30]) is 0. NAIVE FIX (set KPCR gs:[0x30]=self + gs:[0x60]=EPROCESS) REGRESSES
-the NtUserProcessConnect (0x10FA) path → gate 104. So reaching InitVideo needs proper per-context
-KPCR/current-process modeling (the display/window-station chunk) — reverted, left green.
+## Result — InitVideo REACHED (gate 106 PASS / 0 FAIL, winsrv ON)
+- InitFontSupport passes (ftfd hosted + KPCR CurrentThread + ZwOpenFile-fail).
+- Per-context current-process model (setup_dispatch_context): at DISPATCH time (not bring-up attach,
+  which is happy with gs:[0x30]=0), set the chain win32k's inlined accessors read:
+  gs:[0x30] (KPCR.Used_Self)=self; [KPCR+0x60]=PH_EPROCESS; SessionId(0x2c0)=0; PH_EPROCESS[+0x20]=Q;
+  Q[+0x80]=&emptyWStr. Fixes UserCreateWinstaDirectory (0xfc2f0, SessionId read) + the process-env
+  getter (0x13d285) without disturbing bring-up. Bookkeeping: "/93" is a stale summary denominator;
+  real signal = 106 PASS / 0 FAIL, winsrv ON.
+- UserCreateWinstaDirectory PASSES (session-0 winsta path) → InitVideo (display.c:151, RVA 0x6e0b0)
+  RUNS: "VGA mode requested" (display.c:164), EngpUpdateGraphicsDeviceList (empty list), returns
+  STATUS_SUCCESS. Then UserInitialize → GreCreateBitmap (gpsi->hbrGray) fails ("Failed to allocate a
+  brush", brush.cpp:219 → STATUS_INSUFFICIENT_RESOURCES 0xc000009a) — no PDEV.
+
+## STOP boundary reached = framebuf.dll display-driver chunk (overseer directs)
+InitVideo runs but has no real display device/PDEV → GDI can't allocate bitmaps/brushes → no pixels.
+Next = host framebuf.dll via the driver-loader + wire win32k's Eng* DDI → Phase-0a fb (0x80000000).
