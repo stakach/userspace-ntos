@@ -168,6 +168,11 @@ pub const SSN_INIT_DESKTOP_GFX: u64 = 0x1FFD;
 /// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure).
 pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
 
+/// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
+pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
+/// NtUserCreateDesktop — SSDT idx 0x22d, calls IntCreateDesktop (RVA 0x657f0).
+pub const NT_USER_CREATE_DESKTOP_RVA: u64 = 0x6b530;
+
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
 /// the dispatch loop uses a genuine `seL4_Call` on its fault-endpoint cap ([`crate::CT_FAULT`]) —
@@ -331,18 +336,211 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
     0
 }
 
+// --- win32k Ob object layer (DESKTOP + WINDOWSTATION) ----------------------------------------
+//
+// win32k creates/opens real DESKTOP and WINDOWSTATION_OBJECT bodies through the ntoskrnl Ob* API
+// (ObOpenObjectByName / ObCreateObject / ObInsertObject / ObReferenceObjectByHandle). Previously
+// these all fell to `s_zero` (returned STATUS_SUCCESS but wrote no handle/object) so
+// IntCreateDesktop got Context==FALSE and returned early WITHOUT building the desktop window graph.
+// Here we back them with REAL object bodies allocated from the win32k pool + a tiny handle→body
+// registry, so IntCreateDesktop advances past the Ob early-return into the window-manager graph
+// (IntGetAndReferenceClass(WC_DESKTOP) etc.). Single-threaded host, so a fixed-size static registry
+// + a "last created object" latch (linking ObCreateObject→ObInsertObject) suffice.
+//
+// The object-type discriminators are the type-object POINTERS win32k passes to Ob*: these are the
+// VALUES held in the data-export cells (see DATA_EXPORTS), i.e. the placeholder OBJECT_TYPE structs
+// win32k's InitDesktopImpl/InitWindowStationImpl wrote their TypeInfo into.
+pub const DESKTOP_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x0C0; // == *ExDesktopObjectType
+pub const WINSTA_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x100; // == *ExWindowStationObjectType
+
+const OBJ_KIND_NONE: u32 = 0;
+const OBJ_KIND_DESKTOP: u32 = 1;
+const OBJ_KIND_WINSTA: u32 = 2;
+
+/// Fixed-size handle→(kind, body) registry. Entry 0 unused (handle 0 = NULL). Handles are minted
+/// densely from 1; the client-visible HANDLE we hand back is `idx << 2` (a real Ob handle has its
+/// low bits clear / tag bits), always non-null and distinguishable from the process handle
+/// (`FAKE_PROCESS_HANDLE`) which is NOT in the registry (→ EPROCESS fallback).
+static mut OBJ_KIND: [u32; 16] = [OBJ_KIND_NONE; 16];
+static mut OBJ_BODY: [u64; 16] = [0; 16];
+static mut OBJ_NEXT: usize = 1;
+/// Latches ObCreateObject's (kind, body) so the following ObInsertObject can register them under a
+/// freshly minted handle (ObInsertObject only receives the object pointer, not its type).
+static mut OBJ_PENDING_KIND: u32 = OBJ_KIND_NONE;
+static mut OBJ_PENDING_BODY: u64 = 0;
+/// The one input window station, once created — a second ObOpenObjectByName(WINSTA) should OPEN it
+/// (return its handle) rather than report NOT_FOUND (which would create a duplicate).
+static mut WINSTA_HANDLE: u64 = 0;
+static mut WINSTA_BODY: u64 = 0;
+
+/// Register a body under a fresh handle; returns the client-visible HANDLE (0 if the table is full).
+unsafe fn obj_register(kind: u32, body: u64) -> u64 {
+    let table = &mut *core::ptr::addr_of_mut!(OBJ_NEXT);
+    let idx = *table;
+    if idx >= 16 {
+        return 0;
+    }
+    *table = idx + 1;
+    (*core::ptr::addr_of_mut!(OBJ_KIND))[idx] = kind;
+    (*core::ptr::addr_of_mut!(OBJ_BODY))[idx] = body;
+    (idx as u64) << 2
+}
+
+/// Resolve a handle to its registered body, or 0 if not a win32k object handle.
+unsafe fn obj_lookup(handle: u64) -> u64 {
+    let idx = (handle >> 2) as usize;
+    if idx == 0 || idx >= 16 || idx >= *core::ptr::addr_of!(OBJ_NEXT) {
+        return 0;
+    }
+    (*core::ptr::addr_of!(OBJ_BODY))[idx]
+}
+
+/// Allocate + zero a DESKTOP body (with a DESKTOPINFO hung off `pDeskInfo`@+0x08) from the win32k
+/// pool. Enough to satisfy IntCreateDesktop up to IntGetAndReferenceClass(WC_DESKTOP); the desktop
+/// heap + full DESKTOPINFO population is the following increment's work.
+unsafe fn alloc_desktop_body() -> u64 {
+    let desk = pool_alloc(0x200); // sizeof(DESKTOP) is ~0x100; give headroom, zeroed by the arena
+    if desk == 0 {
+        return 0;
+    }
+    let dinfo = pool_alloc(0x120); // DESKTOPINFO + szDesktopName tail, zeroed
+    if dinfo != 0 {
+        write_volatile((desk + 0x08) as *mut u64, dinfo); // DESKTOP.pDeskInfo
+    }
+    desk
+}
+
+/// `NTSTATUS ObOpenObjectByName(POBJECT_ATTRIBUTES, POBJECT_TYPE, KPROCESSOR_MODE, PACCESS_STATE,
+/// ACCESS_MASK DesiredAccess, PVOID ParseContext, PHANDLE Handle)`.
+/// - DESKTOP (ParseContext != NULL = a create-open): allocate a real DESKTOP, write *Handle, set
+///   *ParseContext = TRUE (Context — "the object was created"), return SUCCESS. This is what makes
+///   IntCreateDesktop proceed past its `if (Context == FALSE) goto Quit` early-return.
+/// - WINDOWSTATION (IntCreateWindowStation's "try open existing", ParseContext == NULL): if we have
+///   already created the input winsta, OPEN it (write its handle, SUCCESS); otherwise report
+///   STATUS_OBJECT_NAME_NOT_FOUND so IntCreateWindowStation falls through to ObCreateObject/Insert.
+extern "win64" fn s_ob_open_object_by_name(
+    _object_attributes: u64,
+    obj_type: u64,
+    _access_mode: u64,
+    _access_state: u64,
+    _desired_access: u64,
+    parse_context: u64,
+    handle: *mut u64,
+) -> i32 {
+    unsafe {
+        if obj_type == DESKTOP_TYPE_PTR {
+            let body = alloc_desktop_body();
+            if body == 0 {
+                return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+            }
+            let h = obj_register(OBJ_KIND_DESKTOP, body);
+            if !handle.is_null() {
+                write_unaligned(handle, h);
+            }
+            if parse_context != 0 {
+                write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
+            }
+            return 0;
+        }
+        if obj_type == WINSTA_TYPE_PTR {
+            if *core::ptr::addr_of!(WINSTA_HANDLE) != 0 {
+                if !handle.is_null() {
+                    write_unaligned(handle, *core::ptr::addr_of!(WINSTA_HANDLE));
+                }
+                if parse_context != 0 {
+                    write_volatile(parse_context as *mut u8, 0); // opened existing, not created
+                }
+                return 0;
+            }
+            // No existing winsta → force IntCreateWindowStation's create path.
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        // Unknown object type: preserve the old benign behaviour (success, no handle).
+        0
+    }
+}
+
+/// `NTSTATUS ObCreateObject(KPROCESSOR_MODE ProbeMode, POBJECT_TYPE ObjectType, POBJECT_ATTRIBUTES,
+/// KPROCESSOR_MODE OwnerMode, PVOID ParseContext, ULONG ObjectBodySize, ULONG PagedCharge,
+/// ULONG NonPagedCharge, PVOID *Object)` — allocate a zeroed object body of ObjectBodySize from the
+/// win32k pool, write *Object, and latch (kind, body) for the following ObInsertObject.
+extern "win64" fn s_ob_create_object(
+    _probe_mode: u64,
+    obj_type: u64,
+    _object_attributes: u64,
+    _owner_mode: u64,
+    _parse_context: u64,
+    body_size: u64,
+    _paged: u64,
+    _nonpaged: u64,
+    object_out: *mut u64,
+) -> i32 {
+    unsafe {
+        let size = (body_size as u32 as u64).max(0x40);
+        let body = pool_alloc(size);
+        if body == 0 {
+            return 0xC000_009Au32 as i32;
+        }
+        let kind = if obj_type == WINSTA_TYPE_PTR {
+            OBJ_KIND_WINSTA
+        } else if obj_type == DESKTOP_TYPE_PTR {
+            OBJ_KIND_DESKTOP
+        } else {
+            OBJ_KIND_NONE
+        };
+        *core::ptr::addr_of_mut!(OBJ_PENDING_KIND) = kind;
+        *core::ptr::addr_of_mut!(OBJ_PENDING_BODY) = body;
+        if !object_out.is_null() {
+            write_unaligned(object_out, body);
+        }
+        0
+    }
+}
+
+/// `NTSTATUS ObInsertObject(PVOID Object, PACCESS_STATE, ACCESS_MASK, ULONG ObjectPointerBias,
+/// PVOID *NewObject, PHANDLE Handle)` — register the (latched) object under a fresh handle, write
+/// *Handle (+ *NewObject if requested).
+extern "win64" fn s_ob_insert_object(
+    object: u64,
+    _access_state: u64,
+    _desired_access: u64,
+    _bias: u64,
+    new_object: *mut u64,
+    handle: *mut u64,
+) -> i32 {
+    unsafe {
+        let kind = *core::ptr::addr_of!(OBJ_PENDING_KIND);
+        let h = obj_register(kind, object);
+        if kind == OBJ_KIND_WINSTA {
+            *core::ptr::addr_of_mut!(WINSTA_HANDLE) = h;
+            *core::ptr::addr_of_mut!(WINSTA_BODY) = object;
+        }
+        *core::ptr::addr_of_mut!(OBJ_PENDING_KIND) = OBJ_KIND_NONE;
+        if !handle.is_null() {
+            write_unaligned(handle, h);
+        }
+        if !new_object.is_null() {
+            write_unaligned(new_object, object);
+        }
+        0
+    }
+}
+
 /// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE,
-/// PVOID *Object, ...)` — resolve a handle to its object. For win32k's process-connect the handle
-/// is the client process handle → return the current EPROCESS. Writes `*Object`, refs it.
+/// PVOID *Object, ...)` — resolve a handle to its object. A registered win32k object handle
+/// (DESKTOP/WINDOWSTATION) → its real body; otherwise (win32k's process-connect handle) → the
+/// current EPROCESS. Writes `*Object`, refs it.
 extern "win64" fn s_ob_reference_object_by_handle(
-    _handle: u64,
+    handle: u64,
     _access: u64,
     _obj_type: u64,
     _mode: u64,
     object_out: *mut u64,
 ) -> i32 {
     if !object_out.is_null() {
-        unsafe { write_unaligned(object_out, PH_EPROCESS_VA) };
+        let body = unsafe { obj_lookup(handle) };
+        let obj = if body != 0 { body } else { PH_EPROCESS_VA };
+        unsafe { write_unaligned(object_out, obj) };
     }
     0
 }
@@ -1513,6 +1711,10 @@ pub fn export_addr(name: &str) -> u64 {
         "PsSetThreadWin32Thread" => s_set_win32thread as usize as u64,
         "PsEstablishWin32Callouts" => s_establish_win32_callouts as usize as u64,
         "ObReferenceObjectByHandle" => s_ob_reference_object_by_handle as usize as u64,
+        // real Ob object layer for win32k's DESKTOP + WINDOWSTATION creation
+        "ObOpenObjectByName" => s_ob_open_object_by_name as usize as u64,
+        "ObCreateObject" => s_ob_create_object as usize as u64,
+        "ObInsertObject" => s_ob_insert_object as usize as u64,
         // resource / lock acquire → BOOLEAN TRUE (single-threaded host: always "acquired")
         "ExAcquireResourceExclusiveLite"
         | "ExAcquireResourceSharedLite"
@@ -1885,6 +2087,18 @@ unsafe fn setup_dispatch_context() {
     let cb_head = w32thread + 0x2e8;
     write_volatile(cb_head as *mut u64, cb_head); // Flink = &head
     write_volatile((cb_head + 8) as *mut u64, cb_head); // Blink = &head
+
+    // IntCreateDesktop (RVA 0x659f4) does `ptiCurrent->pClientInfo->dwTIFlags = TIF_flags`, i.e.
+    // reads THREADINFO+0x88 (pClientInfo) then writes [pClientInfo+0x1c]. A zeroed W32THREAD
+    // placeholder has pClientInfo==NULL → a null store. Real win32k points pClientInfo at the
+    // thread's CLIENTINFO (in the client TEB/desktop-heap). Give it a real zeroed CLIENTINFO scratch
+    // so IntCreateDesktop's flag write lands. Offset 0x88 confirmed by disasm of IntCreateDesktop.
+    if read_volatile((w32thread + 0x88) as *const u64) == 0 {
+        let ci = pool_alloc(0x100);
+        if ci != 0 {
+            write_volatile((w32thread + 0x88) as *mut u64, ci);
+        }
+    }
 }
 
 /// Load the staged system font (arial.ttf at [`FONTBUF_VADDR`]) into win32k via
@@ -1939,6 +2153,64 @@ unsafe fn load_system_font() {
     print_str(b"\n");
 }
 
+/// Build a minimal OBJECT_ATTRIBUTES (Length=0x30) naming `name` (a null-terminated wide string
+/// already written in win32k memory) in the win32k pool, and return its address. A non-NULL
+/// ObjectName makes NtUserCreateWindowStation skip BuildUserModeWindowStationName (which would touch
+/// the client TEB). Layout (x64): OA{Length@0, RootDirectory@8, ObjectName@0x10, Attributes@0x18,
+/// SD@0x20, SQoS@0x28}; UNICODE_STRING{Length@0, MaxLength@2, Buffer@8}.
+unsafe fn build_object_attributes(name: &[u16]) -> u64 {
+    let buf = pool_alloc(((name.len() + 1) * 2) as u64);
+    for (i, &w) in name.iter().enumerate() {
+        write_volatile((buf + (i * 2) as u64) as *mut u16, w);
+    }
+    write_volatile((buf + (name.len() * 2) as u64) as *mut u16, 0);
+    let us = pool_alloc(0x10);
+    write_volatile(us as *mut u16, (name.len() * 2) as u16); // Length (bytes)
+    write_volatile((us + 2) as *mut u16, ((name.len() + 1) * 2) as u16); // MaximumLength
+    write_volatile((us + 8) as *mut u64, buf); // Buffer
+    let oa = pool_alloc(0x30);
+    write_volatile(oa as *mut u32, 0x30); // Length == sizeof(OBJECT_ATTRIBUTES)
+    write_volatile((oa + 0x10) as *mut u64, us); // ObjectName
+    write_volatile((oa + 0x18) as *mut u32, 0x40); // Attributes = OBJ_CASE_INSENSITIVE
+    oa
+}
+
+/// Drive `NtUserCreateWindowStation` → `NtUserCreateDesktop` (winlogon's normal path, which our
+/// hosted csrss can't reach — it's blocked upstream at the Phase-4 SmConnectToSm LPC wall) so
+/// IntCreateDesktop runs on REAL Ob DESKTOP + WINDOWSTATION objects (see the Ob object layer above)
+/// instead of the previous all-`s_zero` stubs. This advances IntCreateDesktop past its Context==FALSE
+/// early-return into the window-manager object graph (IntGetAndReferenceClass(WC_DESKTOP), the next
+/// wall). Runs in the SSN_INIT_DESKTOP_GFX dispatch context (GS=KPCR/session heap/pClientInfo set),
+/// so any internal faults/asserts are serviced by the executive's win32k_dispatch fault loop.
+unsafe fn create_winsta_and_desktop() {
+    const MAXIMUM_ALLOWED: u64 = 0x0200_0000;
+    // "WinSta0"
+    let winsta_name = [0x57u16, 0x69, 0x6e, 0x53, 0x74, 0x61, 0x30];
+    let oa_ws = build_object_attributes(&winsta_name);
+    print_str(b"[win32k-host] NtUserCreateWindowStation(WinSta0)...\n");
+    let cws: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> i32 =
+        core::mem::transmute((WIN32K_CODE_VA + NT_USER_CREATE_WINDOW_STATION_RVA) as *const ());
+    let hws = cws(oa_ws, MAXIMUM_ALLOWED, 0, 0, 0, 0, 0);
+    print_str(b"[win32k-host] NtUserCreateWindowStation -> hWinSta=0x");
+    print_hex(hws as u32);
+    print_str(b" (winsta body=0x");
+    print_hex((*core::ptr::addr_of!(WINSTA_BODY)) as u32);
+    print_str(b")\n");
+
+    // "Default"
+    let desk_name = [0x44u16, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74];
+    let oa_dsk = build_object_attributes(&desk_name);
+    print_str(b"[win32k-host] NtUserCreateDesktop(Default)...\n");
+    // NtUserCreateDesktop(ObjectAttributes, lpszDesktopDevice, lpdmw, dwFlags, dwDesiredAccess) -> HDESK
+    let cd: extern "win64" fn(u64, u64, u64, u64, u64) -> u64 =
+        core::mem::transmute((WIN32K_CODE_VA + NT_USER_CREATE_DESKTOP_RVA) as *const ());
+    let hdesk = cd(oa_dsk, 0, 0, 0, MAXIMUM_ALLOWED);
+    print_str(b"[win32k-host] NtUserCreateDesktop -> hDesk=0x");
+    print_hex((hdesk >> 32) as u32);
+    print_hex(hdesk as u32);
+    print_str(b"\n");
+}
+
 unsafe fn dispatch_loop() -> ! {
     // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
     // attach already ran with a zeroed KPCR (its happy path); every dispatch below runs as the
@@ -1965,6 +2237,11 @@ unsafe fn dispatch_loop() -> ! {
             // the subsequent desktop-graphics font realize (TextIntRealizeFont) then finds it instead
             // of null-derefing at RVA 0x4d7eb ("no fonts loaded at all").
             load_system_font();
+            // Build the real Ob DESKTOP + WINDOWSTATION object graph BEFORE the desktop paint:
+            // NtUserCreateWindowStation → NtUserCreateDesktop create real objects (see the Ob layer)
+            // so IntCreateDesktop advances past its early Ob return toward the desktop window +
+            // gpdeskInputDesktop that co_IntShowDesktop needs.
+            create_winsta_and_desktop();
             // Invoke co_IntInitializeDesktopGraphics() directly (VOID → BOOL) to run the framebuf
             // display-driver enable + primary-surface + show-desktop chain (= PIXELS).
             print_str(b"[win32k-host] invoking co_IntInitializeDesktopGraphics (RVA 0xfca10)\n");
