@@ -19,6 +19,7 @@ mod io;
 mod namespace;
 mod store;
 mod types;
+pub mod win32k_ob;
 
 pub use access::compute_granted;
 pub use handles::{ClientKind, ClientRegistry, HandleTable};

@@ -342,70 +342,50 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // (ObOpenObjectByName / ObCreateObject / ObInsertObject / ObReferenceObjectByHandle). Previously
 // these all fell to `s_zero` (returned STATUS_SUCCESS but wrote no handle/object) so
 // IntCreateDesktop got Context==FALSE and returned early WITHOUT building the desktop window graph.
-// Here we back them with REAL object bodies allocated from the win32k pool + a tiny handle→body
-// registry, so IntCreateDesktop advances past the Ob early-return into the window-manager graph
-// (IntGetAndReferenceClass(WC_DESKTOP) etc.). Single-threaded host, so a fixed-size static registry
-// + a "last created object" latch (linking ObCreateObject→ObInsertObject) suffice.
+// Backed by REAL object bodies (allocated from the win32k pool) + the handle→(type, body) registry
+// that lives in `nt_object_manager::win32k_ob` (a raw-pointer, alloc-free, host-tested primitive),
+// IntCreateDesktop advances past the Ob early-return into the window-manager graph
+// (IntGetAndReferenceClass(WC_DESKTOP) etc.).
 //
+// The four trampolines below are THIN win64-ABI marshaling shims: they classify the type-object
+// pointer win32k passes into an `ObKind`, allocate bodies from the win32k pool, drive the shared
+// `ObHandleTable`, and write *Handle / *Context / *Object into win32k's memory. ALL object-manager
+// semantics (handle minting, the registry, the create→insert latch, the single-instance
+// window-station cache) live in the crate.
+use nt_object_manager::win32k_ob::{
+    init_desktop_body, ObHandleTable, ObKind, DESKTOPINFO_SIZE, DESKTOP_BODY_SIZE,
+};
+
 // The object-type discriminators are the type-object POINTERS win32k passes to Ob*: these are the
 // VALUES held in the data-export cells (see DATA_EXPORTS), i.e. the placeholder OBJECT_TYPE structs
 // win32k's InitDesktopImpl/InitWindowStationImpl wrote their TypeInfo into.
 pub const DESKTOP_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x0C0; // == *ExDesktopObjectType
 pub const WINSTA_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x100; // == *ExWindowStationObjectType
 
-const OBJ_KIND_NONE: u32 = 0;
-const OBJ_KIND_DESKTOP: u32 = 1;
-const OBJ_KIND_WINSTA: u32 = 2;
+/// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
+static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
-/// Fixed-size handle→(kind, body) registry. Entry 0 unused (handle 0 = NULL). Handles are minted
-/// densely from 1; the client-visible HANDLE we hand back is `idx << 2` (a real Ob handle has its
-/// low bits clear / tag bits), always non-null and distinguishable from the process handle
-/// (`FAKE_PROCESS_HANDLE`) which is NOT in the registry (→ EPROCESS fallback).
-static mut OBJ_KIND: [u32; 16] = [OBJ_KIND_NONE; 16];
-static mut OBJ_BODY: [u64; 16] = [0; 16];
-static mut OBJ_NEXT: usize = 1;
-/// Latches ObCreateObject's (kind, body) so the following ObInsertObject can register them under a
-/// freshly minted handle (ObInsertObject only receives the object pointer, not its type).
-static mut OBJ_PENDING_KIND: u32 = OBJ_KIND_NONE;
-static mut OBJ_PENDING_BODY: u64 = 0;
-/// The one input window station, once created — a second ObOpenObjectByName(WINSTA) should OPEN it
-/// (return its handle) rather than report NOT_FOUND (which would create a duplicate).
-static mut WINSTA_HANDLE: u64 = 0;
-static mut WINSTA_BODY: u64 = 0;
-
-/// Register a body under a fresh handle; returns the client-visible HANDLE (0 if the table is full).
-unsafe fn obj_register(kind: u32, body: u64) -> u64 {
-    let table = &mut *core::ptr::addr_of_mut!(OBJ_NEXT);
-    let idx = *table;
-    if idx >= 16 {
-        return 0;
+/// Classify the type-object VA win32k passed into an [`ObKind`] (`None` = an unrecognized type).
+fn classify_type(obj_type: u64) -> Option<ObKind> {
+    match obj_type {
+        DESKTOP_TYPE_PTR => Some(ObKind::Desktop),
+        WINSTA_TYPE_PTR => Some(ObKind::WindowStation),
+        _ => None,
     }
-    *table = idx + 1;
-    (*core::ptr::addr_of_mut!(OBJ_KIND))[idx] = kind;
-    (*core::ptr::addr_of_mut!(OBJ_BODY))[idx] = body;
-    (idx as u64) << 2
-}
-
-/// Resolve a handle to its registered body, or 0 if not a win32k object handle.
-unsafe fn obj_lookup(handle: u64) -> u64 {
-    let idx = (handle >> 2) as usize;
-    if idx == 0 || idx >= 16 || idx >= *core::ptr::addr_of!(OBJ_NEXT) {
-        return 0;
-    }
-    (*core::ptr::addr_of!(OBJ_BODY))[idx]
 }
 
 /// Allocate + zero a DESKTOP body (with a DESKTOPINFO hung off `pDeskInfo`@+0x08) from the win32k
 /// pool. Enough to satisfy IntCreateDesktop up to IntGetAndReferenceClass(WC_DESKTOP); the desktop
-/// heap + full DESKTOPINFO population is the following increment's work.
+/// heap + full DESKTOPINFO population is the following increment's work. The body layout lives with
+/// the object-type definition in the crate ([`init_desktop_body`]).
 unsafe fn alloc_desktop_body() -> u64 {
-    let desk = pool_alloc(0x200); // sizeof(DESKTOP) is ~0x100; give headroom, zeroed by the arena
+    let desk = pool_alloc(DESKTOP_BODY_SIZE); // zeroed by the arena
     if desk == 0 {
         return 0;
     }
-    let dinfo = pool_alloc(0x120); // DESKTOPINFO + szDesktopName tail, zeroed
+    let dinfo = pool_alloc(DESKTOPINFO_SIZE); // DESKTOPINFO + szDesktopName tail, zeroed
     if dinfo != 0 {
-        write_volatile((desk + 0x08) as *mut u64, dinfo); // DESKTOP.pDeskInfo
+        init_desktop_body(desk as *mut u8, dinfo); // DESKTOP.pDeskInfo
     }
     desk
 }
@@ -428,35 +408,39 @@ extern "win64" fn s_ob_open_object_by_name(
     handle: *mut u64,
 ) -> i32 {
     unsafe {
-        if obj_type == DESKTOP_TYPE_PTR {
-            let body = alloc_desktop_body();
-            if body == 0 {
-                return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
-            }
-            let h = obj_register(OBJ_KIND_DESKTOP, body);
-            if !handle.is_null() {
-                write_unaligned(handle, h);
-            }
-            if parse_context != 0 {
-                write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
-            }
-            return 0;
-        }
-        if obj_type == WINSTA_TYPE_PTR {
-            if *core::ptr::addr_of!(WINSTA_HANDLE) != 0 {
+        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+        match classify_type(obj_type) {
+            Some(ObKind::Desktop) => {
+                let body = alloc_desktop_body();
+                if body == 0 {
+                    return 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
+                }
+                let h = table.register(ObKind::Desktop, body);
                 if !handle.is_null() {
-                    write_unaligned(handle, *core::ptr::addr_of!(WINSTA_HANDLE));
+                    write_unaligned(handle, h);
                 }
                 if parse_context != 0 {
-                    write_volatile(parse_context as *mut u8, 0); // opened existing, not created
+                    write_volatile(parse_context as *mut u8, 1); // Context = TRUE (object created)
                 }
-                return 0;
+                0
             }
-            // No existing winsta → force IntCreateWindowStation's create path.
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+            Some(ObKind::WindowStation) => {
+                let cached = table.cached_winsta_handle();
+                if cached != 0 {
+                    if !handle.is_null() {
+                        write_unaligned(handle, cached);
+                    }
+                    if parse_context != 0 {
+                        write_volatile(parse_context as *mut u8, 0); // opened existing, not created
+                    }
+                    return 0;
+                }
+                // No existing winsta → force IntCreateWindowStation's create path.
+                STATUS_OBJECT_NAME_NOT_FOUND
+            }
+            // Unknown object type: preserve the old benign behaviour (success, no handle).
+            _ => 0,
         }
-        // Unknown object type: preserve the old benign behaviour (success, no handle).
-        0
     }
 }
 
@@ -481,15 +465,9 @@ extern "win64" fn s_ob_create_object(
         if body == 0 {
             return 0xC000_009Au32 as i32;
         }
-        let kind = if obj_type == WINSTA_TYPE_PTR {
-            OBJ_KIND_WINSTA
-        } else if obj_type == DESKTOP_TYPE_PTR {
-            OBJ_KIND_DESKTOP
-        } else {
-            OBJ_KIND_NONE
-        };
-        *core::ptr::addr_of_mut!(OBJ_PENDING_KIND) = kind;
-        *core::ptr::addr_of_mut!(OBJ_PENDING_BODY) = body;
+        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+        let kind = classify_type(obj_type).unwrap_or(ObKind::Other);
+        table.latch_pending(kind, body);
         if !object_out.is_null() {
             write_unaligned(object_out, body);
         }
@@ -509,13 +487,8 @@ extern "win64" fn s_ob_insert_object(
     handle: *mut u64,
 ) -> i32 {
     unsafe {
-        let kind = *core::ptr::addr_of!(OBJ_PENDING_KIND);
-        let h = obj_register(kind, object);
-        if kind == OBJ_KIND_WINSTA {
-            *core::ptr::addr_of_mut!(WINSTA_HANDLE) = h;
-            *core::ptr::addr_of_mut!(WINSTA_BODY) = object;
-        }
-        *core::ptr::addr_of_mut!(OBJ_PENDING_KIND) = OBJ_KIND_NONE;
+        let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+        let h = table.insert_pending(object);
         if !handle.is_null() {
             write_unaligned(handle, h);
         }
@@ -538,7 +511,8 @@ extern "win64" fn s_ob_reference_object_by_handle(
     object_out: *mut u64,
 ) -> i32 {
     if !object_out.is_null() {
-        let body = unsafe { obj_lookup(handle) };
+        let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
+        let body = table.lookup_body(handle);
         let obj = if body != 0 { body } else { PH_EPROCESS_VA };
         unsafe { write_unaligned(object_out, obj) };
     }
@@ -2194,7 +2168,7 @@ unsafe fn create_winsta_and_desktop() {
     print_str(b"[win32k-host] NtUserCreateWindowStation -> hWinSta=0x");
     print_hex(hws as u32);
     print_str(b" (winsta body=0x");
-    print_hex((*core::ptr::addr_of!(WINSTA_BODY)) as u32);
+    print_hex((*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body() as u32);
     print_str(b")\n");
 
     // "Default"
