@@ -329,6 +329,10 @@ pub const DXGTHKBUF_FRAMES: u64 = 8;
 /// (245 frames span 0x0670_0000..0x067f_5000, clear of WIN32K_CODE_VA at 0x0680). ftfd size=1,000,960 B.
 pub const FTFDBUF_VADDR: u64 = 0x0000_0100_0670_0000;
 pub const FTFDBUF_FRAMES: u64 = 245;
+/// Raw framebuf.dll staging buffer (display driver, 12 KiB / size_of_image 0x8000). Own PT window at
+/// 0x06C0 — free between the win32k image (0x0680..0x06A2) and the aux window (0x0700).
+pub const FRAMEBUFBUF_VADDR: u64 = 0x0000_0100_06C0_0000;
+pub const FRAMEBUFBUF_FRAMES: u64 = 8;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -5097,13 +5101,31 @@ unsafe fn spawn_win32k_host(
         let rights = code_rights.get(i as usize).copied().unwrap_or(RW_NX);
         let _ = page_map(cp, win32k_host::WIN32K_CODE_VA + i * 0x1000, rights, pml4);
     }
-    // Pool + data + shared all live in one 2 MiB PT window (0x0700_0000..0x0720_0000).
-    let ppt = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
-    let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_POOL_VADDR, pml4);
+    // DATA/SHARED/SENTINEL/ARG share the aux PT window (0x0700_0000..0x0720_0000); the pool has its
+    // own dedicated window (0x0A00_0000, 8 MiB / 4 PTs), pre-mapped.
+    let apt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
+    let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_AUX_PT_VADDR, pml4);
+    for p in 0..(win32k_host::WIN32K_POOL_FRAMES + 511) / 512 {
+        let ppt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
+        let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_POOL_VADDR + p * 0x20_0000, pml4);
+    }
     for i in 0..win32k_host::WIN32K_POOL_FRAMES {
         let cp = copy_cap(pool_base + i);
         let _ = page_map(cp, win32k_host::WIN32K_POOL_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    // FreeType's separate arena (win32k-only; own window + PTs, pre-mapped) — bounds ftfd's unbounded
+    // font-init allocations so they can't starve the main pool.
+    for p in 0..(win32k_host::WIN32K_FTYP_FRAMES + 511) / 512 {
+        let fpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, fpt);
+        let _ = paging_struct_map(fpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_FTYP_VADDR + p * 0x20_0000, pml4);
+    }
+    for i in 0..win32k_host::WIN32K_FTYP_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, win32k_host::WIN32K_FTYP_VADDR + i * 0x1000, RW_NX, pml4);
     }
     for i in 0..win32k_host::WIN32K_DATA_FRAMES {
         let cp = copy_cap(data_base + i);
@@ -5255,6 +5277,7 @@ unsafe fn spawn_storage_host(
         (DXGBUF_START.load(Ordering::Relaxed), DXGBUF_VADDR, DXGBUF_FRAMES),
         (DXGTHKBUF_START.load(Ordering::Relaxed), DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
         (FTFDBUF_START.load(Ordering::Relaxed), FTFDBUF_VADDR, FTFDBUF_FRAMES),
+        (FRAMEBUFBUF_START.load(Ordering::Relaxed), FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
     ] {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -5326,6 +5349,8 @@ static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the raw ftfd.dll staged into FTFDBUF (FreeType font driver).
 static FTFDBUF_START: AtomicU64 = AtomicU64::new(0);
+/// Frame-cap base of the raw framebuf.dll staged into FRAMEBUFBUF (display driver).
+static FRAMEBUFBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -5341,6 +5366,11 @@ static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// 0 until win32k's USER heap arena has been RO-mapped into csrss (one-time; guards re-mapping on a
 /// second NtUserProcessConnect from the same client).
 static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
+/// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
+/// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
+static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// RO-map win32k's global USER heap arena ([`win32k_host::WIN32K_HEAP_VADDR`], where gpsi /
 /// gHandleTable / the USER handle-entry array live) into the caller's (csrss's) VSpace at
@@ -5392,7 +5422,7 @@ unsafe fn map_win32k_heap_into_csrss(pml4: u64) -> u64 {
 // detect "already mapped" — track it). Client VAs are all < 0x100_0000_0000 (PML4 slots 0/1), never
 // win32k's own PML4[2] (>= 0x100_..), so building a fresh PDPT/PD/PT hierarchy here can't collide
 // with win32k's own mappings.
-static mut W32_CLIENT_SEEN: [u64; 1024] = [0; 1024];
+static mut W32_CLIENT_SEEN: [u64; 8192] = [0; 8192];
 static mut W32_CLIENT_SEEN_N: usize = 0;
 unsafe fn w32_seen(key: u64) -> bool {
     let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
@@ -5406,12 +5436,18 @@ unsafe fn w32_seen(key: u64) -> bool {
 }
 unsafe fn w32_mark(key: u64) {
     let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
-    if n < 1024 {
+    if n < 8192 {
         core::ptr::write((core::ptr::addr_of_mut!(W32_CLIENT_SEEN) as *mut u64).add(n), key);
         core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n + 1);
     }
 }
-/// Ensure win32k's VSpace has a PDPT/PD/PT chain covering `page` (each created once, tracked).
+/// Ensure win32k's VSpace has a PDPT/PD/PT chain covering `page` (each created once, tracked in
+/// W32_CLIENT_SEEN). Used both for FOREIGN client pages (PML4[0/1], fresh hierarchy) AND for
+/// win32k-OWN demand-mapped regions (the demand-mapped pool at 0x0A00, whose 2 MiB PTs don't exist
+/// yet). Deterministic because `page_map`/`paging_struct_map` are SYS_SEND (fire-and-forget) and
+/// can't report a missing-PT error to drive a retry — so the PT must be created up front. For
+/// win32k-own PML4[2] pages the PDPT/PD already exist; the duplicate retype+map fails silently
+/// (seL4 won't replace an occupied slot) and only the fresh PT actually takes.
 unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) {
     let k_pdpt = (1u64 << 60) | (page >> 39);
     if !w32_seen(k_pdpt) {
@@ -5574,6 +5610,56 @@ unsafe fn load_ftfd_driver(host_pml4: u64) {
     }
 }
 
+/// Host framebuf.dll (the display driver) into win32k's VSpace + map the BOOTBOOT framebuffer into
+/// win32k. win32k loads framebuf DYNAMICALLY (like dxg) via ZwSetSystemInformation when it enables the
+/// display device (co_IntInitializeDesktopGraphics → PDEVOBJ_Create → LDEVOBJ_pLoadDriver("framebuf")),
+/// so pre-load it + record it for the s_zw_set_system_information trampoline. framebuf's video-miniport
+/// IOCTLs (DrvEnablePDEV/DrvEnableSurface) are serviced by the patched EngDeviceIoControl intercept,
+/// which returns WIN32K_FB_VA — the fb frames mapped here.
+unsafe fn load_framebuf_driver(host_pml4: u64) {
+    let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x8C) as *const u32);
+    if sz == 0 {
+        print_str(b"[win32k-svc] framebuf.dll not staged - display gate will fail\n");
+        return;
+    }
+    match load_one_driver(
+        FRAMEBUFBUF_VADDR,
+        win32k_host::FRAMEBUF_VA,
+        win32k_host::FRAMEBUF_LOAD_FRAMES,
+        host_pml4,
+        0,
+    ) {
+        Some((entry, expdir, len)) => {
+            win32k_host::record_framebuf(entry, expdir, len);
+            print_str(b"[win32k-svc] hosted framebuf.dll: entry_rva=0x");
+            print_hex(entry);
+            print_str(b" (DrvEnableDriver) len=0x");
+            print_hex(len);
+            print_str(b"\n");
+        }
+        None => print_str(b"[win32k-svc] framebuf load failed\n"),
+    }
+    // Map the BOOTBOOT framebuffer (Phase-0a fb device frames) into win32k at WIN32K_FB_VA, RW.
+    let base = FB_FRAME_BASE.load(Ordering::Relaxed);
+    let count = FB_FRAME_COUNT.load(Ordering::Relaxed);
+    if base != 0 && count != 0 {
+        for p in 0..(count + 511) / 512 {
+            let pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_FB_VA + p * 0x20_0000, host_pml4);
+        }
+        for i in 0..count {
+            let _ = page_map(copy_cap(base + i), win32k_host::WIN32K_FB_VA + i * 0x1000, RW_NX, host_pml4);
+        }
+        print_str(b"[win32k-svc] mapped BOOTBOOT framebuffer into win32k: ");
+        print_u64(count);
+        print_str(b" frames @ WIN32K_FB_VA=0x");
+        print_hex((win32k_host::WIN32K_FB_VA >> 32) as u32);
+        print_hex(win32k_host::WIN32K_FB_VA as u32);
+        print_str(b"\n");
+    }
+}
+
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
 /// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
 /// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We
@@ -5655,16 +5741,12 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
                     return (0xC000_0001u32 as i32, false);
                 }
             } else {
-                // A win32k-own demand-pageable page (past the image tail / session arena): zero-fill.
+                // A win32k-own demand-pageable page (past the image tail / session arena / the
+                // demand-mapped pool): ensure its page table exists (SYS_SEND page_map can't report a
+                // missing-PT error to drive a retry), then zero-fill.
+                ensure_w32_client_paging(page, host_pml4);
                 let f = alloc_frame();
-                let mut e = page_map(f, page, RW_NX, host_pml4);
-                if e != 0 {
-                    let npt = alloc_slot();
-                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
-                    let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
-                    e = page_map(f, page, RW_NX, host_pml4);
-                }
-                let _ = e;
+                let _ = page_map(f, page, RW_NX, host_pml4);
             }
             demand += 1;
             // Fix (B): resume win32k via its bound reply cap (Send-on-REPLY_W32 -> decode_reply ->
@@ -6716,6 +6798,7 @@ unsafe fn storage_probe(
             (b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
             (b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
             (b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
+            (b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 let cap = (cap_frames * 0x1000) as u32;
@@ -7423,6 +7506,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // hands out consecutive frames fb_paddr + i*4K at FB_VADDR + i*4K.
             let base_slot = claim_device_pages(bi, fb_paddr, FB_VADDR, n_pages);
             map_ok = base_slot != 0;
+            // Retain the fb frame-cap base + count so the win32k bring-up can map the SAME physical
+            // frames into win32k's VSpace (framebuf.dll draws pixels there → the real framebuffer).
+            FB_FRAME_BASE.store(base_slot, Ordering::Relaxed);
+            FB_FRAME_COUNT.store(n_pages, Ordering::Relaxed);
             check(b"exec_framebuffer_map", map_ok, &mut passed);
 
             if map_ok {
@@ -8141,6 +8228,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (&DXGBUF_START, DXGBUF_VADDR, DXGBUF_FRAMES),
                 (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
                 (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
+                (&FRAMEBUFBUF_START, FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
             ] {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -8371,10 +8459,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let heap_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
-            // The pool-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718).
+            // The aux-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718 + ARG
+            // @0x071A; the pool is host-only, in its own window, so not mapped in the executive).
             let ppt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
-            let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_POOL_VADDR, CAP_INIT_THREAD_VSPACE);
+            let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_AUX_PT_VADDR, CAP_INIT_THREAD_VSPACE);
             for i in 0..win32k_host::WIN32K_DATA_FRAMES {
                 let _ = page_map(copy_cap(data_base + i), win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
@@ -8451,16 +8540,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         wall_label = label;
                         break;
                     }
+                    // Ensure the page's table exists (SYS_SEND page_map can't report a missing-PT
+                    // error to drive a retry — critical for the demand-mapped pool at 0x0A00 whose
+                    // 2 MiB PTs aren't pre-created), then zero-fill.
                     let page = addr & !0xFFF;
+                    ensure_w32_client_paging(page, host_pml4);
                     let f = alloc_frame();
-                    let mut e = page_map(f, page, RW_NX, host_pml4);
-                    if e != 0 {
-                        let npt = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
-                        let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
-                        e = page_map(f, page, RW_NX, host_pml4);
-                    }
-                    let _ = e;
+                    let _ = page_map(f, page, RW_NX, host_pml4);
                     demand += 1;
                     let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -8495,6 +8581,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // Host ftfd.dll (FreeType font driver) + patch win32k's IAT for its 34 FT_* imports so
                 // InitFontSupport → FT_Init_FreeType initialises the font subsystem for real.
                 load_ftfd_driver(host_pml4);
+                // Host framebuf.dll (display driver) + map the BOOTBOOT framebuffer into win32k, so
+                // win32k's desktop-graphics init (PDEVOBJ_Create → DrvEnablePDEV/DrvEnableSurface) can
+                // enable the primary surface on the real framebuffer → PIXELS.
+                load_framebuf_driver(host_pml4);
             }
 
             let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);

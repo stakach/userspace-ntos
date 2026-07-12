@@ -28,10 +28,18 @@ use crate::*;
 pub const WIN32K_CODE_VA: u64 = 0x0000_0100_0680_0000;
 /// win32k image frame count (size_of_image 0x220000 / 0x1000).
 pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
-/// Pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter at +0, data at
-/// +0x1000). Retype-zeroed frames give counter 0 → no init step. 256 frames = 1 MiB.
-pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0700_0000;
-pub const WIN32K_POOL_FRAMES: u64 = 256;
+/// Pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter at +0, data at +0x1000).
+/// PRE-MAPPED pure bump (the committed-baseline mechanism), relocated to its own window + grown from
+/// 1 MiB → 8 MiB: win32k's GUI init (DirectX + fonts + PDEV/surface/brush) needs more than 1 MiB, and
+/// the old 1 MiB exhausted at the gray-brush allocation. Retype-zeroed frames give counter 0. Its own
+/// 0x0A00_0000 window (4 × 2 MiB PTs). (Demand-mapping + a real free list were tried and reverted —
+/// win32k's init froze with them.)
+pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0A00_0000;
+pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
+/// The 2 MiB PT window (0x0700_0000..0x0720_0000) that holds the DATA/SHARED/SENTINEL/ARG frames
+/// (the pool used to share it; now the pool has its own window above). Both the executive-load view
+/// and the host-run view map a page table here for those frames.
+pub const WIN32K_AUX_PT_VADDR: u64 = 0x0000_0100_0700_0000;
 /// Data-export region: placeholder structs (page 0) + import cells (page 1) + KPCR (page 2) +
 /// HEAP handle (page 3) + per-process slots/callout table (page 4) + EPROCESS (page 5) +
 /// W32PROCESS (page 6) + W32THREAD (page 7). 8 frames.
@@ -158,6 +166,18 @@ pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
 pub const W32_DISPATCH_LABEL: u64 = 0x770;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
+//
+// A real free-list allocator (NOT a leak-forever bump arena): win32k's GUI bring-up ALLOC/FREEs
+// pool in tight churn loops (font/GDI object caches), and with no-op `ExFreePool` those leak
+// unbounded — the pool exhausted at EXACTLY whatever cap was set (1 MiB, then 8 MiB). So each block
+// carries a 16-byte header ([hdr+0]=capacity, [hdr+8]=next-free when on the list); `pool_free`
+// pushes the block onto a single free list (head word at [POOL_VADDR+8]); `pool_alloc` first-fits
+// that list before bumping. Same-size churn (the common case) reuses the freed block immediately →
+// bounded. The bump counter lives at [POOL_VADDR+0]; data starts at POOL_DATA_OFF (0x1000).
+
+// Pure bump arena (matches the known-good committed baseline, just larger + relocated). NOTE: a real
+// free list was tried and reverted — win32k's GUI init froze with it (a churn path did not compose
+// with reclaimed blocks). `ExFreePool` stays a no-op; the arena is sized generously instead.
 
 unsafe fn pool_alloc(size: u64) -> u64 {
     let ctr = WIN32K_POOL_VADDR as *mut u64;
@@ -176,6 +196,32 @@ unsafe fn pool_alloc(size: u64) -> u64 {
         return 0;
     }
     write_volatile(ctr, (start + size) - WIN32K_POOL_VADDR);
+    start
+}
+
+/// A SEPARATE bump arena for FreeType (ftfd) allocations. FreeType's font-subsystem init allocates
+/// unboundedly (it allocates until the arena OOMs, then truncates + returns success — the same graceful
+/// behaviour the shared 1 MiB pool gave in the committed baseline). Isolating its `'FTYP'`-tagged
+/// allocations here means it can't starve the MAIN pool that the gray-brush / PDEV / primary-surface
+/// creation in the rest of NtUserInitialize needs. (Root cause — a FreeType loop fed a bad count via a
+/// win32k font-init path — is a deeper ftfd-hosting fix; this bounds the blast radius.) Counter at +0.
+pub const WIN32K_FTYP_VADDR: u64 = 0x0000_0100_0B00_0000;
+pub const WIN32K_FTYP_FRAMES: u64 = 512; // 2 MiB (own window, pre-mapped)
+/// FreeType's `EngAllocMem` tag ('FTYP', little-endian) — see the ftfd ft_alloc disasm.
+pub const FTYP_TAG: u64 = 0x5059_5446;
+
+unsafe fn ftyp_alloc(size: u64) -> u64 {
+    let ctr = WIN32K_FTYP_VADDR as *mut u64;
+    let mut cur = read_volatile(ctr);
+    if cur < POOL_DATA_OFF {
+        cur = POOL_DATA_OFF;
+    }
+    let start = (WIN32K_FTYP_VADDR + cur + 15) & !15;
+    let cap = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
+    if size == 0 || start + size > cap {
+        return 0; // OOM → FreeType truncates gracefully (matches the baseline)
+    }
+    write_volatile(ctr, (start + size) - WIN32K_FTYP_VADDR);
     start
 }
 
@@ -440,9 +486,16 @@ extern "win64" fn s_mm_map_view_of_section(
     0
 }
 
-/// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
-extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, _tag: u64) -> u64 {
-    unsafe { pool_alloc(size) }
+/// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`. FreeType's `'FTYP'`-
+/// tagged allocations (unbounded) go to a separate arena so they can't starve the main pool.
+extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, tag: u64) -> u64 {
+    unsafe {
+        if (tag as u32) as u64 == FTYP_TAG {
+            ftyp_alloc(size)
+        } else {
+            pool_alloc(size)
+        }
+    }
 }
 /// `PVOID ExAllocatePool(POOL_TYPE, SIZE_T NumberOfBytes)`.
 extern "win64" fn s_ex_alloc_pool(_pool: u64, size: u64) -> u64 {
@@ -578,7 +631,7 @@ extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
     }
     dst
 }
-/// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (bump arenas never free).
+/// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (pure bump arena).
 extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` — a fixed nonzero PID.
 extern "win64" fn s_current_process_id() -> u64 {
@@ -751,6 +804,22 @@ extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
 /// We pre-loaded dxg.sys into win32k's VSpace at bring-up; match the name + fill the struct from the
 /// recorded info (offsets: DriverName@0, ImageAddress@0x10, SectionPointer@0x18, EntryPoint@0x20,
 /// ExportSectionPointer@0x28, ImageLength@0x30). Other classes → benign success.
+/// Case-insensitive: does the wide DriverName [name_buf, +name_len bytes) end with the ASCII tail?
+unsafe fn wname_ends_with(name_buf: u64, name_len: usize, tail: &[u8]) -> bool {
+    if name_buf == 0 || name_len < tail.len() * 2 {
+        return false;
+    }
+    for (k, &wc) in tail.iter().enumerate() {
+        let off = name_buf + (name_len as u64 - (tail.len() - k) as u64 * 2);
+        let c = read_unaligned(off as *const u16);
+        let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+        if lc != wc as u16 {
+            return false;
+        }
+    }
+    true
+}
+
 extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
     const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
     if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
@@ -760,41 +829,356 @@ extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -
         // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
         let name_len = read_unaligned(buf as *const u16) as usize;
         let name_buf = read_unaligned((buf + 8) as *const u64);
-        // Match the tail against "dxg.sys" (case-insensitive), i.e. the loaded DirectX driver.
-        let mut is_dxg = false;
-        if name_buf != 0 && name_len >= 14 {
-            // last 7 wchars == "dxg.sys"
-            let want = b"dxg.sys";
-            is_dxg = true;
-            for (k, &wc) in want.iter().enumerate() {
-                let off = name_buf + (name_len as u64 - (7 - k as u64) * 2);
-                let c = read_unaligned(off as *const u16);
-                let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
-                if lc != wc as u16 {
-                    is_dxg = false;
-                    break;
-                }
-            }
-        }
-        if !is_dxg {
-            print_str(b"[win32k dxg] ZwSetSystemInformation(GdiDriver) unknown driver\n");
-            return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
-        }
-        let image = read_volatile(core::ptr::addr_of!(DXG_IMAGE));
+        // Match the tail against a hosted GDI driver (dxg.sys / framebuf.dll) + pick its recorded info.
+        let (image, entry, expdir, len, tag): (u64, u64, u64, u32, &[u8]) =
+            if wname_ends_with(name_buf, name_len, b"dxg.sys") {
+                (
+                    read_volatile(core::ptr::addr_of!(DXG_IMAGE)),
+                    read_volatile(core::ptr::addr_of!(DXG_ENTRY)),
+                    read_volatile(core::ptr::addr_of!(DXG_EXPORT_DIR)),
+                    read_volatile(core::ptr::addr_of!(DXG_IMAGE_LEN)),
+                    b"dxg.sys",
+                )
+            } else if wname_ends_with(name_buf, name_len, b"framebuf.dll") {
+                (
+                    read_volatile(core::ptr::addr_of!(FRAMEBUF_IMAGE)),
+                    read_volatile(core::ptr::addr_of!(FRAMEBUF_ENTRY)),
+                    read_volatile(core::ptr::addr_of!(FRAMEBUF_EXPORT_DIR)),
+                    read_volatile(core::ptr::addr_of!(FRAMEBUF_IMAGE_LEN)),
+                    b"framebuf.dll",
+                )
+            } else {
+                print_str(b"[win32k gdidrv] ZwSetSystemInformation(GdiDriver) unknown driver\n");
+                return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
+            };
         if image == 0 {
             return 0xC000_0135u32 as i32;
         }
         write_unaligned((buf + 0x10) as *mut u64, image); // ImageAddress
         write_unaligned((buf + 0x18) as *mut u64, image); // SectionPointer (non-null placeholder)
-        write_unaligned((buf + 0x20) as *mut u64, read_volatile(core::ptr::addr_of!(DXG_ENTRY))); // EntryPoint
-        write_unaligned((buf + 0x28) as *mut u64, read_volatile(core::ptr::addr_of!(DXG_EXPORT_DIR))); // ExportSectionPointer
-        write_unaligned((buf + 0x30) as *mut u32, read_volatile(core::ptr::addr_of!(DXG_IMAGE_LEN))); // ImageLength
-        print_str(b"[win32k dxg] hosted dxg.sys -> image=0x");
+        write_unaligned((buf + 0x20) as *mut u64, entry); // EntryPoint (= DrvEnableDriver for framebuf)
+        write_unaligned((buf + 0x28) as *mut u64, expdir); // ExportSectionPointer
+        write_unaligned((buf + 0x30) as *mut u32, len); // ImageLength
+        print_str(b"[win32k gdidrv] hosted ");
+        print_str(tag);
+        print_str(b" -> image=0x");
         print_hex((image >> 32) as u32);
         print_hex(image as u32);
         print_str(b"\n");
     }
     0
+}
+
+// --- video-device registry synthesis + framebuf miniport IOCTL intercept ---------------------
+//
+// win32k's EngpUpdateGraphicsDeviceList / InitDisplayDriver (ReactOS win32ss/gdi/eng/device.c +
+// win32ss/user/ntuser/display.c) read the video device map from the registry (RegOpenKey→ZwOpenKey,
+// RegQueryValue/RegReadDWORD→ZwQueryValueKey). There is no real registry in win32k's context, so
+// these trampolines synthesise the MINIMAL device map that makes win32k find + load a "framebuf"
+// display device, and intercept framebuf's video-miniport IOCTLs to feed it the BOOTBOOT framebuffer.
+
+// Synthetic HKEYs (opaque handles win32k passes back to ZwQueryValueKey / ZwClose).
+const HKEY_VIDEO_MAP: u64 = 0x5A5A_0F10; // \Registry\Machine\HARDWARE\DEVICEMAP\VIDEO
+const HKEY_FB_SETTINGS: u64 = 0x5A5A_0F11; // ..\Services\framebuf\Device0 (the display settings key)
+// A fake DEVICE_OBJECT / FILE_OBJECT for \Device\Video0 (win32k passes DeviceObject as the miniport
+// handle to framebuf + EngDeviceIoControl — which we intercept — so it only needs to be non-null +
+// stable). Zeroed sub-regions of DATA page 0.
+const FAKE_DEVICE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x900;
+const FAKE_FILE_OBJECT: u64 = WIN32K_DATA_VADDR + 0x980;
+
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
+const REG_SZ: u32 = 1;
+const REG_DWORD: u32 = 4;
+const REG_MULTI_SZ: u32 = 7;
+
+/// Case-insensitive: does the wide string [buf, +len_bytes) contain the ASCII pattern?
+unsafe fn wstr_contains_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
+    if buf == 0 || pat.is_empty() {
+        return false;
+    }
+    let n = len_bytes / 2;
+    if n < pat.len() {
+        return false;
+    }
+    let low = |c: u16| -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }
+    };
+    for start in 0..=(n - pat.len()) {
+        let mut ok = true;
+        for (k, &pb) in pat.iter().enumerate() {
+            let c = low(read_unaligned((buf + ((start + k) * 2) as u64) as *const u16));
+            if c != low(pb as u16) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+/// Case-insensitive exact compare of a wide value-name [buf, +len_bytes) against an ASCII pattern.
+unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
+    if buf == 0 || len_bytes / 2 != pat.len() {
+        return false;
+    }
+    let low = |c: u16| -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }
+    };
+    for k in 0..pat.len() {
+        let c = low(read_unaligned((buf + (k * 2) as u64) as *const u16));
+        if c != low(pat[k] as u16) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
+/// ObjectName (PUNICODE_STRING) at +0x10. Match the key path to a synthetic HKEY (else NOT_FOUND, so
+/// win32k's optional keys — e.g. GraphicsDrivers\BaseVideo — fail cleanly and gbBaseVideo stays 0).
+extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u64) -> i32 {
+    if obj_attr == 0 {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    unsafe {
+        let ustr = read_unaligned((obj_attr + 0x10) as *const u64); // PUNICODE_STRING
+        if ustr == 0 {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        let len = read_unaligned(ustr as *const u16) as usize; // Length (bytes)
+        let buf = read_unaligned((ustr + 8) as *const u64); // Buffer
+        let hkey = if wstr_contains_ascii(buf, len, b"DEVICEMAP\\VIDEO") {
+            HKEY_VIDEO_MAP
+        } else if wstr_contains_ascii(buf, len, b"framebuf") {
+            HKEY_FB_SETTINGS
+        } else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        if !handle_out.is_null() {
+            write_unaligned(handle_out, hkey);
+        }
+    }
+    0
+}
+
+/// Emit an ASCII string `s` as a wide (UTF-16) REG_SZ/REG_MULTI_SZ into a KEY_VALUE_PARTIAL_INFORMATION
+/// {TitleIndex@0, Type@4, DataLength@8, Data@0xC}. `extra_nul` adds a second terminator (MULTI_SZ).
+unsafe fn emit_kvpi_wsz(kvi: u64, length: u64, result_len: *mut u32, rtype: u32, s: &[u8], extra_nul: bool) -> i32 {
+    let nchars = s.len() + 1 + if extra_nul { 1 } else { 0 };
+    let dbytes = (nchars * 2) as u64;
+    let need = 0xC + dbytes;
+    if !result_len.is_null() {
+        write_unaligned(result_len, need as u32);
+    }
+    if kvi == 0 || length < need {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    write_unaligned(kvi as *mut u32, 0);
+    write_unaligned((kvi + 4) as *mut u32, rtype);
+    write_unaligned((kvi + 8) as *mut u32, dbytes as u32);
+    let d = kvi + 0xC;
+    for (i, &b) in s.iter().enumerate() {
+        write_unaligned((d + (i * 2) as u64) as *mut u16, b as u16);
+    }
+    write_unaligned((d + (s.len() * 2) as u64) as *mut u16, 0);
+    if extra_nul {
+        write_unaligned((d + ((s.len() + 1) * 2) as u64) as *mut u16, 0);
+    }
+    0
+}
+unsafe fn emit_kvpi_dword(kvi: u64, length: u64, result_len: *mut u32, val: u32) -> i32 {
+    let need = 0xC + 4;
+    if !result_len.is_null() {
+        write_unaligned(result_len, need as u32);
+    }
+    if kvi == 0 || length < need {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    write_unaligned(kvi as *mut u32, 0);
+    write_unaligned((kvi + 4) as *mut u32, REG_DWORD);
+    write_unaligned((kvi + 8) as *mut u32, 4);
+    write_unaligned((kvi + 0xC) as *mut u32, val);
+    0
+}
+
+/// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
+/// KeyValueInformation, ULONG Length, PULONG ResultLength)` — serve the synthetic device-map values.
+extern "win64" fn s_zw_query_value_key(
+    hkey: u64,
+    value_name: u64,
+    info_class: u64,
+    kvi: u64,
+    length: u64,
+    result_len: *mut u32,
+) -> i32 {
+    const KEY_VALUE_PARTIAL_INFORMATION: u64 = 2;
+    if info_class != KEY_VALUE_PARTIAL_INFORMATION || value_name == 0 {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    unsafe {
+        let vlen = read_unaligned(value_name as *const u16) as usize;
+        let vbuf = read_unaligned((value_name + 8) as *const u64);
+        match hkey {
+            HKEY_VIDEO_MAP => {
+                if wstr_eq_ascii(vbuf, vlen, b"MaxObjectNumber") {
+                    return emit_kvpi_dword(kvi, length, result_len, 0);
+                }
+                if wstr_eq_ascii(vbuf, vlen, b"\\Device\\Video0") {
+                    return emit_kvpi_wsz(
+                        kvi, length, result_len, REG_SZ,
+                        b"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\framebuf\\Device0",
+                        false,
+                    );
+                }
+            }
+            HKEY_FB_SETTINGS => {
+                if wstr_eq_ascii(vbuf, vlen, b"InstalledDisplayDrivers") {
+                    return emit_kvpi_wsz(kvi, length, result_len, REG_MULTI_SZ, b"framebuf", true);
+                }
+                if wstr_eq_ascii(vbuf, vlen, b"Device Description") {
+                    return emit_kvpi_wsz(kvi, length, result_len, REG_SZ, b"BOOTBOOT Framebuffer", false);
+                }
+                if wstr_eq_ascii(vbuf, vlen, b"VgaCompatible") {
+                    return emit_kvpi_dword(kvi, length, result_len, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+/// `NTSTATUS IoGetDeviceObjectPointer(PUNICODE_STRING, ACCESS_MASK, PFILE_OBJECT*, PDEVICE_OBJECT*)`.
+extern "win64" fn s_io_get_device_object_pointer(
+    _name: u64,
+    _access: u64,
+    fileobj_out: *mut u64,
+    devobj_out: *mut u64,
+) -> i32 {
+    unsafe {
+        if !fileobj_out.is_null() {
+            write_unaligned(fileobj_out, FAKE_FILE_OBJECT);
+        }
+        if !devobj_out.is_null() {
+            write_unaligned(devobj_out, FAKE_DEVICE_OBJECT);
+        }
+    }
+    0
+}
+
+// Video-miniport IOCTLs (ntddvdeo.h: FILE_DEVICE_VIDEO=0x23, METHOD_BUFFERED, FILE_ANY_ACCESS →
+// value = 0x0023_0000 | (Function << 2)).
+const IOCTL_VIDEO_QUERY_AVAIL_MODES: u64 = 0x0023_0400;
+const IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES: u64 = 0x0023_0404;
+const IOCTL_VIDEO_QUERY_CURRENT_MODE: u64 = 0x0023_0408;
+const IOCTL_VIDEO_SET_CURRENT_MODE: u64 = 0x0023_040C;
+const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u64 = 0x0023_0458;
+
+/// Fill an 80-byte VIDEO_MODE_INFORMATION for 1024x768x32 (scanline 4096) at `out`.
+unsafe fn fill_video_mode(out: u64) {
+    let w = |off: u64, v: u32| write_unaligned((out + off) as *mut u32, v);
+    w(0, 80); // Length (== ModeInformationLength; nonzero = a valid mode)
+    w(4, 1); // ModeIndex
+    w(8, 1024); // VisScreenWidth
+    w(12, 768); // VisScreenHeight
+    w(16, 4096); // ScreenStride (bytes/scanline)
+    w(20, 1); // NumberOfPlanes (must be 1)
+    w(24, 32); // BitsPerPlane (8/16/24/32)
+    w(28, 60); // Frequency
+    w(32, 320); // XMillimeter
+    w(36, 240); // YMillimeter
+    w(40, 8); // NumberRedBits
+    w(44, 8); // NumberGreenBits
+    w(48, 8); // NumberBlueBits
+    w(52, 0x00FF_0000); // RedMask
+    w(56, 0x0000_FF00); // GreenMask
+    w(60, 0x0000_00FF); // BlueMask
+    w(64, 0x0000_0003); // AttributeFlags = VIDEO_MODE_COLOR | VIDEO_MODE_GRAPHICS
+    w(68, 1024); // VideoMemoryBitmapWidth
+    w(72, 768); // VideoMemoryBitmapHeight
+    w(76, 0); // DriverSpecificAttributeFlags
+}
+
+/// win32k's `EngDeviceIoControl` — INTERCEPTED (win32k's export is patched to jmp here in `load_into`,
+/// so BOTH framebuf's imported calls AND win32k's own internal calls route here without a real
+/// miniport/DeviceObject). Services the video IOCTLs framebuf.dll issues, feeding it the BOOTBOOT
+/// framebuffer. Returns 0 (ERROR_SUCCESS) on handled, nonzero on unhandled (benign for the optional
+/// IOCTLs — the callers only check zero/non-zero). win64: rcx=hDev, rdx=ioctl, r8=inbuf, r9=inlen,
+/// stack: outbuf, outlen, bytesret.
+extern "win64" fn s_eng_device_io_control(
+    _hdev: u64,
+    ioctl: u64,
+    _in_buf: u64,
+    _in_len: u64,
+    out_buf: u64,
+    out_len: u64,
+    bytes_ret: *mut u32,
+) -> u32 {
+    unsafe {
+        let set_ret = |n: u32| {
+            if !bytes_ret.is_null() {
+                write_unaligned(bytes_ret, n);
+            }
+        };
+        match ioctl {
+            IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES => {
+                if out_buf != 0 && out_len >= 8 {
+                    write_unaligned(out_buf as *mut u32, 1); // NumModes
+                    write_unaligned((out_buf + 4) as *mut u32, 80); // ModeInformationLength
+                    set_ret(8);
+                    return 0;
+                }
+            }
+            IOCTL_VIDEO_QUERY_AVAIL_MODES | IOCTL_VIDEO_QUERY_CURRENT_MODE => {
+                if out_buf != 0 && out_len >= 80 {
+                    fill_video_mode(out_buf);
+                    set_ret(80);
+                    return 0;
+                }
+            }
+            IOCTL_VIDEO_SET_CURRENT_MODE => {
+                set_ret(0);
+                return 0;
+            }
+            IOCTL_VIDEO_MAP_VIDEO_MEMORY => {
+                if out_buf != 0 && out_len >= 32 {
+                    write_unaligned(out_buf as *mut u64, WIN32K_FB_VA); // VideoRamBase
+                    write_unaligned((out_buf + 8) as *mut u32, WIN32K_FB_SIZE as u32); // VideoRamLength
+                    write_unaligned((out_buf + 16) as *mut u64, WIN32K_FB_VA); // FrameBufferBase
+                    write_unaligned((out_buf + 24) as *mut u32, WIN32K_FB_SIZE as u32); // FrameBufferLength
+                    set_ret(32);
+                    print_str(b"[win32k fb] IOCTL_VIDEO_MAP_VIDEO_MEMORY -> FrameBufferBase=0x");
+                    print_hex((WIN32K_FB_VA >> 32) as u32);
+                    print_hex(WIN32K_FB_VA as u32);
+                    print_str(b"\n");
+                    return 0;
+                }
+            }
+            _ => {}
+        }
+    }
+    1 // unhandled → failure (benign)
+}
+
+/// Patch win32k's exported `EngDeviceIoControl` to `jmp s_eng_device_io_control`. Runs in `load_into`
+/// while win32k's image is mapped RW in the executive (before spawn maps it RX). 12 bytes:
+/// `mov rax, imm64 (48 B8 ..); jmp rax (FF E0)`. Both framebuf's IAT-resolved import AND win32k's own
+/// internal EngDeviceIoControl callers then route to our video-IOCTL handler.
+unsafe fn patch_eng_device_io_control() {
+    let va = pe_export_lookup(WIN32K_CODE_VA, b"EngDeviceIoControl\0");
+    if va == 0 {
+        print_str(b"[win32k fb] WARN: EngDeviceIoControl export not found\n");
+        return;
+    }
+    let tgt = s_eng_device_io_control as usize as u64;
+    write_volatile(va as *mut u8, 0x48);
+    write_volatile((va + 1) as *mut u8, 0xB8);
+    write_unaligned((va + 2) as *mut u64, tgt);
+    write_volatile((va + 10) as *mut u8, 0xFF);
+    write_volatile((va + 11) as *mut u8, 0xE0);
 }
 
 /// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
@@ -826,6 +1210,10 @@ pub fn export_addr(name: &str) -> u64 {
         "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
         // font dir open (\SystemRoot\Fonts) → fail cleanly so IntLoadSystemFonts skips enumeration
         "ZwOpenFile" | "NtOpenFile" => s_zw_open_file_fail as usize as u64,
+        // video-device registry synthesis (EngpUpdateGraphicsDeviceList / InitDisplayDriver)
+        "ZwOpenKey" | "NtOpenKey" => s_zw_open_key as usize as u64,
+        "ZwQueryValueKey" | "NtQueryValueKey" => s_zw_query_value_key as usize as u64,
+        "IoGetDeviceObjectPointer" => s_io_get_device_object_pointer as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
@@ -1049,6 +1437,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
             desc += 20;
         }
     }
+
+    // Patch win32k's EngDeviceIoControl export to our video-IOCTL intercept (so framebuf's imported
+    // calls AND win32k's own internal miniport IOCTLs route to us — no real DeviceObject needed).
+    patch_eng_device_io_control();
 
     Some(entry_rva)
 }
@@ -1325,6 +1717,18 @@ pub const DXG_LOAD_FRAMES: u64 = 16;
 /// 248 frames (one 2 MiB PT, 2 MiB-aligned at 0x0870). win32k statically imports 34 FT_* from it.
 pub const FTFD_VA: u64 = 0x0000_0100_0870_0000;
 pub const FTFD_LOAD_FRAMES: u64 = 248;
+/// framebuf.dll (generic linear-framebuffer display driver) loaded-image base in win32k's VSpace.
+/// size_of_image 0x8000 -> 8 frames (its own 2 MiB PT at 0x0890). win32k loads it dynamically via
+/// ZwSetSystemInformation (like dxg); framebuf's PE entry (RVA 0x1260) IS its DrvEnableDriver.
+pub const FRAMEBUF_VA: u64 = 0x0000_0100_0890_0000;
+pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
+/// The BOOTBOOT framebuffer (Phase-0a fb device frames) mapped into win32k's VSpace, RW. framebuf's
+/// DrvEnableSurface issues IOCTL_VIDEO_MAP_VIDEO_MEMORY; our EngDeviceIoControl intercept returns
+/// this VA as FrameBufferBase, so framebuf writes pixels straight to the real framebuffer.
+/// 1024x768x32 scanline 4096 = 0x300000 = 768 pages (2 PTs at 0x0900/0x0920).
+pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
+pub const WIN32K_FB_FRAMES: u64 = 768;
+pub const WIN32K_FB_SIZE: u64 = 0x30_0000;
 
 // The pre-loaded dxg.sys image info the ZwSetSystemInformation trampoline reports to win32k. Written
 // by the executive (load_dxg_drivers) at bring-up; read by s_zw_set_system_information.
@@ -1332,6 +1736,25 @@ static mut DXG_IMAGE: u64 = 0; // ImageAddress = DXG_VA
 static mut DXG_ENTRY: u64 = 0; // EntryPoint = DXG_VA + entry_rva
 static mut DXG_EXPORT_DIR: u64 = 0; // ExportSectionPointer = DXG_VA + export_dir_rva
 static mut DXG_IMAGE_LEN: u32 = 0; // size_of_image
+// Pre-loaded framebuf.dll image info (parallel to DXG_*), reported to win32k when it dynamically
+// loads "framebuf.dll" via ZwSetSystemInformation(SystemLoadGdiDriverInformation).
+static mut FRAMEBUF_IMAGE: u64 = 0;
+static mut FRAMEBUF_ENTRY: u64 = 0;
+static mut FRAMEBUF_EXPORT_DIR: u64 = 0;
+static mut FRAMEBUF_IMAGE_LEN: u32 = 0;
+
+/// Record the loaded framebuf.dll info (called by the executive after `load_driver_into(framebuf)`).
+/// framebuf has NO export directory; win32k's `EngFindImageProcAddress("DrvEnableDriver")` special-
+/// cases to `EntryPoint` (ldevobj.c), so ExportSectionPointer may be 0.
+pub fn record_framebuf(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
+    unsafe {
+        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE), FRAMEBUF_VA);
+        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_ENTRY), FRAMEBUF_VA + entry_rva as u64);
+        let expd = if export_dir_rva != 0 { FRAMEBUF_VA + export_dir_rva as u64 } else { 0 };
+        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_EXPORT_DIR), expd);
+        write_volatile(core::ptr::addr_of_mut!(FRAMEBUF_IMAGE_LEN), image_len);
+    }
+}
 
 /// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export
 /// named `name` (nul-terminated), or 0. Handles FORWARDER exports: dxgthk's Eng* exports forward to
