@@ -5179,6 +5179,18 @@ unsafe fn spawn_win32k_host(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, win32k_host::WIN32K_USERVM_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // The staged system font (arial.ttf) frames — the SAME frames the storage host filled (via
+    // FONTBUF_START) mapped into win32k at FONTBUF_VADDR, so load_system_font can feed the raw ttf
+    // bytes to IntGdiAddFontMemResource (own PT window at 0x06E0).
+    let font_base = FONTBUF_START.load(Ordering::Relaxed);
+    if font_base != 0 {
+        let fbpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, fbpt);
+        let _ = paging_struct_map(fbpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::FONTBUF_VADDR, pml4);
+        for i in 0..win32k_host::FONTBUF_FRAMES {
+            let _ = page_map(copy_cap(font_base + i), win32k_host::FONTBUF_VADDR + i * 0x1000, RW_NX, pml4);
+        }
+    }
     for i in 0..win32k_host::WIN32K_DATA_FRAMES {
         let cp = copy_cap(data_base + i);
         let _ = page_map(cp, win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, pml4);
@@ -5330,6 +5342,7 @@ unsafe fn spawn_storage_host(
         (DXGTHKBUF_START.load(Ordering::Relaxed), DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
         (FTFDBUF_START.load(Ordering::Relaxed), FTFDBUF_VADDR, FTFDBUF_FRAMES),
         (FRAMEBUFBUF_START.load(Ordering::Relaxed), FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
+        (FONTBUF_START.load(Ordering::Relaxed), win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES),
     ] {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -5403,6 +5416,8 @@ static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
 static FTFDBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of the raw framebuf.dll staged into FRAMEBUFBUF (display driver).
 static FRAMEBUFBUF_START: AtomicU64 = AtomicU64::new(0);
+/// Frame-cap base of the staged system font (arial.ttf) in FONTBUF (fed to IntGdiAddFontMemResource).
+static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -5757,7 +5772,7 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
     // plain Send (no cap), distinguished by its label. cptr 0 (pre-retype) falls back to reply_to.
     let rw = REPLY_W32_SLOT.load(Ordering::Relaxed);
     ep_send(w_fault, win32k_host::W32_DISPATCH_LABEL);
-    let (_b0, mut mi, mut m0, mut m1, _, _) = if rw != 0 {
+    let (_b0, mut mi, mut m0, mut m1, mut m2, mut m3) = if rw != 0 {
         recv_full_r12(w_fault, rw)
     } else {
         ep_recv_full(w_fault)
@@ -5855,10 +5870,12 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
                 }
                 skips += 1;
                 send_on_reply(rw, 1, ip + 2, 0, 0, 0); // label 0, len 1, MR0 = resume FaultIP (past CD 2C)
-                let (_b, nmi, nm0, nm1, _, _) = recv_full_r12(w_fault, rw);
+                let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(w_fault, rw);
                 mi = nmi;
                 m0 = nm0;
                 m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
                 continue;
             }
         }
@@ -5876,6 +5893,11 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
         print_str(b" m1=0x");
         print_hex((m1 >> 32) as u32);
         print_hex(m1 as u32);
+        // For a UserException (label 3): m2=FLAGS, m3=exception Number (#UD=6, #NM=7, #GP=13, #AC=17).
+        print_str(b" exc#=");
+        print_u64(m3);
+        print_str(b" flags=0x");
+        print_hex(m2 as u32);
         print_str(b"\n");
         return (0xC000_0001u32 as i32, false);
     }
@@ -6888,6 +6910,7 @@ unsafe fn storage_probe(
             (b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
             (b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
             (b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
+            (b"ARIAL   TTF", win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES, 0x90u64),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 let cap = (cap_frames * 0x1000) as u32;
@@ -8321,6 +8344,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
                 (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
                 (&FRAMEBUFBUF_START, FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
+                (&FONTBUF_START, win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES),
             ] {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -8577,6 +8601,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 entry_rva as u64,
             );
             core::ptr::write_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *mut u32, 0);
+            // Pass the staged system-font (.ttf) byte size so the host can feed it to
+            // IntGdiAddFontMemResource at bring-up (storage reported it at STORAGE_SHARED+0x90).
+            let font_sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x90) as *const u32);
+            core::ptr::write_volatile(
+                (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_FONT_SIZE) as *mut u32,
+                font_sz,
+            );
+            print_str(b"[win32k-svc] staged system font size=0x");
+            print_hex(font_sz);
+            print_str(b"\n");
 
             // Spawn the isolated component (prio 100; the executive is 255 and blocks in the fault
             // loop, yielding to it) and receive its faults.

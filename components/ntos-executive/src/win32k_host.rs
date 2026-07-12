@@ -125,6 +125,7 @@ pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
 pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
 pub const SH_REQ_STATUS: u64 = 0x78; // out: handler NTSTATUS (i32)
 pub const SH_REQ_SEQ: u64 = 0x80; // out: completed-request counter (u64) — observability
+pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
@@ -243,6 +244,22 @@ unsafe fn ftyp_alloc(size: u64) -> u64 {
 /// Counter at +0 (like the pool/ftyp arenas).
 pub const WIN32K_USERVM_VADDR: u64 = 0x0000_0100_0C00_0000;
 pub const WIN32K_USERVM_FRAMES: u64 = 1024; // 4 MiB, pre-mapped (64 GDI-pool sections)
+
+/// A system font (arial.ttf) staged off disk into a buffer mapped into win32k's VSpace (both the
+/// executive + win32k map the same frames here). At bring-up the host feeds these bytes to
+/// win32k's `IntGdiAddFontMemResource` so the desktop-graphics font realize finds a real font (the
+/// registry Fonts key is empty + `\SystemRoot\Fonts` doesn't exist, so no font loads naturally).
+/// Own 2 MiB PT window at 0x06E0 (free in both VSpaces: after FRAMEBUFBUF 0x06C0, before AUX_PT 0x0700).
+pub const FONTBUF_VADDR: u64 = 0x0000_0100_06E0_0000;
+pub const FONTBUF_FRAMES: u64 = 64; // 256 KiB (arial.ttf = 180,144 B)
+/// `IntGdiAddFontMemResource(PVOID Buffer, DWORD dwSize, PDWORD pNumAdded)` — win32k RVA. Found via
+/// NtGdiAddFontMemResourceEx (SSDT idx 0x116 / RVA 0x124020): the SECOND internal call is
+/// IntGdiAddFontMemResource (the first, 0x1cbd80, is the inlined memcpy for RtlCopyMemory). Verified
+/// by disasm: ExAllocatePoolWithTag(PagedPool, dwSize, 'ETNF') → memcpy → SharedMem_Create →
+/// Characteristics=0x30 (FR_PRIVATE|FR_NOT_ENUM) → IntGdiLoadFontByIndexFromMemory. Adds the font
+/// FR_PRIVATE to the current process's private list, which TextIntRealizeFont searches (alongside
+/// g_FontListHead) to find the system font.
+pub const INT_GDI_ADD_FONT_MEM_RESOURCE_RVA: u64 = 0x12c840;
 
 unsafe fn uservm_alloc(size: u64) -> u64 {
     let ctr = WIN32K_USERVM_VADDR as *mut u64;
@@ -1776,6 +1793,58 @@ unsafe fn setup_dispatch_context() {
     write_volatile(zstr as *mut u16, 0);
 }
 
+/// Load the staged system font (arial.ttf at [`FONTBUF_VADDR`]) into win32k via
+/// `IntGdiAddFontMemResource`, so the desktop-graphics font realize (TextIntRealizeFont) finds a
+/// real font instead of null-derefing at RVA 0x4d7eb ("no fonts loaded at all"). Runs once, after
+/// the dispatch context is established (win32k's font code reads gs:/current-process).
+///
+/// Reclaims the FreeType arena first: ftfd's FreeType probe during InitFontSupport alloc-then-freed
+/// the whole `'FTYP'` arena in a churn loop (our ExFreePoolWithTag is a no-op, so the bump pointer
+/// never rewound). Those blocks are logically free, so resetting the bump pointer gives
+/// `FT_New_Memory_Face` room to parse this face without OOM.
+unsafe fn load_system_font() {
+    let size = read_volatile((WIN32K_SHARED_VADDR + SH_FONT_SIZE) as *const u32) as u64;
+    if size == 0 {
+        print_str(b"[win32k-host] no system font staged - font realize will fail\n");
+        return;
+    }
+    let ftyp_hw = read_volatile(WIN32K_FTYP_VADDR as *const u64);
+    print_str(b"[win32k-host] FTYP arena high-water=0x");
+    print_hex(ftyp_hw as u32);
+    print_str(b" (cap=0x");
+    print_hex((WIN32K_FTYP_FRAMES * 0x1000) as u32);
+    print_str(b")\n");
+    print_str(b"[win32k-host] loading system font (");
+    print_hex(size as u32);
+    print_str(b" B) via IntGdiAddFontMemResource\n");
+    let mut num_added: u32 = 0;
+    let fptr = WIN32K_CODE_VA + INT_GDI_ADD_FONT_MEM_RESOURCE_RVA;
+    // Call through an asm shim that FORCES 16-byte stack alignment (`and rsp,-16` + shadow space):
+    // ftfd (FreeType) saves xmm6-15 with `movdqa`, which #GPs (exc 13) on a stack slot that isn't
+    // 16-aligned. Guarantee the win64 ABI alignment invariant across the Rust→MSVC→ftfd boundary.
+    let handle: u64;
+    core::arch::asm!(
+        "mov r14, rsp",
+        "and rsp, -16",
+        "sub rsp, 32",          // shadow space (keeps rsp % 16 == 0 before the call)
+        "call r11",
+        "mov rsp, r14",
+        in("r11") fptr,
+        in("rcx") FONTBUF_VADDR,
+        in("edx") size as u32,
+        in("r8") &mut num_added as *mut u32,
+        out("rax") handle,
+        out("r14") _,
+        clobber_abi("win64"),
+    );
+    print_str(b"[win32k-host] IntGdiAddFontMemResource -> handle=0x");
+    print_hex((handle >> 32) as u32);
+    print_hex(handle as u32);
+    print_str(b" numAdded=");
+    print_hex(num_added);
+    print_str(b"\n");
+}
+
 unsafe fn dispatch_loop() -> ! {
     // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
     // attach already ran with a zeroed KPCR (its happy path); every dispatch below runs as the
@@ -1797,6 +1866,11 @@ unsafe fn dispatch_loop() -> ! {
             write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
             TEST_FAULT_STATUS
         } else if ssn == SSN_INIT_DESKTOP_GFX {
+            // Load a system font FIRST — NtUserInitialize → InitializeGreCSRSS → InitFontSupport has
+            // now run (it allocates g_FreeTypeLock + inits FreeType), so the memory-font load is safe;
+            // the subsequent desktop-graphics font realize (TextIntRealizeFont) then finds it instead
+            // of null-derefing at RVA 0x4d7eb ("no fonts loaded at all").
+            load_system_font();
             // Invoke co_IntInitializeDesktopGraphics() directly (VOID → BOOL) to run the framebuf
             // display-driver enable + primary-surface + show-desktop chain (= PIXELS).
             print_str(b"[win32k-host] invoking co_IntInitializeDesktopGraphics (RVA 0xfca10)\n");
