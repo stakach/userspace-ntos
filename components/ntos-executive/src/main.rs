@@ -506,6 +506,17 @@ static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Fix (B) — per-caller MCS reply objects so the executive's dispatch composes with nested service.
+/// The kernel has a SINGLE per-TCB `reply_to` stash; `finish_call` (endpoint.rs) UNCONDITIONALLY
+/// overwrites it with the latest caller. When a win32k SSN handler FAULTS while the executive is
+/// mid-servicing a csrss syscall, the fault Call clobbers `reply_to` from csrss -> win32k and
+/// csrss's pending reply is orphaned. Binding each channel's caller to its OWN `Cap::Reply`
+/// (recv-with-r12 + Send-on-reply-cap / decode_reply) resumes exactly that caller regardless of
+/// `reply_to`. REPLY_MAIN backs the main service loop (csrss/smss); REPLY_W32 backs win32k's
+/// demand-page faults during a dispatch. cptr 0 = "not yet retyped" (legacy reply_to fallback).
+static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
+static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
+
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
 }
@@ -974,6 +985,12 @@ unsafe fn reply_recv_badge(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u
     let mr1: u64;
     let mr2: u64;
     let mr3: u64;
+    // Fix (B): the RECV half registers REPLY_MAIN in the MCS reply register (r12) so the kernel
+    // binds the next caller's Call to REPLY_MAIN (finish_call -> replies[idx].bound_tcb = caller).
+    // The REPLY half still targets the legacy `reply_to` (unchanged behavior); only the win32k-
+    // routed syscall arm reads back through Send-on-REPLY_MAIN so its reply survives a nested
+    // win32k-fault `reply_to` clobber. cptr 0 (pre-retype) = no cap, legacy path only.
+    let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     core::arch::asm!(
         "syscall",
         in("rdx") SYS_REPLY_RECV as u64,
@@ -983,10 +1000,57 @@ unsafe fn reply_recv_badge(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u
         inout("r8") r1 => mr1,
         inout("r9") r2 => mr2,
         inout("r15") r3 => mr3,
+        in("r12") reply_cptr,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
     (badge, msginfo, mr0, mr1, mr2, mr3)
+}
+
+/// `seL4_Recv(ep)` that ALSO registers a reply capability via the MCS `replyRegister` (r12): the
+/// kernel binds `reply_cptr`'s Reply object to whichever thread's Call pairs with this recv
+/// (finish_call -> replies[idx].bound_tcb = caller). A later Send on `reply_cptr` (decode_reply)
+/// then resumes exactly that caller regardless of the single per-TCB `reply_to` slot — so a nested
+/// faulting dispatch can't orphan an outer caller's pending reply. The kernel preserves the user's
+/// r12 across the syscall (it reads it, never writes it), so `in` is sufficient.
+unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let badge: u64;
+    let msginfo: u64;
+    let mr0: u64;
+    let mr1: u64;
+    let mr2: u64;
+    let mr3: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_RECV as u64,
+        inout("rdi") ep => badge,
+        lateout("rsi") msginfo,
+        lateout("r10") mr0,
+        lateout("r8") mr1,
+        lateout("r9") mr2,
+        lateout("r15") mr3,
+        in("r12") reply_cptr,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    (badge, msginfo, mr0, mr1, mr2, mr3)
+}
+
+/// Reply to a Call/fault via a `seL4_Send` on a `Cap::Reply` (kernel `decode_reply`): resume the
+/// reply object's bound caller, applying `apply_fault_reply` when the caller is blocked on a fault
+/// (the win32k/csrss demand-page + syscall replies are all fault replies). MR0..3 ride in
+/// r10/r8/r9/r15; MR4+ come from the IPC buffer (`set_reply_mr`). Used instead of SYS_REPLY_RECV so
+/// the reply targets the bound caller, NOT the (possibly clobbered) legacy `reply_to`.
+unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64, r3: u64) {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") reply_cptr,
+        in("rsi") msginfo,
+        in("r10") r0, in("r8") r1, in("r9") r2, in("r15") r3,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
 }
 
 unsafe fn set_reply_mr(i: usize, v: u64) {
@@ -3261,7 +3325,10 @@ unsafe fn service_sec_image(
     let mut pfirst = [0u64; 2];
     let mut pntfaults = [0u64; 2];
     let mut pfilled = [[0u64; 256]; 2];
-    let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(fault_ep);
+    // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
+    // as a reply cap, matching every reply_recv_badge recv in the loop body.
+    let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
     loop {
         // SAFETY: every allocation made past `heap_mark` belongs to the previous iteration's
         // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
@@ -3520,6 +3587,11 @@ unsafe fn service_sec_image(
             let flags = get_recv_mr(17);
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
             let mut handled = true;
+            // Fix (B): set when this syscall was routed to the win32k component. win32k faults
+            // during the nested dispatch clobber the executive's `reply_to` (finish_call), so this
+            // caller's reply must go back through its bound reply cap (REPLY_MAIN) rather than the
+            // legacy reply_to path — see the tail below.
+            let mut routed_win32k = false;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -4404,6 +4476,7 @@ unsafe fn service_sec_image(
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
                 // fake handle is a no-op).
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
+                routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
                 // csrss — winsrv's UserServerDllInitialization drives NtUserInitialize into win32k.
                 // Forward it to the parked win32k component through the persistent dispatch loop; the
@@ -4472,7 +4545,19 @@ unsafe fn service_sec_image(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
-            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 18, result, m1, 0, m3);
+            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let (nb, nmi, nm0, nm1, nm2, nm3) = if routed_win32k && reply_main != 0 {
+                // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
+                // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
+                // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,
+                // then recv the next event (re-binding REPLY_MAIN). Split reply+recv is equivalent to
+                // the atomic reply_recv_badge — the executive is the sole replier.
+                send_on_reply(reply_main, 18, result, m1, 0, m3);
+                recv_full_r12(fault_ep, reply_main)
+            } else {
+                // Non-routed path: `reply_to` names this caller (never clobbered) — legacy reply.
+                reply_recv_badge(fault_ep, 18, result, m1, 0, m3)
+            };
             badge = nb;
             mi = nmi;
             m0 = nm0;
@@ -5151,12 +5236,21 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
     // Fix (A): WAKE the parked component with a PLAIN Send (it is blocked in `recv_req`, waiting for
     // a request). A plain Send does NOT touch the executive's single `reply_to` slot, so a csrss
     // syscall reply in flight on this same executive thread is preserved (the root-caused nesting
-    // bug). The component reads SH_REQ_* + runs the handler on its own scheduling context. Then we
-    // recv: a fault (a real Call from the kernel → `reply_to`=win32k, fine to reply-recv) is
-    // demand-mapped; the DONE signal (the component's next plain `send_done`) means the handler
-    // finished.
+    // bug). The component reads SH_REQ_* + runs the handler on its own scheduling context.
+    //
+    // Fix (B): the component's demand-page FAULTS are delivered as Calls to `w_fault`; recv them
+    // with REPLY_W32 registered (r12) so the kernel binds win32k to REPLY_W32 (finish_call) INSTEAD
+    // of relying on `reply_to`. We then resume win32k via Send-on-REPLY_W32 (decode_reply). This
+    // leaves REPLY_MAIN's binding to the outer csrss caller intact across win32k faults — removing
+    // the (A) caveat where a nested faulting SSN clobbered `reply_to`. The DONE signal is still a
+    // plain Send (no cap), distinguished by its label. cptr 0 (pre-retype) falls back to reply_to.
+    let rw = REPLY_W32_SLOT.load(Ordering::Relaxed);
     ep_send(w_fault, win32k_host::W32_DISPATCH_LABEL);
-    let (_b0, mut mi, mut m0, mut m1, _, _) = ep_recv_full(w_fault);
+    let (_b0, mut mi, mut m0, mut m1, _, _) = if rw != 0 {
+        recv_full_r12(w_fault, rw)
+    } else {
+        ep_recv_full(w_fault)
+    };
     loop {
         let label = mi >> 12;
         if label == 6 {
@@ -5190,7 +5284,18 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             }
             let _ = e;
             demand += 1;
-            let (nmi, nm0, nm1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+            // Fix (B): resume win32k via its bound reply cap (Send-on-REPLY_W32 -> decode_reply ->
+            // apply_fault_reply for the VMFault, length 0) then recv the next fault/DONE re-binding
+            // REPLY_W32. Falls back to the legacy reply_recv on the single `reply_to` if REPLY_W32
+            // wasn't retyped.
+            let (nmi, nm0, nm1) = if rw != 0 {
+                send_on_reply(rw, 0, 0, 0, 0, 0);
+                let (_b, nmi, nm0, nm1, _, _) = recv_full_r12(w_fault, rw);
+                (nmi, nm0, nm1)
+            } else {
+                let (nmi, nm0, nm1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+                (nmi, nm0, nm1)
+            };
             mi = nmi;
             m0 = nm0;
             m1 = nm1;
@@ -6319,6 +6424,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
     IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
+
+    // Fix (B): retype two MCS Reply objects (OBJ_REPLY=6, fixed size, size_bits=0) into the
+    // executive's root cspace — one for the main service loop (csrss/smss), one for win32k's
+    // dispatch faults. Cap-based reply IPC decouples each channel's pending reply from the single
+    // per-TCB `reply_to` slot, so a nested win32k fault no longer orphans csrss's reply.
+    let rm = alloc_slot();
+    let e_rm = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rm);
+    let rw = alloc_slot();
+    let e_rw = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rw);
+    if e_rm == 0 {
+        REPLY_MAIN_SLOT.store(rm, Ordering::Relaxed);
+    }
+    if e_rw == 0 {
+        REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
+    }
+    print_str(b"[ntos-exec] reply caps: REPLY_MAIN cptr=0x");
+    print_hex(REPLY_MAIN_SLOT.load(Ordering::Relaxed) as u32);
+    print_str(b" (retype e=0x");
+    print_hex(e_rm as u32);
+    print_str(b") REPLY_W32 cptr=0x");
+    print_hex(REPLY_W32_SLOT.load(Ordering::Relaxed) as u32);
+    print_str(b" (retype e=0x");
+    print_hex(e_rw as u32);
+    print_str(b")\n");
 
     print_str(b"[ntos-exec] NT executive core: spawning the Object Manager as an isolated service\n");
 
@@ -8072,6 +8201,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_u64(seq);
                 print_str(b")\n");
                 check(b"win32k_dispatch_loop_roundtrip", ok && seq >= 1, &mut passed);
+
+                // --- Fix (B): prove a win32k dispatch whose handler FAULTS is resolved through the
+                // per-caller reply cap (REPLY_W32 / decode_reply), NOT the single per-TCB reply_to.
+                // SSN_TEST_FAULT's handler reads an un-demand-paged page → the executive demand-maps
+                // it via Send-on-REPLY_W32 + recv-with-r12 and resumes win32k, which returns the
+                // sentinel. A clean round-trip means the dispatch fault path no longer depends on
+                // reply_to — so a nested faulting SSN can't clobber an outer caller's pending reply.
+                let (fst, fok) = win32k_dispatch(win32k_host::SSN_TEST_FAULT, 0, 0, 0, 0);
+                let fseq = core::ptr::read_volatile(
+                    (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_REQ_SEQ) as *const u64,
+                );
+                print_str(b"[win32k-svc] FAULTING dispatch (reply-cap path): status=0x");
+                print_hex(fst as u32);
+                print_str(if fok { b" (serviced, seq=" } else { b" (WALL, seq=" });
+                print_u64(fseq);
+                print_str(b")\n");
+                check(
+                    b"win32k_dispatch_fault_via_reply_cap",
+                    fok && fst == win32k_host::TEST_FAULT_STATUS && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
+                    &mut passed,
+                );
             }
         }
     }

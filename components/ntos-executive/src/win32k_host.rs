@@ -114,6 +114,21 @@ pub const V_NTUSER_RESOLVED: u32 = 0x200; // SSDT resolve(0x10FA) yielded a real
 pub const WIN32K_SERVICE_BASE: u64 = 0x1000;
 pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
 
+/// Fix (B) self-test SSN — a SYNTHETIC dispatch (well outside win32k's real 740-entry SSDT) whose
+/// handler deliberately READS an un-demand-paged data page in this component's VSpace. The read
+/// FAULTS mid-dispatch; the executive's `win32k_dispatch` fault loop demand-maps the page THROUGH
+/// the per-caller reply cap (REPLY_W32 / decode_reply) and resumes us. We then read the (zeroed)
+/// page and return [`TEST_FAULT_STATUS`]. A clean round-trip proves the dispatch fault path no
+/// longer relies on the single per-TCB `reply_to`, so a nested faulting SSN can't orphan an outer
+/// caller's reply.
+pub const SSN_TEST_FAULT: u64 = 0x1FFE;
+/// Un-demand-paged, demand-pageable probe VA: past the win32k image tail (0x06A2_0000, so NOT
+/// flagged `in_image`) yet inside the same PD as the image, so the executive maps it with no new
+/// page table. Zeroed on first touch.
+pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
+/// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
+pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
+
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
 /// the dispatch loop uses a genuine `seL4_Call` on its fault-endpoint cap ([`crate::CT_FAULT`]) —
@@ -866,7 +881,16 @@ unsafe fn dispatch_loop() -> ! {
         let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
         let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
         let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
-        let status = dispatch_ssn(ssn, a0, a1, a2, a3);
+        let status = if ssn == SSN_TEST_FAULT {
+            // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
+            // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
+            // page (observability into SH_REQ_A0) and report the sentinel status.
+            let probe = read_volatile(TEST_FAULT_VA as *const u64);
+            write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
+            TEST_FAULT_STATUS
+        } else {
+            dispatch_ssn(ssn, a0, a1, a2, a3)
+        };
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
         let seq = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *const u64);
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq + 1);
