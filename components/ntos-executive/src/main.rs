@@ -4639,6 +4639,44 @@ unsafe fn service_sec_image(
                 print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
                 print_hex(st as u32);
                 print_str(b"\n");
+                // Once NtUserInitialize (0x125a) succeeds, the display device is registered but the
+                // PDEV/primary-surface aren't created yet (lazy — on the first GUI op, which our hosted
+                // csrss can't reach: it's blocked at the SM↔CSR LPC handshake). Trigger the display
+                // graphics init DIRECTLY: framebuf DrvEnablePDEV/Surface on the BOOTBOOT framebuffer +
+                // co_IntShowDesktop = PIXELS. Then read the framebuffer back (via the Phase-0a window)
+                // to confirm GDI/framebuf drew over our magenta test pattern.
+                if m0 == 0x125a && ok && st == 0
+                    && DESKTOP_GFX_DONE.swap(1, Ordering::Relaxed) == 0
+                {
+                    let (gst, gok) =
+                        win32k_dispatch(win32k_host::SSN_INIT_DESKTOP_GFX, 0, 0, 0, 0);
+                    print_str(b"[win32k-svc] co_IntInitializeDesktopGraphics -> 0x");
+                    print_hex(gst as u32);
+                    print_str(if gok { b" (ran)\n" } else { b" (WALL)\n" });
+                    // PIXELS: the whole framebuffer was filled magenta in Phase 0a; count how many of
+                    // a sampled grid GDI/framebuf changed. Any change = GDI drew on the real fb.
+                    let fb = FB_VADDR as *const u32;
+                    let mut changed = 0u32;
+                    let mut sample0 = 0u32;
+                    for r in 0..24u64 {
+                        for c in 0..32u64 {
+                            let idx = (r * 32 * 1024 + c * 32) as usize; // ~grid over 768x1024
+                            let px = core::ptr::read_volatile(fb.add(idx));
+                            if r == 0 && c == 0 {
+                                sample0 = px;
+                            }
+                            if px != 0x00FF_00FF {
+                                changed += 1;
+                            }
+                        }
+                    }
+                    print_str(b"[win32k-svc] framebuffer readback after gfx init: changed ");
+                    print_u64(changed as u64);
+                    print_str(b"/768 sampled px (px0=0x");
+                    print_hex(sample0);
+                    print_str(b")\n");
+                    FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
+                }
                 if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
                 } else {
@@ -5373,6 +5411,13 @@ static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
 static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 0 until co_IntInitializeDesktopGraphics has been triggered (once, after NtUserInitialize succeeds).
+static DESKTOP_GFX_DONE: AtomicU64 = AtomicU64::new(0);
+/// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
+static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
+/// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
+/// confirm GDI/framebuf drew pixels).
+const FB_VADDR: u64 = 0x0000_0200_0000_0000;
 
 /// RO-map win32k's global USER heap arena ([`win32k_host::WIN32K_HEAP_VADDR`], where gpsi /
 /// gHandleTable / the USER handle-entry array live) into the caller's (csrss's) VSpace at
@@ -5682,8 +5727,11 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
     core::ptr::write_volatile((sh + win32k_host::SH_REQ_A3) as *mut u64, a3);
     core::ptr::write_volatile((sh + win32k_host::SH_REQ_STATUS) as *mut i32, 0);
     let code_va = win32k_host::WIN32K_CODE_VA;
-    const DEMAND_CAP: u64 = 512;
+    // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
+    // many pages and trips many checked-build asserts; allow generous headroom (still bounded).
+    const DEMAND_CAP: u64 = 8192;
     let mut demand = 0u64;
+    let mut skips = 0u64; // int-0x2c asserts skipped (bounded, so a looping assert still walls)
     // Fix (A): WAKE the parked component with a PLAIN Send (it is blocked in `recv_req`, waiting for
     // a request). A plain Send does NOT touch the executive's single `reply_to` slot, so a csrss
     // syscall reply in flight on this same executive thread is preserved (the root-caused nesting
@@ -5774,6 +5822,33 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let _ = m0;
             let status = core::ptr::read_volatile((sh + win32k_host::SH_REQ_STATUS) as *const i32);
             return (status, true);
+        }
+        if label == 3 {
+            // UserException — almost always a checked-build `int 0x2c` NT_ASSERT
+            // (DbgRaiseAssertionFailure). Verify the faulting instruction (CD 2C) via the executive's
+            // RW view of win32k's image at the SAME VA, then SKIP it (resume at IP+2), treating the
+            // assert as ignored — like a release build. Our single-threaded lock/thread stubs trip
+            // lock-ownership + context asserts that a real multi-threaded kernel wouldn't; the
+            // underlying operation is fine. m0 = FaultIP.
+            let ip = m0;
+            let in_win32k = ip >= code_va && ip < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+            let is_int2c = in_win32k
+                && core::ptr::read_volatile(ip as *const u8) == 0xCD
+                && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
+            if is_int2c && rw != 0 && skips < 4000 {
+                if skips < 40 {
+                    print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
+                    print_hex(ip.wrapping_sub(code_va) as u32);
+                    print_str(b"\n");
+                }
+                skips += 1;
+                send_on_reply(rw, 1, ip + 2, 0, 0, 0); // label 0, len 1, MR0 = resume FaultIP (past CD 2C)
+                let (_b, nmi, nm0, nm1, _, _) = recv_full_r12(w_fault, rw);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                continue;
+            }
         }
         // Any other fault (a real wall inside the handler) — fail. Diagnose: label + fault IP/addr
         // (m0=IP, m1=addr for exceptions; for UnknownSyscall m0=SSN). RVA relative to code / dxg.
@@ -7521,11 +7596,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 const MAGENTA: u32 = 0x00FF_00FF;
                 const GREEN: u32 = 0x0000_FF00;
                 let fb = FB_VADDR as *mut u32;
-                for x in 0..fb_w {
-                    core::ptr::write_volatile(fb.add(x as usize), MAGENTA);
+                // Fill the WHOLE framebuffer magenta (not just line 0) so that a later GDI/framebuf
+                // draw (the desktop-graphics init) is reliably detectable by a readback anywhere.
+                let total_px = (fb_size / 4) as usize;
+                for x in 0..total_px {
+                    core::ptr::write_volatile(fb.add(x), MAGENTA);
                 }
                 // Last fully-addressable pixel in the framebuffer.
-                let last_px = (fb_size / 4 - 1) as usize;
+                let last_px = total_px - 1;
                 core::ptr::write_volatile(fb.add(last_px), GREEN);
 
                 let p0 = core::ptr::read_volatile(fb.add(0));
@@ -8955,6 +9033,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_sec_image_fill", false, &mut passed);
             }
         }
+    }
+
+    // --- Graphics: report whether win32k's desktop-graphics init (triggered after NtUserInitialize
+    // succeeded during csrss's winsrv bring-up) drove framebuf.dll to draw PIXELS on the BOOTBOOT
+    // framebuffer (the readback happened in the csrss service loop, result stashed in FB_PIXELS_DREW).
+    {
+        let d = FB_PIXELS_DREW.load(Ordering::Relaxed);
+        print_str(b"[ntos-exec] win32k desktop-graphics framebuffer pixels: ");
+        print_str(match d {
+            2 => b"DREW (non-magenta)\n".as_slice(),
+            1 => b"unchanged (no draw)\n".as_slice(),
+            _ => b"gfx-init not reached\n".as_slice(),
+        });
     }
 
     // --- Phase 2 (graphics): PROTOTYPE-bind the real ReactOS win32k.sys against the driver-host

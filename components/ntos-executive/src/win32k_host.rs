@@ -157,6 +157,16 @@ pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
 /// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
 pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
 
+/// Synthetic dispatch SSN: invoke win32k's `co_IntInitializeDesktopGraphics` (RVA 0xfca10) directly.
+/// This is the lazy PDEV/desktop-graphics init that a GUI op (GetDC) would trigger — but our hosted
+/// csrss can't reach that (blocked at the SM↔CSR LPC handshake). It runs PDEVOBJ_lChangeDisplaySettings
+/// → loads framebuf.dll → DrvEnablePDEV/DrvEnableSurface (IOCTL_VIDEO_MAP_VIDEO_MEMORY → the BOOTBOOT
+/// framebuffer) → IntCreatePrimarySurface → co_IntShowDesktop (paints the desktop) = PIXELS.
+pub const SSN_INIT_DESKTOP_GFX: u64 = 0x1FFD;
+/// co_IntInitializeDesktopGraphics RVA (identified via its L"DISPLAY" ref + the PDEVOBJ_lChangeDisplay
+/// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure).
+pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
+
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
 /// the dispatch loop uses a genuine `seL4_Call` on its fault-endpoint cap ([`crate::CT_FAULT`]) —
@@ -1614,6 +1624,17 @@ unsafe fn dispatch_loop() -> ! {
             let probe = read_volatile(TEST_FAULT_VA as *const u64);
             write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
             TEST_FAULT_STATUS
+        } else if ssn == SSN_INIT_DESKTOP_GFX {
+            // Invoke co_IntInitializeDesktopGraphics() directly (VOID → BOOL) to run the framebuf
+            // display-driver enable + primary-surface + show-desktop chain (= PIXELS).
+            print_str(b"[win32k-host] invoking co_IntInitializeDesktopGraphics (RVA 0xfca10)\n");
+            let f: extern "win64" fn() -> i32 =
+                core::mem::transmute((WIN32K_CODE_VA + CO_INIT_DESKTOP_GFX_RVA) as *const ());
+            let r = f();
+            print_str(b"[win32k-host] co_IntInitializeDesktopGraphics returned 0x");
+            print_hex(r as u32);
+            print_str(b"\n");
+            r
         } else {
             dispatch_ssn(ssn, a0, a1, a2, a3)
         };
