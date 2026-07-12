@@ -39,6 +39,13 @@ pub const WIN32K_DATA_FRAMES: u64 = 4;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
 /// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
 pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
+/// A zeroed page used as the fake HEAP handle `RtlCreateHeap` returns (win32k stores it + passes
+/// it back to RtlAllocateHeap; any field reads see 0). Page 3 of the DATA region.
+pub const WIN32K_HEAP_HANDLE: u64 = WIN32K_DATA_VADDR + 0x3000;
+/// The win32k session-heap arena that RtlAllocateHeap bump-allocates from (counter at +0, data at
+/// +0x1000). win32k creates its session heap over ~1 MiB; give it 4 MiB. Its own 2 PT window.
+pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
+pub const WIN32K_HEAP_FRAMES: u64 = 1024;
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// An unmapped VA the host reads once DriverEntry returns — the fault-recv loop recognises the
@@ -107,6 +114,37 @@ extern "win64" fn s_get_win32process() -> u64 {
 }
 extern "win64" fn s_get_win32thread() -> u64 {
     PH_WIN32THREAD
+}
+
+/// Bump-allocate from the win32k session-heap arena (RtlAllocateHeap). Same shape as `pool_alloc`
+/// but over its own 4 MiB region.
+unsafe fn heap_alloc(size: u64) -> u64 {
+    let ctr = WIN32K_HEAP_VADDR as *mut u64;
+    let mut cur = read_volatile(ctr);
+    if cur < POOL_DATA_OFF {
+        cur = POOL_DATA_OFF;
+    }
+    let start = (WIN32K_HEAP_VADDR + cur + 15) & !15;
+    let cap = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    if size == 0 || start + size > cap {
+        return 0;
+    }
+    write_volatile(ctr, (start + size) - WIN32K_HEAP_VADDR);
+    start
+}
+
+/// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)` — win32k
+/// creates its session heap. Return a non-null fake handle; RtlAllocateHeap bumps the arena.
+extern "win64" fn s_rtl_create_heap() -> u64 {
+    WIN32K_HEAP_HANDLE
+}
+/// `PVOID RtlAllocateHeap(HeapHandle, Flags, Size)` — bump the session-heap arena.
+extern "win64" fn s_rtl_allocate_heap(_heap: u64, _flags: u64, size: u64) -> u64 {
+    unsafe { heap_alloc(size) }
+}
+/// `BOOLEAN RtlFreeHeap(HeapHandle, Flags, Base)` — no-op (bump arena never frees).
+extern "win64" fn s_rtl_free_heap() -> u64 {
+    1
 }
 
 /// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
@@ -211,6 +249,10 @@ pub fn export_addr(name: &str) -> u64 {
         "ExAllocatePoolWithTag" => s_ex_alloc_pool_with_tag as usize as u64,
         "ExAllocatePool" => s_ex_alloc_pool as usize as u64,
         "ExAllocatePoolWithQuotaTag" => s_ex_alloc_pool_quota as usize as u64,
+        // heap (win32k session heap)
+        "RtlCreateHeap" => s_rtl_create_heap as usize as u64,
+        "RtlAllocateHeap" => s_rtl_allocate_heap as usize as u64,
+        "RtlFreeHeap" => s_rtl_free_heap as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,

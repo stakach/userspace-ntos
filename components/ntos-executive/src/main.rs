@@ -4743,6 +4743,7 @@ unsafe fn spawn_win32k_host(
     pool_base: u64,
     data_base: u64,
     shared_frame: u64,
+    heap_base: u64,
 ) -> u64 {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -4802,6 +4803,16 @@ unsafe fn spawn_win32k_host(
     }
     let sh = copy_cap(shared_frame);
     let _ = page_map(sh, win32k_host::WIN32K_SHARED_VADDR, RW_NX, pml4);
+    // The win32k session-heap arena (RtlCreateHeap/RtlAllocateHeap) — 1024 frames = 4 MiB, 2 PTs.
+    for p in 0..2u64 {
+        let hpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
+        let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_HEAP_VADDR + p * 0x20_0000, pml4);
+    }
+    for i in 0..win32k_host::WIN32K_HEAP_FRAMES {
+        let cp = copy_cap(heap_base + i);
+        let _ = page_map(cp, win32k_host::WIN32K_HEAP_VADDR + i * 0x1000, RW_NX, pml4);
+    }
 
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
@@ -7745,6 +7756,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let data_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
             let shared = alloc_frame();
+            // The win32k session-heap arena (host-only; the executive doesn't map it).
+            let heap_base = alloc_frame();
+            for _ in 1..win32k_host::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
             // The pool-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718).
             let ppt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
@@ -7780,6 +7794,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 pool_base,
                 data_base,
                 shared,
+                heap_base,
             );
 
             const DEMAND_CAP: u64 = 512;
