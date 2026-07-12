@@ -205,6 +205,7 @@ pub const SSN_NT_CREATE_KEYED_EVENT: u64 = 289;
 pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
+pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
 pub const SSN_NT_OPEN_SECTION: u64 = 131;
@@ -3851,6 +3852,7 @@ unsafe fn service_sec_image(
             } else if m0 == SSN_NT_CREATE_PORT
                 || m0 == SSN_NT_CREATE_THREAD
                 || m0 == SSN_NT_CREATE_EVENT
+                || m0 == SSN_NT_CREATE_SEMAPHORE
             {
                 // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events).
                 // Each takes the out handle in RCX (arg1). Hand back a fresh fake handle so the
