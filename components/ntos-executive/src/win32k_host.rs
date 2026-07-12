@@ -235,6 +235,31 @@ unsafe fn ftyp_alloc(size: u64) -> u64 {
     start
 }
 
+/// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute
+/// pool ([`GdiPoolAllocateSection`], win32ss/gdi/ntgdi/gdipool.c) reserves a 64 KiB user-mode region
+/// per pool section (`MEM_RESERVE`) then commits pages on demand (`MEM_COMMIT`) — the DC_ATTR /
+/// RGN_ATTR storage. In this single-address-space host the whole arena is pre-mapped RW, so RESERVE
+/// hands out a bump slice and COMMIT is a no-op. Own 2 MiB-aligned window + PTs (spawn_win32k_host).
+/// Counter at +0 (like the pool/ftyp arenas).
+pub const WIN32K_USERVM_VADDR: u64 = 0x0000_0100_0C00_0000;
+pub const WIN32K_USERVM_FRAMES: u64 = 1024; // 4 MiB, pre-mapped (64 GDI-pool sections)
+
+unsafe fn uservm_alloc(size: u64) -> u64 {
+    let ctr = WIN32K_USERVM_VADDR as *mut u64;
+    let mut cur = read_volatile(ctr);
+    if cur < POOL_DATA_OFF {
+        cur = POOL_DATA_OFF;
+    }
+    // 64 KiB granularity (GDI_POOL_ALLOCATION_GRANULARITY) so each reservation is page-run isolated.
+    let start = (WIN32K_USERVM_VADDR + cur + 0xFFFF) & !0xFFFF;
+    let cap = WIN32K_USERVM_VADDR + WIN32K_USERVM_FRAMES * 0x1000;
+    if size == 0 || start + size > cap {
+        return 0;
+    }
+    write_volatile(ctr, (start + size) - WIN32K_USERVM_VADDR);
+    start
+}
+
 // --- ntoskrnl trampolines (extern "win64"; win64 args = rcx, rdx, r8, r9, stack) -------------
 
 extern "win64" fn s_zero() -> u64 {
@@ -643,6 +668,136 @@ extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
 }
 /// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (pure bump arena).
 extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
+
+// --- ZwAllocateVirtualMemory + RTL_BITMAP (GDI DC_ATTR / RGN_ATTR pool) -----------------------
+
+const MEM_COMMIT: u64 = 0x1000;
+const MEM_RESERVE: u64 = 0x2000;
+
+/// `NTSTATUS ZwAllocateVirtualMemory(HANDLE, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T
+/// RegionSize, ULONG AllocationType, ULONG Protect)`. win32k's GDI attribute pool
+/// (`GdiPoolAllocateSection` → RESERVE 64 KiB; `GdiPoolAllocate` → COMMIT pages) is the caller. The
+/// USERVM arena is pre-mapped RW, so RESERVE hands out a bump slice + writes `*BaseAddress`, and
+/// COMMIT of an already-reserved region just succeeds (memory is already backed). Previously this
+/// fell to the s_zero stub (SUCCESS but never wrote `*BaseAddress`) → `pvBaseAddress` stayed NULL →
+/// GdiPoolAllocate returned NULL → "Could not allocate DC attr".
+extern "win64" fn s_zw_allocate_virtual_memory(
+    _process: u64,
+    base_io: *mut u64,
+    _zero_bits: u64,
+    size_io: *mut u64,
+    alloc_type: u64,
+    _protect: u64,
+) -> i32 {
+    if base_io.is_null() || size_io.is_null() {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    unsafe {
+        let want = read_volatile(size_io);
+        let size = (want + 0xFFF) & !0xFFF;
+        if alloc_type & MEM_RESERVE != 0 {
+            let base = uservm_alloc(size.max(0x1_0000));
+            if base == 0 {
+                return 0xC000_0017u32 as i32; // STATUS_NO_MEMORY
+            }
+            write_volatile(base_io, base);
+            write_volatile(size_io, size.max(0x1_0000));
+        } else {
+            // MEM_COMMIT: the region was already reserved (pre-mapped). Keep *BaseAddress; if the
+            // caller passed a bare COMMIT with no reservation, back it from the arena.
+            if read_volatile(base_io) == 0 {
+                let base = uservm_alloc(size.max(0x1000));
+                if base == 0 {
+                    return 0xC000_0017u32 as i32;
+                }
+                write_volatile(base_io, base);
+            }
+            write_volatile(size_io, size.max(0x1000));
+        }
+        0 // STATUS_SUCCESS
+    }
+}
+
+/// `NTSTATUS ZwFreeVirtualMemory(HANDLE, PVOID* BaseAddress, PSIZE_T RegionSize, ULONG FreeType)` —
+/// no-op success (the USERVM arena never reclaims; GdiPool only frees on section teardown).
+extern "win64" fn s_zw_free_virtual_memory(_p: u64, _base: u64, _size: u64, _ty: u64) -> i32 {
+    0
+}
+
+use nt_kernel_exec::rtl_bitmap;
+
+/// `VOID RtlInitializeBitMap(PRTL_BITMAP, PULONG Buffer, ULONG SizeOfBitMap)`.
+extern "win64" fn s_rtl_initialize_bitmap(bm: u64, buffer: u64, size: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::initialize(bm as *mut u8, buffer, size) };
+    }
+}
+/// `VOID RtlClearAllBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_clear_all_bits(bm: u64) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_all(bm as *mut u8) };
+    }
+}
+/// `VOID RtlSetAllBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_set_all_bits(bm: u64) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_all(bm as *mut u8) };
+    }
+}
+/// `ULONG RtlFindClearBitsAndSet(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex)`.
+extern "win64" fn s_rtl_find_clear_bits_and_set(bm: u64, count: u32, hint: u32) -> u32 {
+    if bm == 0 {
+        return rtl_bitmap::BITMAP_NONE;
+    }
+    unsafe { rtl_bitmap::find_clear_bits_and_set(bm as *mut u8, count, hint) }
+}
+/// `ULONG RtlNumberOfSetBits(PRTL_BITMAP)`.
+extern "win64" fn s_rtl_number_of_set_bits(bm: u64) -> u32 {
+    if bm == 0 {
+        return 0;
+    }
+    unsafe { rtl_bitmap::number_of_set_bits(bm as *const u8) }
+}
+/// `BOOLEAN RtlTestBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_test_bit(bm: u64, i: u32) -> u8 {
+    if bm != 0 && unsafe { rtl_bitmap::test_bit(bm as *const u8, i) } {
+        1
+    } else {
+        0
+    }
+}
+/// `VOID RtlSetBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_set_bit(bm: u64, i: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_bit(bm as *mut u8, i) };
+    }
+}
+/// `VOID RtlClearBit(PRTL_BITMAP, ULONG)`.
+extern "win64" fn s_rtl_clear_bit(bm: u64, i: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_bit(bm as *mut u8, i) };
+    }
+}
+/// `VOID RtlSetBits(PRTL_BITMAP, ULONG StartingIndex, ULONG NumberToSet)`.
+extern "win64" fn s_rtl_set_bits(bm: u64, start: u32, count: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::set_bits(bm as *mut u8, start, count) };
+    }
+}
+/// `VOID RtlClearBits(PRTL_BITMAP, ULONG StartingIndex, ULONG NumberToClear)`.
+extern "win64" fn s_rtl_clear_bits(bm: u64, start: u32, count: u32) {
+    if bm != 0 {
+        unsafe { rtl_bitmap::clear_bits(bm as *mut u8, start, count) };
+    }
+}
+/// `BOOLEAN RtlAreBitsClear(PRTL_BITMAP, ULONG StartingIndex, ULONG Length)`.
+extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
+    if bm != 0 && unsafe { rtl_bitmap::are_bits_clear(bm as *const u8, start, count) } {
+        1
+    } else {
+        0
+    }
+}
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` — a fixed nonzero PID.
 extern "win64" fn s_current_process_id() -> u64 {
     (FAKE_PROCESS_HANDLE as u32) as u64
@@ -1216,6 +1371,23 @@ pub fn export_addr(name: &str) -> u64 {
         "memset" | "RtlFillMemory" => s_memset as usize as u64,
         "ExFreePoolWithTag" | "ExFreePool" => s_ex_free_pool_with_tag as usize as u64,
         "PsGetCurrentProcessId" | "PsGetCurrentThreadProcessId" => s_current_process_id as usize as u64,
+        // GDI attribute pool user-mode VM (GdiPoolAllocateSection RESERVE + GdiPoolAllocate COMMIT)
+        "ZwAllocateVirtualMemory" | "NtAllocateVirtualMemory" => {
+            s_zw_allocate_virtual_memory as usize as u64
+        }
+        "ZwFreeVirtualMemory" | "NtFreeVirtualMemory" => s_zw_free_virtual_memory as usize as u64,
+        // RTL_BITMAP (GDI pool slot allocator — DC_ATTR / RGN_ATTR distinct storage)
+        "RtlInitializeBitMap" => s_rtl_initialize_bitmap as usize as u64,
+        "RtlClearAllBits" => s_rtl_clear_all_bits as usize as u64,
+        "RtlSetAllBits" => s_rtl_set_all_bits as usize as u64,
+        "RtlFindClearBitsAndSet" => s_rtl_find_clear_bits_and_set as usize as u64,
+        "RtlNumberOfSetBits" => s_rtl_number_of_set_bits as usize as u64,
+        "RtlTestBit" => s_rtl_test_bit as usize as u64,
+        "RtlSetBit" => s_rtl_set_bit as usize as u64,
+        "RtlClearBit" => s_rtl_clear_bit as usize as u64,
+        "RtlSetBits" => s_rtl_set_bits as usize as u64,
+        "RtlClearBits" => s_rtl_clear_bits as usize as u64,
+        "RtlAreBitsClear" => s_rtl_are_bits_clear as usize as u64,
         // GDI driver load (win32k's LDEVOBJ_bLoadImage → dxg.sys hosting)
         "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
         // font dir open (\SystemRoot\Fonts) → fail cleanly so IntLoadSystemFonts skips enumeration

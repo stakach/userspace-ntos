@@ -5167,6 +5167,18 @@ unsafe fn spawn_win32k_host(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, win32k_host::WIN32K_FTYP_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // GDI-attribute user-mode VM arena (ZwAllocateVirtualMemory: GDI DC_ATTR / RGN_ATTR pools) —
+    // own window + PTs, pre-mapped RW so RESERVE hands out backed memory and COMMIT is a no-op.
+    for p in 0..(win32k_host::WIN32K_USERVM_FRAMES + 511) / 512 {
+        let upt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, upt);
+        let _ = paging_struct_map(upt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_USERVM_VADDR + p * 0x20_0000, pml4);
+    }
+    for i in 0..win32k_host::WIN32K_USERVM_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, win32k_host::WIN32K_USERVM_VADDR + i * 0x1000, RW_NX, pml4);
+    }
     for i in 0..win32k_host::WIN32K_DATA_FRAMES {
         let cp = copy_cap(data_base + i);
         let _ = page_map(cp, win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, pml4);
