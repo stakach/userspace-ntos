@@ -4770,11 +4770,17 @@ unsafe fn spawn_win32k_host(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
     }
+    let mut stack_slot_base = 0u64;
     for i in 0..stack_frames {
         let f = alloc_slot();
+        if i == 0 {
+            stack_slot_base = f;
+        }
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
     }
+    WIN32K_STACK_SLOT.store(stack_slot_base, Ordering::Relaxed);
+    WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
     let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
@@ -4803,8 +4809,9 @@ unsafe fn spawn_win32k_host(
     }
     let sh = copy_cap(shared_frame);
     let _ = page_map(sh, win32k_host::WIN32K_SHARED_VADDR, RW_NX, pml4);
-    // The win32k session-heap arena (RtlCreateHeap/RtlAllocateHeap) — 1024 frames = 4 MiB, 2 PTs.
-    for p in 0..2u64 {
+    // The win32k session-heap + Mm-view arena (RtlAllocateHeap + MmMapView*) — 4096 frames =
+    // 16 MiB, 8 PTs (0x0740_0000..0x0840_0000).
+    for p in 0..(win32k_host::WIN32K_HEAP_FRAMES / 512) {
         let hpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
         let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_HEAP_VADDR + p * 0x20_0000, pml4);
@@ -4822,6 +4829,7 @@ unsafe fn spawn_win32k_host(
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep, 0);
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    WIN32K_TCB.store(tcb, Ordering::Relaxed);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
     let stack_top = STACK_BASE + stack_frames * 0x1000 - 16;
@@ -4998,6 +5006,28 @@ static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
+/// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
+static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
+static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_TCB: AtomicU64 = AtomicU64::new(0);
+
+/// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's `(rip, rsp, rax)`.
+unsafe fn tcb_read_rsp(tcb: u64) -> u64 {
+    let rsp: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") 2u64 << 12 => _, // TCBReadRegisters, length 0
+        lateout("r10") _,             // MR0 = rip
+        lateout("r8") rsp,            // MR1 = rsp
+        lateout("r9") _,              // MR2 = rax
+        lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    rsp
+}
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
@@ -7900,6 +7930,44 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b" count=");
                 print_u64(ssdt_count as u64);
                 print_str(b"\n");
+            }
+            // On a fault wall, backtrace: map the component's stack into the executive and print
+            // every return address that lands in the win32k image, as an RVA — the call chain.
+            if !finished {
+                let ss = WIN32K_STACK_SLOT.load(Ordering::Relaxed);
+                let sf = WIN32K_STACK_FRAMES.load(Ordering::Relaxed);
+                if ss != 0 && sf != 0 {
+                    let mirror = 0x0000_0100_0730_0000u64;
+                    let spt = alloc_slot();
+                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+                    let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, mirror, CAP_INIT_THREAD_VSPACE);
+                    for i in 0..sf {
+                        let _ = page_map(copy_cap(ss + i), mirror + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    }
+                    // Scan the ACTIVE stack only (from the fault-time RSP up to stack_top), so the
+                    // return addresses are the real call chain (deepest first) — no stale frames.
+                    let rsp = tcb_read_rsp(WIN32K_TCB.load(Ordering::Relaxed));
+                    let stack_top = STACK_BASE + sf * 0x1000;
+                    let start = if rsp >= STACK_BASE && rsp < stack_top { rsp } else { STACK_BASE };
+                    print_str(b"[win32k-svc] stack backtrace from rsp=0x");
+                    print_hex((rsp >> 32) as u32);
+                    print_hex(rsp as u32);
+                    print_str(b" (win32k return-address RVAs, deepest first):\n");
+                    let lo = code_va;
+                    let hi = code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+                    let mut n = 0u32;
+                    let mut va = start;
+                    while va < stack_top && n < 20 {
+                        let v = core::ptr::read_volatile((mirror + (va - STACK_BASE)) as *const u64);
+                        if v >= lo && v < hi {
+                            print_str(b"  rva=0x");
+                            print_hex(v.wrapping_sub(code_va) as u32);
+                            print_str(b"\n");
+                            n += 1;
+                        }
+                        va += 8;
+                    }
+                }
             }
             // Progress checks: the component spawned and win32k's DriverEntry was ENTERED (its
             // trampoline-bound code ran) is the Phase-2b milestone. SSDT registration + full

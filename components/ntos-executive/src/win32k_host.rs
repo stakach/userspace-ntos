@@ -42,10 +42,11 @@ pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
 /// A zeroed page used as the fake HEAP handle `RtlCreateHeap` returns (win32k stores it + passes
 /// it back to RtlAllocateHeap; any field reads see 0). Page 3 of the DATA region.
 pub const WIN32K_HEAP_HANDLE: u64 = WIN32K_DATA_VADDR + 0x3000;
-/// The win32k session-heap arena that RtlAllocateHeap bump-allocates from (counter at +0, data at
-/// +0x1000). win32k creates its session heap over ~1 MiB; give it 4 MiB. Its own 2 PT window.
+/// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers
+/// bump-allocate from (counter at +0, data at +0x1000). win32k creates its session heap + maps
+/// several ~1 MiB session views; give it 16 MiB. Its own 8 PT window (0x0740_0000..0x0840_0000).
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
-pub const WIN32K_HEAP_FRAMES: u64 = 1024;
+pub const WIN32K_HEAP_FRAMES: u64 = 4096;
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// An unmapped VA the host reads once DriverEntry returns — the fault-recv loop recognises the
@@ -80,6 +81,11 @@ unsafe fn pool_alloc(size: u64) -> u64 {
     let start = (WIN32K_POOL_VADDR + cur + 15) & !15;
     let cap = WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000;
     if size == 0 || start + size > cap {
+        print_str(b"[win32k-host] POOL EXHAUSTED size=0x");
+        print_hex(size as u32);
+        print_str(b" used=0x");
+        print_hex(cur as u32);
+        print_str(b"\n");
         return 0;
     }
     write_volatile(ctr, (start + size) - WIN32K_POOL_VADDR);
@@ -127,6 +133,11 @@ unsafe fn heap_alloc(size: u64) -> u64 {
     let start = (WIN32K_HEAP_VADDR + cur + 15) & !15;
     let cap = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
     if size == 0 || start + size > cap {
+        print_str(b"[win32k-host] HEAP EXHAUSTED size=0x");
+        print_hex(size as u32);
+        print_str(b" used=0x");
+        print_hex(cur as u32);
+        print_str(b"\n");
         return 0;
     }
     write_volatile(ctr, (start + size) - WIN32K_HEAP_VADDR);
@@ -145,6 +156,31 @@ extern "win64" fn s_rtl_allocate_heap(_heap: u64, _flags: u64, size: u64) -> u64
 /// `BOOLEAN RtlFreeHeap(HeapHandle, Flags, Base)` — no-op (bump arena never frees).
 extern "win64" fn s_rtl_free_heap() -> u64 {
     1
+}
+
+/// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
+/// — win32k maps a section into session/system space and then USES the mapped view (memsets it,
+/// builds shared structures). Back it with a real region from the heap/view arena, populating the
+/// `*MappedBase` + `*ViewSize` out-params (a no-op stub left `*MappedBase` null → memset(null)).
+extern "win64" fn s_mm_map_view(_section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
+    unsafe {
+        let mut size = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+        if size == 0 || size > 0x0040_0000 {
+            size = 0x0010_0000; // default/cap the view at 1 MiB
+        }
+        size = (size + 0xFFF) & !0xFFF;
+        let region = heap_alloc(size);
+        if region == 0 {
+            return 0xC000_0017u32 as i32; // STATUS_NO_MEMORY
+        }
+        if !base_out.is_null() {
+            write_volatile(base_out, region);
+        }
+        if !size_io.is_null() {
+            write_volatile(size_io, size);
+        }
+    }
+    0
 }
 
 /// `PVOID ExAllocatePoolWithTag(POOL_TYPE, SIZE_T NumberOfBytes, ULONG Tag)`.
@@ -253,6 +289,8 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlCreateHeap" => s_rtl_create_heap as usize as u64,
         "RtlAllocateHeap" => s_rtl_allocate_heap as usize as u64,
         "RtlFreeHeap" => s_rtl_free_heap as usize as u64,
+        // section view mapping into session/system space (populates *MappedBase + *ViewSize)
+        "MmMapViewInSessionSpace" | "MmMapViewInSystemSpace" => s_mm_map_view as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
