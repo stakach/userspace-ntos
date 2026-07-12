@@ -7981,9 +7981,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let progressed = (verdict & win32k_host::V_ENTERED) != 0
                 && (verdict & win32k_host::V_SSDT) != 0;
             check(b"win32k_gredriverentry_progressed", progressed, &mut passed);
-            if finished && (verdict & win32k_host::V_SUCCESS) != 0 {
+            // The milestone: win32k's DriverEntry ran to completion and returned STATUS_SUCCESS.
+            let success = finished && (verdict & win32k_host::V_SUCCESS) != 0;
+            if success {
                 print_str(b"[win32k-svc] DriverEntry ran to STATUS_SUCCESS\n");
             }
+            check(b"win32k_driver_entry_success", success, &mut passed);
         }
     }
 

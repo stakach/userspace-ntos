@@ -144,6 +144,65 @@ unsafe fn heap_alloc(size: u64) -> u64 {
     start
 }
 
+/// A GENERAL_LOOKASIDE's default Allocate `PVOID(POOL_TYPE, SIZE_T, ULONG Tag)` — bump the heap
+/// arena (the lookaside is a per-type object cache; slow-path allocation on an empty free-list).
+extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u64 {
+    unsafe { heap_alloc(size) }
+}
+/// A GENERAL_LOOKASIDE's default Free `VOID(PVOID)` — no-op (bump arena never frees).
+extern "win64" fn s_lookaside_free(_buf: u64) {}
+
+/// Populate a GENERAL_LOOKASIDE (x64: +0x00 ListHead SLIST_HEADER, +0x10 Depth, +0x12
+/// MaximumDepth, +0x24 Type, +0x28 Tag, +0x2c Size, +0x30 Allocate, +0x38 Free, +0x40 ListEntry).
+/// `ExInitialize{,N}PagedLookasideList` — a no-op stub left Allocate(+0x30) null, so win32k's
+/// slow-path `call [desc+0x30]` jumped to null (RVA 0xb3e88).
+unsafe fn init_lookaside(la: u64, allocate: u64, free: u64, size: u64, tag: u64, depth: u64, pool_type: u32) {
+    if la == 0 {
+        return;
+    }
+    for i in 0..0x60u64 {
+        write_volatile((la + i) as *mut u8, 0);
+    }
+    let d = if depth == 0 { 256 } else { depth as u16 };
+    write_volatile((la + 0x10) as *mut u16, 0); // Depth
+    write_volatile((la + 0x12) as *mut u16, d); // MaximumDepth
+    write_volatile((la + 0x24) as *mut u32, pool_type); // Type
+    write_volatile((la + 0x28) as *mut u32, tag as u32); // Tag
+    write_volatile((la + 0x2c) as *mut u32, size as u32); // Size
+    let alloc_fn = if allocate != 0 { allocate } else { s_lookaside_alloc as usize as u64 };
+    let free_fn = if free != 0 { free } else { s_lookaside_free as usize as u64 };
+    write_volatile((la + 0x30) as *mut u64, alloc_fn);
+    write_volatile((la + 0x38) as *mut u64, free_fn);
+    // ListEntry: an empty circular list (self-linked) so a global-lookaside walk is safe.
+    write_volatile((la + 0x40) as *mut u64, la + 0x40);
+    write_volatile((la + 0x48) as *mut u64, la + 0x40);
+}
+
+/// `ExInitializePagedLookasideList(Lookaside, Allocate, Free, Flags, Size, Tag, Depth)`.
+extern "win64" fn s_ex_init_paged_lookaside(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    _flags: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+) {
+    unsafe { init_lookaside(la, allocate, free, size, tag, depth, 1 /* PagedPool */) }
+}
+/// `ExInitializeNPagedLookasideList(...)` — same layout, NonPagedPool type.
+extern "win64" fn s_ex_init_npaged_lookaside(
+    la: u64,
+    allocate: u64,
+    free: u64,
+    _flags: u64,
+    size: u64,
+    tag: u64,
+    depth: u64,
+) {
+    unsafe { init_lookaside(la, allocate, free, size, tag, depth, 0 /* NonPagedPool */) }
+}
+
 /// `PVOID RtlCreateHeap(Flags, HeapBase, ReserveSize, CommitSize, Lock, Parameters)` — win32k
 /// creates its session heap. Return a non-null fake handle; RtlAllocateHeap bumps the arena.
 extern "win64" fn s_rtl_create_heap() -> u64 {
@@ -291,6 +350,9 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlFreeHeap" => s_rtl_free_heap as usize as u64,
         // section view mapping into session/system space (populates *MappedBase + *ViewSize)
         "MmMapViewInSessionSpace" | "MmMapViewInSystemSpace" => s_mm_map_view as usize as u64,
+        // lookaside-list init (populates the GENERAL_LOOKASIDE Allocate/Free callbacks at +0x30/+0x38)
+        "ExInitializePagedLookasideList" => s_ex_init_paged_lookaside as usize as u64,
+        "ExInitializeNPagedLookasideList" => s_ex_init_npaged_lookaside as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
