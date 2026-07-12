@@ -903,6 +903,21 @@ unsafe fn nb_recv(ntfn: u64) -> u64 {
     badge
 }
 
+/// A plain, blocking `seL4_Send(ep, label)` with a length-0 message — used to wake the win32k
+/// dispatch component (fix A: Send/Recv handshake, no reply cap → the kernel's single `reply_to`
+/// slot is untouched, so a csrss syscall reply in flight on the same executive thread survives).
+unsafe fn ep_send(ep: u64, label: u64) {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_SEND as u64,
+        in("rdi") ep,
+        in("rsi") label << 12,
+        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
 unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
     let badge: u64;
     let msginfo: u64;
@@ -5133,10 +5148,15 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
     let code_va = win32k_host::WIN32K_CODE_VA;
     const DEMAND_CAP: u64 = 512;
     let mut demand = 0u64;
-    // Reply to the parked dispatch Call (it returns in the component → runs the handler), then
-    // service the handler's demand-faults until it Calls again (done). A clean IPC reply — no
-    // register restore, because seL4_Call/Reply resumes the caller for us.
-    let (mut mi, mut m0, mut m1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+    // Fix (A): WAKE the parked component with a PLAIN Send (it is blocked in `recv_req`, waiting for
+    // a request). A plain Send does NOT touch the executive's single `reply_to` slot, so a csrss
+    // syscall reply in flight on this same executive thread is preserved (the root-caused nesting
+    // bug). The component reads SH_REQ_* + runs the handler on its own scheduling context. Then we
+    // recv: a fault (a real Call from the kernel → `reply_to`=win32k, fine to reply-recv) is
+    // demand-mapped; the DONE signal (the component's next plain `send_done`) means the handler
+    // finished.
+    ep_send(w_fault, win32k_host::W32_DISPATCH_LABEL);
+    let (_b0, mut mi, mut m0, mut m1, _, _) = ep_recv_full(w_fault);
     loop {
         let label = mi >> 12;
         if label == 6 {
@@ -5177,13 +5197,13 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             continue;
         }
         if label == win32k_host::W32_DISPATCH_LABEL {
-            // The component issued its next dispatch Call — handler done. Read back the status. The
-            // component is now parked in that Call (received, unreplied) ready for the next dispatch.
+            // The component sent its DONE signal (a plain Send) — handler finished. Read back the
+            // status. The component then loops to `recv_req` (blocked), ready for the next dispatch.
             let _ = m0;
             let status = core::ptr::read_volatile((sh + win32k_host::SH_REQ_STATUS) as *const i32);
             return (status, true);
         }
-        // Any other fault (a real wall inside the handler) leaves the component un-parked — fail.
+        // Any other fault (a real wall inside the handler) — fail.
         return (0xC000_0001u32 as i32, false);
     }
 }
@@ -7877,9 +7897,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 } else if label == win32k_host::W32_DISPATCH_LABEL {
-                    // DriverEntry+attach complete: the component reached its dispatch loop and issued
-                    // its ready Call (seL4_Call on the fault EP). Stop the bring-up loop, leaving it
-                    // parked in the Call (received, unreplied) — win32k_dispatch resumes it later.
+                    // DriverEntry+attach complete: the component reached its dispatch loop and sent
+                    // its ready signal (fix A: a plain `send_done` on the fault EP). It is now blocked
+                    // in `recv_req` awaiting a request — `win32k_dispatch` wakes it with a plain Send.
                     let _ = (m2, m3);
                     finished = true;
                     break;

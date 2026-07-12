@@ -818,32 +818,49 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     f(a0, a1, a2, a3)
 }
 
-/// Issue the dispatch ready/done signal: a real `seL4_Call` on this component's fault-endpoint cap
-/// ([`crate::CT_FAULT`]) carrying [`W32_DISPATCH_LABEL`]. This is a normal, resumable IPC (send +
-/// block for the executive's reply), NOT a fault — so win32k needs no `TCBSetHostedSyscalls` flag
-/// (which would break its trampolines' real serial syscalls) and no register-restore trickery. The
-/// executive replies once it has filled the next request in the shared page; the Call then returns.
+/// Signal ready/done to the executive: a PLAIN `seL4_Send` on this component's fault-endpoint cap
+/// ([`crate::CT_FAULT`]) carrying [`W32_DISPATCH_LABEL`]. Fix (A) — the dispatch handshake is
+/// Send/Recv, NOT `seL4_Call`: a Call parks win32k needing the executive's *reply*, which flows
+/// through the kernel's single per-TCB `reply_to` slot. When the executive drives a dispatch while
+/// mid-service of a csrss syscall (nested), `reply_to` names csrss, so the Call-reply targeted the
+/// wrong thread and win32k never ran (the root-caused hang). A plain Send doesn't touch `reply_to`,
+/// so csrss's in-flight reply survives. win32k runs on its own bound scheduling context.
 #[inline(never)]
-unsafe fn dispatch_call() {
+unsafe fn send_done() {
     core::arch::asm!(
         "syscall",
-        in("rdx") crate::SYS_CALL as u64,
+        in("rdx") crate::SYS_SEND as u64,
         in("rdi") crate::CT_FAULT,
         in("rsi") W32_DISPATCH_LABEL << 12, // msginfo: label, length 0 (request via shared page)
+        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rsi") _,
         options(nostack),
     );
 }
 
-/// The persistent win32k dispatch service loop. Each iteration Calls the executive (ready/done); on
-/// the reply the executive has filled `SH_REQ_*`, so we resolve the SSN through the registered SSDT,
-/// invoke the handler in this component's context (GS=KPCR / session heap), and write
-/// `SH_REQ_STATUS`. Never returns.
+/// Block for the next dispatch request: a plain `seL4_Recv` on [`crate::CT_FAULT`]. The executive
+/// wakes us with a plain Send (the request payload rides the shared page `SH_REQ_*`, so the message
+/// itself is ignored). No reply cap involved.
+#[inline(never)]
+unsafe fn recv_req() {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_RECV as u64,
+        inout("rdi") crate::CT_FAULT => _,
+        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// The persistent win32k dispatch service loop (fix A, Send/Recv handshake). Each iteration: Send a
+/// ready/done signal (the FIRST one is the "DriverEntry+attach done" signal the bring-up loop waits
+/// for), Recv the next request, then resolve the SSN through the registered SSDT and invoke the
+/// handler in this component's context (GS=KPCR / session heap). Never returns.
 unsafe fn dispatch_loop() -> ! {
     loop {
-        dispatch_call();
+        send_done();
+        recv_req();
         let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
         let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
         let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
