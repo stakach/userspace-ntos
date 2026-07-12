@@ -28,6 +28,7 @@ mod isr;
 mod kmdf_host;
 mod server;
 mod win32k_pe;
+mod win32k_host;
 mod storage_host;
 
 use core::panic::PanicInfo;
@@ -306,6 +307,11 @@ pub const KERNEL32_VISTA_WIN32BUF_OFFSET: u64 = 0x640000; // kernel32_vista ~32 
 pub const ADVAPI32_VISTA_WIN32BUF_OFFSET: u64 = 0x650000; // advapi32_vista ~23 KiB
 pub const WS2HELP_WIN32BUF_OFFSET: u64 = 0x660000;        // ws2help ~14 KiB
 pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000;    // ntdll_vista ~56 KiB (ends 0x67E000)
+/// Raw win32k.sys staging buffer (2,208,192 B). Its own 2 MiB-aligned window past WIN32BUF, with
+/// 2 page tables (544 frames = 0x220000 spans two 2 MiB PTs). The storage host reads win32k.sys
+/// off disk into here; the executive parses+loads it into the win32k-service component.
+pub const WIN32KBUF_VADDR: u64 = 0x0000_0100_0600_0000;
+pub const WIN32KBUF_FRAMES: u64 = 544; // 0x220 — matches win32k.sys size_of_image
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -4720,6 +4726,101 @@ unsafe fn spawn_kmdf_host(
     let _ = tcb_resume(tcb);
 }
 
+/// Spawn the isolated **win32k-service** component: like `spawn_kmdf_host` but scaled to the
+/// 2.1 MiB win32k image. Maps the executive image RWX (the trampolines live there), a heap +
+/// deep stack, the pre-loaded win32k PE at `WIN32K_CODE_VA` **W^X** (per-frame `code_rights`:
+/// RX code / RW data), the pool arena, the data-export region, and the shared handoff page.
+/// The executive receives on `fault_ep` (crash-contained): win32k's DriverEntry runs here and
+/// every fault (or the completion SENTINEL) is delivered to the executive. Returns the host
+/// `pml4` cap so the fault loop can demand-map pages into it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn spawn_win32k_host(
+    entry: unsafe extern "C" fn() -> !,
+    fault_ep: u64,
+    prio: u64,
+    code_base: u64,
+    code_rights: &[u64],
+    pool_base: u64,
+    data_base: u64,
+    shared_frame: u64,
+) -> u64 {
+    let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
+    let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
+    // Executive image RWX (the trampolines + statics the host calls into live in it).
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, cp, img_start + i, 0);
+        let _ = page_map(cp, IMAGE_BASE + i * 0x1000, /* RWX */ 3, pml4);
+    }
+    for i in 0..allocator::HEAP_FRAMES {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
+    }
+    for i in 0..stack_frames {
+        let f = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+    }
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4);
+    // The pre-loaded win32k PE image, W^X (per-frame rights). Two 2 MiB PTs.
+    for p in 0..2u64 {
+        let cpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
+        let _ = paging_struct_map(cpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_CODE_VA + p * 0x20_0000, pml4);
+    }
+    for i in 0..win32k_host::WIN32K_IMAGE_FRAMES {
+        let cp = copy_cap(code_base + i);
+        let rights = code_rights.get(i as usize).copied().unwrap_or(RW_NX);
+        let _ = page_map(cp, win32k_host::WIN32K_CODE_VA + i * 0x1000, rights, pml4);
+    }
+    // Pool + data + shared all live in one 2 MiB PT window (0x0700_0000..0x0720_0000).
+    let ppt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
+    let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_POOL_VADDR, pml4);
+    for i in 0..win32k_host::WIN32K_POOL_FRAMES {
+        let cp = copy_cap(pool_base + i);
+        let _ = page_map(cp, win32k_host::WIN32K_POOL_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    for i in 0..win32k_host::WIN32K_DATA_FRAMES {
+        let cp = copy_cap(data_base + i);
+        let _ = page_map(cp, win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, pml4);
+    }
+    let sh = copy_cap(shared_frame);
+    let _ = page_map(sh, win32k_host::WIN32K_SHARED_VADDR, RW_NX, pml4);
+
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep, 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = STACK_BASE + stack_frames * 0x1000 - 16;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, prio);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    pml4
+}
+
 /// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a
 /// DMA frame + a shared word, so it drives the disk entirely from its own VSpace. The
 /// executive (Tier-1 broker) has already enabled Bus Master; the host gets no PCI-config
@@ -4741,6 +4842,7 @@ unsafe fn spawn_storage_host(
     nls_case_start: u64,
     nls20127_start: u64,
     hivebuf_start: u64,
+    win32kbuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -4814,6 +4916,16 @@ unsafe fn spawn_storage_host(
         let wb_cp = copy_cap(win32buf_start + i);
         let _ = page_map(wb_cp, WIN32BUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // The raw win32k.sys staging buffer (544 frames = two 2 MiB PTs), mapped into the host too.
+    for p in 0..2u64 {
+        let kpt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, kpt);
+        let _ = paging_struct_map(kpt, LBL_X86_PAGE_TABLE_MAP, WIN32KBUF_VADDR + p * 0x20_0000, pml4);
+    }
+    for i in 0..WIN32KBUF_FRAMES {
+        let kb_cp = copy_cap(win32kbuf_start + i);
+        let _ = page_map(kb_cp, WIN32KBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
     // The NLS + SYSTEM-hive buffers share the NTDLLBUF page table (0xA0-0xC0 region) — no extra PT.
     for (start, vaddr, frames) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
@@ -4870,6 +4982,8 @@ static NLS_CASE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base + byte size of the real SYSTEM hive the storage host read into HIVEBUF.
 static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
+static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 
 /// Run the native-syscall service loop for the isolated user thread, routing each
 /// Ob syscall to the isolated Object Manager service via `client`, backing
@@ -5553,6 +5667,7 @@ unsafe fn storage_probe(
     nls_oem_dest: u64,
     nls_case_dest: u64,
     nls20127_dest: u64,
+    win32kbuf_dest: u64,
 ) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
@@ -5834,6 +5949,22 @@ unsafe fn storage_probe(
             print_str(b"\n");
             if got == want && sz > 0 {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x74) as *mut u32, sz);
+            }
+        }
+        // win32k.sys (~2.1 MiB, PE32+) — the ReactOS GUI subsystem kernel driver. Staged into the
+        // WIN32KBUF (its own 2 MiB-aligned window); size reported at STORAGE_SHARED+0x7c so the
+        // executive can load it into the isolated win32k-service component (Phase 2b).
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WIN32K  SYS") {
+            let cap = (WIN32KBUF_FRAMES * 0x1000) as u32;
+            let want = if sz < cap { sz } else { cap };
+            let got = fat_read_file(&fs, c, want, win32kbuf_dest);
+            print_str(b"[storage-host] WIN32K.SYS size=");
+            print_u64(sz as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && sz > 0 {
+                core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x7c) as *mut u32, sz);
             }
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
@@ -7196,6 +7327,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..WIN32BUF_FRAMES {
                 let _ = page_map(copy_cap(win32buf_start + i), WIN32BUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // The raw win32k.sys buffer (544 frames, two 2 MiB PTs), mapped in the executive too so
+            // it can parse+load win32k.sys into the isolated win32k-service component (Phase 2b).
+            for p in 0..2u64 {
+                let kpt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, kpt);
+                let _ = paging_struct_map(kpt, LBL_X86_PAGE_TABLE_MAP, WIN32KBUF_VADDR + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+            }
+            let win32kbuf_start = alloc_frame();
+            for _ in 1..WIN32KBUF_FRAMES { let _ = alloc_frame(); }
+            for i in 0..WIN32KBUF_FRAMES {
+                let _ = page_map(copy_cap(win32kbuf_start + i), WIN32KBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            WIN32KBUF_START.store(win32kbuf_start, Ordering::Relaxed);
             // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
             // in the executive too, and remember their cap bases for spawn_sec_image to share into
             // smss.
@@ -7263,6 +7407,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nls_starts[2],
                 nls20127_start,
                 hivebuf_start,
+                win32kbuf_start,
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
@@ -7560,6 +7705,198 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 check(b"exec_reactos_smss_parsed", false, &mut passed);
                 check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
                 check(b"exec_reactos_sec_image_fill", false, &mut passed);
+            }
+        }
+    }
+
+    // --- Phase 2b (graphics): LOAD the real ReactOS win32k.sys into an ISOLATED win32k-service
+    // component and RUN its DriverEntry as far as it goes. The storage host staged the 2.1 MiB
+    // image into WIN32KBUF; the executive parses+relocates+IAT-patches it into a run of frames at
+    // WIN32K_CODE_VA (W^X), spawns the component with its fault endpoint armed, and drives a
+    // crash-contained fault-recv loop that reports each faulting IP as `win32k RVA = ip - CODE_VA`
+    // and demand-maps benign accesses — pinning exactly where init stops.
+    {
+        let win32k_size =
+            core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x7c) as *const u32) as usize;
+        let win32kbuf_start = WIN32KBUF_START.load(Ordering::Relaxed);
+        print_str(b"[win32k-svc] staged win32k.sys size=");
+        print_u64(win32k_size as u64);
+        print_str(b"\n");
+        check(b"win32k_sys_staged", win32k_size > 0 && win32kbuf_start != 0, &mut passed);
+        if win32k_size > 0 && win32kbuf_start != 0 {
+            // Executive-side PTs + frames: CODE (544 frames, 2 PTs, mapped RW to load into),
+            // POOL (256), DATA (4), and the shared handoff page. DATA + SHARED are mapped in the
+            // executive (load_into writes the cells + the entry rva); POOL is host-only.
+            for p in 0..2u64 {
+                let cpt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
+                let _ = paging_struct_map(cpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_CODE_VA + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+            }
+            let code_base = alloc_frame();
+            for _ in 1..win32k_host::WIN32K_IMAGE_FRAMES { let _ = alloc_frame(); }
+            for i in 0..win32k_host::WIN32K_IMAGE_FRAMES {
+                let _ = page_map(copy_cap(code_base + i), win32k_host::WIN32K_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            let pool_base = alloc_frame();
+            for _ in 1..win32k_host::WIN32K_POOL_FRAMES { let _ = alloc_frame(); }
+            let data_base = alloc_frame();
+            for _ in 1..win32k_host::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
+            let shared = alloc_frame();
+            // The pool-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718).
+            let ppt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
+            let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_POOL_VADDR, CAP_INIT_THREAD_VSPACE);
+            for i in 0..win32k_host::WIN32K_DATA_FRAMES {
+                let _ = page_map(copy_cap(data_base + i), win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            let _ = page_map(copy_cap(shared), win32k_host::WIN32K_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            // Parse + copy sections + relocate + patch IAT. Fully HEAP-FREE + STACK-light: the
+            // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
+            // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
+            // frame rights into its own `static`.
+            let entry_rva = win32k_host::load_into(WIN32KBUF_VADDR, win32k_size).unwrap_or(0);
+            print_str(b"[win32k-svc] loaded win32k.sys; DriverEntry rva=0x");
+            print_hex(entry_rva);
+            print_str(b"\n");
+            check(b"win32k_loaded", entry_rva == win32k_pe::WIN32K_PE.entry_rva, &mut passed);
+            core::ptr::write_volatile(
+                (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_ENTRY_RVA) as *mut u64,
+                entry_rva as u64,
+            );
+            core::ptr::write_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *mut u32, 0);
+
+            // Spawn the isolated component (prio 100; the executive is 255 and blocks in the fault
+            // loop, yielding to it) and receive its faults.
+            let w_fault = make_object(OBJ_ENDPOINT);
+            let host_pml4 = spawn_win32k_host(
+                win32k_host::win32k_host_entry,
+                w_fault,
+                100,
+                code_base,
+                win32k_host::code_rights(),
+                pool_base,
+                data_base,
+                shared,
+            );
+
+            const DEMAND_CAP: u64 = 512;
+            let code_va = win32k_host::WIN32K_CODE_VA;
+            let mut faults = 0u64;
+            let mut demand = 0u64;
+            let mut finished = false;
+            let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
+            let (mut _bdg, mut mi, mut m0, mut m1, mut m2, mut m3) = ep_recv_full(w_fault);
+            loop {
+                let label = mi >> 12;
+                if label == 6 {
+                    // VMFault: MR0 = fault IP, MR1 = fault address.
+                    let ip = m0;
+                    let addr = m1;
+                    if addr == win32k_host::WIN32K_SENTINEL_VADDR {
+                        finished = true;
+                        break;
+                    }
+                    faults += 1;
+                    if faults <= 40 {
+                        print_str(b"[win32k-svc] fault #");
+                        print_u64(faults);
+                        print_str(b" ip=0x");
+                        print_hex((ip >> 32) as u32);
+                        print_hex(ip as u32);
+                        print_str(b" RVA=0x");
+                        print_hex(ip.wrapping_sub(code_va) as u32);
+                        print_str(b" addr=0x");
+                        print_hex((addr >> 32) as u32);
+                        print_hex(addr as u32);
+                        print_str(b"\n");
+                    }
+                    // A null-region deref (missing/too-shallow placeholder), a W^X write into the
+                    // RX image, or a runaway is a real wall — stop and report. Otherwise demand-map
+                    // a zero page and resume.
+                    let in_image = addr >= code_va
+                        && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+                    if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
+                        wall_ip = ip;
+                        wall_addr = addr;
+                        wall_label = label;
+                        break;
+                    }
+                    let page = addr & !0xFFF;
+                    let f = alloc_frame();
+                    let mut e = page_map(f, page, RW_NX, host_pml4);
+                    if e != 0 {
+                        let npt = alloc_slot();
+                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
+                        let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
+                        e = page_map(f, page, RW_NX, host_pml4);
+                    }
+                    let _ = e;
+                    demand += 1;
+                    let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                } else {
+                    // UnknownSyscall(2)/UserException(3)/CapFault(1): win32k hit a fail-loud
+                    // trap import, a bad IAT slot, or an invalid instruction. Record + stop.
+                    wall_ip = m0;
+                    wall_addr = m1;
+                    wall_label = label;
+                    break;
+                }
+            }
+
+            let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);
+            let de_status = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_DE_STATUS) as *const i32);
+            let ssdt_base = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_SSDT_BASE) as *const u64);
+            let ssdt_count = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_SSDT_COUNT) as *const u32);
+            let pool_used = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_POOL_USED) as *const u64);
+            print_str(b"[win32k-svc] DriverEntry ");
+            if finished {
+                print_str(b"RETURNED status=0x");
+                print_hex(de_status as u32);
+            } else {
+                print_str(b"STOPPED label=");
+                print_u64(wall_label);
+                print_str(b" ip=0x");
+                print_hex((wall_ip >> 32) as u32);
+                print_hex(wall_ip as u32);
+                print_str(b" RVA=0x");
+                print_hex(wall_ip.wrapping_sub(code_va) as u32);
+                print_str(b" addr=0x");
+                print_hex((wall_addr >> 32) as u32);
+                print_hex(wall_addr as u32);
+            }
+            print_str(b" verdict=0x");
+            print_hex(verdict);
+            print_str(b" faults=");
+            print_u64(faults);
+            print_str(b" demand=");
+            print_u64(demand);
+            print_str(b" pool_used=0x");
+            print_hex(pool_used as u32);
+            print_str(b"\n");
+            if (verdict & win32k_host::V_SSDT) != 0 {
+                print_str(b"[win32k-svc] win32k registered its NtUser/NtGdi SSDT: base=0x");
+                print_hex((ssdt_base >> 32) as u32);
+                print_hex(ssdt_base as u32);
+                print_str(b" count=");
+                print_u64(ssdt_count as u64);
+                print_str(b"\n");
+            }
+            // Progress checks: the component spawned and win32k's DriverEntry was ENTERED (its
+            // trampoline-bound code ran) is the Phase-2b milestone. SSDT registration + full
+            // STATUS_SUCCESS are further progress markers reported when reached.
+            check(b"win32k_driver_entry_entered", (verdict & win32k_host::V_ENTERED) != 0, &mut passed);
+            check(b"win32k_ssdt_registered", (verdict & win32k_host::V_SSDT) != 0, &mut passed);
+            // Phase-2b milestone: GreDriverEntry ran through init and registered its NtUser/NtGdi
+            // SSDT (the prerequisite for Phase-2c SSN>=0x1000 routing). Whether DriverEntry then ran
+            // to STATUS_SUCCESS or stopped at the next missing init piece (RVA in the log above) is
+            // reported non-gating — this check passes at the achieved milestone.
+            let progressed = (verdict & win32k_host::V_ENTERED) != 0
+                && (verdict & win32k_host::V_SSDT) != 0;
+            check(b"win32k_gredriverentry_progressed", progressed, &mut passed);
+            if finished && (verdict & win32k_host::V_SUCCESS) != 0 {
+                print_str(b"[win32k-svc] DriverEntry ran to STATUS_SUCCESS\n");
             }
         }
     }
