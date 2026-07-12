@@ -325,6 +325,10 @@ pub const DXGBUF_VADDR: u64 = 0x0000_0100_0630_0000;
 pub const DXGBUF_FRAMES: u64 = 16;
 pub const DXGTHKBUF_VADDR: u64 = 0x0000_0100_0650_0000;
 pub const DXGTHKBUF_FRAMES: u64 = 8;
+/// Raw ftfd.dll staging buffer (FreeType font driver, ~977 KiB). Own 2 MiB PT window [0x0660..0x0680)
+/// (245 frames span 0x0670_0000..0x067f_5000, clear of WIN32K_CODE_VA at 0x0680). ftfd size=1,000,960 B.
+pub const FTFDBUF_VADDR: u64 = 0x0000_0100_0670_0000;
+pub const FTFDBUF_FRAMES: u64 = 245;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
@@ -5250,6 +5254,7 @@ unsafe fn spawn_storage_host(
     for (start, vaddr, frames) in [
         (DXGBUF_START.load(Ordering::Relaxed), DXGBUF_VADDR, DXGBUF_FRAMES),
         (DXGTHKBUF_START.load(Ordering::Relaxed), DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
+        (FTFDBUF_START.load(Ordering::Relaxed), FTFDBUF_VADDR, FTFDBUF_FRAMES),
     ] {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -5319,6 +5324,8 @@ static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
+/// Frame-cap base of the raw ftfd.dll staged into FTFDBUF (FreeType font driver).
+static FTFDBUF_START: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's stack frame-cap base + count + TCB (for the fault-time stack backtrace).
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -5470,8 +5477,14 @@ unsafe fn load_one_driver(
     for i in 0..frames {
         let _ = page_map(copy_cap(base + i), dst_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     }
-    // Parse + copy + reloc + resolve imports (writes via the executive's RW mapping).
-    let mut rights = [RW_NX; 16];
+    // Parse + copy + reloc + resolve imports (writes via the executive's RW mapping). The per-frame
+    // rights live in a `static` (ftfd.dll = 248 frames overflows a stack array; the rootserver stack
+    // is only 16 KiB). Single-threaded + sequential loads → the shared static is safe.
+    static mut DRIVER_RIGHTS: [u64; 256] = [RW_NX; 256];
+    let rights = &mut *core::ptr::addr_of_mut!(DRIVER_RIGHTS);
+    for r in rights.iter_mut() {
+        *r = RW_NX;
+    }
     let res = win32k_host::load_driver_into(
         src_va,
         dst_va,
@@ -5525,6 +5538,39 @@ unsafe fn load_directx_drivers(host_pml4: u64) {
             print_str(b"\n");
         }
         None => print_str(b"[win32k-svc] dxg load failed\n"),
+    }
+}
+
+/// Host ftfd.dll (the FreeType font driver) into win32k's VSpace + patch win32k's OWN IAT for its 34
+/// FT_* imports against ftfd's export table. Unlike dxg (dynamic, via ZwSetSystemInformation), ftfd
+/// is a STATIC win32k import: win32k's InitFontSupport → FT_Init_FreeType calls it directly. ftfd
+/// imports only 8 Eng*/Rtl thunks back from win32k.sys (resolved by load_driver_into's is_win32k arm).
+/// Called once at win32k bring-up, AFTER win32k is loaded (its exports must be present for ftfd's IAT)
+/// and BEFORE any FT_* call (which happens far later, during a routed NtUserInitialize dispatch).
+unsafe fn load_ftfd_driver(host_pml4: u64) {
+    let ftfd_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x88) as *const u32);
+    if ftfd_size == 0 {
+        print_str(b"[win32k-svc] ftfd.dll not staged - font gate will fail\n");
+        return;
+    }
+    match load_one_driver(
+        FTFDBUF_VADDR,
+        win32k_host::FTFD_VA,
+        win32k_host::FTFD_LOAD_FRAMES,
+        host_pml4,
+        0,
+    ) {
+        Some((entry, _expdir, len)) => {
+            let patched = win32k_host::patch_win32k_ftfd_imports(win32k_host::FTFD_VA);
+            print_str(b"[win32k-svc] hosted ftfd.dll: entry_rva=0x");
+            print_hex(entry);
+            print_str(b" len=0x");
+            print_hex(len);
+            print_str(b" win32k FT_* IAT patched=");
+            print_u64(patched as u64);
+            print_str(b"\n");
+        }
+        None => print_str(b"[win32k-svc] ftfd load failed\n"),
     }
 }
 
@@ -6669,6 +6715,7 @@ unsafe fn storage_probe(
         for (name, dest, cap_frames, off) in [
             (b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
             (b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
+            (b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 let cap = (cap_frames * 0x1000) as u32;
@@ -8093,6 +8140,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for (st_static, vaddr, frames) in [
                 (&DXGBUF_START, DXGBUF_VADDR, DXGBUF_FRAMES),
                 (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
+                (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
             ] {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -8444,6 +8492,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // NtUserInitialize → InitializeGreCSRSS → DxDdStartupDxGraphics (ZwSetSystemInformation
                 // SystemLoadGdiDriverInformation) finds a real hosted dxg image.
                 load_directx_drivers(host_pml4);
+                // Host ftfd.dll (FreeType font driver) + patch win32k's IAT for its 34 FT_* imports so
+                // InitFontSupport → FT_Init_FreeType initialises the font subsystem for real.
+                load_ftfd_driver(host_pml4);
             }
 
             let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);

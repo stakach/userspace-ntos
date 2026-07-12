@@ -1,28 +1,27 @@
-# Fix (B): per-caller reply cap for win32k dispatch (removes nested-fault reply_to clobber)
+# win32k font support: host ftfd.dll → InitFontSupport → InitVideo
 
-## Root cause (verified in kernel)
-- `finish_call` (rust-micro/src/endpoint.rs:182) UNCONDITIONALLY sets `receiver.reply_to = Some(sender)`.
-- So when a win32k SSN handler FAULTS during a nested dispatch (executive mid-servicing csrss),
-  the fault Call clobbers the executive's single `reply_to` from csrss -> win32k.
-- => A win32k-only reply cap is NOT enough (handoff premise incomplete): csrss's reply ALSO
-  must be cap-based so it survives the clobber. Need TWO reply objects.
+## Findings
+- ftfd.dll (1000960 B, size_of_image=0xf8000=248 frames) imports only 8 syms, all from win32k.sys:
+  EngAllocMem/EngFreeMem/EngMapFontFileFD/EngUnmapFontFileFD/EngDebugPrint (real win32k code),
+  EngMultiByteToUnicodeN→NTOSKRNL.RtlMultiByteToUnicodeN, EngBugCheckEx→NTOSKRNL.KeBugCheckEx,
+  RtlUnwind→NTOSKRNL.RtlUnwind (forwarders).
+- win32k STATICALLY imports 34 FT_* from ftfd.dll (currently no-op → FT_Init_FreeType fails).
+- InitFontSupport (freetype.c:948): FT_Init_FreeType must succeed; IntLoadFontsInRegistry / IntLoadSystemFonts
+  / FontLink_* all degrade gracefully IF ZwOpenKey/ZwOpenFile FAIL (not falsely succeed). Returns TRUE without fonts.
 
-## Plan (executive-only; rust-micro/src UNTOUCHED -> sel4test byte-identical)
-- [ ] Retype two MCS Reply objects at bring-up: REPLY_MAIN_SLOT (main service loop / csrss),
-      REPLY_W32_SLOT (win32k dispatch faults). OBJ_REPLY=6, size_bits=0.
-- [ ] Add IPC helpers: `recv_full_r12(ep, reply_cptr)` (SYS_RECV with r12=replyRegister) +
-      `send_on_reply(reply_cptr, msginfo, r0..r3)` (SYS_SEND on Cap::Reply -> decode_reply).
-- [ ] Main loop: bind REPLY_MAIN on every recv (r12 in reply_recv_badge + initial recv).
-      Win32k-routed csrss syscall arm: reply via send_on_reply(REPLY_MAIN) instead of reply_to.
-- [ ] win32k_dispatch: recv faults with r12=REPLY_W32; reply faults via send_on_reply(REPLY_W32).
-- [ ] Synthetic proof: TEST_FAULT_SSN handler in the win32k component touches an un-demand-paged
-      data page -> forces a fault through the reply-cap path; bring-up self-test asserts it resolves.
+## Steps
+- [x] 1. Stage ftfd.dll (submodule scripts) — committed 54ca19b
+- [x] 2. Executive: FTFDBUF constants + storage_probe read (::FTFD.DLL → STORAGE_SHARED+0x88) + map into exec VSpace
+- [x] 3. win32k_host.rs: FTFD_VA/frames; load_driver_into win32k.sys import source + pe_export_lookup NTOSKRNL/HAL forwarders; patch_win32k_ftfd_imports (34 patched)
+- [x] 4. Executive bring-up: load ftfd + patch win32k IAT
+- [x] 5. Trampolines: RtlMultiByteToUnicodeN, RtlCreateUnicodeString
+- [x] 6. KPCR CurrentThread (gs:[0x188]=PH_ETHREAD) → font-mutex assert passes; ZwOpenFile→FAIL → IntLoadSystemFonts skips
+- [x] InitFontSupport PASSES; InitializeGreCSRSS returns TRUE; NtUserInitialize → UserInitialize
 
-## Verify
-- [ ] Gate stays 105/105 + microtest sentinel; +1 for the faulting-dispatch self-test.
-- [ ] No rust-micro/src change (byte-identical sel4test).
-- [ ] winsrv-ON diagnostic: nested connect still completes (no regression / no hang).
-
-## Discipline
-- build order: components/ntos-executive/build.sh THEN rust-micro/scripts/build_kernel.sh
-  extern-rootserver THEN run_specs.sh. Synchronous boots.
+## Result (gate 106/93, winsrv ON)
+InitFontSupport passes. Next wall = UserCreateWinstaDirectory (RVA 0xfc2f0, called at 0xc43a5),
+the function IMMEDIATELY BEFORE InitVideo (0x6e0b0). It null-derefs the inlined
+PsGetCurrentProcessSessionId = [[gs:0x30]+0x60]->SessionId@0x2c0 because the fake KPCR's
+self-pointer (gs:[0x30]) is 0. NAIVE FIX (set KPCR gs:[0x30]=self + gs:[0x60]=EPROCESS) REGRESSES
+the NtUserProcessConnect (0x10FA) path → gate 104. So reaching InitVideo needs proper per-context
+KPCR/current-process modeling (the display/window-station chunk) — reverted, left green.

@@ -585,6 +585,15 @@ extern "win64" fn s_current_process_id() -> u64 {
     (FAKE_PROCESS_HANDLE as u32) as u64
 }
 
+/// `NTSTATUS ZwOpenFile(...)` — win32k's font init (IntLoadSystemFonts) opens `\SystemRoot\Fonts\`
+/// as a directory to enumerate *.ttf. That directory doesn't exist in this environment, so return
+/// STATUS_OBJECT_NAME_NOT_FOUND: IntLoadSystemFonts then SKIPS the whole enumeration loop (rather
+/// than being fed a garbage handle by an s_zero=SUCCESS stub and crashing on a bogus font read), and
+/// InitFontSupport returns TRUE. A no-op SUCCESS here is actively harmful (it faked a valid handle).
+extern "win64" fn s_zw_open_file_fail() -> i32 {
+    0xC000_0034u32 as i32 // STATUS_OBJECT_NAME_NOT_FOUND
+}
+
 /// `VOID RtlInitEmptyUnicodeString(PUNICODE_STRING, PWSTR Buffer, USHORT MaximumLength)`.
 extern "win64" fn s_rtl_init_empty_unicode_string(dest: *mut u8, buffer: u64, max_len: u64) {
     if dest.is_null() {
@@ -656,6 +665,63 @@ extern "win64" fn s_rtl_append_unicode_to_string(dest: *mut u8, src: u64) -> i32
         write_unaligned(dest as *mut u16, pos as u16); // new Length
     }
     0
+}
+/// `BOOLEAN RtlCreateUnicodeString(PUNICODE_STRING Dest, PCWSTR Src)` — allocate a NUL-terminated
+/// copy of `Src` from the win32k pool and point `Dest` at it. Returns TRUE on success. win32k's font
+/// init logs "RtlCreateUnicodeString failed" if this returns FALSE, so it must really allocate+copy.
+extern "win64" fn s_rtl_create_unicode_string(dest: *mut u8, src: u64) -> u32 {
+    if dest.is_null() {
+        return 0;
+    }
+    unsafe {
+        // wide length (chars) of Src.
+        let mut n = 0u64;
+        if src != 0 {
+            while read_unaligned((src + n * 2) as *const u16) != 0 && n < 32768 {
+                n += 1;
+            }
+        }
+        let bytes = n * 2;
+        let buf = pool_alloc(bytes + 2); // + NUL wchar
+        if buf == 0 {
+            return 0;
+        }
+        let mut i = 0u64;
+        while i < bytes {
+            write_volatile((buf + i) as *mut u8, read_volatile((src + i) as *const u8));
+            i += 1;
+        }
+        write_unaligned((buf + bytes) as *mut u16, 0);
+        write_unaligned(dest as *mut u16, bytes as u16); // Length
+        write_unaligned((dest as *mut u16).add(1), (bytes + 2) as u16); // MaximumLength
+        write_unaligned(dest.add(8) as *mut u64, buf); // Buffer
+    }
+    1
+}
+
+/// `NTSTATUS RtlMultiByteToUnicodeN(PWCH Unicode, ULONG MaxBytes, PULONG BytesOut, PCSTR Mb, ULONG
+/// MbBytes)` — convert a multibyte string to UTF-16. Simplified to a zero-extending (ASCII/Latin-1)
+/// conversion, which is exact for font/face names. Backs win32k's EngMultiByteToUnicodeN forwarder.
+extern "win64" fn s_rtl_multibyte_to_unicode_n(
+    unicode: *mut u16,
+    max_bytes: u32,
+    bytes_out: *mut u32,
+    mb: *const u8,
+    mb_bytes: u32,
+) -> i32 {
+    let max_chars = (max_bytes / 2) as usize;
+    let n = (mb_bytes as usize).min(max_chars);
+    unsafe {
+        if !unicode.is_null() && !mb.is_null() {
+            for i in 0..n {
+                core::ptr::write_unaligned(unicode.add(i), *mb.add(i) as u16);
+            }
+        }
+        if !bytes_out.is_null() {
+            core::ptr::write_unaligned(bytes_out, (n * 2) as u32);
+        }
+    }
+    0 // STATUS_SUCCESS
 }
 /// `int _wcsnicmp(PCWSTR, PCWSTR, size_t)` — case-insensitive wide compare (0 = equal).
 extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
@@ -758,12 +824,16 @@ pub fn export_addr(name: &str) -> u64 {
         "PsGetCurrentProcessId" | "PsGetCurrentThreadProcessId" => s_current_process_id as usize as u64,
         // GDI driver load (win32k's LDEVOBJ_bLoadImage → dxg.sys hosting)
         "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
+        // font dir open (\SystemRoot\Fonts) → fail cleanly so IntLoadSystemFonts skips enumeration
+        "ZwOpenFile" | "NtOpenFile" => s_zw_open_file_fail as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
         "RtlInitEmptyUnicodeString" => s_rtl_init_empty_unicode_string as usize as u64,
         "RtlCopyUnicodeString" => s_rtl_copy_unicode_string as usize as u64,
         "RtlAppendUnicodeToString" => s_rtl_append_unicode_to_string as usize as u64,
+        "RtlCreateUnicodeString" => s_rtl_create_unicode_string as usize as u64,
+        "RtlMultiByteToUnicodeN" => s_rtl_multibyte_to_unicode_n as usize as u64,
         "wcslen" => s_wcslen as usize as u64,
         "_wcsnicmp" | "wcsnicmp" => s_wcsnicmp as usize as u64,
         // SSDT registration
@@ -932,6 +1002,12 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
     for (idx, (_name, value)) in DATA_EXPORTS.iter().enumerate() {
         write_volatile((WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64, *value);
     }
+
+    // KPCR.Prcb.CurrentThread (gs:[0x188]) — win32k's INTERNAL KeGetCurrentThread reads this directly
+    // (bypassing the import trampoline). Point it at the same fake ETHREAD `s_current_thread` returns
+    // so checked-build lock asserts (e.g. font mutex `NT_ASSERT(Owner != CurrentThread)` at RVA
+    // 0x12e3b3) see a NON-null current thread instead of 0==0.
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, PH_ETHREAD);
 
     // Patch the IAT in place: walk the import descriptors (data dir 1) in the mapped image.
     let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
@@ -1217,6 +1293,10 @@ pub const DXGTHK_LOAD_FRAMES: u64 = 8;
 /// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
 pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
 pub const DXG_LOAD_FRAMES: u64 = 16;
+/// ftfd.dll (FreeType font driver) loaded-image base in win32k's VSpace. size_of_image=0xf8000 ->
+/// 248 frames (one 2 MiB PT, 2 MiB-aligned at 0x0870). win32k statically imports 34 FT_* from it.
+pub const FTFD_VA: u64 = 0x0000_0100_0870_0000;
+pub const FTFD_LOAD_FRAMES: u64 = 248;
 
 // The pre-loaded dxg.sys image info the ZwSetSystemInformation trampoline reports to win32k. Written
 // by the executive (load_dxg_drivers) at bring-up; read by s_zw_set_system_information.
@@ -1263,12 +1343,24 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
             let ord = read_unaligned((ords + i * 2) as *const u16) as u64;
             let far = read_unaligned((funcs + ord * 4) as *const u32) as u64;
             if far >= exp_rva && far < exp_rva + exp_sz {
-                // FORWARDER: the string at base+far is "Dll.Func". Resolve Func against win32k.
+                // FORWARDER: the string at base+far is "Dll.Func". Route by target DLL:
+                //   win32k.*   -> resolve Func against win32k's own exports (dxgthk/ftfd Eng* thunks)
+                //   NTOSKRNL.* / HAL.* -> resolve Func via export_addr trampolines (win32k's own Eng*
+                //                         exports that forward to ntoskrnl, e.g. EngMultiByteToUnicodeN
+                //                         -> RtlMultiByteToUnicodeN, EngBugCheckEx -> KeBugCheckEx).
                 let s = base + far;
+                let mut dll = [0u8; 16];
+                let mut dl = 0usize;
                 let mut dot = 0u64;
-                while read_volatile((s + dot) as *const u8) != 0
-                    && read_volatile((s + dot) as *const u8) != b'.'
-                {
+                loop {
+                    let c = read_volatile((s + dot) as *const u8);
+                    if c == 0 || c == b'.' {
+                        break;
+                    }
+                    if dl < 15 {
+                        dll[dl] = c.to_ascii_lowercase();
+                        dl += 1;
+                    }
                     dot += 1;
                 }
                 let mut fb = [0u8; 64];
@@ -1282,10 +1374,13 @@ unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
                     fl += 1;
                 }
                 fb[fl] = 0;
-                if base == WIN32K_CODE_VA {
-                    return 0; // avoid recursion if win32k itself forwarded (shouldn't happen)
+                let is_win32k = dl >= 6 && &dll[..6] == b"win32k";
+                if is_win32k {
+                    return pe_export_lookup(WIN32K_CODE_VA, &fb[..fl + 1]);
                 }
-                return pe_export_lookup(WIN32K_CODE_VA, &fb[..fl + 1]);
+                // ntoskrnl / hal forwarder → trampoline.
+                let name = core::str::from_utf8_unchecked(&fb[..fl]);
+                return export_addr(name);
             }
             return base + far;
         }
@@ -1398,6 +1493,9 @@ pub unsafe fn load_driver_into(
                 }
             }
             let is_dxgthk = dn >= 6 && &dllbuf[..6] == b"dxgthk";
+            // ftfd.dll imports its 8 Eng*/Rtl thunks from win32k.sys — resolve against win32k's
+            // own export table (real Eng* code + forwarders to ntoskrnl handled by pe_export_lookup).
+            let is_win32k = dn >= 6 && &dllbuf[..6] == b"win32k";
             let names = dst_va + if ilt != 0 { ilt } else { iat };
             let slots = dst_va + iat;
             let mut k = 0u64;
@@ -1422,6 +1520,10 @@ pub unsafe fn load_driver_into(
                         let mut nb = [0u8; 65];
                         nb[..n].copy_from_slice(&buf[..n]);
                         pe_export_lookup(dxgthk_base, &nb[..n + 1])
+                    } else if is_win32k {
+                        let mut nb = [0u8; 65];
+                        nb[..n].copy_from_slice(&buf[..n]);
+                        pe_export_lookup(WIN32K_CODE_VA, &nb[..n + 1])
                     } else {
                         let name = core::str::from_utf8_unchecked(&buf[..n]);
                         export_addr(name)
@@ -1446,4 +1548,76 @@ pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
         write_volatile(core::ptr::addr_of_mut!(DXG_EXPORT_DIR), DXG_VA + export_dir_rva as u64);
         write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE_LEN), image_len);
     }
+}
+
+/// Re-patch win32k's OWN IAT for the `ftfd.dll` import descriptor (34 FT_* entries) against the
+/// now-loaded ftfd image's export table at `ftfd_base`. Runs in the EXECUTIVE (win32k's frames are
+/// still mapped RW at [`WIN32K_CODE_VA`] from `load_into`). load_into initially resolved these to
+/// benign zero stubs (ftfd wasn't loaded yet); this points them at the real FreeType functions so
+/// win32k's InitFontSupport → FT_Init_FreeType actually initialises the font subsystem. Returns the
+/// number of FT_* slots patched (0 if no ftfd descriptor / not found). HEAP-FREE.
+pub unsafe fn patch_win32k_ftfd_imports(ftfd_base: u64) -> u32 {
+    let code_va = WIN32K_CODE_VA;
+    let e = read_unaligned((code_va + 0x3c) as *const u32) as u64;
+    let opt = code_va + e + 4 + 20;
+    let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
+    if imp_rva == 0 {
+        return 0;
+    }
+    let mut patched = 0u32;
+    let mut desc = code_va + imp_rva;
+    loop {
+        let ilt = read_unaligned(desc as *const u32) as u64;
+        let iat = read_unaligned((desc + 16) as *const u32) as u64;
+        let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
+        if ilt == 0 && iat == 0 {
+            break;
+        }
+        // Is this the ftfd.dll descriptor?
+        let mut dllbuf = [0u8; 16];
+        let mut dn = 0usize;
+        if dll_name_rva != 0 {
+            while dn < 15 {
+                let c = read_volatile((code_va + dll_name_rva + dn as u64) as *const u8);
+                if c == 0 {
+                    break;
+                }
+                dllbuf[dn] = c.to_ascii_lowercase();
+                dn += 1;
+            }
+        }
+        if dn >= 4 && &dllbuf[..4] == b"ftfd" {
+            let names = code_va + if ilt != 0 { ilt } else { iat };
+            let slots = code_va + iat;
+            let mut k = 0u64;
+            loop {
+                let thunk = read_unaligned((names + k * 8) as *const u64);
+                if thunk == 0 {
+                    break;
+                }
+                if thunk & 0x8000_0000_0000_0000 == 0 {
+                    let name_ptr = code_va + (thunk & 0x7FFF_FFFF) + 2;
+                    let mut buf = [0u8; 65];
+                    let mut n = 0usize;
+                    while n < 63 {
+                        let c = read_volatile((name_ptr + n as u64) as *const u8);
+                        if c == 0 {
+                            break;
+                        }
+                        buf[n] = c;
+                        n += 1;
+                    }
+                    let addr = pe_export_lookup(ftfd_base, &buf[..n + 1]);
+                    if addr != 0 {
+                        write_unaligned((slots + k * 8) as *mut u64, addr);
+                        patched += 1;
+                    }
+                }
+                k += 1;
+            }
+            break;
+        }
+        desc += 20;
+    }
+    patched
 }
