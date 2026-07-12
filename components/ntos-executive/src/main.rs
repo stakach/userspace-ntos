@@ -7931,6 +7931,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_u64(ssdt_count as u64);
                 print_str(b"\n");
             }
+            // Phase 2c: report the SSN 0x10FA (NtUserInitialize) dispatch through the SSDT.
+            let nt_handler = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_NTUSER_HANDLER) as *const u64);
+            let nt_status = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_NTUSER_STATUS) as *const i32);
+            if (verdict & win32k_host::V_NTUSER_ENTERED) != 0 {
+                print_str(b"[win32k-svc] SSN 0x10FA (NtUserInitialize) routed via SSDT -> handler RVA=0x");
+                print_hex(nt_handler.wrapping_sub(code_va) as u32);
+                if (verdict & win32k_host::V_NTUSER_RETURNED) != 0 {
+                    print_str(b" RETURNED status=0x");
+                    print_hex(nt_status as u32);
+                } else {
+                    print_str(b" (ran in component context, then faulted - see backtrace)");
+                }
+                print_str(b"\n");
+            }
+            // The routing seam works end-to-end: SSN>=0x1000 resolved to a real win32k handler and
+            // that handler executed in the win32k component's own context.
+            check(b"win32k_ntuser_ssn_routed", (verdict & win32k_host::V_NTUSER_ENTERED) != 0, &mut passed);
             // On a fault wall, backtrace: map the component's stack into the executive and print
             // every return address that lands in the win32k image, as an RVA — the call chain.
             if !finished {

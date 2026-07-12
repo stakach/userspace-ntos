@@ -63,12 +63,21 @@ pub const SH_SSDT_BASE: u64 = 0x18; // out: recorded win32k SSDT base (u64)
 pub const SH_SSDT_COUNT: u64 = 0x20; // out: recorded win32k SSDT count (u32)
 pub const SH_SSDT_INDEX: u64 = 0x24; // out: recorded SSDT index (u32)
 pub const SH_POOL_USED: u64 = 0x30; // out: pool high-water (u64)
+pub const SH_NTUSER_HANDLER: u64 = 0x40; // out: resolved SSDT[0xFA] handler VA (u64)
+pub const SH_NTUSER_STATUS: u64 = 0x48; // out: NtUserInitialize NTSTATUS (i32)
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
 pub const V_RETURNED: u32 = 2; // DriverEntry returned (did not fault)
 pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_SSDT: u32 = 8; // KeAddSystemServiceTable recorded the win32k table
+pub const V_NTUSER_ENTERED: u32 = 0x10; // dispatched SSDT[0xFA] NtUserInitialize into the handler
+pub const V_NTUSER_RETURNED: u32 = 0x20; // NtUserInitialize returned (did not fault)
+pub const V_NTUSER_SUCCESS: u32 = 0x40; // NtUserInitialize returned STATUS_SUCCESS
+
+/// The win32k NtUser/NtGdi shadow-SSDT base service number; SSN 0x10FA = NtUserInitialize.
+pub const WIN32K_SERVICE_BASE: u64 = 0x1000;
+pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 
@@ -606,6 +615,42 @@ pub unsafe extern "C" fn win32k_host_entry() -> ! {
     print_str(b" verdict=0x");
     print_hex(v);
     print_str(b"\n");
+
+    // Phase 2c (first cut): dispatch a win32k syscall (SSN 0x10FA = NtUserInitialize) THROUGH THE
+    // REGISTERED SSDT, in THIS COMPONENT's context (its VSpace, GS=KPCR, session heap) — proving
+    // the SSN>=0x1000 routing seam end-to-end and surfacing exactly what per-process state NtUser
+    // calls need. `resolve(ssn)` = *(base + (ssn - 0x1000)*8). A fault here is caught by the
+    // executive's fault loop (which backtraces it) BEFORE the sentinel below.
+    if status == 0 {
+        let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+        if ssdt_base != 0 {
+            let idx = SSN_NT_USER_INITIALIZE - WIN32K_SERVICE_BASE;
+            let handler = read_volatile((ssdt_base + idx * 8) as *const u64);
+            write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_HANDLER) as *mut u64, handler);
+            print_str(b"[win32k-host] SSDT resolve(0x10FA) -> handler=0x");
+            print_hex((handler >> 32) as u32);
+            print_hex(handler as u32);
+            print_str(b"\n");
+            if handler != 0 {
+                let mut v2 = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
+                v2 |= V_NTUSER_ENTERED;
+                write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v2);
+                // NtUserInitialize(DWORD dwWinVersion, HANDLE hPowerReqEvent, HANDLE hMediaReqEvent).
+                let f: extern "win64" fn(u64, u64, u64) -> i32 =
+                    core::mem::transmute(handler as *const ());
+                let nstatus = f(0, 0, 0);
+                v2 = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_RETURNED;
+                if nstatus == 0 {
+                    v2 |= V_NTUSER_SUCCESS;
+                }
+                write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v2);
+                write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32, nstatus);
+                print_str(b"[win32k-host] NtUserInitialize(0x10FA) returned status=0x");
+                print_hex(nstatus as u32);
+                print_str(b"\n");
+            }
+        }
+    }
 
     // Trip the sentinel: a read from an unmapped VA the executive's fault loop recognises.
     let _ = read_volatile(WIN32K_SENTINEL_VADDR as *const u64);
