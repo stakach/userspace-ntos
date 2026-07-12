@@ -5448,6 +5448,86 @@ unsafe fn map_csrss_page_into_win32k(page: u64, w_pml4: u64) -> bool {
     true
 }
 
+/// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,
+/// to load) and win32k (W^X, to run). Reuses [`win32k_host::load_driver_into`]. `dxgthk_base` names
+/// a prior-loaded dxgthk for import resolution (0 for a leaf). Returns (entry_rva, export_dir_rva,
+/// size_of_image). The reusable driver-loader mechanism (framebuf.dll will use it too).
+unsafe fn load_one_driver(
+    src_va: u64,
+    dst_va: u64,
+    frames: u64,
+    host_pml4: u64,
+    dxgthk_base: u64,
+) -> Option<(u32, u32, u32)> {
+    // Executive-side PT + frames (RW), to load into.
+    let ept = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ept);
+    let _ = paging_struct_map(ept, LBL_X86_PAGE_TABLE_MAP, dst_va, CAP_INIT_THREAD_VSPACE);
+    let base = alloc_frame();
+    for _ in 1..frames {
+        let _ = alloc_frame();
+    }
+    for i in 0..frames {
+        let _ = page_map(copy_cap(base + i), dst_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    }
+    // Parse + copy + reloc + resolve imports (writes via the executive's RW mapping).
+    let mut rights = [RW_NX; 16];
+    let res = win32k_host::load_driver_into(
+        src_va,
+        dst_va,
+        frames,
+        &mut rights[..frames as usize],
+        dxgthk_base,
+    )?;
+    // Map the SAME frames W^X into win32k's VSpace at the same VA (RX code / RW data).
+    let wpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
+    let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, dst_va, host_pml4);
+    for i in 0..frames {
+        let r = rights[i as usize];
+        let _ = page_map(copy_cap(base + i), dst_va + i * 0x1000, r, host_pml4);
+    }
+    Some(res)
+}
+
+/// Pre-load dxg.sys + its dxgthk.sys dependency into win32k's VSpace so win32k's
+/// `ZwSetSystemInformation(SystemLoadGdiDriverInformation)` (from InitializeGreCSRSS →
+/// DxDdStartupDxGraphics) can report the hosted dxg image. dxgthk (leaf) first, then dxg (imports
+/// dxgthk's Eng* + ntoskrnl). Called once at win32k bring-up.
+unsafe fn load_directx_drivers(host_pml4: u64) {
+    let dxg_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x80) as *const u32);
+    let dxgthk_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x84) as *const u32);
+    if dxg_size == 0 || dxgthk_size == 0 {
+        print_str(b"[win32k-svc] dxg/dxgthk not staged - DirectX gate will fail\n");
+        return;
+    }
+    if load_one_driver(DXGTHKBUF_VADDR, win32k_host::DXGTHK_VA, win32k_host::DXGTHK_LOAD_FRAMES, host_pml4, 0)
+        .is_none()
+    {
+        print_str(b"[win32k-svc] dxgthk load failed\n");
+        return;
+    }
+    match load_one_driver(
+        DXGBUF_VADDR,
+        win32k_host::DXG_VA,
+        win32k_host::DXG_LOAD_FRAMES,
+        host_pml4,
+        win32k_host::DXGTHK_VA,
+    ) {
+        Some((entry, expdir, len)) => {
+            win32k_host::record_dxg(entry, expdir, len);
+            print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: entry_rva=0x");
+            print_hex(entry);
+            print_str(b" export_dir_rva=0x");
+            print_hex(expdir);
+            print_str(b" len=0x");
+            print_hex(len);
+            print_str(b"\n");
+        }
+        None => print_str(b"[win32k-svc] dxg load failed\n"),
+    }
+}
+
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
 /// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
 /// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We
@@ -5565,7 +5645,21 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let status = core::ptr::read_volatile((sh + win32k_host::SH_REQ_STATUS) as *const i32);
             return (status, true);
         }
-        // Any other fault (a real wall inside the handler) — fail.
+        // Any other fault (a real wall inside the handler) — fail. Diagnose: label + fault IP/addr
+        // (m0=IP, m1=addr for exceptions; for UnknownSyscall m0=SSN). RVA relative to code / dxg.
+        print_str(b"[w32disp] WALL label=");
+        print_u64(label);
+        print_str(b" m0=0x");
+        print_hex((m0 >> 32) as u32);
+        print_hex(m0 as u32);
+        print_str(b" RVA=0x");
+        print_hex(m0.wrapping_sub(code_va) as u32);
+        print_str(b" dxgRVA=0x");
+        print_hex(m0.wrapping_sub(win32k_host::DXG_VA) as u32);
+        print_str(b" m1=0x");
+        print_hex((m1 >> 32) as u32);
+        print_hex(m1 as u32);
+        print_str(b"\n");
         return (0xC000_0001u32 as i32, false);
     }
 }
@@ -8346,6 +8440,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if finished {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
+                // Pre-load the DirectX graphics driver (dxg.sys + dxgthk.sys) into win32k's VSpace so
+                // NtUserInitialize → InitializeGreCSRSS → DxDdStartupDxGraphics (ZwSetSystemInformation
+                // SystemLoadGdiDriverInformation) finds a real hosted dxg image.
+                load_directx_drivers(host_pml4);
             }
 
             let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);

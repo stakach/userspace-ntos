@@ -534,6 +534,203 @@ extern "win64" fn s_dbg_print(fmt: *const u8) -> u32 {
     0
 }
 
+// --- CRT + misc ntoskrnl trampolines dxg.sys imports -----------------------------------------
+
+/// `void* memcpy(void* dst, const void* src, size_t n)`.
+extern "win64" fn s_memcpy(dst: u64, src: u64, n: u64) -> u64 {
+    unsafe {
+        let mut i = 0u64;
+        while i < n {
+            write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
+            i += 1;
+        }
+    }
+    dst
+}
+/// `void* memmove(void* dst, const void* src, size_t n)` — overlap-safe.
+extern "win64" fn s_memmove(dst: u64, src: u64, n: u64) -> u64 {
+    unsafe {
+        if dst < src || dst >= src + n {
+            let mut i = 0u64;
+            while i < n {
+                write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
+                i += 1;
+            }
+        } else {
+            let mut i = n;
+            while i > 0 {
+                i -= 1;
+                write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
+            }
+        }
+    }
+    dst
+}
+/// `void* memset(void* dst, int c, size_t n)`.
+extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
+    unsafe {
+        let b = c as u8;
+        let mut i = 0u64;
+        while i < n {
+            write_volatile((dst + i) as *mut u8, b);
+            i += 1;
+        }
+    }
+    dst
+}
+/// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (bump arenas never free).
+extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
+/// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` — a fixed nonzero PID.
+extern "win64" fn s_current_process_id() -> u64 {
+    (FAKE_PROCESS_HANDLE as u32) as u64
+}
+
+/// `VOID RtlInitEmptyUnicodeString(PUNICODE_STRING, PWSTR Buffer, USHORT MaximumLength)`.
+extern "win64" fn s_rtl_init_empty_unicode_string(dest: *mut u8, buffer: u64, max_len: u64) {
+    if dest.is_null() {
+        return;
+    }
+    unsafe {
+        write_unaligned(dest as *mut u16, 0); // Length
+        write_unaligned((dest as *mut u16).add(1), max_len as u16); // MaximumLength
+        write_unaligned(dest.add(8) as *mut u64, buffer); // Buffer
+    }
+}
+/// `VOID RtlCopyUnicodeString(PUNICODE_STRING Dest, PCUNICODE_STRING Src)`.
+extern "win64" fn s_rtl_copy_unicode_string(dest: *mut u8, src: *const u8) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    unsafe {
+        let src_len = read_unaligned(src as *const u16);
+        let src_buf = read_unaligned(src.add(8) as *const u64);
+        let dst_max = read_unaligned((dest as *const u16).add(1));
+        let n = src_len.min(dst_max);
+        let dst_buf = read_unaligned(dest.add(8) as *const u64);
+        if src_buf != 0 && dst_buf != 0 {
+            let mut i = 0u64;
+            while i < n as u64 {
+                write_volatile((dst_buf + i) as *mut u8, read_volatile((src_buf + i) as *const u8));
+                i += 1;
+            }
+        }
+        write_unaligned(dest as *mut u16, n); // Length
+    }
+}
+
+/// `size_t wcslen(PCWSTR)`.
+extern "win64" fn s_wcslen(s: u64) -> u64 {
+    if s == 0 {
+        return 0;
+    }
+    let mut n = 0u64;
+    unsafe {
+        while read_unaligned((s + n * 2) as *const u16) != 0 && n < 32768 {
+            n += 1;
+        }
+    }
+    n
+}
+/// `NTSTATUS RtlAppendUnicodeToString(PUNICODE_STRING Dest, PCWSTR Src)` — append a wide string.
+extern "win64" fn s_rtl_append_unicode_to_string(dest: *mut u8, src: u64) -> i32 {
+    if dest.is_null() {
+        return 0;
+    }
+    unsafe {
+        let max = read_unaligned((dest as *const u16).add(1)) as u64; // MaximumLength (bytes)
+        let buf = read_unaligned(dest.add(8) as *const u64);
+        if buf == 0 || src == 0 {
+            return 0;
+        }
+        let mut pos = read_unaligned(dest as *const u16) as u64; // current Length (bytes)
+        let mut w = 0u64;
+        loop {
+            let c = read_unaligned((src + w * 2) as *const u16);
+            if c == 0 || pos + 2 > max {
+                break;
+            }
+            write_unaligned((buf + pos) as *mut u16, c);
+            pos += 2;
+            w += 1;
+        }
+        write_unaligned(dest as *mut u16, pos as u16); // new Length
+    }
+    0
+}
+/// `int _wcsnicmp(PCWSTR, PCWSTR, size_t)` — case-insensitive wide compare (0 = equal).
+extern "win64" fn s_wcsnicmp(a: u64, b: u64, n: u64) -> i32 {
+    unsafe {
+        let mut i = 0u64;
+        while i < n {
+            let ca = read_unaligned((a + i * 2) as *const u16);
+            let cb = read_unaligned((b + i * 2) as *const u16);
+            let la = if (b'A' as u16..=b'Z' as u16).contains(&ca) { ca + 32 } else { ca };
+            let lb = if (b'A' as u16..=b'Z' as u16).contains(&cb) { cb + 32 } else { cb };
+            if la != lb {
+                return if la < lb { -1 } else { 1 };
+            }
+            if ca == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+    0
+}
+
+/// `NTSTATUS ZwSetSystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG)`. win32k's
+/// `LDEVOBJ_bLoadImage` loads a GDI driver by calling this with class
+/// `SystemLoadGdiDriverInformation` (26) + a `SYSTEM_GDI_DRIVER_INFORMATION` whose DriverName it
+/// filled; the "kernel" loads the driver + fills ImageAddress/EntryPoint/ExportSectionPointer/etc.
+/// We pre-loaded dxg.sys into win32k's VSpace at bring-up; match the name + fill the struct from the
+/// recorded info (offsets: DriverName@0, ImageAddress@0x10, SectionPointer@0x18, EntryPoint@0x20,
+/// ExportSectionPointer@0x28, ImageLength@0x30). Other classes → benign success.
+extern "win64" fn s_zw_set_system_information(class: u64, buf: u64, _len: u64) -> i32 {
+    const SYSTEM_LOAD_GDI_DRIVER_INFORMATION: u64 = 26;
+    if class != SYSTEM_LOAD_GDI_DRIVER_INFORMATION || buf == 0 {
+        return 0; // STATUS_SUCCESS (unmodelled classes are no-ops)
+    }
+    unsafe {
+        // Read DriverName (UNICODE_STRING @ buf+0: u16 Length, u16 Max, u32 pad, u64 Buffer).
+        let name_len = read_unaligned(buf as *const u16) as usize;
+        let name_buf = read_unaligned((buf + 8) as *const u64);
+        // Match the tail against "dxg.sys" (case-insensitive), i.e. the loaded DirectX driver.
+        let mut is_dxg = false;
+        if name_buf != 0 && name_len >= 14 {
+            // last 7 wchars == "dxg.sys"
+            let want = b"dxg.sys";
+            is_dxg = true;
+            for (k, &wc) in want.iter().enumerate() {
+                let off = name_buf + (name_len as u64 - (7 - k as u64) * 2);
+                let c = read_unaligned(off as *const u16);
+                let lc = if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+                if lc != wc as u16 {
+                    is_dxg = false;
+                    break;
+                }
+            }
+        }
+        if !is_dxg {
+            print_str(b"[win32k dxg] ZwSetSystemInformation(GdiDriver) unknown driver\n");
+            return 0xC000_0135u32 as i32; // STATUS_DLL_NOT_FOUND
+        }
+        let image = read_volatile(core::ptr::addr_of!(DXG_IMAGE));
+        if image == 0 {
+            return 0xC000_0135u32 as i32;
+        }
+        write_unaligned((buf + 0x10) as *mut u64, image); // ImageAddress
+        write_unaligned((buf + 0x18) as *mut u64, image); // SectionPointer (non-null placeholder)
+        write_unaligned((buf + 0x20) as *mut u64, read_volatile(core::ptr::addr_of!(DXG_ENTRY))); // EntryPoint
+        write_unaligned((buf + 0x28) as *mut u64, read_volatile(core::ptr::addr_of!(DXG_EXPORT_DIR))); // ExportSectionPointer
+        write_unaligned((buf + 0x30) as *mut u32, read_volatile(core::ptr::addr_of!(DXG_IMAGE_LEN))); // ImageLength
+        print_str(b"[win32k dxg] hosted dxg.sys -> image=0x");
+        print_hex((image >> 32) as u32);
+        print_hex(image as u32);
+        print_str(b"\n");
+    }
+    0
+}
+
 /// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
 /// returns code addresses only. Unknown/unmodelled → a benign zero stub (like the KMDF host).
 pub fn export_addr(name: &str) -> u64 {
@@ -553,9 +750,22 @@ pub fn export_addr(name: &str) -> u64 {
         // lookaside-list init (populates the GENERAL_LOOKASIDE Allocate/Free callbacks at +0x30/+0x38)
         "ExInitializePagedLookasideList" => s_ex_init_paged_lookaside as usize as u64,
         "ExInitializeNPagedLookasideList" => s_ex_init_npaged_lookaside as usize as u64,
+        // CRT + misc (dxg.sys imports)
+        "memcpy" | "RtlCopyMemory" => s_memcpy as usize as u64,
+        "memmove" | "RtlMoveMemory" => s_memmove as usize as u64,
+        "memset" | "RtlFillMemory" => s_memset as usize as u64,
+        "ExFreePoolWithTag" | "ExFreePool" => s_ex_free_pool_with_tag as usize as u64,
+        "PsGetCurrentProcessId" | "PsGetCurrentThreadProcessId" => s_current_process_id as usize as u64,
+        // GDI driver load (win32k's LDEVOBJ_bLoadImage → dxg.sys hosting)
+        "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
         // Rtl string init
         "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
         "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
+        "RtlInitEmptyUnicodeString" => s_rtl_init_empty_unicode_string as usize as u64,
+        "RtlCopyUnicodeString" => s_rtl_copy_unicode_string as usize as u64,
+        "RtlAppendUnicodeToString" => s_rtl_append_unicode_to_string as usize as u64,
+        "wcslen" => s_wcslen as usize as u64,
+        "_wcsnicmp" | "wcsnicmp" => s_wcsnicmp as usize as u64,
         // SSDT registration
         "KeAddSystemServiceTable" => s_ke_add_system_service_table as usize as u64,
         // debug print
@@ -991,4 +1201,249 @@ unsafe fn establish_client_and_dispatch() {
     print_str(b"[win32k-host] NtUserProcessConnect(0x10FA) returned status=0x");
     print_hex(nstatus as u32);
     print_str(b"\n");
+}
+
+// --- DirectX driver hosting (dxg.sys + dxgthk.sys) -------------------------------------------
+//
+// win32k's InitializeGreCSRSS -> DxDdStartupDxGraphics loads dxg.sys via EngLoadImage ->
+// LDEVOBJ_bLoadImage -> ZwSetSystemInformation(SystemLoadGdiDriverInformation). The executive
+// (privileged) PRE-LOADS dxg.sys + its dxgthk.sys dependency into win32k's VSpace at bring-up
+// (parse, map W^X, relocs, resolve imports), then the ZwSetSystemInformation trampoline reports
+// the pre-loaded image to win32k. This is the reusable driver-loader for framebuf.dll later.
+
+/// dxgthk.sys loaded-image base in win32k's VSpace (size_of_image 0x5000 -> 8 frames / one 2 MiB PT).
+pub const DXGTHK_VA: u64 = 0x0000_0100_0850_0000;
+pub const DXGTHK_LOAD_FRAMES: u64 = 8;
+/// dxg.sys loaded-image base in win32k's VSpace (size_of_image 0xd000 -> 16 frames / one 2 MiB PT).
+pub const DXG_VA: u64 = 0x0000_0100_0860_0000;
+pub const DXG_LOAD_FRAMES: u64 = 16;
+
+// The pre-loaded dxg.sys image info the ZwSetSystemInformation trampoline reports to win32k. Written
+// by the executive (load_dxg_drivers) at bring-up; read by s_zw_set_system_information.
+static mut DXG_IMAGE: u64 = 0; // ImageAddress = DXG_VA
+static mut DXG_ENTRY: u64 = 0; // EntryPoint = DXG_VA + entry_rva
+static mut DXG_EXPORT_DIR: u64 = 0; // ExportSectionPointer = DXG_VA + export_dir_rva
+static mut DXG_IMAGE_LEN: u32 = 0; // size_of_image
+
+/// Walk an already-mapped image's export table (data-dir 0) at `base`; return the VA of the export
+/// named `name` (nul-terminated), or 0. Handles FORWARDER exports: dxgthk's Eng* exports forward to
+/// "win32k.Eng*" (the func RVA points into the export section, and the data there is a "Dll.Func"
+/// string) — resolve the func part against win32k's own export table ([`WIN32K_CODE_VA`]).
+unsafe fn pe_export_lookup(base: u64, name: &[u8]) -> u64 {
+    let e = read_unaligned((base + 0x3c) as *const u32) as u64;
+    let opt = base + e + 4 + 20;
+    let exp_rva = read_unaligned((opt + 112) as *const u32) as u64;
+    let exp_sz = read_unaligned((opt + 116) as *const u32) as u64;
+    if exp_rva == 0 {
+        return 0;
+    }
+    let ed = base + exp_rva;
+    let nnames = read_unaligned((ed + 24) as *const u32) as u64;
+    let funcs = base + read_unaligned((ed + 28) as *const u32) as u64;
+    let names = base + read_unaligned((ed + 32) as *const u32) as u64;
+    let ords = base + read_unaligned((ed + 36) as *const u32) as u64;
+    for i in 0..nnames {
+        let nr = read_unaligned((names + i * 4) as *const u32) as u64;
+        let np = base + nr;
+        let mut eq = true;
+        let mut k = 0usize;
+        loop {
+            let c = read_volatile((np + k as u64) as *const u8);
+            let want = if k < name.len() { name[k] } else { 0 };
+            if c != want {
+                eq = false;
+                break;
+            }
+            if c == 0 {
+                break;
+            }
+            k += 1;
+        }
+        if eq {
+            let ord = read_unaligned((ords + i * 2) as *const u16) as u64;
+            let far = read_unaligned((funcs + ord * 4) as *const u32) as u64;
+            if far >= exp_rva && far < exp_rva + exp_sz {
+                // FORWARDER: the string at base+far is "Dll.Func". Resolve Func against win32k.
+                let s = base + far;
+                let mut dot = 0u64;
+                while read_volatile((s + dot) as *const u8) != 0
+                    && read_volatile((s + dot) as *const u8) != b'.'
+                {
+                    dot += 1;
+                }
+                let mut fb = [0u8; 64];
+                let mut fl = 0usize;
+                while fl < 63 {
+                    let c = read_volatile((s + dot + 1 + fl as u64) as *const u8);
+                    if c == 0 {
+                        break;
+                    }
+                    fb[fl] = c;
+                    fl += 1;
+                }
+                fb[fl] = 0;
+                if base == WIN32K_CODE_VA {
+                    return 0; // avoid recursion if win32k itself forwarded (shouldn't happen)
+                }
+                return pe_export_lookup(WIN32K_CODE_VA, &fb[..fl + 1]);
+            }
+            return base + far;
+        }
+    }
+    0
+}
+
+/// Load a driver PE (raw bytes at `src_va`) into `dst_va` (frames pre-mapped RW in BOTH the executive
+/// and win32k). Copies headers + sections, applies DIR64 relocs for `dst_va`, patches the IAT
+/// (dxgthk imports -> `dxgthk_base` exports; ntoskrnl/hal -> [`export_addr`]), records per-frame
+/// rights in `rights_out`. Returns `(entry_rva, export_dir_rva, size_of_image)` or None. HEAP-FREE.
+pub unsafe fn load_driver_into(
+    src_va: u64,
+    dst_va: u64,
+    max_frames: u64,
+    rights_out: &mut [u64],
+    dxgthk_base: u64,
+) -> Option<(u32, u32, u32)> {
+    let e = read_unaligned((src_va + 0x3c) as *const u32) as u64;
+    let nt = src_va + e;
+    if read_unaligned(nt as *const u32) != 0x0000_4550 {
+        return None;
+    }
+    let file_hdr = nt + 4;
+    let num_sections = read_unaligned((file_hdr + 2) as *const u16) as u64;
+    let size_opt_hdr = read_unaligned((file_hdr + 16) as *const u16) as u64;
+    let opt = file_hdr + 20;
+    let entry_rva = read_unaligned((opt + 16) as *const u32);
+    let image_base = read_unaligned((opt + 24) as *const u64);
+    let size_of_headers = read_unaligned((opt + 60) as *const u32) as u64;
+    let size_of_image = read_unaligned((opt + 56) as *const u32);
+    let export_dir_rva = read_unaligned((opt + 112) as *const u32);
+    let sec_table = opt + size_opt_hdr;
+    let cap = max_frames * 0x1000;
+
+    copy_bytes(dst_va, src_va, size_of_headers.min(cap));
+    for s in 0..num_sections {
+        let sh = sec_table + s * 40;
+        let va = read_unaligned((sh + 12) as *const u32) as u64;
+        let raw_size = read_unaligned((sh + 16) as *const u32) as u64;
+        let raw_ptr = read_unaligned((sh + 20) as *const u32) as u64;
+        let vsize = read_unaligned((sh + 8) as *const u32) as u64;
+        let chars = read_unaligned((sh + 36) as *const u32);
+        if va >= cap {
+            continue;
+        }
+        let n = raw_size.min(cap - va);
+        copy_bytes(dst_va + va, src_va + raw_ptr, n);
+        let r = if chars & 0x2000_0000 != 0 { 2u64 } else { RW_NX };
+        let span = va + vsize.max(raw_size);
+        let mut p = va & !0xFFF;
+        while p < span {
+            let idx = (p / 0x1000) as usize;
+            if idx < rights_out.len() {
+                rights_out[idx] = r;
+            }
+            p += 0x1000;
+        }
+    }
+
+    // DIR64 relocs for the load at dst_va.
+    let delta = dst_va.wrapping_sub(image_base);
+    if delta != 0 {
+        let reloc_rva = read_unaligned((opt + 112 + 5 * 8) as *const u32) as u64;
+        let reloc_size = read_unaligned((opt + 112 + 5 * 8 + 4) as *const u32) as u64;
+        let mut off = 0u64;
+        while reloc_rva != 0 && off + 8 <= reloc_size {
+            let page_rva = read_unaligned((dst_va + reloc_rva + off) as *const u32) as u64;
+            let block = read_unaligned((dst_va + reloc_rva + off + 4) as *const u32) as u64;
+            if block < 8 {
+                break;
+            }
+            let cnt = (block - 8) / 2;
+            for i in 0..cnt {
+                let ent = read_unaligned((dst_va + reloc_rva + off + 8 + i * 2) as *const u16);
+                if (ent >> 12) == 10 {
+                    let t = page_rva + (ent & 0xFFF) as u64;
+                    if t < cap {
+                        let v = read_unaligned((dst_va + t) as *const u64);
+                        write_unaligned((dst_va + t) as *mut u64, v.wrapping_add(delta));
+                    }
+                }
+            }
+            off += block;
+        }
+    }
+
+    // Patch the IAT: resolve per import descriptor by DLL name.
+    let imp_rva = read_unaligned((opt + 112 + 8) as *const u32) as u64;
+    if imp_rva != 0 {
+        let mut desc = dst_va + imp_rva;
+        loop {
+            let ilt = read_unaligned(desc as *const u32) as u64;
+            let iat = read_unaligned((desc + 16) as *const u32) as u64;
+            let dll_name_rva = read_unaligned((desc + 12) as *const u32) as u64;
+            if ilt == 0 && iat == 0 {
+                break;
+            }
+            // read DLL name → is it dxgthk?
+            let mut dllbuf = [0u8; 32];
+            let mut dn = 0usize;
+            if dll_name_rva != 0 {
+                while dn < 31 {
+                    let c = read_volatile((dst_va + dll_name_rva + dn as u64) as *const u8);
+                    if c == 0 {
+                        break;
+                    }
+                    dllbuf[dn] = c.to_ascii_lowercase();
+                    dn += 1;
+                }
+            }
+            let is_dxgthk = dn >= 6 && &dllbuf[..6] == b"dxgthk";
+            let names = dst_va + if ilt != 0 { ilt } else { iat };
+            let slots = dst_va + iat;
+            let mut k = 0u64;
+            loop {
+                let thunk = read_unaligned((names + k * 8) as *const u64);
+                if thunk == 0 {
+                    break;
+                }
+                if thunk & 0x8000_0000_0000_0000 == 0 {
+                    let name_ptr = dst_va + (thunk & 0x7FFF_FFFF) + 2;
+                    let mut buf = [0u8; 64];
+                    let mut n = 0usize;
+                    while n < 63 {
+                        let c = read_volatile((name_ptr + n as u64) as *const u8);
+                        if c == 0 {
+                            break;
+                        }
+                        buf[n] = c;
+                        n += 1;
+                    }
+                    let addr = if is_dxgthk && dxgthk_base != 0 {
+                        let mut nb = [0u8; 65];
+                        nb[..n].copy_from_slice(&buf[..n]);
+                        pe_export_lookup(dxgthk_base, &nb[..n + 1])
+                    } else {
+                        let name = core::str::from_utf8_unchecked(&buf[..n]);
+                        export_addr(name)
+                    };
+                    write_unaligned((slots + k * 8) as *mut u64, addr);
+                }
+                k += 1;
+            }
+            desc += 20;
+        }
+    }
+
+    Some((entry_rva, export_dir_rva, size_of_image))
+}
+
+/// Record the loaded dxg.sys info for the ZwSetSystemInformation trampoline. Called by the executive
+/// after `load_driver_into(dxg)`.
+pub fn record_dxg(entry_rva: u32, export_dir_rva: u32, image_len: u32) {
+    unsafe {
+        write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE), DXG_VA);
+        write_volatile(core::ptr::addr_of_mut!(DXG_ENTRY), DXG_VA + entry_rva as u64);
+        write_volatile(core::ptr::addr_of_mut!(DXG_EXPORT_DIR), DXG_VA + export_dir_rva as u64);
+        write_volatile(core::ptr::addr_of_mut!(DXG_IMAGE_LEN), image_len);
+    }
 }
