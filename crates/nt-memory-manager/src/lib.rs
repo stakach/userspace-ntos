@@ -15,6 +15,10 @@
 
 extern crate alloc;
 
+/// Raw-pointer session-space section objects (`MmCreateSection` / `MmMapView*`) for the win32k
+/// global user heap — an allocation-free primitive independent of the `alloc`-based section table.
+pub mod session_section;
+
 use alloc::vec;
 use alloc::vec::Vec;
 

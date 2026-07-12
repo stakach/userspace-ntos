@@ -280,23 +280,98 @@ extern "win64" fn s_rtl_free_heap() -> u64 {
     1
 }
 
-/// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
-/// — win32k maps a section into session/system space and then USES the mapped view (memsets it,
-/// builds shared structures). Back it with a real region from the heap/view arena, populating the
-/// `*MappedBase` + `*ViewSize` out-params (a no-op stub left `*MappedBase` null → memset(null)).
-extern "win64" fn s_mm_map_view(_section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
-    unsafe {
-        let mut size = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+use nt_memory_manager::session_section::{
+    init_section, is_section, map_section, section_object, section_size,
+};
+
+const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
+
+/// Resolve (allocating once, from the heap arena) the coherent backing base + size for a section
+/// map. If `section` is one of our [`init_section`] descriptors, use its recorded size + idempotent
+/// base (so the kernel session view and every per-process view share one backing); otherwise fall
+/// back to `size_hint` (a foreign/system-space section we didn't create).
+unsafe fn section_view(section: u64, size_hint: u64) -> (u64, u64) {
+    if is_section(section as *const u8) {
+        let sz = section_size(section as *const u8);
+        (map_section(section as *mut u8, |s| heap_alloc(s)), sz)
+    } else {
+        let mut size = size_hint;
         if size == 0 || size > 0x0040_0000 {
             size = 0x0010_0000; // default/cap the view at 1 MiB
         }
         size = (size + 0xFFF) & !0xFFF;
-        let region = heap_alloc(size);
-        if region == 0 {
-            return 0xC000_0017u32 as i32; // STATUS_NO_MEMORY
+        (heap_alloc(size), size)
+    }
+}
+
+/// `NTSTATUS MmCreateSection(PVOID *SectionObject, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER
+/// MaximumSize, ULONG SectionPageProtection, ULONG AllocationAttributes, HANDLE FileHandle,
+/// PFILE_OBJECT FileObject)` — win32k's `UserCreateHeap` creates the global USER-heap section here.
+/// Allocate a real [`session_section`](nt_memory_manager::session_section) descriptor from the pool
+/// and write it to `*SectionObject` (a no-op stub left it null → `MapGlobalUserHeap` later asserted).
+extern "win64" fn s_mm_create_section(
+    section_out: *mut u64,
+    _access: u64,
+    _obj_attr: u64,
+    max_size: *const i64,
+) -> i32 {
+    unsafe {
+        let size = if max_size.is_null() { 0x0010_0000 } else { read_unaligned(max_size) as u64 };
+        let desc = pool_alloc(section_object::SIZE_OF as u64);
+        if desc == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        init_section(desc as *mut u8, size);
+        if !section_out.is_null() {
+            write_unaligned(section_out, desc);
+        }
+    }
+    0
+}
+
+/// `MmMapViewInSessionSpace/MmMapViewInSystemSpace(Section, PVOID *MappedBase, PSIZE_T ViewSize)`
+/// — win32k maps a section into session/system space and then USES the mapped view (memsets it,
+/// builds shared structures). Back it with the section's coherent region, populating `*MappedBase`
+/// + `*ViewSize` (a no-op stub left `*MappedBase` null → memset(null)).
+extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut u64) -> i32 {
+    unsafe {
+        let hint = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+        let (base, size) = section_view(section, hint);
+        if base == 0 {
+            return STATUS_NO_MEMORY;
         }
         if !base_out.is_null() {
-            write_volatile(base_out, region);
+            write_volatile(base_out, base);
+        }
+        if !size_io.is_null() {
+            write_volatile(size_io, size);
+        }
+    }
+    0
+}
+
+/// `NTSTATUS MmMapViewOfSection(PVOID Section, PEPROCESS Process, PVOID *BaseAddress, ULONG_PTR
+/// ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT,
+/// ULONG AllocationType, ULONG Win32Protect)` — `MapGlobalUserHeap` projects the global USER-heap
+/// section into each connecting process. Return the SAME backing the session-space map used (single
+/// address space → kernel + user views coincide, delta 0), writing `*BaseAddress` + `*ViewSize`.
+extern "win64" fn s_mm_map_view_of_section(
+    section: u64,
+    _process: u64,
+    base_out: *mut u64,
+    _zero_bits: u64,
+    _commit: u64,
+    _offset: u64,
+    size_io: *mut u64,
+) -> i32 {
+    unsafe {
+        let hint = if size_io.is_null() { 0 } else { read_volatile(size_io) };
+        let (base, size) = section_view(section, hint);
+        if base == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        if !base_out.is_null() {
+            write_volatile(base_out, base);
         }
         if !size_io.is_null() {
             write_volatile(size_io, size);
@@ -411,8 +486,10 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlCreateHeap" => s_rtl_create_heap as usize as u64,
         "RtlAllocateHeap" => s_rtl_allocate_heap as usize as u64,
         "RtlFreeHeap" => s_rtl_free_heap as usize as u64,
-        // section view mapping into session/system space (populates *MappedBase + *ViewSize)
+        // section objects: create a real descriptor, map it coherently into session/user space
+        "MmCreateSection" => s_mm_create_section as usize as u64,
         "MmMapViewInSessionSpace" | "MmMapViewInSystemSpace" => s_mm_map_view as usize as u64,
+        "MmMapViewOfSection" => s_mm_map_view_of_section as usize as u64,
         // lookaside-list init (populates the GENERAL_LOOKASIDE Allocate/Free callbacks at +0x30/+0x38)
         "ExInitializePagedLookasideList" => s_ex_init_paged_lookaside as usize as u64,
         "ExInitializeNPagedLookasideList" => s_ex_init_npaged_lookaside as usize as u64,

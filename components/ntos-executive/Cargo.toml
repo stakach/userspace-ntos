@@ -47,6 +47,8 @@ nt-hive-core = { path = "../../crates/nt-hive-core" }
 nt-hive-regf = { path = "../../crates/nt-hive-regf" }
 # Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls.
 nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+# Memory manager — the raw-pointer session-section primitive backs win32k's MmCreateSection/MmMapView*.
+nt-memory-manager = { path = "../../crates/nt-memory-manager" }
 # KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }
