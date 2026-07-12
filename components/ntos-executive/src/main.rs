@@ -4816,6 +4816,9 @@ unsafe fn spawn_win32k_host(
     let stack_top = STACK_BASE + stack_frames * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, prio);
+    // win32k is a kernel driver: it reads the KPCR via `gs:[..]`. Point GS at a zeroed KPCR
+    // placeholder so those reads resolve (0) instead of faulting on linear address `[0x30]` etc.
+    let _ = tcb_set_gs_base(tcb, win32k_host::WIN32K_KPCR_VA);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4

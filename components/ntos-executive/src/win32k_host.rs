@@ -32,9 +32,13 @@ pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
 /// +0x1000). Retype-zeroed frames give counter 0 → no init step. 256 frames = 1 MiB.
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0700_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 256;
-/// Data-export region: placeholder structs (page 0) + import cells (page 1). 4 frames.
+/// Data-export region: placeholder structs (page 0) + import cells (page 1) + a KPCR placeholder
+/// (page 2) the component's GS base points at. 4 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
 pub const WIN32K_DATA_FRAMES: u64 = 4;
+/// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
+/// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
+pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 /// An unmapped VA the host reads once DriverEntry returns — the fault-recv loop recognises the
