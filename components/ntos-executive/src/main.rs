@@ -3888,6 +3888,22 @@ unsafe fn service_sec_image(
                     // implicitly by CsrServerInitialization itself. Listing it fails CsrLoadServerDll
                     // with STATUS_INVALID_PARAMETER — it has no ServerId. The real ReactOS command
                     // line omits it too; it was only masked before by winsrv crashing first.)
+                    // Milestone C status: the win32k SSN>=0x1000 forward is WIRED (see the
+                    // service_sec_image arm) and the win32k component comes up + parks in its
+                    // dispatch loop BEFORE csrss spawns, so a routed NtUserInitialize is live.
+                    // BUT re-enabling `ServerDll=winsrv:...` here (verified working: winsrv + the
+                    // full 14-DLL Win32 client stack — csrsrv/basesrv/winsrv/kernel32/user32/gdi32/
+                    // advapi32/rpcrt4/msvcrt/ws2_32/… — all LOAD + MAP into csrss) walls INSIDE the
+                    // client-stack load, BEFORE winsrv's UserServerDllInitialization runs: user32's
+                    // DllMain (`UserClientDllInitialize`, user32 RVA 0x45ac0) null-derefs a client-
+                    // shared win32k connection global (`mov rax,[user32+0xc4da0]; mov rcx,[rax]` with
+                    // rax==NULL) — the client-side win32k connection (gSharedInfo / USER handle-table /
+                    // USERCONNECT shared-section) hasn't been populated. That is a substantial NEW
+                    // grind (the Win32 client↔win32k connection) that precedes NtUserInitialize, and
+                    // the executive's csrss fault loop currently HANGS on it (does not cleanly stop).
+                    // So winsrv stays OUT until that grind lands; the routing infra + win32k ordering
+                    // remain in place so re-enabling is a one-line change once user32 client init runs.
+                    // (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
