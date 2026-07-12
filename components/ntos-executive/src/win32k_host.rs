@@ -168,6 +168,15 @@ pub const SSN_INIT_DESKTOP_GFX: u64 = 0x1FFD;
 /// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure).
 pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
 
+/// win32k `.data` global `gptiDesktopThread` (desktop.c:54) RVA. `IntGetAndReferenceClass(WC_DESKTOP,
+/// bDesktopThread=TRUE)` (class.c:1457) reads it as the desktop thread's THREADINFO — NULL in our host
+/// → the fault at RVA 0x50f94 (`mov rax,[gptiDesktopThread]; mov rax,[rax+0x58]` = pti->ppi). Derived
+/// from the disasm at RVA 0x50f76 `mov rax,[rip+0x1ba5bb]` (0x50f7d + 0x1ba5bb). We point it at a
+/// desktop-thread THREADINFO placeholder whose `ppi` (+0x58) is the hosted client's PROCESSINFO.
+pub const GPTI_DESKTOP_THREAD_RVA: u64 = 0x20b538;
+/// THREADINFO->ppi offset (confirmed by the disasm above: `mov rax,[rax+0x58]`).
+const THREADINFO_PPI_OFF: u64 = 0x58;
+
 /// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
 pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
 /// NtUserCreateDesktop — SSDT idx 0x22d, calls IntCreateDesktop (RVA 0x657f0).
@@ -987,6 +996,81 @@ extern "win64" fn s_rtl_are_bits_clear(bm: u64, start: u32, count: u32) -> u8 {
         0
     }
 }
+
+use nt_kernel_exec::rtl_atom;
+
+/// The single arena backing every atom table this component hands out (`gAtomTable` +
+/// per-window-station tables). Lazily pool-allocated on the first `RtlCreateAtomTable`; each table
+/// is a distinct sub-region so class atoms (global table) and global atoms (winsta tables) don't
+/// collide. Each arena is 64 KiB (≈370 entries — ample for the system classes + a few user atoms).
+const ATOM_ARENA_BYTES: u64 = 0x10000;
+
+/// `NTSTATUS RtlCreateAtomTable(ULONG TableSize, PRTL_ATOM_TABLE* AtomTable)`. Pool-allocate an
+/// arena, lay a fresh table over it, write `*AtomTable`. Idempotent if `*AtomTable` already set
+/// (matches ReactOS sdk/lib/rtl/atom.c). This is what populates win32k's `gAtomTable`
+/// (session.c:20 `InitSessionImpl`), previously null under the `s_zero` stub.
+extern "win64" fn s_rtl_create_atom_table(_size: u32, out_table: *mut u64) -> i32 {
+    if out_table.is_null() {
+        return rtl_atom::status::INVALID_PARAMETER as i32;
+    }
+    unsafe {
+        if read_unaligned(out_table) != 0 {
+            return rtl_atom::status::SUCCESS as i32; // already created
+        }
+        let arena = pool_alloc(ATOM_ARENA_BYTES);
+        if arena == 0 {
+            return rtl_atom::status::NO_MEMORY as i32;
+        }
+        let table = rtl_atom::create(arena as *mut u8, ATOM_ARENA_BYTES as usize);
+        if table.is_null() {
+            return rtl_atom::status::NO_MEMORY as i32;
+        }
+        write_unaligned(out_table, table as u64);
+    }
+    rtl_atom::status::SUCCESS as i32
+}
+/// `NTSTATUS RtlAddAtomToAtomTable(PRTL_ATOM_TABLE, PWSTR AtomName, PRTL_ATOM* Atom)`.
+extern "win64" fn s_rtl_add_atom_to_atom_table(table: u64, name: u64, out: *mut u16) -> i32 {
+    unsafe { rtl_atom::add(table as *mut u8, name as *const u16, out) as i32 }
+}
+/// `NTSTATUS RtlLookupAtomInAtomTable(PRTL_ATOM_TABLE, PWSTR AtomName, PRTL_ATOM* Atom)`.
+extern "win64" fn s_rtl_lookup_atom_in_atom_table(table: u64, name: u64, out: *mut u16) -> i32 {
+    unsafe { rtl_atom::lookup(table as *const u8, name as *const u16, out) as i32 }
+}
+/// `NTSTATUS RtlDeleteAtomFromAtomTable(PRTL_ATOM_TABLE, RTL_ATOM Atom)`.
+extern "win64" fn s_rtl_delete_atom_from_atom_table(table: u64, atom: u32) -> i32 {
+    unsafe { rtl_atom::delete(table as *mut u8, atom as u16) as i32 }
+}
+/// `NTSTATUS RtlPinAtomInAtomTable(PRTL_ATOM_TABLE, RTL_ATOM Atom)`.
+extern "win64" fn s_rtl_pin_atom_in_atom_table(table: u64, atom: u32) -> i32 {
+    unsafe { rtl_atom::pin(table as *mut u8, atom as u16) as i32 }
+}
+/// `NTSTATUS RtlQueryAtomInAtomTable(PRTL_ATOM_TABLE, RTL_ATOM, PULONG RefCount, PULONG PinCount,
+/// PWSTR AtomName, PULONG NameLength)`.
+extern "win64" fn s_rtl_query_atom_in_atom_table(
+    table: u64,
+    atom: u32,
+    ref_count: *mut u32,
+    pin_count: *mut u32,
+    name: u64,
+    name_len: *mut u32,
+) -> i32 {
+    unsafe {
+        rtl_atom::query(
+            table as *const u8,
+            atom as u16,
+            ref_count,
+            pin_count,
+            name as *mut u16,
+            name_len,
+        ) as i32
+    }
+}
+/// `NTSTATUS RtlDestroyAtomTable(PRTL_ATOM_TABLE)` — no-op success (the pool arena is never freed).
+extern "win64" fn s_rtl_destroy_atom_table(_table: u64) -> i32 {
+    rtl_atom::status::SUCCESS as i32
+}
+
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` — a fixed nonzero PID.
 extern "win64" fn s_current_process_id() -> u64 {
     (FAKE_PROCESS_HANDLE as u32) as u64
@@ -1647,6 +1731,16 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlSetBits" => s_rtl_set_bits as usize as u64,
         "RtlClearBits" => s_rtl_clear_bits as usize as u64,
         "RtlAreBitsClear" => s_rtl_are_bits_clear as usize as u64,
+
+        // RTL atom table (nt_kernel_exec::rtl_atom) — gAtomTable + per-window-station tables. Real
+        // now (was s_zero → null gAtomTable → UserRegisterSystemClasses null-deref on string classes).
+        "RtlCreateAtomTable" => s_rtl_create_atom_table as usize as u64,
+        "RtlAddAtomToAtomTable" => s_rtl_add_atom_to_atom_table as usize as u64,
+        "RtlLookupAtomInAtomTable" => s_rtl_lookup_atom_in_atom_table as usize as u64,
+        "RtlDeleteAtomFromAtomTable" => s_rtl_delete_atom_from_atom_table as usize as u64,
+        "RtlPinAtomInAtomTable" => s_rtl_pin_atom_in_atom_table as usize as u64,
+        "RtlQueryAtomInAtomTable" => s_rtl_query_atom_in_atom_table as usize as u64,
+        "RtlDestroyAtomTable" => s_rtl_destroy_atom_table as usize as u64,
         // GDI driver load (win32k's LDEVOBJ_bLoadImage → dxg.sys hosting)
         "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
         // font dir open (\SystemRoot\Fonts) → fail cleanly so IntLoadSystemFonts skips enumeration
@@ -2058,15 +2152,55 @@ unsafe fn setup_dispatch_context() {
         let t = read_volatile(SLOT_W32THREAD as *const u64);
         if t == 0 { PH_W32THREAD_VA } else { t }
     };
-    let cb_head = w32thread + 0x2e8;
-    write_volatile(cb_head as *mut u64, cb_head); // Flink = &head
-    write_volatile((cb_head + 8) as *mut u64, cb_head); // Blink = &head
+    init_threadinfo_placeholder(w32thread);
 
-    // IntCreateDesktop (RVA 0x659f4) does `ptiCurrent->pClientInfo->dwTIFlags = TIF_flags`, i.e.
-    // reads THREADINFO+0x88 (pClientInfo) then writes [pClientInfo+0x1c]. A zeroed W32THREAD
-    // placeholder has pClientInfo==NULL → a null store. Real win32k points pClientInfo at the
-    // thread's CLIENTINFO (in the client TEB/desktop-heap). Give it a real zeroed CLIENTINFO scratch
-    // so IntCreateDesktop's flag write lands. Offset 0x88 confirmed by disasm of IntCreateDesktop.
+    // Stand up gptiDesktopThread so IntCreateDesktop's IntGetAndReferenceClass(WC_DESKTOP, TRUE) has
+    // the desktop thread's THREADINFO (class.c:1457) instead of the NULL global that faults at RVA
+    // 0x50f94. Real win32k sets this from the RIT/desktop-thread bring-up (desktop.c:1566
+    // `gptiDesktopThread = PsGetCurrentThreadWin32Thread()`) which our host never runs. Use a SEPARATE
+    // THREADINFO placeholder (not the current dispatch thread) so the callback.c
+    // `ASSERT(current != gptiDesktopThread)` invariants stay satisfied for later user-mode callbacks.
+    // The desktop thread's `ppi` (+0x58) must be the SAME PROCESSINFO the current thread registers
+    // system classes into (UserRegisterSystemClasses uses GetW32ProcessInfo() = the current ppi;
+    // IntGetClassAtom looks up in gptiDesktopThread->ppi), so both = SLOT_W32PROCESS → the WC_DESKTOP
+    // class registered by one is found by the other. IntReferenceClass gets a NULL rpdesk → it just
+    // returns the base class (class.c:761 Desktop==NULL path), so no desktop is needed here.
+    // The desktop window itself is created ON this thread (IntCreateWindow window.c:1821
+    // `pti = pdeskCreated ? gptiDesktopThread : GetW32ThreadInfo()`), so its list heads + pClientInfo
+    // must be initialized exactly like the dispatch thread's — else InsertTailList(&pti->WindowListHead)
+    // faults at RVA 0x24c66.
+    let ppi = read_volatile(SLOT_W32PROCESS as *const u64);
+    let gpti_cell = (WIN32K_CODE_VA + GPTI_DESKTOP_THREAD_RVA) as *mut u64;
+    if read_volatile(gpti_cell) == 0 && ppi != 0 {
+        let desk_thread = pool_alloc(0x800); // zeroed THREADINFO placeholder for the desktop thread
+        if desk_thread != 0 {
+            write_volatile((desk_thread + THREADINFO_PPI_OFF) as *mut u64, ppi);
+            init_threadinfo_placeholder(desk_thread);
+            write_volatile(gpti_cell, desk_thread);
+            print_str(b"[win32k-host] gptiDesktopThread set (ppi=0x");
+            print_hex((ppi >> 32) as u32);
+            print_hex(ppi as u32);
+            print_str(b")\n");
+        }
+    }
+}
+
+/// Initialize the thread-list heads + `pClientInfo` a win32k THREADINFO needs before it can host
+/// window/callback linking. Both the dispatch thread and the desktop thread (`gptiDesktopThread`) run
+/// through window-manager code that operates on these fields; our zeroed placeholders leave them NULL.
+/// Offsets (checked build, confirmed by disasm):
+///   +0x2d8 WindowListHead     — `InsertTailList(&pti->WindowListHead,…)` IntCreateWindow window.c:2142
+///   +0x2e8 W32CallbackListHead — `InsertTailList(&pti->W32CallbackListHead,…)` IntCbAllocateMemory
+///   +0x88  pClientInfo         — `pti->pClientInfo->dwTIFlags = …` IntCreateDesktop
+/// Real win32k `InitializeListHead`s the lists in CreateThreadInfo (main.c) and points pClientInfo at
+/// the thread's CLIENTINFO. `pool_alloc` returns zeroed memory, so an already-initialized field is
+/// left as-is.
+unsafe fn init_threadinfo_placeholder(w32thread: u64) {
+    for off in [0x2d8u64, 0x2e8] {
+        let head = w32thread + off;
+        write_volatile(head as *mut u64, head); // Flink = &head
+        write_volatile((head + 8) as *mut u64, head); // Blink = &head
+    }
     if read_volatile((w32thread + 0x88) as *const u64) == 0 {
         let ci = pool_alloc(0x100);
         if ci != 0 {
