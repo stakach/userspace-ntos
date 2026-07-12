@@ -6428,6 +6428,108 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // --- Phase 0a: the BOOTBOOT linear framebuffer. The kernel publishes its
+    // geometry in BootInfo and hands its physical memory over as the LAST device
+    // untyped (is_device=1, paddr == fb_paddr). Map every framebuffer frame into
+    // our VSpace, write a recognizable pattern, and read pixels back — proving the
+    // display path a win32k/framebuf display driver will later drive. Headless QEMU
+    // won't SHOW the pixels, but the map+write+readback proves the mapping is real.
+    {
+        let fb_paddr = bi.fb_paddr;
+        let fb_w = bi.fb_width as u64;
+        let fb_h = bi.fb_height as u64;
+        let fb_scan = bi.fb_scanline as u64;
+        let fb_size = bi.fb_size as u64;
+        let fb_type = bi.fb_type;
+        print_str(b"[ntos-exec] Phase 0a: BOOTBOOT framebuffer paddr=0x");
+        print_hex((fb_paddr >> 32) as u32);
+        print_hex(fb_paddr as u32);
+        print_str(b" ");
+        print_u64(fb_w);
+        print_str(b"x");
+        print_u64(fb_h);
+        print_str(b" scanline=");
+        print_u64(fb_scan);
+        print_str(b" size=0x");
+        print_hex(fb_size as u32);
+        print_str(b" type=");
+        print_u64(fb_type as u64);
+        print_str(b"\n");
+
+        // Geometry sanity: a real framebuffer with 32-bpp pixels — nonzero
+        // dimensions, pitch at least width*4, and size covering height*pitch.
+        let geometry_ok = fb_paddr != 0
+            && fb_w != 0
+            && fb_h != 0
+            && fb_scan >= fb_w * 4
+            && fb_size >= fb_scan * fb_h;
+        check(b"exec_framebuffer_geometry_sane", geometry_ok, &mut passed);
+
+        let mut map_ok = false;
+        let mut pattern_ok = false;
+        if geometry_ok {
+            // The framebuffer window: a fresh, unused PML4 slot (PML4[4]) so it
+            // can't collide with the executive's existing user mappings (which
+            // sprawl through PML4[2]). We build the whole paging chain — PDPT, PD,
+            // and one leaf page table per 2 MiB slice — into our own VSpace.
+            const FB_VADDR: u64 = 0x0000_0200_0000_0000;
+            let n_pages = (fb_size + 0xFFF) / 0x1000;
+
+            let pdpt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+            let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, FB_VADDR, CAP_INIT_THREAD_VSPACE);
+            let pd = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+            let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, FB_VADDR, CAP_INIT_THREAD_VSPACE);
+            // One leaf page table per 2 MiB slice the window spans.
+            let win_end = FB_VADDR + fb_size;
+            let mut pt_va = FB_VADDR & !0x1F_FFFFu64; // round down to 2 MiB
+            while pt_va < win_end {
+                let pt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_va, CAP_INIT_THREAD_VSPACE);
+                pt_va += 0x20_0000;
+            }
+
+            // Retype + map every framebuffer frame from its device untyped.
+            // claim_device_pages finds the untyped whose paddr == fb_paddr and
+            // hands out consecutive frames fb_paddr + i*4K at FB_VADDR + i*4K.
+            let base_slot = claim_device_pages(bi, fb_paddr, FB_VADDR, n_pages);
+            map_ok = base_slot != 0;
+            check(b"exec_framebuffer_map", map_ok, &mut passed);
+
+            if map_ok {
+                // Write a recognizable test pattern. Fill the first scanline solid
+                // magenta, drop a green marker in the last pixel of the last page
+                // (proves the far end of the mapping is live), then read them back.
+                const MAGENTA: u32 = 0x00FF_00FF;
+                const GREEN: u32 = 0x0000_FF00;
+                let fb = FB_VADDR as *mut u32;
+                for x in 0..fb_w {
+                    core::ptr::write_volatile(fb.add(x as usize), MAGENTA);
+                }
+                // Last fully-addressable pixel in the framebuffer.
+                let last_px = (fb_size / 4 - 1) as usize;
+                core::ptr::write_volatile(fb.add(last_px), GREEN);
+
+                let p0 = core::ptr::read_volatile(fb.add(0));
+                let pmid = core::ptr::read_volatile(fb.add((fb_w / 2) as usize));
+                let pend = core::ptr::read_volatile(fb.add((fb_w - 1) as usize));
+                let plast = core::ptr::read_volatile(fb.add(last_px));
+                print_str(b"[ntos-exec] framebuffer readback px0=0x");
+                print_hex(p0);
+                print_str(b" pxlast=0x");
+                print_hex(plast);
+                print_str(b"\n");
+                pattern_ok = p0 == MAGENTA
+                    && pmid == MAGENTA
+                    && pend == MAGENTA
+                    && plast == GREEN;
+            }
+        }
+        check(b"exec_framebuffer_pattern_readback", pattern_ok, &mut passed);
+    }
+
     // --- P1: PCI enumeration via real x86 port I/O. Get an I/O-port cap for the PCI
     // config ports, walk bus 0, and read each device's vendor/device/class/BAR0/IRQ —
     // the discovery step that finds a real device (its BAR + IRQ) to hand to a host.
