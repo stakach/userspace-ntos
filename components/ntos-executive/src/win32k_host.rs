@@ -152,30 +152,26 @@ extern "win64" fn s_lookaside_alloc(_pool_type: u64, size: u64, _tag: u64) -> u6
 /// A GENERAL_LOOKASIDE's default Free `VOID(PVOID)` — no-op (bump arena never frees).
 extern "win64" fn s_lookaside_free(_buf: u64) {}
 
-/// Populate a GENERAL_LOOKASIDE (x64: +0x00 ListHead SLIST_HEADER, +0x10 Depth, +0x12
-/// MaximumDepth, +0x24 Type, +0x28 Tag, +0x2c Size, +0x30 Allocate, +0x38 Free, +0x40 ListEntry).
-/// `ExInitialize{,N}PagedLookasideList` — a no-op stub left Allocate(+0x30) null, so win32k's
-/// slow-path `call [desc+0x30]` jumped to null (RVA 0xb3e88).
+/// Initialize a GENERAL_LOOKASIDE via the real [`nt_kernel_exec::init_general_lookaside`] primitive
+/// (host-tested x64 layout), defaulting the Allocate/Free callbacks to this host's pool trampolines
+/// when the caller passed null. `ExInitialize{,N}PagedLookasideList` — a no-op stub left
+/// Allocate(+0x30) null, so win32k's slow-path `call [desc+0x30]` jumped to null (RVA 0xb3e88).
 unsafe fn init_lookaside(la: u64, allocate: u64, free: u64, size: u64, tag: u64, depth: u64, pool_type: u32) {
     if la == 0 {
         return;
     }
-    for i in 0..0x60u64 {
-        write_volatile((la + i) as *mut u8, 0);
-    }
-    let d = if depth == 0 { 256 } else { depth as u16 };
-    write_volatile((la + 0x10) as *mut u16, 0); // Depth
-    write_volatile((la + 0x12) as *mut u16, d); // MaximumDepth
-    write_volatile((la + 0x24) as *mut u32, pool_type); // Type
-    write_volatile((la + 0x28) as *mut u32, tag as u32); // Tag
-    write_volatile((la + 0x2c) as *mut u32, size as u32); // Size
     let alloc_fn = if allocate != 0 { allocate } else { s_lookaside_alloc as usize as u64 };
     let free_fn = if free != 0 { free } else { s_lookaside_free as usize as u64 };
-    write_volatile((la + 0x30) as *mut u64, alloc_fn);
-    write_volatile((la + 0x38) as *mut u64, free_fn);
-    // ListEntry: an empty circular list (self-linked) so a global-lookaside walk is safe.
-    write_volatile((la + 0x40) as *mut u64, la + 0x40);
-    write_volatile((la + 0x48) as *mut u64, la + 0x40);
+    nt_kernel_exec::init_general_lookaside(
+        la as *mut u8,
+        la, // same-AS: the ListEntry self-link VA is the descriptor pointer
+        alloc_fn,
+        free_fn,
+        size as u32,
+        tag as u32,
+        depth as u16,
+        pool_type,
+    );
 }
 
 /// `ExInitializePagedLookasideList(Lookaside, Allocate, Free, Flags, Size, Tag, Depth)`.
@@ -188,7 +184,7 @@ extern "win64" fn s_ex_init_paged_lookaside(
     tag: u64,
     depth: u64,
 ) {
-    unsafe { init_lookaside(la, allocate, free, size, tag, depth, 1 /* PagedPool */) }
+    unsafe { init_lookaside(la, allocate, free, size, tag, depth, nt_kernel_exec::POOL_TYPE_PAGED) }
 }
 /// `ExInitializeNPagedLookasideList(...)` — same layout, NonPagedPool type.
 extern "win64" fn s_ex_init_npaged_lookaside(
