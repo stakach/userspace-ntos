@@ -32,16 +32,31 @@ pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
 /// +0x1000). Retype-zeroed frames give counter 0 → no init step. 256 frames = 1 MiB.
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0700_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 256;
-/// Data-export region: placeholder structs (page 0) + import cells (page 1) + a KPCR placeholder
-/// (page 2) the component's GS base points at. 4 frames.
+/// Data-export region: placeholder structs (page 0) + import cells (page 1) + KPCR (page 2) +
+/// HEAP handle (page 3) + per-process slots/callout table (page 4) + EPROCESS (page 5) +
+/// W32PROCESS (page 6) + W32THREAD (page 7). 8 frames.
 pub const WIN32K_DATA_VADDR: u64 = 0x0000_0100_0710_0000;
-pub const WIN32K_DATA_FRAMES: u64 = 4;
+pub const WIN32K_DATA_FRAMES: u64 = 8;
 /// The component's GS base — a zeroed KPCR placeholder (win32k, a kernel driver, reads `gs:[..]`
 /// expecting the Processor Control Region). Page 2 of the DATA region (mapped, RW, zeroed).
 pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
 /// A zeroed page used as the fake HEAP handle `RtlCreateHeap` returns (win32k stores it + passes
 /// it back to RtlAllocateHeap; any field reads see 0). Page 3 of the DATA region.
 pub const WIN32K_HEAP_HANDLE: u64 = WIN32K_DATA_VADDR + 0x3000;
+/// Per-process win32 state (page 4): the current-process win32-slots + a copy of win32k's callout
+/// table (recorded by PsEstablishWin32Callouts). Single hosted client (csrss) for now.
+const SLOT_W32PROCESS: u64 = WIN32K_DATA_VADDR + 0x4000; // Ps{Set,Get}ProcessWin32Process slot
+const SLOT_W32THREAD: u64 = WIN32K_DATA_VADDR + 0x4008; // Ps{Set,Get}ThreadWin32Thread slot
+const WIN32_CALLOUTS: u64 = WIN32K_DATA_VADDR + 0x4100; // recorded WIN32_CALLOUTS_FG table (copy)
+/// A fuller EPROCESS placeholder (page 5) — win32k's process-attach callout asserts fields like
+/// `EPROCESS+0x2b8 != 0`; ObReferenceObjectByHandle(process handle) returns this.
+const PH_EPROCESS_VA: u64 = WIN32K_DATA_VADDR + 0x5000;
+/// The per-process W32PROCESS/PROCESSINFO placeholder (page 6) win32k's callout initializes.
+const PH_W32PROCESS_VA: u64 = WIN32K_DATA_VADDR + 0x6000;
+/// The per-thread W32THREAD placeholder (page 7).
+const PH_W32THREAD_VA: u64 = WIN32K_DATA_VADDR + 0x7000;
+/// A synthetic process handle NtUserProcessConnect's ObReferenceObjectByHandle resolves.
+const FAKE_PROCESS_HANDLE: u64 = 0x0000_0000_5A5A_0100;
 /// The win32k session-heap arena that RtlAllocateHeap + the Mm session/system view mappers
 /// bump-allocate from (counter at +0, data at +0x1000). win32k creates its session heap + maps
 /// several ~1 MiB session views; give it 16 MiB. Its own 8 PT window (0x0740_0000..0x0840_0000).
@@ -74,6 +89,9 @@ pub const V_SSDT: u32 = 8; // KeAddSystemServiceTable recorded the win32k table
 pub const V_NTUSER_ENTERED: u32 = 0x10; // dispatched SSDT[0xFA] NtUserInitialize into the handler
 pub const V_NTUSER_RETURNED: u32 = 0x20; // NtUserInitialize returned (did not fault)
 pub const V_NTUSER_SUCCESS: u32 = 0x40; // NtUserInitialize returned STATUS_SUCCESS
+pub const V_CALLOUT_ENTERED: u32 = 0x80; // invoked win32k's process-create callout
+pub const V_CALLOUT_RETURNED: u32 = 0x100; // process-create callout returned (did not fault)
+pub const V_NTUSER_RESOLVED: u32 = 0x200; // SSDT resolve(0x10FA) yielded a real win32k handler
 
 /// The win32k NtUser/NtGdi shadow-SSDT base service number; SSN 0x10FA = NtUserInitialize.
 pub const WIN32K_SERVICE_BASE: u64 = 0x1000;
@@ -110,25 +128,65 @@ extern "win64" fn s_true() -> u64 {
     1
 }
 
-// Non-null EPROCESS / ETHREAD / Win32Process / Win32Thread placeholders (zeroed regions in the
-// DATA page-0 area). win32k's post-SSDT init reads current-process/thread pointers and then
-// dereferences their fields — returning a real non-null zeroed struct lets it read past them.
-const PH_EPROCESS: u64 = WIN32K_DATA_VADDR + 0x400;
 const PH_ETHREAD: u64 = WIN32K_DATA_VADDR + 0x600;
-const PH_WIN32PROCESS: u64 = WIN32K_DATA_VADDR + 0x800;
-const PH_WIN32THREAD: u64 = WIN32K_DATA_VADDR + 0xA00;
 
+/// `PEPROCESS IoGetCurrentProcess()` / `PsGetCurrentProcess()` — the current (only) hosted client's
+/// EPROCESS. A fuller placeholder (page 5) so win32k's process-attach callout finds its asserted
+/// fields set.
 extern "win64" fn s_current_process() -> u64 {
-    PH_EPROCESS
+    PH_EPROCESS_VA
 }
 extern "win64" fn s_current_thread() -> u64 {
     PH_ETHREAD
 }
+/// `PVOID PsGetProcessWin32Process(PEPROCESS)` / `PsGetCurrentProcessWin32Process()` — the real
+/// per-process win32-slot (set by win32k via PsSetProcessWin32Process during process attach).
 extern "win64" fn s_get_win32process() -> u64 {
-    PH_WIN32PROCESS
+    unsafe { read_volatile(SLOT_W32PROCESS as *const u64) }
 }
 extern "win64" fn s_get_win32thread() -> u64 {
-    PH_WIN32THREAD
+    unsafe { read_volatile(SLOT_W32THREAD as *const u64) }
+}
+/// `VOID PsSetProcessWin32Process(PEPROCESS Process, PVOID W32Process, PVOID OldValue)` — store the
+/// W32Process win32k allocated in the per-process slot. (Single client; Process arg ignored.)
+extern "win64" fn s_set_win32process(_process: u64, w32process: u64, _old: u64) -> i32 {
+    unsafe { write_volatile(SLOT_W32PROCESS as *mut u64, w32process) };
+    0
+}
+extern "win64" fn s_set_win32thread(_thread: u64, w32thread: u64, _old: u64) -> i32 {
+    unsafe { write_volatile(SLOT_W32THREAD as *mut u64, w32thread) };
+    0
+}
+
+/// `PsEstablishWin32Callouts(PWIN32_CALLOUTS_FG CalloutData)` — record win32k's callout table
+/// (ProcessCallout, ThreadCallout, …) into persistent storage so the host can invoke win32k's own
+/// process-create callout when a client first attaches. The table is on win32k's stack; copy it.
+extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
+    if callout_data != 0 {
+        unsafe {
+            for i in 0..(0x100u64 / 8) {
+                let v = read_volatile((callout_data + i * 8) as *const u64);
+                write_volatile((WIN32_CALLOUTS + i * 8) as *mut u64, v);
+            }
+        }
+    }
+    0
+}
+
+/// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE,
+/// PVOID *Object, ...)` — resolve a handle to its object. For win32k's process-connect the handle
+/// is the client process handle → return the current EPROCESS. Writes `*Object`, refs it.
+extern "win64" fn s_ob_reference_object_by_handle(
+    _handle: u64,
+    _access: u64,
+    _obj_type: u64,
+    _mode: u64,
+    object_out: *mut u64,
+) -> i32 {
+    if !object_out.is_null() {
+        unsafe { write_unaligned(object_out, PH_EPROCESS_VA) };
+    }
+    0
 }
 
 /// Bump-allocate from the win32k session-heap arena (RtlAllocateHeap). Same shape as `pool_alloc`
@@ -366,7 +424,7 @@ pub fn export_addr(name: &str) -> u64 {
         // debug print
         "DbgPrint" => s_dbg_print as usize as u64,
         "vDbgPrintExWithPrefix" => s_zero as usize as u64,
-        // current process/thread → non-null zeroed placeholders (win32k derefs their fields)
+        // current process/thread + real per-process win32-slots (set by win32k's process callout)
         "IoGetCurrentProcess" | "PsGetCurrentProcess" => s_current_process as usize as u64,
         "PsGetCurrentThread" | "KeGetCurrentThread" => s_current_thread as usize as u64,
         "PsGetCurrentProcessWin32Process" | "PsGetProcessWin32Process" => {
@@ -375,6 +433,10 @@ pub fn export_addr(name: &str) -> u64 {
         "PsGetCurrentThreadWin32Thread" | "PsGetThreadWin32Thread" => {
             s_get_win32thread as usize as u64
         }
+        "PsSetProcessWin32Process" => s_set_win32process as usize as u64,
+        "PsSetThreadWin32Thread" => s_set_win32thread as usize as u64,
+        "PsEstablishWin32Callouts" => s_establish_win32_callouts as usize as u64,
+        "ObReferenceObjectByHandle" => s_ob_reference_object_by_handle as usize as u64,
         // resource / lock acquire → BOOLEAN TRUE (single-threaded host: always "acquired")
         "ExAcquireResourceExclusiveLite"
         | "ExAcquireResourceSharedLite"
@@ -616,43 +678,92 @@ pub unsafe extern "C" fn win32k_host_entry() -> ! {
     print_hex(v);
     print_str(b"\n");
 
-    // Phase 2c (first cut): dispatch a win32k syscall (SSN 0x10FA = NtUserInitialize) THROUGH THE
-    // REGISTERED SSDT, in THIS COMPONENT's context (its VSpace, GS=KPCR, session heap) — proving
-    // the SSN>=0x1000 routing seam end-to-end and surfacing exactly what per-process state NtUser
-    // calls need. `resolve(ssn)` = *(base + (ssn - 0x1000)*8). A fault here is caught by the
-    // executive's fault loop (which backtraces it) BEFORE the sentinel below.
+    // Phase 2c: establish the calling client's per-process win32 context THE AUTHENTIC WAY — invoke
+    // win32k's OWN process-create callout (recorded by PsEstablishWin32Callouts during DriverEntry)
+    // so win32k allocates + owns the client's W32PROCESS and calls PsSetProcessWin32Process — then
+    // dispatch NtUserProcessConnect (SSN 0x10FA) through the SSDT in this component's context. Any
+    // fault is caught + backtraced by the executive's fault loop before the sentinel below.
     if status == 0 {
-        let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
-        if ssdt_base != 0 {
-            let idx = SSN_NT_USER_INITIALIZE - WIN32K_SERVICE_BASE;
-            let handler = read_volatile((ssdt_base + idx * 8) as *const u64);
-            write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_HANDLER) as *mut u64, handler);
-            print_str(b"[win32k-host] SSDT resolve(0x10FA) -> handler=0x");
-            print_hex((handler >> 32) as u32);
-            print_hex(handler as u32);
-            print_str(b"\n");
-            if handler != 0 {
-                let mut v2 = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
-                v2 |= V_NTUSER_ENTERED;
-                write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v2);
-                // NtUserInitialize(DWORD dwWinVersion, HANDLE hPowerReqEvent, HANDLE hMediaReqEvent).
-                let f: extern "win64" fn(u64, u64, u64) -> i32 =
-                    core::mem::transmute(handler as *const ());
-                let nstatus = f(0, 0, 0);
-                v2 = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_RETURNED;
-                if nstatus == 0 {
-                    v2 |= V_NTUSER_SUCCESS;
-                }
-                write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v2);
-                write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32, nstatus);
-                print_str(b"[win32k-host] NtUserInitialize(0x10FA) returned status=0x");
-                print_hex(nstatus as u32);
-                print_str(b"\n");
-            }
-        }
+        establish_client_and_dispatch();
     }
 
     // Trip the sentinel: a read from an unmapped VA the executive's fault loop recognises.
     let _ = read_volatile(WIN32K_SENTINEL_VADDR as *const u64);
     park()
+}
+
+/// Give the EPROCESS placeholder the fields win32k's process callout asserts, invoke win32k's
+/// process-create callout (WIN32_CALLOUTS[0]) to build the W32PROCESS authentically, then dispatch
+/// NtUserProcessConnect(ProcessHandle, USERCONNECT buffer, 0x240) via the SSDT.
+unsafe fn establish_client_and_dispatch() {
+    // Resolve NtUserProcessConnect (SSN 0x10FA) through the registered SSDT FIRST (before the
+    // fault-prone callout/connect below) so the routing-seam proof is recorded regardless.
+    let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+    if ssdt_base == 0 {
+        return;
+    }
+    let idx = SSN_NT_USER_INITIALIZE - WIN32K_SERVICE_BASE;
+    let handler = read_volatile((ssdt_base + idx * 8) as *const u64);
+    write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_HANDLER) as *mut u64, handler);
+    print_str(b"[win32k-host] SSDT resolve(0x10FA) -> handler=0x");
+    print_hex((handler >> 32) as u32);
+    print_hex(handler as u32);
+    print_str(b"\n");
+    if handler == 0 {
+        return;
+    }
+    let v0 = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_RESOLVED;
+    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v0);
+
+    // EPROCESS+0x2b8 must be non-null (the callout ASSERTs it — an `int 0x2c` otherwise). Point it
+    // at a small zeroed sub-region of the EPROCESS page.
+    write_volatile((PH_EPROCESS_VA + 0x2b8) as *mut u64, PH_EPROCESS_VA + 0x800);
+
+    // Invoke win32k's process-create callout: W32pProcessCallout(PEPROCESS, BOOLEAN Initialize=TRUE).
+    let callout = read_volatile(WIN32_CALLOUTS as *const u64);
+    print_str(b"[win32k-host] win32k process-create callout=0x");
+    print_hex((callout >> 32) as u32);
+    print_hex(callout as u32);
+    print_str(b"\n");
+    if callout != 0 {
+        let mut v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_CALLOUT_ENTERED;
+        write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
+        let co: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(callout as *const ());
+        let cstatus = co(PH_EPROCESS_VA, 1);
+        v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_CALLOUT_RETURNED;
+        write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
+        print_str(b"[win32k-host] process-create callout returned status=0x");
+        print_hex(cstatus as u32);
+        print_str(b" W32PROCESS=0x");
+        let w32 = read_volatile(SLOT_W32PROCESS as *const u64);
+        print_hex((w32 >> 32) as u32);
+        print_hex(w32 as u32);
+        print_str(b"\n");
+    }
+    // If the callout did not populate the win32-slot, fall back to the placeholder so the connect
+    // path still has a non-null W32PROCESS to walk (surfaces the next requirement rather than a null
+    // deref).
+    if read_volatile(SLOT_W32PROCESS as *const u64) == 0 {
+        write_volatile(SLOT_W32PROCESS as *mut u64, PH_W32PROCESS_VA);
+    }
+    if read_volatile(SLOT_W32THREAD as *const u64) == 0 {
+        write_volatile(SLOT_W32THREAD as *mut u64, PH_W32THREAD_VA);
+    }
+
+    // Dispatch NtUserProcessConnect (SSN 0x10FA) with real args: a process handle, a 0x240-byte
+    // USERCONNECT buffer, and its size 0x240.
+    let user_connect = pool_alloc(0x240);
+    let mut v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_ENTERED;
+    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
+    let f: extern "win64" fn(u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
+    let nstatus = f(FAKE_PROCESS_HANDLE, user_connect, 0x240);
+    v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_RETURNED;
+    if nstatus == 0 {
+        v |= V_NTUSER_SUCCESS;
+    }
+    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
+    write_volatile((WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32, nstatus);
+    print_str(b"[win32k-host] NtUserProcessConnect(0x10FA) returned status=0x");
+    print_hex(nstatus as u32);
+    print_str(b"\n");
 }
