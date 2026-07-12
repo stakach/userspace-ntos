@@ -4357,6 +4357,32 @@ unsafe fn service_sec_image(
                 // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
                 // model thread/process attribute sets, and don't model a handle table (NtClose of a
                 // fake handle is a no-op).
+            } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
+                // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
+                // csrss — winsrv's UserServerDllInitialization drives NtUserInitialize into win32k.
+                // Forward it to the parked win32k component through the persistent dispatch loop; the
+                // handler runs in win32k's OWN context (GS=KPCR / session heap) against the single
+                // hosted client's W32PROCESS (attached during DriverEntry bring-up). Scalar + handle
+                // args ride the registers exactly as the native x64 syscall passed them (arg1=R10,
+                // arg2=RDX, arg3=R8, arg4=R9); pointer/buffer args are marshaled per SSN as needed.
+                let (st, ok) = win32k_dispatch(
+                    m0,
+                    get_recv_mr(9), // rcx <- R10 (syscall arg1)
+                    m3,             // rdx <- RDX (arg2)
+                    get_recv_mr(7), // r8  <- R8  (arg3)
+                    get_recv_mr(8), // r9  <- R9  (arg4)
+                );
+                print_str(b"[win32k-svc] csrss SSN 0x");
+                print_hex(m0 as u32);
+                print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
+                print_hex(st as u32);
+                print_str(b"\n");
+                if ok {
+                    result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
+                } else {
+                    handled = false; // dispatch wall — stop with the SSN recorded
+                    result = 0xC0000001;
+                }
             } else {
                 handled = false;
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
@@ -7642,198 +7668,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
-    // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
-    // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
-    // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
-    // Windows-family binary flowing through the machinery we built.
-    let smss_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x20) as *const u32);
-    if found_storage && smss_size > 0 {
-        let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
-        match nt_pe_loader::PeFile::parse(smss) {
-            Ok(pe) => {
-                // Fix up smss's absolute pointers for its load at PE_LOAD_BASE (before the IAT
-                // patch, which overwrites the import thunks anyway).
-                apply_relocations_to_buf(&pe, FILEBUF_VADDR, PE_LOAD_BASE);
-                // Now that the code is relocated to PE_LOAD_BASE, PATCH the header's
-                // OptionalHeader.ImageBase to PE_LOAD_BASE too. smss's preferred base is
-                // 0x140000000; without this, ntdll sees ImageBaseAddress(PE_LOAD_BASE) != the
-                // header's preferred base and tries to RELOCATE THE EXE — but ReactOS's EXE-reloc
-                // path (ldrinit.c:2409) is UNIMPLEMENTED and returns STATUS_INVALID_IMAGE_FORMAT.
-                // Setting the header field = load base makes ntdll treat it as already-at-preferred
-                // (no relocation). OptionalHeader.ImageBase @ NtHeaders(FILEBUF+e_lfanew)+0x30.
-                let e_lfanew = core::ptr::read_volatile((FILEBUF_VADDR + 0x3c) as *const u32) as u64;
-                core::ptr::write_volatile(
-                    (FILEBUF_VADDR + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-                let nsec = pe.sections().len();
-                let entry = pe.entry_point_rva();
-                let mut imports_ntdll = false;
-                if let Ok(imps) = pe.imports() {
-                    for dll in &imps {
-                        if dll.name.eq_ignore_ascii_case("ntdll.dll") {
-                            imports_ntdll = true;
-                        }
-                    }
-                }
-                // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
-                // translation and compare to the file's .text raw bytes. Match => our loader
-                // maps a real 6-section x64 binary correctly.
-                let scratch = STORAGE_SHARED_VADDR + 0x5000;
-                let _ = page_map(alloc_frame(), scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                let _ = fill_image_page(&pe, 0x1000, scratch);
-                let mut fill_ok = false;
-                if let Some(t) = pe.sections().iter().find(|s| s.virtual_address == 0x1000) {
-                    let raw = t.pointer_to_raw_data as u64;
-                    fill_ok = true;
-                    for j in 0..64u64 {
-                        let a = core::ptr::read_volatile((scratch + j) as *const u8);
-                        let b = core::ptr::read_volatile((FILEBUF_VADDR + raw + j) as *const u8);
-                        if a != b {
-                            fill_ok = false;
-                            break;
-                        }
-                    }
-                }
-                print_str(b"[ntos-exec] REAL ReactOS smss.exe loaded: PE32+ x64, sections=");
-                print_u64(nsec as u64);
-                print_str(b" entry=0x");
-                print_hex(entry);
-                print_str(b" imports_ntdll=");
-                print_u64(imports_ntdll as u64);
-                print_str(b" sec_image_fill_ok=");
-                print_u64(fill_ok as u64);
-                print_str(b"\n");
-                check(b"exec_reactos_smss_parsed", nsec == 6 && entry == 0x12ee0, &mut passed);
-                check(b"exec_reactos_smss_imports_ntdll", imports_ntdll, &mut passed);
-                check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
-
-                // Resolve smss's ntdll imports: apply the build-time patch table (imports.bin,
-                // read off disk into STORAGE_SHARED+0x800) to smss's IAT in the file buffer —
-                // each slot := NTDLL_BASE + the import's real ntdll export RVA. So smss's ntdll
-                // calls now target real ntdll addresses instead of unresolved file thunks.
-                let imports_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
-                let mut resolved = 0u32;
-                if imports_size >= 4 {
-                    let count = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x800) as *const u32);
-                    for i in 0..count as u64 {
-                        let ent = STORAGE_SHARED_VADDR + 0x804 + i * 8;
-                        let off = core::ptr::read_volatile(ent as *const u32) as u64;
-                        let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
-                        core::ptr::write_volatile((FILEBUF_VADDR + off) as *mut u64, NTDLL_BASE + rva);
-                        resolved += 1;
-                    }
-                }
-                let rnpp = core::ptr::read_volatile((FILEBUF_VADDR + 0x13330) as *const u64);
-                print_str(b"[ntos-exec] resolved ");
-                print_u64(resolved as u64);
-                print_str(b" smss ntdll imports; IAT[RtlNormalizeProcessParams]=0x");
-                print_hex((rnpp >> 32) as u32);
-                print_hex(rnpp as u32);
-                print_str(b"\n");
-                check(b"exec_reactos_imports_resolved", resolved == 103, &mut passed);
-
-                // LIVE SEC_IMAGE LOAD with ntdll MAPPED: spawn smss (image VA reserved) AND
-                // demand-map the disk-read ntdll.dll at NTDLL_BASE. smss executes its entry, its
-                // .text faults in live, then it calls RtlNormalizeProcessParams via the resolved
-                // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
-                // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
-                let ntdll_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
-                let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
-                let si_fault = make_object(OBJ_ENDPOINT);
-                let si_fault_c = copy_cap(si_fault);
-                if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
-                    // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
-                    // absolute self-pointers at the preferred base otherwise.
-                    apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
-                    // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
-                    // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
-                    // Demand-fault scratch: each filled image/ntdll page keeps a persistent
-                    // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
-                    // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
-                    // PT and collided with the env buffer at 0x74 after ~128 faults — smss runs far
-                    // deeper into ntdll now, so give it an ISOLATED range with its own page tables
-                    // (8 PTs = 4096 pages) that can't collide with any other executive mapping.
-                    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
-                    for k in 0..8u64 {
-                        let pt = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                        let _ = paging_struct_map(
-                            pt,
-                            LBL_X86_PAGE_TABLE_MAP,
-                            SCRATCH_BASE + k * 0x20_0000,
-                            CAP_INIT_THREAD_VSPACE,
-                        );
-                    }
-                    let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
-                        si_fault,
-                        pml4,
-                        &pe,
-                        SCRATCH_BASE,
-                        Some((NTDLL_BASE, &ntdll_pe)),
-                    );
-                    print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
-                    print_u64(sfaults);
-                    print_str(b" page(s) (");
-                    print_u64(ntfaults);
-                    print_str(b" in ntdll), first=0x");
-                    print_hex((sfirst >> 32) as u32);
-                    print_hex(sfirst as u32);
-                    print_str(b" stop=0x");
-                    print_hex((sstop >> 32) as u32);
-                    print_hex(sstop as u32);
-                    print_str(b" ntalloc_serviced=");
-                    print_u64(NTALLOC_SERVICED.load(Ordering::Relaxed));
-                    print_str(b" rtlcreateheap=0x");
-                    print_hex((heap_verdict >> 32) as u32);
-                    print_hex(heap_verdict as u32);
-                    print_str(b"\n");
-                    let _ = (sfirst, sssn, heap_verdict);
-                    // The trampoline now enters ntdll's REAL loader init, LdrpInitialize
-                    // (ntdll+0x8e70). It runs deep into process bring-up — reads TEB/PEB/KUSER,
-                    // NtQueryVirtualMemory, NtQueryInformationProcess(ProcessCookie), NtOpenKey +
-                    // NtQueryValueKey (IFEO/options → not-found), NtProtectVirtualMemory,
-                    // RtlImageNtHeader on smss's own image (checking Subsystem==NATIVE) — all
-                    // serviced by the executive, demand-loading ~33 ntdll pages. It currently stops
-                    // in a CRT/locale-style string routine (ntdll+0x63dc0) called with a bad context
-                    // pointer — the next blocker on the way to LdrpInitializeProcess's RtlCreateHeap
-                    // and the image entry hand-off.
-                    check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
-                    check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
-                    // LdrpInitialize executes deep loader init (demand-loading many ntdll pages),
-                    // not merely entering — proves the real loader-init path is running.
-                    check(b"exec_reactos_ldrinit_runs_deep", sfaults >= 25, &mut passed);
-                    // LdrpInitializeProcess reached RtlCreateHeap and created the process heap —
-                    // both its NtAllocateVirtualMemory reserve+commit serviced by the executive.
-                    check(
-                        b"exec_reactos_ldrinit_creates_heap",
-                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
-                        &mut passed,
-                    );
-                    // RtlImageNtHeader (in LdrpInitializeProcess) demand-faulted smss's OWN image
-                    // header — at least one fault outside ntdll — proving loader init inspects the
-                    // real ReactOS binary (PEB->ImageBaseAddress) and read past the null derefs.
-                    check(
-                        b"exec_reactos_ldrinit_reads_image",
-                        sfaults > ntfaults && sstop != 0x0000_0100_24bc_8350,
-                        &mut passed,
-                    );
-                } else {
-                    check(b"exec_reactos_smss_live_paged", false, &mut passed);
-                    check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
-                    check(b"exec_reactos_ldrinit_runs_deep", false, &mut passed);
-                    check(b"exec_reactos_ldrinit_creates_heap", false, &mut passed);
-                    check(b"exec_reactos_ldrinit_reads_image", false, &mut passed);
-                }
-            }
-            Err(_) => {
-                print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
-                check(b"exec_reactos_smss_parsed", false, &mut passed);
-                check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
-                check(b"exec_reactos_sec_image_fill", false, &mut passed);
-            }
-        }
-    }
-
     // --- Phase 2b (graphics): LOAD the real ReactOS win32k.sys into an ISOLATED win32k-service
     // component and RUN its DriverEntry as far as it goes. The storage host staged the 2.1 MiB
     // image into WIN32KBUF; the executive parses+relocates+IAT-patches it into a run of frames at
@@ -8143,6 +7977,198 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_u64(seq);
                 print_str(b")\n");
                 check(b"win32k_dispatch_loop_roundtrip", ok && seq >= 1, &mut passed);
+            }
+        }
+    }
+
+    // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
+    // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
+    // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
+    // Windows-family binary flowing through the machinery we built.
+    let smss_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x20) as *const u32);
+    if found_storage && smss_size > 0 {
+        let smss = core::slice::from_raw_parts(FILEBUF_VADDR as *const u8, smss_size as usize);
+        match nt_pe_loader::PeFile::parse(smss) {
+            Ok(pe) => {
+                // Fix up smss's absolute pointers for its load at PE_LOAD_BASE (before the IAT
+                // patch, which overwrites the import thunks anyway).
+                apply_relocations_to_buf(&pe, FILEBUF_VADDR, PE_LOAD_BASE);
+                // Now that the code is relocated to PE_LOAD_BASE, PATCH the header's
+                // OptionalHeader.ImageBase to PE_LOAD_BASE too. smss's preferred base is
+                // 0x140000000; without this, ntdll sees ImageBaseAddress(PE_LOAD_BASE) != the
+                // header's preferred base and tries to RELOCATE THE EXE — but ReactOS's EXE-reloc
+                // path (ldrinit.c:2409) is UNIMPLEMENTED and returns STATUS_INVALID_IMAGE_FORMAT.
+                // Setting the header field = load base makes ntdll treat it as already-at-preferred
+                // (no relocation). OptionalHeader.ImageBase @ NtHeaders(FILEBUF+e_lfanew)+0x30.
+                let e_lfanew = core::ptr::read_volatile((FILEBUF_VADDR + 0x3c) as *const u32) as u64;
+                core::ptr::write_volatile(
+                    (FILEBUF_VADDR + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+                let nsec = pe.sections().len();
+                let entry = pe.entry_point_rva();
+                let mut imports_ntdll = false;
+                if let Ok(imps) = pe.imports() {
+                    for dll in &imps {
+                        if dll.name.eq_ignore_ascii_case("ntdll.dll") {
+                            imports_ntdll = true;
+                        }
+                    }
+                }
+                // SEC_IMAGE fill validation: fill the .text page (RVA 0x1000) via our RVA->file
+                // translation and compare to the file's .text raw bytes. Match => our loader
+                // maps a real 6-section x64 binary correctly.
+                let scratch = STORAGE_SHARED_VADDR + 0x5000;
+                let _ = page_map(alloc_frame(), scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let _ = fill_image_page(&pe, 0x1000, scratch);
+                let mut fill_ok = false;
+                if let Some(t) = pe.sections().iter().find(|s| s.virtual_address == 0x1000) {
+                    let raw = t.pointer_to_raw_data as u64;
+                    fill_ok = true;
+                    for j in 0..64u64 {
+                        let a = core::ptr::read_volatile((scratch + j) as *const u8);
+                        let b = core::ptr::read_volatile((FILEBUF_VADDR + raw + j) as *const u8);
+                        if a != b {
+                            fill_ok = false;
+                            break;
+                        }
+                    }
+                }
+                print_str(b"[ntos-exec] REAL ReactOS smss.exe loaded: PE32+ x64, sections=");
+                print_u64(nsec as u64);
+                print_str(b" entry=0x");
+                print_hex(entry);
+                print_str(b" imports_ntdll=");
+                print_u64(imports_ntdll as u64);
+                print_str(b" sec_image_fill_ok=");
+                print_u64(fill_ok as u64);
+                print_str(b"\n");
+                check(b"exec_reactos_smss_parsed", nsec == 6 && entry == 0x12ee0, &mut passed);
+                check(b"exec_reactos_smss_imports_ntdll", imports_ntdll, &mut passed);
+                check(b"exec_reactos_sec_image_fill", fill_ok, &mut passed);
+
+                // Resolve smss's ntdll imports: apply the build-time patch table (imports.bin,
+                // read off disk into STORAGE_SHARED+0x800) to smss's IAT in the file buffer —
+                // each slot := NTDLL_BASE + the import's real ntdll export RVA. So smss's ntdll
+                // calls now target real ntdll addresses instead of unresolved file thunks.
+                let imports_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x24) as *const u32);
+                let mut resolved = 0u32;
+                if imports_size >= 4 {
+                    let count = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x800) as *const u32);
+                    for i in 0..count as u64 {
+                        let ent = STORAGE_SHARED_VADDR + 0x804 + i * 8;
+                        let off = core::ptr::read_volatile(ent as *const u32) as u64;
+                        let rva = core::ptr::read_volatile((ent + 4) as *const u32) as u64;
+                        core::ptr::write_volatile((FILEBUF_VADDR + off) as *mut u64, NTDLL_BASE + rva);
+                        resolved += 1;
+                    }
+                }
+                let rnpp = core::ptr::read_volatile((FILEBUF_VADDR + 0x13330) as *const u64);
+                print_str(b"[ntos-exec] resolved ");
+                print_u64(resolved as u64);
+                print_str(b" smss ntdll imports; IAT[RtlNormalizeProcessParams]=0x");
+                print_hex((rnpp >> 32) as u32);
+                print_hex(rnpp as u32);
+                print_str(b"\n");
+                check(b"exec_reactos_imports_resolved", resolved == 103, &mut passed);
+
+                // LIVE SEC_IMAGE LOAD with ntdll MAPPED: spawn smss (image VA reserved) AND
+                // demand-map the disk-read ntdll.dll at NTDLL_BASE. smss executes its entry, its
+                // .text faults in live, then it calls RtlNormalizeProcessParams via the resolved
+                // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
+                // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
+                let ntdll_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
+                let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
+                let si_fault = make_object(OBJ_ENDPOINT);
+                let si_fault_c = copy_cap(si_fault);
+                if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
+                    // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
+                    // absolute self-pointers at the preferred base otherwise.
+                    apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
+                    // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
+                    // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    // Demand-fault scratch: each filled image/ntdll page keeps a persistent
+                    // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
+                    // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
+                    // PT and collided with the env buffer at 0x74 after ~128 faults — smss runs far
+                    // deeper into ntdll now, so give it an ISOLATED range with its own page tables
+                    // (8 PTs = 4096 pages) that can't collide with any other executive mapping.
+                    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
+                    for k in 0..8u64 {
+                        let pt = alloc_slot();
+                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                        let _ = paging_struct_map(
+                            pt,
+                            LBL_X86_PAGE_TABLE_MAP,
+                            SCRATCH_BASE + k * 0x20_0000,
+                            CAP_INIT_THREAD_VSPACE,
+                        );
+                    }
+                    let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
+                        si_fault,
+                        pml4,
+                        &pe,
+                        SCRATCH_BASE,
+                        Some((NTDLL_BASE, &ntdll_pe)),
+                    );
+                    print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
+                    print_u64(sfaults);
+                    print_str(b" page(s) (");
+                    print_u64(ntfaults);
+                    print_str(b" in ntdll), first=0x");
+                    print_hex((sfirst >> 32) as u32);
+                    print_hex(sfirst as u32);
+                    print_str(b" stop=0x");
+                    print_hex((sstop >> 32) as u32);
+                    print_hex(sstop as u32);
+                    print_str(b" ntalloc_serviced=");
+                    print_u64(NTALLOC_SERVICED.load(Ordering::Relaxed));
+                    print_str(b" rtlcreateheap=0x");
+                    print_hex((heap_verdict >> 32) as u32);
+                    print_hex(heap_verdict as u32);
+                    print_str(b"\n");
+                    let _ = (sfirst, sssn, heap_verdict);
+                    // The trampoline now enters ntdll's REAL loader init, LdrpInitialize
+                    // (ntdll+0x8e70). It runs deep into process bring-up — reads TEB/PEB/KUSER,
+                    // NtQueryVirtualMemory, NtQueryInformationProcess(ProcessCookie), NtOpenKey +
+                    // NtQueryValueKey (IFEO/options → not-found), NtProtectVirtualMemory,
+                    // RtlImageNtHeader on smss's own image (checking Subsystem==NATIVE) — all
+                    // serviced by the executive, demand-loading ~33 ntdll pages. It currently stops
+                    // in a CRT/locale-style string routine (ntdll+0x63dc0) called with a bad context
+                    // pointer — the next blocker on the way to LdrpInitializeProcess's RtlCreateHeap
+                    // and the image entry hand-off.
+                    check(b"exec_reactos_smss_live_paged", sfaults >= 1, &mut passed);
+                    check(b"exec_reactos_smss_calls_into_ntdll", ntfaults >= 1, &mut passed);
+                    // LdrpInitialize executes deep loader init (demand-loading many ntdll pages),
+                    // not merely entering — proves the real loader-init path is running.
+                    check(b"exec_reactos_ldrinit_runs_deep", sfaults >= 25, &mut passed);
+                    // LdrpInitializeProcess reached RtlCreateHeap and created the process heap —
+                    // both its NtAllocateVirtualMemory reserve+commit serviced by the executive.
+                    check(
+                        b"exec_reactos_ldrinit_creates_heap",
+                        NTALLOC_SERVICED.load(Ordering::Relaxed) >= 2,
+                        &mut passed,
+                    );
+                    // RtlImageNtHeader (in LdrpInitializeProcess) demand-faulted smss's OWN image
+                    // header — at least one fault outside ntdll — proving loader init inspects the
+                    // real ReactOS binary (PEB->ImageBaseAddress) and read past the null derefs.
+                    check(
+                        b"exec_reactos_ldrinit_reads_image",
+                        sfaults > ntfaults && sstop != 0x0000_0100_24bc_8350,
+                        &mut passed,
+                    );
+                } else {
+                    check(b"exec_reactos_smss_live_paged", false, &mut passed);
+                    check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_runs_deep", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_creates_heap", false, &mut passed);
+                    check(b"exec_reactos_ldrinit_reads_image", false, &mut passed);
+                }
+            }
+            Err(_) => {
+                print_str(b"[ntos-exec] ReactOS smss.exe PARSE FAILED\n");
+                check(b"exec_reactos_smss_parsed", false, &mut passed);
+                check(b"exec_reactos_smss_imports_ntdll", false, &mut passed);
+                check(b"exec_reactos_sec_image_fill", false, &mut passed);
             }
         }
     }
