@@ -3784,7 +3784,22 @@ unsafe fn service_sec_image(
                 // NtQueryInformationProcess(Handle, Class, Buffer, Len, *RetLen). Class in RDX.
                 let class = m3; // ProcessInformationClass
                 let buf = get_recv_mr(7); // R8 = ProcessInformation buffer (a stack local)
-                if class == 36 {
+                if class == 0 {
+                    // ProcessBasicInformation — PROCESS_BASIC_INFORMATION (x64, 48 bytes):
+                    // { NTSTATUS ExitStatus; PPEB PebBaseAddress; ULONG_PTR AffinityMask;
+                    //   KPRIORITY BasePriority; ULONG_PTR UniqueProcessId; ULONG_PTR
+                    //   InheritedFromUniqueProcessId; }. Both processes' PEB is at PEB_VA (own VSpace).
+                    smss_stack_write(buf + 0x00, 0); // ExitStatus (running)
+                    smss_stack_write(buf + 0x08, PEB_VA); // PebBaseAddress
+                    smss_stack_write(buf + 0x10, 1); // AffinityMask
+                    smss_stack_write(buf + 0x18, 13); // BasePriority
+                    smss_stack_write(buf + 0x20, (pi as u64 + 1) * 0x100); // UniqueProcessId (fake)
+                    smss_stack_write(buf + 0x28, 0); // InheritedFromUniqueProcessId
+                    let retlen = smss_stack_read(sp + 0x28); // arg5 = *ReturnLength
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 48);
+                    }
+                } else if class == 36 {
                     // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
                     // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
                     smss_stack_write(buf, 0x1a2b_3c4d);
