@@ -556,6 +556,47 @@ unsafe fn dll_cache_put(va: u64, fr: u64) {
         core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), n + 1);
     }
 }
+
+// --- csrss client-page frame tracking (win32k cross-AS client-memory sharing) --------------------
+// win32k runs in its own component VSpace, but its NtUser/NtGdi handlers dereference the CALLING
+// process's (csrss's) user pointers DIRECTLY — the authentic Windows model where win32k shares the
+// caller's user address space. To emulate that we map csrss's OWN frame for a faulting page into
+// win32k at the SAME VA (identity), so win32k reads/writes the caller's live memory (no per-SSN
+// marshaling). This table records the frame cap the fault-fill path allocated for each PER-PROCESS
+// csrss page (page VA -> frame cptr); the shared-DLL-text cache (`dll_cache`) covers RX pages. The
+// executive's scratch alias already shares these frames, so csrss's runtime writes are visible.
+const CSRSS_FRAME_CAP: usize = 8192;
+static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_N: usize = 0;
+/// Record csrss's frame cap `fr` for page VA `page` (once; later fills of the same page are ignored).
+unsafe fn csrss_frame_put(page: u64, fr: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
+    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == page {
+            return;
+        }
+    }
+    if n < CSRSS_FRAME_CAP {
+        core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64).add(n), page);
+        core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64).add(n), fr);
+        core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
+    }
+}
+/// csrss's frame cap for page VA `page`, or 0 if not backed by a recorded per-process frame (falls
+/// back to the shared-DLL-text cache, which backs csrss's RX pages).
+unsafe fn csrss_frame_get(page: u64) -> u64 {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
+    let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == page {
+            return core::ptr::read(frs.add(i));
+        }
+    }
+    dll_cache_get(page)
+}
 unsafe fn alloc_frame() -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
@@ -3433,6 +3474,9 @@ unsafe fn service_sec_image(
             if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
+                if pi == 1 {
+                    csrss_frame_put(page, f); // shareable into win32k (a client stack pointer)
+                }
                 faults += 1;
                 pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
@@ -3452,6 +3496,7 @@ unsafe fn service_sec_image(
             {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
+                csrss_frame_put(page, f); // CSR shared section — shareable into win32k
                 faults += 1;
                 pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
@@ -3537,6 +3582,13 @@ unsafe fn service_sec_image(
                     // read static-string args from .rdata.
                     if (faults as usize) < filled_pages.len() {
                         filled_pages[faults as usize] = page;
+                    }
+                    if pi == 1 {
+                        // Record csrss's frame so win32k can identity-map + read/write it (a client
+                        // pointer into user32/gdi32 .data — e.g. the PFNCLIENT arrays — or csrss's own
+                        // image). The frame is shared with the executive's scratch, so it holds csrss's
+                        // LIVE runtime data, not the (zeroed) PE static content.
+                        csrss_frame_put(page, f);
                     }
                     if base == PE_LOAD_BASE {
                         let off = page - PE_LOAD_BASE;
@@ -5290,6 +5342,75 @@ unsafe fn map_win32k_heap_into_csrss(pml4: u64) -> u64 {
     delta
 }
 
+// --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---
+// win32k-side paging structures provisioned for the shared client window, and pages already mapped,
+// keyed by a level-tagged aligned index (SYS_SEND paging_struct_map is fire-and-forget so we can't
+// detect "already mapped" — track it). Client VAs are all < 0x100_0000_0000 (PML4 slots 0/1), never
+// win32k's own PML4[2] (>= 0x100_..), so building a fresh PDPT/PD/PT hierarchy here can't collide
+// with win32k's own mappings.
+static mut W32_CLIENT_SEEN: [u64; 1024] = [0; 1024];
+static mut W32_CLIENT_SEEN_N: usize = 0;
+unsafe fn w32_seen(key: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
+    let a = core::ptr::addr_of!(W32_CLIENT_SEEN) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(a.add(i)) == key {
+            return true;
+        }
+    }
+    false
+}
+unsafe fn w32_mark(key: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_CLIENT_SEEN_N));
+    if n < 1024 {
+        core::ptr::write((core::ptr::addr_of_mut!(W32_CLIENT_SEEN) as *mut u64).add(n), key);
+        core::ptr::write(core::ptr::addr_of_mut!(W32_CLIENT_SEEN_N), n + 1);
+    }
+}
+/// Ensure win32k's VSpace has a PDPT/PD/PT chain covering `page` (each created once, tracked).
+unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) {
+    let k_pdpt = (1u64 << 60) | (page >> 39);
+    if !w32_seen(k_pdpt) {
+        let s = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, s);
+        let _ = paging_struct_map(s, LBL_X86_PDPT_MAP, page, w_pml4);
+        w32_mark(k_pdpt);
+    }
+    let k_pd = (2u64 << 60) | (page >> 30);
+    if !w32_seen(k_pd) {
+        let s = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, s);
+        let _ = paging_struct_map(s, LBL_X86_PAGE_DIRECTORY_MAP, page, w_pml4);
+        w32_mark(k_pd);
+    }
+    let k_pt = (3u64 << 60) | (page >> 21);
+    if !w32_seen(k_pt) {
+        let s = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, s);
+        let _ = paging_struct_map(s, LBL_X86_PAGE_TABLE_MAP, page, w_pml4);
+        w32_mark(k_pt);
+    }
+}
+/// Share csrss's frame for `page` into win32k's VSpace at the SAME VA (identity) so win32k's handler
+/// dereferences the caller's real user memory. Returns false if the page isn't backed by a known
+/// csrss frame (win32k would read garbage → the caller stops with a diagnostic). Idempotent per page.
+unsafe fn map_csrss_page_into_win32k(page: u64, w_pml4: u64) -> bool {
+    let k_page = (4u64 << 60) | (page >> 12);
+    if w32_seen(k_page) {
+        return true; // already shared
+    }
+    let fr = csrss_frame_get(page);
+    if fr == 0 {
+        return false;
+    }
+    ensure_w32_client_paging(page, w_pml4);
+    // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
+    // csrss so writes propagate back (out-params). Non-executable — client data, not code.
+    let _ = page_map(copy_cap(fr), page, RW_NX, w_pml4);
+    w32_mark(k_page);
+    true
+}
+
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
 /// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
 /// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We
@@ -5337,11 +5458,12 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let in_image =
                 addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
             // A foreign CLIENT pointer: win32k's own demand-pageable VAs are all in its component
-            // window (>= 0x100_0000_0000); anything below is a csrss/user32/gdi32 user pointer the
-            // handler dereferenced directly. A zero page would feed win32k WRONG data, so this is an
-            // un-demand-mappable wall — it needs explicit cross-AS arg marshaling for that SSN (like
-            // NtUserProcessConnect). Stop cleanly on the FIRST such fault (don't spin to DEMAND_CAP).
+            // window (>= 0x100_0000_0000); anything below is a csrss/user32/gdi32 USER pointer the
+            // handler dereferenced directly. Rather than zero-fill (WRONG data), SHARE csrss's own
+            // frame for that page into win32k at the same VA — the authentic model where win32k
+            // dereferences the calling process's user address space.
             let foreign = addr < 0x0000_0100_0000_0000;
+            let page = addr & !0xFFF;
             if demand < 60 {
                 print_str(b"[w32disp] fault #");
                 print_u64(demand);
@@ -5354,23 +5476,33 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
                 print_hex((addr >> 32) as u32);
                 print_hex(addr as u32);
                 if foreign {
-                    print_str(b" (FOREIGN client ptr - needs marshaling)");
+                    print_str(b" (client ptr - sharing csrss frame)");
                 }
                 print_str(b"\n");
             }
-            if addr < 0x10000 || in_image || foreign || demand >= DEMAND_CAP {
+            // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
+            if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
                 return (0xC000_0001u32 as i32, false);
             }
-            let page = addr & !0xFFF;
-            let f = alloc_frame();
-            let mut e = page_map(f, page, RW_NX, host_pml4);
-            if e != 0 {
-                let npt = alloc_slot();
-                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
-                let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
-                e = page_map(f, page, RW_NX, host_pml4);
+            if foreign {
+                // Map the CALLER's (csrss's) own frame for this page into win32k at the identical VA.
+                // False = the page isn't backed by a recorded csrss frame (win32k would read garbage,
+                // or it's a PML4[2] client range needing per-SSN marshaling) — stop cleanly.
+                if !map_csrss_page_into_win32k(page, host_pml4) {
+                    return (0xC000_0001u32 as i32, false);
+                }
+            } else {
+                // A win32k-own demand-pageable page (past the image tail / session arena): zero-fill.
+                let f = alloc_frame();
+                let mut e = page_map(f, page, RW_NX, host_pml4);
+                if e != 0 {
+                    let npt = alloc_slot();
+                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
+                    let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
+                    e = page_map(f, page, RW_NX, host_pml4);
+                }
+                let _ = e;
             }
-            let _ = e;
             demand += 1;
             // Fix (B): resume win32k via its bound reply cap (Send-on-REPLY_W32 -> decode_reply ->
             // apply_fault_reply for the VMFault, length 0) then recv the next fault/DONE re-binding
