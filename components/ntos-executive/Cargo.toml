@@ -45,10 +45,9 @@ nt-compat-exports = { path = "../../crates/nt-compat-exports" }
 nt-hive-core = { path = "../../crates/nt-hive-core" }
 # Read-only regf parser — serves smss's registry from the REAL ReactOS SYSTEM hive read off disk.
 nt-hive-regf = { path = "../../crates/nt-hive-regf" }
-# Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls.
+# Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls; its
+# session_section primitive backs win32k's MmCreateSection/MmMapView*.
 nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
-# Memory manager — the raw-pointer session-section primitive backs win32k's MmCreateSection/MmMapView*.
-nt-memory-manager = { path = "../../crates/nt-memory-manager" }
 # KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }
@@ -58,7 +57,7 @@ nt-wdf-runtime = { path = "../../crates/nt-wdf-runtime" }
 
 [profile.release]
 panic = "abort"
-opt-level = 2
+opt-level = "s"
 lto = false
 debug = false
 codegen-units = 1

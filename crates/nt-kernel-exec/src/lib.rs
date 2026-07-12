@@ -18,6 +18,7 @@ mod event;
 mod interrupt;
 mod irql;
 mod lookaside;
+pub mod session_section;
 mod runtime;
 mod spin;
 mod timer;

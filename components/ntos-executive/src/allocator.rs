@@ -10,7 +10,11 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{null_mut, read_volatile, write_volatile};
 
-/// Base of the RW heap region the broker maps into each component.
+/// Base of the RW heap region the broker maps into each component. Sits just past the executive
+/// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
+/// float RIGHT AFTER the loaded image; the release profile is size-optimised so the image stays
+/// well below this base (if it grows into the aux zone the RO extra-BootInfo page can land on
+/// HEAP_BASE and `map_own_heap`'s RW map silently fails → first heap write faults RO at 0x480000).
 pub const HEAP_BASE: usize = 0x0000_0100_0048_0000;
 /// Heap size in 4 KiB frames (128 KiB). Shared by the executive and every spawned service (same
 /// binary); growing it costs extra frames/slots per component and exhausts the boot resource

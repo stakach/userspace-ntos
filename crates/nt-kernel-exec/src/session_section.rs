@@ -9,12 +9,14 @@
 //! mappings must resolve to the same memory, so a section object must remember the base it was
 //! mapped at and hand it back on every subsequent map.
 //!
-//! Like [`crate::`]-level object tables this would normally be a runtime registry, but the win32k
-//! host is allocation-free (its bump heap is spent by the time win32k runs), so the section object
-//! *carries its own state*: the caller allocates a small descriptor from its pool, and these pure
-//! layout functions (mirroring `nt-kernel-exec`'s `init_general_lookaside`) manage it. The field
-//! offsets + idempotent-map rule are the real semantics, unit-tested here and reused by every
-//! hosted binary that maps section-backed session memory.
+//! This would normally be a runtime registry, but the win32k host is allocation-free (its bump heap
+//! is spent by the time win32k runs), so the section object *carries its own state*: the caller
+//! allocates a small descriptor from its pool, and these pure layout functions (mirroring this
+//! crate's [`init_general_lookaside`](crate::init_general_lookaside)) manage it. The field offsets +
+//! idempotent-map rule are the real Mm section-object semantics, unit-tested here and reused by
+//! every hosted binary that maps section-backed session memory. (Lives in `nt-kernel-exec` beside
+//! the lookaside primitive — rather than `nt-memory-manager`, whose `alloc`/cache-manager section
+//! table would bloat the executive image past its 512 KiB budget.)
 
 /// `MM_SESSION_SECTION` descriptor field offsets (a compact section object; not a Windows-ABI
 /// struct — it is win32k-opaque, only round-tripped through the `Mm*` trampolines).

@@ -4744,6 +4744,7 @@ unsafe fn spawn_win32k_host(
     data_base: u64,
     shared_frame: u64,
     heap_base: u64,
+    arg_base: u64,
 ) -> u64 {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -4809,6 +4810,10 @@ unsafe fn spawn_win32k_host(
     }
     let sh = copy_cap(shared_frame);
     let _ = page_map(sh, win32k_host::WIN32K_SHARED_VADDR, RW_NX, pml4);
+    // The cross-AS arg-marshal frame(s) (same pool PT window as pool/data/shared).
+    for i in 0..win32k_host::WIN32K_ARG_FRAMES {
+        let _ = page_map(copy_cap(arg_base + i), win32k_host::WIN32K_ARG_VADDR + i * 0x1000, RW_NX, pml4);
+    }
     // The win32k session-heap + Mm-view arena (RtlAllocateHeap + MmMapView*) — 4096 frames =
     // 16 MiB, 8 PTs (0x0740_0000..0x0840_0000).
     for p in 0..(win32k_host::WIN32K_HEAP_FRAMES / 512) {
@@ -4838,6 +4843,10 @@ unsafe fn spawn_win32k_host(
     // win32k is a kernel driver: it reads the KPCR via `gs:[..]`. Point GS at a zeroed KPCR
     // placeholder so those reads resolve (0) instead of faulting on linear address `[0x30]` etc.
     let _ = tcb_set_gs_base(tcb, win32k_host::WIN32K_KPCR_VA);
+    // NOTE: win32k is NOT marked HOSTED (unlike smss/csrss): its init/trampoline code issues REAL
+    // seL4 syscalls (SysDebugPutChar for serial), which must dispatch natively. The dispatch loop's
+    // ready/done signal instead faults by putting an INVALID nr in RDX (see `dispatch_signal`), so
+    // only that one syscall becomes an UnknownSyscall the executive catches.
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     pml4
@@ -5010,6 +5019,74 @@ static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TCB: AtomicU64 = AtomicU64::new(0);
+/// The win32k component's fault endpoint + host PML4 (set once DriverEntry+attach parked it at the
+/// dispatch signal), so `win32k_dispatch` can drive its persistent service loop from anywhere.
+static WIN32K_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
+
+/// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
+/// loop until the handler completes (Milestone B). PRECONDITION: the component is blocked in its
+/// dispatch `seL4_Call` on `w_fault` (the executive has received the Call but not yet replied). We
+/// fill the request in the shared page, reply (the Call returns → the component runs the handler),
+/// then demand-page the handler's faults until the component issues its NEXT dispatch Call = "done".
+/// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
+unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32, bool) {
+    let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
+    let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
+    if w_fault == 0 {
+        return (0xC000_0001u32 as i32, false);
+    }
+    let sh = win32k_host::WIN32K_SHARED_VADDR;
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_SSN) as *mut u64, ssn);
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A0) as *mut u64, a0);
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A1) as *mut u64, a1);
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A2) as *mut u64, a2);
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A3) as *mut u64, a3);
+    core::ptr::write_volatile((sh + win32k_host::SH_REQ_STATUS) as *mut i32, 0);
+    let code_va = win32k_host::WIN32K_CODE_VA;
+    const DEMAND_CAP: u64 = 512;
+    let mut demand = 0u64;
+    // Reply to the parked dispatch Call (it returns in the component → runs the handler), then
+    // service the handler's demand-faults until it Calls again (done). A clean IPC reply — no
+    // register restore, because seL4_Call/Reply resumes the caller for us.
+    let (mut mi, mut m0, mut m1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+    loop {
+        let label = mi >> 12;
+        if label == 6 {
+            let addr = m1;
+            let in_image =
+                addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+            if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
+                return (0xC000_0001u32 as i32, false);
+            }
+            let page = addr & !0xFFF;
+            let f = alloc_frame();
+            let mut e = page_map(f, page, RW_NX, host_pml4);
+            if e != 0 {
+                let npt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, npt);
+                let _ = paging_struct_map(npt, LBL_X86_PAGE_TABLE_MAP, page, host_pml4);
+                e = page_map(f, page, RW_NX, host_pml4);
+            }
+            let _ = e;
+            demand += 1;
+            let (nmi, nm0, nm1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            continue;
+        }
+        if label == win32k_host::W32_DISPATCH_LABEL {
+            // The component issued its next dispatch Call — handler done. Read back the status. The
+            // component is now parked in that Call (received, unreplied) ready for the next dispatch.
+            let _ = m0;
+            let status = core::ptr::read_volatile((sh + win32k_host::SH_REQ_STATUS) as *const i32);
+            return (status, true);
+        }
+        // Any other fault (a real wall inside the handler) leaves the component un-parked — fail.
+        return (0xC000_0001u32 as i32, false);
+    }
+}
 
 /// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's `(rip, rsp, rax)`.
 unsafe fn tcb_read_rsp(tcb: u64) -> u64 {
@@ -7786,6 +7863,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let data_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
             let shared = alloc_frame();
+            // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
+            let arg_base = alloc_frame();
+            for _ in 1..win32k_host::WIN32K_ARG_FRAMES { let _ = alloc_frame(); }
             // The win32k session-heap arena (host-only; the executive doesn't map it).
             let heap_base = alloc_frame();
             for _ in 1..win32k_host::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
@@ -7797,6 +7877,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(copy_cap(data_base + i), win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             let _ = page_map(copy_cap(shared), win32k_host::WIN32K_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            for i in 0..win32k_host::WIN32K_ARG_FRAMES {
+                let _ = page_map(copy_cap(arg_base + i), win32k_host::WIN32K_ARG_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // Parse + copy sections + relocate + patch IAT. Fully HEAP-FREE + STACK-light: the
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
@@ -7825,6 +7908,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 data_base,
                 shared,
                 heap_base,
+                arg_base,
             );
 
             const DEMAND_CAP: u64 = 512;
@@ -7840,10 +7924,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // VMFault: MR0 = fault IP, MR1 = fault address.
                     let ip = m0;
                     let addr = m1;
-                    if addr == win32k_host::WIN32K_SENTINEL_VADDR {
-                        finished = true;
-                        break;
-                    }
                     faults += 1;
                     if faults <= 40 {
                         print_str(b"[win32k-svc] fault #");
@@ -7883,6 +7963,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
+                } else if label == win32k_host::W32_DISPATCH_LABEL {
+                    // DriverEntry+attach complete: the component reached its dispatch loop and issued
+                    // its ready Call (seL4_Call on the fault EP). Stop the bring-up loop, leaving it
+                    // parked in the Call (received, unreplied) — win32k_dispatch resumes it later.
+                    let _ = (m2, m3);
+                    finished = true;
+                    break;
                 } else {
                     // UnknownSyscall(2)/UserException(3)/CapFault(1): win32k hit a fail-loud
                     // trap import, a bad IAT slot, or an invalid instruction. Record + stop.
@@ -7891,6 +7978,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     wall_label = label;
                     break;
                 }
+            }
+
+            // If DriverEntry+attach parked the component at the dispatch sentinel (`finished`), it is
+            // now blocked awaiting reply — record its fault EP + host PML4 so `win32k_dispatch` can
+            // drive its persistent service loop (Milestone B) from anywhere (the csrss loop, later).
+            if finished {
+                WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
+                WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
             }
 
             let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);
@@ -8019,6 +8114,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"[win32k-svc] DriverEntry ran to STATUS_SUCCESS\n");
             }
             check(b"win32k_driver_entry_success", success, &mut passed);
+
+            // --- Milestone B: prove the PERSISTENT DISPATCH LOOP end-to-end. The component is now
+            // parked at the dispatch sentinel (not parked/dead). Marshal a USERCONNECT buffer into
+            // the shared arg frame and dispatch NtUserProcessConnect (SSN 0x10FA) THROUGH the loop
+            // (win32k_dispatch resume-replies the sentinel, services handler faults, waits the next
+            // sentinel = done). A clean round-trip (ok=true) proves csrss's win32k syscalls can be
+            // routed to the live component. The arg frame stands in for csrss's user pointer.
+            if finished {
+                core::ptr::write_bytes(win32k_host::WIN32K_ARG_VADDR as *mut u8, 0, 0x240);
+                let (st, ok) = win32k_dispatch(
+                    win32k_host::SSN_NT_USER_INITIALIZE,
+                    0x0000_0000_5A5A_0100, // a process handle (ObReferenceObjectByHandle → EPROCESS)
+                    win32k_host::WIN32K_ARG_VADDR, // USERCONNECT buffer in the shared arg frame
+                    0x240,
+                    0,
+                );
+                let seq = core::ptr::read_volatile(
+                    (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_REQ_SEQ) as *const u64,
+                );
+                print_str(b"[win32k-svc] DISPATCH-LOOP round-trip: SSN 0x10FA -> status=0x");
+                print_hex(st as u32);
+                print_str(if ok { b" (serviced, seq=" } else { b" (WALL, seq=" });
+                print_u64(seq);
+                print_str(b")\n");
+                check(b"win32k_dispatch_loop_roundtrip", ok && seq >= 1, &mut passed);
+            }
         }
     }
 

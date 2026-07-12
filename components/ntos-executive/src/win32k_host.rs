@@ -64,9 +64,15 @@ pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
-/// An unmapped VA the host reads once DriverEntry returns — the fault-recv loop recognises the
-/// address as "DriverEntry finished" (vs. a fault mid-init). Also in the pool PT window.
+/// An unmapped VA the host reads once DriverEntry returns / a dispatch completes — the fault-recv
+/// loop recognises the address as the "ready/done" signal (vs. a fault mid-init). Pool PT window.
 pub const WIN32K_SENTINEL_VADDR: u64 = 0x0000_0100_0719_0000;
+/// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
+/// component (within the pool PT window). The executive copies a dispatched syscall's user buffers
+/// here (sized per the win32k SSN signature); win32k's handler reads/writes them in its own context;
+/// the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
+pub const WIN32K_ARG_VADDR: u64 = 0x0000_0100_071A_0000;
+pub const WIN32K_ARG_FRAMES: u64 = 4;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 
@@ -80,6 +86,17 @@ pub const SH_SSDT_INDEX: u64 = 0x24; // out: recorded SSDT index (u32)
 pub const SH_POOL_USED: u64 = 0x30; // out: pool high-water (u64)
 pub const SH_NTUSER_HANDLER: u64 = 0x40; // out: resolved SSDT[0xFA] handler VA (u64)
 pub const SH_NTUSER_STATUS: u64 = 0x48; // out: NtUserInitialize NTSTATUS (i32)
+// Phase 2c dispatch-loop request/reply (executive → win32k, via the shared page). After
+// DriverEntry+attach the host enters a persistent loop: it trips the sentinel (ready/done), the
+// executive fills these fields + resume-replies, the host resolves the SSN through the registered
+// SSDT, invokes the handler in its own context (GS=KPCR/session heap), writes SH_REQ_STATUS, loops.
+pub const SH_REQ_SSN: u64 = 0x50; // in:  the win32k SSN (>= 0x1000) to dispatch (u64)
+pub const SH_REQ_A0: u64 = 0x58; // in:  handler arg0 (rcx)
+pub const SH_REQ_A1: u64 = 0x60; // in:  handler arg1 (rdx)
+pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
+pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
+pub const SH_REQ_STATUS: u64 = 0x78; // out: handler NTSTATUS (i32)
+pub const SH_REQ_SEQ: u64 = 0x80; // out: completed-request counter (u64) — observability
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
@@ -96,6 +113,14 @@ pub const V_NTUSER_RESOLVED: u32 = 0x200; // SSDT resolve(0x10FA) yielded a real
 /// The win32k NtUser/NtGdi shadow-SSDT base service number; SSN 0x10FA = NtUserInitialize.
 pub const WIN32K_SERVICE_BASE: u64 = 0x1000;
 pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
+
+/// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
+/// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
+/// the dispatch loop uses a genuine `seL4_Call` on its fault-endpoint cap ([`crate::CT_FAULT`]) —
+/// a normal, resumable IPC (send + block for the reply), not a fault. The executive receives faults
+/// AND these Calls on the same endpoint and tells them apart by the message label: fault labels are
+/// small (VMFault=6, UnknownSyscall=2, …), so this distinctive value never collides.
+pub const W32_DISPATCH_LABEL: u64 = 0x770;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 
@@ -280,7 +305,7 @@ extern "win64" fn s_rtl_free_heap() -> u64 {
     1
 }
 
-use nt_memory_manager::session_section::{
+use nt_kernel_exec::session_section::{
     init_section, is_section, map_section, section_object, section_size,
 };
 
@@ -764,9 +789,71 @@ pub unsafe extern "C" fn win32k_host_entry() -> ! {
         establish_client_and_dispatch();
     }
 
-    // Trip the sentinel: a read from an unmapped VA the executive's fault loop recognises.
-    let _ = read_volatile(WIN32K_SENTINEL_VADDR as *const u64);
-    park()
+    // Enter the persistent dispatch loop (Milestone B): the host does NOT park after attach — it
+    // serves win32k SSN requests forever. The first sentinel below IS the "DriverEntry+attach done"
+    // signal the executive's bring-up loop waits for; thereafter each sentinel means "ready / prior
+    // request done", and the executive fills a request + resume-replies to drive the next handler.
+    dispatch_loop()
+}
+
+/// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
+/// invoke its handler with up to four win64 register args. Returns the handler NTSTATUS (or
+/// `STATUS_INVALID_SYSTEM_SERVICE` if the SSN is out of range / unregistered).
+unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
+    const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000_001Cu32 as i32;
+    let base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+    let count = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_COUNT) as *const u32) as u64;
+    if base == 0 || ssn < WIN32K_SERVICE_BASE {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
+    let idx = ssn - WIN32K_SERVICE_BASE;
+    if count != 0 && idx >= count {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
+    let handler = read_volatile((base + idx * 8) as *const u64);
+    if handler == 0 {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
+    let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
+    f(a0, a1, a2, a3)
+}
+
+/// Issue the dispatch ready/done signal: a real `seL4_Call` on this component's fault-endpoint cap
+/// ([`crate::CT_FAULT`]) carrying [`W32_DISPATCH_LABEL`]. This is a normal, resumable IPC (send +
+/// block for the executive's reply), NOT a fault — so win32k needs no `TCBSetHostedSyscalls` flag
+/// (which would break its trampolines' real serial syscalls) and no register-restore trickery. The
+/// executive replies once it has filled the next request in the shared page; the Call then returns.
+#[inline(never)]
+unsafe fn dispatch_call() {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_CALL as u64,
+        in("rdi") crate::CT_FAULT,
+        in("rsi") W32_DISPATCH_LABEL << 12, // msginfo: label, length 0 (request via shared page)
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rsi") _,
+        options(nostack),
+    );
+}
+
+/// The persistent win32k dispatch service loop. Each iteration Calls the executive (ready/done); on
+/// the reply the executive has filled `SH_REQ_*`, so we resolve the SSN through the registered SSDT,
+/// invoke the handler in this component's context (GS=KPCR / session heap), and write
+/// `SH_REQ_STATUS`. Never returns.
+unsafe fn dispatch_loop() -> ! {
+    loop {
+        dispatch_call();
+        let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
+        let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
+        let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
+        let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
+        let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+        let status = dispatch_ssn(ssn, a0, a1, a2, a3);
+        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
+        let seq = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *const u64);
+        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq + 1);
+    }
 }
 
 /// Give the EPROCESS placeholder the fields win32k's process callout asserts, invoke win32k's
