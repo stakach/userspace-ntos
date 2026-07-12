@@ -159,3 +159,14 @@ nt-wdf-kmdf + the ring for both driver styles; the only difference is in-process
       consecutive rapid crashes -> DISABLE: write a flag to the service's ConfigManager registry
       (Start=4 / CrashCount) so userspace can see/disable it; no infinite crash loop. QEMU demo shows
       restart + backoff + disable-in-registry; unit tests cover health-reset + backoff + threshold.
+
+## Win32k Milestone C (session) — build lesson + winsrv wall
+- BUILD: `build_kernel.sh extern-rootserver` only REPACKAGES a pre-staged
+  `.tmp/rootserver.elf`. Run `components/ntos-executive/build.sh` FIRST (or use
+  `scripts/run-executive.sh`) or you boot a STALE executive (edits have no effect).
+- DONE: win32k comes up + parks BEFORE csrss; SSN>=0x1000 forward wired in
+  service_sec_image → win32k_dispatch. Gate 105/105 green.
+- WALL (winsrv deferred): re-enabling ServerDll=winsrv loads the full 14-DLL Win32
+  client stack, but user32 DllMain (UserClientDllInitialize, RVA 0x45ac0) null-derefs
+  the client-shared win32k connection global (gSharedInfo/USERCONNECT). Next grind =
+  the win32k↔user32 client connection + fix the csrss fault-loop hang on that null-deref.
