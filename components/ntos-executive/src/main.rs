@@ -2453,6 +2453,25 @@ struct ExecLoopCtx {
     /// The file handle smss/csrss opened for csrss.exe (NtOpenFile records it; NtCreateSection reads
     /// it to recognise the SEC_IMAGE for the subsystem process). Points at the loop-local.
     csrss_file_handle: *mut u64,
+    /// The SEC_IMAGE section handle for csrss.exe (NtCreateSection records; NtQuerySection/
+    /// NtCreateProcess read). Points at the loop-local.
+    csrss_section_handle: *mut u64,
+    /// The parsed csrss.exe PE (`None` on the earlier demo path). NtQuerySection synthesises its
+    /// SECTION_IMAGE_INFORMATION; NtCreateProcess spawns from it. Lifetime-erased raw ptr.
+    csrss_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
+    /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
+    filled_pages: *mut [u64; 256],
+    faults: *mut u64,
+    /// The faulting image's persistent executive scratch base (smss's), and the two images
+    /// NtQueryDefaultLocale may demand-fill from (the main image `pe` at PE_LOAD_BASE up to
+    /// `img_end`, and `ntdll_pe` in [`nt_base`,`nt_end`); `ntdll_pe` is null if absent).
+    scratch_base: u64,
+    pe: *const nt_pe_loader::PeFile<'static>,
+    ntdll_pe: *const nt_pe_loader::PeFile<'static>,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
 }
 
 struct ExecNtHandler {
@@ -3359,6 +3378,107 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC0000034 // no filesystem yet → not found (smss skips / uses defaults)
                 }
             },
+            // NtQuerySection(SectionHandle[R10], class[RDX]=args[1], buf[R8], len[R9], *ResultLen[sp+0x28]).
+            // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's entry
+            // point, stack sizes + subsystem before creating the initial thread. Return a 64-byte
+            // SECTION_IMAGE_INFORMATION derived from the section's backing PE (a registry DLL at its
+            // registry base, or the csrss.exe EXE at PE_LOAD_BASE).
+            NativeService::NtQuerySection => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &*ctx.reg;
+                let class = args[1]; // RDX
+                let buf = get_recv_mr(7); // R8
+                let sect = get_recv_mr(9); // R10 = SectionHandle
+                let sp = get_recv_mr(16);
+                let csrss_section_handle = *ctx.csrss_section_handle;
+                let csrss_pe = &*ctx.csrss_pe;
+                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(sect) {
+                    reg.image_info(i).map(|b| (b, reg.name(i)))
+                } else if csrss_section_handle != 0 && sect == csrss_section_handle {
+                    csrss_pe.as_ref().map(|p| {
+                        (
+                            nt_dll_registry::image_info(
+                                PE_LOAD_BASE,
+                                p.entry_point_rva(),
+                                p.size_of_image(),
+                                false,
+                            ),
+                            b"csrss.exe" as &[u8],
+                        )
+                    })
+                } else {
+                    None
+                };
+                if class == 1 && info.is_some() {
+                    let (bytes, who) = info.unwrap();
+                    // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
+                    for k in 0..8 {
+                        let mut w = [0u8; 8];
+                        w.copy_from_slice(&bytes[k * 8..k * 8 + 8]);
+                        smss_stack_write(buf + (k as u64) * 8, u64::from_le_bytes(w));
+                    }
+                    let rl = smss_stack_read(sp + 0x28); // arg4 = *ResultLength
+                    if rl != 0 {
+                        smss_stack_write(rl, 64);
+                    }
+                    let entry = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    print_str(b"[ntos-exec] NtQuerySection ");
+                    print_str(who);
+                    print_str(b" entry=0x");
+                    print_hex((entry >> 32) as u32);
+                    print_hex(entry as u32);
+                    print_str(b"\n");
+                    0
+                } else {
+                    self.stop = true;
+                    0xC0000002
+                }
+            },
+            // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId[RDX]=args[1]). Write en-US (0x409) to
+            // the output, which ntdll points at one of its own .data GLOBALS (not the stack) — so copy
+            // out through the target image page's persistent executive scratch mapping, demand-filling
+            // the page first if LdrpInitialize hasn't touched it yet.
+            NativeService::NtQueryDefaultLocale => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let out = args[1]; // RDX = *DefaultLocaleId
+                let pg = out & !0xFFFu64;
+                let filled_pages = &mut *ctx.filled_pages;
+                let faults = &mut *ctx.faults;
+                let mut idx = usize::MAX;
+                for i in 0..(*faults as usize).min(filled_pages.len()) {
+                    if filled_pages[i] == pg {
+                        idx = i;
+                        break;
+                    }
+                }
+                if idx == usize::MAX && (*faults as usize) < filled_pages.len() {
+                    let (base, tpe): (u64, *const nt_pe_loader::PeFile<'static>) =
+                        if pg >= PE_LOAD_BASE && pg < ctx.img_end {
+                            (PE_LOAD_BASE, ctx.pe)
+                        } else if ctx.nt_base != 0 && pg >= ctx.nt_base && pg < ctx.nt_end {
+                            (ctx.nt_base, ctx.ntdll_pe)
+                        } else {
+                            (0u64, ctx.pe)
+                        };
+                    if base != 0 {
+                        let scratch = ctx.scratch_base + *faults * 0x1000;
+                        let f = alloc_frame();
+                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                        let rights = fill_image_page(&*tpe, (pg - base) as u32, scratch);
+                        let _ = page_map(copy_cap(f), pg, rights, ctx.pml4);
+                        filled_pages[*faults as usize] = pg;
+                        idx = *faults as usize;
+                        *faults += 1;
+                    }
+                }
+                if idx != usize::MAX {
+                    core::ptr::write_volatile(
+                        (ctx.scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32,
+                        0x409,
+                    );
+                }
+                0
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3423,6 +3543,9 @@ fn build_nt_table() -> NativeServiceTable {
             // Workstream A batch 6 (group C ladder migrations): name-scoped file fakes.
             (NativeService::NtQueryAttributesFile, SSN_NT_QUERY_ATTRIBUTES_FILE as u32),
             (NativeService::NtOpenFile, SSN_NT_OPEN_FILE as u32),
+            // Workstream A batch 7 (group C): section-image query + locale demand-fill.
+            (NativeService::NtQuerySection, SSN_NT_QUERY_SECTION as u32),
+            (NativeService::NtQueryDefaultLocale, SSN_NT_QUERY_DEFAULT_LOCALE as u32),
         ],
     )
 }
@@ -4365,6 +4488,25 @@ unsafe fn service_sec_image(
                     nls_section_handle: &mut nls_section_handle as *mut u64,
                     reg: &mut reg as *mut nt_dll_registry::Registry,
                     csrss_file_handle: &mut csrss_file_handle as *mut u64,
+                    csrss_section_handle: &mut csrss_section_handle as *mut u64,
+                    csrss_pe: &csrss_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    filled_pages: &mut filled_pages as *mut [u64; 256],
+                    faults: &mut faults as *mut u64,
+                    scratch_base,
+                    // Erase the non-'static lifetime through a thin `*const ()` (the image bytes are
+                    // executive-lifetime; the loop outlives every `dispatch`).
+                    pe: pe as *const nt_pe_loader::PeFile as *const ()
+                        as *const nt_pe_loader::PeFile<'static>,
+                    ntdll_pe: match ntdll {
+                        Some((_, npe)) => {
+                            npe as *const nt_pe_loader::PeFile as *const ()
+                                as *const nt_pe_loader::PeFile<'static>
+                        }
+                        None => core::ptr::null(),
+                    },
+                    img_end,
+                    nt_base,
+                    nt_end,
                 });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
@@ -4598,91 +4740,6 @@ unsafe fn service_sec_image(
                 } else {
                     handled = false; // not the csrss section / not staged -> clean stop
                     result = 0xC0000002;
-                }
-            } else if m0 == SSN_NT_QUERY_SECTION {
-                // NtQuerySection(SectionHandle[R10], class[RDX], buf[R8], len[R9], *ResultLen[sp+0x28]).
-                // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's
-                // entry point, stack sizes + subsystem before creating the initial thread. Return a
-                // 64-byte SECTION_IMAGE_INFORMATION derived from the parsed csrss PE.
-                let class = m3;
-                let buf = get_recv_mr(7); // R8
-                let sect = get_recv_mr(9); // R10 = SectionHandle
-                // Pick the image this section is a view of: a registry DLL (csrsrv/basesrv/winsrv, a
-                // DLL at its registry base) vs the csrss.exe section (an EXE at PE_LOAD_BASE). Wrong
-                // info here (e.g. an EXE's for a DLL) → the loader rejects it (INVALID_IMAGE_FORMAT).
-                // nt-dll-registry synthesises the DLL structs; the EXE uses the same host-tested helper.
-                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(sect) {
-                    reg.image_info(i).map(|b| (b, reg.name(i)))
-                } else if csrss_section_handle != 0 && sect == csrss_section_handle {
-                    csrss_pe.as_ref().map(|p| {
-                        (
-                            nt_dll_registry::image_info(
-                                PE_LOAD_BASE,
-                                p.entry_point_rva(),
-                                p.size_of_image(),
-                                false,
-                            ),
-                            b"csrss.exe" as &[u8],
-                        )
-                    })
-                } else {
-                    None
-                };
-                if class == 1 && info.is_some() {
-                    let (bytes, who) = info.unwrap();
-                    // Copy the 64-byte SECTION_IMAGE_INFORMATION out to `buf` (8 bytes at a time).
-                    for k in 0..8 {
-                        let mut w = [0u8; 8];
-                        w.copy_from_slice(&bytes[k * 8..k * 8 + 8]);
-                        smss_stack_write(buf + (k as u64) * 8, u64::from_le_bytes(w));
-                    }
-                    let rl = smss_stack_read(sp + 0x28); // arg4 = *ResultLength
-                    if rl != 0 {
-                        smss_stack_write(rl, 64);
-                    }
-                    let entry = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    print_str(b"[ntos-exec] NtQuerySection ");
-                    print_str(who);
-                    print_str(b" entry=0x");
-                    print_hex((entry >> 32) as u32);
-                    print_hex(entry as u32);
-                    print_str(b"\n");
-                    // result stays 0 (SUCCESS)
-                } else {
-                    handled = false;
-                    result = 0xC0000002;
-                }
-            } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
-                // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the
-                // output, which ntdll points at one of its own .data GLOBALS (not the stack) — so
-                // copy out through the target image page's persistent executive scratch mapping,
-                // demand-filling the page first if LdrpInitialize hasn't touched it yet.
-                let out = m3; // RDX = *DefaultLocaleId
-                let pg = out & !0xFFFu64;
-                let mut idx = usize::MAX;
-                for i in 0..(faults as usize).min(filled_pages.len()) {
-                    if filled_pages[i] == pg { idx = i; break; }
-                }
-                if idx == usize::MAX && (faults as usize) < filled_pages.len() {
-                    let (base, tpe) = if pg >= PE_LOAD_BASE && pg < img_end {
-                        (PE_LOAD_BASE, pe)
-                    } else if nt_base != 0 && pg >= nt_base && pg < nt_end {
-                        (nt_base, ntdll.unwrap().1)
-                    } else { (0u64, pe) };
-                    if base != 0 {
-                        let scratch = scratch_base + faults * 0x1000;
-                        let f = alloc_frame();
-                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                        let rights = fill_image_page(tpe, (pg - base) as u32, scratch);
-                        let _ = page_map(copy_cap(f), pg, rights, pml4);
-                        filled_pages[faults as usize] = pg;
-                        idx = faults as usize;
-                        faults += 1;
-                    }
-                }
-                if idx != usize::MAX {
-                    core::ptr::write_volatile(
-                        (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
                 }
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
