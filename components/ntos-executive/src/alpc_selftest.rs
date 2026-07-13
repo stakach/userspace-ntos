@@ -13,7 +13,9 @@ use crate::{check, print_str, RingChannel};
 use bytemuck::Pod;
 use nt_alpc_abi::{
     msg_attr_flag, opcode as aop, port_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
-    AlpcContextAttr, AlpcCreatePortRequest, AlpcDataViewAttr, AlpcSendReceiveRequest, PortMessage,
+    AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcSendReceiveRequest, AlpcViewIoRequest,
+    PortMessage,
 };
 use nt_lpc_abi::{opcode as lop, LpcConnectPortRequest, LpcMessageRequest, LpcReceiveRequest};
 
@@ -90,6 +92,16 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         && (valid as u32) & msg_attr_flag::CONTEXT != 0
         && mtype as u16 == REQUEST;
     check(b"exec_alpc_message_context_preserved", ctx_ok, passed);
+
+    // Step 2: REAL cross-endpoint shared memory via a port section + two views.
+    // Endpoint A (client) writes big data into its view; endpoint B (server) reads
+    // it back through ITS view of the same section — proving the data travelled
+    // through shared memory, NOT the (tiny) PORT_MESSAGE body.
+    check(
+        b"exec_alpc_section_view_shared",
+        section_view_shared(chan, listen, client_h, server_h, &mut out),
+        passed,
+    );
 
     // ================= B. LPC client <-> ALPC host (the BRIDGE) =================
     let bname = utf16("\\BridgeLive");
@@ -180,6 +192,104 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     let (ls, _f, li, ldetail0, _lmt) = lpc_recv(chan, bclient_h, &mut out);
     let reply_ok = ls == STATUS_SUCCESS && &out[..li as usize] == &rmsg[..] && ldetail0 == 0;
     check(b"exec_bridge_alpc_reply_body_only", reply_ok, passed);
+}
+
+/// Step 2 driver: a port section shared by two views. Endpoint A writes big data
+/// through view A; endpoint B reads it back through view B (same backing store).
+/// The PORT_MESSAGE that signals it carries only a DATA_VIEW_ATTR + a tiny body.
+fn section_view_shared(
+    chan: &mut RingChannel<'_>,
+    listen: u64,
+    client_h: u64,
+    server_h: u64,
+    out: &mut [u8],
+) -> bool {
+    const SIZE: u64 = 0x4000;
+    const BIG: usize = 2048;
+
+    // Create the port section (real shared backing store) on the listen port.
+    let cs = AlpcCreatePortSectionRequest {
+        abi_size: core::mem::size_of::<AlpcCreatePortSectionRequest>() as u16,
+        port_handle: listen,
+        section_size: SIZE,
+        ..Default::default()
+    };
+    let (s, _f, sz, section, _d) = chan.raw(aop::ALPC_OP_CREATE_PORT_SECTION, &bytes(&cs), out);
+    if s != STATUS_SUCCESS || section == 0 || sz as u64 != SIZE {
+        return false;
+    }
+
+    // Two views of the SAME section — one per endpoint.
+    let mut mk_view = |chan: &mut RingChannel<'_>, out: &mut [u8]| -> u64 {
+        let cv = AlpcCreateSectionViewRequest {
+            abi_size: core::mem::size_of::<AlpcCreateSectionViewRequest>() as u16,
+            port_handle: listen,
+            alpc_section_handle: section,
+            view_size: SIZE,
+            ..Default::default()
+        };
+        let (s, _f, _i, vb, _d) = chan.raw(aop::ALPC_OP_CREATE_SECTION_VIEW, &bytes(&cv), out);
+        if s == STATUS_SUCCESS {
+            vb
+        } else {
+            0
+        }
+    };
+    let view_a = mk_view(chan, out);
+    let view_b = mk_view(chan, out);
+    if view_a == 0 || view_b == 0 || view_a == view_b {
+        return false;
+    }
+
+    // Endpoint A writes a big pattern THROUGH view A into the shared section.
+    let big: alloc::vec::Vec<u8> = (0..BIG).map(|i| (i as u32 * 5 + 1) as u8).collect();
+    let hdr = core::mem::size_of::<AlpcViewIoRequest>() as u32;
+    let mut w = bytes(&AlpcViewIoRequest {
+        abi_size: hdr as u16,
+        view_base: view_a,
+        view_offset: 0,
+        data_offset: hdr,
+        data_len_bytes: BIG as u32,
+        ..Default::default()
+    });
+    w.extend_from_slice(&big);
+    let (ws, _f, wn, _d0, _d1) = chan.raw(aop::ALPC_OP_WRITE_SECTION_VIEW, &w, out);
+    if ws != STATUS_SUCCESS || wn as usize != BIG {
+        return false;
+    }
+
+    // Endpoint A sends a small PORT_MESSAGE carrying a DATA_VIEW_ATTR referencing
+    // the view — NO big body (the data rides the shared section, not the message).
+    let signal = port_message(REQUEST, b"view-ready");
+    let view_attr = bytes(&AlpcDataViewAttr {
+        section_handle: section,
+        view_base: view_a,
+        view_size: BIG as u64,
+        ..Default::default()
+    });
+    alpc_send(chan, client_h, &signal, msg_attr_flag::VIEW, &view_attr, out);
+
+    // Endpoint B receives the signal (VIEW attribute present) ...
+    let (rs, _f, ri, valid, _mt) = alpc_recv(chan, server_h, out);
+    if rs != STATUS_SUCCESS
+        || &out[..ri as usize] != &signal[..]
+        || (valid as u32) & msg_attr_flag::VIEW == 0
+    {
+        return false;
+    }
+    // ... then reads the big data back THROUGH view B — the shared-memory proof.
+    let rd = AlpcViewIoRequest {
+        abi_size: hdr as u16,
+        view_base: view_b,
+        view_offset: 0,
+        data_len_bytes: BIG as u32,
+        ..Default::default()
+    };
+    let mut readback = [0u8; BIG];
+    let (rrs, _f, rn, _d0, _d1) = chan.raw(aop::ALPC_OP_READ_SECTION_VIEW, &bytes(&rd), &mut readback);
+    // Real cross-endpoint shared memory: view B sees view A's write, byte-for-byte,
+    // while the message body stayed small (10 bytes, not 2048).
+    rrs == STATUS_SUCCESS && rn as usize == BIG && readback[..] == big[..] && signal.len() < BIG
 }
 
 // --- ALPC drive helpers ----------------------------------------------------

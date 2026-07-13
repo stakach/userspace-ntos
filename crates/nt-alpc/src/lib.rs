@@ -54,7 +54,7 @@ use nt_alpc_abi::{
     msg_attr_flag, opcode, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
     AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest, AlpcReply,
-    AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr,
+    AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr, AlpcViewIoRequest,
 };
 use nt_port_core::{
     ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, QueuedMessage, ReceiveOutcome,
@@ -65,17 +65,33 @@ use nt_status::NtStatus;
 /// core's `"LP"` port-handle range).
 const ALPC_SECTION_BASE: u64 = 0x0000_4153_0000_0001;
 
-#[allow(dead_code)] // `size` is retained for the section geometry; read when views are wired.
+/// Upper bound on a port section's backing store, so a malformed/hostile
+/// `SectionSize` can't grow the broker's memory without bound. 8 MiB comfortably
+/// covers the WOW64 large-transfer path (real ALPC caps a section at
+/// `MaximumViewSize`, typically well under this).
+const MAX_SECTION_SIZE: u64 = 8 * 1024 * 1024;
+
+/// A port section: the REAL shared-memory region both endpoints map. `backing` is
+/// the actual bytes — every view of this section aliases it, so a write through
+/// one endpoint's view is visible through the other's (the "not a copy" proof).
+/// In a live two-VSpace deployment the broker additionally `copy_cap`+`page_map`s
+/// these frames into each endpoint's address space (the CSR-anonymous-section
+/// machinery); with the synthetic single-address-space endpoints exercised here
+/// the shared `backing` IS that region.
 struct PortSection {
     handle: u64,
     port_handle: u64,
     size: u64,
+    backing: Vec<u8>,
 }
 
-#[allow(dead_code)] // `section_handle`/`size` are retained geometry; read when views are wired.
+/// A mapped view of a section: a `view_base` handle plus the section it aliases
+/// and the byte offset within that section where the view starts.
 struct SectionView {
     view_base: u64,
     section_handle: u64,
+    /// Byte offset into the section's backing store where this view begins.
+    section_offset: u64,
     size: u64,
 }
 
@@ -136,6 +152,8 @@ impl AlpcServer {
             opcode::ALPC_OP_CREATE_SECTION_VIEW => self.op_create_section_view(in_buf),
             opcode::ALPC_OP_DELETE_PORT_SECTION => self.op_delete_port_section(in_buf),
             opcode::ALPC_OP_DELETE_SECTION_VIEW => self.op_delete_section_view(in_buf),
+            opcode::ALPC_OP_WRITE_SECTION_VIEW => self.op_write_section_view(in_buf),
+            opcode::ALPC_OP_READ_SECTION_VIEW => self.op_read_section_view(in_buf, out_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -251,16 +269,21 @@ impl AlpcServer {
         Ok(ok())
     }
 
-    // --- port sections / views (server-modeled this increment) ------------
+    // --- port sections / views (REAL shared backing store) ----------------
 
     fn op_create_port_section(&mut self, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreatePortSectionRequest = read_req(buf)?;
+        if req.section_size == 0 || req.section_size > MAX_SECTION_SIZE {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let handle = self.next_section;
         self.next_section += 1;
+        // Allocate the REAL backing store — the shared region views will alias.
         self.sections.push(PortSection {
             handle,
             port_handle: req.port_handle,
             size: req.section_size,
+            backing: alloc::vec![0u8; req.section_size as usize],
         });
         // detail0 = AlpcSectionHandle, information = ActualSectionSize (low 32).
         Ok(reply(NtStatus::SUCCESS, req.section_size as u32, handle, 0))
@@ -268,20 +291,29 @@ impl AlpcServer {
 
     fn op_create_section_view(&mut self, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
         let req: AlpcCreateSectionViewRequest = read_req(buf)?;
-        // The view must reference a known section.
-        if !self
+        // The view must reference a known section and fit within it.
+        let section = self
             .sections
             .iter()
-            .any(|s| s.handle == req.alpc_section_handle)
-        {
-            return Err(NtStatus::INVALID_HANDLE);
+            .find(|s| s.handle == req.alpc_section_handle)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let size = if req.view_size == 0 {
+            section.size
+        } else {
+            req.view_size
+        };
+        if size > section.size {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
         }
         let view_base = self.next_view_base;
-        self.next_view_base += req.view_size.max(0x1000);
+        self.next_view_base += size.max(0x1000);
         self.views.push(SectionView {
             view_base,
             section_handle: req.alpc_section_handle,
-            size: req.view_size,
+            // Views map the section from its start; every view of a section thus
+            // aliases the same backing bytes (the cross-endpoint sharing).
+            section_offset: 0,
+            size,
         });
         // detail0 = ViewBase (written back into ALPC_DATA_VIEW_ATTR.ViewBase).
         Ok(reply(NtStatus::SUCCESS, 0, view_base, 0))
@@ -297,6 +329,83 @@ impl AlpcServer {
         let req: AlpcHandleRequest = read_req(buf)?;
         self.views.retain(|v| v.view_base != req.handle);
         Ok(ok())
+    }
+
+    /// Write bytes THROUGH a mapped view into the section's shared backing store.
+    /// Because every view of a section aliases the same `backing`, a subsequent
+    /// read through ANOTHER endpoint's view of the same section observes these
+    /// bytes — real cross-endpoint shared memory, no message copy.
+    fn op_write_section_view(&mut self, buf: &[u8]) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcViewIoRequest = read_req(buf)?;
+        let data = read_blob(buf, req.data_offset, req.data_len_bytes)?;
+        let (section_handle, section_offset) =
+            self.resolve_view(req.view_base, req.view_offset, data.len() as u64)?;
+        let section = self
+            .sections
+            .iter_mut()
+            .find(|s| s.handle == section_handle)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let start = section_offset as usize;
+        let end = start + data.len();
+        section
+            .backing
+            .get_mut(start..end)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .copy_from_slice(data);
+        Ok(reply(NtStatus::SUCCESS, data.len() as u32, 0, 0))
+    }
+
+    /// Read bytes THROUGH a mapped view out of the section's shared backing store
+    /// into the reply frame.
+    fn op_read_section_view(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<AlpcReply, NtStatus> {
+        let req: AlpcViewIoRequest = read_req(buf)?;
+        let len = req.data_len_bytes as u64;
+        let (section_handle, section_offset) = self.resolve_view(req.view_base, req.view_offset, len)?;
+        let section = self
+            .sections
+            .iter()
+            .find(|s| s.handle == section_handle)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let start = section_offset as usize;
+        let end = start + len as usize;
+        let src = section
+            .backing
+            .get(start..end)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let n = src.len().min(out_buf.len());
+        out_buf[..n].copy_from_slice(&src[..n]);
+        Ok(reply(NtStatus::SUCCESS, n as u32, 0, 0))
+    }
+
+    /// Resolve a `(view_base, view_offset, len)` to the aliased section handle and
+    /// the absolute byte offset into its backing store, bounds-checking that
+    /// `[view_offset, view_offset+len)` stays within the view AND the section.
+    fn resolve_view(
+        &self,
+        view_base: u64,
+        view_offset: u64,
+        len: u64,
+    ) -> Result<(u64, u64), NtStatus> {
+        let view = self
+            .views
+            .iter()
+            .find(|v| v.view_base == view_base)
+            .ok_or(NtStatus::INVALID_HANDLE)?;
+        let end = view_offset
+            .checked_add(len)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if end > view.size {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let section_offset = view
+            .section_offset
+            .checked_add(view_offset)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        Ok((view.section_handle, section_offset))
     }
 
     /// Number of tracked port sections (diagnostics/tests).

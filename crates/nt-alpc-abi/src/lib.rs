@@ -199,6 +199,21 @@ pub mod opcode {
     pub const ALPC_OP_CREATE_SECTION_VIEW: u16 = 0x2309;
     pub const ALPC_OP_DELETE_SECTION_VIEW: u16 = 0x230a;
     pub const ALPC_OP_CLOSE_PORT: u16 = 0x230b;
+    // Section-view data plane: write/read bytes THROUGH a mapped view into the
+    // section's shared backing store (the ALPC big-data / WOW64 mechanism).
+    pub const ALPC_OP_WRITE_SECTION_VIEW: u16 = 0x230c;
+    pub const ALPC_OP_READ_SECTION_VIEW: u16 = 0x230d;
+}
+
+/// `AlpcSendReceiveRequest.flags` bits.
+pub mod send_flag {
+    /// On a receive, serialize the received `ALPC_MESSAGE_ATTRIBUTES` (the 8-byte
+    /// header + the per-attribute structs, in the fixed SECURITY,VIEW,CONTEXT,
+    /// HANDLE,TOKEN order) into the FRONT of the reply frame, before the message
+    /// body. `AlpcSendReceiveRequest.valid_attributes` is read as the receiver's
+    /// `AllocatedAttributes` (which attributes it has buffer space for); the
+    /// returned `ValidAttributes` = allocated & present.
+    pub const RECV_ATTRIBUTES: u32 = 0x1;
 }
 
 /// True if `op` is an ALPC opcode.
@@ -297,6 +312,27 @@ pub struct AlpcCreateSectionViewRequest {
     pub view_size: u64,
 }
 
+/// `ALPC_OP_WRITE_SECTION_VIEW` / `ALPC_OP_READ_SECTION_VIEW` — transfer bytes
+/// THROUGH a mapped section view into (write) or out of (read) the section's
+/// shared backing store. On a write the payload rides at `data_offset` in the
+/// request frame; on a read `data_len_bytes` bytes are returned in the reply
+/// frame. `view_offset` is the byte offset WITHIN the view.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcViewIoRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub flags: u32,
+    /// The `ViewBase` returned by `ALPC_OP_CREATE_SECTION_VIEW`.
+    pub view_base: u64,
+    /// Byte offset within the view.
+    pub view_offset: u64,
+    /// Where the write payload sits in the request frame (write only).
+    pub data_offset: u32,
+    /// Number of bytes to write (from the request frame) or read (into the reply).
+    pub data_len_bytes: u32,
+}
+
 /// `ALPC_OP_DISCONNECT_PORT` / `ALPC_OP_CLOSE_PORT` / `ALPC_OP_DELETE_*` —
 /// tear-down ops keyed by a single handle/id.
 #[repr(C)]
@@ -344,6 +380,7 @@ const _: () = {
     assert!(size_of::<AlpcSendReceiveRequest>() == 40);
     assert!(size_of::<AlpcCreatePortSectionRequest>() == 32);
     assert!(size_of::<AlpcCreateSectionViewRequest>() == 32);
+    assert!(size_of::<AlpcViewIoRequest>() == 32);
     assert!(size_of::<AlpcHandleRequest>() == 16);
     assert!(size_of::<AlpcReply>() == 24);
 };

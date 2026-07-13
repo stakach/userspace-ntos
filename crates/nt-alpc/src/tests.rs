@@ -7,7 +7,7 @@ use nt_alpc_abi::{
     msg_attr_flag, msg_type, opcode as aop, port_flag, AlpcAcceptConnectRequest,
     AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleRequest, AlpcSendReceiveRequest,
-    PortMessage,
+    AlpcViewIoRequest, PortMessage,
 };
 use nt_lpc_client::{Backend, LpcClient};
 use nt_lpc_server::{AcceptPolicy, ConnState, Server};
@@ -244,6 +244,112 @@ fn alpc_port_section_and_view() {
         &mut [],
     );
     assert_ne!(r.status, SUCCESS);
+}
+
+/// Step 2: two views of ONE section alias the same backing store — a write
+/// through view A is observed by a read through view B (real shared memory, not a
+/// copy). The `PortCore` is irrelevant here (sections are ALPC-only), so a fresh
+/// one is fine per dispatch; the sections/views live on `alpc`.
+#[test]
+fn section_view_shared_memory_not_a_copy() {
+    let mut alpc = AlpcServer::new();
+
+    // Create a 16 KiB section on a nominal port.
+    let cs = bytes(&AlpcCreatePortSectionRequest {
+        abi_size: size_of::<AlpcCreatePortSectionRequest>() as u16,
+        port_handle: 0x1000,
+        section_size: 0x4000,
+        ..Default::default()
+    });
+    let section = alpc
+        .dispatch(&mut PortCore::new(), aop::ALPC_OP_CREATE_PORT_SECTION, &cs, &mut [])
+        .detail0;
+    assert_ne!(section, 0);
+
+    // TWO views of the SAME section — one per endpoint.
+    let mk_view = |alpc: &mut AlpcServer| {
+        let cv = bytes(&AlpcCreateSectionViewRequest {
+            abi_size: size_of::<AlpcCreateSectionViewRequest>() as u16,
+            port_handle: 0x1000,
+            alpc_section_handle: section,
+            view_size: 0x4000,
+            ..Default::default()
+        });
+        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_CREATE_SECTION_VIEW, &cv, &mut [])
+            .detail0
+    };
+    let view_a = mk_view(&mut alpc);
+    let view_b = mk_view(&mut alpc);
+    assert_ne!(view_a, view_b, "distinct view bases");
+
+    // Endpoint A writes a big pattern through view A.
+    let big: Vec<u8> = (0..0x2000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut w = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_a,
+        view_offset: 0,
+        data_offset: size_of::<AlpcViewIoRequest>() as u32,
+        data_len_bytes: big.len() as u32,
+        ..Default::default()
+    });
+    w.extend_from_slice(&big);
+    let r = alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &w, &mut []);
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(r.information, big.len() as u32);
+
+    // Endpoint B reads through view B — sees A's write (same backing, no copy).
+    let rd = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_b,
+        view_offset: 0,
+        data_len_bytes: big.len() as u32,
+        ..Default::default()
+    });
+    let mut out = alloc::vec![0u8; big.len()];
+    let r = alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_READ_SECTION_VIEW, &rd, &mut out);
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(r.information as usize, big.len());
+    assert_eq!(out, big, "view B observes view A's write — shared, not copied");
+
+    // A second write through B is observed through A at a different offset.
+    let tail = [0xAAu8, 0xBB, 0xCC, 0xDD];
+    let mut w2 = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_b,
+        view_offset: 0x2000,
+        data_offset: size_of::<AlpcViewIoRequest>() as u32,
+        data_len_bytes: tail.len() as u32,
+        ..Default::default()
+    });
+    w2.extend_from_slice(&tail);
+    assert_eq!(
+        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &w2, &mut []).status,
+        SUCCESS
+    );
+    let rd2 = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_a,
+        view_offset: 0x2000,
+        data_len_bytes: tail.len() as u32,
+        ..Default::default()
+    });
+    let mut out2 = [0u8; 4];
+    alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_READ_SECTION_VIEW, &rd2, &mut out2);
+    assert_eq!(out2, tail);
+
+    // A write past the view bounds is rejected (no OOB).
+    let oob = bytes(&AlpcViewIoRequest {
+        abi_size: size_of::<AlpcViewIoRequest>() as u16,
+        view_base: view_a,
+        view_offset: 0x3FFF,
+        data_offset: size_of::<AlpcViewIoRequest>() as u32,
+        data_len_bytes: 0x10,
+        ..Default::default()
+    });
+    assert_ne!(
+        alpc.dispatch(&mut PortCore::new(), aop::ALPC_OP_WRITE_SECTION_VIEW, &oob, &mut []).status,
+        SUCCESS
+    );
 }
 
 // --- attribute (de)serialization + degradation ----------------------------

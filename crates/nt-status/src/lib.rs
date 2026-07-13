@@ -111,6 +111,8 @@ statuses! {
     BUFFER_TOO_SMALL = 0xC000_0023u32;
     /// The end of the file / device stream was reached.
     END_OF_FILE = 0xC000_0011u32;
+    /// A view size (e.g. an ALPC section view) exceeds the underlying section.
+    INVALID_VIEW_SIZE = 0xC000_0027u32;
 }
 
 #[cfg(test)]
