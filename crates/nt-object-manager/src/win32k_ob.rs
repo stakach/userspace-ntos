@@ -33,6 +33,25 @@ pub enum ObKind {
     Other,
 }
 
+/// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`], keying off the **real**
+/// [`object_type`](crate::object_type) statics (`ExDesktopObjectType` / `ExWindowStationObjectType`).
+///
+/// win32k reads these type pointers out of its imported data-export cells and hands them to the
+/// `Ob*` trampolines purely as identity tokens (the win32k.sys machine code only ever *writes* the
+/// desktop/window-station `->TypeInfo.*` fields and passes the pointer by identity — it never reads a
+/// field back). The executive points those cells at the real `OBJECT_TYPE` statics and resolves the
+/// win32k object type by comparing the pointer against their addresses; a pointer that matches
+/// neither is an unrecognized type ([`None`]).
+pub fn classify(type_ptr: u64) -> Option<ObKind> {
+    if type_ptr == crate::object_type::desktop_object_type_addr() {
+        Some(ObKind::Desktop)
+    } else if type_ptr == crate::object_type::window_station_object_type_addr() {
+        Some(ObKind::WindowStation)
+    } else {
+        None
+    }
+}
+
 /// DESKTOP body field offsets (`references/reactos/win32ss/user/ntuser/desktop.h` `struct _DESKTOP`).
 pub mod desktop {
     /// `PDESKTOPINFO pDeskInfo` — the desktop-info block hung off the DESKTOP body.
@@ -173,6 +192,25 @@ pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_keys_off_real_object_type_statics() {
+        use crate::object_type::{desktop_object_type_addr, window_station_object_type_addr};
+        // The real OBJECT_TYPE static addresses discriminate DESKTOP vs WINDOWSTATION.
+        assert_eq!(classify(desktop_object_type_addr()), Some(ObKind::Desktop));
+        assert_eq!(
+            classify(window_station_object_type_addr()),
+            Some(ObKind::WindowStation)
+        );
+        // Any other pointer (an unrecognized type, or a stale placeholder value) does not resolve.
+        assert_eq!(classify(0), None);
+        assert_eq!(classify(0xDEAD_BEEF), None);
+        assert_eq!(
+            classify(desktop_object_type_addr() ^ 0x1000),
+            None,
+            "a nearby-but-wrong pointer must not classify"
+        );
+    }
 
     #[test]
     fn registers_and_resolves_typed_objects() {

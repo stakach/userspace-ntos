@@ -17,6 +17,7 @@ mod access;
 mod handles;
 mod io;
 mod namespace;
+pub mod object_type;
 mod store;
 mod types;
 pub mod win32k_ob;

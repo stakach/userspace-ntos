@@ -34,8 +34,10 @@ pub fn export_descriptor(name: &str) -> Option<&'static ExportDescriptor> {
 /// holds the value (an object-type/Se/Nls placeholder pointer, or an architectural Mm boundary
 /// constant). The executive folds these into the [`Win32kExportRegistry`] by binding each name to
 /// its cell address; this list is the declared, host-tested contract of *which* names are data
-/// exports and their order. (Backlog: the 8 object-type/Se/Nls cells should become real
-/// nt-object-manager `OBJECT_TYPE`s instead of placeholder pointers.)
+/// exports and their order. The six object-type cells (`Ps*Type`, `Ex*ObjectType`,
+/// `LpcPortObjectType`) now resolve to **real** `nt_object_manager::object_type` `OBJECT_TYPE`
+/// statics (backlog item 1, done); `SeExports` (→ nt-security, item 2) and `NlsMbCodePageTag` (Nls
+/// data, item 3) remain placeholder cells.
 pub const WIN32K_DATA_EXPORTS: &[&str] = &[
     "PsProcessType",
     "PsThreadType",

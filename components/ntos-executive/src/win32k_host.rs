@@ -378,22 +378,16 @@ use nt_object_manager::win32k_ob::{
     init_desktop_body, ObHandleTable, ObKind, DESKTOPINFO_SIZE, DESKTOP_BODY_SIZE,
 };
 
-// The object-type discriminators are the type-object POINTERS win32k passes to Ob*: these are the
-// VALUES held in the data-export cells (see DATA_EXPORTS), i.e. the placeholder OBJECT_TYPE structs
-// win32k's InitDesktopImpl/InitWindowStationImpl wrote their TypeInfo into.
-pub const DESKTOP_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x0C0; // == *ExDesktopObjectType
-pub const WINSTA_TYPE_PTR: u64 = WIN32K_DATA_VADDR + 0x100; // == *ExWindowStationObjectType
-
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
-/// Classify the type-object VA win32k passed into an [`ObKind`] (`None` = an unrecognized type).
+/// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`] (`None` = an unrecognized
+/// type). The pointer is the value held in win32k's imported `ExDesktopObjectType` /
+/// `ExWindowStationObjectType` data cell — now the address of a **real** `OBJECT_TYPE` static (see
+/// [`object_type_cell_value`] / [`nt_object_manager::object_type`]). Discrimination is delegated to
+/// the host-tested crate, which compares against those static addresses.
 fn classify_type(obj_type: u64) -> Option<ObKind> {
-    match obj_type {
-        DESKTOP_TYPE_PTR => Some(ObKind::Desktop),
-        WINSTA_TYPE_PTR => Some(ObKind::WindowStation),
-        _ => None,
-    }
+    nt_object_manager::win32k_ob::classify(obj_type)
 }
 
 /// Allocate + zero a DESKTOP body (with a DESKTOPINFO hung off `pDeskInfo`@+0x08) from the win32k
@@ -1949,21 +1943,44 @@ pub fn export_addr(name: &str) -> u64 {
     }
 }
 
-/// (name, cell value). Object-type / SE_EXPORTS / NlsMbCodePageTag point at a zeroed placeholder
-/// struct in the DATA page-0 region; the Mm boundary constants hold their x64 values directly.
+/// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)
+/// now resolve at runtime to the address of a **real** `nt_object_manager::object_type` `OBJECT_TYPE`
+/// static (see [`object_type_cell_value`]) — their `0` here is a placeholder overridden in
+/// `load_into`. `SeExports` / `NlsMbCodePageTag` still point at a zeroed placeholder struct in the
+/// DATA page-0 region (backlog items 2/3: Se→nt-security, Nls data); the Mm boundary constants hold
+/// their x64 values directly.
 const DATA_EXPORTS: &[(&str, u64)] = &[
-    ("PsProcessType", WIN32K_DATA_VADDR + 0x040),
-    ("PsThreadType", WIN32K_DATA_VADDR + 0x080),
-    ("ExDesktopObjectType", WIN32K_DATA_VADDR + 0x0C0),
-    ("ExWindowStationObjectType", WIN32K_DATA_VADDR + 0x100),
-    ("ExEventObjectType", WIN32K_DATA_VADDR + 0x140),
-    ("LpcPortObjectType", WIN32K_DATA_VADDR + 0x180),
+    ("PsProcessType", 0),
+    ("PsThreadType", 0),
+    ("ExDesktopObjectType", 0),
+    ("ExWindowStationObjectType", 0),
+    ("ExEventObjectType", 0),
+    ("LpcPortObjectType", 0),
     ("SeExports", WIN32K_DATA_VADDR + 0x1C0),
     ("NlsMbCodePageTag", WIN32K_DATA_VADDR + 0x200),
     ("MmSystemRangeStart", 0xFFFF_0800_0000_0000),
     ("MmUserProbeAddress", 0x0000_7FFF_FFFF_0000),
     ("MmHighestUserAddress", 0x0000_7FFF_FFFF_EFFF),
 ];
+
+/// Resolve an object-type data-export name to the address of its **real** `OBJECT_TYPE` static, or
+/// [`None`] for a non-object-type export (Se/Nls placeholder, Mm constant). win32k reads this value
+/// out of the import cell as its `POBJECT_TYPE` type identity and, for the desktop / window-station
+/// types, writes its `->TypeInfo.{GenericMapping,ValidAccessMask,DefaultNonPagedPoolCharge}` fields
+/// into the struct (offsets +0xB0/+0xC0/+0xD0) — the `OBJECT_TYPE` static is sized and writable to
+/// absorb those writes. `classify_type` compares against the same addresses.
+fn object_type_cell_value(name: &str) -> Option<u64> {
+    use nt_object_manager::object_type as ot;
+    Some(match name {
+        "PsProcessType" => ot::process_object_type_addr(),
+        "PsThreadType" => ot::thread_object_type_addr(),
+        "ExDesktopObjectType" => ot::desktop_object_type_addr(),
+        "ExWindowStationObjectType" => ot::window_station_object_type_addr(),
+        "ExEventObjectType" => ot::event_object_type_addr(),
+        "LpcPortObjectType" => ot::port_object_type_addr(),
+        _ => return None,
+    })
+}
 
 // --- executive-side loader (fully manual, HEAP-FREE) -----------------------------------------
 //
@@ -2066,9 +2083,13 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
         }
     }
 
-    // Initialise the data-export placeholders (page 0, already zero) + cells (page 1).
-    for (idx, (_name, value)) in DATA_EXPORTS.iter().enumerate() {
-        write_volatile((WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64, *value);
+    // Initialise the data-export cells (page 1). The six object-type cells resolve to their real
+    // `OBJECT_TYPE` statics (win32k writes/uses them as typed identities); the rest hold their
+    // Se/Nls placeholder addresses or Mm constants. The page-0 placeholder region is now only used
+    // by the Se/Nls cells.
+    for (idx, (name, value)) in DATA_EXPORTS.iter().enumerate() {
+        let cell_value = object_type_cell_value(name).unwrap_or(*value);
+        write_volatile((WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64, cell_value);
     }
 
     // KPCR.Prcb.CurrentThread (gs:[0x188]) — win32k's INTERNAL KeGetCurrentThread reads this directly
