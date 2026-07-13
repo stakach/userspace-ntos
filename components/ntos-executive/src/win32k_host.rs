@@ -2835,6 +2835,22 @@ unsafe fn dispatch_loop() -> ! {
         let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
         let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
         let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+        // Each client dispatch begins with the dispatch thread owning NO windows. The desktop windows
+        // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
+        // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
+        // would wrongly see those desktop windows as ITS windows and fail "thread has windows",
+        // short-circuiting its `SetThreadDesktop(Winlogon) && SwitchDesktop(Winlogon)` (wlx.c:1077) —
+        // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Re-empty the current
+        // thread's WindowListHead (+0x2d8) each dispatch to restore the authentic invariant (in real
+        // Windows the desktop windows belong to a SEPARATE desktop/RIT thread; the desktop window is
+        // still reachable via pdesk->pDeskInfo->spwnd, not the thread list).
+        {
+            let t = read_volatile(SLOT_W32THREAD as *const u64);
+            let t = if t == 0 { PH_W32THREAD_VA } else { t };
+            let head = t + 0x2d8;
+            write_volatile(head as *mut u64, head);
+            write_volatile((head + 8) as *mut u64, head);
+        }
         if ssn == SSN_NT_USER_INITIALIZE_REAL {
             // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
             // real Event handles winsrv created via NtCreateEvent; win32k's IntInitWin32PowerManagement
