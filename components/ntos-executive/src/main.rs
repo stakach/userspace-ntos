@@ -848,6 +848,192 @@ unsafe fn make_object(obj: u64) -> u64 {
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
     s
 }
+// --- ITEM 2b: seL4 MECHANISM teardown (reclamation) invocations, SYS_CALL so they RETURN the error
+// label (0 = success). `TCBSuspend`=12 / `CNodeDelete`=23 (kernel InvocationLabel). CNodeDelete on a
+// slot under the ROOT CNode is the FULL reclamation primitive — the kernel (src/invocation.rs
+// cnode_delete) does, in one call: (1) suspend the TCB on a Thread-cap delete; (2) unmap a mapped
+// Frame's PTE + TLB-shootdown; (3) release the object's pool slot when it was the last reference;
+// (4) `reclaim_untyped_chain_at_tail` = roll the parent Untyped's `free_index` back so the bytes
+// become allocatable again (return-to-Untyped). So full Untyped-return needs NO new kernel primitive.
+const LBL_TCB_SUSPEND: u64 = 12;
+const LBL_CNODE_DELETE: u64 = 23;
+unsafe fn tcb_suspend_r(tcb: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") LBL_TCB_SUSPEND << 12 => reply,
+        inout("r10") 0u64 => _,
+        inout("r8") 0u64 => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// `CNodeDelete` slot `idx` under the caller's ROOT CNode. Same legacy invocation shape as
+/// `copy_cap_r`/`cnode_copy` (index in a2=r10, msginfo length 0 → the kernel defaults depth to
+/// WORD_BITS, which resolves a direct root-CNode slot). Returns the error label (0 = success).
+unsafe fn cnode_delete_r(idx: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_THREAD_CNODE => _,
+        inout("rsi") LBL_CNODE_DELETE << 12 => reply,
+        inout("r10") idx => _, // a2 = slot index under the root CNode
+        inout("r8") 0u64 => _, // a3 = depth (ignored; msginfo length 0 → WORD_BITS)
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// Retype `num` objects of `obj` (size `bits`) from an ARBITRARY untyped cap `untyped` into `dest`.
+/// (`untyped_retype_r` hardcodes `CAP_INIT_UNTYPED`; the reclamation self-test carves + fills a
+/// throwaway CHILD untyped.) Returns the error label (0 = success; non-zero once the untyped is
+/// exhausted).
+unsafe fn untyped_retype_from_r(untyped: u64, obj: u64, bits: u32, num: u32, dest: u64) -> u64 {
+    let size_num = ((bits as u64) << 32) | (num as u64);
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") untyped => _,
+        inout("rsi") LBL_UNTYPED_RETYPE << 12 => reply,
+        inout("r10") obj => _,
+        inout("r8") size_num => _,
+        inout("r9") dest => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+
+/// ITEM 2b — prove the seL4 MECHANISM-teardown (reclamation) end-to-end on a THROWAWAY untyped, with
+/// ZERO risk to the live boot: runs POST-LOOP (all spawns done), touches only freshly-retyped
+/// throwaway caps + an UNUSED offset of smss's (already-torn-down) demand-fill scratch region, and
+/// deletes everything it makes → the 3 hosted processes' TCB/VSpace/CSpace/frames are NEVER touched.
+/// Returns a bitmask of proven properties (all set = 0b11_1111 = the mechanism works). This is the
+/// reclamation MECHANISM the coordinator asked to prove before (optionally) applying it live.
+///
+/// `RECLAIM_VA`: an unused page of smss's 8-PT demand-fill scratch span (0x…1100_0000..0x…1200_0000,
+/// mapped into the executive's OWN VSpace); smss faulted ~136 pages (offsets < 0x9_0000), so page
+/// 3000 (offset 0xBB8_000) is free + its PT exists → a safe, isolated frame-map/unmap target.
+unsafe fn reclaim_mechanism_selftest() -> u64 {
+    const RECLAIM_VA: u64 = 0x0000_0100_1100_0000 + 3000 * 0x1000;
+    let mut ok = 0u64;
+
+    // (bit0) Carve a THROWAWAY child untyped — 2^16 = 64 KiB (room for ~16 x 4 KiB frames) — out of
+    // the boot untyped. Deleting it at the end returns those 64 KiB to CAP_INIT_UNTYPED.
+    let child = alloc_slot();
+    if untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_UNTYPED, 16, 1, child) == 0 {
+        ok |= 1 << 0;
+    }
+
+    // (bit1) FRAME RECLAMATION via Untyped-return. Allocate 4 KiB frames from the child until it is
+    // EXHAUSTED (round 1, count K); CNodeDelete every one (kernel rolls the child's free_index back);
+    // then allocate again INTO THE SAME SLOTS (round 2). round2 == round1 (and K >= 8) proves the
+    // deletes returned the full capacity to the untyped — the hard "return-to-Untyped" reclamation.
+    let mut fslots = [0u64; 20];
+    let mut round1 = 0usize;
+    while round1 < fslots.len() {
+        let s = alloc_slot();
+        if untyped_retype_from_r(child, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s) != 0 {
+            break; // child untyped exhausted
+        }
+        fslots[round1] = s;
+        round1 += 1;
+    }
+    let mut deleted_all = round1 > 0;
+    for i in 0..round1 {
+        if cnode_delete_r(fslots[i]) != 0 {
+            deleted_all = false;
+        }
+    }
+    let mut round2 = 0usize;
+    while round2 < round1 {
+        // Reuse the round-1 slot (now Null after delete): proves the slot AND the untyped bytes
+        // are both reclaimed. A fresh retype into a freed slot must succeed.
+        if untyped_retype_from_r(child, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fslots[round2]) != 0 {
+            break;
+        }
+        round2 += 1;
+    }
+    if deleted_all && round1 >= 8 && round2 == round1 {
+        ok |= 1 << 1;
+    }
+    // Clean up round-2 frames before the child is deleted.
+    for i in 0..round2 {
+        let _ = cnode_delete_r(fslots[i]);
+    }
+
+    // (bit2) TCB (thread) reclamation: retype a throwaway TCB, SUSPEND it (TCBSuspend), then delete
+    // it (CNodeDelete also suspends on a Thread-cap delete + releases the TCB pool slot).
+    let tcb = alloc_slot();
+    let tcb_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb) == 0;
+    let tcb_suspended = tcb_suspend_r(tcb) == 0;
+    let tcb_deleted = cnode_delete_r(tcb) == 0;
+    if tcb_made && tcb_suspended && tcb_deleted {
+        ok |= 1 << 2;
+    }
+
+    // (bit3) VSpace (PML4) + CSpace (CNode) reclamation: retype a throwaway PML4 + a CNode, delete
+    // both. This is the per-process CREATE mechanism's root caps (the same kinds spawn_sec_image
+    // makes for each hosted process), proven reclaimable.
+    let pml4 = alloc_slot();
+    let cnode = alloc_slot();
+    let pml4_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4) == 0;
+    let cnode_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, cnode) == 0;
+    if pml4_made && cnode_made && cnode_delete_r(pml4) == 0 && cnode_delete_r(cnode) == 0 {
+        ok |= 1 << 3;
+    }
+
+    // (bit4) FRAME-UNMAP-on-delete. Map throwaway frame A at RECLAIM_VA (executive's own VSpace),
+    // write a sentinel, read it back (mapped + writable); CNodeDelete A (the kernel unmaps its PTE +
+    // TLB-shootdown); map a FRESH zeroed frame B at the SAME VA — B mapping SUCCEEDS only if the PTE
+    // was cleared, and reads back 0 (B's zero fill, not A's sentinel) — proving A was truly unmapped.
+    let fa = alloc_slot();
+    let fb = alloc_slot();
+    let a_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fa) == 0;
+    let a_mapped = page_map_r(fa, RECLAIM_VA, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+    let mut unmap_ok = false;
+    if a_made && a_mapped {
+        core::ptr::write_volatile(RECLAIM_VA as *mut u32, 0xABCD_1234);
+        let a_val = core::ptr::read_volatile(RECLAIM_VA as *const u32);
+        let a_deleted = cnode_delete_r(fa) == 0; // kernel unmaps A's PTE
+        let b_made = untyped_retype_from_r(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fb) == 0;
+        let b_mapped = page_map_r(fb, RECLAIM_VA, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+        let b_val = if b_mapped {
+            core::ptr::read_volatile(RECLAIM_VA as *const u32)
+        } else {
+            0xFFFF_FFFF
+        };
+        // A was mapped+writable, A deleted, B re-mapped at the same VA (PTE was free), B reads its
+        // own zero fill (A's sentinel is gone) → frame-unmap-on-delete confirmed.
+        unmap_ok = a_val == 0xABCD_1234 && a_deleted && b_made && b_mapped && b_val == 0;
+        let _ = cnode_delete_r(fb); // tear down B (unmaps + reclaims)
+    }
+    if unmap_ok {
+        ok |= 1 << 4;
+    }
+
+    // (bit5) Return the throwaway child untyped's 64 KiB to the boot untyped (delete rolls
+    // CAP_INIT_UNTYPED's free_index back through the parent chain).
+    if cnode_delete_r(child) == 0 {
+        ok |= 1 << 5;
+    }
+
+    print_str(b"[ntos-exec] item2b reclaim self-test: ok=0x");
+    print_hex(ok as u32);
+    print_str(b" round1=");
+    print_u64(round1 as u64);
+    print_str(b" round2=");
+    print_u64(round2 as u64);
+    print_str(b"\n");
+    ok
+}
 unsafe fn attach_sched_context(tcb: u64) {
     let sc = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
@@ -6745,6 +6931,12 @@ unsafe fn service_sec_image(
             hl_ok |= 4; // no cross-process aliasing
         }
         PM_HANDLE_LOCAL_OK.store(hl_ok, Ordering::Relaxed);
+
+        // ITEM 2b — prove the seL4 MECHANISM-teardown (reclamation) on a THROWAWAY untyped/caps.
+        // Runs here (post-loop, live boot only) alongside the other lifecycle self-tests; it touches
+        // ONLY freshly-retyped throwaway caps + an unused scratch page, deletes everything it makes,
+        // and never touches the 3 hosted processes' resources → byte-identical boot.
+        PM_RECLAIM_OK.store(reclaim_mechanism_selftest(), Ordering::Relaxed);
     }
     if csrss_process_handle != 0 {
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
@@ -8229,6 +8421,10 @@ static PM_TERMINATE_THREAD_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff pi=i's main ETHREAD is Terminated (signalled) via a live NtTerminateThread. Bit 1
 /// (csrss) is set during a normal boot; bits 0/2 stay clear (smss/winlogon don't self-exit at boot).
 static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
+/// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
+/// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
+/// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
+static PM_RECLAIM_OK: AtomicU64 = AtomicU64::new(0);
 // === Path 3 — fold the per-pi IDENTITY arrays into an EPROCESS-linked per-process struct =========
 /// Executive-side per-hosted-process MECHANISM state, EPROCESS-linked. Path 3 of the nt-process
 /// convergence folds the six parallel `[_;3]` identity arrays that `service_sec_image` indexed by
@@ -12288,6 +12484,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" nt-terminate-process-calls=0x");
                     print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
+                    // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
+                    // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-
+                    // PTE unmap, pool-slot release, AND parent-Untyped free_index rollback = return-to-
+                    // Untyped), so NO new kernel primitive is needed. 0b11_1111 = all 6 sub-proofs pass:
+                    // child untyped carved, frame Untyped-return (retype→delete→retype == full count),
+                    // TCB suspend+delete, PML4+CNode delete, frame-unmap-on-delete, child untyped
+                    // returned. The 3 hosted processes' caps/frames are UNTOUCHED (boot byte-identical).
+                    check(
+                        b"exec_sel4_reclaim_mechanism",
+                        PM_RECLAIM_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        &mut passed,
+                    );
                     // Path 3 — the six ex-parallel per-pi identity arrays (pml4s/scratch_bases/
                     // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
                     // EPROCESS-linked via its `pid`. `exec_eprocess_linked_mechanism` = every hosted
@@ -12348,6 +12556,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_ntopenprocess_mints_handle", false, &mut passed);
                     check(b"exec_ntterminateprocess_teardown", false, &mut passed);
                     check(b"exec_live_terminate_thread_routed", false, &mut passed);
+                    check(b"exec_sel4_reclaim_mechanism", false, &mut passed);
                     check(b"exec_eprocess_linked_mechanism", false, &mut passed);
                     check(b"exec_process_local_handle_values", false, &mut passed);
                 }
