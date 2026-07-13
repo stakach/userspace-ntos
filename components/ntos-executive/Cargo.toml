@@ -48,6 +48,9 @@ nt-hive-regf = { path = "../../crates/nt-hive-regf" }
 # Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls; its
 # session_section primitive backs win32k's MmCreateSection/MmMapView*.
 nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+# Security Reference Monitor — its heap-free se_exports primitive backs win32k's SeExports data
+# export (well-known SIDs / privilege LUIDs) + SeQueryAuthenticationIdToken (SYSTEM auth LUID).
+nt-security = { path = "../../crates/nt-security" }
 # KMDF/WDF runtime — host a real KMDF driver through the full WDF lifecycle.
 nt-wdf-types = { path = "../../crates/nt-wdf-types" }
 nt-wdf-object = { path = "../../crates/nt-wdf-object" }

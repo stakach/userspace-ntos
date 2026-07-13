@@ -52,6 +52,14 @@ pub const WIN32K_KPCR_VA: u64 = WIN32K_DATA_VADDR + 0x2000;
 /// A zeroed page used as the fake HEAP handle `RtlCreateHeap` returns (win32k stores it + passes
 /// it back to RtlAllocateHeap; any field reads see 0). Page 3 of the DATA region.
 pub const WIN32K_HEAP_HANDLE: u64 = WIN32K_DATA_VADDR + 0x3000;
+/// The real `SE_EXPORTS` struct (well-known SID pointers + privilege LUIDs) that win32k's `SeExports`
+/// data-export cell points at, built by [`nt_security::se_exports::build_se_exports`]. Lives in DATA
+/// page 0 (the old zeroed placeholder region, clear of the SeExports/Nls placeholders at +0x1C0/
+/// +0x200). win32k reads only `SeAliasAdminsSid` (+0x110), off the interactive boot/paint path
+/// (`IntCreateServiceSecurity`, non-interactive service window-station).
+const WIN32K_SE_EXPORTS_VA: u64 = WIN32K_DATA_VADDR + 0x800;
+/// The SID blob pool the `SE_EXPORTS` pointer members reference (DATA page 0, after the struct).
+const WIN32K_SE_SID_POOL_VA: u64 = WIN32K_DATA_VADDR + 0xA00;
 /// Per-process win32 state (page 4): the current-process win32-slots + a copy of win32k's callout
 /// table (recorded by PsEstablishWin32Callouts). Single hosted client (csrss) for now.
 const SLOT_W32PROCESS: u64 = WIN32K_DATA_VADDR + 0x4000; // Ps{Set,Get}ProcessWin32Process slot
@@ -319,6 +327,29 @@ extern "win64" fn s_zero() -> u64 {
 }
 extern "win64" fn s_true() -> u64 {
     1
+}
+
+/// `NTSTATUS SeQueryAuthenticationIdToken(PACCESS_TOKEN Token, PLUID AuthenticationId)`.
+///
+/// The ONE Se* function on the boot/connect path (backlog item 3, Se→nt-security): win32k's
+/// `GetProcessLuid` (→ `IntResolveDesktop` → `InitThreadCallback`, the per-thread win32k connect
+/// callout) calls it while a GUI thread attaches; a failing/zero-LUID result aborts desktop
+/// resolution. Model the SYSTEM subject (the init path runs as Local System): write the well-known
+/// SYSTEM logon-session LUID + return STATUS_SUCCESS. Behavior-preserving — the prior `s_zero` stub
+/// already returned SUCCESS(0); this additionally fills a genuine LUID
+/// (`nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID`) into the caller's out-param.
+extern "win64" fn s_se_query_authentication_id_token(_token: u64, luid_out: *mut u32) -> i32 {
+    if !luid_out.is_null() {
+        // SAFETY: luid_out is win32k's stack-local &LUID (2 x u32); the component stack is mapped.
+        unsafe {
+            write_unaligned(luid_out, nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW);
+            write_unaligned(
+                luid_out.add(1),
+                nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32,
+            );
+        }
+    }
+    0 // STATUS_SUCCESS
 }
 
 const PH_ETHREAD: u64 = WIN32K_DATA_VADDR + 0x600;
@@ -2022,6 +2053,16 @@ fn register_trampolines() {
     reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
     reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
     reg.bind("ExGetPreviousMode", s_true as usize as u64);
+    // --- batch 5: Se → nt-security (backlog item 3) ---
+    // SeQueryAuthenticationIdToken is the only Se* on the boot/connect path (win32k GetProcessLuid);
+    // return the SYSTEM auth LUID + SUCCESS. The SeExports DATA cell resolves to a real SE_EXPORTS
+    // (built in load_into). The subject-context/privilege group (SeCaptureSubjectContext/Se{Lock,
+    // Unlock,Release}SubjectContext/SePrivilegeCheck) is win32k shutdown-path only (HasPrivilege →
+    // UserInitiateShutdown), off the boot/paint path → left as declared s_zero stubs for now.
+    reg.bind(
+        "SeQueryAuthenticationIdToken",
+        s_se_query_authentication_id_token as usize as u64,
+    );
     // --- batch 4: DATA EXPORTS folded in as data-cell resolutions. The IAT slot points at the
     // cell (WIN32K_DATA_VADDR page 1); load_into writes each cell's VALUE from DATA_EXPORTS. The
     // 8 object-type/Se/Nls cells still hold placeholder pointers (backlog: real OBJECT_TYPEs);
@@ -2056,9 +2097,10 @@ pub fn export_addr(name: &str) -> u64 {
 /// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)
 /// now resolve at runtime to the address of a **real** `nt_object_manager::object_type` `OBJECT_TYPE`
 /// static (see [`object_type_cell_value`]) — their `0` here is a placeholder overridden in
-/// `load_into`. `SeExports` / `NlsMbCodePageTag` still point at a zeroed placeholder struct in the
-/// DATA page-0 region (backlog items 2/3: Se→nt-security, Nls data); the Mm boundary constants hold
-/// their x64 values directly.
+/// `load_into`. `SeExports` now points at a **real** `nt_security::se_exports` `SE_EXPORTS` struct
+/// ([`WIN32K_SE_EXPORTS_VA`], well-known SIDs + privilege LUIDs) built in `load_into` (backlog item 3,
+/// Se→nt-security); `NlsMbCodePageTag` still points at a zeroed placeholder (backlog: Nls data); the
+/// Mm boundary constants hold their x64 values directly.
 const DATA_EXPORTS: &[(&str, u64)] = &[
     ("PsProcessType", 0),
     ("PsThreadType", 0),
@@ -2066,7 +2108,7 @@ const DATA_EXPORTS: &[(&str, u64)] = &[
     ("ExWindowStationObjectType", 0),
     ("ExEventObjectType", 0),
     ("LpcPortObjectType", 0),
-    ("SeExports", WIN32K_DATA_VADDR + 0x1C0),
+    ("SeExports", WIN32K_SE_EXPORTS_VA),
     ("NlsMbCodePageTag", WIN32K_DATA_VADDR + 0x200),
     ("MmSystemRangeStart", 0xFFFF_0800_0000_0000),
     ("MmUserProbeAddress", 0x0000_7FFF_FFFF_0000),
@@ -2201,6 +2243,17 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
         let cell_value = object_type_cell_value(name).unwrap_or(*value);
         write_volatile((WIN32K_DATA_VADDR + 0x1000 + idx as u64 * 8) as *mut u64, cell_value);
     }
+
+    // SeExports (backlog item 3, Se→nt-security): build a REAL SE_EXPORTS in DATA page 0 so
+    // win32k's `SeExports->SeAliasAdminsSid` deref (IntCreateServiceSecurity, the non-interactive
+    // service-window-station SD path — off the interactive boot/paint path) reads a genuine SID
+    // instead of NULL. The DATA frames are retype-zeroed, so the SID-pointer members win32k never
+    // reads stay NULL (matching NT, which only populates what a driver asks for at this stage).
+    nt_security::se_exports::build_se_exports(
+        WIN32K_SE_EXPORTS_VA as *mut u8,
+        WIN32K_SE_SID_POOL_VA as *mut u8,
+        WIN32K_SE_SID_POOL_VA,
+    );
 
     // KPCR.Prcb.CurrentThread (gs:[0x188]) — win32k's INTERNAL KeGetCurrentThread reads this directly
     // (bypassing the import trampoline). Point it at the same fake ETHREAD `s_current_thread` returns

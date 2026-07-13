@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod access;
+pub mod se_exports;
 mod sid;
 mod token;
 
