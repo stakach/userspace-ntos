@@ -230,6 +230,15 @@ pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
 /// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 
+/// SSN of NtUserCreateDesktop (WIN32K_SERVICE_BASE 0x1000 + SSDT idx 0x22d). When a hosted client
+/// (winlogon) drives its own CreateWindowStation→CreateDesktop→SwitchDesktop chain, its
+/// naturally-created DESKTOP objects come through the routed `dispatch_ssn` path; our Ob layer does
+/// not populate `pdesk->rpwinstaParent` (the winsta→desktop parent linkage IntCreateDesktop would
+/// set from the parse context), so we poke it after the create — exactly as the gfx-trigger's
+/// `create_winsta_and_desktop` does for the Default desktop — else NtUserSwitchDesktop NULL-derefs it
+/// (RVA 0x6c281→0x6c285). See the `dispatch_ssn` fixup.
+pub const SSN_NT_USER_CREATE_DESKTOP: u64 = 0x122d;
+
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
 /// the dispatch loop uses a genuine `seL4_Call` on its fault-endpoint cap ([`crate::CT_FAULT`]) —
@@ -2491,7 +2500,39 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
     let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
-    f(a0, a1, a2, a3)
+    let ret = f(a0, a1, a2, a3);
+
+    // Stand up the winsta->desktop parent linkage our Ob layer does not populate. A hosted client's
+    // (winlogon's) natural CreateDesktop returns a real DESKTOP body (IntCreateDesktop builds its
+    // window graph), but `pdesk->rpwinstaParent` (DESKTOP+0x20) stays NULL — in real win32k
+    // IntCreateDesktop sets it from the window station the desktop is parsed under. NtUserSwitchDesktop
+    // then derefs it (session-id guard RVA 0x6c281→0x6c285; WSS_LOCKED guard :3007; the
+    // `rpwinstaParent == InputWindowStation` guard :3015) and NULL-derefs without it. Poke it to the
+    // interactive window station (the single-instance cached WINDOWSTATION == the InputWindowStation
+    // global the bring-up gfx-trigger already set) — the same field the gfx-trigger's
+    // `create_winsta_and_desktop` pokes on the Default desktop. The returned HDESK is a small handle
+    // (0xc/0x10/0x14) so the i32 return carries it intact.
+    if ssn == SSN_NT_USER_CREATE_DESKTOP && ret != 0 {
+        let hdesk = (ret as u32) as u64;
+        let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
+        let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
+        if desk_body != 0 && winsta_body != 0 {
+            let rpwinsta = (desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64;
+            if read_volatile(rpwinsta) == 0 {
+                write_volatile(rpwinsta, winsta_body);
+                // Keep the InputWindowStation global consistent (it is already set by the bring-up
+                // gfx-trigger to this same cached body; setting it is idempotent/harmless).
+                write_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64, winsta_body);
+                print_str(b"[win32k-host] routed NtUserCreateDesktop hDesk=0x");
+                print_hex(hdesk as u32);
+                print_str(b" rpwinstaParent set -> body=0x");
+                print_hex((desk_body >> 32) as u32);
+                print_hex(desk_body as u32);
+                print_str(b"\n");
+            }
+        }
+    }
+    ret
 }
 
 /// Signal ready/done to the executive: a PLAIN `seL4_Send` on this component's fault-endpoint cap

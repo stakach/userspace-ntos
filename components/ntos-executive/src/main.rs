@@ -5986,7 +5986,55 @@ unsafe fn service_sec_image(
                     print_u64(pi as u64);
                     print_str(b"\n");
                 }
+                // NATURAL-PAINT PROOF (task step 3; does NOT retire the gfx-trigger). Right BEFORE
+                // winlogon's own NtUserSwitchDesktop (SSN 0x1288), clear the whole framebuffer to
+                // magenta so that if winlogon's switch -> co_IntShowDesktop -> IntPaintDesktop paints,
+                // we can SEE it re-fill the fb (the bring-up gfx-trigger already painted 0x003a6ea5, so
+                // without clearing we couldn't distinguish the natural paint from the scaffold's). The
+                // scaffold's counted spec sampled BEFORE this (it ran during bring-up), so clearing now
+                // doesn't affect it.
+                let winlogon_switch = m0 == 0x1288 && badge == WINLOGON_BADGE;
+                if winlogon_switch {
+                    let fb = FB_VADDR as *mut u32;
+                    for i in 0..(1024u64 * 768) {
+                        core::ptr::write_volatile(fb.add(i as usize), 0x00FF_00FF);
+                    }
+                    print_str(b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n");
+                }
                 let (st, ok) = win32k_dispatch(m0, d_a0, d_a1, a2, a3);
+                if winlogon_switch {
+                    // Read back the same 768-px sampled grid the scaffold uses; count how many
+                    // winlogon's OWN SwitchDesktop flow re-painted to the WC_DESKTOP background.
+                    let fb = FB_VADDR as *const u32;
+                    let mut matched = 0u32;
+                    let mut changed = 0u32;
+                    let mut sample0 = 0u32;
+                    for r in 0..24u64 {
+                        for c in 0..32u64 {
+                            let idx = (r * 32 * 1024 + c * 32) as usize;
+                            let px = core::ptr::read_volatile(fb.add(idx));
+                            if r == 0 && c == 0 {
+                                sample0 = px;
+                            }
+                            if px != 0x00FF_00FF {
+                                changed += 1;
+                            }
+                            if px == FB_DESKTOP_BG {
+                                matched += 1;
+                            }
+                        }
+                    }
+                    WINLOGON_NATURAL_PAINT.store(matched as u64, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
+                    print_hex(st as u32);
+                    print_str(b" -> NATURAL fb readback: changed ");
+                    print_u64(changed as u64);
+                    print_str(b"/768, desktop-bg ");
+                    print_u64(matched as u64);
+                    print_str(b"/768 (px0=0x");
+                    print_hex(sample0);
+                    print_str(b")\n");
+                }
                 if has_buf && ok {
                     let arg = win32k_host::WIN32K_ARG_VADDR;
                     // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the
@@ -7242,6 +7290,14 @@ static FB_PIXELS_MATCH: AtomicU64 = AtomicU64::new(0);
 static FB_PIXELS_SAMPLE0: AtomicU64 = AtomicU64::new(0);
 /// The number of framebuffer pixels sampled on the readback grid (24 rows x 32 cols).
 const FB_SAMPLE_COUNT: u64 = 24 * 32;
+/// Proof that winlogon's OWN natural NtUserSwitchDesktop -> co_IntShowDesktop -> IntPaintDesktop
+/// flow paints the framebuffer (distinct from the SSN_INIT_DESKTOP_GFX scaffold, which still drives
+/// the counted `exec_win32k_desktop_painted` spec). Set by the forward arm around winlogon's
+/// SwitchDesktop (SSN 0x1288): the fb is cleared to magenta (0x00FF00FF) BEFORE the switch and the
+/// sampled grid is re-read AFTER — this records how many sampled pixels winlogon's flow re-painted to
+/// [`FB_DESKTOP_BG`]. 0 = not yet observed; a full 768 = the natural flow paints. The scaffold is NOT
+/// retired this increment (this is a demonstration alongside the safety net).
+static WINLOGON_NATURAL_PAINT: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
 /// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
 /// is the value the Phase-0a magenta (0x00FF00FF) test pattern must flip to when the desktop is
@@ -11165,6 +11221,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             d == 2 && matched == FB_SAMPLE_COUNT && sample0 as u32 == FB_DESKTOP_BG,
             &mut passed,
         );
+        // NATURAL-FLOW PROOF (diagnostic, NOT yet a counted spec — the scaffold above is still the
+        // gate). The forward arm cleared the fb to magenta right before winlogon's OWN
+        // NtUserSwitchDesktop (SSN 0x1288) and re-read the grid after; a full 768 = winlogon's
+        // natural co_IntShowDesktop -> IntPaintDesktop re-painted the framebuffer itself. This
+        // demonstrates the natural paint works while the SSN_INIT_DESKTOP_GFX safety net remains.
+        let nat = WINLOGON_NATURAL_PAINT.load(Ordering::Relaxed);
+        print_str(b"[ntos-exec] winlogon NATURAL SwitchDesktop paint: ");
+        print_u64(nat);
+        print_str(b"/");
+        print_u64(FB_SAMPLE_COUNT);
+        print_str(if nat == FB_SAMPLE_COUNT {
+            b" px re-painted 0x003a6ea5 (natural flow PAINTS)\n".as_slice()
+        } else {
+            b" px (natural flow did NOT fully re-paint)\n".as_slice()
+        });
     }
 
     // --- Phase 2 (graphics): PROTOTYPE-bind the real ReactOS win32k.sys against the driver-host
