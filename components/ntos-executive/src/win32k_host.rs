@@ -210,6 +210,19 @@ pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
 pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
 /// NtUserCreateDesktop — SSDT idx 0x22d, calls IntCreateDesktop (RVA 0x657f0).
 pub const NT_USER_CREATE_DESKTOP_RVA: u64 = 0x6b530;
+/// NtUserSwitchDesktop — SSDT idx 0x288 (w32ksvc64.h), the AUTHENTIC setter of `gpdeskInputDesktop`
+/// (desktop.c:2971→:3044). We drive it directly (instead of poking `gpdeskInputDesktop`) once the
+/// desktop's `rpwinstaParent` + the `InputWindowStation` global are stood up (see below).
+pub const NT_USER_SWITCH_DESKTOP_RVA: u64 = 0x6c140;
+/// win32k `.data` global `InputWindowStation` (winsta.c:21) RVA — the interactive window station.
+/// `NtUserSwitchDesktop` requires `pdesk->rpwinstaParent == InputWindowStation` (desktop.c:3015) or it
+/// returns FALSE. Derived from the disasm at NtUserSwitchDesktop RVA 0x6c44e `mov rcx,[rip+0x19fc13]`
+/// (0x6c455 + 0x19fc13). We set it to our created WINDOWSTATION body before the switch.
+pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
+/// DESKTOP.rpwinstaParent offset (confirmed by the NtUserSwitchDesktop disasm: RVA 0x6c3b1
+/// `mov rax,[rax+0x20]` = pdesk->rpwinstaParent, then [+0x20]=WINSTATION.Flags for the WSS_LOCKED
+/// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
+pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
@@ -2754,28 +2767,52 @@ unsafe fn create_winsta_and_desktop() {
 
     // Set `gpdeskInputDesktop` to the created DESKTOP body so `IntGetActiveDesktop()` returns it and
     // `co_IntShowDesktop` (winsta.c:340, invoked next by co_IntInitializeDesktopGraphics) derefs a real
-    // `Desktop->pDeskInfo->spwnd` (the desktop window IntCreateWindow built) instead of NULL. This is
-    // what NtUserSwitchDesktop's `gpdeskInputDesktop = pdesk` does (desktop.c:3044); we poke it directly
-    // rather than drive NtUserSwitchDesktop (which needs InputWindowStation / rpwinstaParent / WSS_LOCKED
-    // state + IntValidateDesktopHandle we don't yet stand up). There is exactly one desktop, so the poke
-    // is equivalent + authentic for the paint path that follows.
+    // `Desktop->pDeskInfo->spwnd` (the desktop window IntCreateWindow built) instead of NULL.
+    //
+    // Drive the AUTHENTIC `NtUserSwitchDesktop` (desktop.c:2971) rather than poke the global directly:
+    // it is win32k's own `gpdeskInputDesktop = pdesk` writer (desktop.c:3044) and it validates the
+    // desktop through the real Ob handle (IntValidateDesktopHandle → ObReferenceObjectByHandle against
+    // ExDesktopObjectType). The switch guards (disasm of RVA 0x6c140) require, before it will set the
+    // global:
+    //   (1) pdesk->rpwinstaParent (DESKTOP+0x20) non-NULL and == the InputWindowStation global — else
+    //       desktop.c:3015 returns FALSE (and the session-id check at 0x6c281 derefs it);
+    //   (2) InputWindowStation (winsta.c:21 global, RVA 0x20c068) == that same window station;
+    //   (3) winsta->dwSessionId (WINSTATION+0) == PsGetCurrentProcessSessionId() (both 0 here);
+    //   (4) winsta->Flags (WINSTATION+0x20) WSS_LOCKED bit clear (zeroed body → clear).
+    // We stand up (1)+(2) from our created WINDOWSTATION body; (3)+(4) hold for the zeroed body. This is
+    // strictly MORE authentic than the old blind poke — the switch now runs win32k's real handle
+    // validation + winsta-locking checks. On this first switch gpdeskInputDesktop is NULL so the
+    // hide-previous-desktop branch (desktop.c:3031) is skipped; the switch's own trailing
+    // co_IntShowDesktop runs with bRedraw=FALSE (no paint — SM_CX/CYSCREEN are still 0 pre-InitVideo),
+    // then co_IntInitializeDesktopGraphics's :340 co_IntShowDesktop(bRedraw=TRUE) does the real paint.
     let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
-    if desk_body != 0 {
-        write_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *mut u64, desk_body);
-        print_str(b"[win32k-host] gpdeskInputDesktop <- desktop body=0x");
-        print_hex((desk_body >> 32) as u32);
-        print_hex(desk_body as u32);
+    let winsta_body = (*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body();
+    if desk_body != 0 && winsta_body != 0 {
+        // (1) pdesk->rpwinstaParent = our WINDOWSTATION body.
+        write_volatile((desk_body + DESKTOP_RPWINSTA_PARENT_OFF) as *mut u64, winsta_body);
+        // (2) the interactive InputWindowStation global = the same window station.
+        write_volatile((WIN32K_CODE_VA + INPUT_WINDOW_STATION_RVA) as *mut u64, winsta_body);
+
+        print_str(b"[win32k-host] NtUserSwitchDesktop(hDesk) [rpwinstaParent+InputWindowStation set]\n");
+        let switch: extern "win64" fn(u64) -> i32 =
+            core::mem::transmute((WIN32K_CODE_VA + NT_USER_SWITCH_DESKTOP_RVA) as *const ());
+        let sret = switch(hdesk);
+        let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
+        print_str(b"[win32k-host] NtUserSwitchDesktop -> ret=0x");
+        print_hex(sret as u32);
+        print_str(b", gpdeskInputDesktop=0x");
+        print_hex((gpdesk >> 32) as u32);
+        print_hex(gpdesk as u32);
         print_str(b" (spwnd=0x");
         // pDeskInfo @ body+0x08; DESKTOPINFO.spwnd @ +0x10 (pvDesktopBase@0, pvDesktopLimit@8, spwnd@0x10
         // — confirmed by co_IntShowDesktop disasm 0x6dc5c `mov rax,[rax+8]`; 0x6dc60 `mov rax,[rax+0x10]`).
-        // Report it so we know the desktop window is wired (co_IntShowDesktop ASSERT(pwnd)).
-        let pdeskinfo = read_volatile((desk_body + 0x08) as *const u64);
+        let pdeskinfo = if gpdesk != 0 { read_volatile((gpdesk + 0x08) as *const u64) } else { 0 };
         let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
         print_hex((spwnd >> 32) as u32);
         print_hex(spwnd as u32);
         print_str(b")\n");
     } else {
-        print_str(b"[win32k-host] WARN: no desktop body for hDesk - gpdeskInputDesktop unset\n");
+        print_str(b"[win32k-host] WARN: no desktop/winsta body - gpdeskInputDesktop unset\n");
     }
 }
 
