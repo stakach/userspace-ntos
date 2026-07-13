@@ -1034,6 +1034,268 @@ unsafe fn reclaim_mechanism_selftest() -> u64 {
     print_str(b"\n");
     ok
 }
+
+// ===================== ALPC last-mile item (b): the PHYSICAL two-VSpace port-section view =========
+// Prove a REAL cross-address-space ALPC section view — the WOW64 / big-data path. Two SEPARATE
+// throwaway endpoint VSpaces map the SAME port-section backing frames at the SAME view VA (via
+// copy_cap + page_map — the identical CSRSS_ANON_BASE machinery). A hosted thread in endpoint A
+// WRITES big data through its mapped view; a hosted thread in endpoint B READS it back through ITS
+// OWN mapping at its view VA — proving genuine cross-VSpace shared memory (not a copy, not a single-
+// VSpace backing store). Both throwaway VSpaces + the section frames are CNodeDelete-reclaimed after.
+// Runs POST-LOOP (all live spawns done): touches ONLY freshly-retyped throwaway caps + an unused
+// executive scratch page; the 3 live hosted processes are NEVER touched → boot byte-identical.
+
+/// Writer trampoline (endpoint A): `movabs rcx,view; movabs rax,PATTERN; mov [rcx],rax;
+/// mov [rcx+0x1000],rax; movabs rax,0xA; syscall; jmp $`. With the hosted-syscalls flag every
+/// `syscall` faults as UnknownSyscall, delivering the register file — RAX (=0xA done-marker) in m0.
+fn xview_writer_code(view: u64, pattern: u64) -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x48, 0xB9]);
+    t.extend_from_slice(&view.to_le_bytes()); // movabs rcx, view
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&pattern.to_le_bytes()); // movabs rax, PATTERN
+    t.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax        (page 0)
+    t.extend_from_slice(&[0x48, 0x89, 0x81, 0x00, 0x10, 0x00, 0x00]); // mov [rcx+0x1000], rax (page 1)
+    t.extend_from_slice(&[0x48, 0xB8]);
+    t.extend_from_slice(&0x0Au64.to_le_bytes()); // movabs rax, 0xA (done marker)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall  → UnknownSyscall fault (m0 = RAX)
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    t
+}
+
+/// Reader trampoline (endpoint B): `movabs rcx,view; mov rax,[rcx]; mov rdx,[rcx+0x1000]; syscall;
+/// jmp $`. The fault delivers RAX (=page 0) in m0 and RDX (=page 1) in m3.
+fn xview_reader_code(view: u64) -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    t.extend_from_slice(&[0x48, 0xB9]);
+    t.extend_from_slice(&view.to_le_bytes()); // movabs rcx, view
+    t.extend_from_slice(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]         (page 0)
+    t.extend_from_slice(&[0x48, 0x8B, 0x91, 0x00, 0x10, 0x00, 0x00]); // mov rdx, [rcx+0x1000] (page 1)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall  → fault (m0 = RAX, m3 = RDX)
+    t.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    t
+}
+
+/// Stand up ONE throwaway endpoint VSpace running `code`, with the two port-section frames (`f0`,
+/// `f1` — pass copies for the 2nd endpoint) mapped RW at the view VA + a code page (RX) + stack +
+/// IPC buffer, a fault EP, a hosted-syscalls TCB, an SC — resumed. Every new cap slot is appended to
+/// `slots`. Returns (pml4, tcb, fault_ep). VAs live in the fresh VSpace so any layout is free.
+#[allow(clippy::too_many_arguments)]
+unsafe fn xview_spawn(
+    code: &[u8],
+    f0: u64,
+    f1: u64,
+    write_scratch: u64,
+    slots: &mut [u64; 96],
+    n: &mut usize,
+) -> (u64, u64, u64) {
+    const VIEW: u64 = 0x0000_0000_4000_0000; // 1 GiB — the section-view VA in the endpoint VSpace
+    const CODE: u64 = VIEW + 0x10000;
+    const STK: u64 = VIEW + 0x20000;
+    const IPC: u64 = VIEW + 0x30000;
+    let mut push = |s: u64| {
+        slots[*n] = s;
+        *n += 1;
+        s
+    };
+    let pml4 = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, VIEW, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, VIEW, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, VIEW, pml4);
+    // The port-section backing frames mapped RW at the view VA — the shared region.
+    let _ = page_map(f0, VIEW, RW_NX, pml4);
+    let _ = page_map(f1, VIEW + 0x1000, RW_NX, pml4);
+    // Code page: write the trampoline via an executive scratch mapping, then map a COPY RX (W^X).
+    let codef = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, codef);
+    let _ = page_map(codef, write_scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    for (i, b) in code.iter().enumerate() {
+        core::ptr::write_volatile((write_scratch + i as u64) as *mut u8, *b);
+    }
+    let codecopy = push(copy_cap(codef));
+    let _ = page_map(codecopy, CODE, /* RX */ 2, pml4);
+    let stk = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, stk);
+    let _ = page_map(stk, STK, RW_NX, pml4);
+    let ipc = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipc);
+    let _ = page_map(ipc, IPC, RW_NX, pml4);
+    let fault_ep = push(make_object(OBJ_ENDPOINT));
+    let raw = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = push(alloc_slot());
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
+    let fault_copy = push(copy_cap(fault_ep));
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_copy, 0);
+    let tcb = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPC, ipc, 0);
+    let _ = tcb_write_registers(tcb, CODE, STK + 0x1000 - 16, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    let sc = push(alloc_slot());
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
+    let _ = sched_control_configure(SLOT_SCHED_CONTROL, sc, 1000, 1000);
+    let _ = sched_context_bind(sc, tcb);
+    // Hosted-syscalls flag: `syscall` faults as UnknownSyscall (delivering the register file to our
+    // fault EP) instead of trapping natively — the same mechanism the live smss/csrss threads use.
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    let _ = tcb_resume(tcb);
+    (pml4, tcb, fault_ep)
+}
+
+/// ALPC last-mile item (b): the physical two-VSpace section-view proof. Returns a bitmask (0x3F =
+/// all 6 sub-proofs). See the block comment above. Post-loop, throwaway-only, byte-identical boot.
+unsafe fn alpc_cross_vspace_selftest() -> u64 {
+    const PATTERN: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    // Executive-VSpace scratch pages to write each endpoint's code frame + one window onto the
+    // section frame for an independent read. These sit in smss's (already-torn-down) demand-fill
+    // scratch span, in the SAME 2 MiB page table as the reclaim self-test's proven-mapped RECLAIM_VA
+    // (base + 3000*0x1000, PT index 5) — offsets 3001..3003 share that resident PT, so mapping a
+    // fresh frame there succeeds (a page_map to an absent PT would silently fail → the executive
+    // would then fault writing the trampoline; staying in the proven PT avoids that).
+    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
+    let write_scratch_a = SCRATCH_BASE + 3001 * 0x1000;
+    let write_scratch_b = SCRATCH_BASE + 3002 * 0x1000;
+    let win_va = SCRATCH_BASE + 3003 * 0x1000;
+
+    let mut ok = 0u64;
+    let mut slots = [0u64; 96];
+    let mut n = 0usize;
+
+    // The ALPC port section's REAL backing: two fresh 4 KiB frames (8 KiB — a multi-page big-data
+    // view). These frames ARE the shared section; they map into BOTH endpoint VSpaces at the view VA.
+    let f0 = {
+        let s = alloc_slot();
+        slots[n] = s;
+        n += 1;
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
+        s
+    };
+    let f1 = {
+        let s = alloc_slot();
+        slots[n] = s;
+        n += 1;
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);
+        s
+    };
+    // One MCS Reply object per endpoint (a fault recv binds the faulting thread to its reply cap).
+    let reply_a = {
+        let s = alloc_slot();
+        slots[n] = s;
+        n += 1;
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, s);
+        s
+    };
+    let reply_b = {
+        let s = alloc_slot();
+        slots[n] = s;
+        n += 1;
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, s);
+        s
+    };
+
+    // Endpoint A: a fresh VSpace mapping the ORIGINAL section frames + running the writer. Receive
+    // its fault FIRST so the section carries A's write before endpoint B reads it (serialized).
+    let writer = xview_writer_code(0x0000_0000_4000_0000, PATTERN);
+    let (pml4_a, tcb_a, ep_a) = xview_spawn(&writer, f0, f1, write_scratch_a, &mut slots, &mut n);
+    let (_ba, mia, m0a, _1a, _2a, _3a) = recv_full_r12(ep_a, reply_a);
+    if (mia >> 12) == 2 && m0a == 0x0A {
+        ok |= 1 << 1; // the writer ran in VSpace A + wrote its big data, then fault-reported done
+    }
+
+    // Endpoint B: a SEPARATE VSpace mapping COPIES of the SAME section frames (copy_cap + page_map =
+    // the CSRSS_ANON_BASE machinery) + running the reader. It reads the section back through ITS OWN
+    // mapping at its view VA.
+    let cf0 = {
+        let s = copy_cap(f0);
+        slots[n] = s;
+        n += 1;
+        s
+    };
+    let cf1 = {
+        let s = copy_cap(f1);
+        slots[n] = s;
+        n += 1;
+        s
+    };
+    let reader = xview_reader_code(0x0000_0000_4000_0000);
+    let (pml4_b, tcb_b, ep_b) = xview_spawn(&reader, cf0, cf1, write_scratch_b, &mut slots, &mut n);
+    let (_bb, mib, m0b, _1b, _2b, m3b) = recv_full_r12(ep_b, reply_b);
+
+    if pml4_a != 0 && pml4_b != 0 && pml4_a != pml4_b {
+        ok |= 1 << 0; // two SEPARATE endpoint VSpaces stood up
+    }
+    if (mib >> 12) == 2 && m0b == PATTERN {
+        ok |= 1 << 2; // VSpace B read page 0 written by VSpace A — genuine cross-VSpace shared memory
+    }
+    if (mib >> 12) == 2 && m3b == PATTERN {
+        ok |= 1 << 3; // VSpace B also read page 1 — a real MULTI-PAGE big-data view (WOW64 path)
+    }
+    // Independent confirmation the two VSpaces mapped the SAME physical frame (not a copy): read the
+    // section through a THIRD copy_cap window in the executive's own VSpace — it shows A's write too.
+    let win = {
+        let s = copy_cap(f0);
+        slots[n] = s;
+        n += 1;
+        s
+    };
+    if page_map_r(win, win_va, RW_NX, CAP_INIT_THREAD_VSPACE) == 0
+        && core::ptr::read_volatile(win_va as *const u64) == PATTERN
+    {
+        ok |= 1 << 4; // the physical section frame carries A's write — shared, not copied
+    }
+
+    // Reclaim: suspend both throwaway threads, then CNodeDelete every throwaway slot (return-to-
+    // Untyped — the mechanism proven by reclaim_mechanism_selftest). Delete the section frames FIRST
+    // (they are mapped in BOTH endpoints' PTs), then the rest child-first (reverse push order), then
+    // the essential TCBs + PML4s (whose child paging structs are already gone) — the gated proof.
+    let _ = tcb_suspend_r(tcb_a);
+    let _ = tcb_suspend_r(tcb_b);
+    let sec_ok = cnode_delete_r(f0) == 0
+        && cnode_delete_r(f1) == 0
+        && cnode_delete_r(cf0) == 0
+        && cnode_delete_r(cf1) == 0;
+    for i in (0..n).rev() {
+        let s = slots[i];
+        if s == 0 || s == f0 || s == f1 || s == cf0 || s == cf1 || s == tcb_a || s == tcb_b
+            || s == pml4_a || s == pml4_b
+        {
+            continue;
+        }
+        let _ = cnode_delete_r(s);
+    }
+    let vs_ok = cnode_delete_r(tcb_a) == 0
+        && cnode_delete_r(tcb_b) == 0
+        && cnode_delete_r(pml4_a) == 0
+        && cnode_delete_r(pml4_b) == 0;
+    if sec_ok && vs_ok {
+        ok |= 1 << 5; // throwaway VSpaces + section frames reclaimed
+    }
+
+    print_str(b"[ntos-exec] ALPC cross-vspace section-view self-test: ok=0x");
+    print_hex(ok as u32);
+    print_str(b" writer=0x");
+    print_hex(m0a as u32);
+    print_str(b" readerA=0x");
+    print_hex((m0b >> 32) as u32);
+    print_hex(m0b as u32);
+    print_str(b" readerB=0x");
+    print_hex((m3b >> 32) as u32);
+    print_hex(m3b as u32);
+    print_str(b"\n");
+    ok
+}
+
 unsafe fn attach_sched_context(tcb: u64) {
     let sc = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT, SCHED_CONTEXT_BITS, 1, sc);
@@ -5003,6 +5265,68 @@ impl NativeSyscallHandler for ExecNtHandler {
     }
 }
 
+// ===================== ALPC last-mile item (a): register the NtAlpc* SSNs =========================
+// SSNs EXTRACTED (not hardcoded — the rootserver-constant-drift trap) from references/ntdll.dll (a
+// real Windows x64 ntdll, the Win7-pivot target; ReactOS ros-ntdll.dll, which the LIVE smss/csrss/
+// winlogon run, exports NO NtAlpc* at all — ALPC is Vista+ and ReactOS has only kernel-less stubs).
+//   NtAlpcAcceptConnectPort=111 NtAlpcConnectPort=113 NtAlpcCreatePort=114 NtAlpcCreatePortSection=115
+//   NtAlpcCreateSectionView=117 NtAlpcDisconnectPort=123 NtAlpcSendWaitReceivePort=130
+// ★ CONSTANT-DRIFT / COLLISION FINDING (load-bearing): the Win7 ALPC SSN block (111..131) OVERLAPS
+// the live ReactOS SSN space — e.g. Win7 NtAlpcConnectPort=113 == the live ReactOS NtMapViewOfSection
+// =113 (registered in build_nt_table). So the ALPC route MUST NOT be merged into build_nt_table nor
+// fired on a raw m0 for the 3 live ReactOS processes (that would HIJACK live NtMapViewOfSection etc.).
+// It is a DEDICATED recognizer, gated by ALPC-PROCESS IDENTITY (`ALPC_HOST_PRESENT`, never set at
+// boot — no ALPC binary yet), so it is DORMANT (byte-identical boot) yet genuinely wired into the
+// fault dispatcher. The recognizer + the SSN→adapter routing are proven by counted specs
+// (exec_alpc_ssn_registered / exec_alpc_ssn_routes_to_adapter); a live hosted caller arrives with a
+// real ALPC binary running the Win7 ntdll (whose ntdll then defines the authoritative SSNs).
+pub const SSN_NT_ALPC_ACCEPT_CONNECT_PORT: u64 = 111;
+pub const SSN_NT_ALPC_CONNECT_PORT: u64 = 113;
+pub const SSN_NT_ALPC_CREATE_PORT: u64 = 114;
+pub const SSN_NT_ALPC_CREATE_PORT_SECTION: u64 = 115;
+pub const SSN_NT_ALPC_CREATE_SECTION_VIEW: u64 = 117;
+pub const SSN_NT_ALPC_DISCONNECT_PORT: u64 = 123;
+pub const SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT: u64 = 130;
+
+/// Set true ONLY when a real ALPC binary (running the Win7 ntdll) is hosted. Never set at boot, so
+/// `try_route_alpc_ssn` is dormant — the Win7 ALPC SSNs can never hijack the live ReactOS SSN space.
+static ALPC_HOST_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Recognizer: map a Win7 `NtAlpc*` SSN to its unified port-service ALPC wire opcode (0x2300 block).
+/// This IS the registration of the NtAlpc* SSNs in the executive's dispatch logic.
+pub fn alpc_ssn_to_opcode(ssn: u64) -> Option<u16> {
+    use nt_alpc_abi::opcode as aop;
+    Some(match ssn {
+        SSN_NT_ALPC_CREATE_PORT => aop::ALPC_OP_CREATE_PORT,
+        SSN_NT_ALPC_CONNECT_PORT => aop::ALPC_OP_CONNECT_PORT,
+        SSN_NT_ALPC_ACCEPT_CONNECT_PORT => aop::ALPC_OP_ACCEPT_CONNECT,
+        SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT => aop::ALPC_OP_SEND_RECEIVE,
+        SSN_NT_ALPC_DISCONNECT_PORT => aop::ALPC_OP_DISCONNECT_PORT,
+        SSN_NT_ALPC_CREATE_PORT_SECTION => aop::ALPC_OP_CREATE_PORT_SECTION,
+        SSN_NT_ALPC_CREATE_SECTION_VIEW => aop::ALPC_OP_CREATE_SECTION_VIEW,
+        _ => return None,
+    })
+}
+
+/// Fault-dispatcher hook: if a hosted ALPC process (running the Win7 ntdll) issued an `NtAlpc*`
+/// syscall, translate its SSN → the ALPC adapter opcode and route it to the unified port service
+/// over the shared ring (`LPC_CLIENT`), returning the NTSTATUS. DORMANT unless `ALPC_HOST_PRESENT`
+/// (never set at boot) — so it can NEVER fire for the 3 live ReactOS processes whose SSN space
+/// collides with the Win7 ALPC SSNs. The per-binary marshalling of the native ALPC arg blocks
+/// (PORT_MESSAGE + ALPC_MESSAGE_ATTRIBUTES from the fault register/stack image) is the shim that
+/// lands with a real ALPC binary; the recognizer + adapter routing here are proven by counted specs.
+unsafe fn try_route_alpc_ssn(ssn: u64, req: &[u8], out: &mut [u8]) -> Option<u64> {
+    if !ALPC_HOST_PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
+    let op = alpc_ssn_to_opcode(ssn)?;
+    #[allow(static_mut_refs)]
+    let lpc = LPC_CLIENT.as_mut()?;
+    let (status, _f, _i, _d0, _d1) = lpc.backend_mut().0.raw(op, req, out);
+    Some(status as u64)
+}
+
 /// Build the service table mapping smss's ntdll SSNs -> NativeService, for ONLY the services the
 /// real handler implements. `table.lookup(ssn).is_some()` is the routing switch: present -> real
 /// dispatcher, absent -> broker fallback. Grows as each syscall family is implemented for real.
@@ -6251,10 +6575,21 @@ unsafe fn service_sec_image(
                     dll_pd_created: &mut dll_pd_created as *mut [bool; 3],
                     dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 3],
                 });
-                let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
-                result = res.status as u64;
-                if nt_handler.stop {
-                    handled = false; // handler couldn't service → stop with the SSN recorded
+                // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
+                // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
+                // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
+                // never fire for the 3 live ReactOS processes → byte-identical boot. When active it
+                // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
+                // adapter (skipping the native ReactOS dispatch).
+                if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
+                    result = st;
+                    handled = true;
+                } else {
+                    let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
+                    result = res.status as u64;
+                    if nt_handler.stop {
+                        handled = false; // handler couldn't service → stop with the SSN recorded
+                    }
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
                 // need demand-fill (csrss_out_write); smss out-ptrs are stack locals (smss_stack_write).
@@ -6937,6 +7272,12 @@ unsafe fn service_sec_image(
         // ONLY freshly-retyped throwaway caps + an unused scratch page, deletes everything it makes,
         // and never touches the 3 hosted processes' resources → byte-identical boot.
         PM_RECLAIM_OK.store(reclaim_mechanism_selftest(), Ordering::Relaxed);
+        // ALPC last-mile item (b) — prove a REAL cross-address-space ALPC section view: two SEPARATE
+        // throwaway endpoint VSpaces map the same port-section backing frames (copy_cap + page_map,
+        // the CSRSS_ANON_BASE machinery), a hosted thread in one writes big data, a hosted thread in
+        // the other reads it back through ITS OWN view mapping. Throwaway-only + reclaimed after →
+        // the 3 live hosted processes are untouched (byte-identical boot).
+        ALPC_XVIEW_OK.store(alpc_cross_vspace_selftest(), Ordering::Relaxed);
     }
     if csrss_process_handle != 0 {
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
@@ -8425,6 +8766,8 @@ static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
 static PM_RECLAIM_OK: AtomicU64 = AtomicU64::new(0);
+/// ALPC last-mile item (b): the two-VSpace cross-AS section-view self-test result (0x3F = all 6).
+static ALPC_XVIEW_OK: AtomicU64 = AtomicU64::new(0);
 // === Path 3 — fold the per-pi IDENTITY arrays into an EPROCESS-linked per-process struct =========
 /// Executive-side per-hosted-process MECHANISM state, EPROCESS-linked. Path 3 of the nt-process
 /// convergence folds the six parallel `[_;3]` identity arrays that `service_sec_image` indexed by
@@ -12494,6 +12837,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_sel4_reclaim_mechanism",
                         PM_RECLAIM_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        &mut passed,
+                    );
+                    // ALPC last-mile item (b) — the PHYSICAL two-VSpace port-section view (WOW64
+                    // big-data path). Two SEPARATE endpoint VSpaces map the SAME port-section backing
+                    // frames at the view VA via copy_cap + page_map (the CSRSS_ANON_BASE machinery); a
+                    // hosted thread in endpoint A writes big data, a hosted thread in endpoint B reads
+                    // it back THROUGH ITS OWN mapping. 0x3F = all 6: two separate VSpaces stood up,
+                    // writer wrote in A, reader read page0 + page1 in B (== A's write → genuine cross-
+                    // VSpace shared memory, multi-page), a 3rd executive window confirms one physical
+                    // frame, and the throwaway VSpaces + section frames were CNodeDelete-reclaimed.
+                    check(
+                        b"exec_alpc_section_view_cross_vspace",
+                        ALPC_XVIEW_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
                     // Path 3 — the six ex-parallel per-pi identity arrays (pml4s/scratch_bases/

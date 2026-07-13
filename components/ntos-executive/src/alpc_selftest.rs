@@ -208,6 +208,62 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     let (ls, _f, li, ldetail0, _lmt) = lpc_recv(chan, bclient_h, &mut out);
     let reply_ok = ls == STATUS_SUCCESS && &out[..li as usize] == &rmsg[..] && ldetail0 == 0;
     check(b"exec_bridge_alpc_reply_body_only", reply_ok, passed);
+
+    // ================= C. item (a): NtAlpc* SSN registration + routing =================
+    ssn_registration(chan, passed);
+}
+
+/// ALPC last-mile item (a): the executive registers the Win7 `NtAlpc*` SSNs (extracted from
+/// references/ntdll.dll) in its fault dispatcher via `alpc_ssn_to_opcode`, routing an ALPC syscall
+/// to the unified port-service ALPC adapter. No hosted ALPC binary exists (the live ReactOS
+/// processes issue NO NtAlpc*, and the Win7 ALPC SSNs collide with the live ReactOS SSN space — so
+/// the live route is gated by ALPC-process identity, dormant at boot). These two counted specs prove
+/// the SSN→opcode registration is correct AND that a recognized NtAlpc* SSN routes end-to-end to the
+/// ALPC adapter over the SAME ring the live route would use — the syscall path, minus only the seL4
+/// fault delivery (identical to the proven live smss/csrss hosted-syscall path).
+fn ssn_registration(chan: &mut RingChannel<'_>, passed: &mut u64) {
+    use crate::{
+        alpc_ssn_to_opcode, SSN_NT_ALPC_ACCEPT_CONNECT_PORT, SSN_NT_ALPC_CONNECT_PORT,
+        SSN_NT_ALPC_CREATE_PORT, SSN_NT_ALPC_CREATE_PORT_SECTION, SSN_NT_ALPC_CREATE_SECTION_VIEW,
+        SSN_NT_ALPC_DISCONNECT_PORT, SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT,
+    };
+
+    // (1) The SSN→opcode table matches the ntdll-extracted SSNs, and a non-ALPC SSN is rejected.
+    let table_ok = alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_PORT) == Some(aop::ALPC_OP_CREATE_PORT)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_CONNECT_PORT) == Some(aop::ALPC_OP_CONNECT_PORT)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_ACCEPT_CONNECT_PORT) == Some(aop::ALPC_OP_ACCEPT_CONNECT)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_SEND_WAIT_RECEIVE_PORT) == Some(aop::ALPC_OP_SEND_RECEIVE)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_DISCONNECT_PORT) == Some(aop::ALPC_OP_DISCONNECT_PORT)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_PORT_SECTION)
+            == Some(aop::ALPC_OP_CREATE_PORT_SECTION)
+        && alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_SECTION_VIEW)
+            == Some(aop::ALPC_OP_CREATE_SECTION_VIEW)
+        && alpc_ssn_to_opcode(0x1234).is_none();
+    check(b"exec_alpc_ssn_registered", table_ok, passed);
+
+    // (2) Route an NtAlpcCreatePort SSN through the recognizer → the adapter creates a real port.
+    let mut out = [0u8; 256];
+    let name = utf16("\\AlpcSsnRoute");
+    let hdr = core::mem::size_of::<AlpcCreatePortRequest>() as u32;
+    let req = AlpcCreatePortRequest {
+        abi_size: hdr as u16,
+        port_flags: port_flag::LPC_MODE,
+        max_message_length: 0x1000,
+        name_offset: hdr,
+        name_len_bytes: (name.len() * 2) as u32,
+        ..Default::default()
+    };
+    let mut b = bytes(&req);
+    push_utf16(&mut b, &name);
+    let op = alpc_ssn_to_opcode(SSN_NT_ALPC_CREATE_PORT);
+    let routed_ok = match op {
+        Some(op) => {
+            let (status, _f, _i, listen, _d) = chan.raw(op, &b, &mut out);
+            status == STATUS_SUCCESS && listen != 0
+        }
+        None => false,
+    };
+    check(b"exec_alpc_ssn_routes_to_adapter", routed_ok, passed);
 }
 
 /// Step 2 driver: a port section shared by two views. Endpoint A writes big data

@@ -1,32 +1,34 @@
-# ALPC steps 2-4 (over the unified nt-port-core)
+# ALPC last-mile wrap-up (register NtAlpc* SSNs + two-VSpace cross-AS section view)
 
-## Step 2 — full NtAlpc* surface + REAL cross-endpoint port-section/view shared memory
-- [x] nt-alpc-abi: WRITE/READ_SECTION_VIEW opcodes + AlpcViewIoRequest (32B) + size assert
-- [x] nt-alpc: real backing store for PortSection (Vec<u8>), views alias the section; write/read view ops
-- [x] host test: two views on one section, write via A read via B == not a copy
-- [x] live spec exec_alpc_section_view_shared: big data via shared section, not the message body
-- [x] FLAG: physical copy_cap+page_map into two real VSpaces deferred (no real ALPC binary; = CSRSS_ANON_BASE machinery)
+## Item (a) — register NtAlpc* SSNs
+- [x] Extract NtAlpc* SSNs from references/ntdll.dll (real Win7 ntdll) — NOT hardcoded
+- [x] FINDING: ros-ntdll.dll (what live smss/csrss/winlogon run) exports NO NtAlpc*; the Win7
+      ALPC SSN block (111..131) COLLIDES with the live ReactOS SSN space (Win7 NtAlpcConnectPort=113
+      == live ReactOS NtMapViewOfSection=113). => a live dispatcher arm keyed on raw SSN would
+      HIJACK live ReactOS syscalls. Register as a dedicated recognizer, gated by ALPC-process
+      identity (dormant — no ALPC binary yet), proven by counted spec.
+- [ ] Add SSN consts + `alpc_ssn_to_opcode` recognizer + `try_route_alpc_ssn` (guarded, dormant)
+- [ ] Counted specs: SSN->opcode table correct + NtAlpcCreatePort SSN routes to adapter -> port
 
-## Step 3 — full ALPC_MESSAGE_ATTRIBUTES serialize/parse in the out-param path
-- [x] nt-alpc: serialize_attrs(allocated, attrs) -> ALPC_MESSAGE_ATTRIBUTES blob (fixed order); valid = allocated & present
-- [x] receive path: RECV_ATTRIBUTES flag → attrs blob at front of reply, body after
-- [x] host test: CONTEXT+VIEW round-trip; bridge degradation (VIEW/HANDLE/SECURITY/TOKEN drop to LPC) with full parse
-- [x] live spec exec_alpc_message_attributes_roundtrip
-
-## Step 4 — ALPC peer-direct data plane
-- [x] nt-alpc: PeerDirect cache (executive-cacheable cross-endpoint mailbox), send/recv, mirrors LpcConnRecord
-- [x] host test: peer-direct A<->B delivery + attrs carried
-- [x] live spec exec_alpc_peer_direct: server (ring) not in per-message path (ring op count unchanged)
+## Item (b) — two-VSpace cross-AS ALPC section view (the meaningful capability)
+- [ ] `alpc_cross_vspace_selftest()` post-loop (after reclaim self-test), byte-identical boot
+- [ ] Two throwaway endpoint VSpaces; real section backing frames; copy_cap+page_map into BOTH at view VA
+- [ ] Writer thread in A writes; reader thread in B reads back through ITS OWN mapping (fault-report)
+- [ ] Reclaim throwaway VSpaces + section frames (CNodeDelete); spec exec_alpc_section_view_cross_vspace
 
 ## Discipline
-- gate >=121 pass, 0 FAIL, winsrv ON, sentinel, desktop paint 0x003a6ea5
-- cargo test crates first/throughout; build SUBMODULE rust-micro; run_specs; commit each green step; update project_alpc.md
+- Gate 137 -> additive; winsrv ON, sentinel, desktop paint 0x003a6ea5; ANY regression = REVERT
+- SUBMODULE rust-micro build; verify rootserver.elf mtime.
 
-## Review — DONE (2026-07-13, gate 124 pass, 0 FAIL, winsrv ON, paint 0x003a6ea5)
-- Step 2 committed (122): real shared backing store, WRITE/READ_SECTION_VIEW, exec_alpc_section_view_shared.
-- Step 3 committed (123): serialize_attrs/parse_message_attributes + RECV_ATTRIBUTES, exec_alpc_message_attributes_roundtrip.
-- Step 4 committed (124): PeerDirect executive-local data plane, exec_alpc_peer_direct (ring unchanged per-message).
-- No rust-micro/src change → sel4test byte-identical. Host tests: nt-alpc 7->11.
-- FLAG (not a kernel-primitive gap): physical copy_cap+page_map of section frames into two REAL VSpaces is
-  deferred until a real ALPC binary provides two endpoint VSpaces (= CSRSS_ANON_BASE machinery). With the
-  synthetic single-address-space endpoints the broker's shared backing IS the shared region — the broker model.
+## REVIEW (landed green — gate 140/94, 0 FAIL)
+- Item (a) DONE: SSN consts extracted from references/ntdll.dll + `alpc_ssn_to_opcode` recognizer +
+  `try_route_alpc_ssn` guarded dormant arm wired into the fault dispatch loop (ALPC_HOST_PRESENT
+  never set at boot → byte-identical). Specs `exec_alpc_ssn_registered` + `exec_alpc_ssn_routes_to_adapter`
+  PASS. Live hosted native-ABI caller documented as arriving with a real Win7-ntdll ALPC binary
+  (the SSN-collision with the live ReactOS space forbids a raw-SSN live arm for the 3 ReactOS procs).
+- Item (b) DONE: `alpc_cross_vspace_selftest` — two SEPARATE throwaway VSpaces map the SAME section
+  frames at the view VA (copy_cap + page_map); writer thread in A wrote (m0=0xA), reader thread in B
+  read both pages back through ITS OWN mapping (m0=m3=0xCAFEBABE_DEADBEEF == the write). ok=0x3F.
+  Throwaway VSpaces + section frames reclaimed. Spec `exec_alpc_section_view_cross_vspace` PASS.
+- Boot byte-identical: csrss 339/handle 0x2c, winlogon 230, smss 136, reclaim 0x3F, paint 0x003a6ea5
+  768/768, winsrv ON, [microtest done], exit 3. NO rust-micro/src change → sel4test byte-identical.
