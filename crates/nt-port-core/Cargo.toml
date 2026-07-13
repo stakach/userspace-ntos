@@ -1,0 +1,18 @@
+[package]
+name = "nt-port-core"
+description = "Unified NT port core: the API-neutral port namespace + connection rendezvous state machine + PORT_MESSAGE data model shared by the LPC and ALPC adapters (no_std + alloc, host-testable, zero unsafe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

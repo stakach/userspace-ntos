@@ -1,6 +1,6 @@
 [package]
-name = "nt-lpc-server"
-description = "Transport-agnostic NT LPC service dispatcher: the port namespace + connection rendezvous state machine (no_std + alloc, host-testable)."
+name = "nt-alpc"
+description = "The ALPC (NtAlpc*) adapter over the unified nt-port-core: connect/accept/send-receive + the ALPC message-attribute & port-section/view model, with the LPC↔ALPC bridge degradation policy (no_std + alloc, host-testable)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,11 +14,13 @@ std = ["nt-status/std"]
 [dependencies]
 nt-status = { workspace = true }
 nt-port-core = { workspace = true }
-nt-lpc-abi = { workspace = true }
+nt-alpc-abi = { workspace = true }
 bytemuck = { version = "1", default-features = false }
 
 [dev-dependencies]
+nt-lpc-server = { workspace = true }
 nt-lpc-client = { workspace = true }
+nt-lpc-abi = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

@@ -13,9 +13,12 @@ members = [
     "crates/nt-object-manager",
     "crates/nt-object-server",
     "crates/nt-object-client",
+    "crates/nt-port-core",
     "crates/nt-lpc-abi",
     "crates/nt-lpc-server",
     "crates/nt-lpc-client",
+    "crates/nt-alpc-abi",
+    "crates/nt-alpc",
     "crates/nt-io-abi",
     "crates/nt-io-manager",
     "crates/nt-io-server",
@@ -91,9 +94,12 @@ nt-object-abi = { path = "crates/nt-object-abi" }
 nt-object-manager = { path = "crates/nt-object-manager" }
 nt-object-server = { path = "crates/nt-object-server" }
 nt-object-client = { path = "crates/nt-object-client" }
+nt-port-core = { path = "crates/nt-port-core" }
 nt-lpc-abi = { path = "crates/nt-lpc-abi" }
 nt-lpc-server = { path = "crates/nt-lpc-server" }
 nt-lpc-client = { path = "crates/nt-lpc-client" }
+nt-alpc-abi = { path = "crates/nt-alpc-abi" }
+nt-alpc = { path = "crates/nt-alpc" }
 nt-io-abi = { path = "crates/nt-io-abi" }
 nt-io-manager = { path = "crates/nt-io-manager" }
 nt-io-server = { path = "crates/nt-io-server" }

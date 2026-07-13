@@ -1,0 +1,17 @@
+[package]
+name = "nt-alpc-abi"
+description = "Fixed-layout ALPC (NtAlpc*, Vista+/Win7) ABI: PORT_MESSAGE, ALPC_PORT_ATTRIBUTES, ALPC_MESSAGE_ATTRIBUTES + the attribute structs, and the SURT service-mode wire structs/opcodes (no_std)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
