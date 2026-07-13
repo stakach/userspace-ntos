@@ -18,6 +18,7 @@
 //! so the host calls them at the same VA — exactly the KMDF-host pattern.
 
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
+use nt_compat_exports::Win32kExportRegistry;
 
 use crate::*;
 
@@ -1726,9 +1727,57 @@ extern "win64" fn s_ke_user_mode_callback(
     }
 }
 
+/// Registration-driven export resolution (Workstream B). The executive binds its machine-code
+/// trampoline VAs by import name into the `nt-compat-exports` [`Win32kExportRegistry`]; the loader
+/// resolves win32k's IAT through it instead of the hardcoded `match` below. Migrated FIRST BATCH:
+/// the pool + RTL-atom + Ob groups (all backed by real `nt-*` subsystems). Names not yet registered
+/// keep resolving via the `match` (behavior-preserving hybrid during migration).
+static mut WIN32K_EXPORTS: Win32kExportRegistry = Win32kExportRegistry::new();
+static mut WIN32K_EXPORTS_READY: bool = false;
+
+/// Bind the first-batch trampolines into [`WIN32K_EXPORTS`]. Idempotent (`bind` updates in place),
+/// so it is safe to call from any loader (win32k / dxg / driver) regardless of order; each bound VA
+/// is IDENTICAL to what the `match` in [`export_addr`] would return, so resolution is unchanged.
+fn register_trampolines() {
+    // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
+    let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
+    // pool (Driver Host arena)
+    reg.bind("ExAllocatePoolWithTag", s_ex_alloc_pool_with_tag as usize as u64);
+    reg.bind("ExAllocatePool", s_ex_alloc_pool as usize as u64);
+    reg.bind("ExAllocatePoolWithQuotaTag", s_ex_alloc_pool_quota as usize as u64);
+    reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
+    reg.bind("ExFreePool", s_ex_free_pool_with_tag as usize as u64);
+    // RTL atom table (nt_kernel_exec::rtl_atom)
+    reg.bind("RtlCreateAtomTable", s_rtl_create_atom_table as usize as u64);
+    reg.bind("RtlAddAtomToAtomTable", s_rtl_add_atom_to_atom_table as usize as u64);
+    reg.bind("RtlLookupAtomInAtomTable", s_rtl_lookup_atom_in_atom_table as usize as u64);
+    reg.bind("RtlDeleteAtomFromAtomTable", s_rtl_delete_atom_from_atom_table as usize as u64);
+    reg.bind("RtlPinAtomInAtomTable", s_rtl_pin_atom_in_atom_table as usize as u64);
+    reg.bind("RtlQueryAtomInAtomTable", s_rtl_query_atom_in_atom_table as usize as u64);
+    reg.bind("RtlDestroyAtomTable", s_rtl_destroy_atom_table as usize as u64);
+    // Ob object layer (nt-object-manager)
+    reg.bind("ObReferenceObjectByHandle", s_ob_reference_object_by_handle as usize as u64);
+    reg.bind("ObOpenObjectByName", s_ob_open_object_by_name as usize as u64);
+    reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
+    reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
+}
+
 /// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
 /// returns code addresses only. Unknown/unmodelled → a benign zero stub (like the KMDF host).
 pub fn export_addr(name: &str) -> u64 {
+    // Registration-driven resolution first (Workstream B): a trampoline the executive bound by
+    // name wins over the hardcoded match. Lazily populate the registry so this is correct no
+    // matter which loader calls export_addr first.
+    // SAFETY: single-threaded; populated once, read-only thereafter.
+    unsafe {
+        if !WIN32K_EXPORTS_READY {
+            register_trampolines();
+            WIN32K_EXPORTS_READY = true;
+        }
+        if let Some(va) = (*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup(name) {
+            return va;
+        }
+    }
     let f: u64 = match name {
         // pool
         "ExAllocatePoolWithTag" => s_ex_alloc_pool_with_tag as usize as u64,
