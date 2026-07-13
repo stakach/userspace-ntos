@@ -181,14 +181,12 @@ pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
 /// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
 pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
 
-/// Synthetic dispatch SSN: invoke win32k's `co_IntInitializeDesktopGraphics` (RVA 0xfca10) directly.
-/// This is the lazy PDEV/desktop-graphics init that a GUI op (GetDC) would trigger — but our hosted
-/// csrss can't reach that (blocked at the SM↔CSR LPC handshake). It runs PDEVOBJ_lChangeDisplaySettings
-/// → loads framebuf.dll → DrvEnablePDEV/DrvEnableSurface (IOCTL_VIDEO_MAP_VIDEO_MEMORY → the BOOTBOOT
-/// framebuffer) → IntCreatePrimarySurface → co_IntShowDesktop (paints the desktop) = PIXELS.
-pub const SSN_INIT_DESKTOP_GFX: u64 = 0x1FFD;
 /// co_IntInitializeDesktopGraphics RVA (identified via its L"DISPLAY" ref + the PDEVOBJ_lChangeDisplay
-/// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure).
+/// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure). NOTE: this is NO LONGER
+/// invoked directly by the host — the eager SSN_INIT_DESKTOP_GFX scaffold that called it was RETIRED.
+/// InitVideo/surface + the paint now run fully lazily: winlogon's first GUI DC-op drives
+/// `co_IntGraphicsCheck(TRUE)` → `co_AddGuiApp` (win32k RVA 0x7a080, which bumps the `NrGuiAppsRunning`
+/// counter at RVA 0x20be88 on the 0→1 transition) → this function. Kept only as a structural landmark.
 pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
 
 /// win32k `.data` global `gptiDesktopThread` (desktop.c:54) RVA. `IntGetAndReferenceClass(WC_DESKTOP,
@@ -2782,8 +2780,10 @@ unsafe fn build_object_attributes(name: &[u16]) -> u64 {
 /// IntCreateDesktop runs on REAL Ob DESKTOP + WINDOWSTATION objects (see the Ob object layer above)
 /// instead of the previous all-`s_zero` stubs. This advances IntCreateDesktop past its Context==FALSE
 /// early-return into the window-manager object graph (IntGetAndReferenceClass(WC_DESKTOP), the next
-/// wall). Runs in the SSN_INIT_DESKTOP_GFX dispatch context (GS=KPCR/session heap/pClientInfo set),
-/// so any internal faults/asserts are serviced by the executive's win32k_dispatch fault loop.
+/// wall). Runs in the post-NtUserInitialize (SSN 0x125a) dispatch context (GS=KPCR/session heap/
+/// pClientInfo set), so any internal faults/asserts are serviced by the executive's win32k_dispatch
+/// fault loop. The trailing NtUserSwitchDesktop uses bRedraw=FALSE so it does NOT itself trigger the
+/// lazy co_IntInitializeDesktopGraphics — that stays winlogon's to drive.
 unsafe fn create_winsta_and_desktop() {
     const MAXIMUM_ALLOWED: u64 = 0x0200_0000;
     // "WinSta0"
@@ -2863,6 +2863,10 @@ unsafe fn create_winsta_and_desktop() {
     }
 }
 
+/// Once-guard: the post-NtUserInitialize host-prerequisite seed (system font + WinSta0/Default Ob
+/// objects) runs a single time. Single-threaded component → a plain `static mut` bool suffices.
+static mut DESKTOP_GFX_SEEDED: bool = false;
+
 unsafe fn dispatch_loop() -> ! {
     // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
     // attach already ran with a zeroed KPCR (its happy path); every dispatch below runs as the
@@ -2910,34 +2914,26 @@ unsafe fn dispatch_loop() -> ! {
             let probe = read_volatile(TEST_FAULT_VA as *const u64);
             write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
             TEST_FAULT_STATUS
-        } else if ssn == SSN_INIT_DESKTOP_GFX {
-            // Load a system font FIRST — NtUserInitialize → InitializeGreCSRSS → InitFontSupport has
-            // now run (it allocates g_FreeTypeLock + inits FreeType), so the memory-font load is safe;
-            // the subsequent desktop-graphics font realize (TextIntRealizeFont) then finds it instead
-            // of null-derefing at RVA 0x4d7eb ("no fonts loaded at all").
-            load_system_font();
-            // Build the real Ob DESKTOP + WINDOWSTATION object graph BEFORE the desktop paint:
-            // NtUserCreateWindowStation → NtUserCreateDesktop create real objects (see the Ob layer)
-            // so IntCreateDesktop advances past its early Ob return toward the desktop window +
-            // gpdeskInputDesktop that co_IntShowDesktop needs.
-            create_winsta_and_desktop();
-            // Invoke co_IntInitializeDesktopGraphics() directly (VOID → BOOL) to run the framebuf
-            // display-driver enable + primary-surface + show-desktop chain (= PIXELS).
-            print_str(b"[win32k-host] invoking co_IntInitializeDesktopGraphics (RVA 0xfca10)\n");
-            let f: extern "win64" fn() -> i32 =
-                core::mem::transmute((WIN32K_CODE_VA + CO_INIT_DESKTOP_GFX_RVA) as *const ());
-            let r = f();
-            print_str(b"[win32k-host] co_IntInitializeDesktopGraphics returned 0x");
-            print_hex(r as u32);
-            print_str(b"\n");
-            // The FULL natural tail now runs (KeUserModeCallback bridge services the cursor/icon/menu
-            // callbacks) -> co_IntShowDesktop -> IntPaintDesktop paints the desktop background
-            // AUTHENTICALLY through win32k's own GDI + framebuf onto the BOOTBOOT framebuffer. The
-            // direct-NtGdi first-light fill (`paint_screen_dc`) is removed.
-            r
         } else {
             dispatch_ssn(ssn, a0, a1, a2, a3)
         };
+        // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). The eager
+        // co_IntInitializeDesktopGraphics scaffold is RETIRED — InitVideo/surface + the paint now run
+        // fully lazily from winlogon's own first GUI DC-op (SwitchDesktop → co_IntShowDesktop → erase →
+        // DceAllocDCE → co_IntGraphicsCheck → co_IntInitializeDesktopGraphics). But two host-side
+        // prerequisites that the lazy init depends on cannot be produced by winlogon itself and must be
+        // seeded here, at the earliest valid point (NtUserInitialize → InitializeGreCSRSS → InitFontSupport
+        // has just run, so FreeType/g_FreeTypeLock exist):
+        //   (1) the system font (arial.ttf memory-font) — else the lazy co_IntInitializeDesktopGraphics's
+        //       font realize null-derefs ("no fonts loaded at all");
+        //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
+        //       hWinSta=0x4, and gpdeskInputDesktop is set) — via a bRedraw=FALSE SwitchDesktop that does
+        //       NOT itself trigger the lazy path, leaving NrGuiAppsRunning==0 for winlogon to drive.
+        if ssn == SSN_NT_USER_INITIALIZE_REAL && status == 0 && !DESKTOP_GFX_SEEDED {
+            DESKTOP_GFX_SEEDED = true;
+            load_system_font();
+            create_winsta_and_desktop();
+        }
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
         let seq = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *const u64);
         write_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq + 1);

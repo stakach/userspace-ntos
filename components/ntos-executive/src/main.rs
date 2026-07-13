@@ -6534,34 +6534,16 @@ unsafe fn service_sec_image(
                 print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
                 print_hex(st as u32);
                 print_str(b"\n");
-                // Once NtUserInitialize (0x125a) succeeds, the display device is registered but the
-                // PDEV/primary-surface aren't created yet (lazy — on the first GUI op, which our hosted
-                // csrss can't reach: it's blocked at the SM↔CSR LPC handshake). Run win32k's display
-                // graphics init here so the framebuf DrvEnablePDEV/Surface + IOCTL_VIDEO_MAP primary
-                // surface + SM_CXSCREEN/CYSCREEN + the system font are up BEFORE winlogon runs.
-                //
-                // ★ SCAFFOLD PAINT RETIRED. This arm now provides ONLY the display-INIT bringup that
-                // winlogon's paint depends on — it no longer feeds the counted `exec_win32k_desktop_painted`
-                // gate. That spec is now driven by winlogon's OWN natural NtUserSwitchDesktop paint (the
-                // m0==0x1288 arm above). NOTE: co_IntInitializeDesktopGraphics (winsta.c:255) is an atomic
-                // win32k function that runs InitVideo/surface (:278/:286) AND an internal
-                // co_IntShowDesktop paint (:340) — the two are NOT separable without a binary patch (which
-                // would itself be a scaffold, contradicting the retirement). Its incidental Default-desktop
-                // paint here is WIPED by the magenta-clear before winlogon's SwitchDesktop, so the on-screen
-                // + counted pixels are winlogon's authentic natural paint, not this bringup's.
-                if m0 == 0x125a && ok && st == 0
-                    && DESKTOP_GFX_DONE.swap(1, Ordering::Relaxed) == 0
-                {
-                    let (gst, gok) =
-                        win32k_dispatch(win32k_host::SSN_INIT_DESKTOP_GFX, 0, 0, 0, 0);
-                    print_str(b"[win32k-svc] win32k display-init (InitVideo/surface/font) -> 0x");
-                    print_hex(gst as u32);
-                    print_str(if gok {
-                        b" (ran - counted paint now driven by winlogon's natural SwitchDesktop)\n".as_slice()
-                    } else {
-                        b" (WALL)\n".as_slice()
-                    });
-                }
+                // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
+                // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
+                // seeds the host prerequisites the display init depends on (the system font +
+                // WinSta0/Default Ob objects — see win32k_host::dispatch_loop's post-0x125a step). The
+                // actual InitVideo/framebuf-surface bringup AND the paint now happen FULLY LAZILY from
+                // winlogon's OWN first GUI DC-op: NtUserSwitchDesktop → co_IntShowDesktop →
+                // co_UserRedrawWindow → WM_ERASEBKGND → UserGetDCEx(DCX_CACHE) → DceAllocDCE →
+                // DceCreateDisplayDC → co_IntGraphicsCheck(TRUE) → co_AddGuiApp →
+                // co_IntInitializeDesktopGraphics (InitVideo/surface :278/:286 + the atomic paint :340).
+                // The counted exec_win32k_desktop_painted spec is fed by the m0==0x1288 arm above.
                 if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
                 } else {
@@ -8202,8 +8184,6 @@ static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
 static FB_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
-/// 0 until co_IntInitializeDesktopGraphics has been triggered (once, after NtUserInitialize succeeds).
-static DESKTOP_GFX_DONE: AtomicU64 = AtomicU64::new(0);
 /// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
 static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
 /// Count (of the 768-px sampled grid) whose value == [`FB_DESKTOP_BG`] after the desktop-graphics
@@ -8216,12 +8196,12 @@ static FB_PIXELS_SAMPLE0: AtomicU64 = AtomicU64::new(0);
 /// The number of framebuffer pixels sampled on the readback grid (24 rows x 32 cols).
 const FB_SAMPLE_COUNT: u64 = 24 * 32;
 /// Proof that winlogon's OWN natural NtUserSwitchDesktop -> co_IntShowDesktop -> IntPaintDesktop
-/// flow paints the framebuffer (distinct from the SSN_INIT_DESKTOP_GFX scaffold, which still drives
-/// the counted `exec_win32k_desktop_painted` spec). Set by the forward arm around winlogon's
-/// SwitchDesktop (SSN 0x1288): the fb is cleared to magenta (0x00FF00FF) BEFORE the switch and the
-/// sampled grid is re-read AFTER — this records how many sampled pixels winlogon's flow re-painted to
-/// [`FB_DESKTOP_BG`]. 0 = not yet observed; a full 768 = the natural flow paints. The scaffold is NOT
-/// retired this increment (this is a demonstration alongside the safety net).
+/// flow paints the framebuffer. Set by the forward arm around winlogon's SwitchDesktop (SSN 0x1288):
+/// the fb is cleared to magenta (0x00FF00FF) BEFORE the switch and the sampled grid is re-read AFTER —
+/// this records how many sampled pixels winlogon's flow re-painted to [`FB_DESKTOP_BG`]. 0 = not yet
+/// observed; a full 768 = the natural flow paints. The EAGER SSN_INIT_DESKTOP_GFX scaffold is now
+/// fully RETIRED — winlogon's own DC-op drives BOTH the display init (co_IntGraphicsCheck ->
+/// co_IntInitializeDesktopGraphics) and this paint; this is the sole source of the counted spec.
 static WINLOGON_NATURAL_PAINT: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
 /// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
@@ -12234,11 +12214,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    // --- Graphics: the counted desktop paint. The SSN_INIT_DESKTOP_GFX scaffold PAINT is RETIRED —
-    // the framebuffer is now painted by winlogon's OWN natural NtUserSwitchDesktop -> co_IntShowDesktop
-    // -> IntPaintDesktop (the m0==0x1288 forward arm cleared the fb to magenta first, then re-read the
-    // grid, stashing the result in FB_PIXELS_DREW/MATCH/SAMPLE0). The m0==0x125a arm keeps ONLY the
-    // InitVideo/surface/font bringup that winlogon's paint depends on.
+    // --- Graphics: the counted desktop paint. The ENTIRE eager desktop-graphics scaffold is RETIRED —
+    // both the display init AND the paint are now winlogon-natural. winlogon's OWN first GUI DC-op
+    // (NtUserSwitchDesktop -> co_IntShowDesktop -> WM_ERASEBKGND -> DceAllocDCE -> co_IntGraphicsCheck)
+    // lazily drives co_IntInitializeDesktopGraphics (InitVideo/surface) THEN IntPaintDesktop paints the
+    // framebuffer (the m0==0x1288 forward arm cleared the fb to magenta first, then re-read the grid,
+    // stashing the result in FB_PIXELS_DREW/MATCH/SAMPLE0). There is no longer any m0==0x125a arm; win32k's
+    // own NtUserInitialize dispatch only seeds the host prerequisites (system font + WinSta0/Default Ob).
     {
         let d = FB_PIXELS_DREW.load(Ordering::Relaxed);
         let matched = FB_PIXELS_MATCH.load(Ordering::Relaxed);
