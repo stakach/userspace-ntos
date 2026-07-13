@@ -106,6 +106,27 @@ fn reserved_handle_table_never_reallocates() {
 }
 
 #[test]
+fn pre_created_main_thread_bound_at_spawn() {
+    // The host pre-creates the main thread as an identity at boot (entry unknown), then binds the
+    // real image entry at spawn (alloc-free), and terminates for the lifecycle teardown.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let tid = pm.create_thread(pid, 0, 0, false).unwrap(); // entry unknown at boot
+    assert_eq!(pm.main_thread(pid), Some(tid));
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    // Bind the entry at "spawn".
+    assert!(pm.set_thread_start_address(tid, 0x1400_18e60));
+    assert_eq!(pm.thread(tid).unwrap().start_address, 0x1400_18e60);
+    assert!(!pm.set_thread_start_address(9999, 0)); // unknown tid rejected, not a panic
+    // Teardown: terminate the process → signalled, thread terminated, exit status readable.
+    assert!(!pm.is_process_signaled(pid));
+    pm.terminate_process(pid, 0x1234).unwrap();
+    assert!(pm.is_process_signaled(pid));
+    assert!(pm.is_thread_signaled(tid));
+    assert_eq!(pm.wait_process(pid), Some(0x1234));
+}
+
+#[test]
 fn close_by_object_tag() {
     // The convergence hybrid: a host tags each entry with its own handle VALUE (Opaque) and closes
     // by that tag on NtClose, without knowing this table's internal slot-handle.

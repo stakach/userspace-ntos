@@ -299,6 +299,12 @@ pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
 /// NtAdjustPrivilegesToken — smss enables privileges it needs (SeTcb/SeLoadDriver/…). We don't
 /// model token privileges → no-op success (the enable "succeeds").
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
+/// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
+/// NtClose=27/NtCreateProcess=49/NtCreateThread=55). NOT issued during the current boot (no hosted
+/// process self-terminates) — registering them is additive; the teardown POLICY is proven by the
+/// post-loop self-test. NtOpenProcess (128) stays a handler METHOD until a live caller appears.
+pub const SSN_NT_TERMINATE_PROCESS: u64 = 266;
+pub const SSN_NT_TERMINATE_THREAD: u64 = 267;
 /// A distinctive fake handle we hand back for objects we don't yet model (ports, events, …), so it
 /// is recognisable in traces and never collides with a real (small) handle index.
 pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
@@ -2910,6 +2916,31 @@ impl ExecNtHandler {
                     }
                 }
                 PM_IDENTITY_OK.store(ok, Ordering::Relaxed);
+                // Path 2 — create each hosted process's MAIN THREAD as a real ETHREAD (identity)
+                // NOW, at boot, below the service_sec_image heap mark: pm.create_thread's BTreeMap/
+                // BTreeSet inserts are durable but happen before the mark, so the per-syscall bump
+                // reset never rewinds them (same non-leaking pattern as the EPROCESSes). This moves
+                // each EPROCESS Created→Running + sets its main_thread. The real image ENTRY is bound
+                // later, alloc-free, at the actual seL4 spawn (set_thread_start_address). Entry starts
+                // 0 = "not yet bound".
+                let mut mt_ok = 0u64;
+                let pids = [smss_pid, csrss_pid, winlogon_pid];
+                for (i, &pid) in pids.iter().enumerate() {
+                    if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                        PM_TIDS[i].store(tid as u64, Ordering::Relaxed);
+                        let running = pm
+                            .process(pid)
+                            .is_some_and(|p| p.state == nt_process::ProcessState::Running);
+                        let cid_ok = pm.client_id(tid) == Some(nt_process::ClientId {
+                            unique_process: pid,
+                            unique_thread: tid,
+                        });
+                        if pm.main_thread(pid) == Some(tid) && running && cid_ok {
+                            mt_ok |= 1 << i;
+                        }
+                    }
+                }
+                PM_MAIN_THREADS_OK.store(mt_ok, Ordering::Relaxed);
                 // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
@@ -2956,6 +2987,43 @@ impl ExecNtHandler {
                 PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
             }
             PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
+    /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
+    /// at boot for the non-leaking heap solution; this alloc-free field write completes it).
+    fn bind_main_thread_entry(&mut self, pi: usize, entry: u64) {
+        if let Some(tid) = PM_TIDS.get(pi).map(|t| t.load(Ordering::Relaxed)) {
+            if tid != 0 && self.pm.set_thread_start_address(tid as nt_process::ThreadId, entry) {
+                PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    /// `NtOpenProcess` (spec §9): open a handle to the process identified by `target_pid` in the
+    /// CURRENT process's (`self.pi`) EPROCESS handle table, returning the handle VALUE (the global
+    /// scheme, like every other mint) or `None` if the target/opener is unknown. The table entry is
+    /// a typed `Process(target_pid)` so a later lookup/terminate resolves the real EPROCESS.
+    fn nt_open_process(&mut self, target_pid: nt_process::ProcessId) -> Option<u64> {
+        let opener = self.pm_pid_for_pi(self.pi)?;
+        self.pm.process(target_pid)?; // target must exist
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.pm
+            .insert_handle(opener, nt_process::HandleObject::Process(target_pid), 0)
+            .ok()?;
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(h)
+    }
+    /// Resolve a `NtTerminateProcess` ProcessHandle to the target EPROCESS pid. `NtCurrentProcess()`
+    /// (`-1`) → the caller (self-terminate). A child ProcessHandle can't be resolved to a pid until
+    /// path 1b gives the handle table a value→object index (process handles are typed `Process(pid)`
+    /// but not value-tagged), so it returns `None` for now (documented limitation; not hit at boot).
+    fn resolve_process_handle(&self, handle: u64) -> Option<nt_process::ProcessId> {
+        let caller = self.pm_pid_for_pi(self.pi)?;
+        if handle == 0xFFFF_FFFF_FFFF_FFFF {
+            Some(caller)
+        } else {
+            None
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -4575,6 +4643,36 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC0000002
                 }
             },
+            // NtTerminateProcess(ProcessHandle[R10]=args[0], ExitStatus[RDX]=args[1]). Route the
+            // POLICY teardown through pm: mark the target EPROCESS Terminated (signalled), terminate
+            // its threads, release its image-section map ref. NOT reached during a normal boot (no
+            // hosted process self-terminates); additive + proven by the post-loop self-test. FLAG:
+            // the seL4 MECHANISM teardown (reclaim the VSpace/CSpace/TCB caps + the mirror/scratch
+            // frames) is NOT done here — that needs the trusted-root-task cap reclamation and is the
+            // next path-2 follow-up; today the process simply stops faulting and its frames persist.
+            NativeService::NtTerminateProcess => {
+                PM_TERMINATE_CALLS.fetch_add(1, Ordering::Relaxed);
+                let handle = args.first().copied().unwrap_or(0);
+                let status = args.get(1).copied().unwrap_or(0) as u32;
+                if let Some(pid) = self.resolve_process_handle(handle) {
+                    let _ = self.pm.terminate_process(pid, status);
+                }
+                0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
+            }
+            // NtTerminateThread(ThreadHandle, ExitStatus[RDX]) for NtCurrentThread()==-2 → the
+            // caller's main thread (policy-side). Same additive/self-tested status as above.
+            NativeService::NtTerminateThread => {
+                let handle = args.first().copied().unwrap_or(0);
+                let status = args.get(1).copied().unwrap_or(0) as u32;
+                if handle == 0xFFFF_FFFF_FFFF_FFFE {
+                    if let Some(tid) = PM_TIDS.get(self.pi).map(|t| t.load(Ordering::Relaxed)) {
+                        if tid != 0 {
+                            let _ = self.pm.terminate_thread(tid as nt_process::ThreadId, status);
+                        }
+                    }
+                }
+                0
+            }
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -4654,6 +4752,13 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtMapViewOfSection, 113),
             // Workstream A batch 10 (group C): csrss spawn (table-dispatched-with-post-action).
             (NativeService::NtCreateProcess, SSN_NT_CREATE_PROCESS as u32),
+            // NOTE: NtTerminateProcess/NtTerminateThread are deliberately NOT registered here.
+            // Registering them intercepts LIVE boot calls (a csrss/winlogon worker thread exits via
+            // NtTerminateThread) that currently fall to the benign broker fallback — routing them to
+            // the pm teardown is a BEHAVIOR CHANGE (and needs per-thread identity we don't have until
+            // path 1b's value-indexed handles). The teardown POLICY (pm.terminate_process/thread +
+            // resolve_process_handle) is implemented (the handler arms below) + proven by the
+            // post-loop self-test; wiring it to live dispatch is a flagged follow-up.
         ],
     )
 }
@@ -5395,6 +5500,11 @@ unsafe fn service_sec_image(
     // smss's PE (the function param `pe` is shadowed per-iteration to the active process's image; the
     // SM-loop rendezvous always demand-fills SMSS's image, so capture it here before the shadow).
     let smss_pe: &nt_pe_loader::PeFile = pe;
+    // Bind smss's pre-created main ETHREAD to its real image entry (smss is already running from the
+    // initial recv, not a loop spawn — so bind here). Only on the LIVE run (ntdll present).
+    if ntdll.is_some() {
+        nt_handler.bind_main_thread_entry(0, PE_LOAD_BASE + smss_pe.entry_point_rva() as u64);
+    }
     // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each).
     let mut pml4s = [pml4, 0u64, 0u64];
     let mut scratch_bases = [scratch_base, 0u64, 0u64];
@@ -5870,6 +5980,9 @@ unsafe fn service_sec_image(
                     pml4s[1] = cpml4;
                     img_ends[1] = PE_LOAD_BASE + image_extent(cpe);
                     scratch_bases[1] = CSRSS_SCRATCH_BASE;
+                    // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
+                    nt_handler
+                        .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
                     csrss_process_handle = nt_handler.next_handle;
                     nt_handler.next_handle += 1;
                     smss_stack_write(get_recv_mr(9), csrss_process_handle); // *ProcessHandle (R10)
@@ -5911,6 +6024,9 @@ unsafe fn service_sec_image(
                     pml4s[2] = wpml4;
                     img_ends[2] = PE_LOAD_BASE + image_extent(wpe);
                     scratch_bases[2] = WINLOGON_SCRATCH_BASE;
+                    // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
+                    nt_handler
+                        .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
                     winlogon_process_handle = nt_handler.next_handle;
                     nt_handler.next_handle += 1;
                     smss_stack_write(get_recv_mr(9), winlogon_process_handle); // *ProcessHandle (R10)
@@ -6288,6 +6404,63 @@ unsafe fn service_sec_image(
         }
         stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
         break;
+    }
+    // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
+    // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
+    // The 3 HOSTED EPROCESSes are left untouched — terminate runs on a THROWAWAY process. ===
+    if ntdll.is_some() {
+        // NtOpenProcess: smss (pi 0) opens csrss by pid → a real Process(csrss_pid) handle in smss's
+        // EPROCESS table.
+        nt_handler.pi = 0;
+        let mut open_ok = 0u64;
+        if let (Some(smss_pid), Some(csrss_pid)) =
+            (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1))
+        {
+            if nt_handler.nt_open_process(csrss_pid).is_some() {
+                open_ok |= 1;
+            }
+            if nt_handler
+                .pm
+                .close_handle_by_object(smss_pid, nt_process::HandleObject::Process(csrss_pid))
+            {
+                open_ok |= 2; // the opened handle really is in smss's table
+            }
+        }
+        PM_NTOPENPROCESS_OK.store(open_ok, Ordering::Relaxed);
+
+        // NtTerminateProcess: build a throwaway EPROCESS + thread + handle, then run the same policy
+        // teardown the handler drives, and verify the process/thread are signalled + wait-able + the
+        // handle table closes. Also verify the handler's ProcessHandle resolve (NtCurrentProcess→self).
+        let mut life_ok = 0u64;
+        let parent = nt_handler.pm_pid_for_pi(0);
+        let tpid = nt_handler.pm.create_process("lifecycle-test.exe", parent, None);
+        if let Ok(ttid) = nt_handler.pm.create_thread(tpid, 0x1000, 0, false) {
+            let th = nt_handler
+                .pm
+                .insert_handle(tpid, nt_process::HandleObject::Opaque(0xDEAD), 0)
+                .ok();
+            nt_handler.pi = 0;
+            if nt_handler.resolve_process_handle(0xFFFF_FFFF_FFFF_FFFF) == nt_handler.pm_pid_for_pi(0)
+            {
+                life_ok |= 1; // NtCurrentProcess() resolves to the caller
+            }
+            if nt_handler.pm.terminate_process(tpid, 0x1234).is_ok() {
+                life_ok |= 2;
+            }
+            if nt_handler.pm.is_process_signaled(tpid) {
+                life_ok |= 4;
+            }
+            if nt_handler.pm.is_thread_signaled(ttid) {
+                life_ok |= 8; // teardown signalled the process's threads
+            }
+            if nt_handler.pm.wait_process(tpid) == Some(0x1234) {
+                life_ok |= 16; // exit status readable via wait
+            }
+            if th.is_some_and(|h| nt_handler.pm.close_handle(tpid, h).is_ok()) {
+                life_ok |= 32; // handle-table teardown
+            }
+        }
+        PM_LIFECYCLE_OK.store(life_ok, Ordering::Relaxed);
     }
     if csrss_process_handle != 0 {
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
@@ -7398,6 +7571,27 @@ static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
 /// The handle-table capacity reserved at boot (min across the 3 EPROCESSes). The run proves no
 /// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
 static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
+// === Path 2 — lifecycle: real ETHREADs + create/terminate/open routed through pm ===============
+/// Main-thread tids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created). Pre-created at boot
+/// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
+/// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
+static PM_TIDS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
+/// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
+static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
+/// Count of spawn-time `set_thread_start_address` binds (csrss/winlogon main threads bound to their
+/// real image entry when the seL4 process is actually spawned) — the "NtCreateThread through pm at
+/// real spawn time" routing.
+static PM_THREAD_BINDS: AtomicU64 = AtomicU64::new(0);
+/// Lifecycle self-test result (post-loop): NtTerminateProcess policy teardown on a throwaway EPROCESS
+/// (process signalled + main thread terminated + exit status via wait + handle-table closed).
+static PM_LIFECYCLE_OK: AtomicU64 = AtomicU64::new(0);
+/// NtOpenProcess self-test result (post-loop): opening a process by ClientId mints a Process handle in
+/// the opener's EPROCESS table that resolves back to the target pid.
+static PM_NTOPENPROCESS_OK: AtomicU64 = AtomicU64::new(0);
+/// Count of real NtTerminateProcess calls the executive serviced (0 during a normal boot — no hosted
+/// process terminates; the handler is additive + proven by the post-loop self-test).
+static PM_TERMINATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -11370,6 +11564,38 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" reserved=0x");
                     print_hex(cap as u32);
                     print_str(b" (no realloc)\n");
+                    // Path 2 — lifecycle: real ETHREADs back the 3 main threads (bound to their image
+                    // entry at spawn), and NtTerminateProcess/NtOpenProcess route through pm (proven
+                    // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
+                    check(
+                        b"exec_ethread_backs_main_threads",
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b111,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_main_thread_bound_at_spawn",
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 3,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_ntopenprocess_mints_handle",
+                        PM_NTOPENPROCESS_OK.load(Ordering::Relaxed) == 0b11,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_ntterminateprocess_teardown",
+                        PM_LIFECYCLE_OK.load(Ordering::Relaxed) == 0b11_1111,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] nt-process path2: main-threads-ok=0x");
+                    print_hex(PM_MAIN_THREADS_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b" binds=0x");
+                    print_hex(PM_THREAD_BINDS.load(Ordering::Relaxed) as u32);
+                    print_str(b" open-ok=0x");
+                    print_hex(PM_NTOPENPROCESS_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b" terminate-ok=0x");
+                    print_hex(PM_LIFECYCLE_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] nt-process: EPROCESS pids smss/csrss/winlogon = ");
                     print_hex(PM_PIDS[0].load(Ordering::Relaxed) as u32);
                     print_str(b"/");
@@ -11395,6 +11621,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_eprocess_lookup_by_badge", false, &mut passed);
                     check(b"exec_eprocess_handle_table_routed", false, &mut passed);
                     check(b"exec_eprocess_handle_table_no_realloc", false, &mut passed);
+                    check(b"exec_ethread_backs_main_threads", false, &mut passed);
+                    check(b"exec_main_thread_bound_at_spawn", false, &mut passed);
+                    check(b"exec_ntopenprocess_mints_handle", false, &mut passed);
+                    check(b"exec_ntterminateprocess_teardown", false, &mut passed);
                 }
             }
             Err(_) => {

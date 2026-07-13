@@ -445,6 +445,25 @@ impl ProcessManager {
         })
     }
 
+    /// Bind a thread's start address (spec §10) — a host that pre-creates the main thread as an
+    /// identity (before its image entry point is known) sets it once the entry is resolved at the
+    /// real spawn. Returns `false` for an unknown thread. Alloc-free (a field write) so it is safe
+    /// to call during a serviced call on a reset bump allocator.
+    pub fn set_thread_start_address(&mut self, tid: ThreadId, start_address: u64) -> bool {
+        match self.threads.get_mut(&tid) {
+            Some(t) => {
+                t.start_address = start_address;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `pid`'s main (first) thread id, if any (spec §7.1) — the identity a host binds/queries.
+    pub fn main_thread(&self, pid: ProcessId) -> Option<ThreadId> {
+        self.processes.get(&pid).and_then(|p| p.main_thread)
+    }
+
     /// A scheduling-state transition (spec §11.2), e.g. `Ready` → `Running` → `Waiting`.
     pub fn set_thread_state(&mut self, tid: ThreadId, state: ThreadState) -> Result<(), u32> {
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
