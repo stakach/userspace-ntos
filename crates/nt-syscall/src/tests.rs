@@ -245,6 +245,23 @@ fn win7_table_registers_migrated_services() {
 }
 
 #[test]
+fn group_c_first_cut_services_register() {
+    // Group C first cut (demand-fill/alloc subset reached via ExecLoopCtx): NtAllocateVirtualMemory
+    // (reads Type at stack arg5 → 6-arg) + NtOpenSection register at their real Win7 SSNs.
+    let pairs = [
+        (NativeService::NtAllocateVirtualMemory, 0x12u32),
+        (NativeService::NtOpenSection, 131),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        assert_eq!(t.lookup(num).unwrap().service, svc);
+    }
+    assert_eq!(NativeService::NtAllocateVirtualMemory.arg_count(), (6, 6));
+    assert_eq!(NativeService::NtOpenSection.arg_count(), (0, 4));
+}
+
+#[test]
 fn group_a_services_register_with_register_only_bounds() {
     // Group A (create-handle + no-op) services register at their real Win7 SSNs and carry the
     // capped (0,4) arg bounds so the executive's table-driven dispatch reads only registers.

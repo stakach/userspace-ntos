@@ -120,6 +120,8 @@ pub enum NativeService {
     // filled by the executive after dispatch via a queued-write side-channel).
     NtQueryPerformanceCounter,
     NtQueryVolumeInformationFile,
+    // Group C: section/registry/spawn services entangled with the executive's fault-loop state.
+    NtOpenSection,
 }
 
 impl NativeService {
@@ -185,6 +187,7 @@ impl NativeService {
             NtOpenSymbolicLinkObject => "NtOpenSymbolicLinkObject",
             NtQueryPerformanceCounter => "NtQueryPerformanceCounter",
             NtQueryVolumeInformationFile => "NtQueryVolumeInformationFile",
+            NtOpenSection => "NtOpenSection",
         }
     }
 
@@ -201,7 +204,8 @@ impl NativeService {
             | NtQueryObject | NtQueryVolumeInformationFile => (5, 5),
             NtWaitForSingleObject => (3, 3),
             NtQueryPerformanceCounter => (2, 2),
-            NtQueryVirtualMemory => (6, 6),
+            NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
+            NtOpenSection => (0, 4),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
             | NtOpenSymbolicLinkObject => (0, 4),
             NtEnumerateValueKey => (6, 6),
@@ -281,6 +285,7 @@ impl NativeService {
         NativeService::NtOpenSymbolicLinkObject,
         NativeService::NtQueryPerformanceCounter,
         NativeService::NtQueryVolumeInformationFile,
+        NativeService::NtOpenSection,
     ];
 }
 

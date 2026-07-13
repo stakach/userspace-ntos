@@ -2431,6 +2431,24 @@ fn build_key_value_info(class: u64, name: &str, ty: u32, data: &[u8]) -> alloc::
     b
 }
 
+/// Raw references to the fault/syscall loop's per-iteration state, handed to the group-C handlers
+/// (Workstream A) so they can reach the section/registry/demand-fill state that genuinely lives on
+/// the loop (`service_sec_image`), not on the handler. The Tier-1 dispatch arm rebuilds this each
+/// iteration pointing at the current loop locals.
+///
+/// SAFETY: every pointer targets a `service_sec_image` local that outlives each `dispatch` call;
+/// the executive is single-threaded and the loop does not touch these between building the ctx and
+/// draining the handler's signals, so there is no aliasing in practice. Extended as more group-C
+/// cases migrate (reg / dll_pes / csrss handle-tracking / image PEs / demand-fill state).
+#[derive(Clone, Copy)]
+struct ExecLoopCtx {
+    /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
+    pml4: u64,
+    /// The named NLS section handle (\Nls\NlsSectionCP20127) NtOpenSection records so
+    /// NtMapViewOfSection can back it. Points at the loop-local `nls_section_handle`.
+    nls_section_handle: *mut u64,
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -2459,6 +2477,9 @@ struct ExecNtHandler {
     /// after `dispatch`, writing each via `csrss_out_write` (csrss) or `smss_stack_write` (smss).
     out_writes: [(u64, u64); 8],
     out_writes_n: usize,
+    /// Raw refs to the loop's per-iteration state for group-C handlers (see [`ExecLoopCtx`]). Set
+    /// by the Tier-1 dispatch arm before each `dispatch`; `None` outside the loop.
+    loop_ctx: Option<ExecLoopCtx>,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2512,6 +2533,7 @@ impl ExecNtHandler {
             next_handle: FAKE_HANDLE,
             out_writes: [(0, 0); 8],
             out_writes_n: 0,
+            loop_ctx: None,
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -3152,6 +3174,79 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             }
+            // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress[RDX]=args[1], ZeroBits,
+            // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). RESERVE (base in==0) picks a
+            // per-process bump base; COMMIT maps frames + mirrors the first heap window (group C:
+            // page_map target pml4 comes from the loop ctx).
+            NativeService::NtAllocateVirtualMemory => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let base_ptr = args[1]; // RDX
+                let size_ptr = args[3]; // R9
+                let alloc_type = args[4]; // arg5 = Type
+                let base_in = smss_stack_read(base_ptr);
+                let want = smss_stack_read(size_ptr);
+                let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
+                let base = if base_in != 0 {
+                    base_in
+                } else if self.pi == 1 {
+                    NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                } else {
+                    NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                };
+                if alloc_type & 0x1000 != 0 {
+                    // MEM_COMMIT — back it with real frames.
+                    let mut p = 0u64;
+                    while p < rounded {
+                        let f = alloc_frame();
+                        let _ = page_map(f, base + p, RW_NX, ctx.pml4);
+                        // Mirror the first heap window into the executive so smss_copyin can read
+                        // heap-resident pointer args, into the ACTIVE process's heap mirror.
+                        let va = base + p;
+                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+                            let mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+                            let _ = page_map(copy_cap(f),
+                                mirror + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
+                        }
+                        p += 0x1000;
+                    }
+                }
+                smss_stack_write(base_ptr, base);
+                smss_stack_write(size_ptr, rounded);
+                NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
+                0
+            },
+            // NtOpenSection(*SectionHandle[R10]=args[0], DesiredAccess, *ObjectAttributes[R8]=args[2]).
+            // Provide the US-ASCII NLS code-page section \Nls\NlsSectionCP20127 (csrss's Win32 stack
+            // maps it during a DllMain); everything else → NOT_FOUND. Records nls_section_handle.
+            NativeService::NtOpenSection => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let name16 = smss_read_objattr_name(args[2]); // R8 = *ObjectAttributes
+                print_str(b"[ntos-exec] NtOpenSection name=\"");
+                for &w in name16.iter().take(96) {
+                    debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
+                }
+                print_str(b"\"\n");
+                let mut nb = [0u8; 96];
+                let mut nlen = 0;
+                for &w in &name16 {
+                    if nlen >= nb.len() {
+                        break;
+                    }
+                    nb[nlen] = (w as u8).to_ascii_lowercase();
+                    nlen += 1;
+                }
+                if nb[..nlen].windows(17).any(|w| w == b"nlssectioncp20127") {
+                    smss_stack_write(args[0], self.next_handle); // R10 = *SectionHandle
+                    *ctx.nls_section_handle = self.next_handle;
+                    self.next_handle += 1;
+                    print_str(b"[ntos-exec] NtOpenSection NlsCP20127 -> handle 0x");
+                    print_hex(*ctx.nls_section_handle as u32);
+                    print_str(b"\n");
+                    0 // STATUS_SUCCESS
+                } else {
+                    0xC0000034 // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3210,6 +3305,9 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtQuerySystemTime, SSN_NT_QUERY_SYSTEM_TIME_SVC as u32),
             (NativeService::NtQueryPerformanceCounter, SSN_NT_QUERY_PERF_COUNTER as u32),
             (NativeService::NtQueryVolumeInformationFile, SSN_NT_QUERY_VOLUME_INFO_FILE as u32),
+            // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
+            (NativeService::NtAllocateVirtualMemory, SSN_NT_ALLOCATE_VM as u32),
+            (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),
         ],
     )
 }
@@ -4145,6 +4243,12 @@ unsafe fn service_sec_image(
                 nt_handler.pi = pi;
                 nt_handler.stop = false;
                 nt_handler.out_writes_n = 0;
+                // Group-C handlers reach the loop's section/registry/demand-fill state through this
+                // ctx of raw refs (rebuilt each iteration at the current loop locals).
+                nt_handler.loop_ctx = Some(ExecLoopCtx {
+                    pml4,
+                    nls_section_handle: &mut nls_section_handle as *mut u64,
+                });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
                 if nt_handler.stop {
@@ -4160,79 +4264,6 @@ unsafe fn service_sec_image(
                     } else {
                         smss_stack_write(ptr, val);
                     }
-                }
-            } else if m0 == SSN_NT_ALLOCATE_VM {
-                // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
-                // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size, [sp+0x28]=Type.
-                // RESERVE (base in==0) picks a bump base; COMMIT maps frames at the base.
-                let base_ptr = m3; // RDX
-                let size_ptr = get_recv_mr(8); // R9
-                let alloc_type = smss_stack_read(sp + 0x28);
-                let base_in = smss_stack_read(base_ptr);
-                let want = smss_stack_read(size_ptr);
-                let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
-                let base = if base_in != 0 {
-                    base_in
-                } else if pi == 1 {
-                    NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                } else {
-                    NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
-                };
-                if alloc_type & 0x1000 != 0 {
-                    // MEM_COMMIT — back it with real frames.
-                    let mut p = 0u64;
-                    while p < rounded {
-                        let f = alloc_frame();
-                        let _ = page_map(f, base + p, RW_NX, pml4);
-                        // Mirror the first heap window into the executive so smss_copyin can read
-                        // heap-resident pointer args (registry key paths, the loader's DLL search
-                        // paths). Into the ACTIVE process's heap mirror (smss vs csrss) — they share
-                        // the heap VA but live in different VSpaces, so each gets its own mirror.
-                        let va = base + p;
-                        if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-                            let mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-                            let _ = page_map(copy_cap(f),
-                                mirror + (va - SMSS_ALLOC_VA), RW_NX, CAP_INIT_THREAD_VSPACE);
-                        }
-                        p += 0x1000;
-                    }
-                }
-                smss_stack_write(base_ptr, base);
-                smss_stack_write(size_ptr, rounded);
-                NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-            } else if m0 == SSN_NT_OPEN_SECTION {
-                // NtOpenSection(*SectionHandle[R10], DesiredAccess[RDX], *ObjectAttributes[R8]).
-                // CsrServerInitialization opens named sections. Log the requested name (folded to
-                // printable ASCII) and return NOT_FOUND for now, so we can see which section csrss
-                // wants before deciding whether it's load-bearing.
-                let name16 = smss_read_objattr_name(get_recv_mr(7)); // R8 = *ObjectAttributes
-                print_str(b"[ntos-exec] NtOpenSection name=\"");
-                for &w in name16.iter().take(96) {
-                    debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
-                }
-                print_str(b"\"\n");
-                // Fold the name to lowercase ASCII (like NtOpenFile) and provide the US-ASCII NLS
-                // code-page section \Nls\NlsSectionCP20127 — csrss's Win32 client stack maps it during
-                // a DllMain; a NOT_FOUND here → STATUS_DLL_INIT_FAILED.
-                let mut nb = [0u8; 96];
-                let mut nlen = 0;
-                for &w in &name16 {
-                    if nlen >= nb.len() {
-                        break;
-                    }
-                    nb[nlen] = (w as u8).to_ascii_lowercase();
-                    nlen += 1;
-                }
-                if nb[..nlen].windows(17).any(|w| w == b"nlssectioncp20127") {
-                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // R10 = *SectionHandle
-                    nls_section_handle = nt_handler.next_handle;
-                    nt_handler.next_handle += 1;
-                    print_str(b"[ntos-exec] NtOpenSection NlsCP20127 -> handle 0x");
-                    print_hex(nls_section_handle as u32);
-                    print_str(b"\n");
-                    // result stays 0 (SUCCESS)
-                } else {
-                    result = 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             } else if m0 == SSN_NT_CREATE_SECTION {
                 // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
