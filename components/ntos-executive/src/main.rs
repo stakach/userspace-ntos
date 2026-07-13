@@ -2945,6 +2945,12 @@ impl ExecNtHandler {
             // link (pi 0=smss / 1=csrss / 2=winlogon); the specs verify the objects back the badges.
             pm: {
                 let mut pm = nt_process::ProcessManager::new();
+                // Path 1b: append-only handle values. The executive hands each hosted process its
+                // OWN dense per-process handle VALUES (real NT), then indexes external state (the
+                // per-pi DLL registry, EXE section scalars) by those values. NT-style slot reuse
+                // would recycle a value while stale bindings to the old value still exist →
+                // mis-routing the next open; append-only keeps every value monotonic for the run.
+                pm.set_handle_no_reuse(true);
                 let smss_pid = pm.create_process("smss.exe", None, None);
                 let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
@@ -3026,22 +3032,25 @@ impl ExecNtHandler {
     /// handle — tagged with the value in a `HandleObject::Opaque` so `NtClose` can free it. The
     /// pre-reserved capacity guarantees the `insert_handle` never reallocates under the reset.
     fn mint_handle(&mut self) -> u64 {
+        // Path 1b: return the process-LOCAL dense value the EPROCESS handle table allocates
+        // (real NT `(slot+1)*4`), not a global monotonic value. Two processes each get their own
+        // 0x4, 0x8, … namespace; cross-process collisions are resolved by the per-pi-keyed
+        // consumers (DLL registry) + pi-scoped scalar comparisons. Append-only (no_reuse) keeps
+        // each value monotonic for the run so external bindings never see a recycled value.
+        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+            if let Ok(h) = self.pm.insert_handle(pid, nt_process::HandleObject::Opaque(0), 0) {
+                let c = self.pm.handle_count(pid) as u64;
+                if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+                    PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
+                }
+                PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                return h as u64;
+            }
+        }
+        // Fallback (no EPROCESS for this pi — not the 3 hosted processes): global monotonic value.
         let h = self.next_handle;
         self.next_handle += 1;
-        self.track_handle(nt_process::HandleObject::Opaque(h));
         h
-    }
-    /// Record an object in the CURRENT process's EPROCESS handle table (the caller supplies the
-    /// value-tag / typed object). Used by `mint_handle` and by the loop's process-handle mints.
-    fn track_handle(&mut self, object: nt_process::HandleObject) {
-        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            let _ = self.pm.insert_handle(pid, object, 0);
-            let c = self.pm.handle_count(pid) as u64;
-            if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-                PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
-            }
-            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        }
     }
     /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
     /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
@@ -3060,13 +3069,14 @@ impl ExecNtHandler {
     fn nt_open_process(&mut self, target_pid: nt_process::ProcessId) -> Option<u64> {
         let opener = self.pm_pid_for_pi(self.pi)?;
         self.pm.process(target_pid)?; // target must exist
-        let h = self.next_handle;
-        self.next_handle += 1;
-        self.pm
+        // Path 1b: the returned VALUE is the opener's process-local dense handle for the typed
+        // Process(target_pid) object — so a later value→object lookup resolves the real EPROCESS.
+        let h = self
+            .pm
             .insert_handle(opener, nt_process::HandleObject::Process(target_pid), 0)
             .ok()?;
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        Some(h)
+        Some(h as u64)
     }
     /// Resolve a `NtTerminateProcess` ProcessHandle to the target EPROCESS pid. `NtCurrentProcess()`
     /// (`-1`) → the caller (self-terminate). A child ProcessHandle can't be resolved to a pid until
@@ -3443,17 +3453,16 @@ impl NativeSyscallHandler for ExecNtHandler {
     fn handle(&mut self, ctx: &NativeCallContext, args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
         match ctx.service {
             // NtClose(Handle[R10]=args[0]): free the handle in the caller's REAL EPROCESS handle
-            // table (nt-process convergence path 1). Executive-minted handles are recorded tagged
-            // with their value (HandleObject::Opaque), so close-by-tag frees the slot for reuse. We
-            // still return SUCCESS unconditionally (matching the prior no-op) so a close of a handle
-            // the executive doesn't track — e.g. a win32k/Ob handle, or a typed Process handle smss
-            // never closes — stays benign. Purely additive: the returned status is unchanged.
+            // table by its SLOT (path 1b — the value IS the dense per-process table handle now, so
+            // close by value directly; no value-tag scan). Append-only allocation means the freed
+            // slot is NOT recycled, so a later open never reuses a closed value (keeping external
+            // bindings — the per-pi DLL registry — consistent). We still return SUCCESS
+            // unconditionally (matching the prior no-op) so a close of a handle the executive
+            // doesn't own — a win32k/Ob handle, a pseudo-handle, or a fallback global value — stays
+            // benign. Purely additive: the returned status is unchanged.
             NativeService::NtClose => {
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                    if self
-                        .pm
-                        .close_handle_by_object(pid, nt_process::HandleObject::Opaque(args[0]))
-                    {
+                    if self.pm.close_handle(pid, args[0] as nt_process::Handle).is_ok() {
                         PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -4445,7 +4454,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let winlogon_pe = &*ctx.winlogon_pe;
                 let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(self.pi, sect) {
                     reg.image_info(i).map(|b| (b, reg.name(i)))
-                } else if csrss_section_handle != 0 && sect == csrss_section_handle {
+                } else if self.pi == 0 && csrss_section_handle != 0 && sect == csrss_section_handle {
+                    // The csrss.exe SEC_IMAGE section is created + queried ONLY by smss (pi 0) inside
+                    // RtlCreateUserProcess. Scope to pi 0 so a DIFFERENT process's dense handle with
+                    // the same value (path 1b) can never alias it (reg is matched first regardless).
                     csrss_pe.as_ref().map(|p| {
                         (
                             nt_dll_registry::image_info(
@@ -4457,7 +4469,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                             b"csrss.exe" as &[u8],
                         )
                     })
-                } else if winlogon_section_handle != 0 && sect == winlogon_section_handle {
+                } else if self.pi == 0 && winlogon_section_handle != 0 && sect == winlogon_section_handle {
                     // smss's RtlCreateUserProcess(winlogon) queries SectionImageInformation on the
                     // winlogon SEC_IMAGE section to size the initial thread's stack + find the entry.
                     // Unrecognized before, this stopped the whole demo (the ONLY reason winlogon
@@ -4567,14 +4579,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                     ctx.pml4,
                 );
                 let sec_file = smss_stack_read(sp + 0x38);
-                if *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
+                // The csrss.exe / winlogon.exe EXE sections are created ONLY by smss (pi 0). Scope
+                // to pi 0 so a csrss/winlogon DLL section create with a same-valued dense file handle
+                // (path 1b) can't spuriously match these (the per-pi reg lookup handles DLLs below).
+                if self.pi == 0 && *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
                     *ctx.csrss_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
                     print_hex(h as u32);
                     print_str(b"\n");
                 }
-                if *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
+                if self.pi == 0 && *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
                     *ctx.winlogon_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
@@ -4671,7 +4686,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         self.stop = true;
                         0xC0000002
                     }
-                } else if *ctx.csrss_anon_section_handle != 0 && sect == *ctx.csrss_anon_section_handle {
+                } else if self.pi == 1 && *ctx.csrss_anon_section_handle != 0 && sect == *ctx.csrss_anon_section_handle {
                     // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
                     // (page tables only) and let the fault router demand-page zero frames on touch.
                     const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
@@ -4738,13 +4753,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let sp = get_recv_mr(16);
                 let sect = smss_stack_read(sp + 0x30); // SectionHandle
-                if *ctx.csrss_section_handle != 0
+                // NtCreateProcess(csrss/winlogon) is issued ONLY by smss (pi 0); scope so a dense
+                // section handle of the same value in another process can't trigger a spawn (1b).
+                if self.pi == 0
+                    && *ctx.csrss_section_handle != 0
                     && sect == *ctx.csrss_section_handle
                     && (*ctx.csrss_pe).is_some()
                 {
                     self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
                     0
-                } else if *ctx.winlogon_section_handle != 0
+                } else if self.pi == 0
+                    && *ctx.winlogon_section_handle != 0
                     && sect == *ctx.winlogon_section_handle
                     && (*ctx.winlogon_pe).is_some()
                 {
@@ -6104,22 +6123,31 @@ unsafe fn service_sec_image(
                     // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
-                    csrss_process_handle = nt_handler.next_handle;
-                    nt_handler.next_handle += 1;
-                    smss_stack_write(get_recv_mr(9), csrss_process_handle); // *ProcessHandle (R10)
                     // Record csrss's process handle in smss's (the creator's) EPROCESS table as a
-                    // real Process object (nt-process convergence path 1). Value stays the global
-                    // handle (behavior-preserving); the durable table now owns the process handle.
-                    if let (Some(smss_pid), Some(csrss_pid)) =
-                        (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1))
-                    {
-                        let _ = nt_handler.pm.insert_handle(
-                            smss_pid,
-                            nt_process::HandleObject::Process(csrss_pid),
-                            0,
-                        );
-                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // real typed Process object; the returned dense value IS the handle smss gets
+                    // (path 1b — process-local value). Fallback to a global value if pids are
+                    // unknown (shouldn't happen for the 3 hosted).
+                    csrss_process_handle = match (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1)) {
+                        (Some(smss_pid), Some(csrss_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                smss_pid,
+                                nt_process::HandleObject::Process(csrss_pid),
+                                0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle;
+                                nt_handler.next_handle += 1;
+                                g
+                            })
+                        }
+                        _ => {
+                            let g = nt_handler.next_handle;
+                            nt_handler.next_handle += 1;
+                            g
+                        }
+                    };
+                    smss_stack_write(get_recv_mr(9), csrss_process_handle); // *ProcessHandle (R10)
                     print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
@@ -6148,20 +6176,29 @@ unsafe fn service_sec_image(
                     // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
-                    winlogon_process_handle = nt_handler.next_handle;
-                    nt_handler.next_handle += 1;
+                    // Record winlogon's process handle in smss's EPROCESS table as a typed Process
+                    // object; the returned dense value IS smss's handle (path 1b).
+                    winlogon_process_handle = match (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(2)) {
+                        (Some(smss_pid), Some(winlogon_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                smss_pid,
+                                nt_process::HandleObject::Process(winlogon_pid),
+                                0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle;
+                                nt_handler.next_handle += 1;
+                                g
+                            })
+                        }
+                        _ => {
+                            let g = nt_handler.next_handle;
+                            nt_handler.next_handle += 1;
+                            g
+                        }
+                    };
                     smss_stack_write(get_recv_mr(9), winlogon_process_handle); // *ProcessHandle (R10)
-                    // Record winlogon's process handle in smss's EPROCESS table as a Process object.
-                    if let (Some(smss_pid), Some(winlogon_pid)) =
-                        (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(2))
-                    {
-                        let _ = nt_handler.pm.insert_handle(
-                            smss_pid,
-                            nt_process::HandleObject::Process(winlogon_pid),
-                            0,
-                        );
-                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                    }
                     print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge 4) -> handle 0x");
                     print_hex((winlogon_process_handle >> 32) as u32);
                     print_hex(winlogon_process_handle as u32);
@@ -6646,6 +6683,33 @@ unsafe fn service_sec_image(
             }
         }
         PM_LIFECYCLE_OK.store(life_ok, Ordering::Relaxed);
+
+        // Path 1b COUNTED SPEC — process-local dense handle VALUES. Two DISTINCT live EPROCESSes each
+        // allocate their first handle and BOTH get the SAME dense value (0x4), yet it refers to a
+        // DIFFERENT object in each: proof of per-process handle namespaces (a global value scheme
+        // could not hand out 0x4 twice). Runs post-loop on throwaway EPROCESSes (durable allocs are
+        // safe — no reset follows), leaving the 3 hosted processes untouched.
+        let pa = nt_handler.pm.create_process("hlocal-a.exe", None, None);
+        let pb = nt_handler.pm.create_process("hlocal-b.exe", None, None);
+        let ha = nt_handler
+            .pm
+            .insert_handle(pa, nt_process::HandleObject::Opaque(0xA11CE), 0);
+        let hb = nt_handler
+            .pm
+            .insert_handle(pb, nt_process::HandleObject::Opaque(0xB0B), 0);
+        let mut hl_ok = 0u64;
+        if ha == Ok(4) && hb == Ok(4) {
+            hl_ok |= 1; // both processes' FIRST handle is the same dense value 0x4
+        }
+        if nt_handler.pm.lookup_handle(pa, 4) == Some(nt_process::HandleObject::Opaque(0xA11CE))
+            && nt_handler.pm.lookup_handle(pb, 4) == Some(nt_process::HandleObject::Opaque(0xB0B))
+        {
+            hl_ok |= 2; // the SAME value 0x4 resolves to a DIFFERENT object in each namespace
+        }
+        if nt_handler.pm.lookup_handle(pa, 4) != nt_handler.pm.lookup_handle(pb, 4) {
+            hl_ok |= 4; // no cross-process aliasing
+        }
+        PM_HANDLE_LOCAL_OK.store(hl_ok, Ordering::Relaxed);
     }
     if csrss_process_handle != 0 {
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
@@ -8083,7 +8147,10 @@ static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 /// Reserved handle-table capacity per hosted EPROCESS (path 1). Measured peak is < ~100 handles per
 /// process over a full boot; 256 is ~3× headroom so `insert_handle` never reallocates under the
 /// per-syscall bump reset (the non-leaking heap solution). ~256 × 24 B × 3 ≈ 18 KiB of the 2 MiB heap.
-const PM_HANDLE_RESERVE: usize = 256;
+// Path 1b: append-only handles (no slot reuse) mean a process's table grows to its TOTAL mint
+// count over the run, not its peak-concurrent count, so reserve generously (the whole boot mints
+// well under this per process; keeps the durable table from ever reallocating under the heap-reset).
+const PM_HANDLE_RESERVE: usize = 1024;
 /// Total handles the executive has routed into the real per-EPROCESS handle tables (all mint sites).
 static PM_HANDLES_TRACKED: AtomicU64 = AtomicU64::new(0);
 /// Peak live handle count in any single EPROCESS table over the boot — the reservation-headroom gauge.
@@ -8109,6 +8176,9 @@ static PM_THREAD_BINDS: AtomicU64 = AtomicU64::new(0);
 /// Lifecycle self-test result (post-loop): NtTerminateProcess policy teardown on a throwaway EPROCESS
 /// (process signalled + main thread terminated + exit status via wait + handle-table closed).
 static PM_LIFECYCLE_OK: AtomicU64 = AtomicU64::new(0);
+/// Path 1b counted-spec result (post-loop): two distinct EPROCESSes both allocate dense handle 0x4,
+/// each resolving to a DIFFERENT object — proof of process-local handle namespaces (bits 0b111).
+static PM_HANDLE_LOCAL_OK: AtomicU64 = AtomicU64::new(0);
 /// NtOpenProcess self-test result (post-loop): opening a process by ClientId mints a Process handle in
 /// the opener's EPROCESS table that resolves back to the target pid.
 static PM_NTOPENPROCESS_OK: AtomicU64 = AtomicU64::new(0);
@@ -12164,6 +12234,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b111,
                         &mut passed,
                     );
+                    // Path 1b — process-local dense handle VALUES. Two distinct EPROCESSes both hold
+                    // handle 0x4 referring to DIFFERENT objects (0b111 = same-value + distinct-object
+                    // + no-aliasing). The on-kernel proof that handle namespaces are per-process.
+                    check(
+                        b"exec_process_local_handle_values",
+                        PM_HANDLE_LOCAL_OK.load(Ordering::Relaxed) == 0b111,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] nt-process path1b: process-local-handles=0x");
+                    print_hex(PM_HANDLE_LOCAL_OK.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] nt-process path2: main-threads-ok=0x");
                     print_hex(PM_MAIN_THREADS_OK.load(Ordering::Relaxed) as u32);
                     print_str(b" binds=0x");
@@ -12203,6 +12284,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_ntopenprocess_mints_handle", false, &mut passed);
                     check(b"exec_ntterminateprocess_teardown", false, &mut passed);
                     check(b"exec_eprocess_linked_mechanism", false, &mut passed);
+                    check(b"exec_process_local_handle_values", false, &mut passed);
                 }
             }
             Err(_) => {

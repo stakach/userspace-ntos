@@ -257,3 +257,41 @@ fn win32_callouts_established_once() {
     assert_eq!(pm.establish_win32_callouts(c2), Some(c));
     assert_eq!(pm.win32_callouts(), Some(c2));
 }
+
+#[test]
+fn handle_values_are_process_local() {
+    // Path 1b — process-local dense handle VALUES: two DISTINCT processes each allocate their
+    // first handle and BOTH get the same dense value (4), yet it refers to a DIFFERENT object in
+    // each. Real NT handle namespaces are per-process; a global value scheme could not do this.
+    let mut pm = ProcessManager::new();
+    let a = pm.create_process("proc_a.exe", None, None);
+    let b = pm.create_process("proc_b.exe", None, None);
+    let ha = pm.insert_handle(a, HandleObject::Opaque(0xA11CE), 0).unwrap();
+    let hb = pm.insert_handle(b, HandleObject::Opaque(0xB0B), 0).unwrap();
+    assert_eq!(ha, 4);
+    assert_eq!(hb, 4); // COLLIDES with a's value — legal, they're in different namespaces
+    assert_eq!(pm.lookup_handle(a, 4), Some(HandleObject::Opaque(0xA11CE)));
+    assert_eq!(pm.lookup_handle(b, 4), Some(HandleObject::Opaque(0xB0B)));
+    // b's value 4 is invisible in a and vice-versa (no cross-process aliasing).
+    assert_ne!(pm.lookup_handle(a, 4), pm.lookup_handle(b, 4));
+}
+
+#[test]
+fn append_only_handles_never_recycle_a_closed_value() {
+    // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
+    // executive's per-process DLL registry relies on (a recycled value would collide with a stale
+    // external binding to the old handle). Contrast `reserved_handle_table_never_reallocates`,
+    // which asserts the DEFAULT reuse behavior.
+    let mut pm = ProcessManager::new();
+    pm.set_handle_no_reuse(true);
+    let pid = pm.create_process("host.exe", None, None);
+    let h0 = pm.insert_handle(pid, HandleObject::Opaque(1), 0).unwrap();
+    let h1 = pm.insert_handle(pid, HandleObject::Opaque(2), 0).unwrap();
+    assert_eq!((h0, h1), (4, 8));
+    pm.close_handle(pid, 4).unwrap();
+    assert_eq!(pm.lookup_handle(pid, 4), None);
+    // The next insert APPENDS (value 12) — it does NOT recycle the freed value 4.
+    let h2 = pm.insert_handle(pid, HandleObject::Opaque(3), 0).unwrap();
+    assert_eq!(h2, 12);
+    assert_eq!(pm.lookup_handle(pid, 12), Some(HandleObject::Opaque(3)));
+}

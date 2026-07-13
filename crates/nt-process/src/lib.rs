@@ -200,6 +200,14 @@ pub struct ProcessManager {
     next_asid: u32,
     /// win32k's registered callouts (`PsEstablishWin32Callouts`), once attached.
     win32_callouts: Option<Win32Callouts>,
+    /// When set, [`insert_handle`](Self::insert_handle) never reuses a freed (`None`) slot — it
+    /// always appends, so a process's handle VALUES stay **monotonic** for the lifetime of the run
+    /// (a closed value is never handed out again). A host that hands its returned dense values back
+    /// to a foreign process AND indexes external state by those values (e.g. the ntos executive's
+    /// per-process DLL registry) needs this: NT-style slot reuse would recycle a value while stale
+    /// external bindings to the old value still exist, mis-routing the next open. Default `false`
+    /// (real NT reuses freed handle slots). Path 1b of the nt-process convergence.
+    no_reuse: bool,
 }
 
 impl ProcessManager {
@@ -308,6 +316,13 @@ impl ProcessManager {
                 proc.handles.reserve(capacity - proc.handles.capacity());
             }
         }
+    }
+
+    /// Set append-only handle allocation (see the [`no_reuse`](ProcessManager) field): when `true`,
+    /// [`insert_handle`](Self::insert_handle) never reuses a freed slot, so per-process handle
+    /// VALUES stay monotonic (a closed value is never handed out again).
+    pub fn set_handle_no_reuse(&mut self, no_reuse: bool) {
+        self.no_reuse = no_reuse;
     }
 
     /// `pid`'s current handle-table capacity (reserved slots) — for a host to check headroom.
@@ -567,7 +582,12 @@ impl ProcessManager {
             object,
             granted_access,
         };
-        let slot = match proc.handles.iter().position(|e| e.is_none()) {
+        let free = if self.no_reuse {
+            None // append-only: never recycle a freed value (see `no_reuse`)
+        } else {
+            proc.handles.iter().position(|e| e.is_none())
+        };
+        let slot = match free {
             Some(i) => {
                 proc.handles[i] = Some(entry);
                 i
