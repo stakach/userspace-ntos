@@ -215,6 +215,57 @@ fn unimplemented_service_does_not_silently_succeed() {
 }
 
 #[test]
+fn win7_table_registers_migrated_services() {
+    // Workstream A: the executive migrates hand-wired ladder cases onto a real-SSN table built
+    // via `from_numbers`. Verify the newly-catalogued services register + round-trip by number,
+    // exactly as the executive's `build_nt_table` wires them (real Win7-SP1 SSNs).
+    let pairs = [
+        (NativeService::NtQuerySystemInformation, 0xb5u32),
+        (NativeService::NtQueryInformationProcess, 161),
+        (NativeService::NtProtectVirtualMemory, 143),
+        (NativeService::NtDisplayString, 70),
+        (NativeService::NtQueryDebugFilterState, 148),
+        (NativeService::NtOpenThreadToken, 135),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        assert_eq!(t.lookup(num).unwrap().service, svc);
+        assert_eq!(t.number_of(svc), Some(num));
+    }
+    // A number NOT registered → miss (the dispatcher would fall back to the ladder / reject).
+    assert!(t.lookup(0xdead).is_none());
+    // The new variants carry canonical names + tight arg-count bounds.
+    assert_eq!(NativeService::NtDisplayString.name(), "NtDisplayString");
+    assert_eq!(NativeService::NtDisplayString.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtProtectVirtualMemory.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtQueryInformationProcess.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtOpenThreadToken.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtQueryDebugFilterState.arg_count(), (2, 2));
+}
+
+#[test]
+fn migrated_services_dispatch_and_validate() {
+    // Register on a test dispatcher and prove: (a) a bad arg count is rejected before the handler,
+    // (b) a good call reaches the handler with the previous mode set.
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtDisplayString, 70)],
+    );
+    let d = NativeSyscallDispatcher::new(table);
+    let mut ks = services();
+    // NtDisplayString needs exactly 1 arg.
+    let bad = d.dispatch(70, &[], &origin(ProcessorMode::UserMode), &mut ks);
+    assert_eq!(bad.status, STATUS_INVALID_PARAMETER);
+    assert!(ks.last_mode.is_none()); // handler never ran
+    let ok = d.dispatch(70, &[0x1234], &origin(ProcessorMode::UserMode), &mut ks);
+    // KernelServices' catch-all returns NOT_IMPLEMENTED — the point is it REACHED the handler
+    // (mode captured) after passing validation, i.e. dispatch is table-driven, not a ladder.
+    assert_eq!(ok.status, STATUS_NOT_IMPLEMENTED);
+    assert_eq!(ks.last_mode, Some(ProcessorMode::UserMode));
+}
+
+#[test]
 fn user_probe_copyin_ranges() {
     let mut p = UserProbe::new();
     p.add_range(0x1_0000, 0x1000, false); // read-only

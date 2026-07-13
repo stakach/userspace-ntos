@@ -2440,6 +2440,13 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
     /// like `key_handles`; entries are inline (no nested heap) so pushes never reallocate.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
+    /// converged table-driven path carries executive context on the handler rather than a parallel
+    /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
+    /// sets when it can't service the call, so the loop stops the process (the ladder's
+    /// `handled = false; break`).
+    pi: usize,
+    stop: bool,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2488,6 +2495,8 @@ impl ExecNtHandler {
                 }
                 v
             },
+            pi: 0,
+            stop: false,
         }
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
@@ -2733,6 +2742,109 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
             },
+            // NtQuerySystemInformation(Class[R10]=args[0], Buffer[RDX]=args[1], Len[R8]=args[2],
+            // *RetLen[R9]=args[3]). RtlCreateHeap needs SystemBasicInformation (class 0): PageSize,
+            // AllocationGranularity, and the user-mode address range. Copyout the fields it reads.
+            NativeService::NtQuerySystemInformation => unsafe {
+                let class = args[0];
+                let buf = args[1];
+                let retlen_ptr = args[3]; // R9 = *ReturnLength (a register)
+                if class == 0 {
+                    smss_stack_write(buf + 0x08, 0x1000); // PageSize
+                    smss_stack_write(buf + 0x18, 0x10000); // AllocationGranularity
+                    smss_stack_write(buf + 0x20, 0x10000); // MinimumUserModeAddress
+                    smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
+                    smss_stack_write(retlen_ptr, 0x40);
+                }
+                0
+            },
+            // NtQueryInformationProcess(Handle[R10]=args[0], Class[RDX]=args[1], Buffer[R8]=args[2],
+            // Len[R9]=args[3], *RetLen[arg5]=args[4]).
+            NativeService::NtQueryInformationProcess => unsafe {
+                let class = args[1]; // ProcessInformationClass
+                let buf = args[2]; // R8 = ProcessInformation buffer (a stack local)
+                if class == 0 {
+                    // ProcessBasicInformation — PROCESS_BASIC_INFORMATION (x64, 48 bytes). Both
+                    // processes' PEB is at PEB_VA (own VSpace).
+                    smss_stack_write(buf + 0x00, 0); // ExitStatus (running)
+                    smss_stack_write(buf + 0x08, PEB_VA); // PebBaseAddress
+                    smss_stack_write(buf + 0x10, 1); // AffinityMask
+                    smss_stack_write(buf + 0x18, 13); // BasePriority
+                    smss_stack_write(buf + 0x20, (self.pi as u64 + 1) * 0x100); // UniqueProcessId (fake)
+                    smss_stack_write(buf + 0x28, 0); // InheritedFromUniqueProcessId
+                    let retlen = args[4]; // *ReturnLength
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 48);
+                    }
+                    0
+                } else if class == 36 {
+                    // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
+                    smss_stack_write(buf, 0x1a2b_3c4d);
+                    0
+                } else if class == 28 {
+                    // ProcessLUIDDeviceMapsEnabled — a ULONG BOOL. Not enabled → 0.
+                    smss_stack_write32(buf, 0);
+                    let retlen = args[4];
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 4);
+                    }
+                    0
+                } else if class == 23 {
+                    // ProcessDeviceMap — an EMPTY drive map (no drives) so SmpCreatePagingFiles
+                    // finds no boot volume and smss proceeds without a paging file.
+                    for k in 0..(36u64 / 4) {
+                        smss_stack_write32(buf + k * 4, 0);
+                    }
+                    let retlen = args[4];
+                    if retlen != 0 {
+                        smss_stack_write32(retlen, 36);
+                    }
+                    0
+                } else {
+                    print_str(b"[ntos-exec] NtQueryInformationProcess class=");
+                    print_u64(class);
+                    print_str(b" len=");
+                    print_u64(args[3]);
+                    print_str(b"\n");
+                    self.stop = true; // surfaces the class — stop the process
+                    0xC0000002 // STATUS_NOT_IMPLEMENTED
+                }
+            },
+            // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect[arg5]=args[4]).
+            // We don't model per-page protection yet — report success + a plausible previous
+            // protection so LdrpInitialize's protect/restore pairs proceed.
+            NativeService::NtProtectVirtualMemory => unsafe {
+                let oldprot_ptr = args[4]; // *OldAccessProtection
+                if oldprot_ptr != 0 {
+                    // DWORD write: OldProtect is a ULONG; an 8-byte write clobbers the caller's
+                    // adjacent local (in LdrpSetProtection that is the section-header pointer).
+                    smss_stack_write32(oldprot_ptr, 0x04); // PAGE_READWRITE
+                }
+                0
+            },
+            // NtDisplayString(*String[R10]=args[0] = PUNICODE_STRING). smss prints boot/status text;
+            // route it to the serial console.
+            NativeService::NtDisplayString => unsafe {
+                let s16 = smss_read_ustr(args[0]);
+                print_str(b"[smss] ");
+                for &w in &s16 {
+                    let b = w as u8;
+                    debug_put_char(if (0x20..0x7f).contains(&b) || b == b'\n' {
+                        b
+                    } else {
+                        b'.'
+                    });
+                }
+                print_str(b"\n");
+                0
+            },
+            // NtQueryDebugFilterState — return FALSE (filter disabled), the state of a machine with
+            // no kernel debugger attached, so DbgPrintEx suppresses the message (see the ladder note
+            // this replaces: a TRUE here makes ntdll format a null-relative string → VMFault).
+            NativeService::NtQueryDebugFilterState => 0,
+            // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
+            // the process token.
+            NativeService::NtOpenThreadToken => 0xC000007C,
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -2749,6 +2861,13 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
             (NativeService::NtQueryValueKey, SSN_NT_QUERY_VALUE_KEY as u32),
+            // Workstream A batch 1: services migrated off the hand-wired ladder into the table.
+            (NativeService::NtQuerySystemInformation, SSN_NT_QUERY_SYSTEM_INFO as u32),
+            (NativeService::NtQueryInformationProcess, SSN_NT_QUERY_INFO_PROCESS as u32),
+            (NativeService::NtProtectVirtualMemory, SSN_NT_PROTECT_VM as u32),
+            (NativeService::NtDisplayString, SSN_NT_DISPLAY_STRING as u32),
+            (NativeService::NtQueryDebugFilterState, SSN_NT_QUERY_DEBUG_FILTER_STATE as u32),
+            (NativeService::NtOpenThreadToken, SSN_NT_OPEN_THREAD_TOKEN as u32),
         ],
     )
 }
@@ -3679,8 +3798,15 @@ unsafe fn service_sec_image(
                 for i in 4..n {
                     argv[i] = smss_stack_read(sp + 0x28 + (i as u64 - 4) * 8);
                 }
+                // Refresh the handler's per-call executive context, then clear the stop side-signal
+                // so a migrated handler can raise it (the ladder's `handled = false; break`).
+                nt_handler.pi = pi;
+                nt_handler.stop = false;
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
+                if nt_handler.stop {
+                    handled = false; // handler couldn't service → stop with the SSN recorded
+                }
             } else if m0 == SSN_NT_ALLOCATE_VM {
                 // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
                 // Type, Protect): R10=handle, RDX=&Base, R8=zerobits, R9=&Size, [sp+0x28]=Type.
@@ -3720,20 +3846,6 @@ unsafe fn service_sec_image(
                 smss_stack_write(base_ptr, base);
                 smss_stack_write(size_ptr, rounded);
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-            } else if m0 == SSN_NT_QUERY_SYSTEM_INFO {
-                // NtQuerySystemInformation(Class, Buffer, Len, *RetLen). RtlCreateHeap needs
-                // SystemBasicInformation (class 0): PageSize, AllocationGranularity, and the
-                // user-mode address range. Copyout the fields it reads.
-                let class = get_recv_mr(9); // R10 = SystemInformationClass
-                let buf = m3; // RDX = SystemInformation buffer
-                let retlen_ptr = get_recv_mr(8); // R9 = *ReturnLength (4th arg, a register)
-                if class == 0 {
-                    smss_stack_write(buf + 0x08, 0x1000); // PageSize
-                    smss_stack_write(buf + 0x18, 0x10000); // AllocationGranularity
-                    smss_stack_write(buf + 0x20, 0x10000); // MinimumUserModeAddress
-                    smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
-                    smss_stack_write(retlen_ptr, 0x40);
-                }
             } else if m0 == SSN_NT_QUERY_SYSTEM_TIME_SVC {
                 // NtQuerySystemTime(PLARGE_INTEGER SystemTime). arg0=R10=SystemTime out-ptr. Return
                 // a non-zero, monotonic 64-bit clock (kernel HPET counter) so csrss's init timing
@@ -3795,59 +3907,6 @@ unsafe fn service_sec_image(
                 smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
                 if retlen_ptr != 0 {
                     smss_stack_write(retlen_ptr, 0x30);
-                }
-            } else if m0 == SSN_NT_QUERY_INFO_PROCESS {
-                // NtQueryInformationProcess(Handle, Class, Buffer, Len, *RetLen). Class in RDX.
-                let class = m3; // ProcessInformationClass
-                let buf = get_recv_mr(7); // R8 = ProcessInformation buffer (a stack local)
-                if class == 0 {
-                    // ProcessBasicInformation — PROCESS_BASIC_INFORMATION (x64, 48 bytes):
-                    // { NTSTATUS ExitStatus; PPEB PebBaseAddress; ULONG_PTR AffinityMask;
-                    //   KPRIORITY BasePriority; ULONG_PTR UniqueProcessId; ULONG_PTR
-                    //   InheritedFromUniqueProcessId; }. Both processes' PEB is at PEB_VA (own VSpace).
-                    smss_stack_write(buf + 0x00, 0); // ExitStatus (running)
-                    smss_stack_write(buf + 0x08, PEB_VA); // PebBaseAddress
-                    smss_stack_write(buf + 0x10, 1); // AffinityMask
-                    smss_stack_write(buf + 0x18, 13); // BasePriority
-                    smss_stack_write(buf + 0x20, (pi as u64 + 1) * 0x100); // UniqueProcessId (fake)
-                    smss_stack_write(buf + 0x28, 0); // InheritedFromUniqueProcessId
-                    let retlen = smss_stack_read(sp + 0x28); // arg5 = *ReturnLength
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 48);
-                    }
-                } else if class == 36 {
-                    // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
-                    // A fixed nonzero cookie is fine as long as encode/decode round-trip with it.
-                    smss_stack_write(buf, 0x1a2b_3c4d);
-                } else if class == 28 {
-                    // ProcessLUIDDeviceMapsEnabled — a ULONG BOOL. Not enabled → 0.
-                    smss_stack_write32(buf, 0);
-                    let retlen = smss_stack_read(sp + 0x28);
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 4);
-                    }
-                } else if class == 23 {
-                    // ProcessDeviceMap — PROCESS_DEVICEMAP_INFORMATION.Query { ULONG DriveMap;
-                    // UCHAR DriveType[32] }. SmpCreatePagingFiles enumerates volumes from this. An
-                    // EMPTY drive map (no drives) → SmpGetVolumeDescriptors finds no boot volume,
-                    // its BootVolumeFound assert fires once (RtlAssert now Ignores + returns), it
-                    // returns an error, and SmpCreatePagingFiles' (ignored) return lets smss proceed
-                    // WITHOUT a paging file. A real volume/disk subsystem is a later step.
-                    for k in 0..(36u64 / 4) {
-                        smss_stack_write32(buf + k * 4, 0);
-                    }
-                    let retlen = smss_stack_read(sp + 0x28); // arg4 = *ReturnLength
-                    if retlen != 0 {
-                        smss_stack_write32(retlen, 36);
-                    }
-                } else {
-                    print_str(b"[ntos-exec] NtQueryInformationProcess class=");
-                    print_u64(class);
-                    print_str(b" len=");
-                    print_u64(get_recv_mr(8));
-                    print_str(b"\n");
-                    handled = false;
-                    result = 0xC0000002; // STATUS_NOT_IMPLEMENTED — surfaces the class via m3
                 }
             } else if m0 == SSN_NT_CREATE_PORT
                 || m0 == SSN_NT_CREATE_THREAD
@@ -4165,9 +4224,6 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002;
                 }
-            } else if m0 == SSN_NT_OPEN_THREAD_TOKEN {
-                // No impersonation token → STATUS_NO_TOKEN; the caller falls back to the process one.
-                result = 0xC000007C;
             } else if m0 == SSN_NT_OPEN_PROCESS_TOKEN {
                 // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
                 let out = get_recv_mr(7); // R8
@@ -4295,20 +4351,6 @@ unsafe fn service_sec_image(
                     }
                     _ => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-            } else if m0 == SSN_NT_DISPLAY_STRING {
-                // NtDisplayString(*String[R10] = PUNICODE_STRING). smss prints boot/status text;
-                // route it to the serial console so we can see what the Session Manager reports.
-                let s16 = smss_read_ustr(get_recv_mr(9));
-                print_str(b"[smss] ");
-                for &w in &s16 {
-                    let b = w as u8;
-                    debug_put_char(if (0x20..0x7f).contains(&b) || b == b'\n' {
-                        b
-                    } else {
-                        b'.'
-                    });
-                }
-                print_str(b"\n");
             } else if m0 == SSN_NT_MAKE_TEMPORARY_OBJECT {
                 // Clears OBJ_PERMANENT on a link SmpInit re-creates; we don't track permanence.
                 // Success no-op.
@@ -4455,16 +4497,6 @@ unsafe fn service_sec_image(
                         scratch_base, &reg, &dll_pes, pml4); // Information = bytes written
                 }
                 result = 0;
-            } else if m0 == SSN_NT_PROTECT_VM {
-                // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect). We don't
-                // model per-page protection changes yet — report success and hand back a plausible
-                // previous protection so LdrpInitialize's protect/restore pairs proceed.
-                let oldprot_ptr = smss_stack_read(sp + 0x28); // arg5 = *OldAccessProtection
-                if oldprot_ptr != 0 {
-                    // DWORD write: OldProtect is a ULONG; an 8-byte write clobbers the caller's
-                    // adjacent local (in LdrpSetProtection that is the section-header pointer).
-                    smss_stack_write32(oldprot_ptr, 0x04); // PAGE_READWRITE
-                }
             } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
                 // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the
                 // output, which ntdll points at one of its own .data GLOBALS (not the stack) — so
@@ -4531,14 +4563,6 @@ unsafe fn service_sec_image(
                         core::ptr::write_volatile(m as *mut u32, 0);
                     }
                 }
-                result = 0;
-            } else if m0 == SSN_NT_QUERY_DEBUG_FILTER_STATE {
-                // Return FALSE (filter disabled) — the state of a machine with no kernel debugger
-                // attached, where DbgPrintEx suppresses the message and returns without formatting
-                // it. We returned TRUE earlier to unmask the SXS/LDR loader diagnostics, but the DLL
-                // load phase is done; keeping it TRUE now makes ntdll format a DbgPrint message whose
-                // string pointer is a null-relative garbage value in our partial process env (a
-                // strnlen over 0x100 → VMFault). Suppressing the trace is the correct no-op.
                 result = 0;
             } else if m0 == SSN_NT_FREE_VM
                 || m0 == SSN_NT_SET_INFO_THREAD

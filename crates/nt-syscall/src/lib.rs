@@ -81,6 +81,13 @@ pub enum NativeService {
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
+    // Additional services the executive hosts for real binaries (smss/csrss). These are real
+    // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
+    // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
+    NtProtectVirtualMemory,
+    NtDisplayString,
+    NtQueryDebugFilterState,
+    NtOpenThreadToken,
 }
 
 impl NativeService {
@@ -117,6 +124,10 @@ impl NativeService {
             NtAccessCheck => "NtAccessCheck",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
+            NtProtectVirtualMemory => "NtProtectVirtualMemory",
+            NtDisplayString => "NtDisplayString",
+            NtQueryDebugFilterState => "NtQueryDebugFilterState",
+            NtOpenThreadToken => "NtOpenThreadToken",
         }
     }
 
@@ -124,10 +135,12 @@ impl NativeService {
     pub fn arg_count(self) -> (u8, u8) {
         use NativeService::*;
         match self {
-            NtClose | NtTerminateThread | NtQuerySystemTime => (1, 1),
-            NtTerminateProcess | NtUnmapViewOfSection => (2, 2),
+            NtClose | NtTerminateThread | NtQuerySystemTime | NtDisplayString => (1, 1),
+            NtTerminateProcess | NtUnmapViewOfSection | NtQueryDebugFilterState => (2, 2),
             NtOpenKey | NtCreateKey => (3, 3),
             NtQueryValueKey => (4, 6),
+            NtOpenThreadToken => (4, 4),
+            NtProtectVirtualMemory | NtQueryInformationProcess => (5, 5),
             NtEnumerateValueKey => (6, 6),
             NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
@@ -167,6 +180,10 @@ impl NativeService {
         NativeService::NtAccessCheck,
         NativeService::NtQuerySystemInformation,
         NativeService::NtQuerySystemTime,
+        NativeService::NtProtectVirtualMemory,
+        NativeService::NtDisplayString,
+        NativeService::NtQueryDebugFilterState,
+        NativeService::NtOpenThreadToken,
     ];
 }
 
