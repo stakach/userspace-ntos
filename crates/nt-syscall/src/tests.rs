@@ -270,6 +270,32 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
+fn group_b_query_and_namespace_services_register() {
+    // Group B1: query + object-namespace services register at their real Win7 SSNs with the
+    // arg bounds the executive's table dispatch relies on (QueryVirtualMemory reads a stack arg6).
+    let pairs = [
+        (NativeService::NtQueryVirtualMemory, 186u32),
+        (NativeService::NtQueryInformationToken, 163),
+        (NativeService::NtQueryObject, 170),
+        (NativeService::NtWaitForSingleObject, 281),
+        (NativeService::NtOpenDirectoryObject, 119),
+        (NativeService::NtCreateDirectoryObject, 36),
+        (NativeService::NtCreateSymbolicLinkObject, 54),
+        (NativeService::NtOpenSymbolicLinkObject, 133),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        assert_eq!(t.lookup(num).unwrap().service, svc);
+    }
+    assert_eq!(NativeService::NtQueryVirtualMemory.arg_count(), (6, 6));
+    assert_eq!(NativeService::NtQueryInformationToken.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtQueryObject.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtWaitForSingleObject.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtOpenDirectoryObject.arg_count(), (0, 4));
+}
+
+#[test]
 fn migrated_services_dispatch_and_validate() {
     // Register on a test dispatcher and prove: (a) a bad arg count is rejected before the handler,
     // (b) a good call reaches the handler with the previous mode set.

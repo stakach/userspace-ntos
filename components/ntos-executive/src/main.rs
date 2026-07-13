@@ -2892,6 +2892,196 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetSecurityObject
             | NativeService::NtResumeThread
             | NativeService::NtSetInformationObject => 0,
+            // NtQueryVirtualMemory(Process, Base[RDX]=args[1], Class, Buffer[R9]=args[3], Len,
+            // *RetLen[arg6]=args[5]). LdrpInitialize queries MemoryBasicInformation (class 0) for
+            // [TEB+0x10]. Report a plausible committed private region; the env page is 1-page.
+            NativeService::NtQueryVirtualMemory => unsafe {
+                let base = args[1];
+                let buf = args[3];
+                let retlen_ptr = args[5];
+                let page = base & !0xFFFu64;
+                // The env block is a SINGLE mapped page at SMSS_PARAMS_VA+0x1000; report the true
+                // 1-page region so ntdll's env-duplication memmove stays in bounds.
+                let is_env = page == SMSS_PARAMS_VA + 0x1000;
+                let region = if is_env { 0x1000u64 } else { 0x10000u64 };
+                let alloc_base = if is_env { page } else { base & !0xFFFFu64 };
+                smss_stack_write(buf + 0x00, page); // BaseAddress
+                smss_stack_write(buf + 0x08, alloc_base); // AllocationBase
+                smss_stack_write(buf + 0x10, 0x04); // AllocationProtect = PAGE_READWRITE
+                smss_stack_write(buf + 0x18, region); // RegionSize
+                smss_stack_write(buf + 0x20, 0x1000 | (0x04u64 << 32)); // State=MEM_COMMIT, Protect=RW
+                smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
+                if retlen_ptr != 0 {
+                    smss_stack_write(retlen_ptr, 0x30);
+                }
+                0
+            },
+            // NtQueryInformationToken(TokenHandle, Class[RDX]=args[1], buf[R8]=args[2],
+            // len[R9]=args[3], *RetLen[arg5]=args[4]). csrss runs as Local System (S-1-5-18).
+            NativeService::NtQueryInformationToken => unsafe {
+                let class = args[1];
+                let buf = args[2];
+                let len = args[3];
+                let retlen_ptr = args[4];
+                match class {
+                    1 | 5 => {
+                        // TokenUser(1)/TokenPrimaryGroup(5): SID_AND_ATTRIBUTES + the S-1-5-18 SID.
+                        let needed: u32 = 0x1C;
+                        if len < needed as u64 {
+                            if let Some(m) = smss_mirror(retlen_ptr, 4) {
+                                core::ptr::write_volatile(m as *mut u32, needed);
+                            }
+                            0xC000_0023 // STATUS_BUFFER_TOO_SMALL
+                        } else if let Some(m) = smss_mirror(buf, needed as u64) {
+                            core::ptr::write_volatile((m + 0x00) as *mut u64, buf + 0x10); // Sid → +0x10
+                            core::ptr::write_volatile((m + 0x08) as *mut u32, 0); // Attributes
+                            core::ptr::write_volatile((m + 0x10) as *mut u64, 0x0500_0000_0000_0101); // Rev,Cnt,IdAuth
+                            core::ptr::write_volatile((m + 0x18) as *mut u32, 18); // SubAuthority[0]
+                            if let Some(rl) = smss_mirror(retlen_ptr, 4) {
+                                core::ptr::write_volatile(rl as *mut u32, needed);
+                            }
+                            0
+                        } else {
+                            0xC000_0023
+                        }
+                    }
+                    _ => {
+                        print_str(b"[ntos-exec] NtQueryInformationToken class=");
+                        print_u64(class);
+                        print_str(b" (unhandled)\n");
+                        self.stop = true;
+                        0xC0000002
+                    }
+                }
+            },
+            // NtQueryObject(Handle[R10]=args[0], class[RDX]=args[1], buf[R8]=args[2], len[R9]=args[3],
+            // *RetLen[arg5]=args[4]). DIAGNOSTIC: log + return a zeroed buffer + retlen.
+            NativeService::NtQueryObject => unsafe {
+                let class = args[1];
+                let handle = args[0];
+                let buf = args[2];
+                let len = args[3];
+                let retlen_ptr = args[4];
+                print_str(b"[ntos-exec] NtQueryObject handle=0x");
+                print_hex(handle as u32);
+                print_str(b" class=");
+                print_u64(class);
+                print_str(b" len=");
+                print_u64(len);
+                print_str(b"\n");
+                if len > 0 {
+                    if let Some(m) = smss_mirror(buf, len.min(64)) {
+                        for i in 0..len.min(64) {
+                            core::ptr::write_volatile((m + i) as *mut u8, 0);
+                        }
+                    }
+                }
+                if retlen_ptr != 0 {
+                    if let Some(m) = smss_mirror(retlen_ptr, 4) {
+                        core::ptr::write_volatile(m as *mut u32, 0);
+                    }
+                }
+                0
+            },
+            // NtWaitForSingleObject — csrsrv's CsrApiPortInitialize waits on its worker-thread
+            // startup event; we don't model the worker → STATUS_WAIT_0 (0) so init proceeds.
+            // Scoped to csrss (pi==1); smss never issues 281, so a smss 281 stops (as before).
+            NativeService::NtWaitForSingleObject => {
+                if self.pi == 1 {
+                    0
+                } else {
+                    self.stop = true;
+                    0xC0000002
+                }
+            }
+            // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
+            // Resolve/insert in the executive object namespace, hand back a real handle.
+            NativeService::NtOpenDirectoryObject | NativeService::NtCreateDirectoryObject => unsafe {
+                let out = args[0]; // R10 = *Handle
+                let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = Self::fold_name(&name16, &mut nbuf);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                let idx = if ctx.service == NativeService::NtCreateDirectoryObject {
+                    self.obj_create(&nbuf[..nlen], root_idx, 0, &[])
+                } else {
+                    self.obj_resolve(&nbuf[..nlen], root_idx)
+                };
+                match idx {
+                    Some(i) => {
+                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
+                        0
+                    }
+                    None => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
+            // NtCreateSymbolicLinkObject(*Handle[R10]=args[0], access, *OA[R8]=args[2],
+            // *LinkTarget[R9]=args[3]). SmpInit creates the \?? drive-letter links.
+            NativeService::NtCreateSymbolicLinkObject => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                let tgt = args[3]; // R9 = PUNICODE_STRING target
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = Self::fold_name(&name16, &mut nbuf);
+                let target16 = smss_read_ustr(tgt);
+                let mut tbuf = [0u8; 40]; // keep the target's case (a device path)
+                let mut tl = 0;
+                for &w in &target16 {
+                    if tl >= tbuf.len() {
+                        break;
+                    }
+                    tbuf[tl] = w as u8;
+                    tl += 1;
+                }
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                match self.obj_create(&nbuf[..nlen], root_idx, 1, &tbuf[..tl]) {
+                    Some(i) => {
+                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
+                        0
+                    }
+                    None => 0xC0000034,
+                }
+            },
+            // NtOpenSymbolicLinkObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
+            // Resolve; hand back a handle only for an actual symbolic link (a dir match is a miss).
+            NativeService::NtOpenSymbolicLinkObject => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                let mut rd = [0u8; 8];
+                let _ = smss_copyin(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = smss_read_objattr_name(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = Self::fold_name(&name16, &mut nbuf);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    0
+                };
+                match self.obj_resolve(&nbuf[..nlen], root_idx) {
+                    Some(i) if self.obj_ns[i].kind == 1 => {
+                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64);
+                        0
+                    }
+                    _ => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -2937,6 +3127,15 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtSetSecurityObject, 246),
             (NativeService::NtResumeThread, 214),
             (NativeService::NtSetInformationObject, 236),
+            // Workstream A batch 3 (group B1): query + object-namespace services.
+            (NativeService::NtQueryVirtualMemory, SSN_NT_QUERY_VIRTUAL_MEM as u32),
+            (NativeService::NtQueryInformationToken, SSN_NT_QUERY_INFO_TOKEN as u32),
+            (NativeService::NtQueryObject, 170),
+            (NativeService::NtWaitForSingleObject, 281),
+            (NativeService::NtOpenDirectoryObject, SSN_NT_OPEN_DIRECTORY_OBJECT as u32),
+            (NativeService::NtCreateDirectoryObject, SSN_NT_CREATE_DIRECTORY_OBJECT as u32),
+            (NativeService::NtCreateSymbolicLinkObject, SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT as u32),
+            (NativeService::NtOpenSymbolicLinkObject, SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32),
         ],
     )
 }
@@ -3951,32 +4150,6 @@ unsafe fn service_sec_image(
                         smss_stack_write(freq_ptr, freq);
                     }
                 }
-            } else if m0 == SSN_NT_QUERY_VIRTUAL_MEM {
-                // NtQueryVirtualMemory(Process, BaseAddress, Class, Buffer, Len, *RetLen).
-                // LdrpInitialize queries MemoryBasicInformation (class 0) for [TEB+0x10]. Return a
-                // plausible committed private region (buffer is a stack local → stack mirror).
-                let base = m3; // RDX = BaseAddress
-                let buf = get_recv_mr(8); // R9 = MemoryInformation buffer
-                let retlen_ptr = smss_stack_read(sp + 0x30); // arg6 = *ReturnLength (stack slot)
-                let page = base & !0xFFFu64;
-                // The process env block lives in a SINGLE mapped page at SMSS_PARAMS_VA+0x1000; the
-                // page after it is unmapped (its natural 64 KiB region can't be extended — the TEB
-                // sits at +0x10000). ntdll's env duplication in LdrpInitializeProcess queries this
-                // region then memmoves RegionSize bytes from Environment (ntdll+0x5e420); a 0x10000
-                // RegionSize overruns the env page and #PFs at ntdll+0x5e478. Report the true 1-page
-                // region so the copy stays in bounds. Other queries keep the 64 KiB default.
-                let is_env = page == SMSS_PARAMS_VA + 0x1000;
-                let region = if is_env { 0x1000u64 } else { 0x10000u64 };
-                let alloc_base = if is_env { page } else { base & !0xFFFFu64 };
-                smss_stack_write(buf + 0x00, page); // BaseAddress
-                smss_stack_write(buf + 0x08, alloc_base); // AllocationBase
-                smss_stack_write(buf + 0x10, 0x04); // AllocationProtect = PAGE_READWRITE
-                smss_stack_write(buf + 0x18, region); // RegionSize
-                smss_stack_write(buf + 0x20, 0x1000 | (0x04u64 << 32)); // State=MEM_COMMIT, Protect=RW
-                smss_stack_write(buf + 0x28, 0x20000); // Type = MEM_PRIVATE
-                if retlen_ptr != 0 {
-                    smss_stack_write(retlen_ptr, 0x30);
-                }
             } else if m0 == SSN_NT_OPEN_SECTION {
                 // NtOpenSection(*SectionHandle[R10], DesiredAccess[RDX], *ObjectAttributes[R8]).
                 // CsrServerInitialization opens named sections. Log the requested name (folded to
@@ -4281,128 +4454,6 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002;
                 }
-            } else if m0 == SSN_NT_QUERY_INFO_TOKEN {
-                // NtQueryInformationToken(TokenHandle[R10], class[RDX], buf[R8], len[R9],
-                // *RetLen[sp+0x28]). csrss runs as Local System (S-1-5-18); serve the classes its
-                // CsrServerInitialization needs. Callers use the 2-call pattern: len=0 → return the
-                // required size + STATUS_BUFFER_TOO_SMALL, then re-query with an allocated buffer.
-                let class = m3;
-                let buf = get_recv_mr(7); // R8 = TokenInformation
-                let len = get_recv_mr(8); // R9 = TokenInformationLength
-                let retlen_ptr = smss_stack_read(sp + 0x28); // arg4 = *ReturnLength
-                match class {
-                    1 | 5 => {
-                        // TokenUser(1)/TokenPrimaryGroup(5): {PSID Sid/Group; ULONG Attributes;} + the
-                        // SID data. S-1-5-18 = SID{Rev=1,Count=1,IdAuth=NT(5),SubAuth[0]=18} = 12 B.
-                        let needed: u32 = 0x1C; // 16 (SID_AND_ATTRIBUTES) + 12 (SID)
-                        if len < needed as u64 {
-                            if let Some(m) = smss_mirror(retlen_ptr, 4) {
-                                core::ptr::write_volatile(m as *mut u32, needed);
-                            }
-                            result = 0xC000_0023; // STATUS_BUFFER_TOO_SMALL
-                        } else if let Some(m) = smss_mirror(buf, needed as u64) {
-                            core::ptr::write_volatile((m + 0x00) as *mut u64, buf + 0x10); // Sid → +0x10
-                            core::ptr::write_volatile((m + 0x08) as *mut u32, 0); // Attributes
-                            core::ptr::write_volatile((m + 0x10) as *mut u64, 0x0500_0000_0000_0101); // Rev,Cnt,IdAuth
-                            core::ptr::write_volatile((m + 0x18) as *mut u32, 18); // SubAuthority[0]
-                            if let Some(rl) = smss_mirror(retlen_ptr, 4) {
-                                core::ptr::write_volatile(rl as *mut u32, needed);
-                            }
-                        } else {
-                            result = 0xC000_0023;
-                        }
-                    }
-                    _ => {
-                        print_str(b"[ntos-exec] NtQueryInformationToken class=");
-                        print_u64(class);
-                        print_str(b" (unhandled)\n");
-                        handled = false;
-                        result = 0xC0000002;
-                    }
-                }
-            } else if m0 == SSN_NT_OPEN_DIRECTORY_OBJECT
-                || m0 == SSN_NT_CREATE_DIRECTORY_OBJECT
-            {
-                // NtOpen/CreateDirectoryObject(*Handle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES
-                // [R8]). Resolve/insert in the executive's object namespace and hand back a real
-                // handle so SmpInit can open \?? and create the DosDevices links under it.
-                let out = get_recv_mr(9); // R10 = *Handle (arg0)
-                let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES (arg2)
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
-                };
-                let idx = if m0 == SSN_NT_CREATE_DIRECTORY_OBJECT {
-                    nt_handler.obj_create(&nbuf[..nlen], root_idx, 0, &[])
-                } else {
-                    nt_handler.obj_resolve(&nbuf[..nlen], root_idx)
-                };
-                match idx {
-                    Some(i) => smss_stack_write(out, OBJ_HANDLE_BASE + i as u64),
-                    None => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
-                }
-            } else if m0 == SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT {
-                // NtCreateSymbolicLinkObject(*Handle[R10], access[RDX], *OA[R8], *LinkTarget[R9]).
-                // SmpInit creates the drive-letter links in \?? (OA.RootDirectory = the \?? handle).
-                let out = get_recv_mr(9); // R10
-                let oa = get_recv_mr(7); // R8
-                let tgt = get_recv_mr(8); // R9 = PUNICODE_STRING target
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
-                let target16 = smss_read_ustr(tgt);
-                let mut tbuf = [0u8; 40]; // keep the target's case (it's a device path)
-                let mut tl = 0;
-                for &w in &target16 {
-                    if tl >= tbuf.len() {
-                        break;
-                    }
-                    tbuf[tl] = w as u8;
-                    tl += 1;
-                }
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
-                };
-                match nt_handler.obj_create(&nbuf[..nlen], root_idx, 1, &tbuf[..tl]) {
-                    Some(i) => smss_stack_write(out, OBJ_HANDLE_BASE + i as u64),
-                    None => result = 0xC0000034,
-                }
-            } else if m0 == SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT {
-                // NtOpenSymbolicLinkObject(*Handle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8]).
-                // Resolve the named object in the namespace; hand back a handle if it exists.
-                let out = get_recv_mr(9); // R10
-                let oa = get_recv_mr(7); // R8
-                let mut rd = [0u8; 8];
-                let _ = smss_copyin(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = ExecNtHandler::fold_name(&name16, &mut nbuf);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    0
-                };
-                match nt_handler.obj_resolve(&nbuf[..nlen], root_idx) {
-                    // Only an actual symbolic link opens here; a directory match is a miss (smss's
-                    // SmpTranslateSystemPartitionInformation only wants drive-letter links in \??).
-                    Some(i) if nt_handler.obj_ns[i].kind == 1 => {
-                        smss_stack_write(out, OBJ_HANDLE_BASE + i as u64)
-                    }
-                    _ => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
-                }
             } else if m0 == SSN_NT_OPEN_FILE {
                 // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
                 // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
@@ -4578,41 +4629,6 @@ unsafe fn service_sec_image(
                     core::ptr::write_volatile(
                         (scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32, 0x409);
                 }
-            } else if badge == CSRSS_BADGE && m0 == 281 {
-                // NtWaitForSingleObject(Handle[R10], Alertable[RDX], *Timeout[R8]). csrsrv's
-                // CsrApiPortInitialize creates the API-port worker thread (NtCreateThread 55 +
-                // NtResumeThread 214) then waits on its startup event for the worker to signal it's
-                // listening. We don't model the worker thread, so return STATUS_WAIT_0 (0) so the
-                // main init thread proceeds past the rendezvous to CsrSbApiPortInitialize /
-                // SmConnectToSm. (smss never issues SSN 281; scoped to csrss to keep its bring-up.)
-                result = 0;
-            } else if m0 == 170 {
-                // NtQueryObject(Handle[R10], class[RDX], buf[R8], len[R9], *RetLen[sp+0x28]).
-                // DIAGNOSTIC: log the handle + class so we can see what CsrApiPortInitialize queries
-                // after creating its API port + worker thread. Return zeroed buffer + retlen for now.
-                let class = m3;
-                let handle = get_recv_mr(9);
-                let buf = get_recv_mr(7);
-                let len = get_recv_mr(8);
-                let retlen_ptr = smss_stack_read(sp + 0x28);
-                print_str(b"[ntos-exec] NtQueryObject handle=0x");
-                print_hex(handle as u32);
-                print_str(b" class=");
-                print_u64(class);
-                print_str(b" len=");
-                print_u64(len);
-                print_str(b"\n");
-                if len > 0 {
-                    if let Some(m) = smss_mirror(buf, len.min(64)) {
-                        for i in 0..len.min(64) { core::ptr::write_volatile((m + i) as *mut u8, 0); }
-                    }
-                }
-                if retlen_ptr != 0 {
-                    if let Some(m) = smss_mirror(retlen_ptr, 4) {
-                        core::ptr::write_volatile(m as *mut u32, 0);
-                    }
-                }
-                result = 0;
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by

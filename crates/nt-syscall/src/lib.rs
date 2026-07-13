@@ -109,6 +109,13 @@ pub enum NativeService {
     NtSetSecurityObject,
     NtResumeThread,
     NtSetInformationObject,
+    // Group B: query + object-namespace services (executive out-writes / obj_ns lookups).
+    NtQueryVirtualMemory,
+    NtQueryInformationToken,
+    NtOpenDirectoryObject,
+    NtCreateDirectoryObject,
+    NtCreateSymbolicLinkObject,
+    NtOpenSymbolicLinkObject,
 }
 
 impl NativeService {
@@ -166,6 +173,12 @@ impl NativeService {
             NtSetSecurityObject => "NtSetSecurityObject",
             NtResumeThread => "NtResumeThread",
             NtSetInformationObject => "NtSetInformationObject",
+            NtQueryVirtualMemory => "NtQueryVirtualMemory",
+            NtQueryInformationToken => "NtQueryInformationToken",
+            NtOpenDirectoryObject => "NtOpenDirectoryObject",
+            NtCreateDirectoryObject => "NtCreateDirectoryObject",
+            NtCreateSymbolicLinkObject => "NtCreateSymbolicLinkObject",
+            NtOpenSymbolicLinkObject => "NtOpenSymbolicLinkObject",
         }
     }
 
@@ -178,7 +191,12 @@ impl NativeService {
             NtOpenKey | NtCreateKey => (3, 3),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken => (4, 4),
-            NtProtectVirtualMemory | NtQueryInformationProcess => (5, 5),
+            NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
+            | NtQueryObject => (5, 5),
+            NtWaitForSingleObject => (3, 3),
+            NtQueryVirtualMemory => (6, 6),
+            NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
+            | NtOpenSymbolicLinkObject => (0, 4),
             NtEnumerateValueKey => (6, 6),
             NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
@@ -248,6 +266,12 @@ impl NativeService {
         NativeService::NtSetSecurityObject,
         NativeService::NtResumeThread,
         NativeService::NtSetInformationObject,
+        NativeService::NtQueryVirtualMemory,
+        NativeService::NtQueryInformationToken,
+        NativeService::NtOpenDirectoryObject,
+        NativeService::NtCreateDirectoryObject,
+        NativeService::NtCreateSymbolicLinkObject,
+        NativeService::NtOpenSymbolicLinkObject,
     ];
 }
 
