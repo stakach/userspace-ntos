@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+pub mod dbg;
 mod dpc;
 mod event;
 mod interrupt;

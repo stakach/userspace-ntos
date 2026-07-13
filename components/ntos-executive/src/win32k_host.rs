@@ -833,6 +833,76 @@ extern "win64" fn s_dbg_print(fmt: *const u8) -> u32 {
     0
 }
 
+/// `ULONG vDbgPrintExWithPrefix(PCCH Prefix, ULONG ComponentId, ULONG Level, PCCH Format,
+/// va_list arglist)` — the real DbgPrintEx backend. win64: rcx/rdx/r8/r9 + the 5th arg
+/// (`va_list`, a pointer to the argument array) from the stack. Prints the prefix then the
+/// `%`-substituted format via the host-tested `nt_kernel_exec::dbg` formatter, so win32k's
+/// `DPRINT`/`DbgPrintEx` diagnostics finally render substituted (was an `s_zero` no-op).
+extern "win64" fn s_vdbg_print_ex_with_prefix(
+    prefix: u64,
+    _component: u64,
+    _level: u64,
+    fmt: u64,
+    va_list: u64,
+) -> u32 {
+    print_str(b"[win32k dbg] ");
+    unsafe {
+        if prefix != 0 {
+            let mut i = 0u64;
+            while i < 64 {
+                let c = read_volatile((prefix + i) as *const u8);
+                if c == 0 {
+                    break;
+                }
+                debug_put_char(c);
+                i += 1;
+            }
+        }
+        if fmt != 0 {
+            let mut fbuf = [0u8; 256];
+            let mut flen = 0usize;
+            while flen < 255 {
+                let c = read_volatile((fmt + flen as u64) as *const u8);
+                if c == 0 {
+                    break;
+                }
+                fbuf[flen] = c;
+                flen += 1;
+            }
+            let mut k = 0u64;
+            let mut next_arg = || {
+                let v = if va_list != 0 {
+                    unsafe { read_volatile((va_list + k * 8) as *const u64) }
+                } else {
+                    0
+                };
+                k += 1;
+                v
+            };
+            let mut read_cstr = |ptr: u64, buf: &mut [u8]| -> usize {
+                let mut n = 0usize;
+                while n < buf.len() {
+                    let c = unsafe { read_volatile((ptr + n as u64) as *const u8) };
+                    if c == 0 {
+                        break;
+                    }
+                    buf[n] = c;
+                    n += 1;
+                }
+                n
+            };
+            nt_kernel_exec::dbg::format_dbg(
+                &fbuf[..flen],
+                &mut next_arg,
+                &mut read_cstr,
+                &mut |b| debug_put_char(b),
+            );
+        }
+    }
+    print_str(b"\n");
+    0
+}
+
 // --- CRT + misc ntoskrnl trampolines dxg.sys imports -----------------------------------------
 
 /// `void* memcpy(void* dst, const void* src, size_t n)`.
@@ -1760,6 +1830,63 @@ fn register_trampolines() {
     reg.bind("ObOpenObjectByName", s_ob_open_object_by_name as usize as u64);
     reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
+    // --- batch 2: RTL heap (win32k session heap) ---
+    reg.bind("RtlCreateHeap", s_rtl_create_heap as usize as u64);
+    reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as usize as u64);
+    reg.bind("RtlFreeHeap", s_rtl_free_heap as usize as u64);
+    // --- batch 2: RTL_BITMAP (GDI pool slot allocator) ---
+    reg.bind("RtlInitializeBitMap", s_rtl_initialize_bitmap as usize as u64);
+    reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as usize as u64);
+    reg.bind("RtlSetAllBits", s_rtl_set_all_bits as usize as u64);
+    reg.bind("RtlFindClearBitsAndSet", s_rtl_find_clear_bits_and_set as usize as u64);
+    reg.bind("RtlNumberOfSetBits", s_rtl_number_of_set_bits as usize as u64);
+    reg.bind("RtlTestBit", s_rtl_test_bit as usize as u64);
+    reg.bind("RtlSetBit", s_rtl_set_bit as usize as u64);
+    reg.bind("RtlClearBit", s_rtl_clear_bit as usize as u64);
+    reg.bind("RtlSetBits", s_rtl_set_bits as usize as u64);
+    reg.bind("RtlClearBits", s_rtl_clear_bits as usize as u64);
+    reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as usize as u64);
+    // --- batch 2: RTL string init ---
+    reg.bind("RtlInitUnicodeString", s_rtl_init_unicode_string as usize as u64);
+    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
+    reg.bind("RtlInitEmptyUnicodeString", s_rtl_init_empty_unicode_string as usize as u64);
+    reg.bind("RtlCopyUnicodeString", s_rtl_copy_unicode_string as usize as u64);
+    reg.bind("RtlAppendUnicodeToString", s_rtl_append_unicode_to_string as usize as u64);
+    reg.bind("RtlCreateUnicodeString", s_rtl_create_unicode_string as usize as u64);
+    reg.bind("RtlMultiByteToUnicodeN", s_rtl_multibyte_to_unicode_n as usize as u64);
+    reg.bind("wcslen", s_wcslen as usize as u64);
+    reg.bind("_wcsnicmp", s_wcsnicmp as usize as u64);
+    reg.bind("wcsnicmp", s_wcsnicmp as usize as u64);
+    // --- batch 2: real va_list DbgPrintEx backend (nt_kernel_exec::dbg) ---
+    reg.bind("vDbgPrintExWithPrefix", s_vdbg_print_ex_with_prefix as usize as u64);
+    // --- batch 3: section objects (nt-kernel-exec session_section) ---
+    reg.bind("MmCreateSection", s_mm_create_section as usize as u64);
+    reg.bind("MmMapViewInSessionSpace", s_mm_map_view as usize as u64);
+    reg.bind("MmMapViewInSystemSpace", s_mm_map_view as usize as u64);
+    reg.bind("MmMapViewOfSection", s_mm_map_view_of_section as usize as u64);
+    // --- batch 3: lookaside-list init (nt_kernel_exec::init_general_lookaside) ---
+    reg.bind("ExInitializePagedLookasideList", s_ex_init_paged_lookaside as usize as u64);
+    reg.bind("ExInitializeNPagedLookasideList", s_ex_init_npaged_lookaside as usize as u64);
+    // --- batch 3: Zw virtual-memory / registry / file (canned; see backlog) ---
+    reg.bind("ZwAllocateVirtualMemory", s_zw_allocate_virtual_memory as usize as u64);
+    reg.bind("NtAllocateVirtualMemory", s_zw_allocate_virtual_memory as usize as u64);
+    reg.bind("ZwFreeVirtualMemory", s_zw_free_virtual_memory as usize as u64);
+    reg.bind("NtFreeVirtualMemory", s_zw_free_virtual_memory as usize as u64);
+    reg.bind("ZwSetSystemInformation", s_zw_set_system_information as usize as u64);
+    reg.bind("NtSetSystemInformation", s_zw_set_system_information as usize as u64);
+    reg.bind("ZwOpenFile", s_zw_open_file_fail as usize as u64);
+    reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
+    reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
+    reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
+    reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
+    // --- batch 3: CRT mem intrinsics (dxg.sys imports) ---
+    reg.bind("memcpy", s_memcpy as usize as u64);
+    reg.bind("RtlCopyMemory", s_memcpy as usize as u64);
+    reg.bind("memmove", s_memmove as usize as u64);
+    reg.bind("RtlMoveMemory", s_memmove as usize as u64);
+    reg.bind("memset", s_memset as usize as u64);
+    reg.bind("RtlFillMemory", s_memset as usize as u64);
 }
 
 /// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
@@ -1783,41 +1910,8 @@ pub fn export_addr(name: &str) -> u64 {
         "ExAllocatePoolWithTag" => s_ex_alloc_pool_with_tag as usize as u64,
         "ExAllocatePool" => s_ex_alloc_pool as usize as u64,
         "ExAllocatePoolWithQuotaTag" => s_ex_alloc_pool_quota as usize as u64,
-        // heap (win32k session heap)
-        "RtlCreateHeap" => s_rtl_create_heap as usize as u64,
-        "RtlAllocateHeap" => s_rtl_allocate_heap as usize as u64,
-        "RtlFreeHeap" => s_rtl_free_heap as usize as u64,
-        // section objects: create a real descriptor, map it coherently into session/user space
-        "MmCreateSection" => s_mm_create_section as usize as u64,
-        "MmMapViewInSessionSpace" | "MmMapViewInSystemSpace" => s_mm_map_view as usize as u64,
-        "MmMapViewOfSection" => s_mm_map_view_of_section as usize as u64,
-        // lookaside-list init (populates the GENERAL_LOOKASIDE Allocate/Free callbacks at +0x30/+0x38)
-        "ExInitializePagedLookasideList" => s_ex_init_paged_lookaside as usize as u64,
-        "ExInitializeNPagedLookasideList" => s_ex_init_npaged_lookaside as usize as u64,
-        // CRT + misc (dxg.sys imports)
-        "memcpy" | "RtlCopyMemory" => s_memcpy as usize as u64,
-        "memmove" | "RtlMoveMemory" => s_memmove as usize as u64,
-        "memset" | "RtlFillMemory" => s_memset as usize as u64,
         "ExFreePoolWithTag" | "ExFreePool" => s_ex_free_pool_with_tag as usize as u64,
         "PsGetCurrentProcessId" | "PsGetCurrentThreadProcessId" => s_current_process_id as usize as u64,
-        // GDI attribute pool user-mode VM (GdiPoolAllocateSection RESERVE + GdiPoolAllocate COMMIT)
-        "ZwAllocateVirtualMemory" | "NtAllocateVirtualMemory" => {
-            s_zw_allocate_virtual_memory as usize as u64
-        }
-        "ZwFreeVirtualMemory" | "NtFreeVirtualMemory" => s_zw_free_virtual_memory as usize as u64,
-        // RTL_BITMAP (GDI pool slot allocator — DC_ATTR / RGN_ATTR distinct storage)
-        "RtlInitializeBitMap" => s_rtl_initialize_bitmap as usize as u64,
-        "RtlClearAllBits" => s_rtl_clear_all_bits as usize as u64,
-        "RtlSetAllBits" => s_rtl_set_all_bits as usize as u64,
-        "RtlFindClearBitsAndSet" => s_rtl_find_clear_bits_and_set as usize as u64,
-        "RtlNumberOfSetBits" => s_rtl_number_of_set_bits as usize as u64,
-        "RtlTestBit" => s_rtl_test_bit as usize as u64,
-        "RtlSetBit" => s_rtl_set_bit as usize as u64,
-        "RtlClearBit" => s_rtl_clear_bit as usize as u64,
-        "RtlSetBits" => s_rtl_set_bits as usize as u64,
-        "RtlClearBits" => s_rtl_clear_bits as usize as u64,
-        "RtlAreBitsClear" => s_rtl_are_bits_clear as usize as u64,
-
         // RTL atom table (nt_kernel_exec::rtl_atom) — gAtomTable + per-window-station tables. Real
         // now (was s_zero → null gAtomTable → UserRegisterSystemClasses null-deref on string classes).
         "RtlCreateAtomTable" => s_rtl_create_atom_table as usize as u64,
@@ -1827,31 +1921,13 @@ pub fn export_addr(name: &str) -> u64 {
         "RtlPinAtomInAtomTable" => s_rtl_pin_atom_in_atom_table as usize as u64,
         "RtlQueryAtomInAtomTable" => s_rtl_query_atom_in_atom_table as usize as u64,
         "RtlDestroyAtomTable" => s_rtl_destroy_atom_table as usize as u64,
-        // GDI driver load (win32k's LDEVOBJ_bLoadImage → dxg.sys hosting)
-        "ZwSetSystemInformation" | "NtSetSystemInformation" => s_zw_set_system_information as usize as u64,
-        // font dir open (\SystemRoot\Fonts) → fail cleanly so IntLoadSystemFonts skips enumeration
-        "ZwOpenFile" | "NtOpenFile" => s_zw_open_file_fail as usize as u64,
-        // video-device registry synthesis (EngpUpdateGraphicsDeviceList / InitDisplayDriver)
-        "ZwOpenKey" | "NtOpenKey" => s_zw_open_key as usize as u64,
-        "ZwQueryValueKey" | "NtQueryValueKey" => s_zw_query_value_key as usize as u64,
         "IoGetDeviceObjectPointer" => s_io_get_device_object_pointer as usize as u64,
-        // Rtl string init
-        "RtlInitUnicodeString" => s_rtl_init_unicode_string as usize as u64,
-        "RtlInitAnsiString" => s_rtl_init_ansi_string as usize as u64,
-        "RtlInitEmptyUnicodeString" => s_rtl_init_empty_unicode_string as usize as u64,
-        "RtlCopyUnicodeString" => s_rtl_copy_unicode_string as usize as u64,
-        "RtlAppendUnicodeToString" => s_rtl_append_unicode_to_string as usize as u64,
-        "RtlCreateUnicodeString" => s_rtl_create_unicode_string as usize as u64,
-        "RtlMultiByteToUnicodeN" => s_rtl_multibyte_to_unicode_n as usize as u64,
-        "wcslen" => s_wcslen as usize as u64,
-        "_wcsnicmp" | "wcsnicmp" => s_wcsnicmp as usize as u64,
         // win32k -> client user-mode callback bridge (cursor/icon/menu resource setup)
         "KeUserModeCallback" => s_ke_user_mode_callback as usize as u64,
         // SSDT registration
         "KeAddSystemServiceTable" => s_ke_add_system_service_table as usize as u64,
         // debug print
         "DbgPrint" => s_dbg_print as usize as u64,
-        "vDbgPrintExWithPrefix" => s_zero as usize as u64,
         // current process/thread + real per-process win32-slots (set by win32k's process callout)
         "IoGetCurrentProcess" | "PsGetCurrentProcess" => s_current_process as usize as u64,
         "PsGetCurrentThread" | "KeGetCurrentThread" => s_current_thread as usize as u64,
