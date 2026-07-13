@@ -49,6 +49,25 @@ fn system_thread_does_not_exit_process() {
 }
 
 #[test]
+fn exit_thread_marks_thread_without_terminating_process() {
+    // The hosted csrss.exe case: its init thread exits via NtTerminateThread while CSRSRV's API
+    // worker threads keep the process running. `exit_thread` must mark JUST that ETHREAD terminated
+    // (signalled + exit status) and leave the EPROCESS Running — no last-thread cascade.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("csrss.exe", None, None);
+    let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    pm.exit_thread(main, 0x1234).unwrap();
+    assert!(pm.is_thread_signaled(main));
+    assert_eq!(pm.thread(main).unwrap().exit_status, Some(0x1234));
+    // Process stays Running (unlike terminate_thread, which would cascade to process exit).
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    assert!(!pm.is_process_signaled(pid));
+    // Unknown tid is rejected.
+    assert_eq!(pm.exit_thread(0xDEAD, 0), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
 fn handle_table_operations() {
     let mut pm = ProcessManager::new();
     let p1 = pm.create_process("a.exe", None, None);

@@ -515,6 +515,20 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Terminate a SINGLE thread WITHOUT the last-thread process-exit cascade (unlike
+    /// [`terminate_thread`](Self::terminate_thread)). For a hosted process whose OTHER threads keep
+    /// it alive even though this (main/init) thread exits — e.g. csrss.exe's init thread calls
+    /// `NtTerminateThread(NtCurrentThread())` and CSRSRV's API worker threads keep the process
+    /// running ("CSRSRV keeps us going"). Marks the ETHREAD Terminated (signalled) + records the
+    /// exit status; the EPROCESS stays whatever it was (Running). Alloc-free (in-place field writes
+    /// on an already-allocated node) — safe to call under the executive's per-syscall heap reset.
+    pub fn exit_thread(&mut self, tid: ThreadId, exit_status: u32) -> Result<(), u32> {
+        let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        t.state = ThreadState::Terminated;
+        t.exit_status = Some(exit_status);
+        Ok(())
+    }
+
     /// `NtTerminateProcess` (spec §21.2): terminate all threads, set the exit status, and mark the
     /// process terminated (signalled). Releases the image-section map ref (spec §13.7).
     pub fn terminate_process(&mut self, pid: ProcessId, exit_status: u32) -> Result<(), u32> {

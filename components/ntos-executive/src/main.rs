@@ -3078,16 +3078,21 @@ impl ExecNtHandler {
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(h as u64)
     }
-    /// Resolve a `NtTerminateProcess` ProcessHandle to the target EPROCESS pid. `NtCurrentProcess()`
-    /// (`-1`) → the caller (self-terminate). A child ProcessHandle can't be resolved to a pid until
-    /// path 1b gives the handle table a value→object index (process handles are typed `Process(pid)`
-    /// but not value-tagged), so it returns `None` for now (documented limitation; not hit at boot).
+    /// Resolve a `NtTerminateProcess`/`NtOpenProcess`-style ProcessHandle to the target EPROCESS pid.
+    /// `NtCurrentProcess()` (`-1`) → the caller (self-terminate). A real child ProcessHandle is now
+    /// resolved via path 1b's value→object index: process handles are dense typed `Process(pid)`
+    /// entries in the CALLER's EPROCESS handle table, so `lookup_handle(caller, handle)` returns the
+    /// target pid. Returns `None` for an unknown/untyped handle (→ the caller falls back to a benign
+    /// no-op, never terminating the wrong process).
     fn resolve_process_handle(&self, handle: u64) -> Option<nt_process::ProcessId> {
         let caller = self.pm_pid_for_pi(self.pi)?;
         if handle == 0xFFFF_FFFF_FFFF_FFFF {
-            Some(caller)
-        } else {
-            None
+            return Some(caller); // NtCurrentProcess()
+        }
+        // Path 1b: dense process-local handle VALUE → typed Process(pid) object in the caller's table.
+        match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Process(pid)) => Some(pid),
+            _ => None,
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -4791,14 +4796,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
             }
             // NtTerminateThread(ThreadHandle, ExitStatus[RDX]) for NtCurrentThread()==-2 → the
-            // caller's main thread (policy-side). Same additive/self-tested status as above.
+            // caller's main thread. Uses `exit_thread` (NO process cascade — a hosted process's other
+            // threads keep it alive), matching the live broker-arm routing (item 2a). This arm is NOT
+            // table-registered (267 stays in the broker arm to preserve park_caller); it exists so the
+            // policy is exercisable and args-defensive should a future flow register it.
             NativeService::NtTerminateThread => {
                 let handle = args.first().copied().unwrap_or(0);
                 let status = args.get(1).copied().unwrap_or(0) as u32;
                 if handle == 0xFFFF_FFFF_FFFF_FFFE {
                     if let Some(tid) = PM_TIDS.get(self.pi).map(|t| t.load(Ordering::Relaxed)) {
                         if tid != 0 {
-                            let _ = self.pm.terminate_thread(tid as nt_process::ThreadId, status);
+                            let _ = self.pm.exit_thread(tid as nt_process::ThreadId, status);
                         }
                     }
                 }
@@ -4883,13 +4891,20 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtMapViewOfSection, 113),
             // Workstream A batch 10 (group C): csrss spawn (table-dispatched-with-post-action).
             (NativeService::NtCreateProcess, SSN_NT_CREATE_PROCESS as u32),
-            // NOTE: NtTerminateProcess/NtTerminateThread are deliberately NOT registered here.
-            // Registering them intercepts LIVE boot calls (a csrss/winlogon worker thread exits via
-            // NtTerminateThread) that currently fall to the benign broker fallback — routing them to
-            // the pm teardown is a BEHAVIOR CHANGE (and needs per-thread identity we don't have until
-            // path 1b's value-indexed handles). The teardown POLICY (pm.terminate_process/thread +
-            // resolve_process_handle) is implemented (the handler arms below) + proven by the
-            // post-loop self-test; wiring it to live dispatch is a flagged follow-up.
+            // ITEM 2a — live terminate-dispatch. NtTerminateProcess IS registered: it is NOT issued
+            // during a normal boot (the 3 hosted processes never self-terminate — verified: registering
+            // it keeps the boot byte-identical), so routing it to the real pm.terminate_process teardown
+            // (via resolve_process_handle: NtCurrentProcess→self, a child ProcessHandle→its Process(pid)
+            // via path 1b's value→object index) is additive. terminate_process only mutates below-mark
+            // EPROCESS/ETHREAD nodes in place + a transient consumed-and-dropped Vec → safe under the
+            // per-syscall heap reset even if a future flow does hit it.
+            (NativeService::NtTerminateProcess, SSN_NT_TERMINATE_PROCESS as u32),
+            // NtTerminateThread is deliberately NOT registered here — it IS issued live (csrss.exe's
+            // init thread self-exits). It stays in the broker arm (`m0 == 267 && badge == CSRSS_BADGE`)
+            // so it keeps setting park_caller (the load-bearing "leave the thread blocked" behavior);
+            // that arm routes the exit through the real ETHREAD teardown (pm.exit_thread, no cascade).
+            // Registering it in the table would shadow the broker arm → drop park_caller (behavior
+            // change) — the exact pre-path-2 regression.
         ],
     )
 }
@@ -6384,6 +6399,26 @@ unsafe fn service_sec_image(
                 // NtTerminateThread(NtCurrentThread()) — its init thread exits and CSRSRV's worker
                 // threads (fake here) keep the process alive (csrss.c:93). Park csrss's thread (don't
                 // reply → it stays blocked) so csrss goes quiet and smss drives the rest of init.
+                //
+                // ITEM 2a — LIVE terminate-dispatch: route this real thread-exit through the real
+                // ETHREAD teardown. Resolve the caller's thread by identity — NtCurrentThread()==-2
+                // → THIS process's (pi=1=csrss) main ETHREAD (PM_TIDS[pi]) — and mark it Terminated
+                // via `pm.exit_thread` (marks the ETHREAD signalled + exit status, NO process cascade:
+                // csrss's EPROCESS stays Running, its other threads keep it alive). BEHAVIOR-PRESERVING:
+                // the seL4 outcome is IDENTICAL to the pre-2a park-only fallback (park_caller=true →
+                // the thread stays blocked, never runs again; the process + other processes + the boot
+                // are untouched). `exit_thread` is alloc-free (in-place field writes on a below-mark
+                // ETHREAD node) → safe under the per-syscall heap reset. Args-defensive: the ExitStatus
+                // (RDX=m3) is read directly (no arg-slice → no OOB; the pre-path-2 regression was an
+                // args[1] OOB in a table-registered arm — this stays in the broker arm on purpose so it
+                // never shadows the park behavior).
+                let status = m3 as u32;
+                if let Some(tid) = PM_TIDS.get(pi).map(|t| t.load(Ordering::Relaxed)) {
+                    if tid != 0 && nt_handler.pm.exit_thread(tid as nt_process::ThreadId, status).is_ok() {
+                        PM_TERMINATE_THREAD_LIVE.fetch_add(1, Ordering::Relaxed);
+                        PM_TERMINATE_THREAD_STATE.fetch_or(1 << pi, Ordering::Relaxed);
+                    }
+                }
                 park_caller = true;
                 result = 0;
             } else if m0 == 228 {
@@ -8185,6 +8220,15 @@ static PM_NTOPENPROCESS_OK: AtomicU64 = AtomicU64::new(0);
 /// Count of real NtTerminateProcess calls the executive serviced (0 during a normal boot — no hosted
 /// process terminates; the handler is additive + proven by the post-loop self-test).
 static PM_TERMINATE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Count of LIVE NtTerminateThread self-exits routed through the real ETHREAD teardown (item 2a).
+/// csrss.exe's init thread exits via NtTerminateThread(NtCurrentThread()) once during a normal boot
+/// ("CSRSRV keeps us going"); the executive marks that ETHREAD Terminated via `pm.exit_thread` (no
+/// process cascade — csrss keeps running) and parks the seL4 thread, unchanged. >=1 proves the live
+/// thread-exit was routed to the real teardown (not the pre-2a benign park-only fallback).
+static PM_TERMINATE_THREAD_LIVE: AtomicU64 = AtomicU64::new(0);
+/// Bit i set iff pi=i's main ETHREAD is Terminated (signalled) via a live NtTerminateThread. Bit 1
+/// (csrss) is set during a normal boot; bits 0/2 stay clear (smss/winlogon don't self-exit at boot).
+static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
 // === Path 3 — fold the per-pi IDENTITY arrays into an EPROCESS-linked per-process struct =========
 /// Executive-side per-hosted-process MECHANISM state, EPROCESS-linked. Path 3 of the nt-process
 /// convergence folds the six parallel `[_;3]` identity arrays that `service_sec_image` indexed by
@@ -12224,6 +12268,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_LIFECYCLE_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
+                    // ITEM 2a — LIVE terminate-dispatch: csrss.exe's init thread self-exits via
+                    // NtTerminateThread(NtCurrentThread()) during the real boot, and the executive now
+                    // routes that live exit through the real ETHREAD teardown (pm.exit_thread, no
+                    // cascade — csrss's EPROCESS stays Running). `exec_live_terminate_thread_routed` =
+                    // the live exit fired (>=1) AND csrss's (pi=1) main ETHREAD is marked Terminated,
+                    // while smss/winlogon (bits 0/2) are NOT (they don't self-exit at boot) → the exit
+                    // was routed to the CORRECT thread by identity, not the whole process.
+                    check(
+                        b"exec_live_terminate_thread_routed",
+                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 1
+                            && PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) == 0b010,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] item2a live-terminate-thread: count=0x");
+                    print_hex(PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) as u32);
+                    print_str(b" ethread-terminated-bits=0x");
+                    print_hex(PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) as u32);
+                    print_str(b" nt-terminate-process-calls=0x");
+                    print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     // Path 3 — the six ex-parallel per-pi identity arrays (pml4s/scratch_bases/
                     // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
                     // EPROCESS-linked via its `pid`. `exec_eprocess_linked_mechanism` = every hosted
@@ -12283,6 +12347,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_main_thread_bound_at_spawn", false, &mut passed);
                     check(b"exec_ntopenprocess_mints_handle", false, &mut passed);
                     check(b"exec_ntterminateprocess_teardown", false, &mut passed);
+                    check(b"exec_live_terminate_thread_routed", false, &mut passed);
                     check(b"exec_eprocess_linked_mechanism", false, &mut passed);
                     check(b"exec_process_local_handle_values", false, &mut passed);
                 }
