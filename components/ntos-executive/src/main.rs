@@ -3441,23 +3441,38 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     n
                 };
-                let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
-                // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
-                // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
                 // Reject SxS/actctx probes (csrss.exe.local, csrss.exe.manifest, *.config).
                 let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
-                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // The System32 DIRECTORY open (SmpCreateInitialSession → KnownDLLs) resolves through
+                // the REAL nt-fs namespace: the substring classifies the probe, nt-fs authoritatively
+                // confirms \Windows\System32 exists AND is a directory (canonical path is
+                // mount-resolvable, so path-form independent).
+                let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
+                let is_sys32_dir = want_dir
+                    && nb[..nlen].windows(8).any(|w| w == b"system32")
+                    && self
+                        .fs
+                        .query_attributes(r"\SystemRoot\System32")
+                        .is_some_and(|si| si.is_directory);
+                // csrss.exe FILE open (SmpExecuteImage): same as NtQueryAttributesFile — substring
+                // classifies, nt-fs owns existence + file-vs-dir. Scoped by name so the loader's
+                // manifest opens are unaffected.
+                let is_csrss = !is_sxs
+                    && nb[..nlen].windows(5).any(|w| w == b"csrss")
+                    && self
+                        .fs
+                        .query_attributes(r"\SystemRoot\System32\csrss.exe")
+                        .is_some_and(|si| !si.is_directory);
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
                 // smss skips them and launches csrss. Only csrss's loader should resolve these DLLs.
+                // nt-dll-registry keeps the image base/geometry role for CONTENT (SEC_IMAGE); nt-fs
+                // owns namespace/existence (csrss.exe + System32 dir here).
                 let dll_i = if self.pi == 1 { reg.resolve_name(&nb[..nlen]) } else { None };
-                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
-                    || is_csrss
-                    || dll_i.is_some()
-                {
+                if is_sys32_dir || is_csrss || dll_i.is_some() {
                     smss_stack_write(get_recv_mr(9), self.next_handle); // *FileHandle
                     if is_csrss {
                         *ctx.csrss_file_handle = self.next_handle; // remember it for NtCreateSection
