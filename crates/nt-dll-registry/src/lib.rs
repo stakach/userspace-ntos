@@ -29,6 +29,15 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+/// Number of per-process (per-owner) handle slots the registry keys on. Handle VALUES are
+/// **process-local** (each hosted process has its own NT handle namespace), so the same DLL,
+/// loaded by two processes, gets a distinct file/section handle **per process** — and those
+/// values may COLLIDE across processes (real NT dense per-process handles reuse small integers).
+/// Every handle store/lookup is therefore keyed by the owning process index `pi`
+/// (0 = smss, 1 = csrss, 2 = winlogon; the executive's fault-badge → pi mapping). `pi` values
+/// `>= PI_SLOTS` are ignored (out-of-range owner). Path 1b of the nt-process convergence.
+pub const PI_SLOTS: usize = 3;
+
 /// One registered DLL image and the handles/state the load flow accumulates for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dll {
@@ -40,10 +49,13 @@ pub struct Dll {
     pub image_size: u64,
     /// `AddressOfEntryPoint` (RVA), for the `SECTION_IMAGE_INFORMATION` transfer address.
     pub entry_rva: u32,
-    /// File handle from NtOpenFile (0 until opened).
-    pub file_handle: u64,
-    /// Section handle from NtCreateSection (0 until sectioned).
-    pub section_handle: u64,
+    /// File handle from NtOpenFile, **per owning process** (`file_handle[pi]`; 0 until opened by
+    /// that process). Two processes loading the same DLL each store their own (possibly equal)
+    /// handle VALUE here, so the lookup must be keyed by `pi`.
+    pub file_handle: [u64; PI_SLOTS],
+    /// Section handle from NtCreateSection, **per owning process** (`section_handle[pi]`; 0 until
+    /// sectioned by that process).
+    pub section_handle: [u64; PI_SLOTS],
     /// Set once NtMapViewOfSection has reserved this DLL's VA range.
     pub mapped: bool,
 }
@@ -74,8 +86,8 @@ impl Registry {
             base,
             image_size,
             entry_rva,
-            file_handle: 0,
-            section_handle: 0,
+            file_handle: [0; PI_SLOTS],
+            section_handle: [0; PI_SLOTS],
             mapped: false,
         });
         self.dlls.len() - 1
@@ -130,34 +142,42 @@ impl Registry {
             .map(|(i, _)| i)
     }
 
-    /// Record the NtOpenFile handle for DLL `i`.
-    pub fn set_file_handle(&mut self, i: usize, handle: u64) {
+    /// Record the NtOpenFile handle for DLL `i`, owned by process `pi` (handles are process-local).
+    pub fn set_file_handle(&mut self, pi: usize, i: usize, handle: u64) {
+        if pi >= PI_SLOTS {
+            return;
+        }
         if let Some(d) = self.dlls.get_mut(i) {
-            d.file_handle = handle;
+            d.file_handle[pi] = handle;
         }
     }
 
-    /// The DLL a (non-zero) file handle belongs to.
-    pub fn index_for_file(&self, handle: u64) -> Option<usize> {
-        if handle == 0 {
+    /// The DLL a (non-zero) file handle belongs to, **within process `pi`'s handle namespace**.
+    /// The same handle VALUE in a different process is a different handle, so the lookup is scoped
+    /// to `pi` and never matches another process's identical value.
+    pub fn index_for_file(&self, pi: usize, handle: u64) -> Option<usize> {
+        if handle == 0 || pi >= PI_SLOTS {
             return None;
         }
-        self.dlls.iter().position(|d| d.file_handle == handle)
+        self.dlls.iter().position(|d| d.file_handle[pi] == handle)
     }
 
-    /// Record the NtCreateSection handle for DLL `i`.
-    pub fn set_section_handle(&mut self, i: usize, handle: u64) {
+    /// Record the NtCreateSection handle for DLL `i`, owned by process `pi`.
+    pub fn set_section_handle(&mut self, pi: usize, i: usize, handle: u64) {
+        if pi >= PI_SLOTS {
+            return;
+        }
         if let Some(d) = self.dlls.get_mut(i) {
-            d.section_handle = handle;
+            d.section_handle[pi] = handle;
         }
     }
 
-    /// The DLL a (non-zero) section handle belongs to.
-    pub fn index_for_section(&self, handle: u64) -> Option<usize> {
-        if handle == 0 {
+    /// The DLL a (non-zero) section handle belongs to, **within process `pi`'s handle namespace**.
+    pub fn index_for_section(&self, pi: usize, handle: u64) -> Option<usize> {
+        if handle == 0 || pi >= PI_SLOTS {
             return None;
         }
-        self.dlls.iter().position(|d| d.section_handle == handle)
+        self.dlls.iter().position(|d| d.section_handle[pi] == handle)
     }
 
     /// Mark DLL `i`'s view mapped (its VA range is now reserved + demand-pageable).
@@ -298,13 +318,36 @@ mod tests {
     #[test]
     fn handle_round_trips() {
         let mut r = seeded();
-        assert_eq!(r.index_for_file(0), None); // a zero handle never matches
-        r.set_file_handle(1, 0x5a5a_0007);
-        assert_eq!(r.index_for_file(0x5a5a_0007), Some(1));
-        assert_eq!(r.index_for_file(0x1234), None);
-        r.set_section_handle(1, 0x5a5a_0009);
-        assert_eq!(r.index_for_section(0x5a5a_0009), Some(1));
-        assert_eq!(r.index_for_section(0), None);
+        assert_eq!(r.index_for_file(1, 0), None); // a zero handle never matches
+        r.set_file_handle(1, 1, 0x5a5a_0007); // csrss (pi 1) opens basesrv
+        assert_eq!(r.index_for_file(1, 0x5a5a_0007), Some(1));
+        assert_eq!(r.index_for_file(1, 0x1234), None);
+        r.set_section_handle(1, 1, 0x5a5a_0009);
+        assert_eq!(r.index_for_section(1, 0x5a5a_0009), Some(1));
+        assert_eq!(r.index_for_section(1, 0), None);
+    }
+
+    #[test]
+    fn handles_are_process_local() {
+        // The load-bearing property for path 1b: process-local handle VALUES may COLLIDE across
+        // processes yet refer to DIFFERENT DLLs, and the per-pi lookup resolves each correctly.
+        let mut r = seeded();
+        // csrss (pi 1) and winlogon (pi 2) BOTH get dense handle value 0x4 — csrss's 0x4 is csrsrv,
+        // winlogon's 0x4 is winsrv. No global scheme could tell these apart; the per-pi key does.
+        r.set_file_handle(1, 0, 0x4); // csrss: handle 0x4 -> csrsrv (dll 0)
+        r.set_file_handle(2, 2, 0x4); // winlogon: handle 0x4 -> winsrv (dll 2)
+        assert_eq!(r.index_for_file(1, 0x4), Some(0)); // csrss's 0x4
+        assert_eq!(r.index_for_file(2, 0x4), Some(2)); // winlogon's 0x4 — a different object
+        // A process that never opened handle 0x4 doesn't see the other process's binding.
+        assert_eq!(r.index_for_file(0, 0x4), None); // smss
+        // Same for section handles.
+        r.set_section_handle(1, 0, 0x8);
+        r.set_section_handle(2, 2, 0x8);
+        assert_eq!(r.index_for_section(1, 0x8), Some(0));
+        assert_eq!(r.index_for_section(2, 0x8), Some(2));
+        // Out-of-range owner index is inert (never panics).
+        r.set_file_handle(99, 0, 0x4);
+        assert_eq!(r.index_for_file(99, 0x4), None);
     }
 
     #[test]

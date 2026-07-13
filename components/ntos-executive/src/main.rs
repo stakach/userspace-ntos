@@ -4415,7 +4415,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         *ctx.winlogon_file_handle = h; // for NtCreateSection
                     }
                     if let Some(i) = dll_i {
-                        reg.set_file_handle(i, h); // remember it for NtCreateSection
+                        reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
                     }
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                     if iosb != 0 {
@@ -4443,7 +4443,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let csrss_pe = &*ctx.csrss_pe;
                 let winlogon_section_handle = *ctx.winlogon_section_handle;
                 let winlogon_pe = &*ctx.winlogon_pe;
-                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(sect) {
+                let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(self.pi, sect) {
                     reg.image_info(i).map(|b| (b, reg.name(i)))
                 } else if csrss_section_handle != 0 && sect == csrss_section_handle {
                     csrss_pe.as_ref().map(|p| {
@@ -4582,8 +4582,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_str(b"\n");
                 }
                 // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
-                if let Some(i) = reg.index_for_file(sec_file) {
-                    reg.set_section_handle(i, h);
+                if let Some(i) = reg.index_for_file(self.pi, sec_file) {
+                    reg.set_section_handle(self.pi, i, h);
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                     print_str(reg.name(i));
                     print_str(b" -> handle 0x");
@@ -4626,7 +4626,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let scratch_base = ctx.scratch_base;
                 let sp = get_recv_mr(16);
                 let sect = get_recv_mr(9);
-                if let Some(i) = reg.index_for_section(sect) {
+                if let Some(i) = reg.index_for_section(self.pi, sect) {
                     // A registry DLL (csrsrv/basesrv/winsrv). Reserve its VA range, hand back its base
                     // + view size, and let the fault router demand-page it from its PE. All DLL slots
                     // share the 0x8000_0000 1 GiB PDPT range, so the PD is created once (first mapped
