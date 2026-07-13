@@ -2521,6 +2521,12 @@ struct ExecNtHandler {
     /// spawn_sec_image + per-badge state + *ProcessHandle out) after dispatch — the spawn needs
     /// fault_ep + the per-process arrays which stay loop-resident. Mirrors `stop`/the write queue.
     spawn_request: bool,
+    /// The two most-recent csrss `NtCreateEvent` handles, in creation order (winsrv's power + media
+    /// request events). NtUserInitialize's SSN>=0x1000 forward substitutes these for its NULL event
+    /// args (our csrss demand-fill window can't write the handle back to winsrv's late .bss global),
+    /// so win32k receives + models the REAL Event objects. See the `NtCreateEvent` handler.
+    csrss_event_handles: [u64; 2],
+    csrss_event_n: usize,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2576,6 +2582,8 @@ impl ExecNtHandler {
             out_writes_n: 0,
             loop_ctx: None,
             spawn_request: false,
+            csrss_event_handles: [0; 2],
+            csrss_event_n: 0,
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -2937,13 +2945,45 @@ impl NativeSyscallHandler for ExecNtHandler {
             // init keeps flowing (the RCX slot is stale but these handles are never checked).
             NativeService::NtCreatePort
             | NativeService::NtCreateThread
-            | NativeService::NtCreateEvent
             | NativeService::NtCreateSemaphore => unsafe {
                 let out = get_recv_mr(2); // RCX = *Handle
                 smss_stack_write(out, self.next_handle);
                 self.next_handle += 1;
                 0
             },
+            // NtCreateEvent(*EventHandle[R10], ACCESS, *OA, EVENT_TYPE, InitialState). winsrv's
+            // UserServerDllInitialization creates ghPowerRequestEvent/ghMediaRequestEvent here and
+            // hands them to NtUserInitialize (SSN 0x125a); win32k's IntInitWin32PowerManagement then
+            // does ObReferenceObjectByHandle(hEvent, *ExEventObjectType, &gpPowerRequestCalloutEvent)
+            // on the power event. So the minted handle MUST reach the caller's *EventHandle — which
+            // is arg1 = R10 (the x64 out-arg; the syscall stub moved the caller's RCX there, and RCX
+            // at the fault holds the return IP, out of any writable range). For csrss that PHANDLE is
+            // a winsrv .data global, so QUEUE the write for the loop's per-process out-writer
+            // (csrss_out_write demand-pages the global; smss_stack_write handles an smss stack local).
+            // The out PHANDLE is arg1 = R10, and for csrss it is a winsrv .bss global. Our csrss
+            // demand-fill window is only 256 pages (csrss demand-pages ~343), so `csrss_out_write`
+            // cannot reliably reach winsrv's late .bss page — the handle would arrive back at winsrv
+            // as NULL (as it did pre-fix, masked by a fake). So instead of writing the flaky global,
+            // RECORD the minted handle (csrss only) and DELIVER it to win32k by substituting it into
+            // NtUserInitialize's event args at the forward point (see the SSN>=0x1000 arm). That gives
+            // win32k the REAL event handles winsrv created, which it models as typed Event objects.
+            // (Memory behaviour matches the pre-fix baseline: nothing is written to the caller here.)
+            NativeService::NtCreateEvent => {
+                let h = self.next_handle;
+                self.next_handle += 1;
+                if self.pi == 1 {
+                    // Keep the two most-recent csrss event handles in creation order (winsrv creates
+                    // hPowerRequestEvent then hMediaRequestEvent right before NtUserInitialize).
+                    if self.csrss_event_n < self.csrss_event_handles.len() {
+                        self.csrss_event_handles[self.csrss_event_n] = h;
+                    } else {
+                        self.csrss_event_handles[0] = self.csrss_event_handles[1];
+                        self.csrss_event_handles[1] = h;
+                    }
+                    self.csrss_event_n += 1;
+                }
+                0
+            }
             // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
             NativeService::NtOpenProcessToken => unsafe {
                 let out = get_recv_mr(7); // R8
@@ -4811,9 +4851,23 @@ unsafe fn service_sec_image(
                 // args ride the registers exactly as the native x64 syscall passed them (arg1=R10,
                 // arg2=RDX, arg3=R8, arg4=R9); pointer/buffer args are marshaled per SSN as needed.
                 let a0 = get_recv_mr(9); // R10 = arg1
-                let a1 = m3; // RDX = arg2
-                let a2 = get_recv_mr(7); // R8 = arg3
+                let mut a1 = m3; // RDX = arg2
+                let mut a2 = get_recv_mr(7); // R8 = arg3
                 let a3 = get_recv_mr(8); // R9 = arg4
+                // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
+                // winsrv created these events via NtCreateEvent but our csrss demand-fill window
+                // couldn't write the handle back to winsrv's late .bss global, so they arrive NULL
+                // (pre-fix a fake EPROCESS masked that). Substitute the REAL minted handles the
+                // executive recorded (creation order = power, media), so win32k models + references
+                // genuine typed Event objects. Only fills NULLs (a working marshal is respected).
+                if m0 == win32k_host::SSN_NT_USER_INITIALIZE_REAL {
+                    if a1 == 0 {
+                        a1 = nt_handler.csrss_event_handles[0];
+                    }
+                    if a2 == 0 {
+                        a2 = nt_handler.csrss_event_handles[1];
+                    }
+                }
                 // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
                 // hosted client's process via the synthetic handle the DriverEntry attach used.
                 let d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_host::FAKE_PROCESS_HANDLE } else { a0 };

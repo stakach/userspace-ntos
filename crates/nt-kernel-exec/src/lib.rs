@@ -17,6 +17,7 @@ pub mod dbg;
 mod dpc;
 mod event;
 mod interrupt;
+pub mod kevent;
 mod irql;
 mod lookaside;
 pub mod rtl_atom;

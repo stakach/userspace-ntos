@@ -140,9 +140,17 @@ pub const V_CALLOUT_ENTERED: u32 = 0x80; // invoked win32k's process-create call
 pub const V_CALLOUT_RETURNED: u32 = 0x100; // process-create callout returned (did not fault)
 pub const V_NTUSER_RESOLVED: u32 = 0x200; // SSDT resolve(0x10FA) yielded a real win32k handler
 
-/// The win32k NtUser/NtGdi shadow-SSDT base service number; SSN 0x10FA = NtUserInitialize.
+/// The win32k NtUser/NtGdi shadow-SSDT base service number (`SSN >= 0x1000` selects the shadow SSDT).
 pub const WIN32K_SERVICE_BASE: u64 = 0x1000;
+/// `SSN 0x10FA` — the win32k service csrss's user32 client init drives through the connect path
+/// (`NtUserProcessConnect`, RVA 0xc2ba0; the marshaled-buffer dispatch). Named for its historical
+/// role in the bring-up; NOT `NtUserInitialize` (that is [`SSN_NT_USER_INITIALIZE_REAL`]).
 pub const SSN_NT_USER_INITIALIZE: u64 = 0x10FA;
+/// `SSN 0x125a` — the real `NtUserInitialize(dwWinVersion, hPowerRequestEvent, hMediaRequestEvent)`
+/// (RVA 0xc41a0) winsrv's `UserServerDllInitialization` issues. Its `IntInitWin32PowerManagement`
+/// does `ObReferenceObjectByHandle(hPowerRequestEvent, *ExEventObjectType)`; the dispatch loop
+/// materializes real typed `Event` objects for the two event-handle args (see `dispatch_loop`).
+pub const SSN_NT_USER_INITIALIZE_REAL: u64 = 0x125A;
 
 /// Fix (B) self-test SSN — a SYNTHETIC dispatch (well outside win32k's real 740-entry SSDT) whose
 /// handler deliberately READS an un-demand-paged data page in this component's VSpace. The read
@@ -390,6 +398,30 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
     nt_object_manager::win32k_ob::classify(obj_type)
 }
 
+/// Model a real `Event` object for a win32k-visible event `handle` (winsrv's power/media request
+/// events). Allocates a genuine `KEVENT` (`nt_kernel_exec::kevent`, Synchronization / non-signalled)
+/// from the win32k pool and registers it in [`OBJ_TABLE`] under the external handle value, so
+/// [`s_ob_reference_object_by_handle`] resolves it to a typed `Event` (`ExEventObjectType`). A NULL
+/// or already-modelled handle is a no-op (the registry is idempotent). Runs in the win32k component
+/// (its pool + `OBJ_TABLE` are live here).
+unsafe fn register_event_object(handle: u64) {
+    use nt_object_manager::win32k_ob::ObKind;
+    let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
+    if handle == 0 || matches!(table.lookup(handle), Some((ObKind::Event, _))) {
+        return; // NULL, or already modelled (idempotent — don't leak a second KEVENT).
+    }
+    let body = pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64);
+    if body == 0 {
+        return; // pool exhausted — leave unmodelled (ObRefByHandle will report no object).
+    }
+    nt_kernel_exec::kevent::init_kevent(
+        body as *mut u8,
+        nt_kernel_exec::kevent::EventKind::Synchronization,
+        false,
+    );
+    table.register_event(handle, body);
+}
+
 /// Allocate + zero a DESKTOP body (with a DESKTOPINFO hung off `pDeskInfo`@+0x08) from the win32k
 /// pool. Enough to satisfy IntCreateDesktop up to IntGetAndReferenceClass(WC_DESKTOP); the desktop
 /// heap + full DESKTOPINFO population is the following increment's work. The body layout lives with
@@ -524,10 +556,16 @@ const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 /// referenced object's type fails with `STATUS_OBJECT_TYPE_MISMATCH` and hands back no object; a NULL
 /// `ObjectType` is polymorphic (any type — e.g. `NtClose`/`NtQueryObject`).
 ///
-/// A registered win32k object handle (DESKTOP/WINDOWSTATION) → its real body, checked against its
-/// [`ObKind`] via [`nt_object_manager::win32k_ob::object_type_matches`]. Any other handle is win32k's
-/// process-connect handle ([`FAKE_PROCESS_HANDLE`]) → the current EPROCESS, whose type is
-/// `PsProcessType`; a non-NULL `ObjectType` there must be `PsProcessType`.
+/// A registered win32k object handle → its real body, checked against its [`ObKind`] via
+/// [`nt_object_manager::win32k_ob::object_type_matches`]:
+///  - `DESKTOP` / `WINDOWSTATION` (from the `Ob*` create path);
+///  - `Event` (`ExEventObjectType`) — winsrv's power/media request events, modeled as real `KEVENT`
+///    objects when `NtUserInitialize` receives their handles (see [`register_event_object`]).
+///
+/// The only unregistered handle we resolve is win32k's process-connect handle ([`FAKE_PROCESS_HANDLE`])
+/// → the current EPROCESS (`PsProcessType`). Every other typed reference to an unregistered handle is
+/// enforced honestly (`STATUS_OBJECT_TYPE_MISMATCH`) — no fake-EPROCESS rubber-stamp; a future win32k
+/// path that needs such an object should MODEL it (as the Event path now does).
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
     _access: u64,
@@ -544,26 +582,28 @@ extern "win64" fn s_ob_reference_object_by_handle(
             }
             body
         }
-        // Unregistered handle → the current EPROCESS catch-all fake. Two cases:
-        //  - the process-connect handle (FAKE_PROCESS_HANDLE): a real, typed object == the current
-        //    EPROCESS (PsProcessType) — ENFORCE ExpectedType against PsProcessType.
-        //  - any other unregistered handle (e.g. an optional/NULL handle): we have no modeled typed
-        //    object to check it against, so we stay permissive (as before enforcement). Rejecting
-        //    here would regress paths the catch-all fake formerly satisfied — see the note below.
         None => {
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
             if handle == FAKE_PROCESS_HANDLE {
+                // win32k's process-connect handle → the current EPROCESS; enforce a specific
+                // ExpectedType against PsProcessType (NULL is polymorphic).
                 if obj_type != 0 && obj_type != process_ty {
                     ob_type_mismatch_trace(handle, obj_type, b"process-connect");
                     return STATUS_OBJECT_TYPE_MISMATCH;
                 }
-            } else if obj_type != 0 && obj_type != process_ty {
-                // A specific ExpectedType against the untyped catch-all fake. This surfaces a latent
-                // gap (the real typed object — here an Event — is not modeled; csrss's win32 init
-                // path references it through win32k). Permissive to preserve behaviour; reported.
-                ob_untyped_catchall_trace(handle, obj_type);
+                PH_EPROCESS_VA
+            } else if obj_type == 0 || obj_type == process_ty {
+                // A polymorphic (NULL) or process-typed reference to some other unregistered handle →
+                // the EPROCESS fallback (unchanged; no modeled object to verify against).
+                PH_EPROCESS_VA
+            } else {
+                // A SPECIFIC non-process ExpectedType against an unregistered handle. Every modeled
+                // typed object resolves above; reaching here is a real type requirement we don't model
+                // — enforce honestly (this is where the Event fake used to rubber-stamp a fake
+                // EPROCESS; that path is now a real modeled Event).
+                ob_type_mismatch_trace(handle, obj_type, b"unmodeled");
+                return STATUS_OBJECT_TYPE_MISMATCH;
             }
-            PH_EPROCESS_VA
         }
     };
     if !object_out.is_null() {
@@ -602,28 +642,6 @@ fn ob_type_mismatch_trace(handle: u64, obj_type: u64, which: &[u8]) {
         };
         print_str(tag);
         print_str(b"\n");
-    }
-}
-
-/// Informational trace for an `ObReferenceObjectByHandle` against the untyped EPROCESS catch-all fake
-/// with a specific (non-Process) ExpectedType — a latent gap the fake masks. Permissive (no reject).
-fn ob_untyped_catchall_trace(handle: u64, obj_type: u64) {
-    unsafe {
-        use nt_object_manager::object_type as ot;
-        print_str(b"[win32k-host] ObRefByHandle untyped catch-all handle=0x");
-        print_hex(handle as u32);
-        print_str(b" expected_type=0x");
-        print_hex(obj_type as u32);
-        let tag: &[u8] = if obj_type == ot::event_object_type_addr() {
-            b" (=Event) -> permissive (real Event object not modeled)\n"
-        } else if obj_type == ot::desktop_object_type_addr() {
-            b" (=Desktop) -> permissive\n"
-        } else if obj_type == ot::window_station_object_type_addr() {
-            b" (=WindowStation) -> permissive\n"
-        } else {
-            b" -> permissive\n"
-        };
-        print_str(tag);
     }
 }
 
@@ -2657,6 +2675,17 @@ unsafe fn dispatch_loop() -> ! {
         let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
         let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
         let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+        if ssn == SSN_NT_USER_INITIALIZE_REAL {
+            // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
+            // real Event handles winsrv created via NtCreateEvent; win32k's IntInitWin32PowerManagement
+            // references the power event by handle+type. MODEL them as real typed Event objects — a
+            // KEVENT body from the win32k pool + a win32k_ob registration keyed by the handle — so the
+            // subsequent ObReferenceObjectByHandle(handle, *ExEventObjectType) resolves + type-checks a
+            // genuine KEVENT (no fake-EPROCESS masking). Synchronization/non-signalled == winsrv's
+            // NtCreateEvent(SynchronizationEvent, FALSE).
+            register_event_object(a1);
+            register_event_object(a2);
+        }
         let status = if ssn == SSN_TEST_FAULT {
             // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
             // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed

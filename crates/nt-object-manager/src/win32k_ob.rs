@@ -29,6 +29,11 @@ pub enum ObKind {
     Desktop,
     /// A `WINDOWSTATION_OBJECT` (`ExWindowStationObjectType`).
     WindowStation,
+    /// A `KEVENT` object (`ExEventObjectType`) — e.g. winsrv's power/media request events, created
+    /// via `NtCreateEvent` and referenced by win32k's `NtUserInitialize`
+    /// (`IntInitWin32PowerManagement` → `ObReferenceObjectByHandle(hEvent, *ExEventObjectType)`). The
+    /// body is a real `KEVENT` (`nt_kernel_exec::kevent`).
+    Event,
     /// An object of some other (unrecognized) win32k type.
     Other,
 }
@@ -72,6 +77,7 @@ pub fn object_type_matches(kind: ObKind, expected_type_ptr: u64) -> bool {
         ObKind::WindowStation => {
             expected_type_ptr == crate::object_type::window_station_object_type_addr()
         }
+        ObKind::Event => expected_type_ptr == crate::object_type::event_object_type_addr(),
         // Unrecognized create-time type: we have no type identity to check against — stay permissive
         // rather than reject (preserves the pre-enforcement behaviour for these objects).
         ObKind::Other => true,
@@ -103,6 +109,11 @@ pub const DESKTOPINFO_SIZE: u64 = 0x120;
 /// Number of live win32k objects the table can hold. Slot 0 is reserved (handle 0 == `NULL`).
 pub const OB_TABLE_LEN: usize = 16;
 
+/// Number of `Event` objects the table can track by external handle value. win32k only references
+/// the handful of events passed into it (winsrv's power + media request events); a small ring
+/// (evicting the oldest on overflow — the referenced events are always the most-recent) suffices.
+pub const OB_EVENTS_LEN: usize = 4;
+
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
 /// Handles are minted densely from 1; the client-visible `HANDLE` is `idx << 2` (a real Ob handle
@@ -119,6 +130,12 @@ pub struct ObHandleTable {
     /// (returns this handle) instead of reporting NOT_FOUND (which would create a duplicate).
     winsta_handle: u64,
     winsta_body: u64,
+    /// `Event` objects keyed by their EXTERNAL handle value (the value `NtCreateEvent` minted, which
+    /// win32k receives as an argument — not one of the dense `idx << 2` handles this table mints).
+    /// `(handle, KEVENT body)`. A ring: [`register_event`](Self::register_event) evicts the oldest on
+    /// overflow.
+    events: [Option<(u64, u64)>; OB_EVENTS_LEN],
+    events_next: usize,
 }
 
 impl Default for ObHandleTable {
@@ -136,7 +153,48 @@ impl ObHandleTable {
             pending: None,
             winsta_handle: 0,
             winsta_body: 0,
+            events: [None; OB_EVENTS_LEN],
+            events_next: 0,
         }
+    }
+
+    /// Register an `Event` object under its external `handle` value (`NtCreateEvent`'s minted handle),
+    /// backed by the real `KEVENT` at `body`. Idempotent: re-registering the same handle updates its
+    /// body. A NULL handle (0) is rejected (a NULL is never a valid object handle) and returns false.
+    /// Returns true on success.
+    pub fn register_event(&mut self, handle: u64, body: u64) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        // Idempotent: refresh an already-registered handle in place.
+        for slot in self.events.iter_mut() {
+            if let Some((h, b)) = slot {
+                if *h == handle {
+                    *b = body;
+                    return true;
+                }
+            }
+        }
+        // Fill an empty slot, else evict the oldest (ring).
+        if let Some(slot) = self.events.iter_mut().find(|s| s.is_none()) {
+            *slot = Some((handle, body));
+        } else {
+            self.events[self.events_next] = Some((handle, body));
+            self.events_next = (self.events_next + 1) % OB_EVENTS_LEN;
+        }
+        true
+    }
+
+    /// Resolve a registered `Event` handle to its `KEVENT` body, or `None`.
+    fn lookup_event(&self, handle: u64) -> Option<u64> {
+        if handle == 0 {
+            return None;
+        }
+        self.events
+            .iter()
+            .flatten()
+            .find(|(h, _)| *h == handle)
+            .map(|(_, b)| *b)
     }
 
     /// Register `body` under `kind` at a fresh slot and return its client-visible `HANDLE`
@@ -158,13 +216,17 @@ impl ObHandleTable {
     }
 
     /// Resolve a handle to its `(kind, body)`, or `None` if it is not a registered win32k object
-    /// handle.
+    /// handle. Checks the dense `idx << 2` object slots (Desktop/WindowStation/Other), then the
+    /// external-handle `Event` registry. (The two spaces never collide: `Event` handles are the large
+    /// values `NtCreateEvent` mints, whose `>> 2` index is far above `OB_TABLE_LEN`.)
     pub fn lookup(&self, handle: u64) -> Option<(ObKind, u64)> {
         let idx = (handle >> 2) as usize;
-        if idx == 0 || idx >= self.next {
-            return None;
+        if idx != 0 && idx < self.next {
+            if let Some(entry) = self.slots.get(idx).copied().flatten() {
+                return Some(entry);
+            }
         }
-        self.slots.get(idx).copied().flatten()
+        self.lookup_event(handle).map(|body| (ObKind::Event, body))
     }
 
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
@@ -266,6 +328,69 @@ mod tests {
         assert!(!object_type_matches(ObKind::Desktop, process_object_type_addr()));
         // Unrecognized create-time type stays permissive (no identity to verify).
         assert!(object_type_matches(ObKind::Other, desktop_object_type_addr()));
+    }
+
+    #[test]
+    fn event_type_check_matches_only_ex_event_object_type() {
+        use crate::object_type::{
+            desktop_object_type_addr, event_object_type_addr, process_object_type_addr,
+        };
+        // An Event matches ExEventObjectType.
+        assert!(object_type_matches(ObKind::Event, event_object_type_addr()));
+        // NULL ExpectedType is polymorphic.
+        assert!(object_type_matches(ObKind::Event, 0));
+        // A different type is rejected (would be STATUS_OBJECT_TYPE_MISMATCH).
+        assert!(!object_type_matches(ObKind::Event, process_object_type_addr()));
+        assert!(!object_type_matches(ObKind::Event, desktop_object_type_addr()));
+    }
+
+    #[test]
+    fn registers_and_resolves_events_by_external_handle() {
+        let mut t = ObHandleTable::new();
+        // winsrv's power/media request events arrive as the large handle values NtCreateEvent minted.
+        let power = 0x5A5A_0007u64;
+        let media = 0x5A5A_0008u64;
+        assert!(t.register_event(power, 0xE0E0_1000));
+        assert!(t.register_event(media, 0xE0E0_2000));
+        assert_eq!(t.lookup(power), Some((ObKind::Event, 0xE0E0_1000)));
+        assert_eq!(t.lookup(media), Some((ObKind::Event, 0xE0E0_2000)));
+        assert_eq!(t.lookup_body(power), 0xE0E0_1000);
+        // Re-registering the same handle updates the body (idempotent).
+        assert!(t.register_event(power, 0xE0E0_9000));
+        assert_eq!(t.lookup(power), Some((ObKind::Event, 0xE0E0_9000)));
+        // A NULL handle is never a valid event.
+        assert!(!t.register_event(0, 0xDEAD));
+        assert_eq!(t.lookup(0), None);
+        // An unregistered handle does not resolve.
+        assert_eq!(t.lookup(0x5A5A_0099), None);
+    }
+
+    #[test]
+    fn events_do_not_collide_with_dense_object_handles() {
+        let mut t = ObHandleTable::new();
+        let desk = t.register(ObKind::Desktop, 0xD00D_0000);
+        let winsta = t.register(ObKind::WindowStation, 0x5700_0000);
+        t.register_event(0x5A5A_0005, 0xE0E0_5000);
+        // Object handles still resolve to their kinds; the event resolves as an Event.
+        assert_eq!(t.lookup(desk), Some((ObKind::Desktop, 0xD00D_0000)));
+        assert_eq!(t.lookup(winsta), Some((ObKind::WindowStation, 0x5700_0000)));
+        assert_eq!(t.lookup(0x5A5A_0005), Some((ObKind::Event, 0xE0E0_5000)));
+    }
+
+    #[test]
+    fn event_registry_is_a_ring_keeping_the_most_recent() {
+        let mut t = ObHandleTable::new();
+        // Fill past capacity; the oldest fall off, the most-recent (win32k references these) stay.
+        for i in 1..=(OB_EVENTS_LEN as u64 + 2) {
+            assert!(t.register_event(0x5A5A_0000 + i, 0xE000_0000 + i));
+        }
+        // The last OB_EVENTS_LEN registrations resolve.
+        for i in 3..=(OB_EVENTS_LEN as u64 + 2) {
+            assert_eq!(
+                t.lookup(0x5A5A_0000 + i),
+                Some((ObKind::Event, 0xE000_0000 + i))
+            );
+        }
     }
 
     #[test]
