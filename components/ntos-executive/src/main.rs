@@ -2472,6 +2472,13 @@ struct ExecLoopCtx {
     img_end: u64,
     nt_base: u64,
     nt_end: u64,
+    /// The 14 loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
+    /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
+    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; 14],
+    /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
+    /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
+    csrss_anon_section_handle: *mut u64,
+    csrss_anon_size: *mut u64,
 }
 
 struct ExecNtHandler {
@@ -3479,6 +3486,63 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             },
+            // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
+            // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
+            // Unlike the other creates, smss USES the section handle (NtCreateProcess), so write it to
+            // the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record the handle
+            // so NtCreateProcess can spawn the real csrss image from it.
+            NativeService::NtCreateSection => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &mut *ctx.reg;
+                let dll_pes = &*ctx.dll_pes;
+                let filled_pages = &mut *ctx.filled_pages;
+                let faults = &mut *ctx.faults;
+                let sp = get_recv_mr(16);
+                let out = get_recv_mr(9); // R10 = *SectionHandle
+                // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
+                csrss_out_write(
+                    out, self.next_handle, filled_pages, faults, ctx.scratch_base, reg, dll_pes,
+                    ctx.pml4,
+                );
+                let sec_file = smss_stack_read(sp + 0x38);
+                if *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
+                    *ctx.csrss_section_handle = self.next_handle;
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
+                    print_hex((self.next_handle >> 32) as u32);
+                    print_hex(self.next_handle as u32);
+                    print_str(b"\n");
+                }
+                // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
+                if let Some(i) = reg.index_for_file(sec_file) {
+                    reg.set_section_handle(i, self.next_handle);
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                    print_str(reg.name(i));
+                    print_str(b" -> handle 0x");
+                    print_hex(self.next_handle as u32);
+                    print_str(b"\n");
+                }
+                // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
+                // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
+                if sec_file == 0 && self.pi == 1 && *ctx.csrss_anon_section_handle == 0 {
+                    let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
+                    let size = if let Some(m) = smss_mirror(maxsize_ptr, 8) {
+                        core::ptr::read_volatile(m as *const u64)
+                    } else {
+                        0
+                    };
+                    *ctx.csrss_anon_section_handle = self.next_handle;
+                    // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
+                    // window (demand-paged on touch, so unused pages cost nothing).
+                    *ctx.csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
+                    print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
+                    print_hex(*ctx.csrss_anon_size as u32);
+                    print_str(b" -> handle 0x");
+                    print_hex(self.next_handle as u32);
+                    print_str(b"\n");
+                }
+                self.next_handle += 1;
+                0
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3546,6 +3610,8 @@ fn build_nt_table() -> NativeServiceTable {
             // Workstream A batch 7 (group C): section-image query + locale demand-fill.
             (NativeService::NtQuerySection, SSN_NT_QUERY_SECTION as u32),
             (NativeService::NtQueryDefaultLocale, SSN_NT_QUERY_DEFAULT_LOCALE as u32),
+            // Workstream A batch 8 (group C): section creation (csrss.exe SEC_IMAGE + DLL + anon).
+            (NativeService::NtCreateSection, SSN_NT_CREATE_SECTION as u32),
         ],
     )
 }
@@ -4507,6 +4573,10 @@ unsafe fn service_sec_image(
                     img_end,
                     nt_base,
                     nt_end,
+                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; 14] as *const ()
+                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; 14],
+                    csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
+                    csrss_anon_size: &mut csrss_anon_size as *mut u64,
                 });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
@@ -4524,52 +4594,6 @@ unsafe fn service_sec_image(
                         smss_stack_write(ptr, val);
                     }
                 }
-            } else if m0 == SSN_NT_CREATE_SECTION {
-                // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
-                // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
-                // Unlike the other creates, smss USES the section handle (NtCreateProcess), so write
-                // it to the real out-param (arg0 = R10). When it's a SEC_IMAGE of csrss.exe, record
-                // the handle so NtCreateProcess can spawn the real csrss image from it.
-                let out = get_recv_mr(9); // R10 = *SectionHandle
-                // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
-                csrss_out_write(out, nt_handler.next_handle, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                let sec_file = smss_stack_read(sp + 0x38);
-                if csrss_file_handle != 0 && sec_file == csrss_file_handle {
-                    csrss_section_handle = nt_handler.next_handle;
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
-                    print_hex((nt_handler.next_handle >> 32) as u32);
-                    print_hex(nt_handler.next_handle as u32);
-                    print_str(b"\n");
-                }
-                // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
-                if let Some(i) = reg.index_for_file(sec_file) {
-                    reg.set_section_handle(i, nt_handler.next_handle);
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                    print_str(reg.name(i));
-                    print_str(b" -> handle 0x");
-                    print_hex(nt_handler.next_handle as u32);
-                    print_str(b"\n");
-                }
-                // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
-                // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
-                if sec_file == 0 && badge == CSRSS_BADGE && csrss_anon_section_handle == 0 {
-                    let maxsize_ptr = get_recv_mr(8); // R9 = *MaximumSize (LARGE_INTEGER)
-                    let size = if let Some(m) = smss_mirror(maxsize_ptr, 8) {
-                        core::ptr::read_volatile(m as *const u64)
-                    } else {
-                        0
-                    };
-                    csrss_anon_section_handle = nt_handler.next_handle;
-                    // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
-                    // window (demand-paged on touch, so unused pages cost nothing).
-                    csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
-                    print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
-                    print_hex(csrss_anon_size as u32);
-                    print_str(b" -> handle 0x");
-                    print_hex(nt_handler.next_handle as u32);
-                    print_str(b"\n");
-                }
-                nt_handler.next_handle += 1;
             } else if m0 == 113 {
                 // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
                 // ZeroBits[R9], CommitSize[sp+0x28], *SectionOffset[sp+0x30], *ViewSize[sp+0x38], …).
