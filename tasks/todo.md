@@ -31,4 +31,14 @@ desktop paint 0x003a6ea5 768/768, no hang.
 - [ ] CHECKPOINT + report at connect success; and at the natural desktop-gfx trigger.
 
 ## Review
-(pending)
+- Sub-step 1 LANDED + committed green (c3a4266): winlogon routed as win32k's 2nd
+  GUI client. NtUserProcessConnect(0x10FA) SUCCEEDS, winlogon's WinMain runs to
+  NtUserCreateWindowStation(0x122f). Gate 115/115, 0 FAIL, desktop paint 768/768,
+  csrss still connects, NO HANG. sel4test byte-identical (executive-only).
+- The 2nd-client attach was SMALL: the reply routing already generalized (REPLY_MAIN
+  binds per-Call), and NtUserProcessConnect is idempotent (reused FAKE_PROCESS_HANDLE).
+- NEW WALL = NtUserCreateWindowStation(0x122f) "Invalid ObjectAttributes length!":
+  win32k's cross-AS client memory is csrss-only; winlogon's client VAs collide with
+  csrss's frames in win32k's window (stale data). NEXT = per-client frame sharing +
+  per-dispatch re-point of win32k's client window (attach/detach). Handed off.
+- CHECKPOINT reached (connect-success + WinMain-runs milestones). Reported to coordinator.
