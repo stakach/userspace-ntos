@@ -1,0 +1,23 @@
+[package]
+name = "nt-lpc-server"
+description = "Transport-agnostic NT LPC service dispatcher: the port namespace + connection rendezvous state machine (no_std + alloc, host-testable)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-lpc-abi = { workspace = true }
+bytemuck = { version = "1", default-features = false }
+
+[dev-dependencies]
+nt-lpc-client = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -24,6 +24,10 @@ nt-object-abi = { path = "../../crates/nt-object-abi" }
 nt-object-manager = { path = "../../crates/nt-object-manager" }
 nt-object-server = { path = "../../crates/nt-object-server" }
 nt-object-client = { path = "../../crates/nt-object-client" }
+# The NT LPC connection broker (control plane) — isolated over SURT, like the object stack.
+nt-lpc-abi = { path = "../../crates/nt-lpc-abi" }
+nt-lpc-server = { path = "../../crates/nt-lpc-server" }
+nt-lpc-client = { path = "../../crates/nt-lpc-client" }
 nt-syscall = { path = "../../crates/nt-syscall" }
 nt-config-abi = { path = "../../crates/nt-config-abi" }
 nt-config-server = { path = "../../crates/nt-config-server" }

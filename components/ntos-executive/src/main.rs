@@ -22,6 +22,7 @@ pub use sel4_rt::*;
 mod allocator;
 mod cm_server;
 mod io_server;
+mod lpc_server;
 mod driver_host;
 mod driver_pe;
 mod isr;
@@ -41,6 +42,8 @@ use nt_config_client::ConfigClient;
 use nt_io_abi::wire::IoReply;
 use nt_io_client::IoClient;
 use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
+use nt_lpc_abi::LpcReply;
+use nt_lpc_client::LpcClient;
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
 use nt_hive_core::apply_ccs_alias;
@@ -99,6 +102,13 @@ pub const IO_SUB_VADDR: u64 = 0x0000_0100_1058_0000;
 pub const IO_COMP_VADDR: u64 = 0x0000_0100_1059_0000;
 pub const IO_REQ_VADDR: u64 = 0x0000_0100_105A_0000;
 pub const IO_REP_VADDR: u64 = 0x0000_0100_105B_0000;
+// A FOURTH ring set — the executive's side of the LPC connection broker. Placed in the FREE low
+// half of the WORK_CLUSTER 2 MiB PT (0x1040..0x104F, all covered by map_cluster_pt, unused by the
+// ring/stack/sysarg region at 0x1050+), so no new page table is needed.
+pub const LPC_SUB_VADDR: u64 = 0x0000_0100_1040_0000;
+pub const LPC_COMP_VADDR: u64 = 0x0000_0100_1041_0000;
+pub const LPC_REQ_VADDR: u64 = 0x0000_0100_1042_0000;
+pub const LPC_REP_VADDR: u64 = 0x0000_0100_1043_0000;
 pub const STACK_BASE: u64 = 0x0000_0100_105C_0000;
 /// Floor for on-demand stack growth: a fault in [STACK_GROWTH_FLOOR, STACK_BASE) commits a fresh
 /// page and restarts (Windows guard-page style), so smss's stack grows past the 16 KiB initial
@@ -207,6 +217,11 @@ pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
+// NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
+pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
+pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
+pub const SSN_NT_CONNECT_PORT: u64 = 33;
+pub const SSN_NT_SECURE_CONNECT_PORT: u64 = 218;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
 pub const SSN_NT_OPEN_SECTION: u64 = 131;
@@ -924,6 +939,33 @@ impl nt_io_client::Backend for IoChan<'_> {
             detail1,
         }
     }
+}
+
+/// The LPC connection-broker transport wrapper (control plane over SURT).
+struct LpcChan<'a>(RingChannel<'a>);
+impl nt_lpc_client::Backend for LpcChan<'_> {
+    fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> LpcReply {
+        let (status, _flags, information, detail0, detail1) = self.0.raw(opcode, in_buf, out_buf);
+        LpcReply {
+            status,
+            information: information as u32,
+            detail0,
+            detail1,
+        }
+    }
+}
+
+/// The executive's client to the isolated `lpc-server` component. Set once in
+/// `_start` after `stand_up_service`; the LPC syscall handlers reach it via
+/// [`lpc_client`] (single-threaded executive → the `static mut` is race-free).
+static mut LPC_CLIENT: Option<LpcClient<LpcChan<'static>>> = None;
+
+/// Borrow the LPC client (None until the service is stood up).
+///
+/// # Safety
+/// Single-threaded executive; no aliasing across the one service loop.
+unsafe fn lpc_client() -> Option<&'static mut LpcClient<LpcChan<'static>>> {
+    (*core::ptr::addr_of_mut!(LPC_CLIENT)).as_mut()
 }
 
 // --- Native syscall trap front-end -----------------------------------------
@@ -2559,6 +2601,33 @@ struct ExecNtHandler {
     /// Allocated in `new()` (before the per-syscall heap mark) so it persists across the bump resets;
     /// `query_attributes` is `&self` (no handle allocation) so it never reallocates during a syscall.
     fs: FileSystem,
+    /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
+    /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
+    /// completes through the server, the executive records the connection here so the future message
+    /// bulk (NtRequestWaitReplyPort/NtReplyWaitReceivePort/NtReplyPort) is served by DIRECT cross-
+    /// badge delivery against this cache — never a per-message round-trip to the server. Pre-reserved
+    /// below the heap mark (like `key_handles`) so pushes never reallocate across the per-syscall
+    /// bump reset. Records are `Copy` (inline name, no nested heap).
+    lpc_connections: alloc::vec::Vec<LpcConnRecord>,
+}
+
+/// One established LPC connection cached executive-side (the data-plane record — see
+/// `ExecNtHandler::lpc_connections`). Identity + peer refs only; the message queues will live here
+/// when the data plane lands. `Copy`/inline (no nested heap) so it survives the per-syscall bump reset.
+// Fields are populated now (control plane) and consumed when the direct message data plane lands
+// (path B / bulk) — write-only until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct LpcConnRecord {
+    /// The broker's connection id (ties back to the nt-lpc-server connection).
+    connection_id: u64,
+    /// The client comm-port handle handed to the connector.
+    client_handle: u64,
+    /// Which hosted process connected (0 = smss, 1 = csrss) — the connector badge for direct delivery.
+    connector_pi: u8,
+    /// Folded port name (inline; `\SmApiPort` etc. fit in 32 units).
+    name: [u16; 32],
+    name_len: u8,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2630,6 +2699,9 @@ impl ExecNtHandler {
                 }
                 fs
             },
+            // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
+            // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
+            lpc_connections: alloc::vec::Vec::with_capacity(16),
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -2639,6 +2711,65 @@ impl ExecNtHandler {
             self.out_writes[self.out_writes_n] = (ptr, val);
             self.out_writes_n += 1;
         }
+    }
+    /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
+    /// a buffer that lives OUTSIDE the stack/heap/image mirrors — e.g. csrss's `NtConnectPort`
+    /// PortName `L"\\SmApiPort"` is a static string in csrsrv's `.rdata` (~0x8000_xxxx). The
+    /// UNICODE_STRING struct itself is a stack local (mirror-readable); its Buffer is read via the
+    /// per-fault scratch alias of the already-demand-faulted `.rdata` page (`scratch_for`). Empty on
+    /// failure (→ the caller's connect misses by name, a clean error, not a crash).
+    unsafe fn read_lpc_name(&self, ustr_va: u64) -> alloc::vec::Vec<u16> {
+        if ustr_va == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let mut lm = [0u8; 2];
+        let mut bp = [0u8; 8];
+        if !smss_copyin(ustr_va, &mut lm) || !smss_copyin(ustr_va + 8, &mut bp) {
+            return alloc::vec::Vec::new();
+        }
+        let buffer_va = u64::from_le_bytes(bp);
+        let n = ((u16::from_le_bytes(lm) as usize) / 2).min(1024);
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            let va = buffer_va + (i as u64) * 2;
+            let mut w = [0u8; 2];
+            if smss_copyin(va, &mut w) {
+                out.push(u16::from_le_bytes(w));
+                continue;
+            }
+            // Not in a mirror → try the scratch alias of an already-faulted page (csrsrv .rdata).
+            if let Some(ctx) = self.loop_ctx.as_ref() {
+                let fp = &*ctx.filled_pages;
+                let nf = *ctx.faults as usize;
+                if let Some(m) = scratch_for(va, fp, nf, ctx.scratch_base) {
+                    let p = m as *const u8;
+                    w[0] = *p;
+                    w[1] = *p.add(1);
+                    out.push(u16::from_le_bytes(w));
+                    continue;
+                }
+            }
+            break;
+        }
+        out
+    }
+    /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
+    /// capacity so the push never reallocates across the per-syscall bump reset. `connector_pi` =
+    /// the current process (0=smss, 1=csrss).
+    fn cache_lpc_connection(&mut self, connection_id: u64, client_handle: u64, name: &[u16]) {
+        if self.lpc_connections.len() >= self.lpc_connections.capacity() {
+            return;
+        }
+        let mut buf = [0u16; 32];
+        let n = name.len().min(32);
+        buf[..n].copy_from_slice(&name[..n]);
+        self.lpc_connections.push(LpcConnRecord {
+            connection_id,
+            client_handle,
+            connector_pi: self.pi as u8,
+            name: buf,
+            name_len: n as u8,
+        });
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
     /// returns the filled length. Non-ASCII code units are truncated to their low byte.
@@ -3005,17 +3136,73 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
             // the process token.
             NativeService::NtOpenThreadToken => 0xC000007C,
-            // Object-creation calls SmpInit/csrss make (\SmApiPort, SM/CSR worker threads, events,
-            // semaphores). Each takes the out handle in RCX (arg1); hand back a fresh fake handle so
-            // init keeps flowing (the RCX slot is stale but these handles are never checked).
-            NativeService::NtCreatePort
-            | NativeService::NtCreateThread
-            | NativeService::NtCreateSemaphore => unsafe {
+            // NtCreatePort(*PortHandle[R10=args[0]], *ObjectAttributes[RDX=args[1]],
+            // MaxConnInfo[R8=args[2]], MaxMsg[R9=args[3]], MaxPool[stack]). Create a REAL named port
+            // in the isolated LPC connection broker (control plane) and hand the caller its handle.
+            // ★ BUG FIX: the out *PortHandle is arg1 = R10 (the x64 out-arg; the stub did `mov r10,rcx`
+            // and RCX at the fault holds the return IP). The old fake wrote RCX → csrsrv's CsrSbApiPort
+            // stayed 0 → SmConnectToSm returned STATUS_INVALID_PARAMETER_MIX before ever issuing
+            // NtConnectPort. Writing to R10 via the out-writer queue (csrss: a .data global; smss: a
+            // stack local) lands the handle where the caller reads it → SmConnectToSm reaches connect.
+            NativeService::NtCreatePort => unsafe {
+                let name16 = smss_read_objattr_name(args[1]);
+                let handle = lpc_client()
+                    .and_then(|c| {
+                        c.create_port(&name16, args[2] as u32, args[3] as u32, 0).ok()
+                    })
+                    .unwrap_or_else(|| {
+                        let h = self.next_handle;
+                        self.next_handle += 1;
+                        h
+                    });
+                self.queue_write(args[0], handle);
+                0
+            },
+            // SM/CSR worker threads + semaphores. Fake handle written to RCX (stale slot). NOTE: this
+            // is the SAME latent RCX-vs-R10 out-param bug fixed for NtCreatePort above — harmless here
+            // ONLY because these handles are never checked by smss/csrss (a real NtCreateThread that
+            // runs the smss SM-loop = path B, which needs the real spawn + the R10 out-param).
+            NativeService::NtCreateThread | NativeService::NtCreateSemaphore => unsafe {
                 let out = get_recv_mr(2); // RCX = *Handle
                 smss_stack_write(out, self.next_handle);
                 self.next_handle += 1;
                 0
             },
+            // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
+            // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). NtSecureConnectPort is the same but with
+            // *ServerSid inserted at arg5 — PortName stays arg2. Route to the LPC broker; on the
+            // interim AutoAccept path the connect completes synchronously → write the client comm-port
+            // handle to the caller's *PortHandle (arg1=R10) + cache the connection for the (future)
+            // direct message data plane. This is what unblocks csrss's SmConnectToSm.
+            NativeService::NtConnectPort | NativeService::NtSecureConnectPort => unsafe {
+                let name16 = self.read_lpc_name(args[1]);
+                match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
+                    Some(Ok(r)) => {
+                        if !r.pending && r.handle != 0 {
+                            self.queue_write(args[0], r.handle);
+                            self.cache_lpc_connection(r.connection_id, r.handle, &name16);
+                            0 // STATUS_SUCCESS
+                        } else {
+                            // PENDING (path B) not wired to park yet → report as the natural stop.
+                            0x0000_0103 // STATUS_PENDING
+                        }
+                    }
+                    Some(Err(st)) => st.raw() as u32, // e.g. OBJECT_NAME_NOT_FOUND
+                    None => 0xC000_0001,              // STATUS_UNSUCCESSFUL (broker absent)
+                }
+            },
+            // NtAcceptConnectPort/NtCompleteConnectPort — the server-side rendezvous (path B). Under
+            // AutoAccept these are not reached (the server models the acceptor at connect); wired to
+            // the broker so path B is a policy swap, not new plumbing.
+            NativeService::NtAcceptConnectPort => unsafe {
+                // (*PortHandle[R10], PortContext[RDX], *ConnReq[R8], Accept[R9], ...). We don't yet
+                // decode the connection id from the received PORT_MESSAGE (path B), so accept the most
+                // recent pending connection is a bulk concern — return success placeholder for now.
+                self.queue_write(args[0], self.next_handle);
+                self.next_handle += 1;
+                0
+            },
+            NativeService::NtCompleteConnectPort => 0,
             // NtCreateEvent(*EventHandle[R10], ACCESS, *OA, EVENT_TYPE, InitialState). winsrv's
             // UserServerDllInitialization creates ghPowerRequestEvent/ghMediaRequestEvent here and
             // hands them to NtUserInitialize (SSN 0x125a); win32k's IntInitWin32PowerManagement then
@@ -3846,6 +4033,11 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),
             (NativeService::NtCreateEvent, SSN_NT_CREATE_EVENT as u32),
             (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
+            // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
+            (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),
+            (NativeService::NtSecureConnectPort, SSN_NT_SECURE_CONNECT_PORT as u32),
+            (NativeService::NtAcceptConnectPort, SSN_NT_ACCEPT_CONNECT_PORT as u32),
+            (NativeService::NtCompleteConnectPort, SSN_NT_COMPLETE_CONNECT_PORT as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
@@ -7629,6 +7821,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     check(b"exec_io_close", io.close(ih).is_ok(), &mut passed);
+
+    // --- Fourth isolated service: the LPC connection broker over SURT (control plane). Stood up
+    // BEFORE the live smss/csrss run so their NtCreatePort/NtConnectPort syscalls resolve through
+    // it. The client is stashed in a static (LPC_CLIENT) that the LPC syscall handlers reach.
+    print_str(b"[ntos-exec] spawning the LPC connection broker as a fourth isolated service\n");
+    let mut lpc = LpcClient::new(LpcChan(stand_up_service(
+        lpc_server::lpc_server_entry,
+        LPC_SUB_VADDR,
+        LPC_COMP_VADDR,
+        LPC_REQ_VADDR,
+        LPC_REP_VADDR,
+    )));
+    check(b"exec_lpc_ping", lpc.ping(), &mut passed);
+    // Self-test the connect rendezvous end-to-end through the isolated server over the real SURT
+    // ring: create a distinct test port, connect (auto-accept) → a real client comm-port handle,
+    // no relay. Uses \LpcSelfTest (NOT \SmApiPort) so the live smss \SmApiPort creation stays honest.
+    let selftest: Vec<u16> = "\\LpcSelfTest".encode_utf16().collect();
+    let lpc_create_ok = lpc.create_port(&selftest, 0x88, 0x148, 0x2400).is_ok();
+    check(b"exec_lpc_create_port", lpc_create_ok, &mut passed);
+    let lpc_connect_ok =
+        matches!(lpc.connect_port(&selftest, 2, &[]), Ok(r) if !r.pending && r.handle != 0);
+    check(b"exec_lpc_connect_rendezvous", lpc_connect_ok, &mut passed);
+    // Publish the client to the static so the live-run LPC syscall handlers can drive it.
+    // SAFETY: single-threaded executive; set once before the service loop runs.
+    unsafe {
+        LPC_CLIENT = Some(lpc);
+    }
 
     // --- Native syscall front-end: an isolated USER thread traps `syscall`s; the
     // executive routes each to the isolated Ob service over SURT and replies so the

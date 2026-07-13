@@ -1,0 +1,18 @@
+[package]
+name = "nt-lpc-abi"
+description = "Fixed-layout SURT wire ABI (opcodes + request/reply structs) for the NT LPC service mode (no_std)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+# Safe POD <-> bytes for the fixed-layout wire structs (no unsafe in our code).
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

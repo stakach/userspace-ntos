@@ -1,0 +1,20 @@
+[package]
+name = "nt-lpc-client"
+description = "Ergonomic client stub for the NT LPC service: encodes connect-rendezvous requests / decodes replies over a pluggable transport backend (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+std = ["nt-status/std"]
+
+[dependencies]
+nt-status = { workspace = true }
+nt-lpc-abi = { workspace = true }
+bytemuck = { version = "1", default-features = false }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

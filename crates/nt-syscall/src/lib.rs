@@ -94,6 +94,14 @@ pub enum NativeService {
     NtCreateThread,
     NtCreateEvent,
     NtCreateSemaphore,
+    // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
+    // SURT. The message data plane (request/reply/receive) is served directly by the executive
+    // against its cached connection, so those ops are NOT in this table (they never round-trip to
+    // the server).
+    NtConnectPort,
+    NtSecureConnectPort,
+    NtAcceptConnectPort,
+    NtCompleteConnectPort,
     NtMakeTemporaryObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
     // no per-thread/process attribute sets, no per-object security, no keyed events).
@@ -170,6 +178,10 @@ impl NativeService {
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
             NtCreateSemaphore => "NtCreateSemaphore",
+            NtConnectPort => "NtConnectPort",
+            NtSecureConnectPort => "NtSecureConnectPort",
+            NtAcceptConnectPort => "NtAcceptConnectPort",
+            NtCompleteConnectPort => "NtCompleteConnectPort",
             NtMakeTemporaryObject => "NtMakeTemporaryObject",
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
@@ -277,6 +289,10 @@ impl NativeService {
         NativeService::NtCreateThread,
         NativeService::NtCreateEvent,
         NativeService::NtCreateSemaphore,
+        NativeService::NtConnectPort,
+        NativeService::NtSecureConnectPort,
+        NativeService::NtAcceptConnectPort,
+        NativeService::NtCompleteConnectPort,
         NativeService::NtMakeTemporaryObject,
         NativeService::NtSetInformationThread,
         NativeService::NtSetInformationProcess,
