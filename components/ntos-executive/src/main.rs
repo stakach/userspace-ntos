@@ -162,6 +162,13 @@ pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 K
 /// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
 /// (inside the NTDLLBUF page table, 0xA0-0xC0). ACTIVE_IMAGE_MIRROR selects by the current badge.
 pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
+/// winlogon's per-process executive mirrors (3rd hosted process). Stack mirror sits beside the
+/// smss/csrss/SM mirrors in the FILEBUF PT (0x1068/0x1069/0x106A used → 0x106B free). Heap + image
+/// mirrors get their OWN page tables (created in spawn_sec_image, past CSRSS_HEAP_MIRROR 0x1200) so
+/// they can't collide with smss's/csrss's mirrors. ACTIVE_*_MIRROR selects them for pi==2.
+pub const WINLOGON_STACK_MIRROR_VA: u64 = 0x0000_0100_106B_0000; // FILEBUF PT, present
+pub const WINLOGON_HEAP_MIRROR_VA: u64 = 0x0000_0100_1220_0000; // own PT (spawn_sec_image creates it)
+pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spawn_sec_image creates it)
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
 // smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
@@ -332,6 +339,12 @@ pub const SRVBUF_VADDR: u64 = 0x0000_0100_1400_0000;
 pub const SRVBUF_FRAMES: u64 = 128; // 512 KiB
 pub const BASESRV_SRVBUF_OFFSET: u64 = 0x0;
 pub const WINSRV_SRVBUF_OFFSET: u64 = 0x10000; // 64 KiB in — clear of basesrv (~50 KiB)
+/// winlogon.exe (~225 KiB, PE32+) — smss's SmpExecuteInitialCommand initial command. The FILEBUF
+/// tail is full (smss+csrss+csrsrv), so it gets its OWN 256 KiB buffer (its own 2 MiB PT past
+/// SRVBUF), dual-mapped host<->exec like SRVBUF. Size reported at STORAGE_SHARED+0x94; the executive
+/// parses it PE32+ and spawns it as the 3rd hosted process when smss's RtlCreateUserProcess creates it.
+pub const WINLOGONBUF_VADDR: u64 = 0x0000_0100_1420_0000; // own PT, past SRVBUF (0x1400)
+pub const WINLOGONBUF_FRAMES: u64 = 64; // 256 KiB — holds the 229888 B winlogon.exe
 /// The Win32 client stack (kernel32 ~2.66 MiB + user32 ~1.12 MiB + gdi32 ~326 KiB) that winsrv.dll
 /// statically imports. These are too large for the SRVBUF, so they get their own fresh 6 MiB region
 /// (3 PTs), dual-mapped host<->exec like SRVBUF. Sizes reported at STORAGE_SHARED +0x4c/+0x50/+0x54.
@@ -376,6 +389,12 @@ pub const CSRSS_BADGE: u64 = 2;
 /// smss's already-mapped 8-PT scratch range (smss uses [0x1_1100_0000 .. +256 pages]; PT k=4 backs
 /// this), so no extra page tables are needed.
 pub const CSRSS_SCRATCH_BASE: u64 = 0x0000_0100_1180_0000;
+/// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
+pub const WINLOGON_BADGE: u64 = 4;
+/// winlogon's demand-fault scratch — PT 6 of smss's already-mapped 8-PT scratch range
+/// (0x1100..0x1200); smss uses PT 0 (0x1100), csrss PT 4 (0x1180). PT 6 (0x11C0) is clear of both
+/// (csrss realistically uses < 0x40 PTs of headroom), so no extra page tables are needed.
+pub const WINLOGON_SCRATCH_BASE: u64 = 0x0000_0100_11C0_0000;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -578,6 +597,12 @@ static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
 /// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
+/// (0 = smss, 1 = csrss, 2 = winlogon). Kept off the 16 KiB rootserver stack — a [[u64;256];3]
+/// local (6 KiB) plus service_sec_image's other arrays would risk the guard page. Zeroed at
+/// service_sec_image entry; only that single loop touches it.
+static mut PFILLED: [[u64; 256]; 3] = [[0u64; 256]; 3];
 
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -1846,6 +1871,7 @@ unsafe fn spawn_sec_image(
     scr_base: u64,
     stack_mirror: u64,
     heap_mirror: u64,
+    image_mirror: u64,
     image_path: &[u8],
     cmd_line: &[u8],
 ) -> u64 {
@@ -1879,6 +1905,14 @@ unsafe fn spawn_sec_image(
         let hpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
         let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, heap_mirror, CAP_INIT_THREAD_VSPACE);
+        // A dedicated PT for the IMAGE copyin mirror, when the process needs its own (winlogon: its
+        // image mirror is a fresh VA with no pre-existing PT, unlike smss's IMAGE_MIRROR (FILEBUF PT)
+        // and csrss's CSRSS_IMAGE_MIRROR (NTDLLBUF PT), which pass image_mirror=0 to reuse those).
+        if image_mirror != 0 {
+            let ipt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ipt);
+            let _ = paging_struct_map(ipt, LBL_X86_PAGE_TABLE_MAP, image_mirror, CAP_INIT_THREAD_VSPACE);
+        }
     }
     for i in 0..STACK_FRAMES {
         let f = alloc_frame();
@@ -2409,6 +2443,7 @@ const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 /// served binary is a seed entry here, not a handler edit.
 const SYSTEM32_FILES: &[&str] = &[
     "csrss.exe",
+    "winlogon.exe",
     "csrsrv.dll",
     "basesrv.dll",
     "winsrv.dll",
@@ -2555,6 +2590,12 @@ struct ExecLoopCtx {
     /// The parsed csrss.exe PE (`None` on the earlier demo path). NtQuerySection synthesises its
     /// SECTION_IMAGE_INFORMATION; NtCreateProcess spawns from it. Lifetime-erased raw ptr.
     csrss_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// winlogon.exe (the 3rd hosted process) — the file/section handles smss opens+creates for it
+    /// (NtOpenFile/NtCreateSection track them) so NtCreateProcess recognises its SEC_IMAGE and asks
+    /// the loop to spawn it; the parsed PE the loop spawns from. Same roles as the csrss_* trio.
+    winlogon_file_handle: *mut u64,
+    winlogon_section_handle: *mut u64,
+    winlogon_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 256],
@@ -2617,6 +2658,9 @@ struct ExecNtHandler {
     /// spawn_sec_image + per-badge state + *ProcessHandle out) after dispatch — the spawn needs
     /// fault_ep + the per-process arrays which stay loop-resident. Mirrors `stop`/the write queue.
     spawn_request: bool,
+    /// Like `spawn_request` but for the 3rd hosted process: NtCreateProcess recognised winlogon's
+    /// SEC_IMAGE section, so the loop spawns winlogon (badge WINLOGON_BADGE) after dispatch.
+    winlogon_spawn_request: bool,
     /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
     /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
     /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.
@@ -2722,6 +2766,7 @@ impl ExecNtHandler {
             out_writes_n: 0,
             loop_ctx: None,
             spawn_request: false,
+            winlogon_spawn_request: false,
             sm_spawn_request: false,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
@@ -3614,6 +3659,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     base_in
                 } else if self.pi == 1 {
                     NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                } else if self.pi == 2 {
+                    NEXT_WINLOGON_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else {
                     NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 };
@@ -3696,8 +3743,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // is seeded, so a csrss probe resolves EXISTS; if the seed were removed nt-fs would
                 // correctly report not-found. Content delivery stays on the nt-dll-registry/PE path.
                 let is_csrss_probe = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // winlogon.exe — smss's SmpParseCommandLine probes the initial command (×N paths).
+                // Not scoped to a pi: smss (pi==0) launches it, exactly like csrss.
+                let is_winlogon_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"winlogon");
                 let csrss_attrs = if is_csrss_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\csrss.exe")
+                } else if is_winlogon_probe {
+                    self.fs.query_attributes(r"\SystemRoot\System32\winlogon.exe")
                 } else {
                     None
                 };
@@ -3782,6 +3834,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                         .fs
                         .query_attributes(r"\SystemRoot\System32\csrss.exe")
                         .is_some_and(|si| !si.is_directory);
+                // winlogon.exe FILE open (SmpExecuteImage → RtlCreateUserProcess): same shape as
+                // csrss — substring classifies, nt-fs owns existence + file-vs-dir. Not pi-scoped.
+                let is_winlogon = !is_sxs
+                    && nb[..nlen].windows(8).any(|w| w == b"winlogon")
+                    && self
+                        .fs
+                        .query_attributes(r"\SystemRoot\System32\winlogon.exe")
+                        .is_some_and(|si| !si.is_directory);
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -3789,10 +3849,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // nt-dll-registry keeps the image base/geometry role for CONTENT (SEC_IMAGE); nt-fs
                 // owns namespace/existence (csrss.exe + System32 dir here).
                 let dll_i = if self.pi == 1 { reg.resolve_name(&nb[..nlen]) } else { None };
-                if is_sys32_dir || is_csrss || dll_i.is_some() {
+                if is_sys32_dir || is_csrss || is_winlogon || dll_i.is_some() {
                     smss_stack_write(get_recv_mr(9), self.next_handle); // *FileHandle
                     if is_csrss {
                         *ctx.csrss_file_handle = self.next_handle; // remember it for NtCreateSection
+                    }
+                    if is_winlogon {
+                        *ctx.winlogon_file_handle = self.next_handle; // for NtCreateSection
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(i, self.next_handle); // remember it for NtCreateSection
@@ -3931,6 +3994,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
                     *ctx.csrss_section_handle = self.next_handle;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
+                    print_hex((self.next_handle >> 32) as u32);
+                    print_hex(self.next_handle as u32);
+                    print_str(b"\n");
+                }
+                if *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
+                    *ctx.winlogon_section_handle = self.next_handle;
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
                     print_hex((self.next_handle >> 32) as u32);
                     print_hex(self.next_handle as u32);
                     print_str(b"\n");
@@ -4090,8 +4160,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                 {
                     self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
                     0
+                } else if *ctx.winlogon_section_handle != 0
+                    && sect == *ctx.winlogon_section_handle
+                    && (*ctx.winlogon_pe).is_some()
+                {
+                    self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
+                    0
                 } else {
-                    self.stop = true; // not the csrss section / not staged -> clean stop
+                    self.stop = true; // not a known section / not staged -> clean stop
                     0xC0000002
                 }
             },
@@ -4221,6 +4297,12 @@ unsafe fn service_sec_image(
     let mut csrss_file_handle = 0u64;
     let mut csrss_section_handle = 0u64;
     let mut csrss_process_handle = 0u64;
+    // winlogon.exe (the 3rd hosted process, smss's SmpExecuteInitialCommand initial command): the
+    // file/section handles smss opens+creates for it, and its process handle once spawned. Same roles
+    // as the csrss_* trio; the parsed PE is `winlogon_pe` below.
+    let mut winlogon_file_handle = 0u64;
+    let mut winlogon_section_handle = 0u64;
+    let mut winlogon_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
@@ -4269,6 +4351,43 @@ unsafe fn service_sec_image(
                 }
                 Err(_) => {
                     print_str(b"[ntos-exec] staged csrss.exe: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
+    // Parsed from its own WINLOGONBUF (size at STORAGE_SHARED+0x94), relocated to PE_LOAD_BASE +
+    // ImageBase patched (like csrss.exe) so ntdll doesn't take the UNIMPLEMENTED EXE-reloc path.
+    let winlogon_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let wsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x94) as *const u32) as usize;
+        if wsz > 0 {
+            let bytes: &'static [u8] =
+                core::slice::from_raw_parts(WINLOGONBUF_VADDR as *const u8, wsz);
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(wpe) => {
+                    print_str(b"[ntos-exec] staged winlogon.exe: ");
+                    print_u64(wsz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(wpe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(wpe.entry_point_rva());
+                    print_str(b"\n");
+                    apply_relocations_to_buf(&wpe, WINLOGONBUF_VADDR, PE_LOAD_BASE);
+                    let e_lfanew =
+                        core::ptr::read_volatile((WINLOGONBUF_VADDR + 0x3c) as *const u32) as u64;
+                    core::ptr::write_volatile(
+                        (WINLOGONBUF_VADDR + e_lfanew + 0x30) as *mut u64,
+                        PE_LOAD_BASE,
+                    );
+                    Some(wpe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged winlogon.exe: PARSE FAILED\n");
                     None
                 }
             }
@@ -4802,13 +4921,23 @@ unsafe fn service_sec_image(
     // smss's PE (the function param `pe` is shadowed per-iteration to the active process's image; the
     // SM-loop rendezvous always demand-fills SMSS's image, so capture it here before the shadow).
     let smss_pe: &nt_pe_loader::PeFile = pe;
-    let mut pml4s = [pml4, 0u64];
-    let mut scratch_bases = [scratch_base, 0u64];
-    let mut img_ends = [img_end, 0u64];
-    let mut pfaults = [0u64; 2];
-    let mut pfirst = [0u64; 2];
-    let mut pntfaults = [0u64; 2];
-    let mut pfilled = [[0u64; 256]; 2];
+    // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each).
+    let mut pml4s = [pml4, 0u64, 0u64];
+    let mut scratch_bases = [scratch_base, 0u64, 0u64];
+    let mut img_ends = [img_end, 0u64, 0u64];
+    let mut pfaults = [0u64; 3];
+    let mut pfirst = [0u64; 3];
+    let mut pntfaults = [0u64; 3];
+    // Per-process demand-fill bookkeeping — kept in a `static mut` (3×2 KiB) rather than on the
+    // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
+    // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
+    // run; zero it at entry so the demo call (ntdll=None) starts clean too.
+    let pfilled: &mut [[u64; 256]; 3] = &mut *core::ptr::addr_of_mut!(PFILLED);
+    for p in pfilled.iter_mut() {
+        for e in p.iter_mut() {
+            *e = 0;
+        }
+    }
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
@@ -4832,26 +4961,48 @@ unsafe fn service_sec_image(
         // LOAD its state into the working locals. pml4/scratch_base/img_end/pe are immutable per
         // process (shadow the params); faults/first/ntfaults/filled_pages are mutable (SAVED back
         // before every recv below).
-        let pi = if badge == CSRSS_BADGE { 1 } else { 0 };
+        let pi = if badge == CSRSS_BADGE {
+            1
+        } else if badge == WINLOGON_BADGE {
+            2
+        } else {
+            0
+        };
         // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
         ACTIVE_STACK_MIRROR.store(
-            if pi == 1 { CSRSS_STACK_MIRROR_VA } else { SMSS_STACK_MIRROR_VA },
+            match pi {
+                1 => CSRSS_STACK_MIRROR_VA,
+                2 => WINLOGON_STACK_MIRROR_VA,
+                _ => SMSS_STACK_MIRROR_VA,
+            },
             Ordering::Relaxed,
         );
         ACTIVE_IMAGE_MIRROR.store(
-            if pi == 1 { CSRSS_IMAGE_MIRROR_VA } else { IMAGE_MIRROR_VA },
+            match pi {
+                1 => CSRSS_IMAGE_MIRROR_VA,
+                2 => WINLOGON_IMAGE_MIRROR_VA,
+                _ => IMAGE_MIRROR_VA,
+            },
             Ordering::Relaxed,
         );
         ACTIVE_HEAP_MIRROR.store(
-            if pi == 1 { CSRSS_HEAP_MIRROR_VA } else { SMSS_HEAP_MIRROR_VA },
+            match pi {
+                1 => CSRSS_HEAP_MIRROR_VA,
+                2 => WINLOGON_HEAP_MIRROR_VA,
+                _ => SMSS_HEAP_MIRROR_VA,
+            },
             Ordering::Relaxed,
         );
         let pml4 = pml4s[pi];
         let scratch_base = scratch_bases[pi];
         let img_end = img_ends[pi];
-        let pe: &nt_pe_loader::PeFile = if pi == 1 { csrss_pe.as_ref().unwrap() } else { pe };
+        let pe: &nt_pe_loader::PeFile = match pi {
+            1 => csrss_pe.as_ref().unwrap(),
+            2 => winlogon_pe.as_ref().unwrap(),
+            _ => pe,
+        };
         faults = pfaults[pi];
         first = pfirst[pi];
         ntfaults = pntfaults[pi];
@@ -5121,6 +5272,7 @@ unsafe fn service_sec_image(
                 nt_handler.stop = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
+                nt_handler.winlogon_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.lpc_rendezvous_conn = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
@@ -5132,6 +5284,9 @@ unsafe fn service_sec_image(
                     csrss_file_handle: &mut csrss_file_handle as *mut u64,
                     csrss_section_handle: &mut csrss_section_handle as *mut u64,
                     csrss_pe: &csrss_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    winlogon_file_handle: &mut winlogon_file_handle as *mut u64,
+                    winlogon_section_handle: &mut winlogon_section_handle as *mut u64,
+                    winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: &mut filled_pages as *mut [u64; 256],
                     faults: &mut faults as *mut u64,
                     scratch_base,
@@ -5219,7 +5374,7 @@ unsafe fn service_sec_image(
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
                         cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
-                        CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
+                        CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, 0, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
@@ -5233,6 +5388,35 @@ unsafe fn service_sec_image(
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
                     print_str(b"; its faults now multiplexed into this loop\n");
+                }
+                // The 3rd hosted process: smss's SmpExecuteInitialCommand → RtlCreateUserProcess
+                // created winlogon's SEC_IMAGE section; NtCreateProcess validated it. Spawn winlogon
+                // (badge WINLOGON_BADGE) exactly like csrss — its own VSpace + image + ntdll + fault
+                // EP, per-process env-scratch/mirrors/alloc-bump (all distinct from smss/csrss). Its
+                // ntdll loader then runs, multiplexed into this loop by badge. Prio 102 (> csrss 101 >
+                // smss 100) so it is actually scheduled; it blocks on every demand-fault (serviced
+                // here), handing the others their turns.
+                if nt_handler.winlogon_spawn_request {
+                    let wf_c = mint_badged(fault_ep, WINLOGON_BADGE);
+                    let wpe = winlogon_pe.as_ref().unwrap();
+                    const WINLOGON_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\winlogon.exe";
+                    const WINLOGON_CMD_LINE: &[u8] = b"winlogon.exe";
+                    let wpml4 = spawn_sec_image(
+                        wpe, wf_c, NTDLL_BASE, true, 102, 0x0000_0100_107C_0000,
+                        WINLOGON_STACK_MIRROR_VA, WINLOGON_HEAP_MIRROR_VA, WINLOGON_IMAGE_MIRROR_VA,
+                        WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
+                    );
+                    pml4s[2] = wpml4;
+                    img_ends[2] = PE_LOAD_BASE + image_extent(wpe);
+                    scratch_bases[2] = WINLOGON_SCRATCH_BASE;
+                    winlogon_process_handle = nt_handler.next_handle;
+                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *ProcessHandle (R10)
+                    nt_handler.next_handle += 1;
+                    print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge 4) -> handle 0x");
+                    print_hex((winlogon_process_handle >> 32) as u32);
+                    print_hex(winlogon_process_handle as u32);
+                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
+                    WINLOGON_SPAWNED.store(1, Ordering::Relaxed);
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
@@ -5546,7 +5730,13 @@ unsafe fn service_sec_image(
     print_str(b"\n[sec-stop] badge=");
     print_u64(badge);
     print_str(b" (");
-    print_str(if badge == CSRSS_BADGE { b"csrss" } else { b"smss" });
+    print_str(if badge == CSRSS_BADGE {
+        b"csrss" as &[u8]
+    } else if badge == WINLOGON_BADGE {
+        b"winlogon"
+    } else {
+        b"smss"
+    });
     print_str(b") label=");
     print_u64(mi >> 12);
     print_str(b" m0=0x");
@@ -5636,6 +5826,14 @@ unsafe fn service_sec_image(
             }
         }
     }
+    print_str(b"\n");
+    // Record winlogon's (slot 2) demand-fault count for the spec check + report line.
+    WINLOGON_FAULTS.store(pfaults[2], Ordering::Relaxed);
+    print_str(b"[ntos-exec] winlogon (slot 2) demand-faulted ");
+    print_u64(pfaults[2]);
+    print_str(b" page(s), first=0x");
+    print_hex((pfirst[2] >> 32) as u32);
+    print_hex(pfirst[2] as u32);
     print_str(b"\n");
     // Report smss's (slot 0) own fault stats regardless of which process stopped the loop — csrss
     // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
@@ -6407,6 +6605,7 @@ unsafe fn spawn_storage_host(
     nls20127_start: u64,
     hivebuf_start: u64,
     win32kbuf_start: u64,
+    winlogonbuf_start: u64,
 ) {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
@@ -6482,6 +6681,15 @@ unsafe fn spawn_storage_host(
         let kb_cp = copy_cap(win32kbuf_start + i);
         let _ = page_map(kb_cp, WIN32KBUF_VADDR + i * 0x1000, RW_NX, pml4);
     }
+    // The raw winlogon.exe staging buffer (its own PT), mapped into the host too so it reads the PE
+    // off disk into it; the executive parses the same frames + spawns winlogon.
+    let wl_pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wl_pt);
+    let _ = paging_struct_map(wl_pt, LBL_X86_PAGE_TABLE_MAP, WINLOGONBUF_VADDR, pml4);
+    for i in 0..WINLOGONBUF_FRAMES {
+        let wl_cp = copy_cap(winlogonbuf_start + i);
+        let _ = page_map(wl_cp, WINLOGONBUF_VADDR + i * 0x1000, RW_NX, pml4);
+    }
     // The raw dxg.sys / dxgthk.sys staging buffers (one PT each), mapped into the host too.
     for (start, vaddr, frames) in [
         (DXGBUF_START.load(Ordering::Relaxed), DXGBUF_VADDR, DXGBUF_FRAMES),
@@ -6539,6 +6747,10 @@ static NEXT_SMSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// SMSS_ALLOC_VA: the two processes have independent VSpaces, so the same VA (with each's own PT) is
 /// fine, and csrss's heap then lands low, within its mapped PT.
 static NEXT_CSRSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
+/// winlogon's OWN NtAllocateVirtualMemory bump (3rd hosted process) — a SEPARATE counter so smss's
+/// (or csrss's) allocations don't push winlogon's heap base past the single alloc PT spawn_sec_image
+/// maps. Starts at SMSS_ALLOC_VA: independent VSpaces make the same VA (own PT) fine.
+static NEXT_WINLOGON_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 /// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can
@@ -6555,6 +6767,13 @@ static HIVEBUF_START: AtomicU64 = AtomicU64::new(0);
 static REAL_HIVE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The frame-cap base of the raw win32k.sys the storage host staged into WIN32KBUF (Phase 2b).
 static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
+/// The frame-cap base of the raw winlogon.exe the storage host staged into WINLOGONBUF (3rd process).
+static WINLOGONBUF_START: AtomicU64 = AtomicU64::new(0);
+/// Set once smss's NtCreateProcess spawns winlogon as the 3rd hosted process (its ntdll loader then
+/// runs, multiplexed by badge). Read by the post-run spec checks to prove the milestone.
+static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
+/// How many pages winlogon's ntdll loader demand-faulted (slot 2), for the spec-check report.
+static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -7818,6 +8037,7 @@ unsafe fn storage_probe(
     nls_case_dest: u64,
     nls20127_dest: u64,
     win32kbuf_dest: u64,
+    winlogonbuf_dest: u64,
 ) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
@@ -8140,6 +8360,22 @@ unsafe fn storage_probe(
                 if got == want && sz > 0 {
                     core::ptr::write_volatile((STORAGE_SHARED_VADDR + off) as *mut u32, sz);
                 }
+            }
+        }
+        // winlogon.exe — smss's SmpExecuteInitialCommand initial command. Staged into its own
+        // WINLOGONBUF (256 KiB, own PT), size reported at STORAGE_SHARED+0x94 so the executive can
+        // parse it PE32+ and spawn it as the 3rd hosted process.
+        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WINLOGONEXE") {
+            let cap = (WINLOGONBUF_FRAMES * 0x1000) as u32;
+            let want = if sz < cap { sz } else { cap };
+            let got = fat_read_file(&fs, c, want, winlogonbuf_dest);
+            print_str(b"[storage-host] WINLOGON.EXE size=");
+            print_u64(sz as u64);
+            print_str(b" read=");
+            print_u64(got as u64);
+            print_str(b"\n");
+            if got == want && sz > 0 {
+                core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x94) as *mut u32, sz);
             }
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
@@ -8695,7 +8931,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -9599,6 +9835,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(copy_cap(win32kbuf_start + i), WIN32KBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             WIN32KBUF_START.store(win32kbuf_start, Ordering::Relaxed);
+            // The raw winlogon.exe buffer (64 frames, its own PT), mapped in the executive too so it
+            // can parse+spawn winlogon as the 3rd hosted process.
+            let wl_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wl_pt);
+            let _ = paging_struct_map(wl_pt, LBL_X86_PAGE_TABLE_MAP, WINLOGONBUF_VADDR, CAP_INIT_THREAD_VSPACE);
+            let winlogonbuf_start = alloc_frame();
+            for _ in 1..WINLOGONBUF_FRAMES { let _ = alloc_frame(); }
+            for i in 0..WINLOGONBUF_FRAMES {
+                let _ = page_map(copy_cap(winlogonbuf_start + i), WINLOGONBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
+            WINLOGONBUF_START.store(winlogonbuf_start, Ordering::Relaxed);
             // The raw dxg.sys / dxgthk.sys buffers (one PT each), mapped in the executive too so it
             // can parse+load them into win32k's VSpace (DirectX driver hosting).
             for (st_static, vaddr, frames) in [
@@ -9686,6 +9933,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 nls20127_start,
                 hivebuf_start,
                 win32kbuf_start,
+                winlogonbuf_start,
             );
             let _ = sfault;
             let (_z, _b, _s, _m) = ep_recv(sresult);
@@ -10255,7 +10503,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
@@ -10326,12 +10574,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         sfaults > ntfaults && sstop != 0x0000_0100_24bc_8350,
                         &mut passed,
                     );
+                    // winlogon bring-up: smss's SmpExecuteInitialCommand found + launched
+                    // winlogon.exe as the 3rd hosted process (NtOpenFile→NtCreateSection→
+                    // NtCreateProcess), the executive spawned it, and its ntdll loader ran
+                    // (demand-faulting pages) — multiplexed into the same badge-keyed loop.
+                    let wl_staged = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x94) as *const u32) > 0;
+                    check(b"exec_winlogon_staged", wl_staged, &mut passed);
+                    check(
+                        b"exec_winlogon_spawned",
+                        WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_winlogon_loader_runs",
+                        WINLOGON_FAULTS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
                 } else {
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
                     check(b"exec_reactos_ldrinit_runs_deep", false, &mut passed);
                     check(b"exec_reactos_ldrinit_creates_heap", false, &mut passed);
                     check(b"exec_reactos_ldrinit_reads_image", false, &mut passed);
+                    check(b"exec_winlogon_staged", false, &mut passed);
+                    check(b"exec_winlogon_spawned", false, &mut passed);
+                    check(b"exec_winlogon_loader_runs", false, &mut passed);
                 }
             }
             Err(_) => {

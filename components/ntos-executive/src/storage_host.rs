@@ -44,6 +44,7 @@ pub unsafe extern "C" fn storage_host_entry() -> ! {
         NLS_CASE_VADDR,
         NLS_20127_VADDR,
         WIN32KBUF_VADDR,
+        WINLOGONBUF_VADDR,
     );
 
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, verdict);
