@@ -2504,6 +2504,8 @@ const SYSTEM32_FILES: &[&str] = &[
     "advapi32_vista.dll",
     "ws2help.dll",
     "ntdll_vista.dll",
+    "userenv.dll",
+    "mpr.dll",
 ];
 
 /// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
