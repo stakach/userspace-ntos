@@ -2516,6 +2516,11 @@ struct ExecNtHandler {
     /// Raw refs to the loop's per-iteration state for group-C handlers (see [`ExecLoopCtx`]). Set
     /// by the Tier-1 dispatch arm before each `dispatch`; `None` outside the loop.
     loop_ctx: Option<ExecLoopCtx>,
+    /// Control-flow signal-back (Workstream A group C): NtCreateProcess validates the csrss section
+    /// then sets this so the LOOP performs the actual spawn (mint_badged(CSRSS_BADGE) +
+    /// spawn_sec_image + per-badge state + *ProcessHandle out) after dispatch — the spawn needs
+    /// fault_ep + the per-process arrays which stay loop-resident. Mirrors `stop`/the write queue.
+    spawn_request: bool,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2570,6 +2575,7 @@ impl ExecNtHandler {
             out_writes: [(0, 0); 8],
             out_writes_n: 0,
             loop_ctx: None,
+            spawn_request: false,
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -3657,6 +3663,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC0000002
                 }
             },
+            // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
+            // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Control-flow case: validate the
+            // SectionHandle names the tracked csrss.exe SEC_IMAGE, then hand the actual spawn to the
+            // loop (it needs fault_ep + the per-badge process arrays) via `spawn_request`.
+            NativeService::NtCreateProcess => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let sp = get_recv_mr(16);
+                let sect = smss_stack_read(sp + 0x30); // SectionHandle
+                if *ctx.csrss_section_handle != 0
+                    && sect == *ctx.csrss_section_handle
+                    && (*ctx.csrss_pe).is_some()
+                {
+                    self.spawn_request = true; // the loop performs the spawn + writes *ProcessHandle
+                    0
+                } else {
+                    self.stop = true; // not the csrss section / not staged -> clean stop
+                    0xC0000002
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3728,6 +3753,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreateSection, SSN_NT_CREATE_SECTION as u32),
             // Workstream A batch 9 (group C): view mapping (DLL SEC_IMAGE + anon + NLS).
             (NativeService::NtMapViewOfSection, 113),
+            // Workstream A batch 10 (group C): csrss spawn (table-dispatched-with-post-action).
+            (NativeService::NtCreateProcess, SSN_NT_CREATE_PROCESS as u32),
         ],
     )
 }
@@ -4662,6 +4689,7 @@ unsafe fn service_sec_image(
                 nt_handler.pi = pi;
                 nt_handler.stop = false;
                 nt_handler.out_writes_n = 0;
+                nt_handler.spawn_request = false;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
@@ -4711,15 +4739,10 @@ unsafe fn service_sec_image(
                         smss_stack_write(ptr, val);
                     }
                 }
-            } else if m0 == SSN_NT_CREATE_PROCESS {
-                // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
-                // InheritHandles[sp+0x28], SectionHandle[sp+0x30], …). Spawn a REAL second SEC_IMAGE
-                // process from the tracked csrss section: its own VSpace + the csrss image + ntdll,
-                // via spawn_sec_image. Its thread starts and faults to its OWN fault EP, which is not
-                // serviced yet (the multiplexed 2-process loop is the next step) — so it just blocks
-                // on its first page, while smss gets a real process handle and proceeds.
-                let sect = smss_stack_read(sp + 0x30);
-                if csrss_section_handle != 0 && sect == csrss_section_handle && csrss_pe.is_some() {
+                // Control-flow post-action (group C): NtCreateProcess validated the csrss section and
+                // asked the loop to spawn the subsystem process (needs fault_ep + the per-badge
+                // arrays that stay loop-resident). Mirrors the stop/out-write signal-back.
+                if nt_handler.spawn_request {
                     // Fault-EP cap minted at CSRSS_BADGE: csrss's faults/syscalls arrive on the shared
                     // service EP tagged with that badge, so this loop multiplexes it against smss.
                     let cf_c = mint_badged(fault_ep, CSRSS_BADGE);
@@ -4777,10 +4800,6 @@ unsafe fn service_sec_image(
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
                     print_str(b"; its faults now multiplexed into this loop\n");
-                    // result stays 0 (SUCCESS)
-                } else {
-                    handled = false; // not the csrss section / not staged -> clean stop
-                    result = 0xC0000002;
                 }
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
