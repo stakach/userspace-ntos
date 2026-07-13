@@ -114,8 +114,14 @@ pub struct NtProcess {
     /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
     /// `PsGetProcessWin32WindowStation`).
     pub win32_window_station: Option<u64>,
-    handles: BTreeMap<Handle, HandleEntry>,
-    next_handle: u32,
+    /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
+    /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
+    /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
+    /// the real handle table does). This representation is **pre-reservable**: a host that reserves
+    /// capacity up front ([`ProcessManager::reserve_handles`]) gets `insert_handle` writing into
+    /// pre-allocated storage with **no reallocation**, so it can run on a bump allocator whose
+    /// transient region is reset per call without corrupting the durable table.
+    handles: Vec<Option<HandleEntry>>,
 }
 
 /// What a handle refers to (spec §8.1). v0.1 covers the object kinds the loader needs.
@@ -124,11 +130,31 @@ pub enum HandleObject {
     Process(ProcessId),
     Thread(ThreadId),
     Section(SectionId),
+    /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
+    /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
+    /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
+    Opaque(u64),
 }
 
 struct HandleEntry {
     object: HandleObject,
     granted_access: u32,
+}
+
+/// The NT handle-value ↔ table-slot mapping: handle `h` (a non-zero multiple of 4) indexes slot
+/// `h/4 - 1`. Returns `None` for a malformed handle (zero or not a multiple of 4).
+#[inline]
+fn handle_to_slot(handle: Handle) -> Option<usize> {
+    if handle == 0 || handle % 4 != 0 {
+        return None;
+    }
+    Some((handle / 4 - 1) as usize)
+}
+
+/// The inverse of [`handle_to_slot`]: table slot `i` → handle value `(i + 1) * 4`.
+#[inline]
+fn slot_to_handle(slot: usize) -> Handle {
+    ((slot + 1) * 4) as Handle
 }
 
 /// The `NtThread` object (spec §7.2).
@@ -265,11 +291,31 @@ impl ProcessManager {
                 exit_status: None,
                 win32_process: None,
                 win32_window_station: None,
-                handles: BTreeMap::new(),
-                next_handle: 4,
+                handles: Vec::new(),
             },
         );
         pid
+    }
+
+    /// Pre-reserve `pid`'s handle-table capacity so subsequent [`insert_handle`](Self::insert_handle)
+    /// calls write into already-allocated storage and never reallocate (spec §8.1). A host on a
+    /// bump/reset allocator reserves the durable table at boot (below its per-call reset mark), so
+    /// handle inserts during a serviced call don't leak into the transient region. No-op for an
+    /// unknown pid.
+    pub fn reserve_handles(&mut self, pid: ProcessId, capacity: usize) {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            if capacity > proc.handles.capacity() {
+                proc.handles.reserve(capacity - proc.handles.capacity());
+            }
+        }
+    }
+
+    /// `pid`'s current handle-table capacity (reserved slots) — for a host to check headroom.
+    pub fn handle_capacity(&self, pid: ProcessId) -> usize {
+        self.processes
+            .get(&pid)
+            .map(|p| p.handles.capacity())
+            .unwrap_or(0)
     }
 
     pub fn process(&self, pid: ProcessId) -> Option<&NtProcess> {
@@ -487,7 +533,10 @@ impl ProcessManager {
 
     // --- handle tables (spec §8) ---------------------------------------------
 
-    /// Insert an object into `pid`'s handle table (spec §8.1), returning the handle.
+    /// Insert an object into `pid`'s handle table (spec §8.1), returning the handle. Reuses the
+    /// first free slot (as the real NT handle table does), else appends. With capacity reserved via
+    /// [`reserve_handles`](Self::reserve_handles), appending stays within pre-allocated storage (no
+    /// reallocation).
     pub fn insert_handle(
         &mut self,
         pid: ProcessId,
@@ -495,39 +544,68 @@ impl ProcessManager {
         granted_access: u32,
     ) -> Result<Handle, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-        let h = proc.next_handle;
-        proc.next_handle += 4; // handles are pointer-sized multiples of 4 (NT convention)
-        proc.handles.insert(
-            h,
-            HandleEntry {
-                object,
-                granted_access,
-            },
-        );
-        Ok(h)
+        let entry = HandleEntry {
+            object,
+            granted_access,
+        };
+        let slot = match proc.handles.iter().position(|e| e.is_none()) {
+            Some(i) => {
+                proc.handles[i] = Some(entry);
+                i
+            }
+            None => {
+                proc.handles.push(Some(entry));
+                proc.handles.len() - 1
+            }
+        };
+        Ok(slot_to_handle(slot))
     }
     /// Resolve a handle in `pid`'s table (spec §8.1).
     pub fn lookup_handle(&self, pid: ProcessId, handle: Handle) -> Option<HandleObject> {
-        self.processes
-            .get(&pid)?
-            .handles
-            .get(&handle)
+        let proc = self.processes.get(&pid)?;
+        proc.handles
+            .get(handle_to_slot(handle)?)?
+            .as_ref()
             .map(|e| e.object)
     }
     pub fn handle_access(&self, pid: ProcessId, handle: Handle) -> Option<u32> {
-        self.processes
-            .get(&pid)?
-            .handles
-            .get(&handle)
+        let proc = self.processes.get(&pid)?;
+        proc.handles
+            .get(handle_to_slot(handle)?)?
+            .as_ref()
             .map(|e| e.granted_access)
     }
-    /// `NtClose` (spec §8.1): remove a handle from `pid`'s table.
+    /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
     pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
-        proc.handles
-            .remove(&handle)
-            .map(|_| ())
-            .ok_or(STATUS_INVALID_HANDLE)
+        let slot = handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
+        match proc.handles.get_mut(slot) {
+            Some(e @ Some(_)) => {
+                *e = None;
+                Ok(())
+            }
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+    /// Close the first handle in `pid`'s table whose entry refers to `object` (spec §8.1), freeing
+    /// the slot; returns whether one was found. A host that assigns its own handle VALUES (outside
+    /// this table's `(slot+1)*4` scheme) records each with the value in a [`HandleObject::Opaque`]
+    /// tag and closes by that tag on `NtClose` — so the per-process table is the ownership record
+    /// even while the value allocator stays host-side (the process-hosting convergence hybrid).
+    pub fn close_handle_by_object(&mut self, pid: ProcessId, object: HandleObject) -> bool {
+        let Some(proc) = self.processes.get_mut(&pid) else {
+            return false;
+        };
+        if let Some(slot) = proc
+            .handles
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|h| h.object == object))
+        {
+            proc.handles[slot] = None;
+            true
+        } else {
+            false
+        }
     }
     /// `NtDuplicateObject` into another process's table (spec §8) — the target gets its own handle.
     pub fn duplicate_handle(
@@ -540,7 +618,8 @@ impl ProcessManager {
             let e = self
                 .processes
                 .get(&src_pid)
-                .and_then(|p| p.handles.get(&handle))
+                .and_then(|p| p.handles.get(handle_to_slot(handle)?))
+                .and_then(|e| e.as_ref())
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (e.object, e.granted_access)
         };
@@ -549,7 +628,7 @@ impl ProcessManager {
     pub fn handle_count(&self, pid: ProcessId) -> usize {
         self.processes
             .get(&pid)
-            .map(|p| p.handles.len())
+            .map(|p| p.handles.iter().filter(|e| e.is_some()).count())
             .unwrap_or(0)
     }
 }

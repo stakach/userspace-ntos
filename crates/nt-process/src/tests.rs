@@ -70,6 +70,65 @@ fn handle_table_operations() {
 }
 
 #[test]
+fn reserved_handle_table_never_reallocates() {
+    // The pre-reservable slot table (the executive's non-leaking heap-reset solution): reserve
+    // capacity up front, then a burst of inserts writes into pre-allocated storage with NO
+    // reallocation (capacity stays constant → the durable table never allocates during a call).
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    pm.reserve_handles(pid, 256);
+    let cap0 = pm.handle_capacity(pid);
+    assert!(cap0 >= 256);
+    let mut handles = alloc::vec::Vec::new();
+    for i in 0..200u64 {
+        let h = pm
+            .insert_handle(pid, HandleObject::Opaque(0x5A5A_0000 + i), 0)
+            .unwrap();
+        handles.push(h);
+    }
+    // No reallocation across the whole burst.
+    assert_eq!(pm.handle_capacity(pid), cap0);
+    assert_eq!(pm.handle_count(pid), 200);
+    // Handles are the NT convention: non-zero multiples of 4, dense from 4.
+    assert_eq!(handles[0], 4);
+    assert_eq!(handles[1], 8);
+    assert_eq!(pm.lookup_handle(pid, 4), Some(HandleObject::Opaque(0x5A5A_0000)));
+    // Closing frees the slot; the next insert reuses it (still no realloc).
+    pm.close_handle(pid, 4).unwrap();
+    assert_eq!(pm.lookup_handle(pid, 4), None);
+    let reused = pm.insert_handle(pid, HandleObject::Opaque(0xBEEF), 0).unwrap();
+    assert_eq!(reused, 4); // first free slot reused
+    assert_eq!(pm.handle_capacity(pid), cap0);
+    // Malformed handles are rejected, not panics.
+    assert_eq!(pm.lookup_handle(pid, 0), None);
+    assert_eq!(pm.lookup_handle(pid, 3), None); // not a multiple of 4
+    assert_eq!(pm.close_handle(pid, 0), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
+fn close_by_object_tag() {
+    // The convergence hybrid: a host tags each entry with its own handle VALUE (Opaque) and closes
+    // by that tag on NtClose, without knowing this table's internal slot-handle.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    pm.reserve_handles(pid, 16);
+    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0001), 0).unwrap();
+    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0002), 0).unwrap();
+    assert_eq!(pm.handle_count(pid), 2);
+    assert!(pm.close_handle_by_object(pid, HandleObject::Opaque(0x5A5A_0001)));
+    assert_eq!(pm.handle_count(pid), 1);
+    // Idempotent-safe: closing an absent tag reports false (the host still returns SUCCESS to match
+    // the prior no-op NtClose behavior).
+    assert!(!pm.close_handle_by_object(pid, HandleObject::Opaque(0x5A5A_0001)));
+    assert!(!pm.close_handle_by_object(pid, HandleObject::Opaque(0xDEAD)));
+    // Typed entries coexist and are matched by identity.
+    let other = pm.create_process("b.exe", None, None);
+    pm.insert_handle(pid, HandleObject::Process(other), 0).unwrap();
+    assert!(pm.close_handle_by_object(pid, HandleObject::Process(other)));
+    assert_eq!(pm.handle_count(pid), 1); // the surviving Opaque(0x5A5A_0002)
+}
+
+#[test]
 fn image_section_load_and_run_entry() {
     // Stage 1 (spec §20): load a PE with no imports, get a valid entry point.
     let mut pm = ProcessManager::new();

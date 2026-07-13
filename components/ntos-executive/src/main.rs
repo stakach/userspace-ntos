@@ -2910,6 +2910,20 @@ impl ExecNtHandler {
                     }
                 }
                 PM_IDENTITY_OK.store(ok, Ordering::Relaxed);
+                // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
+                // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
+                // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
+                // Measured peak is < ~100 handles per process over a full boot; 256 is ~3× headroom.
+                for pid in [smss_pid, csrss_pid, winlogon_pid] {
+                    pm.reserve_handles(pid, PM_HANDLE_RESERVE);
+                }
+                // Record the reserved capacity (min across the 3) so the run can prove it never
+                // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
+                let cap = pm
+                    .handle_capacity(smss_pid)
+                    .min(pm.handle_capacity(csrss_pid))
+                    .min(pm.handle_capacity(winlogon_pid));
+                PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
         }
@@ -2919,6 +2933,30 @@ impl ExecNtHandler {
     fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
         let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
         (pid != 0).then_some(pid as nt_process::ProcessId)
+    }
+    /// Mint an executive handle for the CURRENT process (`self.pi`) and record it in that process's
+    /// real EPROCESS handle table (path 1 of the nt-process convergence). Behaviour-preserving: the
+    /// returned VALUE is still the global monotonic `next_handle` (so the reg/LPC/win32k consumers
+    /// that match on handle values are unchanged), but the durable per-process table now OWNS the
+    /// handle — tagged with the value in a `HandleObject::Opaque` so `NtClose` can free it. The
+    /// pre-reserved capacity guarantees the `insert_handle` never reallocates under the reset.
+    fn mint_handle(&mut self) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.track_handle(nt_process::HandleObject::Opaque(h));
+        h
+    }
+    /// Record an object in the CURRENT process's EPROCESS handle table (the caller supplies the
+    /// value-tag / typed object). Used by `mint_handle` and by the loop's process-handle mints.
+    fn track_handle(&mut self, object: nt_process::HandleObject) {
+        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+            let _ = self.pm.insert_handle(pid, object, 0);
+            let c = self.pm.handle_count(pid) as u64;
+            if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+                PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
+            }
+            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
     /// drops if the fixed queue is full (bounded per-syscall — no handler queues more than 6).
@@ -3034,8 +3072,7 @@ impl ExecNtHandler {
             }
         }
         if client_handle == 0 {
-            client_handle = self.next_handle;
-            self.next_handle += 1;
+            client_handle = self.mint_handle();
         }
         let _ = cached;
         // (2) Map winlogon's CSR regions once (heap view + static server data).
@@ -3263,8 +3300,23 @@ impl ExecNtHandler {
 impl NativeSyscallHandler for ExecNtHandler {
     fn handle(&mut self, ctx: &NativeCallContext, args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
         match ctx.service {
-            // No handle table modelled yet → closing a handle is a success (matches the broker).
-            NativeService::NtClose => 0, // STATUS_SUCCESS
+            // NtClose(Handle[R10]=args[0]): free the handle in the caller's REAL EPROCESS handle
+            // table (nt-process convergence path 1). Executive-minted handles are recorded tagged
+            // with their value (HandleObject::Opaque), so close-by-tag frees the slot for reuse. We
+            // still return SUCCESS unconditionally (matching the prior no-op) so a close of a handle
+            // the executive doesn't track — e.g. a win32k/Ob handle, or a typed Process handle smss
+            // never closes — stays benign. Purely additive: the returned status is unchanged.
+            NativeService::NtClose => {
+                if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                    if self
+                        .pm
+                        .close_handle_by_object(pid, nt_process::HandleObject::Opaque(args[0]))
+                    {
+                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                0 // STATUS_SUCCESS
+            }
             // NtOpenKey(*KeyHandle[0], DesiredAccess[1], ObjectAttributes[2]). Copy in the object
             // name from smss, resolve it in the SYSTEM hive, hand back a handle (copyout to arg0).
             NativeService::NtOpenKey => unsafe {
@@ -3513,9 +3565,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         c.create_port(&name16, args[2] as u32, args[3] as u32, 0).ok()
                     })
                     .unwrap_or_else(|| {
-                        let h = self.next_handle;
-                        self.next_handle += 1;
-                        h
+                        self.mint_handle()
                     });
                 self.queue_write(args[0], handle);
                 0
@@ -3529,8 +3579,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
             // running smss thread in smss's VSpace) is the next path-B step.
             NativeService::NtCreateThread | NativeService::NtCreateSemaphore => {
-                let h = self.next_handle;
-                self.next_handle += 1;
+                let h = self.mint_handle();
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
                 // Path B: smss creates its SmpApiLoop worker threads via NtCreateThread. Signal the
                 // loop to spawn ONE REAL SM-loop thread (the first). The loop reads the CONTEXT (Rip =
@@ -3631,8 +3680,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // (*PortHandle[R10], PortContext[RDX], *ConnReq[R8], Accept[R9], ...). We don't yet
                 // decode the connection id from the received PORT_MESSAGE (path B), so accept the most
                 // recent pending connection is a bulk concern — return success placeholder for now.
-                self.queue_write(args[0], self.next_handle);
-                self.next_handle += 1;
+                let h = self.mint_handle();
+                self.queue_write(args[0], h);
                 0
             },
             NativeService::NtCompleteConnectPort => 0,
@@ -3654,8 +3703,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // win32k the REAL event handles winsrv created, which it models as typed Event objects.
             // (Memory behaviour matches the pre-fix baseline: nothing is written to the caller here.)
             NativeService::NtCreateEvent => {
-                let h = self.next_handle;
-                self.next_handle += 1;
+                let h = self.mint_handle();
                 if self.pi == 1 {
                     // Keep the two most-recent csrss event handles in creation order (winsrv creates
                     // hPowerRequestEvent then hMediaRequestEvent right before NtUserInitialize).
@@ -3672,8 +3720,8 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
             NativeService::NtOpenProcessToken => unsafe {
                 let out = get_recv_mr(7); // R8
-                smss_stack_write(out, self.next_handle);
-                self.next_handle += 1;
+                let h = self.mint_handle();
+                smss_stack_write(out, h);
                 0
             },
             // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
@@ -4031,9 +4079,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     nlen += 1;
                 }
                 if nb[..nlen].windows(17).any(|w| w == b"nlssectioncp20127") {
-                    smss_stack_write(args[0], self.next_handle); // R10 = *SectionHandle
-                    *ctx.nls_section_handle = self.next_handle;
-                    self.next_handle += 1;
+                    let h = self.mint_handle();
+                    smss_stack_write(args[0], h); // R10 = *SectionHandle
+                    *ctx.nls_section_handle = h;
                     print_str(b"[ntos-exec] NtOpenSection NlsCP20127 -> handle 0x");
                     print_hex(*ctx.nls_section_handle as u32);
                     print_str(b"\n");
@@ -4178,17 +4226,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // launches csrss/winlogon.
                 let dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
                 if is_sys32_dir || is_csrss || is_winlogon || dll_i.is_some() {
-                    smss_stack_write(get_recv_mr(9), self.next_handle); // *FileHandle
+                    let h = self.mint_handle();
+                    smss_stack_write(get_recv_mr(9), h); // *FileHandle
                     if is_csrss {
-                        *ctx.csrss_file_handle = self.next_handle; // remember it for NtCreateSection
+                        *ctx.csrss_file_handle = h; // remember it for NtCreateSection
                     }
                     if is_winlogon {
-                        *ctx.winlogon_file_handle = self.next_handle; // for NtCreateSection
+                        *ctx.winlogon_file_handle = h; // for NtCreateSection
                     }
                     if let Some(i) = dll_i {
-                        reg.set_file_handle(i, self.next_handle); // remember it for NtCreateSection
+                        reg.set_file_handle(i, h); // remember it for NtCreateSection
                     }
-                    self.next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                     if iosb != 0 {
                         smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
@@ -4326,6 +4374,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // so NtCreateProcess can spawn the real csrss image from it.
             NativeService::NtCreateSection => unsafe {
                 let ctx = self.loop_ctx.unwrap();
+                let h = self.mint_handle();
                 let reg = &mut *ctx.reg;
                 let dll_pes = &*ctx.dll_pes;
                 let filled_pages = &mut *ctx.filled_pages;
@@ -4334,31 +4383,31 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let out = get_recv_mr(9); // R10 = *SectionHandle
                 // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
                 csrss_out_write(
-                    out, self.next_handle, filled_pages, faults, ctx.scratch_base, reg, dll_pes,
+                    out, h, filled_pages, faults, ctx.scratch_base, reg, dll_pes,
                     ctx.pml4,
                 );
                 let sec_file = smss_stack_read(sp + 0x38);
                 if *ctx.csrss_file_handle != 0 && sec_file == *ctx.csrss_file_handle {
-                    *ctx.csrss_section_handle = self.next_handle;
+                    *ctx.csrss_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
-                    print_hex((self.next_handle >> 32) as u32);
-                    print_hex(self.next_handle as u32);
+                    print_hex((h >> 32) as u32);
+                    print_hex(h as u32);
                     print_str(b"\n");
                 }
                 if *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
-                    *ctx.winlogon_section_handle = self.next_handle;
+                    *ctx.winlogon_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
-                    print_hex((self.next_handle >> 32) as u32);
-                    print_hex(self.next_handle as u32);
+                    print_hex((h >> 32) as u32);
+                    print_hex(h as u32);
                     print_str(b"\n");
                 }
                 // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
                 if let Some(i) = reg.index_for_file(sec_file) {
-                    reg.set_section_handle(i, self.next_handle);
+                    reg.set_section_handle(i, h);
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                     print_str(reg.name(i));
                     print_str(b" -> handle 0x");
-                    print_hex(self.next_handle as u32);
+                    print_hex(h as u32);
                     print_str(b"\n");
                 }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
@@ -4370,17 +4419,16 @@ impl NativeSyscallHandler for ExecNtHandler {
                     } else {
                         0
                     };
-                    *ctx.csrss_anon_section_handle = self.next_handle;
+                    *ctx.csrss_anon_section_handle = h;
                     // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
                     // window (demand-paged on touch, so unused pages cost nothing).
                     *ctx.csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
                     print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
                     print_hex(*ctx.csrss_anon_size as u32);
                     print_str(b" -> handle 0x");
-                    print_hex(self.next_handle as u32);
+                    print_hex(h as u32);
                     print_str(b"\n");
                 }
-                self.next_handle += 1;
                 0
             },
             // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
@@ -5823,8 +5871,21 @@ unsafe fn service_sec_image(
                     img_ends[1] = PE_LOAD_BASE + image_extent(cpe);
                     scratch_bases[1] = CSRSS_SCRATCH_BASE;
                     csrss_process_handle = nt_handler.next_handle;
-                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *ProcessHandle (R10)
                     nt_handler.next_handle += 1;
+                    smss_stack_write(get_recv_mr(9), csrss_process_handle); // *ProcessHandle (R10)
+                    // Record csrss's process handle in smss's (the creator's) EPROCESS table as a
+                    // real Process object (nt-process convergence path 1). Value stays the global
+                    // handle (behavior-preserving); the durable table now owns the process handle.
+                    if let (Some(smss_pid), Some(csrss_pid)) =
+                        (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(1))
+                    {
+                        let _ = nt_handler.pm.insert_handle(
+                            smss_pid,
+                            nt_process::HandleObject::Process(csrss_pid),
+                            0,
+                        );
+                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                    }
                     print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
@@ -5851,8 +5912,19 @@ unsafe fn service_sec_image(
                     img_ends[2] = PE_LOAD_BASE + image_extent(wpe);
                     scratch_bases[2] = WINLOGON_SCRATCH_BASE;
                     winlogon_process_handle = nt_handler.next_handle;
-                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *ProcessHandle (R10)
                     nt_handler.next_handle += 1;
+                    smss_stack_write(get_recv_mr(9), winlogon_process_handle); // *ProcessHandle (R10)
+                    // Record winlogon's process handle in smss's EPROCESS table as a Process object.
+                    if let (Some(smss_pid), Some(winlogon_pid)) =
+                        (nt_handler.pm_pid_for_pi(0), nt_handler.pm_pid_for_pi(2))
+                    {
+                        let _ = nt_handler.pm.insert_handle(
+                            smss_pid,
+                            nt_process::HandleObject::Process(winlogon_pid),
+                            0,
+                        );
+                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                    }
                     print_str(b"[ntos-exec] NtCreateProcess: spawned winlogon (badge 4) -> handle 0x");
                     print_hex((winlogon_process_handle >> 32) as u32);
                     print_hex(winlogon_process_handle as u32);
@@ -7312,6 +7384,20 @@ static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
 /// Incremented each time the live service loop resolves the current fault BADGE → its EPROCESS via
 /// the ProcessManager (`pm.process(PM_PIDS[pi])`) — proves badge↔EPROCESS lookup works at runtime.
 static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// Reserved handle-table capacity per hosted EPROCESS (path 1). Measured peak is < ~100 handles per
+/// process over a full boot; 256 is ~3× headroom so `insert_handle` never reallocates under the
+/// per-syscall bump reset (the non-leaking heap solution). ~256 × 24 B × 3 ≈ 18 KiB of the 2 MiB heap.
+const PM_HANDLE_RESERVE: usize = 256;
+/// Total handles the executive has routed into the real per-EPROCESS handle tables (all mint sites).
+static PM_HANDLES_TRACKED: AtomicU64 = AtomicU64::new(0);
+/// Peak live handle count in any single EPROCESS table over the boot — the reservation-headroom gauge.
+static PM_HANDLE_PEAK: AtomicU64 = AtomicU64::new(0);
+/// Handles freed from a per-EPROCESS table by a real `NtClose` (close-by-value-tag) — proves the
+/// lifecycle end of the handle path works (was a no-op success before path 1).
+static PM_HANDLES_CLOSED: AtomicU64 = AtomicU64::new(0);
+/// The handle-table capacity reserved at boot (min across the 3 EPROCESSes). The run proves no
+/// reallocation by keeping the peak live count strictly below this — the non-leaking heap headroom.
+static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -11260,6 +11346,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_BADGE_LOOKUPS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // Path 1 — handle-table routing: the ~15 executive handle-mint sites now record
+                    // every handle into the caller's REAL per-EPROCESS handle table, and NtClose frees
+                    // it (was a no-op). `exec_eprocess_handle_table_routed` = handles were routed;
+                    // `exec_eprocess_handle_table_no_realloc` = peak live count stayed BELOW the
+                    // pre-reserved capacity → insert_handle never reallocated under the per-syscall
+                    // bump reset (the non-leaking heap-reset solution proven under live load).
+                    let tracked = PM_HANDLES_TRACKED.load(Ordering::Relaxed);
+                    let peak = PM_HANDLE_PEAK.load(Ordering::Relaxed);
+                    let cap = PM_HANDLE_CAP_BOOT.load(Ordering::Relaxed);
+                    check(b"exec_eprocess_handle_table_routed", tracked >= 10, &mut passed);
+                    check(
+                        b"exec_eprocess_handle_table_no_realloc",
+                        cap >= PM_HANDLE_RESERVE as u64 && peak > 0 && peak < cap,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] nt-process path1: handles routed=0x");
+                    print_hex(tracked as u32);
+                    print_str(b" closed=0x");
+                    print_hex(PM_HANDLES_CLOSED.load(Ordering::Relaxed) as u32);
+                    print_str(b" peak=0x");
+                    print_hex(peak as u32);
+                    print_str(b" reserved=0x");
+                    print_hex(cap as u32);
+                    print_str(b" (no realloc)\n");
                     print_str(b"[ntos-exec] nt-process: EPROCESS pids smss/csrss/winlogon = ");
                     print_hex(PM_PIDS[0].load(Ordering::Relaxed) as u32);
                     print_str(b"/");
@@ -11283,6 +11393,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_process_manager_up", false, &mut passed);
                     check(b"exec_eprocess_backs_badges", false, &mut passed);
                     check(b"exec_eprocess_lookup_by_badge", false, &mut passed);
+                    check(b"exec_eprocess_handle_table_routed", false, &mut passed);
+                    check(b"exec_eprocess_handle_table_no_realloc", false, &mut passed);
                 }
             }
             Err(_) => {
