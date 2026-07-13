@@ -2770,6 +2770,15 @@ struct ExecNtHandler {
     /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
     /// connect; guards the one-time region mapping (heap view + static server data) in that handler.
     winlogon_csr_view: u64,
+    /// The real NT Process Manager (nt-process): EPROCESS/ETHREAD, per-process handle tables, and the
+    /// process/thread lifecycle. FIRST convergence increment — each hosted process (smss/csrss/
+    /// winlogon) is backed by a real EPROCESS created in `new()` (below the per-syscall heap mark, so
+    /// its BTreeMap allocations survive the bump reset). This increment only CREATES + LOOKS UP the
+    /// EPROCESSes (read-only during the loop, so no runtime realloc); the ad-hoc identity arrays +
+    /// `next_handle` fakes stay live and are migrated onto this in the sequenced bulk. Policy lives
+    /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
+    /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
+    pm: nt_process::ProcessManager,
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
@@ -2868,7 +2877,48 @@ impl ExecNtHandler {
             // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
             lpc_connections: alloc::vec::Vec::with_capacity(16),
             winlogon_csr_view: 0,
+            // The real Process Manager. Pre-create an EPROCESS for each hosted process (identity is
+            // fixed + known ahead of the actual seL4 spawn — real NT likewise has PspCreateProcess
+            // build the EPROCESS before its threads run). Creating all three here (before the
+            // service_sec_image heap mark) keeps every EPROCESS allocation persistent + avoids any
+            // runtime realloc under the per-syscall bump reset. `PM_PIDS[pi]` records the badge↔pid
+            // link (pi 0=smss / 1=csrss / 2=winlogon); the specs verify the objects back the badges.
+            pm: {
+                let mut pm = nt_process::ProcessManager::new();
+                let smss_pid = pm.create_process("smss.exe", None, None);
+                let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
+                let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
+                PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
+                PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
+                PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
+                PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
+                // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
+                let mut ok = 0u64;
+                let expect: [(usize, u32, &str); 3] = [
+                    (0, smss_pid, "smss.exe"),
+                    (1, csrss_pid, "csrss.exe"),
+                    (2, winlogon_pid, "winlogon.exe"),
+                ];
+                for (i, pid, name) in expect {
+                    let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
+                    if distinct
+                        && pm
+                            .process(pid)
+                            .is_some_and(|p| p.image_file_name.eq_ignore_ascii_case(name))
+                    {
+                        ok |= 1 << i;
+                    }
+                }
+                PM_IDENTITY_OK.store(ok, Ordering::Relaxed);
+                pm
+            },
         }
+    }
+    /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
+    /// link). Returns `None` before the ProcessManager has created that hosted process.
+    fn pm_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
+        let pid = PM_PIDS.get(pi)?.load(Ordering::Relaxed);
+        (pid != 0).then_some(pid as nt_process::ProcessId)
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
     /// drops if the fixed queue is full (bounded per-syscall — no handler queues more than 6).
@@ -5344,6 +5394,16 @@ unsafe fn service_sec_image(
         } else {
             0
         };
+        // Convergence (first increment): resolve this fault badge → its real EPROCESS via the Process
+        // Manager (badge → pi → PM_PIDS[pi] → pm.process(pid)). Read-only (no alloc under the reset),
+        // it proves the live badge-multiplex is backed by real nt-process objects. The ad-hoc per-pi
+        // arrays below still carry the load-bearing mechanism state; the bulk migrates that onto the
+        // EPROCESS next (see the convergence report).
+        if let Some(pid) = nt_handler.pm_pid_for_pi(pi) {
+            if nt_handler.pm.process(pid).is_some() {
+                PM_BADGE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
@@ -7234,6 +7294,24 @@ static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// How many CSR API messages (NtRequestWaitReplyPort → \Windows\ApiPort) the direct message plane
 /// has serviced — proves winlogon↔csrss live traffic over the peer-direct plane.
 static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
+// === nt-process convergence (policy/mechanism split) ===================================
+// The live executive is converging its ad-hoc process IDENTITY tracking (the per-pi `pml4s`/
+// `scratch_bases`/… loop arrays + the `badge→pi` switch) onto the real host-tested nt-process
+// ProcessManager (EPROCESS/ETHREAD/handle-tables/lifecycle). FIRST INCREMENT (behavior-preserving):
+// each hosted process (smss/csrss/winlogon) is backed by a real nt-process EPROCESS created at boot
+// in `ExecNtHandler::new()` (below the per-syscall heap mark → survives the bump reset, no runtime
+// realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
+// keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
+/// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created).
+static PM_PIDS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// How many EPROCESS objects the boot-time ProcessManager holds (expected 3).
+static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
+/// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
+static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
+/// Incremented each time the live service loop resolves the current fault BADGE → its EPROCESS via
+/// the ProcessManager (`pm.process(PM_PIDS[pi])`) — proves badge↔EPROCESS lookup works at runtime.
+static PM_BADGE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -11162,6 +11240,35 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         CSR_MSGS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // nt-process convergence (first increment): the real Process Manager backs the 3
+                    // hosted processes with EPROCESS objects. `exec_process_manager_up` = 3 EPROCESSes
+                    // exist; `exec_eprocess_backs_badges` = each pi's EPROCESS names its hosted binary
+                    // with a distinct pid (identity is real, not a scalar); `exec_eprocess_lookup_by_badge`
+                    // = the live service loop resolved a fault badge → its EPROCESS through the manager.
+                    check(
+                        b"exec_process_manager_up",
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == 3,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_eprocess_backs_badges",
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b111,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_eprocess_lookup_by_badge",
+                        PM_BADGE_LOOKUPS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] nt-process: EPROCESS pids smss/csrss/winlogon = ");
+                    print_hex(PM_PIDS[0].load(Ordering::Relaxed) as u32);
+                    print_str(b"/");
+                    print_hex(PM_PIDS[1].load(Ordering::Relaxed) as u32);
+                    print_str(b"/");
+                    print_hex(PM_PIDS[2].load(Ordering::Relaxed) as u32);
+                    print_str(b" badge-lookups=0x");
+                    print_hex(PM_BADGE_LOOKUPS.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                 } else {
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
@@ -11173,6 +11280,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_winlogon_loader_runs", false, &mut passed);
                     check(b"exec_winlogon_csr_connect", false, &mut passed);
                     check(b"exec_csr_message_plane", false, &mut passed);
+                    check(b"exec_process_manager_up", false, &mut passed);
+                    check(b"exec_eprocess_backs_badges", false, &mut passed);
+                    check(b"exec_eprocess_lookup_by_badge", false, &mut passed);
                 }
             }
             Err(_) => {

@@ -45,6 +45,10 @@ nt-io-client = { path = "../../crates/nt-io-client" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+# Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
+# executive is CONVERGING its ad-hoc process-hosting (spawn_sec_image + badge/pi arrays + next_handle
+# fakes) onto this host-tested subsystem (policy = nt-process; mechanism = seL4 caps stay executive).
+nt-process = { path = "../../crates/nt-process" }
 # Generic DLL registry — host-tested name/handle/VA decisions for demand-loaded shared-text DLLs.
 nt-dll-registry = { path = "../../crates/nt-dll-registry" }
 # The driver-visible ntoskrnl/hal export table + win32k import surface + SSDT recorder — the
