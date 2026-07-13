@@ -5505,13 +5505,17 @@ unsafe fn service_sec_image(
     if ntdll.is_some() {
         nt_handler.bind_main_thread_entry(0, PE_LOAD_BASE + smss_pe.entry_point_rva() as u64);
     }
-    // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each).
-    let mut pml4s = [pml4, 0u64, 0u64];
-    let mut scratch_bases = [scratch_base, 0u64, 0u64];
-    let mut img_ends = [img_end, 0u64, 0u64];
-    let mut pfaults = [0u64; 3];
-    let mut pfirst = [0u64; 3];
-    let mut pntfaults = [0u64; 3];
+    // Slots: 0 = smss, 1 = csrss, 2 = winlogon (filled when NtCreateProcess spawns each). Path 3:
+    // the six ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
+    // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
+    // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
+    let mut procs = [ProcExec::empty(); 3];
+    for (i, p) in procs.iter_mut().enumerate() {
+        p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
+    }
+    procs[0].pml4 = pml4;
+    procs[0].scratch_base = scratch_base;
+    procs[0].img_end = img_end;
     // Per-process demand-fill bookkeeping — kept in a `static mut` (3×2 KiB) rather than on the
     // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
@@ -5589,17 +5593,17 @@ unsafe fn service_sec_image(
             },
             Ordering::Relaxed,
         );
-        let pml4 = pml4s[pi];
-        let scratch_base = scratch_bases[pi];
-        let img_end = img_ends[pi];
+        let pml4 = procs[pi].pml4;
+        let scratch_base = procs[pi].scratch_base;
+        let img_end = procs[pi].img_end;
         let pe: &nt_pe_loader::PeFile = match pi {
             1 => csrss_pe.as_ref().unwrap(),
             2 => winlogon_pe.as_ref().unwrap(),
             _ => pe,
         };
-        faults = pfaults[pi];
-        first = pfirst[pi];
-        ntfaults = pntfaults[pi];
+        faults = procs[pi].faults;
+        first = procs[pi].first;
+        ntfaults = procs[pi].ntfaults;
         filled_pages = pfilled[pi];
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
@@ -5613,7 +5617,7 @@ unsafe fn service_sec_image(
                 if fip >= nb && fip < nb + image_extent(npe) {
                     if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
                         // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
-                        pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                        procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
                         let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 3, fip + 3, m1, m2, 0);
                         badge = nb;
                         mi = nmi;
@@ -5668,7 +5672,7 @@ unsafe fn service_sec_image(
                     csrss_frame_put(pi as u64, page, f);
                 }
                 faults += 1;
-                pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -5688,7 +5692,7 @@ unsafe fn service_sec_image(
                 let _ = page_map(f, page, RW_NX, pml4);
                 csrss_frame_put(pi as u64, page, f); // CSR shared section (pi 1) — shareable into win32k
                 faults += 1;
-                pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -5807,7 +5811,7 @@ unsafe fn service_sec_image(
                 print_u64(shareable as u64);
                 print_str(b"\n");
             }
-            pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
             badge = nb;
             mi = nmi;
@@ -5977,9 +5981,9 @@ unsafe fn service_sec_image(
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
-                    pml4s[1] = cpml4;
-                    img_ends[1] = PE_LOAD_BASE + image_extent(cpe);
-                    scratch_bases[1] = CSRSS_SCRATCH_BASE;
+                    procs[1].pml4 = cpml4;
+                    procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
+                    procs[1].scratch_base = CSRSS_SCRATCH_BASE;
                     // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
@@ -6021,9 +6025,9 @@ unsafe fn service_sec_image(
                         WINLOGON_STACK_MIRROR_VA, WINLOGON_HEAP_MIRROR_VA, WINLOGON_IMAGE_MIRROR_VA,
                         WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
                     );
-                    pml4s[2] = wpml4;
-                    img_ends[2] = PE_LOAD_BASE + image_extent(wpe);
-                    scratch_bases[2] = WINLOGON_SCRATCH_BASE;
+                    procs[2].pml4 = wpml4;
+                    procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
+                    procs[2].scratch_base = WINLOGON_SCRATCH_BASE;
                     // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
@@ -6074,7 +6078,7 @@ unsafe fn service_sec_image(
                 }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
-                // in smss's VSpace = pml4s[0], demand-filling from smss's image + ntdll), then write the
+                // in smss's VSpace = procs[0].pml4, demand-filling from smss's image + ntdll), then write the
                 // completed client comm-port handle to csrss's *PortHandle + reply csrss via REPLY_MAIN.
                 if nt_handler.lpc_rendezvous_conn != 0 {
                     let conn_id = nt_handler.lpc_rendezvous_conn;
@@ -6084,9 +6088,9 @@ unsafe fn service_sec_image(
                     print_str(b") -> driving the real SmpApiLoop accept\n");
                     let client_handle = sm_rendezvous(
                         conn_id,
-                        pml4s[0],
+                        procs[0].pml4,
                         smss_pe,
-                        img_ends[0],
+                        procs[0].img_end,
                         nt_base,
                         nt_end,
                         ntdll.map(|(_, p)| p),
@@ -6376,7 +6380,7 @@ unsafe fn service_sec_image(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
+            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 // Don't reply to the self-terminated thread — leave it blocked and recv the next
@@ -6466,12 +6470,12 @@ unsafe fn service_sec_image(
         print_str(b"[sec-stop] csrss (badge 2) spawned, handle 0x");
         print_hex(csrss_process_handle as u32);
         print_str(b"; demand-paged ");
-        print_u64(pfaults[1]);
+        print_u64(procs[1].faults);
         print_str(b" page(s) (");
-        print_u64(pntfaults[1]);
+        print_u64(procs[1].ntfaults);
         print_str(b" in ntdll), first fault=0x");
-        print_hex((pfirst[1] >> 32) as u32);
-        print_hex(pfirst[1] as u32);
+        print_hex((procs[1].first >> 32) as u32);
+        print_hex(procs[1].first as u32);
         print_str(b"\n");
     }
     print_str(b"[sec-stop] NEXT_SLOT=");
@@ -6581,17 +6585,27 @@ unsafe fn service_sec_image(
     }
     print_str(b"\n");
     // Record winlogon's (slot 2) demand-fault count for the spec check + report line.
-    WINLOGON_FAULTS.store(pfaults[2], Ordering::Relaxed);
+    WINLOGON_FAULTS.store(procs[2].faults, Ordering::Relaxed);
     print_str(b"[ntos-exec] winlogon (slot 2) demand-faulted ");
-    print_u64(pfaults[2]);
+    print_u64(procs[2].faults);
     print_str(b" page(s), first=0x");
-    print_hex((pfirst[2] >> 32) as u32);
-    print_hex(pfirst[2] as u32);
+    print_hex((procs[2].first >> 32) as u32);
+    print_hex(procs[2].first as u32);
     print_str(b"\n");
+    // Path 3: record that each folded per-process ProcExec is EPROCESS-linked (live pml4 + its pid
+    // matches the ProcessManager's pid for that pi). Read by `exec_eprocess_linked_mechanism`.
+    let mut link_ok = 0u64;
+    for (i, p) in procs.iter().enumerate() {
+        if p.pml4 != 0 && p.pid != 0 && nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64) == Some(p.pid)
+        {
+            link_ok |= 1 << i;
+        }
+    }
+    PM_EXEC_LINK_OK.store(link_ok, Ordering::Relaxed);
     // Report smss's (slot 0) own fault stats regardless of which process stopped the loop — csrss
     // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
     // exec_reactos_smss_* checks are about smss specifically. csrss's counts are in the sec-stop line.
-    (verdict, pfaults[0], pfirst[0], stop, pntfaults[0], stop_ssn)
+    (verdict, procs[0].faults, procs[0].first, stop, procs[0].ntfaults, stop_ssn)
 }
 
 /// Spawn the isolated user thread: its own VSpace (image RO + stack + IPC buffer),
@@ -7592,6 +7606,43 @@ static PM_NTOPENPROCESS_OK: AtomicU64 = AtomicU64::new(0);
 /// Count of real NtTerminateProcess calls the executive serviced (0 during a normal boot — no hosted
 /// process terminates; the handler is additive + proven by the post-loop self-test).
 static PM_TERMINATE_CALLS: AtomicU64 = AtomicU64::new(0);
+// === Path 3 — fold the per-pi IDENTITY arrays into an EPROCESS-linked per-process struct =========
+/// Executive-side per-hosted-process MECHANISM state, EPROCESS-linked. Path 3 of the nt-process
+/// convergence folds the six parallel `[_;3]` identity arrays that `service_sec_image` indexed by
+/// `pi` (pml4s / scratch_bases / img_ends / pfaults / pfirst / pntfaults) into ONE array-of-structs,
+/// each slot carrying its own mechanism state PLUS the `pid` link to its real nt-process EPROCESS
+/// (== the pid in `PM_PIDS[pi]`). Behavior-preserving: the same values, keyed the same way (fault
+/// badge → pi), just consolidated + EPROCESS-linked instead of six parallel arrays. The seL4 VSpace
+/// cap + the scratch/image VAs stay executive-side (only the trusted root task holds those caps — the
+/// policy/mechanism split); this struct just consolidates them under the EPROCESS link so the service
+/// loop reads a process's mechanism state via its EPROCESS instead of parallel arrays.
+#[derive(Clone, Copy)]
+struct ProcExec {
+    /// EPROCESS pid backing this hosted process (0 until linked); mirrors `PM_PIDS[pi]` — the
+    /// badge↔pid convergence link, so the loop reaches the per-process mechanism via the EPROCESS.
+    pid: u64,
+    /// seL4 VSpace (PML4) cap for this process's address space (0 until the process is spawned).
+    pml4: u64,
+    /// Per-process demand-fill scratch base VA (was `scratch_bases[pi]`).
+    scratch_base: u64,
+    /// End VA of this process's mapped image — the demand-fill upper bound (was `img_ends[pi]`).
+    img_end: u64,
+    /// Total page faults serviced for this process (was `pfaults[pi]`).
+    faults: u64,
+    /// First faulting address seen for this process — diagnostics (was `pfirst[pi]`).
+    first: u64,
+    /// NT-syscall faults serviced for this process (was `pntfaults[pi]`).
+    ntfaults: u64,
+}
+impl ProcExec {
+    const fn empty() -> Self {
+        ProcExec { pid: 0, pml4: 0, scratch_base: 0, img_end: 0, faults: 0, first: 0, ntfaults: 0 }
+    }
+}
+/// Bit i set iff `procs[i]` (the folded EPROCESS-linked per-process struct) has a live pml4 AND its
+/// `pid` matches the ProcessManager's pid for pi=i — proves the consolidated per-process mechanism
+/// struct is EPROCESS-linked at runtime (path 3). Expected 0b111 (all 3 hosted processes spawned).
+static PM_EXEC_LINK_OK: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -11587,6 +11638,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_LIFECYCLE_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
+                    // Path 3 — the six ex-parallel per-pi identity arrays (pml4s/scratch_bases/
+                    // img_ends/pfaults/pfirst/pntfaults) are now ONE array of `ProcExec`, each slot
+                    // EPROCESS-linked via its `pid`. `exec_eprocess_linked_mechanism` = every hosted
+                    // process's folded mechanism struct has a live pml4 AND its pid matches the
+                    // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
+                    check(
+                        b"exec_eprocess_linked_mechanism",
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b111,
+                        &mut passed,
+                    );
                     print_str(b"[ntos-exec] nt-process path2: main-threads-ok=0x");
                     print_hex(PM_MAIN_THREADS_OK.load(Ordering::Relaxed) as u32);
                     print_str(b" binds=0x");
@@ -11625,6 +11686,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_main_thread_bound_at_spawn", false, &mut passed);
                     check(b"exec_ntopenprocess_mints_handle", false, &mut passed);
                     check(b"exec_ntterminateprocess_teardown", false, &mut passed);
+                    check(b"exec_eprocess_linked_mechanism", false, &mut passed);
                 }
             }
             Err(_) => {
