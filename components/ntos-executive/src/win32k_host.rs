@@ -1887,89 +1887,66 @@ fn register_trampolines() {
     reg.bind("RtlMoveMemory", s_memmove as usize as u64);
     reg.bind("memset", s_memset as usize as u64);
     reg.bind("RtlFillMemory", s_memset as usize as u64);
+    // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
+    reg.bind("PsGetCurrentProcessId", s_current_process_id as usize as u64);
+    reg.bind("PsGetCurrentThreadProcessId", s_current_process_id as usize as u64);
+    reg.bind("IoGetCurrentProcess", s_current_process as usize as u64);
+    reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
+    reg.bind("PsGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind("KeGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind("PsGetCurrentProcessWin32Process", s_get_win32process as usize as u64);
+    reg.bind("PsGetProcessWin32Process", s_get_win32process as usize as u64);
+    reg.bind("PsGetCurrentThreadWin32Thread", s_get_win32thread as usize as u64);
+    reg.bind("PsGetThreadWin32Thread", s_get_win32thread as usize as u64);
+    reg.bind("PsSetProcessWin32Process", s_set_win32process as usize as u64);
+    reg.bind("PsSetThreadWin32Thread", s_set_win32thread as usize as u64);
+    reg.bind("PsEstablishWin32Callouts", s_establish_win32_callouts as usize as u64);
+    // --- batch 4: misc scalars ---
+    reg.bind("IoGetDeviceObjectPointer", s_io_get_device_object_pointer as usize as u64);
+    reg.bind("KeUserModeCallback", s_ke_user_mode_callback as usize as u64);
+    reg.bind("KeAddSystemServiceTable", s_ke_add_system_service_table as usize as u64);
+    reg.bind("DbgPrint", s_dbg_print as usize as u64);
+    // --- batch 4: resource / lock acquire → BOOLEAN TRUE (single-threaded host: always acquired) ---
+    reg.bind("ExAcquireResourceExclusiveLite", s_true as usize as u64);
+    reg.bind("ExAcquireResourceSharedLite", s_true as usize as u64);
+    reg.bind("ExIsResourceAcquiredExclusiveLite", s_true as usize as u64);
+    reg.bind("ExIsResourceAcquiredSharedLite", s_true as usize as u64);
+    reg.bind("ExEnterCriticalRegionAndAcquireResourceShared", s_true as usize as u64);
+    reg.bind("ExEnterCriticalRegionAndAcquireResourceExclusive", s_true as usize as u64);
+    reg.bind("ExEnterCriticalRegionAndAcquireFastMutexUnsafe", s_true as usize as u64);
+    reg.bind("ExfAcquirePushLockExclusive", s_true as usize as u64);
+    reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
+    reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
+    reg.bind("ExGetPreviousMode", s_true as usize as u64);
+    // --- batch 4: DATA EXPORTS folded in as data-cell resolutions. The IAT slot points at the
+    // cell (WIN32K_DATA_VADDR page 1); load_into writes each cell's VALUE from DATA_EXPORTS. The
+    // 8 object-type/Se/Nls cells still hold placeholder pointers (backlog: real OBJECT_TYPEs);
+    // the 3 Mm cells hold architectural x64 constants. Contract declared in
+    // nt_compat_exports::win32k_resolve::WIN32K_DATA_EXPORTS.
+    let mut di = 0usize;
+    while di < DATA_EXPORTS.len() {
+        reg.bind(DATA_EXPORTS[di].0, WIN32K_DATA_VADDR + 0x1000 + di as u64 * 8);
+        di += 1;
+    }
 }
 
-/// Resolve an import name to a trampoline. Data exports are handled separately (cells); this
-/// returns code addresses only. Unknown/unmodelled → a benign zero stub (like the KMDF host).
+/// Resolve an import name to its IAT-slot value: a code trampoline VA, or (for the 11 data
+/// exports) the data-cell address. Pure registry resolve now (Workstream B): the executive
+/// registered every real trampoline + data cell by name into the `nt-compat-exports`
+/// [`Win32kExportRegistry`]; unregistered names get the benign zero stub (STATUS_SUCCESS / null
+/// / void), which is how the declared stub / `TrapIfCalled` / off-path imports resolve. The
+/// hardcoded match is GONE.
 pub fn export_addr(name: &str) -> u64 {
-    // Registration-driven resolution first (Workstream B): a trampoline the executive bound by
-    // name wins over the hardcoded match. Lazily populate the registry so this is correct no
-    // matter which loader calls export_addr first.
-    // SAFETY: single-threaded; populated once, read-only thereafter.
+    // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
     unsafe {
         if !WIN32K_EXPORTS_READY {
             register_trampolines();
             WIN32K_EXPORTS_READY = true;
         }
-        if let Some(va) = (*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup(name) {
-            return va;
-        }
+        (*core::ptr::addr_of!(WIN32K_EXPORTS))
+            .lookup(name)
+            .unwrap_or(s_zero as usize as u64)
     }
-    let f: u64 = match name {
-        // pool
-        "ExAllocatePoolWithTag" => s_ex_alloc_pool_with_tag as usize as u64,
-        "ExAllocatePool" => s_ex_alloc_pool as usize as u64,
-        "ExAllocatePoolWithQuotaTag" => s_ex_alloc_pool_quota as usize as u64,
-        "ExFreePoolWithTag" | "ExFreePool" => s_ex_free_pool_with_tag as usize as u64,
-        "PsGetCurrentProcessId" | "PsGetCurrentThreadProcessId" => s_current_process_id as usize as u64,
-        // RTL atom table (nt_kernel_exec::rtl_atom) — gAtomTable + per-window-station tables. Real
-        // now (was s_zero → null gAtomTable → UserRegisterSystemClasses null-deref on string classes).
-        "RtlCreateAtomTable" => s_rtl_create_atom_table as usize as u64,
-        "RtlAddAtomToAtomTable" => s_rtl_add_atom_to_atom_table as usize as u64,
-        "RtlLookupAtomInAtomTable" => s_rtl_lookup_atom_in_atom_table as usize as u64,
-        "RtlDeleteAtomFromAtomTable" => s_rtl_delete_atom_from_atom_table as usize as u64,
-        "RtlPinAtomInAtomTable" => s_rtl_pin_atom_in_atom_table as usize as u64,
-        "RtlQueryAtomInAtomTable" => s_rtl_query_atom_in_atom_table as usize as u64,
-        "RtlDestroyAtomTable" => s_rtl_destroy_atom_table as usize as u64,
-        "IoGetDeviceObjectPointer" => s_io_get_device_object_pointer as usize as u64,
-        // win32k -> client user-mode callback bridge (cursor/icon/menu resource setup)
-        "KeUserModeCallback" => s_ke_user_mode_callback as usize as u64,
-        // SSDT registration
-        "KeAddSystemServiceTable" => s_ke_add_system_service_table as usize as u64,
-        // debug print
-        "DbgPrint" => s_dbg_print as usize as u64,
-        // current process/thread + real per-process win32-slots (set by win32k's process callout)
-        "IoGetCurrentProcess" | "PsGetCurrentProcess" => s_current_process as usize as u64,
-        "PsGetCurrentThread" | "KeGetCurrentThread" => s_current_thread as usize as u64,
-        "PsGetCurrentProcessWin32Process" | "PsGetProcessWin32Process" => {
-            s_get_win32process as usize as u64
-        }
-        "PsGetCurrentThreadWin32Thread" | "PsGetThreadWin32Thread" => {
-            s_get_win32thread as usize as u64
-        }
-        "PsSetProcessWin32Process" => s_set_win32process as usize as u64,
-        "PsSetThreadWin32Thread" => s_set_win32thread as usize as u64,
-        "PsEstablishWin32Callouts" => s_establish_win32_callouts as usize as u64,
-        "ObReferenceObjectByHandle" => s_ob_reference_object_by_handle as usize as u64,
-        // real Ob object layer for win32k's DESKTOP + WINDOWSTATION creation
-        "ObOpenObjectByName" => s_ob_open_object_by_name as usize as u64,
-        "ObCreateObject" => s_ob_create_object as usize as u64,
-        "ObInsertObject" => s_ob_insert_object as usize as u64,
-        // resource / lock acquire → BOOLEAN TRUE (single-threaded host: always "acquired")
-        "ExAcquireResourceExclusiveLite"
-        | "ExAcquireResourceSharedLite"
-        | "ExIsResourceAcquiredExclusiveLite"
-        | "ExIsResourceAcquiredSharedLite"
-        | "ExEnterCriticalRegionAndAcquireResourceShared"
-        | "ExEnterCriticalRegionAndAcquireResourceExclusive"
-        | "ExEnterCriticalRegionAndAcquireFastMutexUnsafe"
-        | "ExfAcquirePushLockExclusive"
-        | "ExfTryToWakePushLock"
-        | "KeSetKernelStackSwapEnable"
-        | "ExGetPreviousMode" => s_true as usize as u64,
-        // everything else: benign zero (STATUS_SUCCESS / null / void)
-        _ => s_zero as usize as u64,
-    };
-    f
-}
-
-/// The 11 data-export globals win32k dereferences at init. Returns the fixed CELL address for
-/// `name` (the IAT slot points here; the cell holds a non-null pointer or a constant value),
-/// or `None` if `name` is not a data export.
-fn data_cell_addr(name: &str) -> Option<u64> {
-    let cell = WIN32K_DATA_VADDR + 0x1000;
-    let idx = DATA_EXPORTS.iter().position(|(n, _)| *n == name)?;
-    Some(cell + idx as u64 * 8)
 }
 
 /// (name, cell value). Object-type / SE_EXPORTS / NlsMbCodePageTag point at a zeroed placeholder
@@ -2132,7 +2109,9 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
                         n += 1;
                     }
                     let name = core::str::from_utf8_unchecked(&buf[..n]);
-                    let addr = data_cell_addr(name).unwrap_or_else(|| export_addr(name));
+                    // Pure registry resolve: code trampoline VAs AND the 11 data-cell addresses
+                    // both come from export_addr now (data cells folded into the registry).
+                    let addr = export_addr(name);
                     write_unaligned((slots + k * 8) as *mut u64, addr);
                 }
                 k += 1;

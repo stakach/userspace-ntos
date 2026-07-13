@@ -29,6 +29,27 @@ pub fn export_descriptor(name: &str) -> Option<&'static ExportDescriptor> {
         .find(|d| d.name == name)
 }
 
+/// The 11 `ntoskrnl.exe` **data exports** win32k dereferences at init, in cell-index order.
+/// Each resolves to a data *cell* (not a code trampoline): the IAT slot points at the cell, which
+/// holds the value (an object-type/Se/Nls placeholder pointer, or an architectural Mm boundary
+/// constant). The executive folds these into the [`Win32kExportRegistry`] by binding each name to
+/// its cell address; this list is the declared, host-tested contract of *which* names are data
+/// exports and their order. (Backlog: the 8 object-type/Se/Nls cells should become real
+/// nt-object-manager `OBJECT_TYPE`s instead of placeholder pointers.)
+pub const WIN32K_DATA_EXPORTS: &[&str] = &[
+    "PsProcessType",
+    "PsThreadType",
+    "ExDesktopObjectType",
+    "ExWindowStationObjectType",
+    "ExEventObjectType",
+    "LpcPortObjectType",
+    "SeExports",
+    "NlsMbCodePageTag",
+    "MmSystemRangeStart",
+    "MmUserProbeAddress",
+    "MmHighestUserAddress",
+];
+
 /// Capacity of the fixed trampoline-binding array. Comfortably above the number
 /// of distinct trampolines the executive registers (~41 today, aliases share a
 /// VA); [`Win32kExportRegistry::bind`] returns `false` once exhausted.
@@ -226,6 +247,25 @@ mod tests {
                 "first-batch import {name} is {:?}, expected Implemented/Partial",
                 d.status
             );
+        }
+    }
+
+    #[test]
+    fn data_exports_are_declared_data_exports() {
+        assert_eq!(WIN32K_DATA_EXPORTS.len(), 11);
+        for name in WIN32K_DATA_EXPORTS {
+            let d = export_descriptor(name)
+                .unwrap_or_else(|| panic!("data export {name} is not declared"));
+            assert!(
+                d.notes.contains("data export"),
+                "data export {name} descriptor notes do not mark it as a data export: {:?}",
+                d.notes
+            );
+        }
+        // No duplicates (cell indices must be unique).
+        let mut seen = std::collections::BTreeSet::new();
+        for n in WIN32K_DATA_EXPORTS {
+            assert!(seen.insert(*n), "duplicate data export {n}");
         }
     }
 

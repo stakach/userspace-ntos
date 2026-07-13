@@ -21,7 +21,9 @@ pub mod win32k;
 pub mod win32k_resolve;
 
 pub use registry::{ExportRegistry, ImportCheck, ImportOutcome, ImportReport};
-pub use win32k_resolve::{export_descriptor, Win32kExportRegistry, WIN32K_TRAMPOLINE_CAP};
+pub use win32k_resolve::{
+    export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_TRAMPOLINE_CAP,
+};
 pub use ssdt::{
     ServiceTable, ServiceTableRegistry, WIN32K_SERVICE_BASE, WIN32K_SERVICE_TABLE_INDEX,
 };
