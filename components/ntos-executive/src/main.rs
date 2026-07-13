@@ -128,12 +128,21 @@ pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 /// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
 /// NTDLL_BASE + each import's export RVA.
 pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
-/// smss's process environment (all clear of smss's image extent 0x56-0x57d and the stack 0x5c):
-/// a trampoline that sets RCX=PEB then jumps to the entry, a PEB, the process parameters, a TEB.
+/// A hosted process's environment pages (TEB/PEB/params/trampoline). These live in the SAME 2 MiB
+/// image page table (the reserved IMAGE_BASE PT spans [0x40_0000, 0x60_0000)) but must sit BELOW
+/// PE_LOAD_BASE (0x56_0000) so they never collide with the hosted EXE's own image, which loads at
+/// PE_LOAD_BASE and grows UP. The OLD placement at 0x58/0x59/0x5A_0000 (= PE_LOAD_BASE + 0x20/0x30/
+/// 0x40 KiB) worked only because smss/csrss are tiny (<128 KiB); winlogon.exe is 245 KiB (image
+/// ends 0x59d000), so its .rdata (the TLS directory @ rva 0x20940 → 0x58_0940) was SHADOWED by the
+/// PEB page → LdrpInitializeTls read a zero AddressOfIndex and #PF'd writing through NULL. Placing
+/// the env block in [0x51_0000, 0x54_0000) keeps it clear of every hosted EXE (all load at
+/// 0x56_0000). Same VA in each VSpace (independent page tables), so one set of constants suffices.
+/// Layout (below PE_LOAD_BASE, distinct pages, in the reserved image PT): TEB @0x51 (2 pages),
+/// params+env @0x52 (2 pages), PEB @0x53 (1 page), trampoline @0x55 (1 page).
 pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
-pub const SMSS_PEB_VA: u64 = 0x0000_0100_0058_0000;
-pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0059_0000;
-pub const SMSS_TEB_VA: u64 = 0x0000_0100_005A_0000;
+pub const SMSS_PEB_VA: u64 = 0x0000_0100_0053_0000;
+pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0052_0000;
+pub const SMSS_TEB_VA: u64 = 0x0000_0100_0051_0000;
 /// The executive's mirror of smss's stack (same frames), for reading/writing a syscall's
 /// stack-based pointer args (copyin/copyout). In the FILEBUF PT (0x60-0x80), present.
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
