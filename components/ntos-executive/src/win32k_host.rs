@@ -515,24 +515,116 @@ extern "win64" fn s_ob_insert_object(
     }
 }
 
-/// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE,
-/// PVOID *Object, ...)` — resolve a handle to its object. A registered win32k object handle
-/// (DESKTOP/WINDOWSTATION) → its real body; otherwise (win32k's process-connect handle) → the
-/// current EPROCESS. Writes `*Object`, refs it.
+/// `STATUS_OBJECT_TYPE_MISMATCH` — `ObReferenceObjectByHandle` ExpectedType check failed.
+const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
+
+/// `NTSTATUS ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, POBJECT_TYPE ObjectType, KPROCESSOR_MODE,
+/// PVOID *Object, ...)` — resolve a handle to its object, **enforcing `ObjectType`** (real NT
+/// semantics, `references/nt5/base/ntos/ob/obref.c`): a non-NULL `ObjectType` that does not match the
+/// referenced object's type fails with `STATUS_OBJECT_TYPE_MISMATCH` and hands back no object; a NULL
+/// `ObjectType` is polymorphic (any type — e.g. `NtClose`/`NtQueryObject`).
+///
+/// A registered win32k object handle (DESKTOP/WINDOWSTATION) → its real body, checked against its
+/// [`ObKind`] via [`nt_object_manager::win32k_ob::object_type_matches`]. Any other handle is win32k's
+/// process-connect handle ([`FAKE_PROCESS_HANDLE`]) → the current EPROCESS, whose type is
+/// `PsProcessType`; a non-NULL `ObjectType` there must be `PsProcessType`.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
     _access: u64,
-    _obj_type: u64,
+    obj_type: u64,
     _mode: u64,
     object_out: *mut u64,
 ) -> i32 {
+    let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
+    let obj = match table.lookup(handle) {
+        Some((kind, body)) => {
+            if !nt_object_manager::win32k_ob::object_type_matches(kind, obj_type) {
+                ob_type_mismatch_trace(handle, obj_type, b"win32k-obj");
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+            body
+        }
+        // Unregistered handle → the current EPROCESS catch-all fake. Two cases:
+        //  - the process-connect handle (FAKE_PROCESS_HANDLE): a real, typed object == the current
+        //    EPROCESS (PsProcessType) — ENFORCE ExpectedType against PsProcessType.
+        //  - any other unregistered handle (e.g. an optional/NULL handle): we have no modeled typed
+        //    object to check it against, so we stay permissive (as before enforcement). Rejecting
+        //    here would regress paths the catch-all fake formerly satisfied — see the note below.
+        None => {
+            let process_ty = nt_object_manager::object_type::process_object_type_addr();
+            if handle == FAKE_PROCESS_HANDLE {
+                if obj_type != 0 && obj_type != process_ty {
+                    ob_type_mismatch_trace(handle, obj_type, b"process-connect");
+                    return STATUS_OBJECT_TYPE_MISMATCH;
+                }
+            } else if obj_type != 0 && obj_type != process_ty {
+                // A specific ExpectedType against the untyped catch-all fake. This surfaces a latent
+                // gap (the real typed object — here an Event — is not modeled; csrss's win32 init
+                // path references it through win32k). Permissive to preserve behaviour; reported.
+                ob_untyped_catchall_trace(handle, obj_type);
+            }
+            PH_EPROCESS_VA
+        }
+    };
     if !object_out.is_null() {
-        let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
-        let body = table.lookup_body(handle);
-        let obj = if body != 0 { body } else { PH_EPROCESS_VA };
         unsafe { write_unaligned(object_out, obj) };
     }
     0
+}
+
+/// Diagnostic for an `ObReferenceObjectByHandle` ExpectedType mismatch — prints the handle, the
+/// (unexpected) `ObjectType` pointer, and which known type statics it is/ isn't, so a gate mismatch
+/// can be classified (polymorphic call site that should pass NULL vs a genuine type confusion).
+fn ob_type_mismatch_trace(handle: u64, obj_type: u64, which: &[u8]) {
+    unsafe {
+        use nt_object_manager::object_type as ot;
+        print_str(b"[win32k-host] ObRefByHandle TYPE_MISMATCH on ");
+        print_str(which);
+        print_str(b" handle=0x");
+        print_hex(handle as u32);
+        print_str(b" expected_type=0x");
+        print_hex((obj_type >> 32) as u32);
+        print_hex(obj_type as u32);
+        let tag: &[u8] = if obj_type == ot::desktop_object_type_addr() {
+            b" (=Desktop)"
+        } else if obj_type == ot::window_station_object_type_addr() {
+            b" (=WindowStation)"
+        } else if obj_type == ot::process_object_type_addr() {
+            b" (=Process)"
+        } else if obj_type == ot::thread_object_type_addr() {
+            b" (=Thread)"
+        } else if obj_type == ot::event_object_type_addr() {
+            b" (=Event)"
+        } else if obj_type == ot::port_object_type_addr() {
+            b" (=Port)"
+        } else {
+            b" (=unknown)"
+        };
+        print_str(tag);
+        print_str(b"\n");
+    }
+}
+
+/// Informational trace for an `ObReferenceObjectByHandle` against the untyped EPROCESS catch-all fake
+/// with a specific (non-Process) ExpectedType — a latent gap the fake masks. Permissive (no reject).
+fn ob_untyped_catchall_trace(handle: u64, obj_type: u64) {
+    unsafe {
+        use nt_object_manager::object_type as ot;
+        print_str(b"[win32k-host] ObRefByHandle untyped catch-all handle=0x");
+        print_hex(handle as u32);
+        print_str(b" expected_type=0x");
+        print_hex(obj_type as u32);
+        let tag: &[u8] = if obj_type == ot::event_object_type_addr() {
+            b" (=Event) -> permissive (real Event object not modeled)\n"
+        } else if obj_type == ot::desktop_object_type_addr() {
+            b" (=Desktop) -> permissive\n"
+        } else if obj_type == ot::window_station_object_type_addr() {
+            b" (=WindowStation) -> permissive\n"
+        } else {
+            b" -> permissive\n"
+        };
+        print_str(tag);
+    }
 }
 
 /// Bump-allocate from the win32k session-heap arena (RtlAllocateHeap). Same shape as `pool_alloc`

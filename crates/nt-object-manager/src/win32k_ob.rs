@@ -52,6 +52,32 @@ pub fn classify(type_ptr: u64) -> Option<ObKind> {
     }
 }
 
+/// Enforce an `ObReferenceObjectByHandle` **ExpectedType** against an object of `kind`.
+///
+/// NT semantics (`references/nt5/base/ntos/ob/obref.c` `ObpReferenceObjectByHandle`): if the caller
+/// passes a non-NULL `ObjectType` and the referenced object's type does not match, the reference
+/// fails with `STATUS_OBJECT_TYPE_MISMATCH`. A NULL `ObjectType` (`expected_type_ptr == 0`) is the
+/// polymorphic case (e.g. `NtClose` / `NtQueryObject`) — any type is allowed.
+///
+/// `expected_type_ptr` is the `POBJECT_TYPE` the caller supplied — the address of one of the real
+/// [`object_type`](crate::object_type) statics. A `Desktop` / `WindowStation` object matches only its
+/// own type static. [`ObKind::Other`] (an object created through `ObCreateObject` with a type this
+/// layer did not recognize) cannot be verified, so it stays permissive.
+pub fn object_type_matches(kind: ObKind, expected_type_ptr: u64) -> bool {
+    if expected_type_ptr == 0 {
+        return true; // NULL ExpectedType: polymorphic, any type allowed.
+    }
+    match kind {
+        ObKind::Desktop => expected_type_ptr == crate::object_type::desktop_object_type_addr(),
+        ObKind::WindowStation => {
+            expected_type_ptr == crate::object_type::window_station_object_type_addr()
+        }
+        // Unrecognized create-time type: we have no type identity to check against — stay permissive
+        // rather than reject (preserves the pre-enforcement behaviour for these objects).
+        ObKind::Other => true,
+    }
+}
+
 /// DESKTOP body field offsets (`references/reactos/win32ss/user/ntuser/desktop.h` `struct _DESKTOP`).
 pub mod desktop {
     /// `PDESKTOPINFO pDeskInfo` — the desktop-info block hung off the DESKTOP body.
@@ -210,6 +236,36 @@ mod tests {
             None,
             "a nearby-but-wrong pointer must not classify"
         );
+    }
+
+    #[test]
+    fn object_type_matches_enforces_expected_type() {
+        use crate::object_type::{
+            desktop_object_type_addr, process_object_type_addr, window_station_object_type_addr,
+        };
+        // Matching type resolves.
+        assert!(object_type_matches(ObKind::Desktop, desktop_object_type_addr()));
+        assert!(object_type_matches(
+            ObKind::WindowStation,
+            window_station_object_type_addr()
+        ));
+        // NULL ExpectedType is polymorphic: any kind resolves.
+        assert!(object_type_matches(ObKind::Desktop, 0));
+        assert!(object_type_matches(ObKind::WindowStation, 0));
+        assert!(object_type_matches(ObKind::Other, 0));
+        // Mismatched type is rejected (would be STATUS_OBJECT_TYPE_MISMATCH).
+        assert!(!object_type_matches(
+            ObKind::Desktop,
+            window_station_object_type_addr()
+        ));
+        assert!(!object_type_matches(
+            ObKind::WindowStation,
+            desktop_object_type_addr()
+        ));
+        // A desktop referenced as a Process (wrong type) is rejected.
+        assert!(!object_type_matches(ObKind::Desktop, process_object_type_addr()));
+        // Unrecognized create-time type stays permissive (no identity to verify).
+        assert!(object_type_matches(ObKind::Other, desktop_object_type_addr()));
     }
 
     #[test]
