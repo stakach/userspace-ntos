@@ -3158,16 +3158,20 @@ impl NativeSyscallHandler for ExecNtHandler {
                 self.queue_write(args[0], handle);
                 0
             },
-            // SM/CSR worker threads + semaphores. Fake handle written to RCX (stale slot). NOTE: this
-            // is the SAME latent RCX-vs-R10 out-param bug fixed for NtCreatePort above — harmless here
-            // ONLY because these handles are never checked by smss/csrss (a real NtCreateThread that
-            // runs the smss SM-loop = path B, which needs the real spawn + the R10 out-param).
-            NativeService::NtCreateThread | NativeService::NtCreateSemaphore => unsafe {
-                let out = get_recv_mr(2); // RCX = *Handle
-                smss_stack_write(out, self.next_handle);
+            // SM/CSR worker threads + semaphores. ★ OUT-PARAM FIX (path-B prep): the fake handle now
+            // goes to the x64 out-arg0 *Handle = R10 = args[0] via the out-writer queue (was RCX =
+            // get_recv_mr(2), which at UnknownSyscall-fault holds the syscall RETURN IP, so the handle
+            // landed on a code address and silently missed) — the SAME class as the NtCreatePort /
+            // NtCreateEvent bug. Harmless-but-latent while the handles are unused; making it correct is
+            // load-bearing for the AUTHENTIC path B (smss's real SmpApiLoop thread needs a REAL handle
+            // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
+            // running smss thread in smss's VSpace) is the next path-B step.
+            NativeService::NtCreateThread | NativeService::NtCreateSemaphore => {
+                let h = self.next_handle;
                 self.next_handle += 1;
+                self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
                 0
-            },
+            }
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
             // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). NtSecureConnectPort is the same but with
             // *ServerSid inserted at arg5 — PortName stays arg2. Route to the LPC broker; on the
