@@ -37,6 +37,17 @@ pub enum ObKind {
 pub mod desktop {
     /// `PDESKTOPINFO pDeskInfo` — the desktop-info block hung off the DESKTOP body.
     pub const P_DESK_INFO: usize = 0x08;
+    /// `LIST_ENTRY PtiList` — the desktop's thread-info list head (desktop.h). Offset from the
+    /// DESKTOP layout: dwSessionId@0, pDeskInfo@8, ListEntry@0x10, rpwinstaParent@0x20, dwDTFlags@0x28,
+    /// dwDesktopId@0x30, spmenu{Sys,DialogSys,HScroll,VScroll}@0x38..0x58, spwnd*@0x58..0x78,
+    /// hsectionDesktop@0x78, pheapDesktop@0x80, ulHeapSize@0x88, PtiList@0x90.
+    pub const PTI_LIST: usize = 0x90;
+    /// `LIST_ENTRY ShellHookWindows` — the desktop's shell-hook window list head. Continuing:
+    /// dwConsoleThreadId@0xA0, spwndTrack@0xA8, htEx@0xB0, rcMouseHover@0xB4, dwMouseHoverTime@0xC4,
+    /// ActiveMessageQueue@0xC8, DesktopWindow@0xD0, BlockInputThread@0xD8, ShellHookWindows@0xE0.
+    /// `UserBuildShellHookHwndList` (desktop.c) walks this on every window activation (SWP_SHOWWINDOW
+    /// → co_IntShellHookNotify) — an uninitialized head null-derefs.
+    pub const SHELL_HOOK_WINDOWS: usize = 0xE0;
 }
 
 /// Body size to allocate for a `DESKTOP` (real `sizeof(DESKTOP)` is ~0x100; headroom, zeroed).
@@ -146,9 +157,17 @@ impl ObHandleTable {
 /// object-type definition rather than in host glue.
 ///
 /// # Safety
-/// `desktop_body` must point to at least [`desktop::P_DESK_INFO`] + 8 writable bytes.
+/// `desktop_body` must point to at least [`DESKTOP_BODY_SIZE`] writable bytes.
 pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
     core::ptr::write_unaligned(desktop_body.add(desktop::P_DESK_INFO) as *mut u64, desktop_info);
+    // InitializeListHead the DESKTOP's list heads (Flink=Blink=&head), as real IntCreateDesktop does.
+    // The window-manager/paint path walks these (PtiList, ShellHookWindows); a zeroed (NULL Flink) head
+    // null-derefs on the first traversal.
+    for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
+        let head = desktop_body.add(off) as u64;
+        core::ptr::write_unaligned(desktop_body.add(off) as *mut u64, head); // Flink = &head
+        core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head); // Blink = &head
+    }
 }
 
 #[cfg(test)]
@@ -228,11 +247,28 @@ mod tests {
 
     #[test]
     fn desktop_body_wires_desk_info() {
-        let mut body = [0u8; 0x40];
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
         unsafe {
             init_desktop_body(body.as_mut_ptr(), 0xDEC0_0000);
             let p = core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
             assert_eq!(p, 0xDEC0_0000);
+        }
+    }
+
+    #[test]
+    fn desktop_body_initializes_list_heads() {
+        // ShellHookWindows + PtiList must be self-referential empty list heads (Flink=Blink=&head),
+        // so win32k's list traversals (UserBuildShellHookHwndList) terminate immediately.
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        let base = body.as_mut_ptr() as u64;
+        unsafe {
+            init_desktop_body(body.as_mut_ptr(), 0x1000);
+            for off in [desktop::PTI_LIST, desktop::SHELL_HOOK_WINDOWS] {
+                let flink = core::ptr::read_unaligned(body.as_ptr().add(off) as *const u64);
+                let blink = core::ptr::read_unaligned(body.as_ptr().add(off + 8) as *const u64);
+                assert_eq!(flink, base + off as u64);
+                assert_eq!(blink, base + off as u64);
+            }
         }
     }
 }

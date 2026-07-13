@@ -5422,6 +5422,9 @@ static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TCB: AtomicU64 = AtomicU64::new(0);
+/// One-shot guard: the dispatch-path backtrace mirror PT has been created (SYS_SEND paging is
+/// fire-and-forget so we can't re-map the PT idempotently).
+static WIN32K_DISP_BT_PT: AtomicU64 = AtomicU64::new(0);
 /// The win32k component's fault endpoint + host PML4 (set once DriverEntry+attach parked it at the
 /// dispatch signal), so `win32k_dispatch` can drive its persistent service loop from anywhere.
 static WIN32K_FAULT_EP: AtomicU64 = AtomicU64::new(0);
@@ -5808,6 +5811,7 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             }
             // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
             if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
+                win32k_dispatch_backtrace();
                 return (0xC000_0001u32 as i32, false);
             }
             if foreign {
@@ -5919,6 +5923,56 @@ unsafe fn tcb_read_rsp(tcb: u64) -> u64 {
         options(nostack),
     );
     rsp
+}
+
+/// Print the win32k call chain (return-address RVAs, deepest first) at a `win32k_dispatch` wall.
+/// Mirrors win32k's ACTIVE stack (fault-time RSP .. stack_top) into the executive's own VSpace and
+/// scans it for return addresses in win32k's image — same technique as the DriverEntry-path backtrace.
+unsafe fn win32k_dispatch_backtrace() {
+    let ss = WIN32K_STACK_SLOT.load(Ordering::Relaxed);
+    let sf = WIN32K_STACK_FRAMES.load(Ordering::Relaxed);
+    let tcb = WIN32K_TCB.load(Ordering::Relaxed);
+    if ss == 0 || sf == 0 || tcb == 0 {
+        return;
+    }
+    let mirror = 0x0000_0100_0732_0000u64;
+    if WIN32K_DISP_BT_PT.load(Ordering::Relaxed) == 0 {
+        let spt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+        let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, mirror, CAP_INIT_THREAD_VSPACE);
+        for i in 0..sf {
+            let _ = page_map(copy_cap(ss + i), mirror + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        WIN32K_DISP_BT_PT.store(1, Ordering::Relaxed);
+    }
+    let rsp = tcb_read_rsp(tcb);
+    let stack_top = STACK_BASE + sf * 0x1000;
+    let start = if rsp >= STACK_BASE && rsp < stack_top { rsp } else { STACK_BASE };
+    let code_va = win32k_host::WIN32K_CODE_VA;
+    let lo = code_va;
+    let hi = code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+    print_str(b"[w32disp] backtrace rsp=0x");
+    print_hex((rsp >> 32) as u32);
+    print_hex(rsp as u32);
+    print_str(b"\n");
+    // RAW stack window from fault rsp: each qword annotated with its win32k RVA if it lands in the
+    // image (a return address). RtlpCheckListEntry (0x24c50) did `sub rsp,0x28`, so its own return
+    // address is at [rsp+0x28] = the exact InsertXxxList wrapper caller — read that precisely.
+    if start >= STACK_BASE && start + 0x120 <= stack_top {
+        let mut off = 0u64;
+        while off < 0x120 {
+            let va = start + off;
+            let v = core::ptr::read_volatile((mirror + (va - STACK_BASE)) as *const u64);
+            if v >= lo && v < hi {
+                print_str(b"  [rsp+0x");
+                print_hex(off as u32);
+                print_str(b"] rva=0x");
+                print_hex(v.wrapping_sub(code_va) as u32);
+                print_str(b"\n");
+            }
+            off += 8;
+        }
+    }
 }
 
 /// Run the native-syscall service loop for the isolated user thread, routing each

@@ -177,6 +177,18 @@ pub const GPTI_DESKTOP_THREAD_RVA: u64 = 0x20b538;
 /// THREADINFO->ppi offset (confirmed by the disasm above: `mov rax,[rax+0x58]`).
 const THREADINFO_PPI_OFF: u64 = 0x58;
 
+/// win32k `.data` global `gpdeskInputDesktop` (desktop.c:52) RVA. `IntGetActiveDesktop()` returns it
+/// (desktop.c:1287); `co_IntShowDesktop` (winsta.c:340) derefs `Desktop->pDeskInfo->spwnd` and faults
+/// when it is NULL (RVA 0x6dc5c `mov rax,[rcx+8]`). It is written ONLY by `NtUserSwitchDesktop`
+/// (desktop.c:3044) — winlogon-driven, never reached in our flow. Derived from the disasm at
+/// NtUserSwitchDesktop RVA 0x6c2f8 `mov rax,[rip+0x19f229]` (0x6c2ff + 0x19f229) = the
+/// `pdesk == gpdeskInputDesktop` compare (desktop.c:2995); it sits directly below ScreenDeviceContext
+/// (0x20b530) and gptiDesktopThread (0x20b538). We poke it with the created DESKTOP body so
+/// co_IntShowDesktop's redraw machinery runs authentically (there is exactly one desktop, so the poke
+/// is equivalent to NtUserSwitchDesktop's `gpdeskInputDesktop = pdesk` without its winsta-locking /
+/// InputWindowStation / IntValidateDesktopHandle prerequisites we don't yet stand up).
+pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
+
 /// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
 pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
 /// NtUserCreateDesktop — SSDT idx 0x22d, calls IntCreateDesktop (RVA 0x657f0).
@@ -1619,6 +1631,31 @@ unsafe fn patch_eng_device_io_control() {
     write_volatile((va + 11) as *mut u8, 0xE0);
 }
 
+/// win32k's KeGetCurrentIrql helper RVA — `mov rax, cr8` (bytes 44 0F 20 C0) followed by `ret`. The
+/// unique CR8 access in the image (verified by opcode scan).
+const KE_GET_CURRENT_IRQL_RVA: u64 = 0x305c0;
+
+/// Patch win32k's inlined KeGetCurrentIrql (`mov rax,cr8`) to `xor rax,rax; nop` so it returns
+/// PASSIVE_LEVEL (0) instead of executing the CPL-0-only CR8 read (which #GPs in our user-mode
+/// component). Runs in `load_into` while win32k is mapped RW in the executive. Verifies the exact
+/// bytes first (44 0F 20 C0) so a future rebuild that moves the helper fails loudly rather than
+/// corrupting an unrelated instruction.
+unsafe fn patch_ke_get_current_irql() {
+    let p = WIN32K_CODE_VA + KE_GET_CURRENT_IRQL_RVA;
+    if read_volatile(p as *const u8) == 0x44
+        && read_volatile((p + 1) as *const u8) == 0x0F
+        && read_volatile((p + 2) as *const u8) == 0x20
+        && read_volatile((p + 3) as *const u8) == 0xC0
+    {
+        write_volatile(p as *mut u8, 0x48); // xor rax, rax
+        write_volatile((p + 1) as *mut u8, 0x31);
+        write_volatile((p + 2) as *mut u8, 0xC0);
+        write_volatile((p + 3) as *mut u8, 0x90); // nop (preserve the following ret)
+    } else {
+        print_str(b"[win32k] WARN: KeGetCurrentIrql cr8 bytes not found at RVA 0x305c0\n");
+    }
+}
+
 // --- win32k -> client user-mode callback bridge (KeUserModeCallback) --------------------------
 //
 // `NTSTATUS KeUserModeCallback(ULONG ApiNumber, PVOID InputBuffer, ULONG InputLength,
@@ -1983,6 +2020,14 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
     // calls AND win32k's own internal miniport IOCTLs route to us — no real DeviceObject needed).
     patch_eng_device_io_control();
 
+    // Patch win32k's inlined KeGetCurrentIrql helper (RVA 0x305c0 = `mov rax,cr8; ret`) to
+    // `xor rax,rax; nop; ret` (= return PASSIVE_LEVEL). CR8 (the x64 IRQL register) is CPL-0 only, so
+    // the read #GPs in our user-mode component; the window-position/lock path (co_WinPosSetWindowPos →
+    // focus/activation) reaches it. There is exactly ONE CR8 access in the image (verified by opcode
+    // scan), and our single-threaded, interrupt-free host is always at PASSIVE_LEVEL, so returning 0 is
+    // authentic.
+    patch_ke_get_current_irql();
+
     // NOTE: the FIRST-LIGHT binary patch (`patch_skip_cursor_tail`) that made
     // co_IntInitializeDesktopGraphics return early — skipping the cursor/icon/menu/show-desktop tail —
     // is REMOVED. The real `KeUserModeCallback` bridge (`s_ke_user_mode_callback`) now services the
@@ -2157,27 +2202,31 @@ unsafe fn setup_dispatch_context() {
     // Stand up gptiDesktopThread so IntCreateDesktop's IntGetAndReferenceClass(WC_DESKTOP, TRUE) has
     // the desktop thread's THREADINFO (class.c:1457) instead of the NULL global that faults at RVA
     // 0x50f94. Real win32k sets this from the RIT/desktop-thread bring-up (desktop.c:1566
-    // `gptiDesktopThread = PsGetCurrentThreadWin32Thread()`) which our host never runs. Use a SEPARATE
-    // THREADINFO placeholder (not the current dispatch thread) so the callback.c
-    // `ASSERT(current != gptiDesktopThread)` invariants stay satisfied for later user-mode callbacks.
-    // The desktop thread's `ppi` (+0x58) must be the SAME PROCESSINFO the current thread registers
-    // system classes into (UserRegisterSystemClasses uses GetW32ProcessInfo() = the current ppi;
-    // IntGetClassAtom looks up in gptiDesktopThread->ppi), so both = SLOT_W32PROCESS → the WC_DESKTOP
-    // class registered by one is found by the other. IntReferenceClass gets a NULL rpdesk → it just
-    // returns the base class (class.c:761 Desktop==NULL path), so no desktop is needed here.
-    // The desktop window itself is created ON this thread (IntCreateWindow window.c:1821
-    // `pti = pdeskCreated ? gptiDesktopThread : GetW32ThreadInfo()`), so its list heads + pClientInfo
-    // must be initialized exactly like the dispatch thread's — else InsertTailList(&pti->WindowListHead)
-    // faults at RVA 0x24c66.
+    // `gptiDesktopThread = PsGetCurrentThreadWin32Thread()`) which our host never runs.
+    //
+    // POINT IT AT THE DISPATCH THREAD (== the current thread), NOT a separate placeholder. The desktop
+    // WINDOW is created ON gptiDesktopThread (IntCreateWindow window.c:1821
+    // `pti = pdeskCreated ? gptiDesktopThread : GetW32ThreadInfo()`). If that differs from the current
+    // thread, then co_IntShowDesktop's `co_WinPosSetWindowPos`/`co_UserRedrawWindow` sends to the desktop
+    // window become CROSS-THREAD → co_MsqSendMessage queues into the desktop thread's message queue
+    // (uninitialized here → RtlpCheckListEntry null-deref at RVA 0x24c66, msgqueue.c) and would block on
+    // a thread that never runs. Making gptiDesktopThread == the current dispatch thread makes every
+    // desktop-window send INTRA-thread → win32k dispatches straight to DesktopWindowProc (WM_ERASEBKGND
+    // → IntPaintDesktop, no queue) — which mirrors real Windows where co_IntInitializeDesktopGraphics
+    // runs ON the desktop thread. The callback.c `ASSERT(current != gptiDesktopThread)` in the
+    // KeUserModeCallback path then trips (current IS gptiDesktopThread) but is an `int 0x2c` we skip
+    // (release-build semantics), harmless in our single-threaded host. `ppi` (+0x58) must be the
+    // PROCESSINFO the system classes registered into (SLOT_W32PROCESS) so IntGetClassAtom finds
+    // WC_DESKTOP.
     let ppi = read_volatile(SLOT_W32PROCESS as *const u64);
     let gpti_cell = (WIN32K_CODE_VA + GPTI_DESKTOP_THREAD_RVA) as *mut u64;
     if read_volatile(gpti_cell) == 0 && ppi != 0 {
-        let desk_thread = pool_alloc(0x800); // zeroed THREADINFO placeholder for the desktop thread
+        let desk_thread = w32thread; // the dispatch thread (same-thread desktop-window sends)
         if desk_thread != 0 {
             write_volatile((desk_thread + THREADINFO_PPI_OFF) as *mut u64, ppi);
             init_threadinfo_placeholder(desk_thread);
             write_volatile(gpti_cell, desk_thread);
-            print_str(b"[win32k-host] gptiDesktopThread set (ppi=0x");
+            print_str(b"[win32k-host] gptiDesktopThread = dispatch thread (ppi=0x");
             print_hex((ppi >> 32) as u32);
             print_hex(ppi as u32);
             print_str(b")\n");
@@ -2196,7 +2245,12 @@ unsafe fn setup_dispatch_context() {
 /// the thread's CLIENTINFO. `pool_alloc` returns zeroed memory, so an already-initialized field is
 /// left as-is.
 unsafe fn init_threadinfo_placeholder(w32thread: u64) {
-    for off in [0x2d8u64, 0x2e8] {
+    // THREADINFO LIST_ENTRY heads the window-manager / paint path touches (offsets from win32.h,
+    // W32THREAD prefix = 0x50; anchored to the confirmed +0x88 pClientInfo / +0x90 TIF_flags):
+    //   +0xB0  SentMessagesListHead   (message.c / co_MsqSendMessage)
+    //   +0x2d8 WindowListHead         (IntCreateWindow window.c:2142)
+    //   +0x2e8 W32CallbackListHead    (IntCbAllocateMemory callback.c)
+    for off in [0xB0u64, 0x2d8, 0x2e8] {
         let head = w32thread + off;
         write_volatile(head as *mut u64, head); // Flink = &head
         write_volatile((head + 8) as *mut u64, head); // Blink = &head
@@ -2205,6 +2259,34 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
         let ci = pool_alloc(0x100);
         if ci != 0 {
             write_volatile((w32thread + 0x88) as *mut u64, ci);
+        }
+    }
+    // MessageQueue (THREADINFO+0x60): the paint/window-position path references the window's thread
+    // and reads `pti->MessageQueue->QF_flags` (USER_MESSAGE_QUEUE+0xAC) — a NULL queue null-derefs in
+    // painting.c (RVA 0xb6a55). Provision a real zeroed USER_MESSAGE_QUEUE (References=1) with its
+    // HardwareMessagesListHead (+0x38) initialized. Since the desktop-window sends are intra-thread
+    // (gptiDesktopThread == the dispatch thread), win32k dispatches straight to DesktopWindowProc; the
+    // queue is used only for paint accounting (cPaintsReady, QF_flags), so a zeroed queue with valid
+    // list heads suffices. Real win32k creates this in CreateThreadInfo → MsqCreateMessageQueue.
+    if read_volatile((w32thread + 0x60) as *const u64) == 0 {
+        let mq = pool_alloc(0x200); // USER_MESSAGE_QUEUE (~0xC0 + CaretInfo), zeroed
+        if mq != 0 {
+            write_volatile(mq as *mut u32, 1); // References = 1
+            let hw = mq + 0x38; // HardwareMessagesListHead
+            write_volatile(hw as *mut u64, hw);
+            write_volatile((hw + 8) as *mut u64, hw);
+            write_volatile((w32thread + 0x60) as *mut u64, mq);
+        }
+    }
+    // pcti (THREADINFO+0x70): the paint path sets the thread's wake bits via
+    // `pti->pcti->fsWakeBits |= …` (CLIENTTHREADINFO+0x6) — a NULL pcti null-derefs in painting.c
+    // (RVA 0xb6acc). Provision a zeroed CLIENTTHREADINFO (CTI_flags@0, fsChangeBits@4, fsWakeBits@6,
+    // fsWakeMask@0xA, timeLastRead@0xC). Real win32k points pcti at the desktop-heap CLIENTTHREADINFO
+    // (or the embedded pti->cti when there is no desktop).
+    if read_volatile((w32thread + 0x70) as *const u64) == 0 {
+        let pcti = pool_alloc(0x20);
+        if pcti != 0 {
+            write_volatile((w32thread + 0x70) as *mut u64, pcti);
         }
     }
 }
@@ -2317,6 +2399,32 @@ unsafe fn create_winsta_and_desktop() {
     print_hex((hdesk >> 32) as u32);
     print_hex(hdesk as u32);
     print_str(b"\n");
+
+    // Set `gpdeskInputDesktop` to the created DESKTOP body so `IntGetActiveDesktop()` returns it and
+    // `co_IntShowDesktop` (winsta.c:340, invoked next by co_IntInitializeDesktopGraphics) derefs a real
+    // `Desktop->pDeskInfo->spwnd` (the desktop window IntCreateWindow built) instead of NULL. This is
+    // what NtUserSwitchDesktop's `gpdeskInputDesktop = pdesk` does (desktop.c:3044); we poke it directly
+    // rather than drive NtUserSwitchDesktop (which needs InputWindowStation / rpwinstaParent / WSS_LOCKED
+    // state + IntValidateDesktopHandle we don't yet stand up). There is exactly one desktop, so the poke
+    // is equivalent + authentic for the paint path that follows.
+    let desk_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(hdesk);
+    if desk_body != 0 {
+        write_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *mut u64, desk_body);
+        print_str(b"[win32k-host] gpdeskInputDesktop <- desktop body=0x");
+        print_hex((desk_body >> 32) as u32);
+        print_hex(desk_body as u32);
+        print_str(b" (spwnd=0x");
+        // pDeskInfo @ body+0x08; DESKTOPINFO.spwnd @ +0x10 (pvDesktopBase@0, pvDesktopLimit@8, spwnd@0x10
+        // — confirmed by co_IntShowDesktop disasm 0x6dc5c `mov rax,[rax+8]`; 0x6dc60 `mov rax,[rax+0x10]`).
+        // Report it so we know the desktop window is wired (co_IntShowDesktop ASSERT(pwnd)).
+        let pdeskinfo = read_volatile((desk_body + 0x08) as *const u64);
+        let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
+        print_hex((spwnd >> 32) as u32);
+        print_hex(spwnd as u32);
+        print_str(b")\n");
+    } else {
+        print_str(b"[win32k-host] WARN: no desktop body for hDesk - gpdeskInputDesktop unset\n");
+    }
 }
 
 unsafe fn dispatch_loop() -> ! {
