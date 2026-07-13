@@ -3427,8 +3427,34 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if self.pi == 1 {
                     0
                 } else {
-                    self.stop = true;
-                    0xC0000002
+                    // smss now issues 281 too: SmpLoadSubSystem waits on NewSubsystem->Event for csrss
+                    // to signal init-complete (smsubsys.c:432). csrss IS initialized (parked after
+                    // CsrServerInitialization), so model the wait as satisfied (STATUS_WAIT_0). Print
+                    // the handle + caller chain once for identification while grinding forward.
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        print_str(b"[281] smss wait handle=0x");
+                        print_hex(args[0] as u32);
+                        print_str(b" chain:");
+                        let mut shown = 0;
+                        for i in 0..96u64 {
+                            let v = smss_stack_read(sp + i * 8);
+                            if v >= NTDLL_BASE && v < NTDLL_BASE + 0xf4000 {
+                                print_str(b" n+0x");
+                                print_hex((v - NTDLL_BASE) as u32);
+                                shown += 1;
+                            } else if v >= PE_LOAD_BASE && v < PE_LOAD_BASE + 0x40000 {
+                                print_str(b" s+0x");
+                                print_hex((v - PE_LOAD_BASE) as u32);
+                                shown += 1;
+                            }
+                            if shown >= 12 {
+                                break;
+                            }
+                        }
+                        print_str(b"\n");
+                    }
+                    0 // STATUS_WAIT_0
                 }
             }
             // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
@@ -4183,6 +4209,7 @@ unsafe fn service_sec_image(
     let mut filled_pages = [0u64; 256];
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
+    let mut ssn_ring_badge = [0u8; 32];
     let mut ssn_ri = 0usize;
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
     // on `nt_handler.next_handle` (Workstream A group A) — a single monotonic source shared by the
@@ -5049,6 +5076,7 @@ unsafe fn service_sec_image(
                 break;
             }
             ssn_ring[ssn_ri % 32] = m0 as u16;
+            ssn_ring_badge[ssn_ri % 32] = badge as u8;
             ssn_ri += 1;
             let resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
@@ -5063,6 +5091,11 @@ unsafe fn service_sec_image(
             // Set when csrss's NtConnectPort was completed via the nested SM rendezvous (like
             // routed_win32k, the SM-loop thread's faults clobbered `reply_to`, so reply via REPLY_MAIN).
             let mut routed_lpc = false;
+            // Set when the caller terminates its own thread (NtTerminateThread of NtCurrentThread):
+            // leave it blocked in the kernel (never reply) and recv the next event. csrss's main
+            // thread does this after CsrServerInitialization ("CSRSRV keeps us going" — the fake API
+            // worker threads stand in), so csrss goes quiet and smss proceeds.
+            let mut park_caller = false;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -5264,6 +5297,42 @@ unsafe fn service_sec_image(
                         result = 0xC0000001;
                     }
                 }
+            } else if m0 == 287 {
+                // NtWriteVirtualMemory(ProcessHandle=R10, BaseAddress=RDX, Buffer=R8, Size=R9,
+                // *NumberOfBytesWritten=[sp+0x28]). smss's RtlCreateUserProcess(csrss) reaches here to
+                // inject the child's RTL_USER_PROCESS_PARAMETERS. In our hosted model spawn_sec_image
+                // already built csrss's REAL PEB/params AND csrss has long since run its loader + SM
+                // connect, so this late write is moot (its BaseAddress is garbage — the child-side
+                // NtAllocateVirtualMemory that would have reserved the target is faked). Model it as a
+                // successful write: set *NumberOfBytesWritten = Size and return SUCCESS so
+                // RtlCreateUserProcess completes. TODO(migrate): a real cross-AS NtWriteVirtualMemory
+                // belongs in nt-memory-manager once a genuinely-new child needs live param injection.
+                let size = get_recv_mr(8); // R9 = NumberOfBytesToWrite
+                let sp = get_recv_mr(16);
+                let written_ptr = smss_stack_read(sp + 0x28); // arg5 = *NumberOfBytesWritten (optional)
+                if written_ptr != 0 {
+                    if badge == CSRSS_BADGE {
+                        csrss_out_write(written_ptr, size, &mut filled_pages, &mut faults,
+                            scratch_base, &reg, &dll_pes, pml4);
+                    } else {
+                        smss_stack_write(written_ptr, size);
+                    }
+                }
+                result = 0; // STATUS_SUCCESS
+            } else if m0 == 223 {
+                // NtSetDefaultHardErrorPort(PortHandle=R10). csrsrv's CsrServerInitialization registers
+                // its API port as the hard-error port right after SmConnectToSm succeeds
+                // (init.c:1119). No kernel state to model in the host — accept it so CsrServerInit
+                // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
+                // our diagnostic path.)
+                result = 0; // STATUS_SUCCESS
+            } else if m0 == 267 && badge == CSRSS_BADGE {
+                // NtTerminateThread(ThreadHandle=R10, ExitStatus=RDX). csrss.exe _main's last act is
+                // NtTerminateThread(NtCurrentThread()) — its init thread exits and CSRSRV's worker
+                // threads (fake here) keep the process alive (csrss.c:93). Park csrss's thread (don't
+                // reply → it stays blocked) so csrss goes quiet and smss drives the rest of init.
+                park_caller = true;
+                result = 0;
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
@@ -5423,7 +5492,11 @@ unsafe fn service_sec_image(
             set_reply_mr(17, flags);
             pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            let (nb, nmi, nm0, nm1, nm2, nm3) = if (routed_win32k || routed_lpc) && reply_main != 0 {
+            let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
+                // Don't reply to the self-terminated thread — leave it blocked and recv the next
+                // event (re-binding REPLY_MAIN for the next caller). The parked thread never runs again.
+                recv_full_r12(fault_ep, reply_main)
+            } else if (routed_win32k || routed_lpc) && reply_main != 0 {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
                 // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
                 // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,
@@ -5491,7 +5564,44 @@ unsafe fn service_sec_image(
     let ring_n = if ssn_ri < 32 { 0 } else { ssn_ri - 32 };
     for k in ring_n..ssn_ri {
         print_str(b" ");
+        print_u64(ssn_ring_badge[k % 32] as u64);
+        print_str(b":");
         print_u64(ssn_ring[k % 32] as u64);
+    }
+    // NtWriteVirtualMemory(287) diagnostic: dump the args + scan the caller's stack for smss/ntdll
+    // return addresses to identify which routine issued it (RtlCreateUserProcess param-inject?).
+    if stop_ssn == 287 {
+        let sp = get_recv_mr(16);
+        print_str(b"\n[287] proc=0x");
+        print_hex(get_recv_mr(9) as u32); // R10 ProcessHandle
+        print_str(b" base=0x");
+        print_hex((m3 >> 32) as u32);
+        print_hex(m3 as u32); // RDX BaseAddress
+        print_str(b" buf=0x");
+        print_hex((get_recv_mr(7) >> 32) as u32);
+        print_hex(get_recv_mr(7) as u32); // R8 Buffer
+        print_str(b" size=0x");
+        print_hex(get_recv_mr(8) as u32); // R9 Size
+        print_str(b" written*=0x");
+        print_hex(smss_stack_read(sp + 0x28) as u32);
+        print_str(b" chain:");
+        let mut shown = 0;
+        for i in 0..160u64 {
+            let v = smss_stack_read(sp + i * 8);
+            if v >= NTDLL_BASE && v < NTDLL_BASE + 0xf4000 {
+                print_str(b" n+0x");
+                print_hex((v - NTDLL_BASE) as u32);
+                shown += 1;
+            } else if v >= PE_LOAD_BASE && v < PE_LOAD_BASE + 0x40000 {
+                // smss image
+                print_str(b" s+0x");
+                print_hex((v - PE_LOAD_BASE) as u32);
+                shown += 1;
+            }
+            if shown >= 16 {
+                break;
+            }
+        }
     }
     // NtRaiseHardError(190): decode the status (R10), Parameters[0], and the caller ([rsp]).
     // Guarded to this case — get_recv_mr(16)/(8) only hold a valid smss stack ptr here.
