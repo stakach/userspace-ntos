@@ -12,10 +12,10 @@ use crate::{check, print_str, RingChannel};
 
 use bytemuck::Pod;
 use nt_alpc_abi::{
-    msg_attr_flag, opcode as aop, port_flag, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
-    AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
-    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcSendReceiveRequest, AlpcViewIoRequest,
-    PortMessage,
+    msg_attr_flag, opcode as aop, port_flag, send_flag, AlpcAcceptConnectRequest,
+    AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcMessageAttributes, AlpcSendReceiveRequest,
+    AlpcViewIoRequest, PortMessage,
 };
 use nt_lpc_abi::{opcode as lop, LpcConnectPortRequest, LpcMessageRequest, LpcReceiveRequest};
 
@@ -100,6 +100,15 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
     check(
         b"exec_alpc_section_view_shared",
         section_view_shared(chan, listen, client_h, server_h, &mut out),
+        passed,
+    );
+
+    // Step 3: a full ALPC_MESSAGE_ATTRIBUTES round-trip — the receive out-param
+    // path serializes the header + CONTEXT + VIEW structs; the receiver parses
+    // ValidAttributes + both structs back.
+    check(
+        b"exec_alpc_message_attributes_roundtrip",
+        message_attributes_roundtrip(chan, client_h, server_h),
         passed,
     );
 
@@ -290,6 +299,67 @@ fn section_view_shared(
     // Real cross-endpoint shared memory: view B sees view A's write, byte-for-byte,
     // while the message body stayed small (10 bytes, not 2048).
     rrs == STATUS_SUCCESS && rn as usize == BIG && readback[..] == big[..] && signal.len() < BIG
+}
+
+/// Step 3 driver: an ALPC message carries CONTEXT + VIEW; the receiver reads them
+/// back as a full ALPC_MESSAGE_ATTRIBUTES (header + structs, body after).
+fn message_attributes_roundtrip(chan: &mut RingChannel<'_>, client_h: u64, server_h: u64) -> bool {
+    let ctx: u64 = 0xFEED_FACE;
+    let view_base: u64 = 0x7000_0000;
+    let allocated = msg_attr_flag::CONTEXT | msg_attr_flag::VIEW;
+
+    // Client sends body + (VIEW, CONTEXT) attributes (serialized order: VIEW,CONTEXT).
+    let body = port_message(REQUEST, b"attr-body");
+    let mut attrs = bytes(&AlpcDataViewAttr {
+        section_handle: 0x99,
+        view_base,
+        view_size: 0x1000,
+        ..Default::default()
+    });
+    attrs.extend_from_slice(&bytes(&AlpcContextAttr {
+        port_context: ctx,
+        ..Default::default()
+    }));
+    let mut out = [0u8; 256];
+    alpc_send(chan, client_h, &body, allocated, &attrs, &mut out);
+
+    // Receiver requests the full attribute out-param (RECV_ATTRIBUTES + allocated).
+    let hdr = core::mem::size_of::<AlpcSendReceiveRequest>() as u32;
+    let req = AlpcSendReceiveRequest {
+        abi_size: hdr as u16,
+        flags: send_flag::RECV_ATTRIBUTES,
+        port_handle: server_h,
+        message_offset: hdr,
+        message_len_bytes: 0,
+        valid_attributes: allocated,
+        ..Default::default()
+    };
+    let (rs, _f, ri, valid, _mt) = chan.raw(aop::ALPC_OP_SEND_RECEIVE, &bytes(&req), &mut out);
+    if rs != STATUS_SUCCESS || valid as u32 != allocated {
+        return false;
+    }
+    let total = ri as usize;
+    // Parse: [AlpcMessageAttributes header][VIEW attr][CONTEXT attr][body].
+    let mah = core::mem::size_of::<AlpcMessageAttributes>();
+    let dva = core::mem::size_of::<AlpcDataViewAttr>();
+    let cta = core::mem::size_of::<AlpcContextAttr>();
+    if total < mah + dva + cta {
+        return false;
+    }
+    let header: AlpcMessageAttributes = read_pod(&out[..mah]);
+    let got_view: AlpcDataViewAttr = read_pod(&out[mah..mah + dva]);
+    let got_ctx: AlpcContextAttr = read_pod(&out[mah + dva..mah + dva + cta]);
+    let body_off = mah + dva + cta;
+    header.valid_attributes == allocated
+        && got_view.view_base == view_base
+        && got_ctx.port_context == ctx
+        && &out[body_off..total] == &body[..]
+}
+
+fn read_pod<T: Pod + Default>(buf: &[u8]) -> T {
+    let mut v = T::default();
+    bytemuck::bytes_of_mut(&mut v).copy_from_slice(&buf[..core::mem::size_of::<T>()]);
+    v
 }
 
 // --- ALPC drive helpers ----------------------------------------------------

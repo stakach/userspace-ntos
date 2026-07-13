@@ -371,6 +371,119 @@ fn attr_roundtrip_and_projection() {
     assert_eq!(project_valid_attributes(&ctx_only), msg_attr_flag::CONTEXT);
 }
 
+/// Step 3: a full `ALPC_MESSAGE_ATTRIBUTES` buffer (header + structs) round-trips
+/// through serialize → parse, and `AllocatedAttributes` masks `ValidAttributes`.
+#[test]
+fn message_attributes_full_serialize_parse() {
+    let attrs = MessageAttrs {
+        context: Some(0xDEAD),
+        view: Some(nt_port_core::DataView {
+            section_handle: 0x11,
+            view_base: 0x5000_0000,
+            view_size: 0x2000,
+        }),
+        ..Default::default()
+    };
+    // Caller allocates CONTEXT + VIEW → both are valid.
+    let allocated = msg_attr_flag::CONTEXT | msg_attr_flag::VIEW;
+    let (valid, blob) = serialize_attrs(allocated, &attrs);
+    assert_eq!(valid, allocated);
+    let (pvalid, parsed, consumed) = parse_message_attributes(&blob);
+    assert_eq!(pvalid, allocated);
+    assert_eq!(parsed.context, Some(0xDEAD));
+    assert_eq!(parsed.view.map(|v| v.view_base), Some(0x5000_0000));
+    assert_eq!(consumed, blob.len());
+
+    // AllocatedAttributes masks: allocate only CONTEXT → VIEW is dropped from valid.
+    let (valid2, blob2) = serialize_attrs(msg_attr_flag::CONTEXT, &attrs);
+    assert_eq!(valid2, msg_attr_flag::CONTEXT);
+    let (_, parsed2, _) = parse_message_attributes(&blob2);
+    assert_eq!(parsed2.context, Some(0xDEAD));
+    assert!(parsed2.view.is_none(), "un-allocated VIEW is not serialized");
+}
+
+/// Step 3: the receive out-param path serializes ALPC_MESSAGE_ATTRIBUTES at the
+/// front of the reply buffer (behind the RECV_ATTRIBUTES flag), body after — and
+/// the bridge degradation (an LPC-originated message → ValidAttributes 0) still
+/// holds with the full parse.
+#[test]
+fn receive_out_param_attributes_and_bridge_degradation() {
+    let mut lpc = Server::new();
+    lpc.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\AttrPort");
+
+    // ALPC host port + an ALPC client rendezvous (both ALPC → attrs flow).
+    let listen = alpc
+        .dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT, &enc_create_port(&name, port_flag::NONE), &mut [])
+        .detail0;
+    let cn = enc_connect(&name, 0, &port_message(msg_type::CONNECTION_REQUEST, b"c"));
+    let conn_id = alpc
+        .dispatch(lpc.core_mut(), aop::ALPC_OP_CONNECT_PORT, &cn, &mut [])
+        .detail1;
+    let mut out = [0u8; 256];
+    alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_RECEIVE, &enc_send_receive(listen, None, 0, &[]), &mut out);
+    let ac = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_ACCEPT_CONNECT, &enc_accept(conn_id, true, 0), &mut []);
+    let (server_h, client_h) = (ac.detail0, ac.detail1);
+
+    // ALPC client sends a message carrying CONTEXT + VIEW.
+    let body = port_message(msg_type::REQUEST, b"payload");
+    let attrs = enc_attrs_view_context(0xABC, 0x6000_0000, 0x1000, 0x1234);
+    let valid = msg_attr_flag::VIEW | msg_attr_flag::CONTEXT;
+    let sr = enc_send_receive(client_h, Some(&body), valid, &attrs);
+    alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE, &sr, &mut out);
+
+    // Host receives WITH the RECV_ATTRIBUTES flag + AllocatedAttributes = VIEW|CONTEXT.
+    let rr = recv_with_attrs(server_h, valid);
+    let mut rout = [0u8; 256];
+    let r = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE, &rr, &mut rout);
+    assert_eq!(r.status, SUCCESS);
+    assert_eq!(r.detail0 as u32, valid, "ValidAttributes = allocated & present");
+    // Parse the front ALPC_MESSAGE_ATTRIBUTES; the body follows.
+    let (pvalid, parsed, consumed) = parse_message_attributes(&rout[..r.information as usize]);
+    assert_eq!(pvalid, valid);
+    assert_eq!(parsed.context, Some(0x1234));
+    assert_eq!(parsed.view.map(|v| v.view_base), Some(0x6000_0000));
+    assert_eq!(&rout[consumed..r.information as usize], &body[..], "body after the attrs");
+
+    // --- bridge: an LPC client to the same host degrades to ValidAttributes 0.
+    let name2 = utf16("\\AttrBridge");
+    let listen2 = alpc
+        .dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT, &enc_create_port(&name2, port_flag::LPC_MODE), &mut [])
+        .detail0;
+    let lconn = {
+        let mut c = LpcClient::new(LpcDirect { server: &mut lpc, out: [0; 512] });
+        c.connect_port(&name2, 2, b"SB").unwrap().connection_id
+    };
+    alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_RECEIVE, &enc_send_receive(listen2, None, 0, &[]), &mut out);
+    let ac2 = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_ACCEPT_CONNECT, &enc_accept(lconn, true, 0), &mut []);
+    let (bserver_h, bclient_h) = (ac2.detail0, ac2.detail1);
+    // LPC client sends (no attributes).
+    lpc.core_mut()
+        .send_message(bclient_h, &port_message(msg_type::REQUEST, b"lp"), MessageAttrs::default())
+        .unwrap();
+    // ALPC host receives WITH RECV_ATTRIBUTES + all allocated → still ValidAttributes 0.
+    let rr2 = recv_with_attrs(bserver_h, 0xF800_0000);
+    let mut rout2 = [0u8; 256];
+    let r2 = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE, &rr2, &mut rout2);
+    assert_eq!(r2.detail0, 0, "LPC-originated message → no ALPC attributes");
+    let (pv2, _, consumed2) = parse_message_attributes(&rout2[..r2.information as usize]);
+    assert_eq!(pv2, 0);
+    assert_eq!(consumed2, size_of::<nt_alpc_abi::AlpcMessageAttributes>(), "header only, no structs");
+}
+
+/// Build a send/receive request with the RECV_ATTRIBUTES flag set and `allocated`
+/// as the receiver's AllocatedAttributes mask.
+fn recv_with_attrs(port: u64, allocated: u32) -> Vec<u8> {
+    bytes(&AlpcSendReceiveRequest {
+        abi_size: size_of::<AlpcSendReceiveRequest>() as u16,
+        flags: nt_alpc_abi::send_flag::RECV_ATTRIBUTES,
+        port_handle: port,
+        valid_attributes: allocated,
+        ..Default::default()
+    })
+}
+
 // --- LPC direct backend for driving the classic-LPC adapter in the test ----
 
 struct LpcDirect<'a> {

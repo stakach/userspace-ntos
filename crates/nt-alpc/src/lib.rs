@@ -53,8 +53,9 @@ use bytemuck::Pod;
 use nt_alpc_abi::{
     msg_attr_flag, opcode, AlpcAcceptConnectRequest, AlpcConnectPortRequest,
     AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
-    AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest, AlpcReply,
-    AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr, AlpcViewIoRequest,
+    send_flag, AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleAttr, AlpcHandleRequest,
+    AlpcMessageAttributes, AlpcReply, AlpcSecurityAttr, AlpcSendReceiveRequest, AlpcTokenAttr,
+    AlpcViewIoRequest,
 };
 use nt_port_core::{
     ConnectOutcome, DataView, MessageAttrs, PortApi, PortCore, QueuedMessage, ReceiveOutcome,
@@ -237,14 +238,32 @@ impl AlpcServer {
         let is_listen_port = conn_try.is_ok();
         match core.receive_message(req.port_handle) {
             Ok(Some(QueuedMessage { bytes, attrs })) => {
-                let n = bytes.len().min(out_buf.len());
-                out_buf[..n].copy_from_slice(&bytes[..n]);
+                let msg_type = read_msg_type(&bytes);
                 // Project the neutral attrs into the ALPC valid-attributes view.
                 // Non-bridging attrs from an ALPC peer are surfaced; an LPC peer
                 // carried none, so valid == 0 (the LPC → ALPC degradation).
-                let valid = project_valid_attributes(&attrs);
-                let msg_type = read_msg_type(&bytes);
-                Ok(reply(NtStatus::SUCCESS, n as u32, valid as u64, msg_type as u64))
+                let present = project_valid_attributes(&attrs);
+                if req.flags & send_flag::RECV_ATTRIBUTES != 0 {
+                    // Full ALPC_MESSAGE_ATTRIBUTES out-param: the 8-byte header +
+                    // the per-attr structs (fixed order) at the FRONT of the reply,
+                    // the message body after. ValidAttributes = allocated & present.
+                    let (valid, blob) = serialize_attrs(req.valid_attributes, &attrs);
+                    let a = blob.len().min(out_buf.len());
+                    out_buf[..a].copy_from_slice(&blob[..a]);
+                    let rest = out_buf.len().saturating_sub(a);
+                    let n = bytes.len().min(rest);
+                    out_buf[a..a + n].copy_from_slice(&bytes[..n]);
+                    Ok(reply(
+                        NtStatus::SUCCESS,
+                        (a + n) as u32,
+                        valid as u64,
+                        msg_type as u64,
+                    ))
+                } else {
+                    let n = bytes.len().min(out_buf.len());
+                    out_buf[..n].copy_from_slice(&bytes[..n]);
+                    Ok(reply(NtStatus::SUCCESS, n as u32, present as u64, msg_type as u64))
+                }
             }
             Ok(None) => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
             Err(e) => {
@@ -469,6 +488,88 @@ pub fn parse_attrs(valid: u32, blob: &[u8]) -> MessageAttrs {
         }
     }
     out
+}
+
+/// Serialize a core-neutral [`MessageAttrs`] into a full `ALPC_MESSAGE_ATTRIBUTES`
+/// out-buffer: the 8-byte [`AlpcMessageAttributes`] header followed by the
+/// per-attribute structs in the fixed order SECURITY, VIEW, CONTEXT, HANDLE,
+/// TOKEN. `allocated` is the receiver's `AllocatedAttributes` mask (which
+/// attributes it has buffer space for); the emitted `ValidAttributes` (and the
+/// structs written) = `allocated & present`. Returns `(valid, blob)`.
+pub fn serialize_attrs(allocated: u32, attrs: &MessageAttrs) -> (u32, Vec<u8>) {
+    let valid = allocated & project_valid_attributes(attrs);
+    let mut blob = Vec::new();
+    blob.extend_from_slice(bytemuck::bytes_of(&AlpcMessageAttributes {
+        allocated_attributes: allocated,
+        valid_attributes: valid,
+    }));
+    if valid & msg_attr_flag::SECURITY != 0 {
+        blob.extend_from_slice(bytemuck::bytes_of(&AlpcSecurityAttr {
+            context_handle: attrs.security.unwrap_or(0),
+            ..Default::default()
+        }));
+    }
+    if valid & msg_attr_flag::VIEW != 0 {
+        let v = attrs.view.unwrap_or_default();
+        blob.extend_from_slice(bytemuck::bytes_of(&AlpcDataViewAttr {
+            section_handle: v.section_handle,
+            view_base: v.view_base,
+            view_size: v.view_size,
+            ..Default::default()
+        }));
+    }
+    if valid & msg_attr_flag::CONTEXT != 0 {
+        blob.extend_from_slice(bytemuck::bytes_of(&AlpcContextAttr {
+            port_context: attrs.context.unwrap_or(0),
+            ..Default::default()
+        }));
+    }
+    if valid & msg_attr_flag::HANDLE != 0 {
+        blob.extend_from_slice(bytemuck::bytes_of(&AlpcHandleAttr {
+            handle: attrs.handles.first().copied().unwrap_or(0),
+            ..Default::default()
+        }));
+    }
+    if valid & msg_attr_flag::TOKEN != 0 {
+        blob.extend_from_slice(bytemuck::bytes_of(&AlpcTokenAttr {
+            token_id: attrs.token.unwrap_or(0),
+            ..Default::default()
+        }));
+    }
+    (valid, blob)
+}
+
+/// Parse a full `ALPC_MESSAGE_ATTRIBUTES` buffer (header + structs) — the inverse
+/// of [`serialize_attrs`]. Reads the 8-byte header for `ValidAttributes`, then the
+/// per-attribute structs in the fixed order. Returns `(valid, attrs, header_plus_
+/// structs_len)` so the caller can locate any trailing message body. Bounds-checked;
+/// a truncated buffer yields whatever parsed cleanly.
+pub fn parse_message_attributes(blob: &[u8]) -> (u32, MessageAttrs, usize) {
+    let header: AlpcMessageAttributes = match read_at(blob, 0) {
+        Some(h) => h,
+        None => return (0, MessageAttrs::default(), 0),
+    };
+    let valid = header.valid_attributes;
+    let body = blob.get(size_of::<AlpcMessageAttributes>()..).unwrap_or(&[]);
+    let attrs = parse_attrs(valid, body);
+    // Compute the consumed length (header + only the present structs).
+    let mut structs = 0usize;
+    if valid & msg_attr_flag::SECURITY != 0 {
+        structs += size_of::<AlpcSecurityAttr>();
+    }
+    if valid & msg_attr_flag::VIEW != 0 {
+        structs += size_of::<AlpcDataViewAttr>();
+    }
+    if valid & msg_attr_flag::CONTEXT != 0 {
+        structs += size_of::<AlpcContextAttr>();
+    }
+    if valid & msg_attr_flag::HANDLE != 0 {
+        structs += size_of::<AlpcHandleAttr>();
+    }
+    if valid & msg_attr_flag::TOKEN != 0 {
+        structs += size_of::<AlpcTokenAttr>();
+    }
+    (valid, attrs, size_of::<AlpcMessageAttributes>() + structs)
 }
 
 /// The `ValidAttributes` bitmask a set of core-neutral [`MessageAttrs`] projects
