@@ -5333,6 +5333,12 @@ unsafe fn service_sec_image(
                 // reply → it stays blocked) so csrss goes quiet and smss drives the rest of init.
                 park_caller = true;
                 result = 0;
+            } else if m0 == 228 {
+                // NtSetEvent(EventHandle=R10, *PreviousState=RDX). smss signals events during the
+                // Session-Manager tail (subsystem/session bookkeeping). No real event object is
+                // modeled in the host, so accept it (STATUS_SUCCESS); *PreviousState is optional and
+                // smss ignores it here. Lets SmpInit/SmpExecuteInitialCommand proceed.
+                result = 0;
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
