@@ -45,6 +45,9 @@ nt-compat-exports = { path = "../../crates/nt-compat-exports" }
 nt-hive-core = { path = "../../crates/nt-hive-core" }
 # Read-only regf parser — serves smss's registry from the REAL ReactOS SYSTEM hive read off disk.
 nt-hive-regf = { path = "../../crates/nt-hive-regf" }
+# Real in-memory filesystem (MemFs + Zw*/Nt* file APIs) — backs the executive's file-existence
+# answers (NtQueryAttributesFile) with a real NT namespace instead of a name-scoped substring fake.
+nt-fs = { path = "../../crates/nt-fs" }
 # Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls; its
 # session_section primitive backs win32k's MmCreateSection/MmMapView*.
 nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }

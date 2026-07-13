@@ -24,6 +24,27 @@ fn mount_resolver() {
 }
 
 #[test]
+fn query_attributes_by_path_no_handle() {
+    let fs = FileSystem::new(MemFs::with_fixture());
+    // A file resolves and reports non-directory — without allocating a handle.
+    let si = fs
+        .query_attributes(SYSTEM_HIVE)
+        .expect("SYSTEM hive should resolve");
+    assert!(!si.is_directory);
+    // A directory resolves and reports is_directory.
+    let d = fs
+        .query_attributes(r"\SystemRoot\System32")
+        .expect("System32 dir should resolve");
+    assert!(d.is_directory);
+    // A missing path → None (→ STATUS_OBJECT_NAME_NOT_FOUND at the syscall seam).
+    assert!(fs
+        .query_attributes(r"\SystemRoot\System32\Config\NOPE")
+        .is_none());
+    // A path outside any mount → None (no volume).
+    assert!(fs.query_attributes(r"\Registry\Machine").is_none());
+}
+
+#[test]
 fn create_dispositions() {
     let mut fs = FileSystem::new(MemFs::with_fixture());
     // OPEN an existing fixture hive file.

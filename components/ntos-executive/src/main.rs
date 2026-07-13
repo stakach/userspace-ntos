@@ -44,6 +44,7 @@ use nt_kernel_exec::{EventKind, EventStore, IrqlState, WaitResult};
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
 use nt_hive_core::apply_ccs_alias;
+use nt_fs::{FileSystem, MemFs};
 use nt_hive_regf::{KeyRef, RegfHive};
 use nt_syscall::{
     NativeCallContext, NativeService, NativeServiceTable, NativeSyscallDispatcher,
@@ -2527,6 +2528,14 @@ struct ExecNtHandler {
     /// so win32k receives + models the REAL Event objects. See the `NtCreateEvent` handler.
     csrss_event_handles: [u64; 2],
     csrss_event_n: usize,
+    /// A REAL in-memory NT filesystem (nt-fs MemFs + mount manager) seeded with the boot-path system
+    /// binaries the loader probes. NtQueryAttributesFile resolves file EXISTENCE + attributes through
+    /// this real namespace instead of a hardcoded name substring — adding a served binary is a seed
+    /// call, not a handler edit. Content delivery (SEC_IMAGE demand-fault) is unchanged and still
+    /// flows through nt-dll-registry + the PE loader; this only owns the exists/attributes answer.
+    /// Allocated in `new()` (before the per-syscall heap mark) so it persists across the bump resets;
+    /// `query_attributes` is `&self` (no handle allocation) so it never reallocates during a syscall.
+    fs: FileSystem,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2584,6 +2593,23 @@ impl ExecNtHandler {
             spawn_request: false,
             csrss_event_handles: [0; 2],
             csrss_event_n: 0,
+            fs: {
+                // MemFs::with_fixture() gives the \Windows\System32\Config\* tree (so
+                // \Windows\System32 exists as a directory). Seed the boot-path binary smss's
+                // SmpParseCommandLine probes for: csrss.exe under System32. FILE_CREATE allocates a
+                // handle below the heap mark (persistent) — the query path below never allocates one.
+                let mut fs = FileSystem::new(MemFs::with_fixture());
+                let r = fs.zw_create_file(
+                    r"\SystemRoot\System32\csrss.exe",
+                    0,
+                    0,
+                    0,
+                    nt_fs::FILE_CREATE,
+                    0,
+                );
+                let _ = fs.zw_close(r.handle);
+                fs
+            },
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -3350,12 +3376,27 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
                 // so the loader doesn't take the .Local\ redirection or a manifest path.
                 let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
-                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // The substring only CLASSIFIES which file the loader is probing (path-form
+                // tolerant); the REAL nt-fs namespace (seeded in ExecNtHandler::new) authoritatively
+                // answers whether csrss.exe exists and its attributes. Identical accept set: csrss.exe
+                // is seeded, so a csrss probe resolves EXISTS; if the seed were removed nt-fs would
+                // correctly report not-found. Content delivery stays on the nt-dll-registry/PE path.
+                let is_csrss_probe = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                let csrss_attrs = if is_csrss_probe {
+                    self.fs.query_attributes(r"\SystemRoot\System32\csrss.exe")
+                } else {
+                    None
+                };
                 // The registry-DLL "EXISTS" answer is scoped to csrss (see NtOpenFile) so smss's
                 // KnownDLLs probes for kernel32/user32/gdi32 keep failing and it launches csrss.
                 let dll_exists = self.pi == 1 && reg.resolve_name(&nb[..nlen]).is_some();
-                if is_csrss || dll_exists {
+                if let Some(si) = csrss_attrs {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
+                    // Attributes come from nt-fs: a file → NORMAL, a directory → DIRECTORY.
+                    let attr = if si.is_directory { 0x10 } else { 0x80 };
+                    smss_stack_write32(args[1] + 0x20, attr);
+                    0
+                } else if dll_exists {
                     smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                     0
                 } else {

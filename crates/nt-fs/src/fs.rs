@@ -171,6 +171,17 @@ impl MemFs {
         }
     }
 
+    /// Query a volume-relative path's attributes WITHOUT opening a handle — the
+    /// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` path (attributes are read straight off
+    /// the node, no `FILE_OBJECT` allocated). `None` if the path does not resolve.
+    fn query(&self, rel_path: &str) -> Option<StandardInformation> {
+        let id = self.lookup(rel_path)?;
+        Some(StandardInformation {
+            end_of_file: self.size(id),
+            is_directory: self.is_dir(id),
+        })
+    }
+
     fn is_dir(&self, id: u64) -> bool {
         self.node(id).map(|n| n.is_dir).unwrap_or(false)
     }
@@ -354,6 +365,15 @@ impl FileSystem {
             end_of_file: self.volume.size(obj.node_id),
             is_directory: self.volume.is_dir(obj.node_id),
         })
+    }
+
+    /// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` (spec §8.6): query a file's attributes
+    /// by PATH, without opening a handle. Resolves the NT path through the mount manager, then reads
+    /// the node's attributes. `None` if the path (or its volume) does not resolve — the syscall seam
+    /// maps that to `STATUS_OBJECT_NAME_NOT_FOUND`.
+    pub fn query_attributes(&self, path: &str) -> Option<StandardInformation> {
+        let rel = self.to_relative(&normalize_separators(path))?;
+        self.volume.query(&rel)
     }
 
     /// `ZwClose` (spec §8.7, §6.2): cleanup-before-close, then free the file object.
