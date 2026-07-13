@@ -5890,15 +5890,21 @@ unsafe fn service_sec_image(
                 // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
                 // loader runs the remaining DllMains toward winlogon's entry.
                 result = 0;
-            } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
+            } else if m0 >= win32k_host::WIN32K_SERVICE_BASE
+                && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE)
+            {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
-                // csrss — winsrv's UserServerDllInitialization drives NtUserInitialize into win32k.
-                // Forward it to the parked win32k component through the persistent dispatch loop; the
-                // handler runs in win32k's OWN context (GS=KPCR / session heap) against the single
-                // hosted client's W32PROCESS (attached during DriverEntry bring-up). Scalar + handle
-                // args ride the registers exactly as the native x64 syscall passed them (arg1=R10,
-                // arg2=RDX, arg3=R8, arg4=R9); pointer/buffer args are marshaled per SSN as needed.
+                // csrss (winsrv's UserServerDllInitialization) OR by winlogon (its user32 DllMain's
+                // NtUserProcessConnect + WinMain's window-station/desktop calls) — the SECOND hosted
+                // GUI client. Forward it to the parked win32k component through the persistent dispatch
+                // loop; the handler runs in win32k's OWN context (GS=KPCR / session heap). Both clients
+                // are serviced ONE AT A TIME by the main loop (FIFO recv), each bound to REPLY_MAIN at
+                // its recv, so the routed reply (send_on_reply(REPLY_MAIN)) resumes exactly this caller
+                // — csrss and winlogon never orphan each other. Scalar + handle args ride the registers
+                // exactly as the native x64 syscall passed them (arg1=R10, arg2=RDX, arg3=R8, arg4=R9);
+                // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap/image
+                // mirrors are already selected by `pi` above (smss_stack_read reaches winlogon's stack).
                 let a0 = get_recv_mr(9); // R10 = arg1
                 let mut a1 = m3; // RDX = arg2
                 let mut a2 = get_recv_mr(7); // R8 = arg3
@@ -5952,7 +5958,7 @@ unsafe fn service_sec_image(
                     // gSharedInfo.aheList->handles. RO-map that heap arena into csrss and rewrite the
                     // siClient pointers (+ ulSharedDelta) to the csrss-relative client addresses so
                     // the client reads valid memory. delta = server(win32k) − client(csrss).
-                    let delta = map_win32k_heap_into_csrss(pml4);
+                    let delta = map_win32k_heap_into_csrss(pml4, pi);
                     let heap_lo = win32k_host::WIN32K_HEAP_VADDR;
                     let heap_hi = heap_lo + win32k_host::WIN32K_HEAP_FRAMES * 0x1000;
                     // The handler's own shift (0 in this single-AS host; be robust anyway): recover
@@ -7207,10 +7213,14 @@ const FB_VADDR: u64 = 0x0000_0200_0000_0000;
 /// USERCONNECT points at. Maps a fresh copy of each arena frame RO+NX (win32k keeps its own RW
 /// copy — coherent shared memory). One-time (guarded). Returns the server→client delta
 /// (`WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`) the marshaling applies to the siClient pointers.
-unsafe fn map_win32k_heap_into_csrss(pml4: u64) -> u64 {
+unsafe fn map_win32k_heap_into_csrss(pml4: u64, pi: usize) -> u64 {
     let delta = win32k_host::WIN32K_HEAP_VADDR - win32k_host::CSRSS_W32_SHARED_VA;
-    if WIN32K_CLIENT_MAPPED.swap(1, Ordering::Relaxed) != 0 {
-        return delta; // already mapped
+    // Per-process guard (bit `pi`): the arena is mapped into EACH GUI client's VSpace independently
+    // (csrss = pi 1, winlogon = pi 2) at the same CSRSS_W32_SHARED_VA window, so the delta — hence
+    // the siClient rewrite — is identical for both. A single bool would skip the 2nd client's map.
+    let bit = 1u64 << pi;
+    if WIN32K_CLIENT_MAPPED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return delta; // already mapped into this process's VSpace
     }
     let heap_base = WIN32K_HEAP_FRAME_BASE.load(Ordering::Relaxed);
     if heap_base == 0 {
