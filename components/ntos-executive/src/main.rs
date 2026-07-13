@@ -208,6 +208,25 @@ pub const SM_ENV_SCRATCH_VA: u64 = 0x0000_0100_1070_0000;
 /// Isolated executive scratch (its own PT) for demand-filling the SM-loop thread's code pages
 /// (SmpApiLoop/SmpHandleConnectionRequest in smss's .text + ntdll stubs) during the rendezvous.
 pub const SM_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
+// --- Authentic CSR accept: the REAL CsrApiRequestThread runs in CSRSS's VSpace (a 2nd csrss thread),
+// mirroring the SM-loop thread. The csrss-VSpace VAs (stack/ipc/teb/tramp) REUSE the SM numeric
+// values — safe because they land in csrss's OWN pml4 (isolated from smss's, where the SM thread
+// uses the same VAs); both fall in the STACK_BASE 2 MiB PT (0x1040_0000) that csrss's spawn already
+// created. Only the EXECUTIVE-side aliases (mirror/env/fill, in CAP_INIT_THREAD_VSPACE) must be
+// DISTINCT from the SM ones.
+pub const CSR_STACK_BASE: u64 = SM_STACK_BASE; // csrss VSpace (4 frames)
+pub const CSR_IPCBUF_VA: u64 = SM_IPCBUF_VA; // csrss VSpace
+pub const CSR_TEB_VA: u64 = SM_TEB_VA; // csrss VSpace (2 pages)
+pub const CSR_TRAMP_VA: u64 = SM_TRAMP_VA; // csrss VSpace
+/// Executive mirror of the CSR thread's stack (same frames) for syscall out-params. FILEBUF PT,
+/// beside SM (0x106A) / winlogon (0x106B) stack mirrors.
+pub const CSR_STACK_MIRROR_VA: u64 = 0x0000_0100_106C_0000;
+/// Executive scratch (3 pages) to populate the CSR thread's TEB/trampoline before copy_cap into
+/// csrss. FILEBUF PT, clear of the SM (0x1070) / smss (0x1074) / csrss (0x1078) env scratch.
+pub const CSR_ENV_SCRATCH_VA: u64 = 0x0000_0100_1071_0000;
+/// Isolated executive scratch (its own PT) for demand-filling the CSR thread's code pages
+/// (CsrApiRequestThread/CsrApiHandleConnectionRequest in csrsrv + ntdll/csrss) during the rendezvous.
+pub const CSR_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1310_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -629,6 +648,28 @@ static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
 /// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
+/// Authentic CSR accept (mirrors the SM triad): the REAL CsrApiRequestThread's dedicated fault EP
+/// (the executive recvs its NtSetEvent/NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort
+/// faults here during `csr_rendezvous`; no standing receiver otherwise → the thread parks) + its own
+/// MCS reply object (REPLY_CSRLOOP). 0 = not yet retyped.
+static CSR_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+static REPLY_CSRLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
+/// The CSR API thread's TCB (0 until csrss's first NtCreateThread spawns it; one real thread suffices
+/// for one connection accept — CsrpCheckRequestThreads does NOT fire on the connection path).
+static CSR_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
+/// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
+static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
+/// Set once the CSR API thread has been resumed (lazily, at the first `csr_rendezvous`).
+static CSR_RESUMED: AtomicU64 = AtomicU64::new(0);
+/// Count of csrss's NtCreatePort calls (its port names are unreadable csrsrv .data globals, so they
+/// are assigned canonical names by creation order: 0 = \Windows\ApiPort, 1 = \Windows\SbApiPort).
+static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
+/// The self-connect ClientId (FLAGGED simplification, like SM's PID_SMSS): written to the faked
+/// CsrApiRequestThread's *ClientId out-param (so csrss's CsrAddStaticServerThread registers a
+/// CSR_THREAD with this CID) AND marshaled into the connection-request PORT_MESSAGE, so csrss's real
+/// CsrLocateThreadByClientId finds it → CsrProcess=CsrRootProcess → AllowConnection=TRUE → accept.
+const CSR_STATIC_CID_PROC: u64 = 0x0000_0000_0000_0244; // csrss's CSR pid (arbitrary, must be consistent)
+const CSR_STATIC_CID_THREAD: u64 = 0x0000_0000_0000_0248;
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
 /// (0 = smss, 1 = csrss, 2 = winlogon). Kept off the 16 KiB rootserver stack — a [[u64;256];3]
@@ -2750,6 +2791,16 @@ struct ExecNtHandler {
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
     lpc_rendezvous_conn: u64,
     lpc_rendezvous_out: u64,
+    /// Authentic CSR accept (mirrors the SM path): set by csrss's FIRST `NtCreateThread` (its
+    /// `CsrApiRequestThread`) so the LOOP spawns the REAL CSR API thread (`spawn_csr_loop_thread`,
+    /// which needs csrss's PML4 + the caller's SP — loop-resident). Parks on `CSR_FAULT_EP`.
+    csr_spawn_request: bool,
+    /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
+    /// connection Pending (Manual), the handler records the broker connection id + the caller's
+    /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
+    /// accept), writes the completed client comm-port handle, and replies winlogon. 0 = none.
+    csr_rendezvous_conn: u64,
+    csr_rendezvous_out: u64,
     /// The two most-recent csrss `NtCreateEvent` handles, in creation order (winsrv's power + media
     /// request events). NtUserInitialize's SSN>=0x1000 forward substitutes these for its NULL event
     /// args (our csrss demand-fill window can't write the handle back to winsrv's late .bss global),
@@ -2863,6 +2914,9 @@ impl ExecNtHandler {
             sm_spawn_request: false,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
+            csr_spawn_request: false,
+            csr_rendezvous_conn: 0,
+            csr_rendezvous_out: 0,
             csrss_event_handles: [0; 2],
             csrss_event_n: 0,
             fs: {
@@ -3040,6 +3094,21 @@ impl ExecNtHandler {
     /// UNICODE_STRING struct itself is a stack local (mirror-readable); its Buffer is read via the
     /// per-fault scratch alias of the already-demand-faulted `.rdata` page (`scratch_for`). Empty on
     /// failure (→ the caller's connect misses by name, a clean error, not a crash).
+    /// Read an OBJECT_ATTRIBUTES.ObjectName (OA+0x10 → PUNICODE_STRING) with the SAME .rdata-capable
+    /// fallback as `read_lpc_name`. The free `smss_read_objattr_name` is mirror-only, so csrss's
+    /// `NtCreatePort(\Windows\ApiPort)` (name in csrsrv .rdata) registered under an EMPTY name → the
+    /// broker couldn't match winlogon's connect. Use this so the port registers under its real name.
+    unsafe fn read_objattr_name(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
+        let mut p = [0u8; 8];
+        if !smss_copyin(oa_va + 0x10, &mut p) {
+            return alloc::vec::Vec::new();
+        }
+        let objname = u64::from_le_bytes(p);
+        if objname == 0 {
+            return alloc::vec::Vec::new();
+        }
+        self.read_lpc_name(objname)
+    }
     unsafe fn read_lpc_name(&self, ustr_va: u64) -> alloc::vec::Vec<u16> {
         if ustr_va == 0 {
             return alloc::vec::Vec::new();
@@ -3118,31 +3187,30 @@ impl ExecNtHandler {
             None => return 0xC000_0001,
         };
         let pml4 = ctx.pml4;
-        // (1) Model the CSR acceptor via the broker: connect (Pending under Manual) then accept +
-        // complete synchronously → a real client comm-port handle + a cached LpcConnRecord for the
-        // direct message plane. IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
+        // (1) Connect through the broker (Pending under Manual). ★ AUTHENTIC accept (mirrors SM path
+        // B): rather than modeling the acceptor here, RECORD the pending connection id + the caller's
+        // *PortHandle so the LOOP drives `csr_rendezvous` — csrss's REAL CsrApiRequestThread issues the
+        // NtReplyWaitReceivePort → CsrApiHandleConnectionRequest → NtAcceptConnectPort →
+        // NtCompleteConnectPort. The loop overrides the client handle + writes *PortHandle after the
+        // rendezvous. Only if the broker connect is NOT pending (no live named port) do we fall back to
+        // a modeled handle + write it here. IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
         let mut client_handle = 0u64;
-        let mut cached = false;
+        let mut pending = false;
         if let Some(c) = lpc_client() {
             if let Ok(r) = c.connect_port(name16, 2, &[]) {
                 if r.pending && r.connection_id != 0 {
-                    let _ = c.accept_connect(r.connection_id, true, 0);
-                    if let Ok((ch, _)) = c.complete_connect(r.connection_id) {
-                        client_handle = ch;
-                        self.cache_lpc_connection(r.connection_id, ch, name16);
-                        cached = true;
-                    }
+                    self.csr_rendezvous_conn = r.connection_id;
+                    self.csr_rendezvous_out = porthandle_ptr;
+                    pending = true;
                 } else if r.handle != 0 {
                     client_handle = r.handle;
                     self.cache_lpc_connection(r.connection_id, r.handle, name16);
-                    cached = true;
                 }
             }
         }
-        if client_handle == 0 {
+        if !pending && client_handle == 0 {
             client_handle = self.mint_handle();
         }
-        let _ = cached;
         // (2) Map winlogon's CSR regions once (heap view + static server data).
         if self.winlogon_csr_view == 0 {
             // One 2 MiB PT in winlogon covers both regions; a second PT in the executive VSpace is
@@ -3211,9 +3279,11 @@ impl ExecNtHandler {
             smss_stack_write(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA); // SharedSectionHeap
             smss_stack_write(conninfo_ptr + 0x30, 8); // ServerProcessId (csrss — plausible)
         }
-        // (5) *PortHandle = &CsrApiPort (an ntdll .data global) — best-effort (the modeled message
-        // plane doesn't dispatch by this handle, so a silent miss is harmless).
-        if porthandle_ptr != 0 {
+        // (5) *PortHandle = &CsrApiPort (an ntdll .data global) — best-effort. On the AUTHENTIC path
+        // the loop writes it after `csr_rendezvous` produces the real client comm-port handle; here we
+        // write only the fallback (non-pending) handle. (The modeled message plane doesn't dispatch by
+        // this handle, so a silent miss is harmless.)
+        if !pending && porthandle_ptr != 0 {
             csrss_out_write(
                 porthandle_ptr,
                 client_handle,
@@ -3226,7 +3296,11 @@ impl ExecNtHandler {
             );
         }
         WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
-        print_str(b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> SUCCESS; client=0x");
+        print_str(if pending {
+            b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(fallback)=0x".as_slice()
+        } else {
+            b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> modeled accept; client=0x".as_slice()
+        });
         print_hex((client_handle >> 32) as u32);
         print_hex(client_handle as u32);
         print_str(b" ViewBase=0x");
@@ -3627,7 +3701,24 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtConnectPort. Writing to R10 via the out-writer queue (csrss: a .data global; smss: a
             // stack local) lands the handle where the caller reads it → SmConnectToSm reaches connect.
             NativeService::NtCreatePort => unsafe {
-                let name16 = smss_read_objattr_name(args[1]);
+                // Robust .rdata-capable name read (csrss's \Windows\ApiPort name is in csrsrv .rdata,
+                // unreachable by the mirror-only smss_read_objattr_name) so the port registers under
+                // its real name → winlogon's NtSecureConnectPort matches it → the authentic CSR accept.
+                let mut name16 = self.read_objattr_name(args[1]);
+                if name16.is_empty() {
+                    name16 = smss_read_objattr_name(args[1]);
+                }
+                // csrss's OA + ObjectName UNICODE_STRING are csrsrv .data globals unreachable by the
+                // mirror/scratch readers → the name reads EMPTY, so the port would register unnamed and
+                // winlogon's NtSecureConnectPort(\Windows\ApiPort) could not match it. csrss creates
+                // exactly two ports, in a fixed order: CsrApiPortInitialize(\Windows\ApiPort) then
+                // CsrSbApiPortInitialize(\Windows\SbApiPort). Assign the canonical name by order so the
+                // ports register correctly → the authentic CSR accept can find the pending connection.
+                if self.pi == 1 && name16.is_empty() {
+                    let n = CSR_CREATEPORT_N.fetch_add(1, Ordering::Relaxed);
+                    let canon: &str = if n == 0 { "\\Windows\\ApiPort" } else { "\\Windows\\SbApiPort" };
+                    name16 = canon.encode_utf16().collect();
+                }
                 let handle = lpc_client()
                     .and_then(|c| {
                         c.create_port(&name16, args[2] as u32, args[3] as u32, 0).ok()
@@ -3657,6 +3748,27 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && SM_LOOP_TCB.load(Ordering::Relaxed) == 0
                 {
                     self.sm_spawn_request = true;
+                }
+                // Authentic CSR accept: csrss's FIRST NtCreateThread is its CsrApiRequestThread
+                // (CsrApiPortInitialize runs before CsrSbApiPortInitialize). Spawn ONE real thread.
+                // ★ Also write a chosen ClientId to the *ClientId out-param ([sp+0x28] = arg5): csrss's
+                // CsrAddStaticServerThread then registers a CSR_THREAD with this CID, so the connection
+                // rendezvous can marshal the SAME CID into the connect message → CsrLocateThreadByClientId
+                // finds it → CsrProcess=CsrRootProcess → the accept is ALLOWED (the self-connect
+                // simplification, analogous to SM's PID_SMSS — FLAGGED residual).
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 1
+                    && CSR_LOOP_TCB.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let cid_ptr = smss_stack_read(sp + 0x28); // arg5 = *ClientId
+                        if cid_ptr != 0 {
+                            self.queue_write(cid_ptr, CSR_STATIC_CID_PROC);
+                            self.queue_write(cid_ptr + 8, CSR_STATIC_CID_THREAD);
+                        }
+                    }
+                    self.csr_spawn_request = true;
                 }
                 0
             }
@@ -5844,6 +5956,9 @@ unsafe fn service_sec_image(
             // Set when csrss's NtConnectPort was completed via the nested SM rendezvous (like
             // routed_win32k, the SM-loop thread's faults clobbered `reply_to`, so reply via REPLY_MAIN).
             let mut routed_lpc = false;
+            // Set when winlogon's NtSecureConnectPort was completed via the nested CSR rendezvous
+            // (like routed_lpc, the CSR thread's faults clobbered reply_to → reply via REPLY_MAIN).
+            let mut routed_csr = false;
             // Set when the caller terminates its own thread (NtTerminateThread of NtCurrentThread):
             // leave it blocked in the kernel (never reply) and recv the next event. csrss's main
             // thread does this after CsrServerInitialization ("CSRSRV keeps us going" — the fake API
@@ -5877,6 +5992,8 @@ unsafe fn service_sec_image(
                 nt_handler.winlogon_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.lpc_rendezvous_conn = 0;
+                nt_handler.csr_spawn_request = false;
+                nt_handler.csr_rendezvous_conn = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
@@ -6076,6 +6193,26 @@ unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to sm_fault_ep)\n");
                 }
+                // Authentic CSR accept: csrss's first NtCreateThread (its CsrApiRequestThread) — spawn
+                // the REAL CSR API thread in csrss's VSpace (pi == 1 here → pml4 = csrss's PML4,
+                // ACTIVE_STACK_MIRROR = csrss's mirror). Same CONTEXT ABI as SM: Context* at [sp+0x30],
+                // CONTEXT.Rip@0xF8 = CsrApiRequestThread, CONTEXT.Rcx@0x80 = Parameter (hRequestEvent).
+                if nt_handler.csr_spawn_request && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    print_str(b"[csr-loop] spawning REAL CsrApiRequestThread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" param=0x");
+                    print_hex(param as u32);
+                    print_str(b"\n");
+                    let tcb = spawn_csr_loop_thread(pml4, entry_rip, param);
+                    CSR_LOOP_TCB.store(tcb, Ordering::Relaxed);
+                    print_str(b"[csr-loop] spawned tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (parks on its first fault to csr_fault_ep)\n");
+                }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
                 // in smss's VSpace = procs[0].pml4, demand-filling from smss's image + ntdll), then write the
@@ -6113,6 +6250,68 @@ unsafe fn service_sec_image(
                         handled = false;
                         result = 0xC0000001;
                     }
+                }
+                // Authentic CSR accept: winlogon's NtSecureConnectPort left the broker connection
+                // Pending (Manual). Drive the REAL CsrApiRequestThread through the connection accept (it
+                // runs in csrss's VSpace = procs[1].pml4, demand-filling from csrss's image + the mapped
+                // DLLs + ntdll), then write the completed client comm-port handle to winlogon's
+                // *PortHandle + reply winlogon via REPLY_MAIN. (pi == 2 here = winlogon, so pml4 =
+                // winlogon's; csr_rendezvous takes csrss's PML4 explicitly.)
+                if nt_handler.csr_rendezvous_conn != 0 {
+                    let conn_id = nt_handler.csr_rendezvous_conn;
+                    let out_ptr = nt_handler.csr_rendezvous_out;
+                    // Only drive the real accept if csrss actually spawned its CsrApiRequestThread
+                    // (CSR_LOOP_TCB is a real cap > 1). Otherwise recv_full_r12(CSR_FAULT_EP) would block
+                    // forever with no faulter — fall back to a modeled accept so winlogon still connects.
+                    let have_thread = CSR_LOOP_TCB.load(Ordering::Relaxed) > 1
+                        && csrss_pe.is_some();
+                    let client_handle = if have_thread {
+                        print_str(b"[csr-rdv] winlogon NtSecureConnectPort pending (conn=");
+                        print_u64(conn_id);
+                        print_str(b") -> driving the real CsrApiRequestThread accept\n");
+                        csr_rendezvous(
+                            conn_id,
+                            procs[1].pml4,
+                            csrss_pe.as_ref().unwrap(),
+                            procs[1].img_end,
+                            nt_base,
+                            nt_end,
+                            ntdll.map(|(_, p)| p),
+                            &reg,
+                            &dll_pes,
+                        )
+                    } else {
+                        print_str(b"[csr-rdv] no real CSR thread -> modeled accept\n");
+                        0
+                    };
+                    let ch = if client_handle != 0 {
+                        // AUTHENTIC: the real CSR thread accepted + completed the connection.
+                        nt_handler.cache_lpc_connection(conn_id, client_handle, b"\\Windows\\ApiPort".iter().map(|&b| b as u16).collect::<alloc::vec::Vec<u16>>().as_slice());
+                        print_str(b"[csr-rdv] AUTHENTIC accept complete: client handle=0x");
+                        print_hex((client_handle >> 32) as u32);
+                        print_hex(client_handle as u32);
+                        print_str(b" -> winlogon NtSecureConnectPort SUCCESS\n");
+                        client_handle
+                    } else {
+                        // The rendezvous walled — fall back to a modeled accept so winlogon still
+                        // connects (behavior-preserving; the boot never hangs on the CSR path).
+                        print_str(b"[csr-rdv] WALL: rendezvous produced no handle -> modeled fallback\n");
+                        let h = lpc_client()
+                            .and_then(|c| {
+                                let _ = c.accept_connect(conn_id, true, 0);
+                                c.complete_connect(conn_id).ok().map(|(ch, _)| ch)
+                            })
+                            .unwrap_or_else(|| nt_handler.mint_handle());
+                        nt_handler.cache_lpc_connection(conn_id, h, b"\\Windows\\ApiPort".iter().map(|&b| b as u16).collect::<alloc::vec::Vec<u16>>().as_slice());
+                        h
+                    };
+                    if out_ptr != 0 {
+                        // winlogon's *PortHandle (&CsrApiPort, an ntdll .data global) — demand-fill window.
+                        csrss_out_write(out_ptr, ch, &mut filled_pages, &mut faults,
+                            scratch_base, &reg, &dll_pes, pml4);
+                    }
+                    result = 0; // STATUS_SUCCESS (winlogon's connect always succeeds)
+                    routed_csr = true;
                 }
             } else if m0 == 287 {
                 // NtWriteVirtualMemory(ProcessHandle=R10, BaseAddress=RDX, Buffer=R8, Size=R9,
@@ -6386,7 +6585,7 @@ unsafe fn service_sec_image(
                 // Don't reply to the self-terminated thread — leave it blocked and recv the next
                 // event (re-binding REPLY_MAIN for the next caller). The parked thread never runs again.
                 recv_full_r12(fault_ep, reply_main)
-            } else if (routed_win32k || routed_lpc) && reply_main != 0 {
+            } else if (routed_win32k || routed_lpc || routed_csr) && reply_main != 0 {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
                 // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
                 // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,
@@ -6985,6 +7184,334 @@ unsafe fn sm_rendezvous(
             continue;
         }
         print_str(b"[sm-rdv] WALL: unexpected label=");
+        print_u64(label);
+        print_str(b"\n");
+        break;
+    }
+    client_handle
+}
+
+/// Number of committed stack frames for the CSR API thread (deeper than SM: CsrApiRequestThread →
+/// CsrConnectToUser [loader walk] → CsrApiHandleConnectionRequest).
+pub const CSR_STACK_FRAMES: u64 = 8;
+
+/// Spawn csrss's REAL `CsrApiRequestThread` as a 2nd thread in csrss's VSpace (mirrors
+/// `spawn_sm_loop_thread`). It faults to `CSR_FAULT_EP` (no standing receiver) so it PARKS on its
+/// first fault/syscall until `csr_rendezvous` drains it for winlogon's CSR connect. `param` is the
+/// hRequestEvent handle (CsrApiRequestThread's PVOID Parameter). The TEB carries the self-connect
+/// ClientId so the thread's own bookkeeping is consistent.
+unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, param: u64) -> u64 {
+    let scr = CSR_ENV_SCRATCH_VA;
+    for i in 0..CSR_STACK_FRAMES {
+        let f = alloc_frame();
+        let _ = page_map(copy_cap(f), CSR_STACK_BASE + i * 0x1000, RW_NX, csrss_pml4);
+        let _ = page_map(copy_cap(f), CSR_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    }
+    // TEB page 1: self@0x30, ClientId@0x40/0x48 (the self-connect CID), PEB@0x60 (csrss's PEB —
+    // shared with the main thread), StackBase@0x08/StackLimit@0x10, ACS@0x2C8.
+    let teb = alloc_frame();
+    let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((scr + 0x30) as *mut u64, CSR_TEB_VA);
+    core::ptr::write_volatile((scr + 0x40) as *mut u64, CSR_STATIC_CID_PROC);
+    core::ptr::write_volatile((scr + 0x48) as *mut u64, CSR_STATIC_CID_THREAD);
+    core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
+    core::ptr::write_volatile((scr + 0x08) as *mut u64, CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000);
+    core::ptr::write_volatile((scr + 0x10) as *mut u64, CSR_STACK_BASE);
+    let acs_va = CSR_TEB_VA + 0x1800;
+    core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
+    let _ = page_map(copy_cap(teb), CSR_TEB_VA, RW_NX, csrss_pml4);
+    // TEB page 2: ACTIVATION_CONTEXT_STACK + StaticUnicodeString.
+    let teb2 = alloc_frame();
+    let _ = page_map(teb2, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let acs = scr + 0x1000 + 0x800;
+    core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
+    core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
+    core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
+    core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
+    core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522);
+    core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, CSR_TEB_VA + 0x1268);
+    let _ = page_map(copy_cap(teb2), CSR_TEB_VA + 0x1000, RW_NX, csrss_pml4);
+    // IPC buffer.
+    let ipcbuf = alloc_frame();
+    let _ = page_map(ipcbuf, CSR_IPCBUF_VA, RW_NX, csrss_pml4);
+    // Trampoline: RCX = Parameter (hRequestEvent), then `call` CsrApiRequestThread.
+    let tramp = alloc_frame();
+    let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let mut tb = alloc::vec::Vec::new();
+    tb.extend_from_slice(&[0x48, 0xB9]);
+    tb.extend_from_slice(&param.to_le_bytes()); // movabs rcx, param
+    tb.extend_from_slice(&[0x48, 0xB8]);
+    tb.extend_from_slice(&entry_rip.to_le_bytes()); // movabs rax, CsrApiRequestThread
+    tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    for (j, &b) in tb.iter().enumerate() {
+        core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+    }
+    let _ = page_map(copy_cap(tramp), CSR_TRAMP_VA, /* RX */ 2, csrss_pml4);
+    // CNode (csrss's PML4 + the dedicated CSR fault EP) + TCB.
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, csrss_pml4, 0);
+    let csr_ep = CSR_FAULT_EP.load(Ordering::Relaxed);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(csr_ep), 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, csrss_pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CSR_IPCBUF_VA, ipcbuf, 0);
+    let _ = tcb_write_registers(tcb, CSR_TRAMP_VA, CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 - 16, 0);
+    let _ = tcb_set_gs_base(tcb, CSR_TEB_VA);
+    let _ = tcb_set_priority(tcb, 100);
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    attach_sched_context(tcb);
+    // NOT resumed here: CsrApiRequestThread's pre-loop CsrConnectToUser touches CsrRootProcess's
+    // thread list under csrss's process lock, which csrss's MAIN thread is still mutating during init
+    // (CsrAddStaticServerThread). Resuming now would race. Instead `csr_rendezvous` resumes it lazily,
+    // by which time csrss main has finished init + parked → the CSR thread runs alone in csrss's VSpace.
+    tcb
+}
+
+/// Write a u64 to the CSR thread's stack (via the executive's CSR_STACK_MIRROR alias).
+unsafe fn csr_stack_write(va: u64, v: u64) {
+    if va >= CSR_STACK_BASE && va + 8 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u64, v);
+    }
+}
+/// Write a u16 to the CSR thread's stack (for PORT_MESSAGE.Type@0x04).
+unsafe fn csr_stack_write16(va: u64, v: u16) {
+    if va >= CSR_STACK_BASE && va + 2 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u16, v);
+    }
+}
+
+/// Demand-fill one code/data page for the CSR API thread during the rendezvous. The page is in
+/// csrss's own image (PE_LOAD_BASE..img_end), ntdll, or a mapped registry DLL (csrsrv/user32/…, via
+/// `dll_for_page`). Filled through an isolated executive scratch (CSR_FILL_SCRATCH_BASE, own PT) then
+/// mapped into csrss's VSpace. Returns false if the page belongs to none (a genuine fault).
+#[allow(clippy::too_many_arguments)]
+unsafe fn csr_fill_page(
+    page: u64,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>; 16],
+    fill_idx: &mut u64,
+) -> bool {
+    let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
+        (PE_LOAD_BASE, csrss_pe)
+    } else if nt_base != 0 && page >= nt_base && page < nt_end {
+        match ntdll_pe {
+            Some(p) => (nt_base, p),
+            None => return false,
+        }
+    } else if let Some((i, _)) = reg.dll_for_page(page) {
+        match dll_pes[i].as_ref() {
+            Some(p) => (reg.base(i), p),
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+    if CSR_FILL_PT_DONE.swap(1, Ordering::Relaxed) == 0 {
+        let spt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+        let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, CSR_FILL_SCRATCH_BASE, CAP_INIT_THREAD_VSPACE);
+    }
+    let scratch = CSR_FILL_SCRATCH_BASE + (*fill_idx).min(511) * 0x1000;
+    *fill_idx += 1;
+    let f = alloc_frame();
+    let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let rights = fill_image_page(tpe, (page - base) as u32, scratch);
+    let _ = page_map(copy_cap(f), page, rights, csrss_pml4);
+    true
+}
+
+/// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one connection accept for
+/// winlogon's `NtSecureConnectPort(\Windows\ApiPort)`. Mirrors `sm_rendezvous`: a nested loop on
+/// `CSR_FAULT_EP`/`REPLY_CSRLOOP` services the thread's real syscalls until `NtCompleteConnectPort`.
+/// The thread's pre-loop `CsrConnectToUser` is in-process (no syscalls; ClientThreadSetup is a stub
+/// returning TRUE, and CsrLocateThreadInProcess returns non-NULL since csrss registered its static
+/// threads at init → no spin). On the connection: NtSetEvent (signal hRequestEvent, no-op) →
+/// NtReplyWaitReceivePort (drain the broker's pending connection + marshal the PORT_MESSAGE:
+/// Type=LPC_CONNECTION_REQUEST, ClientId = the self-connect CID so CsrLocateThreadByClientId matches a
+/// registered CSR_THREAD → CsrProcess=CsrRootProcess → AllowConnection=TRUE) → [NtMapViewOfSection of
+/// the CSR shared section — no-op success] → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort
+/// (broker complete). Returns the client comm-port handle (0 on wall). Leaves the thread re-parked on
+/// its next NtReplyWaitReceivePort (break-after-complete, like SM).
+///
+/// ★ FLAGGED RESIDUALS (host limitations, NOT the accept mechanism — the real thread runs + issues the
+/// real receive/accept syscalls): (a) THE ACCEPT DECISION — CsrApiHandleConnectionRequest's
+/// CsrLocateThreadByClientId (hash table, exact CID) finds NO thread for winlogon because winlogon is
+/// not a registered CSR_PROCESS (that needs the SM→SB→CsrSrvCreateProcess *session-registration* plane,
+/// a separate fork), so the real thread computes AllowConnection=FALSE and passes Accept=FALSE. The
+/// executive OVERRIDES the broker to accept+complete at the NtAcceptConnectPort syscall so winlogon
+/// connects; (b) the CSR_API_CONNECTINFO reply payload + shared-section mapping into winlogon are still
+/// executive-modeled (in `csr_client_connect`) because the isolated LPC broker carries no message
+/// payload across the connect. (The marshaled connection-request ClientId is now cosmetic — no hashed
+/// CSR_THREAD can match it either way.)
+#[allow(clippy::too_many_arguments)]
+unsafe fn csr_rendezvous(
+    conn_id: u64,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>; 16],
+) -> u64 {
+    const SSN_SET_EVENT: u64 = 228;
+    const SSN_MAP_VIEW: u64 = 113;
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_ACCEPT_CONNECT: u64 = 0;
+    const SSN_COMPLETE_CONNECT: u64 = 31;
+    let ep = CSR_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_CSRLOOP_SLOT.load(Ordering::Relaxed);
+    if ep == 0 || reply == 0 {
+        return 0;
+    }
+    let mut client_handle = 0u64;
+    let mut fill_idx = 0u64;
+    let mut guard = 0u64;
+    // Lazily resume the CSR thread on the FIRST rendezvous (csrss main has finished init + parked, so
+    // the thread runs alone in csrss's VSpace — no race on the CSR process/thread lists). Subsequent
+    // rendezvous re-recv the thread already re-parked on its next NtReplyWaitReceivePort.
+    if CSR_RESUMED.swap(1, Ordering::Relaxed) == 0 {
+        let tcb = CSR_LOOP_TCB.load(Ordering::Relaxed);
+        if tcb != 0 && tcb != 1 {
+            let _ = tcb_resume(tcb);
+        }
+    }
+    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    loop {
+        guard += 1;
+        if guard > 8000 {
+            print_str(b"[csr-rdv] WALL: guard exhausted\n");
+            break;
+        }
+        let label = mi >> 12;
+        if label == 6 {
+            let page = m1 & !0xFFFu64;
+            if m1 < 0x10000
+                || !csr_fill_page(page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe, reg, dll_pes, &mut fill_idx)
+            {
+                print_str(b"[csr-rdv] WALL: unresolved fault ip=0x");
+                print_hex((m0 >> 32) as u32);
+                print_hex(m0 as u32);
+                print_str(b" addr=0x");
+                print_hex((m1 >> 32) as u32);
+                print_hex(m1 as u32);
+                print_str(b"\n");
+                break;
+            }
+            send_on_reply(reply, 0, 0, 0, 0, 0);
+            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            continue;
+        }
+        if label == 3 {
+            let fip = m0;
+            if let Some(p) = ntdll_pe {
+                if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
+                    send_on_reply(reply, 3, fip + 3, m1, m2, 0);
+                    let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+            }
+            print_str(b"[csr-rdv] WALL: exception fip=0x");
+            print_hex((fip >> 32) as u32);
+            print_hex(fip as u32);
+            print_str(b" num=");
+            print_u64(m3);
+            print_str(b"\n");
+            break;
+        }
+        if label == 2 {
+            let ssn = m0;
+            let resume_ip = m2;
+            let sp = get_recv_mr(16);
+            let flags = get_recv_mr(17);
+            let rdx = m3;
+            let mut result = 0u64;
+            let mut done = false;
+            match ssn {
+                SSN_SET_EVENT => {} // NtSetEvent(hRequestEvent) — no-op success
+                SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
+                SSN_REPLY_WAIT_RECV => {
+                    let recvmsg = get_recv_mr(8); // R9 = &ReceiveMsg.Header
+                    let port = get_recv_mr(9); // R10 = CsrApiPort handle
+                    let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
+                    match got {
+                        Some(r) if r.connection_id != 0 => {
+                            csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
+                            csr_stack_write(recvmsg + 0x08, CSR_STATIC_CID_PROC); // ClientId.UniqueProcess
+                            csr_stack_write(recvmsg + 0x10, CSR_STATIC_CID_THREAD); // ClientId.UniqueThread
+                        }
+                        _ => {
+                            // No pending connection (the re-park receive): leave the thread PARKED.
+                            break;
+                        }
+                    }
+                }
+                SSN_ACCEPT_CONNECT => {
+                    // The REAL CsrApiHandleConnectionRequest reached NtAcceptConnectPort. ★ FLAGGED
+                    // OVERRIDE: in our host winlogon is NOT a registered CSR_PROCESS (that needs the
+                    // SM→SB→CsrSrvCreateProcess session plane we don't model), so CsrLocateThreadByClientId
+                    // returned NULL → the thread passes Accept=FALSE (R9) and will SKIP NtCompleteConnectPort.
+                    // Force the broker to ACCEPT + COMPLETE here so winlogon's connect succeeds — the real
+                    // thread issued the accept syscall; only the accept DECISION is executive-supplied.
+                    let porthandle_out = get_recv_mr(9); // R10 = *ServerPort
+                    let sh = lpc_client()
+                        .and_then(|c| c.accept_connect(conn_id, true, rdx).ok())
+                        .unwrap_or(0);
+                    csr_stack_write(porthandle_out, sh);
+                    if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
+                        client_handle = ch;
+                    }
+                    // Reply the accept, then break: the thread resumes into its (rejecting) tail +
+                    // re-parks on its next NtReplyWaitReceivePort. Single winlogon connect → done.
+                    done = true;
+                }
+                SSN_COMPLETE_CONNECT => {
+                    // Defensive: if the accept were ever ALLOWED (a future registered CSR process),
+                    // the thread would call this — complete through the broker.
+                    if client_handle == 0 {
+                        if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
+                            client_handle = ch;
+                        }
+                    }
+                    done = true;
+                }
+                _ => {
+                    // An incidental syscall on the accept path (NtDelayExecution retry,
+                    // NtSetInformationThread, …) — no-op success + keep going (bounded by `guard`).
+                    print_str(b"[csr-rdv] incidental SSN=");
+                    print_u64(ssn);
+                    print_str(b" -> no-op success\n");
+                }
+            }
+            set_reply_mr(15, resume_ip);
+            set_reply_mr(16, sp);
+            set_reply_mr(17, flags);
+            send_on_reply(reply, 18, result, 0, 0, rdx);
+            if done {
+                break;
+            }
+            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            continue;
+        }
+        print_str(b"[csr-rdv] WALL: unexpected label=");
         print_u64(label);
         print_str(b"\n");
         break;
@@ -9472,6 +9999,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let e_rs = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rs);
     if e_rs == 0 {
         REPLY_SMLOOP_SLOT.store(rs, Ordering::Relaxed);
+    }
+    // Authentic CSR accept: a dedicated fault endpoint + reply object for the real CsrApiRequestThread
+    // (mirrors the SM triad above).
+    let csr_ep = make_object(OBJ_ENDPOINT);
+    CSR_FAULT_EP.store(csr_ep, Ordering::Relaxed);
+    let rc = alloc_slot();
+    let e_rc = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rc);
+    if e_rc == 0 {
+        REPLY_CSRLOOP_SLOT.store(rc, Ordering::Relaxed);
     }
     print_str(b"[ntos-exec] reply caps: REPLY_MAIN cptr=0x");
     print_hex(REPLY_MAIN_SLOT.load(Ordering::Relaxed) as u32);
