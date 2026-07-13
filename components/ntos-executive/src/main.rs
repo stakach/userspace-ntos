@@ -169,6 +169,16 @@ pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
 pub const WINLOGON_STACK_MIRROR_VA: u64 = 0x0000_0100_106B_0000; // FILEBUF PT, present
 pub const WINLOGON_HEAP_MIRROR_VA: u64 = 0x0000_0100_1220_0000; // own PT (spawn_sec_image creates it)
 pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spawn_sec_image creates it)
+/// winlogon's CSR client-connect regions (mapped into winlogon's OWN VSpace by the NtSecureConnectPort
+/// handler, lazily). One 2 MiB PT holds both: the LpcWrite heap VIEW (16 pages / 64 KiB — kernel32
+/// RtlCreateHeaps over it as CsrPortHeap; ViewBase in the returned PORT_VIEW) and the CSR shared
+/// STATIC server data (4 pages — ConnectionInfo.SharedStaticServerData → an array of per-ServerDll
+/// pointers; [BASESRV=1] → a BASE_STATIC_SERVER_DATA whose WindowsDirectory/WindowsSystemDirectory
+/// kernel32's BaseDllInitialize dereferences). Free in winlogon (DLLs at 0x8000_0000+, image/ntdll/
+/// stack/heap elsewhere). Executive-side fill via a dedicated scratch PT.
+pub const WINLOGON_CSR_HEAP_VA: u64 = 0x0000_0100_0400_0000; // 64 KiB LpcWrite view (ViewBase)
+pub const WINLOGON_CSR_STATIC_VA: u64 = 0x0000_0100_0401_0000; // 16 KiB shared static server data
+pub const WINLOGON_CSR_FILL_SCRATCH: u64 = 0x0000_0100_1320_0000; // exec-side fill alias (own PT)
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
 // smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
@@ -248,6 +258,9 @@ pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
 pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
 pub const SSN_NT_CONNECT_PORT: u64 = 33;
 pub const SSN_NT_SECURE_CONNECT_PORT: u64 = 218;
+/// NtRequestWaitReplyPort — the LPC message data plane (CSR API calls: kernel32's CsrClientCallServer
+/// → \Windows\ApiPort). Serviced by the executive's DIRECT cross-badge message plane.
+pub const SSN_NT_REQUEST_WAIT_REPLY_PORT: u64 = 208;
 pub const SSN_NT_CREATE_SECTION: u64 = 52;
 /// NtOpenSection — CsrServerInitialization opens named sections (NLS, \KnownDlls\*, CSR shared mem).
 pub const SSN_NT_OPEN_SECTION: u64 = 131;
@@ -2348,6 +2361,27 @@ unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
     }
 }
 
+/// Write a 16-bit value to a stack VA (via the mirror). Use for the PORT_MESSAGE u2.s2.Type field
+/// (a CSHORT) when modeling an LPC reply in place — a wider write would clobber the adjacent
+/// DataInfoOffset / u1 length fields.
+unsafe fn smss_stack_write16(stack_va: u64, v: u16) {
+    if stack_va >= STACK_BASE && stack_va + 2 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+        let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u16, v);
+    }
+}
+
+/// Write an ASCII string as a NUL-terminated UTF-16LE buffer at an executive scratch VA (for building
+/// the CSR shared static server data's WCHAR name buffers before they are mapped into winlogon).
+unsafe fn write_wstr(exec_va: u64, s: &str) {
+    let mut off = 0u64;
+    for u in s.encode_utf16() {
+        core::ptr::write_volatile((exec_va + off) as *mut u16, u);
+        off += 2;
+    }
+    core::ptr::write_volatile((exec_va + off) as *mut u16, 0);
+}
+
 /// The file byte at image RVA `rva` (translated via the section table). For reading a faulting
 /// instruction's opcode from the mapped PE.
 unsafe fn pe_byte_at_rva(pe: &nt_pe_loader::PeFile, rva: u32) -> Option<u8> {
@@ -2703,6 +2737,10 @@ struct ExecNtHandler {
     /// below the heap mark (like `key_handles`) so pushes never reallocate across the per-syscall
     /// bump reset. Records are `Copy` (inline name, no nested heap).
     lpc_connections: alloc::vec::Vec<LpcConnRecord>,
+    /// winlogon's CSR client-connect LpcWrite heap-view base (0 = the CSR regions haven't been mapped
+    /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
+    /// connect; guards the one-time region mapping (heap view + static server data) in that handler.
+    winlogon_csr_view: u64,
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
@@ -2800,6 +2838,7 @@ impl ExecNtHandler {
             // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
             // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
             lpc_connections: alloc::vec::Vec::with_capacity(16),
+            winlogon_csr_view: 0,
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -2868,6 +2907,152 @@ impl ExecNtHandler {
             name: buf,
             name_len: n as u8,
         });
+    }
+    /// Service winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
+    ///
+    /// csrss owns \Windows\ApiPort but its real CsrApiRequestThread doesn't run yet, so the executive
+    /// MODELS the CSR acceptor (interim, mirroring SM path A): auto-accept through the broker + fill the
+    /// reply the client reads back. kernel32's BaseDllInitialize is FATAL on a failed connect and then
+    /// dereferences the shared static server data (`Peb->ReadOnlyStaticServerData[BASESRV]->
+    /// WindowsDirectory`), so this must hand back real, mapped memory:
+    ///  - `ClientView` (PORT_VIEW LpcWrite) ViewBase = a 64 KiB RW region kernel32 RtlCreateHeaps over.
+    ///  - `ConnectionInfo` (CSR_API_CONNECTINFO) SharedSectionBase/Heap, SharedStaticServerData (→ an
+    ///    array whose [BASESRV=1] slot points at a BASE_STATIC_SERVER_DATA with valid Windows dirs),
+    ///    and ServerProcessId.
+    /// All out-params are winlogon STACK locals (ConnectionInfo/LpcWrite) reached via the mirror; the
+    /// backing regions are mapped into winlogon's own VSpace (lazily, once). Returns STATUS_SUCCESS.
+    unsafe fn csr_client_connect(
+        &mut self,
+        name16: &[u16],
+        porthandle_ptr: u64,
+        clientview_ptr: u64,
+        conninfo_ptr: u64,
+    ) -> u32 {
+        let ctx = match self.loop_ctx {
+            Some(c) => c,
+            None => return 0xC000_0001,
+        };
+        let pml4 = ctx.pml4;
+        // (1) Model the CSR acceptor via the broker: connect (Pending under Manual) then accept +
+        // complete synchronously → a real client comm-port handle + a cached LpcConnRecord for the
+        // direct message plane. IMAGE_SUBSYSTEM_WINDOWS_GUI(2) = a Win32 GUI client.
+        let mut client_handle = 0u64;
+        let mut cached = false;
+        if let Some(c) = lpc_client() {
+            if let Ok(r) = c.connect_port(name16, 2, &[]) {
+                if r.pending && r.connection_id != 0 {
+                    let _ = c.accept_connect(r.connection_id, true, 0);
+                    if let Ok((ch, _)) = c.complete_connect(r.connection_id) {
+                        client_handle = ch;
+                        self.cache_lpc_connection(r.connection_id, ch, name16);
+                        cached = true;
+                    }
+                } else if r.handle != 0 {
+                    client_handle = r.handle;
+                    self.cache_lpc_connection(r.connection_id, r.handle, name16);
+                    cached = true;
+                }
+            }
+        }
+        if client_handle == 0 {
+            client_handle = self.next_handle;
+            self.next_handle += 1;
+        }
+        let _ = cached;
+        // (2) Map winlogon's CSR regions once (heap view + static server data).
+        if self.winlogon_csr_view == 0 {
+            // One 2 MiB PT in winlogon covers both regions; a second PT in the executive VSpace is
+            // the fill-scratch alias for populating the static data before copy_cap'ing it in.
+            let wpt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
+            let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WINLOGON_CSR_HEAP_VA, pml4);
+            let spt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+            let _ = paging_struct_map(
+                spt,
+                LBL_X86_PAGE_TABLE_MAP,
+                WINLOGON_CSR_FILL_SCRATCH,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            // LpcWrite heap view: 16 committed RW frames (kernel32 RtlCreateHeaps over ViewBase).
+            for i in 0..16u64 {
+                let f = alloc_frame();
+                let _ = page_map(copy_cap(f), WINLOGON_CSR_HEAP_VA + i * 0x1000, RW_NX, pml4);
+            }
+            // Static server data (4 frames): fill via the exec scratch alias, then map into winlogon.
+            //   page0 +0x0000: ReadOnlyStaticServerData[4]; [1] -> BASE_STATIC_SERVER_DATA
+            //   page0 +0x0100: BASE_STATIC_SERVER_DATA (WindowsDirectory@0, WindowsSystemDirectory@0x10,
+            //                  NamedObjectDirectory@0x20 — all x64 UNICODE_STRINGs)
+            //   page3 (+0x3000 in-region): the WCHAR name buffers
+            for i in 0..4u64 {
+                let f = alloc_frame();
+                let sc = WINLOGON_CSR_FILL_SCRATCH + i * 0x1000;
+                let _ = page_map(f, sc, RW_NX, CAP_INIT_THREAD_VSPACE);
+                if i == 0 {
+                    core::ptr::write_volatile((sc + 0x08) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x0100);
+                    let bssd = sc + 0x0100;
+                    // WindowsDirectory = L"C:\Windows" (9 wchars)
+                    core::ptr::write_volatile((bssd + 0x00) as *mut u16, 9 * 2);
+                    core::ptr::write_volatile((bssd + 0x02) as *mut u16, 10 * 2);
+                    core::ptr::write_volatile((bssd + 0x08) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3000);
+                    // WindowsSystemDirectory = L"C:\Windows\System32" (18 wchars)
+                    core::ptr::write_volatile((bssd + 0x10) as *mut u16, 18 * 2);
+                    core::ptr::write_volatile((bssd + 0x12) as *mut u16, 19 * 2);
+                    core::ptr::write_volatile((bssd + 0x18) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3020);
+                    // NamedObjectDirectory = L"\BaseNamedObjects" (17 wchars)
+                    core::ptr::write_volatile((bssd + 0x20) as *mut u16, 17 * 2);
+                    core::ptr::write_volatile((bssd + 0x22) as *mut u16, 18 * 2);
+                    core::ptr::write_volatile((bssd + 0x28) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3060);
+                } else if i == 3 {
+                    write_wstr(sc + 0x000, "C:\\Windows");
+                    write_wstr(sc + 0x020, "C:\\Windows\\System32");
+                    write_wstr(sc + 0x060, "\\BaseNamedObjects");
+                }
+                let _ = page_map(copy_cap(f), WINLOGON_CSR_STATIC_VA + i * 0x1000, RW_NX, pml4);
+            }
+            self.winlogon_csr_view = WINLOGON_CSR_HEAP_VA;
+        }
+        // (3) Fill the client PORT_VIEW (LpcWrite): ViewBase/ViewRemoteBase (delta 0 → capture pointers
+        // are client pointers, which the direct message plane reads via the mirror) + ViewSize.
+        if clientview_ptr != 0 {
+            smss_stack_write(clientview_ptr + 0x18, 0x1_0000); // ViewSize = 64 KiB
+            smss_stack_write(clientview_ptr + 0x20, WINLOGON_CSR_HEAP_VA); // ViewBase
+            smss_stack_write(clientview_ptr + 0x28, WINLOGON_CSR_HEAP_VA); // ViewRemoteBase
+        }
+        // (4) Fill CSR_API_CONNECTINFO: kernel32 copies these into the PEB (ReadOnlySharedMemoryBase/
+        // Heap, ReadOnlyStaticServerData) + records ServerProcessId.
+        if conninfo_ptr != 0 {
+            smss_stack_write(conninfo_ptr + 0x08, WINLOGON_CSR_HEAP_VA); // SharedSectionBase
+            smss_stack_write(conninfo_ptr + 0x10, WINLOGON_CSR_STATIC_VA); // SharedStaticServerData
+            smss_stack_write(conninfo_ptr + 0x18, WINLOGON_CSR_HEAP_VA); // SharedSectionHeap
+            smss_stack_write(conninfo_ptr + 0x30, 8); // ServerProcessId (csrss — plausible)
+        }
+        // (5) *PortHandle = &CsrApiPort (an ntdll .data global) — best-effort (the modeled message
+        // plane doesn't dispatch by this handle, so a silent miss is harmless).
+        if porthandle_ptr != 0 {
+            csrss_out_write(
+                porthandle_ptr,
+                client_handle,
+                &mut *ctx.filled_pages,
+                &mut *ctx.faults,
+                ctx.scratch_base,
+                &*ctx.reg,
+                &*ctx.dll_pes,
+                pml4,
+            );
+        }
+        WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
+        print_str(b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> SUCCESS; client=0x");
+        print_hex((client_handle >> 32) as u32);
+        print_hex(client_handle as u32);
+        print_str(b" ViewBase=0x");
+        print_hex((WINLOGON_CSR_HEAP_VA >> 32) as u32);
+        print_hex(WINLOGON_CSR_HEAP_VA as u32);
+        print_str(b" StaticData=0x");
+        print_hex((WINLOGON_CSR_STATIC_VA >> 32) as u32);
+        print_hex(WINLOGON_CSR_STATIC_VA as u32);
+        print_str(b"\n");
+        0
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
     /// returns the filled length. Non-ASCII code units are truncated to their low byte.
@@ -3279,13 +3464,62 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             }
+            // NtSecureConnectPort — the CSR client connect (kernel32's CsrClientConnectToServer →
+            // \Windows\ApiPort, from winlogon's BaseDllInitialize). The SECURE variant (SecurityQos +
+            // ServerSid) is CSR-only in this system: SmConnectToSm uses plain NtConnectPort(33), so 218
+            // unambiguously means "a Win32 client connecting to CSR". csrss OWNS \Windows\ApiPort but
+            // its real CsrApiRequestThread doesn't run (interim), so the executive MODELS the CSR
+            // acceptor: auto-accept in the broker + fill the CSR_API_CONNECTINFO reply (SharedSection
+            // pointers + a BASE_STATIC_SERVER_DATA) + the LpcWrite PORT_VIEW, so kernel32's DllMain
+            // proceeds. See `csr_client_connect`. (Authentic swap: drive csrss's real
+            // CsrApiRequestThread via a csr_rendezvous, mirroring the SM path A→B.)
+            // x64 ABI: PortHandle=R10=args[0], PortName=RDX=args[1], SecurityQos=R8, ClientView=R9,
+            // ServerSid=[sp+0x28], ServerView=[sp+0x30], MaxMsgLen=[sp+0x38], ConnInfo=[sp+0x40],
+            // ConnInfoLen=[sp+0x48].
+            NativeService::NtSecureConnectPort => unsafe {
+                let name16 = self.read_lpc_name(args[1]);
+                let sp = get_recv_mr(16);
+                let porthandle_ptr = get_recv_mr(9); // R10 = *PortHandle (&CsrApiPort, ntdll .data)
+                let clientview_ptr = get_recv_mr(8); // R9 = *ClientView (PORT_VIEW, stack local)
+                let conninfo_ptr = smss_stack_read(sp + 0x40); // arg8 = *ConnectionInformation (stack)
+                self.csr_client_connect(&name16, porthandle_ptr, clientview_ptr, conninfo_ptr)
+            },
+            // NtRequestWaitReplyPort(PortHandle=R10, RequestMessage=RDX, ReplyMessage=R8) — the LPC
+            // message DATA plane. kernel32's CsrClientCallServer sends the CsrpClientConnect message
+            // (ApiNumber 0, ServerId=BASESRV) right after the port connect; its reply Status must be
+            // STATUS_SUCCESS or BaseDllInitialize fails. Serviced by the DIRECT cross-badge message
+            // plane: the executive reads the CSR_API_MESSAGE off the caller's stack (mirror) and models
+            // csrss's reply in place (Status=SUCCESS), against the cached winlogon↔\Windows\ApiPort
+            // LpcConnRecord — never a round-trip to the isolated broker. (Interim: a real acceptor would
+            // be csrss's CsrApiRequestThread; this models it, like SM path A.)
+            NativeService::NtRequestWaitReplyPort => unsafe {
+                let reqmsg = args[1]; // RDX = &ApiMessage.Header (request, in/out = same buffer)
+                // CSR_API_MESSAGE: PORT_MESSAGE Header(0x28), CsrCaptureData@0x28, ApiNumber@0x30,
+                // Status@0x34. Read ApiNumber, model the CSR server: every call → STATUS_SUCCESS.
+                let api_number = {
+                    let mut b = [0u8; 4];
+                    if smss_copyin(reqmsg + 0x30, &mut b) {
+                        u32::from_le_bytes(b)
+                    } else {
+                        0xFFFF_FFFF
+                    }
+                };
+                // Reply in place: Status@+0x34 = STATUS_SUCCESS + mark the PORT_MESSAGE Type = LPC_REPLY.
+                smss_stack_write32(reqmsg + 0x34, 0); // ApiMessage.Status = STATUS_SUCCESS
+                smss_stack_write16(reqmsg + 0x04, nt_lpc_abi::msg_type::LPC_REPLY); // Header.u2.s2.Type
+                print_str(b"[csr-msg] winlogon CsrClientCallServer ApiNumber=0x");
+                print_hex(api_number);
+                print_str(b" -> modeled reply Status=SUCCESS (direct message plane)\n");
+                CSR_MSGS.fetch_add(1, Ordering::Relaxed);
+                0
+            },
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
-            // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). NtSecureConnectPort is the same but with
-            // *ServerSid inserted at arg5 — PortName stays arg2. Route to the LPC broker; on the
-            // interim AutoAccept path the connect completes synchronously → write the client comm-port
-            // handle to the caller's *PortHandle (arg1=R10) + cache the connection for the (future)
-            // direct message data plane. This is what unblocks csrss's SmConnectToSm.
-            NativeService::NtConnectPort | NativeService::NtSecureConnectPort => unsafe {
+            // *ServerView, *MaxMsg, *ConnInfo, *ConnInfoLen). The SM connect (SmConnectToSm →
+            // \SmApiPort). Route to the LPC broker; on the interim AutoAccept path the connect completes
+            // synchronously → write the client comm-port handle to the caller's *PortHandle (arg1=R10)
+            // + cache the connection; on Manual (path B) the loop drives the authentic SmpApiLoop accept
+            // via sm_rendezvous. This is what unblocks csrss's SmConnectToSm.
+            NativeService::NtConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
                 match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
                     Some(Ok(r)) => {
@@ -3900,6 +4134,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let sp = get_recv_mr(16);
                 let csrss_section_handle = *ctx.csrss_section_handle;
                 let csrss_pe = &*ctx.csrss_pe;
+                let winlogon_section_handle = *ctx.winlogon_section_handle;
+                let winlogon_pe = &*ctx.winlogon_pe;
                 let info: Option<([u8; 64], &[u8])> = if let Some(i) = reg.index_for_section(sect) {
                     reg.image_info(i).map(|b| (b, reg.name(i)))
                 } else if csrss_section_handle != 0 && sect == csrss_section_handle {
@@ -3912,6 +4148,23 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 false,
                             ),
                             b"csrss.exe" as &[u8],
+                        )
+                    })
+                } else if winlogon_section_handle != 0 && sect == winlogon_section_handle {
+                    // smss's RtlCreateUserProcess(winlogon) queries SectionImageInformation on the
+                    // winlogon SEC_IMAGE section to size the initial thread's stack + find the entry.
+                    // Unrecognized before, this stopped the whole demo (the ONLY reason winlogon
+                    // couldn't run past its CSR connect); recognized now → smss proceeds + winlogon
+                    // (higher prio) keeps running.
+                    winlogon_pe.as_ref().map(|p| {
+                        (
+                            nt_dll_registry::image_info(
+                                PE_LOAD_BASE,
+                                p.entry_point_rva(),
+                                p.size_of_image(),
+                                false,
+                            ),
+                            b"winlogon.exe" as &[u8],
                         )
                     })
                 } else {
@@ -4228,6 +4481,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtSecureConnectPort, SSN_NT_SECURE_CONNECT_PORT as u32),
             (NativeService::NtAcceptConnectPort, SSN_NT_ACCEPT_CONNECT_PORT as u32),
             (NativeService::NtCompleteConnectPort, SSN_NT_COMPLETE_CONNECT_PORT as u32),
+            (NativeService::NtRequestWaitReplyPort, SSN_NT_REQUEST_WAIT_REPLY_PORT as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
@@ -5618,6 +5872,13 @@ unsafe fn service_sec_image(
                 // modeled in the host, so accept it (STATUS_SUCCESS); *PreviousState is optional and
                 // smss ignores it here. Lets SmpInit/SmpExecuteInitialCommand proceed.
                 result = 0;
+            } else if m0 == 195 {
+                // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST
+                // step of BaseDllInitialize after the CSR connect — registers the thread's LPC
+                // terminate port (so CSR is told when the thread dies). No terminate-port model in the
+                // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
+                // loader runs the remaining DllMains toward winlogon's entry.
+                result = 0;
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
@@ -6869,6 +7130,12 @@ static WINLOGONBUF_START: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages winlogon's ntdll loader demand-faulted (slot 2), for the spec-check report.
 static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
+/// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
+static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
+/// How many CSR API messages (NtRequestWaitReplyPort → \Windows\ApiPort) the direct message plane
+/// has serviced — proves winlogon↔csrss live traffic over the peer-direct plane.
+static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap bases of the raw dxg.sys / dxgthk.sys staged into DXGBUF / DXGTHKBUF (DirectX host).
 static DXGBUF_START: AtomicU64 = AtomicU64::new(0);
 static DXGTHKBUF_START: AtomicU64 = AtomicU64::new(0);
@@ -10688,6 +10955,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WINLOGON_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort)
+                    // was serviced: the CSR regions were mapped + the CSR_API_CONNECTINFO reply filled,
+                    // so BaseDllInitialize proceeds past the (otherwise fatal) connect.
+                    check(
+                        b"exec_winlogon_csr_connect",
+                        WINLOGON_CSR_CONNECTED.load(Ordering::Relaxed) == 1,
+                        &mut passed,
+                    );
+                    // The DIRECT cross-badge message plane carried live winlogon↔csrss CSR API traffic
+                    // (NtRequestWaitReplyPort → the CsrpClientConnect message, modeled reply=SUCCESS).
+                    check(
+                        b"exec_csr_message_plane",
+                        CSR_MSGS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
                 } else {
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
@@ -10697,6 +10979,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(b"exec_winlogon_staged", false, &mut passed);
                     check(b"exec_winlogon_spawned", false, &mut passed);
                     check(b"exec_winlogon_loader_runs", false, &mut passed);
+                    check(b"exec_winlogon_csr_connect", false, &mut passed);
+                    check(b"exec_csr_message_plane", false, &mut passed);
                 }
             }
             Err(_) => {

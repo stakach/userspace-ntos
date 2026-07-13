@@ -102,6 +102,10 @@ pub enum NativeService {
     NtSecureConnectPort,
     NtAcceptConnectPort,
     NtCompleteConnectPort,
+    // The LPC message data plane (request/reply). Registered so the executive can service the CSR
+    // API message exchange (kernel32's CsrClientCallServer → \Windows\ApiPort) via DIRECT cross-
+    // badge delivery against the cached connection — it does NOT round-trip to the isolated broker.
+    NtRequestWaitReplyPort,
     NtMakeTemporaryObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
     // no per-thread/process attribute sets, no per-object security, no keyed events).
@@ -182,6 +186,7 @@ impl NativeService {
             NtSecureConnectPort => "NtSecureConnectPort",
             NtAcceptConnectPort => "NtAcceptConnectPort",
             NtCompleteConnectPort => "NtCompleteConnectPort",
+            NtRequestWaitReplyPort => "NtRequestWaitReplyPort",
             NtMakeTemporaryObject => "NtMakeTemporaryObject",
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
@@ -245,7 +250,10 @@ impl NativeService {
             | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
             | NtFlushInstructionCache | NtCreateKeyedEvent | NtAdjustPrivilegesToken
             | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
-            | NtSetSecurityObject | NtResumeThread | NtSetInformationObject => (0, 4),
+            | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
+            // CSR message plane: the handler reads Request/Reply message ptrs via the register
+            // args + the winlogon stack mirror directly; cap at 4 register args (no stack prefill).
+            | NtRequestWaitReplyPort => (0, 4),
             _ => (0, 16), // permissive for the rest in v0.1
         }
     }
@@ -293,6 +301,7 @@ impl NativeService {
         NativeService::NtSecureConnectPort,
         NativeService::NtAcceptConnectPort,
         NativeService::NtCompleteConnectPort,
+        NativeService::NtRequestWaitReplyPort,
         NativeService::NtMakeTemporaryObject,
         NativeService::NtSetInformationThread,
         NativeService::NtSetInformationProcess,
