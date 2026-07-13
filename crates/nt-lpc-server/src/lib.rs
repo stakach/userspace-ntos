@@ -38,9 +38,9 @@ use core::mem::size_of;
 use bytemuck::Pod;
 use nt_lpc_abi::{
     opcode, LpcAcceptConnectRequest, LpcClosePortRequest, LpcCompleteConnectRequest,
-    LpcConnectPortRequest, LpcCreatePortRequest, LpcReceiveRequest, LpcReply,
+    LpcConnectPortRequest, LpcCreatePortRequest, LpcMessageRequest, LpcReceiveRequest, LpcReply,
 };
-use nt_port_core::{ConnectOutcome, PortApi, PortCore, ReceiveOutcome};
+use nt_port_core::{ConnectOutcome, MessageAttrs, PortApi, PortCore, ReceiveOutcome};
 use nt_status::NtStatus;
 
 /// Re-exported from the unified core so existing `nt_lpc_server::{AcceptPolicy,
@@ -135,10 +135,13 @@ impl Server {
                 self.op_receive(in_buf, out_buf)
             }
             opcode::LPC_OP_CLOSE_PORT => self.op_close_port(in_buf),
-            // Request/reply message loop is served directly by the executive.
-            opcode::LPC_OP_REQUEST_WAIT_REPLY | opcode::LPC_OP_REPLY_PORT => {
-                Err(NtStatus::NOT_IMPLEMENTED)
-            }
+            // Message plane over the shared core. In the live executive smss/csrss
+            // LPC traffic is served by the executive-direct data plane (this path is
+            // bypassed); these core-backed ops exist so the LPC↔ALPC bridge — where
+            // both sides must meet in ONE core — is exercisable (host tests + the
+            // live bridge microtest). LPC carries NO message attributes.
+            opcode::LPC_OP_REQUEST_WAIT_REPLY => self.op_request_wait_reply(in_buf, out_buf),
+            opcode::LPC_OP_REPLY_PORT => self.op_reply_port(in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -186,14 +189,58 @@ impl Server {
 
     fn op_receive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcReceiveRequest = read_req(buf)?;
-        let _ = out_buf; // PORT_MESSAGE marshaling is served by the executive.
-        match self.core.receive(req.port_handle)? {
-            ReceiveOutcome::WouldBlock => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
-            ReceiveOutcome::ConnectionRequest {
-                connection_id,
-                msg_type,
-            } => Ok(reply(NtStatus::SUCCESS, 0, connection_id, msg_type as u64)),
+        // A connection request on a listen port takes priority (the SM rendezvous
+        // path — behavior preserved); else a data message on a comm port.
+        let conn_try = self.core.receive(req.port_handle);
+        if let Ok(ReceiveOutcome::ConnectionRequest {
+            connection_id,
+            msg_type,
+        }) = conn_try
+        {
+            return Ok(reply(NtStatus::SUCCESS, 0, connection_id, msg_type as u64));
         }
+        let is_listen_port = conn_try.is_ok(); // valid listen port, nothing pending
+        match self.core.receive_message(req.port_handle) {
+            Ok(Some(m)) => {
+                let n = m.bytes.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&m.bytes[..n]);
+                // detail0 = 0 (LPC surfaces no attributes); detail1 = PORT_MESSAGE type.
+                Ok(reply(NtStatus::SUCCESS, n as u32, 0, msg_type_of(&m.bytes) as u64))
+            }
+            Ok(None) => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
+            Err(e) => {
+                if is_listen_port {
+                    Ok(reply(NtStatus::PENDING, 0, 0, 0))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// `NtRequestWaitReplyPort` — send a message then receive the reply (if any).
+    fn op_request_wait_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcMessageRequest = read_req(buf)?;
+        let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
+        self.core
+            .send_message(req.port_handle, msg, MessageAttrs::default())?;
+        match self.core.receive_message(req.port_handle)? {
+            Some(m) => {
+                let n = m.bytes.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&m.bytes[..n]);
+                Ok(reply(NtStatus::SUCCESS, n as u32, 0, msg_type_of(&m.bytes) as u64))
+            }
+            None => Ok(ok()),
+        }
+    }
+
+    /// `NtReplyPort` — send a message (no receive).
+    fn op_reply_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcMessageRequest = read_req(buf)?;
+        let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
+        self.core
+            .send_message(req.port_handle, msg, MessageAttrs::default())?;
+        Ok(ok())
     }
 
     fn op_close_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
@@ -235,6 +282,14 @@ fn read_blob(buf: &[u8], offset: u32, len_bytes: u32) -> Result<&[u8], NtStatus>
         .checked_add(len_bytes as usize)
         .ok_or(NtStatus::INVALID_PARAMETER)?;
     buf.get(start..end).ok_or(NtStatus::INVALID_PARAMETER)
+}
+
+/// The `PORT_MESSAGE.Type` at offset 4 of a framed message (0 if too short).
+fn msg_type_of(bytes: &[u8]) -> u16 {
+    match bytes.get(4..6) {
+        Some(b) => u16::from_le_bytes([b[0], b[1]]),
+        None => 0,
+    }
 }
 
 fn reply(status: NtStatus, information: u32, detail0: u64, detail1: u64) -> LpcReply {
@@ -412,5 +467,68 @@ mod tests {
             assert_ne!(client_handle, 0);
         }
         assert_eq!(s.connection_state(conn_id), Some(ConnState::Connected));
+    }
+
+    /// The core-backed LPC message plane (REPLY_PORT send + REPLY_WAIT_RECEIVE
+    /// data receive) — used by the bridge, bypassed by the live executive.
+    #[test]
+    fn lpc_message_plane_roundtrip() {
+        use nt_lpc_abi::LpcMessageRequest;
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        // Full rendezvous → Connected with both comm handles.
+        let (ph, cid) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let ph = c.create_port(&utf16("\\P"), 0, 0, 0).unwrap();
+            let r = c.connect_port(&utf16("\\P"), 0, &[]).unwrap();
+            (ph, r.connection_id)
+        };
+        let sh = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(ph).unwrap();
+            let sh = c.accept_connect(cid, true, 0).unwrap();
+            let (ch, _) = c.complete_connect(cid).unwrap();
+            assert_ne!(ch, 0);
+            sh
+        };
+        // The client comm-port handle: a re-complete returns it (idempotent).
+        let (client_h, _) = s.core_mut().complete(cid).unwrap();
+
+        // Client sends "ping" via REPLY_PORT (send-only).
+        let send = LpcMessageRequest {
+            abi_size: size_of::<LpcMessageRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: client_h,
+            msg_offset: size_of::<LpcMessageRequest>() as u32,
+            msg_len_bytes: 4,
+        };
+        let mut buf = bytemuck::bytes_of(&send).to_vec();
+        buf.extend_from_slice(b"ping");
+        let r = s.dispatch(opcode::LPC_OP_REPLY_PORT, &buf, &mut []);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+
+        // Server receives it via REPLY_WAIT_RECEIVE on its comm handle.
+        let recv = LpcReceiveRequest {
+            abi_size: size_of::<LpcReceiveRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle: sh,
+            reply_msg_offset: 0,
+            reply_msg_len_bytes: 0,
+        };
+        let rbuf = bytemuck::bytes_of(&recv).to_vec();
+        let mut out = [0u8; 64];
+        let r = s.dispatch(opcode::LPC_OP_REPLY_WAIT_RECEIVE, &rbuf, &mut out);
+        assert_eq!(r.status, NtStatus::SUCCESS.raw());
+        assert_eq!(r.information, 4);
+        assert_eq!(&out[..4], b"ping");
+        assert_eq!(r.detail0, 0, "LPC surfaces no attributes");
     }
 }

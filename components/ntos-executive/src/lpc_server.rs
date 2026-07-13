@@ -1,12 +1,15 @@
-//! The LPC connection-broker component: an isolated `nt_lpc_server::Server`
-//! driven by SURT.
+//! The unified NT port-service component: ONE `nt_port_core::PortCore` driven by
+//! BOTH the classic-LPC adapter (`nt_lpc_server::Server`) and the ALPC adapter
+//! (`nt_alpc::AlpcServer`), over a single SURT ring.
 //!
-//! It consumes LPC control-plane requests off the submission ring (`SurtSqe` =
-//! opcode + a slice of the shared request frame), dispatches each through the
-//! unchanged `Server::dispatch`, and produces replies onto the completion ring
-//! (`SurtCqe` = `LpcReply` field-for-field). This is the CONTROL plane only —
-//! create/connect/accept/complete rendezvous; the message data plane never
-//! reaches this component (the executive serves it directly).
+//! It consumes control-plane requests off the submission ring (`SurtSqe` = opcode
+//! + a slice of the shared request frame) and routes each by opcode range: LPC
+//! opcodes (0x2200 block) → `Server::dispatch`, ALPC opcodes (0x2300 block) →
+//! `AlpcServer::dispatch(server.core_mut(), …)`. Because both adapters mutate the
+//! SAME core, a cross-API (LPC↔ALPC) connection is a single core object — the
+//! bridge is automatic. Replies (`LpcReply`/`AlpcReply`, field-identical) go onto
+//! the completion ring as `SurtCqe`. CONTROL plane only — the message data plane
+//! is served directly by the executive against its cached connection record.
 //!
 //! Runs in its own VSpace/CSpace/TCB (spawned by `stand_up_service`), mapping the
 //! executive image read-only + the shared ring/data frames at the shared
@@ -15,6 +18,7 @@
 
 use crate::*;
 
+use nt_alpc::AlpcServer;
 use nt_lpc_server::{AcceptPolicy, Server};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
@@ -40,6 +44,9 @@ pub unsafe extern "C" fn lpc_server_entry() -> ! {
     // acceptor. The full receive/accept/complete machinery is unchanged (host-tested under both).
     let mut server = Server::new();
     server.set_accept_policy(AcceptPolicy::Manual);
+    // The ALPC adapter over the SAME port core (via server.core_mut()). Holds only
+    // ALPC-specific state (port sections/views); LPC + ALPC share the namespace.
+    let mut alpc = AlpcServer::new();
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop pairs order the
@@ -49,14 +56,22 @@ pub unsafe extern "C" fn lpc_server_entry() -> ! {
         };
         let out_buf =
             unsafe { core::slice::from_raw_parts_mut(REP_DATA_VADDR as *mut u8, REP_DATA_LEN) };
-        let reply = server.dispatch(sqe.opcode, in_buf, out_buf);
+
+        // Route by opcode range onto the shared core. Both replies are field-identical.
+        let (status, information, detail0, detail1) = if nt_alpc_abi::is_alpc_opcode(sqe.opcode) {
+            let r = alpc.dispatch(server.core_mut(), sqe.opcode, in_buf, out_buf);
+            (r.status, r.information, r.detail0, r.detail1)
+        } else {
+            let r = server.dispatch(sqe.opcode, in_buf, out_buf);
+            (r.status, r.information, r.detail0, r.detail1)
+        };
 
         let cqe = SurtCqe {
             request_id: sqe.request_id,
-            status: reply.status,
-            information: reply.information as u64,
-            detail0: reply.detail0,
-            detail1: reply.detail1,
+            status,
+            information: information as u64,
+            detail0,
+            detail1,
             ..Default::default()
         };
         while completions.try_push(cqe).is_err() {

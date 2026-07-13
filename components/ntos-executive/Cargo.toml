@@ -25,9 +25,14 @@ nt-object-manager = { path = "../../crates/nt-object-manager" }
 nt-object-server = { path = "../../crates/nt-object-server" }
 nt-object-client = { path = "../../crates/nt-object-client" }
 # The NT LPC connection broker (control plane) — isolated over SURT, like the object stack.
+nt-port-core = { path = "../../crates/nt-port-core" }
 nt-lpc-abi = { path = "../../crates/nt-lpc-abi" }
 nt-lpc-server = { path = "../../crates/nt-lpc-server" }
 nt-lpc-client = { path = "../../crates/nt-lpc-client" }
+# The ALPC adapter over the same nt-port-core — a peer of the LPC adapter (the bridge).
+nt-alpc-abi = { path = "../../crates/nt-alpc-abi" }
+nt-alpc = { path = "../../crates/nt-alpc" }
+bytemuck = { version = "1", default-features = false }
 nt-syscall = { path = "../../crates/nt-syscall" }
 nt-config-abi = { path = "../../crates/nt-config-abi" }
 nt-config-server = { path = "../../crates/nt-config-server" }

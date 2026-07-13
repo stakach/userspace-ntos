@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 
 mod allocator;
+mod alpc_selftest;
 mod cm_server;
 mod io_server;
 mod lpc_server;
@@ -9205,6 +9206,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         && lpc.accept_connect(conn_id, true, 0).map(|sh| sh != 0).unwrap_or(false)
         && lpc.complete_connect(conn_id).map(|(ch, _)| ch != 0).unwrap_or(false);
     check(b"exec_lpc_connect_rendezvous", lpc_rdv_ok, &mut passed);
+    // Live ALPC + LPC↔ALPC bridge self-test over the SAME ring/component/core (the
+    // integration proof — no real ALPC binary exists yet). Drives ALPC + classic-LPC
+    // message-plane opcodes raw on the shared channel, uses distinct \AlpcLive /
+    // \BridgeLive ports (the live smss \SmApiPort path stays untouched).
+    alpc_selftest::run(&mut lpc.backend_mut().0, &mut passed);
     // Publish the client to the static so the live-run LPC syscall handlers can drive it.
     // SAFETY: single-threaded executive; set once before the service loop runs.
     unsafe {
