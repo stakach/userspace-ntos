@@ -17,7 +17,9 @@ use nt_alpc_abi::{
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcMessageAttributes, AlpcSendReceiveRequest,
     AlpcViewIoRequest, PortMessage,
 };
+use nt_alpc::PeerDirect;
 use nt_lpc_abi::{opcode as lop, LpcConnectPortRequest, LpcMessageRequest, LpcReceiveRequest};
+use nt_port_core::MessageAttrs;
 
 const CONNECTION_REQUEST: u16 = 10;
 const REQUEST: u16 = 1;
@@ -111,6 +113,11 @@ pub fn run(chan: &mut RingChannel<'_>, passed: &mut u64) {
         message_attributes_roundtrip(chan, client_h, server_h),
         passed,
     );
+
+    // Step 4: peer-direct data plane — the broker (port-service ring) completes
+    // the connect, then endpoint↔endpoint messages are delivered DIRECTLY against
+    // the executive-local cache with the broker OFF the per-message path.
+    check(b"exec_alpc_peer_direct", peer_direct(chan, &mut out), passed);
 
     // ================= B. LPC client <-> ALPC host (the BRIDGE) =================
     let bname = utf16("\\BridgeLive");
@@ -354,6 +361,75 @@ fn message_attributes_roundtrip(chan: &mut RingChannel<'_>, client_h: u64, serve
         && got_view.view_base == view_base
         && got_ctx.port_context == ctx
         && &out[body_off..total] == &body[..]
+}
+
+/// Step 4 driver: the broker (ring) completes a connect; then a message is
+/// delivered peer-direct (executive-local) with the ring untouched per-message.
+fn peer_direct(chan: &mut RingChannel<'_>, out: &mut [u8]) -> bool {
+    // Broker a fresh connection over the ring.
+    let name = utf16("\\AlpcDirect");
+    let cp = {
+        let hdr = core::mem::size_of::<AlpcCreatePortRequest>() as u32;
+        let req = AlpcCreatePortRequest {
+            abi_size: hdr as u16,
+            port_flags: port_flag::LPC_MODE,
+            max_message_length: 0x1000,
+            name_offset: hdr,
+            name_len_bytes: (name.len() * 2) as u32,
+            ..Default::default()
+        };
+        let mut b = bytes(&req);
+        push_utf16(&mut b, &name);
+        b
+    };
+    let (s, _f, _i, listen, _d) = chan.raw(aop::ALPC_OP_CREATE_PORT, &cp, out);
+    if s != STATUS_SUCCESS || listen == 0 {
+        return false;
+    }
+    let (server_h, client_h, ok) = alpc_rendezvous(chan, &name, listen, out);
+    if !ok {
+        return false;
+    }
+
+    // Register the broker-completed connection for peer-direct delivery.
+    let mut pd = PeerDirect::new();
+    pd.register(client_h, server_h);
+
+    // Snapshot the ring op counter — peer-direct delivery must not advance it.
+    let ring_before = chan.next_id;
+
+    // Deliver a message client → server DIRECTLY (no ring), carrying CONTEXT.
+    if pd
+        .send(
+            client_h,
+            b"direct-payload",
+            MessageAttrs {
+                context: Some(0x00AB_CDEF),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let got = match pd.recv(server_h) {
+        Ok(Some(m)) => m,
+        _ => return false,
+    };
+    // And a reply server → client, also peer-direct.
+    if pd.send(server_h, b"direct-reply", MessageAttrs::default()).is_err() {
+        return false;
+    }
+    let reply_ok = matches!(pd.recv(client_h), Ok(Some(m)) if m.bytes == b"direct-reply");
+
+    let ring_after = chan.next_id;
+
+    // The broker was NOT on the message path: the ring counter is unchanged across
+    // both peer-direct sends/receives.
+    got.bytes == b"direct-payload"
+        && got.attrs.context == Some(0x00AB_CDEF)
+        && reply_ok
+        && ring_after == ring_before
 }
 
 fn read_pod<T: Pod + Default>(buf: &[u8]) -> T {

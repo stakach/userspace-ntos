@@ -484,6 +484,40 @@ fn recv_with_attrs(port: u64, allocated: u32) -> Vec<u8> {
     })
 }
 
+/// Step 4: peer-direct delivery — messages flow endpoint↔endpoint against the
+/// executive-local cache, carrying attributes, with no broker on the path.
+#[test]
+fn peer_direct_delivery() {
+    let mut pd = PeerDirect::new();
+    pd.register(0x100, 0x200);
+    pd.register(0x100, 0x200); // idempotent
+    assert_eq!(pd.connection_count(), 1);
+
+    // client → server, carrying a CONTEXT attribute.
+    pd.send(
+        0x100,
+        b"request",
+        MessageAttrs {
+            context: Some(0x7),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let m = pd.recv(0x200).unwrap().unwrap();
+    assert_eq!(m.bytes, b"request");
+    assert_eq!(m.attrs.context, Some(0x7));
+    // drained
+    assert!(pd.recv(0x200).unwrap().is_none());
+
+    // server → client
+    pd.send(0x200, b"reply", MessageAttrs::default()).unwrap();
+    assert_eq!(pd.recv(0x100).unwrap().unwrap().bytes, b"reply");
+
+    // an unknown endpoint is rejected.
+    assert!(pd.send(0xDEAD, b"x", MessageAttrs::default()).is_err());
+    assert!(pd.recv(0xDEAD).is_err());
+}
+
 // --- LPC direct backend for driving the classic-LPC adapter in the test ----
 
 struct LpcDirect<'a> {
