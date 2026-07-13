@@ -2330,6 +2330,29 @@ const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 /// cell offset, so it never collides with a hive key.
 const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 
+/// The real filenames of the boot-path binaries staged under `\SystemRoot\System32` (the names the
+/// ntdll/csrss loader probes). The executive's nt-fs namespace is seeded with these so nt-fs is the
+/// single authority for "does this System32 file exist + attributes." Mirrors the nt-dll-registry
+/// `dll_seed` set (which keeps the SEC_IMAGE base/geometry role for CONTENT) + csrss.exe. Adding a
+/// served binary is a seed entry here, not a handler edit.
+const SYSTEM32_FILES: &[&str] = &[
+    "csrss.exe",
+    "csrsrv.dll",
+    "basesrv.dll",
+    "winsrv.dll",
+    "kernel32.dll",
+    "user32.dll",
+    "gdi32.dll",
+    "rpcrt4.dll",
+    "msvcrt.dll",
+    "advapi32.dll",
+    "ws2_32.dll",
+    "kernel32_vista.dll",
+    "advapi32_vista.dll",
+    "ws2help.dll",
+    "ntdll_vista.dll",
+];
+
 /// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
 /// for SmpInit's PROCESSOR_IDENTIFIER build (Identifier + VendorIdentifier, both REG_SZ).
 fn synth_cpu_value(name_lc: &str) -> Option<(u32, alloc::vec::Vec<u16>)> {
@@ -2595,19 +2618,16 @@ impl ExecNtHandler {
             csrss_event_n: 0,
             fs: {
                 // MemFs::with_fixture() gives the \Windows\System32\Config\* tree (so
-                // \Windows\System32 exists as a directory). Seed the boot-path binary smss's
-                // SmpParseCommandLine probes for: csrss.exe under System32. FILE_CREATE allocates a
-                // handle below the heap mark (persistent) — the query path below never allocates one.
+                // \Windows\System32 exists as a directory). Seed the full boot-path binary set
+                // (SYSTEM32_FILES) under System32 so nt-fs is the single authority for System32 file
+                // existence. FILE_CREATE allocates a handle below the heap mark (persistent) — the
+                // query path (`&self` query_attributes) never allocates one.
                 let mut fs = FileSystem::new(MemFs::with_fixture());
-                let r = fs.zw_create_file(
-                    r"\SystemRoot\System32\csrss.exe",
-                    0,
-                    0,
-                    0,
-                    nt_fs::FILE_CREATE,
-                    0,
-                );
-                let _ = fs.zw_close(r.handle);
+                for name in SYSTEM32_FILES {
+                    let path = alloc::format!(r"\SystemRoot\System32\{name}");
+                    let r = fs.zw_create_file(&path, 0, 0, 0, nt_fs::FILE_CREATE, 0);
+                    let _ = fs.zw_close(r.handle);
+                }
                 fs
             },
         }
@@ -2726,6 +2746,25 @@ impl ExecNtHandler {
             return Some(SYNTH_CPU_KEY);
         }
         None
+    }
+    /// Does a `\SystemRoot\System32` file with this probe's leaf name exist in the real nt-fs
+    /// namespace? Extracts the leaf (last `\`-component) of the folded probe path and looks it up
+    /// under System32 — path-form independent (the loader probes many directory prefixes for the
+    /// same DLL). nt-fs is the single existence authority; nt-dll-registry keeps SEC_IMAGE geometry.
+    fn fs_system32_has(&self, folded: &[u8]) -> bool {
+        let leaf = match folded.iter().rposition(|&c| c == b'\\') {
+            Some(p) => &folded[p + 1..],
+            None => folded,
+        };
+        if leaf.is_empty() {
+            return false;
+        }
+        let Ok(leaf_str) = core::str::from_utf8(leaf) else {
+            return false;
+        };
+        let mut path = alloc::string::String::from(r"\SystemRoot\System32\");
+        path.push_str(leaf_str);
+        self.fs.query_attributes(&path).is_some()
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
@@ -3360,8 +3399,6 @@ impl NativeSyscallHandler for ExecNtHandler {
             // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
             // → not-found so the loader's manifest probes keep failing.
             NativeService::NtQueryAttributesFile => unsafe {
-                let ctx = self.loop_ctx.unwrap();
-                let reg = &*ctx.reg;
                 let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
                 let mut nb = [0u8; 96];
                 let mut nlen = 0;
@@ -3387,9 +3424,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                 } else {
                     None
                 };
-                // The registry-DLL "EXISTS" answer is scoped to csrss (see NtOpenFile) so smss's
-                // KnownDLLs probes for kernel32/user32/gdi32 keep failing and it launches csrss.
-                let dll_exists = self.pi == 1 && reg.resolve_name(&nb[..nlen]).is_some();
+                // DLL existence for csrss (pi==1) now comes from the REAL nt-fs System32 namespace
+                // (seeded with SYSTEM32_FILES). NtQueryAttributesFile is a pure existence/attributes
+                // query with no image geometry, so nt-fs is cleanly the sole authority here;
+                // nt-dll-registry keeps the SEC_IMAGE base/geometry role in NtOpenFile/NtCreateSection.
+                // Scoped to csrss so smss's KnownDLLs probes keep failing and it launches csrss.
+                let dll_exists = self.pi == 1 && self.fs_system32_has(&nb[..nlen]);
                 if let Some(si) = csrss_attrs {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     // Attributes come from nt-fs: a file → NORMAL, a directory → DIRECTORY.
