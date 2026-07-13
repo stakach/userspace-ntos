@@ -362,6 +362,9 @@ pub const KERNEL32_VISTA_WIN32BUF_OFFSET: u64 = 0x640000; // kernel32_vista ~32 
 pub const ADVAPI32_VISTA_WIN32BUF_OFFSET: u64 = 0x650000; // advapi32_vista ~23 KiB
 pub const WS2HELP_WIN32BUF_OFFSET: u64 = 0x660000;        // ws2help ~14 KiB
 pub const NTDLL_VISTA_WIN32BUF_OFFSET: u64 = 0x670000;    // ntdll_vista ~56 KiB (ends 0x67E000)
+// winlogon.exe's two extra static imports (the rest of its Win32 stack is shared with csrss above).
+pub const USERENV_WIN32BUF_OFFSET: u64 = 0x680000;        // userenv ~166 KiB (file 0x297C0)
+pub const MPR_WIN32BUF_OFFSET: u64 = 0x6C0000;            // mpr ~107 KiB (ends ~0x6DAC00)
 /// Raw win32k.sys staging buffer (2,208,192 B). Its own 2 MiB-aligned window past WIN32BUF, with
 /// 2 page tables (544 frames = 0x220000 spans two 2 MiB PTs). The storage host reads win32k.sys
 /// off disk into here; the executive parses+loads it into the win32k-service component.
@@ -2611,15 +2614,23 @@ struct ExecLoopCtx {
     nt_end: u64,
     /// The 14 loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
     /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
-    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; 14],
+    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; 16],
     /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
     csrss_anon_size: *mut u64,
     /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) + the
-    /// once-only flag for the shared 0x8000_0000 DLL page-directory. Point at the loop-locals.
+    /// PER-PROCESS once-only flag for the shared 0x8000_0000 DLL page-directory (indexed by pi:
+    /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
+    /// loop-locals.
     csrss_anon_base: *mut u64,
-    dll_pd_created: *mut bool,
+    dll_pd_created: *mut [bool; 3],
+    /// PER-PROCESS bitmask of which registry DLLs have had their VA-range page table reserved in
+    /// THIS process's VSpace (bit i = DLL i mapped in process pi). csrss (pi==1) and winlogon
+    /// (pi==2) each load an overlapping DLL set at the SAME fixed bases but into DISTINCT VSpaces,
+    /// so the PT reservation must be tracked per-process (the registry's global `mapped` flag stays
+    /// for `dll_for_page` VA-range resolution, which is base-identical across processes).
+    dll_mapped_bits: *mut [u32; 3],
 }
 
 struct ExecNtHandler {
@@ -3757,8 +3768,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // (seeded with SYSTEM32_FILES). NtQueryAttributesFile is a pure existence/attributes
                 // query with no image geometry, so nt-fs is cleanly the sole authority here;
                 // nt-dll-registry keeps the SEC_IMAGE base/geometry role in NtOpenFile/NtCreateSection.
-                // Scoped to csrss so smss's KnownDLLs probes keep failing and it launches csrss.
-                let dll_exists = self.pi == 1 && self.fs_system32_has(&nb[..nlen]);
+                // Scoped to a DLL-loading process (pi>=1: csrss OR winlogon) so smss's (pi==0)
+                // KnownDLLs probes keep failing and it launches csrss/winlogon.
+                let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
                 if let Some(si) = csrss_attrs {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     // Attributes come from nt-fs: a file → NORMAL, a directory → DIRECTORY.
@@ -3769,10 +3781,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                     smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
                     0
                 } else {
-                    // DIAG: log the not-found probes from csrss — a DllMain probes 5 files before
-                    // failing init; we need to know which are load-bearing.
-                    if self.pi == 1 {
-                        print_str(b"[ntos-exec] NtQueryAttributesFile(csrss) not-found: \"");
+                    // DIAG: log the not-found probes from a DLL-loading process (csrss/winlogon) —
+                    // a DllMain probes several files before failing init; we need to know which are
+                    // load-bearing.
+                    if self.pi >= 1 {
+                        print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
                         for &w in name16.iter().take(96) {
                             debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
                         }
@@ -3847,8 +3860,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
                 // smss skips them and launches csrss. Only csrss's loader should resolve these DLLs.
                 // nt-dll-registry keeps the image base/geometry role for CONTENT (SEC_IMAGE); nt-fs
-                // owns namespace/existence (csrss.exe + System32 dir here).
-                let dll_i = if self.pi == 1 { reg.resolve_name(&nb[..nlen]) } else { None };
+                // owns namespace/existence (csrss.exe + System32 dir here). pi>=1 = csrss OR winlogon
+                // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
+                // launches csrss/winlogon.
+                let dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
                 if is_sys32_dir || is_csrss || is_winlogon || dll_i.is_some() {
                     smss_stack_write(get_recv_mr(9), self.next_handle); // *FileHandle
                     if is_csrss {
@@ -4059,16 +4074,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                     // relocation); the ServerDlls are loader-relocated.
                     if let Some(cpe) = dll_pes[i].as_ref() {
                         let dbase = reg.base(i);
-                        if !reg.is_mapped(i) {
-                            if !*ctx.dll_pd_created {
+                        // PER-PROCESS PD/PT reservation: the DLL's fixed base is the same in every
+                        // process, but each VSpace needs its own page tables. csrss and winlogon load
+                        // an overlapping DLL set at identical bases into distinct VSpaces, so gate the
+                        // reservation on this process's bitmask, not the registry's global `mapped`.
+                        let pi = self.pi;
+                        let dll_pd_created = &mut *ctx.dll_pd_created;
+                        let dll_mapped_bits = &mut *ctx.dll_mapped_bits;
+                        if dll_mapped_bits[pi] & (1u32 << i) == 0 {
+                            if !dll_pd_created[pi] {
                                 let pd = alloc_slot();
                                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
                                 let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, dbase, pml4);
-                                *ctx.dll_pd_created = true;
+                                dll_pd_created[pi] = true;
                             }
                             let pt = alloc_slot();
                             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
                             let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, dbase, pml4);
+                            dll_mapped_bits[pi] |= 1u32 << i;
+                            // Global flag drives `dll_for_page` VA-range resolution (base-identical).
                             reg.set_mapped(i);
                         }
                         let ext = image_extent(cpe);
@@ -4306,7 +4330,12 @@ unsafe fn service_sec_image(
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
-    let mut dll_pd_created = false;
+    // Per-process (indexed by pi: 0=smss, 1=csrss, 2=winlogon): the DLL page-directory once-flag +
+    // a bitmask of which registry DLLs have their PT reserved in that process's VSpace. csrss and
+    // winlogon load an overlapping DLL set at identical bases into DISTINCT VSpaces, so each needs
+    // its own PD/PT reservation (the registry's global `mapped` flag stays for VA-range resolution).
+    let mut dll_pd_created = [false; 3];
+    let mut dll_mapped_bits = [0u32; 3];
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -4841,6 +4870,67 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    // userenv.dll + mpr.dll — winlogon.exe's two extra static imports (the rest of its Win32 stack
+    // is shared with csrss above). Staged into WIN32BUF (sizes at STORAGE_SHARED +0x98/+0x9c); the
+    // winlogon loader (pi==2) resolves + demand-pages them via the same nt-dll-registry path.
+    let userenv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x98) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged userenv.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged userenv.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mpr_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
+        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9c) as *const u32) as usize;
+        if sz > 0 {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(
+                (WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET) as *const u8,
+                sz,
+            );
+            match nt_pe_loader::PeFile::parse(bytes) {
+                Ok(pe) => {
+                    print_str(b"[ntos-exec] staged mpr.dll: ");
+                    print_u64(sz as u64);
+                    print_str(b" bytes, PE32+ sections=");
+                    print_u64(pe.sections().len() as u64);
+                    print_str(b" entry=0x");
+                    print_hex(pe.entry_point_rva());
+                    print_str(b"\n");
+                    Some(pe)
+                }
+                Err(_) => {
+                    print_str(b"[ntos-exec] staged mpr.dll: PARSE FAILED\n");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -4850,17 +4940,18 @@ unsafe fn service_sec_image(
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
     // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
     // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; 14] = [
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; 16] = [
         &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
         &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
-        &ntdll_vista_pe,
+        &ntdll_vista_pe, &userenv_pe, &mpr_pe,
     ];
-    let dll_seed: [&[u8]; 14] = [
+    let dll_seed: [&[u8]; 16] = [
         b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
         b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help", b"ntdll_vista",
+        b"userenv", b"mpr",
     ];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..14 {
+    for i in 0..16 {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
@@ -4876,7 +4967,7 @@ unsafe fn service_sec_image(
     // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
     // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
     // ImageBase == mapped base and doesn't double-relocate.
-    let dll_buf_va: [u64; 14] = [
+    let dll_buf_va: [u64; 16] = [
         FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET,
         SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET,
         SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET,
@@ -4891,8 +4982,10 @@ unsafe fn service_sec_image(
         WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + NTDLL_VISTA_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET,
+        WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET,
     ];
-    for i in 0..14 {
+    for i in 0..16 {
         if let Some(pe) = dll_pes[i].as_ref() {
             let base = reg.base(i);
             apply_relocations_to_buf(pe, dll_buf_va[i], base);
@@ -5108,10 +5201,11 @@ unsafe fn service_sec_image(
             } else if nt_base != 0 && page >= nt_base && page < nt_end {
                 ntfaults += 1;
                 (nt_base, ntdll.unwrap().1)
-            } else if let Some((i, _)) = if pi == 1 { reg.dll_for_page(page) } else { None } {
-                // A mapped registry DLL (csrsrv/basesrv/winsrv) in csrss's VSpace — demand-page it
-                // from that DLL's parsed PE. csrsrv sits at its preferred ImageBase (no relocation);
-                // the ServerDlls are loader-relocated. The registry resolves which one owns the page.
+            } else if let Some((i, _)) = if pi >= 1 { reg.dll_for_page(page) } else { None } {
+                // A mapped registry DLL (csrsrv/basesrv/winsrv/Win32 stack) in a DLL-loading
+                // process's VSpace (csrss pi==1 OR winlogon pi==2) — demand-page it from that DLL's
+                // parsed PE. csrsrv sits at its preferred ImageBase (no relocation); the others are
+                // loader-relocated to their fixed bases. The registry resolves which one owns the page.
                 (reg.base(i), dll_pes[i].as_ref().unwrap())
             } else {
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
@@ -5304,12 +5398,13 @@ unsafe fn service_sec_image(
                     img_end,
                     nt_base,
                     nt_end,
-                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; 14] as *const ()
-                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; 14],
+                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; 16] as *const ()
+                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; 16],
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: &mut dll_pd_created as *mut bool,
+                    dll_pd_created: &mut dll_pd_created as *mut [bool; 3],
+                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 3],
                 });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
@@ -8246,7 +8341,10 @@ unsafe fn storage_probe(
             (b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
             (b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
             (b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET),
-            (b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, WIN32BUF_FRAMES * 0x1000 - NTDLL_VISTA_WIN32BUF_OFFSET),
+            (b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, USERENV_WIN32BUF_OFFSET - NTDLL_VISTA_WIN32BUF_OFFSET),
+            // winlogon.exe's two extra static imports (the rest of its stack is shared with csrss).
+            (b"USERENV DLL", USERENV_WIN32BUF_OFFSET, 0x98, MPR_WIN32BUF_OFFSET - USERENV_WIN32BUF_OFFSET),
+            (b"MPR     DLL", MPR_WIN32BUF_OFFSET, 0x9c, WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET),
         ] {
             if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
                 if sz > 0 && (sz as u64) <= cap {
