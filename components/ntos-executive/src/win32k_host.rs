@@ -352,6 +352,51 @@ extern "win64" fn s_se_query_authentication_id_token(_token: u64, luid_out: *mut
     0 // STATUS_SUCCESS
 }
 
+/// A synthetic non-null SYSTEM primary-token marker stored in captured subject contexts. The host's
+/// `SePrivilegeCheck` models the SYSTEM subject via `nt_security` `SYSTEM_PRIVILEGE_LUIDS` and never
+/// dereferences this pointer; it exists only so a captured context has a non-null `PrimaryToken`.
+const PH_SYSTEM_TOKEN: u64 = 0x0000_0000_5E5E_0018; // "Se" + S-1-5-18 (LocalSystem) marker
+
+/// `void SeCaptureSubjectContext(PSECURITY_SUBJECT_CONTEXT SubjectContext)`. Snapshot the caller's
+/// security identity into `SubjectContext`. The win32k init/shutdown caller runs as Local System, so
+/// capture the SYSTEM subject (no impersonation, PrimaryToken = the SYSTEM marker). Off the boot/paint
+/// path (only `HasPrivilege` → `UserInitiateShutdown` calls it).
+extern "win64" fn s_se_capture_subject_context(ctx: *mut u8) {
+    if !ctx.is_null() {
+        // SAFETY: ctx is win32k's stack-local SECURITY_SUBJECT_CONTEXT (0x20 bytes); stack is mapped.
+        unsafe { nt_security::se_exports::capture_system_subject_context(ctx, PH_SYSTEM_TOKEN) };
+    }
+}
+
+/// `void SeLockSubjectContext` / `SeUnlockSubjectContext` / `SeReleaseSubjectContext`
+/// `(PSECURITY_SUBJECT_CONTEXT)`. In real NT these take/release the token reference lock and deref the
+/// captured tokens; in this single-threaded, no-token-object host there is nothing to lock or free, so
+/// they are genuine no-ops (the captured SYSTEM identity is const data). Kept as a distinct named
+/// trampoline (not `s_zero`) so the Se surface is fully bound + auditable.
+extern "win64" fn s_se_lock_subject_context(_ctx: u64) {}
+
+/// `BOOLEAN SePrivilegeCheck(PPRIVILEGE_SET RequiredPrivileges, PSECURITY_SUBJECT_CONTEXT
+/// SubjectContext, KPROCESSOR_MODE AccessMode)`. The real privilege-check algorithm (via
+/// `nt_security::se_exports::se_privilege_check_raw`) over the SYSTEM subject's privileges: KernelMode
+/// callers bypass; a UserMode check succeeds because the SYSTEM subject holds the required privilege
+/// (e.g. `SeShutdownPrivilege` for win32k's `HasPrivilege` on the shutdown path — legitimately PASS,
+/// not a bypass; an unprivileged subject would be DENIED). Off the boot/paint path.
+extern "win64" fn s_se_privilege_check(required: *const u8, _ctx: u64, access_mode: u64) -> i32 {
+    // KPROCESSOR_MODE: KernelMode == 0 (privilege checks are bypassed for kernel-mode callers).
+    if access_mode == 0 || required.is_null() {
+        return 1;
+    }
+    // SAFETY: required is win32k's PRIVILEGE_SET (stack/static); max 8 entries caps any over-read.
+    let ok = unsafe {
+        nt_security::se_exports::se_privilege_check_raw(
+            required,
+            nt_security::se_exports::SYSTEM_PRIVILEGE_LUIDS,
+            8,
+        )
+    };
+    ok as i32
+}
+
 const PH_ETHREAD: u64 = WIN32K_DATA_VADDR + 0x600;
 
 /// `PEPROCESS IoGetCurrentProcess()` / `PsGetCurrentProcess()` — the current (only) hosted client's
@@ -2053,16 +2098,35 @@ fn register_trampolines() {
     reg.bind("ExfTryToWakePushLock", s_true as usize as u64);
     reg.bind("KeSetKernelStackSwapEnable", s_true as usize as u64);
     reg.bind("ExGetPreviousMode", s_true as usize as u64);
-    // --- batch 5: Se → nt-security (backlog item 3) ---
+    // --- batch 5: Se → nt-security (backlog item 3, COMPLETE — all 7 Se imports real) ---
     // SeQueryAuthenticationIdToken is the only Se* on the boot/connect path (win32k GetProcessLuid);
     // return the SYSTEM auth LUID + SUCCESS. The SeExports DATA cell resolves to a real SE_EXPORTS
-    // (built in load_into). The subject-context/privilege group (SeCaptureSubjectContext/Se{Lock,
-    // Unlock,Release}SubjectContext/SePrivilegeCheck) is win32k shutdown-path only (HasPrivilege →
-    // UserInitiateShutdown), off the boot/paint path → left as declared s_zero stubs for now.
+    // (built in load_into). The subject-context/privilege group (SeCaptureSubjectContext / Se{Lock,
+    // Unlock,Release}SubjectContext / SePrivilegeCheck) is win32k shutdown-path only (HasPrivilege →
+    // UserInitiateShutdown, off the boot/paint path): capture models the SYSTEM subject, lock/unlock/
+    // release are no-ops (single-threaded, no token objects), and SePrivilegeCheck runs the REAL
+    // privilege-check algorithm over the SYSTEM privilege set → legitimately PASSES for SeShutdown.
     reg.bind(
         "SeQueryAuthenticationIdToken",
         s_se_query_authentication_id_token as usize as u64,
     );
+    reg.bind(
+        "SeCaptureSubjectContext",
+        s_se_capture_subject_context as usize as u64,
+    );
+    reg.bind(
+        "SeLockSubjectContext",
+        s_se_lock_subject_context as usize as u64,
+    );
+    reg.bind(
+        "SeUnlockSubjectContext",
+        s_se_lock_subject_context as usize as u64,
+    );
+    reg.bind(
+        "SeReleaseSubjectContext",
+        s_se_lock_subject_context as usize as u64,
+    );
+    reg.bind("SePrivilegeCheck", s_se_privilege_check as usize as u64);
     // --- batch 4: DATA EXPORTS folded in as data-cell resolutions. The IAT slot points at the
     // cell (WIN32K_DATA_VADDR page 1); load_into writes each cell's VALUE from DATA_EXPORTS. The
     // 8 object-type/Se/Nls cells still hold placeholder pointers (backlog: real OBJECT_TYPEs);

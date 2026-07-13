@@ -26,7 +26,8 @@ pub use access::{
 pub use sid::{Luid, Sid};
 pub use token::{
     AccessToken, TokenGroup, TokenPrivilege, TokenType, SE_BACKUP, SE_CHANGE_NOTIFY, SE_DEBUG,
-    SE_IMPERSONATE, SE_LOAD_DRIVER, SE_RESTORE, SE_SECURITY, SE_TAKE_OWNERSHIP, SE_TCB,
+    SE_IMPERSONATE, SE_LOAD_DRIVER, SE_RESTORE, SE_SECURITY, SE_SHUTDOWN, SE_TAKE_OWNERSHIP,
+    SE_TCB,
 };
 
 #[cfg(test)]

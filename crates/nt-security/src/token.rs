@@ -58,6 +58,7 @@ pub const SE_SECURITY: &str = "SeSecurityPrivilege";
 pub const SE_TAKE_OWNERSHIP: &str = "SeTakeOwnershipPrivilege";
 pub const SE_TCB: &str = "SeTcbPrivilege";
 pub const SE_IMPERSONATE: &str = "SeImpersonatePrivilege";
+pub const SE_SHUTDOWN: &str = "SeShutdownPrivilege";
 
 /// An access token — the subject's security identity (spec §7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +124,7 @@ impl AccessToken {
                 Self::priv_enabled(SE_LOAD_DRIVER, 10),
                 Self::priv_enabled(SE_BACKUP, 17),
                 Self::priv_enabled(SE_RESTORE, 18),
+                Self::priv_enabled(SE_SHUTDOWN, 19),
                 Self::priv_enabled(SE_DEBUG, 20),
                 Self::priv_enabled(SE_CHANGE_NOTIFY, 23),
                 Self::priv_enabled(SE_IMPERSONATE, 29),

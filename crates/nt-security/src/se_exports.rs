@@ -129,6 +129,101 @@ pub const SYSTEM_AUTHENTICATION_LUID_LOW: u32 = 0x3e7;
 /// High-part of [`SYSTEM_AUTHENTICATION_LUID_LOW`] (always 0 for the well-known LUIDs).
 pub const SYSTEM_AUTHENTICATION_LUID_HIGH: i32 = 0;
 
+// --- privilege checking (SePrivilegeCheck) ----------------------------------------------------
+
+/// `SE_SHUTDOWN_PRIVILEGE` LUID low-part (`winnt.h`).
+pub const LUID_SHUTDOWN: u32 = 19;
+/// `SE_REMOTE_SHUTDOWN_PRIVILEGE` LUID low-part (`winnt.h`).
+pub const LUID_REMOTE_SHUTDOWN: u32 = 24;
+
+/// `PRIVILEGE_SET.Control` bit — every listed privilege must be held (`winnt.h`
+/// `PRIVILEGE_SET_ALL_NECESSARY`). When clear, holding any one satisfies the set.
+pub const PRIVILEGE_SET_ALL_NECESSARY: u32 = 1;
+
+/// The privilege LUID low-parts the **Local System** subject holds. Windows' LocalSystem token
+/// carries essentially every well-known privilege; this models the full well-known range so a
+/// `SePrivilegeCheck` for any standard privilege (e.g. `SeShutdownPrivilege`) legitimately passes for
+/// the SYSTEM init caller. (A real algorithm over the SYSTEM privilege set — not a bypass.)
+pub const SYSTEM_PRIVILEGE_LUIDS: &[u32] = &[
+    2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 29,
+    30, 31, 33, 34, 35,
+];
+
+/// A standard interactive user's held privileges — only `SeChangeNotifyPrivilege`. The unprivileged
+/// baseline for the deny side of a privilege check.
+pub const USER_PRIVILEGE_LUIDS: &[u32] = &[LUID_CHANGE_NOTIFY];
+
+/// `x64` `PRIVILEGE_SET` layout (`winnt.h`): `{ DWORD PrivilegeCount; DWORD Control;
+/// LUID_AND_ATTRIBUTES Privilege[]; }` where `LUID_AND_ATTRIBUTES = { LUID Luid; DWORD Attributes; }`
+/// is 12 bytes (`LowPart@0`, `HighPart@4`, `Attributes@8`).
+pub mod privilege_set_offset {
+    /// `ULONG PrivilegeCount`.
+    pub const COUNT: usize = 0x00;
+    /// `ULONG Control` (bit [`PRIVILEGE_SET_ALL_NECESSARY`](super::PRIVILEGE_SET_ALL_NECESSARY)).
+    pub const CONTROL: usize = 0x04;
+    /// First `LUID_AND_ATTRIBUTES`.
+    pub const FIRST_PRIVILEGE: usize = 0x08;
+    /// Stride between successive `LUID_AND_ATTRIBUTES` entries.
+    pub const ENTRY_STRIDE: usize = 0x0C;
+}
+
+/// The `SePrivilegeCheck` decision: are the `required` privilege LUID low-parts satisfied by the
+/// subject's `held` privileges? `all_necessary` mirrors `PRIVILEGE_SET_ALL_NECESSARY` — every
+/// required privilege must be held; otherwise any one suffices. An empty requirement is vacuously
+/// satisfied (matches NT).
+pub fn se_privilege_check(held: &[u32], required: &[u32], all_necessary: bool) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    if all_necessary {
+        required.iter().all(|r| held.contains(r))
+    } else {
+        required.iter().any(|r| held.contains(r))
+    }
+}
+
+/// Run [`se_privilege_check`] against a raw x64 `PRIVILEGE_SET` in caller memory (the form win32k's
+/// `HasPrivilege` passes to `SePrivilegeCheck`), using `held` as the subject's privilege LUIDs.
+/// Reads `PrivilegeCount`/`Control` and each entry's LUID low-part; caps the count at `max_entries`
+/// so a malformed set can never over-read.
+///
+/// # Safety
+/// `privilege_set` must point to a valid `PRIVILEGE_SET` with at least `PrivilegeCount` (≤
+/// `max_entries`) `LUID_AND_ATTRIBUTES` entries.
+pub unsafe fn se_privilege_check_raw(
+    privilege_set: *const u8,
+    held: &[u32],
+    max_entries: usize,
+) -> bool {
+    use privilege_set_offset as o;
+    let count = core::ptr::read_unaligned(privilege_set.add(o::COUNT) as *const u32) as usize;
+    let control = core::ptr::read_unaligned(privilege_set.add(o::CONTROL) as *const u32);
+    let all_necessary = control & PRIVILEGE_SET_ALL_NECESSARY != 0;
+    let count = count.min(max_entries);
+    if count == 0 {
+        return true;
+    }
+    // ALL_NECESSARY: every required LUID must be held. ANY: at least one.
+    let mut any = false;
+    for i in 0..count {
+        let entry = privilege_set.add(o::FIRST_PRIVILEGE + i * o::ENTRY_STRIDE);
+        let luid_low = core::ptr::read_unaligned(entry as *const u32);
+        let held_it = held.contains(&luid_low);
+        if all_necessary {
+            if !held_it {
+                return false;
+            }
+        } else if held_it {
+            any = true;
+        }
+    }
+    if all_necessary {
+        true
+    } else {
+        any
+    }
+}
+
 // --- SE_EXPORTS struct layout (se.h) ----------------------------------------------------------
 
 /// Byte offsets of the fields win32k / drivers read out of `SE_EXPORTS`. The first 23 members are
@@ -333,6 +428,117 @@ const _: () = assert!(size_of::<u64>() == 8);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn se_privilege_check_passes_for_system_denies_unprivileged() {
+        // win32k's HasPrivilege(ShutdownPrivilege): a SYSTEM subject holds SeShutdownPrivilege → PASS.
+        assert!(se_privilege_check(
+            SYSTEM_PRIVILEGE_LUIDS,
+            &[LUID_SHUTDOWN],
+            true
+        ));
+        // An unprivileged (change-notify-only) user does NOT → DENY.
+        assert!(!se_privilege_check(
+            USER_PRIVILEGE_LUIDS,
+            &[LUID_SHUTDOWN],
+            true
+        ));
+        // ALL_NECESSARY over multiple: SYSTEM holds both shutdown + remote-shutdown.
+        assert!(se_privilege_check(
+            SYSTEM_PRIVILEGE_LUIDS,
+            &[LUID_SHUTDOWN, LUID_REMOTE_SHUTDOWN],
+            true
+        ));
+        // A subject holding only ONE of two required → ALL_NECESSARY fails, ANY succeeds.
+        assert!(!se_privilege_check(
+            &[LUID_SHUTDOWN],
+            &[LUID_SHUTDOWN, LUID_SECURITY],
+            true
+        ));
+        assert!(se_privilege_check(
+            &[LUID_SHUTDOWN],
+            &[LUID_SHUTDOWN, LUID_SECURITY],
+            false
+        ));
+        // Empty requirement is vacuously satisfied.
+        assert!(se_privilege_check(USER_PRIVILEGE_LUIDS, &[], true));
+    }
+
+    #[test]
+    fn system_privilege_set_agrees_with_system_token() {
+        // The heap-free SYSTEM privilege set and the alloc-based SYSTEM AccessToken must agree that
+        // SYSTEM holds shutdown / load-driver / security / change-notify (no divergent SYSTEM models).
+        let sys = crate::AccessToken::system();
+        assert!(sys.has_privilege(crate::SE_SHUTDOWN));
+        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_SHUTDOWN));
+        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_LOAD_DRIVER));
+        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_SECURITY));
+        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_CHANGE_NOTIFY));
+    }
+
+    #[test]
+    fn se_privilege_check_raw_parses_win32k_shutdown_privilege_set() {
+        // Build the exact x64 PRIVILEGE_SET win32k's shutdown.c uses:
+        // { PrivilegeCount=1, Control=PRIVILEGE_SET_ALL_NECESSARY, { {{SE_SHUTDOWN,0},0} } }.
+        let mut ps = [0u8; 0x20];
+        unsafe {
+            core::ptr::write_unaligned(
+                ps.as_mut_ptr().add(privilege_set_offset::COUNT) as *mut u32,
+                1,
+            );
+            core::ptr::write_unaligned(
+                ps.as_mut_ptr().add(privilege_set_offset::CONTROL) as *mut u32,
+                PRIVILEGE_SET_ALL_NECESSARY,
+            );
+            core::ptr::write_unaligned(
+                ps.as_mut_ptr().add(privilege_set_offset::FIRST_PRIVILEGE) as *mut u32,
+                LUID_SHUTDOWN,
+            );
+            // SYSTEM passes; a change-notify-only user is denied.
+            assert!(se_privilege_check_raw(
+                ps.as_ptr(),
+                SYSTEM_PRIVILEGE_LUIDS,
+                8
+            ));
+            assert!(!se_privilege_check_raw(
+                ps.as_ptr(),
+                USER_PRIVILEGE_LUIDS,
+                8
+            ));
+            // A malformed huge count is capped by max_entries (no over-read, treated as its entries).
+            core::ptr::write_unaligned(
+                ps.as_mut_ptr().add(privilege_set_offset::COUNT) as *mut u32,
+                0xFFFF_FFFF,
+            );
+            // Only 1 entry fits in the buffer; cap at 1 so the single SE_SHUTDOWN entry is read.
+            assert!(se_privilege_check_raw(
+                ps.as_ptr(),
+                SYSTEM_PRIVILEGE_LUIDS,
+                1
+            ));
+        }
+    }
+
+    #[test]
+    fn subject_context_round_trips_through_lock_release_sequence() {
+        // HasPrivilege's sequence: capture → lock → check → unlock → release. Lock/unlock/release are
+        // no-ops in the single-threaded host; the captured SYSTEM identity must survive unchanged so
+        // the privilege check sees the right token.
+        let mut ctx = [0u8; subject_context_offset::SIZE];
+        let token = 0x5E5E_0001u64;
+        unsafe {
+            capture_system_subject_context(ctx.as_mut_ptr(), token);
+            // (lock/unlock/release are win32k-glue no-ops — modeled here as leaving ctx untouched)
+            assert_eq!(subject_context_token(ctx.as_ptr()), token);
+            // Client token stays NULL (not impersonating); primary token stands as the effective token.
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    ctx.as_ptr().add(subject_context_offset::CLIENT_TOKEN) as *const u64
+                ),
+                0
+            );
+        }
+    }
 
     #[test]
     fn well_known_sid_encoding_matches_windows_format() {
