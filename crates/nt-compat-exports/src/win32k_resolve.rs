@@ -36,8 +36,9 @@ pub fn export_descriptor(name: &str) -> Option<&'static ExportDescriptor> {
 /// its cell address; this list is the declared, host-tested contract of *which* names are data
 /// exports and their order. The six object-type cells (`Ps*Type`, `Ex*ObjectType`,
 /// `LpcPortObjectType`) now resolve to **real** `nt_object_manager::object_type` `OBJECT_TYPE`
-/// statics (backlog item 1, done); `SeExports` (→ nt-security, item 2) and `NlsMbCodePageTag` (Nls
-/// data, item 3) remain placeholder cells.
+/// statics (implement-for-real backlog item 1, done). `SeExports` (a security-export struct, the
+/// Se->nt-security backlog item) and `NlsMbCodePageTag` (genuine Nls code-page data) remain
+/// placeholder cells and are NOT object types.
 pub const WIN32K_DATA_EXPORTS: &[&str] = &[
     "PsProcessType",
     "PsThreadType",
