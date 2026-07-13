@@ -15,7 +15,7 @@
 
 use crate::*;
 
-use nt_lpc_server::Server;
+use nt_lpc_server::{AcceptPolicy, Server};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
@@ -34,10 +34,12 @@ pub unsafe extern "C" fn lpc_server_entry() -> ! {
     let wait_requests = Sel4Notify::new(&ENV, CT_N_SUB);
     let signal_completion = Sel4Notify::new(&ENV, CT_N_COMP);
 
-    // Interim path-A policy: the server models the acceptor (AutoAccept is the
-    // Server::new default). Path B flips this to Manual once smss's SM-loop
-    // threads run the real accept.
+    // Path B (authentic): Manual accept — a connect leaves the connection Pending for a REAL
+    // receiver (smss's SmpApiLoop thread, driven by the executive's `sm_rendezvous`) to drain via
+    // receive → accept → complete. Replaces the interim AutoAccept where the server modelled the
+    // acceptor. The full receive/accept/complete machinery is unchanged (host-tested under both).
     let mut server = Server::new();
+    server.set_accept_policy(AcceptPolicy::Manual);
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop pairs order the

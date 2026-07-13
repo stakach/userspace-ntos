@@ -3234,12 +3234,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                 match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
+                            // AutoAccept (interim): the broker modelled the acceptor — complete now.
                             self.queue_write(args[0], r.handle);
                             self.cache_lpc_connection(r.connection_id, r.handle, &name16);
                             0 // STATUS_SUCCESS
+                        } else if r.pending {
+                            // Manual (path B, authentic): the connection is Pending in the broker.
+                            // Signal the LOOP to drive `sm_rendezvous` (the REAL SmpApiLoop accept)
+                            // synchronously, write the completed client comm-port handle to *PortHandle
+                            // (args[0]=R10), and reply csrss. The loop needs smss's PML4 + the smss
+                            // image/ntdll refs (loop-resident), so it can't run here.
+                            self.lpc_rendezvous_conn = r.connection_id;
+                            self.lpc_rendezvous_out = args[0];
+                            0 // SUCCESS (the loop overrides with the rendezvous outcome)
                         } else {
-                            // PENDING (path B) not wired to park yet → report as the natural stop.
-                            0x0000_0103 // STATUS_PENDING
+                            0x0000_0103 // STATUS_PENDING (broker returned no handle + not pending)
                         }
                     }
                     Some(Err(st)) => st.raw() as u32, // e.g. OBJECT_NAME_NOT_FOUND
@@ -4763,6 +4772,9 @@ unsafe fn service_sec_image(
     // working locals (pml4/scratch_base/img_end/pe via shadowing, faults/first/ntfaults/filled_pages)
     // are LOADED from these at the top of each iteration and SAVED back before each recv, so the
     // ~30 body references stay unchanged.
+    // smss's PE (the function param `pe` is shadowed per-iteration to the active process's image; the
+    // SM-loop rendezvous always demand-fills SMSS's image, so capture it here before the shadow).
+    let smss_pe: &nt_pe_loader::PeFile = pe;
     let mut pml4s = [pml4, 0u64];
     let mut scratch_bases = [scratch_base, 0u64];
     let mut img_ends = [img_end, 0u64];
@@ -5048,6 +5060,9 @@ unsafe fn service_sec_image(
             // caller's reply must go back through its bound reply cap (REPLY_MAIN) rather than the
             // legacy reply_to path — see the tail below.
             let mut routed_win32k = false;
+            // Set when csrss's NtConnectPort was completed via the nested SM rendezvous (like
+            // routed_win32k, the SM-loop thread's faults clobbered `reply_to`, so reply via REPLY_MAIN).
+            let mut routed_lpc = false;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -5211,6 +5226,44 @@ unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to sm_fault_ep)\n");
                 }
+                // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
+                // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
+                // in smss's VSpace = pml4s[0], demand-filling from smss's image + ntdll), then write the
+                // completed client comm-port handle to csrss's *PortHandle + reply csrss via REPLY_MAIN.
+                if nt_handler.lpc_rendezvous_conn != 0 {
+                    let conn_id = nt_handler.lpc_rendezvous_conn;
+                    let out_ptr = nt_handler.lpc_rendezvous_out;
+                    print_str(b"[sm-rdv] csrss NtConnectPort pending (conn=");
+                    print_u64(conn_id);
+                    print_str(b") -> driving the real SmpApiLoop accept\n");
+                    let client_handle = sm_rendezvous(
+                        conn_id,
+                        pml4s[0],
+                        smss_pe,
+                        img_ends[0],
+                        nt_base,
+                        nt_end,
+                        ntdll.map(|(_, p)| p),
+                    );
+                    if client_handle != 0 {
+                        // csrss's *PortHandle is a csrsrv/csrss VA (demand-fill window) — csrss_out_write.
+                        csrss_out_write(out_ptr, client_handle, &mut filled_pages, &mut faults,
+                            scratch_base, &reg, &dll_pes, pml4);
+                        let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName (for the cache record)
+                        nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
+                        result = 0; // STATUS_SUCCESS
+                        routed_lpc = true;
+                        print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
+                        print_hex((client_handle >> 32) as u32);
+                        print_hex(client_handle as u32);
+                        print_str(b" -> csrss NtConnectPort SUCCESS\n");
+                    } else {
+                        // The rendezvous walled — stop cleanly with a diagnostic (don't hand csrss junk).
+                        print_str(b"[sm-rdv] WALL: rendezvous produced no client handle\n");
+                        handled = false;
+                        result = 0xC0000001;
+                    }
+                }
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
@@ -5370,7 +5423,7 @@ unsafe fn service_sec_image(
             set_reply_mr(17, flags);
             pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            let (nb, nmi, nm0, nm1, nm2, nm3) = if routed_win32k && reply_main != 0 {
+            let (nb, nmi, nm0, nm1, nm2, nm3) = if (routed_win32k || routed_lpc) && reply_main != 0 {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
                 // clobbered the executive's single `reply_to`. Resume csrss via its BOUND reply cap
                 // (REPLY_MAIN, decode_reply -> apply_fault_reply) instead of the now-stale reply_to,
@@ -5633,6 +5686,229 @@ unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64)
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     tcb
+}
+
+/// Write a u64 to the SM-loop thread's stack (via the executive's SM_STACK_MIRROR alias), for a
+/// syscall out-param that lives on its stack (RequestMsg / PortHandle / PROCESS_BASIC_INFORMATION).
+unsafe fn sm_stack_write(va: u64, v: u64) {
+    if va >= SM_STACK_BASE && va + 8 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u64, v);
+    }
+}
+/// Write a u16 to the SM-loop thread's stack (for PORT_MESSAGE.Type@0x04).
+unsafe fn sm_stack_write16(va: u64, v: u16) {
+    if va >= SM_STACK_BASE && va + 2 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u16, v);
+    }
+}
+/// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
+/// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
+/// through an isolated executive scratch (SM_FILL_SCRATCH_BASE, its own PT) then mapped into smss's
+/// VSpace (shared with the main thread, so this only happens once per page). Returns false if the page
+/// belongs to neither image (a genuine fault the rendezvous can't resolve).
+unsafe fn sm_fill_page(
+    page: u64,
+    smss_pml4: u64,
+    smss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    fill_idx: &mut u64,
+) -> bool {
+    let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
+        (PE_LOAD_BASE, smss_pe)
+    } else if nt_base != 0 && page >= nt_base && page < nt_end {
+        match ntdll_pe {
+            Some(p) => (nt_base, p),
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+    // Ensure the isolated fill-scratch PT exists (once).
+    if SM_FILL_PT_DONE.swap(1, Ordering::Relaxed) == 0 {
+        let spt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+        let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, SM_FILL_SCRATCH_BASE, CAP_INIT_THREAD_VSPACE);
+    }
+    // Monotonic scratch slot (one PT = 512 pages; the SM-loop thread faults far fewer, so no wrap).
+    let scratch = SM_FILL_SCRATCH_BASE + (*fill_idx).min(511) * 0x1000;
+    *fill_idx += 1;
+    let f = alloc_frame();
+    let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let rights = fill_image_page(tpe, (page - base) as u32, scratch);
+    let _ = page_map(copy_cap(f), page, rights, smss_pml4);
+    true
+}
+
+/// AUTHENTIC SM accept (path B): drive smss's REAL `SmpApiLoop` thread through one connection
+/// rendezvous. Called synchronously from the main loop when csrss's `NtConnectPort` leaves the broker
+/// connection `conn_id` Pending (Manual policy). A nested loop on `SM_FAULT_EP`/`REPLY_SMLOOP`
+/// (mirroring `win32k_dispatch`, but the SM-loop thread is a HOSTED faulter, not a Call peer) services
+/// its real syscalls until `NtCompleteConnectPort`: the preamble (RtlSetThreadIsCritical →
+/// NtSetInformationThread no-op; NtQueryInformationProcess ProcessBasicInformation → write
+/// UniqueProcessId = PID_SMSS), then NtReplyWaitReceivePort (drain the pending connection from the
+/// broker + marshal the PORT_MESSAGE: Type=LPC_CONNECTION_REQUEST, ClientId.UniqueProcess=PID_SMSS →
+/// the "SM connecting to itself" branch of SmpHandleConnectionRequest, no NtOpenProcess/SB connect-back)
+/// → NtAcceptConnectPort (broker accept) → NtCompleteConnectPort (broker complete). Demand-fills the
+/// thread's code/data faults + skips int-0x2d DPRINTs. Returns the client comm-port handle (0 on
+/// failure), which the caller writes to csrss's *PortHandle. Leaves the thread re-parked on its next
+/// NtReplyWaitReceivePort (no pending connection).
+unsafe fn sm_rendezvous(
+    conn_id: u64,
+    smss_pml4: u64,
+    smss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+) -> u64 {
+    const PID_SMSS: u64 = 4; // any nonzero value; must match on both sides (self-connect ClientId)
+    const SSN_SET_INFO_THREAD: u64 = 238;
+    const SSN_QUERY_INFO_PROCESS: u64 = 161;
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_ACCEPT_CONNECT: u64 = 0;
+    const SSN_COMPLETE_CONNECT: u64 = 31;
+    let ep = SM_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_SMLOOP_SLOT.load(Ordering::Relaxed);
+    if ep == 0 || reply == 0 {
+        return 0;
+    }
+    let mut client_handle = 0u64;
+    let mut fill_idx = 0u64;
+    let mut guard = 0u64;
+    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    loop {
+        guard += 1;
+        if guard > 8000 {
+            print_str(b"[sm-rdv] WALL: guard exhausted\n");
+            break;
+        }
+        let label = mi >> 12;
+        if label == 6 {
+            // VMFault: demand-fill an smss/ntdll code or data page for the SM-loop thread.
+            let page = m1 & !0xFFFu64;
+            if m1 < 0x10000 || !sm_fill_page(page, smss_pml4, smss_pe, img_end, nt_base, nt_end, ntdll_pe, &mut fill_idx) {
+                print_str(b"[sm-rdv] WALL: unresolved fault ip=0x");
+                print_hex((m0 >> 32) as u32);
+                print_hex(m0 as u32);
+                print_str(b" addr=0x");
+                print_hex((m1 >> 32) as u32);
+                print_hex(m1 as u32);
+                print_str(b"\n");
+                break;
+            }
+            send_on_reply(reply, 0, 0, 0, 0, 0);
+            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            continue;
+        }
+        if label == 3 {
+            // Debug ntdll int-0x2d (DbgPrint from a DPRINT1) — skip the `int 0x2d; int3` (3 bytes),
+            // like the main loop. m0 = FaultIP.
+            let fip = m0;
+            if let Some(p) = ntdll_pe {
+                if fip >= nt_base && fip < nt_end && pe_byte_at_rva(p, (fip - nt_base) as u32) == Some(0xCD) {
+                    send_on_reply(reply, 3, fip + 3, m1, m2, 0);
+                    let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+                    mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+            }
+            print_str(b"[sm-rdv] WALL: exception fip=0x");
+            print_hex((fip >> 32) as u32);
+            print_hex(fip as u32);
+            print_str(b" num=");
+            print_u64(m3);
+            print_str(b"\n");
+            break;
+        }
+        if label == 2 {
+            // A real Nt* syscall from SmpApiLoop.
+            let ssn = m0;
+            let resume_ip = m2;
+            let sp = get_recv_mr(16);
+            let flags = get_recv_mr(17);
+            let rdx = m3;
+            let mut result = 0u64;
+            let mut stop_rdv = false;
+            let mut done = false;
+            match ssn {
+                SSN_SET_INFO_THREAD => {} // RtlSetThreadIsCritical → no-op success
+                SSN_QUERY_INFO_PROCESS => {
+                    // ProcessBasicInformation (class 0): write UniqueProcessId@+0x20 = PID_SMSS so
+                    // SmUniqueProcessId is set → the connection request's ClientId matches (self-connect).
+                    let class = rdx;
+                    let buf = get_recv_mr(7); // R8 = buffer
+                    if class == 0 {
+                        sm_stack_write(buf + 0x20, PID_SMSS);
+                    }
+                }
+                SSN_REPLY_WAIT_RECV => {
+                    let recvmsg = get_recv_mr(8); // R9 = &RequestMsg.h
+                    let port = get_recv_mr(9); // R10 = SmApiPort handle
+                    let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
+                    match got {
+                        Some(r) if r.connection_id != 0 => {
+                            // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
+                            sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
+                            sm_stack_write(recvmsg + 0x08, PID_SMSS); // ClientId.UniqueProcess
+                            sm_stack_write(recvmsg + 0x10, PID_SMSS + 4); // ClientId.UniqueThread
+                        }
+                        _ => {
+                            // No pending connection (the 2nd receive): leave the thread PARKED — do NOT
+                            // reply. It re-blocks on this NtReplyWaitReceivePort until the next connect.
+                            stop_rdv = true;
+                        }
+                    }
+                }
+                SSN_ACCEPT_CONNECT => {
+                    let porthandle_out = get_recv_mr(9); // R10 = *PortHandle
+                    let accept = get_recv_mr(8); // R9 = Accept BOOLEAN
+                    let sh = lpc_client()
+                        .and_then(|c| c.accept_connect(conn_id, accept != 0, rdx).ok())
+                        .unwrap_or(0);
+                    sm_stack_write(porthandle_out, sh);
+                }
+                SSN_COMPLETE_CONNECT => {
+                    if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
+                        client_handle = ch;
+                    }
+                    // Reply (below), then BREAK: the connection is done. SmpApiLoop loops back to its
+                    // next NtReplyWaitReceivePort, which faults FRESH to sm_fault_ep (no receiver) and
+                    // re-parks — so a LATER connect's rendezvous can recv that fresh fault (rather than
+                    // this rendezvous draining an empty receive, which would leave the thread blocked
+                    // on a reply and deadlock the next connect).
+                    done = true;
+                }
+                _ => {
+                    print_str(b"[sm-rdv] WALL: unexpected SSN=");
+                    print_u64(ssn);
+                    print_str(b"\n");
+                    stop_rdv = true;
+                }
+            }
+            if stop_rdv {
+                break;
+            }
+            set_reply_mr(15, resume_ip);
+            set_reply_mr(16, sp);
+            set_reply_mr(17, flags);
+            send_on_reply(reply, 18, result, 0, 0, rdx);
+            if done {
+                break;
+            }
+            let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+            mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+            continue;
+        }
+        print_str(b"[sm-rdv] WALL: unexpected label=");
+        print_u64(label);
+        print_str(b"\n");
+        break;
+    }
+    client_handle
 }
 
 /// Spawn the isolated ISR "driver host" (P1): its own VSpace (image RO + stack + IPC
@@ -8004,15 +8280,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         LPC_REP_VADDR,
     )));
     check(b"exec_lpc_ping", lpc.ping(), &mut passed);
-    // Self-test the connect rendezvous end-to-end through the isolated server over the real SURT
-    // ring: create a distinct test port, connect (auto-accept) → a real client comm-port handle,
-    // no relay. Uses \LpcSelfTest (NOT \SmApiPort) so the live smss \SmApiPort creation stays honest.
+    // Self-test the AUTHENTIC (Manual/path-B) connect rendezvous end-to-end through the isolated
+    // server over the real SURT ring: create a distinct test port, connect (→ Pending), then drive
+    // the real receive → accept → complete drain (as the SM-loop thread does) → a client comm-port
+    // handle. Uses \LpcSelfTest (NOT \SmApiPort) so the live smss \SmApiPort creation stays honest.
     let selftest: Vec<u16> = "\\LpcSelfTest".encode_utf16().collect();
-    let lpc_create_ok = lpc.create_port(&selftest, 0x88, 0x148, 0x2400).is_ok();
-    check(b"exec_lpc_create_port", lpc_create_ok, &mut passed);
-    let lpc_connect_ok =
-        matches!(lpc.connect_port(&selftest, 2, &[]), Ok(r) if !r.pending && r.handle != 0);
-    check(b"exec_lpc_connect_rendezvous", lpc_connect_ok, &mut passed);
+    let selftest_port = lpc.create_port(&selftest, 0x88, 0x148, 0x2400);
+    check(b"exec_lpc_create_port", selftest_port.is_ok(), &mut passed);
+    let selftest_ph = selftest_port.unwrap_or(0);
+    // Manual policy: the connect leaves the connection Pending (a real receiver must drain it).
+    let selftest_conn = lpc.connect_port(&selftest, 2, &[]);
+    let conn_id = match &selftest_conn {
+        Ok(r) if r.pending => r.connection_id,
+        _ => 0,
+    };
+    // Drive the server-side rendezvous: receive the connection request, accept, complete.
+    let lpc_rdv_ok = conn_id != 0
+        && matches!(lpc.reply_wait_receive(selftest_ph),
+            Ok(rr) if rr.connection_id == conn_id
+                && rr.msg_type == nt_lpc_client::LPC_CONNECTION_REQUEST)
+        && lpc.accept_connect(conn_id, true, 0).map(|sh| sh != 0).unwrap_or(false)
+        && lpc.complete_connect(conn_id).map(|(ch, _)| ch != 0).unwrap_or(false);
+    check(b"exec_lpc_connect_rendezvous", lpc_rdv_ok, &mut passed);
     // Publish the client to the static so the live-run LPC syscall handlers can drive it.
     // SAFETY: single-threaded executive; set once before the service loop runs.
     unsafe {
