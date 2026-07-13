@@ -122,6 +122,10 @@ pub enum NativeService {
     NtQueryVolumeInformationFile,
     // Group C: section/registry/spawn services entangled with the executive's fault-loop state.
     NtOpenSection,
+    NtQueryAttributesFile,
+    NtQuerySection,
+    NtQueryDefaultLocale,
+    NtCreateProcess,
 }
 
 impl NativeService {
@@ -188,6 +192,10 @@ impl NativeService {
             NtQueryPerformanceCounter => "NtQueryPerformanceCounter",
             NtQueryVolumeInformationFile => "NtQueryVolumeInformationFile",
             NtOpenSection => "NtOpenSection",
+            NtQueryAttributesFile => "NtQueryAttributesFile",
+            NtQuerySection => "NtQuerySection",
+            NtQueryDefaultLocale => "NtQueryDefaultLocale",
+            NtCreateProcess => "NtCreateProcess",
         }
     }
 
@@ -206,6 +214,11 @@ impl NativeService {
             NtQueryPerformanceCounter => (2, 2),
             NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
             NtOpenSection => (0, 4),
+            // Group-C ladder migrations: these handlers read their register args via the executive's
+            // IPC helpers (get_recv_mr) + stack args off the caller's SP directly, and use the arg
+            // vector only for RDX (args[1]); cap at 4 register args (no stack-arg prefill needed).
+            NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtCreateProcess
+            | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
             | NtOpenSymbolicLinkObject => (0, 4),
             NtEnumerateValueKey => (6, 6),
@@ -286,6 +299,10 @@ impl NativeService {
         NativeService::NtQueryPerformanceCounter,
         NativeService::NtQueryVolumeInformationFile,
         NativeService::NtOpenSection,
+        NativeService::NtQueryAttributesFile,
+        NativeService::NtQuerySection,
+        NativeService::NtQueryDefaultLocale,
+        NativeService::NtCreateProcess,
     ];
 }
 

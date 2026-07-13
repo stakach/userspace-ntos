@@ -2447,6 +2447,12 @@ struct ExecLoopCtx {
     /// The named NLS section handle (\Nls\NlsSectionCP20127) NtOpenSection records so
     /// NtMapViewOfSection can back it. Points at the loop-local `nls_section_handle`.
     nls_section_handle: *mut u64,
+    /// The DLL registry (csrsrv/basesrv/winsrv + the Win32 client stack): name→index resolution,
+    /// per-DLL file/section-handle tracking, and image-info synthesis for the file/section fakes.
+    reg: *mut nt_dll_registry::Registry,
+    /// The file handle smss/csrss opened for csrss.exe (NtOpenFile records it; NtCreateSection reads
+    /// it to recognise the SEC_IMAGE for the subsystem process). Points at the loop-local.
+    csrss_file_handle: *mut u64,
 }
 
 struct ExecNtHandler {
@@ -3247,6 +3253,112 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC0000034 // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
+            // NtQueryAttributesFile(*OBJECT_ATTRIBUTES[R10], *FILE_BASIC_INFORMATION[RDX]=args[1]).
+            // RtlDosSearchPath_U probes for csrss.exe here (SmpParseCommandLine). Report it EXISTS
+            // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
+            // → not-found so the loader's manifest probes keep failing.
+            NativeService::NtQueryAttributesFile => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &*ctx.reg;
+                let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
+                let mut nb = [0u8; 96];
+                let mut nlen = 0;
+                for &w in &name16 {
+                    if nlen >= nb.len() {
+                        break;
+                    }
+                    nb[nlen] = (w as u8).to_ascii_lowercase();
+                    nlen += 1;
+                }
+                // Report EXISTS for csrss.exe + any registry DLL (csrsrv/basesrv/winsrv). The registry
+                // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
+                // so the loader doesn't take the .Local\ redirection or a manifest path.
+                let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
+                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // The registry-DLL "EXISTS" answer is scoped to csrss (see NtOpenFile) so smss's
+                // KnownDLLs probes for kernel32/user32/gdi32 keep failing and it launches csrss.
+                let dll_exists = self.pi == 1 && reg.resolve_name(&nb[..nlen]).is_some();
+                if is_csrss || dll_exists {
+                    // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
+                    smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
+                    0
+                } else {
+                    // DIAG: log the not-found probes from csrss — a DllMain probes 5 files before
+                    // failing init; we need to know which are load-bearing.
+                    if self.pi == 1 {
+                        print_str(b"[ntos-exec] NtQueryAttributesFile(csrss) not-found: \"");
+                        for &w in name16.iter().take(96) {
+                            debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
+                        }
+                        print_str(b"\"\n");
+                    }
+                    0xC0000034
+                }
+            },
+            // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
+            // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
+            // SmpCreateInitialSession opens %SystemRoot%\system32 as a DIRECTORY
+            // (FILE_DIRECTORY_FILE) before creating the KnownDllPath symlink + looping KnownDLLs.
+            // Hand back a directory handle so it proceeds; a plain FILE open (an individual
+            // KnownDLL) still fails → smss `continue`s past each DLL and completes the loop.
+            NativeService::NtOpenFile => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &mut *ctx.reg;
+                const FILE_DIRECTORY_FILE: u64 = 0x01;
+                let sp = get_recv_mr(16);
+                // Succeed ONLY for SmpInit's KnownDLL directory open (…\system32). The loader's
+                // actctx/manifest opens (individual .manifest FILES, and the \??\C:\Windows SxS
+                // search directory) must keep failing so ntdll falls back to its defaults and
+                // proceeds to SmpInit — otherwise we divert the loader down the SxS path. Match the
+                // (folded) object name against "system32".
+                let name16 = smss_read_objattr_name(get_recv_mr(7));
+                let mut nb = [0u8; 96];
+                let nlen = {
+                    let mut n = 0;
+                    for &w in &name16 {
+                        if n >= nb.len() {
+                            break;
+                        }
+                        nb[n] = (w as u8).to_ascii_lowercase();
+                        n += 1;
+                    }
+                    n
+                };
+                let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
+                // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
+                // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
+                // Reject SxS/actctx probes (csrss.exe.local, csrss.exe.manifest, *.config).
+                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
+                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
+                    || nb[..nlen].windows(7).any(|w| w == b".config");
+                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
+                // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
+                // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
+                // smss skips them and launches csrss. Only csrss's loader should resolve these DLLs.
+                let dll_i = if self.pi == 1 { reg.resolve_name(&nb[..nlen]) } else { None };
+                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
+                    || is_csrss
+                    || dll_i.is_some()
+                {
+                    smss_stack_write(get_recv_mr(9), self.next_handle); // *FileHandle
+                    if is_csrss {
+                        *ctx.csrss_file_handle = self.next_handle; // remember it for NtCreateSection
+                    }
+                    if let Some(i) = dll_i {
+                        reg.set_file_handle(i, self.next_handle); // remember it for NtCreateSection
+                    }
+                    self.next_handle += 1;
+                    let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
+                    if iosb != 0 {
+                        smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
+                        smss_stack_write(iosb + 8, 1); // Information = FILE_OPENED
+                    }
+                    0
+                } else {
+                    0xC0000034 // no filesystem yet → not found (smss skips / uses defaults)
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3308,6 +3420,9 @@ fn build_nt_table() -> NativeServiceTable {
             // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
             (NativeService::NtAllocateVirtualMemory, SSN_NT_ALLOCATE_VM as u32),
             (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),
+            // Workstream A batch 6 (group C ladder migrations): name-scoped file fakes.
+            (NativeService::NtQueryAttributesFile, SSN_NT_QUERY_ATTRIBUTES_FILE as u32),
+            (NativeService::NtOpenFile, SSN_NT_OPEN_FILE as u32),
         ],
     )
 }
@@ -4248,6 +4363,8 @@ unsafe fn service_sec_image(
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
                     pml4,
                     nls_section_handle: &mut nls_section_handle as *mut u64,
+                    reg: &mut reg as *mut nt_dll_registry::Registry,
+                    csrss_file_handle: &mut csrss_file_handle as *mut u64,
                 });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
@@ -4534,109 +4651,6 @@ unsafe fn service_sec_image(
                 } else {
                     handled = false;
                     result = 0xC0000002;
-                }
-            } else if m0 == SSN_NT_OPEN_FILE {
-                // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
-                // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
-                // SmpCreateInitialSession opens %SystemRoot%\system32 as a DIRECTORY
-                // (FILE_DIRECTORY_FILE) before creating the KnownDllPath symlink + looping KnownDLLs.
-                // Hand back a directory handle so it proceeds; a plain FILE open (an individual
-                // KnownDLL) still fails → smss `continue`s past each DLL and completes the loop.
-                const FILE_DIRECTORY_FILE: u64 = 0x01;
-                // Succeed ONLY for SmpInit's KnownDLL directory open (…\system32). The loader's
-                // actctx/manifest opens (individual .manifest FILES, and the \??\C:\Windows SxS
-                // search directory) must keep failing so ntdll falls back to its defaults and
-                // proceeds to SmpInit — otherwise we divert the loader down the SxS path. Match the
-                // (folded) object name against "system32".
-                let name16 = smss_read_objattr_name(get_recv_mr(7));
-                let mut nb = [0u8; 96];
-                let nlen = {
-                    let mut n = 0;
-                    for &w in &name16 {
-                        if n >= nb.len() {
-                            break;
-                        }
-                        nb[n] = (w as u8).to_ascii_lowercase();
-                        n += 1;
-                    }
-                    n
-                };
-                let is_sys32 = nb[..nlen].windows(8).any(|w| w == b"system32");
-                // Also succeed for csrss.exe (a FILE open): SmpExecuteImage opens it to create the
-                // subsystem process. Scoped by name so we don't affect the loader's manifest opens.
-                // Reject SxS/actctx probes (csrss.exe.local, csrss.exe.manifest, *.config): matching
-                // them diverts the loader into DLL-redirection / manifest parsing instead of the
-                // normal System32 search where we actually map csrsrv. ".local" also triggers the
-                // .Local\ redirection (…\csrss.exe.Local\csrsrv.dll).
-                let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
-                    || nb[..nlen].windows(9).any(|w| w == b".manifest")
-                    || nb[..nlen].windows(7).any(|w| w == b".config");
-                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
-                // Win32 client stack (kernel32/user32/gdi32): the registry resolves the (folded) name
-                // to a DLL index and rejects SxS probes itself. "csrsrv" is distinct from the "csrss"
-                // match (position 4 differs), so no collision.
-                // SCOPED TO csrss (badge): smss's SmpInit enumerates the KnownDLLs — which now include
-                // kernel32/user32/gdi32 — and those opens MUST keep failing so smss skips them and
-                // proceeds to launch csrss. Only csrss's loader should resolve these DLLs.
-                let dll_i = if badge == CSRSS_BADGE { reg.resolve_name(&nb[..nlen]) } else { None };
-                if (smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0 && is_sys32)
-                    || is_csrss
-                    || dll_i.is_some()
-                {
-                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *FileHandle
-                    if is_csrss {
-                        csrss_file_handle = nt_handler.next_handle; // remember it for NtCreateSection
-                    }
-                    if let Some(i) = dll_i {
-                        reg.set_file_handle(i, nt_handler.next_handle); // remember it for NtCreateSection
-                    }
-                    nt_handler.next_handle += 1;
-                    let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
-                    if iosb != 0 {
-                        smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
-                        smss_stack_write(iosb + 8, 1); // Information = FILE_OPENED
-                    }
-                } else {
-                    result = 0xC0000034; // no filesystem yet → not found (smss skips / uses defaults)
-                }
-            } else if m0 == SSN_NT_QUERY_ATTRIBUTES_FILE {
-                // NtQueryAttributesFile(*OBJECT_ATTRIBUTES[R10], *FILE_BASIC_INFORMATION[RDX]).
-                // RtlDosSearchPath_U probes for csrss.exe here (SmpParseCommandLine). Report it
-                // EXISTS (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set;
-                // everything else → not-found so the loader's manifest probes keep failing.
-                let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
-                let mut nb = [0u8; 96];
-                let mut nlen = 0;
-                for &w in &name16 {
-                    if nlen >= nb.len() {
-                        break;
-                    }
-                    nb[nlen] = (w as u8).to_ascii_lowercase();
-                    nlen += 1;
-                }
-                // Report EXISTS for csrss.exe + any registry DLL (csrsrv/basesrv/winsrv). The registry
-                // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
-                // so the loader doesn't take the .Local\ redirection or a manifest path.
-                let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
-                let is_csrss = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                // The registry-DLL "EXISTS" answer is scoped to csrss (see NtOpenFile) so smss's
-                // KnownDLLs probes for kernel32/user32/gdi32 keep failing and it launches csrss.
-                let dll_exists = badge == CSRSS_BADGE && reg.resolve_name(&nb[..nlen]).is_some();
-                if is_csrss || dll_exists {
-                    // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
-                    smss_stack_write32(m3 + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
-                } else {
-                    // DIAG: log the not-found probes from csrss — a DllMain probes 5 files before
-                    // failing init; we need to know which are load-bearing.
-                    if badge == CSRSS_BADGE {
-                        print_str(b"[ntos-exec] NtQueryAttributesFile(csrss) not-found: \"");
-                        for &w in name16.iter().take(96) {
-                            debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
-                        }
-                        print_str(b"\"\n");
-                    }
-                    result = 0xC0000034;
                 }
             } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
                 // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the

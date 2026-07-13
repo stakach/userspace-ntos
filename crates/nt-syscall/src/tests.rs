@@ -262,6 +262,29 @@ fn group_c_first_cut_services_register() {
 }
 
 #[test]
+fn group_c_ladder_migrations_register() {
+    // Remaining group-C ladder cases migrated onto the table (name-scoped file fakes, section
+    // queries, locale demand-fill, and the csrss spawn). They register at their real Win7 SSNs
+    // and carry register-only (0,4) bounds (handlers read stack args off SP directly).
+    let pairs = [
+        (NativeService::NtQueryAttributesFile, 145u32),
+        (NativeService::NtOpenFile, 122),
+        (NativeService::NtQuerySection, 175),
+        (NativeService::NtQueryDefaultLocale, 149),
+        (NativeService::NtCreateSection, 52),
+        (NativeService::NtMapViewOfSection, 113),
+        (NativeService::NtCreateProcess, 49),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        let e = t.lookup(num).unwrap();
+        assert_eq!(e.service, svc);
+        assert_eq!(e.max_args, 4, "{} should cap at 4 register args", svc.name());
+    }
+}
+
+#[test]
 fn group_a_services_register_with_register_only_bounds() {
     // Group A (create-handle + no-op) services register at their real Win7 SSNs and carry the
     // capped (0,4) arg bounds so the executive's table-driven dispatch reads only registers.
