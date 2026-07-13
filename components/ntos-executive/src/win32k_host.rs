@@ -37,6 +37,12 @@ pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
 /// win32k's init froze with them.)
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0A00_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
+/// The win32k COMPONENT's own stack (32 frames = 128 KiB, own 2 MiB PT). Deliberately NOT at the
+/// hosted-process `STACK_BASE` (0x100_105C_0000): win32k must be able to dereference a GUI client's
+/// stack-built pointers (e.g. winlogon's NtUserCreateWindowStation OBJECT_ATTRIBUTES) at their
+/// IDENTITY VA (STACK_BASE region) via the per-client attach — so that VA MUST be free in win32k's
+/// own VSpace (else win32k's own stack shadows it and the client pointer reads win32k's stack garbage).
+pub const WIN32K_STACK_VADDR: u64 = 0x0000_0100_0D00_0000;
 /// The 2 MiB PT window (0x0700_0000..0x0720_0000) that holds the DATA/SHARED/SENTINEL/ARG frames
 /// (the pool used to share it; now the pool has its own window above). Both the executive-load view
 /// and the host-run view map a page table here for those frames.

@@ -671,39 +671,48 @@ unsafe fn dll_cache_put(va: u64, fr: u64) {
 
 // --- csrss client-page frame tracking (win32k cross-AS client-memory sharing) --------------------
 // win32k runs in its own component VSpace, but its NtUser/NtGdi handlers dereference the CALLING
-// process's (csrss's) user pointers DIRECTLY — the authentic Windows model where win32k shares the
-// caller's user address space. To emulate that we map csrss's OWN frame for a faulting page into
-// win32k at the SAME VA (identity), so win32k reads/writes the caller's live memory (no per-SSN
-// marshaling). This table records the frame cap the fault-fill path allocated for each PER-PROCESS
-// csrss page (page VA -> frame cptr); the shared-DLL-text cache (`dll_cache`) covers RX pages. The
-// executive's scratch alias already shares these frames, so csrss's runtime writes are visible.
+// process's (the GUI client's) user pointers DIRECTLY — the authentic Windows model where win32k
+// shares the caller's user address space. To emulate that we map the CURRENT dispatch client's OWN
+// frame for a faulting page into win32k at the SAME VA (identity), so win32k reads/writes that
+// caller's live memory (no per-SSN marshaling). This table is PER-CLIENT (pi-keyed): csrss (pi 1)
+// and winlogon (pi 2) load an OVERLAPPING set of DLLs/stacks at IDENTICAL VAs but into DISTINCT
+// frames, so the SAME VA resolves to a DIFFERENT frame per client. The win32k `attach` (see
+// `w32_client_attach`) re-points win32k's client window to the current dispatch's client, mapping
+// THIS pi's frame at each colliding VA (the KeStackAttachProcess model). It records the frame cap
+// the fault-fill path allocated for each PER-PROCESS client page ((pi,page) -> frame cptr); the
+// shared-DLL-text cache (`dll_cache`) covers RX pages (byte-identical across clients). The
+// executive's scratch alias already shares these frames, so the client's runtime writes are visible.
 const CSRSS_FRAME_CAP: usize = 8192;
+static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
-/// Record csrss's frame cap `fr` for page VA `page` (once; later fills of the same page are ignored).
-unsafe fn csrss_frame_put(page: u64, fr: u64) {
+/// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
+unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
+    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
     for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page {
+        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
             return;
         }
     }
     if n < CSRSS_FRAME_CAP {
+        core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8).add(n), pi as u8);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64).add(n), page);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64).add(n), fr);
         core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
     }
 }
-/// csrss's frame cap for page VA `page`, or 0 if not backed by a recorded per-process frame (falls
-/// back to the shared-DLL-text cache, which backs csrss's RX pages).
-unsafe fn csrss_frame_get(page: u64) -> u64 {
+/// GUI client `pi`'s frame cap for page VA `page`, or 0 if not backed by a recorded per-process
+/// frame (falls back to the shared-DLL-text cache, which backs every client's RX pages identically).
+unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
     let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
+    let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
     for i in 0..n {
-        if core::ptr::read(vas.add(i)) == page {
+        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
             return core::ptr::read(frs.add(i));
         }
     }
@@ -1888,6 +1897,7 @@ unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u64) -> u64 
 /// present, image pages ABSENT), map a stack + IPC buffer, and start the entry point. The image
 /// pages fault in on demand (service_sec_image fills each by RVA). Returns the pml4.
 unsafe fn spawn_sec_image(
+    pi: u64,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,
     ntdll_base: u64,
@@ -1946,6 +1956,13 @@ unsafe fn spawn_sec_image(
         // pointer args (copyin/copyout).
         if setup_env {
             let _ = page_map(copy_cap(f), stack_mirror + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        // Record the INITIAL committed stack frames for a GUI client (csrss pi 1 / winlogon pi 2) so
+        // win32k can share them per-client. Unlike demand-grown stack pages (fault site), these are
+        // mapped at spawn, so they'd otherwise be absent from the client-frame table — and a client's
+        // stack-built OBJECT_ATTRIBUTES (e.g. winlogon's NtUserCreateWindowStation) lives here.
+        if pi >= 1 {
+            csrss_frame_put(pi, STACK_BASE + i * 0x1000, f);
         }
     }
     let ipcbuf = alloc_frame();
@@ -5426,8 +5443,10 @@ unsafe fn service_sec_image(
             if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
-                if pi == 1 {
-                    csrss_frame_put(page, f); // shareable into win32k (a client stack pointer)
+                if pi >= 1 {
+                    // A GUI client (csrss pi 1 / winlogon pi 2) stack pointer — shareable into win32k
+                    // at the same VA when this client dispatches an NtUser/NtGdi call (per-client).
+                    csrss_frame_put(pi as u64, page, f);
                 }
                 faults += 1;
                 pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
@@ -5448,7 +5467,7 @@ unsafe fn service_sec_image(
             {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
-                csrss_frame_put(page, f); // CSR shared section — shareable into win32k
+                csrss_frame_put(pi as u64, page, f); // CSR shared section (pi 1) — shareable into win32k
                 faults += 1;
                 pfaults[pi] = faults; pfirst[pi] = first; pntfaults[pi] = ntfaults; pfilled[pi] = filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
@@ -5536,12 +5555,13 @@ unsafe fn service_sec_image(
                     if (faults as usize) < filled_pages.len() {
                         filled_pages[faults as usize] = page;
                     }
-                    if pi == 1 {
-                        // Record csrss's frame so win32k can identity-map + read/write it (a client
-                        // pointer into user32/gdi32 .data — e.g. the PFNCLIENT arrays — or csrss's own
-                        // image). The frame is shared with the executive's scratch, so it holds csrss's
-                        // LIVE runtime data, not the (zeroed) PE static content.
-                        csrss_frame_put(page, f);
+                    if pi >= 1 {
+                        // Record this GUI client's (csrss pi 1 / winlogon pi 2) frame so win32k can
+                        // identity-map + read/write it per-client (a client pointer into user32/gdi32
+                        // .data — e.g. the PFNCLIENT arrays — the client's stack-built OBJECT_ATTRIBUTES,
+                        // or its own image). The frame is shared with the executive's scratch, so it
+                        // holds the client's LIVE runtime data, not the (zeroed) PE static content.
+                        csrss_frame_put(pi as u64, page, f);
                     }
                     if base == PE_LOAD_BASE {
                         let off = page - PE_LOAD_BASE;
@@ -5733,7 +5753,7 @@ unsafe fn service_sec_image(
                     // green. (`ServerDll=csrsrv` also stays OUT — csrsrv is ServerDll index 0, implicit.)
                     const CSRSS_CMD_LINE: &[u8] = b"csrss.exe ObjectDirectory=\\Windows SharedSection=1024,3072,512 Windows=On SubSystemType=Windows ServerDll=basesrv,1 ServerDll=winsrv:UserServerDllInitialization,3 ServerDll=winsrv:ConServerDllInitialization,2 ProfileControl=Off MaxRequestThreads=16";
                     let cpml4 = spawn_sec_image(
-                        cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
+                        1, cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, 0, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
@@ -5762,7 +5782,7 @@ unsafe fn service_sec_image(
                     const WINLOGON_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\winlogon.exe";
                     const WINLOGON_CMD_LINE: &[u8] = b"winlogon.exe";
                     let wpml4 = spawn_sec_image(
-                        wpe, wf_c, NTDLL_BASE, true, 102, 0x0000_0100_107C_0000,
+                        2, wpe, wf_c, NTDLL_BASE, true, 102, 0x0000_0100_107C_0000,
                         WINLOGON_STACK_MIRROR_VA, WINLOGON_HEAP_MIRROR_VA, WINLOGON_IMAGE_MIRROR_VA,
                         WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
                     );
@@ -5894,6 +5914,11 @@ unsafe fn service_sec_image(
                 && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE)
             {
                 routed_win32k = true;
+                // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2)
+                // so it attaches win32k's client window to this client's frames (per-client cross-AS
+                // client memory — winlogon's OBJECT_ATTRIBUTES resolve to WINLOGON's frames, not the
+                // stale csrss frame at the same VA).
+                W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
                 // csrss (winsrv's UserServerDllInitialization) OR by winlogon (its user32 DllMain's
                 // NtUserProcessConnect + WinMain's window-station/desktop calls) — the SECOND hosted
@@ -5948,6 +5973,19 @@ unsafe fn service_sec_image(
                 print_str(b"[win32k-svc] csrss -> SSN 0x");
                 print_hex(m0 as u32);
                 print_str(b" (dispatch)\n");
+                // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
+                // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
+                // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
+                if m0 == 0x122f {
+                    print_str(b"[w32diag] 0x122f OA=0x");
+                    print_hex((a0 >> 32) as u32);
+                    print_hex(a0 as u32);
+                    print_str(b" real-Length=0x");
+                    print_hex(smss_stack_read(a0) as u32);
+                    print_str(b" pi=");
+                    print_u64(pi as u64);
+                    print_str(b"\n");
+                }
                 let (st, ok) = win32k_dispatch(m0, d_a0, d_a1, a2, a3);
                 if has_buf && ok {
                     let arg = win32k_host::WIN32K_ARG_VADDR;
@@ -6833,6 +6871,12 @@ unsafe fn spawn_win32k_host(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
         let _ = page_map(f, allocator::HEAP_BASE as u64 + i * 0x1000, RW_NX, pml4);
     }
+    // win32k's OWN stack at WIN32K_STACK_VADDR (NOT the hosted-process STACK_BASE — that VA must stay
+    // free in win32k's VSpace so the per-client attach can identity-map a client's stack-built pointer
+    // there). Its own 2 MiB PT (128 KiB stack fits one PT).
+    let wspt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wspt);
+    let _ = paging_struct_map(wspt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_STACK_VADDR, pml4);
     let mut stack_slot_base = 0u64;
     for i in 0..stack_frames {
         let f = alloc_slot();
@@ -6840,7 +6884,7 @@ unsafe fn spawn_win32k_host(
             stack_slot_base = f;
         }
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-        let _ = page_map(f, STACK_BASE + i * 0x1000, RW_NX, pml4);
+        let _ = page_map(f, win32k_host::WIN32K_STACK_VADDR + i * 0x1000, RW_NX, pml4);
     }
     WIN32K_STACK_SLOT.store(stack_slot_base, Ordering::Relaxed);
     WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
@@ -6941,7 +6985,7 @@ unsafe fn spawn_win32k_host(
     WIN32K_TCB.store(tcb, Ordering::Relaxed);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
-    let stack_top = STACK_BASE + stack_frames * 0x1000 - 16;
+    let stack_top = win32k_host::WIN32K_STACK_VADDR + stack_frames * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
     let _ = tcb_set_priority(tcb, prio);
     // win32k is a kernel driver: it reads the KPCR via `gs:[..]`. Point GS at a zeroed KPCR
@@ -7310,23 +7354,89 @@ unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) {
         w32_mark(k_pt);
     }
 }
-/// Share csrss's frame for `page` into win32k's VSpace at the SAME VA (identity) so win32k's handler
-/// dereferences the caller's real user memory. Returns false if the page isn't backed by a known
-/// csrss frame (win32k would read garbage → the caller stops with a diagnostic). Idempotent per page.
-unsafe fn map_csrss_page_into_win32k(page: u64, w_pml4: u64) -> bool {
-    let k_page = (4u64 << 60) | (page >> 12);
-    if w32_seen(k_page) {
-        return true; // already shared
+// --- win32k per-client attach/detach (the KeStackAttachProcess model) ---------------------------
+// win32k's client window is shared with EXACTLY ONE GUI client at a time. csrss (pi 1) and winlogon
+// (pi 2) map an overlapping DLL/stack set at IDENTICAL VAs but DISTINCT frames, so a static shared
+// window can't hold both — win32k must re-point (attach to) the CURRENT dispatch's client. The
+// attach table records the client leaf pages currently mapped into win32k (page -> the copy_cap
+// slot used, so we can Unmap it on detach). On a client switch we Unmap the previous client's leaf
+// pages (they re-fault fresh for the new client, resolving the colliding VA to THIS client's frame);
+// the PDPT/PD/PT structures persist in W32_CLIENT_SEEN (empty tables after the leaf Unmap). The
+// arch-level Unmap uses the invoked (win32k) cap's asid → only win32k's mapping is torn down; the
+// client keeps its own mapping in its own VSpace.
+static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
+/// The pi of the client whose call `win32k_dispatch` is currently servicing (set by the forward arm
+/// before each dispatch; defaults to csrss so bring-up/self-test dispatches attach to pi 1). Read by
+/// `win32k_dispatch` at entry to drive `w32_client_attach`.
+static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(1);
+const W32_ATTACH_CAP: usize = 8192;
+static mut W32_ATTACH_PAGE: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
+static mut W32_ATTACH_SLOT: [u64; W32_ATTACH_CAP] = [0; W32_ATTACH_CAP];
+static mut W32_ATTACH_N: usize = 0;
+/// Is `page` currently mapped into win32k for the attached client?
+unsafe fn w32_attach_mapped(page: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    let a = core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(a.add(i)) == page {
+            return true;
+        }
     }
-    let fr = csrss_frame_get(page);
+    false
+}
+/// Record that `page` is now mapped into win32k via copy-cap `slot` (for a later detach Unmap).
+unsafe fn w32_attach_record(page: u64, slot: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    if n < W32_ATTACH_CAP {
+        core::ptr::write((core::ptr::addr_of_mut!(W32_ATTACH_PAGE) as *mut u64).add(n), page);
+        core::ptr::write((core::ptr::addr_of_mut!(W32_ATTACH_SLOT) as *mut u64).add(n), slot);
+        core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), n + 1);
+    }
+}
+/// Attach win32k's client window to GUI client `pi` (the KeStackAttachProcess model). If a DIFFERENT
+/// client is currently attached, DETACH it: Unmap all its leaf client pages from win32k so the new
+/// client's colliding VAs re-fault to THIS client's frames. Idempotent when `pi` is already attached.
+unsafe fn w32_client_attach(pi: u64) {
+    let prev = W32_ATTACHED_PI.load(Ordering::Relaxed);
+    if prev == pi {
+        return;
+    }
+    let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
+    let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
+    for i in 0..n {
+        // Unmap win32k's mapping of the previous client's page (arch Unmap uses this cap's win32k
+        // asid → csrss/winlogon's own VSpace mapping is untouched). Cap slot is leaked (bump CNode,
+        // XL 131072-slot pool → bounded for bring-up); a fresh copy_cap is used on the re-map.
+        let _ = page_unmap(core::ptr::read(slots.add(i)));
+    }
+    print_str(b"[w32attach] client ");
+    print_u64(prev);
+    print_str(b" -> ");
+    print_u64(pi);
+    print_str(b" (detached ");
+    print_u64(n as u64);
+    print_str(b" client pages)\n");
+    core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), 0);
+    W32_ATTACHED_PI.store(pi, Ordering::Relaxed);
+}
+/// Share GUI client `pi`'s frame for `page` into win32k's VSpace at the SAME VA (identity) so
+/// win32k's handler dereferences the caller's real user memory. Returns false if the page isn't
+/// backed by a known client frame (win32k would read garbage → the caller stops with a diagnostic).
+/// Idempotent per page for the currently-attached client (see `w32_client_attach`).
+unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64) -> bool {
+    if w32_attach_mapped(page) {
+        return true; // already shared for the currently-attached client
+    }
+    let fr = csrss_frame_get(pi, page);
     if fr == 0 {
         return false;
     }
     ensure_w32_client_paging(page, w_pml4);
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
-    // csrss so writes propagate back (out-params). Non-executable — client data, not code.
-    let _ = page_map(copy_cap(fr), page, RW_NX, w_pml4);
-    w32_mark(k_page);
+    // the client so writes propagate back (out-params). Non-executable — client data, not code.
+    let cc = copy_cap(fr);
+    let _ = page_map(cc, page, RW_NX, w_pml4);
+    w32_attach_record(page, cc);
     true
 }
 
@@ -7511,6 +7621,11 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
     if w_fault == 0 {
         return (0xC000_0001u32 as i32, false);
     }
+    // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
+    // a different client than last time, the previous client's leaf pages are Unmapped so the new
+    // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
+    let client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    w32_client_attach(client_pi);
     let sh = win32k_host::WIN32K_SHARED_VADDR;
     core::ptr::write_volatile((sh + win32k_host::SH_REQ_SSN) as *mut u64, ssn);
     core::ptr::write_volatile((sh + win32k_host::SH_REQ_A0) as *mut u64, a0);
@@ -7548,13 +7663,18 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
             let addr = m1;
             let in_image =
                 addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
-            // A foreign CLIENT pointer: win32k's own demand-pageable VAs are all in its component
-            // window (>= 0x100_0000_0000); anything below is a csrss/user32/gdi32 USER pointer the
-            // handler dereferenced directly. Rather than zero-fill (WRONG data), SHARE csrss's own
+            // A foreign CLIENT pointer: the handler dereferenced a csrss/user32/gdi32/winlogon USER
+            // pointer directly. Rather than zero-fill (WRONG data), SHARE the current client's OWN
             // frame for that page into win32k at the same VA — the authentic model where win32k
-            // dereferences the calling process's user address space.
-            let foreign = addr < 0x0000_0100_0000_0000;
+            // dereferences the calling process's user address space. Detection: (a) anything below
+            // 0x100_.. is a client DLL/heap/anon pointer (win32k's own regions are all PML4[2] >=
+            // 0x100_0680_0000); (b) a HIGH client pointer — the hosted-process STACK lives at
+            // STACK_BASE=0x100_105C_0000 (PML4[2], ABOVE win32k's own regions), so an address-range
+            // test alone misses a stack-built OBJECT_ATTRIBUTES; identify it by the per-client frame
+            // table (win32k's OWN demand pages — session/pool/past-image — are never recorded there).
             let page = addr & !0xFFF;
+            let foreign = addr < 0x0000_0100_0000_0000
+                || (addr >= 0x10000 && !in_image && csrss_frame_get(client_pi, page) != 0);
             if demand < 60 {
                 print_str(b"[w32disp] fault #");
                 print_u64(demand);
@@ -7580,7 +7700,7 @@ unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32,
                 // Map the CALLER's (csrss's) own frame for this page into win32k at the identical VA.
                 // False = the page isn't backed by a recorded csrss frame (win32k would read garbage,
                 // or it's a PML4[2] client range needing per-SSN marshaling) — stop cleanly.
-                if !map_csrss_page_into_win32k(page, host_pml4) {
+                if !map_csrss_page_into_win32k(page, client_pi, host_pml4) {
                     return (0xC000_0001u32 as i32, false);
                 }
             } else {
@@ -7708,8 +7828,9 @@ unsafe fn win32k_dispatch_backtrace() {
         WIN32K_DISP_BT_PT.store(1, Ordering::Relaxed);
     }
     let rsp = tcb_read_rsp(tcb);
-    let stack_top = STACK_BASE + sf * 0x1000;
-    let start = if rsp >= STACK_BASE && rsp < stack_top { rsp } else { STACK_BASE };
+    let sbase = win32k_host::WIN32K_STACK_VADDR;
+    let stack_top = sbase + sf * 0x1000;
+    let start = if rsp >= sbase && rsp < stack_top { rsp } else { sbase };
     let code_va = win32k_host::WIN32K_CODE_VA;
     let lo = code_va;
     let hi = code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
@@ -7720,11 +7841,11 @@ unsafe fn win32k_dispatch_backtrace() {
     // RAW stack window from fault rsp: each qword annotated with its win32k RVA if it lands in the
     // image (a return address). RtlpCheckListEntry (0x24c50) did `sub rsp,0x28`, so its own return
     // address is at [rsp+0x28] = the exact InsertXxxList wrapper caller — read that precisely.
-    if start >= STACK_BASE && start + 0x120 <= stack_top {
+    if start >= sbase && start + 0x120 <= stack_top {
         let mut off = 0u64;
         while off < 0x120 {
             let va = start + off;
-            let v = core::ptr::read_volatile((mirror + (va - STACK_BASE)) as *const u64);
+            let v = core::ptr::read_volatile((mirror + (va - sbase)) as *const u64);
             if v >= lo && v < hi {
                 print_str(b"  [rsp+0x");
                 print_hex(off as u32);
@@ -9317,7 +9438,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(&pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+        let pml4 = spawn_sec_image(0, &pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -10889,7 +11010,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(&pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
