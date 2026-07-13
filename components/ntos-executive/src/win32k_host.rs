@@ -200,10 +200,10 @@ const THREADINFO_PPI_OFF: u64 = 0x58;
 /// (desktop.c:3044) — winlogon-driven, never reached in our flow. Derived from the disasm at
 /// NtUserSwitchDesktop RVA 0x6c2f8 `mov rax,[rip+0x19f229]` (0x6c2ff + 0x19f229) = the
 /// `pdesk == gpdeskInputDesktop` compare (desktop.c:2995); it sits directly below ScreenDeviceContext
-/// (0x20b530) and gptiDesktopThread (0x20b538). We poke it with the created DESKTOP body so
-/// co_IntShowDesktop's redraw machinery runs authentically (there is exactly one desktop, so the poke
-/// is equivalent to NtUserSwitchDesktop's `gpdeskInputDesktop = pdesk` without its winsta-locking /
-/// InputWindowStation / IntValidateDesktopHandle prerequisites we don't yet stand up).
+/// (0x20b530) and gptiDesktopThread (0x20b538). We no longer poke this global directly — the real
+/// `NtUserSwitchDesktop` (RVA 0x6c140, driven from `create_winsta_and_desktop`) sets it after its full
+/// handle-validation / winsta-locking / InputWindowStation guards; we only READ it here to report the
+/// switch's effect.
 pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
 
 /// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
