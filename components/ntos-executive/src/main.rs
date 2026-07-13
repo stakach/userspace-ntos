@@ -2452,6 +2452,13 @@ struct ExecNtHandler {
     /// the remaining ladder cases reference `nt_handler.next_handle`). Migrated off the loop-local
     /// `next_handle` when the create-handle group moved onto the table (Workstream A, group A).
     next_handle: u64,
+    /// Queued out-param writes (Workstream A group B2): out-writing query handlers (NtQuerySystemTime
+    /// /PerformanceCounter/VolumeInformationFile) push `(ptr, value)` here instead of writing
+    /// directly, because a csrss out-ptr can be an arbitrary VA that needs the loop's demand-fill
+    /// bookkeeping (filled_pages/faults/scratch/reg/dll_pes/pml4). The dispatch loop drains this
+    /// after `dispatch`, writing each via `csrss_out_write` (csrss) or `smss_stack_write` (smss).
+    out_writes: [(u64, u64); 8],
+    out_writes_n: usize,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2503,6 +2510,16 @@ impl ExecNtHandler {
             pi: 0,
             stop: false,
             next_handle: FAKE_HANDLE,
+            out_writes: [(0, 0); 8],
+            out_writes_n: 0,
+        }
+    }
+    /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
+    /// drops if the fixed queue is full (bounded per-syscall — no handler queues more than 6).
+    fn queue_write(&mut self, ptr: u64, val: u64) {
+        if self.out_writes_n < self.out_writes.len() {
+            self.out_writes[self.out_writes_n] = (ptr, val);
+            self.out_writes_n += 1;
         }
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
@@ -3082,6 +3099,59 @@ impl NativeSyscallHandler for ExecNtHandler {
                     _ => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
+            // NtQuerySystemTime(*SystemTime[R10]=args[0]). Return a non-zero monotonic 64-bit clock
+            // (rdtsc — a plain ring-3 instruction; do NOT `syscall` from the executive). The out-ptr
+            // write is queued so the loop demand-fills it (csrss arbitrary VA vs smss stack local).
+            NativeService::NtQuerySystemTime => {
+                let out = args[0];
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                self.queue_write(out, now);
+                0
+            }
+            // NtQueryPerformanceCounter(*Counter[R10]=args[0], *Frequency[RDX]=args[1] optional).
+            NativeService::NtQueryPerformanceCounter => {
+                let ctr_ptr = args[0];
+                let freq_ptr = args[1];
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                let freq = 1_000_000_000u64; // 1 GHz — plausible TSC frequency
+                self.queue_write(ctr_ptr, now);
+                if freq_ptr != 0 {
+                    self.queue_write(freq_ptr, freq);
+                }
+                0
+            }
+            // NtQueryVolumeInformationFile(FileHandle, *IoStatusBlock[RDX]=args[1], FsInfo[R8]=args[2],
+            // Length[R9]=args[3], FsInformationClass[arg5]=args[4]). CsrServerInitialization probes a
+            // handle's volume; no real FS → conservative answer. All writes queued (csrss-only).
+            NativeService::NtQueryVolumeInformationFile => {
+                let iosb = args[1];
+                let buf = args[2];
+                let len = args[3];
+                // FsInformationClass is a ULONG; the 8-byte stack slot has garbage in the high dword.
+                let class = args[4] & 0xFFFF_FFFF;
+                let info_bytes: u64;
+                if class == 4 {
+                    // FileFsDeviceInformation { DeviceType=FILE_DEVICE_DISK(7), Characteristics=0 }.
+                    self.queue_write(buf, 0x0000_0000_0000_0007);
+                    info_bytes = 8;
+                } else {
+                    print_str(b"[ntos-exec] NtQueryVolumeInformationFile class=");
+                    print_u64(class);
+                    print_str(b" len=");
+                    print_u64(len);
+                    print_str(b"\n");
+                    let n = len.min(32) / 8;
+                    for k in 0..n {
+                        self.queue_write(buf + k * 8, 0);
+                    }
+                    info_bytes = len.min(32);
+                }
+                if iosb != 0 {
+                    self.queue_write(iosb, 0); // Status = STATUS_SUCCESS
+                    self.queue_write(iosb + 8, info_bytes); // Information = bytes written
+                }
+                0
+            }
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3136,6 +3206,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreateDirectoryObject, SSN_NT_CREATE_DIRECTORY_OBJECT as u32),
             (NativeService::NtCreateSymbolicLinkObject, SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT as u32),
             (NativeService::NtOpenSymbolicLinkObject, SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32),
+            // Workstream A batch 4 (group B2): out-writing query services (queued-write drain).
+            (NativeService::NtQuerySystemTime, SSN_NT_QUERY_SYSTEM_TIME_SVC as u32),
+            (NativeService::NtQueryPerformanceCounter, SSN_NT_QUERY_PERF_COUNTER as u32),
+            (NativeService::NtQueryVolumeInformationFile, SSN_NT_QUERY_VOLUME_INFO_FILE as u32),
         ],
     )
 }
@@ -4067,13 +4141,25 @@ unsafe fn service_sec_image(
                     argv[i] = smss_stack_read(sp + 0x28 + (i as u64 - 4) * 8);
                 }
                 // Refresh the handler's per-call executive context, then clear the stop side-signal
-                // so a migrated handler can raise it (the ladder's `handled = false; break`).
+                // + out-write queue so a migrated handler can raise them (group A/B signals).
                 nt_handler.pi = pi;
                 nt_handler.stop = false;
+                nt_handler.out_writes_n = 0;
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
                 if nt_handler.stop {
                     handled = false; // handler couldn't service → stop with the SSN recorded
+                }
+                // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
+                // need demand-fill (csrss_out_write); smss out-ptrs are stack locals (smss_stack_write).
+                for k in 0..nt_handler.out_writes_n {
+                    let (ptr, val) = nt_handler.out_writes[k];
+                    if badge == CSRSS_BADGE {
+                        csrss_out_write(ptr, val, &mut filled_pages, &mut faults, scratch_base,
+                            &reg, &dll_pes, pml4);
+                    } else {
+                        smss_stack_write(ptr, val);
+                    }
                 }
             } else if m0 == SSN_NT_ALLOCATE_VM {
                 // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits, *RegionSize,
@@ -4114,42 +4200,6 @@ unsafe fn service_sec_image(
                 smss_stack_write(base_ptr, base);
                 smss_stack_write(size_ptr, rounded);
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
-            } else if m0 == SSN_NT_QUERY_SYSTEM_TIME_SVC {
-                // NtQuerySystemTime(PLARGE_INTEGER SystemTime). arg0=R10=SystemTime out-ptr. Return
-                // a non-zero, monotonic 64-bit clock (kernel HPET counter) so csrss's init timing
-                // is plausible. csrss's out-ptr is an arbitrary VA → csrss_out_write; smss's is a
-                // stack local → smss_stack_write.
-                let out = get_recv_mr(9); // R10 = SystemTime
-                // Read a monotonic clock DIRECTLY (rdtsc) — do NOT call native_syscall here: that
-                // issues a raw `syscall` from the executive (the rootserver, which has no fault
-                // handler), so an unrecognised number faults as UnknownSyscall and the kernel
-                // suspends the executive (deadlocking the fault loop). rdtsc is a plain instruction,
-                // always valid in ring 3, giving a non-zero monotonic value for csrss init timing.
-                let now = core::arch::x86_64::_rdtsc();
-                if badge == CSRSS_BADGE {
-                    csrss_out_write(out, now, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                } else {
-                    smss_stack_write(out, now);
-                }
-            } else if m0 == SSN_NT_QUERY_PERF_COUNTER {
-                // NtQueryPerformanceCounter(*PerformanceCounter[R10], *PerformanceFrequency[RDX]).
-                // The frequency out-ptr is optional (may be NULL). Return a monotonic rdtsc counter
-                // and a plausible fixed frequency; csrss's init only needs non-zero monotonic values.
-                let ctr_ptr = get_recv_mr(9); // R10 = *PerformanceCounter
-                let freq_ptr = m3; // RDX = *PerformanceFrequency (optional)
-                let now = core::arch::x86_64::_rdtsc();
-                let freq = 1_000_000_000u64; // 1 GHz — plausible TSC frequency
-                if badge == CSRSS_BADGE {
-                    csrss_out_write(ctr_ptr, now, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                    if freq_ptr != 0 {
-                        csrss_out_write(freq_ptr, freq, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                    }
-                } else {
-                    smss_stack_write(ctr_ptr, now);
-                    if freq_ptr != 0 {
-                        smss_stack_write(freq_ptr, freq);
-                    }
-                }
             } else if m0 == SSN_NT_OPEN_SECTION {
                 // NtOpenSection(*SectionHandle[R10], DesiredAccess[RDX], *ObjectAttributes[R8]).
                 // CsrServerInitialization opens named sections. Log the requested name (folded to
@@ -4557,46 +4607,6 @@ unsafe fn service_sec_image(
                     }
                     result = 0xC0000034;
                 }
-            } else if m0 == SSN_NT_QUERY_VOLUME_INFO_FILE {
-                // NtQueryVolumeInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FsInformation[R8],
-                //   Length[R9], FsInformationClass[sp+0x28]). CsrServerInitialization probes a file
-                //   handle's volume. We have no real FS; return the most conservative plausible answer.
-                let iosb = m3; // RDX = *IO_STATUS_BLOCK { Status@+0, Information@+8 }
-                let buf = get_recv_mr(7); // R8 = FsInformation
-                let len = get_recv_mr(8); // R9 = Length
-                // FsInformationClass is a ULONG (32-bit enum); the 8-byte stack slot carries stack
-                // garbage in its high dword, so mask to 32 bits (else `class == 4` never matches and
-                // csrss gets a zeroed FileFsDeviceInformation → a bad path → thread suspend).
-                let class = smss_stack_read(sp + 0x28) & 0xFFFF_FFFF; // arg4 = FsInformationClass
-                let mut info_bytes: u64 = 0;
-                if class == 4 {
-                    // FileFsDeviceInformation { DeviceType(u32), Characteristics(u32) }.
-                    // DeviceType=FILE_DEVICE_DISK(7), Characteristics=0.
-                    csrss_out_write(buf, 0x0000_0000_0000_0007, &mut filled_pages, &mut faults,
-                        scratch_base, &reg, &dll_pes, pml4);
-                    info_bytes = 8;
-                } else {
-                    // Unknown class: log it, zero what fits (up to 32 bytes) and report success so
-                    // CsrServerInitialization proceeds without a real volume subsystem.
-                    print_str(b"[ntos-exec] NtQueryVolumeInformationFile class=");
-                    print_u64(class);
-                    print_str(b" len=");
-                    print_u64(len);
-                    print_str(b"\n");
-                    let n = (len.min(32) / 8) as u64;
-                    for k in 0..n {
-                        csrss_out_write(buf + k * 8, 0, &mut filled_pages, &mut faults,
-                            scratch_base, &reg, &dll_pes, pml4);
-                    }
-                    info_bytes = len.min(32);
-                }
-                if iosb != 0 {
-                    csrss_out_write(iosb, 0, &mut filled_pages, &mut faults, scratch_base,
-                        &reg, &dll_pes, pml4); // Status = STATUS_SUCCESS
-                    csrss_out_write(iosb + 8, info_bytes, &mut filled_pages, &mut faults,
-                        scratch_base, &reg, &dll_pes, pml4); // Information = bytes written
-                }
-                result = 0;
             } else if m0 == SSN_NT_QUERY_DEFAULT_LOCALE {
                 // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId). Write en-US (0x409) to the
                 // output, which ntdll points at one of its own .data GLOBALS (not the stack) — so

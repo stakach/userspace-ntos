@@ -270,6 +270,25 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
+fn group_b2_out_writing_query_services_register() {
+    // Group B2: out-writing query services register at their real Win7 SSNs; the executive drains
+    // their queued out-writes after dispatch. QueryVolumeInformationFile reads a stack arg5.
+    let pairs = [
+        (NativeService::NtQuerySystemTime, 182u32),
+        (NativeService::NtQueryPerformanceCounter, 173),
+        (NativeService::NtQueryVolumeInformationFile, 187),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        assert_eq!(t.lookup(num).unwrap().service, svc);
+    }
+    assert_eq!(NativeService::NtQuerySystemTime.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtQueryPerformanceCounter.arg_count(), (2, 2));
+    assert_eq!(NativeService::NtQueryVolumeInformationFile.arg_count(), (5, 5));
+}
+
+#[test]
 fn group_b_query_and_namespace_services_register() {
     // Group B1: query + object-namespace services register at their real Win7 SSNs with the
     // arg bounds the executive's table dispatch relies on (QueryVirtualMemory reads a stack arg6).

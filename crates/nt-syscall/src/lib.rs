@@ -116,6 +116,10 @@ pub enum NativeService {
     NtCreateDirectoryObject,
     NtCreateSymbolicLinkObject,
     NtOpenSymbolicLinkObject,
+    // Group B2: out-writing query services whose out-ptr may be an arbitrary hosted VA (demand-
+    // filled by the executive after dispatch via a queued-write side-channel).
+    NtQueryPerformanceCounter,
+    NtQueryVolumeInformationFile,
 }
 
 impl NativeService {
@@ -179,6 +183,8 @@ impl NativeService {
             NtCreateDirectoryObject => "NtCreateDirectoryObject",
             NtCreateSymbolicLinkObject => "NtCreateSymbolicLinkObject",
             NtOpenSymbolicLinkObject => "NtOpenSymbolicLinkObject",
+            NtQueryPerformanceCounter => "NtQueryPerformanceCounter",
+            NtQueryVolumeInformationFile => "NtQueryVolumeInformationFile",
         }
     }
 
@@ -192,8 +198,9 @@ impl NativeService {
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
-            | NtQueryObject => (5, 5),
+            | NtQueryObject | NtQueryVolumeInformationFile => (5, 5),
             NtWaitForSingleObject => (3, 3),
+            NtQueryPerformanceCounter => (2, 2),
             NtQueryVirtualMemory => (6, 6),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
             | NtOpenSymbolicLinkObject => (0, 4),
@@ -272,6 +279,8 @@ impl NativeService {
         NativeService::NtCreateDirectoryObject,
         NativeService::NtCreateSymbolicLinkObject,
         NativeService::NtOpenSymbolicLinkObject,
+        NativeService::NtQueryPerformanceCounter,
+        NativeService::NtQueryVolumeInformationFile,
     ];
 }
 
