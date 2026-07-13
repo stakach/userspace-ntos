@@ -2479,6 +2479,10 @@ struct ExecLoopCtx {
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
     csrss_anon_size: *mut u64,
+    /// The base NtMapViewOfSection assigned the anonymous CSR section (0 until first mapped) + the
+    /// once-only flag for the shared 0x8000_0000 DLL page-directory. Point at the loop-locals.
+    csrss_anon_base: *mut u64,
+    dll_pd_created: *mut bool,
 }
 
 struct ExecNtHandler {
@@ -3543,6 +3547,116 @@ impl NativeSyscallHandler for ExecNtHandler {
                 self.next_handle += 1;
                 0
             },
+            // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
+            // ZeroBits[R9], CommitSize[sp+0x28], *SectionOffset[sp+0x30], *ViewSize[sp+0x38], …).
+            // Map a registry DLL SEC_IMAGE at its (fixed) registry base, the anonymous CSR shared
+            // section, or the named NLS section into csrss's VSpace; the fault router demand-pages
+            // the DLL/anon views and the NLS frames are mapped eagerly here.
+            NativeService::NtMapViewOfSection => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &mut *ctx.reg;
+                let dll_pes = &*ctx.dll_pes;
+                let filled_pages = &mut *ctx.filled_pages;
+                let faults = &mut *ctx.faults;
+                let pml4 = ctx.pml4;
+                let scratch_base = ctx.scratch_base;
+                let sp = get_recv_mr(16);
+                let sect = get_recv_mr(9);
+                if let Some(i) = reg.index_for_section(sect) {
+                    // A registry DLL (csrsrv/basesrv/winsrv). Reserve its VA range, hand back its base
+                    // + view size, and let the fault router demand-page it from its PE. All DLL slots
+                    // share the 0x8000_0000 1 GiB PDPT range, so the PD is created once (first mapped
+                    // DLL) and each DLL gets its own PT. csrsrv sits at its preferred ImageBase (no
+                    // relocation); the ServerDlls are loader-relocated.
+                    if let Some(cpe) = dll_pes[i].as_ref() {
+                        let dbase = reg.base(i);
+                        if !reg.is_mapped(i) {
+                            if !*ctx.dll_pd_created {
+                                let pd = alloc_slot();
+                                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+                                let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, dbase, pml4);
+                                *ctx.dll_pd_created = true;
+                            }
+                            let pt = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, dbase, pml4);
+                            reg.set_mapped(i);
+                        }
+                        let ext = image_extent(cpe);
+                        csrss_out_write(get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                        let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                        if vs_ptr != 0 {
+                            csrss_out_write(vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                        }
+                        print_str(b"[ntos-exec] NtMapViewOfSection ");
+                        print_str(reg.name(i));
+                        print_str(b" -> base 0x");
+                        print_hex(dbase as u32);
+                        print_str(b"\n");
+                        0
+                    } else {
+                        self.stop = true;
+                        0xC0000002
+                    }
+                } else if *ctx.csrss_anon_section_handle != 0 && sect == *ctx.csrss_anon_section_handle {
+                    // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
+                    // (page tables only) and let the fault router demand-page zero frames on touch.
+                    const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
+                    if *ctx.csrss_anon_base == 0 {
+                        let npts = ((*ctx.csrss_anon_size + 0x1F_FFFF) / 0x20_0000).max(1);
+                        let mut k = 0u64;
+                        while k < npts {
+                            let pt = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                            let _ = paging_struct_map(
+                                pt,
+                                LBL_X86_PAGE_TABLE_MAP,
+                                CSRSS_ANON_BASE + k * 0x20_0000,
+                                pml4,
+                            );
+                            k += 1;
+                        }
+                        *ctx.csrss_anon_base = CSRSS_ANON_BASE;
+                    }
+                    // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
+                    // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
+                    csrss_out_write(get_recv_mr(7), *ctx.csrss_anon_base, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    if vs_ptr != 0 {
+                        csrss_out_write(vs_ptr, *ctx.csrss_anon_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                    }
+                    print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
+                    print_hex((*ctx.csrss_anon_base >> 32) as u32);
+                    print_hex(*ctx.csrss_anon_base as u32);
+                    print_str(b"\n");
+                    0
+                } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
+                    // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
+                    // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
+                    // DLL loads already created), then hand back *BaseAddress / *ViewSize.
+                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_A000_0000;
+                    let nls_start = NLS_20127_START.load(Ordering::Relaxed);
+                    let nls_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32) as u64;
+                    let npages = (nls_size + 0xFFF) / 0x1000;
+                    // Reserve one PT (the DLL PD already covers this 1 GiB PDPT slot).
+                    let pt = alloc_slot();
+                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, NLS_SECTION_CSRSS_VA, pml4);
+                    for i in 0..npages {
+                        let _ = page_map(copy_cap(nls_start + i), NLS_SECTION_CSRSS_VA + i * 0x1000, RW_NX, pml4);
+                    }
+                    csrss_out_write(get_recv_mr(7), NLS_SECTION_CSRSS_VA, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
+                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
+                    if vs_ptr != 0 {
+                        csrss_out_write(vs_ptr, nls_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
+                    }
+                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
+                    0
+                } else {
+                    self.stop = true; // other sections not modeled
+                    0xC0000002
+                }
+            },
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -3612,6 +3726,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtQueryDefaultLocale, SSN_NT_QUERY_DEFAULT_LOCALE as u32),
             // Workstream A batch 8 (group C): section creation (csrss.exe SEC_IMAGE + DLL + anon).
             (NativeService::NtCreateSection, SSN_NT_CREATE_SECTION as u32),
+            // Workstream A batch 9 (group C): view mapping (DLL SEC_IMAGE + anon + NLS).
+            (NativeService::NtMapViewOfSection, 113),
         ],
     )
 }
@@ -3673,7 +3789,6 @@ unsafe fn service_sec_image(
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
     let mut nls_section_handle = 0u64;
-    const CSRSS_ANON_BASE: u64 = 0x0000_0100_0300_0000;
     // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
     // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
     let csrss_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
@@ -4577,6 +4692,8 @@ unsafe fn service_sec_image(
                         as *const [&'static Option<nt_pe_loader::PeFile<'static>>; 14],
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
+                    csrss_anon_base: &mut csrss_anon_base as *mut u64,
+                    dll_pd_created: &mut dll_pd_created as *mut bool,
                 });
                 let res = nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                 result = res.status as u64;
@@ -4593,106 +4710,6 @@ unsafe fn service_sec_image(
                     } else {
                         smss_stack_write(ptr, val);
                     }
-                }
-            } else if m0 == 113 {
-                // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
-                // ZeroBits[R9], CommitSize[sp+0x28], *SectionOffset[sp+0x30], *ViewSize[sp+0x38], …).
-                // Map the csrsrv.dll SEC_IMAGE into csrss's VSpace at its preferred ImageBase
-                // (CSRSRV_BASE = 0x80000000) so no relocation is needed; the fault router then
-                // demand-pages it from csrsrv_pe and the loader resolves csrss's IAT against it.
-                let sect = get_recv_mr(9);
-                if let Some(i) = reg.index_for_section(sect) {
-                    // A registry DLL (csrsrv/basesrv/winsrv). Reserve its VA range, hand back its base
-                    // + view size, and let the fault router demand-page it from its PE. All DLL slots
-                    // share the 0x8000_0000 1 GiB PDPT range, so the PD is created once (first mapped
-                    // DLL) and each DLL gets its own PT. csrsrv sits at its preferred ImageBase (no
-                    // relocation); the ServerDlls are loader-relocated.
-                    if let Some(cpe) = dll_pes[i].as_ref() {
-                        let dbase = reg.base(i);
-                        if !reg.is_mapped(i) {
-                            if !dll_pd_created {
-                                let pd = alloc_slot();
-                                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-                                let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, dbase, pml4);
-                                dll_pd_created = true;
-                            }
-                            let pt = alloc_slot();
-                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, dbase, pml4);
-                            reg.set_mapped(i);
-                        }
-                        let ext = image_extent(cpe);
-                        csrss_out_write(get_recv_mr(7), dbase, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4); // *BaseAddress
-                        let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
-                        if vs_ptr != 0 {
-                            csrss_out_write(vs_ptr, ext, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                        }
-                        print_str(b"[ntos-exec] NtMapViewOfSection ");
-                        print_str(reg.name(i));
-                        print_str(b" -> base 0x");
-                        print_hex(dbase as u32);
-                        print_str(b"\n");
-                        // result = 0 (SUCCESS)
-                    } else {
-                        handled = false;
-                        result = 0xC0000002;
-                    }
-                } else if csrss_anon_section_handle != 0 && sect == csrss_anon_section_handle {
-                    // Anonymous section (CSR shared memory): reserve a VA range in csrss's VSpace
-                    // (page tables only) and let the fault router demand-page zero frames on touch.
-                    if csrss_anon_base == 0 {
-                        let npts = ((csrss_anon_size + 0x1F_FFFF) / 0x20_0000).max(1);
-                        let mut k = 0u64;
-                        while k < npts {
-                            let pt = alloc_slot();
-                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                            let _ = paging_struct_map(
-                                pt,
-                                LBL_X86_PAGE_TABLE_MAP,
-                                CSRSS_ANON_BASE + k * 0x20_0000,
-                                pml4,
-                            );
-                            k += 1;
-                        }
-                        csrss_anon_base = CSRSS_ANON_BASE;
-                    }
-                    // *BaseAddress / *ViewSize are csrsrv globals (CsrSrvSharedSectionBase) — write via
-                    // the general path so they don't silently miss (NULL base → RtlAllocateHeap(NULL)).
-                    csrss_out_write(get_recv_mr(7), csrss_anon_base, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
-                    if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, csrss_anon_size, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                    }
-                    print_str(b"[ntos-exec] NtMapViewOfSection(anonymous) -> base 0x");
-                    print_hex((csrss_anon_base >> 32) as u32);
-                    print_hex(csrss_anon_base as u32);
-                    print_str(b"\n");
-                    // result = 0 (SUCCESS)
-                } else if nls_section_handle != 0 && sect == nls_section_handle {
-                    // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
-                    // into csrss at a VA past the DLL bases (same 0x8000_0000 PDPT slot, whose PD the
-                    // DLL loads already created), then hand back *BaseAddress / *ViewSize.
-                    const NLS_SECTION_CSRSS_VA: u64 = 0x0000_0000_A000_0000;
-                    let nls_start = NLS_20127_START.load(Ordering::Relaxed);
-                    let nls_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x74) as *const u32) as u64;
-                    let npages = (nls_size + 0xFFF) / 0x1000;
-                    // Reserve one PT (the DLL PD already covers this 1 GiB PDPT slot).
-                    let pt = alloc_slot();
-                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, NLS_SECTION_CSRSS_VA, pml4);
-                    for i in 0..npages {
-                        let _ = page_map(copy_cap(nls_start + i), NLS_SECTION_CSRSS_VA + i * 0x1000, RW_NX, pml4);
-                    }
-                    csrss_out_write(get_recv_mr(7), NLS_SECTION_CSRSS_VA, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4); // *BaseAddress
-                    let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize
-                    if vs_ptr != 0 {
-                        csrss_out_write(vs_ptr, nls_size, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
-                    }
-                    print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
-                    // result = 0 (SUCCESS)
-                } else {
-                    handled = false; // other sections not modeled
-                    result = 0xC0000002;
                 }
             } else if m0 == SSN_NT_CREATE_PROCESS {
                 // NtCreateProcess(*ProcessHandle[R10], access[RDX], *OA[R8], ParentProcess[R9],
