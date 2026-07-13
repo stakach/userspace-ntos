@@ -88,6 +88,27 @@ pub enum NativeService {
     NtDisplayString,
     NtQueryDebugFilterState,
     NtOpenThreadToken,
+    // Object-creation services the executive hands a fake handle for (SmpInit's \SmApiPort, the
+    // SM/CSR worker threads, events/semaphores) — real LPC/thread objects are later work.
+    NtCreatePort,
+    NtCreateThread,
+    NtCreateEvent,
+    NtCreateSemaphore,
+    NtMakeTemporaryObject,
+    // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
+    // no per-thread/process attribute sets, no per-object security, no keyed events).
+    NtSetInformationThread,
+    NtSetInformationProcess,
+    NtTestAlert,
+    NtFlushInstructionCache,
+    NtCreateKeyedEvent,
+    NtAdjustPrivilegesToken,
+    NtDeleteValueKey,
+    NtInitializeRegistry,
+    NtSetSystemInformation,
+    NtSetSecurityObject,
+    NtResumeThread,
+    NtSetInformationObject,
 }
 
 impl NativeService {
@@ -128,6 +149,23 @@ impl NativeService {
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
             NtOpenThreadToken => "NtOpenThreadToken",
+            NtCreatePort => "NtCreatePort",
+            NtCreateThread => "NtCreateThread",
+            NtCreateEvent => "NtCreateEvent",
+            NtCreateSemaphore => "NtCreateSemaphore",
+            NtMakeTemporaryObject => "NtMakeTemporaryObject",
+            NtSetInformationThread => "NtSetInformationThread",
+            NtSetInformationProcess => "NtSetInformationProcess",
+            NtTestAlert => "NtTestAlert",
+            NtFlushInstructionCache => "NtFlushInstructionCache",
+            NtCreateKeyedEvent => "NtCreateKeyedEvent",
+            NtAdjustPrivilegesToken => "NtAdjustPrivilegesToken",
+            NtDeleteValueKey => "NtDeleteValueKey",
+            NtInitializeRegistry => "NtInitializeRegistry",
+            NtSetSystemInformation => "NtSetSystemInformation",
+            NtSetSecurityObject => "NtSetSecurityObject",
+            NtResumeThread => "NtResumeThread",
+            NtSetInformationObject => "NtSetInformationObject",
         }
     }
 
@@ -145,6 +183,15 @@ impl NativeService {
             NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
             NtCreateFile => (8, 11),
+            // Group-A services the executive handles by reading registers directly (out-handle in
+            // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
+            // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
+            NtCreatePort | NtCreateThread | NtCreateEvent | NtCreateSemaphore
+            | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
+            | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
+            | NtFlushInstructionCache | NtCreateKeyedEvent | NtAdjustPrivilegesToken
+            | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
+            | NtSetSecurityObject | NtResumeThread | NtSetInformationObject => (0, 4),
             _ => (0, 16), // permissive for the rest in v0.1
         }
     }
@@ -184,6 +231,23 @@ impl NativeService {
         NativeService::NtDisplayString,
         NativeService::NtQueryDebugFilterState,
         NativeService::NtOpenThreadToken,
+        NativeService::NtCreatePort,
+        NativeService::NtCreateThread,
+        NativeService::NtCreateEvent,
+        NativeService::NtCreateSemaphore,
+        NativeService::NtMakeTemporaryObject,
+        NativeService::NtSetInformationThread,
+        NativeService::NtSetInformationProcess,
+        NativeService::NtTestAlert,
+        NativeService::NtFlushInstructionCache,
+        NativeService::NtCreateKeyedEvent,
+        NativeService::NtAdjustPrivilegesToken,
+        NativeService::NtDeleteValueKey,
+        NativeService::NtInitializeRegistry,
+        NativeService::NtSetSystemInformation,
+        NativeService::NtSetSecurityObject,
+        NativeService::NtResumeThread,
+        NativeService::NtSetInformationObject,
     ];
 }
 

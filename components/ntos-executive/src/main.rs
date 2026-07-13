@@ -2447,6 +2447,11 @@ struct ExecNtHandler {
     /// `handled = false; break`).
     pi: usize,
     stop: bool,
+    /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
+    /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
+    /// the remaining ladder cases reference `nt_handler.next_handle`). Migrated off the loop-local
+    /// `next_handle` when the create-handle group moved onto the table (Workstream A, group A).
+    next_handle: u64,
 }
 impl ExecNtHandler {
     fn new() -> Self {
@@ -2497,6 +2502,7 @@ impl ExecNtHandler {
             },
             pi: 0,
             stop: false,
+            next_handle: FAKE_HANDLE,
         }
     }
     /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
@@ -2845,6 +2851,47 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
             // the process token.
             NativeService::NtOpenThreadToken => 0xC000007C,
+            // Object-creation calls SmpInit/csrss make (\SmApiPort, SM/CSR worker threads, events,
+            // semaphores). Each takes the out handle in RCX (arg1); hand back a fresh fake handle so
+            // init keeps flowing (the RCX slot is stale but these handles are never checked).
+            NativeService::NtCreatePort
+            | NativeService::NtCreateThread
+            | NativeService::NtCreateEvent
+            | NativeService::NtCreateSemaphore => unsafe {
+                let out = get_recv_mr(2); // RCX = *Handle
+                smss_stack_write(out, self.next_handle);
+                self.next_handle += 1;
+                0
+            },
+            // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
+            NativeService::NtOpenProcessToken => unsafe {
+                let out = get_recv_mr(7); // R8
+                smss_stack_write(out, self.next_handle);
+                self.next_handle += 1;
+                0
+            },
+            // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
+            // track permanence. Success no-op.
+            NativeService::NtMakeTemporaryObject => 0,
+            // No-op → STATUS_SUCCESS: the bump allocator never frees, we don't model thread/process
+            // attribute sets, per-object security, keyed events, or a real handle table. (277
+            // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
+            // NtResumeThread: CSR worker not modeled; 236 NtSetInformationObject.)
+            NativeService::NtFreeVirtualMemory
+            | NativeService::NtSetInformationThread
+            | NativeService::NtSetInformationProcess
+            | NativeService::NtTestAlert
+            | NativeService::NtFlushInstructionCache
+            | NativeService::NtCreateKeyedEvent
+            | NativeService::NtAdjustPrivilegesToken
+            | NativeService::NtDeleteValueKey
+            | NativeService::NtInitializeRegistry
+            | NativeService::NtSetValueKey
+            | NativeService::NtSetSystemInformation
+            | NativeService::NtUnmapViewOfSection
+            | NativeService::NtSetSecurityObject
+            | NativeService::NtResumeThread
+            | NativeService::NtSetInformationObject => 0,
             _ => 0xC000_0002, // STATUS_NOT_IMPLEMENTED — never silently succeed
         }
     }
@@ -2868,6 +2915,28 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtDisplayString, SSN_NT_DISPLAY_STRING as u32),
             (NativeService::NtQueryDebugFilterState, SSN_NT_QUERY_DEBUG_FILTER_STATE as u32),
             (NativeService::NtOpenThreadToken, SSN_NT_OPEN_THREAD_TOKEN as u32),
+            // Workstream A batch 2 (group A): create-handle + no-op services.
+            (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
+            (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),
+            (NativeService::NtCreateEvent, SSN_NT_CREATE_EVENT as u32),
+            (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
+            (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
+            (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
+            (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
+            (NativeService::NtSetInformationThread, SSN_NT_SET_INFO_THREAD as u32),
+            (NativeService::NtSetInformationProcess, SSN_NT_SET_INFO_PROCESS as u32),
+            (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
+            (NativeService::NtFlushInstructionCache, SSN_NT_FLUSH_INSTRUCTION_CACHE as u32),
+            (NativeService::NtCreateKeyedEvent, SSN_NT_CREATE_KEYED_EVENT as u32),
+            (NativeService::NtAdjustPrivilegesToken, SSN_NT_ADJUST_PRIV_TOKEN as u32),
+            (NativeService::NtDeleteValueKey, SSN_NT_DELETE_VALUE_KEY as u32),
+            (NativeService::NtInitializeRegistry, SSN_NT_INITIALIZE_REGISTRY as u32),
+            (NativeService::NtSetValueKey, SSN_NT_SET_VALUE_KEY as u32),
+            (NativeService::NtSetSystemInformation, SSN_NT_SET_SYSTEM_INFORMATION as u32),
+            (NativeService::NtUnmapViewOfSection, 277),
+            (NativeService::NtSetSecurityObject, 246),
+            (NativeService::NtResumeThread, 214),
+            (NativeService::NtSetInformationObject, 236),
         ],
     )
 }
@@ -2905,9 +2974,9 @@ unsafe fn service_sec_image(
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
     let mut ssn_ri = 0usize;
-    // Distinct fake handles for objects we don't model yet (ports/threads/events/sections), so the
-    // Session Manager's SmpInit keeps flowing. Each create hands out a fresh value.
-    let mut next_handle = FAKE_HANDLE;
+    // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
+    // on `nt_handler.next_handle` (Workstream A group A) — a single monotonic source shared by the
+    // migrated create-handle handlers and the remaining ladder cases (NtCreateSection/Process/File).
     // Track the handles smss uses to launch csrss.exe: the file handle it opens (NtOpenFile), and
     // the SEC_IMAGE section it creates from it (NtCreateSection). NtCreateProcess (next step) will
     // spawn the real process from the section. Parse the staged csrss PE up front to prove it's
@@ -3908,18 +3977,6 @@ unsafe fn service_sec_image(
                 if retlen_ptr != 0 {
                     smss_stack_write(retlen_ptr, 0x30);
                 }
-            } else if m0 == SSN_NT_CREATE_PORT
-                || m0 == SSN_NT_CREATE_THREAD
-                || m0 == SSN_NT_CREATE_EVENT
-                || m0 == SSN_NT_CREATE_SEMAPHORE
-            {
-                // Object-creation calls SmpInit makes (\SmApiPort, the SM API-loop thread, events).
-                // Each takes the out handle in RCX (arg1). Hand back a fresh fake handle so the
-                // Session Manager keeps initialising — real LPC / thread objects are later steps.
-                // (The RCX slot is stale but these handles are never checked by smss.)
-                let out = get_recv_mr(2); // RCX = *Handle
-                smss_stack_write(out, next_handle);
-                next_handle += 1;
             } else if m0 == SSN_NT_OPEN_SECTION {
                 // NtOpenSection(*SectionHandle[R10], DesiredAccess[RDX], *ObjectAttributes[R8]).
                 // CsrServerInitialization opens named sections. Log the requested name (folded to
@@ -3944,9 +4001,9 @@ unsafe fn service_sec_image(
                     nlen += 1;
                 }
                 if nb[..nlen].windows(17).any(|w| w == b"nlssectioncp20127") {
-                    smss_stack_write(get_recv_mr(9), next_handle); // R10 = *SectionHandle
-                    nls_section_handle = next_handle;
-                    next_handle += 1;
+                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // R10 = *SectionHandle
+                    nls_section_handle = nt_handler.next_handle;
+                    nt_handler.next_handle += 1;
                     print_str(b"[ntos-exec] NtOpenSection NlsCP20127 -> handle 0x");
                     print_hex(nls_section_handle as u32);
                     print_str(b"\n");
@@ -3962,22 +4019,22 @@ unsafe fn service_sec_image(
                 // the handle so NtCreateProcess can spawn the real csrss image from it.
                 let out = get_recv_mr(9); // R10 = *SectionHandle
                 // *SectionHandle can live outside the stack/heap/image mirrors (e.g. a csrsrv global).
-                csrss_out_write(out, next_handle, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
+                csrss_out_write(out, nt_handler.next_handle, &mut filled_pages, &mut faults, scratch_base, &reg, &dll_pes, pml4);
                 let sec_file = smss_stack_read(sp + 0x38);
                 if csrss_file_handle != 0 && sec_file == csrss_file_handle {
-                    csrss_section_handle = next_handle;
+                    csrss_section_handle = nt_handler.next_handle;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for csrss.exe -> handle 0x");
-                    print_hex((next_handle >> 32) as u32);
-                    print_hex(next_handle as u32);
+                    print_hex((nt_handler.next_handle >> 32) as u32);
+                    print_hex(nt_handler.next_handle as u32);
                     print_str(b"\n");
                 }
                 // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
                 if let Some(i) = reg.index_for_file(sec_file) {
-                    reg.set_section_handle(i, next_handle);
+                    reg.set_section_handle(i, nt_handler.next_handle);
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
                     print_str(reg.name(i));
                     print_str(b" -> handle 0x");
-                    print_hex(next_handle as u32);
+                    print_hex(nt_handler.next_handle as u32);
                     print_str(b"\n");
                 }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
@@ -3989,17 +4046,17 @@ unsafe fn service_sec_image(
                     } else {
                         0
                     };
-                    csrss_anon_section_handle = next_handle;
+                    csrss_anon_section_handle = nt_handler.next_handle;
                     // SEC_RESERVE with MaximumSize==0 gives no size here; reserve a default 1 MiB
                     // window (demand-paged on touch, so unused pages cost nothing).
                     csrss_anon_size = if size == 0 { 0x10_0000 } else { size };
                     print_str(b"[ntos-exec] NtCreateSection(anonymous) size=0x");
                     print_hex(csrss_anon_size as u32);
                     print_str(b" -> handle 0x");
-                    print_hex(next_handle as u32);
+                    print_hex(nt_handler.next_handle as u32);
                     print_str(b"\n");
                 }
-                next_handle += 1;
+                nt_handler.next_handle += 1;
             } else if m0 == 113 {
                 // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
                 // ZeroBits[R9], CommitSize[sp+0x28], *SectionOffset[sp+0x30], *ViewSize[sp+0x38], …).
@@ -4159,9 +4216,9 @@ unsafe fn service_sec_image(
                     pml4s[1] = cpml4;
                     img_ends[1] = PE_LOAD_BASE + image_extent(cpe);
                     scratch_bases[1] = CSRSS_SCRATCH_BASE;
-                    csrss_process_handle = next_handle;
-                    smss_stack_write(get_recv_mr(9), next_handle); // *ProcessHandle (R10)
-                    next_handle += 1;
+                    csrss_process_handle = nt_handler.next_handle;
+                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *ProcessHandle (R10)
+                    nt_handler.next_handle += 1;
                     print_str(b"[ntos-exec] NtCreateProcess: spawned csrss (badge 2) -> handle 0x");
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
@@ -4224,11 +4281,6 @@ unsafe fn service_sec_image(
                     handled = false;
                     result = 0xC0000002;
                 }
-            } else if m0 == SSN_NT_OPEN_PROCESS_TOKEN {
-                // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
-                let out = get_recv_mr(7); // R8
-                smss_stack_write(out, next_handle);
-                next_handle += 1;
             } else if m0 == SSN_NT_QUERY_INFO_TOKEN {
                 // NtQueryInformationToken(TokenHandle[R10], class[RDX], buf[R8], len[R9],
                 // *RetLen[sp+0x28]). csrss runs as Local System (S-1-5-18); serve the classes its
@@ -4351,9 +4403,6 @@ unsafe fn service_sec_image(
                     }
                     _ => result = 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-            } else if m0 == SSN_NT_MAKE_TEMPORARY_OBJECT {
-                // Clears OBJ_PERMANENT on a link SmpInit re-creates; we don't track permanence.
-                // Success no-op.
             } else if m0 == SSN_NT_OPEN_FILE {
                 // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
                 // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
@@ -4403,14 +4452,14 @@ unsafe fn service_sec_image(
                     || is_csrss
                     || dll_i.is_some()
                 {
-                    smss_stack_write(get_recv_mr(9), next_handle); // *FileHandle
+                    smss_stack_write(get_recv_mr(9), nt_handler.next_handle); // *FileHandle
                     if is_csrss {
-                        csrss_file_handle = next_handle; // remember it for NtCreateSection
+                        csrss_file_handle = nt_handler.next_handle; // remember it for NtCreateSection
                     }
                     if let Some(i) = dll_i {
-                        reg.set_file_handle(i, next_handle); // remember it for NtCreateSection
+                        reg.set_file_handle(i, nt_handler.next_handle); // remember it for NtCreateSection
                     }
-                    next_handle += 1;
+                    nt_handler.next_handle += 1;
                     let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                     if iosb != 0 {
                         smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
@@ -4564,25 +4613,6 @@ unsafe fn service_sec_image(
                     }
                 }
                 result = 0;
-            } else if m0 == SSN_NT_FREE_VM
-                || m0 == SSN_NT_SET_INFO_THREAD
-                || m0 == SSN_NT_SET_INFO_PROCESS
-                || m0 == SSN_NT_TEST_ALERT
-                || m0 == SSN_NT_FLUSH_INSTRUCTION_CACHE
-                || m0 == SSN_NT_CREATE_KEYED_EVENT
-                || m0 == SSN_NT_ADJUST_PRIV_TOKEN
-                || m0 == SSN_NT_DELETE_VALUE_KEY
-                || m0 == SSN_NT_INITIALIZE_REGISTRY
-                || m0 == SSN_NT_SET_VALUE_KEY
-                || m0 == SSN_NT_SET_SYSTEM_INFORMATION
-                || m0 == 277 // NtUnmapViewOfSection — no-op (we never reclaim a mapped view yet)
-                || m0 == 246 // NtSetSecurityObject — no-op (we don't model per-object security)
-                || m0 == 214 // NtResumeThread — no-op (CSR API-port worker thread not modeled)
-                || m0 == 236 // NtSetInformationObject — no-op (handle-attr sets we don't model)
-            {
-                // No-op → STATUS_SUCCESS (result stays 0). We never free (bump allocator), don't
-                // model thread/process attribute sets, and don't model a handle table (NtClose of a
-                // fake handle is a no-op).
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by

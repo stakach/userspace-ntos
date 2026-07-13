@@ -245,6 +245,31 @@ fn win7_table_registers_migrated_services() {
 }
 
 #[test]
+fn group_a_services_register_with_register_only_bounds() {
+    // Group A (create-handle + no-op) services register at their real Win7 SSNs and carry the
+    // capped (0,4) arg bounds so the executive's table-driven dispatch reads only registers.
+    let pairs = [
+        (NativeService::NtCreatePort, 48u32),
+        (NativeService::NtCreateThread, 55),
+        (NativeService::NtCreateEvent, 37),
+        (NativeService::NtCreateSemaphore, 53),
+        (NativeService::NtOpenProcessToken, 129),
+        (NativeService::NtMakeTemporaryObject, 110),
+        (NativeService::NtFreeVirtualMemory, 87),
+        (NativeService::NtResumeThread, 214),
+        (NativeService::NtSetInformationObject, 236),
+        (NativeService::NtSetSecurityObject, 246),
+    ];
+    let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(t.len(), pairs.len());
+    for (svc, num) in pairs {
+        let e = t.lookup(num).unwrap();
+        assert_eq!(e.service, svc);
+        assert_eq!(e.max_args, 4, "{} should cap at 4 register args", svc.name());
+    }
+}
+
+#[test]
 fn migrated_services_dispatch_and_validate() {
     // Register on a test dispatcher and prove: (a) a bad arg count is rejected before the handler,
     // (b) a good call reaches the handler with the previous mode set.
