@@ -5049,6 +5049,7 @@ unsafe fn service_sec_image(
                     // a sampled grid GDI/framebuf changed. Any change = GDI drew on the real fb.
                     let fb = FB_VADDR as *const u32;
                     let mut changed = 0u32;
+                    let mut matched = 0u32;
                     let mut sample0 = 0u32;
                     for r in 0..24u64 {
                         for c in 0..32u64 {
@@ -5060,14 +5061,21 @@ unsafe fn service_sec_image(
                             if px != 0x00FF_00FF {
                                 changed += 1;
                             }
+                            if px == FB_DESKTOP_BG {
+                                matched += 1;
+                            }
                         }
                     }
                     print_str(b"[win32k-svc] framebuffer readback after gfx init: changed ");
                     print_u64(changed as u64);
+                    print_str(b"/768, desktop-bg ");
+                    print_u64(matched as u64);
                     print_str(b"/768 sampled px (px0=0x");
                     print_hex(sample0);
                     print_str(b")\n");
                     FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
+                    FB_PIXELS_MATCH.store(matched as u64, Ordering::Relaxed);
+                    FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
                 }
                 if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
@@ -5837,6 +5845,20 @@ static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_GFX_DONE: AtomicU64 = AtomicU64::new(0);
 /// Framebuffer-pixel readback result after the desktop-graphics init: 0=not run, 1=unchanged, 2=drew.
 static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
+/// Count (of the 768-px sampled grid) whose value == [`FB_DESKTOP_BG`] after the desktop-graphics
+/// init — i.e. how many sampled pixels hold the authentic WC_DESKTOP background win32k painted.
+/// The `exec_win32k_desktop_painted` gate asserts this is the full 768 (see the summary section).
+static FB_PIXELS_MATCH: AtomicU64 = AtomicU64::new(0);
+/// The first sampled pixel (grid origin) after the desktop-graphics init — recorded so the gate
+/// report shows the actual painted COLORREF (expected [`FB_DESKTOP_BG`]).
+static FB_PIXELS_SAMPLE0: AtomicU64 = AtomicU64::new(0);
+/// The number of framebuffer pixels sampled on the readback grid (24 rows x 32 cols).
+const FB_SAMPLE_COUNT: u64 = 24 * 32;
+/// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
+/// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
+/// is the value the Phase-0a magenta (0x00FF00FF) test pattern must flip to when the desktop is
+/// painted; the `exec_win32k_desktop_painted` gate spec asserts the WHOLE sampled grid == this.
+const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
 /// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
 /// confirm GDI/framebuf drew pixels).
 const FB_VADDR: u64 = 0x0000_0200_0000_0000;
@@ -9532,12 +9554,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // framebuffer (the readback happened in the csrss service loop, result stashed in FB_PIXELS_DREW).
     {
         let d = FB_PIXELS_DREW.load(Ordering::Relaxed);
+        let matched = FB_PIXELS_MATCH.load(Ordering::Relaxed);
+        let sample0 = FB_PIXELS_SAMPLE0.load(Ordering::Relaxed);
         print_str(b"[ntos-exec] win32k desktop-graphics framebuffer pixels: ");
         print_str(match d {
             2 => b"DREW (non-magenta)\n".as_slice(),
             1 => b"unchanged (no draw)\n".as_slice(),
             _ => b"gfx-init not reached\n".as_slice(),
         });
+        print_str(b"[ntos-exec] desktop-bg match ");
+        print_u64(matched);
+        print_str(b"/");
+        print_u64(FB_SAMPLE_COUNT);
+        print_str(b" px, px0=0x");
+        print_hex(sample0 as u32);
+        print_str(b" (expected 0x");
+        print_hex(FB_DESKTOP_BG);
+        print_str(b")\n");
+        // PERMANENT GATE: the whole sampled framebuffer grid must hold the authentic WC_DESKTOP
+        // background win32k painted (co_IntShowDesktop -> IntPaintDesktop). A regression that
+        // stops the desktop paint (or changes the color) now FAILS the gate, so "pixels on screen"
+        // is a first-class counted spec assertion, not a boot diagnostic.
+        check(
+            b"exec_win32k_desktop_painted",
+            d == 2 && matched == FB_SAMPLE_COUNT && sample0 as u32 == FB_DESKTOP_BG,
+            &mut passed,
+        );
     }
 
     // --- Phase 2 (graphics): PROTOTYPE-bind the real ReactOS win32k.sys against the driver-host
@@ -9601,7 +9643,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/93 executive->isolated-service checks passed]\n");
+    print_str(b"/94 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }
