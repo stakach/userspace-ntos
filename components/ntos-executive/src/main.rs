@@ -162,6 +162,25 @@ pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 K
 /// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
 /// (inside the NTDLLBUF page table, 0xA0-0xC0). ACTIVE_IMAGE_MIRROR selects by the current badge.
 pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
+// --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
+// Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
+// smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
+// executive-side, so 0x1044-0x104B are free in smss's VSpace).
+pub const SM_STACK_BASE: u64 = 0x0000_0100_1044_0000; // 4 frames (16 KiB)
+pub const SM_STACK_FRAMES: u64 = 4;
+pub const SM_IPCBUF_VA: u64 = 0x0000_0100_1048_0000;
+pub const SM_TEB_VA: u64 = 0x0000_0100_1049_0000; // 2 pages (TEB + ACS/StaticUnicode)
+pub const SM_TRAMP_VA: u64 = 0x0000_0100_104B_0000;
+/// The executive's mirror of the SM-loop thread's stack (same frames), so the rendezvous can write
+/// its syscall out-params (the received PORT_MESSAGE, PROCESS_BASIC_INFORMATION, the accepted port
+/// handle) onto its stack. In the FILEBUF PT (0x60-0x80), beside the smss/csrss stack mirrors.
+pub const SM_STACK_MIRROR_VA: u64 = 0x0000_0100_106A_0000;
+/// Executive scratch (3 pages) to populate the SM-loop thread's TEB/trampoline frames before they
+/// are copy_cap'd into smss. In the FILEBUF PT, clear of the smss (0x74) / csrss (0x78) env scratch.
+pub const SM_ENV_SCRATCH_VA: u64 = 0x0000_0100_1070_0000;
+/// Isolated executive scratch (its own PT) for demand-filling the SM-loop thread's code pages
+/// (SmpApiLoop/SmpHandleConnectionRequest in smss's .text + ntdll stubs) during the rendezvous.
+pub const SM_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1300_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -548,6 +567,17 @@ static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 /// demand-page faults during a dispatch. cptr 0 = "not yet retyped" (legacy reply_to fallback).
 static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Path B (authentic SM accept): the SM-loop thread's dedicated fault endpoint (the executive recvs
+/// its real NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort faults here during the
+/// nested `sm_rendezvous`; no standing receiver otherwise, so the thread parks) + its own MCS reply
+/// object (REPLY_SMLOOP), mirroring REPLY_W32. 0 = not yet retyped.
+static SM_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
+/// The SM-loop thread's TCB (0 until smss's first NtCreateThread spawns it; one real SmpApiLoop
+/// thread is enough — subsequent NtCreateThread stays a fake handle).
+static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
+/// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
+static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -2587,6 +2617,15 @@ struct ExecNtHandler {
     /// spawn_sec_image + per-badge state + *ProcessHandle out) after dispatch — the spawn needs
     /// fault_ep + the per-process arrays which stay loop-resident. Mirrors `stop`/the write queue.
     spawn_request: bool,
+    /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
+    /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
+    /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.
+    sm_spawn_request: bool,
+    /// Path B: when csrss's `NtConnectPort` leaves the connection Pending (Manual policy), the handler
+    /// records the broker connection id + the caller's `*PortHandle` VA (arg0) here; the loop then
+    /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
+    lpc_rendezvous_conn: u64,
+    lpc_rendezvous_out: u64,
     /// The two most-recent csrss `NtCreateEvent` handles, in creation order (winsrv's power + media
     /// request events). NtUserInitialize's SSN>=0x1000 forward substitutes these for its NULL event
     /// args (our csrss demand-fill window can't write the handle back to winsrv's late .bss global),
@@ -2683,6 +2722,9 @@ impl ExecNtHandler {
             out_writes_n: 0,
             loop_ctx: None,
             spawn_request: false,
+            sm_spawn_request: false,
+            lpc_rendezvous_conn: 0,
+            lpc_rendezvous_out: 0,
             csrss_event_handles: [0; 2],
             csrss_event_n: 0,
             fs: {
@@ -3170,6 +3212,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let h = self.next_handle;
                 self.next_handle += 1;
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
+                // Path B: smss creates its SmpApiLoop worker threads via NtCreateThread. Signal the
+                // loop to spawn ONE REAL SM-loop thread (the first). The loop reads the CONTEXT (Rip =
+                // SmpApiLoop, Rcx = \SmApiPort handle) off the caller's stack + spawns in smss's PML4.
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 0
+                    && SM_LOOP_TCB.load(Ordering::Relaxed) == 0
+                {
+                    self.sm_spawn_request = true;
+                }
                 0
             }
             // NtConnectPort(*PortHandle[R10=args[0]], *PortName[RDX=args[1]], *Qos[R8], *ClientView[R9],
@@ -5022,6 +5073,8 @@ unsafe fn service_sec_image(
                 nt_handler.stop = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
+                nt_handler.sm_spawn_request = false;
+                nt_handler.lpc_rendezvous_conn = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
                 nt_handler.loop_ctx = Some(ExecLoopCtx {
@@ -5132,6 +5185,31 @@ unsafe fn service_sec_image(
                     print_hex((csrss_process_handle >> 32) as u32);
                     print_hex(csrss_process_handle as u32);
                     print_str(b"; its faults now multiplexed into this loop\n");
+                }
+                // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
+                // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
+                // has Context* at [sp+0x30] (arg6), and RtlInitializeContext(amd64) set CONTEXT.Rip@0xF8
+                // = StartAddress (SmpApiLoop) and CONTEXT.Rcx@0x80 = Parameter (the \SmApiPort handle).
+                // (pi == 0 here so ACTIVE_STACK_MIRROR = smss's mirror; pml4 = smss's PML4.)
+                if nt_handler.sm_spawn_request && SM_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let port_handle = smss_stack_read(ctx_va + 0x80);
+                    print_str(b"[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x");
+                    print_hex((ctx_va >> 32) as u32);
+                    print_hex(ctx_va as u32);
+                    print_str(b" entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" port=0x");
+                    print_hex((port_handle >> 32) as u32);
+                    print_hex(port_handle as u32);
+                    print_str(b"\n");
+                    let tcb = spawn_sm_loop_thread(pml4, entry_rip, port_handle);
+                    SM_LOOP_TCB.store(tcb, Ordering::Relaxed);
+                    print_str(b"[sm-loop] spawned tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (parks on its first fault to sm_fault_ep)\n");
                 }
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE && badge == CSRSS_BADGE {
                 routed_win32k = true;
@@ -5472,6 +5550,86 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_va, ipcbuf, 0);
     let _ = tcb_write_registers(tcb, entry, stack_base + 0x4000 - 16, 0);
     let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb);
+    let _ = tcb_resume(tcb);
+    tcb
+}
+
+/// Spawn the AUTHENTIC SM-loop thread (path B): a REAL 2nd thread in smss's VSpace (`smss_pml4`)
+/// running smss's real `SmpApiLoop` (`entry_rip`) with RCX = the `\SmApiPort` handle (`port_handle`,
+/// the SmpApiLoop parameter). Unlike `spawn_thread_in` it builds the full hosted-Windows-thread env
+/// (own TEB + GS base, StaticUnicodeString, an ACTIVATION_CONTEXT_STACK, hosted-syscalls flag, a
+/// dedicated fault EP) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/params/KUSER are already
+/// mapped, shared with smss's main thread). Its stack is MIRRORED into the executive so the nested
+/// `sm_rendezvous` can write its syscall out-params. The thread faults to `SM_FAULT_EP`, which has no
+/// standing receiver until the rendezvous drives it — so it PARKS on its first fault. Returns the TCB.
+unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
+    let scr = SM_ENV_SCRATCH_VA;
+    // Stack (4 frames), mapped into smss AND mirrored into the executive (for out-param copyout).
+    for i in 0..SM_STACK_FRAMES {
+        let f = alloc_frame();
+        let _ = page_map(copy_cap(f), SM_STACK_BASE + i * 0x1000, RW_NX, smss_pml4);
+        let _ = page_map(copy_cap(f), SM_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    }
+    // TEB page 1: self@0x30, PEB@0x60 (smss's PEB — shared), StackBase@0x08/StackLimit@0x10, and
+    // ActivationContextStackPointer@0x2C8 → an empty ACS in the 2nd TEB page.
+    let teb = alloc_frame();
+    let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile((scr + 0x30) as *mut u64, SM_TEB_VA);
+    core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
+    core::ptr::write_volatile((scr + 0x08) as *mut u64, SM_STACK_BASE + SM_STACK_FRAMES * 0x1000);
+    core::ptr::write_volatile((scr + 0x10) as *mut u64, SM_STACK_BASE);
+    let acs_va = SM_TEB_VA + 0x1800;
+    core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
+    let _ = page_map(copy_cap(teb), SM_TEB_VA, RW_NX, smss_pml4);
+    // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
+    let teb2 = alloc_frame();
+    let _ = page_map(teb2, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let acs = scr + 0x1000 + 0x800;
+    core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
+    core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
+    core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
+    core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
+    core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
+    core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, SM_TEB_VA + 0x1268); // .Buffer
+    let _ = page_map(copy_cap(teb2), SM_TEB_VA + 0x1000, RW_NX, smss_pml4);
+    // IPC buffer (its own frame + VA; smss's main thread owns IPCBUF_VADDR).
+    let ipcbuf = alloc_frame();
+    let _ = page_map(ipcbuf, SM_IPCBUF_VA, RW_NX, smss_pml4);
+    // Trampoline: RCX = the SmApiPort handle (SmpApiLoop's PVOID Parameter), then `call` SmpApiLoop
+    // (call keeps rsp ≡ 8 mod 16 at entry). SmpApiLoop loops forever; the trailing jmp$ is a net.
+    let tramp = alloc_frame();
+    let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let mut tb = alloc::vec::Vec::new();
+    tb.extend_from_slice(&[0x48, 0xB9]);
+    tb.extend_from_slice(&port_handle.to_le_bytes()); // movabs rcx, port_handle
+    tb.extend_from_slice(&[0x48, 0xB8]);
+    tb.extend_from_slice(&entry_rip.to_le_bytes()); // movabs rax, SmpApiLoop
+    tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    for (j, &b) in tb.iter().enumerate() {
+        core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+    }
+    let _ = page_map(copy_cap(tramp), SM_TRAMP_VA, /* RX */ 2, smss_pml4);
+    // CNode (PML4 of smss + the dedicated fault EP) + TCB.
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let cnode = alloc_slot();
+    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, smss_pml4, 0);
+    let sm_ep = SM_FAULT_EP.load(Ordering::Relaxed);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(sm_ep), 0);
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, smss_pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, SM_IPCBUF_VA, ipcbuf, 0);
+    let _ = tcb_write_registers(tcb, SM_TRAMP_VA, SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 - 16, 0);
+    let _ = tcb_set_gs_base(tcb, SM_TEB_VA);
+    let _ = tcb_set_priority(tcb, 100);
+    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
     let _ = tcb_resume(tcb);
     tcb
@@ -7717,6 +7875,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
+    }
+    // Path B: a dedicated fault endpoint + reply object for the real SM-loop thread's rendezvous.
+    let sm_ep = make_object(OBJ_ENDPOINT);
+    SM_FAULT_EP.store(sm_ep, Ordering::Relaxed);
+    let rs = alloc_slot();
+    let e_rs = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rs);
+    if e_rs == 0 {
+        REPLY_SMLOOP_SLOT.store(rs, Ordering::Relaxed);
     }
     print_str(b"[ntos-exec] reply caps: REPLY_MAIN cptr=0x");
     print_hex(REPLY_MAIN_SLOT.load(Ordering::Relaxed) as u32);
