@@ -394,8 +394,12 @@ pub(crate) unsafe fn service_sec_image(
         // NtEnumerateValueKey/NtClose) — to a NATURAL stop: SmpInit fails at the missing \??
         // DosDevices object namespace and smss winds down into an unserviced syscall (stop_ssn),
         // ~290 iters, a few seconds. This ceiling is only a safety backstop against a future
-        // genuine infinite loop; the run stops well before it.
-        if iters > 3000 {
+        // genuine infinite loop; the run stops well before it. NOTE: with FOUR hosted processes
+        // (smss/csrss/winlogon/services) multiplexing through this ONE service loop, the shared
+        // budget now covers services' full DllMain/CRT bring-up too — raised 3000→5000 so services
+        // reaches its real SCM entry (ScmMain) rather than starving at the old ceiling. Verified
+        // each process still PROGRESSES (new SSNs / advancing demand-faults), not spinning.
+        if iters > 5000 {
             stop = m1;
             break;
         }
@@ -1207,14 +1211,15 @@ pub(crate) unsafe fn service_sec_image(
                 // so report WAIT_0 (satisfied) and let winlogon's MAIN thread proceed to return
                 // RPC_S_OK. (smss's 280 stays PARKED in the badge==0 arm above.)
                 result = 0;
-            } else if m0 == 162 && badge == WINLOGON_BADGE {
+            } else if m0 == 162 {
                 // ★ NtQueryInformationThread(ThreadHandle=R10, ThreadInformationClass=RDX,
-                // ThreadInformation=R8, Length=R9, *ReturnLength=[sp+0x28]). RpcServerListen's kernel32
-                // path queries the RPC LISTENER thread's ThreadBasicInformation to read its TEB/ClientId
-                // (kernel32 RVA 0x25f62 then derefs [Teb+0x2c8]). The listener is now a REAL ETHREAD
-                // with a real TEB, so resolve the ThreadHandle VALUE → the ETHREAD and fill a real
-                // THREAD_BASIC_INFORMATION → the NULL-deref is GONE. Class 0 = ThreadBasicInformation.
-                nt_handler.pi = pi; // resolve the ThreadHandle in the CALLER's (winlogon's) handle table
+                // ThreadInformation=R8, Length=R9, *ReturnLength=[sp+0x28]). GENERAL (all hosted
+                // clients): winlogon's RpcServerListen queries the RPC LISTENER thread's
+                // ThreadBasicInformation (kernel32 RVA 0x25f62 then derefs [Teb+0x2c8]); services'
+                // msvcrt/ntdll CRT init queries its OWN thread (NtCurrentThread==-2) during startup.
+                // Resolve the ThreadHandle VALUE → the ETHREAD and fill a real THREAD_BASIC_INFORMATION.
+                // Class 0 = ThreadBasicInformation. Per-pi handle table (nt_handler.pi = pi below).
+                nt_handler.pi = pi; // resolve the ThreadHandle in the CALLER's own handle table
                 let cls = m3; // RDX = ThreadInformationClass
                 let handle = get_recv_mr(9); // R10 = ThreadHandle
                 let buf = get_recv_mr(7); // R8 = ThreadInformation
@@ -1222,7 +1227,20 @@ pub(crate) unsafe fn service_sec_image(
                 if cls == 0 && buf != 0 {
                     if let Some(tid) = nt_handler.resolve_thread_handle(handle) {
                         let t = tid as nt_process::ThreadId;
-                        let teb = nt_handler.pm.thread_teb(t).unwrap_or(0);
+                        // Real TEB if recorded (the winlogon listener via set_thread_teb); else fall
+                        // back to the caller's per-process main-thread TEB VA (spawn_sec_image set GS
+                        // base = TEB_VA for pi 1-3, SMSS_TEB_VA for smss pi 0) so services' CRT reads a
+                        // valid TebBaseAddress rather than NULL.
+                        let teb = match nt_handler.pm.thread_teb(t) {
+                            Some(v) if v != 0 => v,
+                            _ => {
+                                if pi == 0 {
+                                    SMSS_TEB_VA
+                                } else {
+                                    TEB_VA
+                                }
+                            }
+                        };
                         let cid = nt_handler
                             .pm
                             .client_id(t)
