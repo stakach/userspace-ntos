@@ -498,40 +498,97 @@ unsafe fn dispatch_loop(drv: u64) -> ! {
         let handler = read_volatile((mj_base + major * 8) as *const u64);
         let (mut st, mut info): (i32, u64) = (0xC000_0002u32 as i32, 0); // STATUS_NOT_IMPLEMENTED
         if handler != 0 {
-            // Build a minimal IRP: IoStatus@+0x30 { Status; Information }, StackLocation via
-            // CurrentStackLocation@+0xb8. Allocate the IRP + one stack location from the pool.
-            let irp = pool_alloc(0x100);
-            let mut i = 0u64;
-            while i < 0x100 {
-                write_unaligned((irp + i) as *mut u64, 0);
-                i += 8;
-            }
-            let iosl = pool_alloc(0x48);
-            let mut k = 0u64;
-            while k < 0x48 {
-                write_unaligned((iosl + k) as *mut u64, 0);
-                k += 8;
-            }
-            // IO_STACK_LOCATION: MajorFunction@0, MinorFunction@1.
-            write_unaligned(iosl as *mut u8, major as u8);
-            write_unaligned((iosl + 1) as *mut u8, 0);
-            // IRP.Tail.Overlay.CurrentStackLocation@0xb8.
-            write_unaligned((irp + 0xb8) as *mut u64, iosl);
-            // Point IoStatus to a known slot; the handler / IoCompleteRequest write it.
-            // We read it back from irp+0x30 after.
-            let devobj = read_volatile((NPFS_SHARED_VADDR + SH_DEVOBJ) as *const u64);
-            let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(handler as *const ());
-            let ret = f(devobj, irp);
-            // Prefer the IRP's IoStatus if the handler filled it, else the return value.
-            let irp_status = read_unaligned((irp + 0x30) as *const i32);
-            info = read_unaligned((irp + 0x38) as *const u64);
-            st = if irp_status != 0 || info != 0 { irp_status } else { ret };
-            pool_free(iosl);
-            pool_free(irp);
+            let (rst, rinfo) = run_irp(major, handler);
+            st = rst;
+            info = rinfo;
         }
         write_volatile((NPFS_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, st);
         write_volatile((NPFS_SHARED_VADDR + SH_REQ_INFO) as *mut u64, info);
         seq += 1;
         write_volatile((NPFS_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq);
+    }
+}
+
+/// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke npfs's
+/// `MajorFunction[major]` handler. The pipe name (UTF-16) rides in the ARG frame ([SH_REQ_INLEN]
+/// bytes); the FILE_OBJECT's FileName points at it. Returns (status, information).
+///
+/// x64 layouts (references/nt5 io.h): FILE_OBJECT { DeviceObject@8, FsContext@0x18, FsContext2@0x20,
+/// RelatedFileObject@0x40, FileName(UNICODE_STRING)@0x58 }. IRP { IoStatus@0x30, CurrentLocation
+/// (CCHAR)@0x42, StackCount@0x43, AssociatedIrp.SystemBuffer@0x18, UserBuffer@0x70,
+/// Tail.Overlay.CurrentStackLocation@0xb8 }. IO_STACK_LOCATION { Major@0, Minor@1, Parameters(union)
+/// @0x08, DeviceObject@0x20, FileObject@0x30 }.
+unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
+    let devobj = read_volatile((NPFS_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let inlen = read_volatile((NPFS_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
+    let outlen = read_volatile((NPFS_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
+    let fsctl = read_volatile((NPFS_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+
+    // FILE_OBJECT (0x100 bytes) — DeviceObject + FileName (points at the ARG frame name buffer).
+    let fo = pool_alloc(0x100);
+    zero(fo, 0x100);
+    write_unaligned(fo as *mut i16, 5); // Type = IO_TYPE_FILE
+    write_unaligned((fo + 2) as *mut u16, 0x100);
+    write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
+    // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
+    write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
+    write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
+    write_unaligned((fo + 0x60) as *mut u64, NPFS_ARG_VADDR); // Buffer = the pipe name (UTF-16)
+
+    // IRP (0x120 bytes).
+    let irp = pool_alloc(0x120);
+    zero(irp, 0x120);
+    // AssociatedIrp.SystemBuffer@0x18 = the ARG frame (buffered I/O in/out).
+    write_unaligned((irp + 0x18) as *mut u64, NPFS_ARG_VADDR);
+    write_unaligned((irp + 0x70) as *mut u64, NPFS_ARG_VADDR); // UserBuffer
+    // CurrentLocation@0x42 = 1, StackCount@0x43 = 1 (IoGetCurrentIrpStackLocation asserts this).
+    write_unaligned((irp + 0x42) as *mut u8, 1);
+    write_unaligned((irp + 0x43) as *mut u8, 1);
+
+    // IO_STACK_LOCATION (0x48 bytes).
+    let iosl = pool_alloc(0x48);
+    zero(iosl, 0x48);
+    write_unaligned(iosl as *mut u8, major as u8); // MajorFunction
+    write_unaligned((iosl + 1) as *mut u8, 0); // MinorFunction
+    write_unaligned((iosl + 0x20) as *mut u64, devobj); // DeviceObject
+    write_unaligned((iosl + 0x30) as *mut u64, fo); // FileObject
+    // Parameters union @0x08: for Create, { PIO_SECURITY_CONTEXT@0x08; ULONG Options@0x10;
+    // USHORT FileAttributes@0x14; USHORT ShareAccess@0x16; }. For Read/Write { ULONG Length@0x08;
+    // ULONG Key@0x10; LARGE_INTEGER ByteOffset@0x18 }. For FS/DeviceControl { ULONG OutputBufferLength
+    // @0x08; ULONG InputBufferLength@0x10; ULONG IoControlCode@0x18; PVOID Type3InputBuffer@0x20 }.
+    match major {
+        3 | 4 => {
+            write_unaligned((iosl + 0x08) as *mut u32, if major == 4 { inlen } else { outlen } as u32);
+        }
+        0xd | 0xe => {
+            write_unaligned((iosl + 0x08) as *mut u32, outlen as u32);
+            write_unaligned((iosl + 0x10) as *mut u32, inlen as u32);
+            write_unaligned((iosl + 0x18) as *mut u32, fsctl as u32);
+        }
+        _ => {}
+    }
+    write_unaligned((irp + 0xb8) as *mut u64, iosl); // CurrentStackLocation
+
+    let f: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(handler as *const ());
+    let ret = f(devobj, irp);
+
+    let irp_status = read_unaligned((irp + 0x30) as *const i32);
+    let info = read_unaligned((irp + 0x38) as *const u64);
+    let st = if irp_status != 0 || info != 0 { irp_status } else { ret };
+    // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
+    let fsctx = read_unaligned((fo + 0x18) as *const u64);
+    write_volatile((NPFS_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
+    pool_free(iosl);
+    pool_free(irp);
+    pool_free(fo);
+    (st, info)
+}
+
+#[inline]
+unsafe fn zero(p: u64, n: u64) {
+    let mut i = 0u64;
+    while i < n {
+        write_unaligned((p + i) as *mut u64, 0);
+        i += 8;
     }
 }

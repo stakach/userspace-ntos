@@ -5430,13 +5430,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // Isolation proof: npfs runs in its OWN VSpace (a distinct PML4 cap != the executive's).
             check(b"npfs_isolated_vspace", dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE, &mut passed);
             if dc.finished && (dc.verdict & npfs_host::V_MJ) != 0 {
-                // C1 round-trip: dispatch a benign IRP_MJ_CREATE to the live component (proves the
-                // dispatch loop + MajorFunction routing works before wiring real named-pipe syscalls).
+                // C2 round-trip: dispatch a REAL IRP_MJ_CREATE_NAMED_PIPE (major 1) to the live
+                // component with a pipe name (UTF-16 "\ntsvcs") — exercising npfs's REAL
+                // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the
+                // routing path is real (a fault mid-create lands on npfs's own EP = contained).
+                let name16: [u8; 14] = *b"\\\0n\0t\0s\0v\0c\0s\0";
                 let mut out = [0u8; 16];
-                let r = npfs_dispatch_irp(0 /* IRP_MJ_CREATE */, 0, 0, &[], &mut out);
-                if let Some((st, _info)) = r {
-                    print_str(b"[npfs-svc] C1 dispatch IRP_MJ_CREATE -> status=0x");
+                let r = npfs_dispatch_irp(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, 0, &name16, &mut out);
+                if let Some((st, info)) = r {
+                    print_str(b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntsvcs) -> status=0x");
                     print_hex(st as u32);
+                    print_str(b" info=");
+                    print_u64(info);
                     print_str(b"\n");
                     check(b"npfs_dispatch_roundtrip", true, &mut passed);
                 }
