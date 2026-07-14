@@ -82,9 +82,78 @@ Expected boot output:
 [ntos] boot smoke-test OK
 ```
 
-`run.sh` builds the `ntos-root` ELF, stages it as the kernel's rootserver, and
-drives the kernel's build+image+QEMU pipeline in `extern-rootserver` mode (bring
-your own root task).
+`scripts/run.sh` builds the `ntos-root` ELF (a minimal boot smoke-test), stages
+it as the kernel's rootserver, and drives the kernel's build+image+QEMU pipeline
+in `extern-rootserver` mode (bring your own root task).
+
+## Running the hosted ReactOS desktop (quick start)
+
+The headline demo boots the rust-micro microkernel hosting **real, unmodified
+GPL ReactOS binaries** — `smss.exe → csrss.exe → winlogon.exe → win32k.sys` —
+all the way to a **painted Windows desktop**. One command from a fresh clone:
+
+```sh
+git clone --recursive https://github.com/stakach/userspace-ntos.git
+cd userspace-ntos
+./run.sh                # headless serial gate (default)
+./run.sh --desktop      # boot with a QEMU window so you SEE the painted desktop
+```
+
+`./run.sh` (at the repo root — distinct from `scripts/run.sh` above) is a
+self-contained launcher that:
+
+1. **Preflight-checks every prerequisite** (QEMU, `mkfs.vfat`/dosfstools,
+   `mmd`/`mcopy`/mtools, `bsdtar`/libarchive, `python3`, the Rust **nightly**
+   toolchain + `rust-src`, and OVMF/edk2 UEFI firmware). If anything is missing
+   it prints a per-platform `brew install …` / `apt install …` remediation table
+   and stops — no cryptic mid-build failure.
+2. **Checks out the `rust-micro` submodule** if you forgot `--recursive`.
+3. **Fetches the ReactOS binaries** on first run (a ~30 MiB GPL ReactOS x64
+   livecd, `reactos-livecd-0.4.17-dev-478-g4117217`, from
+   [iso.reactos.org](https://iso.reactos.org/livecd/); cached under
+   `rust-micro/.tmp/reactos/`, extracted with `bsdtar`). Override the URL with
+   `REACTOS_7Z_URL=…`. ReactOS is GPL, so its binaries are freely
+   redistributable — the executive loads them via `SEC_IMAGE` and runs their
+   real ntdll loader.
+4. **Builds** the `ntos-executive` (the NT executive that hosts the ReactOS
+   processes) + the kernel, and packs the FAT32/UEFI disk image.
+5. **Boots QEMU.**
+
+### What you should see
+
+Headless (default) — the serial log streams to your terminal and ends with the
+executive's success sentinel; `run.sh` then prints a clear verdict:
+
+```
+  PASS exec_win32k_desktop_painted
+[ntos-exec] desktop-bg match 768/768 px, px0=0x003a6ea5 (expected 0x003a6ea5)
+[ntos-exec summary: 140/94 executive->isolated-service checks passed]
+[microtest done]
+SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5).
+```
+
+`--desktop` — a QEMU window opens showing the **real painted desktop**: win32k
+authentically fills the BOOTBOOT GOP framebuffer with the ReactOS desktop
+background colour `0x003a6ea5` (RGB 58,110,165) via winlogon's natural
+`SwitchDesktop` flow. This is a genuine graphics path (the real ReactOS
+`win32k.sys` + `framebuf.dll` display driver + `ftfd.dll`/Arial font stack), not
+a stub or a mock. The window persists after the run so you can see it — close it
+to quit.
+
+**Expected run time:** ~1 minute once the toolchain is warm (the QEMU boot +
+gate is ~50 s); the very first run adds the one-time ReactOS download + a full
+`cargo` build.
+
+**Gotchas:**
+
+- The kernel is a **git submodule** (`rust-micro`); the build target is
+  `userspace-ntos/rust-micro`, not any standalone checkout. A clone without
+  `--recursive` needs `git submodule update --init --recursive` (the launcher
+  does this for you).
+- Some ReactOS binaries are only staged onto the disk image **if they were
+  fetched first** — a fresh clone that skips the fetch step boots the kernel
+  *without* the hosted processes. Always let `./run.sh` run the fetch (it is
+  idempotent and cached).
 
 ## Updating the kernel
 
