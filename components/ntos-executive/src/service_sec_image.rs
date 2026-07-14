@@ -137,206 +137,68 @@ pub(crate) unsafe fn service_sec_image(
         let e_lfanew = core::ptr::read_volatile((lsass_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((lsass_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
-    // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
-    // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
-    // csrsrv) maps it into csrss's VSpace and demand-pages it from here so csrss's imports resolve.
-    // P7-A batch 3: source csrss's csrsrv.dll (static import) + basesrv.dll/winsrv.dll (its two
-    // CsrLoadServerDll ServerDlls) BY PATH from the FS pool (hybrid; falls back to FILEBUF/SRVBUF on
-    // any FS miss). dll_buf_va[0..3] = *_va below. csrsrv keeps registry base 0x8000_0000 = its
-    // preferred ImageBase (relocation delta 0) regardless of where its bytes live.
-    let (csrsrv_pe, csrsrv_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\csrsrv.dll", b"csrsrv",
-        FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET, 0x40);
-    let (basesrv_pe, basesrv_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\basesrv.dll", b"basesrv",
-        SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET, 0x44);
-    let (winsrv_pe, winsrv_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\winsrv.dll", b"winsrv",
-        SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET, 0x48);
-    // P7-A batch 4: the Win32 client stack heavyweights kernel32.dll (~2.66 MiB) + user32.dll
-    // (~1.12 MiB) — winsrv.dll's static imports. Sourced BY PATH from the FS pool (hybrid; falls back
-    // to WIN32BUF on any FS miss). Done last per the untyped caveat — during hybrid both the pool AND
-    // WIN32BUF hold them, but headroom is ample (~36% of the slot budget). dll_buf_va[3..5] = *_va.
-    let (kernel32_pe, kernel32_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\kernel32.dll", b"kernel32",
-        WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET, 0x4c);
-    let (user32_pe, user32_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\user32.dll", b"user32",
-        WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET, 0x50);
-    // P7-A migration: source gdi32.dll BY PATH from the executive's FS pool; fall back to the fixed
-    // WIN32BUF staging only if the FS load fails (hybrid). `gdi32_va` feeds dll_buf_va[5] below so the
-    // relocation + demand-fault router use the same bytes the PeFile wraps.
-    let mut gdi32_va = WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET;
-    let gdi32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\gdi32.dll", b"gdi32.dll");
-        if fs_va != 0 {
-            gdi32_va = fs_va;
-            fs_pe
-        } else {
-            let gsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x54) as *const u32) as usize;
-            if gsz > 0 {
-                let bytes: &'static [u8] = core::slice::from_raw_parts(
-                    (WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET) as *const u8,
-                    gsz,
-                );
-                match nt_pe_loader::PeFile::parse(bytes) {
-                    Ok(gpe) => {
-                        print_str(b"[ntos-exec] staged gdi32.dll: ");
-                        print_u64(gsz as u64);
-                        print_str(b" bytes (fixed buffer fallback)\n");
-                        Some(gpe)
-                    }
-                    Err(_) => {
-                        print_str(b"[ntos-exec] staged gdi32.dll: PARSE FAILED\n");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // P7-A batch 2: source the 4 mid-size Win32 DLLs BY PATH from the FS pool (hybrid; falls back to
-    // WIN32BUF on any FS miss). dll_buf_va[6..10] = *_va below.
-    let (rpcrt4_pe, rpcrt4_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\rpcrt4.dll", b"rpcrt4",
-        WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET, 0x58);
-    let (msvcrt_pe, msvcrt_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\msvcrt.dll", b"msvcrt",
-        WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET, 0x5c);
-    let (advapi32_pe, advapi32_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\advapi32.dll", b"advapi32",
-        WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET, 0x60);
-    let (ws2_32_pe, ws2_32_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\ws2_32.dll", b"ws2_32",
-        WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET, 0x64);
-    // P7-A batch 1: source the 4 small vista-forwarder DLLs BY PATH from the FS pool (hybrid; falls
-    // back to WIN32BUF on any FS miss). dll_buf_va[10..14] = *_va below.
-    let (kernel32_vista_pe, kernel32_vista_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\kernel32_vista.dll", b"kernel32_vista",
-        WIN32BUF_VADDR + KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68);
-    let (advapi32_vista_pe, advapi32_vista_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\advapi32_vista.dll", b"advapi32_vista",
-        WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c);
-    let (ws2help_pe, ws2help_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\ws2help.dll", b"ws2help",
-        WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET, 0x70);
-    let (ntdll_vista_pe, ntdll_vista_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\ntdll_vista.dll", b"ntdll_vista",
-        WIN32BUF_VADDR + NTDLL_VISTA_WIN32BUF_OFFSET, 0x78);
-    // userenv.dll + mpr.dll — winlogon.exe's two extra static imports (the rest of its Win32 stack
-    // is shared with csrss above). Staged into WIN32BUF (sizes at STORAGE_SHARED +0x98/+0x9c); the
-    // winlogon loader (pi==2) resolves + demand-pages them via the same nt-dll-registry path.
-    // P7-A migration: source userenv.dll + mpr.dll BY PATH from the FS pool (fall back to WIN32BUF).
-    let mut userenv_va = WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET;
-    let userenv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\userenv.dll", b"userenv.dll");
-        if fs_va != 0 {
-            userenv_va = fs_va;
-            fs_pe
-        } else {
-            let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x98) as *const u32) as usize;
-            if sz > 0 {
-                let bytes: &'static [u8] = core::slice::from_raw_parts(
-                    (WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET) as *const u8,
-                    sz,
-                );
-                match nt_pe_loader::PeFile::parse(bytes) {
-                    Ok(pe) => {
-                        print_str(b"[ntos-exec] staged userenv.dll (fixed buffer fallback)\n");
-                        Some(pe)
-                    }
-                    Err(_) => {
-                        print_str(b"[ntos-exec] staged userenv.dll: PARSE FAILED\n");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut mpr_va = WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET;
-    let mpr_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\mpr.dll", b"mpr.dll");
-        if fs_va != 0 {
-            mpr_va = fs_va;
-            fs_pe
-        } else {
-            let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9c) as *const u32) as usize;
-            if sz > 0 {
-                let bytes: &'static [u8] = core::slice::from_raw_parts(
-                    (WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET) as *const u8,
-                    sz,
-                );
-                match nt_pe_loader::PeFile::parse(bytes) {
-                    Ok(pe) => {
-                        print_str(b"[ntos-exec] staged mpr.dll (fixed buffer fallback)\n");
-                        Some(pe)
-                    }
-                    Err(_) => {
-                        print_str(b"[ntos-exec] staged mpr.dll: PARSE FAILED\n");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // lsasrv.dll + samsrv.dll — lsass.exe's (pi 4) static-import LSA/SAM server DLLs. Sourced BY PATH
-    // from the FS pool (staged in the full \reactos tree); lsass's ntdll loader resolves + demand-pages
-    // them through the same nt-dll-registry path as csrss's Win32 stack. Only present on the live run.
-    let (lsasrv_pe, lsasrv_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\lsasrv.dll", b"lsasrv.dll")
-    } else {
-        (None, 0)
-    };
-    let (samsrv_pe, samsrv_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\samsrv.dll", b"samsrv.dll")
-    } else {
-        (None, 0)
-    };
-    // msv1_0.dll — lsass' default authentication package (LsapInitAuthPackages loads the DLLs listed in
-    // HKLM\...\Control\Lsa\Authentication Packages; ReactOS's default is msv1_0). Loaded BY PATH from the
-    // FS pool like lsasrv/samsrv; lsass' LoadLibrary resolves it through the nt-dll-registry path.
-    let (msv1_0_pe, msv1_0_va) = if ntdll.is_some() {
-        load_dll_from_fs(b"reactos\\system32\\msv1_0.dll", b"msv1_0.dll")
-    } else {
-        (None, 0)
-    };
-    // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
-    // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
-    // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
-    // csrsrv (registered first) keeps 0x8000_0000 = its preferred ImageBase so the loader never
-    // relocates it (its text is byte-identical and shared read-only). All slots share the 1 GiB
+    // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
+    // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
+    // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
+    // userenv/mpr, and lsass's lsasrv/samsrv/msv1_0. ALL are sourced BY PATH from the real \reactos
+    // FS into the demand-load pool — NO hardcoded per-DLL block, NO fixed staging buffer, NO
+    // STORAGE_SHARED offset: a single DATA-DRIVEN table (seed stem, System32 leaf) drives the load.
+    // Adding a served DLL = one row here. ORDER IS LOAD-BEARING: it is the registration order, which
+    // is the base-assignment order — csrsrv MUST stay first so it keeps registry base 0x8000_0000 =
+    // its preferred ImageBase (relocation delta 0, text byte-identical + shared read-only across
+    // processes); the rest are loader-relocated to their fixed slots. All slots share the 1 GiB
     // 0x8000_0000 PDPT range. Load-flow DECISIONS (name/handle/VA lookups + SECTION_IMAGE_INFORMATION)
-    // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
-    // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
-    // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] = [
-        &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
-        &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
-        &ntdll_vista_pe, &userenv_pe, &mpr_pe, &lsasrv_pe, &samsrv_pe, &msv1_0_pe,
+    // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (same
+    // index) for the effectful demand-fill. (winsrv is ~100 pages — the root CNode is an XL page under
+    // extern-rootserver, so the caps fit.) These load at BOOT (below the service_sec_image heap mark)
+    // rather than on the fly during a syscall because the per-syscall bump-heap reset would rewind any
+    // registry Vec growth / pool alloc made ABOVE the mark; loading them here keeps every DLL's parsed
+    // PE + registry slot persistent (see project_full_fs Part 2 for the demand-load-during-syscall
+    // rework this still awaits).
+    const DLL_TABLE: [(&[u8], &[u8]); DLL_REG_COUNT] = [
+        (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
+        (b"basesrv", b"reactos\\system32\\basesrv.dll"),
+        (b"winsrv", b"reactos\\system32\\winsrv.dll"),
+        (b"kernel32", b"reactos\\system32\\kernel32.dll"),
+        (b"user32", b"reactos\\system32\\user32.dll"),
+        (b"gdi32", b"reactos\\system32\\gdi32.dll"),
+        (b"rpcrt4", b"reactos\\system32\\rpcrt4.dll"),
+        (b"msvcrt", b"reactos\\system32\\msvcrt.dll"),
+        (b"advapi32", b"reactos\\system32\\advapi32.dll"),
+        (b"ws2_32", b"reactos\\system32\\ws2_32.dll"),
+        (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
+        (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
+        (b"ws2help", b"reactos\\system32\\ws2help.dll"),
+        (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
+        (b"userenv", b"reactos\\system32\\userenv.dll"),
+        (b"mpr", b"reactos\\system32\\mpr.dll"),
+        (b"lsasrv", b"reactos\\system32\\lsasrv.dll"),
+        (b"samsrv", b"reactos\\system32\\samsrv.dll"),
+        (b"msv1_0", b"reactos\\system32\\msv1_0.dll"),
     ];
-    let dll_seed: [&[u8]; DLL_REG_COUNT] = [
-        b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
-        b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help", b"ntdll_vista",
-        b"userenv", b"mpr", b"lsasrv", b"samsrv", b"msv1_0",
-    ];
+    // Owned parsed-PE storage (lives for the whole service loop). `dll_pes[i]` holds `&dll_pe_store[i]`
+    // — a stable ref into this array — so the erased `*const [&Option<PeFile>; N]` handed to the
+    // handler is byte-identical to the prior array-of-refs form. Only the LIVE run (ntdll present) has
+    // the pool + FS mounted; the demo SEC_IMAGE call leaves them None.
+    let mut dll_pe_store: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
+        [const { None }; DLL_REG_COUNT];
+    let mut dll_buf_va = [0u64; DLL_REG_COUNT];
+    if ntdll.is_some() {
+        for i in 0..DLL_REG_COUNT {
+            let (pe, va) = load_dll_from_fs(DLL_TABLE[i].1, DLL_TABLE[i].0);
+            dll_pe_store[i] = pe;
+            dll_buf_va[i] = va;
+        }
+    }
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] =
+        core::array::from_fn(|i| &dll_pe_store[i]);
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
     for i in 0..DLL_REG_COUNT {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
             .unwrap_or((0, 0));
-        reg.register(dll_seed[i], sz, ent);
+        reg.register(DLL_TABLE[i].0, sz, ent);
     }
     // Pre-relocate each registry DLL to its fixed registry base + patch OptionalHeader.ImageBase to
     // match. Our fake NtMapViewOfSection does NOT relocate SEC_IMAGE views — real Windows relocates
@@ -347,27 +209,6 @@ pub(crate) unsafe fn service_sec_image(
     // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
     // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
     // ImageBase == mapped base and doesn't double-relocate.
-    let dll_buf_va: [u64; DLL_REG_COUNT] = [
-        csrsrv_va,  // P7-A batch 3: pool VA on FS hit, else FILEBUF+CSRSRV_FILEBUF_OFFSET
-        basesrv_va, // P7-A batch 3: pool VA on FS hit, else SRVBUF+BASESRV_SRVBUF_OFFSET
-        winsrv_va,  // P7-A batch 3: pool VA on FS hit, else SRVBUF+WINSRV_SRVBUF_OFFSET
-        kernel32_va, // P7-A batch 4: pool VA on FS hit, else WIN32BUF+KERNEL32_WIN32BUF_OFFSET
-        user32_va,   // P7-A batch 4: pool VA on FS hit, else WIN32BUF+USER32_WIN32BUF_OFFSET
-        gdi32_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+GDI32_WIN32BUF_OFFSET
-        rpcrt4_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+RPCRT4_WIN32BUF_OFFSET
-        msvcrt_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+MSVCRT_WIN32BUF_OFFSET
-        advapi32_va, // P7-A batch 2: pool VA on FS hit, else WIN32BUF+ADVAPI32_WIN32BUF_OFFSET
-        ws2_32_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+WS2_32_WIN32BUF_OFFSET
-        kernel32_vista_va, // P7-A batch 1: pool VA on FS hit, else WIN32BUF+KERNEL32_VISTA_WIN32BUF_OFFSET
-        advapi32_vista_va, // P7-A batch 1: pool VA on FS hit, else WIN32BUF+ADVAPI32_VISTA_WIN32BUF_OFFSET
-        ws2help_va,        // P7-A batch 1: pool VA on FS hit, else WIN32BUF+WS2HELP_WIN32BUF_OFFSET
-        ntdll_vista_va,    // P7-A batch 1: pool VA on FS hit, else WIN32BUF+NTDLL_VISTA_WIN32BUF_OFFSET
-        userenv_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+USERENV_WIN32BUF_OFFSET
-        mpr_va,     // P7-A: pool VA when sourced BY PATH, else WIN32BUF+MPR_WIN32BUF_OFFSET
-        lsasrv_va,  // lsass's LSA server DLL — pool VA (FS-by-path)
-        samsrv_va,  // lsass's SAM server DLL — pool VA (FS-by-path)
-        msv1_0_va,  // lsass's default auth package — pool VA (FS-by-path)
-    ];
     for i in 0..DLL_REG_COUNT {
         if let Some(pe) = dll_pes[i].as_ref() {
             let base = reg.base(i);
