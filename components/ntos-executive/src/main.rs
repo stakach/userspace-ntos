@@ -10344,6 +10344,111 @@ unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
     fat_open_path(fs, &path[..n])
 }
 
+// --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------
+// After the isolated storage host reports and PARKS, the executive drives the SAME AHCI HBA itself
+// (it owns the BAR cap at AHCI_VADDR + the DMA frame cap + the VT-d IO mapping at AHCI_IOVA) to
+// resolve ANY \reactos path → bytes on demand. This is the mechanism that retires the fixed
+// per-binary staging buffers: instead of the host batch-reading a hardcoded file list into ~15
+// fixed dual-mapped buffers, the executive reads each binary BY PATH into a dynamically pooled
+// buffer at load time. The demand-fault router + nt-dll-registry consume it UNCHANGED — they operate
+// on PeFile byte-slices, which now point into the pool. Adding a P5 binary (services.exe/lsass/
+// explorer) then needs NO new buffer/offset/fake: it just resolves from the FS.
+
+/// The executive's own live FAT32 handle, mounted after the storage host parks (bound to the
+/// executive's AHCI BAR + DMA-frame mappings). `None` until mounted. Read-only.
+static mut EXEC_FS: Option<Fat32> = None;
+
+/// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
+/// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
+unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
+    let _ = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    let bp = |o: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + o) as *const u8);
+    let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
+    let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
+    let bps = bp16(0x0B);
+    let spc = bp(0x0D) as u32;
+    let reserved = bp16(0x0E);
+    let nfats = bp(0x10) as u32;
+    let spf32 = bp32(0x24);
+    let root_cl = bp32(0x2C);
+    let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
+    if bps == 512 && spc >= 1 && is_fat32 {
+        Some(Fat32 {
+            ahci_vaddr,
+            dma_vaddr,
+            dma_paddr,
+            bps,
+            spc,
+            fat_start: reserved,
+            data_start: reserved + nfats * spf32,
+            root_cl,
+        })
+    } else {
+        None
+    }
+}
+
+/// The executive's on-demand file-buffer POOL: a fresh VA region whose frames are allocated + mapped
+/// (into the executive's own VSpace) on demand, one file at a time. Replaces the ~15 fixed staging
+/// buffers with a single bump-allocated arena. Each loaded PE's bytes persist here for the run so the
+/// demand-fault router can fill hosted-process pages from them (same lifetime as the old buffers).
+pub const POOL_VADDR: u64 = 0x0000_0100_1500_0000;
+pub const POOL_PTS: u64 = 24; // 48 MiB (24 * 2 MiB) — headroom for the whole stack + P5 binaries
+static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
+static POOL_INITED: AtomicU64 = AtomicU64::new(0);
+
+/// Reserve the pool's page tables in the executive's VSpace (once). Idempotent.
+unsafe fn pool_init() {
+    if POOL_INITED.swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    for p in 0..POOL_PTS {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            POOL_VADDR + p * 0x20_0000,
+            CAP_INIT_THREAD_VSPACE,
+        );
+    }
+}
+
+/// Allocate `nbytes` (page-rounded) of pool space, mapping fresh RW frames into the executive's
+/// VSpace. Returns the base VA, or None if the pool is exhausted. Bump-only (no free) — pool buffers
+/// live for the whole run, exactly like the fixed buffers they replace.
+unsafe fn pool_alloc(nbytes: u32) -> Option<u64> {
+    pool_init();
+    let pages = ((nbytes as u64) + 0xFFF) / 0x1000;
+    let off = POOL_NEXT.fetch_add(pages * 0x1000, Ordering::Relaxed);
+    if off + pages * 0x1000 > POOL_PTS * 0x20_0000 {
+        return None;
+    }
+    let base = POOL_VADDR + off;
+    for i in 0..pages {
+        let f = alloc_frame();
+        let _ = page_map(f, base + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    }
+    Some(base)
+}
+
+/// Resolve `path` (root-relative, e.g. `b"reactos\\system32\\version.dll"`) on the executive's live
+/// volume, read the WHOLE file into a fresh pool buffer, and return `(va, size)`. The bytes stay
+/// resident for the run so a PeFile parsed over them + the demand-fault router keep working. This is
+/// the single call the per-binary staging blocks collapse into: open path → bytes.
+unsafe fn load_file_to_pool(fs: &Fat32, path: &[u8]) -> Option<(u64, u32)> {
+    let (cluster, size) = fat_open_path(fs, path)?;
+    if size == 0 {
+        return None;
+    }
+    let va = pool_alloc(size)?;
+    let read = fat_read_file(fs, cluster, size, va);
+    if read < size {
+        return None;
+    }
+    Some((va, size))
+}
+
 /// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
 /// sector 0 (MBR), parse the FAT32 volume, list the root directory, read BOOTBOOT/INITRD, and
 /// read the registry hive `SYSTEM.DAT` into `hive_dest`. Returns (verdict, initrd_cluster,
@@ -12377,6 +12482,44 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_u64(fs_fallbacks as u64);
             print_str(b"\n");
             check(b"exec_full_stack_from_fs", (verdict & 0x200) != 0, &mut passed);
+
+            // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the storage host has now PARKED, so the executive
+            // drives the same (idle) AHCI HBA itself to resolve ANY \reactos path on demand. It
+            // already owns the AHCI BAR (mapped at AHCI_VADDR) + the DMA frame cap + the VT-d IO
+            // mapping (AHCI_IOVA); it only needs a CPU-side mapping of that DMA frame. Map it at
+            // AHCI_DMA_VADDR (same page table as AHCI_VADDR/STORAGE_SHARED — no new PT), mount the
+            // FAT32 volume into a persistent handle (EXEC_FS), then PROVE the generic loader: read a
+            // binary NOT in the staged set (version.dll) BY PATH into the pool and PE32+-parse it.
+            // This is the P5 enabler — adding services.exe/lsass/explorer needs zero per-binary code.
+            let dma_exec = copy_cap(dma_frame);
+            let _ = page_map(dma_exec, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let mut generic_loader_ok = false;
+            if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA) {
+                EXEC_FS = Some(fs);
+                if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
+                    let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
+                    let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
+                    let parsed = nt_pe_loader::PeFile::parse(bytes).is_ok();
+                    print_str(b"[ntos-exec] P7-A generic loader: version.dll BY PATH size=");
+                    print_u64(sz as u64);
+                    print_str(b" MZ=");
+                    print_u64(mz as u64);
+                    print_str(b" PE32+=");
+                    print_u64(parsed as u64);
+                    print_str(b" @pool=0x");
+                    print_hex((va >> 32) as u32);
+                    print_hex(va as u32);
+                    print_str(b"\n");
+                    generic_loader_ok = mz && parsed && sz >= 0x4000;
+                } else {
+                    print_str(b"[ntos-exec] P7-A generic loader: version.dll load FAILED\n");
+                }
+            } else {
+                print_str(b"[ntos-exec] P7-A: executive FAT32 mount FAILED\n");
+            }
+            // A binary the fixed staging never touched loaded purely BY PATH from the real \reactos
+            // tree through the executive's own FS reader + pool — no new buffer, offset, or fake.
+            check(b"exec_generic_loader_by_path", generic_loader_ok, &mut passed);
 
             // --- P2 finale: the Config Manager parses the registry hive the isolated storage
             // host read off the FS (an nt-hive-core image at STORAGE_SHARED_VADDR+0x100) and
