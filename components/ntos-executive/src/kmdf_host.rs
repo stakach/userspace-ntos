@@ -22,6 +22,7 @@ use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::boxed::Box;
+use nt_compat_exports::DriverExportRegistry;
 use nt_pe_loader::{ImportRef, PeFile};
 use nt_wdf_queue::DispatchType;
 use nt_wdf_request::RequestBuffers;
@@ -473,20 +474,52 @@ unsafe fn install_function_table() {
     set(wt::IDX_WDF_CM_RESOURCE_LIST_GET_DESCRIPTOR, wdf_cm_resource_list_get_descriptor as usize as u64);
 }
 
-/// Resolve an ntoskrnl/WDFLDR import name to a stub address. Unknown → a benign `ntos_stub`.
+// --- the SHARED ntoskrnl/WDFLDR export surface (registration-driven, the win32k/FSD model) -----
+
+/// The KMDF class's import registry: a heap-free `name -> trampoline-VA` map (the SHARED
+/// `nt-compat-exports` [`DriverExportRegistry`] mechanism, identical to the FSD's `FSD_EXPORTS`
+/// and the Subsystem's `WIN32K_EXPORTS`). The executive binds each KMDF `ntos_*`/WDFLDR trampoline
+/// by import name; [`export_addr`] resolves the driver's IAT through it. Unlike the FSD/Subsystem
+/// classes, KMDF's imports are ALL WDF-specific glue (Rtl string with KMDF semantics, MmMapIoSpace →
+/// the real NIC BAR, WdfVersionBind publishing the function table) — there are NO pure primitives
+/// (memcpy/memset/wcslen/RtlCompareMemory) in KmdfBasicTest's import surface to de-dup onto
+/// `ntoskrnl_shared.rs`; so the convergence here is purely the shared REGISTRY mechanism, keeping the
+/// KMDF trampolines KMDF-local (they'd differ from the FSD/Subsystem semantics by design).
+static mut KMDF_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
+static mut KMDF_EXPORTS_READY: bool = false;
+
+/// Bind the KMDF ntoskrnl/WDFLDR trampolines into [`KMDF_EXPORTS`]. Idempotent (`bind` updates in
+/// place). Mirrors `register_fsd_trampolines` / win32k's `register_trampolines`.
+fn register_kmdf_trampolines() {
+    // SAFETY: single-threaded executive; the registry is only touched here + in export_addr.
+    let reg = unsafe { &mut *core::ptr::addr_of_mut!(KMDF_EXPORTS) };
+    // ntoskrnl.exe imports (KMDF-specific glue — NOT shared with the FSD/Subsystem classes)
+    reg.bind("RtlInitUnicodeString", ntos_rtl_init_unicode_string as usize as u64);
+    reg.bind("RtlCopyUnicodeString", ntos_rtl_copy_unicode_string as usize as u64);
+    reg.bind("DbgPrintEx", ntos_dbg_print_ex as usize as u64);
+    reg.bind("MmMapIoSpace", ntos_mm_map_io_space as usize as u64);
+    reg.bind("MmUnmapIoSpace", ntos_mm_unmap_io_space as usize as u64);
+    // WDFLDR.SYS imports (the WDF version-bind protocol — publishes the function table)
+    reg.bind("WdfVersionBind", ntos_wdf_version_bind as usize as u64);
+    reg.bind("WdfVersionUnbind", ntos_wdf_version_unbind as usize as u64);
+    reg.bind("WdfVersionBindClass", ntos_wdf_version_bind_class as usize as u64);
+    reg.bind("WdfVersionUnbindClass", ntos_wdf_version_unbind_class as usize as u64);
+}
+
+/// Resolve an ntoskrnl/WDFLDR import name to a trampoline VA through the SHARED
+/// [`DriverExportRegistry`]. Unknown names fall back to a benign `ntos_stub`.
 pub fn export_addr(name: &str) -> u64 {
-    match name {
-        "RtlInitUnicodeString" => ntos_rtl_init_unicode_string as usize as u64,
-        "RtlCopyUnicodeString" => ntos_rtl_copy_unicode_string as usize as u64,
-        "DbgPrintEx" => ntos_dbg_print_ex as usize as u64,
-        "MmMapIoSpace" => ntos_mm_map_io_space as usize as u64,
-        "MmUnmapIoSpace" => ntos_mm_unmap_io_space as usize as u64,
-        "WdfVersionBind" => ntos_wdf_version_bind as usize as u64,
-        "WdfVersionUnbind" => ntos_wdf_version_unbind as usize as u64,
-        "WdfVersionBindClass" => ntos_wdf_version_bind_class as usize as u64,
-        "WdfVersionUnbindClass" => ntos_wdf_version_unbind_class as usize as u64,
-        _ => ntos_stub as usize as u64,
+    // SAFETY: single-threaded; the registry is populated once (lazily) and read-only thereafter.
+    unsafe {
+        if !KMDF_EXPORTS_READY {
+            register_kmdf_trampolines();
+            KMDF_EXPORTS_READY = true;
+        }
+        if let Some(va) = (*core::ptr::addr_of!(KMDF_EXPORTS)).lookup(name) {
+            return va;
+        }
     }
+    ntos_stub as usize as u64
 }
 
 // --- driver callback invocation ---------------------------------------------
