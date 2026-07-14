@@ -47,7 +47,7 @@ pub(crate) struct Region {
 
 /// Helper: `pts` value that gives one PT per 2 MiB spanning `count` frames.
 #[inline]
-const fn pts_for(count: u64) -> u64 {
+pub(crate) const fn pts_for(count: u64) -> u64 {
     (count + 511) / 512
 }
 
@@ -219,93 +219,6 @@ pub(crate) unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64,
         gs_base: None,
     };
     let _ = spawn_component(&d);
-}
-
-/// Spawn the isolated **win32k-service** component: like the KMDF host but scaled to the
-/// 2.1 MiB win32k image. Maps the executive image RWX (the trampolines live there), a heap +
-/// deep stack, the pre-loaded win32k PE at `WIN32K_CODE_VA` **W^X** (per-frame `code_rights`:
-/// RX code / RW data), the pool arena, the data-export region, and the shared handoff page.
-/// The executive receives on `fault_ep` (crash-contained): win32k's DriverEntry runs here and
-/// every fault (or the completion SENTINEL) is delivered to the executive. Returns the host
-/// `pml4` cap so the fault loop can demand-map pages into it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn spawn_win32k_host(
-    entry: unsafe extern "C" fn() -> !,
-    fault_ep: u64,
-    prio: u64,
-    code_base: u64,
-    code_rights: &[u64],
-    pool_base: u64,
-    data_base: u64,
-    shared_frame: u64,
-    heap_base: u64,
-    arg_base: u64,
-) -> u64 {
-    let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
-    // code_rights is a &[u64]; the descriptor's PerFrame wants &'static. win32k_host::code_rights()
-    // returns a &'static slice, so re-borrow it as such (it lives in the win32k module's statics).
-    let code_rights_static: &'static [u64] = core::mem::transmute::<&[u64], &'static [u64]>(code_rights);
-    let font_base = FONTBUF_START.load(Ordering::Relaxed);
-
-    // Regions, in the EXACT order the old bespoke spawner mapped them (order is behaviourally
-    // irrelevant but kept identical for a byte-identical boot). The image is RWX (image_rights);
-    // the win32k PE is W^X (PerFrame code_rights). DATA/SHARED/ARG share the aux PT window (a single
-    // aux-PT region with count=0 builds that PT ahead of them). We model each window's `pts` explicitly.
-    //
-    // NOTE: several windows below carried their own PT builds in the original; we reproduce each.
-    let mut regions: [Region; 32] = [Region { source: FrameSource::Alias(0), base_va: 0, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 }; 32];
-    let mut n = 0usize;
-    // Heap (uses the pre-built heap PT — map_heap_pt=true).
-    regions[n] = Region { source: FrameSource::FreshZeroed, base_va: allocator::HEAP_BASE as u64, count: allocator::SERVICE_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    // win32k PE image, W^X, its own two 2 MiB PTs.
-    regions[n] = Region { source: FrameSource::Alias(code_base), base_va: win32k_host::WIN32K_CODE_VA, count: win32k_host::WIN32K_IMAGE_FRAMES, rights: Rights::PerFrame(code_rights_static), pts: 2 }; n += 1;
-    // The aux PT window (DATA/SHARED/ARG live here) — a single PT built ahead of those frames.
-    regions[n] = Region { source: FrameSource::Alias(0), base_va: win32k_host::WIN32K_AUX_PT_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
-    // Pool arena (own window + PTs).
-    regions[n] = Region { source: FrameSource::Alias(pool_base), base_va: win32k_host::WIN32K_POOL_VADDR, count: win32k_host::WIN32K_POOL_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_POOL_FRAMES) }; n += 1;
-    // FreeType arena (own window + PTs, fresh frames).
-    regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_FTYP_VADDR, count: win32k_host::WIN32K_FTYP_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_FTYP_FRAMES) }; n += 1;
-    // GDI-attribute user-mode VM arena (own window + PTs, fresh frames).
-    regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_USERVM_VADDR, count: win32k_host::WIN32K_USERVM_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_USERVM_FRAMES) }; n += 1;
-    // Staged system font (arial.ttf) — its own PT window, aliased frames (only if present).
-    if font_base != 0 {
-        regions[n] = Region { source: FrameSource::Alias(font_base), base_va: win32k_host::FONTBUF_VADDR, count: win32k_host::FONTBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
-    }
-    // DATA export region (aux PT window — no dedicated PT).
-    regions[n] = Region { source: FrameSource::Alias(data_base), base_va: win32k_host::WIN32K_DATA_VADDR, count: win32k_host::WIN32K_DATA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    // Shared handoff page (aux PT window).
-    regions[n] = Region { source: FrameSource::Alias(shared_frame), base_va: win32k_host::WIN32K_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    // Arg-marshal frame(s) (aux PT window).
-    regions[n] = Region { source: FrameSource::Alias(arg_base), base_va: win32k_host::WIN32K_ARG_VADDR, count: win32k_host::WIN32K_ARG_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
-    // Session-heap + Mm-view arena (own window + PTs, aliased frames). Original used HEAP_FRAMES/512.
-    regions[n] = Region { source: FrameSource::Alias(heap_base), base_va: win32k_host::WIN32K_HEAP_VADDR, count: win32k_host::WIN32K_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: win32k_host::WIN32K_HEAP_FRAMES / 512 }; n += 1;
-
-    let d = ComponentDescriptor {
-        entry,
-        image_rights: Rights::Uniform(3), // RWX (trampolines + statics)
-        map_heap_pt: true,
-        // win32k's OWN stack at WIN32K_STACK_VADDR (NOT STACK_BASE — that VA must stay free for the
-        // per-client attach). Its own dedicated PT (128 KiB fits one PT).
-        stack_base: win32k_host::WIN32K_STACK_VADDR,
-        stack_frames,
-        stack_dedicated_pt: true,
-        regions: &regions[..n],
-        granted: GrantedCaps { irq_ntfn: None, result_ntfn: None, fault_ep: Some(fault_ep) },
-        prio,
-        // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed KPCR
-        // placeholder so those reads resolve (0) instead of faulting.
-        gs_base: Some(win32k_host::WIN32K_KPCR_VA),
-    };
-    let sc = spawn_component(&d);
-    // Stash the globals the old bespoke spawner set (the demand-map fault loop + per-client attach
-    // need them). The stack frame base is the first FreshZeroed frame of the dedicated stack.
-    WIN32K_STACK_SLOT.store(sc.stack_frame_base, Ordering::Relaxed);
-    WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
-    WIN32K_TCB.store(sc.tcb, Ordering::Relaxed);
-    // NOTE: win32k is NOT marked HOSTED (unlike smss/csrss): its init/trampoline code issues REAL
-    // seL4 syscalls (SysDebugPutChar for serial), which must dispatch natively. The dispatch loop's
-    // ready/done signal instead faults by putting an INVALID nr in RDX (see `dispatch_signal`).
-    sc.pml4
 }
 
 /// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a

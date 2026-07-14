@@ -5215,20 +5215,69 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"\n");
 
             // Spawn the isolated component (prio 100; the executive is 255 and blocks in the fault
-            // loop, yielding to it) and receive its faults.
+            // loop, yielding to it) and receive its faults. The bespoke `spawn_win32k_host` is gone
+            // (driver-model migration): its Subsystem-class ComponentDescriptor is inlined here and
+            // spawned via the generic `spawn_component` engine. win32k.sys is already loaded BY-PATH
+            // (the storage host staged it into WIN32KBUF from the FS), so — like npfs — this is the
+            // dynamic path; only the launch scaffolding was bespoke. The region map ORDER + every
+            // `pts` value + the alloc sequence are reproduced EXACTLY (PAINT 768/768 @ 0x003a6ea5 is
+            // load-bearing). Component-side trampolines (win32k_host) are unchanged.
             let w_fault = make_object(OBJ_ENDPOINT);
-            let host_pml4 = spawn_win32k_host(
-                win32k_host::win32k_host_entry,
-                w_fault,
-                100,
-                code_base,
-                win32k_host::code_rights(),
-                pool_base,
-                data_base,
-                shared,
-                heap_base,
-                arg_base,
-            );
+            let host_pml4 = {
+                let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
+                let code_rights_static: &'static [u64] =
+                    core::mem::transmute::<&[u64], &'static [u64]>(win32k_host::code_rights());
+                let font_base = FONTBUF_START.load(Ordering::Relaxed);
+                let mut regions: [Region; 32] = [Region { source: FrameSource::Alias(0), base_va: 0, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 }; 32];
+                let mut n = 0usize;
+                // Heap (uses the pre-built heap PT — map_heap_pt=true).
+                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: allocator::HEAP_BASE as u64, count: allocator::SERVICE_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                // win32k PE image, W^X, its own two 2 MiB PTs.
+                regions[n] = Region { source: FrameSource::Alias(code_base), base_va: win32k_host::WIN32K_CODE_VA, count: win32k_host::WIN32K_IMAGE_FRAMES, rights: Rights::PerFrame(code_rights_static), pts: 2 }; n += 1;
+                // The aux PT window (DATA/SHARED/ARG live here) — a single PT built ahead of those frames.
+                regions[n] = Region { source: FrameSource::Alias(0), base_va: win32k_host::WIN32K_AUX_PT_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+                // Pool arena (own window + PTs).
+                regions[n] = Region { source: FrameSource::Alias(pool_base), base_va: win32k_host::WIN32K_POOL_VADDR, count: win32k_host::WIN32K_POOL_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_POOL_FRAMES) }; n += 1;
+                // FreeType arena (own window + PTs, fresh frames).
+                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_FTYP_VADDR, count: win32k_host::WIN32K_FTYP_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_FTYP_FRAMES) }; n += 1;
+                // GDI-attribute user-mode VM arena (own window + PTs, fresh frames).
+                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_USERVM_VADDR, count: win32k_host::WIN32K_USERVM_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_USERVM_FRAMES) }; n += 1;
+                // Staged system font (arial.ttf) — its own PT window, aliased frames (only if present).
+                if font_base != 0 {
+                    regions[n] = Region { source: FrameSource::Alias(font_base), base_va: win32k_host::FONTBUF_VADDR, count: win32k_host::FONTBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+                }
+                // DATA export region (aux PT window — no dedicated PT).
+                regions[n] = Region { source: FrameSource::Alias(data_base), base_va: win32k_host::WIN32K_DATA_VADDR, count: win32k_host::WIN32K_DATA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                // Shared handoff page (aux PT window).
+                regions[n] = Region { source: FrameSource::Alias(shared), base_va: win32k_host::WIN32K_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                // Arg-marshal frame(s) (aux PT window).
+                regions[n] = Region { source: FrameSource::Alias(arg_base), base_va: win32k_host::WIN32K_ARG_VADDR, count: win32k_host::WIN32K_ARG_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                // Session-heap + Mm-view arena (own window + PTs, aliased frames).
+                regions[n] = Region { source: FrameSource::Alias(heap_base), base_va: win32k_host::WIN32K_HEAP_VADDR, count: win32k_host::WIN32K_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: win32k_host::WIN32K_HEAP_FRAMES / 512 }; n += 1;
+                let d = ComponentDescriptor {
+                    entry: win32k_host::win32k_host_entry,
+                    image_rights: Rights::Uniform(3), // RWX (trampolines + statics)
+                    map_heap_pt: true,
+                    // win32k's OWN stack at WIN32K_STACK_VADDR (NOT STACK_BASE — that VA must stay free
+                    // for the per-client attach). Its own dedicated PT (128 KiB fits one PT).
+                    stack_base: win32k_host::WIN32K_STACK_VADDR,
+                    stack_frames,
+                    stack_dedicated_pt: true,
+                    regions: &regions[..n],
+                    granted: GrantedCaps { irq_ntfn: None, result_ntfn: None, fault_ep: Some(w_fault) },
+                    prio: 100,
+                    // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed
+                    // KPCR placeholder so those reads resolve (0) instead of faulting.
+                    gs_base: Some(win32k_host::WIN32K_KPCR_VA),
+                };
+                let sc = spawn_component(&d);
+                // Stash the globals the demand-map fault loop + per-client attach need. The stack frame
+                // base is the first FreshZeroed frame of the dedicated stack.
+                WIN32K_STACK_SLOT.store(sc.stack_frame_base, Ordering::Relaxed);
+                WIN32K_STACK_FRAMES.store(stack_frames, Ordering::Relaxed);
+                WIN32K_TCB.store(sc.tcb, Ordering::Relaxed);
+                sc.pml4
+            };
 
             const DEMAND_CAP: u64 = 512;
             let code_va = win32k_host::WIN32K_CODE_VA;
