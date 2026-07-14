@@ -2456,6 +2456,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
             (NativeService::NtQueryKey, SSN_NT_QUERY_KEY as u32),
             (NativeService::NtCreateFile, SSN_NT_CREATE_FILE as u32),
+            (NativeService::NtWriteFile, 284),
+            (NativeService::NtReadFile, 191),
             (NativeService::NtSetInformationFile, 233),
             (NativeService::NtCreateNamedPipeFile, SSN_NT_CREATE_NAMED_PIPE_FILE as u32),
             (NativeService::NtFsControlFile, SSN_NT_FS_CONTROL_FILE as u32),

@@ -2749,6 +2749,58 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let _ = &mut info;
                 status as u32
             },
+            // NtWriteFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
+            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). lsass' rpcrt4 writes to
+            // its \pipe\lsarpc endpoint. Route the write to the real npfs FSD (IRP_MJ_WRITE) for a
+            // tracked pipe handle; npfs completes it synchronously. Signal the caller's completion Event
+            // (RDX) so a following (immediate-return) NtWaitForSingleObject is consistent. pi 0-3 stop.
+            NativeService::NtWriteFile => unsafe {
+                if self.pi != 4 {
+                    self.stop = true;
+                    return 0xC000_0002;
+                }
+                let sp = get_recv_mr(16);
+                let iosb = smss_stack_read(sp + 0x28);
+                let len = smss_stack_read(sp + 0x38);
+                let fh = args[0]; // R10 = FileHandle
+                let fid = Self::npfs_file_id_for(fh);
+                let mut status: u64 = 0;
+                if fid != 0 {
+                    if let Some((st, _)) = self.npfs_route(3 /* IRP_MJ_WRITE */, 0, &[], fid) {
+                        status = st as u64;
+                    }
+                }
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes()); // Status
+                    self.xas_write_buf(iosb + 8, &len.to_le_bytes()); // Information = bytes written
+                }
+                status as u32
+            },
+            // NtReadFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
+            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). rpcrt4's listener reads
+            // from \pipe\lsarpc; with no connected client the read would block (STATUS_PENDING). Route
+            // to npfs (IRP_MJ_READ); report its status. pi 0-3 stop.
+            NativeService::NtReadFile => unsafe {
+                if self.pi != 4 {
+                    self.stop = true;
+                    return 0xC000_0002;
+                }
+                let sp = get_recv_mr(16);
+                let iosb = smss_stack_read(sp + 0x28);
+                let fh = args[0];
+                let fid = Self::npfs_file_id_for(fh);
+                let mut status: u64 = 0;
+                if fid != 0 {
+                    if let Some((st, _)) = self.npfs_route(4 /* IRP_MJ_READ */, 0, &[], fid) {
+                        status = st as u64;
+                    }
+                }
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                }
+                status as u32
+            },
             // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
             // Length[R9], FileInformationClass[sp+0x28]). lsass' rpcrt4 sets up its \pipe\lsarpc
             // (FilePipeInformation / FileCompletionInformation for async listen) before FSCTL_PIPE_LISTEN.
