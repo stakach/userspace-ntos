@@ -5490,84 +5490,30 @@ unsafe fn service_sec_image(
     let mut nls_section_handle = 0u64;
     // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
     // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
-    let csrss_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let csz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x3c) as *const u32) as usize;
-        if csz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET) as *const u8,
-                csz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(cpe) => {
-                    print_str(b"[ntos-exec] staged csrss.exe: ");
-                    print_u64(csz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(cpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(cpe.entry_point_rva());
-                    print_str(b"\n");
-                    // Relocate csrss.exe to its load base (PE_LOAD_BASE) + patch its header's
-                    // OptionalHeader.ImageBase to match — exactly as the LIVE smss path does — so ntdll
-                    // doesn't try to RELOCATE THE EXE (ldrinit.c:2409, the EXE-reloc path, is
-                    // UNIMPLEMENTED in ReactOS and returns STATUS_INVALID_IMAGE_FORMAT).
-                    apply_relocations_to_buf(&cpe, FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET, PE_LOAD_BASE);
-                    let e_lfanew = core::ptr::read_volatile(
-                        (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET + 0x3c) as *const u32,
-                    ) as u64;
-                    core::ptr::write_volatile(
-                        (FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET + e_lfanew + 0x30) as *mut u64,
-                        PE_LOAD_BASE,
-                    );
-                    Some(cpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged csrss.exe: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // P7-A batch 5: source the two hosted-process EXEs csrss.exe + winlogon.exe BY PATH from the FS
+    // pool (hybrid; falls back to FILEBUF/WINLOGONBUF on any FS miss). Each is then relocated to its
+    // load base (PE_LOAD_BASE) + its OptionalHeader.ImageBase patched to match — exactly as the LIVE
+    // smss path does — so ntdll doesn't try to RELOCATE THE EXE (ldrinit.c:2409, the EXE-reloc path,
+    // is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT). The relocation runs on `*_va` (the
+    // pool buffer on an FS hit, else the fixed buffer); the demand-fault router reads the relocated
+    // bytes via the PeFile slice, so it is agnostic to where the bytes live.
+    let (csrss_pe, csrss_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\csrss.exe", b"csrss.exe",
+        FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET, 0x3c);
+    if let Some(ref cpe) = csrss_pe {
+        apply_relocations_to_buf(cpe, csrss_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((csrss_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((csrss_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
     // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
-    // Parsed from its own WINLOGONBUF (size at STORAGE_SHARED+0x94), relocated to PE_LOAD_BASE +
-    // ImageBase patched (like csrss.exe) so ntdll doesn't take the UNIMPLEMENTED EXE-reloc path.
-    let winlogon_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let wsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x94) as *const u32) as usize;
-        if wsz > 0 {
-            let bytes: &'static [u8] =
-                core::slice::from_raw_parts(WINLOGONBUF_VADDR as *const u8, wsz);
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(wpe) => {
-                    print_str(b"[ntos-exec] staged winlogon.exe: ");
-                    print_u64(wsz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(wpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(wpe.entry_point_rva());
-                    print_str(b"\n");
-                    apply_relocations_to_buf(&wpe, WINLOGONBUF_VADDR, PE_LOAD_BASE);
-                    let e_lfanew =
-                        core::ptr::read_volatile((WINLOGONBUF_VADDR + 0x3c) as *const u32) as u64;
-                    core::ptr::write_volatile(
-                        (WINLOGONBUF_VADDR + e_lfanew + 0x30) as *mut u64,
-                        PE_LOAD_BASE,
-                    );
-                    Some(wpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged winlogon.exe: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let (winlogon_pe, winlogon_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\winlogon.exe", b"winlogon.exe",
+        WINLOGONBUF_VADDR, 0x94);
+    if let Some(ref wpe) = winlogon_pe {
+        apply_relocations_to_buf(wpe, winlogon_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((winlogon_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((winlogon_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
     // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
     // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
     // csrsrv) maps it into csrss's VSpace and demand-pages it from here so csrss's imports resolve.
