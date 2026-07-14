@@ -169,6 +169,17 @@ impl<'a> PeFile<'a> {
     pub fn entry_point_rva(&self) -> u32 {
         self.headers.entry_point_rva
     }
+    /// The image subsystem (IMAGE_SUBSYSTEM_*: 1=NATIVE, 2=WINDOWS_GUI, 3=WINDOWS_CUI, …).
+    pub fn subsystem(&self) -> u16 {
+        self.headers.subsystem
+    }
+    /// The required subsystem version `(major, minor)`.
+    pub fn subsystem_version(&self) -> (u16, u16) {
+        (
+            self.headers.major_subsystem_version,
+            self.headers.minor_subsystem_version,
+        )
+    }
 
     /// Parse the import table (spec §7.2). Returns one [`ImportedDll`] per imported
     /// module with its named/ordinal functions + IAT slot RVAs.

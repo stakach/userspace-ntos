@@ -1,34 +1,48 @@
-# ALPC last-mile wrap-up (register NtAlpc* SSNs + two-VSpace cross-AS section view)
+# Spawn services.exe as the 4th hosted process (badge 6, pi 3)
 
-## Item (a) — register NtAlpc* SSNs
-- [x] Extract NtAlpc* SSNs from references/ntdll.dll (real Win7 ntdll) — NOT hardcoded
-- [x] FINDING: ros-ntdll.dll (what live smss/csrss/winlogon run) exports NO NtAlpc*; the Win7
-      ALPC SSN block (111..131) COLLIDES with the live ReactOS SSN space (Win7 NtAlpcConnectPort=113
-      == live ReactOS NtMapViewOfSection=113). => a live dispatcher arm keyed on raw SSN would
-      HIJACK live ReactOS syscalls. Register as a dedicated recognizer, gated by ALPC-process
-      identity (dormant — no ALPC binary yet), proven by counted spec.
-- [ ] Add SSN consts + `alpc_ssn_to_opcode` recognizer + `try_route_alpc_ssn` (guarded, dormant)
-- [ ] Counted specs: SSN->opcode table correct + NtAlpcCreatePort SSN routes to adapter -> port
+Frontier: winlogon (badge 4) walls at SSN 98 NtIsProcessInJob = kernel32 CreateProcessInternalW
+spawning services.exe (winlogon.c StartServicesManager). Service the Win32 create chain, spawn
+services.exe via spawn_sec_image(pi=3), get its ntdll loader running. Land committed-green.
 
-## Item (b) — two-VSpace cross-AS ALPC section view (the meaningful capability)
-- [ ] `alpc_cross_vspace_selftest()` post-loop (after reclaim self-test), byte-identical boot
-- [ ] Two throwaway endpoint VSpaces; real section backing frames; copy_cap+page_map into BOTH at view VA
-- [ ] Writer thread in A writes; reader thread in B reads back through ITS OWN mapping (fault-report)
-- [ ] Reclaim throwaway VSpaces + section frames (CNodeDelete); spec exec_alpc_section_view_cross_vspace
+## VA design (pi 3, badge 6)
+- SERVICES_BADGE = 6
+- SERVICES_SCRATCH_BASE = 0x…1140_0000 (PT2 of smss's pre-mapped 8-PT scratch range, free)
+- SERVICES_STACK_MIRROR_VA = 0x…106D_0000 (FILEBUF PT, present)
+- SERVICES_HEAP_MIRROR_VA  = 0x…1260_0000 (own PT via spawn_sec_image)
+- SERVICES_IMAGE_MIRROR_VA = 0x…1280_0000 (own PT via spawn_sec_image)
+- services env scr_base     = 0x…1076_0000 (FILEBUF PT, between smss 0x1074 / csrss 0x1078)
+- NEXT_SERVICES_ALLOC, prio 103
 
-## Discipline
-- Gate 137 -> additive; winsrv ON, sentinel, desktop paint 0x003a6ea5; ANY regression = REVERT
-- SUBMODULE rust-micro build; verify rootserver.elf mtime.
+## Steps
+- [ ] G1 constants
+- [ ] G2 nt-dll-registry PI_SLOTS 3→4
+- [ ] G3 static arrays 3→4 (PM_PIDS/PM_TIDS/PM_POOL_TID/PFILLED)
+- [ ] G4 pm init: 4th create_process(services.exe, parent winlogon) + expect/pids/reserve arrays
+- [ ] G5 procs [4]; dll_pd_created/dll_mapped_bits [4]; ExecLoopCtx field types
+- [ ] G6 badge→pi + ACTIVE_*_MIRROR + PE-select add pi 3 arms
+- [ ] G7 services_pe load (load_dll_from_fs by path) + loop_ctx services_file/section_handle + services_pe
+- [ ] G8 NtOpenFile is_services; NtCreateSection services tracking; alloc pi==3
+- [ ] G9 raw arms: 98 NtIsProcessInJob; 50 NtCreateProcessEx→services spawn inline; grind child-AS syscalls
+- [ ] G10 sec-stop services name; specs 0b111→0b1111, count 4, SERVICES_SPAWNED
+- [x] build + run_specs (green: paint 0x003a6ea5, [microtest done], services spawned + loader running)
 
-## REVIEW (landed green — gate 140/94, 0 FAIL)
-- Item (a) DONE: SSN consts extracted from references/ntdll.dll + `alpc_ssn_to_opcode` recognizer +
-  `try_route_alpc_ssn` guarded dormant arm wired into the fault dispatch loop (ALPC_HOST_PRESENT
-  never set at boot → byte-identical). Specs `exec_alpc_ssn_registered` + `exec_alpc_ssn_routes_to_adapter`
-  PASS. Live hosted native-ABI caller documented as arriving with a real Win7-ntdll ALPC binary
-  (the SSN-collision with the live ReactOS space forbids a raw-SSN live arm for the 3 ReactOS procs).
-- Item (b) DONE: `alpc_cross_vspace_selftest` — two SEPARATE throwaway VSpaces map the SAME section
-  frames at the view VA (copy_cap + page_map); writer thread in A wrote (m0=0xA), reader thread in B
-  read both pages back through ITS OWN mapping (m0=m3=0xCAFEBABE_DEADBEEF == the write). ok=0x3F.
-  Throwaway VSpaces + section frames reclaimed. Spec `exec_alpc_section_view_cross_vspace` PASS.
-- Boot byte-identical: csrss 339/handle 0x2c, winlogon 230, smss 136, reclaim 0x3F, paint 0x003a6ea5
-  768/768, winsrv ON, [microtest done], exit 3. NO rust-micro/src change → sel4test byte-identical.
+## REVIEW — MILESTONE LANDED (gate 149/94, 0 FAIL, desktop 0x003a6ea5 768/768, exit 3)
+services.exe is the 4th hosted process (badge 6, pi 3). winlogon's real Win32 CreateProcessW
+(StartServicesManager) drove the full CreateProcessInternalW chain to NtCreateProcessEx(50), which
+spawned services via spawn_sec_image(pi=3); its ntdll loader ran (46 pages, loading its DLLs
+OpenFile→CreateSection→QuerySection→MapView→Protect). NO rust-micro/src change → sel4test byte-identical.
+
+Walls ground through (all in winlogon's Win32 create path, between the SSN-98 frontier and NtCreateProcessEx):
+1. NtIsProcessInJob(98) — serviced (not-in-job).
+2. BasepIsProcessAllowed c0000002 — the broad empty-name NtOpenKey→MACHINE_ROOT_HANDLE fallback made
+   AppCertDlls spuriously succeed → RtlQueryRegistryValues failed. Gated the fallback OFF once services
+   create starts (SERVICES_CREATE_STARTED); keyboard path runs earlier so it's unaffected.
+3. NtApphelpCacheControl(19) — serviced SUCCESS (no shim; BaseCheckRunApp returns TRUE without apphelp.dll).
+4. STATUS_IMAGE_MACHINE_TYPE_MISMATCH_EXE — KUSER_SHARED_DATA.ImageNumberLow/High were 0 (zeroed page);
+   set 0x014c..0x8664 in spawn_sec_image (offsets 0x2c/0x2e per ReactOS KUSER layout, NOT 0x260).
+5. SubSystemType/version reject (proc.c:3504/3544) — image_info hardcoded NATIVE(1)/v0.0; services is
+   CUI(3). Added PeFile::subsystem()/subsystem_version() + patched the services NtQuerySection info.
+
+NEW FRONTIER: services.exe faults at cr2=0x04000000 (the CSR connect ViewBase/StaticData region) doing
+its kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort). Needs per-process CSR connect
+regions for services (the winlogon WINLOGON_CSR_HEAP_VA/STATIC_VA recipe, per-pi) — the next real service.

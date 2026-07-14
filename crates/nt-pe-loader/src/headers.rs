@@ -47,6 +47,8 @@ pub struct Headers {
     pub size_of_image: u32,
     pub size_of_headers: u32,
     pub subsystem: u16,
+    pub major_subsystem_version: u16,
+    pub minor_subsystem_version: u16,
     pub number_of_rva_and_sizes: u32,
     pub data_directories: [DataDirectory; 16],
 }
@@ -88,6 +90,9 @@ impl Headers {
         let size_of_image = u32_at(b, oh + 56)?;
         let size_of_headers = u32_at(b, oh + 60)?;
         let subsystem = u16_at(b, oh + 68)?;
+        // MajorSubsystemVersion@oh+48, MinorSubsystemVersion@oh+50 (optional-header offsets 0x30/0x32).
+        let major_subsystem_version = u16_at(b, oh + 48)?;
+        let minor_subsystem_version = u16_at(b, oh + 50)?;
         let number_of_rva_and_sizes = u32_at(b, oh + 108)?;
 
         let mut data_directories = [DataDirectory::default(); 16];
@@ -114,6 +119,8 @@ impl Headers {
             size_of_image,
             size_of_headers,
             subsystem,
+            major_subsystem_version,
+            minor_subsystem_version,
             number_of_rva_and_sizes,
             data_directories,
         })

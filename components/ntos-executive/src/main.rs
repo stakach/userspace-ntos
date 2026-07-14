@@ -189,6 +189,16 @@ pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spaw
 pub const WINLOGON_CSR_HEAP_VA: u64 = 0x0000_0100_0400_0000; // 64 KiB LpcWrite view (ViewBase)
 pub const WINLOGON_CSR_STATIC_VA: u64 = 0x0000_0100_0401_0000; // 16 KiB shared static server data
 pub const WINLOGON_CSR_FILL_SCRATCH: u64 = 0x0000_0100_1320_0000; // exec-side fill alias (own PT)
+/// The 4th hosted process — services.exe (badge 6, pi 3), spawned by winlogon's Win32 CreateProcessW
+/// (StartServicesManager). Same env VAs (SMSS_*) in its own VSpace; only the EXECUTIVE-side mirrors +
+/// the demand-fill scratch must be distinct from smss/csrss/winlogon. STACK mirror is in the FILEBUF
+/// PT (present); HEAP/IMAGE mirrors get their own PTs in spawn_sec_image (past winlogon's 0x1240).
+/// SCRATCH_BASE is PT2 of smss's pre-mapped 8-PT scratch range (0x1100..0x1200; PT0 smss / PT4 csrss /
+/// PT6 winlogon → PT2 free). Env-build scratch sits between smss's 0x1074 and csrss's 0x1078.
+pub const SERVICES_STACK_MIRROR_VA: u64 = 0x0000_0100_106D_0000; // FILEBUF PT, present
+pub const SERVICES_HEAP_MIRROR_VA: u64 = 0x0000_0100_1260_0000; // own PT (spawn_sec_image creates it)
+pub const SERVICES_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1280_0000; // own PT (spawn_sec_image creates it)
+pub const SERVICES_ENV_SCRATCH_VA: u64 = 0x0000_0100_1076_0000; // FILEBUF PT (between smss/csrss env)
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
 // smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
@@ -465,6 +475,12 @@ pub const WINLOGON_BADGE: u64 = 4;
 /// (0x1100..0x1200); smss uses PT 0 (0x1100), csrss PT 4 (0x1180). PT 6 (0x11C0) is clear of both
 /// (csrss realistically uses < 0x40 PTs of headroom), so no extra page tables are needed.
 pub const WINLOGON_SCRATCH_BASE: u64 = 0x0000_0100_11C0_0000;
+/// Fault-endpoint badge for the FOURTH hosted process (services.exe). Distinct from smss (0) /
+/// csrss (2) / winlogon (4).
+pub const SERVICES_BADGE: u64 = 6;
+/// services.exe's demand-fault scratch — PT 2 of smss's already-mapped 8-PT scratch range
+/// (0x1100..0x1200); PT0 smss / PT4 csrss / PT6 winlogon → PT2 (0x1140) is free + pre-mapped.
+pub const SERVICES_SCRATCH_BASE: u64 = 0x0000_0100_1140_0000;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -705,10 +721,10 @@ static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
-/// (0 = smss, 1 = csrss, 2 = winlogon). Kept off the 16 KiB rootserver stack — a [[u64;256];3]
-/// local (6 KiB) plus service_sec_image's other arrays would risk the guard page. Zeroed at
-/// service_sec_image entry; only that single loop touches it.
-static mut PFILLED: [[u64; 256]; 3] = [[0u64; 256]; 3];
+/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services). Kept off the 16 KiB rootserver stack — a
+/// [[u64;256];4] local (8 KiB) plus service_sec_image's other arrays would risk the guard page.
+/// Zeroed at service_sec_image entry; only that single loop touches it.
+static mut PFILLED: [[u64; 256]; 4] = [[0u64; 256]; 4];
 
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -2674,7 +2690,19 @@ unsafe fn spawn_sec_image(
         let _ = paging_struct_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
         let _ = paging_struct_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
         let _ = paging_struct_map(kpt, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
-        let _ = page_map(alloc_frame(), KUSER_VA, RW_NX, pml4);
+        // Build the KUSER page via a scratch mapping so we can populate the fields the Win32 create
+        // path reads. KUSER_SHARED_DATA.ImageNumberLow(@0x260)/ImageNumberHigh(@0x262) bound the
+        // machine types kernel32's CreateProcessInternalW allows (proc.c:3474 —
+        // ImageInformation.Machine outside [Low,High] → NtRaiseHardError STATUS_IMAGE_MACHINE_TYPE_
+        // MISMATCH_EXE). A zeroed page → [0,0] → rejects our AMD64 (0x8664) EXEs. Set the authentic x64
+        // range 0x014c (i386) .. 0x8664 (amd64) so services.exe (and any hosted create target) passes.
+        // Offsets are the ReactOS KUSER_SHARED_DATA layout: ImageNumberLow@0x2c, ImageNumberHigh@0x2e.
+        let kuser_f = alloc_frame();
+        let kscr = scr + 0x6000; // next free page in the env-scratch window (past env at +0x4000/+0x5000)
+        let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile((kscr + 0x2c) as *mut u16, 0x014c); // ImageNumberLow  (IMAGE_FILE_MACHINE_I386)
+        core::ptr::write_volatile((kscr + 0x2e) as *mut u16, 0x8664); // ImageNumberHigh (IMAGE_FILE_MACHINE_AMD64)
+        let _ = page_map(copy_cap(kuser_f), KUSER_VA, RW_NX, pml4);
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
         // TEB/PEB/KUSER, NtQueryVirtualMemory, creates the process heap (RtlCreateHeap itself),
@@ -3074,6 +3102,7 @@ static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 const SYSTEM32_FILES: &[&str] = &[
     "csrss.exe",
     "winlogon.exe",
+    "services.exe",
     "csrsrv.dll",
     "basesrv.dll",
     "winsrv.dll",
@@ -3228,6 +3257,11 @@ struct ExecLoopCtx {
     winlogon_file_handle: *mut u64,
     winlogon_section_handle: *mut u64,
     winlogon_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// services.exe (4th hosted process, spawned by winlogon's Win32 CreateProcessW): its file/section
+    /// handles (set when winlogon (pi 2) opens+creates the services.exe SEC_IMAGE) + the parsed PE.
+    services_file_handle: *mut u64,
+    services_section_handle: *mut u64,
+    services_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 256],
@@ -3253,13 +3287,13 @@ struct ExecLoopCtx {
     /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
     /// loop-locals.
     csrss_anon_base: *mut u64,
-    dll_pd_created: *mut [bool; 3],
+    dll_pd_created: *mut [bool; 4],
     /// PER-PROCESS bitmask of which registry DLLs have had their VA-range page table reserved in
     /// THIS process's VSpace (bit i = DLL i mapped in process pi). csrss (pi==1) and winlogon
     /// (pi==2) each load an overlapping DLL set at the SAME fixed bases but into DISTINCT VSpaces,
     /// so the PT reservation must be tracked per-process (the registry's global `mapped` flag stays
     /// for `dll_for_page` VA-range resolution, which is base-identical across processes).
-    dll_mapped_bits: *mut [u32; 3],
+    dll_mapped_bits: *mut [u32; 4],
 }
 
 struct ExecNtHandler {
@@ -3478,16 +3512,21 @@ impl ExecNtHandler {
                 let smss_pid = pm.create_process("smss.exe", None, None);
                 let csrss_pid = pm.create_process("csrss.exe", Some(smss_pid), None);
                 let winlogon_pid = pm.create_process("winlogon.exe", Some(smss_pid), None);
+                // The 4th hosted process — services.exe, spawned by winlogon's Win32 CreateProcessW
+                // (StartServicesManager), so its EPROCESS parent is winlogon.
+                let services_pid = pm.create_process("services.exe", Some(winlogon_pid), None);
                 PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
+                PM_PIDS[3].store(services_pid as u64, Ordering::Relaxed);
                 PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
                 // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
                 let mut ok = 0u64;
-                let expect: [(usize, u32, &str); 3] = [
+                let expect: [(usize, u32, &str); 4] = [
                     (0, smss_pid, "smss.exe"),
                     (1, csrss_pid, "csrss.exe"),
                     (2, winlogon_pid, "winlogon.exe"),
+                    (3, services_pid, "services.exe"),
                 ];
                 for (i, pid, name) in expect {
                     let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
@@ -3508,7 +3547,7 @@ impl ExecNtHandler {
                 // later, alloc-free, at the actual seL4 spawn (set_thread_start_address). Entry starts
                 // 0 = "not yet bound".
                 let mut mt_ok = 0u64;
-                let pids = [smss_pid, csrss_pid, winlogon_pid];
+                let pids = [smss_pid, csrss_pid, winlogon_pid, services_pid];
                 for (i, &pid) in pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
                         PM_TIDS[i].store(tid as u64, Ordering::Relaxed);
@@ -3542,15 +3581,16 @@ impl ExecNtHandler {
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
                 // Measured peak is < ~100 handles per process over a full boot; 256 is ~3× headroom.
-                for pid in [smss_pid, csrss_pid, winlogon_pid] {
+                for pid in [smss_pid, csrss_pid, winlogon_pid, services_pid] {
                     pm.reserve_handles(pid, PM_HANDLE_RESERVE);
                 }
-                // Record the reserved capacity (min across the 3) so the run can prove it never
+                // Record the reserved capacity (min across the 4) so the run can prove it never
                 // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
                 let cap = pm
                     .handle_capacity(smss_pid)
                     .min(pm.handle_capacity(csrss_pid))
-                    .min(pm.handle_capacity(winlogon_pid));
+                    .min(pm.handle_capacity(winlogon_pid))
+                    .min(pm.handle_capacity(services_pid));
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
@@ -4080,9 +4120,20 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // predefined-root open (HKLM/HKCU/HKCR); hand back the sentinel so MapDefaultKey
                 // succeeds (else the keyboard subkey open never fires). Non-keyboard subkeys stay
                 // not-found via the match above.
-                if root_dir < KEY_HANDLE_BASE && path.is_empty() {
+                if root_dir < KEY_HANDLE_BASE
+                    && path.is_empty()
+                    && SERVICES_CREATE_STARTED.load(Ordering::Relaxed) == 0
+                {
                     smss_copyout(args[0], &MACHINE_ROOT_HANDLE.to_le_bytes());
                     return 0; // STATUS_SUCCESS
+                }
+                // Once winlogon's Win32 create for services.exe has begun, an empty-name absolute open
+                // is BasepIsProcessAllowed's AppCertDlls key (its .rdata static reads empty in the
+                // mirror). Return NOT_FOUND so BasepIsProcessAllowed skips RtlQueryRegistryValues and
+                // returns SUCCESS (else that query fails c0000002 → "Process not allowed to launch").
+                // The keyboard-layout path that needs MACHINE_ROOT_HANDLE runs long before this.
+                if root_dir < KEY_HANDLE_BASE && path.is_empty() {
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 let cell = if root_dir >= KEY_HANDLE_BASE {
                     let idx = (root_dir - KEY_HANDLE_BASE) as usize;
@@ -4892,6 +4943,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     NEXT_CSRSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else if self.pi == 2 {
                     NEXT_WINLOGON_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                } else if self.pi == 3 {
+                    NEXT_SERVICES_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else {
                     NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 };
@@ -4977,10 +5030,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // winlogon.exe — smss's SmpParseCommandLine probes the initial command (×N paths).
                 // Not scoped to a pi: smss (pi==0) launches it, exactly like csrss.
                 let is_winlogon_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"winlogon");
+                // services.exe — winlogon's Win32 CreateProcessW target (the 4th hosted process).
+                let is_services_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"services");
                 let csrss_attrs = if is_csrss_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\csrss.exe")
                 } else if is_winlogon_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\winlogon.exe")
+                } else if is_services_probe {
+                    self.fs.query_attributes(r"\SystemRoot\System32\services.exe")
                 } else {
                     None
                 };
@@ -5075,6 +5132,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                         .fs
                         .query_attributes(r"\SystemRoot\System32\winlogon.exe")
                         .is_some_and(|si| !si.is_directory);
+                // services.exe FILE open — winlogon's kernel32 CreateProcessInternalW opens it (the
+                // 4th hosted process). Same shape as csrss/winlogon; substring classifies, nt-fs owns
+                // existence + file-vs-dir. Issued by winlogon (pi 2).
+                let is_services = !is_sxs
+                    && nb[..nlen].windows(8).any(|w| w == b"services")
+                    && self
+                        .fs
+                        .query_attributes(r"\SystemRoot\System32\services.exe")
+                        .is_some_and(|si| !si.is_directory);
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -5084,7 +5150,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
                 // launches csrss/winlogon.
                 let dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
-                if is_sys32_dir || is_csrss || is_winlogon || dll_i.is_some() {
+                if is_sys32_dir || is_csrss || is_winlogon || is_services || dll_i.is_some() {
                     let h = self.mint_handle();
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
                     if is_csrss {
@@ -5092,6 +5158,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     if is_winlogon {
                         *ctx.winlogon_file_handle = h; // for NtCreateSection
+                    }
+                    if is_services {
+                        *ctx.services_file_handle = h; // for NtCreateSection (winlogon → services.exe)
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
@@ -5155,6 +5224,29 @@ impl NativeSyscallHandler for ExecNtHandler {
                             ),
                             b"winlogon.exe" as &[u8],
                         )
+                    })
+                } else if self.pi == 2
+                    && *ctx.services_section_handle != 0
+                    && sect == *ctx.services_section_handle
+                {
+                    // winlogon's kernel32 CreateProcessInternalW queries SectionImageInformation on the
+                    // services.exe SEC_IMAGE (for the entry/stack/subsystem) before NtCreateProcessEx.
+                    // Unlike smss's native path, kernel32 VALIDATES SubSystemType (must be GUI/CUI, not
+                    // NATIVE — proc.c:3504) + SubSystemVersion (>= 3.10 — BasepIsImageVersionOk), so
+                    // patch the image_info's defaults (SubSystemType@0x20, MinorVersion@0x24,
+                    // MajorVersion@0x26) with services.exe's REAL PE values.
+                    (*ctx.services_pe).as_ref().map(|p| {
+                        let mut info = nt_dll_registry::image_info(
+                            PE_LOAD_BASE,
+                            p.entry_point_rva(),
+                            p.size_of_image(),
+                            false,
+                        );
+                        let (maj, min) = p.subsystem_version();
+                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
+                        info[0x24..0x26].copy_from_slice(&min.to_le_bytes());
+                        info[0x26..0x28].copy_from_slice(&maj.to_le_bytes());
+                        (info, b"services.exe" as &[u8])
                     })
                 } else {
                     None
@@ -5262,6 +5354,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if self.pi == 0 && *ctx.winlogon_file_handle != 0 && sec_file == *ctx.winlogon_file_handle {
                     *ctx.winlogon_section_handle = h;
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for winlogon.exe -> handle 0x");
+                    print_hex((h >> 32) as u32);
+                    print_hex(h as u32);
+                    print_str(b"\n");
+                }
+                // The services.exe SEC_IMAGE is created by WINLOGON (pi 2) — its Win32 CreateProcessW.
+                if self.pi == 2 && *ctx.services_file_handle != 0 && sec_file == *ctx.services_file_handle {
+                    *ctx.services_section_handle = h;
+                    SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for services.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
                     print_hex(h as u32);
                     print_str(b"\n");
@@ -5689,6 +5790,12 @@ unsafe fn service_sec_image(
     let mut winlogon_file_handle = 0u64;
     let mut winlogon_section_handle = 0u64;
     let mut winlogon_process_handle = 0u64;
+    // services.exe (the 4th hosted process, winlogon's Win32 CreateProcessW target): the file/section
+    // handles winlogon opens+creates for it. Same roles as the csrss_/winlogon_ trios; `services_pe`
+    // is parsed above. `services_process_handle` is set by the NtCreateProcessEx spawn (badge 4).
+    let mut services_file_handle = 0u64;
+    let mut services_section_handle = 0u64;
+    let mut services_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
@@ -5696,8 +5803,8 @@ unsafe fn service_sec_image(
     // a bitmask of which registry DLLs have their PT reserved in that process's VSpace. csrss and
     // winlogon load an overlapping DLL set at identical bases into DISTINCT VSpaces, so each needs
     // its own PD/PT reservation (the registry's global `mapped` flag stays for VA-range resolution).
-    let mut dll_pd_created = [false; 3];
-    let mut dll_mapped_bits = [0u32; 3];
+    let mut dll_pd_created = [false; 4];
+    let mut dll_mapped_bits = [0u32; 4];
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -5733,6 +5840,20 @@ unsafe fn service_sec_image(
         apply_relocations_to_buf(wpe, winlogon_va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((winlogon_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((winlogon_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
+    // services.exe — the 4th hosted process, spawned by winlogon's Win32 CreateProcessW
+    // (StartServicesManager). Sourced BY PATH from the FS pool (P7-A — no fixed buffer needed); on
+    // the demo run (ntdll=None) it stays None (services only spawns on the live run). Same EXE-reloc
+    // + ImageBase patch as csrss/winlogon so ntdll doesn't hit the unimplemented EXE-reloc path.
+    let (services_pe, services_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\services.exe", b"services.exe")
+    } else {
+        (None, 0)
+    };
+    if let Some(ref spe) = services_pe {
+        apply_relocations_to_buf(spe, services_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((services_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((services_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
     // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
     // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
@@ -5979,7 +6100,7 @@ unsafe fn service_sec_image(
     // the six ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
     // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
     // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
-    let mut procs = [ProcExec::empty(); 3];
+    let mut procs = [ProcExec::empty(); 4];
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
     }
@@ -5990,7 +6111,7 @@ unsafe fn service_sec_image(
     // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
     // run; zero it at entry so the demo call (ntdll=None) starts clean too.
-    let pfilled: &mut [[u64; 256]; 3] = &mut *core::ptr::addr_of_mut!(PFILLED);
+    let pfilled: &mut [[u64; 256]; 4] = &mut *core::ptr::addr_of_mut!(PFILLED);
     for p in pfilled.iter_mut() {
         for e in p.iter_mut() {
             *e = 0;
@@ -6023,6 +6144,8 @@ unsafe fn service_sec_image(
             1
         } else if badge == WINLOGON_BADGE {
             2
+        } else if badge == SERVICES_BADGE {
+            3
         } else {
             0
         };
@@ -6043,6 +6166,7 @@ unsafe fn service_sec_image(
             match pi {
                 1 => CSRSS_STACK_MIRROR_VA,
                 2 => WINLOGON_STACK_MIRROR_VA,
+                3 => SERVICES_STACK_MIRROR_VA,
                 _ => SMSS_STACK_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -6051,6 +6175,7 @@ unsafe fn service_sec_image(
             match pi {
                 1 => CSRSS_IMAGE_MIRROR_VA,
                 2 => WINLOGON_IMAGE_MIRROR_VA,
+                3 => SERVICES_IMAGE_MIRROR_VA,
                 _ => IMAGE_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -6059,6 +6184,7 @@ unsafe fn service_sec_image(
             match pi {
                 1 => CSRSS_HEAP_MIRROR_VA,
                 2 => WINLOGON_HEAP_MIRROR_VA,
+                3 => SERVICES_HEAP_MIRROR_VA,
                 _ => SMSS_HEAP_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -6069,6 +6195,7 @@ unsafe fn service_sec_image(
         let pe: &nt_pe_loader::PeFile = match pi {
             1 => csrss_pe.as_ref().unwrap(),
             2 => winlogon_pe.as_ref().unwrap(),
+            3 => services_pe.as_ref().unwrap(),
             _ => pe,
         };
         faults = procs[pi].faults;
@@ -6365,6 +6492,9 @@ unsafe fn service_sec_image(
                     winlogon_file_handle: &mut winlogon_file_handle as *mut u64,
                     winlogon_section_handle: &mut winlogon_section_handle as *mut u64,
                     winlogon_pe: &winlogon_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    services_file_handle: &mut services_file_handle as *mut u64,
+                    services_section_handle: &mut services_section_handle as *mut u64,
+                    services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
                     filled_pages: &mut filled_pages as *mut [u64; 256],
                     faults: &mut faults as *mut u64,
                     scratch_base,
@@ -6387,8 +6517,8 @@ unsafe fn service_sec_image(
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: &mut dll_pd_created as *mut [bool; 3],
-                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 3],
+                    dll_pd_created: &mut dll_pd_created as *mut [bool; 4],
+                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 4],
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
@@ -6865,6 +6995,85 @@ unsafe fn service_sec_image(
                     }
                 }
                 result = 0; // STATUS_SUCCESS
+            } else if m0 == 98 && badge == WINLOGON_BADGE {
+                // NtIsProcessInJob(ProcessHandle=R10, JobHandle=RDX). kernel32's CreateProcessInternalW
+                // prologue (spawning services.exe) queries whether winlogon is in a job (JobHandle=NULL
+                // → "in ANY job"). Not modeled — winlogon is in no job. Return STATUS_SUCCESS (0):
+                // kernel32 treats a non-zero return as "in a job" (→ CREATE_SEPARATE_WOW_VDM, harmless
+                // for a native x64 app but avoided); 0 keeps it on the normal create path.
+                result = 0;
+            } else if m0 == 19 {
+                // NtApphelpCacheControl(Command=R10, Data=RDX). kernel32's CreateProcessInternalW →
+                // BasepCheckBadapp → BaseCheckAppcompatCache → BasepShimCacheSearch does
+                // NtApphelpCacheControl(ApphelpCacheServiceLookup). Returning SUCCESS means "the image
+                // is in the shim cache, known-good" → BaseCheckAppcompatCache returns TRUE → the app is
+                // allowed WITHOUT loading apphelp.dll or running the shim engine. No app-compat state is
+                // modeled; SUCCESS is the "no shim needed" answer. (BasepShimCacheCheckBypass is a
+                // hardcoded FALSE in ReactOS, so this single SUCCESS short-circuits the whole path.)
+                result = 0;
+            } else if m0 == 50 && badge == WINLOGON_BADGE {
+                // NtCreateProcessEx(*ProcessHandle[R10], DesiredAccess[RDX], OA[R8], ParentProcess[R9],
+                // Flags[sp+0x28], SectionHandle[sp+0x30], DebugPort[sp+0x38], ExceptionPort[sp+0x40]).
+                // winlogon's kernel32 CreateProcessInternalW creates services.exe — the 4th hosted
+                // process (StartServicesManager). The Win32 path (unlike smss's native
+                // RtlCreateUserProcess) builds the child AS via cross-process syscalls
+                // (NtAllocateVirtualMemory/NtWriteVirtualMemory/NtCreateThread against the child
+                // handle); in our hosted model spawn_sec_image already builds services.exe's REAL
+                // env/stack/thread, so those cross-process calls are benign no-ops. Here we validate the
+                // SectionHandle names the tracked services.exe SEC_IMAGE, then spawn services (badge
+                // SERVICES_BADGE, pi 3) with its own VSpace/mirrors/scratch at prio 103.
+                let sect = smss_stack_read(sp + 0x30); // SectionHandle
+                if services_section_handle != 0
+                    && sect == services_section_handle
+                    && services_pe.is_some()
+                    && SERVICES_SPAWNED.swap(1, Ordering::Relaxed) == 0
+                {
+                    let sf_c = mint_badged(fault_ep, SERVICES_BADGE);
+                    let spe = services_pe.as_ref().unwrap();
+                    const SERVICES_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\services.exe";
+                    const SERVICES_CMD_LINE: &[u8] = b"services.exe";
+                    let spml4 = spawn_sec_image(
+                        3, spe, sf_c, NTDLL_BASE, true, 103, SERVICES_ENV_SCRATCH_VA,
+                        SERVICES_STACK_MIRROR_VA, SERVICES_HEAP_MIRROR_VA, SERVICES_IMAGE_MIRROR_VA,
+                        SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
+                    );
+                    procs[3].pml4 = spml4;
+                    procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
+                    procs[3].scratch_base = SERVICES_SCRATCH_BASE;
+                    // Bind services' pre-created main ETHREAD to its real image entry — pm at spawn.
+                    nt_handler.bind_main_thread_entry(3, PE_LOAD_BASE + spe.entry_point_rva() as u64);
+                    // Record services' process handle in winlogon's (pi 2) EPROCESS table as a typed
+                    // Process object; the returned dense value IS winlogon's handle (path 1b).
+                    services_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(3)) {
+                        (Some(wl_pid), Some(sv_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                wl_pid,
+                                nt_process::HandleObject::Process(sv_pid),
+                                0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle;
+                                nt_handler.next_handle += 1;
+                                g
+                            })
+                        }
+                        _ => {
+                            let g = nt_handler.next_handle;
+                            nt_handler.next_handle += 1;
+                            g
+                        }
+                    };
+                    smss_stack_write(get_recv_mr(9), services_process_handle); // *ProcessHandle (R10)
+                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
+                    print_hex((services_process_handle >> 32) as u32);
+                    print_hex(services_process_handle as u32);
+                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
+                } else if services_process_handle != 0 {
+                    // Idempotent (a second create should not re-spawn): return the same handle.
+                    smss_stack_write(get_recv_mr(9), services_process_handle);
+                }
+                result = 0;
             } else if m0 == 195 {
                 // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST
                 // step of BaseDllInitialize after the CSR connect — registers the thread's LPC
@@ -7281,6 +7490,8 @@ unsafe fn service_sec_image(
         b"csrss" as &[u8]
     } else if badge == WINLOGON_BADGE {
         b"winlogon"
+    } else if badge == SERVICES_BADGE {
+        b"services"
     } else {
         b"smss"
     });
@@ -7381,6 +7592,14 @@ unsafe fn service_sec_image(
     print_str(b" page(s), first=0x");
     print_hex((procs[2].first >> 32) as u32);
     print_hex(procs[2].first as u32);
+    print_str(b"\n");
+    // Record services.exe's (slot 3) demand-fault count for the milestone spec + report line.
+    SERVICES_FAULTS.store(procs[3].faults, Ordering::Relaxed);
+    print_str(b"[ntos-exec] services (slot 3) demand-faulted ");
+    print_u64(procs[3].faults);
+    print_str(b" page(s), first=0x");
+    print_hex((procs[3].first >> 32) as u32);
+    print_hex(procs[3].first as u32);
     print_str(b"\n");
     // Path 3: record that each folded per-process ProcExec is EPROCESS-linked (live pml4 + its pid
     // matches the ProcessManager's pid for that pi). Read by `exec_eprocess_linked_mechanism`.
@@ -8683,6 +8902,9 @@ static NEXT_CSRSS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// (or csrss's) allocations don't push winlogon's heap base past the single alloc PT spawn_sec_image
 /// maps. Starts at SMSS_ALLOC_VA: independent VSpaces make the same VA (own PT) fine.
 static NEXT_WINLOGON_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
+/// services.exe's OWN NtAllocateVirtualMemory bump (4th hosted process) — a SEPARATE counter (same
+/// rationale as csrss/winlogon: independent VSpaces make the same start VA (own PT) fine).
+static NEXT_SERVICES_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 /// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can
@@ -8706,6 +8928,17 @@ static WINLOGONBUF_START: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages winlogon's ntdll loader demand-faulted (slot 2), for the spec-check report.
 static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Set when winlogon's kernel32 CreateProcessInternalW creates the services.exe SEC_IMAGE section —
+/// i.e. the Win32 process-create for services.exe has begun. Used to gate OFF the broad empty-name
+/// NtOpenKey → MACHINE_ROOT_HANDLE fallback (which the keyboard-layout path needed, but which makes
+/// BasepIsProcessAllowed's AppCertDlls open spuriously succeed → RtlQueryRegistryValues fails
+/// c0000002 → "Process not allowed to launch"). The keyboard path runs long before services create.
+static SERVICES_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
+/// Set once winlogon's Win32 CreateProcessW (NtCreateProcessEx) spawns services.exe as the 4th hosted
+/// process (badge 6) — its ntdll loader then runs, multiplexed by badge. Read by the milestone spec.
+static SERVICES_SPAWNED: AtomicU64 = AtomicU64::new(0);
+/// How many pages services.exe's ntdll loader demand-faulted (slot 3), for the spec-check report.
+static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
@@ -8720,8 +8953,9 @@ static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 // in `ExecNtHandler::new()` (below the per-syscall heap mark → survives the bump reset, no runtime
 // realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
 // keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
-/// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created).
-static PM_PIDS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon / 3=services (0 = not yet created).
+static PM_PIDS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// How many EPROCESS objects the boot-time ProcessManager holds (expected 3).
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
@@ -8751,11 +8985,13 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Main-thread tids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created). Pre-created at boot
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
-static PM_TIDS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-/// Pool of ONE spare ETHREAD per process (pi 0/1/2), pre-created at boot so a RUNTIME NtCreateThread
+static PM_TIDS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Pool of ONE spare ETHREAD per process (pi 0/1/2/3), pre-created at boot so a RUNTIME NtCreateThread
 /// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
 /// its RPC listener; the array generalizes to any pi.)
-static PM_POOL_TID: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_POOL_TID: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
@@ -13295,12 +13531,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // = the live service loop resolved a fault badge → its EPROCESS through the manager.
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == 3,
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == 4,
                         &mut passed,
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b111,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b1111,
                         &mut passed,
                     );
                     check(
@@ -13337,12 +13573,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b111,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b1111,
                         &mut passed,
                     );
                     check(
                         b"exec_main_thread_bound_at_spawn",
-                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 3,
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 4,
                         &mut passed,
                     );
                     check(
@@ -13407,7 +13643,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b111,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b1111,
+                        &mut passed,
+                    );
+                    // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32
+                    // CreateProcessW (StartServicesManager → NtCreateProcessEx) spawned it (badge 6, pi
+                    // 3) via spawn_sec_image, and its REAL ntdll loader ran (demand-faulted its image +
+                    // ntdll + DLLs, resolved BY PATH from the FS pool). `exec_services_spawned` = the
+                    // spawn fired; `exec_services_loader_running` = its loader demand-faulted pages.
+                    check(
+                        b"exec_services_spawned",
+                        SERVICES_SPAWNED.load(Ordering::Relaxed) == 1,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_services_loader_running",
+                        SERVICES_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     // Path 1b — process-local dense handle VALUES. Two distinct EPROCESSes both hold
