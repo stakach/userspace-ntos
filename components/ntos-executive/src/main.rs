@@ -6549,6 +6549,40 @@ unsafe fn service_sec_image(
                 // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
                 // loader runs the remaining DllMains toward winlogon's entry.
                 result = 0;
+            } else if m0 == 71 && badge == 0 {
+                // NtDuplicateObject — smss's SmpExecuteInitialCommand duplicates winlogon's process
+                // handle (SourceHandle=RDX) into InitialCommandProcess (*TargetHandle=R9) so it can
+                // later wait on it (smss.c:344). If this FAILS smss KILLS winlogon (smss.c:355), so it
+                // MUST succeed. Model the dup: write the source handle value to *TargetHandle and
+                // return STATUS_SUCCESS (no real cross-process handle table needed — smss only uses the
+                // dup'd handle in the NtWaitForMultipleObjects below, which we park). This is the smss
+                // step that, when serviced, lets the loop keep multiplexing so winlogon (prio 102) runs
+                // FORWARD past the desktop paint toward StartServicesManager -> services.exe.
+                // ABI: SourceProcess=R10, SourceHandle=RDX(m3), TargetProcess=R8, TargetHandle=R9(PHANDLE).
+                let src_handle = m3;
+                let target = get_recv_mr(8); // R9 = *TargetHandle
+                if target != 0 {
+                    smss_stack_write(target, src_handle);
+                }
+                result = 0; // STATUS_SUCCESS
+            } else if m0 == 280 && badge == 0 {
+                // NtWaitForMultipleObjects — smss's main thread waits (WaitAny) on {csrss, winlogon}
+                // to die (smss.c:518). In our boot NEITHER dies, so smss's correct terminal state is to
+                // block here FOREVER. PARK it (never reply, recv the next event) so the higher-priority
+                // winlogon keeps running forward. Returning STATUS_WAIT_0 instead would make smss think
+                // csrss/winlogon terminated -> its hard-error teardown path (wrong). This is the
+                // designed end of smss's lifetime; the loop now terminates on winlogon's next wall.
+                park_caller = true;
+                result = 0;
+            } else if m0 == 136 {
+                // NtOpenThreadTokenEx — winlogon's InitKeyboardLayouts calls RegOpenKeyExW(
+                // HKEY_CURRENT_USER, "Keyboard Layout\\Preload") -> RtlOpenCurrentUser ->
+                // NtOpenThreadToken(Ex). winlogon runs as SYSTEM with no impersonation token, so the
+                // authentic result is STATUS_NO_TOKEN (0xC000007C) -> RtlOpenCurrentUser falls back to
+                // the process-token user key (\Registry\User\S-1-5-18), which misses our SYSTEM-only
+                // hive -> InitKeyboardLayouts loads the default US layout instead. (Mirrors the
+                // NtOpenThreadToken=135 handler; 136 is the Ex variant the real ntdll uses.)
+                result = 0xC000007C;
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE)
             {
