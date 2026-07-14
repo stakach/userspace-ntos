@@ -377,7 +377,7 @@ pub(crate) unsafe fn csr_fill_page(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>; 16],
+    dll_pes: &[&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT],
     fill_idx: &mut u64,
 ) -> bool {
     let (base, tpe) = if page >= PE_LOAD_BASE && page < img_end {
@@ -442,7 +442,7 @@ pub(crate) unsafe fn csr_rendezvous(
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
-    dll_pes: &[&Option<nt_pe_loader::PeFile>; 16],
+    dll_pes: &[&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT],
 ) -> u64 {
     const SSN_SET_EVENT: u64 = 228;
     const SSN_MAP_VIEW: u64 = 113;

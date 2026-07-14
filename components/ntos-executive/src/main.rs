@@ -553,6 +553,11 @@ pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
+/// Number of DLLs in the generic nt-dll-registry (`dll_pes`/`dll_seed`/`dll_buf_va`). Each occupies a
+/// fixed 16 MiB base slot from 0x8000_0000 (shared 1 GiB PDPT range), demand-paged from its parsed PE.
+/// csrss's Win32 stack (16) + lsass's LSA server DLLs lsasrv/samsrv (2) = 18. Grow this + add the PE /
+/// seed / buf_va entries in service_sec_image to register a new registry DLL.
+pub const DLL_REG_COUNT: usize = 18;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -1988,6 +1993,8 @@ const SYSTEM32_FILES: &[&str] = &[
     "ntdll_vista.dll",
     "userenv.dll",
     "mpr.dll",
+    "lsasrv.dll",
+    "samsrv.dll",
 ];
 
 /// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
@@ -2155,7 +2162,7 @@ struct ExecLoopCtx {
     nt_end: u64,
     /// The 14 loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
     /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
-    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; 16],
+    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
     /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
@@ -2749,6 +2756,10 @@ static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
 static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Set once lsass's lsasrv `LsapRmInitializeServer` NtConnectPort(\SeRmCommandPort) is modeled-accepted
+/// — i.e. lsass's LSA init (LsapInitLsa) has resolved lsasrv+samsrv (SERVICE 10 step 2) and is running
+/// its real SRM/LSA-database bring-up. Read by the exec_lsass_lsa_init_running milestone spec.
+static LSASS_SRM_CONNECTED: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
@@ -6079,6 +6090,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_lsass_loader_running",
                         LSASS_FAULTS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    // SERVICE 10 step 2 (checkpoint A): lsasrv.dll + samsrv.dll are registered, so
+                    // lsass's loader resolves them, reaches its real LSA entry, and runs
+                    // LsapInitLsa → LsapRmInitializeServer, whose NtConnectPort(\SeRmCommandPort) we
+                    // model-accept. This proves lsass advanced PAST the lsasrv DLL_NOT_FOUND wall into
+                    // its genuine SRM/LSA-database bring-up.
+                    check(
+                        b"exec_lsass_lsa_init_running",
+                        LSASS_SRM_CONNECTED.load(Ordering::Relaxed) == 1,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] lsass spawned=0x");

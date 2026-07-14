@@ -290,6 +290,19 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         None
     };
+    // lsasrv.dll + samsrv.dll — lsass.exe's (pi 4) static-import LSA/SAM server DLLs. Sourced BY PATH
+    // from the FS pool (staged in the full \reactos tree); lsass's ntdll loader resolves + demand-pages
+    // them through the same nt-dll-registry path as csrss's Win32 stack. Only present on the live run.
+    let (lsasrv_pe, lsasrv_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\lsasrv.dll", b"lsasrv.dll")
+    } else {
+        (None, 0)
+    };
+    let (samsrv_pe, samsrv_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\samsrv.dll", b"samsrv.dll")
+    } else {
+        (None, 0)
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -299,18 +312,18 @@ pub(crate) unsafe fn service_sec_image(
     // run through host-tested nt-dll-registry; the executive keeps the parsed PEs parallel (indexed
     // the same) for the effectful demand-fill. Adding a DLL = stage it + one register() call.
     // (winsrv is ~100 pages — the root CNode is an XL page under extern-rootserver, so the caps fit.)
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; 16] = [
+    let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] = [
         &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
         &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
-        &ntdll_vista_pe, &userenv_pe, &mpr_pe,
+        &ntdll_vista_pe, &userenv_pe, &mpr_pe, &lsasrv_pe, &samsrv_pe,
     ];
-    let dll_seed: [&[u8]; 16] = [
+    let dll_seed: [&[u8]; DLL_REG_COUNT] = [
         b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
         b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help", b"ntdll_vista",
-        b"userenv", b"mpr",
+        b"userenv", b"mpr", b"lsasrv", b"samsrv",
     ];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..16 {
+    for i in 0..DLL_REG_COUNT {
         let (sz, ent) = dll_pes[i]
             .as_ref()
             .map(|p| (image_extent(p), p.entry_point_rva()))
@@ -326,7 +339,7 @@ pub(crate) unsafe fn service_sec_image(
     // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
     // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
     // ImageBase == mapped base and doesn't double-relocate.
-    let dll_buf_va: [u64; 16] = [
+    let dll_buf_va: [u64; DLL_REG_COUNT] = [
         csrsrv_va,  // P7-A batch 3: pool VA on FS hit, else FILEBUF+CSRSRV_FILEBUF_OFFSET
         basesrv_va, // P7-A batch 3: pool VA on FS hit, else SRVBUF+BASESRV_SRVBUF_OFFSET
         winsrv_va,  // P7-A batch 3: pool VA on FS hit, else SRVBUF+WINSRV_SRVBUF_OFFSET
@@ -343,8 +356,10 @@ pub(crate) unsafe fn service_sec_image(
         ntdll_vista_va,    // P7-A batch 1: pool VA on FS hit, else WIN32BUF+NTDLL_VISTA_WIN32BUF_OFFSET
         userenv_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+USERENV_WIN32BUF_OFFSET
         mpr_va,     // P7-A: pool VA when sourced BY PATH, else WIN32BUF+MPR_WIN32BUF_OFFSET
+        lsasrv_va,  // lsass's LSA server DLL — pool VA (FS-by-path)
+        samsrv_va,  // lsass's SAM server DLL — pool VA (FS-by-path)
     ];
-    for i in 0..16 {
+    for i in 0..DLL_REG_COUNT {
         if let Some(pe) = dll_pes[i].as_ref() {
             let base = reg.base(i);
             apply_relocations_to_buf(pe, dll_buf_va[i], base);
@@ -859,8 +874,9 @@ pub(crate) unsafe fn service_sec_image(
                     img_end,
                     nt_base,
                     nt_end,
-                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; 16] as *const ()
-                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; 16],
+                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT]
+                        as *const ()
+                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
@@ -1561,11 +1577,14 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 result = 0; // STATUS_SUCCESS
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
-                && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE || badge == SERVICES_BADGE)
+                && (badge == CSRSS_BADGE
+                    || badge == WINLOGON_BADGE
+                    || badge == SERVICES_BADGE
+                    || badge == LSASS_BADGE)
             {
                 routed_win32k = true;
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
-                // services pi 3) so it attaches win32k's client window to this client's frames
+                // services pi 3 / lsass pi 4) so it attaches win32k's client window to this client's frames
                 // (per-client cross-AS client memory — services' OBJECT_ATTRIBUTES / USERCONNECT
                 // resolve to SERVICES' frames, not the stale csrss/winlogon frame at the same VA).
                 // The w32_client_attach / csrss_frame_get / map_win32k_heap_into_csrss machinery is

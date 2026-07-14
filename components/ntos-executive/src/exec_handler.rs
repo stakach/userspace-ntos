@@ -1838,6 +1838,24 @@ impl NativeSyscallHandler for ExecNtHandler {
             // via sm_rendezvous. This is what unblocks csrss's SmConnectToSm.
             NativeService::NtConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
+                // \SeRmCommandPort — the Security Reference Monitor's command port, created by the SRM
+                // in ntoskrnl (SeRmInitPhase1). lsass's lsasrv LsapRmInitializeServer (srm.c:216)
+                // NtConnectPort's it during LsapInitLsa. We don't host a real SRM, so MODEL the port:
+                // mint a comm-port handle + return SUCCESS so LsapRmInitializeServer proceeds (its
+                // LsapRmServerThread only NtRequestWaitReplyPort's the SRM for logon/token events, which
+                // don't occur on this boot path). Scoped to lsass (pi 4) so it can't perturb the CSR/SM
+                // LPC broker path (csrss/winlogon pi 1/2).
+                {
+                    let mut nb = [0u8; 40];
+                    let nlen = Self::fold_name(&name16, &mut nb);
+                    if self.pi == 4 && nb[..nlen].windows(15).any(|w| w == b"sermcommandport") {
+                        let h = self.mint_handle();
+                        self.queue_write(args[0], h);
+                        LSASS_SRM_CONNECTED.store(1, Ordering::Relaxed);
+                        print_str(b"[ntos-exec] lsass NtConnectPort(\\SeRmCommandPort) -> modeled SRM accept\n");
+                        return 0;
+                    }
+                }
                 match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
