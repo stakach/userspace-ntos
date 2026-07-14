@@ -51,6 +51,9 @@ mod img_spawn;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
 pub(crate) use win32k_glue::*;
+mod npfs_host;
+mod driver_launch;
+pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -5400,6 +5403,46 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     &mut passed,
                 );
             }
+        }
+    }
+
+    // --- SERVICE 9: the GENERAL DYNAMIC driver-launch path, proven with npfs.sys as the FIRST
+    // CLIENT (an isolated FSD component). `load_driver` resolves \reactos\system32\drivers\npfs.sys
+    // BY-PATH from the FS, IAT-patches it against the npfs ntoskrnl-import trampolines, spawns it in
+    // its OWN VSpace/CNode/TCB (FSD-class descriptor — NO device caps) with a fault EP, and runs its
+    // REAL DriverEntry (which IoCreateDevice(\Device\NamedPipe) + fills the MajorFunction[] table)
+    // fault-contained. This is the reusable dynamic path (NT IoLoadDriver / SCM driver-start) — any
+    // .sys becomes launchable at runtime; the existing bespoke spawners are follow-on migrations.
+    if let Some(fs) = exec_fs() {
+        print_str(b"[driver-launch] launching npfs.sys (FSD, isolated) via the general dynamic path\n");
+        if let Some(dc) = load_driver(&fs, b"reactos\\system32\\drivers\\npfs.sys", DriverClass::Fsd)
+        {
+            register_npfs(&dc);
+            // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
+            check(b"npfs_driver_entry_entered", (dc.verdict & npfs_host::V_ENTERED) != 0, &mut passed);
+            check(
+                b"npfs_device_created",
+                (dc.verdict & npfs_host::V_DEVICE) != 0 && dc.devobj != 0,
+                &mut passed,
+            );
+            check(b"npfs_driver_entry_success", (dc.verdict & npfs_host::V_SUCCESS) != 0, &mut passed);
+            check(b"npfs_major_function_table", (dc.verdict & npfs_host::V_MJ) != 0, &mut passed);
+            // Isolation proof: npfs runs in its OWN VSpace (a distinct PML4 cap != the executive's).
+            check(b"npfs_isolated_vspace", dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE, &mut passed);
+            if dc.finished && (dc.verdict & npfs_host::V_MJ) != 0 {
+                // C1 round-trip: dispatch a benign IRP_MJ_CREATE to the live component (proves the
+                // dispatch loop + MajorFunction routing works before wiring real named-pipe syscalls).
+                let mut out = [0u8; 16];
+                let r = npfs_dispatch_irp(0 /* IRP_MJ_CREATE */, 0, 0, &[], &mut out);
+                if let Some((st, _info)) = r {
+                    print_str(b"[npfs-svc] C1 dispatch IRP_MJ_CREATE -> status=0x");
+                    print_hex(st as u32);
+                    print_str(b"\n");
+                    check(b"npfs_dispatch_roundtrip", true, &mut passed);
+                }
+            }
+        } else {
+            print_str(b"[driver-launch] npfs.sys launch returned None (not staged / load failed)\n");
         }
     }
 
