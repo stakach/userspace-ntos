@@ -43,6 +43,8 @@ mod spawn_hosts;
 pub(crate) use spawn_hosts::*;
 mod device_io;
 pub(crate) use device_io::*;
+mod pnp;
+pub(crate) use pnp::*;
 mod selftests;
 pub(crate) use selftests::*;
 mod img_spawn;
@@ -4137,59 +4139,53 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(b"exec_pci_portio_reads_config", hb_vendor != 0xFFFF, &mut passed);
     check(b"exec_pci_host_bridge_intel", hb_vendor == 0x8086, &mut passed);
 
+    // PnP Manager bus walk — the enumeration is now the host-tested `nt-pnp` policy (parse
+    // vendor/device/class + IRQ + decode each BAR with the write-all-ones size probe, restoring
+    // it). The executive-side broker (`pnp.rs`) drives it over `pci_read32`/`pci_write32`.
+    let pci_devices = enumerate_pci_bus0(pci_io);
     let mut count = 0u64;
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
     let (mut storage_dev, mut storage_func) = (0u8, 0u8);
     let (mut nic_bar0, mut nic_irq, mut found_nic) = (0u32, 0u32, false);
     let (mut nic_dev, mut nic_func) = (0u8, 0u8);
-    for dev in 0..32u8 {
-        for func in 0..8u8 {
-            let vd = pci_read32(pci_io, 0, dev, func, 0x00);
-            let vendor = (vd & 0xFFFF) as u16;
-            if vendor == 0xFFFF {
-                if func == 0 {
-                    break; // no function 0 → device absent
-                }
-                continue;
-            }
-            count += 1;
-            let device = (vd >> 16) as u16;
-            let class = pci_read32(pci_io, 0, dev, func, 0x08); // [class][sub][progif][rev]
-            let bar0 = pci_read32(pci_io, 0, dev, func, 0x10);
-            let irq = pci_read32(pci_io, 0, dev, func, 0x3C) & 0xFF;
-            print_str(b"  pci 0:");
-            print_u64(dev as u64);
-            print_str(b".");
-            print_u64(func as u64);
-            print_str(b" id=");
-            print_hex(((device as u32) << 16) | vendor as u32);
-            print_str(b" class=");
-            print_hex(class >> 8);
-            print_str(b" bar0=");
-            print_hex(bar0);
-            print_str(b" irq=");
-            print_u64(irq as u64);
-            print_str(b"\n");
-            // First AHCI SATA controller (class 0x0106). On q35 the boot disk is on the
-            // add-in `-device ahci` at a low slot (00:3.0); the built-in ICH9 SATA (00:31.2)
-            // is empty — so first-wins picks the one with the disk. ABAR = BAR5.
-            if (class >> 8) == 0x01_0601 && !found_storage {
-                found_storage = true;
-                storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
-                storage_irq = irq;
-                storage_dev = dev;
-                storage_func = func;
-            }
-            // A network controller (class 0x02) — the e1000e NIC we drive as the
-            // P1 capstone (its MMIO BAR0 + interrupt line).
-            if (class >> 24) == 0x02 {
-                found_nic = true;
-                nic_bar0 = bar0;
-                nic_irq = irq;
-                nic_dev = dev;
-                nic_func = func;
-            }
+    for d in &pci_devices {
+        count += 1;
+        let (dev, func) = (d.dev, d.func);
+        let class = pci_read32(pci_io, 0, dev, func, 0x08); // [class][sub][progif][rev]
+        let bar0 = pci_read32(pci_io, 0, dev, func, 0x10); // raw BAR0 (flag bits intact for the log)
+        let irq = d.irq_line as u32;
+        print_str(b"  pci 0:");
+        print_u64(dev as u64);
+        print_str(b".");
+        print_u64(func as u64);
+        print_str(b" id=");
+        print_hex(((d.device as u32) << 16) | d.vendor as u32);
+        print_str(b" class=");
+        print_hex(class >> 8);
+        print_str(b" bar0=");
+        print_hex(bar0);
+        print_str(b" irq=");
+        print_u64(irq as u64);
+        print_str(b"\n");
+        // First AHCI SATA controller (class 0x0106). On q35 the boot disk is on the
+        // add-in `-device ahci` at a low slot (00:3.0); the built-in ICH9 SATA (00:31.2)
+        // is empty — so first-wins picks the one with the disk. ABAR = BAR5.
+        if (class >> 8) == 0x01_0601 && !found_storage {
+            found_storage = true;
+            storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
+            storage_irq = irq;
+            storage_dev = dev;
+            storage_func = func;
+        }
+        // A network controller (class 0x02) — the e1000e NIC we drive as the
+        // P1 capstone (its MMIO BAR0 + interrupt line). nt-pnp binds it below.
+        if d.base_class() == nt_pnp::PCI_CLASS_NETWORK {
+            found_nic = true;
+            nic_bar0 = bar0;
+            nic_irq = irq;
+            nic_dev = dev;
+            nic_func = func;
         }
     }
     print_str(b"[ntos-exec] PCI devices on bus 0 = ");
@@ -4494,27 +4490,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let reslist_frame = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, reslist_frame);
             let _ = page_map(reslist_frame, RESLIST_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-            {
-                use nt_cm_resources::*;
-                let buf =
-                    core::slice::from_raw_parts_mut(RESLIST_VADDR as *mut u8, MEMORY_INTERRUPT_LIST_SIZE);
-                let _ = build_memory_interrupt_list(
-                    buf,
-                    0, // bus 0
-                    MemoryDescriptor {
-                        start: NIC_VADDR, // the host's MMIO window (already mapped for it)
-                        length: 0x4000,
-                        flags: CM_RESOURCE_MEMORY_READ_WRITE,
-                        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-                    },
-                    InterruptDescriptor {
-                        level: NIC_MSI_VECTOR as u32,
-                        vector: NIC_MSI_VECTOR as u32,
-                        affinity: 1,
-                        flags: CM_RESOURCE_INTERRUPT_LATCHED,
-                        share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
-                    },
-                );
+            // PnP resource assignment (host-tested `nt-pnp` policy): bind the enumerated NIC and
+            // assign it its MMIO BAR + the MSI vector the executive programmed (latched). The broker
+            // then writes the driver-visible CM_RESOURCE_LIST — the exact bytes the .sys reads at
+            // IRP_MN_START_DEVICE — naming the driver's mapped MMIO window (NIC_VADDR, the minted
+            // BAR frames aliased into the host) + the assigned interrupt. The interrupt vector +
+            // MMIO BAR now come from PnP, not hand-authored constants.
+            if let Some(g) = assign_nic(&pci_devices, NIC_MSI_VECTOR as u32, true, 0x1000) {
+                write_cm_resource_list(RESLIST_VADDR, 0, &g.assignment, NIC_VADDR, 0x4000);
             }
             // Common-buffer descriptor (the DMA adapter's AllocateCommonBuffer result):
             // CPU virtual address, device logical address (IOVA), length.

@@ -43,6 +43,9 @@ nt-io-server = { path = "../../crates/nt-io-server", features = ["object-manager
 nt-io-client = { path = "../../crates/nt-io-client" }
 # Real NT CM_RESOURCE_LIST encoding — the resources PnP hands a driver at START.
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
+# PnP resource-assignment policy — PCI enum + BAR-size probe + CM_RESOURCE_LIST build. The
+# executive-side broker (pnp.rs) mints the caps this policy's resource list describes.
+nt-pnp = { path = "../../crates/nt-pnp" }
 # PE loader — load + map + relocate a real Windows .sys binary in the isolated host.
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 # Process Manager — real EPROCESS/ETHREAD + per-process handle tables + lifecycle. The live
