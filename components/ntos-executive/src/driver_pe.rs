@@ -10,12 +10,6 @@
 use crate::*;
 use nt_pe_loader::{ImportRef, PeFile};
 
-/// A real MSVC-compiled WDM driver (git-tracked fixture): DriverEntry sets AddDevice +
-/// MajorFunction[IRP_MJ_PNP]; START parses the CM_RESOURCE_LIST → MmMapIoSpace + MMIO +
-/// IoConnectInterrupt.
-pub static SYS_BYTES: &[u8] =
-    include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/PnpMmioInterruptTest.sys");
-
 /// Where the PE image is mapped (R+W+X) in BOTH the executive (to load it) and the host
 /// (to run it) — same vaddr so the relocation base matches. Lives in the relocated shared
 /// "cluster" region (WORK_CLUSTER_BASE, 0x1040_0000), well clear of the 64 MiB ELF reserve.
@@ -189,12 +183,12 @@ fn export_addr(name: &str) -> u64 {
     f
 }
 
-/// Runs in the EXECUTIVE (which has the heap). Parse the `.sys`, map+relocate it for
-/// `CODE_VA`, copy the mapped bytes into the (executive-mapped) image frames, patch the
-/// IAT to our stubs, seed the /GS cookie. Returns the DriverEntry RVA. The executive then
-/// re-maps those same frames R+X into the host.
-pub unsafe fn load_into() -> Option<u32> {
-    let pe = PeFile::parse(SYS_BYTES).ok()?;
+/// Runs in the EXECUTIVE (which has the heap). Parse the `.sys` (raw bytes loaded BY-PATH from
+/// the FS — no baked `include_bytes!`), map+relocate it for `CODE_VA`, copy the mapped bytes into
+/// the (executive-mapped) image frames, patch the IAT to our stubs, seed the /GS cookie. Returns
+/// the DriverEntry RVA. The executive then re-maps those same frames R+X into the host.
+pub unsafe fn load_into(sys_bytes: &[u8]) -> Option<u32> {
+    let pe = PeFile::parse(sys_bytes).ok()?;
     let mapped = pe.map(CODE_VA).ok()?;
     let dst = CODE_VA as *mut u8;
     for (i, b) in mapped.bytes.iter().enumerate() {

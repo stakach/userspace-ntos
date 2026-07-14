@@ -30,10 +30,6 @@ use nt_wdf_types as wt;
 
 use crate::*;
 
-/// A real MSVC-compiled KMDF v1.15 driver (git-tracked fixture).
-pub static SYS_BYTES: &[u8] =
-    include_bytes!("../../../crates/nt-driver-test-fixtures/fixtures/KmdfBasicTest.sys");
-
 /// Where the KMDF PE image is mapped (in BOTH the executive to load it, and the host
 /// to run it) — same vaddr so the relocation base matches.
 pub const KMDF_CODE_VA: u64 = 0x0000_0100_104D_0000;
@@ -565,8 +561,8 @@ unsafe fn run_ioctl(device: u64, ioctl: u32, input: &[u8], out_cap: u64) -> (i32
 /// (executive-mapped) image frames, patch the IAT to our stubs + the CFG dispatch slot to the
 /// `jmp rax` stub, seed the /GS cookie. Returns the DriverEntry RVA. The executive then
 /// re-maps those same frames W^X into the host.
-pub unsafe fn load_into() -> Option<u32> {
-    let pe = PeFile::parse(SYS_BYTES).ok()?;
+pub unsafe fn load_into(sys_bytes: &[u8]) -> Option<u32> {
+    let pe = PeFile::parse(sys_bytes).ok()?;
     let mapped = pe.map(KMDF_CODE_VA).ok()?;
     let dst = KMDF_CODE_VA as *mut u8;
     for (i, b) in mapped.bytes.iter().enumerate() {

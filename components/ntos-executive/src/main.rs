@@ -4247,8 +4247,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // device frame and read a live device register — a real driver path touching
     // real (QEMU-emulated) network hardware, not a mock.
     let mut kmdf_nic_bar_base = 0u64; // the real NIC BAR caps, handed to the KMDF host below
+    // Driver-model migration: these NIC resources are captured here (VT-d must be enabled by this
+    // block BEFORE the storage block) but the real-.sys DRIVER-HOST hosting is DEFERRED until after
+    // the FS is mounted, so the driver `.sys` can be loaded BY-PATH (no baked include_bytes!). Hoist
+    // the handful of locals the deferred hosting block needs to function scope.
+    let mut nic_bar_base = 0u64;
+    let mut nic_mmio = 0u64;
+    let mut nic_irq_ntfn = 0u64;
+    let mut nic_dma_frame = 0u64;
     if found_nic {
-        let nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
+        nic_mmio = (nic_bar0 & 0xFFFF_FFF0) as u64; // mask the BAR flag bits
         print_str(b"[ntos-exec] P1 CAPSTONE: mapping e1000e NIC BAR0 ");
         print_hex(nic_mmio as u32);
         print_str(b" (irq ");
@@ -4256,7 +4264,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b")\n");
         // Map the first 4 pages (16 KiB) of the BAR: page 0 has CTRL/STATUS/interrupt
         // regs, page 3 (offset 0x3000) has the TX descriptor registers (0x3800..0x3828).
-        let nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
+        nic_bar_base = claim_device_pages(bi, nic_mmio, NIC_VADDR, 4);
         check(b"exec_nic_bar_mapped", nic_bar_base != 0, &mut passed);
         kmdf_nic_bar_base = nic_bar_base; // hand the real BAR to the KMDF host later
         if nic_bar_base != 0 {
@@ -4286,7 +4294,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[ntos-exec] NIC Interrupt Pin = ");
             print_u64(int_pin as u64);
             print_str(b"\n");
-            let nic_irq_ntfn = make_object(OBJ_NOTIFICATION);
+            nic_irq_ntfn = make_object(OBJ_NOTIFICATION);
             let nic_irq_badged = alloc_slot();
             let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, nic_irq_badged, nic_irq_ntfn, IRQ_BADGE);
             let result_ntfn = make_object(OBJ_NOTIFICATION);
@@ -4395,6 +4403,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             pci_write32(pci_io, 0, nic_dev, nic_func, 0x04, cmd | (1 << 2) | (1 << 1));
 
             let dma_frame = alloc_slot();
+            nic_dma_frame = dma_frame; // hoist for the deferred (post-FS-mount) driver-host hosting
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
             let _ = page_map(dma_frame, DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let dma_paddr = get_frame_paddr(dma_frame);
@@ -4520,193 +4529,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_hex(dd2 as u32);
             print_str(b" (DD=1 => NIC DMA went through VT-d: IOVA -> frame)\n");
             check(b"exec_nic_confined_dma", dd2 & 0x1 != 0, &mut passed);
-
-            // ---- DRIVER HOST AT START: the executive, acting as the PnP manager + HAL,
-            // hands an ISOLATED driver host a real NT CM_RESOURCE_LIST (MMIO + interrupt)
-            // and a VT-d-confined common DMA buffer, then lets it drive the NIC (MMIO +
-            // confined DMA) entirely from its own CSpace/VSpace — the seL4 analogue of a
-            // KMDF driver's START_DEVICE. A fault or rogue DMA is contained in the host.
-            print_str(b"[ntos-exec] driver host: START with CM_RESOURCE_LIST + confined DMA buffer\n");
-            // Resource frame: mapped here (to fill it) and, via a copy, in the host.
-            let reslist_frame = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, reslist_frame);
-            let _ = page_map(reslist_frame, RESLIST_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-            // PnP resource assignment (host-tested `nt-pnp` policy): bind the enumerated NIC and
-            // assign it its MMIO BAR + the MSI vector the executive programmed (latched). The broker
-            // then writes the driver-visible CM_RESOURCE_LIST — the exact bytes the .sys reads at
-            // IRP_MN_START_DEVICE — naming the driver's mapped MMIO window (NIC_VADDR, the minted
-            // BAR frames aliased into the host) + the assigned interrupt. The interrupt vector +
-            // MMIO BAR now come from PnP, not hand-authored constants.
-            if let Some(g) = assign_nic(&pci_devices, NIC_MSI_VECTOR as u32, true, 0x1000) {
-                write_cm_resource_list(RESLIST_VADDR, 0, &g.assignment, NIC_VADDR, 0x4000);
-            }
-            // Common-buffer descriptor (the DMA adapter's AllocateCommonBuffer result):
-            // CPU virtual address, device logical address (IOVA), length.
-            core::ptr::write_volatile((RESLIST_VADDR + 0x100) as *mut u64, DMA_VADDR);
-            core::ptr::write_volatile((RESLIST_VADDR + 0x108) as *mut u64, NIC_IOVA);
-            core::ptr::write_volatile((RESLIST_VADDR + 0x110) as *mut u64, 0x1000u64);
-            core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, 0); // clear verdict
-            core::ptr::write_volatile((RESLIST_VADDR + 0x210) as *mut u8, 0); // clear .sys verdict
-            // Pre-load the REAL .sys driver (the executive owns the heap): map its image
-            // frames RW here, parse/map/relocate/patch-IAT to our stubs, then hand the same
-            // frames to the host R+X. Also a RW arena for the driver's host-side state.
-            let mut pe_base = 0u64;
-            for i in 0..driver_pe::PE_FRAMES {
-                let f = alloc_slot();
-                if i == 0 {
-                    pe_base = f;
-                }
-                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-                let _ = page_map(f, driver_pe::CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-            }
-            let sys_entry = driver_pe::load_into().unwrap_or(0);
-            let mut arena_base = 0u64;
-            for i in 0..driver_pe::ARENA_FRAMES {
-                let f = alloc_slot();
-                if i == 0 {
-                    arena_base = f;
-                }
-                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-                let _ = page_map(f, driver_pe::ARENA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-            }
-            core::ptr::write_volatile((RESLIST_VADDR + 0x300) as *mut u64, sys_entry as u64);
-            core::ptr::write_volatile((RESLIST_VADDR + 0x308) as *mut u64, nic_mmio);
-            print_str(b"[ntos-exec] pre-loaded real PnpMmioInterruptTest.sys; DriverEntry rva=");
-            print_hex(sys_entry);
-            print_str(b"\n");
-            // A fresh badged result notification the host signals when it's done.
-            let dh_result = make_object(OBJ_NOTIFICATION);
-            let dh_result_badged = alloc_slot();
-            let _ = syscall5(
-                SYS_SEND,
-                CAP_INIT_THREAD_CNODE,
-                LBL_CNODE_MINT << 12,
-                dh_result_badged,
-                dh_result,
-                ISR_DONE_BADGE,
-            );
-            // Hand the host a cap to the NIC's IRQ notification too (full resource grant).
-            let dh_irq = copy_cap(nic_irq_ntfn);
-            let dh_fault = make_object(OBJ_ENDPOINT);
-            spawn_driver_host(
-                driver_host::driver_host_entry,
-                dh_irq,
-                dh_result_badged,
-                dh_fault,
-                100,
-                nic_bar_base,
-                dma_frame,
-                reslist_frame,
-                pe_base,
-                arena_base,
-            );
-            let _ = dh_fault; // a fault EP so a host fault is contained cleanly, not silent
-            // The host always signals when done; read back its verdict from the shared frame.
-            let (_z, dhb, _s, _m) = ep_recv(dh_result);
-            let dh_verdict = core::ptr::read_volatile((RESLIST_VADDR + 0x200) as *const u8);
-            print_str(b"[ntos-exec] driver host signalled badge=");
-            print_u64(dhb);
-            print_str(b" verdict=");
-            print_u64(dh_verdict as u64);
-            print_str(b"\n");
-            check(b"exec_driver_host_drove_nic", dh_verdict == 1, &mut passed);
-            // ...and a REAL Windows .sys driver binary ran in that same isolated host,
-            // driven through DriverEntry → AddDevice → IRP_MN_START_DEVICE with our real
-            // CM_RESOURCE_LIST, reaching the real NIC via MmMapIoSpace.
-            let sys_v = core::ptr::read_volatile((RESLIST_VADDR + 0x210) as *const u8);
-            print_str(b"[ntos-exec] hosted real .sys verdict bits=0x");
-            print_hex(sys_v as u32);
-            print_str(b"\n");
-            check(b"exec_sys_driver_entry_ok", (sys_v & 1) != 0, &mut passed);
-            check(b"exec_sys_adddevice_built_fdo", (sys_v & 2) != 0, &mut passed);
-            check(b"exec_sys_start_reached_real_nic", (sys_v & 8) != 0, &mut passed);
-            if (sys_v & 4) == 0 {
-                print_str(b"[ntos-exec]   note: the driver's START handler ran + did real MMIO,\n");
-                print_str(b"[ntos-exec]   then returned a device-specific status (the real device\n");
-                print_str(b"[ntos-exec]   is an e1000e NIC, not this driver's own test device).\n");
-            }
+            // NOTE: the ISOLATED real-.sys DRIVER-HOST hosting used to run here, but it now loads
+            // the driver BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
+            // the FS mount (search "DEFERRED DRIVER-HOST"). VT-d + the raw NIC MMIO/DMA specs above
+            // MUST stay here (before the storage block turns on / relies on VT-d).
         }
     }
 
-    // ---- KMDF DRIVER HOST: host a real KMDF driver (KmdfBasicTest.sys) through the FULL
-    // WDF lifecycle (DriverEntry → WdfDriverCreate → AddDevice → EvtDevicePrepareHardware
-    // → D0Entry → IOCTLs → REMOVE) in a SEPARATE isolated host — the MODERN Windows driver
-    // framework, crash-contained on the microkernel. Software-only (simulated MMIO).
-    {
-        print_str(b"[ntos-exec] KMDF host: loading real KmdfBasicTest.sys\n");
-        let mut kmdf_pe_base = 0u64;
-        for i in 0..kmdf_host::KMDF_PE_FRAMES {
-            let f = alloc_slot();
-            if i == 0 {
-                kmdf_pe_base = f;
-            }
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
-            let _ = page_map(f, kmdf_host::KMDF_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-        }
-        let kmdf_entry = kmdf_host::load_into().unwrap_or(0);
-        let kmdf_shared = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, kmdf_shared);
-        let _ = page_map(kmdf_shared, kmdf_host::KMDF_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-        core::ptr::write_volatile(kmdf_host::KMDF_SHARED_VADDR as *mut u64, kmdf_entry as u64);
-        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *mut u32, 0);
-        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *mut u32, 0);
-        print_str(b"[ntos-exec] pre-loaded KmdfBasicTest.sys; FxDriverEntry rva=");
-        print_hex(kmdf_entry);
-        print_str(b"\n");
-        let kmdf_result = make_object(OBJ_NOTIFICATION);
-        let kmdf_result_badged = alloc_slot();
-        let _ = syscall5(
-            SYS_SEND,
-            CAP_INIT_THREAD_CNODE,
-            LBL_CNODE_MINT << 12,
-            kmdf_result_badged,
-            kmdf_result,
-            ISR_DONE_BADGE,
-        );
-        let kmdf_fault = make_object(OBJ_ENDPOINT);
-        spawn_kmdf_host(
-            kmdf_host::kmdf_host_entry,
-            kmdf_result_badged,
-            kmdf_fault,
-            100,
-            kmdf_pe_base,
-            kmdf_shared,
-            kmdf_nic_bar_base,
-        );
-        let _ = kmdf_fault;
-        let (_z, _b, _s, _m) = ep_recv(kmdf_result);
-        let kv = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *const u32);
-        print_str(b"[ntos-exec] KMDF host lifecycle verdict bits=0x");
-        print_hex(kv);
-        print_str(b"\n");
-        check(b"exec_kmdf_driver_create", (kv & 1) != 0, &mut passed);
-        check(b"exec_kmdf_adddevice_queue", (kv & 2) != 0, &mut passed);
-        // bit 4 now = the driver's PrepareHardware mapped the REAL NIC BAR + read + rejected
-        // a real register (not its 'KMDF' test HW) — a real KMDF driver reaching real HW.
-        check(b"exec_kmdf_prepare_hw_read_real_nic", (kv & 4) != 0, &mut passed);
-        check(b"exec_kmdf_ioctl", (kv & 8) != 0, &mut passed);
-        check(b"exec_kmdf_remove", (kv & 16) != 0, &mut passed);
-        // The KMDF driver, in EvtDevicePrepareHardware, mapped the REAL e1000e BAR
-        // (MmMapIoSpace → NIC_VADDR) and its READ_REG32 IOCTL returned register 0 (CTRL).
-        // Verify it matches a direct read of the same live register — a real KMDF driver
-        // reaching real hardware through the WDF stack.
-        let kmdf_ctrl = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *const u32);
-        let direct_ctrl = if kmdf_nic_bar_base != 0 {
-            core::ptr::read_volatile(NIC_VADDR as *const u32)
-        } else {
-            0
-        };
-        print_str(b"[ntos-exec] KMDF driver read real NIC CTRL=0x");
-        print_hex(kmdf_ctrl);
-        print_str(b" (direct read=0x");
-        print_hex(direct_ctrl);
-        print_str(b")\n");
-        check(
-            b"exec_kmdf_read_real_nic",
-            kmdf_ctrl != 0 && kmdf_ctrl != 0xFFFF_FFFF && kmdf_ctrl == direct_ctrl,
-            &mut passed,
-        );
-    }
+    // NOTE: the KMDF DRIVER HOST used to run here, but (like the NIC driver-host) it now loads
+    // KmdfBasicTest.sys BY-PATH from the FS (no baked include_bytes!), so it is DEFERRED to after
+    // the FS mount (search "DEFERRED DRIVER-HOST").
 
     // --- P2: real block I/O in an ISOLATED host with VT-d-CONFINED DMA. The executive is the
     // Tier-1 broker: it enables Bus Master, claims the AHCI BAR + a DMA frame, gives the AHCI
@@ -5084,6 +4916,221 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         check(
             b"exec_disk_section_demand_paged",
             ld_magic == 0x3145_5649_4854_4E55 && ld_faults >= 1,
+            &mut passed,
+        );
+    }
+
+    // ==== DEFERRED DRIVER-HOST hosting (NIC + KMDF) — driver-model migration ====================
+    // The NIC (PnpMmioInterruptTest.sys) + KMDF (KmdfBasicTest.sys) driver hosts are launched here,
+    // AFTER the FS is mounted, so both `.sys` binaries are loaded BY-PATH from the FS via the general
+    // dynamic path (load_file_to_pool) — NO baked include_bytes!. The raw NIC MMIO/DMA + VT-d specs
+    // ran earlier (they must precede the storage block). The bespoke `spawn_driver_host` /
+    // `spawn_kmdf_host` are gone: their least-privilege ComponentDescriptors are inlined below and
+    // spawned via the generic `spawn_component` engine. Behaviour-preserving (verdict-identical).
+    //
+    // ---- NIC (WDM) real-.sys driver host: DriverEntry → AddDevice → IRP_MN_START_DEVICE.
+    if found_nic && nic_bar_base != 0 {
+        // ---- DRIVER HOST AT START: the executive, acting as the PnP manager + HAL, hands an
+        // ISOLATED driver host a real NT CM_RESOURCE_LIST (MMIO + interrupt) and a VT-d-confined
+        // common DMA buffer, then lets it drive the NIC from its own CSpace/VSpace.
+        print_str(b"[ntos-exec] driver host: START with CM_RESOURCE_LIST + confined DMA buffer\n");
+        let reslist_frame = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, reslist_frame);
+        let _ = page_map(reslist_frame, RESLIST_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+        // PnP resource assignment (host-tested `nt-pnp` policy) → the driver-visible CM_RESOURCE_LIST.
+        if let Some(g) = assign_nic(&pci_devices, NIC_MSI_VECTOR as u32, true, 0x1000) {
+            write_cm_resource_list(RESLIST_VADDR, 0, &g.assignment, NIC_VADDR, 0x4000);
+        }
+        core::ptr::write_volatile((RESLIST_VADDR + 0x100) as *mut u64, DMA_VADDR);
+        core::ptr::write_volatile((RESLIST_VADDR + 0x108) as *mut u64, NIC_IOVA);
+        core::ptr::write_volatile((RESLIST_VADDR + 0x110) as *mut u64, 0x1000u64);
+        core::ptr::write_volatile((RESLIST_VADDR + 0x200) as *mut u8, 0); // clear verdict
+        core::ptr::write_volatile((RESLIST_VADDR + 0x210) as *mut u8, 0); // clear .sys verdict
+        // Load the REAL .sys driver BY-PATH from the FS, map its image frames RW here,
+        // parse/map/relocate/patch-IAT to our stubs, then hand the same frames to the host R+X.
+        let mut pe_base = 0u64;
+        for i in 0..driver_pe::PE_FRAMES {
+            let f = alloc_slot();
+            if i == 0 {
+                pe_base = f;
+            }
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+            let _ = page_map(f, driver_pe::CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        let sys_entry = exec_fs()
+            .and_then(|fs| {
+                load_file_to_pool(&fs, b"reactos\\system32\\drivers\\PnpMmioInterruptTest.sys")
+            })
+            .and_then(|(va, sz)| {
+                driver_pe::load_into(core::slice::from_raw_parts(va as *const u8, sz as usize))
+            })
+            .unwrap_or(0);
+        let mut arena_base = 0u64;
+        for i in 0..driver_pe::ARENA_FRAMES {
+            let f = alloc_slot();
+            if i == 0 {
+                arena_base = f;
+            }
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+            let _ = page_map(f, driver_pe::ARENA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        core::ptr::write_volatile((RESLIST_VADDR + 0x300) as *mut u64, sys_entry as u64);
+        core::ptr::write_volatile((RESLIST_VADDR + 0x308) as *mut u64, nic_mmio);
+        print_str(b"[ntos-exec] loaded PnpMmioInterruptTest.sys BY-PATH; DriverEntry rva=");
+        print_hex(sys_entry);
+        print_str(b"\n");
+        let dh_result = make_object(OBJ_NOTIFICATION);
+        let dh_result_badged = alloc_slot();
+        let _ = syscall5(
+            SYS_SEND,
+            CAP_INIT_THREAD_CNODE,
+            LBL_CNODE_MINT << 12,
+            dh_result_badged,
+            dh_result,
+            ISR_DONE_BADGE,
+        );
+        let dh_irq = copy_cap(nic_irq_ntfn);
+        let dh_fault = make_object(OBJ_ENDPOINT);
+        // Inlined descriptor (was spawn_driver_host): the granted device resources — the 4 NIC BAR
+        // pages, the confined DMA buffer, the CM_RESOURCE_LIST frame, the real .sys image (RWX) + its
+        // RW arena — each aliasing the executive's frame. Least privilege via `spawn_component`.
+        {
+            let regions = [
+                Region { source: FrameSource::Alias(nic_bar_base), base_va: NIC_VADDR, count: 4, rights: Rights::Uniform(RW_NX), pts: 0 },
+                Region { source: FrameSource::Alias(nic_dma_frame), base_va: DMA_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
+                Region { source: FrameSource::Alias(reslist_frame), base_va: RESLIST_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
+                Region { source: FrameSource::Alias(pe_base), base_va: driver_pe::CODE_VA, count: driver_pe::PE_FRAMES, rights: Rights::Uniform(3 /* RWX */), pts: 0 },
+                Region { source: FrameSource::Alias(arena_base), base_va: driver_pe::ARENA_VADDR, count: driver_pe::ARENA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 },
+            ];
+            let d = ComponentDescriptor {
+                entry: driver_host::driver_host_entry,
+                image_rights: Rights::Uniform(2), // RO
+                map_heap_pt: false,
+                stack_base: STACK_BASE,
+                stack_frames: STACK_FRAMES,
+                stack_dedicated_pt: false,
+                regions: &regions,
+                granted: GrantedCaps { irq_ntfn: Some(dh_irq), result_ntfn: Some(dh_result_badged), fault_ep: Some(dh_fault) },
+                prio: 100,
+                gs_base: None,
+            };
+            let _ = spawn_component(&d);
+        }
+        let _ = dh_fault; // a fault EP so a host fault is contained cleanly, not silent
+        let (_z, dhb, _s, _m) = ep_recv(dh_result);
+        let dh_verdict = core::ptr::read_volatile((RESLIST_VADDR + 0x200) as *const u8);
+        print_str(b"[ntos-exec] driver host signalled badge=");
+        print_u64(dhb);
+        print_str(b" verdict=");
+        print_u64(dh_verdict as u64);
+        print_str(b"\n");
+        check(b"exec_driver_host_drove_nic", dh_verdict == 1, &mut passed);
+        let sys_v = core::ptr::read_volatile((RESLIST_VADDR + 0x210) as *const u8);
+        print_str(b"[ntos-exec] hosted real .sys verdict bits=0x");
+        print_hex(sys_v as u32);
+        print_str(b"\n");
+        check(b"exec_sys_driver_entry_ok", (sys_v & 1) != 0, &mut passed);
+        check(b"exec_sys_adddevice_built_fdo", (sys_v & 2) != 0, &mut passed);
+        check(b"exec_sys_start_reached_real_nic", (sys_v & 8) != 0, &mut passed);
+        if (sys_v & 4) == 0 {
+            print_str(b"[ntos-exec]   note: the driver's START handler ran + did real MMIO,\n");
+            print_str(b"[ntos-exec]   then returned a device-specific status (the real device\n");
+            print_str(b"[ntos-exec]   is an e1000e NIC, not this driver's own test device).\n");
+        }
+    }
+
+    // ---- KMDF DRIVER HOST: host a real KMDF driver (KmdfBasicTest.sys) through the FULL WDF
+    // lifecycle (DriverEntry → WdfDriverCreate → AddDevice → EvtDevicePrepareHardware → D0Entry →
+    // IOCTLs → REMOVE) in a SEPARATE isolated host — crash-contained on the microkernel.
+    {
+        print_str(b"[ntos-exec] KMDF host: loading real KmdfBasicTest.sys BY-PATH\n");
+        let mut kmdf_pe_base = 0u64;
+        for i in 0..kmdf_host::KMDF_PE_FRAMES {
+            let f = alloc_slot();
+            if i == 0 {
+                kmdf_pe_base = f;
+            }
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, f);
+            let _ = page_map(f, kmdf_host::KMDF_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
+        let kmdf_entry = exec_fs()
+            .and_then(|fs| load_file_to_pool(&fs, b"reactos\\system32\\drivers\\KmdfBasicTest.sys"))
+            .and_then(|(va, sz)| {
+                kmdf_host::load_into(core::slice::from_raw_parts(va as *const u8, sz as usize))
+            })
+            .unwrap_or(0);
+        let kmdf_shared = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, kmdf_shared);
+        let _ = page_map(kmdf_shared, kmdf_host::KMDF_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+        core::ptr::write_volatile(kmdf_host::KMDF_SHARED_VADDR as *mut u64, kmdf_entry as u64);
+        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *mut u32, 0);
+        core::ptr::write_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *mut u32, 0);
+        print_str(b"[ntos-exec] loaded KmdfBasicTest.sys BY-PATH; FxDriverEntry rva=");
+        print_hex(kmdf_entry);
+        print_str(b"\n");
+        let kmdf_result = make_object(OBJ_NOTIFICATION);
+        let kmdf_result_badged = alloc_slot();
+        let _ = syscall5(
+            SYS_SEND,
+            CAP_INIT_THREAD_CNODE,
+            LBL_CNODE_MINT << 12,
+            kmdf_result_badged,
+            kmdf_result,
+            ISR_DONE_BADGE,
+        );
+        let kmdf_fault = make_object(OBJ_ENDPOINT);
+        // Inlined descriptor (was spawn_kmdf_host): image RWX (WDF fn-table/globals live in .bss), a
+        // heap (WdfRuntime + Wdf*Create allocate), the KMDF PE (RWX), a shared word, and (optionally)
+        // the real e1000e NIC BAR (4 pages aliased) at NIC_VADDR for MmMapIoSpace. Deep stack.
+        {
+            let mut regions: [Region; 4] = [
+                Region { source: FrameSource::FreshZeroed, base_va: allocator::HEAP_BASE as u64, count: allocator::SERVICE_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 },
+                Region { source: FrameSource::Alias(kmdf_pe_base), base_va: kmdf_host::KMDF_CODE_VA, count: kmdf_host::KMDF_PE_FRAMES, rights: Rights::Uniform(3 /* RWX */), pts: 0 },
+                Region { source: FrameSource::Alias(kmdf_shared), base_va: kmdf_host::KMDF_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
+                Region { source: FrameSource::Alias(0), base_va: NIC_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 },
+            ];
+            if kmdf_nic_bar_base != 0 {
+                regions[3] = Region { source: FrameSource::Alias(kmdf_nic_bar_base), base_va: NIC_VADDR, count: 4, rights: Rights::Uniform(RW_NX), pts: 0 };
+            }
+            let d = ComponentDescriptor {
+                entry: kmdf_host::kmdf_host_entry,
+                image_rights: Rights::Uniform(3), // RWX
+                map_heap_pt: true,
+                stack_base: STACK_BASE,
+                stack_frames: 16, // 64 KiB — WDF call chains are deep
+                stack_dedicated_pt: false,
+                regions: &regions,
+                granted: GrantedCaps { irq_ntfn: None, result_ntfn: Some(kmdf_result_badged), fault_ep: Some(kmdf_fault) },
+                prio: 100,
+                gs_base: None,
+            };
+            let _ = spawn_component(&d);
+        }
+        let _ = kmdf_fault;
+        let (_z, _b, _s, _m) = ep_recv(kmdf_result);
+        let kv = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 8) as *const u32);
+        print_str(b"[ntos-exec] KMDF host lifecycle verdict bits=0x");
+        print_hex(kv);
+        print_str(b"\n");
+        check(b"exec_kmdf_driver_create", (kv & 1) != 0, &mut passed);
+        check(b"exec_kmdf_adddevice_queue", (kv & 2) != 0, &mut passed);
+        check(b"exec_kmdf_prepare_hw_read_real_nic", (kv & 4) != 0, &mut passed);
+        check(b"exec_kmdf_ioctl", (kv & 8) != 0, &mut passed);
+        check(b"exec_kmdf_remove", (kv & 16) != 0, &mut passed);
+        let kmdf_ctrl = core::ptr::read_volatile((kmdf_host::KMDF_SHARED_VADDR + 0x10) as *const u32);
+        let direct_ctrl = if kmdf_nic_bar_base != 0 {
+            core::ptr::read_volatile(NIC_VADDR as *const u32)
+        } else {
+            0
+        };
+        print_str(b"[ntos-exec] KMDF driver read real NIC CTRL=0x");
+        print_hex(kmdf_ctrl);
+        print_str(b" (direct read=0x");
+        print_hex(direct_ctrl);
+        print_str(b")\n");
+        check(
+            b"exec_kmdf_read_real_nic",
+            kmdf_ctrl != 0 && kmdf_ctrl != 0xFFFF_FFFF && kmdf_ctrl == direct_ctrl,
             &mut passed,
         );
     }
