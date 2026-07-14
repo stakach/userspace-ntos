@@ -7,7 +7,37 @@ STAGED SUBSET (each binary at a flat `::NAME` on the disk, read into a fixed buf
 to loading ANY ReactOS binary **BY PATH** from a real FS holding the full `\reactos`
 install tree.
 
-## Status: **FOUNDATION STARTED (2026-07-14)** — first FS-backed-by-path load proven
+## Status: **FOUNDATION — FS MIGRATION LANDED (2026-07-14)** — the whole stack loads from the real FS by path
+
+### P7-A DONE (green, 142/142, desktop 0x003a6ea5, `./run.sh` SUCCESS): sub-steps A+B+C
+The storage host reads EVERY ReactOS binary BY PATH from the full `\reactos` tree on a 256 MiB
+FAT32 superfloppy; the flat `::NAME` staging is retired.
+- **A — full-FS image** (rust-micro `6a4fdd7`): `fetch_reactos.sh` extracts the complete `reactos/`
+  tree (171 MiB / 1011 files, `.fulltree-ok` marker); `make_image.sh` grew the superfloppy 64→256
+  MiB + `mcopy -s`'s the whole tree to `::reactos`. BOOTBOOT + the LBA48 AHCI reader handle it.
+- **B — LFN in dir_find** (executive `25f07c9`): `dir_find_lfn` reassembles VFAT long names so
+  `kernel32_vista.dll`/`advapi32_vista.dll`/… resolve by real name. **Load-bearing collision fix:**
+  the 8.3 fallback is gated on `fits_83` — a long target truncates via `name_to_83`
+  (`kernel32_vista.dll`→`KERNEL32DLL`) and would falsely match `kernel32.dll` (2.7 MB > the 64 KB
+  vista slot → read skipped → csrss vista forwarder breaks → no winlogon/desktop). Long names match
+  ONLY via LFN. (Caught by the gate: 8 regressions incl. the desktop; fixed before commit.)
+- **C — source everything by path + retire flat staging** (executive `25f07c9` + rust-micro
+  `7122b67`): `storage_probe` reads all 31 binaries via `open_sys32`/`fat_open_path`; `make_image.sh`
+  no longer stages flat `::NAME` (only `::SYSTEM.DAT` synthetic hive + `::IMPORTS.BIN` remain flat —
+  both build-generated, non-tree). New spec **`exec_full_stack_from_fs`** (verdict 0x200 = 31 hits /
+  0 fallbacks). `STAGE_FLAT_REACTOS=1` re-stages the flat copies for A/B debugging.
+
+**REMAINING (P7-A completion — the on-demand generalization; DEFERRED for review):** the ~15 fixed
+dual-mapped buffers + the name-scoped `NtOpenFile`/`NtQueryAttributesFile`/`NtCreateSection` fakes
+still exist — the host fills the buffers from FS-by-path reads AT BOOT, and the executive PE-parses
+each at a hardcoded offset. Retiring the BUFFERS means resolving `\SystemRoot\system32\X` at
+NtOpenFile TIME → `fat_open_path` → on-demand read → PE-parse. The mapping agent confirmed this is
+feasible WITHOUT a new IPC channel (the executive already owns the AHCI BAR cap; needs to map the
+DMA frame into its own VSpace + keep a `Fat32` handle post-boot + call the FS fns from the fake).
+This removes the 4-place add-a-binary contract — the real unlock for P5 (add services.exe/lsass by
+path, no new buffer). Deep refactor of the delicate loader — **hold for review before proceeding.**
+
+### P7-A history / audit (first increment)
 
 ### P7-A: FS-backed-by-path loading (in progress)
 

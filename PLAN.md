@@ -844,3 +844,23 @@ findings). A step is not "done" until the plan reflects it.
   `fat_open_path` into the on-demand loader seam, retiring the staged buffers) is in
   `plans/P7-reactos-integration.md` (P7-A) — AWAITING REVIEW before the migration.** Detail:
   memory `project_full_fs.md`.
+- **2026-07-14 — P7-A FS MIGRATION LANDED: the WHOLE stack loads from the real FS by path**
+  (rust-micro `6a4fdd7`+`7122b67`, executive `25f07c9`). Design approved; migration done in green
+  sub-steps. **A — full-FS image:** `fetch_reactos.sh` extracts the complete `reactos/` tree (171
+  MiB / 1011 files, `.fulltree-ok` marker); `make_image.sh` grew the superfloppy 64→256 MiB +
+  `mcopy -s`'d the whole tree to `::reactos`; BOOTBOOT (UEFI) + the LBA48 AHCI reader both handle
+  the larger volume. **B — LFN:** `dir_find_lfn` reassembles VFAT long names so `kernel32_vista.dll`
+  /`advapi32_vista.dll` resolve by real name; **load-bearing collision fix** — the 8.3 fallback is
+  gated on `fits_83` (a long name truncates via `name_to_83` → `KERNEL32DLL` and would falsely match
+  `kernel32.dll` 2.7 MB > the 64 KB vista slot → csrss vista forwarder breaks → no desktop; the gate
+  caught 8 regressions). **C — by-path + retire flat staging:** `storage_probe` reads all 31 binaries
+  (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32 client stack + the vista forwarders + NLS +
+  win32k/dxg/dxgthk/ftfd/framebuf/arial/winlogon + the SYSTEM hive at `system32\config\system`) via
+  `open_sys32`/`fat_open_path`; `make_image.sh` no longer stages flat `::NAME` (only `::SYSTEM.DAT` +
+  `::IMPORTS.BIN`, both build-generated non-tree, remain flat; `STAGE_FLAT_REACTOS=1` re-stages).
+  New counted spec **`exec_full_stack_from_fs`** (verdict 0x200 = 31 hits / 0 fallbacks). **Gate
+  142/142, desktop paints `0x003a6ea5`, `[microtest done]`, `./run.sh` SUCCESS.** No `rust-micro/src`
+  change → sel4test byte-identical. **REMAINING P7-A (the on-demand generalization — retiring the ~15
+  fixed buffers + name-scoped fakes via a read-at-NtOpenFile path) is DEFERRED for review** before P5
+  — feasible without a new IPC channel (mapping agent confirmed); it removes the 4-place add-a-binary
+  contract, the real unlock for P5. Detail: memory `project_full_fs.md`.
