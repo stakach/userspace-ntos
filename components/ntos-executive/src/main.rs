@@ -10134,6 +10134,74 @@ unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, dest_vaddr: u
     written
 }
 
+/// Convert one path component (e.g. `b"ntdll.dll"`) to a space-padded 8.3 FAT short name.
+/// ASCII-uppercases; splits on the LAST '.' (a leading dot is treated as part of the base);
+/// truncates base to 8 and extension to 3. Good enough for the ReactOS install tree, whose
+/// names (`reactos`, `system32`, `ntdll.dll`, …) all have clean 8.3 aliases — verified: mcopy
+/// stores the uppercased 8.3 short entry (`REACTOS`, `SYSTEM32`, `NTDLL   DLL`) alongside an
+/// LFN, and `dir_find` matches the short entry (skipping LFN fragments). No `~1` mangling.
+fn name_to_83(comp: &[u8]) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    let upper = |c: u8| if c.is_ascii_lowercase() { c - 32 } else { c };
+    // Locate the extension separator = the last '.' that isn't the first char.
+    let mut dot: Option<usize> = None;
+    let mut i = 0usize;
+    while i < comp.len() {
+        if comp[i] == b'.' && i != 0 {
+            dot = Some(i);
+        }
+        i += 1;
+    }
+    let (base_end, ext_start) = match dot {
+        Some(d) => (d, d + 1),
+        None => (comp.len(), comp.len()),
+    };
+    let mut j = 0usize;
+    while j < 8 && j < base_end {
+        out[j] = upper(comp[j]);
+        j += 1;
+    }
+    let mut k = 0usize;
+    while k < 3 && ext_start + k < comp.len() {
+        out[8 + k] = upper(comp[ext_start + k]);
+        k += 1;
+    }
+    out
+}
+
+/// Resolve a `\`- or `/`-separated PATH (e.g. `b"reactos\\system32\\ntdll.dll"`) from the
+/// volume root, walking each component with `dir_find`. Returns `(first_cluster, size)` of the
+/// final file, or `None` if any component is missing. 8.3 short names only (no LFN reassembly)
+/// — sufficient for the real ReactOS tree, whose names carry clean 8.3 aliases. Each non-final
+/// component must be a directory (FAT attr bit 0x10). This is the FS-backed-by-path primitive:
+/// the seam a full `\SystemRoot\system32\X` loader generalizes (see P7).
+unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
+    let mut cur = fs.root_cl;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut result: Option<(u32, u32)> = None;
+    while i <= path.len() {
+        let is_sep = i == path.len() || path[i] == b'\\' || path[i] == b'/';
+        if is_sep {
+            if i > start {
+                let name11 = name_to_83(&path[start..i]);
+                let (cl, sz, attr) = dir_find(fs, cur, &name11)?;
+                if i == path.len() {
+                    result = Some((cl, sz)); // final component = the file
+                } else {
+                    if (attr & 0x10) == 0 {
+                        return None; // intermediate must be a directory
+                    }
+                    cur = cl;
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    result
+}
+
 /// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
 /// sector 0 (MBR), parse the FAT32 volume, list the root directory, read BOOTBOOT/INITRD, and
 /// read the registry hive `SYSTEM.DAT` into `hive_dest`. Returns (verdict, initrd_cluster,
@@ -10390,7 +10458,27 @@ unsafe fn storage_probe(
             }
         }
         // The real ReactOS ntdll.dll (~975 KiB) into `ntdll_dest` — smss's imports resolve here.
-        if let Some((nc, nsz, _)) = dir_find(&fs, fs.root_cl, b"NTDLL   DLL") {
+        // P7 FS-BACKED-BY-PATH: prefer resolving ntdll from the real install tree at
+        // \reactos\system32\ntdll.dll via a nested-directory walk (fat_open_path); fall back to
+        // the flat staged ::NTDLL.DLL so the boot stays green if the tree isn't present. The bytes
+        // are identical either way, so the loaded ntdll (and the whole boot) is unchanged.
+        // verdict bit 0x100 = ntdll came from the FS BY PATH (the counted spec).
+        let ntdll_ent = match fat_open_path(&fs, b"reactos\\system32\\ntdll.dll") {
+            Some((pc, psz)) => {
+                print_str(b"[storage-host] ntdll resolved BY PATH \\reactos\\system32\\ntdll.dll cluster=");
+                print_u64(pc as u64);
+                print_str(b" size=");
+                print_u64(psz as u64);
+                print_str(b"\n");
+                verdict |= 0x100;
+                Some((pc, psz, 0u8))
+            }
+            None => {
+                print_str(b"[storage-host] ntdll BY PATH not found; falling back to flat ::NTDLL.DLL\n");
+                dir_find(&fs, fs.root_cl, b"NTDLL   DLL")
+            }
+        };
+        if let Some((nc, nsz, _)) = ntdll_ent {
             let cap = (NTDLLBUF_FRAMES * 0x1000) as u32;
             let want = if nsz < cap { nsz } else { cap };
             let got = fat_read_file(&fs, nc, want, ntdll_dest);
@@ -12108,6 +12196,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"exec_storage_host_root_dir", (verdict & 4) != 0, &mut passed);
             check(b"exec_storage_host_confined_read_file", (verdict & 8) != 0, &mut passed);
             check(b"exec_storage_host_read_hive", (verdict & 0x10) != 0, &mut passed);
+            // P7 FS-BACKED-BY-PATH: the storage host resolved + read ntdll.dll from the real
+            // install tree at \reactos\system32\ntdll.dll via a nested-directory walk (not the
+            // flat staged ::NTDLL.DLL) — the first binary loaded from a real FS BY PATH.
+            check(b"exec_ntdll_loaded_from_fs_by_path", (verdict & 0x100) != 0, &mut passed);
 
             // --- P2 finale: the Config Manager parses the registry hive the isolated storage
             // host read off the FS (an nt-hive-core image at STORAGE_SHARED_VADDR+0x100) and

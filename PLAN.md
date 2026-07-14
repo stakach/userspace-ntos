@@ -827,3 +827,20 @@ findings). A step is not "done" until the plan reflects it.
     4. **winlogon-forward / fidelity** (SM->SB session-registration plane + `CsrSrvCreateProcess`;
        real window + input plumbing; the login UI). *Unlocks:* a more authentic desktop/session.
        *Size:* medium. *Readiness:* high — win32k multi-client + the CSR rendezvous already run.
+- **2026-07-14 — P7 FOUNDATION STARTED: first binary loaded from a real FS BY PATH** (rust-micro
+  `815adb4` + executive commit below). Goal: move binary loading from the curated STAGED SUBSET
+  (each binary flat `::NAME` on disk → a fixed buffer, name-substring `NtOpenFile` fakes) to
+  loading ANY ReactOS binary BY PATH from a real FS carrying the full `\reactos` tree. **Audited**
+  the staged-load seam (`storage_probe` `main.rs:10143` reads ~35 hardcoded 8.3 names into ~15
+  fixed dual-mapped buffers, published via the `STORAGE_SHARED` mailbox, PE-parsed in
+  `service_sec_image`), the P2 FS primitives (8.3-only `dir_find`/`fat_read_file`; only prior
+  multi-level walk = hand-inlined BOOTBOOT/INITRD), and ISO sizing (full `\reactos` = 171 MiB /
+  1011 files vs the 64 MiB superfloppy → 256 MiB for the full tree). **First increment (green):**
+  added a `name_to_83` + `fat_open_path` nested-directory path-walker; `make_image.sh` also stages
+  `::reactos/system32/ntdll.dll`; `storage_probe` now resolves ntdll BY PATH from
+  `\reactos\system32\ntdll.dll` (verdict `0x100`, falls back to flat `::NTDLL.DLL`). New counted
+  spec **`exec_ntdll_loaded_from_fs_by_path`** — gate **141/141**, desktop still paints
+  `0x003a6ea5`, `[microtest done]`. **Design for the bulk (full-tree 256 MiB image + generalizing
+  `fat_open_path` into the on-demand loader seam, retiring the staged buffers) is in
+  `plans/P7-reactos-integration.md` (P7-A) — AWAITING REVIEW before the migration.** Detail:
+  memory `project_full_fs.md`.
