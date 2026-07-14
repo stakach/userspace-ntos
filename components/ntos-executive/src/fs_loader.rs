@@ -383,42 +383,6 @@ pub(crate) unsafe fn load_dll_from_fs(
     (None, 0)
 }
 
-/// Hybrid per-DLL loader: on the LIVE run (`live`), source a registry DLL BY PATH from the FS pool;
-/// on any FS miss (or the demo run) fall back to its fixed staging buffer. Returns `(pe, buf_va)`
-/// where `buf_va` is the pool VA on an FS hit else `fb_va` — so `dll_buf_va[i] = buf_va` ALWAYS holds
-/// a valid backing VA (never 0) for relocation + the demand-fault router, exactly like the proven
-/// gdi32/userenv/mpr per-block migration. `fb_off` = the STORAGE_SHARED size offset of the fixed
-/// buffer. Centralizing the fixed-buffer arm here means retirement later = delete it in ONE place.
-pub(crate) unsafe fn load_dll_hybrid(
-    live: bool,
-    path: &[u8],
-    name: &[u8],
-    fb_va: u64,
-    fb_off: u64,
-) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
-    if !live {
-        return (None, fb_va);
-    }
-    let (fs_pe, fs_va) = load_dll_from_fs(path, name);
-    if fs_va != 0 {
-        return (fs_pe, fs_va);
-    }
-    let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + fb_off) as *const u32) as usize;
-    if sz > 0 {
-        let bytes: &'static [u8] = core::slice::from_raw_parts(fb_va as *const u8, sz);
-        if let Ok(pe) = nt_pe_loader::PeFile::parse(bytes) {
-            print_str(b"[ntos-exec] staged ");
-            print_str(name);
-            print_str(b" (fixed buffer)\n");
-            return (Some(pe), fb_va);
-        }
-        print_str(b"[ntos-exec] staged ");
-        print_str(name);
-        print_str(b": PARSE FAILED\n");
-    }
-    (None, fb_va)
-}
-
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
 /// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {

@@ -85,27 +85,30 @@ pub(crate) unsafe fn service_sec_image(
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
     let mut nls_section_handle = 0u64;
-    // Only the LIVE smss run (ntdll present) launches csrss AND has FILEBUF/STORAGE_SHARED mapped in
-    // the executive; the earlier demo SEC_IMAGE call has neither, so skip the read there.
-    // P7-A batch 5: source the two hosted-process EXEs csrss.exe + winlogon.exe BY PATH from the FS
-    // pool (hybrid; falls back to FILEBUF/WINLOGONBUF on any FS miss). Each is then relocated to its
-    // load base (PE_LOAD_BASE) + its OptionalHeader.ImageBase patched to match — exactly as the LIVE
-    // smss path does — so ntdll doesn't try to RELOCATE THE EXE (ldrinit.c:2409, the EXE-reloc path,
-    // is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT). The relocation runs on `*_va` (the
-    // pool buffer on an FS hit, else the fixed buffer); the demand-fault router reads the relocated
-    // bytes via the PeFile slice, so it is agnostic to where the bytes live.
-    let (csrss_pe, csrss_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\csrss.exe", b"csrss.exe",
-        FILEBUF_VADDR + CSRSS_FILEBUF_OFFSET, 0x3c);
+    // Only the LIVE smss run (ntdll present) launches csrss/winlogon; the earlier demo SEC_IMAGE call
+    // has no FS/pool, so skip the read there. The two hosted-process EXEs csrss.exe + winlogon.exe
+    // (like services.exe/lsass.exe below) are sourced BY PATH from the real \reactos FS into the
+    // demand-load pool — NO fixed buffer. Each is relocated to its load base (PE_LOAD_BASE) + its
+    // OptionalHeader.ImageBase patched to match — so ntdll doesn't try to RELOCATE THE EXE
+    // (ldrinit.c:2409, the EXE-reloc path, is UNIMPLEMENTED in ReactOS → STATUS_INVALID_IMAGE_FORMAT).
+    // The relocation runs on the pool `*_va`; the demand-fault router reads the relocated bytes via the
+    // PeFile slice.
+    let (csrss_pe, csrss_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\csrss.exe", b"csrss.exe")
+    } else {
+        (None, 0)
+    };
     if let Some(ref cpe) = csrss_pe {
         apply_relocations_to_buf(cpe, csrss_va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((csrss_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((csrss_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
     // winlogon.exe — smss's SmpExecuteInitialCommand initial command (the 3rd hosted process).
-    let (winlogon_pe, winlogon_va) = load_dll_hybrid(
-        ntdll.is_some(), b"reactos\\system32\\winlogon.exe", b"winlogon.exe",
-        WINLOGONBUF_VADDR, 0x94);
+    let (winlogon_pe, winlogon_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\winlogon.exe", b"winlogon.exe")
+    } else {
+        (None, 0)
+    };
     if let Some(ref wpe) = winlogon_pe {
         apply_relocations_to_buf(wpe, winlogon_va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((winlogon_va + 0x3c) as *const u32) as u64;
