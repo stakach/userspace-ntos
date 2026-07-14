@@ -3384,6 +3384,11 @@ struct ExecNtHandler {
     /// yet). Set the first time NtSecureConnectPort services winlogon's kernel32 → \Windows\ApiPort
     /// connect; guards the one-time region mapping (heap view + static server data) in that handler.
     winlogon_csr_view: u64,
+    /// Per-process CSR-connect region guard (bit `pi` = process pi's CSR heap-view + static-server-data
+    /// regions have been mapped into ITS VSpace). GENERAL per-process CSR/LPC connect plane: EVERY
+    /// hosted Win32 process (winlogon pi 2, services pi 3, …) gets its OWN copy of the CSR regions at
+    /// the shared CSR VAs in its own PML4. Was a single `winlogon_csr_view` guard (winlogon-only).
+    csr_view_mask: u32,
     /// The real NT Process Manager (nt-process): EPROCESS/ETHREAD, per-process handle tables, and the
     /// process/thread lifecycle. FIRST convergence increment — each hosted process (smss/csrss/
     /// winlogon) is backed by a real EPROCESS created in `new()` (below the per-syscall heap mark, so
@@ -3495,6 +3500,7 @@ impl ExecNtHandler {
             // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
             lpc_connections: alloc::vec::Vec::with_capacity(16),
             winlogon_csr_view: 0,
+            csr_view_mask: 0,
             // The real Process Manager. Pre-create an EPROCESS for each hosted process (identity is
             // fixed + known ahead of the actual seL4 spawn — real NT likewise has PspCreateProcess
             // build the EPROCESS before its threads run). Creating all three here (before the
@@ -3836,27 +3842,37 @@ impl ExecNtHandler {
         if !pending && client_handle == 0 {
             client_handle = self.mint_handle();
         }
-        // (2) Map winlogon's CSR regions once (heap view + static server data).
-        if self.winlogon_csr_view == 0 {
-            // One 2 MiB PT in winlogon covers both regions; a second PT in the executive VSpace is
-            // the fill-scratch alias for populating the static data before copy_cap'ing it in.
+        // (2) Map THIS process's CSR regions once (heap view + static server data) — per-pi. GENERAL
+        // per-process plane: winlogon (pi 2), services (pi 3), and every later Win32 process each get
+        // their OWN copy of the CSR heap-view + static-server-data at the shared CSR VAs, in their OWN
+        // VSpace (`pml4`). The regions are IDENTICAL content-wise across processes (like the DLL bases),
+        // so the same VAs are reused per-VSpace; only the guard is per-pi.
+        let pibit = 1u32 << self.pi;
+        if self.csr_view_mask & pibit == 0 {
+            // One 2 MiB PT in THIS process covers both regions.
             let wpt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, wpt);
             let _ = paging_struct_map(wpt, LBL_X86_PAGE_TABLE_MAP, WINLOGON_CSR_HEAP_VA, pml4);
-            let spt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
-            let _ = paging_struct_map(
-                spt,
-                LBL_X86_PAGE_TABLE_MAP,
-                WINLOGON_CSR_FILL_SCRATCH,
-                CAP_INIT_THREAD_VSPACE,
-            );
+            // The exec-side fill-scratch alias PT is mapped ONCE (shared across all processes — the
+            // executive services one syscall at a time, so its frames are filled-then-copied-then-
+            // unmapped within THIS call, leaving the scratch VAs free for the next process).
+            if CSR_FILL_SCRATCH_PT.swap(1, Ordering::Relaxed) == 0 {
+                let spt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
+                let _ = paging_struct_map(
+                    spt,
+                    LBL_X86_PAGE_TABLE_MAP,
+                    WINLOGON_CSR_FILL_SCRATCH,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
             // LpcWrite heap view: 16 committed RW frames (kernel32 RtlCreateHeaps over ViewBase).
             for i in 0..16u64 {
                 let f = alloc_frame();
                 let _ = page_map(copy_cap(f), WINLOGON_CSR_HEAP_VA + i * 0x1000, RW_NX, pml4);
             }
-            // Static server data (4 frames): fill via the exec scratch alias, then map into winlogon.
+            // Static server data (4 frames): fill via the exec scratch alias, then map into THIS
+            // process, then UNMAP the scratch alias so the next process reuses the same scratch VAs.
             //   page0 +0x0000: ReadOnlyStaticServerData[4]; [1] -> BASE_STATIC_SERVER_DATA
             //   page0 +0x0100: BASE_STATIC_SERVER_DATA (WindowsDirectory@0, WindowsSystemDirectory@0x10,
             //                  NamedObjectDirectory@0x20 — all x64 UNICODE_STRINGs)
@@ -3886,7 +3902,11 @@ impl ExecNtHandler {
                     write_wstr(sc + 0x060, "\\BaseNamedObjects");
                 }
                 let _ = page_map(copy_cap(f), WINLOGON_CSR_STATIC_VA + i * 0x1000, RW_NX, pml4);
+                // Release the scratch alias mapping of `f` (the target copy_cap is a distinct cap →
+                // unaffected) so the next process's fill can remap the same scratch VA.
+                let _ = page_unmap(f);
             }
+            self.csr_view_mask |= pibit;
             self.winlogon_csr_view = WINLOGON_CSR_HEAP_VA;
         }
         // (3) Fill the client PORT_VIEW (LpcWrite): ViewBase/ViewRemoteBase (delta 0 → capture pointers
@@ -3921,10 +3941,13 @@ impl ExecNtHandler {
             );
         }
         WINLOGON_CSR_CONNECTED.store(1, Ordering::Relaxed);
+        CSR_CONNECTED_MASK.fetch_or(1u64 << self.pi, Ordering::Relaxed);
+        print_str(b"[csr] pi=");
+        print_u64(self.pi as u64);
         print_str(if pending {
-            b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(fallback)=0x".as_slice()
+            b" NtSecureConnectPort(\\Windows\\ApiPort) -> driving REAL CsrApiRequestThread accept; client(fallback)=0x".as_slice()
         } else {
-            b"[csr] winlogon NtSecureConnectPort(\\Windows\\ApiPort) -> modeled accept; client=0x".as_slice()
+            b" NtSecureConnectPort(\\Windows\\ApiPort) -> modeled accept; client=0x".as_slice()
         });
         print_hex((client_handle >> 32) as u32);
         print_hex(client_handle as u32);
@@ -8942,6 +8965,13 @@ static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
+/// Set once the exec-side CSR fill-scratch page table (WINLOGON_CSR_FILL_SCRATCH) is mapped (once,
+/// shared across all hosted processes' CSR-region fills — the executive is single-threaded).
+static CSR_FILL_SCRATCH_PT: AtomicU64 = AtomicU64::new(0);
+/// Bitmask of hosted processes (bit `pi`) whose GENERAL per-process CSR client connect completed
+/// (NtSecureConnectPort → \Windows\ApiPort serviced + their own CSR regions mapped). bit 2 = winlogon,
+/// bit 3 = services. Proves the CSR connect is a per-process service, not winlogon-specific.
+static CSR_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 /// How many CSR API messages (NtRequestWaitReplyPort → \Windows\ApiPort) the direct message plane
 /// has serviced — proves winlogon↔csrss live traffic over the peer-direct plane.
 static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
@@ -13661,6 +13691,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SERVICES_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // ★ GENERAL per-process CSR client-connect: services.exe (pi 3) connected to
+                    // csrss's \Windows\ApiPort through the SAME mechanism winlogon (pi 2) uses — its own
+                    // CSR heap-view + static-server-data mapped into ITS VSpace, the real
+                    // CsrApiRequestThread accept. Both bits set (0b1100) proves the CSR connect is a
+                    // per-process service, not winlogon-specific.
+                    check(
+                        b"exec_services_csr_connect",
+                        CSR_CONNECTED_MASK.load(Ordering::Relaxed) & (1 << 3) != 0,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] CSR per-process connect mask=0x");
+                    print_hex(CSR_CONNECTED_MASK.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     // Path 1b — process-local dense handle VALUES. Two distinct EPROCESSes both hold
                     // handle 0x4 referring to DIFFERENT objects (0b111 = same-value + distinct-object
                     // + no-aliasing). The on-kernel proof that handle namespaces are per-process.
