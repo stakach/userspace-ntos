@@ -70,7 +70,6 @@ use nt_lpc_client::LpcClient;
 use nt_object_abi::ObReply;
 use nt_object_client::ObjectClient;
 use nt_hive_core::apply_ccs_alias;
-use nt_fs::{FileSystem, MemFs};
 use nt_hive_regf::{KeyRef, RegfHive};
 use nt_syscall::{
     NativeCallContext, NativeService, NativeServiceTable, NativeSyscallDispatcher,
@@ -2020,37 +2019,6 @@ static mut NPFS_PIPE_HANDLES: [(u64, u64); 32] = [(0, 0); 32];
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
 static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
-/// The real filenames of the boot-path binaries staged under `\SystemRoot\System32` (the names the
-/// ntdll/csrss loader probes). The executive's nt-fs namespace is seeded with these so nt-fs is the
-/// single authority for "does this System32 file exist + attributes." Mirrors the nt-dll-registry
-/// `dll_seed` set (which keeps the SEC_IMAGE base/geometry role for CONTENT) + csrss.exe. Adding a
-/// served binary is a seed entry here, not a handler edit.
-const SYSTEM32_FILES: &[&str] = &[
-    "csrss.exe",
-    "winlogon.exe",
-    "services.exe",
-    "lsass.exe",
-    "csrsrv.dll",
-    "basesrv.dll",
-    "winsrv.dll",
-    "kernel32.dll",
-    "user32.dll",
-    "gdi32.dll",
-    "rpcrt4.dll",
-    "msvcrt.dll",
-    "advapi32.dll",
-    "ws2_32.dll",
-    "kernel32_vista.dll",
-    "advapi32_vista.dll",
-    "ws2help.dll",
-    "ntdll_vista.dll",
-    "userenv.dll",
-    "mpr.dll",
-    "lsasrv.dll",
-    "samsrv.dll",
-    "msv1_0.dll",
-];
-
 /// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
 /// for SmpInit's PROCESSOR_IDENTIFIER build (Identifier + VendorIdentifier, both REG_SZ).
 fn synth_cpu_value(name_lc: &str) -> Option<(u32, alloc::vec::Vec<u16>)> {
@@ -2314,14 +2282,6 @@ struct ExecNtHandler {
     /// so win32k receives + models the REAL Event objects. See the `NtCreateEvent` handler.
     csrss_event_handles: [u64; 2],
     csrss_event_n: usize,
-    /// A REAL in-memory NT filesystem (nt-fs MemFs + mount manager) seeded with the boot-path system
-    /// binaries the loader probes. NtQueryAttributesFile resolves file EXISTENCE + attributes through
-    /// this real namespace instead of a hardcoded name substring — adding a served binary is a seed
-    /// call, not a handler edit. Content delivery (SEC_IMAGE demand-fault) is unchanged and still
-    /// flows through nt-dll-registry + the PE loader; this only owns the exists/attributes answer.
-    /// Allocated in `new()` (before the per-syscall heap mark) so it persists across the bump resets;
-    /// `query_attributes` is `&self` (no handle allocation) so it never reallocates during a syscall.
-    fs: FileSystem,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message

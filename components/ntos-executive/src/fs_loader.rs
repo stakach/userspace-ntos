@@ -300,6 +300,39 @@ pub(crate) unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
     fat_open_path(fs, &path[..n])
 }
 
+/// Does `\reactos\system32\<leaf>` exist on the executive's live FS? The REAL-FS existence
+/// authority for NtQueryAttributesFile/NtOpenFile (replaces the hand-maintained SYSTEM32_FILES
+/// seed): a System32 file exists iff it's present on the actual \reactos volume. `leaf` is a bare
+/// leaf name (already lowercased/folded is fine — dir_find_lfn is ASCII case-insensitive). Returns
+/// false if the FS isn't mounted yet (pre-boot) — the seed path never ran that early anyway.
+pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
+    if leaf.is_empty() {
+        return false;
+    }
+    match exec_fs() {
+        Some(fs) => open_sys32(&fs, leaf).is_some(),
+        None => false,
+    }
+}
+
+/// Does the `\reactos\system32` DIRECTORY exist on the executive's live FS (the KnownDLLs directory
+/// open)? Walks to `system32` under `reactos` and confirms it's a directory. Returns false if the
+/// FS isn't mounted yet. Real-FS authority for the System32 directory open in NtOpenFile.
+pub(crate) unsafe fn sys32_dir_exists() -> bool {
+    match exec_fs() {
+        // dir_find_lfn returns (cluster, size, attr); attr bit 0x10 = directory. Walk root→reactos→system32.
+        Some(fs) => {
+            match dir_find_lfn(&fs, fs.root_cl, b"reactos") {
+                Some((cl, _, attr)) if (attr & 0x10) != 0 => {
+                    matches!(dir_find_lfn(&fs, cl, b"system32"), Some((_, _, a)) if (a & 0x10) != 0)
+                }
+                _ => false,
+            }
+        }
+        None => false,
+    }
+}
+
 // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------
 // After the isolated storage host reports and PARKS, the executive drives the SAME AHCI HBA itself
 // (it owns the BAR cap at AHCI_VADDR + the DMA frame cap + the VT-d IO mapping at AHCI_IOVA) to

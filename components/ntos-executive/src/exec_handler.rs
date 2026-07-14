@@ -73,20 +73,6 @@ impl ExecNtHandler {
             csr_rendezvous_out: 0,
             csrss_event_handles: [0; 2],
             csrss_event_n: 0,
-            fs: {
-                // MemFs::with_fixture() gives the \Windows\System32\Config\* tree (so
-                // \Windows\System32 exists as a directory). Seed the full boot-path binary set
-                // (SYSTEM32_FILES) under System32 so nt-fs is the single authority for System32 file
-                // existence. FILE_CREATE allocates a handle below the heap mark (persistent) — the
-                // query path (`&self` query_attributes) never allocates one.
-                let mut fs = FileSystem::new(MemFs::with_fixture());
-                for name in SYSTEM32_FILES {
-                    let path = alloc::format!(r"\SystemRoot\System32\{name}");
-                    let r = fs.zw_create_file(&path, 0, 0, 0, nt_fs::FILE_CREATE, 0);
-                    let _ = fs.zw_close(r.handle);
-                }
-                fs
-            },
             // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
             // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
             lpc_connections: alloc::vec::Vec::with_capacity(16),
@@ -906,24 +892,41 @@ impl ExecNtHandler {
         }
         None
     }
-    /// Does a `\SystemRoot\System32` file with this probe's leaf name exist in the real nt-fs
-    /// namespace? Extracts the leaf (last `\`-component) of the folded probe path and looks it up
-    /// under System32 — path-form independent (the loader probes many directory prefixes for the
-    /// same DLL). nt-fs is the single existence authority; nt-dll-registry keeps SEC_IMAGE geometry.
+    /// Does a `\SystemRoot\System32` file with this probe's leaf name exist? Extracts the leaf (last
+    /// `\`-component) of the folded probe path and looks it up under System32 on the REAL \reactos
+    /// FS by-path (`sys32_exists` → `open_sys32` → `fat_open_path`) — path-form independent (the
+    /// loader probes many directory prefixes for the same DLL) and the SOLE existence authority (no
+    /// hand-maintained SYSTEM32_FILES list): a file exists iff it's present on the actual volume.
+    /// nt-dll-registry keeps the SEC_IMAGE base/geometry role for CONTENT.
     pub(crate) fn fs_system32_has(&self, folded: &[u8]) -> bool {
         let leaf = match folded.iter().rposition(|&c| c == b'\\') {
             Some(p) => &folded[p + 1..],
             None => folded,
         };
-        if leaf.is_empty() {
-            return false;
+        unsafe { sys32_exists(leaf) }
+    }
+    /// Classify a folded probe path as one of the hosted-process EXEs by substring and return its
+    /// CANONICAL System32 leaf (so existence resolves against the real file, not a possibly-malformed
+    /// extracted leaf — ReactOS occasionally builds `\??\C:\Windowsservices.exe` with no separator).
+    /// `None` if it isn't a recognized EXE probe or if it's an SxS/actctx probe (which must fail so
+    /// the loader doesn't take the .Local\/manifest path). Purely a name→canonical-leaf classifier;
+    /// the caller still confirms the leaf on the real FS.
+    fn exe_probe_canon(folded: &[u8], is_sxs: bool) -> Option<&'static [u8]> {
+        if is_sxs {
+            return None;
         }
-        let Ok(leaf_str) = core::str::from_utf8(leaf) else {
-            return false;
-        };
-        let mut path = alloc::string::String::from(r"\SystemRoot\System32\");
-        path.push_str(leaf_str);
-        self.fs.query_attributes(&path).is_some()
+        if folded.windows(5).any(|w| w == b"csrss") {
+            Some(b"csrss.exe")
+        } else if folded.windows(8).any(|w| w == b"winlogon") {
+            Some(b"winlogon.exe")
+        } else if folded.windows(8).any(|w| w == b"services") {
+            Some(b"services.exe")
+        } else if folded.windows(5).any(|w| w == b"lsass") {
+            // "lsass" is specific (lsasrv.dll folds to "lsasr", no match).
+            Some(b"lsass.exe")
+        } else {
+            None
+        }
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
@@ -2656,43 +2659,22 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // rejects SxS probes itself; the csrss.exe (EXE) probe is guarded by its own SxS check
                 // so the loader doesn't take the .Local\ redirection or a manifest path.
                 let is_sxs = nt_dll_registry::Registry::is_sxs_probe(&nb[..nlen]);
-                // The substring only CLASSIFIES which file the loader is probing (path-form
-                // tolerant); the REAL nt-fs namespace (seeded in ExecNtHandler::new) authoritatively
-                // answers whether csrss.exe exists and its attributes. Identical accept set: csrss.exe
-                // is seeded, so a csrss probe resolves EXISTS; if the seed were removed nt-fs would
-                // correctly report not-found. Content delivery stays on the nt-dll-registry/PE path.
-                let is_csrss_probe = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"csrss");
-                // winlogon.exe — smss's SmpParseCommandLine probes the initial command (×N paths).
-                // Not scoped to a pi: smss (pi==0) launches it, exactly like csrss.
-                let is_winlogon_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"winlogon");
-                // services.exe — winlogon's Win32 CreateProcessW target (the 4th hosted process).
-                let is_services_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"services");
-                // lsass.exe — winlogon's StartLsass CreateProcessW target (5th hosted process).
-                // "lsass" is specific (lsasrv.dll folds to "lsasr", no match).
-                let is_lsass_probe = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"lsass");
-                let csrss_attrs = if is_csrss_probe {
-                    self.fs.query_attributes(r"\SystemRoot\System32\csrss.exe")
-                } else if is_winlogon_probe {
-                    self.fs.query_attributes(r"\SystemRoot\System32\winlogon.exe")
-                } else if is_services_probe {
-                    self.fs.query_attributes(r"\SystemRoot\System32\services.exe")
-                } else if is_lsass_probe {
-                    self.fs.query_attributes(r"\SystemRoot\System32\lsass.exe")
-                } else {
-                    None
-                };
-                // DLL existence for csrss (pi==1) now comes from the REAL nt-fs System32 namespace
-                // (seeded with SYSTEM32_FILES). NtQueryAttributesFile is a pure existence/attributes
-                // query with no image geometry, so nt-fs is cleanly the sole authority here;
-                // nt-dll-registry keeps the SEC_IMAGE base/geometry role in NtOpenFile/NtCreateSection.
-                // Scoped to a DLL-loading process (pi>=1: csrss OR winlogon) so smss's (pi==0)
-                // KnownDLLs probes keep failing and it launches csrss/winlogon.
+                // The hosted-process EXE probes (csrss/winlogon/services/lsass) are the case where a
+                // pi==0 (smss) OR winlogon probe must resolve EXISTS even though the general DLL
+                // existence path below is gated pi>=1 (so smss's KnownDLLs probes fail → it launches
+                // csrss/winlogon). Existence comes from the REAL \reactos FS by-path (`sys32_exists`)
+                // — no hand-maintained list — but keyed on the CANONICAL leaf the substring
+                // classifies (ReactOS sometimes builds a malformed probe path, e.g.
+                // `\??\C:\Windowsservices.exe` with no separator, so the extracted leaf is garbage;
+                // the substring reliably says WHICH EXE it wants). SxS probes are rejected (loader
+                // must not take the .Local\/manifest path). Content delivery stays on nt-dll-registry.
+                let exe_canon = Self::exe_probe_canon(&nb[..nlen], is_sxs);
+                let exe_exists = exe_canon.is_some_and(|leaf| unsafe { sys32_exists(leaf) });
+                // General DLL existence (pi>=1) also comes from the real FS by-path.
                 let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
-                if let Some(si) = csrss_attrs {
+                if exe_exists {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
-                    // Attributes come from nt-fs: a file → NORMAL, a directory → DIRECTORY.
-                    let attr = if si.is_directory { 0x10 } else { 0x80 };
-                    smss_stack_write32(args[1] + 0x20, attr);
+                    smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL (a file)
                     0
                 } else if dll_exists {
                     smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL
@@ -2891,50 +2873,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
                 // The System32 DIRECTORY open (SmpCreateInitialSession → KnownDLLs) resolves through
-                // the REAL nt-fs namespace: the substring classifies the probe, nt-fs authoritatively
-                // confirms \Windows\System32 exists AND is a directory (canonical path is
-                // mount-resolvable, so path-form independent).
+                // the REAL \reactos FS: the substring classifies the probe, the FS by-path
+                // authoritatively confirms \reactos\system32 exists AND is a directory
+                // (`sys32_dir_exists`). Path-form independent.
                 let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
                 let is_sys32_dir = want_dir
                     && nb[..nlen].windows(8).any(|w| w == b"system32")
-                    && self
-                        .fs
-                        .query_attributes(r"\SystemRoot\System32")
-                        .is_some_and(|si| si.is_directory);
-                // csrss.exe FILE open (SmpExecuteImage): same as NtQueryAttributesFile — substring
-                // classifies, nt-fs owns existence + file-vs-dir. Scoped by name so the loader's
-                // manifest opens are unaffected.
-                let is_csrss = !is_sxs
-                    && nb[..nlen].windows(5).any(|w| w == b"csrss")
-                    && self
-                        .fs
-                        .query_attributes(r"\SystemRoot\System32\csrss.exe")
-                        .is_some_and(|si| !si.is_directory);
-                // winlogon.exe FILE open (SmpExecuteImage → RtlCreateUserProcess): same shape as
-                // csrss — substring classifies, nt-fs owns existence + file-vs-dir. Not pi-scoped.
-                let is_winlogon = !is_sxs
-                    && nb[..nlen].windows(8).any(|w| w == b"winlogon")
-                    && self
-                        .fs
-                        .query_attributes(r"\SystemRoot\System32\winlogon.exe")
-                        .is_some_and(|si| !si.is_directory);
-                // services.exe FILE open — winlogon's kernel32 CreateProcessInternalW opens it (the
-                // 4th hosted process). Same shape as csrss/winlogon; substring classifies, nt-fs owns
-                // existence + file-vs-dir. Issued by winlogon (pi 2).
-                let is_services = !is_sxs
-                    && nb[..nlen].windows(8).any(|w| w == b"services")
-                    && self
-                        .fs
-                        .query_attributes(r"\SystemRoot\System32\services.exe")
-                        .is_some_and(|si| !si.is_directory);
-                // lsass.exe FILE open — winlogon's StartLsass CreateProcessW (5th hosted process).
-                // "lsass" substring is specific (lsasrv.dll = "lsasr", no match); nt-fs owns existence.
-                let is_lsass = !is_sxs
-                    && nb[..nlen].windows(5).any(|w| w == b"lsass")
-                    && self
-                        .fs
-                        .query_attributes(r"\SystemRoot\System32\lsass.exe")
-                        .is_some_and(|si| !si.is_directory);
+                    && sys32_dir_exists();
+                // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
+                // RtlCreateUserProcess / winlogon's CreateProcessInternalW): the substring classifies
+                // WHICH EXE, existence resolves against its CANONICAL leaf on the real \reactos FS
+                // (`exe_probe_canon` + `sys32_exists`) — path-form/malformed-path independent, no
+                // hand-maintained list. Loader manifest opens are unaffected (SxS rejected).
+                let exe_canon = Self::exe_probe_canon(&nb[..nlen], is_sxs);
+                let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
+                let is_csrss = exe_exists && nb[..nlen].windows(5).any(|w| w == b"csrss");
+                let is_winlogon = exe_exists && nb[..nlen].windows(8).any(|w| w == b"winlogon");
+                let is_services = exe_exists && nb[..nlen].windows(8).any(|w| w == b"services");
+                let is_lsass = exe_exists && nb[..nlen].windows(5).any(|w| w == b"lsass");
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
