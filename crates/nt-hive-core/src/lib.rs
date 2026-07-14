@@ -15,6 +15,9 @@ extern crate alloc;
 mod codec;
 mod hive;
 mod io;
+mod overlay;
+
+pub use overlay::{canon_path, RegistryOverlay};
 
 pub use codec::{
     decode_image, encode_image, encode_log_record, replay_log, HiveDecodeError, HiveLogOp,

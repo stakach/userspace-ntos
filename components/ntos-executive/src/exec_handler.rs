@@ -188,7 +188,32 @@ impl ExecNtHandler {
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
+            // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
+            // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
+            // runtime and is retained past the per-syscall bump reset because the loop pins the heap
+            // high-water mark past each mutation (see `overlay_dirty`). 64 keys is ample for the
+            // SCM's volatile-key creation (the boot creates only a handful).
+            overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
+            overlay_dirty: false,
         }
+    }
+    /// Intern a `KeyRef` into `key_handles` (deduped) and return the 4-aligned key handle. Handles
+    /// are 4-aligned because advapi32's `MapDefaultKey` clears HKEY bit 0. Dedup keeps the table
+    /// from growing unboundedly (a reallocation past the heap mark would be clobbered by the reset).
+    pub(crate) fn intern_key_handle(&mut self, kr: KeyRef) -> u64 {
+        let slot = match self.key_handles.iter().position(|&c| c == kr) {
+            Some(i) => i,
+            None => {
+                self.key_handles.push(kr);
+                self.key_handles.len() - 1
+            }
+        };
+        KEY_HANDLE_BASE + (slot as u64) * 4
+    }
+    /// Canonical overlay path for a full NT key path (CurrentControlSet alias applied), matching
+    /// `resolve_key`'s view so an overlay write and a later base-hive read agree on one key.
+    pub(crate) fn overlay_canon(&self, full: &str) -> alloc::string::String {
+        nt_hive_core::canon_path(&apply_ccs_alias(full))
     }
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
     /// link). Returns `None` before the ProcessManager has created that hosted process.
@@ -849,24 +874,33 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // a subkey relative to a real hive handle → `open_key_from`. Self-contained + returns,
                 // so the winlogon/csrss paint-time key hacks below are untouched (byte-identical).
                 if self.pi == 3 {
+                    // Compute the FULL NT path being opened (predefined-root + overlay-relative
+                    // cases). `None` = a hive-handle-relative open (path unknown, resolved below).
                     // NOTE: MACHINE_ROOT_HANDLE (0x9_..) is numerically >= KEY_HANDLE_BASE (0x1_..),
                     // so it MUST be matched BEFORE the generic real-handle branch.
-                    let cell: Option<KeyRef> = if root_dir == MACHINE_ROOT_HANDLE {
-                        // Subkey relative to the predefined HKLM root → \Registry\Machine\<name>.
+                    let full_opt: Option<alloc::string::String> = if root_dir == MACHINE_ROOT_HANDLE {
                         let mut full = alloc::string::String::from(r"\Registry\Machine\");
                         full.push_str(&path);
-                        self.resolve_key(&full)
+                        Some(full)
+                    } else if let Some(oidx) = (root_dir >= KEY_HANDLE_BASE)
+                        .then(|| ((root_dir - KEY_HANDLE_BASE) / 4) as usize)
+                        .and_then(|i| self.key_handles.get(i).copied())
+                        .and_then(overlay_key_idx)
+                    {
+                        // Subkey relative to an OVERLAY (created) key → parent path + \ + name.
+                        self.overlay.path(oidx).map(|p| {
+                            let mut full = alloc::string::String::from(p);
+                            if !path.is_empty() {
+                                full.push('\\');
+                                full.push_str(&path);
+                            }
+                            full
+                        })
                     } else if root_dir >= KEY_HANDLE_BASE {
-                        // Subkey relative to a real hive handle.
-                        let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
-                        match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
-                            (Some(h), Some(parent)) => h.open_key_from(parent, &path),
-                            _ => None,
-                        }
+                        None // relative to a real hive handle — resolved via open_key_from below
                     } else {
                         // Absolute open (root_dir == 0). The predefined `\Registry\Machine` open
-                        // itself → the sentinel machine-root handle; any other absolute path →
-                        // resolve against the hive.
+                        // itself → the sentinel machine-root handle.
                         let comps: alloc::vec::Vec<&str> =
                             path.split('\\').filter(|c| !c.is_empty()).collect();
                         if comps.len() == 2
@@ -876,18 +910,31 @@ impl NativeSyscallHandler for ExecNtHandler {
                             self.xas_write_u64(args[0], MACHINE_ROOT_HANDLE);
                             return 0; // predefined HKLM root → sentinel machine-root handle
                         }
-                        self.resolve_key(&path)
+                        Some(path.clone())
+                    };
+                    // Overlay-FIRST: a created key shadows the base hive. Before services creates
+                    // anything the overlay is empty, so this is byte-identical to the prior path.
+                    if let Some(ref full) = full_opt {
+                        let canon = self.overlay_canon(full);
+                        if let Some(oidx) = self.overlay.find(&canon) {
+                            let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
+                            self.xas_write_u64(args[0], h);
+                            return 0; // STATUS_SUCCESS
+                        }
+                    }
+                    // Base-hive resolution (unchanged from the read-only seam).
+                    let cell: Option<KeyRef> = if let Some(ref full) = full_opt {
+                        self.resolve_key(full)
+                    } else {
+                        let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
+                        match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
+                            (Some(h), Some(parent)) => h.open_key_from(parent, &path),
+                            _ => None,
+                        }
                     };
                     return match cell {
                         Some(cell) => {
-                            let idx = match self.key_handles.iter().position(|&c| c == cell) {
-                                Some(i) => i,
-                                None => {
-                                    self.key_handles.push(cell);
-                                    self.key_handles.len() - 1
-                                }
-                            };
-                            let h = KEY_HANDLE_BASE + (idx as u64) * 4; // 4-aligned: advapi32 clears HKEY bit0
+                            let h = self.intern_key_handle(cell);
                             self.xas_write_u64(args[0], h);
                             0 // STATUS_SUCCESS
                         }
@@ -958,6 +1005,115 @@ impl NativeSyscallHandler for ExecNtHandler {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
+            // NtCreateKey(*KeyHandle[0], DesiredAccess[1], *ObjectAttributes[2], TitleIndex, *Class,
+            // CreateOptions, *Disposition[sp+0x38]). The CM WRITE plane: create-or-open a key in the
+            // in-memory overlay ([`RegistryOverlay`]) that shadows the read-only base hive. services'
+            // (pi 3) ScmCreateServiceDatabase creates volatile keys (Control\ServiceCurrent, group
+            // list) here. Scoped to pi==3; pi 0-2 keep the prior behaviour (NtCreateKey was
+            // unregistered → the loop stopped on the SSN) so their boot is byte-identical.
+            NativeService::NtCreateKey => unsafe {
+                if self.pi != 3 {
+                    self.stop = true;
+                    return 0xC000_0002; // record the SSN + stop (matches the prior unregistered wall)
+                }
+                let oa = args[2];
+                let mut rd = [0u8; 8];
+                let _ = self.xas_read(oa + 8, &mut rd); // OBJECT_ATTRIBUTES.RootDirectory @+8
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = self.read_objattr_name_pe(oa);
+                let mut name = alloc::string::String::new();
+                for &w in &name16 {
+                    if let Some(c) = char::from_u32(w as u32) {
+                        name.push(c);
+                    }
+                }
+                // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
+                let full: Option<alloc::string::String> = if root_dir == MACHINE_ROOT_HANDLE {
+                    let mut f = alloc::string::String::from(r"\Registry\Machine\");
+                    f.push_str(&name);
+                    Some(f)
+                } else if root_dir == 0 {
+                    Some(name.clone())
+                } else if let Some(oidx) = ((root_dir - KEY_HANDLE_BASE) / 4)
+                    .try_into()
+                    .ok()
+                    .filter(|_| root_dir >= KEY_HANDLE_BASE)
+                    .and_then(|i: usize| self.key_handles.get(i).copied())
+                    .and_then(overlay_key_idx)
+                {
+                    self.overlay.path(oidx).map(|p| {
+                        let mut f = alloc::string::String::from(p);
+                        if !name.is_empty() {
+                            f.push('\\');
+                            f.push_str(&name);
+                        }
+                        f
+                    })
+                } else {
+                    // Create relative to a real HIVE handle: the parent path isn't tracked (the SCM
+                    // doesn't take this path). Fall through to NOT_FOUND rather than mis-create.
+                    None
+                };
+                let full = match full {
+                    Some(f) => f,
+                    None => return 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                };
+                let canon = self.overlay_canon(&full);
+                // Disposition: CREATED unless the key already exists in the overlay OR the base hive.
+                let existed =
+                    self.overlay.find(&canon).is_some() || self.resolve_key(&full).is_some();
+                let (oidx, _) = self.overlay.create(&canon);
+                self.overlay_dirty = true;
+                let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
+                self.xas_write_u64(args[0], h); // *KeyHandle
+                // *Disposition (optional): arg6 at [sp+0x38].
+                let disp_ptr = smss_stack_read(get_recv_mr(16) + 0x38);
+                if disp_ptr != 0 {
+                    let disp = if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY };
+                    self.xas_write_buf(disp_ptr, &disp.to_le_bytes());
+                }
+                0 // STATUS_SUCCESS
+            },
+            // NtSetValueKey(KeyHandle[0], *ValueName[1], TitleIndex, Type[3], Data[sp+0x28],
+            // DataSize[sp+0x30]). The CM WRITE plane: write a value into an overlay (created) key.
+            // Scoped to pi==3; pi 0-2 stay a no-op success (byte-identical — smss's SmpInit writes
+            // are still discarded). A write to a base-hive handle (not an overlay key) is a no-op
+            // success too (we don't shadow arbitrary base keys for writes yet).
+            NativeService::NtSetValueKey => unsafe {
+                if self.pi != 3 {
+                    return 0; // STATUS_SUCCESS (byte-identical no-op for smss/csrss/winlogon)
+                }
+                let key = match self
+                    .key_handles
+                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
+                    .copied()
+                {
+                    Some(k) => k,
+                    None => return 0, // unknown handle → benign success (prior no-op)
+                };
+                let oidx = match overlay_key_idx(key) {
+                    Some(i) => i,
+                    None => return 0, // base-hive handle → no-op success (not shadowed for writes)
+                };
+                let name16 = self.read_ustr_pe(args[1]);
+                let mut name = alloc::string::String::new();
+                for &w in &name16 {
+                    if let Some(c) = char::from_u32(w as u32) {
+                        name.push(c);
+                    }
+                }
+                let ty = args[3] as u32; // R9 = Type
+                let sp = get_recv_mr(16);
+                let data_ptr = smss_stack_read(sp + 0x28); // [sp+0x28] = Data
+                let data_size = (smss_stack_read(sp + 0x30) as usize).min(4096); // [sp+0x30] = DataSize
+                let mut data = alloc::vec![0u8; data_size];
+                if data_ptr != 0 && data_size != 0 && !self.xas_read(data_ptr, &mut data) {
+                    data.clear(); // unreadable → store an empty value rather than garbage
+                }
+                self.overlay.set_value(oidx, &name, ty, &data);
+                self.overlay_dirty = true;
+                0 // STATUS_SUCCESS
+            },
             // NtEnumerateValueKey(KeyHandle[0], Index[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). Enumerate the value at Index from the real hive + copy the
             // KEY_VALUE_*_INFORMATION out; SmpInit reads the Environment/DOS-Devices/etc. values.
@@ -986,6 +1142,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                             synth_cpu_value(lc)
                                 .map(|(ty, d16)| (alloc::string::String::from(nm), ty, utf16_bytes(&d16)))
                         })
+                    } else if let Some(oidx) = overlay_key_idx(key) {
+                        // Overlay (created) key: enumerate its own set values.
+                        self.overlay
+                            .value_by_index(oidx, args[1] as usize)
+                            .map(|(nm, ty, d)| (alloc::string::String::from(nm), ty, d.to_vec()))
                     } else {
                         hive.value_by_index(key, args[1] as usize)
                     };
@@ -1025,6 +1186,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(k) => k,
                     None => return 0xC000_0008,
                 };
+                // Overlay (created) keys track no enumerated subkeys here (the SCM creates leaf
+                // volatile keys); report the empty set rather than mis-reading the tag as an offset.
+                if overlay_key_idx(key).is_some() {
+                    return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
+                }
                 let subs = hive.subkeys(key);
                 let idx = args[1] as usize;
                 if idx >= subs.len() {
@@ -1079,6 +1245,30 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(k) => k,
                     None => return 0xC000_0008,
                 };
+                // Overlay (created) key: report its own value count (no subkeys tracked here).
+                if let Some(oidx) = overlay_key_idx(key) {
+                    if args[1] != 2 {
+                        return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                    }
+                    let vlen = self.overlay.values_len(oidx);
+                    let max_vname = (0..vlen)
+                        .filter_map(|i| self.overlay.value_by_index(oidx, i))
+                        .map(|(n, _, _)| n.len())
+                        .max()
+                        .unwrap_or(0) as u32
+                        * 2;
+                    let struct_size = 0x2cu32;
+                    let mut info = [0u8; 0x2c];
+                    info[0x0c..0x10].copy_from_slice(&struct_size.to_le_bytes()); // ClassOffset
+                    info[0x20..0x24].copy_from_slice(&(vlen as u32).to_le_bytes()); // Values
+                    info[0x24..0x28].copy_from_slice(&max_vname.to_le_bytes()); // MaxValueNameLen
+                    smss_copyout(args[4], &struct_size.to_le_bytes()); // *ResultLength
+                    if (args[3] as usize) < struct_size as usize {
+                        return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
+                    }
+                    self.xas_write_buf(args[2], &info);
+                    return 0; // STATUS_SUCCESS
+                }
                 let subs = hive.subkeys(key);
                 let vals = hive.values(key);
                 let subkeys = subs.len() as u32;
@@ -1166,6 +1356,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
+                } else if let Some(oidx) = overlay_key_idx(key) {
+                    // Overlay (created) key: its own set values FIRST, then shadow the base hive by
+                    // the overlay key's path (so a created-then-read of a pre-existing key still
+                    // sees the base values).
+                    if let Some((ty, d)) = self.overlay.value(oidx, &name_lc) {
+                        Some((ty, d.to_vec()))
+                    } else {
+                        let p = self.overlay.path(oidx).map(alloc::string::String::from);
+                        p.and_then(|p| self.resolve_key(&p))
+                            .and_then(|hk| self.hive.as_ref().and_then(|h| h.value(hk, &name_lc)))
+                    }
                 } else if self.pi == 3 {
                     // Real SYSTEM hive value-by-name (case-insensitive) — services' SCM reads
                     // SetupType/SystemSetupInProgress + the service DB values off ::ROSSYS.HIV.
@@ -1559,7 +1760,6 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtAdjustPrivilegesToken
             | NativeService::NtDeleteValueKey
             | NativeService::NtInitializeRegistry
-            | NativeService::NtSetValueKey
             | NativeService::NtSetSystemInformation
             | NativeService::NtUnmapViewOfSection
             | NativeService::NtSetSecurityObject

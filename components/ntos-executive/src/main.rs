@@ -1826,6 +1826,27 @@ const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 /// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
 /// cell offset, so it never collides with a hive key.
 const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
+/// `key_handles` stores a `KeyRef` (u32). A real hive `KeyRef` is an hbin-relative cell offset
+/// (well under the ~204 KiB hive size). A `KeyRef` in the range `[OVERLAY_KEY_TAG,
+/// OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` instead names an OVERLAY (created) key — its low bits are the
+/// index into `ExecNtHandler::overlay`. The range sits far above any real cell offset and below
+/// `SYNTH_CPU_KEY` (0xFFFF_FF00), so it collides with neither.
+const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
+const OVERLAY_KEY_MAX: u32 = 0x1000;
+/// If a `KeyRef` names an overlay (created) key, return its overlay index.
+fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
+    if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
+        Some((kr - OVERLAY_KEY_TAG) as usize)
+    } else {
+        None
+    }
+}
+/// NtCreateKey SSN (ReactOS ntdll — `sysfuncs.lst` line 44). services' SCM creates volatile keys
+/// (e.g. `Control\ServiceCurrent`) here; the write plane is the [`RegistryOverlay`].
+pub const SSN_NT_CREATE_KEY: u64 = 43;
+/// Registry key create dispositions (NtCreateKey *Disposition out-param).
+const REG_CREATED_NEW_KEY: u32 = 1;
+const REG_OPENED_EXISTING_KEY: u32 = 2;
 
 /// P5 — PAINT-SAFE keyboard-layout registry fix. advapi32's `MapDefaultKey` opens a predefined
 /// root (HKLM=`\Registry\Machine`, HKCU, HKCR) via `NtOpenKey(RootDirectory=0, ObjectName=<.rdata
@@ -2169,6 +2190,17 @@ struct ExecNtHandler {
     /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
     /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
     pm: nt_process::ProcessManager,
+    /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
+    /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
+    /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay
+    /// FIRST then fall through to the base hive. Pre-reserved in `new()` (below the per-syscall heap
+    /// mark) so its key vector never reallocates; the executive pins the heap high-water mark past
+    /// each mutation (`overlay_dirty`) so the runtime `String`/`Vec` growth survives the bump reset.
+    overlay: nt_hive_core::RegistryOverlay,
+    /// Set by a handler that mutated `overlay` (`NtCreateKey`/`NtSetValueKey`). The service loop
+    /// consumes it after dispatch: it advances the heap high-water mark to the current bump
+    /// position so the overlay's runtime allocations are retained past the next per-syscall reset.
+    overlay_dirty: bool,
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
@@ -2261,6 +2293,7 @@ fn build_nt_table() -> NativeServiceTable {
         &[
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
+            (NativeService::NtCreateKey, SSN_NT_CREATE_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
             (NativeService::NtQueryKey, SSN_NT_QUERY_KEY as u32),

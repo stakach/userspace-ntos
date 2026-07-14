@@ -343,7 +343,10 @@ pub(crate) unsafe fn service_sec_image(
     // reclamation a few hundred registry syscalls exhaust the 128 KiB heap and the executive
     // panics. Rewinding to this mark each iteration reclaims all per-syscall transients while
     // leaving the persistent state (below the mark) intact.
-    let heap_mark = allocator::mark();
+    // `mut` because the CM write overlay's runtime `String`/`Vec` growth (NtCreateKey/NtSetValueKey)
+    // must survive the per-syscall reset: after a mutating syscall the loop advances this mark past
+    // the overlay's new allocations (see the `overlay_dirty` consume below the dispatch).
+    let mut heap_mark = allocator::mark();
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
@@ -739,6 +742,7 @@ pub(crate) unsafe fn service_sec_image(
                 // + out-write queue so a migrated handler can raise them (group A/B signals).
                 nt_handler.pi = pi;
                 nt_handler.stop = false;
+                nt_handler.overlay_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
@@ -802,6 +806,16 @@ pub(crate) unsafe fn service_sec_image(
                     if nt_handler.stop {
                         handled = false; // handler couldn't service → stop with the SSN recorded
                     }
+                }
+                // CM write plane: a handler that mutated the registry overlay (NtCreateKey/
+                // NtSetValueKey) allocated `String`/`Vec` on the bump heap ABOVE `heap_mark`. Pin the
+                // mark PAST them now so the next iteration's `reset_to(heap_mark)` keeps them (real
+                // NT: created keys/values persist). The mark also swallows this iteration's transient
+                // allocations — a bounded leak (only a handful of overlay mutations per boot), well
+                // within the 2 MiB heap; non-mutating iterations still reset fully.
+                if nt_handler.overlay_dirty {
+                    nt_handler.overlay_dirty = false;
+                    heap_mark = allocator::mark();
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
                 // need demand-fill (csrss_out_write); smss out-ptrs are stack locals (smss_stack_write).
