@@ -1894,6 +1894,13 @@ static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).
 static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Count of live pipe syscalls (NtCreateNamedPipeFile/NtCreateFile/NtOpenFile/NtFsControlFile/
+/// Read/Write) that were ROUTED THROUGH the isolated npfs component (vs modeled-fake). Observability.
+static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
+/// Pipe handle -> npfs FILE_OBJECT id (FsContext) map. Fixed-capacity static (survives the per-syscall
+/// bump heap reset — a Vec above the heap mark would be rewound). Slot 0 unused (0 = no handle).
+/// (handle, file_id); handle is the executive-minted value we returned to the caller.
+static mut NPFS_PIPE_HANDLES: [(u64, u64); 32] = [(0, 0); 32];
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
 static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
@@ -5697,6 +5704,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_winlogon_rpc_pipe",
                         NAMED_PIPE_CREATED.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    // C-b: the LIVE pipe syscalls (services' SCM \pipe\ntsvcs create + its FSCTL_LISTEN)
+                    // are ROUTED THROUGH the isolated npfs FSD (real NpFsdCreateNamedPipe / IRP dispatch),
+                    // not the modeled-fake path. Proven by the routed-IRP counter.
+                    check(
+                        b"exec_pipe_syscalls_routed_through_npfs",
+                        NPFS_ROUTED_IRPS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     // ★ GENERAL NtCreateThread (real service): winlogon's RPC listener thread is a REAL
