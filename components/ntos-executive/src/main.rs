@@ -5733,33 +5733,37 @@ unsafe fn service_sec_image(
     } else {
         None
     };
+    // P7-A migration: source gdi32.dll BY PATH from the executive's FS pool; fall back to the fixed
+    // WIN32BUF staging only if the FS load fails (hybrid). `gdi32_va` feeds dll_buf_va[5] below so the
+    // relocation + demand-fault router use the same bytes the PeFile wraps.
+    let mut gdi32_va = WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET;
     let gdi32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let gsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x54) as *const u32) as usize;
-        if gsz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET) as *const u8,
-                gsz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(gpe) => {
-                    print_str(b"[ntos-exec] staged gdi32.dll: ");
-                    print_u64(gsz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(gpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(gpe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(gpe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(gpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged gdi32.dll: PARSE FAILED\n");
-                    None
-                }
-            }
+        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\gdi32.dll", b"gdi32.dll");
+        if fs_va != 0 {
+            gdi32_va = fs_va;
+            fs_pe
         } else {
-            None
+            let gsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x54) as *const u32) as usize;
+            if gsz > 0 {
+                let bytes: &'static [u8] = core::slice::from_raw_parts(
+                    (WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET) as *const u8,
+                    gsz,
+                );
+                match nt_pe_loader::PeFile::parse(bytes) {
+                    Ok(gpe) => {
+                        print_str(b"[ntos-exec] staged gdi32.dll: ");
+                        print_u64(gsz as u64);
+                        print_str(b" bytes (fixed buffer fallback)\n");
+                        Some(gpe)
+                    }
+                    Err(_) => {
+                        print_str(b"[ntos-exec] staged gdi32.dll: PARSE FAILED\n");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         }
     } else {
         None
@@ -6015,60 +6019,63 @@ unsafe fn service_sec_image(
     // userenv.dll + mpr.dll — winlogon.exe's two extra static imports (the rest of its Win32 stack
     // is shared with csrss above). Staged into WIN32BUF (sizes at STORAGE_SHARED +0x98/+0x9c); the
     // winlogon loader (pi==2) resolves + demand-pages them via the same nt-dll-registry path.
+    // P7-A migration: source userenv.dll + mpr.dll BY PATH from the FS pool (fall back to WIN32BUF).
+    let mut userenv_va = WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET;
     let userenv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x98) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged userenv.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged userenv.dll: PARSE FAILED\n");
-                    None
-                }
-            }
+        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\userenv.dll", b"userenv.dll");
+        if fs_va != 0 {
+            userenv_va = fs_va;
+            fs_pe
         } else {
-            None
+            let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x98) as *const u32) as usize;
+            if sz > 0 {
+                let bytes: &'static [u8] = core::slice::from_raw_parts(
+                    (WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET) as *const u8,
+                    sz,
+                );
+                match nt_pe_loader::PeFile::parse(bytes) {
+                    Ok(pe) => {
+                        print_str(b"[ntos-exec] staged userenv.dll (fixed buffer fallback)\n");
+                        Some(pe)
+                    }
+                    Err(_) => {
+                        print_str(b"[ntos-exec] staged userenv.dll: PARSE FAILED\n");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         }
     } else {
         None
     };
+    let mut mpr_va = WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET;
     let mpr_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9c) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged mpr.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged mpr.dll: PARSE FAILED\n");
-                    None
-                }
-            }
+        let (fs_pe, fs_va) = load_dll_from_fs(b"reactos\\system32\\mpr.dll", b"mpr.dll");
+        if fs_va != 0 {
+            mpr_va = fs_va;
+            fs_pe
         } else {
-            None
+            let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x9c) as *const u32) as usize;
+            if sz > 0 {
+                let bytes: &'static [u8] = core::slice::from_raw_parts(
+                    (WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET) as *const u8,
+                    sz,
+                );
+                match nt_pe_loader::PeFile::parse(bytes) {
+                    Ok(pe) => {
+                        print_str(b"[ntos-exec] staged mpr.dll (fixed buffer fallback)\n");
+                        Some(pe)
+                    }
+                    Err(_) => {
+                        print_str(b"[ntos-exec] staged mpr.dll: PARSE FAILED\n");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         }
     } else {
         None
@@ -6115,7 +6122,7 @@ unsafe fn service_sec_image(
         SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET,
         WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + GDI32_WIN32BUF_OFFSET,
+        gdi32_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+GDI32_WIN32BUF_OFFSET
         WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET,
@@ -6124,8 +6131,8 @@ unsafe fn service_sec_image(
         WIN32BUF_VADDR + ADVAPI32_VISTA_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + WS2HELP_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + NTDLL_VISTA_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + USERENV_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + MPR_WIN32BUF_OFFSET,
+        userenv_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+USERENV_WIN32BUF_OFFSET
+        mpr_va,     // P7-A: pool VA when sourced BY PATH, else WIN32BUF+MPR_WIN32BUF_OFFSET
     ];
     for i in 0..16 {
         if let Some(pe) = dll_pes[i].as_ref() {
@@ -10357,6 +10364,42 @@ unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
 /// The executive's own live FAT32 handle, mounted after the storage host parks (bound to the
 /// executive's AHCI BAR + DMA-frame mappings). `None` until mounted. Read-only.
 static mut EXEC_FS: Option<Fat32> = None;
+
+/// Copy of the executive's mounted FAT32 handle (Fat32 is Copy), or None if not yet mounted.
+/// Read via a raw pointer to avoid the static_mut_refs lint (single-threaded executive).
+unsafe fn exec_fs() -> Option<Fat32> {
+    core::ptr::read(core::ptr::addr_of!(EXEC_FS))
+}
+
+/// Load `path` (root-relative) from the executive's live FS into the pool and PE32+-parse it — the
+/// generic replacement for a per-binary staging block. Returns `(Some(pe), pool_va)` on success (the
+/// bytes stay resident in the pool for the demand-fault router), or `(None, 0)` so the caller can
+/// fall back to a fixed staging buffer during the hybrid migration. `name` is for the boot log.
+unsafe fn load_dll_from_fs(
+    path: &[u8],
+    name: &[u8],
+) -> (Option<nt_pe_loader::PeFile<'static>>, u64) {
+    if let Some(fs) = exec_fs() {
+        if let Some((va, sz)) = load_file_to_pool(&fs, path) {
+            let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
+            if let Ok(pe) = nt_pe_loader::PeFile::parse(bytes) {
+                print_str(b"[ntos-exec] FS-by-path ");
+                print_str(name);
+                print_str(b": ");
+                print_u64(sz as u64);
+                print_str(b" bytes, PE32+ @pool=0x");
+                print_hex((va >> 32) as u32);
+                print_hex(va as u32);
+                print_str(b"\n");
+                return (Some(pe), va);
+            }
+            print_str(b"[ntos-exec] FS-by-path ");
+            print_str(name);
+            print_str(b": PARSE FAILED (fallback to staged buffer)\n");
+        }
+    }
+    (None, 0)
+}
 
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
 /// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
