@@ -227,6 +227,19 @@ pub const CSR_ENV_SCRATCH_VA: u64 = 0x0000_0100_1071_0000;
 /// Isolated executive scratch (its own PT) for demand-filling the CSR thread's code pages
 /// (CsrApiRequestThread/CsrApiHandleConnectionRequest in csrsrv + ntdll/csrss) during the rendezvous.
 pub const CSR_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1310_0000;
+// --- General NtCreateThread: a REAL Nth thread in ANY hosted process (first live user: winlogon's
+// RPC listener thread). Reuses the SM numeric VSpace VAs (0x1044-0x104B) in the TARGET process's OWN
+// pml4 (isolated from smss/csrss's threads at the same VAs) — they fall in the STACK_BASE 2 MiB PT
+// that every spawn_sec_image already created. The EXECUTIVE-side env scratch must be DISTINCT from
+// SM (0x1070) / CSR (0x1071) / smss-spawn (0x1074) / csrss-spawn (0x1078) / winlogon-spawn (0x107C).
+pub const WL_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // target VSpace (4 frames)
+pub const WL_LISTENER_STACK_FRAMES: u64 = 4;
+pub const WL_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA; // target VSpace
+pub const WL_LISTENER_TEB_VA: u64 = SM_TEB_VA; // target VSpace (2 pages)
+pub const WL_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA; // target VSpace
+/// Executive scratch (3 pages) to build the listener thread's TEB/trampoline before copy_cap into
+/// the target VSpace. FILEBUF PT, clear of every other env-scratch VA.
+pub const WL_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1072_0000;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -676,6 +689,20 @@ static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
 /// CsrLocateThreadByClientId finds it → CsrProcess=CsrRootProcess → AllowConnection=TRUE → accept.
 const CSR_STATIC_CID_PROC: u64 = 0x0000_0000_0000_0244; // csrss's CSR pid (arbitrary, must be consistent)
 const CSR_STATIC_CID_THREAD: u64 = 0x0000_0000_0000_0248;
+/// General NtCreateThread: a dedicated fault endpoint the RPC-listener (and any future park-only Nth
+/// thread) faults to — NO standing receiver, so the thread PARKS on its first fault (its real TEB
+/// stays mapped + queryable by the main thread). 0 = not yet retyped. Distinct from SM/CSR EPs so a
+/// listener fault never lands in the SM/CSR rendezvous receivers.
+static WL_LISTENER_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+/// The winlogon RPC-listener thread's TCB (0 until winlogon's first NtCreateThread spawns it).
+static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+/// The listener thread's real ETHREAD tid (a pool ETHREAD popped at NtCreateThread), and a count of
+/// real threads created through the general NtCreateThread path (for the counted spec).
+static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
+static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Set once the main thread has queried the real listener thread's TEB/ClientId via
+/// NtQueryInformationThread(ThreadBasicInformation) — proves the NULL-deref is gone.
+static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
 /// (0 = smss, 1 = csrss, 2 = winlogon). Kept off the 16 KiB rootserver stack — a [[u64;256];3]
@@ -3287,6 +3314,10 @@ struct ExecNtHandler {
     /// `CsrApiRequestThread`) so the LOOP spawns the REAL CSR API thread (`spawn_csr_loop_thread`,
     /// which needs csrss's PML4 + the caller's SP — loop-resident). Parks on `CSR_FAULT_EP`.
     csr_spawn_request: bool,
+    /// General NtCreateThread: set by winlogon's FIRST `NtCreateThread` (its RPC listener) so the LOOP
+    /// spawns the REAL listener thread (`spawn_wl_listener_thread`, which needs winlogon's PML4 + the
+    /// caller's SP to read the CONTEXT — loop-resident). Parks on `WL_LISTENER_FAULT_EP`.
+    wl_spawn_request: bool,
     /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
     /// connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
@@ -3404,6 +3435,7 @@ impl ExecNtHandler {
             spawn_request: false,
             winlogon_spawn_request: false,
             sm_spawn_request: false,
+            wl_spawn_request: false,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
             csr_spawn_request: false,
@@ -3493,6 +3525,19 @@ impl ExecNtHandler {
                     }
                 }
                 PM_MAIN_THREADS_OK.store(mt_ok, Ordering::Relaxed);
+                // General NtCreateThread — pre-create a POOL of extra ETHREADs NOW (at boot, below the
+                // service_sec_image heap mark) so a RUNTIME NtCreateThread can hand one out WITHOUT a
+                // BTreeMap insert (which, made during a serviced call above the mark, the per-syscall
+                // bump reset would rewind → corrupt). Runtime create then only pops a pool tid + binds
+                // its start routine/TEB (both alloc-free field writes) → reset-safe. One pool ETHREAD
+                // per process is enough for the current boot (only winlogon creates a runtime thread —
+                // its RPC listener); the array generalizes to any pi. Pool threads are NOT the main
+                // thread (main was created first above), so main_thread() is unchanged.
+                for (i, &pid) in pids.iter().enumerate() {
+                    if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                        PM_POOL_TID[i].store(tid as u64, Ordering::Relaxed);
+                    }
+                }
                 // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
@@ -3543,6 +3588,39 @@ impl ExecNtHandler {
         let h = self.next_handle;
         self.next_handle += 1;
         h
+    }
+    /// General NtCreateThread: hand out a real pool ETHREAD for the caller (`self.pi`) — bind the
+    /// caller-supplied start routine + parameter + TEB base (all alloc-free field writes, reset-safe),
+    /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
+    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns `(tid, handle)`
+    /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
+    fn nt_create_thread_handle(&mut self, entry: u64, param: u64, teb_base: u64) -> Option<(u64, u64)> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let tid = PM_POOL_TID.get(self.pi)?.load(Ordering::Relaxed);
+        if tid == 0 {
+            return None;
+        }
+        let _ = param; // passed to the thread via the trampoline (RCX); ETHREAD bookkeeping unchanged
+        let t = tid as nt_process::ThreadId;
+        self.pm.set_thread_start_address(t, entry);
+        self.pm.set_thread_teb(t, teb_base);
+        let _ = self.pm.set_thread_state(t, nt_process::ThreadState::Running);
+        let h = self.pm.insert_handle(pid, nt_process::HandleObject::Thread(t), 0).ok()?;
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
+        Some((tid, h as u64))
+    }
+    /// Resolve a ThreadHandle VALUE (in the caller's EPROCESS handle table) → the real ETHREAD tid.
+    /// `NtCurrentThread()` (`-2`) → the caller's main ETHREAD. Used by `NtQueryInformationThread`.
+    fn resolve_thread_handle(&self, handle: u64) -> Option<u64> {
+        let caller = self.pm_pid_for_pi(self.pi)?;
+        if handle == 0xFFFF_FFFF_FFFF_FFFE {
+            return self.pm.main_thread(caller).map(|t| t as u64); // NtCurrentThread()
+        }
+        match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Thread(t)) => Some(t as u64),
+            _ => None,
+        }
     }
     /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
     /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
@@ -4306,6 +4384,39 @@ impl NativeSyscallHandler for ExecNtHandler {
             // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
             // running smss thread in smss's VSpace) is the next path-B step.
             NativeService::NtCreateThread | NativeService::NtCreateSemaphore => {
+                // ★ GENERAL NtCreateThread (real service): winlogon's FIRST NtCreateThread is its RPC
+                // listener. Route it through the REAL nt-process ETHREAD lifecycle: pop a pool ETHREAD
+                // for the caller, bind the caller's StartRoutine + TEB, mint a TYPED Thread(tid) handle,
+                // write NtCreateThread's *ClientId {caller pid, fresh tid} out-param, and signal the loop
+                // to spawn the REAL seL4 thread in the caller's VSpace (`spawn_wl_listener_thread`). The
+                // no-op (a bare fake handle) is RETIRED for this path — kernel32/rpcrt4 now read a real
+                // TEB/ClientId (NtQueryInformationThread(162) resolves the typed handle → the ETHREAD).
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 2
+                    && WL_LISTENER_TCB.load(Ordering::Relaxed) == 0
+                    && PM_LISTENER_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let entry = smss_stack_read(ctx_va + 0xF8); // CONTEXT.Rip = StartRoutine
+                        let param = smss_stack_read(ctx_va + 0x80); // CONTEXT.Rcx = Parameter
+                        if let Some((tid, handle)) =
+                            self.nt_create_thread_handle(entry, param, WL_LISTENER_TEB_VA)
+                        {
+                            let pid = self.pm_pid_for_pi(2).unwrap_or(0);
+                            self.queue_write(args[0], handle); // *ThreadHandle = R10
+                            let cid_ptr = smss_stack_read(sp + 0x28); // arg5 = *ClientId
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
+                                self.queue_write(cid_ptr + 8, tid); // ClientId.UniqueThread
+                            }
+                            PM_LISTENER_TID.store(tid, Ordering::Relaxed);
+                            self.wl_spawn_request = true;
+                            return 0; // SUCCESS (handle/ClientId queued)
+                        }
+                    }
+                }
                 let h = self.mint_handle();
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
                 // Path B: smss creates its SmpApiLoop worker threads via NtCreateThread. Signal the
@@ -6238,6 +6349,7 @@ unsafe fn service_sec_image(
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
+                nt_handler.wl_spawn_request = false;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -6489,6 +6601,37 @@ unsafe fn service_sec_image(
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to csr_fault_ep)\n");
                 }
+                // ★ GENERAL NtCreateThread: winlogon's first NtCreateThread (its RPC listener) — spawn
+                // the REAL thread in winlogon's VSpace (pi == 2 here → pml4 = winlogon's PML4,
+                // ACTIVE_STACK_MIRROR = winlogon's mirror). Same CONTEXT ABI as SM/CSR: Context* at
+                // [sp+0x30], CONTEXT.Rip@0xF8 = StartRoutine, CONTEXT.Rcx@0x80 = Parameter. Its real
+                // ETHREAD (PM_LISTENER_TID) was already popped + bound in the handler; here we build the
+                // seL4 TCB + real TEB and record the TEB base on the ETHREAD (alloc-free). The TCB is
+                // spawned SUSPENDED (a parked listener) — its TEB is mapped + queryable by the main
+                // thread's NtQueryInformationThread(162), which is what unblocks StartRpcServer.
+                if nt_handler.wl_spawn_request && WL_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let tid = PM_LISTENER_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
+                    print_str(b"[wl-thread] spawning REAL RPC listener thread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_wl_listener_thread(pml4, entry_rip, param, cid_proc, tid);
+                    WL_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, WL_LISTENER_TEB_VA);
+                    print_str(b"[wl-thread] spawned tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" TEB=0x");
+                    print_hex((WL_LISTENER_TEB_VA >> 32) as u32);
+                    print_hex(WL_LISTENER_TEB_VA as u32);
+                    print_str(b" (suspended; real ETHREAD + TEB, queryable by the main thread)\n");
+                }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
                 // in smss's VSpace = procs[0].pml4, demand-filling from smss's image + ntdll), then write the
@@ -6667,10 +6810,61 @@ unsafe fn service_sec_image(
                 result = 0;
             } else if m0 == 280 && badge == WINLOGON_BADGE {
                 // NtWaitForMultipleObjects (winlogon). rpcrt4's RpcServerListen may wait for its
-                // listener thread to become ready; that worker never runs (NtCreateThread is a
-                // no-op), so report WAIT_0 (satisfied) and let winlogon's MAIN thread proceed to
-                // return RPC_S_OK. (smss's 280 stays PARKED in the badge==0 arm above.)
+                // listener thread to become ready; the listener is a REAL suspended thread (parked),
+                // so report WAIT_0 (satisfied) and let winlogon's MAIN thread proceed to return
+                // RPC_S_OK. (smss's 280 stays PARKED in the badge==0 arm above.)
                 result = 0;
+            } else if m0 == 162 && badge == WINLOGON_BADGE {
+                // ★ NtQueryInformationThread(ThreadHandle=R10, ThreadInformationClass=RDX,
+                // ThreadInformation=R8, Length=R9, *ReturnLength=[sp+0x28]). RpcServerListen's kernel32
+                // path queries the RPC LISTENER thread's ThreadBasicInformation to read its TEB/ClientId
+                // (kernel32 RVA 0x25f62 then derefs [Teb+0x2c8]). The listener is now a REAL ETHREAD
+                // with a real TEB, so resolve the ThreadHandle VALUE → the ETHREAD and fill a real
+                // THREAD_BASIC_INFORMATION → the NULL-deref is GONE. Class 0 = ThreadBasicInformation.
+                nt_handler.pi = pi; // resolve the ThreadHandle in the CALLER's (winlogon's) handle table
+                let cls = m3; // RDX = ThreadInformationClass
+                let handle = get_recv_mr(9); // R10 = ThreadHandle
+                let buf = get_recv_mr(7); // R8 = ThreadInformation
+                let sp = get_recv_mr(16);
+                if cls == 0 && buf != 0 {
+                    if let Some(tid) = nt_handler.resolve_thread_handle(handle) {
+                        let t = tid as nt_process::ThreadId;
+                        let teb = nt_handler.pm.thread_teb(t).unwrap_or(0);
+                        let cid = nt_handler
+                            .pm
+                            .client_id(t)
+                            .unwrap_or(nt_process::ClientId { unique_process: 0, unique_thread: 0 });
+                        // THREAD_BASIC_INFORMATION (x64, 0x30 bytes): ExitStatus@0, TebBaseAddress@8,
+                        // ClientId{UniqueProcess@0x10, UniqueThread@0x18}, AffinityMask@0x20,
+                        // Priority@0x28, BasePriority@0x2c. Written via the general out-writer (handles
+                        // a stack local OR a demand-fillable VA).
+                        let tbi: [(u64, u64); 6] = [
+                            (0x00, 0),                          // ExitStatus (STATUS_SUCCESS) + pad
+                            (0x08, teb),                        // TebBaseAddress
+                            (0x10, cid.unique_process as u64),  // ClientId.UniqueProcess
+                            (0x18, cid.unique_thread as u64),   // ClientId.UniqueThread
+                            (0x20, 1),                          // AffinityMask
+                            (0x28, 0),                          // Priority + BasePriority
+                        ];
+                        for (off, v) in tbi {
+                            csrss_out_write(buf + off, v, &mut filled_pages, &mut faults, scratch_base,
+                                &reg, &dll_pes, pml4);
+                        }
+                        let rl = smss_stack_read(sp + 0x28); // *ReturnLength (optional)
+                        if rl != 0 {
+                            csrss_out_write(rl, 0x30, &mut filled_pages, &mut faults, scratch_base,
+                                &reg, &dll_pes, pml4);
+                        }
+                        WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[wl-thread] NtQueryInformationThread(BasicInfo) -> listener TEB=0x");
+                        print_hex((teb >> 32) as u32);
+                        print_hex(teb as u32);
+                        print_str(b" tid=");
+                        print_u64(tid);
+                        print_str(b"\n");
+                    }
+                }
+                result = 0; // STATUS_SUCCESS
             } else if m0 == 195 {
                 // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST
                 // step of BaseDllInitialize after the CSR connect — registers the thread's LPC
@@ -7285,33 +7479,73 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
     tcb
 }
 
-/// Spawn the AUTHENTIC SM-loop thread (path B): a REAL 2nd thread in smss's VSpace (`smss_pml4`)
-/// running smss's real `SmpApiLoop` (`entry_rip`) with RCX = the `\SmApiPort` handle (`port_handle`,
-/// the SmpApiLoop parameter). Unlike `spawn_thread_in` it builds the full hosted-Windows-thread env
-/// (own TEB + GS base, StaticUnicodeString, an ACTIVATION_CONTEXT_STACK, hosted-syscalls flag, a
-/// dedicated fault EP) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/params/KUSER are already
-/// mapped, shared with smss's main thread). Its stack is MIRRORED into the executive so the nested
-/// `sm_rendezvous` can write its syscall out-params. The thread faults to `SM_FAULT_EP`, which has no
-/// standing receiver until the rendezvous drives it — so it PARKS on its first fault. Returns the TCB.
-unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
-    let scr = SM_ENV_SCRATCH_VA;
-    // Stack (4 frames), mapped into smss AND mirrored into the executive (for out-param copyout).
-    for i in 0..SM_STACK_FRAMES {
+/// Parameters describing a hosted second thread for [`spawn_hosted_thread`]. All VAs in the
+/// `*_va`/`*_base` fields live in the TARGET process's VSpace (`pml4`) except `scr` and
+/// `stack_mirror_va`, which are in the EXECUTIVE's VSpace (`CAP_INIT_THREAD_VSPACE`).
+struct HostedThread {
+    /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
+    /// image/ntdll/PEB/KUSER mappings.
+    pml4: u64,
+    /// The thread's start routine (`CONTEXT.Rip`) and its `PVOID` parameter (`CONTEXT.Rcx`).
+    entry_rip: u64,
+    param: u64,
+    /// Executive-side scratch base (≥ 3 pages: TEB, TEB2/ACS, trampoline) used to write the env
+    /// before the frames are mapped into `pml4`.
+    scr: u64,
+    /// TEB base VA (2 pages), stack base VA + frame count, IPC buffer VA, trampoline VA — all in `pml4`.
+    teb_va: u64,
+    stack_base: u64,
+    stack_frames: u64,
+    ipcbuf_va: u64,
+    tramp_va: u64,
+    /// The shared PEB VA (the process's PEB, mapped by the main thread's spawn).
+    peb_va: u64,
+    /// Executive-side stack-mirror base (`0` = don't mirror). Only threads driven by a nested
+    /// rendezvous that writes their syscall out-params need a mirror (SM/CSR); a park-only thread
+    /// (the RPC listener) needs none.
+    stack_mirror_va: u64,
+    /// The dedicated fault endpoint this thread faults to (no standing receiver → it PARKS until a
+    /// rendezvous drives it, or forever for a park-only listener).
+    fault_ep: u64,
+    /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
+    cid_proc: u64,
+    cid_thread: u64,
+    /// Resume immediately (SM/listener) or leave suspended for a lazy rendezvous-time resume (CSR).
+    resume: bool,
+}
+
+/// Spawn a REAL 2nd (or Nth) thread in a hosted process's VSpace — the GENERAL hosted-thread
+/// mechanism behind `NtCreateThread`. It builds the full hosted-Windows-thread env (own TEB + GS
+/// base, StaticUnicodeString, an ACTIVATION_CONTEXT_STACK, an IPC buffer, the hosted-syscalls flag,
+/// a dedicated fault EP, a stack, an SC) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/KUSER are
+/// already mapped, shared with the main thread) — then a trampoline that sets RCX = the thread
+/// parameter and `call`s the start routine (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$
+/// is a net). Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
+/// spawns all express (see the thin wrappers below).
+unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
+    let scr = t.scr;
+    // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
+    // rendezvous's out-param copyout.
+    for i in 0..t.stack_frames {
         let f = alloc_frame();
-        let _ = page_map(copy_cap(f), SM_STACK_BASE + i * 0x1000, RW_NX, smss_pml4);
-        let _ = page_map(copy_cap(f), SM_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(copy_cap(f), t.stack_base + i * 0x1000, RW_NX, t.pml4);
+        if t.stack_mirror_va != 0 {
+            let _ = page_map(copy_cap(f), t.stack_mirror_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        }
     }
-    // TEB page 1: self@0x30, PEB@0x60 (smss's PEB — shared), StackBase@0x08/StackLimit@0x10, and
+    // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
     // ActivationContextStackPointer@0x2C8 → an empty ACS in the 2nd TEB page.
     let teb = alloc_frame();
     let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
-    core::ptr::write_volatile((scr + 0x30) as *mut u64, SM_TEB_VA);
-    core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
-    core::ptr::write_volatile((scr + 0x08) as *mut u64, SM_STACK_BASE + SM_STACK_FRAMES * 0x1000);
-    core::ptr::write_volatile((scr + 0x10) as *mut u64, SM_STACK_BASE);
-    let acs_va = SM_TEB_VA + 0x1800;
+    core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
+    core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
+    core::ptr::write_volatile((scr + 0x48) as *mut u64, t.cid_thread);
+    core::ptr::write_volatile((scr + 0x60) as *mut u64, t.peb_va);
+    core::ptr::write_volatile((scr + 0x08) as *mut u64, t.stack_base + t.stack_frames * 0x1000);
+    core::ptr::write_volatile((scr + 0x10) as *mut u64, t.stack_base);
+    let acs_va = t.teb_va + 0x1800;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
-    let _ = page_map(copy_cap(teb), SM_TEB_VA, RW_NX, smss_pml4);
+    let _ = page_map(copy_cap(teb), t.teb_va, RW_NX, t.pml4);
     // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
     let teb2 = alloc_frame();
     let _ = page_map(teb2, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -7323,46 +7557,70 @@ unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64)
     core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
     core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
-    core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, SM_TEB_VA + 0x1268); // .Buffer
-    let _ = page_map(copy_cap(teb2), SM_TEB_VA + 0x1000, RW_NX, smss_pml4);
-    // IPC buffer (its own frame + VA; smss's main thread owns IPCBUF_VADDR).
+    core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
+    let _ = page_map(copy_cap(teb2), t.teb_va + 0x1000, RW_NX, t.pml4);
+    // IPC buffer (its own frame + VA; the main thread owns IPCBUF_VADDR).
     let ipcbuf = alloc_frame();
-    let _ = page_map(ipcbuf, SM_IPCBUF_VA, RW_NX, smss_pml4);
-    // Trampoline: RCX = the SmApiPort handle (SmpApiLoop's PVOID Parameter), then `call` SmpApiLoop
-    // (call keeps rsp ≡ 8 mod 16 at entry). SmpApiLoop loops forever; the trailing jmp$ is a net.
+    let _ = page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4);
+    // Trampoline: RCX = Parameter, then `call` the start routine.
     let tramp = alloc_frame();
     let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
     let mut tb = alloc::vec::Vec::new();
     tb.extend_from_slice(&[0x48, 0xB9]);
-    tb.extend_from_slice(&port_handle.to_le_bytes()); // movabs rcx, port_handle
+    tb.extend_from_slice(&t.param.to_le_bytes()); // movabs rcx, param
     tb.extend_from_slice(&[0x48, 0xB8]);
-    tb.extend_from_slice(&entry_rip.to_le_bytes()); // movabs rax, SmpApiLoop
+    tb.extend_from_slice(&t.entry_rip.to_le_bytes()); // movabs rax, StartRoutine
     tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
     tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
     for (j, &b) in tb.iter().enumerate() {
         core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
     }
-    let _ = page_map(copy_cap(tramp), SM_TRAMP_VA, /* RX */ 2, smss_pml4);
-    // CNode (PML4 of smss + the dedicated fault EP) + TCB.
+    let _ = page_map(copy_cap(tramp), t.tramp_va, /* RX */ 2, t.pml4);
+    // CNode (PML4 + the dedicated fault EP) + TCB.
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, smss_pml4, 0);
-    let sm_ep = SM_FAULT_EP.load(Ordering::Relaxed);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(sm_ep), 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, t.pml4, 0);
+    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(t.fault_ep), 0);
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    let _ = tcb_set_space(tcb, CT_FAULT, cnode, smss_pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, SM_IPCBUF_VA, ipcbuf, 0);
-    let _ = tcb_write_registers(tcb, SM_TRAMP_VA, SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 - 16, 0);
-    let _ = tcb_set_gs_base(tcb, SM_TEB_VA);
+    let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, t.ipcbuf_va, ipcbuf, 0);
+    let _ = tcb_write_registers(tcb, t.tramp_va, t.stack_base + t.stack_frames * 0x1000 - 16, 0);
+    let _ = tcb_set_gs_base(tcb, t.teb_va);
     let _ = tcb_set_priority(tcb, 100);
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
-    let _ = tcb_resume(tcb);
+    if t.resume {
+        let _ = tcb_resume(tcb);
+    }
     tcb
+}
+
+/// Spawn the AUTHENTIC SM-loop thread (path B): the general hosted thread running smss's real
+/// `SmpApiLoop` (`entry_rip`) with RCX = the `\SmApiPort` handle (`port_handle`). Its stack is
+/// MIRRORED into the executive so `sm_rendezvous` can write its syscall out-params. It faults to
+/// `SM_FAULT_EP` (no standing receiver) and is resumed at spawn → PARKS on its first fault.
+unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
+    spawn_hosted_thread(&HostedThread {
+        pml4: smss_pml4,
+        entry_rip,
+        param: port_handle,
+        scr: SM_ENV_SCRATCH_VA,
+        teb_va: SM_TEB_VA,
+        stack_base: SM_STACK_BASE,
+        stack_frames: SM_STACK_FRAMES,
+        ipcbuf_va: SM_IPCBUF_VA,
+        tramp_va: SM_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: SM_STACK_MIRROR_VA,
+        fault_ep: SM_FAULT_EP.load(Ordering::Relaxed),
+        cid_proc: 0,
+        cid_thread: 0,
+        resume: true,
+    })
 }
 
 /// Write a u64 to the SM-loop thread's stack (via the executive's SM_STACK_MIRROR alias), for a
@@ -7598,78 +7856,55 @@ pub const CSR_STACK_FRAMES: u64 = 8;
 /// hRequestEvent handle (CsrApiRequestThread's PVOID Parameter). The TEB carries the self-connect
 /// ClientId so the thread's own bookkeeping is consistent.
 unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, param: u64) -> u64 {
-    let scr = CSR_ENV_SCRATCH_VA;
-    for i in 0..CSR_STACK_FRAMES {
-        let f = alloc_frame();
-        let _ = page_map(copy_cap(f), CSR_STACK_BASE + i * 0x1000, RW_NX, csrss_pml4);
-        let _ = page_map(copy_cap(f), CSR_STACK_MIRROR_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    }
-    // TEB page 1: self@0x30, ClientId@0x40/0x48 (the self-connect CID), PEB@0x60 (csrss's PEB —
-    // shared with the main thread), StackBase@0x08/StackLimit@0x10, ACS@0x2C8.
-    let teb = alloc_frame();
-    let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
-    core::ptr::write_volatile((scr + 0x30) as *mut u64, CSR_TEB_VA);
-    core::ptr::write_volatile((scr + 0x40) as *mut u64, CSR_STATIC_CID_PROC);
-    core::ptr::write_volatile((scr + 0x48) as *mut u64, CSR_STATIC_CID_THREAD);
-    core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA);
-    core::ptr::write_volatile((scr + 0x08) as *mut u64, CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000);
-    core::ptr::write_volatile((scr + 0x10) as *mut u64, CSR_STACK_BASE);
-    let acs_va = CSR_TEB_VA + 0x1800;
-    core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
-    let _ = page_map(copy_cap(teb), CSR_TEB_VA, RW_NX, csrss_pml4);
-    // TEB page 2: ACTIVATION_CONTEXT_STACK + StaticUnicodeString.
-    let teb2 = alloc_frame();
-    let _ = page_map(teb2, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let acs = scr + 0x1000 + 0x800;
-    core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
-    core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
-    core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
-    core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
-    core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
-    core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
-    core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522);
-    core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, CSR_TEB_VA + 0x1268);
-    let _ = page_map(copy_cap(teb2), CSR_TEB_VA + 0x1000, RW_NX, csrss_pml4);
-    // IPC buffer.
-    let ipcbuf = alloc_frame();
-    let _ = page_map(ipcbuf, CSR_IPCBUF_VA, RW_NX, csrss_pml4);
-    // Trampoline: RCX = Parameter (hRequestEvent), then `call` CsrApiRequestThread.
-    let tramp = alloc_frame();
-    let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let mut tb = alloc::vec::Vec::new();
-    tb.extend_from_slice(&[0x48, 0xB9]);
-    tb.extend_from_slice(&param.to_le_bytes()); // movabs rcx, param
-    tb.extend_from_slice(&[0x48, 0xB8]);
-    tb.extend_from_slice(&entry_rip.to_le_bytes()); // movabs rax, CsrApiRequestThread
-    tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
-    for (j, &b) in tb.iter().enumerate() {
-        core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
-    }
-    let _ = page_map(copy_cap(tramp), CSR_TRAMP_VA, /* RX */ 2, csrss_pml4);
-    // CNode (csrss's PML4 + the dedicated CSR fault EP) + TCB.
-    let raw = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
-    let cnode = alloc_slot();
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, csrss_pml4, 0);
-    let csr_ep = CSR_FAULT_EP.load(Ordering::Relaxed);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(csr_ep), 0);
-    let tcb = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    let _ = tcb_set_space(tcb, CT_FAULT, cnode, csrss_pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CSR_IPCBUF_VA, ipcbuf, 0);
-    let _ = tcb_write_registers(tcb, CSR_TRAMP_VA, CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 - 16, 0);
-    let _ = tcb_set_gs_base(tcb, CSR_TEB_VA);
-    let _ = tcb_set_priority(tcb, 100);
-    const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
-    attach_sched_context(tcb);
     // NOT resumed here: CsrApiRequestThread's pre-loop CsrConnectToUser touches CsrRootProcess's
     // thread list under csrss's process lock, which csrss's MAIN thread is still mutating during init
     // (CsrAddStaticServerThread). Resuming now would race. Instead `csr_rendezvous` resumes it lazily,
     // by which time csrss main has finished init + parked → the CSR thread runs alone in csrss's VSpace.
-    tcb
+    // The TEB carries the self-connect ClientId (0x40/0x48) so the thread's own bookkeeping is consistent.
+    spawn_hosted_thread(&HostedThread {
+        pml4: csrss_pml4,
+        entry_rip,
+        param,
+        scr: CSR_ENV_SCRATCH_VA,
+        teb_va: CSR_TEB_VA,
+        stack_base: CSR_STACK_BASE,
+        stack_frames: CSR_STACK_FRAMES,
+        ipcbuf_va: CSR_IPCBUF_VA,
+        tramp_va: CSR_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: CSR_STACK_MIRROR_VA,
+        fault_ep: CSR_FAULT_EP.load(Ordering::Relaxed),
+        cid_proc: CSR_STATIC_CID_PROC,
+        cid_thread: CSR_STATIC_CID_THREAD,
+        resume: false,
+    })
+}
+
+/// Spawn a REAL thread through the GENERAL NtCreateThread path for a hosted process `pml4` (first
+/// live user: winlogon's RPC listener). `entry_rip`/`param` come from the caller's CONTEXT; `cid_*`
+/// is the real ClientId {caller pid, fresh tid} the ETHREAD carries. Returns the TCB. The thread
+/// faults to the dedicated `WL_LISTENER_FAULT_EP` (no receiver). It is left SUSPENDED (`resume:
+/// false`): its real TEB is mapped + queryable, but it is not scheduled — a "parked before first
+/// instruction" listener. Resuming it into the service loop (so it runs to `FSCTL_PIPE_LISTEN`)
+/// requires a per-thread stack-mirror switch in the main multiplex (the flagged follow-up).
+unsafe fn spawn_wl_listener_thread(pml4: u64, entry_rip: u64, param: u64, cid_proc: u64, cid_thread: u64) -> u64 {
+    spawn_hosted_thread(&HostedThread {
+        pml4,
+        entry_rip,
+        param,
+        scr: WL_LISTENER_ENV_SCRATCH_VA,
+        teb_va: WL_LISTENER_TEB_VA,
+        stack_base: WL_LISTENER_STACK_BASE,
+        stack_frames: WL_LISTENER_STACK_FRAMES,
+        ipcbuf_va: WL_LISTENER_IPCBUF_VA,
+        tramp_va: WL_LISTENER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: 0, // park-only: no rendezvous writes its stack
+        fault_ep: WL_LISTENER_FAULT_EP.load(Ordering::Relaxed),
+        cid_proc,
+        cid_thread,
+        resume: false,
+    })
 }
 
 /// Write a u64 to the CSR thread's stack (via the executive's CSR_STACK_MIRROR alias).
@@ -8517,6 +8752,10 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
 static PM_TIDS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Pool of ONE spare ETHREAD per process (pi 0/1/2), pre-created at boot so a RUNTIME NtCreateThread
+/// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
+/// its RPC listener; the array generalizes to any pi.)
+static PM_POOL_TID: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
@@ -10856,6 +11095,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if e_rc == 0 {
         REPLY_CSRLOOP_SLOT.store(rc, Ordering::Relaxed);
     }
+    // General NtCreateThread: a dedicated fault endpoint (no standing receiver) that the RPC-listener
+    // and any future park-only Nth thread faults to → it PARKS on its first fault, its real TEB left
+    // mapped + queryable by the process's main thread.
+    let wl_ep = make_object(OBJ_ENDPOINT);
+    WL_LISTENER_FAULT_EP.store(wl_ep, Ordering::Relaxed);
     print_str(b"[ntos-exec] reply caps: REPLY_MAIN cptr=0x");
     print_hex(REPLY_MAIN_SLOT.load(Ordering::Relaxed) as u32);
     print_str(b" (retype e=0x");
@@ -13023,6 +13267,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_winlogon_rpc_pipe",
                         NAMED_PIPE_CREATED.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    // ★ GENERAL NtCreateThread (real service): winlogon's RPC listener thread is a REAL
+                    // seL4-thread-backed nt-process ETHREAD — its NtCreateThread popped a pool ETHREAD,
+                    // bound the RPC listener StartRoutine, mapped a real TEB, and minted a typed Thread
+                    // handle (`exec_general_nt_create_thread`). The main thread then read that thread's
+                    // real TEB/ClientId via NtQueryInformationThread(ThreadBasicInformation), so
+                    // kernel32's RPC listener setup no longer NULL-derefs an absent TEB
+                    // (`exec_rpc_listener_thread_real`) → StartRpcServer runs past the wall.
+                    check(
+                        b"exec_general_nt_create_thread",
+                        PM_GENERAL_THREADS_CREATED.load(Ordering::Relaxed) >= 1
+                            && WL_LISTENER_TCB.load(Ordering::Relaxed) > 1
+                            && PM_LISTENER_TID.load(Ordering::Relaxed) != 0,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_rpc_listener_thread_real",
+                        WL_LISTENER_TEB_QUERIED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     // nt-process convergence (first increment): the real Process Manager backs the 3

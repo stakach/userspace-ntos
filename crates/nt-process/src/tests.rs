@@ -146,6 +146,37 @@ fn pre_created_main_thread_bound_at_spawn() {
 }
 
 #[test]
+fn runtime_thread_create_with_teb_and_handle() {
+    // The general NtCreateThread service: a host pre-creates a POOL of extra ETHREADs at boot (below
+    // its reset mark), then at runtime NtCreateThread pops one, binds the caller-supplied start
+    // routine + parameter (alloc-free), maps the thread's TEB and records its base, and mints a typed
+    // Thread(tid) handle in the CALLER's handle table. NtQueryInformationThread then resolves that
+    // handle back to the real TEB base + ClientId {pid, tid}.
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("winlogon.exe", None, None);
+    pm.reserve_handles(pid, 16);
+    let main = pm.create_thread(pid, 0, 0, false).unwrap(); // main (identity at boot)
+    // Pool: one extra ETHREAD pre-created at boot (entry/teb unknown yet).
+    let listener = pm.create_thread(pid, 0, 0, false).unwrap();
+    assert_ne!(listener, main);
+    assert_eq!(pm.main_thread(pid), Some(main)); // the pool thread is NOT the main thread
+    // Runtime NtCreateThread: bind the RPC listener start routine + record its mapped TEB.
+    assert!(pm.set_thread_start_address(listener, 0x7ff0_1234));
+    assert!(pm.set_thread_teb(listener, 0x0000_0100_1049_0000));
+    assert_eq!(pm.thread_teb(listener), Some(0x0000_0100_1049_0000));
+    assert_eq!(pm.thread_teb(main), Some(0)); // TEB unbound until mapped
+    assert!(!pm.set_thread_teb(9999, 0)); // unknown tid rejected, not a panic
+    // Mint a typed Thread(tid) handle in the caller's table → resolvable for 162.
+    let h = pm.insert_handle(pid, HandleObject::Thread(listener), 0).unwrap();
+    assert_eq!(pm.lookup_handle(pid, h), Some(HandleObject::Thread(listener)));
+    // The ClientId a host writes to NtCreateThread's *ClientId out-param.
+    assert_eq!(
+        pm.client_id(listener),
+        Some(ClientId { unique_process: pid, unique_thread: listener })
+    );
+}
+
+#[test]
 fn close_by_object_tag() {
     // The convergence hybrid: a host tags each entry with its own handle VALUE (Opaque) and closes
     // by that tag on NtClose, without knowing this table's internal slot-handle.

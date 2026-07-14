@@ -170,6 +170,10 @@ pub struct NtThread {
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
     pub win32_thread: Option<u64>,
+    /// The thread's TEB base VA (its `NtCurrentTeb()` / `KTHREAD.Teb`). Set when the host actually
+    /// spawns the backing thread (its TEB is a per-thread page); read back by
+    /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`. `0` until the TEB is mapped.
+    pub teb_base: u64,
 }
 
 /// The win32k per-system callout function pointers registered via
@@ -377,6 +381,7 @@ impl ProcessManager {
                 exit_status: None,
                 suspend_count: 0,
                 win32_thread: None,
+                teb_base: 0,
             },
         );
         Ok(tid)
@@ -472,6 +477,25 @@ impl ProcessManager {
             }
             None => false,
         }
+    }
+
+    /// Bind a thread's TEB base VA (spec §7.2) — the host sets it once it maps the thread's TEB page
+    /// at the real spawn. Returns `false` for an unknown thread. Alloc-free (a field write), so it is
+    /// safe to call during a serviced call on a reset bump allocator.
+    pub fn set_thread_teb(&mut self, tid: ThreadId, teb_base: u64) -> bool {
+        match self.threads.get_mut(&tid) {
+            Some(t) => {
+                t.teb_base = teb_base;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read back a thread's TEB base VA (`0` until the host maps it) — for
+    /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`.
+    pub fn thread_teb(&self, tid: ThreadId) -> Option<u64> {
+        self.threads.get(&tid).map(|t| t.teb_base)
     }
 
     /// The `pid`'s main (first) thread id, if any (spec §7.1) — the identity a host binds/queries.
