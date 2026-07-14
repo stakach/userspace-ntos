@@ -245,6 +245,8 @@ pub const SSN_NT_OPEN_KEY: u64 = 125;
 pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
 /// ntdll's NtEnumerateValueKey SSN (SmpInit enumerates Environment/DOS-Devices values by index).
 pub const SSN_NT_ENUM_VALUE_KEY: u64 = 77;
+/// ntdll's NtEnumerateKey SSN (winlogon's StartRpcServer path enumerates subkeys).
+pub const SSN_NT_ENUMERATE_KEY: u64 = 75;
 /// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
@@ -2995,6 +2997,40 @@ const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 /// cell offset, so it never collides with a hive key.
 const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 
+/// P5 — PAINT-SAFE keyboard-layout registry fix. advapi32's `MapDefaultKey` opens a predefined
+/// root (HKLM=`\Registry\Machine`, HKCU, HKCR) via `NtOpenKey(RootDirectory=0, ObjectName=<.rdata
+/// static>)`; that name lives in a mapped DLL's `.rdata`, which the executive's copyin mirror can't
+/// read, so `smss_read_objattr_name` returns EMPTY. Pre-fix we return NOT_FOUND, so `MapDefaultKey`
+/// fails and EVERY HKLM/HKCU subkey open fails — including winlogon's `InitKeyboardLayouts` fallback
+/// `LoadKeyboardLayoutW("00000409")` which opens `HKLM\SYSTEM\...\Keyboard Layouts\00000409` — so
+/// `InitKeyboardLayouts` returns FALSE → fatal `NtRaiseHardError`. Fix: hand back this sentinel for
+/// an absolute empty-name (predefined-root) open so `MapDefaultKey` succeeds, then resolve ONLY the
+/// keyboard-layout subkey (relative to this sentinel), returning NOT_FOUND for EVERY other subkey.
+/// That preserves the pre-fix outcome (not-found) for all non-keyboard opens, so win32k's paint-time
+/// client registry reads are byte-for-byte unchanged (a broad DLL-`.rdata`-name read was tried and
+/// regressed the desktop paint by letting ALL HKLM reads succeed → the interactive-winsta fork).
+const MACHINE_ROOT_HANDLE: u64 = 0x0000_0009_0000_0000;
+/// Sentinel key handle returned for the `HKLM\SYSTEM\...\Keyboard Layouts\<KLID>` open. Non-IME
+/// KLIDs (e.g. 00000409) need only the key to OPEN — the optional "Layout Id" value read is allowed
+/// to miss (a query on this handle returns not-found → `IntLoadKeyboardLayout` keeps the default).
+const SYNTH_KBD_HANDLE: u64 = 0x0000_0009_0000_0010;
+
+/// True if `path` is a `...\Keyboard Layouts\<klid>` subkey (the plural "Keyboard Layouts" under
+/// `Control`, distinct from the singular HKCU `Keyboard Layout\Preload`/`Substitutes`). Matched
+/// case-insensitively; this is the ONLY subkey the MACHINE_ROOT sentinel resolves (paint safety).
+fn is_keyboard_layout_key(path: &str) -> bool {
+    let lc = path.to_ascii_lowercase();
+    lc.contains("keyboard layouts\\")
+}
+/// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced (drives the `exec_kbd_layout_opened`
+/// spec — proves winlogon's InitKeyboardLayouts fallback reached its layout key).
+static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+/// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
+/// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
+static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
+/// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
+static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// The real filenames of the boot-path binaries staged under `\SystemRoot\System32` (the names the
 /// ntdll/csrss loader probes). The executive's nt-fs namespace is seeded with these so nt-fs is the
 /// single authority for "does this System32 file exist + attributes." Mirrors the nt-dll-registry
@@ -3938,6 +3974,30 @@ impl NativeSyscallHandler for ExecNtHandler {
                         path.push(c);
                     }
                 }
+                // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_HANDLE). Match the layout key
+                // by NAME (its RootDirectory arrives as 0 — advapi32's MapDefaultKey HKLM handle
+                // doesn't round-trip into the subkey OA — so the sentinel-relative test isn't hit).
+                // This is the ONLY key resolved specially, so every other HKLM/HKCU subkey outcome is
+                // identical to pre-fix and win32k's paint-time client reads are unchanged (a broad
+                // DLL-.rdata read regressed the paint by letting ALL HKLM reads succeed).
+                if is_keyboard_layout_key(&path) {
+                    smss_copyout(args[0], &SYNTH_KBD_HANDLE.to_le_bytes());
+                    KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                    return 0; // STATUS_SUCCESS
+                }
+                // A subkey open relative to the predefined-root sentinel that is NOT the keyboard key:
+                // NOT_FOUND (preserves the pre-fix outcome for all non-keyboard predefined subkeys).
+                if root_dir == MACHINE_ROOT_HANDLE {
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+                // An absolute open whose name is an unreadable DLL `.rdata` static (empty path) is a
+                // predefined-root open (HKLM/HKCU/HKCR); hand back the sentinel so MapDefaultKey
+                // succeeds (else the keyboard subkey open never fires). Non-keyboard subkeys stay
+                // not-found via the match above.
+                if root_dir < KEY_HANDLE_BASE && path.is_empty() {
+                    smss_copyout(args[0], &MACHINE_ROOT_HANDLE.to_le_bytes());
+                    return 0; // STATUS_SUCCESS
+                }
                 let cell = if root_dir >= KEY_HANDLE_BASE {
                     let idx = (root_dir - KEY_HANDLE_BASE) as usize;
                     match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
@@ -4012,6 +4072,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
             },
+            // NtEnumerateKey(KeyHandle[0], Index[1], KeyInformationClass[2], KeyInformation[3],
+            // Length[4], *ResultLength[5]). winlogon's StartRpcServer path enumerates subkeys of a
+            // registry key. We model an EMPTY subkey set (STATUS_NO_MORE_ENTRIES at every index) so
+            // the enumeration terminates cleanly — no subkeys are load-bearing for the RPC bring-up
+            // (the endpoint config it seeks is absent → rpcrt4 falls back to its defaults). Additive.
+            NativeService::NtEnumerateKey => {
+                NT_ENUMERATE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
+                0x8000_001A // STATUS_NO_MORE_ENTRIES
+            }
             // NtQueryValueKey(KeyHandle[0], *ValueName[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the synthetic CPU
             // key to build PROCESSOR_IDENTIFIER. Real-hive values by name → not-found (smss defaults).
@@ -5337,6 +5406,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
+            (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
             (NativeService::NtQueryValueKey, SSN_NT_QUERY_VALUE_KEY as u32),
             // Workstream A batch 1: services migrated off the hand-wired ladder into the table.
             (NativeService::NtQuerySystemInformation, SSN_NT_QUERY_SYSTEM_INFO as u32),
@@ -6688,7 +6758,20 @@ unsafe fn service_sec_image(
                     }
                     print_str(b"[win32k-svc] fb cleared to magenta before winlogon NtUserSwitchDesktop\n");
                 }
-                let (st, ok) = win32k_dispatch(m0, d_a0, d_a1, a2, a3);
+                // P5 — FAKE NtUserLoadKeyboardLayoutEx (SSN 0x125c) for winlogon. Routing it to win32k
+                // faults dereferencing the client `pustrKLID` at a low VA AND drags in the interactive-
+                // winsta / desktop-thread keyboard-layout window-manager fork (which regressed the
+                // paint). winlogon's IntLoadKeyboardLayout only needs a NON-NULL HKL back (it checks
+                // `if (LoadKeyboardLayoutW(...))`), so return the US layout HKL MAKELONG(0x0409,0x0409)
+                // WITHOUT dispatching — win32k's post-paint window state stays clean (the counted paint
+                // already fired at SSN 0x1288 above).
+                let (st, ok) = if m0 == 0x125c && badge == WINLOGON_BADGE {
+                    KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
+                    (0x0409_0409i32, true)
+                } else {
+                    win32k_dispatch(m0, d_a0, d_a1, a2, a3)
+                };
                 if winlogon_switch {
                     // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
                     // painted to the WC_DESKTOP background. This drives the counted paint gate.
@@ -12863,6 +12946,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_csr_message_plane",
                         CSR_MSGS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    // P5 — winlogon's InitKeyboardLayouts fallback reached its layout key: the
+                    // paint-safe MACHINE_ROOT sentinel let RegOpenKeyExW(HKLM\...\Keyboard
+                    // Layouts\00000409) SUCCEED (the previously-fatal open), so winlogon runs past
+                    // InitKeyboardLayouts toward StartRpcServer/StartServicesManager.
+                    check(
+                        b"exec_kbd_layout_opened",
+                        KBD_LAYOUT_KEY_OPENED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     // nt-process convergence (first increment): the real Process Manager backs the 3
