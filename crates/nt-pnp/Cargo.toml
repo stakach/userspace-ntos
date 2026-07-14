@@ -1,0 +1,14 @@
+[package]
+name = "nt-pnp"
+description = "NT PnP policy: PCI config-space enumeration (vendor/device/class, BAR base+size via the write-all-ones probe, IRQ line), device-to-driver binding by class/vendor, and resource assignment building a CM_RESOURCE_LIST. Pure logic (no_std + alloc), config access injected via a closure so it is host-testable against a mock config space; the seL4 executive supplies the real closures and mints the caps the resource list describes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-cm-resources = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
