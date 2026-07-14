@@ -27,15 +27,35 @@ FAT32 superfloppy; the flat `::NAME` staging is retired.
   both build-generated, non-tree). New spec **`exec_full_stack_from_fs`** (verdict 0x200 = 31 hits /
   0 fallbacks). `STAGE_FLAT_REACTOS=1` re-stages the flat copies for A/B debugging.
 
-**REMAINING (P7-A completion — the on-demand generalization; DEFERRED for review):** the ~15 fixed
-dual-mapped buffers + the name-scoped `NtOpenFile`/`NtQueryAttributesFile`/`NtCreateSection` fakes
-still exist — the host fills the buffers from FS-by-path reads AT BOOT, and the executive PE-parses
-each at a hardcoded offset. Retiring the BUFFERS means resolving `\SystemRoot\system32\X` at
-NtOpenFile TIME → `fat_open_path` → on-demand read → PE-parse. The mapping agent confirmed this is
-feasible WITHOUT a new IPC channel (the executive already owns the AHCI BAR cap; needs to map the
-DMA frame into its own VSpace + keep a `Fat32` handle post-boot + call the FS fns from the fake).
-This removes the 4-place add-a-binary contract — the real unlock for P5 (add services.exe/lsass by
-path, no new buffer). Deep refactor of the delicate loader — **hold for review before proceeding.**
+**P7-A GENERALIZATION — MECHANISM PROVEN + MIGRATION IN PROGRESS (2026-07-14):** chose mechanism
+**(b) exec-side FS → bump-allocated pool** (least risk: the demand-fault router / section tracking /
+per-process mirrors stay byte-identical — they operate on `PeFile` byte-slices, which now point into
+a pool buffer instead of a fixed buffer). Landed (both green, 143/94, desktop 0x003a6ea5, 0 FAIL):
+- **Enabler (commit `2e4a950`):** after the storage host reports + PARKS, the executive drives the
+  (idle) AHCI HBA ITSELF — it already owns the BAR cap (`AHCI_VADDR`) + the DMA-frame cap + the VT-d
+  IO mapping (`AHCI_IOVA`); it only needed a CPU-side mapping of the DMA frame at `AHCI_DMA_VADDR`
+  (same PT as `AHCI_VADDR` — no new PT). New helpers in `main.rs` right before `storage_probe`:
+  `fat32_mount` (BPB parse → `EXEC_FS: Option<Fat32>`), `pool_init`/`pool_alloc` (a 48 MiB VA arena
+  at `POOL_VADDR=0x…1500_0000`, 24 PTs, frames mapped on demand), `load_file_to_pool` (path → pooled
+  bytes), `load_dll_from_fs` (path → pool → PE32+ parse, with a fixed-buffer fallback for hybrid).
+  **Proof spec `exec_generic_loader_by_path`:** `version.dll` — NOT in the staged 15 — loads BY PATH
+  (49152 B, MZ+PE32+) with zero new per-binary wiring. This is the P5 enabler.
+- **First migrations (commit `8075b78`):** `gdi32.dll` (heavily demand-faulted), `userenv.dll`,
+  `mpr.dll` (winlogon's imports) now source BY PATH from the pool (`dll_buf_va[5/14/15]` = pool VA);
+  the relocation + demand-fault router + `nt-dll-registry` consume the pool bytes UNCHANGED. Desktop
+  still paints → the pool integrates with the delicate fault router on load-bearing paths.
+
+**REMAINING (finish P7-A):** migrate the other 13 registry DLLs (`dll_pes[0..16]`: csrsrv/basesrv/
+winsrv/kernel32/user32/rpcrt4/msvcrt/advapi32/ws2_32/kernel32_vista/advapi32_vista/ws2help/
+ntdll_vista) + the special-cased binaries (smss/csrss/csrsrv/winlogon at `service_sec_image` top;
+win32k/dxg/dxgthk/ftfd/framebuf/arial + NLS + the SYSTEM hive) onto `load_dll_from_fs`/
+`load_file_to_pool`, **a few per green boot** (same reversible fallback pattern). Then RETIRE: the
+host's per-binary reads in `storage_probe`, the fixed buffers (`FILEBUF`/`SRVBUF`/`WIN32BUF`/`WIN32K`/
+etc.) + their `STORAGE_SHARED` size offsets, and the name-scoped `NtOpenFile`/`NtQueryAttributesFile`/
+`NtCreateSection` fakes. **Untyped-pressure note:** during hybrid both the pool AND the fixed buffers
+consume untyped; keep pool growth modest per step (the big ones — kernel32 2.66 MiB, user32 1.12 MiB
+— last), and when retiring a fixed buffer, STOP allocating its frames in the boot setup (main.rs
+~12204+) to offset the pool. Once no DLL falls back, delete the fallback arms + the host reads.
 
 ### P7-A history / audit (first increment)
 
