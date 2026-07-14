@@ -73,8 +73,8 @@ pub(crate) unsafe fn service_sec_image(
     // a bitmask of which registry DLLs have their PT reserved in that process's VSpace. csrss and
     // winlogon load an overlapping DLL set at identical bases into DISTINCT VSpaces, so each needs
     // its own PD/PT reservation (the registry's global `mapped` flag stays for VA-range resolution).
-    let mut dll_pd_created = [false; 5];
-    let mut dll_mapped_bits = [0u32; 5];
+    let mut dll_pd_created = [false; MAX_PI];
+    let mut dll_mapped_bits = [0u32; MAX_PI];
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -385,7 +385,7 @@ pub(crate) unsafe fn service_sec_image(
     // the six ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
     // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
     // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
-    let mut procs = [ProcExec::empty(); 5];
+    let mut procs = [ProcExec::empty(); MAX_PI];
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
     }
@@ -396,7 +396,7 @@ pub(crate) unsafe fn service_sec_image(
     // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
     // run; zero it at entry so the demo call (ntdll=None) starts clean too.
-    let pfilled: &mut [[u64; 256]; 5] = &mut *core::ptr::addr_of_mut!(PFILLED);
+    let pfilled: &mut [[u64; 256]; MAX_PI] = &mut *core::ptr::addr_of_mut!(PFILLED);
     for p in pfilled.iter_mut() {
         for e in p.iter_mut() {
             *e = 0;
@@ -456,6 +456,12 @@ pub(crate) unsafe fn service_sec_image(
         } else {
             0
         };
+        // LOUD overflow guard: `pi` indexes the fixed-size per-process arrays (procs / pfilled /
+        // dll_pd_created / dll_mapped_bits, all sized to MAX_PI). A future 6th/7th hosted process
+        // adds a badge→pi arm above; if one ever exceeds MAX_PI this panics with a clear message
+        // (the panic handler prints file:line) instead of silently corrupting an adjacent array /
+        // spinning. Bump MAX_PI (a scalar .bss cost) to admit more processes.
+        assert!(pi < MAX_PI, "hosted process pi exceeds MAX_PI — bump MAX_PI");
         // Convergence (first increment): resolve this fault badge → its real EPROCESS via the Process
         // Manager (badge → pi → PM_PIDS[pi] → pm.process(pid)). Read-only (no alloc under the reset),
         // it proves the live badge-multiplex is backed by real nt-process objects. The ad-hoc per-pi
@@ -858,8 +864,8 @@ pub(crate) unsafe fn service_sec_image(
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: &mut dll_pd_created as *mut [bool; 5],
-                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 5],
+                    dll_pd_created: &mut dll_pd_created as *mut [bool; MAX_PI],
+                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; MAX_PI],
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary

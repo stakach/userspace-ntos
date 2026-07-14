@@ -29,14 +29,27 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// Number of per-process (per-owner) handle slots the registry keys on. Handle VALUES are
-/// **process-local** (each hosted process has its own NT handle namespace), so the same DLL,
-/// loaded by two processes, gets a distinct file/section handle **per process** — and those
-/// values may COLLIDE across processes (real NT dense per-process handles reuse small integers).
-/// Every handle store/lookup is therefore keyed by the owning process index `pi`
-/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass; the executive's fault-badge → pi
-/// mapping). `pi` values `>= PI_SLOTS` are ignored (out-of-range owner). Path 1b of the convergence.
-pub const PI_SLOTS: usize = 5;
+/// Per-process (per-owner) handle capacity **pre-reserved** for each DLL at `register()` time.
+/// Handle VALUES are **process-local** (each hosted process has its own NT handle namespace), so
+/// the same DLL, loaded by two processes, gets a distinct file/section handle **per process** — and
+/// those values may COLLIDE across processes (real NT dense per-process handles reuse small
+/// integers). Every handle store/lookup is therefore keyed by the owning process index `pi`
+/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass, 5+ = userinit/explorer/shell after
+/// login; the executive's fault-badge → pi mapping). Path 1b of the convergence.
+///
+/// **This is a RESERVE, not a ceiling.** The per-pi handle stores ([`Dll::file_handle`] /
+/// [`Dll::section_handle`]) are growable `Vec`s: `set_*_handle(pi, …)` extends them on demand, so
+/// there is NO hard process ceiling. The reserve exists purely for the executive's **per-syscall
+/// bump-heap-reset discipline**: DLLs are `register()`ed at BOOT (below the executive's `heap_mark`),
+/// so their per-pi `Vec`s are pre-allocated to `PI_RESERVE` capacity in the persistent (below-mark)
+/// heap region and every runtime `set_*_handle(pi, …)` for `pi < PI_RESERVE` writes into that
+/// already-allocated capacity — no heap growth, so the write SURVIVES the per-syscall `reset_to()`.
+/// A runtime `set_*_handle(pi ≥ PI_RESERVE)` DOES grow the `Vec` above the mark (would be rewound by
+/// the next reset) — so keep `PI_RESERVE` comfortably above the live process count (16 ⇒ the 5
+/// current + all post-login processes fit with headroom). If a boot ever needs > `PI_RESERVE`
+/// processes, either bump this constant OR advance `heap_mark` after the growing syscall (the
+/// `RegistryOverlay` `overlay_dirty` precedent).
+pub const PI_RESERVE: usize = 16;
 
 /// One registered DLL image and the handles/state the load flow accumulates for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,14 +63,27 @@ pub struct Dll {
     /// `AddressOfEntryPoint` (RVA), for the `SECTION_IMAGE_INFORMATION` transfer address.
     pub entry_rva: u32,
     /// File handle from NtOpenFile, **per owning process** (`file_handle[pi]`; 0 until opened by
-    /// that process). Two processes loading the same DLL each store their own (possibly equal)
-    /// handle VALUE here, so the lookup must be keyed by `pi`.
-    pub file_handle: [u64; PI_SLOTS],
-    /// Section handle from NtCreateSection, **per owning process** (`section_handle[pi]`; 0 until
-    /// sectioned by that process).
-    pub section_handle: [u64; PI_SLOTS],
+    /// that process). A GROWABLE per-pi store (pre-reserved to `PI_RESERVE`, extended on demand —
+    /// no fixed process ceiling). Two processes loading the same DLL each store their own (possibly
+    /// equal) handle VALUE here, so the lookup must be keyed by `pi`. Accessed via the
+    /// `file_handle(pi)` / `set_file_handle(pi, …)` methods, never as a raw array.
+    file_handle: Vec<u64>,
+    /// Section handle from NtCreateSection, **per owning process** (growable; `section_handle(pi)`;
+    /// 0 until sectioned by that process).
+    section_handle: Vec<u64>,
     /// Set once NtMapViewOfSection has reserved this DLL's VA range.
     pub mapped: bool,
+}
+
+/// Grow `v` so index `pi` is addressable (padding new slots with 0 = "no handle"), then return
+/// `&mut v[pi]`. Growth past the pre-`register()` reserve allocates in the transient heap (see
+/// [`PI_RESERVE`]); within the reserve it's a pure in-place write.
+#[inline]
+fn slot_mut(v: &mut Vec<u64>, pi: usize) -> &mut u64 {
+    if pi >= v.len() {
+        v.resize(pi + 1, 0);
+    }
+    &mut v[pi]
 }
 
 /// A by-name/handle/VA registry of the DLL images a hosted process demand-loads.
@@ -81,13 +107,21 @@ impl Registry {
     pub fn register(&mut self, name: &'static [u8], image_size: u64, entry_rva: u32) -> usize {
         let base = self.next_base;
         self.next_base += self.slot;
+        // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots. `register()` runs at BOOT
+        // (before the executive takes its per-syscall `heap_mark`), so these allocations live in the
+        // persistent below-mark heap; runtime `set_*_handle(pi < PI_RESERVE)` then writes in place
+        // and survives the per-syscall `reset_to()`. See [`PI_RESERVE`].
+        let mut file_handle = Vec::new();
+        let mut section_handle = Vec::new();
+        file_handle.resize(PI_RESERVE, 0);
+        section_handle.resize(PI_RESERVE, 0);
         self.dlls.push(Dll {
             name,
             base,
             image_size,
             entry_rva,
-            file_handle: [0; PI_SLOTS],
-            section_handle: [0; PI_SLOTS],
+            file_handle,
+            section_handle,
             mapped: false,
         });
         self.dlls.len() - 1
@@ -142,13 +176,18 @@ impl Registry {
             .map(|(i, _)| i)
     }
 
+    /// The NtOpenFile handle DLL `i` has in process `pi`'s handle namespace (0 = none / out of
+    /// range). The per-pi read half of the growable store.
+    pub fn file_handle(&self, pi: usize, i: usize) -> u64 {
+        self.dlls.get(i).and_then(|d| d.file_handle.get(pi)).copied().unwrap_or(0)
+    }
+
     /// Record the NtOpenFile handle for DLL `i`, owned by process `pi` (handles are process-local).
+    /// Grows the per-pi store on demand — no fixed process ceiling (see [`PI_RESERVE`] for the
+    /// bump-heap-reset caveat past the reserve).
     pub fn set_file_handle(&mut self, pi: usize, i: usize, handle: u64) {
-        if pi >= PI_SLOTS {
-            return;
-        }
         if let Some(d) = self.dlls.get_mut(i) {
-            d.file_handle[pi] = handle;
+            *slot_mut(&mut d.file_handle, pi) = handle;
         }
     }
 
@@ -156,28 +195,30 @@ impl Registry {
     /// The same handle VALUE in a different process is a different handle, so the lookup is scoped
     /// to `pi` and never matches another process's identical value.
     pub fn index_for_file(&self, pi: usize, handle: u64) -> Option<usize> {
-        if handle == 0 || pi >= PI_SLOTS {
+        if handle == 0 {
             return None;
         }
-        self.dlls.iter().position(|d| d.file_handle[pi] == handle)
+        self.dlls.iter().position(|d| d.file_handle.get(pi).copied() == Some(handle))
     }
 
-    /// Record the NtCreateSection handle for DLL `i`, owned by process `pi`.
+    /// The NtCreateSection handle DLL `i` has in process `pi`'s handle namespace (0 = none).
+    pub fn section_handle(&self, pi: usize, i: usize) -> u64 {
+        self.dlls.get(i).and_then(|d| d.section_handle.get(pi)).copied().unwrap_or(0)
+    }
+
+    /// Record the NtCreateSection handle for DLL `i`, owned by process `pi`. Grows on demand.
     pub fn set_section_handle(&mut self, pi: usize, i: usize, handle: u64) {
-        if pi >= PI_SLOTS {
-            return;
-        }
         if let Some(d) = self.dlls.get_mut(i) {
-            d.section_handle[pi] = handle;
+            *slot_mut(&mut d.section_handle, pi) = handle;
         }
     }
 
     /// The DLL a (non-zero) section handle belongs to, **within process `pi`'s handle namespace**.
     pub fn index_for_section(&self, pi: usize, handle: u64) -> Option<usize> {
-        if handle == 0 || pi >= PI_SLOTS {
+        if handle == 0 {
             return None;
         }
-        self.dlls.iter().position(|d| d.section_handle[pi] == handle)
+        self.dlls.iter().position(|d| d.section_handle.get(pi).copied() == Some(handle))
     }
 
     /// Mark DLL `i`'s view mapped (its VA range is now reserved + demand-pageable).
@@ -345,9 +386,45 @@ mod tests {
         r.set_section_handle(2, 2, 0x8);
         assert_eq!(r.index_for_section(1, 0x8), Some(0));
         assert_eq!(r.index_for_section(2, 0x8), Some(2));
-        // Out-of-range owner index is inert (never panics).
-        r.set_file_handle(99, 0, 0x4);
-        assert_eq!(r.index_for_file(99, 0x4), None);
+        // A never-set owner index reads back 0 and matches nothing (no panic, no ceiling).
+        assert_eq!(r.file_handle(7, 0), 0);
+        assert_eq!(r.index_for_file(7, 0x4), None);
+    }
+
+    #[test]
+    fn per_pi_handles_grow_past_the_reserve_no_ceiling() {
+        // The load-bearing property for > PI_RESERVE processes: set/get handles for pi 0..24
+        // (well past PI_RESERVE) with NO fixed ceiling — the per-pi store grows on demand and
+        // every prior pi's value is retained (dynamic, not a hard 5- or 16-slot array).
+        let mut r = seeded();
+        let n = PI_RESERVE + 8; // 24 processes: past the pre-reserve
+        for pi in 0..n {
+            // Each process gets a distinct handle value for csrsrv (dll 0) + winsrv (dll 2).
+            r.set_file_handle(pi, 0, 0x1000 + pi as u64);
+            r.set_section_handle(pi, 2, 0x2000 + pi as u64);
+        }
+        // Read them all back — none clobbered, none lost past the reserve.
+        for pi in 0..n {
+            assert_eq!(r.file_handle(pi, 0), 0x1000 + pi as u64, "file handle pi={pi}");
+            assert_eq!(r.index_for_file(pi, 0x1000 + pi as u64), Some(0));
+            assert_eq!(r.section_handle(pi, 2), 0x2000 + pi as u64, "section handle pi={pi}");
+            assert_eq!(r.index_for_section(pi, 0x2000 + pi as u64), Some(2));
+        }
+        // A high pi's value never leaks into a different pi's namespace.
+        assert_eq!(r.index_for_file(0, 0x1000 + 23), None);
+        // Unset dll/pi combos still read 0.
+        assert_eq!(r.file_handle(23, 1), 0); // pi 23 never opened basesrv (dll 1)
+    }
+
+    #[test]
+    fn reserve_capacity_is_preallocated_at_register() {
+        // register() pre-reserves PI_RESERVE slots so runtime sets within the reserve are pure
+        // in-place writes (bump-heap-reset-safe). The store starts zeroed for every reserved pi.
+        let r = seeded();
+        for pi in 0..PI_RESERVE {
+            assert_eq!(r.file_handle(pi, 0), 0);
+            assert_eq!(r.section_handle(pi, 0), 0);
+        }
     }
 
     #[test]

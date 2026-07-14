@@ -541,6 +541,18 @@ pub const LSASS_BADGE: u64 = 8;
 /// lsass.exe's demand-fault scratch — PT 3 of smss's already-mapped 8-PT scratch range
 /// (0x1100..0x1200); PT0 smss / PT2 services / PT4 csrss / PT6 winlogon → PT3 (0x1160) is free.
 pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
+/// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
+/// per-process arrays are sized for. The 5 current processes (smss/csrss/winlogon/services/lsass =
+/// pi 0..4) are live; the extra headroom is for the post-login processes (userinit, explorer, the
+/// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
+/// (PM_PIDS/PM_TIDS/PM_POOL_TID, PFILLED, the service_sec_image `procs`/`dll_pd_created`/
+/// `dll_mapped_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
+/// per-process slot. The pi-indexed WRITE sites guard `pi < MAX_PI` and panic LOUDLY (never a silent
+/// spin) if a spawn ever exceeds this — bump `MAX_PI` (a scalar cost) or move to a per-pid map. The
+/// per-pi VA-LAYOUT still uses distinct fixed windows per process (SCRATCH_BASE / *_MIRROR_VA above),
+/// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
+/// makes the SLOT arrays ready and the overflow LOUD in the meantime.
+pub const MAX_PI: usize = 16;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -786,10 +798,11 @@ static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
-/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services). Kept off the 16 KiB rootserver stack — a
-/// [[u64;256];4] local (8 KiB) plus service_sec_image's other arrays would risk the guard page.
+/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass; MAX_PI rows for post-login growth).
+/// Kept off the 16 KiB rootserver stack — this array as a local plus service_sec_image's other
+/// arrays would risk the guard page. In `.bss`, so growth to MAX_PI is free (no stack cost).
 /// Zeroed at service_sec_image entry; only that single loop touches it.
-static mut PFILLED: [[u64; 256]; 5] = [[0u64; 256]; 5];
+static mut PFILLED: [[u64; 256]; MAX_PI] = [[0u64; 256]; MAX_PI];
 /// SERVICE 10 stack relief: the per-iteration `filled_pages` WORKING buffer (loaded from / saved to
 /// `PFILLED[pi]` around each dispatch) lives in a static, not on the 16 KiB rootserver stack. Adding a
 /// 5th hosted process pushed `service_sec_image`'s frame — its `[u64;256]` working array plus the
@@ -2152,13 +2165,13 @@ struct ExecLoopCtx {
     /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
     /// loop-locals.
     csrss_anon_base: *mut u64,
-    dll_pd_created: *mut [bool; 5],
+    dll_pd_created: *mut [bool; MAX_PI],
     /// PER-PROCESS bitmask of which registry DLLs have had their VA-range page table reserved in
     /// THIS process's VSpace (bit i = DLL i mapped in process pi). csrss (pi==1) and winlogon
     /// (pi==2) each load an overlapping DLL set at the SAME fixed bases but into DISTINCT VSpaces,
     /// so the PT reservation must be tracked per-process (the registry's global `mapped` flag stays
     /// for `dll_for_page` VA-range resolution, which is base-identical across processes).
-    dll_mapped_bits: *mut [u32; 5],
+    dll_mapped_bits: *mut [u32; MAX_PI],
 }
 
 struct ExecNtHandler {
@@ -2758,8 +2771,7 @@ static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 // realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
 // keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
 /// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon / 3=services (0 = not yet created).
-static PM_PIDS: [AtomicU64; 5] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_PIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// How many EPROCESS objects the boot-time ProcessManager holds (expected 3).
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
@@ -2789,13 +2801,11 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Main-thread tids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created). Pre-created at boot
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
-static PM_TIDS: [AtomicU64; 5] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Pool of ONE spare ETHREAD per process (pi 0/1/2/3), pre-created at boot so a RUNTIME NtCreateThread
 /// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
 /// its RPC listener; the array generalizes to any pi.)
-static PM_POOL_TID: [AtomicU64; 5] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_POOL_TID: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
