@@ -10134,6 +10134,129 @@ unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, dest_vaddr: u
     written
 }
 
+/// Like `dir_find` but matches EITHER the 8.3 short entry OR the reassembled long (LFN) name of
+/// `comp` — case-insensitive ASCII — so names WITHOUT a clean 8.3 alias (e.g. `advapi32_vista.dll`,
+/// `windowscodecs.dll`) resolve by their real name. Returns `(first_cluster, size, attr)`. VFAT
+/// stores 0-N LFN entries (attr 0x0F) physically BEFORE the 8.3 entry, each carrying 13 UTF-16
+/// chars keyed by a 1-based sequence ordinal; this reassembles them (ASCII only — sufficient for
+/// the ReactOS tree) and compares to `comp`. When an entry has an LFN, only the long name is
+/// matched (the 8.3 is a mangled alias); otherwise the 8.3 short name is matched (old behavior).
+unsafe fn dir_find_lfn(fs: &Fat32, dir_cluster: u32, comp: &[u8]) -> Option<(u32, u32, u8)> {
+    let short = name_to_83(comp);
+    // Lowercase the target (ASCII) once.
+    let mut want = [0u8; 256];
+    let want_len = if comp.len() < 256 { comp.len() } else { 256 };
+    let mut i = 0;
+    while i < want_len {
+        let c = comp[i];
+        want[i] = if c.is_ascii_uppercase() { c + 32 } else { c };
+        i += 1;
+    }
+    // Does `comp` fit a clean 8.3 (base<=8, ext<=3, at most one dot)? If NOT, the 8.3 fallback
+    // is UNSAFE: `name_to_83` truncates (e.g. "kernel32_vista.dll" -> "KERNEL32DLL") and would
+    // COLLIDE with a different file's short entry ("kernel32.dll"). So the short-name match is
+    // gated on `fits_83`; a long name matches ONLY via its reassembled LFN.
+    let (mut base_len, mut ext_len, mut dots) = (0usize, 0usize, 0usize);
+    for &c in comp {
+        if c == b'.' {
+            dots += 1;
+        } else if dots >= 1 {
+            ext_len += 1;
+        } else {
+            base_len += 1;
+        }
+    }
+    let fits_83 = dots <= 1 && base_len >= 1 && base_len <= 8 && ext_len <= 3;
+    let lfn_off: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+    let mut lfn = [0u8; 260]; // reassembled long name (lowercased ASCII)
+    let mut term: Option<usize> = None; // index of the 0x0000 terminator, if seen
+    let mut hi_ord = 0usize;
+    let mut have_lfn = false;
+    let mut cl = dir_cluster;
+    while cl >= 2 && cl < 0x0FFF_FFF8 {
+        for s in 0..fs.spc {
+            let p = fat_read_sector(fs, fat_cluster_sector(fs, cl) + s);
+            for e in 0..(fs.bps as usize / 32) {
+                let ent = p.add(e * 32);
+                let first = *ent;
+                if first == 0x00 {
+                    return None; // end of directory
+                }
+                if first == 0xE5 {
+                    have_lfn = false; term = None; hi_ord = 0; // deleted — drop any pending LFN
+                    continue;
+                }
+                let attr = *ent.add(0x0B);
+                if attr == 0x0F {
+                    // LFN fragment: place its 13 chars at [(ord-1)*13 ..].
+                    let ord = (first & 0x1F) as usize;
+                    if ord >= 1 && ord <= 20 {
+                        have_lfn = true;
+                        if ord > hi_ord { hi_ord = ord; }
+                        let base = (ord - 1) * 13;
+                        let mut k = 0;
+                        while k < 13 {
+                            let o = lfn_off[k];
+                            let lo = *ent.add(o);
+                            let hi = *ent.add(o + 1);
+                            let idx = base + k;
+                            if idx < 260 {
+                                if lo == 0 && hi == 0 {
+                                    if term.is_none() { term = Some(idx); }
+                                } else if !(lo == 0xFF && hi == 0xFF) {
+                                    lfn[idx] = if hi == 0 {
+                                        if lo.is_ascii_uppercase() { lo + 32 } else { lo }
+                                    } else {
+                                        0xFF // non-ASCII — won't match an ASCII target
+                                    };
+                                }
+                            }
+                            k += 1;
+                        }
+                    }
+                    continue;
+                }
+                if (attr & 0x08) != 0 {
+                    have_lfn = false; term = None; hi_ord = 0; // volume label
+                    continue;
+                }
+                // 8.3 entry: decide match against the long name (if any) or the short name.
+                let matched = if have_lfn {
+                    let len = term.unwrap_or(hi_ord * 13);
+                    len == want_len && {
+                        let mut m = true;
+                        let mut j = 0;
+                        while j < len {
+                            if lfn[j] != want[j] { m = false; break; }
+                            j += 1;
+                        }
+                        m
+                    }
+                } else {
+                    fits_83 && {
+                        let mut m = true;
+                        let mut j = 0;
+                        while j < 11 {
+                            if *ent.add(j) != short[j] { m = false; break; }
+                            j += 1;
+                        }
+                        m
+                    }
+                };
+                if matched {
+                    let hi = core::ptr::read_unaligned(ent.add(0x14) as *const u16) as u32;
+                    let lo = core::ptr::read_unaligned(ent.add(0x1A) as *const u16) as u32;
+                    let size = core::ptr::read_unaligned(ent.add(0x1C) as *const u32);
+                    return Some(((hi << 16) | lo, size, attr));
+                }
+                have_lfn = false; term = None; hi_ord = 0;
+            }
+        }
+        cl = fat_next(fs, cl);
+    }
+    None
+}
+
 /// Convert one path component (e.g. `b"ntdll.dll"`) to a space-padded 8.3 FAT short name.
 /// ASCII-uppercases; splits on the LAST '.' (a leading dot is treated as part of the base);
 /// truncates base to 8 and extension to 3. Good enough for the ReactOS install tree, whose
@@ -10184,8 +10307,7 @@ unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
         let is_sep = i == path.len() || path[i] == b'\\' || path[i] == b'/';
         if is_sep {
             if i > start {
-                let name11 = name_to_83(&path[start..i]);
-                let (cl, sz, attr) = dir_find(fs, cur, &name11)?;
+                let (cl, sz, attr) = dir_find_lfn(fs, cur, &path[start..i])?;
                 if i == path.len() {
                     result = Some((cl, sz)); // final component = the file
                 } else {
@@ -10200,6 +10322,26 @@ unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
         i += 1;
     }
     result
+}
+
+/// Open `\reactos\system32\<leaf>` from the volume (the common ReactOS binary location) via the
+/// LFN-aware path walk. Returns `(first_cluster, size)`. Builds the path in a stack buffer (the
+/// storage host has no allocator). `leaf` may itself contain `\` for a sub-dir (e.g.
+/// `b"drivers\\dxg.sys"`, `b"config\\system"`).
+unsafe fn open_sys32(fs: &Fat32, leaf: &[u8]) -> Option<(u32, u32)> {
+    let mut path = [0u8; 160];
+    let mut n = 0usize;
+    for &c in b"reactos\\system32\\" {
+        path[n] = c;
+        n += 1;
+    }
+    let mut i = 0;
+    while i < leaf.len() && n < path.len() {
+        path[n] = leaf[i];
+        n += 1;
+        i += 1;
+    }
+    fat_open_path(fs, &path[..n])
 }
 
 /// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
@@ -10280,6 +10422,29 @@ unsafe fn storage_probe(
             data_start: reserved + nfats * spf32,
             root_cl,
         };
+        // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
+        // fat_open_path), NOT from the flat root ::NAME files. Each read tries the real path first
+        // and falls back to the flat 8.3 name so the boot stays green during the migration; the
+        // hit/miss counters below prove whether the WHOLE stack came from the FS (miss==0 =>
+        // verdict 0x200). `open_or_sys32!`/`open_or_path!` return dir_find's (cluster,size,attr).
+        let mut fs_hits = 0u32; // files resolved BY PATH from \reactos\...
+        let mut fs_miss = 0u32; // files that fell back to the flat ::NAME
+        macro_rules! open_or_sys32 {
+            ($leaf:expr, $short:expr) => {{
+                match open_sys32(&fs, $leaf) {
+                    Some((c, s)) => { fs_hits += 1; Some((c, s, 0u8)) }
+                    None => { let r = dir_find(&fs, fs.root_cl, $short); if r.is_some() { fs_miss += 1; } r }
+                }
+            }};
+        }
+        macro_rules! open_or_path {
+            ($path:expr, $short:expr) => {{
+                match fat_open_path(&fs, $path) {
+                    Some((c, s)) => { fs_hits += 1; Some((c, s, 0u8)) }
+                    None => { let r = dir_find(&fs, fs.root_cl, $short); if r.is_some() { fs_miss += 1; } r }
+                }
+            }};
+        }
         // List the root directory (a real directory read).
         print_str(b"[storage-host] root dir:");
         let rp = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl));
@@ -10350,7 +10515,7 @@ unsafe fn storage_probe(
         }
         // Read the real ReactOS SMSS.EXE off the root into `smss_dest` (up to the file buffer's
         // capacity) — a real x64 PE for the executive to load via SEC_IMAGE.
-        if let Some((smss_cl, ssize, _)) = dir_find(&fs, fs.root_cl, b"SMSS    EXE") {
+        if let Some((smss_cl, ssize, _)) = open_or_sys32!(b"smss.exe", b"SMSS    EXE") {
             let cap = (FILEBUF_FRAMES * 0x1000) as u32;
             let want = if ssize < cap { ssize } else { cap };
             let got = fat_read_file(&fs, smss_cl, want, smss_dest);
@@ -10368,7 +10533,7 @@ unsafe fn storage_probe(
         }
         // csrss.exe — the Win32 subsystem launcher smss starts. Staged into the FILEBUF tail (past
         // smss), its size reported at STORAGE_SHARED+0x3c. Only if it fits clear of smss.
-        if let Some((cc, csz, _)) = dir_find(&fs, fs.root_cl, b"CSRSS   EXE") {
+        if let Some((cc, csz, _)) = open_or_sys32!(b"csrss.exe", b"CSRSS   EXE") {
             let cap = CSRSRV_FILEBUF_OFFSET as u32 - CSRSS_FILEBUF_OFFSET as u32;
             if csz > 0 && csz <= cap && smss_size <= CSRSS_FILEBUF_OFFSET as u32 {
                 let got = fat_read_file(&fs, cc, csz, smss_dest + CSRSS_FILEBUF_OFFSET);
@@ -10380,7 +10545,7 @@ unsafe fn storage_probe(
         // csrsrv.dll — csrss.exe's static-import Server DLL. Staged further into the FILEBUF (past
         // csrss), size at STORAGE_SHARED+0x40. The executive maps it into csrss's VSpace on the DLL
         // load so csrss's imports resolve (else STATUS_DLL_NOT_FOUND).
-        if let Some((rc, rsz, _)) = dir_find(&fs, fs.root_cl, b"CSRSRV  DLL") {
+        if let Some((rc, rsz, _)) = open_or_sys32!(b"csrsrv.dll", b"CSRSRV  DLL") {
             let cap = (FILEBUF_FRAMES * 0x1000) as u32 - CSRSRV_FILEBUF_OFFSET as u32;
             if rsz > 0 && rsz <= cap {
                 let got = fat_read_file(&fs, rc, rsz, smss_dest + CSRSRV_FILEBUF_OFFSET);
@@ -10394,7 +10559,7 @@ unsafe fn storage_probe(
         }
         // basesrv.dll — csrss's ServerDll=basesrv. Staged into the SRVBUF (offset 0), size at
         // STORAGE_SHARED+0x44; the executive parses+maps it into csrss's VSpace on the DLL load.
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"BASESRV DLL") {
+        if let Some((c, sz, _)) = open_or_sys32!(b"basesrv.dll", b"BASESRV DLL") {
             if sz > 0 && sz <= (WINSRV_SRVBUF_OFFSET as u32) {
                 let got = fat_read_file(&fs, c, sz, srvbuf_dest + BASESRV_SRVBUF_OFFSET);
                 if got == sz {
@@ -10407,7 +10572,7 @@ unsafe fn storage_probe(
         }
         // winsrv.dll — csrss's ServerDll=winsrv. Staged into the SRVBUF (past basesrv, +0x10000),
         // size at STORAGE_SHARED+0x48; the executive parses+maps it into csrss's VSpace.
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WINSRV  DLL") {
+        if let Some((c, sz, _)) = open_or_sys32!(b"winsrv.dll", b"WINSRV  DLL") {
             if sz > 0 && sz <= ((SRVBUF_FRAMES * 0x1000) as u32 - WINSRV_SRVBUF_OFFSET as u32) {
                 let got = fat_read_file(&fs, c, sz, srvbuf_dest + WINSRV_SRVBUF_OFFSET);
                 if got == sz {
@@ -10421,29 +10586,29 @@ unsafe fn storage_probe(
         // The Win32 client stack (kernel32/user32/gdi32) + winsrv's transitive import closure
         // (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders + ws2help) — staged into the WIN32BUF
         // (its own 8 MiB region), sizes reported at STORAGE_SHARED +0x4c..+0x70.
-        for (name, off, shoff, cap) in [
-            (b"KERNEL32DLL", KERNEL32_WIN32BUF_OFFSET, 0x4cu64, USER32_WIN32BUF_OFFSET),
-            (b"USER32  DLL", USER32_WIN32BUF_OFFSET, 0x50, GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET),
-            (b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, RPCRT4_WIN32BUF_OFFSET - GDI32_WIN32BUF_OFFSET),
-            (b"RPCRT4  DLL", RPCRT4_WIN32BUF_OFFSET, 0x58, MSVCRT_WIN32BUF_OFFSET - RPCRT4_WIN32BUF_OFFSET),
-            (b"MSVCRT  DLL", MSVCRT_WIN32BUF_OFFSET, 0x5c, ADVAPI32_WIN32BUF_OFFSET - MSVCRT_WIN32BUF_OFFSET),
-            (b"ADVAPI32DLL", ADVAPI32_WIN32BUF_OFFSET, 0x60, WS2_32_WIN32BUF_OFFSET - ADVAPI32_WIN32BUF_OFFSET),
-            (b"WS2_32  DLL", WS2_32_WIN32BUF_OFFSET, 0x64, KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET),
-            (b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
-            (b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
-            (b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET),
-            (b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, USERENV_WIN32BUF_OFFSET - NTDLL_VISTA_WIN32BUF_OFFSET),
+        for (leaf, short, off, shoff, cap) in [
+            (b"kernel32.dll".as_slice(), b"KERNEL32DLL", KERNEL32_WIN32BUF_OFFSET, 0x4cu64, USER32_WIN32BUF_OFFSET),
+            (b"user32.dll".as_slice(), b"USER32  DLL", USER32_WIN32BUF_OFFSET, 0x50, GDI32_WIN32BUF_OFFSET - USER32_WIN32BUF_OFFSET),
+            (b"gdi32.dll".as_slice(), b"GDI32   DLL", GDI32_WIN32BUF_OFFSET, 0x54, RPCRT4_WIN32BUF_OFFSET - GDI32_WIN32BUF_OFFSET),
+            (b"rpcrt4.dll".as_slice(), b"RPCRT4  DLL", RPCRT4_WIN32BUF_OFFSET, 0x58, MSVCRT_WIN32BUF_OFFSET - RPCRT4_WIN32BUF_OFFSET),
+            (b"msvcrt.dll".as_slice(), b"MSVCRT  DLL", MSVCRT_WIN32BUF_OFFSET, 0x5c, ADVAPI32_WIN32BUF_OFFSET - MSVCRT_WIN32BUF_OFFSET),
+            (b"advapi32.dll".as_slice(), b"ADVAPI32DLL", ADVAPI32_WIN32BUF_OFFSET, 0x60, WS2_32_WIN32BUF_OFFSET - ADVAPI32_WIN32BUF_OFFSET),
+            (b"ws2_32.dll".as_slice(), b"WS2_32  DLL", WS2_32_WIN32BUF_OFFSET, 0x64, KERNEL32_VISTA_WIN32BUF_OFFSET - WS2_32_WIN32BUF_OFFSET),
+            (b"kernel32_vista.dll".as_slice(), b"K32VISTADLL", KERNEL32_VISTA_WIN32BUF_OFFSET, 0x68, ADVAPI32_VISTA_WIN32BUF_OFFSET - KERNEL32_VISTA_WIN32BUF_OFFSET),
+            (b"advapi32_vista.dll".as_slice(), b"A32VISTADLL", ADVAPI32_VISTA_WIN32BUF_OFFSET, 0x6c, WS2HELP_WIN32BUF_OFFSET - ADVAPI32_VISTA_WIN32BUF_OFFSET),
+            (b"ws2help.dll".as_slice(), b"WS2HELP DLL", WS2HELP_WIN32BUF_OFFSET, 0x70, NTDLL_VISTA_WIN32BUF_OFFSET - WS2HELP_WIN32BUF_OFFSET),
+            (b"ntdll_vista.dll".as_slice(), b"NTDLLVISDLL", NTDLL_VISTA_WIN32BUF_OFFSET, 0x78, USERENV_WIN32BUF_OFFSET - NTDLL_VISTA_WIN32BUF_OFFSET),
             // winlogon.exe's two extra static imports (the rest of its stack is shared with csrss).
-            (b"USERENV DLL", USERENV_WIN32BUF_OFFSET, 0x98, MPR_WIN32BUF_OFFSET - USERENV_WIN32BUF_OFFSET),
-            (b"MPR     DLL", MPR_WIN32BUF_OFFSET, 0x9c, WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET),
+            (b"userenv.dll".as_slice(), b"USERENV DLL", USERENV_WIN32BUF_OFFSET, 0x98, MPR_WIN32BUF_OFFSET - USERENV_WIN32BUF_OFFSET),
+            (b"mpr.dll".as_slice(), b"MPR     DLL", MPR_WIN32BUF_OFFSET, 0x9c, WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET),
         ] {
-            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+            if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
                 if sz > 0 && (sz as u64) <= cap {
                     let got = fat_read_file(&fs, c, sz, win32buf_dest + off);
                     if got == sz {
                         core::ptr::write_volatile((STORAGE_SHARED_VADDR + shoff) as *mut u32, sz);
                         print_str(b"[storage-host] ");
-                        for &ch in name { debug_put_char(ch); }
+                        for &ch in leaf { debug_put_char(ch); }
                         print_str(b" size="); print_u64(sz as u64); print_str(b"\n");
                     }
                 }
@@ -10458,25 +10623,12 @@ unsafe fn storage_probe(
             }
         }
         // The real ReactOS ntdll.dll (~975 KiB) into `ntdll_dest` — smss's imports resolve here.
-        // P7 FS-BACKED-BY-PATH: prefer resolving ntdll from the real install tree at
-        // \reactos\system32\ntdll.dll via a nested-directory walk (fat_open_path); fall back to
-        // the flat staged ::NTDLL.DLL so the boot stays green if the tree isn't present. The bytes
-        // are identical either way, so the loaded ntdll (and the whole boot) is unchanged.
-        // verdict bit 0x100 = ntdll came from the FS BY PATH (the counted spec).
-        let ntdll_ent = match fat_open_path(&fs, b"reactos\\system32\\ntdll.dll") {
-            Some((pc, psz)) => {
-                print_str(b"[storage-host] ntdll resolved BY PATH \\reactos\\system32\\ntdll.dll cluster=");
-                print_u64(pc as u64);
-                print_str(b" size=");
-                print_u64(psz as u64);
-                print_str(b"\n");
-                verdict |= 0x100;
-                Some((pc, psz, 0u8))
-            }
-            None => {
-                print_str(b"[storage-host] ntdll BY PATH not found; falling back to flat ::NTDLL.DLL\n");
-                dir_find(&fs, fs.root_cl, b"NTDLL   DLL")
-            }
+        // Resolved BY PATH from \reactos\system32\ntdll.dll (verdict bit 0x100 = the by-path spec,
+        // set ONLY on a genuine path resolution), falling back to the flat ::NTDLL.DLL. Bytes are
+        // identical, so the loaded ntdll is unchanged.
+        let ntdll_ent = match open_sys32(&fs, b"ntdll.dll") {
+            Some((c, s)) => { fs_hits += 1; verdict |= 0x100; Some((c, s, 0u8)) }
+            None => { let r = dir_find(&fs, fs.root_cl, b"NTDLL   DLL"); if r.is_some() { fs_miss += 1; } r }
         };
         if let Some((nc, nsz, _)) = ntdll_ent {
             let cap = (NTDLLBUF_FRAMES * 0x1000) as u32;
@@ -10493,17 +10645,17 @@ unsafe fn storage_probe(
             }
         }
         // NLS code-page tables — c_1252 (ANSI), c_437 (OEM), l_intl (Unicode case).
-        for (name, dest, frames, out) in [
-            (b"C_1252  NLS", nls_ansi_dest, NLS_ANSI_FRAMES, &mut nls_ansi_size),
-            (b"C_437   NLS", nls_oem_dest, NLS_OEM_FRAMES, &mut nls_oem_size),
-            (b"L_INTL  NLS", nls_case_dest, NLS_CASE_FRAMES, &mut nls_case_size),
+        for (leaf, short, dest, frames, out) in [
+            (b"c_1252.nls".as_slice(), b"C_1252  NLS", nls_ansi_dest, NLS_ANSI_FRAMES, &mut nls_ansi_size),
+            (b"c_437.nls".as_slice(), b"C_437   NLS", nls_oem_dest, NLS_OEM_FRAMES, &mut nls_oem_size),
+            (b"l_intl.nls".as_slice(), b"L_INTL  NLS", nls_case_dest, NLS_CASE_FRAMES, &mut nls_case_size),
         ] {
-            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+            if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
                 let cap = (frames * 0x1000) as u32;
                 let want = if sz < cap { sz } else { cap };
                 let got = fat_read_file(&fs, c, want, dest);
                 print_str(b"[storage-host] NLS ");
-                for &ch in name { debug_put_char(ch); }
+                for &ch in leaf { debug_put_char(ch); }
                 print_str(b" size=");
                 print_u64(sz as u64);
                 print_str(b" read=");
@@ -10517,7 +10669,7 @@ unsafe fn storage_probe(
         // c_20127.nls (US-ASCII CP20127) into `nls20127_dest`; report its size at STORAGE_SHARED+0x74
         // (a direct write like the DLL size reads, so it doesn't need a tuple return slot). csrss maps
         // the named section \Nls\NlsSectionCP20127 from this during a DllMain.
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"C_20127 NLS") {
+        if let Some((c, sz, _)) = open_or_sys32!(b"c_20127.nls", b"C_20127 NLS") {
             let cap = (NLS_20127_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
             let got = fat_read_file(&fs, c, want, nls20127_dest);
@@ -10533,7 +10685,7 @@ unsafe fn storage_probe(
         // win32k.sys (~2.1 MiB, PE32+) — the ReactOS GUI subsystem kernel driver. Staged into the
         // WIN32KBUF (its own 2 MiB-aligned window); size reported at STORAGE_SHARED+0x7c so the
         // executive can load it into the isolated win32k-service component (Phase 2b).
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WIN32K  SYS") {
+        if let Some((c, sz, _)) = open_or_sys32!(b"win32k.sys", b"WIN32K  SYS") {
             let cap = (WIN32KBUF_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
             let got = fat_read_file(&fs, c, want, win32kbuf_dest);
@@ -10548,19 +10700,19 @@ unsafe fn storage_probe(
         }
         // dxg.sys + dxgthk.sys (DirectX kernel driver + thunk table) into their own buffers; sizes
         // reported at STORAGE_SHARED+0x80 / +0x84 so the executive can host them into win32k.
-        for (name, dest, cap_frames, off) in [
-            (b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
-            (b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
-            (b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
-            (b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
-            (b"ARIAL   TTF", win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES, 0x90u64),
+        for (path, short, dest, cap_frames, off) in [
+            (b"reactos\\system32\\drivers\\dxg.sys".as_slice(), b"DXG     SYS", DXGBUF_VADDR, DXGBUF_FRAMES, 0x80u64),
+            (b"reactos\\system32\\drivers\\dxgthk.sys".as_slice(), b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
+            (b"reactos\\system32\\ftfd.dll".as_slice(), b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
+            (b"reactos\\system32\\framebuf.dll".as_slice(), b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
+            (b"reactos\\Fonts\\arial.ttf".as_slice(), b"ARIAL   TTF", win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES, 0x90u64),
         ] {
-            if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, name) {
+            if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;
                 let want = if sz < cap { sz } else { cap };
                 let got = fat_read_file(&fs, c, want, dest);
                 print_str(b"[storage-host] ");
-                print_str(name);
+                print_str(short);
                 print_str(b" size=");
                 print_u64(sz as u64);
                 print_str(b" read=");
@@ -10574,7 +10726,7 @@ unsafe fn storage_probe(
         // winlogon.exe — smss's SmpExecuteInitialCommand initial command. Staged into its own
         // WINLOGONBUF (256 KiB, own PT), size reported at STORAGE_SHARED+0x94 so the executive can
         // parse it PE32+ and spawn it as the 3rd hosted process.
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"WINLOGONEXE") {
+        if let Some((c, sz, _)) = open_or_sys32!(b"winlogon.exe", b"WINLOGONEXE") {
             let cap = (WINLOGONBUF_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
             let got = fat_read_file(&fs, c, want, winlogonbuf_dest);
@@ -10589,7 +10741,7 @@ unsafe fn storage_probe(
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
         // size at STORAGE_SHARED+0x38 so the executive can nt-hive-regf-parse it for smss.
-        if let Some((c, sz, _)) = dir_find(&fs, fs.root_cl, b"ROSSYS  HIV") {
+        if let Some((c, sz, _)) = open_or_path!(b"reactos\\system32\\config\\system", b"ROSSYS  HIV") {
             let cap = (HIVEBUF_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
             let got = fat_read_file(&fs, c, want, HIVEBUF_VADDR);
@@ -10601,6 +10753,20 @@ unsafe fn storage_probe(
             if got == want && sz > 0 {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x38) as *mut u32, sz);
             }
+        }
+        // P7-A proof: publish the by-path hit/miss tally. verdict 0x200 = the WHOLE ReactOS stack
+        // (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32 client stack + NLS + win32k/dxg/ftfd/
+        // framebuf/arial/winlogon + the SYSTEM hive) was sourced BY PATH from the real \reactos tree
+        // with ZERO fallbacks to a flat ::NAME file.
+        core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0xA0) as *mut u32, fs_hits);
+        core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0xA4) as *mut u32, fs_miss);
+        print_str(b"[storage-host] FS-by-path: hits=");
+        print_u64(fs_hits as u64);
+        print_str(b" fallbacks=");
+        print_u64(fs_miss as u64);
+        print_str(b"\n");
+        if fs_miss == 0 && fs_hits >= 28 {
+            verdict |= 0x200;
         }
     }
     (
@@ -12200,6 +12366,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // install tree at \reactos\system32\ntdll.dll via a nested-directory walk (not the
             // flat staged ::NTDLL.DLL) — the first binary loaded from a real FS BY PATH.
             check(b"exec_ntdll_loaded_from_fs_by_path", (verdict & 0x100) != 0, &mut passed);
+            // P7-A: the WHOLE ReactOS stack (smss/csrss/csrsrv/basesrv/winsrv/ntdll + the Win32
+            // client stack + NLS + win32k/dxg/ftfd/framebuf/arial/winlogon + the SYSTEM hive) was
+            // sourced BY PATH from the real \reactos install tree — ZERO fallbacks to a flat ::NAME.
+            let fs_hits = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA0) as *const u32);
+            let fs_fallbacks = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xA4) as *const u32);
+            print_str(b"[ntos-exec] FS-by-path load: hits=");
+            print_u64(fs_hits as u64);
+            print_str(b" fallbacks=");
+            print_u64(fs_fallbacks as u64);
+            print_str(b"\n");
+            check(b"exec_full_stack_from_fs", (verdict & 0x200) != 0, &mut passed);
 
             // --- P2 finale: the Config Manager parses the registry hive the isolated storage
             // host read off the FS (an nt-hive-core image at STORAGE_SHARED_VADDR+0x100) and
