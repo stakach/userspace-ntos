@@ -22,6 +22,9 @@ use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 
 use nt_compat_exports::DriverExportRegistry;
 
+// Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
+use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory};
+
 use crate::*;
 
 // =============================================================================================
@@ -468,41 +471,9 @@ extern "win64" fn s_release_resource(_res: u64) {}
 
 /// `void *memcpy(void *dst, const void *src, size_t n)` — REAL (RtlCopyMemory/RtlMoveMemory
 /// macros compile to this; an unbound no-op silently corrupts every FCB name + file data buffer).
-extern "win64" fn s_memcpy(dst: u64, src: u64, n: u64) -> u64 {
-    unsafe {
-        let mut i = 0u64;
-        while i < n {
-            write_unaligned((dst + i) as *mut u8, read_unaligned((src + i) as *const u8));
-            i += 1;
-        }
-    }
-    dst
-}
-/// `void *memset(void *dst, int c, size_t n)` — REAL (RtlZeroMemory / RtlFillMemory).
-extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
-    unsafe {
-        let b = c as u8;
-        let mut i = 0u64;
-        while i < n {
-            write_unaligned((dst + i) as *mut u8, b);
-            i += 1;
-        }
-    }
-    dst
-}
-/// `SIZE_T RtlCompareMemory(const void *s1, const void *s2, SIZE_T n)` — count of leading equal bytes.
-extern "win64" fn s_rtl_compare_memory(a: u64, b: u64, n: u64) -> u64 {
-    unsafe {
-        let mut i = 0u64;
-        while i < n {
-            if read_unaligned((a + i) as *const u8) != read_unaligned((b + i) as *const u8) {
-                break;
-            }
-            i += 1;
-        }
-        i
-    }
-}
+// memcpy / memset / RtlCompareMemory are pure, driver-agnostic byte primitives —
+// shared with the Subsystem (win32k) class in [`crate::ntoskrnl_shared`] (bound by name below).
+
 /// `WCHAR RtlUpcaseUnicodeChar(WCHAR)` — ASCII upcase (the pipe namespace is ASCII).
 extern "win64" fn s_rtl_upcase_char(c: u64) -> u64 {
     let w = c as u16;

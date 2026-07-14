@@ -28,6 +28,7 @@ mod driver_host;
 mod driver_pe;
 mod isr;
 mod kmdf_host;
+mod ntoskrnl_shared;
 mod server;
 mod win32k_pe;
 mod win32k_host;

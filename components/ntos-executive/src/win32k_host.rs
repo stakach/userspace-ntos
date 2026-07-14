@@ -20,6 +20,9 @@
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::DriverExportRegistry;
 
+// Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
+use crate::ntoskrnl_shared::{s_memcpy, s_memmove, s_memset, s_wcslen};
+
 use crate::*;
 
 // --- component VA layout (identical in executive-load + host-run views) ----------------------
@@ -1112,47 +1115,9 @@ extern "win64" fn s_vdbg_print_ex_with_prefix(
 // --- CRT + misc ntoskrnl trampolines dxg.sys imports -----------------------------------------
 
 /// `void* memcpy(void* dst, const void* src, size_t n)`.
-extern "win64" fn s_memcpy(dst: u64, src: u64, n: u64) -> u64 {
-    unsafe {
-        let mut i = 0u64;
-        while i < n {
-            write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
-            i += 1;
-        }
-    }
-    dst
-}
-/// `void* memmove(void* dst, const void* src, size_t n)` — overlap-safe.
-extern "win64" fn s_memmove(dst: u64, src: u64, n: u64) -> u64 {
-    unsafe {
-        if dst < src || dst >= src + n {
-            let mut i = 0u64;
-            while i < n {
-                write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
-                i += 1;
-            }
-        } else {
-            let mut i = n;
-            while i > 0 {
-                i -= 1;
-                write_volatile((dst + i) as *mut u8, read_volatile((src + i) as *const u8));
-            }
-        }
-    }
-    dst
-}
-/// `void* memset(void* dst, int c, size_t n)`.
-extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
-    unsafe {
-        let b = c as u8;
-        let mut i = 0u64;
-        while i < n {
-            write_volatile((dst + i) as *mut u8, b);
-            i += 1;
-        }
-    }
-    dst
-}
+// memcpy / memmove / memset are the pure, driver-agnostic byte-loop primitives —
+// shared with the FSD class in [`crate::ntoskrnl_shared`] (registered by name below).
+
 /// `VOID ExFreePoolWithTag(PVOID, ULONG)` — no-op (pure bump arena).
 extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
 
@@ -1407,19 +1372,8 @@ extern "win64" fn s_rtl_copy_unicode_string(dest: *mut u8, src: *const u8) {
     }
 }
 
-/// `size_t wcslen(PCWSTR)`.
-extern "win64" fn s_wcslen(s: u64) -> u64 {
-    if s == 0 {
-        return 0;
-    }
-    let mut n = 0u64;
-    unsafe {
-        while read_unaligned((s + n * 2) as *const u16) != 0 && n < 32768 {
-            n += 1;
-        }
-    }
-    n
-}
+// wcslen is a pure primitive — shared in [`crate::ntoskrnl_shared`] (bound by name below).
+
 /// `NTSTATUS RtlAppendUnicodeToString(PUNICODE_STRING Dest, PCWSTR Src)` — append a wide string.
 extern "win64" fn s_rtl_append_unicode_to_string(dest: *mut u8, src: u64) -> i32 {
     if dest.is_null() {
