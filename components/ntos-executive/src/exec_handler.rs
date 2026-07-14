@@ -63,6 +63,7 @@ impl ExecNtHandler {
             winlogon_spawn_request: false,
             sm_spawn_request: false,
             wl_spawn_request: false,
+            svc_listener_spawn: false,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
             csr_spawn_request: false,
@@ -1707,6 +1708,36 @@ impl NativeSyscallHandler for ExecNtHandler {
                             PM_LISTENER_TID.store(tid, Ordering::Relaxed);
                             self.wl_spawn_request = true;
                             return 0; // SUCCESS (handle/ClientId queued)
+                        }
+                    }
+                }
+                // ★ N-threads multiplex: services' (pi 3) FIRST NtCreateThread = the SCM's RPC listener
+                // (ScmStartRpcServer → rpcrt4 io_thread). Route it through the REAL ETHREAD lifecycle
+                // like winlogon's, but the LOOP spawns it RESUMED with a badged fault EP (it runs into
+                // the main multiplex). Its faults sub-select to (pi 3, listener) by SVC_LISTENER_BADGE.
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 3
+                    && SVC_LISTENER_TCB.load(Ordering::Relaxed) == 0
+                    && SVC_LISTENER_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let entry = smss_stack_read(ctx_va + 0xF8);
+                        let param = smss_stack_read(ctx_va + 0x80);
+                        if let Some((tid, handle)) =
+                            self.nt_create_thread_handle(entry, param, SVC_LISTENER_TEB_VA)
+                        {
+                            let pid = self.pm_pid_for_pi(3).unwrap_or(0);
+                            self.queue_write(args[0], handle); // *ThreadHandle
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            SVC_LISTENER_TID.store(tid, Ordering::Relaxed);
+                            self.svc_listener_spawn = true;
+                            return 0;
                         }
                     }
                 }

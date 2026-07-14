@@ -272,6 +272,23 @@ pub const WL_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA; // target VSpace
 /// Executive scratch (3 pages) to build the listener thread's TEB/trampoline before copy_cap into
 /// the target VSpace. FILEBUF PT, clear of every other env-scratch VA.
 pub const WL_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1072_0000;
+// --- services' RPC listener thread (the SCM's ScmStartRpcServer io_thread). Runs in services' OWN
+// pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
+// env-scratch + stack-mirror must be DISTINCT. Unlike WL_LISTENER (suspended), this one RESUMES and
+// its faults route into the main service loop keyed by SVC_LISTENER_BADGE (the N-threads multiplex).
+pub const SVC_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // services VSpace (own pml4)
+pub const SVC_LISTENER_STACK_FRAMES: u64 = 8;
+pub const SVC_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA;
+pub const SVC_LISTENER_TEB_VA: u64 = SM_TEB_VA;
+pub const SVC_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA;
+/// Executive scratch (3 pages) — distinct from WL_LISTENER (0x1072). FILEBUF PT.
+pub const SVC_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1073_0000;
+/// Executive-side stack mirror for services' listener (so its syscall out-params / arg reads route to
+/// its OWN stack, not services' main-thread stack). Distinct 8-page window.
+pub const SVC_LISTENER_STACK_MIRROR_VA: u64 = 0x0000_0100_1360_0000;
+/// The fault-EP badge for services' RPC listener thread — the main loop maps it to (pi 3, listener),
+/// switching ACTIVE_STACK_MIRROR to the listener's mirror. The N-threads-per-process sub-selection.
+pub const SVC_LISTENER_BADGE: u64 = 7;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -745,6 +762,11 @@ static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 /// real threads created through the general NtCreateThread path (for the counted spec).
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
+/// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
+/// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
+static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+static SVC_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
+static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once the main thread has queried the real listener thread's TEB/ClientId via
 /// NtQueryInformationThread(ThreadBasicInformation) — proves the NULL-deref is gone.
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
@@ -2167,6 +2189,11 @@ struct ExecNtHandler {
     /// spawns the REAL listener thread (`spawn_wl_listener_thread`, which needs winlogon's PML4 + the
     /// caller's SP to read the CONTEXT — loop-resident). Parks on `WL_LISTENER_FAULT_EP`.
     wl_spawn_request: bool,
+    /// General NtCreateThread: set by services' (pi 3) FIRST `NtCreateThread` (the SCM's RPC listener /
+    /// rpcrt4 io_thread) so the LOOP spawns + RESUMES the REAL listener thread
+    /// (`spawn_svc_listener_thread`, needs services' PML4 + the caller's SP for the CONTEXT). Unlike
+    /// the winlogon listener this one runs into the main multiplex (badge SVC_LISTENER_BADGE).
+    svc_listener_spawn: bool,
     /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
     /// connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
@@ -2521,6 +2548,10 @@ struct HostedThread {
     cid_thread: u64,
     /// Resume immediately (SM/listener) or leave suspended for a lazy rendezvous-time resume (CSR).
     resume: bool,
+    /// Scheduling priority (default 100). The services RPC listener uses a value above the hosted
+    /// processes so that, once services' main thread parks (NtTerminateThread), the listener is the
+    /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
+    prio: u8,
 }
 
 /// Spawn a REAL 2nd (or Nth) thread in a hosted process's VSpace — the GENERAL hosted-thread
@@ -2598,7 +2629,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, t.ipcbuf_va, ipcbuf, 0);
     let _ = tcb_write_registers(tcb, t.tramp_va, t.stack_base + t.stack_frames * 0x1000 - 16, 0);
     let _ = tcb_set_gs_base(tcb, t.teb_va);
-    let _ = tcb_set_priority(tcb, 100);
+    let _ = tcb_set_priority(tcb, if t.prio != 0 { t.prio as u64 } else { 100 });
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
@@ -5714,6 +5745,26 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         NPFS_ROUTED_IRPS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // C-c: the N-threads-per-process fault-multiplex. services' SCM RPC listener thread
+                    // (rpcrt4 io_thread) is a REAL seL4 thread SPAWNED + RESUMED into the SAME service
+                    // loop as its main thread, with a distinct fault-EP badge (SVC_LISTENER_BADGE) that
+                    // sub-selects (pi 3, listener) → the listener's OWN stack mirror/TEB. This is the
+                    // reusable mechanism (lsass + any multi-thread process). Proven: its real TCB exists
+                    // (mechanism live) — with it + the real npfs pipe, rpcrt4 gets PAST the 0x2c8 deref
+                    // and the SCM RPC server goes live (the boot advances to winlogon's StartLsass).
+                    check(
+                        b"exec_svc_rpc_listener_multiplex",
+                        SVC_LISTENER_TCB.load(Ordering::Relaxed) > 1
+                            && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] C-c N-threads multiplex: svc-listener tcb=0x");
+                    print_hex(SVC_LISTENER_TCB.load(Ordering::Relaxed) as u32);
+                    print_str(b" tid=");
+                    print_u64(SVC_LISTENER_TID.load(Ordering::Relaxed));
+                    print_str(b" listener-faults-serviced=");
+                    print_u64(SVC_LISTENER_FAULTS.load(Ordering::Relaxed));
+                    print_str(b"\n");
                     // ★ GENERAL NtCreateThread (real service): winlogon's RPC listener thread is a REAL
                     // seL4-thread-backed nt-process ETHREAD — its NtCreateThread popped a pool ETHREAD,
                     // bound the RPC listener StartRoutine, mapped a real TEB, and minted a typed Thread
@@ -5807,10 +5858,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // the live exit fired (>=1) AND csrss's (pi=1) main ETHREAD is marked Terminated,
                     // while smss/winlogon (bits 0/2) are NOT (they don't self-exit at boot) → the exit
                     // was routed to the CORRECT thread by identity, not the whole process.
+                    // csrss (bit 1) AND now services (bit 3, its SCM init thread exits after
+                    // ScmStartRpcServer so the RPC listener runs alone) self-exit; smss/winlogon
+                    // (bits 0/2) never do → the exit is routed to the CORRECT thread by identity.
+                    let term_state = PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed);
                     check(
                         b"exec_live_terminate_thread_routed",
                         PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 1
-                            && PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) == 0b010,
+                            && (term_state & 0b010) != 0
+                            && (term_state & 0b101) == 0,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] item2a live-terminate-thread: count=0x");

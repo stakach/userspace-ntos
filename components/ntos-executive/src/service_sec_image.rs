@@ -410,11 +410,27 @@ pub(crate) unsafe fn service_sec_image(
         // LOAD its state into the working locals. pml4/scratch_base/img_end/pe are immutable per
         // process (shadow the params); faults/first/ntfaults/filled_pages are mutable (SAVED back
         // before every recv below).
+        // The N-threads-per-process multiplex: SVC_LISTENER_BADGE is services' (pi 3) RPC listener
+        // thread — same VSpace/image/pml4 as services' main thread, but a DIFFERENT stack + TEB. It's
+        // resolved to pi 3 here; the per-thread stack mirror is switched below (is_svc_listener).
+        let is_svc_listener = badge == SVC_LISTENER_BADGE;
+        if is_svc_listener {
+            let n = SVC_LISTENER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            if n < 4 {
+                print_str(b"[svc-listener] multiplex event #");
+                print_u64(n);
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b" (N-threads sub-select: pi 3 listener)\n");
+            }
+        }
         let pi = if badge == CSRSS_BADGE {
             1
         } else if badge == WINLOGON_BADGE {
             2
-        } else if badge == SERVICES_BADGE {
+        } else if badge == SERVICES_BADGE || is_svc_listener {
             3
         } else {
             0
@@ -433,11 +449,17 @@ pub(crate) unsafe fn service_sec_image(
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
         ACTIVE_STACK_MIRROR.store(
-            match pi {
-                1 => CSRSS_STACK_MIRROR_VA,
-                2 => WINLOGON_STACK_MIRROR_VA,
-                3 => SERVICES_STACK_MIRROR_VA,
-                _ => SMSS_STACK_MIRROR_VA,
+            if is_svc_listener {
+                // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
+                // stack-arg reads land on its own stack, not services' main-thread stack).
+                SVC_LISTENER_STACK_MIRROR_VA
+            } else {
+                match pi {
+                    1 => CSRSS_STACK_MIRROR_VA,
+                    2 => WINLOGON_STACK_MIRROR_VA,
+                    3 => SERVICES_STACK_MIRROR_VA,
+                    _ => SMSS_STACK_MIRROR_VA,
+                }
             },
             Ordering::Relaxed,
         );
@@ -516,6 +538,25 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
+                // N-threads multiplex: the services RPC listener (badge 7) walls on its OWN
+                // unrecoverable fault (rpcrt4 io_thread derefs a connection field that needs a real
+                // client connect — the listener's next frontier). PARK it (don't reply → it stays
+                // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
+                // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
+                // stop — the whole point of the per-thread multiplex.
+                if is_svc_listener {
+                    print_str(b"[svc-listener] wall ip=0x");
+                    print_hex((m0 >> 32) as u32);
+                    print_hex(m0 as u32);
+                    print_str(b" addr=0x");
+                    print_hex(addr as u32);
+                    print_str(b" -> PARK listener (needs a real client connect); boot continues\n");
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+                    // Recv the next event WITHOUT replying to the listener (it stays blocked).
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
                 print_hex((m0 >> 32) as u32);
                 print_hex(m0 as u32);
@@ -748,6 +789,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.winlogon_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = false;
+                nt_handler.svc_listener_spawn = false;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -1043,6 +1085,28 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(WL_LISTENER_TEB_VA as u32);
                     print_str(b" (suspended; real ETHREAD + TEB, queryable by the main thread)\n");
                 }
+                // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
+                // service loop (badge SVC_LISTENER_BADGE). Its faults/syscalls interleave with services'
+                // main thread; the loop sub-selects it by badge → the listener's own stack mirror/TEB.
+                if nt_handler.svc_listener_spawn && SVC_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let tid = SVC_LISTENER_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(3).unwrap_or(0) as u64;
+                    print_str(b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_svc_listener_thread(procs[3].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    SVC_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
+                    print_str(b"[svc-thread] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 7)\n");
+                }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
                 // in smss's VSpace = procs[0].pml4, demand-filling from smss's image + ntdll), then write the
@@ -1172,7 +1236,7 @@ pub(crate) unsafe fn service_sec_image(
                 // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
                 // our diagnostic path.)
                 result = 0; // STATUS_SUCCESS
-            } else if m0 == 267 && badge == CSRSS_BADGE {
+            } else if m0 == 267 && (badge == CSRSS_BADGE || badge == SERVICES_BADGE) {
                 // NtTerminateThread(ThreadHandle=R10, ExitStatus=RDX). csrss.exe _main's last act is
                 // NtTerminateThread(NtCurrentThread()) — its init thread exits and CSRSRV's worker
                 // threads (fake here) keep the process alive (csrss.c:93). Park csrss's thread (don't

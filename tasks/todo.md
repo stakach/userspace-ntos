@@ -21,3 +21,18 @@ Walls: (1) npfs IRP CREATE_NAMED_PIPE faults addr=0xffffffe1 (bad SecurityContex
 
 ## Review
 (to fill)
+
+## Review (COMPLETE)
+- C-a DONE (161/96): npfs VCB internals real — NpFsdCreateNamedPipe + NpFsdCreate complete via real
+  prefix-tree/ERESOURCE/security + memcpy/memset trampolines + valid CreatePipe IO_STACK_LOCATION.
+  Create-then-connect proven (real FCB found by name). Key bug: unbound memcpy no-op'd RtlCopyMemory
+  → corrupt FCB names. Key offset fix: ShareAccess@iosl+0x1a, Parameters@iosl+0x20 (POINTER_ALIGNMENT).
+- C-b DONE (162/96): live pipe syscalls (NtCreateNamedPipeFile/NtOpenFile/NtFsControlFile, pi==3)
+  routed through npfs_dispatch_irp. NPFS_ROUTED_IRPS>=1 proven. pi 0-2 byte-identical.
+- C-c DONE (163/96): N-threads-per-process fault-multiplex. services' RPC listener = a real seL4
+  thread spawned+RESUMED into the main loop with badge SVC_LISTENER_BADGE(7); loop sub-selects it to
+  (pi 3, listener) → its own stack mirror/TEB. Proven live: SSN ring shows `6:55 7:238` (main creates
+  listener, listener runs). Listener parks on its own wall (rpcrt4 needs a real client connect); boot
+  CONTINUES to winlogon StartLsass. rpcrt4 PAST 0x2c8 → SCM RPC server live.
+- Paint 768/768 @ 0x003a6ea5 intact throughout; NO rust-micro/src change → sel4test byte-identical.
+- Next frontier: winlogon StartLsass → lsass as pi 4 (the multiplex + reply-cap-parking waits arc).

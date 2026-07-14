@@ -25,6 +25,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         cid_proc: 0,
         cid_thread: 0,
         resume: true,
+        prio: 0,
     })
 }
 
@@ -282,6 +283,7 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         cid_proc: CSR_STATIC_CID_PROC,
         cid_thread: CSR_STATIC_CID_THREAD,
         resume: false,
+        prio: 0,
     })
 }
 
@@ -309,6 +311,42 @@ pub(crate) unsafe fn spawn_wl_listener_thread(pml4: u64, entry_rip: u64, param: 
         cid_proc,
         cid_thread,
         resume: false,
+        prio: 0,
+    })
+}
+
+/// Spawn services' REAL RPC listener thread (ScmStartRpcServer's rpcrt4 io_thread) in services'
+/// VSpace (pi 3) and RESUME it into the main service-loop multiplex. Unlike `spawn_wl_listener_thread`
+/// (suspended, no-receiver EP), this one faults to a cap minted at [`SVC_LISTENER_BADGE`] off the MAIN
+/// service `fault_ep`, so the loop receives + sub-selects it as (pi 3, listener) via its own stack
+/// mirror. `svc_pml4` = services' PML4; `entry_rip`/`param` from the caller's CONTEXT; `main_fault_ep`
+/// = the shared service-loop endpoint (this fn mints the badged cap). Returns the TCB.
+pub(crate) unsafe fn spawn_svc_listener_thread(
+    svc_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+) -> u64 {
+    let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: svc_pml4,
+        entry_rip,
+        param,
+        scr: SVC_LISTENER_ENV_SCRATCH_VA,
+        teb_va: SVC_LISTENER_TEB_VA,
+        stack_base: SVC_LISTENER_STACK_BASE,
+        stack_frames: SVC_LISTENER_STACK_FRAMES,
+        ipcbuf_va: SVC_LISTENER_IPCBUF_VA,
+        tramp_va: SVC_LISTENER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: SVC_LISTENER_STACK_MIRROR_VA,
+        fault_ep: listener_ep,
+        cid_proc,
+        cid_thread,
+        resume: true, // run it into the multiplex (the N-threads mechanism)
+        prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
     })
 }
 
