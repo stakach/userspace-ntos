@@ -34,9 +34,9 @@ use alloc::vec::Vec;
 /// loaded by two processes, gets a distinct file/section handle **per process** — and those
 /// values may COLLIDE across processes (real NT dense per-process handles reuse small integers).
 /// Every handle store/lookup is therefore keyed by the owning process index `pi`
-/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services; the executive's fault-badge → pi mapping). `pi`
-/// values `>= PI_SLOTS` are ignored (out-of-range owner). Path 1b of the nt-process convergence.
-pub const PI_SLOTS: usize = 4;
+/// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass; the executive's fault-badge → pi
+/// mapping). `pi` values `>= PI_SLOTS` are ignored (out-of-range owner). Path 1b of the convergence.
+pub const PI_SLOTS: usize = 5;
 
 /// One registered DLL image and the handles/state the load flow accumulates for it.
 #[derive(Clone, Debug, PartialEq, Eq)]

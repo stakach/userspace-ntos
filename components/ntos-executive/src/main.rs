@@ -221,6 +221,14 @@ pub const SERVICES_STACK_MIRROR_VA: u64 = 0x0000_0100_106D_0000; // FILEBUF PT, 
 pub const SERVICES_HEAP_MIRROR_VA: u64 = 0x0000_0100_1260_0000; // own PT (spawn_sec_image creates it)
 pub const SERVICES_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1280_0000; // own PT (spawn_sec_image creates it)
 pub const SERVICES_ENV_SCRATCH_VA: u64 = 0x0000_0100_1076_0000; // FILEBUF PT (between smss/csrss env)
+/// The 5th hosted process — lsass.exe (badge 8, pi 4), spawned by winlogon's StartLsass Win32
+/// CreateProcessW(L"lsass.exe") (the LSA subsystem). Same env VAs (SMSS_*) in its OWN VSpace; only
+/// the EXECUTIVE-side mirrors + demand-fill scratch must be distinct. STACK mirror FILEBUF PT;
+/// HEAP/IMAGE get their own PTs (past services' 0x1280); env scratch 0x1077 (past services' 0x1076).
+pub const LSASS_STACK_MIRROR_VA: u64 = 0x0000_0100_106E_0000; // FILEBUF PT, present
+pub const LSASS_HEAP_MIRROR_VA: u64 = 0x0000_0100_12A0_0000; // own PT (spawn_sec_image creates it)
+pub const LSASS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_12C0_0000; // own PT (spawn_sec_image creates it)
+pub const LSASS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1077_0000; // FILEBUF PT (past services' 0x1076)
 // --- Authentic SM-loop thread (path B): a REAL 2nd thread in smss's VSpace running SmpApiLoop. ---
 // Its per-thread env (stack/IPC/TEB/trampoline) lives at free VAs in smss's cluster PT (0x1040-0x105B;
 // smss itself only uses 0x105C stack + 0x105F ipc there, and the LPC rings 0x1040-43 are
@@ -527,6 +535,12 @@ pub const SERVICES_BADGE: u64 = 6;
 /// services.exe's demand-fault scratch — PT 2 of smss's already-mapped 8-PT scratch range
 /// (0x1100..0x1200); PT0 smss / PT4 csrss / PT6 winlogon → PT2 (0x1140) is free + pre-mapped.
 pub const SERVICES_SCRATCH_BASE: u64 = 0x0000_0100_1140_0000;
+/// Fault-endpoint badge for the FIFTH hosted process (lsass.exe). Distinct from smss(0)/csrss(2)/
+/// winlogon(4)/services(6)/SVC_LISTENER(7).
+pub const LSASS_BADGE: u64 = 8;
+/// lsass.exe's demand-fault scratch — PT 3 of smss's already-mapped 8-PT scratch range
+/// (0x1100..0x1200); PT0 smss / PT2 services / PT4 csrss / PT6 winlogon → PT3 (0x1160) is free.
+pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -775,7 +789,16 @@ static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 /// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services). Kept off the 16 KiB rootserver stack — a
 /// [[u64;256];4] local (8 KiB) plus service_sec_image's other arrays would risk the guard page.
 /// Zeroed at service_sec_image entry; only that single loop touches it.
-static mut PFILLED: [[u64; 256]; 4] = [[0u64; 256]; 4];
+static mut PFILLED: [[u64; 256]; 5] = [[0u64; 256]; 5];
+/// SERVICE 10 stack relief: the per-iteration `filled_pages` WORKING buffer (loaded from / saved to
+/// `PFILLED[pi]` around each dispatch) lives in a static, not on the 16 KiB rootserver stack. Adding a
+/// 5th hosted process pushed `service_sec_image`'s frame — its `[u64;256]` working array plus the
+/// ~20 DLL-PE locals — over the stack guard on the DEEP FS-walk call chain (fat_open_path →
+/// dir_find_lfn), corrupting that loop's cluster variable → an infinite FAT cluster-chain spin
+/// (100% CPU, no panic). Single-threaded executive → one active pi per iteration → one shared buffer
+/// is safe. Removing this 2 KiB from the frame keeps the boot within the 4-page stack (no kernel
+/// change → sel4test byte-identical).
+static mut FILLED_WORK: [u64; 256] = [0u64; 256];
 
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -1935,6 +1958,7 @@ const SYSTEM32_FILES: &[&str] = &[
     "csrss.exe",
     "winlogon.exe",
     "services.exe",
+    "lsass.exe",
     "csrsrv.dll",
     "basesrv.dll",
     "winsrv.dll",
@@ -2099,6 +2123,10 @@ struct ExecLoopCtx {
     services_file_handle: *mut u64,
     services_section_handle: *mut u64,
     services_pe: *const Option<nt_pe_loader::PeFile<'static>>,
+    /// lsass.exe (5th hosted process): file/section handles + parsed PE (winlogon (pi 2) opens/creates).
+    lsass_file_handle: *mut u64,
+    lsass_section_handle: *mut u64,
+    lsass_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
     filled_pages: *mut [u64; 256],
@@ -2124,13 +2152,13 @@ struct ExecLoopCtx {
     /// each hosted process's VSpace needs its OWN PD covering the DLL PDPT range). Point at the
     /// loop-locals.
     csrss_anon_base: *mut u64,
-    dll_pd_created: *mut [bool; 4],
+    dll_pd_created: *mut [bool; 5],
     /// PER-PROCESS bitmask of which registry DLLs have had their VA-range page table reserved in
     /// THIS process's VSpace (bit i = DLL i mapped in process pi). csrss (pi==1) and winlogon
     /// (pi==2) each load an overlapping DLL set at the SAME fixed bases but into DISTINCT VSpaces,
     /// so the PT reservation must be tracked per-process (the registry's global `mapped` flag stays
     /// for `dll_for_page` VA-range resolution, which is base-identical across processes).
-    dll_mapped_bits: *mut [u32; 4],
+    dll_mapped_bits: *mut [u32; 5],
 }
 
 struct ExecNtHandler {
@@ -2659,6 +2687,8 @@ static NEXT_WINLOGON_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// services.exe's OWN NtAllocateVirtualMemory bump (4th hosted process) — a SEPARATE counter (same
 /// rationale as csrss/winlogon: independent VSpaces make the same start VA (own PT) fine).
 static NEXT_SERVICES_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
+/// lsass.exe's OWN NtAllocateVirtualMemory bump (5th hosted process).
+static NEXT_LSASS_ALLOC: AtomicU64 = AtomicU64::new(SMSS_ALLOC_VA);
 /// How many NtAllocateVirtualMemory calls the executive serviced for a SEC_IMAGE process.
 static NTALLOC_SERVICED: AtomicU64 = AtomicU64::new(0);
 /// NLS shared-buffer frame-cap bases + sizes (set at storage bring-up), so spawn_sec_image can
@@ -2701,6 +2731,11 @@ pub(crate) static SERVICES_QUERY_DIR_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SERVICES_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages services.exe's ntdll loader demand-faulted (slot 3), for the spec-check report.
 static SERVICES_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// SERVICE 10 — lsass.exe (5th hosted process, badge 8, pi 4). CREATE_STARTED set at its
+/// NtCreateSection; SPAWNED set at NtCreateProcessEx; FAULTS = its loader demand-fault count.
+static LSASS_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
+static LSASS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static LSASS_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort) is
 /// serviced (regions mapped + CSR_API_CONNECTINFO filled). Read by the milestone spec check.
 static WINLOGON_CSR_CONNECTED: AtomicU64 = AtomicU64::new(0);
@@ -2723,8 +2758,8 @@ static CSR_MSGS: AtomicU64 = AtomicU64::new(0);
 // realloc); the mechanism arrays are unchanged. `PM_PIDS[pi]` maps the mechanism index (pi 0/1/2,
 // keyed by fault badge) to the EPROCESS pid — the badge↔pid link. Read by the counted specs.
 /// EPROCESS pids for pi 0=smss / 1=csrss / 2=winlogon / 3=services (0 = not yet created).
-static PM_PIDS: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_PIDS: [AtomicU64; 5] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// How many EPROCESS objects the boot-time ProcessManager holds (expected 3).
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
@@ -2754,13 +2789,13 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Main-thread tids for pi 0=smss / 1=csrss / 2=winlogon (0 = not yet created). Pre-created at boot
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
-static PM_TIDS: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_TIDS: [AtomicU64; 5] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Pool of ONE spare ETHREAD per process (pi 0/1/2/3), pre-created at boot so a RUNTIME NtCreateThread
 /// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
 /// its RPC listener; the array generalizes to any pi.)
-static PM_POOL_TID: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static PM_POOL_TID: [AtomicU64; 5] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
@@ -5887,12 +5922,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // = the live service loop resolved a fault badge → its EPROCESS through the manager.
                     check(
                         b"exec_process_manager_up",
-                        PM_PROC_COUNT.load(Ordering::Relaxed) == 4,
+                        PM_PROC_COUNT.load(Ordering::Relaxed) == 5,
                         &mut passed,
                     );
                     check(
                         b"exec_eprocess_backs_badges",
-                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b1111,
+                        PM_IDENTITY_OK.load(Ordering::Relaxed) == 0b11111,
                         &mut passed,
                     );
                     check(
@@ -5929,12 +5964,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // by the post-loop self-test on a throwaway EPROCESS; the 3 hosted are untouched).
                     check(
                         b"exec_ethread_backs_main_threads",
-                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b1111,
+                        PM_MAIN_THREADS_OK.load(Ordering::Relaxed) == 0b11111,
                         &mut passed,
                     );
                     check(
                         b"exec_main_thread_bound_at_spawn",
-                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 4,
+                        PM_THREAD_BINDS.load(Ordering::Relaxed) >= 5,
                         &mut passed,
                     );
                     check(
@@ -6004,7 +6039,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // ProcessManager's pid for that badge slot (0b111 = all 3 spawned + linked).
                     check(
                         b"exec_eprocess_linked_mechanism",
-                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b1111,
+                        PM_EXEC_LINK_OK.load(Ordering::Relaxed) == 0b11111,
                         &mut passed,
                     );
                     // ★ MILESTONE — services.exe is the 4th hosted process: winlogon's Win32
@@ -6022,6 +6057,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SERVICES_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // ★ MILESTONE (SERVICE 10) — lsass.exe is the 5th hosted process: winlogon's
+                    // StartLsass (CreateProcessW(L"lsass.exe") → NtCreateProcessEx) spawned it (badge 8,
+                    // pi 4) via spawn_sec_image, and its REAL ntdll loader ran. NtWaitForSingleObject
+                    // still returns immediately (winlogon's WaitForLsass) — real blocking is step 2.
+                    check(
+                        b"exec_lsass_spawned",
+                        LSASS_SPAWNED.load(Ordering::Relaxed) == 1,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_lsass_loader_running",
+                        LSASS_FAULTS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] lsass spawned=0x");
+                    print_hex(LSASS_SPAWNED.load(Ordering::Relaxed) as u32);
+                    print_str(b" faults=0x");
+                    print_hex(LSASS_FAULTS.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     // ★ GENERAL per-process CSR client-connect: services.exe (pi 3) connected to
                     // csrss's \Windows\ApiPort through the SAME mechanism winlogon (pi 2) uses — its own
                     // CSR heap-view + static-server-data mapped into ITS VSpace, the real

@@ -32,7 +32,10 @@ pub(crate) unsafe fn service_sec_image(
     // page VA filled at each fault index → its persistent executive scratch is
     // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
     // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
-    let mut filled_pages = [0u64; 256];
+    // Working buffer for the current pi's demand-filled page VAs — a STATIC (not a 2 KiB stack local)
+    // so the 5th hosted process doesn't overflow the 16 KiB rootserver stack on the deep FS-walk call
+    // chain (see FILLED_WORK). Loaded from / saved to `pfilled[pi]` around each dispatch below.
+    let filled_pages: &mut [u64; 256] = &mut *core::ptr::addr_of_mut!(FILLED_WORK);
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
     let mut ssn_ring_badge = [0u8; 32];
@@ -59,6 +62,10 @@ pub(crate) unsafe fn service_sec_image(
     let mut services_file_handle = 0u64;
     let mut services_section_handle = 0u64;
     let mut services_process_handle = 0u64;
+    // lsass.exe (the 5th hosted process, winlogon's StartLsass CreateProcessW target).
+    let mut lsass_file_handle = 0u64;
+    let mut lsass_section_handle = 0u64;
+    let mut lsass_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
     // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
@@ -66,8 +73,8 @@ pub(crate) unsafe fn service_sec_image(
     // a bitmask of which registry DLLs have their PT reserved in that process's VSpace. csrss and
     // winlogon load an overlapping DLL set at identical bases into DISTINCT VSpaces, so each needs
     // its own PD/PT reservation (the registry's global `mapped` flag stays for VA-range resolution).
-    let mut dll_pd_created = [false; 4];
-    let mut dll_mapped_bits = [0u32; 4];
+    let mut dll_pd_created = [false; 5];
+    let mut dll_mapped_bits = [0u32; 5];
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -117,6 +124,18 @@ pub(crate) unsafe fn service_sec_image(
         apply_relocations_to_buf(spe, services_va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((services_va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((services_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
+    }
+    // lsass.exe — the 5th hosted process, spawned by winlogon's StartLsass Win32 CreateProcessW.
+    // Sourced BY PATH from the FS pool. Same EXE-reloc + ImageBase patch as services.
+    let (lsass_pe, lsass_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\lsass.exe", b"lsass.exe")
+    } else {
+        (None, 0)
+    };
+    if let Some(ref lpe) = lsass_pe {
+        apply_relocations_to_buf(lpe, lsass_va, PE_LOAD_BASE);
+        let e_lfanew = core::ptr::read_volatile((lsass_va + 0x3c) as *const u32) as u64;
+        core::ptr::write_volatile((lsass_va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
     }
     // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
     // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
@@ -366,7 +385,7 @@ pub(crate) unsafe fn service_sec_image(
     // the six ex-parallel identity arrays are now ONE array of `ProcExec`, each slot EPROCESS-linked
     // via its `pid` (== PM_PIDS[pi]; the EPROCESS exists at boot, so link all three now). smss (slot
     // 0) is live from the initial recv; csrss/winlogon's pml4/scratch/img_end fill in at their spawn.
-    let mut procs = [ProcExec::empty(); 4];
+    let mut procs = [ProcExec::empty(); 5];
     for (i, p) in procs.iter_mut().enumerate() {
         p.pid = nt_handler.pm_pid_for_pi(i).map(|pid| pid as u64).unwrap_or(0);
     }
@@ -377,7 +396,7 @@ pub(crate) unsafe fn service_sec_image(
     // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
     // run; zero it at entry so the demo call (ntdll=None) starts clean too.
-    let pfilled: &mut [[u64; 256]; 4] = &mut *core::ptr::addr_of_mut!(PFILLED);
+    let pfilled: &mut [[u64; 256]; 5] = &mut *core::ptr::addr_of_mut!(PFILLED);
     for p in pfilled.iter_mut() {
         for e in p.iter_mut() {
             *e = 0;
@@ -432,6 +451,8 @@ pub(crate) unsafe fn service_sec_image(
             2
         } else if badge == SERVICES_BADGE || is_svc_listener {
             3
+        } else if badge == LSASS_BADGE {
+            4
         } else {
             0
         };
@@ -458,6 +479,7 @@ pub(crate) unsafe fn service_sec_image(
                     1 => CSRSS_STACK_MIRROR_VA,
                     2 => WINLOGON_STACK_MIRROR_VA,
                     3 => SERVICES_STACK_MIRROR_VA,
+                    4 => LSASS_STACK_MIRROR_VA,
                     _ => SMSS_STACK_MIRROR_VA,
                 }
             },
@@ -468,6 +490,7 @@ pub(crate) unsafe fn service_sec_image(
                 1 => CSRSS_IMAGE_MIRROR_VA,
                 2 => WINLOGON_IMAGE_MIRROR_VA,
                 3 => SERVICES_IMAGE_MIRROR_VA,
+                4 => LSASS_IMAGE_MIRROR_VA,
                 _ => IMAGE_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -477,6 +500,7 @@ pub(crate) unsafe fn service_sec_image(
                 1 => CSRSS_HEAP_MIRROR_VA,
                 2 => WINLOGON_HEAP_MIRROR_VA,
                 3 => SERVICES_HEAP_MIRROR_VA,
+                4 => LSASS_HEAP_MIRROR_VA,
                 _ => SMSS_HEAP_MIRROR_VA,
             },
             Ordering::Relaxed,
@@ -488,12 +512,13 @@ pub(crate) unsafe fn service_sec_image(
             1 => csrss_pe.as_ref().unwrap(),
             2 => winlogon_pe.as_ref().unwrap(),
             3 => services_pe.as_ref().unwrap(),
+            4 => lsass_pe.as_ref().unwrap(),
             _ => pe,
         };
         faults = procs[pi].faults;
         first = procs[pi].first;
         ntfaults = procs[pi].ntfaults;
-        filled_pages = pfilled[pi];
+        *filled_pages = pfilled[pi];
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
         // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
@@ -506,7 +531,7 @@ pub(crate) unsafe fn service_sec_image(
                 if fip >= nb && fip < nb + image_extent(npe) {
                     if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
                         // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
-                        procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+                        procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                         let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 3, fip + 3, m1, m2, 0);
                         badge = nb;
                         mi = nmi;
@@ -551,7 +576,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
                     print_str(b" -> PARK listener (needs a real client connect); boot continues\n");
-                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -580,7 +605,7 @@ pub(crate) unsafe fn service_sec_image(
                     csrss_frame_put(pi as u64, page, f);
                 }
                 faults += 1;
-                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -600,7 +625,7 @@ pub(crate) unsafe fn service_sec_image(
                 let _ = page_map(f, page, RW_NX, pml4);
                 csrss_frame_put(pi as u64, page, f); // CSR shared section (pi 1) — shareable into win32k
                 faults += 1;
-                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+                procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                 badge = nb;
                 mi = nmi;
@@ -719,7 +744,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_u64(shareable as u64);
                 print_str(b"\n");
             }
-            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
             badge = nb;
             mi = nmi;
@@ -808,7 +833,10 @@ pub(crate) unsafe fn service_sec_image(
                     services_file_handle: &mut services_file_handle as *mut u64,
                     services_section_handle: &mut services_section_handle as *mut u64,
                     services_pe: &services_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    filled_pages: &mut filled_pages as *mut [u64; 256],
+                    lsass_file_handle: &mut lsass_file_handle as *mut u64,
+                    lsass_section_handle: &mut lsass_section_handle as *mut u64,
+                    lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
+                    filled_pages: filled_pages as *mut [u64; 256],
                     faults: &mut faults as *mut u64,
                     scratch_base,
                     // Erase the non-'static lifetime through a thin `*const ()` (the image bytes are
@@ -830,8 +858,8 @@ pub(crate) unsafe fn service_sec_image(
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
-                    dll_pd_created: &mut dll_pd_created as *mut [bool; 4],
-                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 4],
+                    dll_pd_created: &mut dll_pd_created as *mut [bool; 5],
+                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; 5],
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
@@ -864,7 +892,7 @@ pub(crate) unsafe fn service_sec_image(
                 for k in 0..nt_handler.out_writes_n {
                     let (ptr, val) = nt_handler.out_writes[k];
                     if badge == CSRSS_BADGE {
-                        csrss_out_write(ptr, val, &mut filled_pages, &mut faults, scratch_base,
+                        csrss_out_write(ptr, val, &mut *filled_pages, &mut faults, scratch_base,
                             &reg, &dll_pes, pml4);
                     } else {
                         smss_stack_write(ptr, val);
@@ -1128,7 +1156,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     if client_handle != 0 {
                         // csrss's *PortHandle is a csrsrv/csrss VA (demand-fill window) — csrss_out_write.
-                        csrss_out_write(out_ptr, client_handle, &mut filled_pages, &mut faults,
+                        csrss_out_write(out_ptr, client_handle, &mut *filled_pages, &mut faults,
                             scratch_base, &reg, &dll_pes, pml4);
                         let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName (for the cache record)
                         nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
@@ -1201,7 +1229,7 @@ pub(crate) unsafe fn service_sec_image(
                     };
                     if out_ptr != 0 {
                         // winlogon's *PortHandle (&CsrApiPort, an ntdll .data global) — demand-fill window.
-                        csrss_out_write(out_ptr, ch, &mut filled_pages, &mut faults,
+                        csrss_out_write(out_ptr, ch, &mut *filled_pages, &mut faults,
                             scratch_base, &reg, &dll_pes, pml4);
                     }
                     result = 0; // STATUS_SUCCESS (winlogon's connect always succeeds)
@@ -1222,7 +1250,7 @@ pub(crate) unsafe fn service_sec_image(
                 let written_ptr = smss_stack_read(sp + 0x28); // arg5 = *NumberOfBytesWritten (optional)
                 if written_ptr != 0 {
                     if badge == CSRSS_BADGE {
-                        csrss_out_write(written_ptr, size, &mut filled_pages, &mut faults,
+                        csrss_out_write(written_ptr, size, &mut *filled_pages, &mut faults,
                             scratch_base, &reg, &dll_pes, pml4);
                     } else {
                         smss_stack_write(written_ptr, size);
@@ -1336,12 +1364,12 @@ pub(crate) unsafe fn service_sec_image(
                             (0x28, 0),                          // Priority + BasePriority
                         ];
                         for (off, v) in tbi {
-                            csrss_out_write(buf + off, v, &mut filled_pages, &mut faults, scratch_base,
+                            csrss_out_write(buf + off, v, &mut *filled_pages, &mut faults, scratch_base,
                                 &reg, &dll_pes, pml4);
                         }
                         let rl = smss_stack_read(sp + 0x28); // *ReturnLength (optional)
                         if rl != 0 {
-                            csrss_out_write(rl, 0x30, &mut filled_pages, &mut faults, scratch_base,
+                            csrss_out_write(rl, 0x30, &mut *filled_pages, &mut faults, scratch_base,
                                 &reg, &dll_pes, pml4);
                         }
                         WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
@@ -1428,9 +1456,48 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex((services_process_handle >> 32) as u32);
                     print_hex(services_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                } else if services_process_handle != 0 {
+                } else if lsass_section_handle != 0
+                    && sect == lsass_section_handle
+                    && lsass_pe.is_some()
+                    && LSASS_SPAWNED.swap(1, Ordering::Relaxed) == 0
+                {
+                    // winlogon's StartLsass CreateProcessW(L"lsass.exe") — the 5th hosted process (badge
+                    // LSASS_BADGE, pi 4), prio 104 (> services 103) so it runs when others park.
+                    let lf_c = mint_badged(fault_ep, LSASS_BADGE);
+                    let lpe = lsass_pe.as_ref().unwrap();
+                    const LSASS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\lsass.exe";
+                    const LSASS_CMD_LINE: &[u8] = b"lsass.exe";
+                    let lpml4 = spawn_sec_image(
+                        4, lpe, lf_c, NTDLL_BASE, true, 104, LSASS_ENV_SCRATCH_VA,
+                        LSASS_STACK_MIRROR_VA, LSASS_HEAP_MIRROR_VA, LSASS_IMAGE_MIRROR_VA,
+                        LSASS_IMAGE_PATH, LSASS_CMD_LINE,
+                    );
+                    procs[4].pml4 = lpml4;
+                    procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
+                    procs[4].scratch_base = LSASS_SCRATCH_BASE;
+                    nt_handler.bind_main_thread_entry(4, PE_LOAD_BASE + lpe.entry_point_rva() as u64);
+                    lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
+                        (Some(wl_pid), Some(ls_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                wl_pid, nt_process::HandleObject::Process(ls_pid), 0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle; nt_handler.next_handle += 1; g
+                            })
+                        }
+                        _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
+                    };
+                    smss_stack_write(get_recv_mr(9), lsass_process_handle); // *ProcessHandle (R10)
+                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
+                    print_hex((lsass_process_handle >> 32) as u32);
+                    print_hex(lsass_process_handle as u32);
+                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
+                } else if services_process_handle != 0 && sect == services_section_handle {
                     // Idempotent (a second create should not re-spawn): return the same handle.
                     smss_stack_write(get_recv_mr(9), services_process_handle);
+                } else if lsass_process_handle != 0 && sect == lsass_section_handle {
+                    smss_stack_write(get_recv_mr(9), lsass_process_handle);
                 }
                 result = 0;
             } else if m0 == 195 {
@@ -1709,7 +1776,7 @@ pub(crate) unsafe fn service_sec_image(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = filled_pages;
+            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 // Don't reply to the self-terminated thread — leave it blocked and recv the next
@@ -1969,6 +2036,13 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b" page(s), first=0x");
     print_hex((procs[3].first >> 32) as u32);
     print_hex(procs[3].first as u32);
+    print_str(b"\n");
+    LSASS_FAULTS.store(procs[4].faults, Ordering::Relaxed);
+    print_str(b"[ntos-exec] lsass (slot 4) demand-faulted ");
+    print_u64(procs[4].faults);
+    print_str(b" page(s), first=0x");
+    print_hex((procs[4].first >> 32) as u32);
+    print_hex(procs[4].first as u32);
     print_str(b"\n");
     // Path 3: record that each folded per-process ProcExec is EPROCESS-linked (live pml4 + its pid
     // matches the ProcessManager's pid for that pi). Read by `exec_eprocess_linked_mechanism`.

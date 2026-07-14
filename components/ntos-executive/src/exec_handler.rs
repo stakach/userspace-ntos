@@ -110,18 +110,23 @@ impl ExecNtHandler {
                 // The 4th hosted process — services.exe, spawned by winlogon's Win32 CreateProcessW
                 // (StartServicesManager), so its EPROCESS parent is winlogon.
                 let services_pid = pm.create_process("services.exe", Some(winlogon_pid), None);
+                // The 5th hosted process — lsass.exe, spawned by winlogon's StartLsass Win32
+                // CreateProcessW (the LSA subsystem), so its EPROCESS parent is winlogon too.
+                let lsass_pid = pm.create_process("lsass.exe", Some(winlogon_pid), None);
                 PM_PIDS[0].store(smss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[1].store(csrss_pid as u64, Ordering::Relaxed);
                 PM_PIDS[2].store(winlogon_pid as u64, Ordering::Relaxed);
                 PM_PIDS[3].store(services_pid as u64, Ordering::Relaxed);
+                PM_PIDS[4].store(lsass_pid as u64, Ordering::Relaxed);
                 PM_PROC_COUNT.store(pm.process_count() as u64, Ordering::Relaxed);
                 // Identity check: each EPROCESS exists, names its hosted binary, and has a distinct pid.
                 let mut ok = 0u64;
-                let expect: [(usize, u32, &str); 4] = [
+                let expect: [(usize, u32, &str); 5] = [
                     (0, smss_pid, "smss.exe"),
                     (1, csrss_pid, "csrss.exe"),
                     (2, winlogon_pid, "winlogon.exe"),
                     (3, services_pid, "services.exe"),
+                    (4, lsass_pid, "lsass.exe"),
                 ];
                 for (i, pid, name) in expect {
                     let distinct = expect.iter().filter(|e| e.1 == pid).count() == 1;
@@ -142,7 +147,7 @@ impl ExecNtHandler {
                 // later, alloc-free, at the actual seL4 spawn (set_thread_start_address). Entry starts
                 // 0 = "not yet bound".
                 let mut mt_ok = 0u64;
-                let pids = [smss_pid, csrss_pid, winlogon_pid, services_pid];
+                let pids = [smss_pid, csrss_pid, winlogon_pid, services_pid, lsass_pid];
                 for (i, &pid) in pids.iter().enumerate() {
                     if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
                         PM_TIDS[i].store(tid as u64, Ordering::Relaxed);
@@ -176,16 +181,17 @@ impl ExecNtHandler {
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
                 // Measured peak is < ~100 handles per process over a full boot; 256 is ~3× headroom.
-                for pid in [smss_pid, csrss_pid, winlogon_pid, services_pid] {
+                for pid in [smss_pid, csrss_pid, winlogon_pid, services_pid, lsass_pid] {
                     pm.reserve_handles(pid, PM_HANDLE_RESERVE);
                 }
-                // Record the reserved capacity (min across the 4) so the run can prove it never
+                // Record the reserved capacity (min across the 5) so the run can prove it never
                 // grows — i.e. `insert_handle` never reallocates under the per-syscall reset.
                 let cap = pm
                     .handle_capacity(smss_pid)
                     .min(pm.handle_capacity(csrss_pid))
                     .min(pm.handle_capacity(winlogon_pid))
-                    .min(pm.handle_capacity(services_pid));
+                    .min(pm.handle_capacity(services_pid))
+                    .min(pm.handle_capacity(lsass_pid));
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
@@ -2447,6 +2453,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     NEXT_WINLOGON_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else if self.pi == 3 {
                     NEXT_SERVICES_ALLOC.fetch_add(rounded, Ordering::Relaxed)
+                } else if self.pi == 4 {
+                    NEXT_LSASS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 } else {
                     NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 };
@@ -2534,12 +2542,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let is_winlogon_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"winlogon");
                 // services.exe — winlogon's Win32 CreateProcessW target (the 4th hosted process).
                 let is_services_probe = !is_sxs && nb[..nlen].windows(8).any(|w| w == b"services");
+                // lsass.exe — winlogon's StartLsass CreateProcessW target (5th hosted process).
+                // "lsass" is specific (lsasrv.dll folds to "lsasr", no match).
+                let is_lsass_probe = !is_sxs && nb[..nlen].windows(5).any(|w| w == b"lsass");
                 let csrss_attrs = if is_csrss_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\csrss.exe")
                 } else if is_winlogon_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\winlogon.exe")
                 } else if is_services_probe {
                     self.fs.query_attributes(r"\SystemRoot\System32\services.exe")
+                } else if is_lsass_probe {
+                    self.fs.query_attributes(r"\SystemRoot\System32\lsass.exe")
                 } else {
                     None
                 };
@@ -2669,6 +2682,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                         .fs
                         .query_attributes(r"\SystemRoot\System32\services.exe")
                         .is_some_and(|si| !si.is_directory);
+                // lsass.exe FILE open — winlogon's StartLsass CreateProcessW (5th hosted process).
+                // "lsass" substring is specific (lsasrv.dll = "lsasr", no match); nt-fs owns existence.
+                let is_lsass = !is_sxs
+                    && nb[..nlen].windows(5).any(|w| w == b"lsass")
+                    && self
+                        .fs
+                        .query_attributes(r"\SystemRoot\System32\lsass.exe")
+                        .is_some_and(|si| !si.is_directory);
                 // csrss's static import (csrsrv.dll) + its dynamic ServerDlls (basesrv/winsrv) + the
                 // Win32 client stack. SCOPED TO csrss (pi==1): smss's SmpInit enumerates the KnownDLLs
                 // — which now include kernel32/user32/gdi32 — and those opens MUST keep failing so
@@ -2678,7 +2699,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
                 // launches csrss/winlogon.
                 let dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
-                if is_sys32_dir || is_csrss || is_winlogon || is_services || dll_i.is_some() {
+                if is_sys32_dir || is_csrss || is_winlogon || is_services || is_lsass || dll_i.is_some() {
                     let h = self.mint_handle();
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
                     if is_csrss {
@@ -2689,6 +2710,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     if is_services {
                         *ctx.services_file_handle = h; // for NtCreateSection (winlogon → services.exe)
+                    }
+                    if is_lsass {
+                        *ctx.lsass_file_handle = h; // for NtCreateSection (winlogon → lsass.exe)
                     }
                     if let Some(i) = dll_i {
                         reg.set_file_handle(self.pi, i, h); // per-process: remember for NtCreateSection
@@ -2775,6 +2799,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                         info[0x24..0x26].copy_from_slice(&min.to_le_bytes());
                         info[0x26..0x28].copy_from_slice(&maj.to_le_bytes());
                         (info, b"services.exe" as &[u8])
+                    })
+                } else if self.pi == 2
+                    && *ctx.lsass_section_handle != 0
+                    && sect == *ctx.lsass_section_handle
+                {
+                    // winlogon's kernel32 queries SectionImageInformation on the lsass.exe SEC_IMAGE
+                    // before NtCreateProcessEx. Same subsystem/version patch as services.
+                    (*ctx.lsass_pe).as_ref().map(|p| {
+                        let mut info = nt_dll_registry::image_info(
+                            PE_LOAD_BASE,
+                            p.entry_point_rva(),
+                            p.size_of_image(),
+                            false,
+                        );
+                        let (maj, min) = p.subsystem_version();
+                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
+                        info[0x24..0x26].copy_from_slice(&min.to_le_bytes());
+                        info[0x26..0x28].copy_from_slice(&maj.to_le_bytes());
+                        (info, b"lsass.exe" as &[u8])
                     })
                 } else {
                     None
@@ -2891,6 +2934,16 @@ impl NativeSyscallHandler for ExecNtHandler {
                     *ctx.services_section_handle = h;
                     SERVICES_CREATE_STARTED.store(1, Ordering::Relaxed);
                     print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for services.exe -> handle 0x");
+                    print_hex((h >> 32) as u32);
+                    print_hex(h as u32);
+                    print_str(b"\n");
+                }
+                // The lsass.exe SEC_IMAGE is also created by WINLOGON (pi 2) — its StartLsass
+                // CreateProcessW. Distinct dense file handle (append-only) → no alias with services.
+                if self.pi == 2 && *ctx.lsass_file_handle != 0 && sec_file == *ctx.lsass_file_handle {
+                    *ctx.lsass_section_handle = h;
+                    LSASS_CREATE_STARTED.store(1, Ordering::Relaxed);
+                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for lsass.exe -> handle 0x");
                     print_hex((h >> 32) as u32);
                     print_hex(h as u32);
                     print_str(b"\n");
