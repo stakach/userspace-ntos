@@ -21,9 +21,11 @@
 //! component's isolated VSpace as shared code); this is the shared RESOLUTION
 //! mechanism.
 
-/// Capacity of the fixed name->VA binding array. FSD drivers (npfs) register ~35
-/// distinct trampolines; a generous cap covers fastfat/ntfs + aliases too.
-pub const DRIVER_TRAMPOLINE_CAP: usize = 96;
+/// Capacity of the fixed name->VA binding array. Sized for the largest hosted
+/// driver class: win32k.sys (the Subsystem class) registers ~110 distinct
+/// trampolines + data cells; FSD drivers (npfs) register ~35. A generous cap
+/// covers fastfat/ntfs + aliases too.
+pub const DRIVER_TRAMPOLINE_CAP: usize = 160;
 
 /// A heap-free, registration-driven resolver for a hosted driver's `ntoskrnl.exe`
 /// imports. Driver-agnostic: the executive owns one per driver class (or shares
@@ -97,7 +99,10 @@ impl Default for DriverExportRegistry {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::boxed::Box;
+    use std::vec::Vec;
 
     #[test]
     fn bind_then_lookup() {
@@ -128,28 +133,19 @@ mod tests {
 
     #[test]
     fn capacity_boundary() {
+        // DRIVER_TRAMPOLINE_CAP distinct &'static names (leaked for the 'static bound).
+        let names: Vec<&'static str> = (0..DRIVER_TRAMPOLINE_CAP)
+            .map(|i| &*Box::leak(std::format!("a{i}").into_boxed_str()))
+            .collect();
         let mut reg = DriverExportRegistry::new();
-        // Fill to capacity with distinct &'static names.
-        for (i, name) in TEST_NAMES.iter().enumerate() {
+        for (i, name) in names.iter().enumerate() {
             assert!(reg.bind(name, i as u64 + 1));
         }
         assert_eq!(reg.len(), DRIVER_TRAMPOLINE_CAP);
         // A brand-new name past capacity is rejected.
         assert!(!reg.bind("overflow_name", 0xFFFF));
         // But re-binding an already-present name still works.
-        assert!(reg.bind(TEST_NAMES[0], 0x1234));
-        assert_eq!(reg.lookup(TEST_NAMES[0]), Some(0x1234));
+        assert!(reg.bind(names[0], 0x1234));
+        assert_eq!(reg.lookup(names[0]), Some(0x1234));
     }
-
-    /// DRIVER_TRAMPOLINE_CAP distinct &'static names for the boundary test.
-    static TEST_NAMES: [&str; DRIVER_TRAMPOLINE_CAP] = [
-        "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11", "a12", "a13",
-        "a14", "a15", "a16", "a17", "a18", "a19", "a20", "a21", "a22", "a23", "a24", "a25", "a26",
-        "a27", "a28", "a29", "a30", "a31", "a32", "a33", "a34", "a35", "a36", "a37", "a38", "a39",
-        "a40", "a41", "a42", "a43", "a44", "a45", "a46", "a47", "a48", "a49", "a50", "a51", "a52",
-        "a53", "a54", "a55", "a56", "a57", "a58", "a59", "a60", "a61", "a62", "a63", "a64", "a65",
-        "a66", "a67", "a68", "a69", "a70", "a71", "a72", "a73", "a74", "a75", "a76", "a77", "a78",
-        "a79", "a80", "a81", "a82", "a83", "a84", "a85", "a86", "a87", "a88", "a89", "a90", "a91",
-        "a92", "a93", "a94", "a95",
-    ];
 }

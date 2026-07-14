@@ -1,22 +1,24 @@
-//! Registration-driven resolution for `win32k.sys`'s `ntoskrnl.exe` imports
-//! (Workstream B: converge the executive's hardcoded `export_addr` match onto
-//! the declared descriptor contract).
+//! win32k-specific declared import CONTRACT: the descriptor lookup + the data-
+//! export list win32k.sys dereferences at init.
 //!
-//! The [`win32k`](crate::win32k) module declares *which* imports win32k names and
-//! their [`ExportStatus`]. This module adds the missing half: a **heap-free,
-//! registration-driven** map from import name → the executive's machine-code
-//! trampoline VA. The executive binds each `s_*` trampoline by name via
-//! [`Win32kExportRegistry::bind`] at win32k load time; the loader then resolves
-//! win32k's IAT slots through [`Win32kExportRegistry::lookup`] instead of a
-//! buried `match`.
-//!
-//! Heap-free by design: the executive's bump heap is exhausted by the time
-//! win32k loads (after smss/csrss), so the registry is a fixed-capacity array
-//! that lives in a `static` — no `alloc`, unlike the Vec-backed
-//! [`ExportRegistry`](crate::ExportRegistry) used by the host-side driver-import
-//! tooling.
+//! The RESOLUTION MECHANISM (name → trampoline VA) is the SHARED, driver-agnostic
+//! [`DriverExportRegistry`](crate::DriverExportRegistry) — win32k binds its
+//! trampolines into the very same registry type every hosted `.sys` uses (the
+//! parallel `Win32kExportRegistry` was retired; [`Win32kExportRegistry`] is now a
+//! thin alias). What stays win32k-specific here is only the *contract*: which
+//! names win32k imports ([`export_descriptor`]) and which are the data-cell
+//! exports it reads ([`WIN32K_DATA_EXPORTS`]).
 
-use crate::{hal, ntoskrnl, win32k, ExportDescriptor};
+use crate::{hal, ntoskrnl, win32k, DriverExportRegistry, ExportDescriptor, DRIVER_TRAMPOLINE_CAP};
+
+/// Retained name for the shared [`DriverExportRegistry`] — win32k resolves its
+/// `ntoskrnl.exe` imports through the SAME driver-agnostic registry mechanism as
+/// every other hosted driver (FSD/KMDF). The parallel win32k-only registry struct
+/// was retired; this alias keeps the win32k call sites readable.
+pub type Win32kExportRegistry = DriverExportRegistry;
+
+/// Retained alias for the shared trampoline-array capacity ([`DRIVER_TRAMPOLINE_CAP`]).
+pub const WIN32K_TRAMPOLINE_CAP: usize = DRIVER_TRAMPOLINE_CAP;
 
 /// Look up an export's static compatibility descriptor across the whole declared
 /// contract (`ntoskrnl.exe` MVP + win32k's extra ntoskrnl surface + `hal.dll`).
@@ -52,84 +54,6 @@ pub const WIN32K_DATA_EXPORTS: &[&str] = &[
     "MmUserProbeAddress",
     "MmHighestUserAddress",
 ];
-
-/// Capacity of the fixed trampoline-binding array. Comfortably above the number
-/// of distinct trampolines the executive registers (~41 today, aliases share a
-/// VA); [`Win32kExportRegistry::bind`] returns `false` once exhausted.
-pub const WIN32K_TRAMPOLINE_CAP: usize = 128;
-
-/// A heap-free, registration-driven resolver for win32k's `ntoskrnl.exe` imports.
-///
-/// The executive owns one of these in a `static` and, at win32k load time, binds
-/// each of its `s_*` machine-code trampoline VAs by import name. The win32k
-/// loader resolves each IAT slot via [`lookup`](Self::lookup); unbound names fall
-/// back to the executive's existing resolution (a benign zero stub or a data
-/// cell) during migration.
-pub struct Win32kExportRegistry {
-    names: [&'static str; WIN32K_TRAMPOLINE_CAP],
-    vas: [u64; WIN32K_TRAMPOLINE_CAP],
-    len: usize,
-}
-
-impl Win32kExportRegistry {
-    /// An empty registry (usable in a `const`/`static` initializer — no heap).
-    pub const fn new() -> Self {
-        Self {
-            names: [""; WIN32K_TRAMPOLINE_CAP],
-            vas: [0; WIN32K_TRAMPOLINE_CAP],
-            len: 0,
-        }
-    }
-
-    /// Register (or re-bind) the trampoline VA for `name`. Returns `false` only
-    /// if the fixed capacity is exhausted while adding a new name.
-    pub fn bind(&mut self, name: &'static str, va: u64) -> bool {
-        for i in 0..self.len {
-            if self.names[i] == name {
-                self.vas[i] = va;
-                return true;
-            }
-        }
-        if self.len >= WIN32K_TRAMPOLINE_CAP {
-            return false;
-        }
-        self.names[self.len] = name;
-        self.vas[self.len] = va;
-        self.len += 1;
-        true
-    }
-
-    /// The bound trampoline VA for `name`, if the executive registered one.
-    pub fn lookup(&self, name: &str) -> Option<u64> {
-        for i in 0..self.len {
-            if self.names[i] == name {
-                return Some(self.vas[i]);
-            }
-        }
-        None
-    }
-
-    /// True if `name` has a registered trampoline.
-    pub fn is_bound(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
-    }
-
-    /// Number of distinct names bound.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// True if no trampolines are bound.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Default for Win32kExportRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -18,7 +18,7 @@
 //! so the host calls them at the same VA — exactly the KMDF-host pattern.
 
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use nt_compat_exports::Win32kExportRegistry;
+use nt_compat_exports::DriverExportRegistry;
 
 use crate::*;
 
@@ -2003,12 +2003,13 @@ extern "win64" fn s_ke_user_mode_callback(
     }
 }
 
-/// Registration-driven export resolution (Workstream B). The executive binds its machine-code
-/// trampoline VAs by import name into the `nt-compat-exports` [`Win32kExportRegistry`]; the loader
-/// resolves win32k's IAT through it instead of the hardcoded `match` below. Migrated FIRST BATCH:
-/// the pool + RTL-atom + Ob groups (all backed by real `nt-*` subsystems). Names not yet registered
-/// keep resolving via the `match` (behavior-preserving hybrid during migration).
-static mut WIN32K_EXPORTS: Win32kExportRegistry = Win32kExportRegistry::new();
+/// Registration-driven export resolution. The executive binds its machine-code trampoline VAs by
+/// import name into the SHARED, driver-agnostic `nt-compat-exports` [`DriverExportRegistry`] — the
+/// SAME registry mechanism every hosted `.sys` (FSD/KMDF/Subsystem) resolves its IAT through; the
+/// loader resolves win32k's IAT via [`export_addr`]. The win32k-specific data (which imports, the
+/// data-cell exports) stays in `nt-compat-exports::win32k_resolve`; only the resolution MECHANISM
+/// is now unified onto the one registry (the parallel `Win32kExportRegistry` struct was retired).
+static mut WIN32K_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut WIN32K_EXPORTS_READY: bool = false;
 
 /// Bind the first-batch trampolines into [`WIN32K_EXPORTS`]. Idempotent (`bind` updates in place),
