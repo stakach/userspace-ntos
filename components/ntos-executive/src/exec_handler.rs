@@ -2817,6 +2817,20 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS
             },
+            // NtFlushBuffersFile(FileHandle[R10], *IoStatusBlock[RDX]). rpcrt4 flushes its \pipe\lsarpc
+            // after a write. A synchronous pipe needs no real flush — model SUCCESS (pi==4). pi 0-3 stop.
+            NativeService::NtFlushBuffersFile => unsafe {
+                if self.pi != 4 {
+                    self.stop = true;
+                    return 0xC000_0002;
+                }
+                let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &0u32.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                }
+                0
+            },
             // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
             // SmpCreateInitialSession opens %SystemRoot%\system32 as a DIRECTORY
