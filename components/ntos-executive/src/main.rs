@@ -5571,103 +5571,19 @@ unsafe fn service_sec_image(
     // csrsrv.dll — csrss.exe's static-import Server DLL. Parsed from the FILEBUF (size at
     // STORAGE_SHARED+0x40); the loader load-path (NtOpenFile/NtCreateSection/NtMapViewOfSection for
     // csrsrv) maps it into csrss's VSpace and demand-pages it from here so csrss's imports resolve.
-    let csrsrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let rsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x40) as *const u32) as usize;
-        if rsz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET) as *const u8,
-                rsz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(rpe) => {
-                    print_str(b"[ntos-exec] staged csrsrv.dll: ");
-                    print_u64(rsz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(rpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(rpe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(rpe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(rpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged csrsrv.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // basesrv.dll — csrss's ServerDll=basesrv. Parsed from the SRVBUF (size at STORAGE_SHARED+0x44,
-    // bytes at SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET); consumed by the csrss ServerDll load path.
-    let basesrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let bsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x44) as *const u32) as usize;
-        if bsz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET) as *const u8,
-                bsz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(bpe) => {
-                    print_str(b"[ntos-exec] staged basesrv.dll: ");
-                    print_u64(bsz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(bpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(bpe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(bpe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(bpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged basesrv.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // winsrv.dll — csrss's ServerDll=winsrv. Parsed from the SRVBUF (size at STORAGE_SHARED+0x48,
-    // bytes at SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET); consumed by the csrss ServerDll load path.
-    let winsrv_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let wsz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x48) as *const u32) as usize;
-        if wsz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET) as *const u8,
-                wsz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(wpe) => {
-                    print_str(b"[ntos-exec] staged winsrv.dll: ");
-                    print_u64(wsz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(wpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(wpe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(wpe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(wpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged winsrv.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // P7-A batch 3: source csrss's csrsrv.dll (static import) + basesrv.dll/winsrv.dll (its two
+    // CsrLoadServerDll ServerDlls) BY PATH from the FS pool (hybrid; falls back to FILEBUF/SRVBUF on
+    // any FS miss). dll_buf_va[0..3] = *_va below. csrsrv keeps registry base 0x8000_0000 = its
+    // preferred ImageBase (relocation delta 0) regardless of where its bytes live.
+    let (csrsrv_pe, csrsrv_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\csrsrv.dll", b"csrsrv",
+        FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET, 0x40);
+    let (basesrv_pe, basesrv_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\basesrv.dll", b"basesrv",
+        SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET, 0x44);
+    let (winsrv_pe, winsrv_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\winsrv.dll", b"winsrv",
+        SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET, 0x48);
     // The Win32 client stack (kernel32/user32/gdi32) — winsrv.dll's static imports. Parsed from the
     // WIN32BUF (sizes at STORAGE_SHARED +0x4c/+0x50/+0x54, bytes at WIN32BUF_VADDR + each offset);
     // registered below so csrss's loader can resolve + demand-page them.
@@ -5897,9 +5813,9 @@ unsafe fn service_sec_image(
     // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
     // ImageBase == mapped base and doesn't double-relocate.
     let dll_buf_va: [u64; 16] = [
-        FILEBUF_VADDR + CSRSRV_FILEBUF_OFFSET,
-        SRVBUF_VADDR + BASESRV_SRVBUF_OFFSET,
-        SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET,
+        csrsrv_va,  // P7-A batch 3: pool VA on FS hit, else FILEBUF+CSRSRV_FILEBUF_OFFSET
+        basesrv_va, // P7-A batch 3: pool VA on FS hit, else SRVBUF+BASESRV_SRVBUF_OFFSET
+        winsrv_va,  // P7-A batch 3: pool VA on FS hit, else SRVBUF+WINSRV_SRVBUF_OFFSET
         WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET,
         gdi32_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+GDI32_WIN32BUF_OFFSET
