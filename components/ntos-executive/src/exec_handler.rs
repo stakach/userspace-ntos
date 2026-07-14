@@ -1437,7 +1437,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // FSD → NpFsdCreateNamedPipe builds a real FCB/CCB + FILE_OBJECT (server end). pi 0-2
                 // keep the modeled-fake path (byte-identical: winlogon's \pipe\winreg never connects).
                 let mut info: u64 = 2; // FILE_CREATED
-                if self.pi == 3 {
+                if self.pi == 3 || self.pi == 4 {
                     let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
                     let name16 = self.read_objattr_name_pe(oa);
                     let leaf = Self::pipe_leaf16(&name16);
@@ -1449,9 +1449,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
-                // *FileHandle (R10): for services (pi 3) it's a DLL .data global → csrss_out_write; for
-                // pi 0-2 the legacy stack write is byte-identical.
-                if self.pi == 3 {
+                // *FileHandle (R10): for services/lsass (pi 3/4) it's a DLL .data global → the cross-AS
+                // writer; for pi 0-2 the legacy stack write is byte-identical.
+                if self.pi == 3 || self.pi == 4 {
                     self.queue_write(get_recv_mr(9), h);
                     if iosb != 0 {
                         self.xas_write_buf(iosb, &0u32.to_le_bytes()); // Status
@@ -1479,7 +1479,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // FSCTL_PIPE_LISTEN on a server pipe with no client returns STATUS_PIPE_LISTENING
                 // (0x00000000-ish PENDING); we surface npfs's status. pi 0-2 keep the modeled path.
                 let mut status: u64 = 0;
-                if self.pi == 3 {
+                if self.pi == 3 || self.pi == 4 {
                     let fh = get_recv_mr(9); // R10 = FileHandle
                     let fsctl = smss_stack_read(sp + 0x30); // [sp+0x30] = FsControlCode
                     let fid = Self::npfs_file_id_for(fh);
@@ -2699,6 +2699,44 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     0xC0000034
                 }
+            },
+            // NtCreateFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
+            // *IoStatusBlock[R9], AllocationSize[sp+0x28], FileAttributes[sp+0x30],
+            // ShareAccess[sp+0x38], CreateDisposition[sp+0x40], CreateOptions[sp+0x48], ...).
+            // lsass (pi 4): rpcrt4's ncacn_np endpoint opens \Device\NamedPipe\lsarpc (client-side
+            // NtCreateFile). Route a pipe path through the real isolated npfs FSD (IRP_MJ_CREATE); a
+            // non-pipe open is modeled as a bare-handle success. pi 0-3 stop as before (unregistered).
+            NativeService::NtCreateFile => unsafe {
+                if self.pi != 4 {
+                    self.stop = true;
+                    return 0xC000_0002; // record the SSN + stop (matches the prior unregistered wall)
+                }
+                let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
+                let name16 = self.read_objattr_name_pe(oa);
+                let lc: alloc::vec::Vec<u8> =
+                    name16.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
+                let is_pipe = lc.windows(5).any(|w| w == b"pipe\\")
+                    || lc.windows(9).any(|w| w == b"namedpipe");
+                let h = self.mint_handle();
+                let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
+                let mut status: u64 = 0;
+                let mut info: u64 = 1; // FILE_OPENED
+                if is_pipe && driver_launch::npfs_ready() {
+                    let leaf = Self::pipe_leaf16(&name16);
+                    if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
+                        if st == 0 && fid != 0 {
+                            Self::npfs_track_handle(h, fid);
+                        }
+                        status = st as u64;
+                    }
+                }
+                self.queue_write(get_recv_mr(9), h); // *FileHandle (DLL .data global → cross-AS writer)
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                }
+                let _ = &mut info;
+                status as u32
             },
             // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).
