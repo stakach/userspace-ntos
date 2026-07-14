@@ -5584,71 +5584,16 @@ unsafe fn service_sec_image(
     let (winsrv_pe, winsrv_va) = load_dll_hybrid(
         ntdll.is_some(), b"reactos\\system32\\winsrv.dll", b"winsrv",
         SRVBUF_VADDR + WINSRV_SRVBUF_OFFSET, 0x48);
-    // The Win32 client stack (kernel32/user32/gdi32) — winsrv.dll's static imports. Parsed from the
-    // WIN32BUF (sizes at STORAGE_SHARED +0x4c/+0x50/+0x54, bytes at WIN32BUF_VADDR + each offset);
-    // registered below so csrss's loader can resolve + demand-page them.
-    let kernel32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let ksz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x4c) as *const u32) as usize;
-        if ksz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET) as *const u8,
-                ksz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(kpe) => {
-                    print_str(b"[ntos-exec] staged kernel32.dll: ");
-                    print_u64(ksz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(kpe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(kpe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(kpe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(kpe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged kernel32.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let user32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let usz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x50) as *const u32) as usize;
-        if usz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET) as *const u8,
-                usz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(upe) => {
-                    print_str(b"[ntos-exec] staged user32.dll: ");
-                    print_u64(usz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(upe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(upe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(upe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(upe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged user32.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // P7-A batch 4: the Win32 client stack heavyweights kernel32.dll (~2.66 MiB) + user32.dll
+    // (~1.12 MiB) — winsrv.dll's static imports. Sourced BY PATH from the FS pool (hybrid; falls back
+    // to WIN32BUF on any FS miss). Done last per the untyped caveat — during hybrid both the pool AND
+    // WIN32BUF hold them, but headroom is ample (~36% of the slot budget). dll_buf_va[3..5] = *_va.
+    let (kernel32_pe, kernel32_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\kernel32.dll", b"kernel32",
+        WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET, 0x4c);
+    let (user32_pe, user32_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\user32.dll", b"user32",
+        WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET, 0x50);
     // P7-A migration: source gdi32.dll BY PATH from the executive's FS pool; fall back to the fixed
     // WIN32BUF staging only if the FS load fails (hybrid). `gdi32_va` feeds dll_buf_va[5] below so the
     // relocation + demand-fault router use the same bytes the PeFile wraps.
@@ -5816,8 +5761,8 @@ unsafe fn service_sec_image(
         csrsrv_va,  // P7-A batch 3: pool VA on FS hit, else FILEBUF+CSRSRV_FILEBUF_OFFSET
         basesrv_va, // P7-A batch 3: pool VA on FS hit, else SRVBUF+BASESRV_SRVBUF_OFFSET
         winsrv_va,  // P7-A batch 3: pool VA on FS hit, else SRVBUF+WINSRV_SRVBUF_OFFSET
-        WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET,
+        kernel32_va, // P7-A batch 4: pool VA on FS hit, else WIN32BUF+KERNEL32_WIN32BUF_OFFSET
+        user32_va,   // P7-A batch 4: pool VA on FS hit, else WIN32BUF+USER32_WIN32BUF_OFFSET
         gdi32_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+GDI32_WIN32BUF_OFFSET
         rpcrt4_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+RPCRT4_WIN32BUF_OFFSET
         msvcrt_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+MSVCRT_WIN32BUF_OFFSET
