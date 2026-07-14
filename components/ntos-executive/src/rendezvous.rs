@@ -350,6 +350,72 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     })
 }
 
+/// Spawn lsass' LSA server thread (StartAuthenticationPort / LsapRmServerThread, created by lsass'
+/// LsapInitDatabase via NtCreateThread) in lsass' VSpace (pi 4) and RESUME it into the main service-loop
+/// multiplex — the SERVICE-9 C-c pattern replicated for lsass. Faults to a cap minted at
+/// [`LSASS_LISTENER_BADGE`] off the MAIN service `fault_ep`; the loop sub-selects it as (pi 4, listener)
+/// via its own stack mirror. `lsass_pml4` = lsass' PML4; `entry_rip`/`param` from the caller's CONTEXT.
+/// Returns the TCB.
+pub(crate) unsafe fn spawn_lsass_listener_thread(
+    lsass_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+) -> u64 {
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: lsass_pml4,
+        entry_rip,
+        param,
+        scr: LSASS_LISTENER_ENV_SCRATCH_VA,
+        teb_va: LSASS_LISTENER_TEB_VA,
+        stack_base: LSASS_LISTENER_STACK_BASE,
+        stack_frames: LSASS_LISTENER_STACK_FRAMES,
+        ipcbuf_va: LSASS_LISTENER_IPCBUF_VA,
+        tramp_va: LSASS_LISTENER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: LSASS_LISTENER_STACK_MIRROR_VA,
+        fault_ep: listener_ep,
+        cid_proc,
+        cid_thread,
+        resume: true, // run it into the multiplex (the N-threads mechanism)
+        prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
+    })
+}
+
+/// Spawn lsass' SECOND LSA server thread (LsapRmServerThread) — same multiplex, its own target-VSpace
+/// VAs (distinct TEB/stack/tramp) + badge (LSASS_LISTENER2_BADGE).
+pub(crate) unsafe fn spawn_lsass_listener2_thread(
+    lsass_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+) -> u64 {
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: lsass_pml4,
+        entry_rip,
+        param,
+        scr: LSASS_LISTENER2_ENV_SCRATCH_VA,
+        teb_va: LSASS_LISTENER2_TEB_VA,
+        stack_base: LSASS_LISTENER2_STACK_BASE,
+        stack_frames: LSASS_LISTENER2_STACK_FRAMES,
+        ipcbuf_va: LSASS_LISTENER2_IPCBUF_VA,
+        tramp_va: LSASS_LISTENER2_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: LSASS_LISTENER2_STACK_MIRROR_VA,
+        fault_ep: listener_ep,
+        cid_proc,
+        cid_thread,
+        resume: true,
+        prio: 105,
+    })
+}
+
 /// Write a u64 to the CSR thread's stack (via the executive's CSR_STACK_MIRROR alias).
 pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
     if va >= CSR_STACK_BASE && va + 8 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {

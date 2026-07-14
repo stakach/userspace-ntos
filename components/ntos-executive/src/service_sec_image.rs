@@ -448,6 +448,8 @@ pub(crate) unsafe fn service_sec_image(
         // thread — same VSpace/image/pml4 as services' main thread, but a DIFFERENT stack + TEB. It's
         // resolved to pi 3 here; the per-thread stack mirror is switched below (is_svc_listener).
         let is_svc_listener = badge == SVC_LISTENER_BADGE;
+        let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
+        let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
         if is_svc_listener {
             let n = SVC_LISTENER_FAULTS.fetch_add(1, Ordering::Relaxed);
             if n < 4 {
@@ -460,13 +462,26 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 3 listener)\n");
             }
         }
+        if is_lsass_listener || is_lsass_listener2 {
+            let ctr = if is_lsass_listener2 { &LSASS_LISTENER2_FAULTS } else { &LSASS_LISTENER_FAULTS };
+            let n = ctr.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                print_str(if is_lsass_listener2 { b"[lsass-listener2] multiplex event #" } else { b"[lsass-listener] multiplex event #" });
+                print_u64(n);
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b" (N-threads sub-select: pi 4 listener)\n");
+            }
+        }
         let pi = if badge == CSRSS_BADGE {
             1
         } else if badge == WINLOGON_BADGE {
             2
         } else if badge == SERVICES_BADGE || is_svc_listener {
             3
-        } else if badge == LSASS_BADGE {
+        } else if badge == LSASS_BADGE || is_lsass_listener || is_lsass_listener2 {
             4
         } else {
             0
@@ -495,6 +510,12 @@ pub(crate) unsafe fn service_sec_image(
                 // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
                 // stack-arg reads land on its own stack, not services' main-thread stack).
                 SVC_LISTENER_STACK_MIRROR_VA
+            } else if is_lsass_listener {
+                // Per-thread sub-selection: lsass' LSA server thread's OWN stack mirror (distinct from
+                // lsass' main-thread stack).
+                LSASS_LISTENER_STACK_MIRROR_VA
+            } else if is_lsass_listener2 {
+                LSASS_LISTENER2_STACK_MIRROR_VA
             } else {
                 match pi {
                     1 => CSRSS_STACK_MIRROR_VA,
@@ -590,13 +611,13 @@ pub(crate) unsafe fn service_sec_image(
                 // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
                 // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
                 // stop — the whole point of the per-thread multiplex.
-                if is_svc_listener {
-                    print_str(b"[svc-listener] wall ip=0x");
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 {
+                    print_str(if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
-                    print_str(b" -> PARK listener (needs a real client connect); boot continues\n");
+                    print_str(b" -> PARK listener (its own unrecoverable fault); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -836,6 +857,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = false;
                 nt_handler.svc_listener_spawn = false;
+                nt_handler.lsass_listener_spawn = false;
+                nt_handler.lsass_listener2_spawn = false;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -1156,6 +1179,48 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[svc-thread] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 7)\n");
+                }
+                // ★ N-threads multiplex: lsass' (pi 4) LSA server thread — spawned RESUMED into the main
+                // service loop (badge LSASS_LISTENER_BADGE). Same shape as the svc listener; its faults
+                // sub-select to (pi 4, listener) by badge → the listener's own stack mirror/TEB.
+                if nt_handler.lsass_listener_spawn && LSASS_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let tid = LSASS_LISTENER_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    print_str(b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_lsass_listener_thread(procs[4].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    LSASS_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
+                    print_str(b"[lsass-thread] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 9)\n");
+                }
+                // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, badge 10.
+                if nt_handler.lsass_listener2_spawn && LSASS_LISTENER2_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let tid = LSASS_LISTENER2_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    print_str(b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_lsass_listener2_thread(procs[4].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    LSASS_LISTENER2_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
+                    print_str(b"[lsass-thread2] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 10)\n");
                 }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
@@ -1795,6 +1860,21 @@ pub(crate) unsafe fn service_sec_image(
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
             }
             if !handled {
+                // N-threads multiplex: a SERVER thread (svc/lsass listener) that walls on an unserviced
+                // BLOCKING server-loop syscall (e.g. NtListenPort / NtReplyWaitReceivePort — it reached
+                // its LPC/RPC receive loop and would block forever waiting for a client) PARKS instead of
+                // stopping the whole boot. Recv the next event WITHOUT replying → the listener's seL4
+                // thread stays blocked (its ETHREAD/TEB/stack stay mapped), and lsass' main thread + the
+                // rest of the boot keep advancing. Contained per-thread — the point of the multiplex.
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 {
+                    print_str(if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
+                    print_u64(m0);
+                    print_str(b" -> PARK listener (reached its LPC/RPC receive loop); boot continues\n");
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 stop_ssn = m0; // an Nt* syscall we don't service yet — stop
                 break;
             }

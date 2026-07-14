@@ -64,6 +64,8 @@ impl ExecNtHandler {
             sm_spawn_request: false,
             wl_spawn_request: false,
             svc_listener_spawn: false,
+            lsass_listener_spawn: false,
+            lsass_listener2_spawn: false,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
             csr_spawn_request: false,
@@ -177,6 +179,12 @@ impl ExecNtHandler {
                         PM_POOL_TID[i].store(tid as u64, Ordering::Relaxed);
                     }
                 }
+                // lsass creates TWO server threads (StartAuthenticationPort + LsapRmServerThread), so it
+                // needs a SECOND pool ETHREAD (the single-per-pi pool covers the first). Reserved at boot,
+                // below the heap mark, like the rest.
+                if let Ok(tid) = pm.create_thread(lsass_pid, 0, 0, false) {
+                    PM_POOL_TID2_LSASS.store(tid as u64, Ordering::Relaxed);
+                }
                 // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
                 // reallocates under the per-call bump reset — the NON-LEAKING heap-reset solution.
@@ -261,8 +269,13 @@ impl ExecNtHandler {
     /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns `(tid, handle)`
     /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
     pub(crate) fn nt_create_thread_handle(&mut self, entry: u64, param: u64, teb_base: u64) -> Option<(u64, u64)> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
         let tid = PM_POOL_TID.get(self.pi)?.load(Ordering::Relaxed);
+        self.nt_create_thread_handle_tid(tid, entry, param, teb_base)
+    }
+    /// As `nt_create_thread_handle` but binds an EXPLICIT pre-created pool tid (for a process that
+    /// creates more than one runtime thread — e.g. lsass' two LSA server threads).
+    pub(crate) fn nt_create_thread_handle_tid(&mut self, tid: u64, entry: u64, param: u64, teb_base: u64) -> Option<(u64, u64)> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
         if tid == 0 {
             return None;
         }
@@ -1743,6 +1756,69 @@ impl NativeSyscallHandler for ExecNtHandler {
                             }
                             SVC_LISTENER_TID.store(tid, Ordering::Relaxed);
                             self.svc_listener_spawn = true;
+                            return 0;
+                        }
+                    }
+                }
+                // ★ N-threads multiplex: lsass' (pi 4) FIRST NtCreateThread = an LSA server thread
+                // (LsapInitDatabase → StartAuthenticationPort / LsapRmServerThread). Route it through the
+                // REAL ETHREAD lifecycle + have the LOOP spawn it RESUMED with a badged fault EP, so it
+                // runs into the main multiplex; its faults sub-select to (pi 4, listener) by
+                // LSASS_LISTENER_BADGE (its own stack mirror / TEB, distinct from lsass' main thread).
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 4
+                    && LSASS_LISTENER_TCB.load(Ordering::Relaxed) == 0
+                    && LSASS_LISTENER_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let entry = smss_stack_read(ctx_va + 0xF8);
+                        let param = smss_stack_read(ctx_va + 0x80);
+                        if let Some((tid, handle)) =
+                            self.nt_create_thread_handle(entry, param, LSASS_LISTENER_TEB_VA)
+                        {
+                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            self.queue_write(args[0], handle); // *ThreadHandle
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            LSASS_LISTENER_TID.store(tid, Ordering::Relaxed);
+                            self.lsass_listener_spawn = true;
+                            return 0;
+                        }
+                    }
+                }
+                // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, its own badge +
+                // its own TEB/stack (LSASS_LISTENER2). Uses the SECOND pool ETHREAD. Without a real,
+                // mapped TEB the subsequent NtQueryInformationThread(162) → kernel32 ActCtx copy
+                // (mov [newTEB+0x1728]) writes to a stale stack pointer and faults.
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 4
+                    && LSASS_LISTENER_TID.load(Ordering::Relaxed) != 0
+                    && LSASS_LISTENER2_TCB.load(Ordering::Relaxed) == 0
+                    && LSASS_LISTENER2_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let entry = smss_stack_read(ctx_va + 0xF8);
+                        let param = smss_stack_read(ctx_va + 0x80);
+                        let tid2 = PM_POOL_TID2_LSASS.load(Ordering::Relaxed);
+                        if let Some((tid, handle)) =
+                            self.nt_create_thread_handle_tid(tid2, entry, param, LSASS_LISTENER2_TEB_VA)
+                        {
+                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            self.queue_write(args[0], handle);
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            LSASS_LISTENER2_TID.store(tid, Ordering::Relaxed);
+                            self.lsass_listener2_spawn = true;
                             return 0;
                         }
                     }

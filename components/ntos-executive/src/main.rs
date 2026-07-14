@@ -297,6 +297,39 @@ pub const SVC_LISTENER_STACK_MIRROR_VA: u64 = 0x0000_0100_1360_0000;
 /// The fault-EP badge for services' RPC listener thread — the main loop maps it to (pi 3, listener),
 /// switching ACTIVE_STACK_MIRROR to the listener's mirror. The N-threads-per-process sub-selection.
 pub const SVC_LISTENER_BADGE: u64 = 7;
+// --- lsass' LSA server thread(s) (StartAuthenticationPort / LsapRmServerThread, created by lsass'
+// LsapInitDatabase via NtCreateThread). Runs in lsass' OWN pml4 (pi 4) at the SAME target VSpace VAs
+// as the SM/SVC listeners (isolated per-VSpace); its executive-side env-scratch + stack-mirror must be
+// DISTINCT. RESUMES + faults route into the main service loop keyed by LSASS_LISTENER_BADGE (the
+// N-threads multiplex — the SERVICE-9 C-c pattern replicated for lsass).
+pub const LSASS_LISTENER_STACK_BASE: u64 = SM_STACK_BASE; // lsass VSpace (own pml4)
+pub const LSASS_LISTENER_STACK_FRAMES: u64 = 8;
+pub const LSASS_LISTENER_IPCBUF_VA: u64 = SM_IPCBUF_VA;
+pub const LSASS_LISTENER_TEB_VA: u64 = SM_TEB_VA;
+pub const LSASS_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA;
+/// Executive scratch (3 pages) — distinct from SVC_LISTENER (0x1073) / lsass-main env (0x1077). FILEBUF PT.
+pub const LSASS_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1079_0000;
+/// Executive-side stack mirror for lsass' listener (its syscall out-params / arg reads route to its OWN
+/// stack, not lsass' main-thread stack). Distinct 8-page window (past SVC_LISTENER's 0x1360).
+pub const LSASS_LISTENER_STACK_MIRROR_VA: u64 = 0x0000_0100_1368_0000;
+/// The fault-EP badge for lsass' LSA server thread — the main loop maps it to (pi 4, listener),
+/// switching ACTIVE_STACK_MIRROR to the listener's mirror. The N-threads-per-process sub-selection.
+pub const LSASS_LISTENER_BADGE: u64 = 9;
+// --- lsass' SECOND LSA server thread (LsapRmServerThread — lsass creates TWO server threads in
+// LsapInitDatabase: StartAuthenticationPort then LsapRmServerThread). It runs in lsass' pml4 (pi 4) too,
+// so it needs its OWN target-VSpace VAs (a distinct TEB → distinct GS base, distinct stack/tramp/ipcbuf)
+// plus distinct executive-side env-scratch + stack-mirror. Same multiplex, badge LSASS_LISTENER2_BADGE.
+pub const LSASS_LISTENER2_STACK_BASE: u64 = 0x0000_0100_104C_0000; // lsass VSpace (own pml4), 0x1040 PT
+pub const LSASS_LISTENER2_STACK_FRAMES: u64 = 8;
+pub const LSASS_LISTENER2_IPCBUF_VA: u64 = 0x0000_0100_104E_0000;
+pub const LSASS_LISTENER2_TEB_VA: u64 = 0x0000_0100_104F_0000; // 2 pages
+pub const LSASS_LISTENER2_TRAMP_VA: u64 = 0x0000_0100_1051_0000;
+/// Executive scratch (3 pages) — distinct from LSASS_LISTENER (0x1079). FILEBUF PT.
+pub const LSASS_LISTENER2_ENV_SCRATCH_VA: u64 = 0x0000_0100_107A_0000;
+/// Executive-side stack mirror for lsass' 2nd server thread. Distinct 8-page window (past 0x1368).
+pub const LSASS_LISTENER2_STACK_MIRROR_VA: u64 = 0x0000_0100_1370_0000;
+/// The fault-EP badge for lsass' 2nd LSA server thread.
+pub const LSASS_LISTENER2_BADGE: u64 = 10;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
@@ -798,6 +831,14 @@ static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// lsass' LSA server thread — same shape as SVC_LISTENER, for pi 4 (the N-threads multiplex).
+static LSASS_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// lsass' SECOND LSA server thread (LsapRmServerThread).
+static LSASS_LISTENER2_TCB: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER2_TID: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once the main thread has queried the real listener thread's TEB/ClientId via
 /// NtQueryInformationThread(ThreadBasicInformation) — proves the NULL-deref is gone.
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
@@ -2242,6 +2283,12 @@ struct ExecNtHandler {
     /// (`spawn_svc_listener_thread`, needs services' PML4 + the caller's SP for the CONTEXT). Unlike
     /// the winlogon listener this one runs into the main multiplex (badge SVC_LISTENER_BADGE).
     svc_listener_spawn: bool,
+    /// General NtCreateThread: set by lsass' (pi 4) FIRST `NtCreateThread` (an LSA server thread —
+    /// StartAuthenticationPort / LsapRmServerThread) so the LOOP spawns + RESUMES the REAL thread
+    /// (`spawn_lsass_listener_thread`) into the main multiplex (badge LSASS_LISTENER_BADGE).
+    lsass_listener_spawn: bool,
+    /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
+    lsass_listener2_spawn: bool,
     /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
     /// connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
@@ -2817,6 +2864,8 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
 /// its RPC listener; the array generalizes to any pi.)
 static PM_POOL_TID: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// A SECOND pool ETHREAD for lsass (pi 4), which creates two server threads.
+static PM_POOL_TID2_LSASS: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
@@ -5916,6 +5965,23 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_u64(SVC_LISTENER_TID.load(Ordering::Relaxed));
                     print_str(b" listener-faults-serviced=");
                     print_u64(SVC_LISTENER_FAULTS.load(Ordering::Relaxed));
+                    print_str(b"\n");
+                    // SERVICE 10 step 2 increment 1: lsass' LSA server thread runs through the SAME
+                    // N-threads multiplex (badge LSASS_LISTENER_BADGE, its own stack mirror/TEB) — a real
+                    // seL4 thread spawned + resumed into the service loop, its faults serviced (proving
+                    // lsass' server threads advance past the tcb=30 stack-fault wall).
+                    check(
+                        b"exec_lsass_lsa_server_thread_multiplex",
+                        LSASS_LISTENER_TCB.load(Ordering::Relaxed) > 1
+                            && LSASS_LISTENER_TID.load(Ordering::Relaxed) != 0,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] lsass N-threads multiplex: lsass-listener tcb=0x");
+                    print_hex(LSASS_LISTENER_TCB.load(Ordering::Relaxed) as u32);
+                    print_str(b" tid=");
+                    print_u64(LSASS_LISTENER_TID.load(Ordering::Relaxed));
+                    print_str(b" listener-faults-serviced=");
+                    print_u64(LSASS_LISTENER_FAULTS.load(Ordering::Relaxed));
                     print_str(b"\n");
                     // ★ GENERAL NtCreateThread (real service): winlogon's RPC listener thread is a REAL
                     // seL4-thread-backed nt-process ETHREAD — its NtCreateThread popped a pool ETHREAD,
