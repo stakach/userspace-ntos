@@ -2027,7 +2027,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // write the handle back, and report STATUS_OBJECT_NAME_EXISTS if it already existed
                 // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event (empty OA name) just
                 // mints a bare handle. The PHANDLE (R10) may be a DLL .data global → xas_write_u64.
-                if self.pi == 3 { unsafe {
+                if self.pi == 3 || self.pi == 4 { unsafe {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
                     // EventType[R9]=args[3], InitialState is the 5th arg (stack [sp+0x28]).
@@ -2077,7 +2077,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // registered event's handle, or STATUS_OBJECT_NAME_NOT_FOUND if it doesn't exist (so the
             // create-then-open logic behaves). Scoped to services (pi 3).
             NativeService::NtOpenEvent => unsafe {
-                if self.pi != 3 {
+                if self.pi != 3 && self.pi != 4 {
                     let h = self.mint_handle();
                     self.queue_write(args[0], h);
                     return 0;
@@ -2095,13 +2095,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                 } else {
                     self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
                 };
-                match self.obj_resolve(&nbuf[..nlen], root_idx) {
-                    Some(i) if self.obj_ns[i].kind == 2 => {
+                if let Some(i) = self.obj_resolve(&nbuf[..nlen], root_idx) {
+                    if self.obj_ns[i].kind == 2 {
                         self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
-                        0
+                        return 0;
                     }
-                    _ => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
+                // lsass (pi 4): \SeLsaInitEvent is created by ntoskrnl's SeRmInitPhase1 (the SRM), which
+                // we don't host — lsass' LsapRmInitializeServer (srm.c:194) NtOpenEvent's it then
+                // NtSetEvent's it to signal the kernel it's ready, and treats an open failure as FATAL.
+                // Model it: auto-create the event so the open + set succeed (like \SeRmCommandPort). The
+                // name folds to "selsainitevent". Scoped pi==4 so services/paint reads are unchanged.
+                if self.pi == 4 && nbuf[..nlen].windows(14).any(|w| w == b"selsainitevent") {
+                    if let Some(i) = self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
+                        self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
+                        return 0;
+                    }
+                }
+                0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
             },
             // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
             NativeService::NtOpenProcessToken => unsafe {
@@ -2737,6 +2748,22 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 let _ = &mut info;
                 status as u32
+            },
+            // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
+            // Length[R9], FileInformationClass[sp+0x28]). lsass' rpcrt4 sets up its \pipe\lsarpc
+            // (FilePipeInformation / FileCompletionInformation for async listen) before FSCTL_PIPE_LISTEN.
+            // Model SUCCESS with a zeroed IO_STATUS_BLOCK so the setup proceeds (pi==4). pi 0-3 stop.
+            NativeService::NtSetInformationFile => unsafe {
+                if self.pi != 4 {
+                    self.stop = true;
+                    return 0xC000_0002;
+                }
+                let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
+                if iosb != 0 {
+                    self.xas_write_buf(iosb, &0u32.to_le_bytes()); // Status
+                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
+                }
+                0 // STATUS_SUCCESS
             },
             // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).

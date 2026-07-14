@@ -59,6 +59,7 @@ pub enum NativeService {
     NtCreateNamedPipeFile,
     NtFsControlFile,
     NtQueryInformationFile,
+    NtSetInformationFile,
     // Registry (§16.3)
     NtOpenKey,
     NtCreateKey,
@@ -166,6 +167,7 @@ impl NativeService {
             NtCreateNamedPipeFile => "NtCreateNamedPipeFile",
             NtFsControlFile => "NtFsControlFile",
             NtQueryInformationFile => "NtQueryInformationFile",
+            NtSetInformationFile => "NtSetInformationFile",
             NtOpenKey => "NtOpenKey",
             NtCreateKey => "NtCreateKey",
             NtQueryValueKey => "NtQueryValueKey",
@@ -293,6 +295,7 @@ impl NativeService {
         NativeService::NtCreateNamedPipeFile,
         NativeService::NtFsControlFile,
         NativeService::NtQueryInformationFile,
+        NativeService::NtSetInformationFile,
         NativeService::NtOpenKey,
         NativeService::NtCreateKey,
         NativeService::NtQueryValueKey,
