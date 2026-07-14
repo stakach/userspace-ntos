@@ -10,6 +10,23 @@ real DMA (contiguous buffers + physical addresses + MDLs).
 
 ## Status: P1 capstone reached — an isolated driver host, handed a CM_RESOURCE_LIST + confined DMA buffer at START, drives the real e1000e (MMIO + IRQ + VT-d-confined DMA) from its own CSpace/VSpace (25454e7). 42/42.
 
+### Status (2026-07-14): DONE (functionally complete; NDIS deferred)
+The full P1 vertical shipped: real MMIO (device untypeds — HPET + e1000e BAR),
+real IRQ (IOAPIC + MSI, with the kernel LAPIC-EOI + level-mask + GSI-base bugs fixed
+at source per Principle 6), real DMA (identity **and** VT-d-confined), real port I/O,
+and — the exit-and-then-some — real unmodified Windows `.sys` binaries hosted through
+the START path in isolated seL4 hosts reaching the real e1000e:
+- **WDM** (`PnpMmioInterruptTest.sys`): DriverEntry → AddDevice → START → MMIO + IRQ + DMA.
+- **KMDF** (`KmdfBasicTest.sys`): the full WDF lifecycle, `EvtDevicePrepareHardware`
+  reading a real NIC register (commits 74287ae, d16be90, 3e066ea).
+**Deferred (off critical path, tracked in PLAN §10):** the Intel NDIS miniport
+(real NIC driver) — needs a full NDIS runtime (~53 `ndis.sys` fns + the
+Miniport/NetBufferList lifecycle); NetAdapterCx would build on the working KMDF
+runtime but few stock drivers use it. The driver-hosting *capability* (WDM + KMDF on
+real hardware, isolated) is proven; revisit NDIS only when networking is a goal.
+The unchecked task boxes below (real timer/clock, the standalone DMA box) were
+subsumed by the capstone + DMA Phase 1/2 work — see the Notes/findings entries.
+
 ## Background to reuse
 - `docs/architecture/sel4_irq_bridge.md`, `hal-resource-interrupt.md`,
   `wdf-hardware.md` — existing designs.

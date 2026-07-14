@@ -145,22 +145,31 @@ Trust tiers (each horizontal band is an isolation boundary):
 
 ---
 
-## 4. Current State (summary)
+## 4. Current State (summary — updated 2026-07-14)
 
 - **Microkernel:** rust-micro passes the upstream sel4test conformance
-  milestone (170+), incl. MCS scheduling, fault endpoints, inter‑AS IPC.
+  milestone (170+), incl. MCS scheduling, fault endpoints, inter‑AS IPC. Several
+  kernel bugs were root-caused + fixed at source during hardware bring-up (LAPIC
+  EOI, level-IRQ mask, IOAPIC GSI-base) + hosting hooks added (`TCBSetHostedSyscalls`).
+- **The stack RUNS the real ReactOS user space:** BOOTBOOT → rust-micro →
+  `ntos-executive` → real `smss.exe` → `csrss.exe` → `winlogon.exe` → isolated
+  `win32k.sys` → **a painted Windows desktop.** Gate ~140 specs, prints **SUCCESS**;
+  `./run.sh` (headless gate) / `./run.sh --desktop` (see the pixels).
 - **Executive cores (host‑tested crates):** Ob, Cm (+ hives + persistence), Mm
-  (sections/VAD/fault/MDL), Ps, Io, PnP, Power, HAL/Resource, Cc, Se, Fs, DMA,
-  and the native syscall dispatcher — **56 crates with unit tests.**
+  (sections/VAD/fault/MDL), Ps, Io, PnP, Power, HAL/Resource, Cc, Se, Fs, DMA, LPC,
+  ALPC + `nt-port-core`, and the native syscall dispatcher — **66 crates.** Three
+  subsystems have **converged** into the live path (dispatch→`nt-syscall`,
+  Ob→`nt-object-manager`, process→`nt-process`).
+- **Real hardware (P1 done):** real MMIO/IRQ(MSI)/DMA(VT-d-confined)/port I/O; real
+  **WDM + KMDF** `.sys` drivers hosted in isolated seL4 hosts reaching the real e1000e.
 - **Driver stack:** `nt-pe-loader` + `nt-wdf-kmdf` runtime host real **WDM,
-  KMDF, and UMDF v2** drivers through their full lifecycle; the isolated
-  `driver-host-um` runs a real UMDF v2 driver in its own process; the supervisor
-  does restart/backoff/disable with a userspace‑visible flag.
-- **Isolation proven:** two‑component SURT (`object-service`), cross‑VSpace
-  reflector, fault‑endpoint crash survival, ELF‑loaded separate binaries.
-- **Mostly simulated today:** hardware (MMIO/IRQ/DMA/port/timer) is largely
-  modeled (`nt-sim-device`, fake MMIO). **Making hardware real under QEMU is the
-  first big gap.**
+  KMDF, and UMDF v2** drivers through their full lifecycle; the supervisor does
+  restart/backoff/disable with a userspace‑visible flag.
+- **Isolation proven:** multi-component SURT, cross‑VSpace reflector + section views,
+  fault‑endpoint crash survival, ELF‑loaded separate binaries, per-process cross-AS
+  memory (attach/detach) for the multi-client win32k.
+- **Remaining phases:** P5 (SCM/services/lsass) and P7 (integration image) are not
+  started; the **Win7 pivot (P8)** is the new forward direction.
 
 ---
 
@@ -168,6 +177,13 @@ Trust tiers (each horizontal band is an isolation boundary):
 
 Priorities are **updatable** as work proceeds. Ordered by what unblocks the
 ReactOS boot chain and real‑data testing. Detail per phase in `./plans/`.
+
+**Status (2026-07-14): gaps 1–16 are DONE / largely-done** (P1–P4 + P6). Real
+hardware (1–5), storage/FS/registry (6–9, minus MBR/GPT partition which is N/A on the
+FAT32 superfloppy), the native syscall breadth + sync objects + image sections +
+real-PE `smss` (10–14), and LPC/ALPC + csrss (15–16) all shipped. **Open gaps: 17–18
+(P5 SCM/services/security-on-boot — not started) and 20 (P7 image build — not started).
+Gap 19 (isolated win32k) is DONE — the desktop paints.**
 
 | # | Area | Gap → target | Owner service | Phase |
 |---|------|--------------|---------------|-------|
@@ -200,11 +216,13 @@ Each phase has a **sub‑plan** in `./plans/` with tasks, exit criteria, and its
 own E2E test. Phases can overlap; the critical path is P0→P1→P2→P3.
 
 - **P0 — Executive core & service model** → [`plans/P0-executive-core.md`]
-  A dedicated `ntos-executive` root task that owns untyped + hardware caps,
-  spawns service components + driver hosts, and brokers SURT rings. Consolidate
-  the ad‑hoc broker role (currently in `driver-host-pnp`). *Exit:* two real
-  services (e.g. Ob + Io) run as separate components under the executive, talking
-  over SURT, with the native front‑end routing a handful of `Nt*` calls.
+  **✅ DONE** (functionally; the `driver-host-pnp` broker migration is the one
+  deferred residual). A dedicated `ntos-executive` root task owns untyped + hardware
+  caps, spawns service components + driver hosts, and brokers SURT rings — now the
+  trusted root of the whole hosted-Windows stack. **Convergences landed:** native
+  dispatch → `nt-syscall`, Ob → `nt-object-manager`, process-hosting → `nt-process`
+  (a trusted-root Tier-1 shim, deliberately not isolated). *Exit met:* Ob + Cm + Io
+  as isolated components over SURT + the native front‑end routing real `Nt*`.
 
 - **P1 — Real hardware (HAL/IRQ/DMA/timer/port)** → [`plans/P1-hardware-hal.md`]
   **✅ COMPLETE.** Real MMIO frame caps, IRQ handler caps (MSI → isolated host),
@@ -215,31 +233,45 @@ own E2E test. Phases can overlap; the critical path is P0→P1→P2→P3.
   fixed at source along the way: LAPIC EOI, IOAPIC GSI-base, lazy VT-d TE.
 
 - **P2 — Storage + filesystem + real registry** → [`plans/P2-storage-fs-registry.md`]
-  Boot‑time disk → storage driver (isolated) → partition/volume → real FS →
-  registry hives. *Exit:* mount a ReactOS‑produced FAT volume, read
-  `\SystemRoot\…`, load the `SYSTEM` hive into Cm.
+  **✅ LARGELY DONE.** Isolated + VT-d-confined storage host → real AHCI block I/O →
+  FAT32 reader → registry hive read off disk (`Answer=42`); smss/csrss read the real
+  204 KB ReactOS SYSTEM hive via `nt-hive-regf`. *Exit met.* Residual: MBR/GPT
+  partition objects (N/A on the FAT32 superfloppy) + hosting real `fastfat.sys`.
 
 - **P3 — Native syscall + process to run a real PE** → [`plans/P3-native-syscall-process.md`]
-  Broaden `Nt*`, add sync/IPC objects, image sections + demand paging, and
-  real‑PE process creation with the wait dispatcher. *Exit:* run ReactOS
-  `smss.exe` far enough to create the session and start `csrss`.
+  **✅ DONE.** The native dispatcher converged onto `nt-syscall`'s ~63-service table;
+  real ReactOS `smss.exe` runs its full ntdll LdrpInitialize + SmpInit and **launches
+  `csrss.exe` + `winlogon.exe`**. SEC_IMAGE demand-paging, multi-image IAT, PEB/TEB/
+  KUSER, base relocations, real registry reads. *Exit met and exceeded.*
 
-- **P4 — LPC/ALPC + csrss (console)** → [`plans/P4-lpc-csrss.md`] *(stub)*
-  Model NT LPC over SURT; run `csrss.exe`; console I/O. *Exit:* `cmd.exe` in a
-  text console.
+- **P4 — LPC/ALPC + csrss** → [`plans/P4-lpc-csrss.md`]
+  **✅ LARGELY DONE.** Real `csrss.exe` runs CsrServerInitialization + loads basesrv/
+  winsrv; an isolated `nt-lpc-server` broker + peer-direct data plane with **authentic
+  SM + CSR rendezvous** (real `SmpApiLoop` + `CsrApiRequestThread`); **ALPC + a LPC↔ALPC
+  bridge** (Win7 prep). Residual: the SM→SB session-registration plane + the text
+  `cmd.exe` console MVP (the stack went graphical instead).
 
-- **P5 — Services & registry‑driven startup** → [`plans/P5-services-startup.md`] *(stub)*
-  `services.exe` SCM + PnP + supervisor start ReactOS drivers/services from the
-  registry. *Exit:* the service control manager boots and starts a service.
+- **P5 — Services & registry‑driven startup** → [`plans/P5-services-startup.md`]
+  **⬜ NOT STARTED** — the frontier of the natural boot flow beyond winlogon.
+  `services.exe` SCM + `lsass` + login/GINA. Readiness high (driver hosts +
+  supervisor + PnP/Io + `nt-security` + live registry all exist).
 
-- **P6 — win32k.sys isolated (graphical)** → [`plans/P6-win32k-graphical.md`] *(stub)*
-  NtUser/NtGdi as an isolated component + a display driver host. *Exit:*
-  `explorer` draws. (Optional for a headless/text MVP; large surface.)
+- **P6 — win32k.sys isolated (graphical)** → [`plans/P6-win32k-graphical.md`]
+  **✅ DONE — the headline.** Real ReactOS `win32k.sys` hosted isolated; full window-
+  manager object graph; framebuffer + DirectX + FreeType; KeUserModeCallback bridge;
+  multi-client (csrss + winlogon). **The Windows desktop PAINTS authentically
+  (`0x003a6ea5`)** via winlogon's natural `co_IntShowDesktop` → `IntPaintDesktop` — no
+  scaffold, guarded by a permanent gate spec. `./run.sh --desktop` to see it.
 
-- **P7 — ReactOS integration & image build** → [`plans/P7-reactos-integration.md`] *(stub)*
-  Mount the ReactOS system volume, launch its user space, and build a bootable
-  disk image (BOOTBOOT + rust-micro + executive + ReactOS user space). *Exit:* a
-  ReactOS user‑space boot to a usable prompt on our kernel.
+- **P7 — ReactOS integration & image build** → [`plans/P7-reactos-integration.md`]
+  **⬜ NOT STARTED.** The final image build (strip freeldr/ntoskrnl/hal, keep + host
+  the `.sys` drivers). Dependencies largely met — `./run.sh` already fetches + builds +
+  packs a dev image — what's left is the integration recipe + boot-driver manifest.
+
+- **P8 — Windows 7 pivot (NEW NORTH STAR)** → [`plans/P8-win7-pivot.md`] *(stub)*
+  ReactOS was the on-ramp; the forward direction is hosting real **Win7** binaries +
+  drivers. Key insight: **route syscalls by per-process ABI identity** (Win7 & ReactOS
+  SSNs collide). ALPC is the first Win7-facing subsystem and is ready.
 
 ---
 
@@ -328,12 +360,17 @@ External: **`github.com/stakach/ntdriver`** — test‑driver sources (we own it
 priorities, changelog) **and** its phase sub‑plan (check off tasks, record
 findings). A step is not "done" until the plan reflects it.
 
-- **Status:** `P0 functionally complete` (broker migration deferred) · **`P1
-  COMPLETE`** (real MMIO + IRQ/MSI + DMA incl. VT-d-confined + port I/O; **real WDM
-  AND KMDF `.sys` drivers hosted in isolated components, reaching the real e1000e**) ·
-  **`P2 COMPLETE`** (storage → FS → registry: AHCI block I/O, FAT32, isolated+VT-d-confined host, hive read) · `P3 not started` · `P4–P7 stub`.
-  (Foundational crates for all phases largely exist; phases are about making them
-  *real + composed + booted*.)
+- **Status (2026-07-14):** `P0 DONE` (functionally; broker migration deferred) ·
+  **`P1 DONE`** (real MMIO + IRQ/MSI + DMA incl. VT-d-confined + port I/O; **real WDM
+  AND KMDF `.sys` drivers hosted in isolated components, reaching the real e1000e**;
+  NDIS deferred) · **`P2 LARGELY DONE`** (storage → FS → registry: AHCI block I/O,
+  FAT32, isolated+VT-d-confined host, hive read) · **`P3 DONE`** (native dispatch
+  converged on `nt-syscall`; real `smss.exe` runs full ntdll init + launches csrss +
+  winlogon) · **`P4 LARGELY DONE`** (real csrss + LPC + ALPC + LPC↔ALPC bridge;
+  authentic SM + CSR rendezvous) · **`P6 DONE — the desktop PAINTS`** (isolated real
+  `win32k.sys`, multi-client, `0x003a6ea5` via winlogon's natural flow) ·
+  `P5 NOT STARTED` (SCM/services/lsass) · `P7 NOT STARTED` (integration image) ·
+  **`P8 Win7 pivot` = the new north star** (stub). **Gate ~140 specs → SUCCESS.**
 - **Network drivers (NDIS miniport / NetAdapterCx): DEFERRED — not on the critical
   path.** Stock/ReactOS NIC drivers are **NDIS** (e.g. the Intel PRO/1000 e1e6232e.sys
   is NDIS 6.2); hosting them needs a full NDIS runtime (~53 ndis.sys functions + the
@@ -743,3 +780,50 @@ findings). A step is not "done" until the plan reflects it.
   formats the heap, then hits a control-flow-to-stack stop at 0x5c3818 (SEH/DebugService nuance).
   NEXT: instrument 0x5c3818, finish RtlCreateHeap -> PEB->ProcessHeap -> smss past 0x74. NOTE:
   the x64 livecd is a DEBUG build (int 0x2d/DPRINT everywhere); a release build would be cleaner.
+- **2026-07-14 — RECONCILIATION: the plans are refreshed to reality (docs-only).** Between the
+  2026-07-09 RtlCreateHeap entry above and today, a very large amount shipped that the changelog
+  had not tracked; this entry reconciles PLAN.md + every `plans/P*.md` to the real state (see the
+  updated per-phase status blocks). Summary of what's actually done:
+  - **P3 DONE:** smss finished LdrpInitialize (heap created) + ran full SmpInit and **launched
+    csrss.exe + winlogon.exe**; the native dispatcher **converged** onto `nt-syscall`'s ~63-service
+    `NativeServiceTable` (the hand-wired SSN ladder deleted). SEC_IMAGE demand-paging by RVA,
+    multi-image IAT vs real ntdll, PEB/TEB/KUSER, base relocations, an Ob namespace, real registry
+    via `nt-hive-regf`. (Detail: memory `project_smss_sec_image.md`.)
+  - **P4 LARGELY DONE:** real csrss runs CsrServerInitialization + loads basesrv/winsrv; an
+    isolated `nt-lpc-server` broker + peer-direct data plane with **authentic SM (`SmpApiLoop`) +
+    CSR (`CsrApiRequestThread`) rendezvous**; plus a full **ALPC** surface + a **LPC↔ALPC bridge**
+    over a unified `nt-port-core` (Win7 prep). Commits `4b29f6d`..`eb648c4`, `a85bc00`, `cbf2620`.
+  - **P6 DONE — the headline:** real ReactOS **win32k.sys** hosted isolated (full window-manager
+    object graph, framebuffer + DirectX + FreeType, KeUserModeCallback bridge, **multi-client**
+    csrss + winlogon with per-client cross-AS memory). **The Windows desktop PAINTS authentically
+    (`0x003a6ea5`) via winlogon's natural `co_IntShowDesktop` -> `IntPaintDesktop`** — no scaffold,
+    permanent gate spec. winlogon runs to WinMain. Commits `25dc18b`..`b2e951c`.
+  - **Beyond P0–P7 — three convergences onto real subsystems** (native dispatch -> `nt-syscall`,
+    Ob -> `nt-object-manager`, process-hosting -> `nt-process` with a policy/mechanism split;
+    `nt-process` stays in the trusted root, deliberately NOT isolated); the **implement-for-real
+    backlog complete** (real OBJECT_TYPEs + `ObReferenceObjectByHandle` ExpectedType enforcement,
+    KEVENT, Se -> `nt-security`, files -> `nt-fs`); the **process-convergence** work backing the 3
+    hosted processes with real per-EPROCESS handle tables + ETHREADs + live terminate->teardown
+    (commits `323a5c7`..`efce49f`, `7c4cb49`, `9606b93`); a one-command **`./run.sh`** launcher.
+  - **NEW NORTH STAR — Win7 pivot (P8, `plans/P8-win7-pivot.md`):** the NT-on-ReactOS goal is
+    largely met for the bring-up (ReactOS was the on-ramp). Forward direction = hosting real
+    **Windows 7** binaries + drivers. **Key insight:** Win7 & ReactOS SSNs collide -> **route
+    syscalls by per-process ABI identity, not a global table** (kernel hook `TCBSetHostedSyscalls`
+    label 66 makes every hosted syscall fault to the executive). **ALPC is ready** as the first
+    Win7-facing subsystem. Gate ~140 specs, prints SUCCESS; `./run.sh --desktop` shows the desktop.
+  - **NEXT-STEP CANDIDATES (to decide with the user — none picked):**
+    1. **P5 — SCM/services** (continue the natural boot beyond winlogon: `services.exe` reads
+       `\...\Services`, PnP/Io + supervisor host a driver, then `lsass`/login). *Unlocks:* a real
+       service/driver start path + the login flow. *Size:* medium-large. *Readiness:* high — driver
+       hosts (WDM/KMDF) + supervisor + PnP/Io + `nt-security` + live registry all exist.
+    2. **P8 — Win7 pivot** (stage + run a first real Win7 x64 binary through the SEC_IMAGE pipeline;
+       per-process-ABI SSN routing; then a first Win7 driver). *Unlocks:* the strategic goal (Win7
+       compat). *Size:* large but incremental. *Readiness:* high — PE/loader/IAT/reloc pipeline is
+       binary-agnostic, ALPC built, `TCBSetHostedSyscalls` in the kernel.
+    3. **P7 — integration image build** (strip freeldr/ntoskrnl/hal, host the `.sys` drivers, one
+       `build-image.sh`). *Unlocks:* a real bootable artifact. *Size:* medium. *Readiness:* high —
+       `./run.sh` already fetches + builds + packs a dev image; needs the integration recipe +
+       boot-driver manifest + two profiles.
+    4. **winlogon-forward / fidelity** (SM->SB session-registration plane + `CsrSrvCreateProcess`;
+       real window + input plumbing; the login UI). *Unlocks:* a more authentic desktop/session.
+       *Size:* medium. *Readiness:* high — win32k multi-client + the CSR rendezvous already run.

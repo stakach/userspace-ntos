@@ -3,7 +3,17 @@
 **Goal:** boot a **real ReactOS user space** on our kernel and produce a bootable
 disk image (BOOTBOOT + rust-micro + `ntos-executive` + ReactOS user-space volume).
 
-## Status: stub (integrates P0–P5, optionally P6)
+## Status: **NOT STARTED (2026-07-14)** (the final image build; dependencies largely met)
+
+### Status (2026-07-14): NOT STARTED
+The production image build — strip `freeldr` + `ntoskrnl.exe` + `hal.dll`, keep + host
+the `.sys` drivers, and produce a single bootable `scripts/build-image.sh` — has **not
+begun**. Most inputs now exist: BOOTBOOT + rust-micro + `ntos-executive` boot and run the
+real ReactOS user space (smss → csrss → winlogon → win32k → a painted desktop) off a real
+FAT32 disk, and `./run.sh` already fetches ReactOS + builds + packs the dev image. What P7
+adds is the *integration* recipe (the two image profiles, the boot-driver manifest, the
+compat-notes tracking) rather than new runtime capability. This is a good "make it a real
+bootable artifact" phase once P5 (SCM) fills in the service startup.
 
 ## Sketch
 - **Boot chain:** BOOTBOOT (UEFI) → `rust-micro` → `ntos-executive` → HAL (P1) →

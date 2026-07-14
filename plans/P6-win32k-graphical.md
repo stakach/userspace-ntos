@@ -4,7 +4,21 @@
 component** (not in the microkernel), with a display driver host, reaching a
 drawn desktop (`explorer`).
 
-## Status: stub (large; optional for a headless/text-server MVP)
+## Status: ~~stub~~ → **DONE (2026-07-14) — the headline: the Windows desktop PAINTS**
+
+### Status (2026-07-14): DONE — real ReactOS win32k.sys hosted, isolated; the desktop paints
+The real ReactOS **win32k.sys** is hosted as an **isolated component** with the full
+window-manager object graph: real Ob DESKTOP/WINDOWSTATION objects, the WC_DESKTOP class,
+the desktop window, the framebuffer display driver + DirectX (dxg/dxgthk) + FreeType
+(ftfd/arial.ttf), and the win32k→client **KeUserModeCallback** bridge. It is
+**multi-client** (csrss + winlogon as two GUI clients, with per-client cross-AS memory via
+attach/detach). **The Windows desktop PAINTS authentically (colour `0x003a6ea5`) via
+winlogon's natural `co_IntShowDesktop` → `IntPaintDesktop` flow — no scaffold** — guarded
+by a permanent gate spec (commits `25dc18b`, `c3a4266`, `7718304`, `02d011e`, `a66081a`,
+`b2e951c`). winlogon.exe runs as the 3rd hosted process to WinMain + the desktop. Run it
+with `./run.sh --desktop` to see the pixels. Files: `components/ntos-executive/src/
+win32k_host.rs` + `win32k_pe.rs`. **Remaining fidelity work (not blockers):** real
+window/input plumbing + the login UI + `explorer`; the GDI-over-SURT perf workstream.
 
 ## Sketch
 - **The wrinkle:** on NT, `win32k.sys` is kernel-mode with an enormous syscall

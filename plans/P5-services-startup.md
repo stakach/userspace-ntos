@@ -4,7 +4,16 @@
 the registry and starts drivers/services, with our **PnP Manager + I/O Manager +
 `nt-driver-supervisor`** hosting the drivers as isolated processes.
 
-## Status: stub (expand when P4 nears exit)
+## Status: **NOT STARTED (2026-07-14)** — the frontier of the natural boot flow
+
+### Status (2026-07-14): NOT STARTED
+services.exe (the SCM), lsass, and the login/GINA path are **not begun**. This is now
+the natural next step *beyond winlogon* in the ReactOS boot chain: winlogon already runs
+to WinMain + a painted desktop (P6), so continuing the authentic flow means bringing up
+the SCM to read `\...\Services` and start a driver/service. Readiness is high — the
+driver-hosting machinery (WDM/KMDF isolated hosts + `nt-driver-supervisor`), the PnP/Io
+managers, `nt-security`, and live registry reads (`nt-hive-regf`) all exist. See the
+next-step candidates in PLAN.md §10 (2026-07-14).
 
 ## Sketch
 - **SCM:** `services.exe` enumerates `\Registry\Machine\System\CurrentControlSet\

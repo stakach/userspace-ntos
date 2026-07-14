@@ -7,7 +7,26 @@ real filesystem → registry hives + system files.
 **Why:** the ReactOS boot chain reads its system volume and registry from disk;
 this is where "real data stores" testing begins.
 
-## Status: not started
+## Status: ~~not started~~ → **LARGELY DONE (2026-07-14)**
+
+### Status (2026-07-14): LARGELY DONE — full disk→volume→FS→registry chain, end to end
+The whole storage vertical shipped (PLAN §10 entries 2026-07-08):
+- **Block device / storage driver (isolated):** the AHCI controller (00:3.0) is brought
+  up and sector 0 read via a real ATA READ DMA EXT, then the whole stack (AHCI +
+  sector read + FAT32 + file read) was moved OUT of the trusted executive into a
+  **crash-contained storage host** (own CSpace/VSpace, granted only the AHCI BAR + DMA
+  frame) with **VT-d-confined DMA** (kernel `ecaceef`, exec `639e356`/`4f2367c`/`d54ddd2`).
+- **Filesystem:** a FAT32 reader (`fat_read_sector`/`fat_next`/`dir_find`/`fat_read_file`)
+  parses the BPB, walks the root dir + cluster chains, and reads real files off the boot
+  disk (BOOTBOOT/INITRD, and later SMSS.EXE / NTDLL.DLL / SYSTEM.DAT) (exec `4896dd0`).
+- **Registry from real hives:** a real NT hive is read off the FAT32 FS and Config Manager
+  `decode_image()`s it — `ControlSet001\Services\NtosTest\Answer = 42` reads back
+  (exec `47c9dc9`, kernel `ae58471`). Separately, smss/csrss read+enumerate the **real
+  204 KB ReactOS SYSTEM hive** via `nt-hive-regf` (::ROSSYS.HIV) in P3.
+The live System32 file-existence authority is `nt-fs` (MemFs). **What's left / PARTIAL:**
+the disk is a FAT32 superfloppy so MBR/GPT **partition/volume** objects (item 7) are N/A
+here; hosting the real ReactOS `fastfat.sys` (vs our reader) and full cache-manager
+integration over the volume remain as later fidelity upgrades, not blockers.
 
 ## Background to reuse
 - `nt-fs` (NT File Object + path/mount resolver + MemFs + `Zw*` file APIs),
@@ -18,23 +37,21 @@ this is where "real data stores" testing begins.
   `io-manager.md`.
 
 ## Tasks
-- [ ] **Block device abstraction:** an Io-level block device object (read/write by
-      LBA) that a storage driver host backs. Define its `nt-io-abi` opcodes.
-- [ ] **Storage driver (isolated host):** AHCI or IDE against the QEMU disk.
-      Options: (a) host ReactOS `uniata`/`atapi`/`storahci`; (b) a KMDF storage
-      driver built in `ntdriver`; (c) a native Rust block backend for the FS while
-      driver hosting matures. Prefer a real driver to validate the I/O path.
-- [ ] **Partition + volume:** parse the MBR/GPT + BPB; present volume device
-      objects (`\Device\HarddiskVolume1`), mount points, `\SystemRoot`.
-- [ ] **Real filesystem:** read a real **FAT** volume. Options: (a) host ReactOS
-      `fastfat.sys` (validates a real FS driver over our Io + Cc); (b) extend
-      `nt-fs` with a FAT reader over the block device. Do (a) if the driver-host
-      FS path is ready, else (b) first and (a) as a milestone.
-- [ ] **Cache integration:** file reads go through `nt-cache-manager` over the
-      volume; verify cached vs. uncached reads.
-- [ ] **Registry from real hives:** point `nt-config-store` at hive files on the
-      volume (`\SystemRoot\System32\config\SYSTEM`, `SOFTWARE`); load them via
-      `nt-hive-core` into `nt-config-manager`. Read real keys/values.
+- [x] **Block device abstraction:** AHCI block read (LBA → DMA frame) backs the FS;
+      the storage host owns it. (exec `639e356`)
+- [x] **Storage driver (isolated host):** real AHCI bring-up + ATA READ DMA EXT in a
+      **crash-contained storage host** (own CSpace/VSpace, VT-d-confined DMA), option
+      (c)+ toward (a). (exec `4f2367c`, `d54ddd2`)
+- [~] **Partition + volume:** BPB parsed; MBR/GPT partition/volume objects **N/A**
+      on this FAT32 superfloppy — deferred until a partitioned disk is needed.
+- [x] **Real filesystem:** a FAT32 reader over the block device reads real files
+      (option (b)); hosting `fastfat.sys` (option (a)) remains a fidelity upgrade.
+      (exec `4896dd0`)
+- [~] **Cache integration:** `nt-cache-manager` exists + is unit-proven; wiring file
+      reads through it over the live volume is a later upgrade.
+- [x] **Registry from real hives:** a real NT hive read off the FS + `decode_image()`d
+      by Config Manager (`Answer=42`); smss/csrss read the real ReactOS SYSTEM hive via
+      `nt-hive-regf`. (exec `47c9dc9`, kernel `ae58471`)
 
 ## Real data to test against
 - A **ReactOS‑produced FAT image** (fixture) with a known directory tree +

@@ -16,6 +16,26 @@ Increments: c2e904f, 44d95bf, db7edac+448673c, 3edd34c, b054569, fc73302, 5420b9
 front-end (real ntdll SSNs + OBJECT_ATTRIBUTES for the registry route). **23/23 QEMU**
 (`scripts/run-executive.sh`). Only the driver-host broker migration remains, intentionally deferred.
 
+### Status (2026-07-14): DONE — executive core is the trusted root of the whole stack
+The `ntos-executive` root task is now the trusted broker/front-end for the entire
+hosted-Windows stack (smss + csrss + winlogon + win32k), not just the P0 microtest.
+Beyond the original P0 exit, three **convergences** landed (this is the biggest P0-era
+change — the ad-hoc cores were replaced by the real isolated subsystems):
+- **Native dispatch → `nt-syscall`**: the front-end routes `Nt*` through the real
+  `NativeServiceTable` (~63 services); the hand-wired SSN ladder was deleted.
+- **Ob → `nt-object-manager`**: real OBJECT_TYPEs + `ObReferenceObjectByHandle`
+  ExpectedType enforcement; the object namespace is the real crate.
+- **Process-hosting → `nt-process`** (policy/mechanism split): the 3 hosted processes
+  are backed by real per-EPROCESS handle tables + ETHREADs; live terminate-dispatch
+  routes to real seL4 mechanism-teardown (commits 323a5c7..efce49f, 7c4cb49, 9606b93).
+  NOTE: `nt-process` is **deliberately NOT isolated** — it stays in the trusted root
+  (it uses microkernel VSpace/TCB primitives, so it's a Tier-1 shim by design).
+Also complete: the "implement-for-real backlog" (real KEVENT Event objects,
+Se → `nt-security`, files → `nt-fs`) and a one-command `./run.sh` launcher.
+**Remaining P0 item — still deferred:** folding `driver-host-pnp`'s broker/supervisor
+role under `ntos-executive`. `driver-host-pnp` works today; migrate once the service
+set stabilizes (post-P5). This is the one genuinely-open P0 residual.
+
 ## Background (what already exists to reuse)
 - `object-service` already spawns **two isolated components over SURT** with cap
   transfer and a result endpoint — the canonical broker pattern.
