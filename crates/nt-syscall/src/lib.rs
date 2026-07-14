@@ -56,6 +56,8 @@ pub enum NativeService {
     NtReadFile,
     NtWriteFile,
     NtDeviceIoControlFile,
+    NtCreateNamedPipeFile,
+    NtFsControlFile,
     NtQueryInformationFile,
     // Registry (§16.3)
     NtOpenKey,
@@ -154,6 +156,8 @@ impl NativeService {
             NtReadFile => "NtReadFile",
             NtWriteFile => "NtWriteFile",
             NtDeviceIoControlFile => "NtDeviceIoControlFile",
+            NtCreateNamedPipeFile => "NtCreateNamedPipeFile",
+            NtFsControlFile => "NtFsControlFile",
             NtQueryInformationFile => "NtQueryInformationFile",
             NtOpenKey => "NtOpenKey",
             NtCreateKey => "NtCreateKey",
@@ -253,7 +257,10 @@ impl NativeService {
             | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
             // CSR message plane: the handler reads Request/Reply message ptrs via the register
             // args + the winlogon stack mirror directly; cap at 4 register args (no stack prefill).
-            | NtRequestWaitReplyPort => (0, 4),
+            | NtRequestWaitReplyPort
+            // Named-pipe / device I/O: the handler writes out-params (FileHandle in R10,
+            // IoStatusBlock in R9) via the executive's register/stack helpers; register-only cap.
+            | NtCreateNamedPipeFile | NtFsControlFile => (0, 4),
             _ => (0, 16), // permissive for the rest in v0.1
         }
     }
@@ -269,6 +276,8 @@ impl NativeService {
         NativeService::NtReadFile,
         NativeService::NtWriteFile,
         NativeService::NtDeviceIoControlFile,
+        NativeService::NtCreateNamedPipeFile,
+        NativeService::NtFsControlFile,
         NativeService::NtQueryInformationFile,
         NativeService::NtOpenKey,
         NativeService::NtCreateKey,

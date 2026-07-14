@@ -247,6 +247,10 @@ pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
 pub const SSN_NT_ENUM_VALUE_KEY: u64 = 77;
 /// ntdll's NtEnumerateKey SSN (winlogon's StartRpcServer path enumerates subkeys).
 pub const SSN_NT_ENUMERATE_KEY: u64 = 75;
+/// ntdll's NtCreateNamedPipeFile SSN (rpcrt4's ncacn_np server creates \pipe\winreg).
+pub const SSN_NT_CREATE_NAMED_PIPE_FILE: u64 = 46;
+/// ntdll's NtFsControlFile SSN (rpcrt4's pipe listen/connect FSCTLs).
+pub const SSN_NT_FS_CONTROL_FILE: u64 = 88;
 /// ntdll's NtProtectVirtualMemory SSN (LdrpInitialize re-protects image sections).
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
@@ -3030,6 +3034,10 @@ static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).
+static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
+static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
 /// The real filenames of the boot-path binaries staged under `\SystemRoot\System32` (the names the
 /// ntdll/csrss loader probes). The executive's nt-fs namespace is seeded with these so nt-fs is the
@@ -4081,6 +4089,35 @@ impl NativeSyscallHandler for ExecNtHandler {
                 NT_ENUMERATE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
                 0x8000_001A // STATUS_NO_MORE_ENTRIES
             }
+            // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
+            // IoStatusBlock[R9], ...). winlogon's StartRpcServer → rpcrt4 ncacn_np creates
+            // \Device\NamedPipe\winreg. Model the pipe: mint a handle + report FILE_CREATED so
+            // RpcServerUseProtseqEpW/RpcServerListen see RPC_S_OK and StartRpcServer returns TRUE
+            // (it is FATAL otherwise). No real transport — nothing connects to \pipe\winreg in the
+            // bring-up; the RPC listener thread (NtCreateThread is a no-op) never runs.
+            NativeService::NtCreateNamedPipeFile => unsafe {
+                let h = self.mint_handle();
+                smss_stack_write(get_recv_mr(9), h); // *FileHandle (R10)
+                let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
+                if iosb != 0 {
+                    smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
+                    smss_stack_write(iosb + 8, 2); // Information = FILE_CREATED
+                }
+                NAMED_PIPE_CREATED.fetch_add(1, Ordering::Relaxed);
+                0 // STATUS_SUCCESS
+            },
+            // NtFsControlFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
+            // IoStatusBlock[sp+0x28], FsControlCode[sp+0x30], ...). rpcrt4's pipe listen/connect
+            // FSCTLs. Report success with a zeroed IoStatusBlock so the listener setup proceeds; no
+            // client ever connects, so the actual pipe-listen semantics are irrelevant to bring-up.
+            NativeService::NtFsControlFile => unsafe {
+                let iosb = smss_stack_read(get_recv_mr(16) + 0x28); // [sp+0x28] = *IO_STATUS_BLOCK
+                if iosb != 0 {
+                    smss_stack_write32(iosb, 0); // Status = STATUS_SUCCESS
+                    smss_stack_write(iosb + 8, 0); // Information = 0
+                }
+                0 // STATUS_SUCCESS
+            },
             // NtQueryValueKey(KeyHandle[0], *ValueName[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the synthetic CPU
             // key to build PROCESSOR_IDENTIFIER. Real-hive values by name → not-found (smss defaults).
@@ -5407,6 +5444,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
+            (NativeService::NtCreateNamedPipeFile, SSN_NT_CREATE_NAMED_PIPE_FILE as u32),
+            (NativeService::NtFsControlFile, SSN_NT_FS_CONTROL_FILE as u32),
             (NativeService::NtQueryValueKey, SSN_NT_QUERY_VALUE_KEY as u32),
             // Workstream A batch 1: services migrated off the hand-wired ladder into the table.
             (NativeService::NtQuerySystemInformation, SSN_NT_QUERY_SYSTEM_INFO as u32),
@@ -6611,6 +6650,26 @@ unsafe fn service_sec_image(
                 // Session-Manager tail (subsystem/session bookkeeping). No real event object is
                 // modeled in the host, so accept it (STATUS_SUCCESS); *PreviousState is optional and
                 // smss ignores it here. Lets SmpInit/SmpExecuteInitialCommand proceed.
+                result = 0;
+            } else if m0 == 45 {
+                // NtCreateMutant(MutantHandle=R10, DesiredAccess=RDX, ObjectAttributes=R8,
+                // InitialOwner=R9). rpcrt4's ncacn_np server init (StartRpcServer) creates sync
+                // mutants. Mint a fake handle so the caller can later wait/release it; no real mutant
+                // is modeled (the wait/release paths below are no-ops). Additive.
+                let out = get_recv_mr(9); // R10 = *MutantHandle
+                if out != 0 {
+                    smss_stack_write(out, FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed));
+                }
+                result = 0;
+            } else if m0 == 196 || m0 == 210 || m0 == 197 {
+                // NtReleaseMutant(196) / NtResetEvent(210) / NtReleaseSemaphore(197) — signaling
+                // no-ops (no real objects modeled). Accept so rpcrt4's server bookkeeping proceeds.
+                result = 0;
+            } else if m0 == 280 && badge == WINLOGON_BADGE {
+                // NtWaitForMultipleObjects (winlogon). rpcrt4's RpcServerListen may wait for its
+                // listener thread to become ready; that worker never runs (NtCreateThread is a
+                // no-op), so report WAIT_0 (satisfied) and let winlogon's MAIN thread proceed to
+                // return RPC_S_OK. (smss's 280 stays PARKED in the badge==0 arm above.)
                 result = 0;
             } else if m0 == 195 {
                 // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST
@@ -12955,6 +13014,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_kbd_layout_opened",
                         KBD_LAYOUT_KEY_OPENED.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    // P5 — winlogon ran PAST InitKeyboardLayouts into StartRpcServer: rpcrt4's
+                    // ncacn_np server created \pipe\winreg (NtCreateNamedPipeFile modeled). It then
+                    // walls in RpcServerListen (its RPC listener thread needs a real TEB — the
+                    // hosted-process multi-threading fork).
+                    check(
+                        b"exec_winlogon_rpc_pipe",
+                        NAMED_PIPE_CREATED.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
                     // nt-process convergence (first increment): the real Process Manager backs the 3
