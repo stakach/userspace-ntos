@@ -287,6 +287,7 @@ pub const SSN_NT_QUERY_VALUE_KEY: u64 = 185;
 pub const SSN_NT_ENUM_VALUE_KEY: u64 = 77;
 /// ntdll's NtEnumerateKey SSN (winlogon's StartRpcServer path enumerates subkeys).
 pub const SSN_NT_ENUMERATE_KEY: u64 = 75;
+pub const SSN_NT_QUERY_KEY: u64 = 167;
 /// ntdll's NtCreateNamedPipeFile SSN (rpcrt4's ncacn_np server creates \pipe\winreg).
 pub const SSN_NT_CREATE_NAMED_PIPE_FILE: u64 = 46;
 /// ntdll's NtFsControlFile SSN (rpcrt4's pipe listen/connect FSCTLs).
@@ -2262,6 +2263,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
+            (NativeService::NtQueryKey, SSN_NT_QUERY_KEY as u32),
             (NativeService::NtCreateNamedPipeFile, SSN_NT_CREATE_NAMED_PIPE_FILE as u32),
             (NativeService::NtFsControlFile, SSN_NT_FS_CONTROL_FILE as u32),
             (NativeService::NtQueryValueKey, SSN_NT_QUERY_VALUE_KEY as u32),

@@ -363,6 +363,127 @@ impl ExecNtHandler {
         }
         out
     }
+    /// Read `dst.len()` bytes from the current process's VA `va`, resolving a page OUTSIDE the
+    /// stack/heap/image mirrors by reading the STATIC content straight from the backing PE image
+    /// (main image / ntdll / a registered DLL). The general cross-AS reader for services' registry
+    /// key-name strings: those are `RTL_CONSTANT_STRING` literals in a DLL `.rdata` page services
+    /// NEVER dereferences (the executive is the first reader), so the page is not demand-faulted and
+    /// not in any mirror or frame table — but its bytes are exactly the (relocation-free) `.rdata`
+    /// file content, which we read via the loaded PE. Handles a read that spans a page boundary.
+    pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
+        if smss_copyin(va, dst) {
+            return true;
+        }
+        let ctx = match self.loop_ctx.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
+        let reg = &*ctx.reg;
+        let dll_pes = &*ctx.dll_pes;
+        let mut done = 0usize;
+        while done < dst.len() {
+            let cur = va + done as u64;
+            let (pe, byte_rva): (&nt_pe_loader::PeFile, u32) =
+                if cur >= PE_LOAD_BASE && cur < ctx.img_end {
+                    (&*ctx.pe, (cur - PE_LOAD_BASE) as u32)
+                } else if !ctx.ntdll_pe.is_null() && cur >= ctx.nt_base && cur < ctx.nt_end {
+                    (&*ctx.ntdll_pe, (cur - ctx.nt_base) as u32)
+                } else if let Some((i, rva)) = reg.dll_for_page(cur) {
+                    match dll_pes[i].as_ref() {
+                        Some(pe) => (pe, rva),
+                        None => return false,
+                    }
+                } else {
+                    return false;
+                };
+            let off = (cur & 0xFFF) as usize;
+            let n = (0x1000 - off).min(dst.len() - done);
+            for j in 0..n {
+                match pe_byte_at_rva(pe, byte_rva + j as u32) {
+                    Some(b) => dst[done + j] = b,
+                    None => return false,
+                }
+            }
+            done += n;
+        }
+        true
+    }
+    /// Cross-AS 8-byte out-param write to the current process's VA `va` — handles a target that lives
+    /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
+    /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
+    /// [`csrss_out_write`] (mirror → already-faulted page's scratch alias → demand-fill from the DLL
+    /// PE). No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
+    pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) {
+        if let Some(ctx) = self.loop_ctx {
+            let filled_pages = &mut *ctx.filled_pages;
+            let faults = &mut *ctx.faults;
+            let reg = &*ctx.reg;
+            let dll_pes = &*ctx.dll_pes;
+            csrss_out_write(va, val, filled_pages, faults, ctx.scratch_base, reg, dll_pes, ctx.pml4);
+        } else {
+            smss_copyout(va, &val.to_le_bytes());
+        }
+    }
+    /// Cross-AS byte-buffer write to the current process's VA `va` — mirror first, else 8-byte chunks
+    /// via [`xas_write_u64`] (each demand-fills a not-yet-faulted DLL/heap page as needed). The last
+    /// partial word is read-modify-written so trailing bytes past `src` in that word are preserved.
+    /// Used for services (pi 3) registry info-structure copyout (KEY_*_INFORMATION into a heap buffer).
+    pub(crate) unsafe fn xas_write_buf(&self, va: u64, src: &[u8]) {
+        if smss_copyout(va, src) {
+            return;
+        }
+        let mut i = 0usize;
+        while i < src.len() {
+            let n = (src.len() - i).min(8);
+            let mut w = [0u8; 8];
+            if n < 8 {
+                let _ = self.xas_read(va + i as u64, &mut w); // preserve bytes n..8
+            }
+            w[..n].copy_from_slice(&src[i..i + n]);
+            self.xas_write_u64(va + i as u64, u64::from_le_bytes(w));
+            i += 8;
+        }
+    }
+    /// Cross-AS UNICODE_STRING read (x64 {u16 Length, u16 Max, u32 pad, u64 Buffer}) via [`xas_read`],
+    /// so a Buffer in a not-yet-faulted DLL `.rdata` page resolves from the backing PE. Used for
+    /// services (pi 3) registry name strings (key names + value names).
+    pub(crate) unsafe fn read_ustr_pe(&self, ustr_va: u64) -> alloc::vec::Vec<u16> {
+        if ustr_va == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let mut lm = [0u8; 2];
+        let mut bp = [0u8; 8];
+        if !self.xas_read(ustr_va, &mut lm) || !self.xas_read(ustr_va + 8, &mut bp) {
+            return alloc::vec::Vec::new();
+        }
+        let byte_len = u16::from_le_bytes(lm) as usize;
+        let buffer_va = u64::from_le_bytes(bp);
+        let n = (byte_len / 2).min(1024);
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            let mut w = [0u8; 2];
+            if !self.xas_read(buffer_va + (i as u64) * 2, &mut w) {
+                break;
+            }
+            out.push(u16::from_le_bytes(w));
+        }
+        out
+    }
+    /// Cross-AS OBJECT_ATTRIBUTES.ObjectName read (OA+0x10 → PUNICODE_STRING) via [`read_ustr_pe`],
+    /// so a name Buffer in a not-yet-faulted DLL `.rdata` page resolves from the PE. Used for services
+    /// (pi 3) registry key opens (see `read_objattr_name`, whose scratch-alias fallback only reaches
+    /// already-faulted pages).
+    pub(crate) unsafe fn read_objattr_name_pe(&self, oa_va: u64) -> alloc::vec::Vec<u16> {
+        let mut p = [0u8; 8];
+        if !self.xas_read(oa_va + 0x10, &mut p) {
+            return alloc::vec::Vec::new();
+        }
+        let objname = u64::from_le_bytes(p);
+        if objname == 0 {
+            return alloc::vec::Vec::new();
+        }
+        self.read_ustr_pe(objname)
+    }
     /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
     /// capacity so the push never reallocates across the per-syscall bump reset. `connector_pi` =
     /// the current process (0=smss, 1=csrss).
@@ -704,12 +825,74 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let mut rd = [0u8; 8];
                 let _ = smss_copyin(oa + 8, &mut rd);
                 let root_dir = u64::from_le_bytes(rd);
-                let name16 = smss_read_objattr_name(oa);
+                // services (pi 3): its RegOpenKeyExW key-name strings are RTL_CONSTANT_STRING literals
+                // in a DLL `.rdata` page (advapi32 ~0x88000000) that services NEVER dereferences (the
+                // executive is the first reader), so the page is not demand-faulted → unreachable by
+                // the mirror/frame table. Read the static content straight from the backing PE image
+                // (`read_objattr_name_pe`). Scoped to pi==3 so winlogon/csrss paint-time OA-name reads
+                // stay mirror-only (byte-identical).
+                let name16 = if self.pi == 3 {
+                    self.read_objattr_name_pe(oa)
+                } else {
+                    smss_read_objattr_name(oa)
+                };
                 let mut path = alloc::string::String::new();
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
                         path.push(c);
                     }
+                }
+                // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
+                // the real SYSTEM hive (::ROSSYS.HIV). A predefined `\Registry\Machine` open → the
+                // sentinel machine-root handle; a subkey relative to it (RootDirectory ==
+                // MACHINE_ROOT_HANDLE) or an absolute `\Registry\Machine\...` path → `resolve_key`;
+                // a subkey relative to a real hive handle → `open_key_from`. Self-contained + returns,
+                // so the winlogon/csrss paint-time key hacks below are untouched (byte-identical).
+                if self.pi == 3 {
+                    // NOTE: MACHINE_ROOT_HANDLE (0x9_..) is numerically >= KEY_HANDLE_BASE (0x1_..),
+                    // so it MUST be matched BEFORE the generic real-handle branch.
+                    let cell: Option<KeyRef> = if root_dir == MACHINE_ROOT_HANDLE {
+                        // Subkey relative to the predefined HKLM root → \Registry\Machine\<name>.
+                        let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                        full.push_str(&path);
+                        self.resolve_key(&full)
+                    } else if root_dir >= KEY_HANDLE_BASE {
+                        // Subkey relative to a real hive handle.
+                        let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
+                        match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
+                            (Some(h), Some(parent)) => h.open_key_from(parent, &path),
+                            _ => None,
+                        }
+                    } else {
+                        // Absolute open (root_dir == 0). The predefined `\Registry\Machine` open
+                        // itself → the sentinel machine-root handle; any other absolute path →
+                        // resolve against the hive.
+                        let comps: alloc::vec::Vec<&str> =
+                            path.split('\\').filter(|c| !c.is_empty()).collect();
+                        if comps.len() == 2
+                            && comps[0].eq_ignore_ascii_case("Registry")
+                            && comps[1].eq_ignore_ascii_case("Machine")
+                        {
+                            self.xas_write_u64(args[0], MACHINE_ROOT_HANDLE);
+                            return 0; // predefined HKLM root → sentinel machine-root handle
+                        }
+                        self.resolve_key(&path)
+                    };
+                    return match cell {
+                        Some(cell) => {
+                            let idx = match self.key_handles.iter().position(|&c| c == cell) {
+                                Some(i) => i,
+                                None => {
+                                    self.key_handles.push(cell);
+                                    self.key_handles.len() - 1
+                                }
+                            };
+                            let h = KEY_HANDLE_BASE + (idx as u64) * 4; // 4-aligned: advapi32 clears HKEY bit0
+                            self.xas_write_u64(args[0], h);
+                            0 // STATUS_SUCCESS
+                        }
+                        None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                    };
                 }
                 // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_HANDLE). Match the layout key
                 // by NAME (its RootDirectory arrives as 0 — advapi32's MapDefaultKey HKLM handle
@@ -747,7 +930,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 let cell = if root_dir >= KEY_HANDLE_BASE {
-                    let idx = (root_dir - KEY_HANDLE_BASE) as usize;
+                    let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
                     match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
                         (Some(h), Some(parent)) => h.open_key_from(parent, &path),
                         _ => None,
@@ -768,7 +951,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 self.key_handles.len() - 1
                             }
                         };
-                        let h = KEY_HANDLE_BASE + idx as u64;
+                        let h = KEY_HANDLE_BASE + (idx as u64) * 4; // 4-aligned: advapi32 clears HKEY bit0
                         smss_copyout(args[0], &h.to_le_bytes());
                         0 // STATUS_SUCCESS
                     }
@@ -785,7 +968,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 let key = match self
                     .key_handles
-                    .get(args[0].wrapping_sub(KEY_HANDLE_BASE) as usize)
+                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
                     .copied()
                 {
                     Some(k) => k,
@@ -821,14 +1004,112 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
             },
             // NtEnumerateKey(KeyHandle[0], Index[1], KeyInformationClass[2], KeyInformation[3],
-            // Length[4], *ResultLength[5]). winlogon's StartRpcServer path enumerates subkeys of a
-            // registry key. We model an EMPTY subkey set (STATUS_NO_MORE_ENTRIES at every index) so
-            // the enumeration terminates cleanly — no subkeys are load-bearing for the RPC bring-up
-            // (the endpoint config it seeks is absent → rpcrt4 falls back to its defaults). Additive.
-            NativeService::NtEnumerateKey => {
+            // Length[4], *ResultLength[5]). For services (pi 3) this enumerates the REAL subkeys of a
+            // hive key (ScmCreateServiceDatabase walks HKLM\SYSTEM\CurrentControlSet\Services). For
+            // winlogon/csrss (pi 0-2) it stays the empty-set stub (STATUS_NO_MORE_ENTRIES) — the RPC
+            // bring-up needs no subkeys and this keeps their paths byte-identical.
+            NativeService::NtEnumerateKey => unsafe {
                 NT_ENUMERATE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
-                0x8000_001A // STATUS_NO_MORE_ENTRIES
-            }
+                if self.pi != 3 {
+                    return 0x8000_001A; // STATUS_NO_MORE_ENTRIES (byte-identical stub for pi 0-2)
+                }
+                let hive = match self.hive.as_ref() {
+                    Some(h) => h,
+                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                };
+                let key = match self
+                    .key_handles
+                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
+                    .copied()
+                {
+                    Some(k) => k,
+                    None => return 0xC000_0008,
+                };
+                let subs = hive.subkeys(key);
+                let idx = args[1] as usize;
+                if idx >= subs.len() {
+                    return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
+                }
+                let name16: alloc::vec::Vec<u16> = subs[idx].0.encode_utf16().collect();
+                let name_bytes = name16.len() * 2;
+                // class 0 = KeyBasicInformation {LastWriteTime@0(8), TitleIndex@8(4), NameLength@0xc(4),
+                // Name@0x10}; class 1 = KeyNodeInformation {…, ClassOffset@0xc, ClassLength@0x10,
+                // NameLength@0x14, Name@0x18}. RegEnumKeyExW(lpClass=NULL) → basic; ScmCreateService-
+                // Database uses that. Build both; other classes → basic.
+                let node = args[2] == 1;
+                let hdr = if node { 0x18usize } else { 0x10 };
+                let mut info = alloc::vec::Vec::with_capacity(hdr + name_bytes);
+                info.resize(hdr, 0); // LastWriteTime/TitleIndex/(ClassOffset/ClassLength) all 0
+                let nl_off = if node { 0x14 } else { 0x0c };
+                info[nl_off..nl_off + 4].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+                if node {
+                    // ClassOffset = header + name (no class stored) — points past the name.
+                    let class_off = (hdr + name_bytes) as u32;
+                    info[0x0c..0x10].copy_from_slice(&class_off.to_le_bytes());
+                }
+                for w in &name16 {
+                    info.extend_from_slice(&w.to_le_bytes());
+                }
+                let total = info.len() as u32;
+                smss_copyout(args[5], &total.to_le_bytes()); // *ResultLength (stack local)
+                if (args[4] as usize) < info.len() {
+                    return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
+                }
+                self.xas_write_buf(args[3], &info); // KeyInformation (heap buffer)
+                0 // STATUS_SUCCESS
+            },
+            // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
+            // *ResultLength[4]). services' RegQueryInfoKeyW (KeyFullInformation) reads the subkey/value
+            // counts + max name lengths of a hive key to size its RegEnumKeyExW buffers. Scoped to
+            // pi==3 (services); other processes have no real NtQueryKey path today → stop as before.
+            NativeService::NtQueryKey => unsafe {
+                if self.pi != 3 {
+                    self.stop = true;
+                    return 0xC000_0002; // STATUS_NOT_IMPLEMENTED (record the SSN for pi 0-2)
+                }
+                let hive = match self.hive.as_ref() {
+                    Some(h) => h,
+                    None => return 0xC000_0008,
+                };
+                let key = match self
+                    .key_handles
+                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
+                    .copied()
+                {
+                    Some(k) => k,
+                    None => return 0xC000_0008,
+                };
+                let subs = hive.subkeys(key);
+                let vals = hive.values(key);
+                let subkeys = subs.len() as u32;
+                let max_name = subs.iter().map(|(n, _)| n.len()).max().unwrap_or(0) as u32 * 2;
+                let values = vals.len() as u32;
+                let max_vname = vals.iter().map(|(n, _)| n.len()).max().unwrap_or(0) as u32 * 2;
+                // class 2 = KeyFullInformation {LastWriteTime@0(8), TitleIndex@8, ClassOffset@0xc,
+                // ClassLength@0x10, SubKeys@0x14, MaxNameLen@0x18, MaxClassLen@0x1c, Values@0x20,
+                // MaxValueNameLen@0x24, MaxValueDataLen@0x28, Class@0x2c}. We report no Class.
+                if args[1] != 2 {
+                    // KeyBasic/Node/Name classes on THIS key aren't needed by the SCM path; report a
+                    // clean empty full-info-sized answer is wrong for them, so signal invalid-info.
+                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                }
+                let struct_size = 0x2cu32;
+                let mut info = [0u8; 0x2c];
+                info[0x0c..0x10].copy_from_slice(&struct_size.to_le_bytes()); // ClassOffset
+                // ClassLength@0x10 = 0
+                info[0x14..0x18].copy_from_slice(&subkeys.to_le_bytes());
+                info[0x18..0x1c].copy_from_slice(&max_name.to_le_bytes());
+                // MaxClassLen@0x1c = 0
+                info[0x20..0x24].copy_from_slice(&values.to_le_bytes());
+                info[0x24..0x28].copy_from_slice(&max_vname.to_le_bytes());
+                // MaxValueDataLen@0x28 = 0 (callers re-query per value; unused for sizing here)
+                smss_copyout(args[4], &struct_size.to_le_bytes()); // *ResultLength (stack local)
+                if (args[3] as usize) < struct_size as usize {
+                    return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
+                }
+                self.xas_write_buf(args[2], &info);
+                0 // STATUS_SUCCESS
+            },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
             // IoStatusBlock[R9], ...). winlogon's StartRpcServer → rpcrt4 ncacn_np creates
             // \Device\NamedPipe\winreg. Model the pipe: mint a handle + report FILE_CREATED so
@@ -864,13 +1145,19 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtQueryValueKey => unsafe {
                 let key = match self
                     .key_handles
-                    .get(args[0].wrapping_sub(KEY_HANDLE_BASE) as usize)
+                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
                     .copied()
                 {
                     Some(k) => k,
                     None => return 0xC000_0008, // STATUS_INVALID_HANDLE
                 };
-                let name16 = smss_read_ustr(args[1]);
+                // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
+                // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).
+                let name16 = if self.pi == 3 {
+                    self.read_ustr_pe(args[1])
+                } else {
+                    smss_read_ustr(args[1])
+                };
                 let mut name_lc = alloc::string::String::new();
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
@@ -879,8 +1166,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
+                } else if self.pi == 3 {
+                    // Real SYSTEM hive value-by-name (case-insensitive) — services' SCM reads
+                    // SetupType/SystemSetupInProgress + the service DB values off ::ROSSYS.HIV.
+                    // Scoped to pi==3 so smss/winlogon/csrss keep the prior None (byte-identical).
+                    self.hive.as_ref().and_then(|h| h.value(key, &name_lc))
                 } else {
-                    None // real-hive value-by-name not modelled yet
+                    None // real-hive value-by-name not modelled for pi 0-2
                 };
                 match val {
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
@@ -891,7 +1183,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                         if info.len() > args[4] as usize {
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
-                            smss_copyout(args[3], &info);
+                            // services' out-buffer may be an advapi32 heap allocation the mirror can't
+                            // reach → use the cross-AS writer so the DWORD data actually lands.
+                            if self.pi == 3 {
+                                self.xas_write_buf(args[3], &info);
+                            } else {
+                                smss_copyout(args[3], &info);
+                            }
                             0 // STATUS_SUCCESS
                         }
                     }

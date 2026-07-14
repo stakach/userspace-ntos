@@ -66,6 +66,7 @@ pub enum NativeService {
     NtSetValueKey,
     NtEnumerateKey,
     NtEnumerateValueKey,
+    NtQueryKey,
     // Memory / section (§16.4)
     NtAllocateVirtualMemory,
     NtFreeVirtualMemory,
@@ -165,6 +166,7 @@ impl NativeService {
             NtSetValueKey => "NtSetValueKey",
             NtEnumerateKey => "NtEnumerateKey",
             NtEnumerateValueKey => "NtEnumerateValueKey",
+            NtQueryKey => "NtQueryKey",
             NtAllocateVirtualMemory => "NtAllocateVirtualMemory",
             NtFreeVirtualMemory => "NtFreeVirtualMemory",
             NtCreateSection => "NtCreateSection",
@@ -243,6 +245,7 @@ impl NativeService {
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
             | NtOpenSymbolicLinkObject => (0, 4),
             NtEnumerateValueKey => (6, 6),
+            NtQueryKey => (5, 5),
             NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
             NtCreateFile => (8, 11),
