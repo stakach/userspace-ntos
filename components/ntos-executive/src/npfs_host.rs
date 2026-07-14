@@ -274,34 +274,148 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
 /// the handler returns, so completion is a no-op marker here.
 extern "win64" fn s_io_complete_request(_irp: u64, _boost: u64) {}
 
-// The DriverEntry/init path also touches: prefix trees, generic tables, resources, spinlocks,
-// timers, DPCs. In this single-threaded host the synchronization primitives are genuine no-ops.
-// The prefix tree / generic table INIT functions just zero their control structs; npfs allocates the
-// structs from paged pool + passes them in, so a zeroing init suffices for DriverEntry to complete
-// (the real lookup/insert semantics are exercised only during IRP dispatch — modeled there).
+// --- REAL VCB internals: the Unicode prefix table (name -> FCB), generic table, ERESOURCE ---------
+//
+// npfs's DriverEntry runs its OWN `NpInitializeVcb`/`NpCreateRootDcb`, and every create/open runs its
+// OWN `NpFsdCreate*` → `NpCreateFcb`/`NpCreateCcb`. Those exercise the prefix table + resource for
+// REAL (the create path bug-checks on a NULL `RtlFindUnicodePrefix`, and create-then-connect must find
+// the FCB by name). So these trampolines carry real host-side logic, backed by a fixed-capacity static
+// table (no `alloc` in the isolated component). The prefix-MATCH contract is the host-tested
+// [`nt_kernel_exec::np_prefix`] logic (component-prefix, case-insensitive, longest wins).
+//
+// `RtlInsertUnicodePrefix(Table, &Fcb->FullName, &Fcb->PrefixTableEntry)` records the entry pointer
+// npfs passed (so `RtlFindUnicodePrefix` can return the SAME pointer → `CONTAINING_RECORD` recovers
+// the FCB). `RtlFindUnicodePrefix(Table, FullName, _)` returns the recorded entry of the longest name
+// that is a component-prefix of `FullName`.
 
-/// `void RtlInitializeUnicodePrefix(PUNICODE_PREFIX_TABLE)` — zero the small control struct.
+/// A recorded prefix-table entry: (the caller's `PUNICODE_PREFIX_TABLE_ENTRY`, the name VA, len-bytes).
+/// The name is a `UNICODE_STRING.Buffer` (UTF-16); we read it live from npfs's own pool at Find time.
+#[derive(Clone, Copy)]
+struct PrefixSlot {
+    entry: u64,   // the PUNICODE_PREFIX_TABLE_ENTRY npfs passed to Insert (returned by Find)
+    name_va: u64, // UNICODE_STRING.Buffer VA
+    name_len: u16, // UNICODE_STRING.Length (bytes)
+    used: bool,
+}
+
+const PREFIX_CAP: usize = 64;
+
+/// The single VCB prefix table (npfs is a singleton driver). Lives in the executive image `.bss`
+/// (shared into the component). Populated by `s_rtl_insert_unicode_prefix`, queried by
+/// `s_rtl_find_unicode_prefix`. Reset by `s_rtl_init_unicode_prefix`.
+static mut PREFIX_TABLE: [PrefixSlot; PREFIX_CAP] =
+    [PrefixSlot { entry: 0, name_va: 0, name_len: 0, used: false }; PREFIX_CAP];
+
+/// Copy a UNICODE_STRING.Buffer (UTF-16) into a fixed scratch for comparison. Returns the length in
+/// u16 units (capped at the scratch size). npfs pipe names are short (`\ntsvcs` = 7).
+unsafe fn read_ustr16(buf_va: u64, len_bytes: u16, out: &mut [u16]) -> usize {
+    let n = ((len_bytes as usize) / 2).min(out.len());
+    for i in 0..n {
+        out[i] = read_unaligned((buf_va + (i as u64) * 2) as *const u16);
+    }
+    n
+}
+
+/// `void RtlInitializeUnicodePrefix(PUNICODE_PREFIX_TABLE)` — zero the control struct AND clear the
+/// host-side table (npfs calls this once at NpInitializeVcb before inserting the root DCB).
 extern "win64" fn s_rtl_init_unicode_prefix(tbl: u64) {
-    if tbl != 0 {
-        unsafe {
-            // UNICODE_PREFIX_TABLE = { SHORT NodeTypeCode; SHORT NameLength; PUNICODE_PREFIX_TABLE_ENTRY
-            // NextPrefixTree; PRTL_SPLAY_LINKS TableRoot; } — 0x18 bytes.
+    unsafe {
+        if tbl != 0 {
+            // UNICODE_PREFIX_TABLE (0x14 bytes): zero it (NodeTypeCode/NameLength/NextPrefixTree/…).
             write_unaligned(tbl as *mut u64, 0);
             write_unaligned((tbl + 8) as *mut u64, 0);
-            write_unaligned((tbl + 16) as *mut u64, 0);
+            write_unaligned((tbl + 16) as *mut u32, 0);
+        }
+        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+        for s in table.iter_mut() {
+            *s = PrefixSlot { entry: 0, name_va: 0, name_len: 0, used: false };
         }
     }
 }
 
-/// `void RtlInitializeGenericTable(PRTL_GENERIC_TABLE, ...)` — zero the control struct.
-extern "win64" fn s_rtl_init_generic_table(tbl: u64, _cmp: u64, _alloc: u64, _free: u64, _ctx: u64) {
+/// `BOOLEAN RtlInsertUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_STRING Prefix,
+/// PUNICODE_PREFIX_TABLE_ENTRY PrefixTableEntry)`. Record (entry, name) so Find returns this entry for
+/// names of which `Prefix` is a component-prefix. Returns TRUE unless a duplicate exact name exists.
+extern "win64" fn s_rtl_insert_unicode_prefix(_tbl: u64, prefix: u64, entry: u64) -> u64 {
+    if prefix == 0 || entry == 0 {
+        return 0;
+    }
+    unsafe {
+        let name_len = read_unaligned(prefix as *const u16); // UNICODE_STRING.Length
+        let name_va = read_unaligned((prefix + 8) as *const u64); // UNICODE_STRING.Buffer
+        let table = &mut *core::ptr::addr_of_mut!(PREFIX_TABLE);
+        // dedup: an identical (case-insensitive) name already present → FALSE (npfs bug-checks on this,
+        // meaning it never re-creates the same pipe; our create arm rejects duplicates before calling).
+        let mut new: [u16; 128] = [0; 128];
+        let nn = read_ustr16(name_va, name_len, &mut new);
+        for s in table.iter() {
+            if !s.used {
+                continue;
+            }
+            let mut ex: [u16; 128] = [0; 128];
+            let en = read_ustr16(s.name_va, s.name_len, &mut ex);
+            if en == nn && nt_kernel_exec::np_prefix::is_component_prefix(&ex[..en], &new[..nn]) && nn == en {
+                return 0; // duplicate
+            }
+        }
+        for s in table.iter_mut() {
+            if !s.used {
+                *s = PrefixSlot { entry, name_va, name_len, used: true };
+                return 1;
+            }
+        }
+    }
+    0 // table full
+}
+
+/// `PUNICODE_PREFIX_TABLE_ENTRY RtlFindUnicodePrefix(PUNICODE_PREFIX_TABLE, PUNICODE_STRING FullName,
+/// ULONG CaseInsensitiveIndex)`. Return the recorded entry of the longest inserted name that is a
+/// component-prefix of `FullName` (NULL if none — npfs bug-checks, but the root `\` always matches).
+extern "win64" fn s_rtl_find_unicode_prefix(_tbl: u64, full: u64, _ci: u64) -> u64 {
+    if full == 0 {
+        return 0;
+    }
+    unsafe {
+        let full_len = read_unaligned(full as *const u16);
+        let full_va = read_unaligned((full + 8) as *const u64);
+        let mut fbuf: [u16; 256] = [0; 256];
+        let fn_ = read_ustr16(full_va, full_len, &mut fbuf);
+        let table = &*core::ptr::addr_of!(PREFIX_TABLE);
+        let mut best_entry = 0u64;
+        let mut best_len = 0usize; // matched name length in u16 units
+        // Compare against each used slot; keep the longest component-prefix.
+        let mut cbuf: [u16; 128] = [0; 128];
+        for s in table.iter() {
+            if !s.used {
+                continue;
+            }
+            let cn = read_ustr16(s.name_va, s.name_len, &mut cbuf);
+            if nt_kernel_exec::np_prefix::is_component_prefix(&cbuf[..cn], &fbuf[..fn_]) && cn >= best_len {
+                best_len = cn;
+                best_entry = s.entry;
+            }
+        }
+        let _ = full_len;
+        best_entry
+    }
+}
+
+/// `void RtlInitializeGenericTable(PRTL_GENERIC_TABLE, ...)` — zero the 0x48-byte control struct +
+/// stash the callbacks (npfs's EventTable is only exercised on pipe-state-change notify — no live
+/// consumer in bring-up, so a zeroing init suffices for it to be enumerable-empty).
+extern "win64" fn s_rtl_init_generic_table(tbl: u64, cmp: u64, alloc: u64, free: u64, ctx: u64) {
     if tbl != 0 {
         unsafe {
             let mut i = 0u64;
-            while i < 0x40 {
+            while i < 0x48 {
                 write_unaligned((tbl + i) as *mut u64, 0);
                 i += 8;
             }
+            // RTL_GENERIC_TABLE: CompareRoutine@0x28, AllocateRoutine@0x30, FreeRoutine@0x38, Context@0x40.
+            write_unaligned((tbl + 0x28) as *mut u64, cmp);
+            write_unaligned((tbl + 0x30) as *mut u64, alloc);
+            write_unaligned((tbl + 0x38) as *mut u64, free);
+            write_unaligned((tbl + 0x40) as *mut u64, ctx);
         }
     }
 }
@@ -316,6 +430,97 @@ extern "win64" fn s_init_small_struct(p: u64) -> i32 {
                 write_unaligned((p + i) as *mut u64, 0);
                 i += 8;
             }
+        }
+    }
+    0
+}
+
+/// `BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE, BOOLEAN Wait)` /
+/// `ExAcquireResourceSharedLite` — uncontended single-threaded host: always granted.
+extern "win64" fn s_acquire_resource(_res: u64, _wait: u64) -> u64 {
+    1 // TRUE — acquired
+}
+/// `void ExReleaseResourceLite(PERESOURCE)` / `ExReleaseResourceForThreadLite` — no-op.
+extern "win64" fn s_release_resource(_res: u64) {}
+
+/// `void *memcpy(void *dst, const void *src, size_t n)` — REAL (npfs's RtlCopyMemory/RtlMoveMemory
+/// macros compile to this; an unbound no-op silently corrupts every FCB name + pipe data buffer).
+extern "win64" fn s_memcpy(dst: u64, src: u64, n: u64) -> u64 {
+    unsafe {
+        let mut i = 0u64;
+        while i < n {
+            write_unaligned((dst + i) as *mut u8, read_unaligned((src + i) as *const u8));
+            i += 1;
+        }
+    }
+    dst
+}
+/// `void *memset(void *dst, int c, size_t n)` — REAL (RtlZeroMemory / RtlFillMemory).
+extern "win64" fn s_memset(dst: u64, c: u64, n: u64) -> u64 {
+    unsafe {
+        let b = c as u8;
+        let mut i = 0u64;
+        while i < n {
+            write_unaligned((dst + i) as *mut u8, b);
+            i += 1;
+        }
+    }
+    dst
+}
+/// `SIZE_T RtlCompareMemory(const void *s1, const void *s2, SIZE_T n)` — count of leading equal bytes.
+extern "win64" fn s_rtl_compare_memory(a: u64, b: u64, n: u64) -> u64 {
+    unsafe {
+        let mut i = 0u64;
+        while i < n {
+            if read_unaligned((a + i) as *const u8) != read_unaligned((b + i) as *const u8) {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+}
+/// `WCHAR RtlUpcaseUnicodeChar(WCHAR)` — ASCII upcase (the pipe namespace is ASCII).
+extern "win64" fn s_rtl_upcase_char(c: u64) -> u64 {
+    let w = c as u16;
+    if (b'a' as u16..=b'z' as u16).contains(&w) {
+        (w - 32) as u64
+    } else {
+        w as u64
+    }
+}
+
+/// `PGENERIC_MAPPING IoGetFileObjectGenericMapping()` — a static all-zero GENERIC_MAPPING is fine for
+/// SeAssignSecurity in a host with no live access checks. Points at the KPCR placeholder page (zeroed).
+extern "win64" fn s_generic_mapping() -> u64 {
+    NPFS_KPCR_VA
+}
+
+/// `NTSTATUS SeAssignSecurity(...)` — write a fake non-null SD pointer to *NewDescriptor (arg3) and
+/// return SUCCESS. No live access checks in the host; the SD is only cached + stored on the FCB.
+extern "win64" fn s_se_assign_security(
+    _parent: u64,
+    _explicit: u64,
+    new_desc: u64,
+    _is_dir: u64,
+    _subj: u64,
+    _map: u64,
+    _pool: u64,
+) -> i32 {
+    unsafe {
+        if new_desc != 0 {
+            write_unaligned(new_desc as *mut u64, pool_alloc(0x40)); // a zeroed SD blob
+        }
+    }
+    0
+}
+
+/// `NTSTATUS ObLogSecurityDescriptor(PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR *Cached, ULONG)` —
+/// echo the input as the cached SD, return SUCCESS.
+extern "win64" fn s_ob_log_sd(input: u64, cached_out: u64, _refbias: u64) -> i32 {
+    unsafe {
+        if cached_out != 0 {
+            write_unaligned(cached_out as *mut u64, input);
         }
     }
     0
@@ -354,7 +559,21 @@ pub fn npfs_export_addr(name: &str) -> u64 {
         "IoRegisterFileSystem" => s_io_register_file_system as usize,
         "IoCompleteRequest" => s_io_complete_request as usize,
         "RtlInitializeUnicodePrefix" => s_rtl_init_unicode_prefix as usize,
+        "RtlInsertUnicodePrefix" => s_rtl_insert_unicode_prefix as usize,
+        "RtlFindUnicodePrefix" => s_rtl_find_unicode_prefix as usize,
         "RtlInitializeGenericTable" => s_rtl_init_generic_table as usize,
+        "ExAcquireResourceExclusiveLite" | "ExAcquireResourceSharedLite"
+        | "ExAcquireSharedStarveExclusive" | "ExAcquireSharedWaitForExclusive" => {
+            s_acquire_resource as usize
+        }
+        "ExReleaseResourceLite" | "ExReleaseResourceForThreadLite" => s_release_resource as usize,
+        "memcpy" | "memmove" | "RtlCopyMemory" | "RtlMoveMemory" => s_memcpy as usize,
+        "memset" | "RtlFillMemory" => s_memset as usize,
+        "RtlCompareMemory" | "RtlCompareMemoryUlong" => s_rtl_compare_memory as usize,
+        "RtlUpcaseUnicodeChar" => s_rtl_upcase_char as usize,
+        "IoGetFileObjectGenericMapping" => s_generic_mapping as usize,
+        "SeAssignSecurity" => s_se_assign_security as usize,
+        "ObLogSecurityDescriptor" => s_ob_log_sd as usize,
         "ExInitializeResourceLite" | "KeInitializeSpinLock" | "KeInitializeEvent"
         | "KeInitializeTimer" | "KeInitializeDpc" | "ExInitializeFastMutex"
         | "KeInitializeMutex" | "KeInitializeSemaphore" => s_init_small_struct as usize,
@@ -552,11 +771,46 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     write_unaligned((iosl + 1) as *mut u8, 0); // MinorFunction
     write_unaligned((iosl + 0x20) as *mut u64, devobj); // DeviceObject
     write_unaligned((iosl + 0x30) as *mut u64, fo); // FileObject
-    // Parameters union @0x08: for Create, { PIO_SECURITY_CONTEXT@0x08; ULONG Options@0x10;
-    // USHORT FileAttributes@0x14; USHORT ShareAccess@0x16; }. For Read/Write { ULONG Length@0x08;
-    // ULONG Key@0x10; LARGE_INTEGER ByteOffset@0x18 }. For FS/DeviceControl { ULONG OutputBufferLength
-    // @0x08; ULONG InputBufferLength@0x10; ULONG IoControlCode@0x18; PVOID Type3InputBuffer@0x20 }.
+    // Parameters union @ iosl+0x08. Layouts (references/reactos ndk/iotypes.h; POINTER_ALIGNMENT =
+    // DECLSPEC_ALIGN(8) on x64 → Reserved/FileAttributes 8-align, ShareAccess follows, next ptr 8-aligns):
+    //  Create/CreatePipe: SecurityContext@iosl+0x08, Options@iosl+0x10, ShareAccess(USHORT)@iosl+0x1a,
+    //    Parameters@iosl+0x20.
+    //  Read/Write: Length(ULONG)@0x08, Key@0x10, ByteOffset(LARGE_INTEGER)@0x18.
+    //  FS/DeviceControl: OutputBufferLength@0x08, InputBufferLength@0x10, IoControlCode@0x18,
+    //    Type3InputBuffer@0x20.
     match major {
+        0 | 1 => {
+            // IRP_MJ_CREATE (client open) / IRP_MJ_CREATE_NAMED_PIPE (server create). npfs derefs
+            // SecurityContext->{AccessState,DesiredAccess}, Options (disposition<<24), ShareAccess, and
+            // (create-named-pipe only) the NAMED_PIPE_CREATE_PARAMETERS. Build valid blocks from the pool.
+            let sec_ctx = pool_alloc(0x20); // IO_SECURITY_CONTEXT {SecurityQos,AccessState,DesiredAccess,FullCreateOptions}
+            let access_state = pool_alloc(0x80); // ACCESS_STATE — npfs reads AccessState->{SecurityDescriptor,SubjectSecurityContext}
+            zero(sec_ctx, 0x20);
+            zero(access_state, 0x80);
+            write_unaligned((sec_ctx + 0x08) as *mut u64, access_state); // AccessState
+            write_unaligned((sec_ctx + 0x10) as *mut u32, 0x001F_01FF); // DesiredAccess = all
+            write_unaligned((iosl + 0x08) as *mut u64, sec_ctx); // SecurityContext
+            // Options: Disposition (FILE_CREATE=2) in the high byte, CreateOptions in the low 24.
+            let disposition: u32 = if major == 1 { 2 } else { 1 }; // create-named-pipe=FILE_CREATE, open=FILE_OPEN
+            write_unaligned((iosl + 0x10) as *mut u32, disposition << 24);
+            write_unaligned((iosl + 0x1a) as *mut u16, 3); // ShareAccess = FILE_SHARE_READ|WRITE (full duplex)
+            if major == 1 {
+                // NAMED_PIPE_CREATE_PARAMETERS (0x28 bytes): NamedPipeType@0, ReadMode@4, CompletionMode@8,
+                // MaximumInstances@0xc, InboundQuota@0x10, OutboundQuota@0x14, DefaultTimeout@0x18 (LI, must
+                // be < 0 = relative), TimeoutSpecified@0x20 (BOOLEAN, must be TRUE + MaximumInstances != 0).
+                let params = pool_alloc(0x28);
+                zero(params, 0x28);
+                write_unaligned((params + 0x00) as *mut u32, 1); // NamedPipeType = FILE_PIPE_MESSAGE_TYPE
+                write_unaligned((params + 0x04) as *mut u32, 1); // ReadMode = message
+                write_unaligned((params + 0x08) as *mut u32, 0); // CompletionMode = queue
+                write_unaligned((params + 0x0c) as *mut u32, 0xFF); // MaximumInstances = unlimited-ish
+                write_unaligned((params + 0x10) as *mut u32, 0x1000); // InboundQuota
+                write_unaligned((params + 0x14) as *mut u32, 0x1000); // OutboundQuota
+                write_unaligned((params + 0x18) as *mut i64, -50_000_000i64); // DefaultTimeout = -5s (relative)
+                write_unaligned((params + 0x20) as *mut u8, 1); // TimeoutSpecified = TRUE
+                write_unaligned((iosl + 0x20) as *mut u64, params); // Parameters
+            }
+        }
         3 | 4 => {
             write_unaligned((iosl + 0x08) as *mut u32, if major == 4 { inlen } else { outlen } as u32);
         }

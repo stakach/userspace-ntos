@@ -5438,12 +5438,36 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let mut out = [0u8; 16];
                 let r = npfs_dispatch_irp(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, 0, &name16, &mut out);
                 if let Some((st, info)) = r {
+                    let srv_fid = driver_launch::npfs_last_file_id();
                     print_str(b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntsvcs) -> status=0x");
                     print_hex(st as u32);
                     print_str(b" info=");
                     print_u64(info);
+                    print_str(b" fsctx=0x");
+                    print_hex(srv_fid as u32);
                     print_str(b"\n");
                     check(b"npfs_dispatch_roundtrip", true, &mut passed);
+                    // C-a: NpFsdCreateNamedPipe COMPLETED — SUCCESS + FILE_CREATED(2) + a real CCB-backed
+                    // FsContext. The VCB prefix-tree/ERESOURCE/security trampolines ran for real.
+                    check(
+                        b"npfs_create_named_pipe_complete",
+                        st == 0 && info == 2 && srv_fid != 0,
+                        &mut passed,
+                    );
+                    // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntsvcs) must find the FCB via the
+                    // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
+                    let mut cout = [0u8; 16];
+                    if let Some((cst, _cinfo)) =
+                        npfs_dispatch_irp(0 /* IRP_MJ_CREATE */, 0, 0, &name16, &mut cout)
+                    {
+                        let cli_fid = driver_launch::npfs_last_file_id();
+                        print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntsvcs) -> status=0x");
+                        print_hex(cst as u32);
+                        print_str(b" fsctx=0x");
+                        print_hex(cli_fid as u32);
+                        print_str(b"\n");
+                        check(b"npfs_client_connect_finds_fcb", cst == 0 && cli_fid != 0, &mut passed);
+                    }
                 }
             }
         } else {

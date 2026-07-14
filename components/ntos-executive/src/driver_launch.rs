@@ -487,6 +487,12 @@ pub(crate) fn npfs_devobj() -> u64 {
     NPFS_DEVOBJ.load(Ordering::Relaxed)
 }
 
+/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP — a non-zero value
+/// proves the create/open produced a real CCB-backed FILE_OBJECT (0 = failed / not a pipe).
+pub(crate) unsafe fn npfs_last_file_id() -> u64 {
+    read_volatile((npfs_host::NPFS_SHARED_VADDR + npfs_host::SH_REQ_FILEID) as *const u64)
+}
+
 /// Route one IRP to the isolated npfs component: fill the shared request fields, drive its dispatch
 /// loop (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP
 /// lands on its fault EP → demand-map + resume), then read back the completion. Returns

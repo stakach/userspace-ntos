@@ -20,6 +20,7 @@ mod interrupt;
 pub mod kevent;
 mod irql;
 mod lookaside;
+pub mod np_prefix;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
 pub mod session_section;
