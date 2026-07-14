@@ -51,7 +51,6 @@ mod img_spawn;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
 pub(crate) use win32k_glue::*;
-mod npfs_host;
 mod driver_launch;
 pub(crate) use driver_launch::*;
 
@@ -5553,17 +5552,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         {
             register_npfs(&dc);
             // C1 checks: the general dynamic path loaded npfs isolated + ran its DriverEntry.
-            check(b"npfs_driver_entry_entered", (dc.verdict & npfs_host::V_ENTERED) != 0, &mut passed);
+            check(b"npfs_driver_entry_entered", (dc.verdict & V_ENTERED) != 0, &mut passed);
             check(
                 b"npfs_device_created",
-                (dc.verdict & npfs_host::V_DEVICE) != 0 && dc.devobj != 0,
+                (dc.verdict & V_DEVICE) != 0 && dc.devobj != 0,
                 &mut passed,
             );
-            check(b"npfs_driver_entry_success", (dc.verdict & npfs_host::V_SUCCESS) != 0, &mut passed);
-            check(b"npfs_major_function_table", (dc.verdict & npfs_host::V_MJ) != 0, &mut passed);
+            check(b"npfs_driver_entry_success", (dc.verdict & V_SUCCESS) != 0, &mut passed);
+            check(b"npfs_major_function_table", (dc.verdict & V_MJ) != 0, &mut passed);
             // Isolation proof: npfs runs in its OWN VSpace (a distinct PML4 cap != the executive's).
             check(b"npfs_isolated_vspace", dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE, &mut passed);
-            if dc.finished && (dc.verdict & npfs_host::V_MJ) != 0 {
+            if dc.finished && (dc.verdict & V_MJ) != 0 {
                 // C2 round-trip: dispatch a REAL IRP_MJ_CREATE_NAMED_PIPE (major 1) to the live
                 // component with a pipe name (UTF-16 "\ntsvcs") — exercising npfs's REAL
                 // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the

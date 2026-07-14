@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod driver_resolve;
 mod hal;
 mod ntoskrnl;
 mod registry;
@@ -20,6 +21,7 @@ pub mod ssdt;
 pub mod win32k;
 pub mod win32k_resolve;
 
+pub use driver_resolve::{DriverExportRegistry, DRIVER_TRAMPOLINE_CAP};
 pub use registry::{ExportRegistry, ImportCheck, ImportOutcome, ImportReport};
 pub use win32k_resolve::{
     export_descriptor, Win32kExportRegistry, WIN32K_DATA_EXPORTS, WIN32K_TRAMPOLINE_CAP,
