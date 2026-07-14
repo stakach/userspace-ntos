@@ -303,6 +303,14 @@ pub(crate) unsafe fn service_sec_image(
     } else {
         (None, 0)
     };
+    // msv1_0.dll — lsass' default authentication package (LsapInitAuthPackages loads the DLLs listed in
+    // HKLM\...\Control\Lsa\Authentication Packages; ReactOS's default is msv1_0). Loaded BY PATH from the
+    // FS pool like lsasrv/samsrv; lsass' LoadLibrary resolves it through the nt-dll-registry path.
+    let (msv1_0_pe, msv1_0_va) = if ntdll.is_some() {
+        load_dll_from_fs(b"reactos\\system32\\msv1_0.dll", b"msv1_0.dll")
+    } else {
+        (None, 0)
+    };
     // Generic DLL registry: csrss's loadable DLLs — its static import csrsrv.dll + the dynamically
     // loaded ServerDlls basesrv.dll/winsrv.dll (CsrLoadServerDll), and — later — the Win32 client
     // stack, which becomes staging-only. Each is given a fixed 16 MiB base slot from 0x8000_0000;
@@ -315,12 +323,12 @@ pub(crate) unsafe fn service_sec_image(
     let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] = [
         &csrsrv_pe, &basesrv_pe, &winsrv_pe, &kernel32_pe, &user32_pe, &gdi32_pe, &rpcrt4_pe,
         &msvcrt_pe, &advapi32_pe, &ws2_32_pe, &kernel32_vista_pe, &advapi32_vista_pe, &ws2help_pe,
-        &ntdll_vista_pe, &userenv_pe, &mpr_pe, &lsasrv_pe, &samsrv_pe,
+        &ntdll_vista_pe, &userenv_pe, &mpr_pe, &lsasrv_pe, &samsrv_pe, &msv1_0_pe,
     ];
     let dll_seed: [&[u8]; DLL_REG_COUNT] = [
         b"csrsrv", b"basesrv", b"winsrv", b"kernel32", b"user32", b"gdi32", b"rpcrt4", b"msvcrt",
         b"advapi32", b"ws2_32", b"kernel32_vista", b"advapi32_vista", b"ws2help", b"ntdll_vista",
-        b"userenv", b"mpr", b"lsasrv", b"samsrv",
+        b"userenv", b"mpr", b"lsasrv", b"samsrv", b"msv1_0",
     ];
     let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
     for i in 0..DLL_REG_COUNT {
@@ -358,6 +366,7 @@ pub(crate) unsafe fn service_sec_image(
         mpr_va,     // P7-A: pool VA when sourced BY PATH, else WIN32BUF+MPR_WIN32BUF_OFFSET
         lsasrv_va,  // lsass's LSA server DLL — pool VA (FS-by-path)
         samsrv_va,  // lsass's SAM server DLL — pool VA (FS-by-path)
+        msv1_0_va,  // lsass's default auth package — pool VA (FS-by-path)
     ];
     for i in 0..DLL_REG_COUNT {
         if let Some(pe) = dll_pes[i].as_ref() {

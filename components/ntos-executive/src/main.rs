@@ -588,9 +588,11 @@ pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
 pub const MAX_PI: usize = 16;
 /// Number of DLLs in the generic nt-dll-registry (`dll_pes`/`dll_seed`/`dll_buf_va`). Each occupies a
 /// fixed 16 MiB base slot from 0x8000_0000 (shared 1 GiB PDPT range), demand-paged from its parsed PE.
-/// csrss's Win32 stack (16) + lsass's LSA server DLLs lsasrv/samsrv (2) = 18. Grow this + add the PE /
-/// seed / buf_va entries in service_sec_image to register a new registry DLL.
-pub const DLL_REG_COUNT: usize = 18;
+/// csrss's Win32 stack (16) + lsass's LSA server DLLs lsasrv/samsrv (2) + lsass' auth package
+/// msv1_0 (1) = 19. Grow this + add the PE / seed / buf_va entries in service_sec_image to register a
+/// new registry DLL. NOTE: slot N sits at 0x8000_0000 + N*16MiB; slot 19 = 0x93000000, still below the
+/// win32k client window (0x9800_0000) + NLS section (0xA000_0000) — keep those above the max slot.
+pub const DLL_REG_COUNT: usize = 19;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -2044,6 +2046,7 @@ const SYSTEM32_FILES: &[&str] = &[
     "mpr.dll",
     "lsasrv.dll",
     "samsrv.dll",
+    "msv1_0.dll",
 ];
 
 /// The (Type, UTF-16 data) for a value name under the synthesized CentralProcessor\0 key. Enough
