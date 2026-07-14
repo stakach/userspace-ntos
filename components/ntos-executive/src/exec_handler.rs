@@ -961,7 +961,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // the mirror/frame table. Read the static content straight from the backing PE image
                 // (`read_objattr_name_pe`). Scoped to pi==3 so winlogon/csrss paint-time OA-name reads
                 // stay mirror-only (byte-identical).
-                let name16 = if self.pi == 3 {
+                let name16 = if self.pi == 3 || self.pi == 4 {
                     self.read_objattr_name_pe(oa)
                 } else {
                     smss_read_objattr_name(oa)
@@ -978,7 +978,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // MACHINE_ROOT_HANDLE) or an absolute `\Registry\Machine\...` path → `resolve_key`;
                 // a subkey relative to a real hive handle → `open_key_from`. Self-contained + returns,
                 // so the winlogon/csrss paint-time key hacks below are untouched (byte-identical).
-                if self.pi == 3 {
+                if self.pi == 3 || self.pi == 4 {
                     // Compute the FULL NT path being opened (predefined-root + overlay-relative
                     // cases). `None` = a hive-handle-relative open (path unknown, resolved below).
                     // NOTE: MACHINE_ROOT_HANDLE (0x9_..) is numerically >= KEY_HANDLE_BASE (0x1_..),
@@ -1037,14 +1037,33 @@ impl NativeSyscallHandler for ExecNtHandler {
                             _ => None,
                         }
                     };
-                    return match cell {
-                        Some(cell) => {
-                            let h = self.intern_key_handle(cell);
-                            self.xas_write_u64(args[0], h);
-                            0 // STATUS_SUCCESS
+                    if let Some(cell) = cell {
+                        let h = self.intern_key_handle(cell);
+                        self.xas_write_u64(args[0], h);
+                        return 0; // STATUS_SUCCESS
+                    }
+                    // lsass (pi 4): the SECURITY + SAM hives (\Registry\Machine\{SECURITY,SAM}) don't
+                    // exist in our staged SYSTEM hive, but real ReactOS creates them at setup. lsass'
+                    // LsapOpenServiceKey (\Registry\Machine\SECURITY, KEY_CREATE_SUB_KEY) + samsrv's
+                    // SampInitDatabase (\Registry\Machine\SAM) do a plain OPEN that would fail c0000034
+                    // → lsass bails at LsapInitDatabase / SamIInitialize. Model these hives as EMPTY
+                    // overlay roots: on a pi==4 open of a path under SECURITY/SAM that isn't in the base
+                    // or overlay yet, auto-create it in the overlay so the open succeeds (lsass then
+                    // creates its Policy/database subkeys under them via NtCreateKey → overlay). Scoped to
+                    // pi==4 so services (pi 3) / paint reads are unchanged.
+                    if self.pi == 4 {
+                        if let Some(ref full) = full_opt {
+                            if is_lsa_hive_path(full) {
+                                let canon = self.overlay_canon(full);
+                                let (oidx, _) = self.overlay.create(&canon);
+                                self.overlay_dirty = true;
+                                let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
+                                self.xas_write_u64(args[0], h);
+                                return 0; // STATUS_SUCCESS (empty LSA/SAM hive root/subkey)
+                            }
                         }
-                        None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
-                    };
+                    }
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_HANDLE). Match the layout key
                 // by NAME (its RootDirectory arrives as 0 — advapi32's MapDefaultKey HKLM handle
@@ -1117,7 +1136,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // list) here. Scoped to pi==3; pi 0-2 keep the prior behaviour (NtCreateKey was
             // unregistered → the loop stopped on the SSN) so their boot is byte-identical.
             NativeService::NtCreateKey => unsafe {
-                if self.pi != 3 {
+                if self.pi != 3 && self.pi != 4 {
                     self.stop = true;
                     return 0xC000_0002; // record the SSN + stop (matches the prior unregistered wall)
                 }
@@ -1185,7 +1204,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // are still discarded). A write to a base-hive handle (not an overlay key) is a no-op
             // success too (we don't shadow arbitrary base keys for writes yet).
             NativeService::NtSetValueKey => unsafe {
-                if self.pi != 3 {
+                if self.pi != 3 && self.pi != 4 {
                     return 0; // STATUS_SUCCESS (byte-identical no-op for smss/csrss/winlogon)
                 }
                 let key = match self
@@ -1495,7 +1514,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
                 // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).
-                let name16 = if self.pi == 3 {
+                let name16 = if self.pi == 3 || self.pi == 4 {
                     self.read_ustr_pe(args[1])
                 } else {
                     smss_read_ustr(args[1])
@@ -1519,10 +1538,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         p.and_then(|p| self.resolve_key(&p))
                             .and_then(|hk| self.hive.as_ref().and_then(|h| h.value(hk, &name_lc)))
                     }
-                } else if self.pi == 3 {
+                } else if self.pi == 3 || self.pi == 4 {
                     // Real SYSTEM hive value-by-name (case-insensitive) — services' SCM reads
-                    // SetupType/SystemSetupInProgress + the service DB values off ::ROSSYS.HIV.
-                    // Scoped to pi==3 so smss/winlogon/csrss keep the prior None (byte-identical).
+                    // SetupType/SystemSetupInProgress + the service DB values off ::ROSSYS.HIV; lsass
+                    // (pi 4) reads its own values. Scoped to pi 3/4 so smss/winlogon/csrss keep the
+                    // prior None (byte-identical).
                     self.hive.as_ref().and_then(|h| h.value(key, &name_lc))
                 } else {
                     None // real-hive value-by-name not modelled for pi 0-2
@@ -1538,7 +1558,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         } else {
                             // services' out-buffer may be an advapi32 heap allocation the mirror can't
                             // reach → use the cross-AS writer so the DWORD data actually lands.
-                            if self.pi == 3 {
+                            if self.pi == 3 || self.pi == 4 {
                                 self.xas_write_buf(args[3], &info);
                             } else {
                                 smss_copyout(args[3], &info);

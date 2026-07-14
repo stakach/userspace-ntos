@@ -1988,6 +1988,14 @@ fn is_keyboard_layout_key(path: &str) -> bool {
     let lc = path.to_ascii_lowercase();
     lc.contains("keyboard layouts\\")
 }
+/// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or
+/// `\Registry\Machine\SAM[...]`) — lsass' LsapOpenServiceKey / samsrv's SampInitDatabase open these,
+/// which our staged SYSTEM hive doesn't contain (real ReactOS creates them at setup). The executive
+/// models them as empty overlay hives so lsass can open + populate them (pi 4).
+pub(crate) fn is_lsa_hive_path(path: &str) -> bool {
+    let lc = path.to_ascii_lowercase();
+    lc.starts_with(r"\registry\machine\security") || lc.starts_with(r"\registry\machine\sam")
+}
 /// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced (drives the `exec_kbd_layout_opened`
 /// spec — proves winlogon's InitKeyboardLayouts fallback reached its layout key).
 static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
