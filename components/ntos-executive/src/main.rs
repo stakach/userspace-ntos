@@ -5757,6 +5757,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b"[ntos-exec] CSR per-process connect mask=0x");
                     print_hex(CSR_CONNECTED_MASK.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
+                    // ★ MILESTONE — services.exe is the 3rd win32k GUI client: its user32 DllMain
+                    // NtUserProcessConnect (SSN 0x10FA) was routed to the win32k component (badge 6 /
+                    // pi 3, the KeStackAttachProcess w32_client_attach re-point + the pi-keyed CSR heap
+                    // RO-map) and returned STATUS_SUCCESS — bit 3 set. csrss (pi 1) + winlogon (pi 2)
+                    // connects still work (the counted desktop paint below proves win32k still serves
+                    // them). Three win32k clients coexist through the one parked win32k component.
+                    check(
+                        b"exec_services_win32k_connect",
+                        W32_CONNECTED_MASK.load(Ordering::Relaxed) & (1 << 3) != 0,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] win32k per-process connect mask=0x");
+                    print_hex(W32_CONNECTED_MASK.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     // Path 1b — process-local dense handle VALUES. Two distinct EPROCESSes both hold
                     // handle 0x4 referring to DIFFERENT objects (0b111 = same-value + distinct-object
                     // + no-aliasing). The on-kernel proof that handle namespaces are per-process.

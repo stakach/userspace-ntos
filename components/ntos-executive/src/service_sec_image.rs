@@ -1392,13 +1392,18 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 result = 0; // STATUS_SUCCESS
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE
-                && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE)
+                && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE || badge == SERVICES_BADGE)
             {
                 routed_win32k = true;
-                // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2)
-                // so it attaches win32k's client window to this client's frames (per-client cross-AS
-                // client memory — winlogon's OBJECT_ATTRIBUTES resolve to WINLOGON's frames, not the
-                // stale csrss frame at the same VA).
+                // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
+                // services pi 3) so it attaches win32k's client window to this client's frames
+                // (per-client cross-AS client memory — services' OBJECT_ATTRIBUTES / USERCONNECT
+                // resolve to SERVICES' frames, not the stale csrss/winlogon frame at the same VA).
+                // The w32_client_attach / csrss_frame_get / map_win32k_heap_into_csrss machinery is
+                // fully pi-keyed (bit `1<<pi`), so a 3rd GUI client needs no new state — same recipe
+                // that made winlogon the 2nd client. The reply routing (routed_win32k ->
+                // send_on_reply(REPLY_MAIN)) is caller-agnostic: REPLY_MAIN is bound to THIS caller at
+                // its recv, so the routed reply resumes exactly services (no reply-spin).
                 W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
                 // csrss (winsrv's UserServerDllInitialization) OR by winlogon (its user32 DllMain's
@@ -1534,6 +1539,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"/768 (px0=0x");
                     print_hex(sample0);
                     print_str(b")\n");
+                }
+                if has_buf && ok && st == 0 {
+                    // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client —
+                    // record the per-pi "win32k client connected" bit (csrss=1, winlogon=2, services=3).
+                    W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
                 }
                 if has_buf && ok {
                     let arg = win32k_host::WIN32K_ARG_VADDR;

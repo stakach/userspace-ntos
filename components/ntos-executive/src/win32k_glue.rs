@@ -118,6 +118,10 @@ pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) {
 // the PDPT/PD/PT structures persist in W32_CLIENT_SEEN (empty tables after the leaf Unmap). The
 // arch-level Unmap uses the invoked (win32k) cap's asid → only win32k's mapping is torn down; the
 // client keeps its own mapping in its own VSpace.
+/// Bit `pi` set once a GUI client's `NtUserProcessConnect` (SSN 0x10FA) has been routed to win32k and
+/// returned STATUS_SUCCESS — the "win32k client connected" mask. csrss=pi 1, winlogon=pi 2,
+/// services=pi 3. Drives the `exec_services_win32k_connect` gate spec (bit 3 = the 3rd client).
+pub(crate) static W32_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
 /// The pi of the client whose call `win32k_dispatch` is currently servicing (set by the forward arm
 /// before each dispatch; defaults to csrss so bring-up/self-test dispatches attach to pi 1). Read by
