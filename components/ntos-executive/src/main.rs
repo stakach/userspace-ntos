@@ -6583,6 +6583,19 @@ unsafe fn service_sec_image(
                 // hive -> InitKeyboardLayouts loads the default US layout instead. (Mirrors the
                 // NtOpenThreadToken=135 handler; 136 is the Ex variant the real ntdll uses.)
                 result = 0xC000007C;
+            } else if m0 == 130 {
+                // NtOpenProcessTokenEx(ProcessHandle=R10, DesiredAccess=RDX, HandleAttributes=R8,
+                // *TokenHandle=R9). RtlOpenCurrentUser falls here after NtOpenThreadTokenEx=NO_TOKEN to
+                // fetch the process (primary) token so it can read the user SID (NtQueryInformationToken
+                // TokenUser -> S-1-5-18) and open \Registry\User\<SID>. Mint a fake token handle to
+                // *TokenHandle (mirrors the NtOpenProcessToken=129 handler; 130 is the Ex variant).
+                let out = get_recv_mr(8); // R9 = *TokenHandle
+                let h = nt_handler.next_handle;
+                nt_handler.next_handle += 1;
+                if out != 0 {
+                    smss_stack_write(out, h);
+                }
+                result = 0; // STATUS_SUCCESS
             } else if m0 >= win32k_host::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE)
             {
