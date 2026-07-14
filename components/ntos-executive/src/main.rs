@@ -5768,130 +5768,20 @@ unsafe fn service_sec_image(
     } else {
         None
     };
-    let rpcrt4_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x58) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged rpcrt4.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(pe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged rpcrt4.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let msvcrt_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x5c) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged msvcrt.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(pe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged msvcrt.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let advapi32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x60) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged advapi32.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(pe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged advapi32.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let ws2_32_pe: Option<nt_pe_loader::PeFile<'static>> = if ntdll.is_some() {
-        let sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x64) as *const u32) as usize;
-        if sz > 0 {
-            let bytes: &'static [u8] = core::slice::from_raw_parts(
-                (WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET) as *const u8,
-                sz,
-            );
-            match nt_pe_loader::PeFile::parse(bytes) {
-                Ok(pe) => {
-                    print_str(b"[ntos-exec] staged ws2_32.dll: ");
-                    print_u64(sz as u64);
-                    print_str(b" bytes, PE32+ sections=");
-                    print_u64(pe.sections().len() as u64);
-                    print_str(b" entry=0x");
-                    print_hex(pe.entry_point_rva());
-                    print_str(b" imgbase=0x");
-                    print_hex(pe.image_base() as u32);
-                    print_str(b"\n");
-                    Some(pe)
-                }
-                Err(_) => {
-                    print_str(b"[ntos-exec] staged ws2_32.dll: PARSE FAILED\n");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // P7-A batch 2: source the 4 mid-size Win32 DLLs BY PATH from the FS pool (hybrid; falls back to
+    // WIN32BUF on any FS miss). dll_buf_va[6..10] = *_va below.
+    let (rpcrt4_pe, rpcrt4_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\rpcrt4.dll", b"rpcrt4",
+        WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET, 0x58);
+    let (msvcrt_pe, msvcrt_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\msvcrt.dll", b"msvcrt",
+        WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET, 0x5c);
+    let (advapi32_pe, advapi32_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\advapi32.dll", b"advapi32",
+        WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET, 0x60);
+    let (ws2_32_pe, ws2_32_va) = load_dll_hybrid(
+        ntdll.is_some(), b"reactos\\system32\\ws2_32.dll", b"ws2_32",
+        WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET, 0x64);
     // P7-A batch 1: source the 4 small vista-forwarder DLLs BY PATH from the FS pool (hybrid; falls
     // back to WIN32BUF on any FS miss). dll_buf_va[10..14] = *_va below.
     let (kernel32_vista_pe, kernel32_vista_va) = load_dll_hybrid(
@@ -6013,10 +5903,10 @@ unsafe fn service_sec_image(
         WIN32BUF_VADDR + KERNEL32_WIN32BUF_OFFSET,
         WIN32BUF_VADDR + USER32_WIN32BUF_OFFSET,
         gdi32_va, // P7-A: pool VA when sourced BY PATH, else WIN32BUF+GDI32_WIN32BUF_OFFSET
-        WIN32BUF_VADDR + RPCRT4_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + MSVCRT_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + ADVAPI32_WIN32BUF_OFFSET,
-        WIN32BUF_VADDR + WS2_32_WIN32BUF_OFFSET,
+        rpcrt4_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+RPCRT4_WIN32BUF_OFFSET
+        msvcrt_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+MSVCRT_WIN32BUF_OFFSET
+        advapi32_va, // P7-A batch 2: pool VA on FS hit, else WIN32BUF+ADVAPI32_WIN32BUF_OFFSET
+        ws2_32_va,   // P7-A batch 2: pool VA on FS hit, else WIN32BUF+WS2_32_WIN32BUF_OFFSET
         kernel32_vista_va, // P7-A batch 1: pool VA on FS hit, else WIN32BUF+KERNEL32_VISTA_WIN32BUF_OFFSET
         advapi32_vista_va, // P7-A batch 1: pool VA on FS hit, else WIN32BUF+ADVAPI32_VISTA_WIN32BUF_OFFSET
         ws2help_va,        // P7-A batch 1: pool VA on FS hit, else WIN32BUF+WS2HELP_WIN32BUF_OFFSET
