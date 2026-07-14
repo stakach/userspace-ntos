@@ -365,7 +365,7 @@ pub(crate) unsafe fn storage_probe(
             (b"reactos\\system32\\drivers\\dxgthk.sys".as_slice(), b"DXGTHK  SYS", DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES, 0x84u64),
             (b"reactos\\system32\\ftfd.dll".as_slice(), b"FTFD    DLL", FTFDBUF_VADDR, FTFDBUF_FRAMES, 0x88u64),
             (b"reactos\\system32\\framebuf.dll".as_slice(), b"FRAMEBUFDLL", FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES, 0x8Cu64),
-            (b"reactos\\Fonts\\arial.ttf".as_slice(), b"ARIAL   TTF", win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES, 0x90u64),
+            (b"reactos\\Fonts\\arial.ttf".as_slice(), b"ARIAL   TTF", win32k_subsystem::FONTBUF_VADDR, win32k_subsystem::FONTBUF_FRAMES, 0x90u64),
         ] {
             if let Some((c, sz, _)) = open_or_path!(path, short) {
                 let cap = (cap_frames * 0x1000) as u32;

@@ -1,21 +1,33 @@
-//! `win32k_host` — load the REAL ReactOS `win32k.sys` into an isolated seL4 component and
-//! run its `DriverEntry` as far as it goes (Phase 2b of `plans/wiggly-doodling-badger.md`).
+//! `win32k_subsystem` — the **Subsystem-class** driver implementation: the REAL ReactOS
+//! `win32k.sys` loaded by-path into an isolated seL4 component, plus the genuine subsystem POLICY
+//! that has no generic home and stays here (the window-manager Ob object graph, the Ps win32
+//! callouts, the NtUser/NtGdi SSDT dispatch, and the `KeUserModeCallback`/framebuffer paint loop).
 //!
-//! Structural split (mirrors [`crate::kmdf_host`], scaled to a 2.1 MiB image staged off disk):
+//! Class relationship: like `npfs.sys` is the first client of the FSD class (`driver_launch`'s
+//! `fsd_component_entry` + shared `DriverExportRegistry`), `win32k.sys` is the first client of the
+//! Subsystem class ([`DriverClass::Subsystem`](crate::driver_launch::DriverClass)). The RESOLUTION
+//! MECHANISM is converged — win32k binds its `ntoskrnl.exe` imports into the SAME driver-agnostic
+//! [`DriverExportRegistry`] every hosted `.sys` uses, and the pure byte/string primitives are the
+//! SAME [`crate::ntoskrnl_shared`] impls the FSD class calls. What is NOT generic (and by design
+//! stays here) is the subsystem-specific policy: win32k's protocol is a large inline demand-fault
+//! init loop with paint side-effects, not the FSD IRP-dispatch loop, so its component entry is
+//! win32k's own ([`win32k_subsystem_entry`]) rather than the FSD entry.
+//!
+//! Structural split (scaled to a 2.1 MiB image staged off disk):
 //!   * the EXECUTIVE (which owns the heap + the staged image at `WIN32KBUF`) parses the PE,
 //!     copies its 8 sections into a run of untyped-backed frames at [`WIN32K_CODE_VA`]
 //!     (VIRTUAL layout — not a `PeFile::map()` Vec, which the 128 KiB bump heap can't hold),
 //!     applies the 1920 DIR64 relocations in place, and patches the IAT: init-path imports →
 //!     real trampolines below, data-export globals → non-null placeholder cells, everything
 //!     else → a benign zero stub. See [`load_into`].
-//!   * the HOST (the spawned component) maps the image W^X (RX code / RW data), a pool arena,
-//!     the data-export region, and calls `DriverEntry(DRIVER_OBJECT*, UNICODE_STRING*)` with
-//!     its fault endpoint armed. On return it writes a verdict + the recorded SSDT to the
-//!     shared page and trips a SENTINEL fault so the executive's fault-recv loop knows it
-//!     finished (vs. faulted mid-init). See [`win32k_host_entry`].
+//!   * the COMPONENT (the spawned Subsystem-class component) maps the image W^X (RX code / RW
+//!     data), a pool arena, the data-export region, and calls `DriverEntry(DRIVER_OBJECT*,
+//!     UNICODE_STRING*)` with its fault endpoint armed. On return it writes a verdict + the
+//!     recorded SSDT to the shared page and trips a SENTINEL fault so the executive's fault-recv
+//!     loop knows it finished (vs. faulted mid-init). See [`win32k_subsystem_entry`].
 //!
-//! The trampolines are compiled into the executive's image (mapped RWX-shared into the host),
-//! so the host calls them at the same VA — exactly the KMDF-host pattern.
+//! The trampolines are compiled into the executive's image (mapped RWX-shared into the component),
+//! so the component calls them at the same VA.
 
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use nt_compat_exports::DriverExportRegistry;
@@ -2376,8 +2388,8 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
 /// minimal DRIVER_OBJECT + RegistryPath from the pool, calls `DriverEntry`, writes the verdict,
 /// then trips the SENTINEL fault so the executive knows init finished.
 #[no_mangle]
-#[link_section = ".text.win32k_host_entry"]
-pub unsafe extern "C" fn win32k_host_entry() -> ! {
+#[link_section = ".text.win32k_subsystem_entry"]
+pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
     let entry_rva = read_volatile((WIN32K_SHARED_VADDR + SH_ENTRY_RVA) as *const u64) as u32;
     print_str(b"[win32k-host] START DriverEntry rva=0x");
     print_hex(entry_rva);

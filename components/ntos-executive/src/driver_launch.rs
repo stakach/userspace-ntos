@@ -898,7 +898,12 @@ pub(crate) enum DriverClass {
     /// Hardware device driver — device caps minted by nt-pnp (SEAM; not built here).
     #[allow(dead_code)]
     Device,
-    /// Subsystem/runtime driver (win32k, WDF) — bespoke (not routed through here yet).
+    /// Subsystem/runtime driver (win32k, WDF). The RESOLUTION MECHANISM is converged (the shared
+    /// [`DriverExportRegistry`] + [`crate::ntoskrnl_shared`] primitives), but the class protocol is
+    /// its own: a large inline demand-fault init loop with paint side-effects, not the FSD IRP
+    /// loop. The first client is win32k — see [`crate::win32k_subsystem`] (component entry
+    /// `win32k_subsystem_entry`); it is spawned via the generic `spawn_component`, so `load_driver`
+    /// keeps a documented seam for it rather than folding the paint-loop protocol in here.
     #[allow(dead_code)]
     Subsystem,
 }
@@ -1106,8 +1111,10 @@ static mut FSD_RIGHTS: [u64; FSD_IMAGE_FRAMES as usize] = [RW_NX; FSD_IMAGE_FRAM
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
 /// it as an ISOLATED component (per its `class`), run its real DriverEntry, and return the live
-/// [`DriverComponent`]. Currently the FSD class is fully built (npfs is the first client); the
-/// Device class is a documented seam (nt-pnp populates the device caps) and Subsystem stays bespoke.
+/// [`DriverComponent`]. Currently the FSD class is fully built here (npfs is the first client); the
+/// Device class is a documented seam (nt-pnp populates the device caps), and the Subsystem class
+/// (win32k, see [`crate::win32k_subsystem`]) has its own paint-loop protocol driven at the call
+/// site via `spawn_component` — [`DriverClass::Subsystem`] documents why it isn't folded in here.
 ///
 /// Fault-contained: the component's DriverEntry faults land on ITS fault EP (this loop demand-maps
 /// benign pages + reports a wall) — a driver crash never brings down the executive root.

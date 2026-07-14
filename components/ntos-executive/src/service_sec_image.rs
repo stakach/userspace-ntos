@@ -1487,7 +1487,7 @@ pub(crate) unsafe fn service_sec_image(
                     smss_stack_write(out, h);
                 }
                 result = 0; // STATUS_SUCCESS
-            } else if m0 >= win32k_host::WIN32K_SERVICE_BASE
+            } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE || badge == WINLOGON_BADGE || badge == SERVICES_BADGE)
             {
                 routed_win32k = true;
@@ -1522,7 +1522,7 @@ pub(crate) unsafe fn service_sec_image(
                 // (pre-fix a fake EPROCESS masked that). Substitute the REAL minted handles the
                 // executive recorded (creation order = power, media), so win32k models + references
                 // genuine typed Event objects. Only fills NULLs (a working marshal is respected).
-                if m0 == win32k_host::SSN_NT_USER_INITIALIZE_REAL {
+                if m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE_REAL {
                     if a1 == 0 {
                         a1 = nt_handler.csrss_event_handles[0];
                     }
@@ -1532,17 +1532,17 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
                 // hosted client's process via the synthetic handle the DriverEntry attach used.
-                let d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_host::FAKE_PROCESS_HANDLE } else { a0 };
+                let d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_subsystem::FAKE_PROCESS_HANDLE } else { a0 };
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a csrss user pointer (its stack) NOT mapped in win32k's VSpace — passing it
                 // raw makes win32k's handler fault/spin on an address win32k_dispatch can't resolve.
                 // Copy csrss's input buffer into the shared ARG frame (mapped in BOTH), dispatch with
                 // the ARG-frame pointer, then copy win32k's out-params (the USERCONNECT) back to csrss.
-                let has_buf = m0 == win32k_host::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
+                let has_buf = m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE; // 0x10FA = NtUserProcessConnect
                 let (d_a1, blen) = if has_buf {
-                    let arg = win32k_host::WIN32K_ARG_VADDR;
-                    let n = a2.min(win32k_host::WIN32K_ARG_FRAMES * 0x1000);
-                    core::ptr::write_bytes(arg as *mut u8, 0, (win32k_host::WIN32K_ARG_FRAMES * 0x1000) as usize);
+                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                    let n = a2.min(win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000);
+                    core::ptr::write_bytes(arg as *mut u8, 0, (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize);
                     let mut off = 0u64;
                     while off + 8 <= n {
                         core::ptr::write_volatile((arg + off) as *mut u64, smss_stack_read(a1 + off));
@@ -1642,7 +1642,7 @@ pub(crate) unsafe fn service_sec_image(
                     W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
                 }
                 if has_buf && ok {
-                    let arg = win32k_host::WIN32K_ARG_VADDR;
+                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the
                     // USERCONNECT's siClient with pointers into its OWN session-space USER heap
                     // (gpsi / gHandleTable / the handle-entry array — all `UserHeapAlloc`ed), which
@@ -1651,12 +1651,12 @@ pub(crate) unsafe fn service_sec_image(
                     // siClient pointers (+ ulSharedDelta) to the csrss-relative client addresses so
                     // the client reads valid memory. delta = server(win32k) − client(csrss).
                     let delta = map_win32k_heap_into_csrss(pml4, pi);
-                    let heap_lo = win32k_host::WIN32K_HEAP_VADDR;
-                    let heap_hi = heap_lo + win32k_host::WIN32K_HEAP_FRAMES * 0x1000;
+                    let heap_lo = win32k_subsystem::WIN32K_HEAP_VADDR;
+                    let heap_hi = heap_lo + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000;
                     // The handler's own shift (0 in this single-AS host; be robust anyway): recover
                     // the raw server VA before applying our delta.
-                    let hd = core::ptr::read_volatile((arg + win32k_host::UC_SI_DELTA) as *const u64);
-                    for off in [win32k_host::UC_SI_PSI, win32k_host::UC_SI_AHELIST] {
+                    let hd = core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *const u64);
+                    for off in [win32k_subsystem::UC_SI_PSI, win32k_subsystem::UC_SI_AHELIST] {
                         let client = core::ptr::read_volatile((arg + off) as *const u64);
                         if client != 0 {
                             let server = client.wrapping_add(hd);
@@ -1668,8 +1668,8 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
-                    core::ptr::write_volatile((arg + win32k_host::UC_SI_DELTA) as *mut u64, delta);
-                    core::ptr::write_volatile((arg + win32k_host::UC_SI_PDISPINFO) as *mut u64, 0);
+                    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *mut u64, delta);
+                    core::ptr::write_volatile((arg + win32k_subsystem::UC_SI_PDISPINFO) as *mut u64, 0);
                     // Copy the fixed-up USERCONNECT back to csrss's stack.
                     let mut off = 0u64;
                     while off + 8 <= blen {
@@ -1685,7 +1685,7 @@ pub(crate) unsafe fn service_sec_image(
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
                 // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
                 // seeds the host prerequisites the display init depends on (the system font +
-                // WinSta0/Default Ob objects — see win32k_host::dispatch_loop's post-0x125a step). The
+                // WinSta0/Default Ob objects — see win32k_subsystem::dispatch_loop's post-0x125a step). The
                 // actual InitVideo/framebuf-surface bringup AND the paint now happen FULLY LAZILY from
                 // winlogon's OWN first GUI DC-op: NtUserSwitchDesktop → co_IntShowDesktop →
                 // co_UserRedrawWindow → WM_ERASEBKGND → UserGetDCEx(DCX_CACHE) → DceAllocDCE →

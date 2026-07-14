@@ -4,7 +4,7 @@
 //! per-class behavior — that every hosted `.sys` (FSD/npfs, Subsystem/win32k,
 //! KMDF) needs identically. They live here ONCE, in the executive image, and are
 //! registered by name into each driver class's [`DriverExportRegistry`]
-//! ([`crate::driver_launch`]'s `FSD_EXPORTS`, [`crate::win32k_host`]'s
+//! ([`crate::driver_launch`]'s `FSD_EXPORTS`, [`crate::win32k_subsystem`]'s
 //! `WIN32K_EXPORTS`). Because they run as executive `.text` mapped into each
 //! component's isolated VSpace (RWX-shared code), a single definition resolves to
 //! one VA reachable in every component.

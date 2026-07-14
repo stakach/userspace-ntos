@@ -31,7 +31,7 @@ mod kmdf_host;
 mod ntoskrnl_shared;
 mod server;
 mod win32k_pe;
-mod win32k_host;
+mod win32k_subsystem;
 mod storage_host;
 mod service_sec_image;
 pub(crate) use service_sec_image::*;
@@ -4677,7 +4677,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 (&DXGTHKBUF_START, DXGTHKBUF_VADDR, DXGTHKBUF_FRAMES),
                 (&FTFDBUF_START, FTFDBUF_VADDR, FTFDBUF_FRAMES),
                 (&FRAMEBUFBUF_START, FRAMEBUFBUF_VADDR, FRAMEBUFBUF_FRAMES),
-                (&FONTBUF_START, win32k_host::FONTBUF_VADDR, win32k_host::FONTBUF_FRAMES),
+                (&FONTBUF_START, win32k_subsystem::FONTBUF_VADDR, win32k_subsystem::FONTBUF_FRAMES),
             ] {
                 let pt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
@@ -5156,58 +5156,58 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for p in 0..2u64 {
                 let cpt = alloc_slot();
                 let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
-                let _ = paging_struct_map(cpt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_CODE_VA + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+                let _ = paging_struct_map(cpt, LBL_X86_PAGE_TABLE_MAP, win32k_subsystem::WIN32K_CODE_VA + p * 0x20_0000, CAP_INIT_THREAD_VSPACE);
             }
             let code_base = alloc_frame();
-            for _ in 1..win32k_host::WIN32K_IMAGE_FRAMES { let _ = alloc_frame(); }
-            for i in 0..win32k_host::WIN32K_IMAGE_FRAMES {
-                let _ = page_map(copy_cap(code_base + i), win32k_host::WIN32K_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            for _ in 1..win32k_subsystem::WIN32K_IMAGE_FRAMES { let _ = alloc_frame(); }
+            for i in 0..win32k_subsystem::WIN32K_IMAGE_FRAMES {
+                let _ = page_map(copy_cap(code_base + i), win32k_subsystem::WIN32K_CODE_VA + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             let pool_base = alloc_frame();
-            for _ in 1..win32k_host::WIN32K_POOL_FRAMES { let _ = alloc_frame(); }
+            for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES { let _ = alloc_frame(); }
             let data_base = alloc_frame();
-            for _ in 1..win32k_host::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
+            for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
             let shared = alloc_frame();
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame();
-            for _ in 1..win32k_host::WIN32K_ARG_FRAMES { let _ = alloc_frame(); }
+            for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES { let _ = alloc_frame(); }
             // The win32k session-heap arena (host-only; the executive doesn't map it). Retain the
             // frame-cap base so the connect marshaling can RO-map the global USER heap into a GUI
             // client's VSpace (the gSharedInfo client-mapping).
             let heap_base = alloc_frame();
-            for _ in 1..win32k_host::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
+            for _ in 1..win32k_subsystem::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
             // The aux-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718 + ARG
             // @0x071A; the pool is host-only, in its own window, so not mapped in the executive).
             let ppt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
-            let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_AUX_PT_VADDR, CAP_INIT_THREAD_VSPACE);
-            for i in 0..win32k_host::WIN32K_DATA_FRAMES {
-                let _ = page_map(copy_cap(data_base + i), win32k_host::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let _ = paging_struct_map(ppt, LBL_X86_PAGE_TABLE_MAP, win32k_subsystem::WIN32K_AUX_PT_VADDR, CAP_INIT_THREAD_VSPACE);
+            for i in 0..win32k_subsystem::WIN32K_DATA_FRAMES {
+                let _ = page_map(copy_cap(data_base + i), win32k_subsystem::WIN32K_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
-            let _ = page_map(copy_cap(shared), win32k_host::WIN32K_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
-            for i in 0..win32k_host::WIN32K_ARG_FRAMES {
-                let _ = page_map(copy_cap(arg_base + i), win32k_host::WIN32K_ARG_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let _ = page_map(copy_cap(shared), win32k_subsystem::WIN32K_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            for i in 0..win32k_subsystem::WIN32K_ARG_FRAMES {
+                let _ = page_map(copy_cap(arg_base + i), win32k_subsystem::WIN32K_ARG_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
             // Parse + copy sections + relocate + patch IAT. Fully HEAP-FREE + STACK-light: the
             // 128 KiB bump heap is exhausted by this point (after smss/csrss) and the rootserver
             // stack is only 16 KiB — load_into parses win32k.sys manually and records the W^X
             // frame rights into its own `static`.
-            let entry_rva = win32k_host::load_into(WIN32KBUF_VADDR, win32k_size).unwrap_or(0);
+            let entry_rva = win32k_subsystem::load_into(WIN32KBUF_VADDR, win32k_size).unwrap_or(0);
             print_str(b"[win32k-svc] loaded win32k.sys; DriverEntry rva=0x");
             print_hex(entry_rva);
             print_str(b"\n");
             check(b"win32k_loaded", entry_rva == win32k_pe::WIN32K_PE.entry_rva, &mut passed);
             core::ptr::write_volatile(
-                (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_ENTRY_RVA) as *mut u64,
+                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_ENTRY_RVA) as *mut u64,
                 entry_rva as u64,
             );
-            core::ptr::write_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *mut u32, 0);
+            core::ptr::write_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT) as *mut u32, 0);
             // Pass the staged system-font (.ttf) byte size so the host can feed it to
             // IntGdiAddFontMemResource at bring-up (storage reported it at STORAGE_SHARED+0x90).
             let font_sz = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x90) as *const u32);
             core::ptr::write_volatile(
-                (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_FONT_SIZE) as *mut u32,
+                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_FONT_SIZE) as *mut u32,
                 font_sz,
             );
             print_str(b"[win32k-svc] staged system font size=0x");
@@ -5221,46 +5221,46 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // (the storage host staged it into WIN32KBUF from the FS), so — like npfs — this is the
             // dynamic path; only the launch scaffolding was bespoke. The region map ORDER + every
             // `pts` value + the alloc sequence are reproduced EXACTLY (PAINT 768/768 @ 0x003a6ea5 is
-            // load-bearing). Component-side trampolines (win32k_host) are unchanged.
+            // load-bearing). Component-side trampolines (win32k_subsystem) are unchanged.
             let w_fault = make_object(OBJ_ENDPOINT);
             let host_pml4 = {
                 let stack_frames = 32u64; // 128 KiB — win32k init call chains are deep
                 let code_rights_static: &'static [u64] =
-                    core::mem::transmute::<&[u64], &'static [u64]>(win32k_host::code_rights());
+                    core::mem::transmute::<&[u64], &'static [u64]>(win32k_subsystem::code_rights());
                 let font_base = FONTBUF_START.load(Ordering::Relaxed);
                 let mut regions: [Region; 32] = [Region { source: FrameSource::Alias(0), base_va: 0, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 }; 32];
                 let mut n = 0usize;
                 // Heap (uses the pre-built heap PT — map_heap_pt=true).
                 regions[n] = Region { source: FrameSource::FreshZeroed, base_va: allocator::HEAP_BASE as u64, count: allocator::SERVICE_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
                 // win32k PE image, W^X, its own two 2 MiB PTs.
-                regions[n] = Region { source: FrameSource::Alias(code_base), base_va: win32k_host::WIN32K_CODE_VA, count: win32k_host::WIN32K_IMAGE_FRAMES, rights: Rights::PerFrame(code_rights_static), pts: 2 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(code_base), base_va: win32k_subsystem::WIN32K_CODE_VA, count: win32k_subsystem::WIN32K_IMAGE_FRAMES, rights: Rights::PerFrame(code_rights_static), pts: 2 }; n += 1;
                 // The aux PT window (DATA/SHARED/ARG live here) — a single PT built ahead of those frames.
-                regions[n] = Region { source: FrameSource::Alias(0), base_va: win32k_host::WIN32K_AUX_PT_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(0), base_va: win32k_subsystem::WIN32K_AUX_PT_VADDR, count: 0, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
                 // Pool arena (own window + PTs).
-                regions[n] = Region { source: FrameSource::Alias(pool_base), base_va: win32k_host::WIN32K_POOL_VADDR, count: win32k_host::WIN32K_POOL_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_POOL_FRAMES) }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(pool_base), base_va: win32k_subsystem::WIN32K_POOL_VADDR, count: win32k_subsystem::WIN32K_POOL_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_subsystem::WIN32K_POOL_FRAMES) }; n += 1;
                 // FreeType arena (own window + PTs, fresh frames).
-                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_FTYP_VADDR, count: win32k_host::WIN32K_FTYP_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_FTYP_FRAMES) }; n += 1;
+                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_subsystem::WIN32K_FTYP_VADDR, count: win32k_subsystem::WIN32K_FTYP_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_subsystem::WIN32K_FTYP_FRAMES) }; n += 1;
                 // GDI-attribute user-mode VM arena (own window + PTs, fresh frames).
-                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_host::WIN32K_USERVM_VADDR, count: win32k_host::WIN32K_USERVM_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_host::WIN32K_USERVM_FRAMES) }; n += 1;
+                regions[n] = Region { source: FrameSource::FreshZeroed, base_va: win32k_subsystem::WIN32K_USERVM_VADDR, count: win32k_subsystem::WIN32K_USERVM_FRAMES, rights: Rights::Uniform(RW_NX), pts: pts_for(win32k_subsystem::WIN32K_USERVM_FRAMES) }; n += 1;
                 // Staged system font (arial.ttf) — its own PT window, aliased frames (only if present).
                 if font_base != 0 {
-                    regions[n] = Region { source: FrameSource::Alias(font_base), base_va: win32k_host::FONTBUF_VADDR, count: win32k_host::FONTBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
+                    regions[n] = Region { source: FrameSource::Alias(font_base), base_va: win32k_subsystem::FONTBUF_VADDR, count: win32k_subsystem::FONTBUF_FRAMES, rights: Rights::Uniform(RW_NX), pts: 1 }; n += 1;
                 }
                 // DATA export region (aux PT window — no dedicated PT).
-                regions[n] = Region { source: FrameSource::Alias(data_base), base_va: win32k_host::WIN32K_DATA_VADDR, count: win32k_host::WIN32K_DATA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(data_base), base_va: win32k_subsystem::WIN32K_DATA_VADDR, count: win32k_subsystem::WIN32K_DATA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
                 // Shared handoff page (aux PT window).
-                regions[n] = Region { source: FrameSource::Alias(shared), base_va: win32k_host::WIN32K_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(shared), base_va: win32k_subsystem::WIN32K_SHARED_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
                 // Arg-marshal frame(s) (aux PT window).
-                regions[n] = Region { source: FrameSource::Alias(arg_base), base_va: win32k_host::WIN32K_ARG_VADDR, count: win32k_host::WIN32K_ARG_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(arg_base), base_va: win32k_subsystem::WIN32K_ARG_VADDR, count: win32k_subsystem::WIN32K_ARG_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
                 // Session-heap + Mm-view arena (own window + PTs, aliased frames).
-                regions[n] = Region { source: FrameSource::Alias(heap_base), base_va: win32k_host::WIN32K_HEAP_VADDR, count: win32k_host::WIN32K_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: win32k_host::WIN32K_HEAP_FRAMES / 512 }; n += 1;
+                regions[n] = Region { source: FrameSource::Alias(heap_base), base_va: win32k_subsystem::WIN32K_HEAP_VADDR, count: win32k_subsystem::WIN32K_HEAP_FRAMES, rights: Rights::Uniform(RW_NX), pts: win32k_subsystem::WIN32K_HEAP_FRAMES / 512 }; n += 1;
                 let d = ComponentDescriptor {
-                    entry: win32k_host::win32k_host_entry,
+                    entry: win32k_subsystem::win32k_subsystem_entry,
                     image_rights: Rights::Uniform(3), // RWX (trampolines + statics)
                     map_heap_pt: true,
                     // win32k's OWN stack at WIN32K_STACK_VADDR (NOT STACK_BASE — that VA must stay free
                     // for the per-client attach). Its own dedicated PT (128 KiB fits one PT).
-                    stack_base: win32k_host::WIN32K_STACK_VADDR,
+                    stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
                     stack_frames,
                     stack_dedicated_pt: true,
                     regions: &regions[..n],
@@ -5268,7 +5268,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     prio: 100,
                     // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed
                     // KPCR placeholder so those reads resolve (0) instead of faulting.
-                    gs_base: Some(win32k_host::WIN32K_KPCR_VA),
+                    gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
                 };
                 let sc = spawn_component(&d);
                 // Stash the globals the demand-map fault loop + per-client attach need. The stack frame
@@ -5280,7 +5280,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             };
 
             const DEMAND_CAP: u64 = 512;
-            let code_va = win32k_host::WIN32K_CODE_VA;
+            let code_va = win32k_subsystem::WIN32K_CODE_VA;
             let mut faults = 0u64;
             let mut demand = 0u64;
             let mut finished = false;
@@ -5310,7 +5310,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // RX image, or a runaway is a real wall — stop and report. Otherwise demand-map
                     // a zero page and resume.
                     let in_image = addr >= code_va
-                        && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+                        && addr < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
                     if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
                         wall_ip = ip;
                         wall_addr = addr;
@@ -5328,7 +5328,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
                     mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
-                } else if label == win32k_host::W32_DISPATCH_LABEL {
+                } else if label == win32k_subsystem::W32_DISPATCH_LABEL {
                     // DriverEntry+attach complete: the component reached its dispatch loop and sent
                     // its ready signal (fix A: a plain `send_done` on the fault EP). It is now blocked
                     // in `recv_req` awaiting a request — `win32k_dispatch` wakes it with a plain Send.
@@ -5364,11 +5364,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 load_framebuf_driver(host_pml4);
             }
 
-            let verdict = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_VERDICT) as *const u32);
-            let de_status = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_DE_STATUS) as *const i32);
-            let ssdt_base = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_SSDT_BASE) as *const u64);
-            let ssdt_count = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_SSDT_COUNT) as *const u32);
-            let pool_used = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_POOL_USED) as *const u64);
+            let verdict = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_VERDICT) as *const u32);
+            let de_status = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_DE_STATUS) as *const i32);
+            let ssdt_base = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SSDT_BASE) as *const u64);
+            let ssdt_count = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SSDT_COUNT) as *const u32);
+            let pool_used = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_POOL_USED) as *const u64);
             print_str(b"[win32k-svc] DriverEntry ");
             if finished {
                 print_str(b"RETURNED status=0x");
@@ -5394,7 +5394,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b" pool_used=0x");
             print_hex(pool_used as u32);
             print_str(b"\n");
-            if (verdict & win32k_host::V_SSDT) != 0 {
+            if (verdict & win32k_subsystem::V_SSDT) != 0 {
                 print_str(b"[win32k-svc] win32k registered its NtUser/NtGdi SSDT: base=0x");
                 print_hex((ssdt_base >> 32) as u32);
                 print_hex(ssdt_base as u32);
@@ -5404,24 +5404,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             // Phase 2c: report the per-process attach (win32k's process-create callout) + the SSN
             // 0x10FA (NtUserProcessConnect) dispatch through the SSDT.
-            let nt_handler = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_NTUSER_HANDLER) as *const u64);
-            let nt_status = core::ptr::read_volatile((win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_NTUSER_STATUS) as *const i32);
-            if (verdict & win32k_host::V_CALLOUT_ENTERED) != 0 {
+            let nt_handler = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_NTUSER_HANDLER) as *const u64);
+            let nt_status = core::ptr::read_volatile((win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_NTUSER_STATUS) as *const i32);
+            if (verdict & win32k_subsystem::V_CALLOUT_ENTERED) != 0 {
                 print_str(b"[win32k-svc] win32k process-create callout ");
-                if (verdict & win32k_host::V_CALLOUT_RETURNED) != 0 {
+                if (verdict & win32k_subsystem::V_CALLOUT_RETURNED) != 0 {
                     print_str(b"RETURNED");
                 } else {
                     print_str(b"ran then faulted (see backtrace)");
                 }
                 print_str(b"\n");
             }
-            if (verdict & win32k_host::V_NTUSER_ENTERED) != 0 {
+            if (verdict & win32k_subsystem::V_NTUSER_ENTERED) != 0 {
                 print_str(b"[win32k-svc] NtUserProcessConnect(0x10FA) via SSDT -> handler RVA=0x");
                 print_hex(nt_handler.wrapping_sub(code_va) as u32);
-                if (verdict & win32k_host::V_NTUSER_RETURNED) != 0 {
+                if (verdict & win32k_subsystem::V_NTUSER_RETURNED) != 0 {
                     print_str(b" RETURNED status=0x");
                     print_hex(nt_status as u32);
-                    if (verdict & win32k_host::V_NTUSER_SUCCESS) != 0 {
+                    if (verdict & win32k_subsystem::V_NTUSER_SUCCESS) != 0 {
                         print_str(b" (STATUS_SUCCESS)");
                     }
                 } else {
@@ -5431,7 +5431,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             // The routing seam works end-to-end: SSN>=0x1000 resolved to a real win32k handler
             // (verdict bit set before the fault-prone callout/connect, so this stays gate-stable).
-            check(b"win32k_ntuser_ssn_routed", (verdict & win32k_host::V_NTUSER_RESOLVED) != 0, &mut passed);
+            check(b"win32k_ntuser_ssn_routed", (verdict & win32k_subsystem::V_NTUSER_RESOLVED) != 0, &mut passed);
             // On a fault wall, backtrace: map the component's stack into the executive and print
             // every return address that lands in the win32k image, as an RVA — the call chain.
             if !finished {
@@ -5455,7 +5455,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(rsp as u32);
                     print_str(b" (win32k return-address RVAs, deepest first):\n");
                     let lo = code_va;
-                    let hi = code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+                    let hi = code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
                     let mut n = 0u32;
                     let mut va = start;
                     while va < stack_top && n < 20 {
@@ -5473,19 +5473,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // Progress checks: the component spawned and win32k's DriverEntry was ENTERED (its
             // trampoline-bound code ran) is the Phase-2b milestone. SSDT registration + full
             // STATUS_SUCCESS are further progress markers reported when reached.
-            check(b"win32k_driver_entry_entered", (verdict & win32k_host::V_ENTERED) != 0, &mut passed);
-            check(b"win32k_ssdt_registered", (verdict & win32k_host::V_SSDT) != 0, &mut passed);
+            check(b"win32k_driver_entry_entered", (verdict & win32k_subsystem::V_ENTERED) != 0, &mut passed);
+            check(b"win32k_ssdt_registered", (verdict & win32k_subsystem::V_SSDT) != 0, &mut passed);
             // Phase-2b milestone: GreDriverEntry ran through init and registered its NtUser/NtGdi
             // SSDT (the prerequisite for Phase-2c SSN>=0x1000 routing). Whether DriverEntry then ran
             // to STATUS_SUCCESS or stopped at the next missing init piece (RVA in the log above) is
             // reported non-gating — this check passes at the achieved milestone.
-            let progressed = (verdict & win32k_host::V_ENTERED) != 0
-                && (verdict & win32k_host::V_SSDT) != 0;
+            let progressed = (verdict & win32k_subsystem::V_ENTERED) != 0
+                && (verdict & win32k_subsystem::V_SSDT) != 0;
             check(b"win32k_gredriverentry_progressed", progressed, &mut passed);
             // The milestone: win32k's DriverEntry ran to completion and returned STATUS_SUCCESS.
             // V_SUCCESS is set right after DriverEntry returns 0, BEFORE the exploratory per-process
             // callout/connect below — so a fault there doesn't flip this gate-critical check.
-            let success = (verdict & win32k_host::V_SUCCESS) != 0;
+            let success = (verdict & win32k_subsystem::V_SUCCESS) != 0;
             if success {
                 print_str(b"[win32k-svc] DriverEntry ran to STATUS_SUCCESS\n");
             }
@@ -5498,16 +5498,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // sentinel = done). A clean round-trip (ok=true) proves csrss's win32k syscalls can be
             // routed to the live component. The arg frame stands in for csrss's user pointer.
             if finished {
-                core::ptr::write_bytes(win32k_host::WIN32K_ARG_VADDR as *mut u8, 0, 0x240);
+                core::ptr::write_bytes(win32k_subsystem::WIN32K_ARG_VADDR as *mut u8, 0, 0x240);
                 let (st, ok) = win32k_dispatch(
-                    win32k_host::SSN_NT_USER_INITIALIZE,
+                    win32k_subsystem::SSN_NT_USER_INITIALIZE,
                     0x0000_0000_5A5A_0100, // a process handle (ObReferenceObjectByHandle → EPROCESS)
-                    win32k_host::WIN32K_ARG_VADDR, // USERCONNECT buffer in the shared arg frame
+                    win32k_subsystem::WIN32K_ARG_VADDR, // USERCONNECT buffer in the shared arg frame
                     0x240,
                     0,
                 );
                 let seq = core::ptr::read_volatile(
-                    (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_REQ_SEQ) as *const u64,
+                    (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_REQ_SEQ) as *const u64,
                 );
                 print_str(b"[win32k-svc] DISPATCH-LOOP round-trip: SSN 0x10FA -> status=0x");
                 print_hex(st as u32);
@@ -5522,9 +5522,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // it via Send-on-REPLY_W32 + recv-with-r12 and resumes win32k, which returns the
                 // sentinel. A clean round-trip means the dispatch fault path no longer depends on
                 // reply_to — so a nested faulting SSN can't clobber an outer caller's pending reply.
-                let (fst, fok) = win32k_dispatch(win32k_host::SSN_TEST_FAULT, 0, 0, 0, 0);
+                let (fst, fok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
                 let fseq = core::ptr::read_volatile(
-                    (win32k_host::WIN32K_SHARED_VADDR + win32k_host::SH_REQ_SEQ) as *const u64,
+                    (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_REQ_SEQ) as *const u64,
                 );
                 print_str(b"[win32k-svc] FAULTING dispatch (reply-cap path): status=0x");
                 print_hex(fst as u32);
@@ -5533,7 +5533,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b")\n");
                 check(
                     b"win32k_dispatch_fault_via_reply_cap",
-                    fok && fst == win32k_host::TEST_FAULT_STATUS && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
+                    fok && fst == win32k_subsystem::TEST_FAULT_STATUS && REPLY_W32_SLOT.load(Ordering::Relaxed) != 0,
                     &mut passed,
                 );
             }

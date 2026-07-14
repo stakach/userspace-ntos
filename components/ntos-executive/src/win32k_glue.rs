@@ -5,14 +5,14 @@
 #![allow(clippy::all)]
 use crate::*;
 
-/// RO-map win32k's global USER heap arena ([`win32k_host::WIN32K_HEAP_VADDR`], where gpsi /
+/// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi /
 /// gHandleTable / the USER handle-entry array live) into the caller's (csrss's) VSpace at
-/// [`win32k_host::CSRSS_W32_SHARED_VA`], so the Win32 client can dereference the SHAREDINFO the
+/// [`win32k_subsystem::CSRSS_W32_SHARED_VA`], so the Win32 client can dereference the SHAREDINFO the
 /// USERCONNECT points at. Maps a fresh copy of each arena frame RO+NX (win32k keeps its own RW
 /// copy — coherent shared memory). One-time (guarded). Returns the server→client delta
 /// (`WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`) the marshaling applies to the siClient pointers.
 pub(crate) unsafe fn map_win32k_heap_into_csrss(pml4: u64, pi: usize) -> u64 {
-    let delta = win32k_host::WIN32K_HEAP_VADDR - win32k_host::CSRSS_W32_SHARED_VA;
+    let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
     // Per-process guard (bit `pi`): the arena is mapped into EACH GUI client's VSpace independently
     // (csrss = pi 1, winlogon = pi 2) at the same CSRSS_W32_SHARED_VA window, so the delta — hence
     // the siClient rewrite — is identical for both. A single bool would skip the 2nd client's map.
@@ -25,7 +25,7 @@ pub(crate) unsafe fn map_win32k_heap_into_csrss(pml4: u64, pi: usize) -> u64 {
         return delta;
     }
     const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER; // read-only, non-executable
-    let frames = win32k_host::WIN32K_HEAP_FRAMES;
+    let frames = win32k_subsystem::WIN32K_HEAP_FRAMES;
     // The 1 GiB PD covering 0x8000_0000..0xC000_0000 already exists in csrss (its DLL region shares
     // it). The CSRSS_W32_SHARED_VA window is fresh, so allocate + map one page table per 2 MiB
     // sub-range UP FRONT — deterministic, because the SYS_SEND `page_map` is fire-and-forget and
@@ -36,16 +36,16 @@ pub(crate) unsafe fn map_win32k_heap_into_csrss(pml4: u64, pi: usize) -> u64 {
         let _ = paging_struct_map(
             pt,
             LBL_X86_PAGE_TABLE_MAP,
-            win32k_host::CSRSS_W32_SHARED_VA + p * 0x20_0000,
+            win32k_subsystem::CSRSS_W32_SHARED_VA + p * 0x20_0000,
             pml4,
         );
     }
     for i in 0..frames {
         let cp = copy_cap(heap_base + i);
-        let _ = page_map(cp, win32k_host::CSRSS_W32_SHARED_VA + i * 0x1000, RO_NX, pml4);
+        let _ = page_map(cp, win32k_subsystem::CSRSS_W32_SHARED_VA + i * 0x1000, RO_NX, pml4);
     }
     print_str(b"[win32k-svc] RO-mapped win32k USER heap into csrss @0x");
-    print_hex(win32k_host::CSRSS_W32_SHARED_VA as u32);
+    print_hex(win32k_subsystem::CSRSS_W32_SHARED_VA as u32);
     print_str(b" (delta=0x");
     print_hex((delta >> 32) as u32);
     print_hex(delta as u32);
@@ -199,7 +199,7 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
 }
 
 /// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,
-/// to load) and win32k (W^X, to run). Reuses [`win32k_host::load_driver_into`]. `dxgthk_base` names
+/// to load) and win32k (W^X, to run). Reuses [`win32k_subsystem::load_driver_into`]. `dxgthk_base` names
 /// a prior-loaded dxgthk for import resolution (0 for a leaf). Returns (entry_rva, export_dir_rva,
 /// size_of_image). The reusable driver-loader mechanism (framebuf.dll will use it too).
 pub(crate) unsafe fn load_one_driver(
@@ -228,7 +228,7 @@ pub(crate) unsafe fn load_one_driver(
     for r in rights.iter_mut() {
         *r = RW_NX;
     }
-    let res = win32k_host::load_driver_into(
+    let res = win32k_subsystem::load_driver_into(
         src_va,
         dst_va,
         frames,
@@ -257,7 +257,7 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
         print_str(b"[win32k-svc] dxg/dxgthk not staged - DirectX gate will fail\n");
         return;
     }
-    if load_one_driver(DXGTHKBUF_VADDR, win32k_host::DXGTHK_VA, win32k_host::DXGTHK_LOAD_FRAMES, host_pml4, 0)
+    if load_one_driver(DXGTHKBUF_VADDR, win32k_subsystem::DXGTHK_VA, win32k_subsystem::DXGTHK_LOAD_FRAMES, host_pml4, 0)
         .is_none()
     {
         print_str(b"[win32k-svc] dxgthk load failed\n");
@@ -265,13 +265,13 @@ pub(crate) unsafe fn load_directx_drivers(host_pml4: u64) {
     }
     match load_one_driver(
         DXGBUF_VADDR,
-        win32k_host::DXG_VA,
-        win32k_host::DXG_LOAD_FRAMES,
+        win32k_subsystem::DXG_VA,
+        win32k_subsystem::DXG_LOAD_FRAMES,
         host_pml4,
-        win32k_host::DXGTHK_VA,
+        win32k_subsystem::DXGTHK_VA,
     ) {
         Some((entry, expdir, len)) => {
-            win32k_host::record_dxg(entry, expdir, len);
+            win32k_subsystem::record_dxg(entry, expdir, len);
             print_str(b"[win32k-svc] hosted dxg.sys + dxgthk.sys: entry_rva=0x");
             print_hex(entry);
             print_str(b" export_dir_rva=0x");
@@ -298,13 +298,13 @@ pub(crate) unsafe fn load_ftfd_driver(host_pml4: u64) {
     }
     match load_one_driver(
         FTFDBUF_VADDR,
-        win32k_host::FTFD_VA,
-        win32k_host::FTFD_LOAD_FRAMES,
+        win32k_subsystem::FTFD_VA,
+        win32k_subsystem::FTFD_LOAD_FRAMES,
         host_pml4,
         0,
     ) {
         Some((entry, _expdir, len)) => {
-            let patched = win32k_host::patch_win32k_ftfd_imports(win32k_host::FTFD_VA);
+            let patched = win32k_subsystem::patch_win32k_ftfd_imports(win32k_subsystem::FTFD_VA);
             print_str(b"[win32k-svc] hosted ftfd.dll: entry_rva=0x");
             print_hex(entry);
             print_str(b" len=0x");
@@ -331,13 +331,13 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
     }
     match load_one_driver(
         FRAMEBUFBUF_VADDR,
-        win32k_host::FRAMEBUF_VA,
-        win32k_host::FRAMEBUF_LOAD_FRAMES,
+        win32k_subsystem::FRAMEBUF_VA,
+        win32k_subsystem::FRAMEBUF_LOAD_FRAMES,
         host_pml4,
         0,
     ) {
         Some((entry, expdir, len)) => {
-            win32k_host::record_framebuf(entry, expdir, len);
+            win32k_subsystem::record_framebuf(entry, expdir, len);
             print_str(b"[win32k-svc] hosted framebuf.dll: entry_rva=0x");
             print_hex(entry);
             print_str(b" (DrvEnableDriver) len=0x");
@@ -353,16 +353,16 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
         for p in 0..(count + 511) / 512 {
             let pt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, win32k_host::WIN32K_FB_VA + p * 0x20_0000, host_pml4);
+            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, win32k_subsystem::WIN32K_FB_VA + p * 0x20_0000, host_pml4);
         }
         for i in 0..count {
-            let _ = page_map(copy_cap(base + i), win32k_host::WIN32K_FB_VA + i * 0x1000, RW_NX, host_pml4);
+            let _ = page_map(copy_cap(base + i), win32k_subsystem::WIN32K_FB_VA + i * 0x1000, RW_NX, host_pml4);
         }
         print_str(b"[win32k-svc] mapped BOOTBOOT framebuffer into win32k: ");
         print_u64(count);
         print_str(b" frames @ WIN32K_FB_VA=0x");
-        print_hex((win32k_host::WIN32K_FB_VA >> 32) as u32);
-        print_hex(win32k_host::WIN32K_FB_VA as u32);
+        print_hex((win32k_subsystem::WIN32K_FB_VA >> 32) as u32);
+        print_hex(win32k_subsystem::WIN32K_FB_VA as u32);
         print_str(b"\n");
     }
 }
@@ -384,14 +384,14 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
     let client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
     w32_client_attach(client_pi);
-    let sh = win32k_host::WIN32K_SHARED_VADDR;
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_SSN) as *mut u64, ssn);
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A0) as *mut u64, a0);
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A1) as *mut u64, a1);
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A2) as *mut u64, a2);
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_A3) as *mut u64, a3);
-    core::ptr::write_volatile((sh + win32k_host::SH_REQ_STATUS) as *mut i32, 0);
-    let code_va = win32k_host::WIN32K_CODE_VA;
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *mut u64, ssn);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A2) as *mut u64, a2);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A3) as *mut u64, a3);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *mut i32, 0);
+    let code_va = win32k_subsystem::WIN32K_CODE_VA;
     // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
     // many pages and trips many checked-build asserts; allow generous headroom (still bounded).
     const DEMAND_CAP: u64 = 8192;
@@ -409,7 +409,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     // the (A) caveat where a nested faulting SSN clobbered `reply_to`. The DONE signal is still a
     // plain Send (no cap), distinguished by its label. cptr 0 (pre-retype) falls back to reply_to.
     let rw = REPLY_W32_SLOT.load(Ordering::Relaxed);
-    ep_send(w_fault, win32k_host::W32_DISPATCH_LABEL);
+    ep_send(w_fault, win32k_subsystem::W32_DISPATCH_LABEL);
     let (_b0, mut mi, mut m0, mut m1, mut m2, mut m3) = if rw != 0 {
         recv_full_r12(w_fault, rw)
     } else {
@@ -420,7 +420,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         if label == 6 {
             let addr = m1;
             let in_image =
-                addr >= code_va && addr < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+                addr >= code_va && addr < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
             // A foreign CLIENT pointer: the handler dereferenced a csrss/user32/gdi32/winlogon USER
             // pointer directly. Rather than zero-fill (WRONG data), SHARE the current client's OWN
             // frame for that page into win32k at the same VA — the authentic model where win32k
@@ -487,11 +487,11 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             m1 = nm1;
             continue;
         }
-        if label == win32k_host::W32_DISPATCH_LABEL {
+        if label == win32k_subsystem::W32_DISPATCH_LABEL {
             // The component sent its DONE signal (a plain Send) — handler finished. Read back the
             // status. The component then loops to `recv_req` (blocked), ready for the next dispatch.
             let _ = m0;
-            let status = core::ptr::read_volatile((sh + win32k_host::SH_REQ_STATUS) as *const i32);
+            let status = core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *const i32);
             return (status, true);
         }
         if label == 3 {
@@ -502,7 +502,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             // lock-ownership + context asserts that a real multi-threaded kernel wouldn't; the
             // underlying operation is fine. m0 = FaultIP.
             let ip = m0;
-            let in_win32k = ip >= code_va && ip < code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+            let in_win32k = ip >= code_va && ip < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
             let is_int2c = in_win32k
                 && core::ptr::read_volatile(ip as *const u8) == 0xCD
                 && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
@@ -533,7 +533,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         print_str(b" RVA=0x");
         print_hex(m0.wrapping_sub(code_va) as u32);
         print_str(b" dxgRVA=0x");
-        print_hex(m0.wrapping_sub(win32k_host::DXG_VA) as u32);
+        print_hex(m0.wrapping_sub(win32k_subsystem::DXG_VA) as u32);
         print_str(b" m1=0x");
         print_hex((m1 >> 32) as u32);
         print_hex(m1 as u32);
@@ -586,12 +586,12 @@ pub(crate) unsafe fn win32k_dispatch_backtrace() {
         WIN32K_DISP_BT_PT.store(1, Ordering::Relaxed);
     }
     let rsp = tcb_read_rsp(tcb);
-    let sbase = win32k_host::WIN32K_STACK_VADDR;
+    let sbase = win32k_subsystem::WIN32K_STACK_VADDR;
     let stack_top = sbase + sf * 0x1000;
     let start = if rsp >= sbase && rsp < stack_top { rsp } else { sbase };
-    let code_va = win32k_host::WIN32K_CODE_VA;
+    let code_va = win32k_subsystem::WIN32K_CODE_VA;
     let lo = code_va;
-    let hi = code_va + win32k_host::WIN32K_IMAGE_FRAMES * 0x1000;
+    let hi = code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
     print_str(b"[w32disp] backtrace rsp=0x");
     print_hex((rsp >> 32) as u32);
     print_hex(rsp as u32);
