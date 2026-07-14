@@ -376,6 +376,12 @@ pub const SSN_NT_TERMINATE_THREAD: u64 = 267;
 pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
 /// ntdll's NtOpenDirectoryObject SSN (SmpInit opens \?? for DosDevices; served by the object ns).
 pub const SSN_NT_OPEN_DIRECTORY_OBJECT: u64 = 119;
+/// NtQueryDirectoryObject SSN (sysfuncs.lst line 153 = SSN 152). ntdll's named-object path
+/// enumerates \BaseNamedObjects when services' SCM CreateEventW resolves a named event.
+pub const SSN_NT_QUERY_DIRECTORY_OBJECT: u64 = 152;
+/// NtOpenEvent SSN (sysfuncs.lst line 121 = SSN 120). CreateEventW's ERROR_ALREADY_EXISTS
+/// fallback + OpenEventW open an existing named event in \BaseNamedObjects.
+pub const SSN_NT_OPEN_EVENT: u64 = 120;
 /// NtCreateSymbolicLinkObject SSN (SmpInit creates the drive-letter links in \??). SSN = sysfuncs
 /// line 55 − 1.
 pub const SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT: u64 = 54;
@@ -1946,9 +1952,13 @@ struct ObjEntry {
     name: [u8; 40],   // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
     parent: u8,       // index of the parent directory; 0xFF = the root itself
-    kind: u8,         // 0 = directory, 1 = symbolic link
+    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event
     target: [u8; 40], // symbolic-link target (kind == 1)
     target_len: u8,
+    // kind == 2 (event): the signalled state. Named events registered in \BaseNamedObjects
+    // (services' SCM_START_EVENT/LSA_RPC_SERVER_ACTIVE/…) live here as real executive objects
+    // keyed by name; SetEvent/ResetEvent are modelled as flips of this flag.
+    signalled: u8,
 }
 impl ObjEntry {
     fn dir(name: &[u8], parent: u8) -> Self {
@@ -1959,6 +1969,7 @@ impl ObjEntry {
             kind: 0,
             target: [0; 40],
             target_len: 0,
+            signalled: 0,
         };
         let n = name.len().min(40);
         e.name[..n].copy_from_slice(&name[..n]);
@@ -2311,6 +2322,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),
             (NativeService::NtCreateEvent, SSN_NT_CREATE_EVENT as u32),
+            (NativeService::NtOpenEvent, SSN_NT_OPEN_EVENT as u32),
             (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
             (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),
@@ -2342,6 +2354,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtWaitForSingleObject, 281),
             (NativeService::NtOpenDirectoryObject, SSN_NT_OPEN_DIRECTORY_OBJECT as u32),
             (NativeService::NtCreateDirectoryObject, SSN_NT_CREATE_DIRECTORY_OBJECT as u32),
+            (NativeService::NtQueryDirectoryObject, SSN_NT_QUERY_DIRECTORY_OBJECT as u32),
             (NativeService::NtCreateSymbolicLinkObject, SSN_NT_CREATE_SYMBOLIC_LINK_OBJECT as u32),
             (NativeService::NtOpenSymbolicLinkObject, SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32),
             // Workstream A batch 4 (group B2): out-writing query services (queued-write drain).
@@ -2632,6 +2645,14 @@ static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BasepIsProcessAllowed's AppCertDlls open spuriously succeed → RtlQueryRegistryValues fails
 /// c0000002 → "Process not allowed to launch"). The keyboard path runs long before services create.
 static SERVICES_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
+/// SERVICE 8 — count of REAL named events services (pi 3) registered in \BaseNamedObjects via
+/// NtCreateEvent (SCM_START_EVENT / SC_AutoStartComplete / LSA_RPC_SERVER_ACTIVE / …). Drives the
+/// `exec_services_named_events` milestone spec: the SCM's CreateEventW now resolves real event
+/// objects + gets a valid handle back (was: no out-handle → CreateEventW returned NULL → wall).
+pub(crate) static SERVICES_NAMED_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// SERVICE 8 — count of NtQueryDirectoryObject enumerations serviced for pi 3 (ntdll's named-object
+/// path walking \BaseNamedObjects). Drives the `exec_services_query_dir_object` spec (was the wall).
+pub(crate) static SERVICES_QUERY_DIR_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's Win32 CreateProcessW (NtCreateProcessEx) spawns services.exe as the 4th hosted
 /// process (badge 6) — its ntdll loader then runs, multiplexed by badge. Read by the milestone spec.
 static SERVICES_SPAWNED: AtomicU64 = AtomicU64::new(0);
@@ -5806,6 +5827,29 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b"[ntos-exec] win32k per-process connect mask=0x");
                     print_hex(W32_CONNECTED_MASK.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
+                    // ★ SERVICE 8 — services' SCM creates REAL named events in \BaseNamedObjects
+                    // (SCM_START_EVENT / SC_AutoStartComplete / LSA_RPC_SERVER_ACTIVE / …) via
+                    // NtCreateEvent: the named-event object is registered + the handle written back
+                    // (was: no out-handle → CreateEventW returned NULL → wall). And ntdll's named-object
+                    // path (NtQueryDirectoryObject enumerating \BaseNamedObjects) is serviced — the SSN
+                    // 152 wall is gone. Past both, the SCM advances through CreateEventW(SCM_START/
+                    // AUTOSTARTCOMPLETE) → ScmCreateServiceDatabase → RPC-server startup
+                    // (NtCreateNamedPipeFile \pipe\ntsvcs). Waits still return immediately (no deadlock).
+                    check(
+                        b"exec_services_named_events",
+                        SERVICES_NAMED_EVENTS.load(Ordering::Relaxed) >= 2,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_services_query_dir_object",
+                        SERVICES_QUERY_DIR_OBJECT.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] SERVICE 8: services named-events=0x");
+                    print_hex(SERVICES_NAMED_EVENTS.load(Ordering::Relaxed) as u32);
+                    print_str(b" query-dir-object=0x");
+                    print_hex(SERVICES_QUERY_DIR_OBJECT.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     // Path 1b — process-local dense handle VALUES. Two distinct EPROCESSes both hold
                     // handle 0x4 referring to DIFFERENT objects (0b111 = same-value + distinct-object
                     // + no-aliasing). The on-kernel proof that handle namespaces are per-process.
@@ -5982,7 +6026,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/94 executive->isolated-service checks passed]\n");
+    print_str(b"/96 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

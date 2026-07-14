@@ -96,6 +96,9 @@ pub enum NativeService {
     NtCreatePort,
     NtCreateThread,
     NtCreateEvent,
+    // NtOpenEvent — open an existing named event in \BaseNamedObjects (CreateEventW's
+    // ERROR_ALREADY_EXISTS fallback + OpenEventW). Resolved against the executive object namespace.
+    NtOpenEvent,
     NtCreateSemaphore,
     // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
     // SURT. The message data plane (request/reply/receive) is served directly by the executive
@@ -129,6 +132,9 @@ pub enum NativeService {
     NtQueryInformationToken,
     NtOpenDirectoryObject,
     NtCreateDirectoryObject,
+    // NtQueryDirectoryObject — enumerate a directory object's entries (ntdll's named-object path
+    // walks \BaseNamedObjects). Served from the executive object namespace.
+    NtQueryDirectoryObject,
     NtCreateSymbolicLinkObject,
     NtOpenSymbolicLinkObject,
     // Group B2: out-writing query services whose out-ptr may be an arbitrary hosted VA (demand-
@@ -187,6 +193,7 @@ impl NativeService {
             NtCreatePort => "NtCreatePort",
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
+            NtOpenEvent => "NtOpenEvent",
             NtCreateSemaphore => "NtCreateSemaphore",
             NtConnectPort => "NtConnectPort",
             NtSecureConnectPort => "NtSecureConnectPort",
@@ -210,6 +217,7 @@ impl NativeService {
             NtQueryInformationToken => "NtQueryInformationToken",
             NtOpenDirectoryObject => "NtOpenDirectoryObject",
             NtCreateDirectoryObject => "NtCreateDirectoryObject",
+            NtQueryDirectoryObject => "NtQueryDirectoryObject",
             NtCreateSymbolicLinkObject => "NtCreateSymbolicLinkObject",
             NtOpenSymbolicLinkObject => "NtOpenSymbolicLinkObject",
             NtQueryPerformanceCounter => "NtQueryPerformanceCounter",
@@ -243,7 +251,10 @@ impl NativeService {
             NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtCreateProcess
             | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
-            | NtOpenSymbolicLinkObject => (0, 4),
+            | NtOpenSymbolicLinkObject | NtOpenEvent => (0, 4),
+            // NtQueryDirectoryObject(Handle, Buffer, Length, ReturnSingleEntry, RestartScan,
+            // *Context, *ReturnLength): the handler reads out-ptrs via register/stack helpers → cap.
+            NtQueryDirectoryObject => (0, 4),
             NtEnumerateValueKey => (6, 6),
             NtQueryKey => (5, 5),
             NtQuerySystemInformation => (4, 4),
@@ -308,6 +319,7 @@ impl NativeService {
         NativeService::NtCreatePort,
         NativeService::NtCreateThread,
         NativeService::NtCreateEvent,
+        NativeService::NtOpenEvent,
         NativeService::NtCreateSemaphore,
         NativeService::NtConnectPort,
         NativeService::NtSecureConnectPort,
@@ -331,6 +343,7 @@ impl NativeService {
         NativeService::NtQueryInformationToken,
         NativeService::NtOpenDirectoryObject,
         NativeService::NtCreateDirectoryObject,
+        NativeService::NtQueryDirectoryObject,
         NativeService::NtCreateSymbolicLinkObject,
         NativeService::NtOpenSymbolicLinkObject,
         NativeService::NtQueryPerformanceCounter,

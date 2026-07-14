@@ -1734,9 +1734,92 @@ impl NativeSyscallHandler for ExecNtHandler {
                         self.csrss_event_handles[1] = h;
                     }
                     self.csrss_event_n += 1;
+                    return 0; // csrss win32k-forward path is BYTE-IDENTICAL (no out-write)
                 }
-                0
+                // Services (pi 3): CreateEventW(SCM_START_EVENT/AUTOSTARTCOMPLETE/LSA_RPC_SERVER_ACTIVE/
+                // SECURITY_SERVICES_STARTED). NtCreateEvent(*EventHandle[R10]=args[0], ACCESS,
+                // *OA[R8]=args[2], EVENT_TYPE, InitialState). Register a REAL named event object in the
+                // executive object namespace (kind==2) keyed by the OA name (rooted at the OA's
+                // RootDirectory = the \BaseNamedObjects handle BaseGetNamedObjectDirectory returned),
+                // write the handle back, and report STATUS_OBJECT_NAME_EXISTS if it already existed
+                // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event (empty OA name) just
+                // mints a bare handle. The PHANDLE (R10) may be a DLL .data global → xas_write_u64.
+                if self.pi == 3 { unsafe {
+                    let out = args[0]; // R10 = *EventHandle
+                    let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
+                    // EventType[R9]=args[3], InitialState is the 5th arg (stack [sp+0x28]).
+                    let init_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1;
+                    if oa == 0 {
+                        self.xas_write_u64(out, h);
+                        return 0;
+                    }
+                    let mut rd = [0u8; 8];
+                    let _ = self.xas_read(oa + 8, &mut rd);
+                    let root_dir = u64::from_le_bytes(rd);
+                    let name16 = self.read_objattr_name_pe(oa);
+                    if name16.is_empty() {
+                        self.xas_write_u64(out, h);
+                        return 0;
+                    }
+                    let mut nbuf = [0u8; 40];
+                    let nlen = Self::fold_name(&name16, &mut nbuf);
+                    let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                        (root_dir - OBJ_HANDLE_BASE) as usize
+                    } else {
+                        // Named event with no BnO root handle → default to \BaseNamedObjects.
+                        self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                    };
+                    let existed = self.obj_resolve(&nbuf[..nlen], root_idx)
+                        .map_or(false, |i| self.obj_ns[i].kind == 2);
+                    match self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
+                        Some(i) => {
+                            if !existed {
+                                self.obj_ns[i].signalled = init_state as u8;
+                            }
+                            self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
+                            SERVICES_NAMED_EVENTS.fetch_add(1, Ordering::Relaxed);
+                            if existed { 0x4000_0000 } else { 0 } // STATUS_OBJECT_NAME_EXISTS : SUCCESS
+                        }
+                        None => {
+                            self.xas_write_u64(out, h);
+                            0
+                        }
+                    }
+                } } else {
+                    0
+                }
             }
+            // NtOpenEvent(*EventHandle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]). CreateEventW's
+            // ERROR_ALREADY_EXISTS fallback + OpenEventW resolve an existing named event. Return the
+            // registered event's handle, or STATUS_OBJECT_NAME_NOT_FOUND if it doesn't exist (so the
+            // create-then-open logic behaves). Scoped to services (pi 3).
+            NativeService::NtOpenEvent => unsafe {
+                if self.pi != 3 {
+                    let h = self.mint_handle();
+                    self.queue_write(args[0], h);
+                    return 0;
+                }
+                let out = args[0];
+                let oa = args[2];
+                let mut rd = [0u8; 8];
+                let _ = self.xas_read(oa + 8, &mut rd);
+                let root_dir = u64::from_le_bytes(rd);
+                let name16 = self.read_objattr_name_pe(oa);
+                let mut nbuf = [0u8; 40];
+                let nlen = Self::fold_name(&name16, &mut nbuf);
+                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
+                    (root_dir - OBJ_HANDLE_BASE) as usize
+                } else {
+                    self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                };
+                match self.obj_resolve(&nbuf[..nlen], root_idx) {
+                    Some(i) if self.obj_ns[i].kind == 2 => {
+                        self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
+                        0
+                    }
+                    _ => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
             // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
             NativeService::NtOpenProcessToken => unsafe {
                 let out = get_recv_mr(7); // R8
@@ -1920,6 +2003,153 @@ impl NativeSyscallHandler for ExecNtHandler {
                         0
                     }
                     None => 0xC0000034, // STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            },
+            // NtQueryDirectoryObject(DirectoryHandle[R10]=args[0], Buffer[RDX]=args[1],
+            // Length[R8]=args[2], ReturnSingleEntry[R9]=args[3], RestartScan[sp+0x28],
+            // *Context[sp+0x30], *ReturnLength[sp+0x38]). ntdll's named-object path enumerates
+            // \BaseNamedObjects. Enumerate the target directory's children as
+            // OBJECT_DIRECTORY_INFORMATION records (x64: {UNICODE_STRING Name; UNICODE_STRING
+            // TypeName;} = 0x20 bytes each), terminated by a zero record, followed by the UTF-16
+            // name/type strings; return STATUS_NO_MORE_ENTRIES when the directory has no more
+            // entries. Context is the next-child index (0 on RestartScan). Scoped to services (pi 3).
+            NativeService::NtQueryDirectoryObject => unsafe {
+                SERVICES_QUERY_DIR_OBJECT.fetch_add(1, Ordering::Relaxed);
+                let dir_handle = args[0];
+                let buf = args[1];
+                let length = args[2];
+                let return_single = args[3] & 1;
+                let sp = get_recv_mr(16);
+                let restart_scan = smss_stack_read(sp + 0x28) & 1;
+                let context_ptr = smss_stack_read(sp + 0x30);
+                let retlen_ptr = smss_stack_read(sp + 0x38);
+                let dir_idx = if dir_handle >= OBJ_HANDLE_BASE {
+                    (dir_handle - OBJ_HANDLE_BASE) as usize
+                } else {
+                    // A predefined \BaseNamedObjects handle we may not have minted (defensive).
+                    self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                };
+                // Starting child ordinal: 0 on RestartScan, else the captured Context.
+                let mut start = if restart_scan != 0 {
+                    0u64
+                } else if context_ptr != 0 {
+                    let mut c = [0u8; 4];
+                    let _ = self.xas_read(context_ptr, &mut c);
+                    u32::from_le_bytes(c) as u64
+                } else {
+                    0
+                };
+                // Collect this directory's children (by insertion index) beyond `start`.
+                let mut children: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                for (i, e) in self.obj_ns.iter().enumerate() {
+                    if e.parent as usize == dir_idx && i != dir_idx {
+                        children.push(i);
+                    }
+                }
+                let total = children.len() as u64;
+                if start >= total {
+                    // No more entries — the standard empty/end result.
+                    if retlen_ptr != 0 {
+                        self.xas_write_buf(retlen_ptr, &0u32.to_le_bytes()); // *ReturnLength = 0 (ULONG)
+                    }
+                    0x8000_001A // STATUS_NO_MORE_ENTRIES
+                } else {
+                    // Emit records + strings into the caller's buffer. Each record is 0x20 bytes;
+                    // there is one terminating zero record, then the strings. Emit as many as fit
+                    // (or one, if ReturnSingleEntry). The type name is "Event"/"Directory"/
+                    // "SymbolicLink" per kind.
+                    const REC: u64 = 0x20;
+                    // First pass: choose how many entries to emit.
+                    let mut records: alloc::vec::Vec<(alloc::vec::Vec<u16>, &'static str)> =
+                        alloc::vec::Vec::new();
+                    let mut idx = start as usize;
+                    while idx < children.len() {
+                        let e = &self.obj_ns[children[idx]];
+                        let name16: alloc::vec::Vec<u16> =
+                            e.name().iter().map(|&b| b as u16).collect();
+                        let type_name = match e.kind {
+                            2 => "Event",
+                            1 => "SymbolicLink",
+                            _ => "Directory",
+                        };
+                        records.push((name16, type_name));
+                        idx += 1;
+                        if return_single != 0 {
+                            break;
+                        }
+                        // Bound the batch by the caller's buffer length (records + strings + null rec).
+                        let mut needed = REC; // terminating null record
+                        for (n, t) in &records {
+                            needed += REC + (n.len() as u64 + 1) * 2 + (t.len() as u64 + 1) * 2;
+                        }
+                        if needed > length {
+                            records.pop();
+                            idx -= 1;
+                            break;
+                        }
+                    }
+                    let emitted = records.len();
+                    // Layout: [records...][null record][name0,type0,name1,type1,...] (UTF-16 null-term).
+                    let rec_area = REC * (emitted as u64 + 1);
+                    let mut str_off = rec_area;
+                    let mut total_len = rec_area;
+                    for (n, t) in &records {
+                        total_len += (n.len() as u64 + 1) * 2 + (t.len() as u64 + 1) * 2;
+                    }
+                    for (k, (n, t)) in records.iter().enumerate() {
+                        let rec_base = buf + REC * k as u64;
+                        // Name UNICODE_STRING {Length, MaxLength, pad, Buffer}
+                        let name_bytes = (n.len() as u64) * 2;
+                        let name_buf_va = buf + str_off;
+                        self.xas_write_u64(
+                            rec_base,
+                            (name_bytes) | ((name_bytes + 2) << 16),
+                        );
+                        self.xas_write_u64(rec_base + 8, name_buf_va);
+                        // TypeName UNICODE_STRING
+                        let type_bytes = (t.len() as u64) * 2;
+                        // write name string
+                        let mut nb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        for &w in n {
+                            nb.extend_from_slice(&w.to_le_bytes());
+                        }
+                        nb.extend_from_slice(&0u16.to_le_bytes());
+                        self.xas_write_buf(name_buf_va, &nb);
+                        str_off += name_bytes + 2;
+                        let type_buf_va = buf + str_off;
+                        self.xas_write_u64(
+                            rec_base + 0x10,
+                            (type_bytes) | ((type_bytes + 2) << 16),
+                        );
+                        self.xas_write_u64(rec_base + 0x18, type_buf_va);
+                        let mut tb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        for c in t.encode_utf16() {
+                            tb.extend_from_slice(&c.to_le_bytes());
+                        }
+                        tb.extend_from_slice(&0u16.to_le_bytes());
+                        self.xas_write_buf(type_buf_va, &tb);
+                        str_off += type_bytes + 2;
+                    }
+                    // Terminating zero record.
+                    let term = buf + REC * emitted as u64;
+                    self.xas_write_u64(term, 0);
+                    self.xas_write_u64(term + 8, 0);
+                    self.xas_write_u64(term + 0x10, 0);
+                    self.xas_write_u64(term + 0x18, 0);
+                    start += emitted as u64;
+                    if context_ptr != 0 {
+                        // Context is a PULONG — write only 4 bytes.
+                        self.xas_write_buf(context_ptr, &(start as u32).to_le_bytes());
+                    }
+                    if retlen_ptr != 0 {
+                        self.xas_write_buf(retlen_ptr, &(total_len as u32).to_le_bytes());
+                    }
+                    // STATUS_MORE_ENTRIES if more remain, else SUCCESS.
+                    if start < total {
+                        0x0000_0105 // STATUS_MORE_ENTRIES
+                    } else {
+                        0
+                    }
                 }
             },
             // NtCreateSymbolicLinkObject(*Handle[R10]=args[0], access, *OA[R8]=args[2],
