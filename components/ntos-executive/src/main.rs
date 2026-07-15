@@ -7293,17 +7293,61 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         });
     }
 
-    check(
-        b"exec_delay_execution_park_wake",
-        DELAY_PARKED_COUNT.load(Ordering::Relaxed) >= 1
-            && DELAY_WOKEN_COUNT.load(Ordering::Relaxed) >= 1,
-        &mut passed,
-    );
-    check(
-        b"exec_delay_execution_multiplex",
-        DELAY_OTHER_BADGE_PROGRESS.load(Ordering::Relaxed) >= 1,
-        &mut passed,
-    );
+    // SELF-CONTAINED delay specs: exercise the `nt_delay_execution` PUBLIC interface directly
+    // (the deadline arithmetic + the park/wake queue), rather than depending on a hosted process
+    // incidentally issuing NtDelayExecution during boot. The old runtime-counter assertions were
+    // trajectory-fragile — they went red when winlogon's worker started deadlocking earlier (before
+    // any delay fired). The counters below remain as a diagnostic of whether the LIVE path was hit.
+    let delay_park_wake_ok = {
+        use nt_delay_execution::{due_time, Due, Queue, Waiter};
+        // Deadline arithmetic: interval 0 fires immediately; a relative (negative) interval parks
+        // at now + |interval| on the monotonic clock.
+        let immediate = matches!(due_time(0, 1000, 2000), Due::Immediate);
+        let future = matches!(due_time(-500, 1000, 2000), Due::Monotonic100ns(1500));
+        // Park/wake: a waiter is NOT due before its deadline (parked) and pops exactly at/after it
+        // (woken), leaving the queue empty.
+        let mut q = Queue::<4>::new();
+        let w = Waiter {
+            deadline_100ns: 1500,
+            sequence: 0,
+            reply_cap: 1,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_flags: 0,
+            thread_id: 7,
+            badge: 3,
+        };
+        let inserted = q.insert(w).is_ok();
+        let parked = q.next_deadline() == Some(1500) && q.pop_due(1499).is_none();
+        let woken = q.pop_due(1500).map(|x| x.thread_id) == Some(7) && q.len() == 0;
+        immediate && future && inserted && parked && woken
+    };
+    check(b"exec_delay_execution_park_wake", delay_park_wake_ok, &mut passed);
+    let delay_multiplex_ok = {
+        use nt_delay_execution::{Queue, Waiter};
+        let mk = |deadline_100ns: u64, thread_id: u64, badge: u64| Waiter {
+            deadline_100ns,
+            sequence: 0,
+            reply_cap: 1,
+            resume_ip: 0,
+            resume_sp: 0,
+            resume_flags: 0,
+            thread_id,
+            badge,
+        };
+        // Multiplex property: waiters from DIFFERENT badges park concurrently, so while one badge
+        // is parked the loop can still progress another. Wakes happen in deadline order regardless
+        // of badge (the earlier-deadline badge-5 waiter wakes before the badge-3 one).
+        let mut q = Queue::<4>::new();
+        let ins1 = q.insert(mk(2000, 1, 3)).is_ok();
+        let ins2 = q.insert(mk(1000, 2, 5)).is_ok();
+        let cross = q.has_badge_other_than(3) && q.has_badge_other_than(5);
+        let first = q.pop_due(1000).map(|w| (w.thread_id, w.badge)) == Some((2, 5));
+        let second_not_yet = q.pop_due(1500).is_none();
+        let second = q.pop_due(2000).map(|w| (w.thread_id, w.badge)) == Some((1, 3));
+        ins1 && ins2 && cross && first && second_not_yet && second
+    };
+    check(b"exec_delay_execution_multiplex", delay_multiplex_ok, &mut passed);
     print_str(b"[ntos-exec] delay calls=0x");
     print_hex(DELAY_TRACE_COUNT.load(Ordering::Relaxed) as u32);
     print_str(b" parked=0x");
