@@ -1701,6 +1701,107 @@ unsafe fn wait_park(event_idx: usize, resume_ip: u64, sp: u64, flags: u64) -> bo
     wait_park_multi(&[event_idx], false, resume_ip, sp, flags)
 }
 
+/// Consume the Reply object bound to the current native-syscall fault without sending on it, then
+/// rotate a fresh pool object into `REPLY_MAIN_SLOT`. Deleting the bound object clears the only
+/// capability that can resume this Call; the caller remains blocked until its TCB is destroyed.
+/// The vacated cptr is immediately retyped as an unbound Reply object and returned to the pool.
+unsafe fn drop_current_syscall_reply() -> bool {
+    let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if active == 0 {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let active_index = (0..WAIT_REPLY_POOL_N)
+        .find(|&index| WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == active);
+    let fresh_index = (0..WAIT_REPLY_POOL_N).find(|&index| {
+        used & (1u64 << index) == 0 && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+    });
+    let (active_index, fresh_index) = match (active_index, fresh_index) {
+        (Some(active_index), Some(fresh_index)) => (active_index, fresh_index),
+        _ => return false,
+    };
+    let fresh = WAIT_REPLY_POOL[fresh_index].load(Ordering::Relaxed);
+    let delete = cnode_delete_r(active);
+    if delete != 0 {
+        print_str(b"[thread-term] reply-drop cap=0x");
+        print_hex(active as u32);
+        print_str(b" delete=");
+        print_u64(delete);
+        print_str(b"\n");
+        return false;
+    }
+    WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << active_index), Ordering::Relaxed);
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, active);
+    if retype != 0 {
+        WAIT_REPLY_POOL[active_index].store(0, Ordering::Relaxed);
+    }
+    print_str(b"[thread-term] reply-drop cap=0x");
+    print_hex(active as u32);
+    print_str(b" next=0x");
+    print_hex(fresh as u32);
+    print_str(b" delete=0 retype=");
+    print_u64(retype);
+    print_str(b"\n");
+    true
+}
+
+fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
+    if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
+        Some(&WL_LISTENER_TCB)
+    } else if tid == WL_WORKER2_TID.load(Ordering::Relaxed) {
+        Some(&WL_WORKER2_TCB)
+    } else if tid == WL_WORKER3_TID.load(Ordering::Relaxed) {
+        Some(&WL_WORKER3_TCB)
+    } else if tid == SVC_LISTENER_TID.load(Ordering::Relaxed) {
+        Some(&SVC_LISTENER_TCB)
+    } else if tid == LSASS_LISTENER_TID.load(Ordering::Relaxed) {
+        Some(&LSASS_LISTENER_TCB)
+    } else if tid == LSASS_LISTENER2_TID.load(Ordering::Relaxed) {
+        Some(&LSASS_LISTENER2_TCB)
+    } else if tid == LSASS_LISTENER3_TID.load(Ordering::Relaxed) {
+        Some(&LSASS_LISTENER3_TCB)
+    } else {
+        (0..MAX_PI)
+            .find(|&index| tid == PM_TIDS[index].load(Ordering::Relaxed))
+            .map(|index| &PM_MAIN_TCBS[index])
+    }
+}
+
+unsafe fn terminate_hosted_thread_mechanism(tid: u64) -> bool {
+    let cell = match hosted_thread_tcb_cell(tid) {
+        Some(cell) => cell,
+        None => return false,
+    };
+    let tcb = cell.load(Ordering::Relaxed);
+    if tcb <= 1 {
+        return false;
+    }
+    let suspend = tcb_suspend_r(tcb);
+    let delete = if suspend == 0 {
+        cnode_delete_r(tcb)
+    } else {
+        u64::MAX
+    };
+    print_str(b"[thread-term] mechanism tid=");
+    print_u64(tid);
+    print_str(b" tcb=0x");
+    print_hex(tcb as u32);
+    print_str(b" suspend=");
+    print_u64(suspend);
+    print_str(b" delete=");
+    print_u64(delete);
+    print_str(b"\n");
+    if suspend == 0 && delete == 0 {
+        cell.store(0, Ordering::Relaxed);
+        PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// GENERAL park: block the current caller on a SET of obj_ns events (`events`), with `wait_all`
 /// selecting WaitAll (wake when all signalled → WAIT_0) vs WaitAny (wake on the first signalled →
 /// WAIT_0+index). Steals this caller's bound reply object (REPLY_MAIN) into a free waiter slot and
@@ -2580,8 +2681,7 @@ struct ExecNtHandler {
     pi: usize,
     current_tid: u64,
     current_badge: u64,
-    terminate_thread_tid: u64,
-    terminate_thread_current: bool,
+    post_action: ExecPostAction,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
     /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
@@ -2703,6 +2803,13 @@ struct ExecNtHandler {
     /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
     /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
     dll_loaded_dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecPostAction {
+    None,
+    TerminateCurrentThread { tid: u64 },
+    TerminateRemoteThread { tid: u64 },
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see
@@ -3264,6 +3371,13 @@ static PM_TERMINATE_THREAD_LIVE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_TRACE: AtomicU64 = AtomicU64::new(0);
 static PM_TERMINATE_THREAD_TCB_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+/// Successful current-thread terminations whose bound syscall Reply object was deleted without a
+/// send before the exact caller TCB was suspended/deleted. This is the non-return contract proof.
+static PM_TERMINATE_THREAD_NO_REPLY: AtomicU64 = AtomicU64::new(0);
+/// Badges that issued a successful self-termination and badges observed by the service loop after
+/// the first dropped reply. Their difference proves unrelated callers continued making progress.
+static PM_TERMINATE_THREAD_BADGES: AtomicU64 = AtomicU64::new(0);
+static PM_POST_TERM_CONTINUED_BADGES: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -6483,19 +6597,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // the live exit fired (>=1) AND csrss's (pi=1) main ETHREAD is marked Terminated,
                     // while smss/winlogon (bits 0/2) are NOT (they don't self-exit at boot) → the exit
                     // was routed to the CORRECT thread by identity, not the whole process.
-                    // csrss (bit 1) and lsass (bit 4) self-exit; smss/winlogon (bits 0/2) do not.
+                    // csrss (bit 1), services (bit 3), and lsass (bit 4) self-exit;
+                    // smss/winlogon (bits 0/2) do not.
                     let term_state = PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed);
                     check(
                         b"exec_live_terminate_thread_routed",
-                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 2
+                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 3
                             && (term_state & 0b010) != 0
+                            && (term_state & 0b1000) != 0
                             && (term_state & 0b1_0000) != 0
                             && (term_state & 0b101) == 0,
                         &mut passed,
                     );
                     check(
                         b"exec_live_terminate_thread_tcb_reclaimed",
-                        PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) >= 2,
+                        PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) >= 3,
+                        &mut passed,
+                    );
+                    let terminated_badges = PM_TERMINATE_THREAD_BADGES.load(Ordering::Relaxed);
+                    let continued_badges = PM_POST_TERM_CONTINUED_BADGES.load(Ordering::Relaxed);
+                    check(
+                        b"exec_live_terminate_thread_no_reply",
+                        PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) >= 3,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_live_terminate_thread_unrelated_continued",
+                        continued_badges & !terminated_badges != 0,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] item2a live-terminate-thread: count=0x");
@@ -6506,6 +6634,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
                     print_str(b" tcb-reclaimed=0x");
                     print_hex(PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) as u32);
+                    print_str(b" no-reply=0x");
+                    print_hex(PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) as u32);
+                    print_str(b" term-badges=0x");
+                    print_hex(terminated_badges as u32);
+                    print_str(b" continued-badges=0x");
+                    print_hex(continued_badges as u32);
                     print_str(b"\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-

@@ -236,6 +236,19 @@ fn terminate_thread_handle_resolution_checks_identity_type_and_access() {
         pm.resolve_thread_handle(caller, current, u64::MAX - 1, THREAD_TERMINATE),
         Ok(current)
     );
+    assert_eq!(
+        pm.resolve_terminate_thread_handle(caller, current, 0, THREAD_TERMINATE),
+        Ok(current)
+    );
+    assert_eq!(
+        pm.resolve_terminate_thread_handle(
+            caller,
+            current,
+            u64::MAX - 1,
+            THREAD_TERMINATE,
+        ),
+        Ok(current)
+    );
     let denied = pm
         .insert_handle(caller, HandleObject::Thread(remote), 0)
         .unwrap();

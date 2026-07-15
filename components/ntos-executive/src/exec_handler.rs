@@ -62,8 +62,7 @@ impl ExecNtHandler {
             pi: 0,
             current_tid: 0,
             current_badge: 0,
-            terminate_thread_tid: 0,
-            terminate_thread_current: false,
+            post_action: ExecPostAction::None,
             stop: false,
             next_handle: FAKE_HANDLE,
             out_writes: [(0, 0); 8],
@@ -4593,17 +4592,43 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let status = args.get(1).copied().unwrap_or(0) as u32;
                 let caller_pid = match self.pm_pid_for_pi(self.pi) {
                     Some(pid) => pid,
-                    None => return nt_process::STATUS_INVALID_HANDLE,
+                    None => {
+                        print_str(b"[thread-term-reject] no caller pid badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" handle=0x");
+                        print_hex(handle as u32);
+                        print_str(b"\n");
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    }
                 };
                 let current_tid = self.current_tid as nt_process::ThreadId;
-                let target = match self.pm.resolve_thread_handle(
+                let target = match self.pm.resolve_terminate_thread_handle(
                     caller_pid,
                     current_tid,
                     handle,
                     THREAD_TERMINATE,
                 ) {
                     Ok(tid) => tid,
-                    Err(status) => return status,
+                    Err(status) => {
+                        print_str(b"[thread-term-reject] resolve badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" pid=");
+                        print_u64(caller_pid as u64);
+                        print_str(b" tid=");
+                        print_u64(current_tid as u64);
+                        print_str(b" handle-hi=0x");
+                        print_hex((handle >> 32) as u32);
+                        print_str(b" lo=0x");
+                        print_hex(handle as u32);
+                        print_str(b" status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        return status;
+                    }
                 };
                 let prior_state = self.pm.thread(target).map(|thread| thread.state);
                 let is_current = target == current_tid;
@@ -4615,10 +4640,19 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if let Err(status) = outcome {
                     return status;
                 }
-                self.terminate_thread_tid = target as u64;
-                self.terminate_thread_current = is_current;
+                self.post_action = if is_current {
+                    ExecPostAction::TerminateCurrentThread { tid: target as u64 }
+                } else {
+                    ExecPostAction::TerminateRemoteThread { tid: target as u64 }
+                };
                 PM_TERMINATE_THREAD_LIVE.fetch_add(1, Ordering::Relaxed);
                 PM_TERMINATE_THREAD_STATE.fetch_or(1 << self.pi, Ordering::Relaxed);
+                if is_current && self.current_badge < 64 {
+                    PM_TERMINATE_THREAD_BADGES.fetch_or(
+                        1u64 << self.current_badge,
+                        Ordering::Relaxed,
+                    );
+                }
                 if PM_TERMINATE_THREAD_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
                     print_str(b"[thread-term] badge=");
                     print_u64(self.current_badge);

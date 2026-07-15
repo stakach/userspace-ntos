@@ -547,6 +547,24 @@ impl ProcessManager {
         Ok(tid)
     }
 
+    /// Resolve the target of `NtTerminateThread`. In addition to the ordinary typed thread handle
+    /// and `NtCurrentThread` pseudo-handle forms, NT defines a NULL handle as the current thread for
+    /// this service (the form used by ReactOS kernel32!ExitThread).
+    pub fn resolve_terminate_thread_handle(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<ThreadId, u32> {
+        self.resolve_thread_handle(
+            caller_pid,
+            current_tid,
+            if handle == 0 { u64::MAX - 1 } else { handle },
+            required_access,
+        )
+    }
+
     /// A terminated ETHREAD may only be recycled after every process handle referring to it has
     /// closed. Hosts can use this predicate to avoid TID/slot aliasing while reclaiming mechanism
     /// resources independently of the policy object.

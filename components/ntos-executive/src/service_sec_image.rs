@@ -376,6 +376,9 @@ pub(crate) unsafe fn service_sec_image(
         } else {
             0
         };
+        if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
+            PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
+        }
         // LOUD overflow guard: `pi` indexes the fixed-size per-process arrays (procs / pfilled /
         // dll_pd_created / dll_pt_bits, all sized to MAX_PI). A future 6th/7th hosted process
         // adds a badge→pi arm above; if one ever exceeds MAX_PI this panics with a clear message
@@ -738,10 +741,9 @@ pub(crate) unsafe fn service_sec_image(
             // Set when winlogon's NtSecureConnectPort was completed via the nested CSR rendezvous
             // (like routed_lpc, the CSR thread's faults clobbered reply_to → reply via REPLY_MAIN).
             let mut routed_csr = false;
-            // Set when the caller terminates its own thread (NtTerminateThread of NtCurrentThread):
-            // leave it blocked in the kernel (never reply) and recv the next event. csrss's main
-            // thread does this after CsrServerInitialization ("CSRSRV keeps us going" — the fake API
-            // worker threads stand in), so csrss goes quiet and smss proceeds.
+            // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
+            // by withholding a reply. Self-termination does not use this flag: its explicit post
+            // action deletes the bound Reply cap and caller TCB before receiving again.
             let mut park_caller = false;
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
             // the given obj_ns event index (set from nt_handler.wait_park_event after dispatch).
@@ -791,8 +793,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     PM_TIDS[pi].load(Ordering::Relaxed)
                 };
-                nt_handler.terminate_thread_tid = 0;
-                nt_handler.terminate_thread_current = false;
+                nt_handler.post_action = ExecPostAction::None;
                 nt_handler.stop = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
@@ -872,55 +873,44 @@ pub(crate) unsafe fn service_sec_image(
                         handled = false; // handler couldn't service → stop with the SSN recorded
                     }
                 }
-                // NtTerminateThread policy has marked the real ETHREAD terminated. Tear down only
-                // the matching runtime-thread mechanism; main-thread TCB caps are not retained by
-                // this hosting path, so a self-terminating main thread is left blocked by withholding
-                // its reply. The terminated ETHREAD/TID remains queryable while handles exist, and
-                // PM_POOL_USED deliberately stays claimed, preventing slot/TID aliasing.
-                if nt_handler.terminate_thread_tid != 0 {
-                    let tid = nt_handler.terminate_thread_tid;
-                    let tcb_cell = if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
-                        Some(&WL_LISTENER_TCB)
-                    } else if tid == WL_WORKER2_TID.load(Ordering::Relaxed) {
-                        Some(&WL_WORKER2_TCB)
-                    } else if tid == WL_WORKER3_TID.load(Ordering::Relaxed) {
-                        Some(&WL_WORKER3_TCB)
-                    } else if tid == SVC_LISTENER_TID.load(Ordering::Relaxed) {
-                        Some(&SVC_LISTENER_TCB)
-                    } else if tid == LSASS_LISTENER_TID.load(Ordering::Relaxed) {
-                        Some(&LSASS_LISTENER_TCB)
-                    } else if tid == LSASS_LISTENER2_TID.load(Ordering::Relaxed) {
-                        Some(&LSASS_LISTENER2_TCB)
-                    } else if tid == LSASS_LISTENER3_TID.load(Ordering::Relaxed) {
-                        Some(&LSASS_LISTENER3_TCB)
-                    } else {
-                        (0..MAX_PI)
-                            .find(|&index| tid == PM_TIDS[index].load(Ordering::Relaxed))
-                            .map(|index| &PM_MAIN_TCBS[index])
-                    };
-                    if let Some(cell) = tcb_cell {
-                        let tcb = cell.load(Ordering::Relaxed);
-                        if tcb > 1 {
-                            let suspend = tcb_suspend_r(tcb);
-                            let delete = if suspend == 0 { cnode_delete_r(tcb) } else { u64::MAX };
-                            print_str(b"[thread-term] mechanism tid=");
-                            print_u64(tid);
-                            print_str(b" tcb=0x");
-                            print_hex(tcb as u32);
-                            print_str(b" suspend=");
-                            print_u64(suspend);
-                            print_str(b" delete=");
-                            print_u64(delete);
-                            print_str(b"\n");
-                            if suspend == 0 && delete == 0 {
-                                cell.store(0, Ordering::Relaxed);
-                                PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
-                            }
+                // A successful self-termination is a control-flow action, not a status-returning
+                // syscall. First delete/replace the Reply object bound to this fault (so no send can
+                // resume it), then suspend/delete the exact badge-selected TCB, and receive the next
+                // caller immediately. Remote termination tears down its target but still replies to
+                // the caller through the normal tail below.
+                match nt_handler.post_action {
+                    ExecPostAction::TerminateCurrentThread { tid } => {
+                        let reply_dropped = drop_current_syscall_reply();
+                        let mechanism_deleted = terminate_hosted_thread_mechanism(tid);
+                        if reply_dropped && mechanism_deleted {
+                            PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
+                        print_str(b"[thread-term] self-post tid=");
+                        print_u64(tid);
+                        print_str(b" reply-dropped=");
+                        print_u64(reply_dropped as u64);
+                        print_str(b" mechanism-deleted=");
+                        print_u64(mechanism_deleted as u64);
+                        print_str(b" -> recv without reply\n");
+                        procs[pi].faults = faults;
+                        procs[pi].first = first;
+                        procs[pi].ntfaults = ntfaults;
+                        pfilled[pi] = *filled_pages;
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) =
+                            recv_full_r12(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
                     }
-                    if nt_handler.terminate_thread_current {
-                        park_caller = true;
+                    ExecPostAction::TerminateRemoteThread { tid } => {
+                        let _ = terminate_hosted_thread_mechanism(tid);
                     }
+                    ExecPostAction::None => {}
                 }
                 // CM write plane: a handler that mutated the registry overlay (NtCreateKey/
                 // NtSetValueKey) allocated `String`/`Vec` on the bump heap ABOVE `heap_mark`. Pin the
@@ -2103,8 +2093,6 @@ pub(crate) unsafe fn service_sec_image(
                 result = 0;
             }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
-                // Don't reply to the self-terminated thread — leave it blocked and recv the next
-                // event (re-binding REPLY_MAIN for the next caller). The parked thread never runs again.
                 recv_full_r12(fault_ep, reply_main)
             } else if (routed_win32k || routed_lpc || routed_csr) && reply_main != 0 {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults
