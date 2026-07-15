@@ -436,6 +436,25 @@ pub(crate) unsafe fn service_sec_image(
         // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
+        let (active_stack_base, active_stack_frames) = if is_svc_listener {
+            (SVC_LISTENER_STACK_BASE, SVC_LISTENER_STACK_FRAMES)
+        } else if is_lsass_listener {
+            (LSASS_LISTENER_STACK_BASE, LSASS_LISTENER_STACK_FRAMES)
+        } else if is_lsass_listener2 {
+            (LSASS_LISTENER2_STACK_BASE, LSASS_LISTENER2_STACK_FRAMES)
+        } else if is_lsass_listener3 {
+            (LSASS_LISTENER3_STACK_BASE, LSASS_LISTENER3_STACK_FRAMES)
+        } else if is_wl_worker {
+            match badge {
+                WINLOGON_WORKER2_BADGE => (WL_WORKER2_STACK_BASE, WL_WORKER2_STACK_FRAMES),
+                WINLOGON_WORKER3_BADGE => (WL_WORKER3_STACK_BASE, WL_WORKER3_STACK_FRAMES),
+                _ => (WL_LISTENER_STACK_BASE, WL_LISTENER_STACK_FRAMES),
+            }
+        } else {
+            (STACK_BASE, STACK_FRAMES)
+        };
+        ACTIVE_STACK_BASE.store(active_stack_base, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(active_stack_frames * 0x1000, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(
             if is_svc_listener {
                 // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
@@ -1245,8 +1264,10 @@ pub(crate) unsafe fn service_sec_image(
                     };
                     tcb_cell.store(1, Ordering::Relaxed);
                     let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
                     let tid = match slot {
                         0 => PM_LISTENER_TID.load(Ordering::Relaxed),
                         1 => WL_WORKER2_TID.load(Ordering::Relaxed),
@@ -1263,12 +1284,29 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[wl-thread] spawning REAL worker slot=");
                     print_u64(slot as u64);
                     print_str(b" (multiplexed): entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
+                    print_str(b" arg0=0x");
+                    print_hex((start.rcx >> 32) as u32);
+                    print_hex(start.rcx as u32);
+                    print_str(b" arg1=0x");
+                    print_hex((start.rdx >> 32) as u32);
+                    print_hex(start.rdx as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_wl_listener_thread(slot, procs[2].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    let suspended = PM_POOL_SUSPENDED[2].load(Ordering::Relaxed) & (1 << slot) != 0;
+                    let tcb = spawn_wl_listener_thread(
+                        slot,
+                        procs[2].pml4,
+                        start.rip,
+                        start.rcx,
+                        start.rdx,
+                        cid_proc,
+                        tid,
+                        fault_ep,
+                        !suspended,
+                    );
                     tcb_cell.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
@@ -1277,7 +1315,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" TEB=0x");
                     print_hex((teb >> 32) as u32);
                     print_hex(teb as u32);
-                    print_str(b" (RESUMED into multiplex, badge WINLOGON_WORKER_BADGE; real ETHREAD + TEB)\n");
+                    print_str(if suspended {
+                        b" (SUSPENDED; NtResumeThread owns first run; real ETHREAD + TEB)\n"
+                    } else {
+                        b" (RESUMED into multiplex; real ETHREAD + TEB)\n"
+                    });
                     nt_handler.wl_spawn_request = 0;
                 }
                 // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
@@ -1285,17 +1327,24 @@ pub(crate) unsafe fn service_sec_image(
                 // main thread; the loop sub-selects it by badge → the listener's own stack mirror/TEB.
                 if nt_handler.svc_listener_spawn && SVC_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
                     let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
                     let tid = SVC_LISTENER_TID.load(Ordering::Relaxed);
                     let cid_proc = nt_handler.pm_pid_for_pi(3).unwrap_or(0) as u64;
                     print_str(b"[svc-thread] spawning + RESUMING REAL RPC listener thread: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_svc_listener_thread(procs[3].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    let suspended = runtime_thread_slot(tid)
+                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
+                    let tcb = spawn_svc_listener_thread(
+                        procs[3].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        !suspended,
+                    );
                     SVC_LISTENER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
                     print_str(b"[svc-thread] spawned + resumed tcb=0x");
@@ -1307,17 +1356,24 @@ pub(crate) unsafe fn service_sec_image(
                 // sub-select to (pi 4, listener) by badge → the listener's own stack mirror/TEB.
                 if nt_handler.lsass_listener_spawn && LSASS_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
                     let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
                     let tid = LSASS_LISTENER_TID.load(Ordering::Relaxed);
                     let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread] spawning + RESUMING REAL LSA server thread: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_lsass_listener_thread(procs[4].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    let suspended = runtime_thread_slot(tid)
+                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
+                    let tcb = spawn_lsass_listener_thread(
+                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        !suspended,
+                    );
                     LSASS_LISTENER_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
                     print_str(b"[lsass-thread] spawned + resumed tcb=0x");
@@ -1327,17 +1383,24 @@ pub(crate) unsafe fn service_sec_image(
                 // ★ lsass' SECOND server thread (LsapRmServerThread) — same multiplex, badge 10.
                 if nt_handler.lsass_listener2_spawn && LSASS_LISTENER2_TCB.swap(1, Ordering::Relaxed) == 0 {
                     let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
                     let tid = LSASS_LISTENER2_TID.load(Ordering::Relaxed);
                     let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread2] spawning + RESUMING 2nd LSA server thread: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_lsass_listener2_thread(procs[4].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    let suspended = runtime_thread_slot(tid)
+                        .is_some_and(|(pi, slot)| PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0);
+                    let tcb = spawn_lsass_listener2_thread(
+                        procs[4].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        !suspended,
+                    );
                     LSASS_LISTENER2_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                     print_str(b"[lsass-thread2] spawned + resumed tcb=0x");
@@ -1348,23 +1411,29 @@ pub(crate) unsafe fn service_sec_image(
                     && LSASS_LISTENER3_TCB.swap(1, Ordering::Relaxed) == 0
                 {
                     let ctx_va = smss_stack_read(sp + 0x30);
-                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
-                    let param = smss_stack_read(ctx_va + 0x80);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
                     let tid = LSASS_LISTENER3_TID.load(Ordering::Relaxed);
                     let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
                     print_str(b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x");
-                    print_hex((entry_rip >> 32) as u32);
-                    print_hex(entry_rip as u32);
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
                     let tcb = spawn_lsass_listener3_thread(
                         procs[4].pml4,
-                        entry_rip,
-                        param,
+                        start.rip,
+                        start.rcx,
+                        start.rdx,
                         cid_proc,
                         tid,
                         fault_ep,
+                        !runtime_thread_slot(tid).is_some_and(|(pi, slot)| {
+                            PM_POOL_SUSPENDED[pi].load(Ordering::Relaxed) & (1 << slot) != 0
+                        }),
                     );
                     LSASS_LISTENER3_TCB.store(tcb, Ordering::Relaxed);
                     nt_handler

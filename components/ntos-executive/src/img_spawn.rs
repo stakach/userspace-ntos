@@ -610,9 +610,11 @@ pub(crate) unsafe fn spawn_sec_image(
 /// Read a u64 from a SEC_IMAGE process's stack VA (a syscall's pointer arg) via the executive's
 /// stack mirror. Returns 0 if the VA isn't in the mirrored stack range.
 pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
-    if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    if stack_va >= base && stack_va + 8 <= base + size {
         let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::read_volatile((mirror + (stack_va - STACK_BASE)) as *const u64)
+        core::ptr::read_volatile((mirror + (stack_va - base)) as *const u64)
     } else {
         0
     }
@@ -621,8 +623,10 @@ pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// the range isn't covered by a mirror. The executive's copyin/copyout base: a userspace broker
 /// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
 pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
-    if va >= STACK_BASE && va + len <= STACK_BASE + STACK_FRAMES * 0x1000 {
-        Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - STACK_BASE))
+    let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    if va >= stack_base && va + len <= stack_base + stack_size {
+        Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - stack_base))
     } else if va >= SMSS_ALLOC_VA && va + len <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
     } else if va >= PE_LOAD_BASE && va + len <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
@@ -759,18 +763,22 @@ pub(crate) unsafe fn smss_read_objattr_name(oa_va: u64) -> alloc::vec::Vec<u16> 
 }
 /// Write a u64 to a SEC_IMAGE process's stack VA via the mirror (copyout).
 pub(crate) unsafe fn smss_stack_write(stack_va: u64, v: u64) {
-    if stack_va >= STACK_BASE && stack_va + 8 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    if stack_va >= base && stack_va + 8 <= base + size {
         let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u64, v);
+        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u64, v);
     }
 }
 
 /// Write a 32-bit value to a stack VA (via the mirror). Use for DWORD out-params (e.g. an
 /// NtProtectVirtualMemory *OldProtect) — an 8-byte write would clobber the adjacent local.
 pub(crate) unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
-    if stack_va >= STACK_BASE && stack_va + 4 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    if stack_va >= base && stack_va + 4 <= base + size {
         let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u32, v);
+        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u32, v);
     }
 }
 
@@ -778,9 +786,11 @@ pub(crate) unsafe fn smss_stack_write32(stack_va: u64, v: u32) {
 /// (a CSHORT) when modeling an LPC reply in place — a wider write would clobber the adjacent
 /// DataInfoOffset / u1 length fields.
 pub(crate) unsafe fn smss_stack_write16(stack_va: u64, v: u16) {
-    if stack_va >= STACK_BASE && stack_va + 2 <= STACK_BASE + STACK_FRAMES * 0x1000 {
+    let base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    if stack_va >= base && stack_va + 2 <= base + size {
         let mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
-        core::ptr::write_volatile((mirror + (stack_va - STACK_BASE)) as *mut u16, v);
+        core::ptr::write_volatile((mirror + (stack_va - base)) as *mut u16, v);
     }
 }
 

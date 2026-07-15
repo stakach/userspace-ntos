@@ -12,7 +12,8 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
     spawn_hosted_thread(&HostedThread {
         pml4: smss_pml4,
         entry_rip,
-        param: port_handle,
+        arg0: port_handle,
+        arg1: 0,
         scr: SM_ENV_SCRATCH_VA,
         teb_va: SM_TEB_VA,
         stack_base: SM_STACK_BASE,
@@ -270,7 +271,8 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
     spawn_hosted_thread(&HostedThread {
         pml4: csrss_pml4,
         entry_rip,
-        param,
+        arg0: param,
+        arg1: 0,
         scr: CSR_ENV_SCRATCH_VA,
         teb_va: CSR_TEB_VA,
         stack_base: CSR_STACK_BASE,
@@ -300,10 +302,12 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     slot: usize,
     pml4: u64,
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
+    resume: bool,
 ) -> u64 {
     let (scr, teb_va, stack_base, stack_frames, ipcbuf_va, tramp_va, stack_mirror_va, badge) =
         match slot {
@@ -343,7 +347,8 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     spawn_hosted_thread(&HostedThread {
         pml4,
         entry_rip,
-        param,
+        arg0,
+        arg1,
         scr,
         teb_va,
         stack_base,
@@ -355,7 +360,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         fault_ep: worker_ep,
         cid_proc,
         cid_thread,
-        resume: true, // run it into the multiplex (the N-threads mechanism)
+        resume,
         prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
     })
 }
@@ -369,16 +374,19 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
 pub(crate) unsafe fn spawn_svc_listener_thread(
     svc_pml4: u64,
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
+    resume: bool,
 ) -> u64 {
     let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
         entry_rip,
-        param,
+        arg0,
+        arg1,
         scr: SVC_LISTENER_ENV_SCRATCH_VA,
         teb_va: SVC_LISTENER_TEB_VA,
         stack_base: SVC_LISTENER_STACK_BASE,
@@ -390,7 +398,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         fault_ep: listener_ep,
         cid_proc,
         cid_thread,
-        resume: true, // run it into the multiplex (the N-threads mechanism)
+        resume,
         prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
     })
 }
@@ -404,16 +412,19 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
 pub(crate) unsafe fn spawn_lsass_listener_thread(
     lsass_pml4: u64,
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
+    resume: bool,
 ) -> u64 {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         entry_rip,
-        param,
+        arg0,
+        arg1,
         scr: LSASS_LISTENER_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER_TEB_VA,
         stack_base: LSASS_LISTENER_STACK_BASE,
@@ -425,7 +436,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         fault_ep: listener_ep,
         cid_proc,
         cid_thread,
-        resume: true, // run it into the multiplex (the N-threads mechanism)
+        resume,
         prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
     })
 }
@@ -435,16 +446,19 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
 pub(crate) unsafe fn spawn_lsass_listener2_thread(
     lsass_pml4: u64,
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
+    resume: bool,
 ) -> u64 {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         entry_rip,
-        param,
+        arg0,
+        arg1,
         scr: LSASS_LISTENER2_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER2_TEB_VA,
         stack_base: LSASS_LISTENER2_STACK_BASE,
@@ -456,7 +470,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         fault_ep: listener_ep,
         cid_proc,
         cid_thread,
-        resume: true,
+        resume,
         prio: 105,
     })
 }
@@ -464,16 +478,19 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
 pub(crate) unsafe fn spawn_lsass_listener3_thread(
     lsass_pml4: u64,
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
+    resume: bool,
 ) -> u64 {
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
         entry_rip,
-        param,
+        arg0,
+        arg1,
         scr: LSASS_LISTENER3_ENV_SCRATCH_VA,
         teb_va: LSASS_LISTENER3_TEB_VA,
         stack_base: LSASS_LISTENER3_STACK_BASE,
@@ -485,7 +502,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
         fault_ep: listener_ep,
         cid_proc,
         cid_thread,
-        resume: true,
+        resume,
         prio: 105,
     })
 }

@@ -316,7 +316,7 @@ impl ExecNtHandler {
     pub(crate) fn nt_create_thread_handle(
         &mut self,
         entry: u64,
-        param: u64,
+        create_suspended: bool,
         desired_access: u32,
     ) -> Option<(usize, u64, u64)> {
         let pid = self.pm_pid_for_pi(self.pi)?;
@@ -342,7 +342,14 @@ impl ExecNtHandler {
         }
         let t = tid as nt_process::ThreadId;
         self.pm.set_thread_start_address(t, entry);
-        let _ = self.pm.set_thread_state(t, nt_process::ThreadState::Running);
+        let _ = self.pm.set_thread_state(
+            t,
+            if create_suspended {
+                nt_process::ThreadState::Initialized
+            } else {
+                nt_process::ThreadState::Running
+            },
+        );
         let h = match self
             .pm
             .insert_handle(pid, nt_process::HandleObject::Thread(t), desired_access)
@@ -356,7 +363,11 @@ impl ExecNtHandler {
                 return None;
             }
         };
-        let _ = param;
+        if create_suspended {
+            PM_POOL_SUSPENDED[self.pi].fetch_or(1 << slot, Ordering::Relaxed);
+        } else {
+            PM_POOL_SUSPENDED[self.pi].fetch_and(!(1 << slot), Ordering::Relaxed);
+        }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
         Some((slot, tid, h as u64))
@@ -2210,11 +2221,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let cid_ptr = smss_stack_read(sp + 0x28);
                         let ctx_va = smss_stack_read(sp + 0x30);
                         let initial_teb = smss_stack_read(sp + 0x38);
-                        let create_suspended = smss_stack_read(sp + 0x40);
-                        let entry = smss_stack_read(ctx_va + 0xF8); // CONTEXT.Rip = StartRoutine
-                        let param = smss_stack_read(ctx_va + 0x80); // CONTEXT.Rcx = Parameter
+                        let initial_stack = nt_thread_start::InitialTeb64::read(
+                            |address| smss_stack_read(address),
+                            initial_teb,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
                         if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, args[1] as u32)
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             let teb = match slot {
                                 0 => WL_LISTENER_TEB_VA,
@@ -2245,25 +2262,34 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 print_str(b" slot=");
                                 print_u64(slot as u64);
                                 print_str(b" start=0x");
-                                print_hex((entry >> 32) as u32);
-                                print_hex(entry as u32);
+                                print_hex((start.rip >> 32) as u32);
+                                print_hex(start.rip as u32);
+                                print_str(b" arg0=0x");
+                                print_hex((start.rcx >> 32) as u32);
+                                print_hex(start.rcx as u32);
+                                print_str(b" arg1=0x");
+                                print_hex((start.rdx >> 32) as u32);
+                                print_hex(start.rdx as u32);
+                                print_str(b" rsp=0x");
+                                print_hex((start.rsp >> 32) as u32);
+                                print_hex(start.rsp as u32);
                                 print_str(b" teb=0x");
                                 print_hex((teb >> 32) as u32);
                                 print_hex(teb as u32);
                                 print_str(b" initial_teb=0x");
                                 print_hex(initial_teb as u32);
                                 print_str(b" stack_base=0x");
-                                print_hex(smss_stack_read(initial_teb + 0x10) as u32);
+                                print_hex(initial_stack.stack_base as u32);
                                 print_str(b" stack_limit=0x");
-                                print_hex(smss_stack_read(initial_teb + 0x18) as u32);
+                                print_hex(initial_stack.stack_limit as u32);
                                 print_str(b" alloc_base=0x");
-                                print_hex(smss_stack_read(initial_teb + 0x20) as u32);
+                                print_hex(initial_stack.allocated_stack_base as u32);
                                 print_str(b" handle=0x");
                                 print_hex(handle as u32);
                                 print_str(b" tid=");
                                 print_u64(tid);
                                 print_str(b" suspended=");
-                                print_u64(create_suspended & 0xff);
+                                print_u64(create_suspended as u64);
                                 print_str(b" status=0\n");
                             }
                             return 0; // SUCCESS (handle/ClientId queued)
@@ -2284,10 +2310,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     unsafe {
                         let sp = get_recv_mr(16);
                         let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
-                        let entry = smss_stack_read(ctx_va + 0xF8);
-                        let param = smss_stack_read(ctx_va + 0x80);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, args[1] as u32)
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
@@ -2317,10 +2346,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     unsafe {
                         let sp = get_recv_mr(16);
                         let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
-                        let entry = smss_stack_read(ctx_va + 0xF8);
-                        let param = smss_stack_read(ctx_va + 0x80);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, args[1] as u32)
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
@@ -2350,10 +2382,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     unsafe {
                         let sp = get_recv_mr(16);
                         let ctx_va = smss_stack_read(sp + 0x30);
-                        let entry = smss_stack_read(ctx_va + 0xF8);
-                        let param = smss_stack_read(ctx_va + 0x80);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, args[1] as u32)
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                             let pid = self.pm_pid_for_pi(4).unwrap_or(0);
@@ -2378,10 +2413,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     unsafe {
                         let sp = get_recv_mr(16);
                         let ctx_va = smss_stack_read(sp + 0x30);
-                        let entry = smss_stack_read(ctx_va + 0xF8);
-                        let param = smss_stack_read(ctx_va + 0x80);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, args[1] as u32)
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
                         {
                             self.pm.set_thread_teb(
                                 tid as nt_process::ThreadId,
@@ -2400,8 +2438,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                             print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
                             print_hex(args[3] as u32);
                             print_str(b" slot=2 start=0x");
-                            print_hex((entry >> 32) as u32);
-                            print_hex(entry as u32);
+                            print_hex((start.rip >> 32) as u32);
+                            print_hex(start.rip as u32);
                             print_str(b" teb=0x");
                             print_hex((LSASS_LISTENER3_TEB_VA >> 32) as u32);
                             print_hex(LSASS_LISTENER3_TEB_VA as u32);
@@ -2611,22 +2649,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // write the handle back, and report STATUS_OBJECT_NAME_EXISTS if it already existed
                 // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event (empty OA name) just
                 // mints a bare handle. The PHANDLE (R10) may be a DLL .data global → xas_write_u64.
-                // ★ winlogon (pi 2): rpcrt4's server-thread handshake creates UNNAMED sync events
-                // (server_ready_event / mgr_event). The rpcrt4 server WORKER thread walls on a KNOWN
-                // deeper rpcrt4 frontier (NULL deref at rpcrt4+0x515db in get_wait_array/
-                // rpcrt4_conn_create_pipe — it needs a REAL npfs pipe/client, the same wall the svc
-                // listener hits) BEFORE it can SetEvent(server_ready_event). So parking winlogon's main
-                // thread on server_ready_event would HANG (no live signaler) — a violation of the
-                // no-deadlock guarantee. Therefore winlogon's unnamed rpcrt4 sync events stay BARE
-                // handles (< OBJ_HANDLE_BASE) → NtWaitForSingleObject returns immediate WAIT_0
-                // (documented, byte-identical to winlogon's pre-worker behavior). The worker multiplex +
-                // the REAL array-wait park (Part 1) are still in place for events with a live signaler;
-                // completing winlogon's own RPC server needs the real npfs client-connect frontier (the
-                // svc-listener wall) — a separate increment. See project_real_services SERVICE 10 step 2.
+                // Winlogon's unnamed rpcrt4 server_ready_event/mgr_event are a live cross-thread
+                // handshake. Model them as distinct events: the main thread signals mgr_event, the
+                // server worker consumes it and signals server_ready_event, and the main waiter wakes.
                 if self.pi == 2 {
                     unsafe {
                         let out = args[0]; // R10 = *EventHandle
-                        if out != 0 { smss_stack_write(out, h); }
+                        let auto_reset = args[3] == 1; // SynchronizationEvent
+                        let initial_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1 != 0;
+                        let Some(index) = self.obj_create_anon_event(auto_reset) else {
+                            return 0xC000_009A;
+                        };
+                        self.obj_ns[index].signalled = initial_state as u8;
+                        if out != 0 {
+                            self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64);
+                        }
                     }
                     return 0;
                 }
@@ -2724,13 +2761,71 @@ impl NativeSyscallHandler for ExecNtHandler {
                 smss_stack_write(out, h);
                 0
             },
+            NativeService::NtResumeThread => unsafe {
+                const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+                let caller_pid = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return nt_process::STATUS_INVALID_HANDLE,
+                };
+                let tid = match self.pm.resolve_thread_handle(
+                    caller_pid,
+                    self.current_tid as nt_process::ThreadId,
+                    args[0],
+                    THREAD_SUSPEND_RESUME,
+                ) {
+                    Ok(tid) => tid as u64,
+                    Err(status) => return status,
+                };
+                let Some((pi, slot)) = runtime_thread_slot(tid) else {
+                    if args[1] != 0 {
+                        self.queue_write(args[1], 0);
+                    }
+                    return 0;
+                };
+                let bit = 1u64 << slot;
+                let previous = if PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
+                    1
+                } else {
+                    0
+                };
+                if args[1] != 0 {
+                    self.queue_write(args[1], previous);
+                }
+                if previous != 0 {
+                    let _ = self
+                        .pm
+                        .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Running);
+                    let tcb = hosted_thread_tcb_cell(tid)
+                        .map(|cell| cell.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    if tcb <= 1 {
+                        return 0xC000_0001;
+                    }
+                    let result = tcb_resume(tcb);
+                    print_str(b"[thread-life] resume pi=");
+                    print_u64(pi as u64);
+                    print_str(b" slot=");
+                    print_u64(slot as u64);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b" tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" previous=1 result=");
+                    print_u64(result);
+                    print_str(b"\n");
+                    if result != 0 {
+                        return 0xC000_0001;
+                    }
+                }
+                0
+            },
             // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
             // track permanence. Success no-op.
             NativeService::NtMakeTemporaryObject => 0,
             // No-op → STATUS_SUCCESS: the bump allocator never frees, we don't model thread/process
             // attribute sets, per-object security, keyed events, or a real handle table. (277
             // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
-            // NtResumeThread: CSR worker not modeled; 236 NtSetInformationObject.)
+            // 236 NtSetInformationObject.)
             NativeService::NtFreeVirtualMemory
             | NativeService::NtSetInformationThread
             | NativeService::NtSetInformationProcess
@@ -2742,7 +2837,6 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetSystemInformation
             | NativeService::NtUnmapViewOfSection
             | NativeService::NtSetSecurityObject
-            | NativeService::NtResumeThread
             | NativeService::NtSetInformationObject => 0,
             NativeService::NtFlushInstructionCache => {
                 let base = args.get(1).copied().unwrap_or(0);

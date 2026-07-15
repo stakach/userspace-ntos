@@ -306,6 +306,7 @@ pub const WL_WORKER3_TEB_VA: u64 = 0x0000_0100_1055_0000;
 pub const WL_WORKER3_TRAMP_VA: u64 = 0x0000_0100_1057_0000;
 pub const WL_WORKER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107D_0000;
 pub const WINLOGON_WORKER3_BADGE: u64 = 13;
+static HOSTED_STACK_MIRROR_PT_BITS: AtomicU64 = AtomicU64::new(0);
 pub const WINLOGON_WORKER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1388_0000;
 // --- services' RPC listener thread (the SCM's ScmStartRpcServer io_thread). Runs in services' OWN
 // pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
@@ -805,6 +806,8 @@ static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 /// The 2-process service loop sets this at the top of each iteration (smss vs csrss) so the shared
 /// smss_stack_read/write helpers read+write the RIGHT process's stack.
 static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
+static ACTIVE_STACK_BASE: AtomicU64 = AtomicU64::new(STACK_BASE);
+static ACTIVE_STACK_SIZE: AtomicU64 = AtomicU64::new(STACK_FRAMES * 0x1000);
 /// Executive image-mirror base for the process currently being serviced (smss vs csrss), so the
 /// shared copyin path reads import-descriptor DLL names etc. from the RIGHT process's image.
 static ACTIVE_IMAGE_MIRROR: AtomicU64 = AtomicU64::new(IMAGE_MIRROR_VA);
@@ -2021,6 +2024,17 @@ fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
             .find(|&index| tid == PM_TIDS[index].load(Ordering::Relaxed))
             .map(|index| &PM_MAIN_TCBS[index])
     }
+}
+
+fn runtime_thread_slot(tid: u64) -> Option<(usize, usize)> {
+    for pi in 0..MAX_PI {
+        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+            if PM_POOL_TID[pi][slot].load(Ordering::Relaxed) == tid {
+                return Some((pi, slot));
+            }
+        }
+    }
+    None
 }
 
 unsafe fn terminate_hosted_thread_mechanism(
@@ -3355,9 +3369,10 @@ struct HostedThread {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
     pml4: u64,
-    /// The thread's start routine (`CONTEXT.Rip`) and its `PVOID` parameter (`CONTEXT.Rcx`).
+    /// The thread's instruction pointer and first two Windows x64 argument registers.
     entry_rip: u64,
-    param: u64,
+    arg0: u64,
+    arg1: u64,
     /// Executive-side scratch base (≥ 3 pages: TEB, TEB2/ACS, trampoline) used to write the env
     /// before the frames are mapped into `pml4`.
     scr: u64,
@@ -3391,12 +3406,22 @@ struct HostedThread {
 /// mechanism behind `NtCreateThread`. It builds the full hosted-Windows-thread env (own TEB + GS
 /// base, StaticUnicodeString, an ACTIVATION_CONTEXT_STACK, an IPC buffer, the hosted-syscalls flag,
 /// a dedicated fault EP, a stack, an SC) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/KUSER are
-/// already mapped, shared with the main thread) — then a trampoline that sets RCX = the thread
-/// parameter and `call`s the start routine (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$
-/// is a net). Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
+/// already mapped, shared with the main thread) — then a trampoline that restores RCX/RDX and
+/// `call`s the context RIP (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$ is a net).
+/// Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
 /// spawns all express (see the thin wrappers below).
 unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let scr = t.scr;
+    if t.stack_mirror_va != 0 {
+        let pt_base = t.stack_mirror_va & !0x1f_ffffu64;
+        let pt_index = ((pt_base - (SVC_LISTENER_STACK_MIRROR_VA & !0x1f_ffffu64)) >> 21) as u32;
+        let bit = 1u64 << pt_index;
+        if HOSTED_STACK_MIRROR_PT_BITS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            let pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_base, CAP_INIT_THREAD_VSPACE);
+        }
+    }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
     // rendezvous's out-param copyout.
     for i in 0..t.stack_frames {
@@ -3435,16 +3460,16 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     // IPC buffer (its own frame + VA; the main thread owns IPCBUF_VADDR).
     let ipcbuf = alloc_frame();
     let _ = page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4);
-    // Trampoline: RCX = Parameter, then `call` the start routine.
+    // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let tramp = alloc_frame();
     let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let mut tb = alloc::vec::Vec::new();
-    tb.extend_from_slice(&[0x48, 0xB9]);
-    tb.extend_from_slice(&t.param.to_le_bytes()); // movabs rcx, param
-    tb.extend_from_slice(&[0x48, 0xB8]);
-    tb.extend_from_slice(&t.entry_rip.to_le_bytes()); // movabs rax, StartRoutine
-    tb.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    let tb = nt_thread_start::Amd64ThreadContext {
+        rip: t.entry_rip,
+        rsp: 0,
+        rcx: t.arg0,
+        rdx: t.arg1,
+    }
+    .call_trampoline();
     for (j, &b) in tb.iter().enumerate() {
         core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
     }
@@ -3607,6 +3632,8 @@ const PM_RUNTIME_THREAD_SLOTS: usize = 3;
 static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
     [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
 static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Bit `slot` is set while a runtime thread still has its initial suspend count.
+static PM_POOL_SUSPENDED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);

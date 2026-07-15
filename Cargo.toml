@@ -75,6 +75,7 @@ members = [
     "crates/nt-dll-registry",
     "crates/nt-loader-trace",
     "crates/nt-delay-execution",
+    "crates/nt-thread-start",
     "tools/driver-import-report",
 ]
 exclude = [
@@ -158,3 +159,4 @@ nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
 nt-loader-trace = { path = "crates/nt-loader-trace" }
 nt-delay-execution = { path = "crates/nt-delay-execution" }
+nt-thread-start = { path = "crates/nt-thread-start" }
