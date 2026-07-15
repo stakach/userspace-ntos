@@ -383,6 +383,117 @@ pub(crate) unsafe fn load_dll_from_fs(
     (None, 0)
 }
 
+/// Extract the DLL leaf (`<stem>.dll`) + its stem from a folded (lowercased-ASCII) requested object
+/// name, which may be a full path (`\systemroot\system32\version.dll`) or a bare leaf. Returns
+/// `(leaf, stem)` as sub-slices of `name` on success, or `None` if there's no `.dll` leaf. The stem
+/// (no extension) is what the registry matches by substring; the leaf drives the FS open.
+fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
+    // Find the last path separator; the leaf is everything after it.
+    let start = name
+        .iter()
+        .rposition(|&c| c == b'\\' || c == b'/')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let leaf = &name[start..];
+    // Must end in ".dll" (the demand-load path is for DLLs only; EXEs load through the boot path).
+    if leaf.len() < 5 || !leaf.ends_with(b".dll") {
+        return None;
+    }
+    let stem = &leaf[..leaf.len() - 4];
+    Some((leaf, stem))
+}
+
+/// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
+/// the real `\reactos\system32` FS, load its bytes into the (reset-safe, cap-mapped) pool, claim a
+/// pre-reserved registry slot, activate it (stem + geometry, keeping its fixed collision-free base),
+/// relocate the pool bytes to that base + patch its ImageBase, store the parsed `PeFile` into the
+/// caller's `dll_pe_store` slot, and return the slot index. The demand-fault router + the
+/// NtOpenFile→NtCreateSection→NtMapViewOfSection flow then treat it exactly like a boot-registered
+/// DLL (no code-path difference — it operates on the `PeFile` slice + the registry).
+///
+/// Returns `None` if the name isn't a `.dll`, the file isn't on the FS, no reserved slot is free, or
+/// the parse fails — the caller then falls through to its normal "not found" answer.
+///
+/// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
+/// survives the per-syscall reset). `dll_pe_store` is a `service_sec_image` stack local (also not the
+/// bump heap). The ONLY bump-heap allocations here are the registry's inline slot fill (no growth —
+/// `activate` writes in place). So the caller need only advance `heap_mark` for any transient it
+/// itself allocated around this call; `demand_load_dll`'s own state is inherently reset-safe. This is
+/// the `overlay_dirty` precedent, minimized.
+///
+/// # Safety
+/// `store` must point at a live `[Option<PeFile>; N]` whose slots outlive the service loop; `reg`
+/// must be the live registry. Single-threaded executive; no aliasing.
+pub(crate) unsafe fn demand_load_dll(
+    reg: &mut nt_dll_registry::Registry,
+    store: *mut Option<nt_pe_loader::PeFile<'static>>,
+    store_len: usize,
+    folded_name: &[u8],
+) -> Option<usize> {
+    let (leaf, stem) = split_dll_leaf(folded_name)?;
+    // Reject SxS/actctx probes (the registry's own rule) so we never demand-load a manifest as a DLL.
+    if nt_dll_registry::Registry::is_sxs_probe(folded_name) {
+        return None;
+    }
+    // BEHAVIORAL-PARITY DENYLIST (a tiny documented set, NOT a content list): a few System32 DLLs,
+    // if satisfied, DIVERT a hosted process down an optional side-path the boot must NOT take at the
+    // current frontier. The curated eager table historically EXCLUDED these (its open failed → the
+    // loader gracefully degraded + proceeded), so demand-loading them is a REGRESSION, not progress:
+    //   • apphelp — the Application-Compatibility shim engine CreateProcessW loads to check for shims.
+    //     Loading it makes winlogon run the shim path (extra unserviceable NtCreateSection) and it
+    //     never reaches NtCreateProcess(services.exe) → services/lsass never spawn. Real Windows has
+    //     the app-compat database; we don't, so degrading (as the eager path did) is correct here.
+    // This is the ONE place the "load anything by-path" policy is deliberately narrowed for boot
+    // parity — a denylist of DIVERTERS, not an allowlist of content. Revisit when the diverted
+    // side-path (app-compat DB) is actually implemented.
+    if stem == b"apphelp" {
+        return None;
+    }
+    let slot = reg.first_free()?;
+    if slot >= store_len {
+        return None; // registry has a reserved slot but the parallel PE store doesn't — capacity bug
+    }
+    let fs = exec_fs()?;
+    let (va, sz) = open_sys32_read(&fs, leaf)?;
+    let bytes: &'static [u8] = core::slice::from_raw_parts(va as *const u8, sz as usize);
+    let pe = nt_pe_loader::PeFile::parse(bytes).ok()?;
+    let ext = image_extent(&pe);
+    let entry = pe.entry_point_rva();
+    // Claim the reserved slot: activate its identity (base was fixed at reserve time → collision-free).
+    reg.activate(slot, stem, ext, entry);
+    let base = reg.base(slot);
+    // Relocate to the slot base + patch OptionalHeader.ImageBase (same as the boot table DLLs).
+    apply_relocations_to_buf(&pe, va, base);
+    let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
+    core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
+    *store.add(slot) = Some(pe);
+    print_str(b"[ntos-exec] DEMAND-LOAD ");
+    print_str(stem);
+    print_str(b" (");
+    print_u64(sz as u64);
+    print_str(b" B) -> slot ");
+    print_u64(slot as u64);
+    print_str(b" base 0x");
+    print_hex(base as u32);
+    print_str(b"\n");
+    Some(slot)
+}
+
+/// Read `\reactos\system32\<leaf>` into a fresh pool buffer, returning `(va, size)`. Like
+/// `load_file_to_pool` but with the System32 prefix built in.
+unsafe fn open_sys32_read(fs: &Fat32, leaf: &[u8]) -> Option<(u64, u32)> {
+    let (cluster, size) = open_sys32(fs, leaf)?;
+    if size == 0 {
+        return None;
+    }
+    let va = pool_alloc(size)?;
+    let read = fat_read_file(fs, cluster, size, va);
+    if read < size {
+        return None;
+    }
+    Some((va, size))
+}
+
 /// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
 /// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {

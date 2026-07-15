@@ -587,13 +587,33 @@ pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
-/// Number of DLLs in the generic nt-dll-registry (`dll_pes`/`dll_seed`/`dll_buf_va`). Each occupies a
-/// fixed 16 MiB base slot from 0x8000_0000 (shared 1 GiB PDPT range), demand-paged from its parsed PE.
-/// csrss's Win32 stack (16) + lsass's LSA server DLLs lsasrv/samsrv (2) + lsass' auth package
-/// msv1_0 (1) = 19. Grow this + add the PE / seed / buf_va entries in service_sec_image to register a
-/// new registry DLL. NOTE: slot N sits at 0x8000_0000 + N*16MiB; slot 19 = 0x93000000, still below the
-/// win32k client window (0x9800_0000) + NLS section (0xA000_0000) — keep those above the max slot.
-pub const DLL_REG_COUNT: usize = 19;
+/// Total number of nt-dll-registry SLOTS pre-reserved at boot (the `dll_pes` / `dll_pe_store` array
+/// size + the registry's slot count). Each occupies a fixed 16 MiB base slot from 0x8000_0000
+/// (shared 1 GiB PDPT range), demand-paged from its parsed PE. Since Part 3, DLLs load PURELY
+/// ON-DEMAND (no eager `DLL_TABLE`): all slots except the csrsrv pin are RESERVED empty at boot and
+/// ACTIVATED at syscall time when a hosted process's loader first requests a DLL (see
+/// `fs_loader::demand_load_dll`). This is a CAPACITY, not a maintained list — adding a new DLL needs
+/// NO edit here (it demand-loads into a free slot) until the slots run out. NOTE: slot N sits at
+/// 0x8000_0000 + N*16MiB; slot 22 = 0x96000000, still below the win32k client window (0x9800_0000) +
+/// NLS section (0xA000_0000) — keep DLL_REG_COUNT ≤ 23 (0x97000000) so no slot collides with those.
+pub const DLL_REG_COUNT: usize = 23;
+/// Slots PINNED (eagerly loaded + registered at BOOT, NOT demand-loaded). The FLAGGED IRREDUCIBLE
+/// MINIMUM — every OTHER System32 DLL demand-loads on the fly. Two reasons a DLL must be pinned:
+///   • **csrsrv** (slot 0) — needs base 0x8000_0000 (its preferred ImageBase → relocation delta 0 →
+///     byte-identical shared text, loader never relocates it). Demand-load assigns slots in
+///     loader-request order, which can't guarantee csrsrv lands at slot 0.
+///   • **the `_vista` forwarder DLLs + ws2help** — these are loaded by ntdll's loader via the
+///     FORWARDER path in `LdrpSnapThunk`/`ldrpe.c` (e.g. advapi32 exports `RegDeleteTreeW` as a
+///     forwarder to `advapi32_vista.RegDeleteTreeW`). That forwarder resolution can fail BEFORE it
+///     ever reaches NtOpenFile (SxS/actctx redirection returns 0xC0000034 with no implicit act ctx),
+///     so the demand-load hook (which fires on the NtOpenFile resolve-miss) never sees the request →
+///     the snap fails fatally (observed: "Failed to snap advapi32_vista.dll!RegDeleteTreeW for
+///     rpcrt4.dll" → NtRaiseHardError). Pre-registering them means the loader finds them already
+///     loaded (`LdrpCheckForLoadedDll` hits) and skips the fragile forwarder-open path. This is a
+///     loader limitation, not a demand-load bug — documented pin, not a maintained content list.
+/// Every leaf DLL (kernel32/user32/gdi32/advapi32/rpcrt4/msvcrt/ws2_32/basesrv/winsrv + lsass'
+/// lsasrv/samsrv/msv1_0 + all P5+ binaries) demand-loads with NO edit here.
+pub const DLL_PIN_COUNT: usize = 4;
 /// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
 pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
@@ -2185,6 +2205,11 @@ struct ExecLoopCtx {
     /// The 14 loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
     /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
     dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
+    /// The mutable backing store for `dll_pes` — the demand-load path (`fs_loader::demand_load_dll`,
+    /// called on a `reg.resolve_name` MISS in NtOpenFile) writes a freshly-parsed `PeFile` into a
+    /// reserved slot here; `dll_pes[slot]` (a ref AT the slot) then observes it. Raw mut ptr to the
+    /// `service_sec_image` stack array (not the bump heap → the write survives the per-syscall reset).
+    dll_pe_store: *mut Option<nt_pe_loader::PeFile<'static>>,
     /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
     csrss_anon_section_handle: *mut u64,
@@ -2319,6 +2344,12 @@ struct ExecNtHandler {
     /// consumes it after dispatch: it advances the heap high-water mark to the current bump
     /// position so the overlay's runtime allocations are retained past the next per-syscall reset.
     overlay_dirty: bool,
+    /// Set by NtOpenFile when it DEMAND-LOADED a DLL (`fs_loader::demand_load_dll` on a
+    /// `reg.resolve_name` miss). Like `overlay_dirty`, the service loop advances the heap high-water
+    /// mark past whatever the load allocated so the registry's activated slot survives the per-syscall
+    /// reset. (The pool bytes + the `dll_pe_store` write are already reset-safe; this covers the
+    /// registry's inline-slot fill + any transient — a belt-and-braces pin, minimal leak.)
+    dll_loaded_dirty: bool,
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see

@@ -158,68 +158,68 @@ pub(crate) unsafe fn service_sec_image(
     // registry Vec growth / pool alloc made ABOVE the mark; loading them here keeps every DLL's parsed
     // PE + registry slot persistent (see project_full_fs Part 2 for the demand-load-during-syscall
     // rework this still awaits).
-    const DLL_TABLE: [(&[u8], &[u8]); DLL_REG_COUNT] = [
+    // Part 3 — TRUE syscall-time demand-load. The eager per-DLL `DLL_TABLE` is GONE: DLLs load PURELY
+    // ON-DEMAND from the real \reactos FS when a hosted process's loader first requests one (a
+    // `reg.resolve_name` MISS in NtOpenFile → `fs_loader::demand_load_dll`). At boot we only:
+    //   (1) PIN csrsrv at slot 0 (base 0x8000_0000 = its preferred ImageBase, relocation delta 0 →
+    //       byte-identical shared text, loader never relocates it). Demand-load assigns slots in
+    //       loader-request order, which can't guarantee csrsrv lands at slot 0, so this ONE entry is a
+    //       documented pin (DLL_PIN_COUNT). No other DLL cares about its base (all get relocated).
+    //   (2) RESERVE the remaining slots empty (base fixed + per-pi handle stores pre-allocated below
+    //       the heap_mark → the on-demand `activate` at syscall time needs NO heap growth, surviving
+    //       the per-syscall bump-heap reset). `dll_pe_store` is a stack local (also not the bump heap),
+    //       so an on-demand `dll_pe_store[slot] = Some(pe)` is likewise reset-safe. The pool bytes live
+    //       in the cap-mapped POOL arena (atomic POOL_NEXT), reset-safe too.
+    // Adding a new DLL (userinit/explorer/shell32/…) now needs NO edit here — it demand-loads into a
+    // free reserved slot. NO maintained DLL list remains (only the 1-entry csrsrv base pin).
+    // csrsrv (base pin) + the three `_vista` forwarder DLLs (loaded via LdrpSnapThunk's forwarder
+    // path, which the NtOpenFile-based demand-load hook can't catch — see DLL_PIN_COUNT). ws2help is
+    // demand-loadable (ws2_32 loads it as a normal import, not a forwarder), so it's NOT pinned.
+    const DLL_PINS: [(&[u8], &[u8]); DLL_PIN_COUNT] = [
         (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
-        (b"basesrv", b"reactos\\system32\\basesrv.dll"),
-        (b"winsrv", b"reactos\\system32\\winsrv.dll"),
-        (b"kernel32", b"reactos\\system32\\kernel32.dll"),
-        (b"user32", b"reactos\\system32\\user32.dll"),
-        (b"gdi32", b"reactos\\system32\\gdi32.dll"),
-        (b"rpcrt4", b"reactos\\system32\\rpcrt4.dll"),
-        (b"msvcrt", b"reactos\\system32\\msvcrt.dll"),
-        (b"advapi32", b"reactos\\system32\\advapi32.dll"),
-        (b"ws2_32", b"reactos\\system32\\ws2_32.dll"),
         (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
         (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
-        (b"ws2help", b"reactos\\system32\\ws2help.dll"),
         (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
-        (b"userenv", b"reactos\\system32\\userenv.dll"),
-        (b"mpr", b"reactos\\system32\\mpr.dll"),
-        (b"lsasrv", b"reactos\\system32\\lsasrv.dll"),
-        (b"samsrv", b"reactos\\system32\\samsrv.dll"),
-        (b"msv1_0", b"reactos\\system32\\msv1_0.dll"),
     ];
     // Owned parsed-PE storage (lives for the whole service loop). `dll_pes[i]` holds `&dll_pe_store[i]`
     // — a stable ref into this array — so the erased `*const [&Option<PeFile>; N]` handed to the
-    // handler is byte-identical to the prior array-of-refs form. Only the LIVE run (ntdll present) has
-    // the pool + FS mounted; the demo SEC_IMAGE call leaves them None.
+    // handler stays valid when a demand-load later writes `dll_pe_store[slot] = Some(pe)` (the ref
+    // points AT the slot, so it observes the new value). Only the LIVE run (ntdll present) mounts the
+    // pool/FS + demand-loads; the demo SEC_IMAGE call leaves every slot None.
     let mut dll_pe_store: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
         [const { None }; DLL_REG_COUNT];
-    let mut dll_buf_va = [0u64; DLL_REG_COUNT];
+    let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
     if ntdll.is_some() {
-        for i in 0..DLL_REG_COUNT {
-            let (pe, va) = load_dll_from_fs(DLL_TABLE[i].1, DLL_TABLE[i].0);
+        // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
+        for (i, &(stem, path)) in DLL_PINS.iter().enumerate() {
+            let (pe, va) = load_dll_from_fs(path, stem);
+            let (sz, ent) = pe
+                .as_ref()
+                .map(|p| (image_extent(p), p.entry_point_rva()))
+                .unwrap_or((0, 0));
+            reg.register(stem, sz, ent);
+            if let Some(ref p) = pe {
+                let base = reg.base(i);
+                apply_relocations_to_buf(p, va, base);
+                let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
+                core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
+            }
             dll_pe_store[i] = pe;
-            dll_buf_va[i] = va;
         }
     }
+    // (2) Reserve the remaining slots empty (base + handle stores pre-allocated at BOOT). On both the
+    // live + demo runs so the registry always has DLL_REG_COUNT slots (base assignment is identical).
+    for _ in DLL_PIN_COUNT..DLL_REG_COUNT {
+        reg.reserve();
+    }
+    // Raw mut ptr to the PE store for the on-demand fill (the handler activates a reserved slot then
+    // writes its parsed PE here via this ptr; `dll_pes[slot]` — a ref AT the slot — observes it).
+    // Taken BEFORE `dll_pes` borrows the array immutably (a raw ptr holds no borrow). The demand-load
+    // writes through this ptr are single-threaded + never alias a live `dll_pes[i]` read (the router
+    // reads a slot only after it's mapped, which is after it's written).
+    let dll_pe_store_ptr = dll_pe_store.as_mut_ptr();
     let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] =
         core::array::from_fn(|i| &dll_pe_store[i]);
-    let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
-    for i in 0..DLL_REG_COUNT {
-        let (sz, ent) = dll_pes[i]
-            .as_ref()
-            .map(|p| (image_extent(p), p.entry_point_rva()))
-            .unwrap_or((0, 0));
-        reg.register(DLL_TABLE[i].0, sz, ent);
-    }
-    // Pre-relocate each registry DLL to its fixed registry base + patch OptionalHeader.ImageBase to
-    // match. Our fake NtMapViewOfSection does NOT relocate SEC_IMAGE views — real Windows relocates
-    // an image section in the kernel at map time, so ntdll's loader trusts it's done and skips its own
-    // relocation. So WE must relocate, or a DLL that dereferences an absolute pointer during init
-    // faults (advapi32_vista read an un-relocated ImageBase+0x7000). Relocating to a FIXED base also
-    // makes each DLL's executable text byte-identical across processes → correctly shared read-only.
-    // csrsrv is already at its preferred ImageBase (delta 0 → no-op). Patch ImageBase AFTER relocating
-    // (apply_relocations_to_buf reads the old ImageBase to compute the delta) so the loader sees
-    // ImageBase == mapped base and doesn't double-relocate.
-    for i in 0..DLL_REG_COUNT {
-        if let Some(pe) = dll_pes[i].as_ref() {
-            let base = reg.base(i);
-            apply_relocations_to_buf(pe, dll_buf_va[i], base);
-            let e_lfanew = core::ptr::read_volatile((dll_buf_va[i] + 0x3c) as *const u32) as u64;
-            core::ptr::write_volatile((dll_buf_va[i] + e_lfanew + 0x30) as *mut u64, base);
-        }
-    }
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -704,6 +704,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pi = pi;
                 nt_handler.stop = false;
                 nt_handler.overlay_dirty = false;
+                nt_handler.dll_loaded_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
@@ -753,6 +754,8 @@ pub(crate) unsafe fn service_sec_image(
                     dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT]
                         as *const ()
                         as *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
+                    dll_pe_store: dll_pe_store_ptr as *mut ()
+                        as *mut Option<nt_pe_loader::PeFile<'static>>,
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
@@ -783,6 +786,15 @@ pub(crate) unsafe fn service_sec_image(
                 // within the 2 MiB heap; non-mutating iterations still reset fully.
                 if nt_handler.overlay_dirty {
                     nt_handler.overlay_dirty = false;
+                    heap_mark = allocator::mark();
+                }
+                // Demand-load plane: a handler that demand-loaded a DLL (NtOpenFile resolve-miss →
+                // fs_loader::demand_load_dll → registry `activate`d a reserved slot + wrote its parsed
+                // PE into dll_pe_store) pins the heap mark PAST the load's allocations so the activated
+                // registry slot survives the next `reset_to(heap_mark)`. Mirrors `overlay_dirty` — the
+                // pool bytes + dll_pe_store write are already reset-safe; this covers the registry fill.
+                if nt_handler.dll_loaded_dirty {
+                    nt_handler.dll_loaded_dirty = false;
                     heap_mark = allocator::mark();
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that

@@ -196,6 +196,7 @@ impl ExecNtHandler {
             // SCM's volatile-key creation (the boot creates only a handful).
             overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
             overlay_dirty: false,
+            dll_loaded_dirty: false,
         }
     }
     /// Intern a `KeyRef` into `key_handles` (deduped) and return the 4-aligned key handle. Handles
@@ -2899,7 +2900,33 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // owns namespace/existence (csrss.exe + System32 dir here). pi>=1 = csrss OR winlogon
                 // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
                 // launches csrss/winlogon.
-                let dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
+                let mut dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
+                // TRUE syscall-time DEMAND-LOAD: a DLL-loading process (pi>=1) whose loader requests a
+                // DLL not yet registered (resolve miss) + not an SxS probe → resolve it BY PATH from
+                // the real \reactos\system32 FS, load into the pool, activate a reserved registry slot,
+                // relocate, and stash its parsed PE. From here it behaves exactly like a boot-pinned
+                // DLL (NtCreateSection/NtMapViewOfSection/the fault router all go through the registry +
+                // dll_pes). This is what retires the eager DLL list — no maintained table.
+                if self.pi >= 1 && dll_i.is_none() && !is_sxs {
+                    if let Some(slot) = demand_load_dll(
+                        reg,
+                        ctx.dll_pe_store,
+                        DLL_REG_COUNT,
+                        &nb[..nlen],
+                    ) {
+                        // Pin the heap mark past the load's registry allocations (service loop consumes).
+                        self.dll_loaded_dirty = true;
+                        dll_i = Some(slot);
+                    } else if nb[..nlen].ends_with(b".dll") || nb[..nlen].windows(4).any(|w| w == b".dll") {
+                        // DIAG: a .dll open that missed the registry AND failed to demand-load — log it
+                        // so we can see which dependency the loader requested that we couldn't satisfy.
+                        print_str(b"[demand-miss] pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b" name=");
+                        print_str(&nb[..nlen.min(64)]);
+                        print_str(b"\n");
+                    }
+                }
                 if is_sys32_dir || is_csrss || is_winlogon || is_services || is_lsass || dll_i.is_some() {
                     let h = self.mint_handle();
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle

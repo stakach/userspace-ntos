@@ -51,12 +51,23 @@ use alloc::vec::Vec;
 /// `RegistryOverlay` `overlay_dirty` precedent).
 pub const PI_RESERVE: usize = 16;
 
+/// Max length of a DLL stem stored inline (see [`Dll::name_buf`]). Long enough for every real
+/// System32 DLL stem (`kernel32_vista` = 14) with headroom.
+pub const MAX_STEM: usize = 32;
+
 /// One registered DLL image and the handles/state the load flow accumulates for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dll {
-    /// Lowercase ASCII stem matched against a (folded) object name, e.g. `b"csrsrv"`.
-    pub name: &'static [u8],
-    /// Fixed system-wide load base (the VA the view is mapped at in every process).
+    /// Lowercase ASCII stem matched against a (folded) object name, stored INLINE (not a `&'static`)
+    /// so a slot can be **activated on demand** (its stem filled in at syscall time from an FS
+    /// request) without needing a `'static` name. A reserved-but-unactivated slot has `name_len == 0`
+    /// and matches nothing. Read via [`Dll::name`].
+    name_buf: [u8; MAX_STEM],
+    /// Number of valid bytes in `name_buf`. 0 = a reserved (unactivated) slot.
+    name_len: usize,
+    /// Fixed system-wide load base (the VA the view is mapped at in every process). Assigned at
+    /// `register`/`reserve` time from the slotted allocator, so it is collision-free and stable even
+    /// for a slot activated later on demand.
     pub base: u64,
     /// Page-aligned image extent (PE `SizeOfImage`), for VA-range containment.
     pub image_size: u64,
@@ -104,27 +115,65 @@ impl Registry {
     /// Register `name` (lowercase ASCII stem) with its image extent + entry RVA. Assigns the next
     /// base slot and returns the DLL's index. The first registered keeps `base_start` as its base —
     /// give it a DLL whose preferred ImageBase equals `base_start` so the loader never relocates it.
-    pub fn register(&mut self, name: &'static [u8], image_size: u64, entry_rva: u32) -> usize {
+    pub fn register(&mut self, name: &[u8], image_size: u64, entry_rva: u32) -> usize {
+        let i = self.reserve();
+        self.activate(i, name, image_size, entry_rva);
+        i
+    }
+
+    /// Pre-**reserve** an EMPTY slot: assign it a fixed base (so its VA range is stable + collision-
+    /// free) and pre-allocate its per-pi handle stores, but leave it nameless (`name_len == 0`) so it
+    /// matches nothing until [`activate`](Self::activate)d. Returns the slot index.
+    ///
+    /// This is the demand-load enabler: reserving all slots at BOOT (below the executive's per-syscall
+    /// `heap_mark`) makes the `dlls` Vec growth + the per-pi handle-store allocations PERSISTENT, so a
+    /// later on-demand `activate` (at syscall time) needs NO heap growth here — only the inline
+    /// `name_buf` fill, which is in-place. The executive then advances `heap_mark` past whatever it
+    /// itself allocated for the load (pool bytes live in a separate cap-mapped arena). See the module
+    /// docs + `PI_RESERVE`.
+    pub fn reserve(&mut self) -> usize {
         let base = self.next_base;
         self.next_base += self.slot;
-        // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots. `register()` runs at BOOT
-        // (before the executive takes its per-syscall `heap_mark`), so these allocations live in the
-        // persistent below-mark heap; runtime `set_*_handle(pi < PI_RESERVE)` then writes in place
-        // and survives the per-syscall `reset_to()`. See [`PI_RESERVE`].
+        // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots (see [`PI_RESERVE`]).
         let mut file_handle = Vec::new();
         let mut section_handle = Vec::new();
         file_handle.resize(PI_RESERVE, 0);
         section_handle.resize(PI_RESERVE, 0);
         self.dlls.push(Dll {
-            name,
+            name_buf: [0u8; MAX_STEM],
+            name_len: 0,
             base,
-            image_size,
-            entry_rva,
+            image_size: 0,
+            entry_rva: 0,
             file_handle,
             section_handle,
             mapped: false,
         });
         self.dlls.len() - 1
+    }
+
+    /// Fill a reserved slot's identity (stem + geometry) IN PLACE — no heap growth, so it's safe to
+    /// call at syscall time under the bump-heap reset. The base was fixed at [`reserve`](Self::reserve)
+    /// time and is left unchanged. `name` is truncated to [`MAX_STEM`]. Idempotent on the geometry.
+    pub fn activate(&mut self, i: usize, name: &[u8], image_size: u64, entry_rva: u32) {
+        if let Some(d) = self.dlls.get_mut(i) {
+            let n = name.len().min(MAX_STEM);
+            d.name_buf[..n].copy_from_slice(&name[..n]);
+            d.name_len = n;
+            d.image_size = image_size;
+            d.entry_rva = entry_rva;
+        }
+    }
+
+    /// The index of the first reserved (unactivated) slot, or `None` if all slots are in use. The
+    /// demand-load path claims one of these on a `resolve_name` miss.
+    pub fn first_free(&self) -> Option<usize> {
+        self.dlls.iter().position(|d| d.name_len == 0)
+    }
+
+    /// True if slot `i` is activated (has a stem).
+    pub fn is_active(&self, i: usize) -> bool {
+        self.dlls.get(i).map(|d| d.name_len != 0).unwrap_or(false)
     }
 
     /// Number of registered DLLs.
@@ -147,9 +196,9 @@ impl Registry {
         self.dlls.get(i).map(|d| d.base).unwrap_or(0)
     }
 
-    /// The lowercase stem of DLL `i` (empty if out of range) — for diagnostics.
+    /// The lowercase stem of DLL `i` (empty if out of range or a reserved slot) — for diagnostics.
     pub fn name(&self, i: usize) -> &[u8] {
-        self.dlls.get(i).map(|d| d.name).unwrap_or(b"")
+        self.dlls.get(i).map(|d| &d.name_buf[..d.name_len]).unwrap_or(b"")
     }
 
     /// True if `name` (any case) is an SxS/actctx probe the loader must be steered away from:
@@ -171,8 +220,8 @@ impl Registry {
         self.dlls
             .iter()
             .enumerate()
-            .filter(|(_, d)| contains(name, d.name))
-            .max_by_key(|(_, d)| d.name.len())
+            .filter(|(_, d)| d.name_len != 0 && contains(name, &d.name_buf[..d.name_len]))
+            .max_by_key(|(_, d)| d.name_len)
             .map(|(i, _)| i)
     }
 
@@ -459,6 +508,65 @@ mod tests {
         // The registry produces the same bytes for a registered DLL.
         let r = seeded();
         assert_eq!(r.image_info(0), Some(image_info(0x8000_0000, 0x1200, 0x1_1000, true)));
+    }
+
+    #[test]
+    fn reserved_slots_match_nothing_until_activated() {
+        // The demand-load enabler: reserving a slot at boot fixes its base + pre-allocates its
+        // handle stores, but it must resolve to NOTHING (name_len == 0) until activated on demand.
+        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        r.register(b"csrsrv", 0x1_1000, 0x1200); // slot 0 = the pinned base 0x8000_0000
+        let free0 = r.reserve(); // slot 1 (base 0x8100_0000), empty
+        let free1 = r.reserve(); // slot 2 (base 0x8200_0000), empty
+        assert_eq!((free0, free1), (1, 2));
+        assert!(!r.is_active(free0));
+        assert_eq!(r.first_free(), Some(1));
+        // A DLL name that WOULD land in a reserved slot resolves to None while the slot is empty
+        // (so the caller knows to demand-load it), and to csrsrv only for csrsrv paths.
+        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\version.dll"), None);
+        assert_eq!(r.name(free0), b""); // reserved → empty diagnostic name
+        assert_eq!(r.base(free0), 0x8100_0000); // base fixed at reserve time (collision-free)
+        // Activate slot 1 on demand (as the executive would after an FS load) — base UNCHANGED.
+        r.activate(free0, b"version", 0x9000, 0x2100);
+        assert!(r.is_active(free0));
+        assert_eq!(r.base(free0), 0x8100_0000); // still its reserved base
+        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\version.dll"), Some(1));
+        assert_eq!(r.name(free0), b"version");
+        assert_eq!(r.image_info(free0), Some(image_info(0x8100_0000, 0x2100, 0x9000, true)));
+        // first_free now points past the activated slot.
+        assert_eq!(r.first_free(), Some(2));
+    }
+
+    #[test]
+    fn register_is_reserve_plus_activate() {
+        // register() must be exactly reserve()+activate() — same base assignment, resolvable name.
+        let mut a = Registry::new(0x8000_0000, 0x0100_0000);
+        a.register(b"csrsrv", 0x1_1000, 0x1200);
+        a.register(b"basesrv", 0xD000, 0x2400);
+        let mut b = Registry::new(0x8000_0000, 0x0100_0000);
+        b.register(b"csrsrv", 0x1_1000, 0x1200);
+        let i = b.reserve();
+        b.activate(i, b"basesrv", 0xD000, 0x2400);
+        assert_eq!(a.base(1), b.base(1));
+        assert_eq!(a.name(1), b.name(1));
+        assert_eq!(a.image_info(1), b.image_info(1));
+        assert_eq!(a.resolve_name(b"basesrv.dll"), b.resolve_name(b"basesrv.dll"));
+    }
+
+    #[test]
+    fn all_slots_can_be_reserved_then_first_free_returns_none() {
+        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        for _ in 0..4 {
+            r.reserve();
+        }
+        for i in 0..4 {
+            assert!(!r.is_active(i));
+        }
+        // Activate all → first_free exhausts.
+        for i in 0..4 {
+            r.activate(i, b"x", 0x1000, 0);
+        }
+        assert_eq!(r.first_free(), None);
     }
 
     #[test]
