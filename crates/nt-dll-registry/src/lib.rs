@@ -8,9 +8,10 @@
 //!
 //! This crate owns the **pure decision half** of that flow so it's `cargo test`-able on the host:
 //!
-//! - **Name resolution** ([`Registry::resolve_name`]) — a folded-lowercase substring match that
-//!   rejects SxS/actctx probes (`.local` / `.manifest` / `.config`), which historically diverted the
-//!   loader down the DLL-redirection / manifest path instead of the plain System32 search.
+//! - **Name resolution** ([`Registry::resolve_name`]) — exact folded-lowercase DLL identity matching
+//!   on a bare name or the final component of a path, while rejecting SxS/actctx probes (`.local` /
+//!   `.manifest` / `.config`) that historically diverted the loader down DLL redirection instead of
+//!   the plain System32 search.
 //! - **Handle tracking** — file handle (NtOpenFile) → section handle (NtCreateSection) → mapped view
 //!   (NtMapViewOfSection), each looked up by handle.
 //! - **Base assignment** — each DLL gets a fixed system-wide load slot; the first registered keeps
@@ -208,20 +209,20 @@ impl Registry {
         contains(name, b".local") || contains(name, b".manifest") || contains(name, b".config")
     }
 
-    /// Resolve a (possibly full-path, any-case) object name to a registered DLL index. Returns
-    /// `None` for an SxS probe or an unregistered name. Matches the DLL stem as a substring of the
-    /// lowercased name; when several stems match, the **longest** wins — so `kernel32_vista.dll`
-    /// resolves to the `kernel32_vista` entry, not `kernel32` (whose stem is also a substring).
+    /// Resolve a possibly-full object name to a registered DLL index. Returns `None` for an SxS
+    /// probe, a non-DLL leaf, or an unregistered identity. The final `\`- or `/`-delimited component
+    /// must equal either the registered stem or `<stem>.dll`; arbitrary substring and suffix matches
+    /// are deliberately rejected so identities such as `sfc`, `sfc_os`, and `sfcfiles` cannot alias.
     /// The caller passes a lowercased-ASCII fold of the UTF-16 object name.
     pub fn resolve_name(&self, name: &[u8]) -> Option<usize> {
         if Self::is_sxs_probe(name) {
             return None;
         }
+        let stem = dll_stem(name)?;
         self.dlls
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.name_len != 0 && contains(name, &d.name_buf[..d.name_len]))
-            .max_by_key(|(_, d)| d.name_len)
+            .find(|(_, d)| d.name_len != 0 && stem == &d.name_buf[..d.name_len])
             .map(|(i, _)| i)
     }
 
@@ -311,6 +312,18 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Extract the exact folded DLL identity from a bare name or final path component.
+fn dll_stem(name: &[u8]) -> Option<&[u8]> {
+    let leaf_start = name
+        .iter()
+        .rposition(|&byte| byte == b'\\' || byte == b'/')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let leaf = &name[leaf_start..];
+    let stem = leaf.strip_suffix(b".dll".as_slice()).unwrap_or(leaf);
+    (!stem.is_empty()).then_some(stem)
+}
+
 /// Build the 64-byte x64 `SECTION_IMAGE_INFORMATION` the loader reads from NtQuerySection (class 1)
 /// for an image loaded at `base` with entry RVA `entry_rva` and `SizeOfImage` `image_size`. `is_dll`
 /// sets the DLL characteristic bit (0x2000) — the loader rejects a DLL section whose info says EXE
@@ -363,16 +376,15 @@ mod tests {
         assert_eq!(r.resolve_name(b"\\systemroot\\system32\\csrsrv.dll"), Some(0));
         assert_eq!(r.resolve_name(b"c:\\windows\\system32\\basesrv.dll"), Some(1));
         assert_eq!(r.resolve_name(b"winsrv"), Some(2));
-        // The caller folds case before calling; a bare uppercase stem won't match (by design —
-        // resolve_name is the pure substring step over already-lowercased input).
+        // The caller folds case before calling; resolve_name compares the already-folded identity.
         assert_eq!(r.resolve_name(b"csrsrv"), Some(0));
     }
 
     #[test]
-    fn longest_stem_wins_over_substring_collision() {
-        // ReactOS ships kernel32_vista.dll / advapi32_vista.dll whose stems SUPERSET the base names
-        // ("kernel32_vista.dll" contains "kernel32"). Longest-match must pick the specific entry
-        // regardless of registration order.
+    fn vista_supersets_are_distinct_exact_identities() {
+        // ReactOS ships kernel32_vista.dll / advapi32_vista.dll whose stems are supersets of the
+        // base names. Exact identity matching must select each entry independent of registration
+        // order rather than depending on a longest-substring heuristic.
         let mut r = Registry::new(0x8000_0000, 0x0100_0000);
         r.register(b"kernel32", 0x2A_8000, 0x1000); // base name registered FIRST
         r.register(b"kernel32_vista", 0x8000, 0x2000);
@@ -385,6 +397,44 @@ mod tests {
         // The base names still resolve to themselves (they don't contain the longer stems).
         assert_eq!(r.name(r.resolve_name(b"kernel32.dll").unwrap()), b"kernel32");
         assert_eq!(r.name(r.resolve_name(b"advapi32.dll").unwrap()), b"advapi32");
+    }
+
+    #[test]
+    fn sfc_family_names_never_alias() {
+        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        let sfc = r.register(b"sfc", 0x1000, 0x100);
+        let sfcfiles = r.register(b"sfcfiles", 0x2000, 0x200);
+        let sfc_os_slot = r.reserve();
+
+        assert_eq!(r.resolve_name(b"sfc.dll"), Some(sfc));
+        assert_eq!(r.resolve_name(b"sfcfiles.dll"), Some(sfcfiles));
+        assert_eq!(r.resolve_name(b"sfc_os.dll"), None);
+        assert_eq!(r.resolve_name(b"not-sfc.dll"), None);
+
+        r.activate(sfc_os_slot, b"sfc_os", 0x3000, 0x300);
+        assert_eq!(r.resolve_name(b"sfc_os.dll"), Some(sfc_os_slot));
+        assert_eq!(r.resolve_name(b"sfc_os"), Some(sfc_os_slot));
+        assert_eq!(r.resolve_name(b"sfc.dll"), Some(sfc));
+        assert_eq!(r.resolve_name(b"sfcfiles.dll"), Some(sfcfiles));
+    }
+
+    #[test]
+    fn resolve_accepts_nt_dos_and_forward_slash_paths() {
+        let r = seeded();
+        assert_eq!(r.resolve_name(b"\\??\\c:\\reactos\\system32\\csrsrv.dll"), Some(0));
+        assert_eq!(r.resolve_name(b"c:/reactos/system32/basesrv.dll"), Some(1));
+        assert_eq!(r.resolve_name(b"\\systemroot\\system32\\\\winsrv.dll"), Some(2));
+    }
+
+    #[test]
+    fn malformed_or_nonfinal_substrings_do_not_resolve() {
+        let r = seeded();
+        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\prefixwinsrv.dll"), None);
+        assert_eq!(r.resolve_name(b"c:\\reactos\\system32winsrv.dll"), None);
+        assert_eq!(r.resolve_name(b"c:\\reactos\\winsrv.dll\\trailer"), None);
+        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\winsrv.dll.bak"), None);
+        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\winsrv"), Some(2));
+        assert_eq!(r.resolve_name(b"c:\\reactos\\system32\\"), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "nt-dll-registry"
-description = "Generic name/handle/VA registry for demand-loaded, shared-text DLL images in the ntos executive: SxS-probe-rejecting name resolution, file/section-handle tracking, per-DLL base assignment, faulting-VA → (dll, rva) lookup, and SECTION_IMAGE_INFORMATION synthesis. Pure logic, host-tested; no_std + alloc, no unsafe."
+description = "Generic name/handle/VA registry for demand-loaded, shared-text DLL images in the ntos executive: exact DLL-identity and SxS-probe-rejecting name resolution, file/section-handle tracking, per-DLL base assignment, faulting-VA → (dll, rva) lookup, and SECTION_IMAGE_INFORMATION synthesis. Pure logic, host-tested; no_std + alloc, no unsafe."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
