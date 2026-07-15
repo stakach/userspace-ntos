@@ -280,8 +280,32 @@ fn group_c_ladder_migrations_register() {
     for (svc, num) in pairs {
         let e = t.lookup(num).unwrap();
         assert_eq!(e.service, svc);
-        assert_eq!(e.max_args, 4, "{} should cap at 4 register args", svc.name());
+        assert_eq!(
+            e.max_args,
+            4,
+            "{} should cap at 4 register args",
+            svc.name()
+        );
     }
+}
+
+#[test]
+fn reactos_global_atom_family_registers_with_exact_contracts() {
+    let pairs = [
+        (NativeService::NtAddAtom, 8u32),
+        (NativeService::NtDeleteAtom, 62),
+        (NativeService::NtFindAtom, 80),
+        (NativeService::NtQueryInformationAtom, 157),
+    ];
+    let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    for (service, ssn) in pairs {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+        assert_eq!(table.number_of(service), Some(ssn));
+    }
+    assert_eq!(NativeService::NtAddAtom.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtDeleteAtom.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtFindAtom.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtQueryInformationAtom.arg_count(), (5, 5));
 }
 
 #[test]
@@ -305,7 +329,12 @@ fn group_a_services_register_with_register_only_bounds() {
     for (svc, num) in pairs {
         let e = t.lookup(num).unwrap();
         assert_eq!(e.service, svc);
-        assert_eq!(e.max_args, 4, "{} should cap at 4 register args", svc.name());
+        assert_eq!(
+            e.max_args,
+            4,
+            "{} should cap at 4 register args",
+            svc.name()
+        );
     }
 }
 
@@ -325,7 +354,10 @@ fn group_b2_out_writing_query_services_register() {
     }
     assert_eq!(NativeService::NtQuerySystemTime.arg_count(), (1, 1));
     assert_eq!(NativeService::NtQueryPerformanceCounter.arg_count(), (2, 2));
-    assert_eq!(NativeService::NtQueryVolumeInformationFile.arg_count(), (5, 5));
+    assert_eq!(
+        NativeService::NtQueryVolumeInformationFile.arg_count(),
+        (5, 5)
+    );
 }
 
 #[test]

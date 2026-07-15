@@ -1271,7 +1271,7 @@ use nt_kernel_exec::rtl_atom;
 /// The single arena backing every atom table this component hands out (`gAtomTable` +
 /// per-window-station tables). Lazily pool-allocated on the first `RtlCreateAtomTable`; each table
 /// is a distinct sub-region so class atoms (global table) and global atoms (winsta tables) don't
-/// collide. Each arena is 64 KiB (≈370 entries — ample for the system classes + a few user atoms).
+/// collide. Each arena is 64 KiB (≈125 full-length entries — ample for system classes + user atoms).
 const ATOM_ARENA_BYTES: u64 = 0x10000;
 
 /// `NTSTATUS RtlCreateAtomTable(ULONG TableSize, PRTL_ATOM_TABLE* AtomTable)`. Pool-allocate an

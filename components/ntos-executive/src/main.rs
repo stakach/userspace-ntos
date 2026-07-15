@@ -343,6 +343,13 @@ pub const LSASS_LISTENER2_STACK_MIRROR_VA: u64 = 0x0000_0100_1370_0000;
 pub const LSASS_LISTENER2_BADGE: u64 = 10;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
+/// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
+pub const SSN_NT_ADD_ATOM: u64 = 8;
+pub const SSN_NT_DELETE_ATOM: u64 = 62;
+pub const SSN_NT_FIND_ATOM: u64 = 80;
+pub const SSN_NT_QUERY_INFORMATION_ATOM: u64 = 157;
+/// Fixed, allocation-free storage for the executive-lifetime global atom table.
+pub const GLOBAL_ATOM_CAPACITY: usize = 32;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
 pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 /// ntdll's NtQueryVirtualMemory SSN (LdrpInitialize queries the region at [TEB+0x10] early).
@@ -2511,6 +2518,11 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
     /// like `key_handles`; entries are inline (no nested heap) so pushes never reallocate.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its arena
+    /// is allocated once in `new()` below the per-syscall heap mark; atom operations mutate only
+    /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
+    /// shared across every hosted process (`pi`).
+    global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -2723,6 +2735,10 @@ fn build_nt_table() -> NativeServiceTable {
     NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,
         &[
+            (NativeService::NtAddAtom, SSN_NT_ADD_ATOM as u32),
+            (NativeService::NtDeleteAtom, SSN_NT_DELETE_ATOM as u32),
+            (NativeService::NtFindAtom, SSN_NT_FIND_ATOM as u32),
+            (NativeService::NtQueryInformationAtom, SSN_NT_QUERY_INFORMATION_ATOM as u32),
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtCreateKey, SSN_NT_CREATE_KEY as u32),

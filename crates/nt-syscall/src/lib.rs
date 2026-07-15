@@ -50,6 +50,11 @@ pub enum NativeService {
     NtDuplicateObject,
     NtWaitForSingleObject,
     NtQueryObject,
+    // Global atom table
+    NtAddAtom,
+    NtDeleteAtom,
+    NtFindAtom,
+    NtQueryInformationAtom,
     // File / I/O (§16.2)
     NtCreateFile,
     NtOpenFile,
@@ -160,6 +165,10 @@ impl NativeService {
             NtDuplicateObject => "NtDuplicateObject",
             NtWaitForSingleObject => "NtWaitForSingleObject",
             NtQueryObject => "NtQueryObject",
+            NtAddAtom => "NtAddAtom",
+            NtDeleteAtom => "NtDeleteAtom",
+            NtFindAtom => "NtFindAtom",
+            NtQueryInformationAtom => "NtQueryInformationAtom",
             NtCreateFile => "NtCreateFile",
             NtOpenFile => "NtOpenFile",
             NtReadFile => "NtReadFile",
@@ -238,13 +247,14 @@ impl NativeService {
     pub fn arg_count(self) -> (u8, u8) {
         use NativeService::*;
         match self {
-            NtClose | NtTerminateThread | NtQuerySystemTime | NtDisplayString => (1, 1),
+            NtClose | NtTerminateThread | NtQuerySystemTime | NtDisplayString
+            | NtDeleteAtom => (1, 1),
             NtTerminateProcess | NtUnmapViewOfSection | NtQueryDebugFilterState => (2, 2),
-            NtOpenKey | NtCreateKey => (3, 3),
+            NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom => (3, 3),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
-            | NtQueryObject | NtQueryVolumeInformationFile => (5, 5),
+            | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom => (5, 5),
             NtWaitForSingleObject => (3, 3),
             NtQueryPerformanceCounter => (2, 2),
             NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
@@ -289,6 +299,10 @@ impl NativeService {
         NativeService::NtDuplicateObject,
         NativeService::NtWaitForSingleObject,
         NativeService::NtQueryObject,
+        NativeService::NtAddAtom,
+        NativeService::NtDeleteAtom,
+        NativeService::NtFindAtom,
+        NativeService::NtQueryInformationAtom,
         NativeService::NtCreateFile,
         NativeService::NtOpenFile,
         NativeService::NtReadFile,

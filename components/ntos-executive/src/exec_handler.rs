@@ -53,6 +53,10 @@ impl ExecNtHandler {
                 }
                 v
             },
+            global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
+                GLOBAL_ATOM_CAPACITY,
+            )
+            .unwrap(),
             pi: 0,
             stop: false,
             next_handle: FAKE_HANDLE,
@@ -477,6 +481,44 @@ impl ExecNtHandler {
             self.xas_write_u64(va + i as u64, u64::from_le_bytes(w));
             i += 8;
         }
+    }
+    /// Capture an NtAddAtom/NtFindAtom explicit-length UTF-16 name from the current process. Small
+    /// pointer values preserve MAKEINTATOM semantics and are returned directly without a read.
+    pub(crate) unsafe fn copyin_atom_name(
+        &self,
+        name_va: u64,
+        byte_len: u32,
+        name: &mut [u16; nt_kernel_exec::rtl_atom::NAME_CAP],
+    ) -> Result<Option<u16>, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        let byte_len = byte_len as usize;
+        if byte_len > nt_kernel_exec::rtl_atom::NAME_CAP * 2 || byte_len & 1 != 0 {
+            return Err(nt_kernel_exec::rtl_atom::status::INVALID_PARAMETER);
+        }
+        if name_va <= 0xFFFF {
+            return Ok(Some(name_va as u16));
+        }
+        let units = byte_len / 2;
+        let mut bytes = [0u8; nt_kernel_exec::rtl_atom::NAME_CAP * 2];
+        if !self.xas_read(name_va, &mut bytes[..byte_len]) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        for i in 0..units {
+            name[i] = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        }
+        Ok(None)
+    }
+
+    /// Probe a small user output range using the current process's cross-address-space reader.
+    pub(crate) unsafe fn probe_atom_output(&self, va: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if va == 0 || len > 8 {
+            return false;
+        }
+        let mut probe = [0u8; 8];
+        self.xas_read(va, &mut probe[..len])
     }
     /// Cross-AS UNICODE_STRING read (x64 {u16 Length, u16 Max, u32 pad, u64 Buffer}) via [`xas_read`],
     /// so a Buffer in a not-yet-faulted DLL `.rdata` page resolves from the backing PE. Used for
@@ -973,6 +1015,137 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS
             }
+            // One executive-lifetime table is shared across every hosted process. Add increments a
+            // duplicate's reference count, Find does not, and Delete decrements/frees at zero.
+            NativeService::NtAddAtom | NativeService::NtFindAtom => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                let out_atom = args[2];
+                if out_atom != 0 && !self.probe_atom_output(out_atom, 2) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let byte_len = args[1] as u32;
+                let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP];
+                let integer = match self.copyin_atom_name(args[0], byte_len, &mut name) {
+                    Ok(integer) => integer,
+                    Err(status) => return status,
+                };
+                let result = match (ctx.service, integer) {
+                    (NativeService::NtAddAtom, Some(atom)) => self.global_atoms.add_integer(atom),
+                    (NativeService::NtFindAtom, Some(atom)) => self.global_atoms.find_integer(atom),
+                    (NativeService::NtAddAtom, None) => {
+                        self.global_atoms.add_name(&name[..byte_len as usize / 2])
+                    }
+                    (NativeService::NtFindAtom, None) => {
+                        self.global_atoms.find_name(&name[..byte_len as usize / 2])
+                    }
+                    _ => unreachable!(),
+                };
+                match result {
+                    Ok(atom) => {
+                        if out_atom != 0 {
+                            self.xas_write_buf(out_atom, &atom.to_le_bytes());
+                        }
+                        nt_kernel_exec::rtl_atom::status::SUCCESS
+                    }
+                    Err(status) => status,
+                }
+            },
+            NativeService::NtDeleteAtom => self.global_atoms.delete(args[0] as u16),
+            NativeService::NtQueryInformationAtom => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                const BASIC_HEADER: usize = 6;
+                const TABLE_HEADER: usize = 4;
+
+                let atom = args[0] as u16;
+                let info_class = args[1] as u32;
+                let info_va = args[2];
+                let info_len = args[3] as u32 as usize;
+                let return_len_va = args[4];
+
+                if return_len_va != 0 && !self.probe_atom_output(return_len_va, 4) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if info_len != 0 {
+                    let mut first = [0u8; 8];
+                    let probe_len = info_len.min(first.len());
+                    if info_va == 0 || !self.xas_read(info_va, &mut first[..probe_len]) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+
+                let mut required_length = 0u32;
+                let status = match info_class {
+                    0 => {
+                        required_length = BASIC_HEADER as u32;
+                        if info_len < BASIC_HEADER {
+                            nt_kernel_exec::rtl_atom::status::INFO_LENGTH_MISMATCH
+                        } else {
+                            let name_capacity = (info_len - BASIC_HEADER) as u32;
+                            let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP + 1];
+                            let query = self.global_atoms.query(atom, &mut name, name_capacity);
+                            if query.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
+                                let copied = query.name_length as usize;
+                                let write_len = BASIC_HEADER + copied + 2;
+                                let mut output = [0u8;
+                                    BASIC_HEADER
+                                        + (nt_kernel_exec::rtl_atom::NAME_CAP + 1) * 2];
+                                if info_va == 0
+                                    || !self.xas_read(info_va, &mut output[..write_len])
+                                {
+                                    return STATUS_ACCESS_VIOLATION;
+                                }
+                                output[0..2].copy_from_slice(
+                                    &(query.reference_count as u16).to_le_bytes(),
+                                );
+                                output[2..4]
+                                    .copy_from_slice(&(query.pin_count as u16).to_le_bytes());
+                                output[4..6]
+                                    .copy_from_slice(&(query.name_length as u16).to_le_bytes());
+                                for i in 0..=(copied / 2) {
+                                    let off = BASIC_HEADER + i * 2;
+                                    output[off..off + 2].copy_from_slice(&name[i].to_le_bytes());
+                                }
+                                self.xas_write_buf(info_va, &output[..write_len]);
+                                required_length = write_len as u32;
+                            }
+                            query.status
+                        }
+                    }
+                    1 => {
+                        required_length = TABLE_HEADER as u32;
+                        if info_len < TABLE_HEADER {
+                            nt_kernel_exec::rtl_atom::status::INFO_LENGTH_MISMATCH
+                        } else {
+                            let slots = ((info_len - TABLE_HEADER) / 2).min(GLOBAL_ATOM_CAPACITY);
+                            let mut atoms = [0u16; GLOBAL_ATOM_CAPACITY];
+                            let list = self.global_atoms.list(&mut atoms[..slots]);
+                            let copied = list.count.min(slots);
+                            let write_len = TABLE_HEADER + copied * 2;
+                            let mut output = [0u8; TABLE_HEADER + GLOBAL_ATOM_CAPACITY * 2];
+                            if info_va == 0 || !self.xas_read(info_va, &mut output[..write_len]) {
+                                return STATUS_ACCESS_VIOLATION;
+                            }
+                            output[..4].copy_from_slice(&(list.count as u32).to_le_bytes());
+                            for (i, atom) in atoms[..copied].iter().enumerate() {
+                                let off = TABLE_HEADER + i * 2;
+                                output[off..off + 2].copy_from_slice(&atom.to_le_bytes());
+                            }
+                            self.xas_write_buf(info_va, &output[..write_len]);
+                            if list.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
+                                required_length = write_len as u32;
+                            }
+                            list.status
+                        }
+                    }
+                    _ => STATUS_INVALID_INFO_CLASS,
+                };
+
+                if return_len_va != 0 {
+                    self.xas_write_buf(return_len_va, &required_length.to_le_bytes());
+                }
+                status
+            },
             // NtOpenKey(*KeyHandle[0], DesiredAccess[1], ObjectAttributes[2]). Copy in the object
             // name from smss, resolve it in the SYSTEM hive, hand back a handle (copyout to arg0).
             NativeService::NtOpenKey => unsafe {

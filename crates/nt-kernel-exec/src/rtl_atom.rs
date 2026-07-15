@@ -27,6 +27,9 @@
 //!   Re-adding an existing name bumps its reference count; deleting decrements and frees at zero.
 //!   Pinned atoms are never ref-counted or deleted.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// NTSTATUS values these functions return (subset used by the atom table).
 pub mod status {
     pub const SUCCESS: u32 = 0x0000_0000;
@@ -35,6 +38,7 @@ pub mod status {
     pub const INVALID_HANDLE: u32 = 0xC000_0008;
     pub const INVALID_PARAMETER: u32 = 0xC000_000D;
     pub const NO_MEMORY: u32 = 0xC000_0017;
+    pub const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
     pub const OBJECT_NAME_INVALID: u32 = 0xC000_0033;
     pub const OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
     pub const BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -46,7 +50,7 @@ const FLAG_PINNED: u16 = 0x0001;
 const FIRST_DYNAMIC_ATOM: u16 = 0xC000;
 /// Maximum characters stored per atom name (Windows `RTL_MAXIMUM_ATOM_LENGTH` is 255; the atom
 /// table entry stores an inline copy — names longer than this are rejected `OBJECT_NAME_INVALID`).
-pub const NAME_CAP: usize = 128;
+pub const NAME_CAP: usize = 255;
 
 /// Table header field offsets.
 mod hdr {
@@ -76,8 +80,164 @@ mod ent {
     /// Inline UTF-16 name buffer.
     pub const NAME: usize = 0x08;
 }
-/// Size of one atom entry: header (8 bytes) + inline name buffer.
-pub const ENTRY_SIZE: usize = ent::NAME + NAME_CAP * 2;
+/// Size of one atom entry: header (8 bytes) + inline name buffer + terminating null.
+pub const ENTRY_SIZE: usize = ent::NAME + (NAME_CAP + 1) * 2;
+
+/// An allocation-backed atom table whose address remains stable for its lifetime. This is the
+/// owning form used for the executive's global atom table; the raw functions below remain the ABI
+/// used by hosted ntoskrnl/win32k exports.
+pub struct OwnedAtomTable {
+    arena: Vec<u8>,
+}
+
+impl OwnedAtomTable {
+    /// Create a table with exactly `capacity` string-atom slots.
+    pub fn with_capacity(capacity: usize) -> Option<Self> {
+        if capacity == 0 || capacity > u32::MAX as usize {
+            return None;
+        }
+        let arena_len = hdr::SIZE.checked_add(capacity.checked_mul(ENTRY_SIZE)?)?;
+        let mut arena = vec![0u8; arena_len];
+        // SAFETY: `arena` is writable for `arena_len` bytes and its allocation remains stable: no
+        // method changes its length or capacity after construction.
+        if unsafe { create(arena.as_mut_ptr(), arena.len()) }.is_null() {
+            return None;
+        }
+        Some(Self { arena })
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.arena.as_ptr()
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.arena.as_mut_ptr()
+    }
+
+    /// Add an explicit-length UTF-16 name. The slice need not contain a trailing null.
+    pub fn add_name(&mut self, name: &[u16]) -> Result<u16, u32> {
+        let mut terminated = [0u16; NAME_CAP + 1];
+        if name.len() > NAME_CAP {
+            return Err(status::INVALID_PARAMETER);
+        }
+        terminated[..name.len()].copy_from_slice(name);
+        let mut atom = 0u16;
+        // SAFETY: `terminated` is null-terminated and the owned table allocation is valid.
+        let status = unsafe { add(self.as_mut_ptr(), terminated.as_ptr(), &mut atom) };
+        if status == status::SUCCESS {
+            Ok(atom)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Find an explicit-length UTF-16 name without changing its reference count.
+    pub fn find_name(&self, name: &[u16]) -> Result<u16, u32> {
+        let mut terminated = [0u16; NAME_CAP + 1];
+        if name.len() > NAME_CAP {
+            return Err(status::INVALID_PARAMETER);
+        }
+        terminated[..name.len()].copy_from_slice(name);
+        let mut atom = 0u16;
+        // SAFETY: `terminated` is null-terminated and the owned table allocation is valid.
+        let status = unsafe { lookup(self.as_ptr(), terminated.as_ptr(), &mut atom) };
+        if status == status::SUCCESS {
+            Ok(atom)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Add an integer atom. Integer atoms are synthesized and never consume a table slot.
+    pub fn add_integer(&mut self, atom: u16) -> Result<u16, u32> {
+        let mut out = 0u16;
+        // SAFETY: small pointer values are the documented MAKEINTATOM representation and are not
+        // dereferenced by `add`.
+        let status = unsafe { add(self.as_mut_ptr(), atom as usize as *const u16, &mut out) };
+        if status == status::SUCCESS {
+            Ok(out)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Find an integer atom. Like add, this is a synthesized pass-through operation.
+    pub fn find_integer(&self, atom: u16) -> Result<u16, u32> {
+        let mut out = 0u16;
+        // SAFETY: see `add_integer`.
+        let status = unsafe { lookup(self.as_ptr(), atom as usize as *const u16, &mut out) };
+        if status == status::SUCCESS {
+            Ok(out)
+        } else {
+            Err(status)
+        }
+    }
+
+    pub fn delete(&mut self, atom: u16) -> u32 {
+        // SAFETY: the pointer is the live allocation initialized by `with_capacity`.
+        unsafe { delete(self.as_mut_ptr(), atom) }
+    }
+
+    /// Query an atom into `name`. `name_capacity_bytes` preserves the native byte-sized contract,
+    /// including odd/truncated capacities; callers must provide a 256-unit scratch buffer.
+    pub fn query(
+        &self,
+        atom: u16,
+        name: &mut [u16; NAME_CAP + 1],
+        name_capacity_bytes: u32,
+    ) -> AtomQueryResult {
+        let mut reference_count = 0u32;
+        let mut pin_count = 0u32;
+        let mut name_length = name_capacity_bytes.min((name.len() * 2) as u32);
+        // SAFETY: all outputs point to initialized writable locals and `name_length` is capped to
+        // the actual scratch buffer size.
+        let status = unsafe {
+            query(
+                self.as_ptr(),
+                atom,
+                &mut reference_count,
+                &mut pin_count,
+                name.as_mut_ptr(),
+                &mut name_length,
+            )
+        };
+        AtomQueryResult {
+            status,
+            reference_count,
+            pin_count,
+            name_length,
+        }
+    }
+
+    /// Enumerate all stored string atoms. Integer atoms are never table entries.
+    pub fn list(&self, atoms: &mut [u16]) -> AtomListResult {
+        let mut count = 0u32;
+        // SAFETY: the table is live and `atoms` describes its writable output capacity.
+        let status = unsafe { query_list(self.as_ptr(), atoms, &mut count) };
+        AtomListResult {
+            status,
+            count: count as usize,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AtomQueryResult {
+    pub status: u32,
+    pub reference_count: u32,
+    pub pin_count: u32,
+    /// Bytes copied, excluding the terminating null; on `BUFFER_TOO_SMALL`, required name bytes.
+    pub name_length: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AtomListResult {
+    pub status: u32,
+    /// Total atoms in the table, even when the output slice was too small.
+    pub count: usize,
+}
 
 #[inline]
 unsafe fn rd_u32(p: *const u8, off: usize) -> u32 {
@@ -458,6 +618,37 @@ pub unsafe fn query(
     status::SUCCESS
 }
 
+/// `RtlQueryAtomListInAtomTable` — copy as many stored string atoms as fit and always return the
+/// total count. Integer atoms are synthesized and therefore never appear in this list.
+///
+/// # Safety
+/// `table` must be a table from [`create`]; `count` must be writable.
+pub unsafe fn query_list(table: *const u8, atoms: &mut [u16], count: *mut u32) -> u32 {
+    if table.is_null() {
+        return status::INVALID_HANDLE;
+    }
+    let cap = rd_u32(table, hdr::CAPACITY);
+    let mut total = 0usize;
+    for i in 0..cap {
+        let atom = rd_u16(entry(table, i), ent::ATOM);
+        if atom == 0 {
+            continue;
+        }
+        if total < atoms.len() {
+            atoms[total] = atom;
+        }
+        total += 1;
+    }
+    if !count.is_null() {
+        core::ptr::write_unaligned(count, total as u32);
+    }
+    if total > atoms.len() {
+        status::INFO_LENGTH_MISMATCH
+    } else {
+        status::SUCCESS
+    }
+}
+
 /// Format a `#<decimal>` name for an integer atom into `name`/`*name_len` (bytes).
 unsafe fn query_write_name_int(atom: u16, name: *mut u16, name_len: *mut u32) -> u32 {
     if name_len.is_null() {
@@ -588,10 +779,7 @@ mod tests {
             assert_eq!(add(core::ptr::null_mut(), name, &mut atom), status::SUCCESS);
             assert_eq!(atom, 0x8001);
             let mut got = 0u16;
-            assert_eq!(
-                lookup(core::ptr::null(), name, &mut got),
-                status::SUCCESS
-            );
+            assert_eq!(lookup(core::ptr::null(), name, &mut got), status::SUCCESS);
             assert_eq!(got, 0x8001);
             // MAKEINTATOM(0) maps to 0xC000, which is out of the integer range → INVALID_PARAMETER.
             assert_eq!(
@@ -607,7 +795,10 @@ mod tests {
         let name = w("#256");
         unsafe {
             let mut atom = 0u16;
-            assert_eq!(add(core::ptr::null_mut(), name.as_ptr(), &mut atom), status::SUCCESS);
+            assert_eq!(
+                add(core::ptr::null_mut(), name.as_ptr(), &mut atom),
+                status::SUCCESS
+            );
             assert_eq!(atom, 256);
         }
     }
@@ -621,7 +812,7 @@ mod tests {
             let mut atom = 0u16;
             add(t, name.as_ptr(), &mut atom);
             add(t, name.as_ptr(), core::ptr::null_mut()); // ref = 2
-            // First delete just decrements.
+                                                          // First delete just decrements.
             assert_eq!(delete(t, atom), status::SUCCESS);
             let mut got = 0u16;
             assert_eq!(lookup(t, name.as_ptr(), &mut got), status::SUCCESS);
@@ -636,7 +827,10 @@ mod tests {
             add(t, name.as_ptr(), &mut a2);
             assert_eq!(pin(t, a2), status::SUCCESS);
             assert_eq!(delete(t, a2), status::WAS_LOCKED);
-            assert_eq!(lookup(t, name.as_ptr(), core::ptr::null_mut()), status::SUCCESS);
+            assert_eq!(
+                lookup(t, name.as_ptr(), core::ptr::null_mut()),
+                status::SUCCESS
+            );
         }
     }
 
@@ -678,5 +872,106 @@ mod tests {
                 status::INVALID_PARAMETER
             );
         }
+    }
+
+    #[test]
+    fn owned_table_uses_explicit_lengths_and_global_refcounts() {
+        let mut table = OwnedAtomTable::with_capacity(4).unwrap();
+        let mixed: std::vec::Vec<u16> = "WinSta0".encode_utf16().collect();
+        let upper: std::vec::Vec<u16> = "WINSTA0".encode_utf16().collect();
+
+        let atom = table.add_name(&mixed).unwrap();
+        assert_eq!(table.add_name(&upper), Ok(atom));
+        assert_eq!(table.find_name(&upper), Ok(atom));
+
+        let mut name = [0u16; NAME_CAP + 1];
+        let name_capacity = (name.len() * 2) as u32;
+        let queried = table.query(atom, &mut name, name_capacity);
+        assert_eq!(queried.status, status::SUCCESS);
+        assert_eq!(queried.reference_count, 2);
+        assert_eq!(queried.name_length, 14);
+        assert_eq!(&name[..7], mixed.as_slice());
+
+        assert_eq!(table.delete(atom), status::SUCCESS);
+        assert_eq!(table.find_name(&mixed), Ok(atom));
+        assert_eq!(table.delete(atom), status::SUCCESS);
+        assert_eq!(table.find_name(&mixed), Err(status::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[test]
+    fn owned_table_synthesizes_integer_atoms() {
+        let mut table = OwnedAtomTable::with_capacity(1).unwrap();
+        assert_eq!(table.add_integer(123), Ok(123));
+        assert_eq!(table.find_integer(0xBFFF), Ok(0xBFFF));
+        assert_eq!(table.add_integer(0), Err(status::INVALID_PARAMETER));
+        assert_eq!(table.add_integer(0xC000), Err(status::INVALID_PARAMETER));
+
+        let mut name = [0u16; NAME_CAP + 1];
+        let queried = table.query(123, &mut name, 64);
+        assert_eq!(queried.status, status::SUCCESS);
+        assert_eq!(queried.reference_count, 1);
+        assert_eq!(queried.pin_count, 1);
+        assert_eq!(queried.name_length, 8);
+        assert_eq!(
+            &name[..4],
+            &[b'#' as u16, b'1' as u16, b'2' as u16, b'3' as u16]
+        );
+    }
+
+    #[test]
+    fn owned_table_lists_all_atoms_and_reports_short_output() {
+        let mut table = OwnedAtomTable::with_capacity(3).unwrap();
+        let one: std::vec::Vec<u16> = "One".encode_utf16().collect();
+        let two: std::vec::Vec<u16> = "Two".encode_utf16().collect();
+        let a1 = table.add_name(&one).unwrap();
+        let a2 = table.add_name(&two).unwrap();
+
+        let mut short = [0u16; 1];
+        assert_eq!(
+            table.list(&mut short),
+            AtomListResult {
+                status: status::INFO_LENGTH_MISMATCH,
+                count: 2,
+            }
+        );
+        assert_eq!(short[0], a1);
+
+        let mut all = [0u16; 3];
+        assert_eq!(
+            table.list(&mut all),
+            AtomListResult {
+                status: status::SUCCESS,
+                count: 2,
+            }
+        );
+        assert_eq!(&all[..2], &[a1, a2]);
+    }
+
+    #[test]
+    fn accepts_the_full_255_character_contract() {
+        let mut table = OwnedAtomTable::with_capacity(1).unwrap();
+        let maximum = std::vec![b'x' as u16; NAME_CAP];
+        assert!(table.add_name(&maximum).is_ok());
+        let overlong = std::vec![b'x' as u16; NAME_CAP + 1];
+        assert_eq!(table.add_name(&overlong), Err(status::INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn owned_query_preserves_native_truncation_contract() {
+        let mut table = OwnedAtomTable::with_capacity(1).unwrap();
+        let value: std::vec::Vec<u16> = "LongName".encode_utf16().collect();
+        let atom = table.add_name(&value).unwrap();
+        let mut name = [0xCCCCu16; NAME_CAP + 1];
+
+        let too_small = table.query(atom, &mut name, 2);
+        assert_eq!(too_small.status, status::BUFFER_TOO_SMALL);
+        assert_eq!(too_small.name_length, 16);
+
+        let truncated = table.query(atom, &mut name, 4);
+        assert_eq!(truncated.status, status::SUCCESS);
+        assert_eq!(truncated.name_length, 2);
+        assert_eq!(name[0], b'L' as u16);
+        assert_eq!(name[1], 0);
+        assert_eq!(name[2], 0xCCCC);
     }
 }
