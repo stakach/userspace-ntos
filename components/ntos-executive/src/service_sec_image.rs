@@ -289,7 +289,7 @@ pub(crate) unsafe fn service_sec_image(
         // budget now covers services' full DllMain/CRT bring-up too — raised 3000→5000 so services
         // reaches its real SCM entry (ScmMain) rather than starving at the old ceiling. Verified
         // each process still PROGRESSES (new SSNs / advancing demand-faults), not spinning.
-        if iters > 5000 {
+        if iters > 8000 {
             stop = m1;
             break;
         }
@@ -563,6 +563,24 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"..0x");
                 print_hex((STACK_BASE + STACK_FRAMES * 0x1000) as u32);
                 print_str(b")\n");
+                // ★ Checkpoint B containment: once lsass has signaled LSA_RPC_SERVER_ACTIVE (its
+                // essential init is done), an unrecoverable fault on lsass' MAIN thread (badge 8) —
+                // e.g. rpcrt4 NdrSimpleTypeUnmarshall dereferencing a bogus RPC request buffer
+                // (cr2 ~0xe000002d6) while its RPC server services a self-directed call — is CONTAINED:
+                // PARK that thread (recv the next event without replying, leaving it blocked) so the
+                // boot advances to winlogon's WaitForLsass/login instead of stopping. Same philosophy
+                // as the N-threads listener-park; scoped so it can't mask a pre-signal lsass fault or
+                // any other process's fault.
+                if badge == LSASS_BADGE
+                    && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                {
+                    print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                        recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
@@ -680,6 +698,9 @@ pub(crate) unsafe fn service_sec_image(
             // thread does this after CsrServerInitialization ("CSRSRV keeps us going" — the fake API
             // worker threads stand in), so csrss goes quiet and smss proceeds.
             let mut park_caller = false;
+            // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
+            // the given obj_ns event index (set from nt_handler.wait_park_event after dispatch).
+            let mut park_wait_event: i64 = -1;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -713,6 +734,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.svc_listener_spawn = false;
                 nt_handler.lsass_listener_spawn = false;
                 nt_handler.lsass_listener2_spawn = false;
+                nt_handler.wait_park_event = -1;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -807,6 +829,12 @@ pub(crate) unsafe fn service_sec_image(
                     } else {
                         smss_stack_write(ptr, val);
                     }
+                }
+                // Checkpoint B: NtWaitForSingleObject on an unsignaled real event asked to PARK this
+                // caller. Latch it for the reply site (the actual reply-cap steal happens there where
+                // resume_ip/sp/flags are known).
+                if nt_handler.wait_park_event >= 0 {
+                    park_wait_event = nt_handler.wait_park_event;
                 }
                 // Control-flow post-action (group C): NtCreateProcess validated the csrss section and
                 // asked the loop to spawn the subsystem process (needs fault_ep + the per-badge
@@ -1244,10 +1272,35 @@ pub(crate) unsafe fn service_sec_image(
                 park_caller = true;
                 result = 0;
             } else if m0 == 228 {
-                // NtSetEvent(EventHandle=R10, *PreviousState=RDX). smss signals events during the
-                // Session-Manager tail (subsystem/session bookkeeping). No real event object is
-                // modeled in the host, so accept it (STATUS_SUCCESS); *PreviousState is optional and
-                // smss ignores it here. Lets SmpInit/SmpExecuteInitialCommand proceed.
+                // NtSetEvent(EventHandle=R10, *PreviousState=RDX).
+                // ★ Checkpoint B: if the handle names a REAL executive named event (obj_ns kind==2),
+                // SET its `signalled` flag and WAKE every waiter parked on it (reply-cap park). This is
+                // the signaler half — e.g. lsass' LsarStartRpcServer SetEvent(LSA_RPC_SERVER_ACTIVE)
+                // wakes winlogon's WaitForLsass. Handles that aren't real events (smss subsystem/session
+                // events, rpcrt4 fakes) are accepted as a SUCCESS no-op (nothing parks on them).
+                let ev_handle = get_recv_mr(9); // R10 = EventHandle
+                if ev_handle >= OBJ_HANDLE_BASE {
+                    let idx = (ev_handle - OBJ_HANDLE_BASE) as usize;
+                    if let Some(e) = nt_handler.obj_ns.get_mut(idx) {
+                        if e.kind == 2 {
+                            e.signalled = 1;
+                            if e.name() == b"lsa_rpc_server_active" {
+                                LSA_RPC_SERVER_ACTIVE_SIGNALLED.store(1, Ordering::Relaxed);
+                                print_str(b"[wait] lsass SIGNALLED LSA_RPC_SERVER_ACTIVE (event #");
+                                print_u64(idx as u64);
+                                print_str(b")\n");
+                            }
+                            let woken = wait_wake_event(idx);
+                            if woken > 0 {
+                                print_str(b"[wait] NtSetEvent(event #");
+                                print_u64(idx as u64);
+                                print_str(b") -> WOKE ");
+                                print_u64(woken);
+                                print_str(b" parked waiter(s)\n");
+                            }
+                        }
+                    }
+                }
                 result = 0;
             } else if m0 == 45 {
                 // NtCreateMutant(MutantHandle=R10, DesiredAccess=RDX, ObjectAttributes=R8,
@@ -1748,6 +1801,21 @@ pub(crate) unsafe fn service_sec_image(
             set_reply_mr(17, flags);
             procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            // Checkpoint B: PARK this caller on an unsignaled event (steal its reply cap into the waiter
+            // queue keyed by the event, rotate REPLY_MAIN to a fresh pool object, recv the next event
+            // WITHOUT replying). The matching NtSetEvent wakes it. If the pool/queue is exhausted,
+            // wait_park returns false → fall through to a normal (immediate WAIT_0) reply, never a hang.
+            if park_wait_event >= 0 && reply_main != 0 {
+                if wait_park(park_wait_event as usize, resume_ip, sp, flags) {
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+                // Pool exhausted → immediate WAIT_0 (documented fallback, never a hang).
+                print_str(b"[wait] park pool exhausted -> immediate WAIT_0 (fallback)\n");
+                result = 0;
+            }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 // Don't reply to the self-terminated thread — leave it blocked and recv the next
                 // event (re-binding REPLY_MAIN for the next caller). The parked thread never runs again.

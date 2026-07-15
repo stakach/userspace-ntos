@@ -805,6 +805,49 @@ static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 /// demand-page faults during a dispatch. cptr 0 = "not yet retyped" (legacy reply_to fallback).
 static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_W32_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// ═══ Checkpoint B: real reply-cap parking for NtWaitForSingleObject on unsignaled events ═══
+/// A parked waiter = a hosted thread that issued `NtWaitForSingleObject` on an event whose
+/// `signalled` flag is 0. Instead of returning STATUS_WAIT_0 with the thread still runnable (the
+/// old immediate-return stub, which made rpcrt4/winlogon proceed on unsatisfied state), the service
+/// loop DOESN'T reply — the thread stays blocked in-kernel on its Call. To keep it bound while the
+/// loop keeps receiving other callers, we can't re-use the single REPLY_MAIN reply object for the
+/// next recv (that would rebind + orphan the parked caller), so the loop STEALS the reply object that
+/// received this caller into a waiter slot and rotates REPLY_MAIN_SLOT to a fresh POOL object for
+/// subsequent recvs. On `NtSetEvent(that event)` the loop does `send_on_reply(stolen_cap, WAIT_0)` to
+/// wake exactly that parked caller, then returns the reply object to the pool. No new kernel
+/// primitive — reuses the existing MCS reply-cap machinery (recv-with-r12 + Send-on-reply).
+const WAIT_REPLY_POOL_N: usize = 8;
+/// The pool of spare MCS Reply objects (cptrs) allocated at boot. Index 0 is the "active" one
+/// currently installed in REPLY_MAIN_SLOT; the rest are free spares. A park swaps the active out
+/// (into a waiter slot) and installs a free spare as the new active.
+static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
+    [const { AtomicU64::new(0) }; WAIT_REPLY_POOL_N];
+/// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
+/// by a parked waiter). Managed by wait_park / wait_wake_event.
+static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
+/// The waiter queue: each slot holds (obj_ns event index, stolen reply cap) for one parked waiter.
+/// event_idx == u32::MAX means the slot is free. Fixed-capacity; parking past capacity falls back to
+/// the immediate-return path (documented, never a hang).
+const WAITER_N: usize = 16;
+static WAITER_EVENT_IDX: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
+static WAITER_REPLY_CAP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+/// The parked waiter's syscall resume context (RCX/RSP/RFLAGS): a native-syscall (UnknownSyscall)
+/// fault is resumed by an apply_fault_reply that restores RCX←resume_ip, RSP←sp, RFLAGS←flags and
+/// RAX/r10←status. The service loop sets these in the IPC buffer at reply time, so we must snapshot
+/// them per-waiter at park and re-install them (set_reply_mr 15/16/17) before the wake send.
+static WAITER_RESUME_IP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+static WAITER_RESUME_SP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+/// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
+static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Set once lsass signals LSA_RPC_SERVER_ACTIVE (its essential init is complete: the LSA RPC server is
+/// up). After this, an unrecoverable fault on lsass' MAIN thread (e.g. rpcrt4 NdrSimpleTypeUnmarshall
+/// dereferencing a bogus request buffer while servicing a self-directed RPC) is CONTAINED (the loop
+/// parks that thread) instead of stopping the boot — lsass has already done its job for the milestone
+/// (winlogon's WaitForLsass can now wake), so the boot advances to winlogon's login path.
+static LSA_RPC_SERVER_ACTIVE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 /// Path B (authentic SM accept): the SM-loop thread's dedicated fault endpoint (the executive recvs
 /// its real NtReplyWaitReceivePort/NtAcceptConnectPort/NtCompleteConnectPort faults here during the
 /// nested `sm_rendezvous`; no standing receiver otherwise, so the thread parks) + its own MCS reply
@@ -1559,6 +1602,96 @@ unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64
     );
 }
 
+/// ═══ Checkpoint B park/wake helpers (real reply-cap parking) ═══
+/// PARK the current caller on `event_idx`: the reply object CURRENTLY installed in REPLY_MAIN_SLOT is
+/// bound (by the last recv-with-r12) to THIS caller's blocked Call, so we STEAL it into a free waiter
+/// slot and rotate a fresh POOL reply object into REPLY_MAIN_SLOT so the loop's next recv binds a
+/// NEW object (never rebinding/orphaning the parked one). The caller stays blocked in-kernel until
+/// `wait_wake_event` sends on the stolen cap. Returns true on success; false if the pool/waiter queue
+/// is exhausted (caller must then fall back to an immediate reply → never a hang).
+unsafe fn wait_park(event_idx: usize, resume_ip: u64, sp: u64, flags: u64) -> bool {
+    // Find a free waiter slot.
+    let mut wslot = usize::MAX;
+    for i in 0..WAITER_N {
+        if WAITER_EVENT_IDX[i].load(Ordering::Relaxed) == u64::MAX {
+            wslot = i;
+            break;
+        }
+    }
+    if wslot == usize::MAX {
+        return false;
+    }
+    // The reply object bound to this caller is the active REPLY_MAIN.
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    // Find a FREE pool object to become the new active REPLY_MAIN. The stolen one is (still) marked
+    // used; we need a different free bit.
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let mut fresh = 0u64;
+    let mut fresh_bit = 0usize;
+    for i in 0..WAIT_REPLY_POOL_N {
+        if used & (1u64 << i) == 0 {
+            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
+            if cp != 0 {
+                fresh = cp;
+                fresh_bit = i;
+                break;
+            }
+        }
+    }
+    if fresh == 0 {
+        return false; // pool exhausted → caller falls back to immediate reply
+    }
+    // Commit: record the waiter + its syscall resume context, install the fresh object as the active
+    // recv reply cap.
+    WAITER_EVENT_IDX[wslot].store(event_idx as u64, Ordering::Relaxed);
+    WAITER_REPLY_CAP[wslot].store(stolen, Ordering::Relaxed);
+    WAITER_RESUME_IP[wslot].store(resume_ip, Ordering::Relaxed);
+    WAITER_RESUME_SP[wslot].store(sp, Ordering::Relaxed);
+    WAITER_RESUME_FLAGS[wslot].store(flags, Ordering::Relaxed);
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// WAKE every waiter parked on `event_idx`: reply STATUS_WAIT_0 (0) on each stolen reply cap (resumes
+/// the blocked caller's `NtWaitForSingleObject`), free its waiter slot, and return its reply object to
+/// the pool. Returns the number woken. Called from the NtSetEvent handler after setting `signalled`.
+unsafe fn wait_wake_event(event_idx: usize) -> u64 {
+    let mut woken = 0u64;
+    for i in 0..WAITER_N {
+        if WAITER_EVENT_IDX[i].load(Ordering::Relaxed) == event_idx as u64 {
+            let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
+            if cap != 0 {
+                // Resume the parked NtWaitForSingleObject with STATUS_WAIT_0. The waiter blocked as a
+                // native syscall (UnknownSyscall fault); apply_fault_reply restores RCX←resume_ip,
+                // RSP←sp, RFLAGS←flags (from IPC MR15/16/17) and RAX/r10←status. Re-install the
+                // snapshotted resume context, then reply length 18 (same shape as the live syscall
+                // reply). r10 (status) = 0 = STATUS_WAIT_0.
+                set_reply_mr(15, WAITER_RESUME_IP[i].load(Ordering::Relaxed));
+                set_reply_mr(16, WAITER_RESUME_SP[i].load(Ordering::Relaxed));
+                set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
+                send_on_reply(cap, 18, 0, 0, 0, 0);
+                // Return this reply object to the pool (clear its used bit).
+                for p in 0..WAIT_REPLY_POOL_N {
+                    if WAIT_REPLY_POOL[p].load(Ordering::Relaxed) == cap {
+                        WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << p), Ordering::Relaxed);
+                        break;
+                    }
+                }
+                woken += 1;
+                WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            WAITER_EVENT_IDX[i].store(u64::MAX, Ordering::Relaxed);
+            WAITER_REPLY_CAP[i].store(0, Ordering::Relaxed);
+        }
+    }
+    woken
+}
+
 unsafe fn set_reply_mr(i: usize, v: u64) {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
@@ -2295,6 +2428,12 @@ struct ExecNtHandler {
     lsass_listener_spawn: bool,
     /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
     lsass_listener2_spawn: bool,
+    /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
+    /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
+    /// event index) instead of replying, and wake it on the matching NtSetEvent. -1 = no park (either
+    /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
+    /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
+    wait_park_event: i64,
     /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
     /// connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
@@ -3606,6 +3745,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let e_rw = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rw);
     if e_rm == 0 {
         REPLY_MAIN_SLOT.store(rm, Ordering::Relaxed);
+    }
+    // Checkpoint B: retype the reply-object POOL. pool[0] IS the REPLY_MAIN object (the loop's active
+    // recv reply cap); pool[1..] are spares the loop rotates in when it steals pool[active] to hold a
+    // parked waiter's Call. All are OBJ_REPLY (size_bits 0).
+    if e_rm == 0 {
+        WAIT_REPLY_POOL[0].store(rm, Ordering::Relaxed);
+        for i in 1..WAIT_REPLY_POOL_N {
+            let rp = alloc_slot();
+            let e = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rp);
+            if e == 0 {
+                WAIT_REPLY_POOL[i].store(rp, Ordering::Relaxed);
+            }
+        }
+        WAIT_REPLY_POOL_USED.store(1, Ordering::Relaxed); // bit 0 = pool[0] is the active REPLY_MAIN
     }
     if e_rw == 0 {
         REPLY_W32_SLOT.store(rw, Ordering::Relaxed);
@@ -6177,6 +6330,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         LSASS_SRM_CONNECTED.load(Ordering::Relaxed) == 1,
                         &mut passed,
                     );
+                    // ★★ CHECKPOINT B (the LSA/wait milestone) — lsass runs its full LsarStartRpcServer
+                    // and SIGNALS LSA_RPC_SERVER_ACTIVE (SetEvent, lsarpc.c:105). Proves lsass reached
+                    // its signal point (past the RpcServerListen/pipe setup).
+                    check(
+                        b"exec_lsass_signals_lsa_rpc_active",
+                        LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) == 1,
+                        &mut passed,
+                    );
+                    // ★★ CHECKPOINT B — REAL reply-cap parking: a waiter (services' ScmWaitForLsa /
+                    // winlogon's WaitForLsass, both WaitForSingleObject(LSA_RPC_SERVER_ACTIVE, INFINITE))
+                    // genuinely BLOCKED on the unsignaled event (parked — the loop kept receiving) and
+                    // was WOKEN by lsass' NtSetEvent. This is the block-then-wake proof: the immediate-
+                    // return NtWaitForSingleObject stub is REPLACED by a real event-state wait for named
+                    // events with a live signaler. parked>=1 && woken>=1.
+                    check(
+                        b"exec_wait_reply_cap_park_wake",
+                        WAIT_PARKED_COUNT.load(Ordering::Relaxed) >= 1
+                            && WAIT_WOKEN_COUNT.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] Checkpoint B: LSA_RPC_SERVER_ACTIVE signalled=0x");
+                    print_hex(LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) as u32);
+                    print_str(b" waiters parked=0x");
+                    print_hex(WAIT_PARKED_COUNT.load(Ordering::Relaxed) as u32);
+                    print_str(b" woken=0x");
+                    print_hex(WAIT_WOKEN_COUNT.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] lsass spawned=0x");
                     print_hex(LSASS_SPAWNED.load(Ordering::Relaxed) as u32);
                     print_str(b" faults=0x");

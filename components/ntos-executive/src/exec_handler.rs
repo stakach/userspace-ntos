@@ -66,6 +66,7 @@ impl ExecNtHandler {
             svc_listener_spawn: false,
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
+            wait_park_event: -1,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
             csr_spawn_request: false,
@@ -2237,42 +2238,56 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             },
-            // NtWaitForSingleObject — csrsrv's CsrApiPortInitialize waits on its worker-thread
-            // startup event; we don't model the worker → STATUS_WAIT_0 (0) so init proceeds.
-            // Scoped to csrss (pi==1); smss never issues 281, so a smss 281 stops (as before).
+            // NtWaitForSingleObject(Handle=R10=args[0], Alertable=RDX, *Timeout=R8).
+            //
+            // ★ Checkpoint B — REAL event-state wait with reply-cap parking (the load-bearing case):
+            // if the target is a REAL executive named event (obj_ns kind==2, e.g. LSA_RPC_SERVER_ACTIVE
+            // that lsass creates+signals in LsarStartRpcServer), consult its `signalled` flag:
+            //   • signalled  → STATUS_WAIT_0 immediately (correct for a manual-reset event that has
+            //                  already been set — e.g. winlogon's WaitForLsass when lsass signaled first).
+            //   • unsignaled → request a PARK (wait_park_event = the event's obj_ns index); the service
+            //                  loop stashes this caller's reply cap keyed by the event and continues
+            //                  receiving. The matching NtSetEvent wakes it. This is the genuine
+            //                  block-then-wake (no deadlock: the loop keeps receiving while parked, and
+            //                  we only park on an event a live signaler can set).
+            // Any OTHER handle (fake sync handles from rpcrt4 mutants/csrsrv worker events, smss's
+            // subsystem event, etc.) has no live signaler → immediate STATUS_WAIT_0 (KEPT — documented:
+            // parking one of those would hang since nothing sets it). csrss (pi==1) stays immediate.
             NativeService::NtWaitForSingleObject => {
-                if self.pi == 1 {
-                    0
-                } else {
-                    // smss now issues 281 too: SmpLoadSubSystem waits on NewSubsystem->Event for csrss
-                    // to signal init-complete (smsubsys.c:432). csrss IS initialized (parked after
-                    // CsrServerInitialization), so model the wait as satisfied (STATUS_WAIT_0). Print
-                    // the handle + caller chain once for identification while grinding forward.
-                    unsafe {
-                        let sp = get_recv_mr(16);
-                        print_str(b"[281] smss wait handle=0x");
-                        print_hex(args[0] as u32);
-                        print_str(b" chain:");
-                        let mut shown = 0;
-                        for i in 0..96u64 {
-                            let v = smss_stack_read(sp + i * 8);
-                            if v >= NTDLL_BASE && v < NTDLL_BASE + 0xf4000 {
-                                print_str(b" n+0x");
-                                print_hex((v - NTDLL_BASE) as u32);
-                                shown += 1;
-                            } else if v >= PE_LOAD_BASE && v < PE_LOAD_BASE + 0x40000 {
-                                print_str(b" s+0x");
-                                print_hex((v - PE_LOAD_BASE) as u32);
-                                shown += 1;
+                let handle = args[0];
+                if handle >= OBJ_HANDLE_BASE {
+                    let idx = (handle - OBJ_HANDLE_BASE) as usize;
+                    if let Some(e) = self.obj_ns.get(idx) {
+                        if e.kind == 2 {
+                            if e.signalled != 0 {
+                                unsafe {
+                                    print_str(b"[wait] pi=");
+                                    print_u64(self.pi as u64);
+                                    print_str(b" NtWaitForSingleObject(event #");
+                                    print_u64(idx as u64);
+                                    print_str(b" '");
+                                    for &c in e.name() { debug_put_char(c); }
+                                    print_str(b"') already SIGNALLED -> immediate WAIT_0\n");
+                                }
+                                return 0;
                             }
-                            if shown >= 12 {
-                                break;
+                            // Unsignaled real event → ask the loop to PARK this caller on it.
+                            self.wait_park_event = idx as i64;
+                            unsafe {
+                                print_str(b"[wait] pi=");
+                                print_u64(self.pi as u64);
+                                print_str(b" NtWaitForSingleObject(event #");
+                                print_u64(idx as u64);
+                                print_str(b" '");
+                                for &c in e.name() { debug_put_char(c); }
+                                print_str(b"') UNSIGNALLED -> PARK caller (reply-cap park)\n");
                             }
+                            return 0x102; // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
                         }
-                        print_str(b"\n");
                     }
-                    0 // STATUS_WAIT_0
                 }
+                // No real parkable event → immediate STATUS_WAIT_0 (no live signaler).
+                0
             }
             // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
             // Resolve/insert in the executive object namespace, hand back a real handle.
