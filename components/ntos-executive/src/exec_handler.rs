@@ -1687,6 +1687,29 @@ impl NativeSyscallHandler for ExecNtHandler {
                     // adjacent local (in LdrpSetProtection that is the section-header pointer).
                     smss_stack_write32(oldprot_ptr, 0x04); // PAGE_READWRITE
                 }
+                let mut word = [0u8; 8];
+                let base = if self.xas_read(args[1], &mut word) {
+                    u64::from_le_bytes(word)
+                } else {
+                    0
+                };
+                let size = if self.xas_read(args[2], &mut word) {
+                    u64::from_le_bytes(word)
+                } else {
+                    0
+                };
+                let registry_slot = self.loop_ctx.and_then(|ctx| {
+                    (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot)
+                });
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::ProtectVirtualMemory,
+                    0,
+                    registry_slot,
+                    base,
+                    size,
+                    b"",
+                );
                 0
             },
             // NtDisplayString(*String[R10]=args[0] = PUNICODE_STRING). smss prints boot/status text;
@@ -2192,7 +2215,6 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetInformationThread
             | NativeService::NtSetInformationProcess
             | NativeService::NtTestAlert
-            | NativeService::NtFlushInstructionCache
             | NativeService::NtCreateKeyedEvent
             | NativeService::NtAdjustPrivilegesToken
             | NativeService::NtDeleteValueKey
@@ -2202,6 +2224,27 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetSecurityObject
             | NativeService::NtResumeThread
             | NativeService::NtSetInformationObject => 0,
+            NativeService::NtFlushInstructionCache => {
+                let base = args.get(1).copied().unwrap_or(0);
+                let size = args.get(2).copied().unwrap_or(0);
+                let registry_slot = unsafe {
+                    self.loop_ctx.and_then(|ctx| {
+                        (&*ctx.reg).dll_for_page(base).map(|(slot, _)| slot)
+                    })
+                };
+                unsafe {
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::FlushInstructionCache,
+                        0,
+                        registry_slot,
+                        base,
+                        size,
+                        b"",
+                    );
+                }
+                0
+            },
             // NtQueryVirtualMemory(Process, Base[RDX]=args[1], Class, Buffer[R9]=args[3], Len,
             // *RetLen[arg6]=args[5]). LdrpInitialize queries MemoryBasicInformation (class 0) for
             // [TEB+0x10]. Report a plausible committed private region; the env page is 1-page.
@@ -2721,6 +2764,8 @@ impl NativeSyscallHandler for ExecNtHandler {
             // (FileAttributes = FILE_ATTRIBUTE_NORMAL) so SMP_INVALID_PATH isn't set; everything else
             // → not-found so the loader's manifest probes keep failing.
             NativeService::NtQueryAttributesFile => unsafe {
+                let ctx = self.loop_ctx.unwrap();
+                let reg = &*ctx.reg;
                 let name16 = smss_read_objattr_name(get_recv_mr(9)); // R10 = *OA
                 let mut nb = [0u8; 96];
                 let mut nlen = 0;
@@ -2748,7 +2793,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let exe_exists = exe_canon.is_some_and(|leaf| unsafe { sys32_exists(leaf) });
                 // General DLL existence (pi>=1) also comes from the real FS by-path.
                 let dll_exists = self.pi >= 1 && self.fs_system32_has(&nb[..nlen]);
-                if exe_exists {
+                let status: u32 = if exe_exists {
                     // FILE_BASIC_INFORMATION: 4×8-byte times, then FileAttributes(u32) @ +0x20.
                     smss_stack_write32(args[1] + 0x20, 0x80); // FILE_ATTRIBUTE_NORMAL (a file)
                     0
@@ -2759,7 +2804,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     // DIAG: log the not-found probes from a DLL-loading process (csrss/winlogon) —
                     // a DllMain probes several files before failing init; we need to know which are
                     // load-bearing.
-                    if self.pi >= 1 {
+                    if self.pi >= 1 && self.pi != 2 {
                         print_str(b"[ntos-exec] NtQueryAttributesFile(hosted) not-found: \"");
                         for &w in name16.iter().take(96) {
                             debug_put_char(if (0x20..0x7f).contains(&w) { w as u8 } else { b'?' });
@@ -2767,7 +2812,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                         print_str(b"\"\n");
                     }
                     0xC0000034
-                }
+                };
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::QueryAttributesFile,
+                    status,
+                    reg.resolve_name(&nb[..nlen]),
+                    0,
+                    0,
+                    &nb[..nlen],
+                );
+                status
             },
             // NtCreateFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], AllocationSize[sp+0x28], FileAttributes[sp+0x30],
@@ -2922,6 +2977,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 self.xas_write_buf(iosb, &(st as u32).to_le_bytes());
                                 self.xas_write_buf(iosb + 8, &1u64.to_le_bytes()); // FILE_OPENED
                             }
+                            loader_trace_record(
+                                self.pi,
+                                LoaderOp::OpenFile,
+                                st as u32,
+                                None,
+                                0,
+                                h,
+                                &lc,
+                            );
                             return st as u32;
                         }
                     }
@@ -2992,7 +3056,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                         // Pin the heap mark past the load's registry allocations (service loop consumes).
                         self.dll_loaded_dirty = true;
                         dll_i = Some(slot);
-                    } else if nb[..nlen].ends_with(b".dll") || nb[..nlen].windows(4).any(|w| w == b".dll") {
+                    } else if self.pi != 2
+                        && (nb[..nlen].ends_with(b".dll")
+                            || nb[..nlen].windows(4).any(|w| w == b".dll"))
+                    {
                         // DIAG: a .dll open that missed the registry AND failed to demand-load — log it
                         // so we can see which dependency the loader requested that we couldn't satisfy.
                         print_str(b"[demand-miss] pi=");
@@ -3002,8 +3069,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                         print_str(b"\n");
                     }
                 }
-                if is_sys32_dir || is_csrss || is_winlogon || is_services || is_lsass || dll_i.is_some() {
+                let mut opened_handle = 0;
+                let status: u32 = if is_sys32_dir || is_csrss || is_winlogon || is_services || is_lsass || dll_i.is_some() {
                     let h = self.mint_handle();
+                    opened_handle = h;
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
                     if is_csrss {
                         *ctx.csrss_file_handle = h; // remember it for NtCreateSection
@@ -3028,7 +3097,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0
                 } else {
                     0xC0000034 // no filesystem yet → not found (smss skips / uses defaults)
-                }
+                };
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::OpenFile,
+                    status,
+                    dll_i,
+                    0,
+                    opened_handle,
+                    &nb[..nlen],
+                );
+                status
             },
             // NtQuerySection(SectionHandle[R10], class[RDX]=args[1], buf[R8], len[R9], *ResultLen[sp+0x28]).
             // RtlCreateUserProcess queries SectionImageInformation (class 1) for the image's entry
@@ -3215,6 +3294,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     ctx.pml4,
                 );
                 let sec_file = smss_stack_read(sp + 0x38);
+                let registry_slot = reg.index_for_file(self.pi, sec_file);
                 // The csrss.exe / winlogon.exe EXE sections are created ONLY by smss (pi 0). Scope
                 // to pi 0 so a csrss/winlogon DLL section create with a same-valued dense file handle
                 // (path 1b) can't spuriously match these (the per-pi reg lookup handles DLLs below).
@@ -3252,13 +3332,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_str(b"\n");
                 }
                 // A registry DLL (csrsrv/basesrv/winsrv): record its section handle by file handle.
-                if let Some(i) = reg.index_for_file(self.pi, sec_file) {
+                if let Some(i) = registry_slot {
                     reg.set_section_handle(self.pi, i, h);
-                    print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
-                    print_str(reg.name(i));
-                    print_str(b" -> handle 0x");
-                    print_hex(h as u32);
-                    print_str(b"\n");
+                    if self.pi != 2 {
+                        print_str(b"[ntos-exec] NtCreateSection(SEC_IMAGE) for ");
+                        print_str(reg.name(i));
+                        print_str(b" -> handle 0x");
+                        print_hex(h as u32);
+                        print_str(b"\n");
+                    }
                 }
                 // Anonymous (no FileHandle) section from csrss — its CSR SharedSection shared memory.
                 // Record the requested size (from *MaximumSize = R9) so NtMapViewOfSection can back it.
@@ -3279,6 +3361,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_hex(h as u32);
                     print_str(b"\n");
                 }
+                loader_trace_record(
+                    self.pi,
+                    LoaderOp::CreateSection,
+                    0,
+                    registry_slot,
+                    sec_file,
+                    h,
+                    b"",
+                );
                 0
             },
             // NtMapViewOfSection(SectionHandle[R10], ProcessHandle[RDX], *BaseAddress[R8],
@@ -3331,14 +3422,34 @@ impl NativeSyscallHandler for ExecNtHandler {
                         if vs_ptr != 0 {
                             csrss_out_write(vs_ptr, ext, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                         }
-                        print_str(b"[ntos-exec] NtMapViewOfSection ");
-                        print_str(reg.name(i));
-                        print_str(b" -> base 0x");
-                        print_hex(dbase as u32);
-                        print_str(b"\n");
+                        if self.pi != 2 {
+                            print_str(b"[ntos-exec] NtMapViewOfSection ");
+                            print_str(reg.name(i));
+                            print_str(b" -> base 0x");
+                            print_hex(dbase as u32);
+                            print_str(b"\n");
+                        }
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::MapViewOfSection,
+                            0,
+                            Some(i),
+                            sect,
+                            dbase,
+                            b"",
+                        );
                         0
                     } else {
                         self.stop = true;
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::MapViewOfSection,
+                            0xC0000002,
+                            Some(i),
+                            sect,
+                            0,
+                            b"",
+                        );
                         0xC0000002
                     }
                 } else if self.pi == 1 && *ctx.csrss_anon_section_handle != 0 && sect == *ctx.csrss_anon_section_handle {
@@ -3372,6 +3483,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_hex((*ctx.csrss_anon_base >> 32) as u32);
                     print_hex(*ctx.csrss_anon_base as u32);
                     print_str(b"\n");
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::MapViewOfSection,
+                        0,
+                        None,
+                        sect,
+                        *ctx.csrss_anon_base,
+                        b"",
+                    );
                     0
                 } else if *ctx.nls_section_handle != 0 && sect == *ctx.nls_section_handle {
                     // The named NLS section \Nls\NlsSectionCP20127: map the staged c_20127.nls frames
@@ -3394,9 +3514,27 @@ impl NativeSyscallHandler for ExecNtHandler {
                         csrss_out_write(vs_ptr, nls_size, filled_pages, faults, scratch_base, reg, dll_pes, pml4);
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::MapViewOfSection,
+                        0,
+                        None,
+                        sect,
+                        NLS_SECTION_CSRSS_VA,
+                        b"",
+                    );
                     0
                 } else {
                     self.stop = true; // other sections not modeled
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::MapViewOfSection,
+                        0xC0000002,
+                        None,
+                        sect,
+                        0,
+                        b"",
+                    );
                     0xC0000002
                 }
             },

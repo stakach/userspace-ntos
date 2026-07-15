@@ -35,6 +35,8 @@ mod win32k_subsystem;
 mod storage_host;
 mod service_sec_image;
 pub(crate) use service_sec_image::*;
+mod loader_trace_diag;
+pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod fs_loader;
 pub(crate) use fs_loader::*;

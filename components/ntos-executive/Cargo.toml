@@ -54,6 +54,7 @@ nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 nt-process = { path = "../../crates/nt-process" }
 # Generic DLL registry — host-tested name/handle/VA decisions for demand-loaded shared-text DLLs.
 nt-dll-registry = { path = "../../crates/nt-dll-registry" }
+nt-loader-trace = { path = "../../crates/nt-loader-trace" }
 # The driver-visible ntoskrnl/hal export table + win32k import surface + SSDT recorder — the
 # load-time contract the win32k.sys prototype resolves its imports against.
 nt-compat-exports = { path = "../../crates/nt-compat-exports" }

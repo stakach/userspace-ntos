@@ -16,6 +16,7 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
 ) -> (u64, u64, u64, u64, u64, u64) {
+    loader_trace_clear();
     let img_end = PE_LOAD_BASE + image_extent(pe);
     let (nt_base, nt_end) = match ntdll {
         Some((b, npe)) => (b, b + image_extent(npe)),
@@ -2185,6 +2186,9 @@ pub(crate) unsafe fn service_sec_image(
         }
     }
     print_str(b"\n");
+    if ntdll.is_some() {
+        loader_trace_dump(&reg);
+    }
     // Record winlogon's (slot 2) demand-fault count for the spec check + report line.
     WINLOGON_FAULTS.store(procs[2].faults, Ordering::Relaxed);
     print_str(b"[ntos-exec] winlogon (slot 2) demand-faulted ");

@@ -72,6 +72,7 @@ members = [
     "crates/nt-driver-runtime",
     "crates/nt-driver-test-fixtures",
     "crates/nt-dll-registry",
+    "crates/nt-loader-trace",
     "tools/driver-import-report",
 ]
 exclude = [
@@ -152,3 +153,4 @@ nt-register-access = { path = "crates/nt-register-access" }
 nt-sim-device = { path = "crates/nt-sim-device" }
 nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
+nt-loader-trace = { path = "crates/nt-loader-trace" }
