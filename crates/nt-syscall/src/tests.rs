@@ -381,6 +381,19 @@ fn group_b2_out_writing_query_services_register() {
 }
 
 #[test]
+fn delay_execution_registers_with_native_abi() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtDelayExecution, 61)],
+    );
+    assert_eq!(
+        table.lookup(61).unwrap().service,
+        NativeService::NtDelayExecution
+    );
+    assert_eq!(NativeService::NtDelayExecution.arg_count(), (2, 2));
+}
+
+#[test]
 fn group_b_query_and_namespace_services_register() {
     // Group B1: query + object-namespace services register at their real Win7 SSNs with the
     // arg bounds the executive's table dispatch relies on (QueryVirtualMemory reads a stack arg6).

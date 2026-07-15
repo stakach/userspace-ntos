@@ -77,6 +77,9 @@ impl ExecNtHandler {
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
             wait_park_event: -1,
+            delay_requested: false,
+            delay_interval_100ns: 0,
+            delay_alertable: false,
             io_signal_event: -1,
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
@@ -3149,8 +3152,58 @@ impl NativeSyscallHandler for ExecNtHandler {
             // write is queued so the loop demand-fills it (csrss arbitrary VA vs smss stack local).
             NativeService::NtQuerySystemTime => {
                 let out = args[0];
-                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                let now = nt_system_time_100ns();
                 self.queue_write(out, now);
+                0
+            }
+            NativeService::NtDelayExecution => {
+                let alertable = args[0] & 0xff != 0;
+                let interval_ptr = args[1];
+                let mut bytes = [0u8; 8];
+                if interval_ptr == 0 || !unsafe { self.xas_read(interval_ptr, &mut bytes) } {
+                    let trace = DELAY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if trace < 16 {
+                        print_str(b"[delay] caller_badge=");
+                        print_u64(self.current_badge);
+                        print_str(b" tid=");
+                        print_u64(self.current_tid);
+                        print_str(b" alertable=");
+                        print_u64(alertable as u64);
+                        print_str(b" interval_ptr=0x");
+                        print_hex_u64(interval_ptr);
+                        print_str(b" readable=0 -> STATUS_ACCESS_VIOLATION\n");
+                    }
+                    return 0xC000_0005;
+                }
+                let interval = i64::from_le_bytes(bytes);
+                self.delay_requested = true;
+                self.delay_interval_100ns = interval;
+                self.delay_alertable = alertable;
+                let trace = DELAY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace < 16 {
+                    print_str(b"[delay] call=");
+                    print_u64(trace + 1);
+                    print_str(b" caller_badge=");
+                    print_u64(self.current_badge);
+                    print_str(b" tid=");
+                    print_u64(self.current_tid);
+                    print_str(b" alertable=");
+                    print_u64(alertable as u64);
+                    print_str(b" interval_ptr=0x");
+                    print_hex_u64(interval_ptr);
+                    print_str(b" readable=1 interval_100ns=");
+                    if interval < 0 {
+                        print_str(b"-");
+                        print_u64(interval.unsigned_abs());
+                        print_str(b" relative=1");
+                    } else {
+                        print_u64(interval as u64);
+                        print_str(b" relative=0");
+                    }
+                    print_str(b"\n");
+                }
+                // This executive has no queued user APC object yet. Alertable delays therefore wait
+                // normally; STATUS_USER_APC is returned only when a real APC queue can prove one.
                 0
             }
             // NtQueryPerformanceCounter(*Counter[R10]=args[0], *Frequency[RDX]=args[1] optional).

@@ -96,6 +96,7 @@ pub enum NativeService {
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
+    NtDelayExecution,
     // Additional services the executive hosts for real binaries (smss/csrss). These are real
     // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
     // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
@@ -209,6 +210,7 @@ impl NativeService {
             NtAccessCheck => "NtAccessCheck",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
+            NtDelayExecution => "NtDelayExecution",
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
@@ -258,7 +260,7 @@ impl NativeService {
         use NativeService::*;
         match self {
             NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom => (1, 1),
-            NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection
+            NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
             | NtQueryDebugFilterState => (2, 2),
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion => (3, 3),
             NtQueryValueKey => (4, 6),
@@ -350,6 +352,7 @@ impl NativeService {
         NativeService::NtAccessCheck,
         NativeService::NtQuerySystemInformation,
         NativeService::NtQuerySystemTime,
+        NativeService::NtDelayExecution,
         NativeService::NtProtectVirtualMemory,
         NativeService::NtDisplayString,
         NativeService::NtQueryDebugFilterState,

@@ -225,6 +225,7 @@ pub(crate) unsafe fn service_sec_image(
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
     let mut nt_handler = ExecNtHandler::new();
+    let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
     // Heap high-water mark taken AFTER all persistent state (the service table + the
     // pre-reserved key_handles buffer) is allocated. Each smss syscall we service allocates
     // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
@@ -276,6 +277,43 @@ pub(crate) unsafe fn service_sec_image(
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
     loop {
+        if badge == DELAY_TIMER_BADGE {
+            if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+                let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
+                if progress < 8 {
+                    print_str(b"[delay] timer badge progressed while client waiter parked: queued=");
+                    print_u64(delay_queue.len() as u64);
+                    print_str(b"\n");
+                }
+            }
+            let timer_trace = DELAY_TIMER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if timer_trace < 8 {
+                print_str(b"[delay] TIMER-NOTIFICATION msginfo_label=");
+                print_u64(mi >> 12);
+                print_str(b" raw_m0=0x");
+                print_hex_u64(m0);
+                print_str(b"\n");
+            }
+            delay_timer_interrupt(&mut delay_queue);
+            let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            badge = received.0;
+            mi = received.1;
+            m0 = received.2;
+            m1 = received.3;
+            m2 = received.4;
+            m3 = received.5;
+            continue;
+        }
+        if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+            let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
+            if progress < 8 {
+                print_str(b"[delay] unrelated badge progressed while waiter parked: badge=");
+                print_u64(badge);
+                print_str(b" queued=");
+                print_u64(delay_queue.len() as u64);
+                print_str(b"\n");
+            }
+        }
         // SAFETY: every allocation made past `heap_mark` belongs to the previous iteration's
         // syscall service and is dead now (its Vec/String were dropped at the loop-body's end).
         unsafe { allocator::reset_to(heap_mark) };
@@ -753,6 +791,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_wait_set = [0usize; 8];
             let mut park_wait_set_n: usize = 0;
             let mut park_wait_set_all = false;
+            let mut park_delay_deadline: Option<u64> = None;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -807,6 +846,9 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.lsass_listener2_spawn = false;
                 nt_handler.lsass_listener3_spawn = false;
                 nt_handler.wait_park_event = -1;
+                nt_handler.delay_requested = false;
+                nt_handler.delay_interval_100ns = 0;
+                nt_handler.delay_alertable = false;
                 nt_handler.io_signal_event = -1;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
@@ -881,7 +923,8 @@ pub(crate) unsafe fn service_sec_image(
                 match nt_handler.post_action {
                     ExecPostAction::TerminateCurrentThread { tid } => {
                         let reply_dropped = drop_current_syscall_reply();
-                        let mechanism_deleted = terminate_hosted_thread_mechanism(tid);
+                        let mechanism_deleted =
+                            terminate_hosted_thread_mechanism(tid, &mut delay_queue);
                         if reply_dropped && mechanism_deleted {
                             PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -908,7 +951,7 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                     ExecPostAction::TerminateRemoteThread { tid } => {
-                        let _ = terminate_hosted_thread_mechanism(tid);
+                        let _ = terminate_hosted_thread_mechanism(tid, &mut delay_queue);
                     }
                     ExecPostAction::None => {}
                 }
@@ -947,6 +990,54 @@ pub(crate) unsafe fn service_sec_image(
                 // resume_ip/sp/flags are known).
                 if nt_handler.wait_park_event >= 0 {
                     park_wait_event = nt_handler.wait_park_event;
+                }
+                if nt_handler.delay_requested {
+                    let monotonic_now = monotonic_time_100ns();
+                    let system_now = nt_system_time_100ns();
+                    match nt_delay_execution::due_time(
+                        nt_handler.delay_interval_100ns,
+                        monotonic_now,
+                        system_now,
+                    ) {
+                        nt_delay_execution::Due::Immediate => {
+                            if DELAY_TRACE_COUNT.load(Ordering::Relaxed) <= 16 {
+                                print_str(b"[delay] COMPLETE-IMMEDIATE badge=");
+                                print_u64(badge);
+                                print_str(b" tid=");
+                                print_u64(nt_handler.current_tid);
+                                print_str(b" callsite=0x");
+                                print_hex_u64(resume_ip);
+                                print_str(b" interval_100ns=");
+                                if nt_handler.delay_interval_100ns < 0 {
+                                    print_str(b"-");
+                                    print_u64(nt_handler.delay_interval_100ns.unsigned_abs());
+                                } else {
+                                    print_u64(nt_handler.delay_interval_100ns as u64);
+                                }
+                                print_str(b"\n");
+                            }
+                        }
+                        nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                            park_delay_deadline = Some(deadline);
+                            if DELAY_TRACE_COUNT.load(Ordering::Relaxed) <= 16 {
+                                print_str(b"[delay] PARK-REQUEST badge=");
+                                print_u64(badge);
+                                print_str(b" tid=");
+                                print_u64(nt_handler.current_tid);
+                                print_str(b" callsite=0x");
+                                print_hex_u64(resume_ip);
+                                print_str(b" deadline_100ns=");
+                                print_u64(deadline);
+                                print_str(b" now_100ns=");
+                                print_u64(monotonic_now);
+                                print_str(if nt_handler.delay_alertable {
+                                    b" alertable=1 queued_apc=0\n"
+                                } else {
+                                    b" alertable=0 queued_apc=0\n"
+                                });
+                            }
+                        }
+                    }
                 }
                 if nt_handler.io_signal_event >= 0 {
                     let event = nt_handler.io_signal_event as usize;
@@ -2059,6 +2150,39 @@ pub(crate) unsafe fn service_sec_image(
             set_reply_mr(17, flags);
             procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            if let Some(deadline) = park_delay_deadline {
+                if delay_park(
+                    &mut delay_queue,
+                    deadline,
+                    reply_main,
+                    resume_ip,
+                    sp,
+                    flags,
+                    nt_handler.current_tid,
+                    badge,
+                ) {
+                    if DELAY_PARKED_COUNT.load(Ordering::Relaxed) <= 16 {
+                        print_str(b"[delay] PARKED badge=");
+                        print_u64(badge);
+                        print_str(b" tid=");
+                        print_u64(nt_handler.current_tid);
+                        print_str(b" queued=");
+                        print_u64(delay_queue.len() as u64);
+                        print_str(b" -> receive continues\n");
+                    }
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let received = recv_full_r12(fault_ep, new_reply);
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                result = 0xC000_009A;
+            }
             // Checkpoint B: PARK this caller on an unsignaled event (steal its reply cap into the waiter
             // queue keyed by the event, rotate REPLY_MAIN to a fresh pool object, recv the next event
             // WITHOUT replying). The matching NtSetEvent wakes it. If the pool/queue is exhausted,
@@ -2173,6 +2297,10 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         PM_LIFECYCLE_OK.store(life_ok, Ordering::Relaxed);
+
+        // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
+        // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
+        delay_timer_shutdown(&delay_queue);
 
         // Path 1b COUNTED SPEC — process-local dense handle VALUES. Two DISTINCT live EPROCESSes each
         // allocate their first handle and BOTH get the SAME dense value (0x4), yet it refers to a

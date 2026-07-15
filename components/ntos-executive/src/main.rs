@@ -380,6 +380,8 @@ pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 pub const SSN_NT_QUERY_VIRTUAL_MEM: u64 = 186;
 /// ntdll's NtQuerySystemTime SSN (csrss init reads the clock during CsrServerInitialization).
 pub const SSN_NT_QUERY_SYSTEM_TIME_SVC: u64 = 182;
+/// ReactOS x64 NtDelayExecution(Alertable, *DelayInterval).
+pub const SSN_NT_DELAY_EXECUTION: u64 = 61;
 /// ntdll's NtQueryPerformanceCounter SSN (csrss init seeds timing / RNG from the perf counter).
 pub const SSN_NT_QUERY_PERF_COUNTER: u64 = 173;
 /// ntdll's NtQueryInformationProcess SSN (LdrpInitialize queries ProcessCookie et al.).
@@ -794,6 +796,7 @@ const NIC_MSI_VECTOR: u64 = 5;
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
 const HPET_MAIN_COUNTER: u64 = 0xF0;
+const HPET_GEN_INT_STATUS: u64 = 0x20;
 const HPET_T0_CONFIG: u64 = 0x100;
 const HPET_T0_COMPARATOR: u64 = 0x108;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
@@ -917,6 +920,20 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 /// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
+const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
+const DELAY_TIMER_IRQ: u64 = 12;
+const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
+const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
+const LBL_IRQ_ACK: u64 = 31;
+const NT_SYSTEM_TIME_BOOT_100NS: u64 = 0x01DA_0000_0000_0000;
+static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
+static DELAY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static DELAY_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static DELAY_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static DELAY_OTHER_BADGE_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Set once lsass signals LSA_RPC_SERVER_ACTIVE (its essential init is complete: the LSA RPC server is
 /// up). After this, an unrecoverable fault on lsass' MAIN thread (e.g. rpcrt4 NdrSimpleTypeUnmarshall
 /// dereferencing a bogus request buffer while servicing a self-directed RPC) is CONTAINED (the loop
@@ -1689,6 +1706,243 @@ unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64
     );
 }
 
+fn monotonic_time_100ns() -> u64 {
+    let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
+    if period != 0 {
+        let ticks = unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64) };
+        nt_delay_execution::ticks_to_100ns(ticks, period)
+    } else {
+        unsafe { core::arch::x86_64::_rdtsc() / 10 }
+    }
+}
+
+fn nt_system_time_100ns() -> u64 {
+    NT_SYSTEM_TIME_BOOT_100NS.saturating_add(monotonic_time_100ns())
+}
+
+fn print_hex_u64(value: u64) {
+    print_hex((value >> 32) as u32);
+    print_hex(value as u32);
+}
+
+fn release_reply_pool_cap(cap: u64) {
+    for index in 0..WAIT_REPLY_POOL_N {
+        if WAIT_REPLY_POOL[index].load(Ordering::Relaxed) == cap {
+            WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << index), Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
+unsafe fn delay_timer_init() -> bool {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
+    if period == 0 {
+        print_str(b"[delay] HPET unavailable; refusing nonzero immediate-success fallback\n");
+        return false;
+    }
+    let route_cap = (core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) >> 32) as u32;
+    if route_cap == 0 {
+        return false;
+    }
+    let already_used = 31 - route_cap.leading_zeros();
+    let remaining = route_cap & !(1u32 << already_used);
+    if remaining == 0 {
+        print_str(b"[delay] HPET timer0 has no spare IOAPIC route\n");
+        return false;
+    }
+    let pin = (31 - remaining.leading_zeros()) as u64;
+    let notification = make_object(OBJ_NOTIFICATION);
+    let badged = alloc_slot();
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        badged,
+        notification,
+        DELAY_TIMER_BADGE,
+    );
+    let handler = alloc_slot();
+    ioapic_issue_irq_handler(handler, pin, DELAY_TIMER_IRQ, 1, 0);
+    let _ = irq_handler_set_notification(handler, badged);
+    // The initial root TCB cap is slot 1. Binding lets an HPET signal cancel the executive's
+    // blocking Recv on the hosted-process endpoint, returning DELAY_TIMER_BADGE with empty msginfo.
+    let _ = syscall5(
+        SYS_SEND,
+        1,
+        LBL_TCB_BIND_NOTIFICATION << 12,
+        notification,
+        0,
+        0,
+    );
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let config = (1u64 << 2) | (pin << 9);
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
+    DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
+    print_str(b"[delay] timer ready pin=");
+    print_u64(pin);
+    print_str(b" irq=");
+    print_u64(DELAY_TIMER_IRQ);
+    print_str(b" period_fs=");
+    print_u64(period);
+    print_str(b" bound_badge=0x");
+    print_hex_u64(DELAY_TIMER_BADGE);
+    print_str(b"\n");
+    true
+}
+
+unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if handler == 0 {
+        return;
+    }
+    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    if let Some(deadline) = queue.next_deadline() {
+        let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
+        let target = nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period);
+        let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+        core::ptr::write_volatile(
+            (HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64,
+            target.max(now.saturating_add(1)),
+        );
+        config |= 1u64 << 1;
+    } else {
+        config &= !(1u64 << 1);
+    }
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+}
+
+unsafe fn delay_park(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    deadline_100ns: u64,
+    reply_cap: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    thread_id: u64,
+    badge: u64,
+) -> bool {
+    if reply_cap == 0 || !delay_timer_init() {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let Some(fresh_index) = (0..WAIT_REPLY_POOL_N).find(|&index| {
+        used & (1u64 << index) == 0 && WAIT_REPLY_POOL[index].load(Ordering::Relaxed) != 0
+    }) else {
+        return false;
+    };
+    let waiter = nt_delay_execution::Waiter {
+        deadline_100ns,
+        sequence: 0,
+        reply_cap,
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+        thread_id,
+        badge,
+    };
+    if queue.insert(waiter).is_err() {
+        return false;
+    }
+    let fresh = WAIT_REPLY_POOL[fresh_index].load(Ordering::Relaxed);
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_index, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    DELAY_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    delay_timer_rearm(queue);
+    true
+}
+
+unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) -> u64 {
+    let now = monotonic_time_100ns();
+    let mut woken = 0;
+    while let Some(waiter) = queue.pop_due(now) {
+        set_reply_mr(15, waiter.resume_ip);
+        set_reply_mr(16, waiter.resume_sp);
+        set_reply_mr(17, waiter.resume_flags);
+        send_on_reply(waiter.reply_cap, 18, 0, 0, 0, 0);
+        release_reply_pool_cap(waiter.reply_cap);
+        woken += 1;
+        let wake_number = DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        if wake_number < 16 {
+            print_str(b"[delay] WAKE #");
+            print_u64(wake_number + 1);
+            print_str(b" tid=");
+            print_u64(waiter.thread_id);
+            print_str(b" badge=");
+            print_u64(waiter.badge);
+            print_str(b" deadline_100ns=");
+            print_u64(waiter.deadline_100ns);
+            print_str(b" now_100ns=");
+            print_u64(now);
+            print_str(b" status=STATUS_SUCCESS\n");
+        }
+    }
+    delay_timer_rearm(queue);
+    woken
+}
+
+unsafe fn delay_timer_interrupt(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) {
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let _ = delay_wake_due(queue);
+    // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
+    // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    if handler != 0 {
+        let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+    }
+}
+
+unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0 || queue.len() != 0 {
+        return;
+    }
+    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
+    config &= !(1u64 << 1);
+    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+    let _ = syscall5(
+        SYS_SEND,
+        1,
+        LBL_TCB_UNBIND_NOTIFICATION << 12,
+        0,
+        0,
+        0,
+    );
+}
+
+unsafe fn delay_cancel_thread(
+    queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+    thread_id: u64,
+) {
+    while let Some(waiter) = queue.pop_thread(thread_id) {
+        let cap = waiter.reply_cap;
+        let deleted = cnode_delete_r(cap);
+        let retyped = if deleted == 0 {
+            untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+        } else {
+            u64::MAX
+        };
+        if deleted == 0 && retyped == 0 {
+            release_reply_pool_cap(cap);
+        }
+        print_str(b"[delay] CANCEL tid=");
+        print_u64(thread_id);
+        print_str(b" reply=0x");
+        print_hex_u64(cap);
+        print_str(b" delete=");
+        print_u64(deleted);
+        print_str(b" retype=");
+        print_u64(retyped);
+        print_str(b"\n");
+    }
+    delay_timer_rearm(queue);
+}
+
 /// ═══ Checkpoint B park/wake helpers (real reply-cap parking) ═══
 /// PARK the current caller on `event_idx`: the reply object CURRENTLY installed in REPLY_MAIN_SLOT is
 /// bound (by the last recv-with-r12) to THIS caller's blocked Call, so we STEAL it into a free waiter
@@ -1769,7 +2023,10 @@ fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
     }
 }
 
-unsafe fn terminate_hosted_thread_mechanism(tid: u64) -> bool {
+unsafe fn terminate_hosted_thread_mechanism(
+    tid: u64,
+    delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
+) -> bool {
     let cell = match hosted_thread_tcb_cell(tid) {
         Some(cell) => cell,
         None => return false,
@@ -1778,6 +2035,7 @@ unsafe fn terminate_hosted_thread_mechanism(tid: u64) -> bool {
     if tcb <= 1 {
         return false;
     }
+    delay_cancel_thread(delay_queue, tid);
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_r(tcb)
@@ -2742,6 +3000,12 @@ struct ExecNtHandler {
     /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
     /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// NtDelayExecution asks the service loop to park this syscall's reply until this signed
+    /// 100ns interval becomes due. The handler validates/copies the user pointer; the loop owns
+    /// deadline conversion and the HPET-backed reply-cap park.
+    delay_requested: bool,
+    delay_interval_100ns: i64,
+    delay_alertable: bool,
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
@@ -2971,6 +3235,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtOpenSymbolicLinkObject, SSN_NT_OPEN_SYMBOLIC_LINK_OBJECT as u32),
             // Workstream A batch 4 (group B2): out-writing query services (queued-write drain).
             (NativeService::NtQuerySystemTime, SSN_NT_QUERY_SYSTEM_TIME_SVC as u32),
+            (NativeService::NtDelayExecution, SSN_NT_DELAY_EXECUTION as u32),
             (NativeService::NtQueryPerformanceCounter, SSN_NT_QUERY_PERF_COUNTER as u32),
             (NativeService::NtQueryVolumeInformationFile, SSN_NT_QUERY_VOLUME_INFO_FILE as u32),
             // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
@@ -4569,7 +4834,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(b"exec_hpet_device_untyped_mapped", mmio_mapped, &mut passed);
     if mmio_mapped {
         // HPET General Capabilities + ID (offset 0): bits [31:16] = VENDOR_ID.
-        let gcap = core::ptr::read_volatile(HPET_VADDR as *const u32);
+        let gcap64 = core::ptr::read_volatile(HPET_VADDR as *const u64);
+        let gcap = gcap64 as u32;
+        HPET_PERIOD_FS.store(gcap64 >> 32, Ordering::Relaxed);
         print_str(b"[ntos-exec] HPET GCAP_ID low dword = ");
         print_u64(gcap as u64);
         print_str(b" (vendor ");
@@ -6924,6 +7191,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         });
     }
 
+    check(
+        b"exec_delay_execution_park_wake",
+        DELAY_PARKED_COUNT.load(Ordering::Relaxed) >= 1
+            && DELAY_WOKEN_COUNT.load(Ordering::Relaxed) >= 1,
+        &mut passed,
+    );
+    check(
+        b"exec_delay_execution_multiplex",
+        DELAY_OTHER_BADGE_PROGRESS.load(Ordering::Relaxed) >= 1,
+        &mut passed,
+    );
+    print_str(b"[ntos-exec] delay calls=0x");
+    print_hex(DELAY_TRACE_COUNT.load(Ordering::Relaxed) as u32);
+    print_str(b" parked=0x");
+    print_hex(DELAY_PARKED_COUNT.load(Ordering::Relaxed) as u32);
+    print_str(b" woken=0x");
+    print_hex(DELAY_WOKEN_COUNT.load(Ordering::Relaxed) as u32);
+    print_str(b" multiplex=0x");
+    print_hex(DELAY_OTHER_BADGE_PROGRESS.load(Ordering::Relaxed) as u32);
+    print_str(b"\n");
+
     // --- Phase 2 (graphics): PROTOTYPE-bind the real ReactOS win32k.sys against the driver-host
     // load contract. Classify + BIND win32k's exact ntoskrnl+hal+ftfd import surface (the names
     // extracted from the real binary) to runtime trampolines — the runtime half of Phase 1's
@@ -6985,7 +7273,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/96 executive->isolated-service checks passed]\n");
+    print_str(b"/98 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

@@ -74,6 +74,7 @@ members = [
     "crates/nt-driver-test-fixtures",
     "crates/nt-dll-registry",
     "crates/nt-loader-trace",
+    "crates/nt-delay-execution",
     "tools/driver-import-report",
 ]
 exclude = [
@@ -156,3 +157,4 @@ nt-sim-device = { path = "crates/nt-sim-device" }
 nt-driver-runtime = { path = "crates/nt-driver-runtime" }
 nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
 nt-loader-trace = { path = "crates/nt-loader-trace" }
+nt-delay-execution = { path = "crates/nt-delay-execution" }
