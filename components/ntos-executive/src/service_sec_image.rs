@@ -759,6 +759,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.lsass_listener_spawn = false;
                 nt_handler.lsass_listener2_spawn = false;
                 nt_handler.wait_park_event = -1;
+                nt_handler.io_signal_event = -1;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -859,6 +860,10 @@ pub(crate) unsafe fn service_sec_image(
                 // resume_ip/sp/flags are known).
                 if nt_handler.wait_park_event >= 0 {
                     park_wait_event = nt_handler.wait_park_event;
+                }
+                if nt_handler.io_signal_event >= 0 {
+                    let event = nt_handler.io_signal_event as usize;
+                    let _ = wait_wake_event_set(event, &mut nt_handler.obj_ns);
                 }
                 // Control-flow post-action (group C): NtCreateProcess validated the csrss section and
                 // asked the loop to spawn the subsystem process (needs fault_ep + the per-badge

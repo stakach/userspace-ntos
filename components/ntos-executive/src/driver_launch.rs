@@ -858,7 +858,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             }
         }
         3 | 4 => {
-            write_unaligned((iosl + 0x08) as *mut u32, if major == 4 { inlen } else { outlen } as u32);
+            // Buffered write bytes arrive as input; buffered reads reserve output capacity.
+            write_unaligned((iosl + 0x08) as *mut u32, if major == 3 { inlen } else { outlen } as u32);
         }
         6 => {
             write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
@@ -882,9 +883,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
     let fsctx = read_unaligned((fo + 0x18) as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
-    pool_free(iosl);
-    pool_free(irp);
-    pool_free(fo);
+    // A pending npfs data-queue entry retains the IRP and may consult its stack/file object when a
+    // peer read completes it. Keep the whole request graph alive; recycling it here makes the next
+    // dispatch overwrite a live queued IRP. Completion-driven reclamation is the next async-I/O
+    // increment; synchronous requests still return every transient allocation immediately.
+    if st as u32 != 0x0000_0103 {
+        pool_free(iosl);
+        pool_free(irp);
+        pool_free(fo);
+    }
     (st, info)
 }
 

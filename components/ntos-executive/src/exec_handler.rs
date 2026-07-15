@@ -71,6 +71,7 @@ impl ExecNtHandler {
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
             wait_park_event: -1,
+            io_signal_event: -1,
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
@@ -651,6 +652,53 @@ impl ExecNtHandler {
         match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::File(file_id)) => file_id,
             _ => 0,
+        }
+    }
+
+    /// Resolve a typed pipe handle and enforce the write access granted at create/open time.
+    pub(crate) fn npfs_write_file_id_for(&self, handle: u64) -> Result<u64, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const FILE_APPEND_DATA: u32 = 0x0000_0004;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let file_id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => file_id,
+            _ => return Err(STATUS_INVALID_HANDLE),
+        };
+        let access = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(file_id)
+    }
+
+    /// Validate an optional I/O completion event. Named executive events return their object index;
+    /// legacy anonymous events are typed as Opaque and retain the existing immediate-wait model.
+    pub(crate) fn validate_io_event(&self, handle: u64) -> Result<Option<usize>, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if handle == 0 {
+            return Ok(None);
+        }
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            return self
+                .obj_ns
+                .get(index)
+                .filter(|entry| entry.kind == 2)
+                .map(|_| Some(index))
+                .ok_or(STATUS_INVALID_HANDLE);
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Opaque(_)) => Ok(None),
+            _ => Err(STATUS_INVALID_HANDLE),
         }
     }
 
@@ -3099,31 +3147,132 @@ impl NativeSyscallHandler for ExecNtHandler {
                 status
             },
             // NtWriteFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). lsass' rpcrt4 writes to
-            // its \pipe\lsarpc endpoint. Route the write to the real npfs FSD (IRP_MJ_WRITE) for a
-            // tracked pipe handle; npfs completes it synchronously. Signal the caller's completion Event
-            // (RDX) so a following (immediate-return) NtWaitForSingleObject is consistent. pi 0-3 stop.
+            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ByteOffset[sp+0x40],
+            // Key[sp+0x48]). Route typed named-pipe handles through isolated npfs with the caller's
+            // actual bytes. The shared FSD transport is four pages, so reject an over-sized request
+            // rather than silently truncating it. Driver status + Information are returned verbatim.
             NativeService::NtWriteFile => unsafe {
-                if self.pi != 4 {
-                    self.stop = true;
-                    return 0xC000_0002;
-                }
                 let sp = get_recv_mr(16);
                 let iosb = smss_stack_read(sp + 0x28);
-                let len = smss_stack_read(sp + 0x38);
+                let buffer = smss_stack_read(sp + 0x30);
+                let len = smss_stack_read(sp + 0x38) as u32 as usize;
+                let byte_offset = smss_stack_read(sp + 0x40);
+                let key = smss_stack_read(sp + 0x48);
                 let fh = args[0]; // R10 = FileHandle
-                let fid = self.npfs_file_id_for(fh);
-                let mut status: u64 = 0;
-                if fid != 0 {
-                    if let Some((st, _)) = self.npfs_route(3 /* IRP_MJ_WRITE */, 0, &[], fid) {
-                        status = st as u64;
+                let event = args[1];
+                let apc_routine = args[2];
+                let apc_context = args[3];
+                let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
+                let mut offset_bytes = [0u8; 8];
+                let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
+                let offset_value = u64::from_le_bytes(offset_bytes);
+                let mut key_bytes = [0u8; 4];
+                let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
+                let key_value = u32::from_le_bytes(key_bytes);
+                let mut iosb_probe = [0u8; 16];
+                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
+                let mut payload = alloc::vec![0u8; len.min(transport_capacity)];
+                let payload_ok = len == 0
+                    || (buffer != 0
+                        && len <= transport_capacity
+                        && self.xas_read(buffer, &mut payload));
+
+                let completion_event = self.validate_io_event(event);
+                let mut information = 0u64;
+                let mut routed = false;
+                let status = if !iosb_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if len > transport_capacity {
+                    0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
+                } else if !payload_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if apc_routine != 0 {
+                    // No executive user-APC queue exists yet; do not pretend the callback ran.
+                    0xC000_00BB // STATUS_NOT_SUPPORTED
+                } else if let Err(event_status) = completion_event {
+                    event_status
+                } else {
+                    match self.npfs_write_file_id_for(fh) {
+                        Err(handle_status) => handle_status,
+                        Ok(file_id) => {
+                            let mut output = [];
+                            match self.npfs_route_raw(
+                                3 /* IRP_MJ_WRITE */,
+                                0,
+                                file_id,
+                                &payload,
+                                &mut output,
+                            ) {
+                                Some((driver_status, completed, _)) => {
+                                    routed = true;
+                                    information = completed;
+                                    driver_status as u32
+                                }
+                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                            }
+                        }
+                    }
+                };
+                if iosb_ok {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                }
+                // A synchronous completion signals a valid real event. Legacy opaque events already
+                // have immediate-wait semantics; STATUS_PENDING must leave every event unsignalled.
+                if routed && status != 0x0000_0103 {
+                    if let Ok(Some(index)) = completion_event {
+                        if let Some(entry) = self.obj_ns.get_mut(index) {
+                            entry.signalled = 1;
+                            self.io_signal_event = index as i64;
+                        }
                     }
                 }
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes()); // Status
-                    self.xas_write_buf(iosb + 8, &len.to_le_bytes()); // Information = bytes written
+                if trace {
+                    print_str(b"[nt-write-file] pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" handle=0x");
+                    print_hex(fh as u32);
+                    print_str(b" length=");
+                    print_u64(len as u64);
+                    print_str(b" event=0x");
+                    print_hex(event as u32);
+                    print_str(b" apc=");
+                    print_u64((apc_routine != 0) as u64);
+                    print_str(b" apc_ctx=");
+                    print_u64((apc_context != 0) as u64);
+                    print_str(b" offset_ptr=");
+                    print_u64((byte_offset != 0) as u64);
+                    print_str(b" offset_ok=");
+                    print_u64(offset_ok as u64);
+                    if byte_offset != 0 && offset_ok {
+                        print_str(b" offset=0x");
+                        print_hex(offset_value as u32);
+                    }
+                    print_str(b" key_ptr=");
+                    print_u64((key != 0) as u64);
+                    print_str(b" key_ok=");
+                    print_u64(key_ok as u64);
+                    if key != 0 && key_ok {
+                        print_str(b" key=0x");
+                        print_hex(key_value);
+                    }
+                    print_str(b" payload_ok=");
+                    print_u64(payload_ok as u64);
+                    print_str(b" prefix=");
+                    if payload_ok {
+                        for &byte in payload.iter().take(16) {
+                            print_hex(byte as u32);
+                            debug_put_char(b' ');
+                        }
+                    }
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b" info=");
+                    print_u64(information);
+                    print_str(b"\n");
                 }
-                status as u32
+                status
             },
             // NtReadFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
             // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). rpcrt4's listener reads

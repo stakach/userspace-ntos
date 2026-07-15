@@ -2307,6 +2307,7 @@ static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 /// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static NT_WRITE_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
@@ -2588,6 +2589,9 @@ struct ExecNtHandler {
     /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
     /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// A synchronous file-I/O completion requested signaling this real executive event. The loop
+    /// consumes it after dispatch so it can also wake reply-cap parked waiters.
+    io_signal_event: i64,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
