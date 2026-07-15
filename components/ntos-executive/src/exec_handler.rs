@@ -680,6 +680,32 @@ impl ExecNtHandler {
         Ok(file_id)
     }
 
+    /// Resolve a typed named-pipe handle for `NtFlushBuffersFile`. ReactOS's I/O manager requires
+    /// write-data access for named pipes (append-data is deliberately excluded because that bit is
+    /// `FILE_CREATE_PIPE_INSTANCE` in the pipe namespace). Generic access is retained in our handle
+    /// table, so accept the generic write/all grants until object creation performs generic mapping.
+    pub(crate) fn npfs_flush_file_id_for(&self, handle: u64) -> Result<u64, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let file_id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => file_id,
+            _ => return Err(STATUS_INVALID_HANDLE),
+        };
+        let access = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if access & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(file_id)
+    }
+
     /// Resolve a typed pipe handle and enforce read access granted at create/open time.
     pub(crate) fn npfs_read_file_id_for(&self, handle: u64) -> Result<u64, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -3447,19 +3473,61 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 status
             },
-            // NtFlushBuffersFile(FileHandle[R10], *IoStatusBlock[RDX]). rpcrt4 flushes its \pipe\lsarpc
-            // after a write. A synchronous pipe needs no real flush — model SUCCESS (pi==4). pi 0-3 stop.
+            // NtFlushBuffersFile(FileHandle[R10], *IoStatusBlock[RDX]). Route the typed pipe handle
+            // through isolated npfs's real IRP_MJ_FLUSH_BUFFERS implementation. NPFS may pend the
+            // flush behind queued write data; driver_launch retains that IRP graph until the peer
+            // drains the queue and IoCompleteRequest reclaims it. This syscall has no event argument.
             NativeService::NtFlushBuffersFile => unsafe {
-                if self.pi != 4 {
-                    self.stop = true;
-                    return 0xC000_0002;
+                let handle = args[0];
+                let iosb = args[1];
+                let mut iosb_probe = [0u8; 16];
+                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let mut information = 0u64;
+                let mut file_id = 0u64;
+                let mut routed = false;
+                let status = if !iosb_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else {
+                    match self.npfs_flush_file_id_for(handle) {
+                        Err(handle_status) => handle_status,
+                        Ok(resolved_file_id) => {
+                            file_id = resolved_file_id;
+                            let mut output = [];
+                            match self.npfs_route_raw(
+                                major::IRP_MJ_FLUSH_BUFFERS as u64,
+                                0,
+                                file_id,
+                                &[],
+                                &mut output,
+                            ) {
+                                Some((driver_status, completed, _)) => {
+                                    routed = true;
+                                    information = completed;
+                                    driver_status as u32
+                                }
+                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                            }
+                        }
+                    }
+                };
+                if iosb_ok {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
-                let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &0u32.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                if routed && status == 0x0000_0103 {
+                    NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
-                0
+                if NT_FLUSH_BUFFERS_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
+                    print_str(b"[nt-flush-file] pi="); print_u64(self.pi as u64);
+                    print_str(b" handle=0x"); print_hex(handle as u32);
+                    print_str(b" iosb_ok="); print_u64(iosb_ok as u64);
+                    print_str(b" file_id=0x"); print_hex(file_id as u32);
+                    print_str(b" routed="); print_u64(routed as u64);
+                    print_str(b" status=0x"); print_hex(status);
+                    print_str(b" info="); print_u64(information);
+                    print_str(b"\n");
+                }
+                status
             },
             // NtOpenFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], ShareAccess[sp+0x28], OpenOptions[sp+0x30]).

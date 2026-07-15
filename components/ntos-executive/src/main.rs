@@ -2309,6 +2309,8 @@ static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_WRITE_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_READ_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static NT_FLUSH_BUFFERS_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static NT_FLUSH_BUFFERS_FILE_PENDING_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
@@ -6290,6 +6292,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     check(
                         b"exec_pipe_syscalls_routed_through_npfs",
                         NPFS_ROUTED_IRPS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_npfs_flush_pending",
+                        NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed) >= 2,
                         &mut passed,
                     );
                     // C-c: the N-threads-per-process fault-multiplex. services' SCM RPC listener thread
