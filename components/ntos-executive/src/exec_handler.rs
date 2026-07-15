@@ -30,7 +30,7 @@ impl ExecNtHandler {
             // never exceeds this.
             key_handles: alloc::vec::Vec::with_capacity(256),
             obj_ns: {
-                let mut v = alloc::vec::Vec::with_capacity(48);
+                let mut v = alloc::vec::Vec::with_capacity(192);
                 v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
                 // The standard top-level directories the object manager pre-creates. SmpInit opens
                 // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
@@ -54,6 +54,7 @@ impl ExecNtHandler {
                 }
                 v
             },
+            events: nt_kernel_exec::EventStore::with_capacity(192),
             global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
                 GLOBAL_ATOM_CAPACITY,
             )
@@ -77,6 +78,7 @@ impl ExecNtHandler {
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
             wait_park_event: -1,
+            wait_deadline_100ns: u64::MAX,
             delay_requested: false,
             delay_interval_100ns: 0,
             delay_alertable: false,
@@ -278,6 +280,69 @@ impl ExecNtHandler {
         }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
+    }
+
+    /// Mint a process-local event handle that references a shared executive event identity.
+    pub(crate) fn mint_event_handle(&mut self, event_index: usize, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let tag = EVENT_HANDLE_TAG | event_index as u64;
+        let handle = self
+            .pm
+            .insert_handle(pid, nt_process::HandleObject::Opaque(tag), access)
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    /// Resolve either a legacy global named-event handle or a typed process-local anonymous-event
+    /// handle. Process-local handles enforce the access requested by the operation.
+    pub(crate) fn event_index_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            return self
+                .obj_ns
+                .get(index)
+                .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
+                .map(|_| index)
+                .ok_or(STATUS_INVALID_HANDLE);
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Opaque(tag))
+                if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG => tag,
+            _ => return Err(STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let index = (tag & 0xFFFF_FFFF) as usize;
+        self.obj_ns
+            .get(index)
+            .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
+            .map(|_| index)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else { return false };
+        matches!(
+            self.pm.lookup_handle(pid, handle as nt_process::Handle),
+            Some(nt_process::HandleObject::Opaque(0))
+        )
     }
     pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
@@ -799,14 +864,8 @@ impl ExecNtHandler {
         if handle == 0 {
             return Ok(None);
         }
-        if handle >= OBJ_HANDLE_BASE {
-            let index = (handle - OBJ_HANDLE_BASE) as usize;
-            return self
-                .obj_ns
-                .get(index)
-                .filter(|entry| entry.kind == 2)
-                .map(|_| Some(index))
-                .ok_or(STATUS_INVALID_HANDLE);
+        if let Ok(index) = self.event_index_for_handle(handle, 0) {
+            return Ok(Some(index));
         }
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
@@ -1058,11 +1117,9 @@ impl ExecNtHandler {
     /// Create a fresh ANONYMOUS (unnamed) event object (kind==2). Each call makes a DISTINCT obj_ns
     /// entry — no dedup — carrying a unique synthetic name under a private parent (250) so it is never
     /// found by name-resolution but is still a real, waitable/signalable event. `auto_reset` marks it
-    /// as a SynchronizationEvent (consumed on satisfying wait). Available for future anonymous events
-    /// with a live signaler (rpcrt4's server_ready_event needs the npfs-client-connect frontier before
-    /// its signaler runs, so winlogon's rpcrt4 sync events currently stay bare — see NtCreateEvent).
-    #[allow(dead_code)]
-    pub(crate) fn obj_create_anon_event(&mut self, auto_reset: bool) -> Option<usize> {
+    /// as a SynchronizationEvent (consumed on satisfying wait). The namespace index is the shared
+    /// event identity; callers receive process-local typed handles referencing it.
+    pub(crate) fn obj_create_anon_event(&mut self, auto_reset: bool, initial_state: bool) -> Option<usize> {
         if self.obj_ns.len() >= self.obj_ns.capacity() {
             return None;
         }
@@ -1073,9 +1130,14 @@ impl ExecNtHandler {
         let name = [b'a', (n & 0xff) as u8, ((n >> 8) & 0xff) as u8, ((n >> 16) & 0xff) as u8];
         let mut e = ObjEntry::dir(&name, 250);
         e.kind = 2;
-        e.auto_reset = auto_reset as u8;
         self.obj_ns.push(e);
-        Some(self.obj_ns.len() - 1)
+        let index = self.obj_ns.len() - 1;
+        self.events.initialize(
+            index as u64,
+            if auto_reset { EventKind::Synchronization } else { EventKind::Notification },
+            initial_state,
+        );
+        Some(index)
     }
     /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
     /// resolve the parent from all but the last component, then insert the leaf. Existing → reused.
@@ -2628,8 +2690,8 @@ impl NativeSyscallHandler for ExecNtHandler {
             // win32k the REAL event handles winsrv created, which it models as typed Event objects.
             // (Memory behaviour matches the pre-fix baseline: nothing is written to the caller here.)
             NativeService::NtCreateEvent => {
-                let h = self.mint_handle();
                 if self.pi == 1 {
+                    let h = self.mint_handle();
                     // Keep the two most-recent csrss event handles in creation order (winsrv creates
                     // hPowerRequestEvent then hMediaRequestEvent right before NtUserInitialize).
                     if self.csrss_event_n < self.csrss_event_handles.len() {
@@ -2647,33 +2709,40 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // executive object namespace (kind==2) keyed by the OA name (rooted at the OA's
                 // RootDirectory = the \BaseNamedObjects handle BaseGetNamedObjectDirectory returned),
                 // write the handle back, and report STATUS_OBJECT_NAME_EXISTS if it already existed
-                // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event (empty OA name) just
-                // mints a bare handle. The PHANDLE (R10) may be a DLL .data global → xas_write_u64.
+                // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event gets a distinct event
+                // identity plus a typed process-local handle. The PHANDLE may be a DLL .data global.
                 // Winlogon's unnamed rpcrt4 server_ready_event/mgr_event are a live cross-thread
                 // handshake. Model them as distinct events: the main thread signals mgr_event, the
                 // server worker consumes it and signals server_ready_event, and the main waiter wakes.
-                if self.pi == 2 {
-                    unsafe {
-                        let out = args[0]; // R10 = *EventHandle
-                        let auto_reset = args[3] == 1; // SynchronizationEvent
-                        let initial_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1 != 0;
-                        let Some(index) = self.obj_create_anon_event(auto_reset) else {
-                            return 0xC000_009A;
-                        };
-                        self.obj_ns[index].signalled = initial_state as u8;
-                        if out != 0 {
-                            self.xas_write_u64(out, OBJ_HANDLE_BASE + index as u64);
-                        }
-                    }
-                    return 0;
-                }
-                if self.pi == 3 || self.pi == 4 { unsafe {
+                if self.pi != 1 { unsafe {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
                     // EventType[R9]=args[3], InitialState is the 5th arg (stack [sp+0x28]).
-                    let init_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1;
+                    let auto_reset = args[3] == 1;
+                    let init_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1 != 0;
                     if oa == 0 {
-                        self.xas_write_u64(out, h);
+                        let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
+                            return 0xC000_009A;
+                        };
+                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                            return 0xC000_009A;
+                        };
+                        self.xas_write_u64(out, event_handle);
+                        let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                        if trace < 32 {
+                            print_str(b"[event] create pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" badge=");
+                            print_u64(self.current_badge);
+                            print_str(b" h=0x");
+                            print_hex_u64(event_handle);
+                            print_str(b" obj=");
+                            print_u64(index as u64);
+                            print_str(b" access=0x");
+                            print_hex(args[1] as u32);
+                            print_str(if auto_reset { b" sync" } else { b" notification" });
+                            print_str(if init_state { b" initial=1\n" } else { b" initial=0\n" });
+                        }
                         return 0;
                     }
                     let mut rd = [0u8; 8];
@@ -2681,7 +2750,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     let root_dir = u64::from_le_bytes(rd);
                     let name16 = self.read_objattr_name_pe(oa);
                     if name16.is_empty() {
-                        self.xas_write_u64(out, h);
+                        let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
+                            return 0xC000_009A;
+                        };
+                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                            return 0xC000_009A;
+                        };
+                        self.xas_write_u64(out, event_handle);
                         return 0;
                     }
                     let mut nbuf = [0u8; 40];
@@ -2697,15 +2772,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                     match self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
                         Some(i) => {
                             if !existed {
-                                self.obj_ns[i].signalled = init_state as u8;
+                                self.events.initialize(
+                                    i as u64,
+                                    if auto_reset { EventKind::Synchronization } else { EventKind::Notification },
+                                    init_state,
+                                );
                             }
                             self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
                             SERVICES_NAMED_EVENTS.fetch_add(1, Ordering::Relaxed);
                             if existed { 0x4000_0000 } else { 0 } // STATUS_OBJECT_NAME_EXISTS : SUCCESS
                         }
                         None => {
-                            self.xas_write_u64(out, h);
-                            0
+                            0xC000_009A
                         }
                     }
                 } } else {
@@ -2748,6 +2826,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // name folds to "selsainitevent". Scoped pi==4 so services/paint reads are unchanged.
                 if self.pi == 4 && nbuf[..nlen].windows(14).any(|w| w == b"selsainitevent") {
                     if let Some(i) = self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
+                        if !self.events.contains(i as u64) {
+                            self.events.initialize(i as u64, EventKind::Notification, false);
+                        }
                         self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
                         return 0;
                     }
@@ -2953,7 +3034,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtWaitForSingleObject(Handle=R10=args[0], Alertable=RDX, *Timeout=R8).
             //
             // ★ Checkpoint B — REAL event-state wait with reply-cap parking (the load-bearing case):
-            // if the target is a REAL executive named event (obj_ns kind==2, e.g. LSA_RPC_SERVER_ACTIVE
+            // if the target is a REAL executive event (obj_ns kind==2, e.g. LSA_RPC_SERVER_ACTIVE
             // that lsass creates+signals in LsarStartRpcServer), consult its `signalled` flag:
             //   • signalled  → STATUS_WAIT_0 immediately (correct for a manual-reset event that has
             //                  already been set — e.g. winlogon's WaitForLsass when lsass signaled first).
@@ -2967,27 +3048,35 @@ impl NativeSyscallHandler for ExecNtHandler {
             // parking one of those would hang since nothing sets it). csrss (pi==1) stays immediate.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
-                if handle >= OBJ_HANDLE_BASE {
-                    let idx = (handle - OBJ_HANDLE_BASE) as usize;
-                    if let Some(e) = self.obj_ns.get(idx) {
-                        if e.kind == 2 {
-                            if e.signalled != 0 {
-                                let auto = e.auto_reset != 0;
+                match self.event_index_for_handle(handle, SYNCHRONIZE_ACCESS) {
+                    Ok(idx) => {
+                        if self.events.read_state(idx as u64) {
                                 unsafe {
                                     print_str(b"[wait] pi=");
                                     print_u64(self.pi as u64);
                                     print_str(b" NtWaitForSingleObject(event #");
                                     print_u64(idx as u64);
                                     print_str(b" '");
-                                    for &c in e.name() { debug_put_char(c); }
+                                    for &c in self.obj_ns[idx].name() { debug_put_char(c); }
                                     print_str(b"') already SIGNALLED -> immediate WAIT_0\n");
                                 }
-                                // Auto-reset event: consume the signal (NT clears it on satisfying wait).
-                                if auto {
-                                    if let Some(em) = self.obj_ns.get_mut(idx) { em.signalled = 0; }
-                                }
+                                self.events.consume_existing(idx as u64);
                                 return 0;
+                        }
+                        let timeout_ptr = args[2];
+                        if timeout_ptr != 0 {
+                            let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
+                            match nt_delay_execution::due_time(
+                                interval,
+                                monotonic_time_100ns(),
+                                nt_system_time_100ns(),
+                            ) {
+                                nt_delay_execution::Due::Immediate => return 0x102,
+                                nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                                    self.wait_deadline_100ns = deadline;
+                                }
                             }
+                        }
                             // Unsignaled real event → ask the loop to PARK this caller on it.
                             self.wait_park_event = idx as i64;
                             unsafe {
@@ -2996,15 +3085,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 print_str(b" NtWaitForSingleObject(event #");
                                 print_u64(idx as u64);
                                 print_str(b" '");
-                                for &c in e.name() { debug_put_char(c); }
+                                for &c in self.obj_ns[idx].name() { debug_put_char(c); }
                                 print_str(b"') UNSIGNALLED -> PARK caller (reply-cap park)\n");
                             }
-                            return 0x102; // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
-                        }
+                        0x102 // STATUS_TIMEOUT sentinel; the loop parks (ignores this)
                     }
+                    Err(_status) if self.is_legacy_opaque_handle(handle) => 0,
+                    Err(status) => status,
                 }
-                // No real parkable event → immediate STATUS_WAIT_0 (no live signaler).
-                0
             }
             // NtOpen/CreateDirectoryObject(*Handle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]).
             // Resolve/insert in the executive object namespace, hand back a real handle.
@@ -3826,8 +3914,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // have immediate-wait semantics; STATUS_PENDING must leave every event unsignalled.
                 if routed && status != 0x0000_0103 {
                     if let Ok(Some(index)) = completion_event {
-                        if let Some(entry) = self.obj_ns.get_mut(index) {
-                            entry.signalled = 1;
+                        if self.events.set_existing(index as u64).is_some() {
                             self.io_signal_event = index as i64;
                         }
                     }
@@ -3937,8 +4024,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 if routed && status != 0x0000_0103 {
                     if let Ok(Some(index)) = completion_event {
-                        if let Some(entry) = self.obj_ns.get_mut(index) {
-                            entry.signalled = 1;
+                        if self.events.set_existing(index as u64).is_some() {
                             self.io_signal_event = index as i64;
                         }
                     }

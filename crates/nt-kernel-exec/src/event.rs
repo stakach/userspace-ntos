@@ -28,6 +28,20 @@ pub enum WaitResult {
     BadIrql,
 }
 
+/// Result of polling a set of dispatcher events.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitManyResult {
+    /// The wait condition is satisfied. `WaitAny` returns the lowest matching index;
+    /// `WaitAll` returns zero.
+    Signaled(usize),
+    /// No event currently satisfies the wait.
+    TimedOut,
+    /// At least one supplied event identity does not exist.
+    InvalidEvent,
+    /// Waiting is not permitted at the current IRQL.
+    BadIrql,
+}
+
 struct Event {
     ptr: u64,
     kind: EventKind,
@@ -43,6 +57,14 @@ pub struct EventStore {
 impl EventStore {
     pub fn new() -> Self {
         Self { events: Vec::new() }
+    }
+
+    /// Construct a store whose backing allocation can be made before a rewindable
+    /// executive heap mark. Event operations do not allocate while within capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(capacity),
+        }
     }
 
     fn slot(&mut self, ptr: u64) -> &mut Event {
@@ -62,6 +84,85 @@ impl EventStore {
         let e = self.slot(ptr);
         e.kind = kind;
         e.signaled = signaled;
+    }
+
+    /// Whether an event identity has been initialized.
+    pub fn contains(&self, ptr: u64) -> bool {
+        self.events.iter().any(|event| event.ptr == ptr)
+    }
+
+    /// Strict `NtSetEvent` state transition. Unlike [`Self::set`], this never
+    /// manufactures an event for an invalid handle.
+    pub fn set_existing(&mut self, ptr: u64) -> Option<bool> {
+        let event = self.events.iter_mut().find(|event| event.ptr == ptr)?;
+        let previous = event.signaled;
+        event.signaled = true;
+        Some(previous)
+    }
+
+    /// Strict `NtResetEvent` state transition.
+    pub fn reset_existing(&mut self, ptr: u64) -> Option<bool> {
+        let event = self.events.iter_mut().find(|event| event.ptr == ptr)?;
+        let previous = event.signaled;
+        event.signaled = false;
+        Some(previous)
+    }
+
+    /// Strict `NtClearEvent` state transition.
+    pub fn clear_existing(&mut self, ptr: u64) -> bool {
+        let Some(event) = self.events.iter_mut().find(|event| event.ptr == ptr) else {
+            return false;
+        };
+        event.signaled = false;
+        true
+    }
+
+    /// Consume a signaled synchronization event, leaving notification events set.
+    pub fn consume_existing(&mut self, ptr: u64) -> bool {
+        let Some(event) = self.events.iter_mut().find(|event| event.ptr == ptr) else {
+            return false;
+        };
+        if !event.signaled {
+            return false;
+        }
+        if event.kind == EventKind::Synchronization {
+            event.signaled = false;
+        }
+        true
+    }
+
+    /// Poll `WaitAny`/`WaitAll` over existing event identities and apply NT
+    /// synchronization-event consumption on success.
+    pub fn poll_many(
+        &mut self,
+        ptrs: &[u64],
+        wait_all: bool,
+        irql: &IrqlState,
+    ) -> WaitManyResult {
+        if !irql.can_wait() {
+            return WaitManyResult::BadIrql;
+        }
+        if ptrs.is_empty()
+            || ptrs
+                .iter()
+                .any(|ptr| !self.events.iter().any(|event| event.ptr == *ptr))
+        {
+            return WaitManyResult::InvalidEvent;
+        }
+        if wait_all {
+            if ptrs.iter().any(|ptr| !self.read_state(*ptr)) {
+                return WaitManyResult::TimedOut;
+            }
+            for ptr in ptrs {
+                self.consume_existing(*ptr);
+            }
+            WaitManyResult::Signaled(0)
+        } else if let Some(index) = ptrs.iter().position(|ptr| self.read_state(*ptr)) {
+            self.consume_existing(ptrs[index]);
+            WaitManyResult::Signaled(index)
+        } else {
+            WaitManyResult::TimedOut
+        }
     }
 
     /// `KeSetEvent` — signal the event, returning the previous state.
@@ -157,5 +258,62 @@ mod tests {
         let mut ev = EventStore::new();
         ev.initialize(0xE3, EventKind::Notification, true);
         assert_eq!(ev.poll(0xE3, &irql), WaitResult::BadIrql);
+    }
+
+    #[test]
+    fn anonymous_identities_are_distinct_and_invalid_is_rejected() {
+        let irql = IrqlState::new();
+        let mut events = EventStore::with_capacity(2);
+        events.initialize(1, EventKind::Notification, false);
+        events.initialize(2, EventKind::Notification, true);
+        assert!(!events.read_state(1));
+        assert!(events.read_state(2));
+        assert_eq!(
+            events.poll_many(&[1, 99], false, &irql),
+            WaitManyResult::InvalidEvent
+        );
+        assert_eq!(events.set_existing(99), None);
+    }
+
+    #[test]
+    fn strict_set_reset_report_previous_state() {
+        let mut events = EventStore::new();
+        events.initialize(7, EventKind::Notification, false);
+        assert_eq!(events.set_existing(7), Some(false));
+        assert_eq!(events.set_existing(7), Some(true));
+        assert_eq!(events.reset_existing(7), Some(true));
+        assert_eq!(events.reset_existing(7), Some(false));
+    }
+
+    #[test]
+    fn wait_any_returns_array_index_and_consumes_only_selected_auto_event() {
+        let irql = IrqlState::new();
+        let mut events = EventStore::new();
+        events.initialize(10, EventKind::Synchronization, false);
+        events.initialize(11, EventKind::Synchronization, true);
+        assert_eq!(
+            events.poll_many(&[10, 11], false, &irql),
+            WaitManyResult::Signaled(1)
+        );
+        assert!(!events.read_state(11));
+    }
+
+    #[test]
+    fn wait_all_requires_every_event_and_consumes_auto_reset_members() {
+        let irql = IrqlState::new();
+        let mut events = EventStore::new();
+        events.initialize(20, EventKind::Notification, true);
+        events.initialize(21, EventKind::Synchronization, false);
+        assert_eq!(
+            events.poll_many(&[20, 21], true, &irql),
+            WaitManyResult::TimedOut
+        );
+        events.set_existing(21);
+        assert_eq!(
+            events.poll_many(&[20, 21], true, &irql),
+            WaitManyResult::Signaled(0)
+        );
+        assert!(events.read_state(20));
+        assert!(!events.read_state(21));
     }
 }

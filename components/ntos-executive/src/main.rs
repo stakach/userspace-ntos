@@ -913,6 +913,9 @@ static WAITER_EVENT_COUNT: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) };
 /// index as STATUS_WAIT_0+i), 1 = WaitAll (wake only when ALL events are signalled, return WAIT_0).
 static WAITER_WAIT_ALL: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
 static WAITER_REPLY_CAP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+static WAITER_TID: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+/// Monotonic 100ns deadline (`u64::MAX` = infinite) for finite event waits.
+static WAITER_DEADLINE: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
 /// The parked waiter's syscall resume context (RCX/RSP/RFLAGS): a native-syscall (UnknownSyscall)
 /// fault is resumed by an apply_fault_reply that restores RCX←resume_ip, RSP←sp, RFLAGS←flags and
 /// RAX/r10←status. The service loop sets these in the IPC buffer at reply time, so we must snapshot
@@ -993,6 +996,7 @@ static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
 /// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
@@ -1804,7 +1808,18 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         return;
     }
     let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    if let Some(deadline) = queue.next_deadline() {
+    let event_deadline = (0..WAITER_N)
+        .filter(|slot| WAITER_EVENT_IDX[*slot].load(Ordering::Relaxed) != u64::MAX)
+        .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
+        .filter(|deadline| *deadline != u64::MAX)
+        .min();
+    let deadline = match (queue.next_deadline(), event_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(deadline) = deadline {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
         let target = nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period);
         let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
@@ -1891,6 +1906,8 @@ unsafe fn delay_wake_due(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) 
 unsafe fn delay_timer_interrupt(queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>) {
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = delay_wake_due(queue);
+    let _ = wait_wake_due();
+    delay_timer_rearm(queue);
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
@@ -1953,9 +1970,43 @@ unsafe fn delay_cancel_thread(
 /// NEW object (never rebinding/orphaning the parked one). The caller stays blocked in-kernel until
 /// `wait_wake_event` sends on the stolen cap. Returns true on success; false if the pool/waiter queue
 /// is exhausted (caller must then fall back to an immediate reply → never a hang).
-unsafe fn wait_park(event_idx: usize, resume_ip: u64, sp: u64, flags: u64) -> bool {
+unsafe fn wait_park(
+    event_idx: usize,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    tid: u64,
+    deadline: Option<u64>,
+) -> bool {
     // Single-object wait = a 1-event WaitAny set.
-    wait_park_multi(&[event_idx], false, resume_ip, sp, flags)
+    wait_park_multi(&[event_idx], false, resume_ip, sp, flags, tid, deadline)
+}
+
+unsafe fn wait_cancel_thread(tid: u64) {
+    for slot in 0..WAITER_N {
+        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
+            || WAITER_TID[slot].load(Ordering::Relaxed) != tid
+        {
+            continue;
+        }
+        let cap = WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        if cap != 0 {
+            let deleted = cnode_delete_r(cap);
+            let retyped = if deleted == 0 {
+                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+            } else {
+                u64::MAX
+            };
+            if deleted == 0 && retyped == 0 {
+                release_reply_pool_cap(cap);
+            }
+        }
+        WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
+        WAITER_EVENT_COUNT[slot].store(0, Ordering::Relaxed);
+        WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
+        WAITER_TID[slot].store(0, Ordering::Relaxed);
+        WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
+    }
 }
 
 /// Consume the Reply object bound to the current native-syscall fault without sending on it, then
@@ -2050,6 +2101,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         return false;
     }
     delay_cancel_thread(delay_queue, tid);
+    wait_cancel_thread(tid);
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_r(tcb)
@@ -2086,6 +2138,8 @@ unsafe fn wait_park_multi(
     resume_ip: u64,
     sp: u64,
     flags: u64,
+    tid: u64,
+    deadline: Option<u64>,
 ) -> bool {
     if events.is_empty() || events.len() > WAITER_MAX_EVENTS {
         return false;
@@ -2122,7 +2176,7 @@ unsafe fn wait_park_multi(
         }
     }
     if fresh == 0 {
-        return false; // pool exhausted → caller falls back to immediate reply
+        return false; // pool exhausted → caller reports STATUS_INSUFFICIENT_RESOURCES
     }
     // Commit: record the waiter's event set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
@@ -2135,6 +2189,8 @@ unsafe fn wait_park_multi(
     WAITER_EVENT_COUNT[wslot].store(events.len() as u64, Ordering::Relaxed);
     WAITER_WAIT_ALL[wslot].store(wait_all as u64, Ordering::Relaxed);
     WAITER_REPLY_CAP[wslot].store(stolen, Ordering::Relaxed);
+    WAITER_TID[wslot].store(tid, Ordering::Relaxed);
+    WAITER_DEADLINE[wslot].store(deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
     WAITER_RESUME_IP[wslot].store(resume_ip, Ordering::Relaxed);
     WAITER_RESUME_SP[wslot].store(sp, Ordering::Relaxed);
     WAITER_RESUME_FLAGS[wslot].store(flags, Ordering::Relaxed);
@@ -2152,10 +2208,7 @@ unsafe fn wait_park_multi(
 /// a wake have their `signalled` flag cleared (NT auto-reset semantics — e.g. rpcrt4's mgr_event /
 /// server_ready_event). Returns the number woken. Called from the NtSetEvent handler after setting the
 /// event's `signalled` flag.
-unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjEntry>) -> u64 {
-    let is_signalled = |ev: usize, ns: &alloc::vec::Vec<ObjEntry>| -> bool {
-        ns.get(ev).map(|e| e.kind == 2 && e.signalled != 0).unwrap_or(false)
-    };
+unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
     let mut woken = 0u64;
     for i in 0..WAITER_N {
         let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
@@ -2175,7 +2228,7 @@ unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjE
             let mut all = true;
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if !is_signalled(ev, obj_ns) {
+                if !events.read_state(ev as u64) {
                     all = false;
                     break;
                 }
@@ -2187,7 +2240,7 @@ unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjE
             // is guaranteed signalled; prefer the lowest index in the set that is signalled.
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if ev == just_set || is_signalled(ev, obj_ns) {
+                if ev == just_set || events.read_state(ev as u64) {
                     wake = true;
                     wake_index = k as u64;
                     break;
@@ -2202,19 +2255,11 @@ unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjE
         if wait_all {
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if let Some(e) = obj_ns.get_mut(ev) {
-                    if e.kind == 2 && e.auto_reset != 0 {
-                        e.signalled = 0;
-                    }
-                }
+                events.consume_existing(ev as u64);
             }
         } else {
             let ev = WAITER_EVENTS[i][wake_index as usize].load(Ordering::Relaxed) as usize;
-            if let Some(e) = obj_ns.get_mut(ev) {
-                if e.kind == 2 && e.auto_reset != 0 {
-                    e.signalled = 0;
-                }
-            }
+            events.consume_existing(ev as u64);
         }
         let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
         if cap != 0 {
@@ -2239,6 +2284,35 @@ unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjE
         WAITER_EVENT_IDX[i].store(u64::MAX, Ordering::Relaxed);
         WAITER_EVENT_COUNT[i].store(0, Ordering::Relaxed);
         WAITER_REPLY_CAP[i].store(0, Ordering::Relaxed);
+        WAITER_TID[i].store(0, Ordering::Relaxed);
+        WAITER_DEADLINE[i].store(u64::MAX, Ordering::Relaxed);
+    }
+    woken
+}
+
+unsafe fn wait_wake_due() -> u64 {
+    let now = monotonic_time_100ns();
+    let mut woken = 0;
+    for slot in 0..WAITER_N {
+        if WAITER_EVENT_IDX[slot].load(Ordering::Relaxed) == u64::MAX
+            || WAITER_DEADLINE[slot].load(Ordering::Relaxed) > now
+        {
+            continue;
+        }
+        let cap = WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        if cap != 0 {
+            set_reply_mr(15, WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
+            set_reply_mr(16, WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
+            set_reply_mr(17, WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
+            send_on_reply(cap, 18, 0x102, 0, 0, 0);
+            release_reply_pool_cap(cap);
+            woken += 1;
+        }
+        WAITER_EVENT_IDX[slot].store(u64::MAX, Ordering::Relaxed);
+        WAITER_EVENT_COUNT[slot].store(0, Ordering::Relaxed);
+        WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
+        WAITER_TID[slot].store(0, Ordering::Relaxed);
+        WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
     }
     woken
 }
@@ -2753,6 +2827,13 @@ fn utf16_bytes(d16: &[u16]) -> alloc::vec::Vec<u8> {
 }
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
 const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
+/// Opaque-tag payload used by the real per-process handle table for anonymous events. The low
+/// 32 bits are the shared object-namespace index; named/global event handles keep OBJ_HANDLE_BASE
+/// for win32k and cross-process compatibility.
+const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
+const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
 /// allocation, so the backing `Vec` (pre-reserved below the per-syscall heap mark) never
@@ -2766,15 +2847,6 @@ struct ObjEntry {
     kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event
     target: [u8; 40], // symbolic-link target (kind == 1)
     target_len: u8,
-    // kind == 2 (event): the signalled state. Named events registered in \BaseNamedObjects
-    // (services' SCM_START_EVENT/LSA_RPC_SERVER_ACTIVE/…) live here as real executive objects
-    // keyed by name; SetEvent/ResetEvent are modelled as flips of this flag.
-    signalled: u8,
-    // kind == 2 (event): 1 = auto-reset (CreateEvent bManualReset=FALSE — e.g. rpcrt4's mgr_event /
-    // server_ready_event). When a wait CONSUMES an auto-reset event (a waiter wakes on it), its
-    // `signalled` flag is cleared so a subsequent wait blocks again. 0 = manual-reset (the default —
-    // stays signalled until an explicit ResetEvent; e.g. LSA_RPC_SERVER_ACTIVE).
-    auto_reset: u8,
 }
 impl ObjEntry {
     fn dir(name: &[u8], parent: u8) -> Self {
@@ -2785,8 +2857,6 @@ impl ObjEntry {
             kind: 0,
             target: [0; 40],
             target_len: 0,
-            signalled: 0,
-            auto_reset: 0,
         };
         let n = name.len().min(40);
         e.name[..n].copy_from_slice(&name[..n]);
@@ -2937,6 +3007,9 @@ struct ExecNtHandler {
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
     /// like `key_handles`; entries are inline (no nested heap) so pushes never reallocate.
     obj_ns: alloc::vec::Vec<ObjEntry>,
+    /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
+    /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
+    events: nt_kernel_exec::EventStore,
     /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its arena
     /// is allocated once in `new()` below the per-syscall heap mark; atom operations mutate only
     /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
@@ -3014,6 +3087,8 @@ struct ExecNtHandler {
     /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
     /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// Monotonic 100ns deadline for the pending single-event park (`u64::MAX` = infinite).
+    wait_deadline_100ns: u64,
     /// NtDelayExecution asks the service loop to park this syscall's reply until this signed
     /// 100ns interval becomes due. The handler validates/copies the user pointer; the loop owns
     /// deadline conversion and the HPET-backed reply-cap park.
