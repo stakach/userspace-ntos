@@ -2306,6 +2306,7 @@ static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 /// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
+static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
@@ -6028,6 +6029,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         print_hex(cli_fid as u32);
                         print_str(b"\n");
                         check(b"npfs_client_connect_finds_fcb", cst == 0 && cli_fid != 0, &mut passed);
+                        if cst == 0 && cli_fid != 0 {
+                            let pipe_info = [1u8, 0, 0, 0, 0, 0, 0, 0];
+                            let mut set_out = [];
+                            if let Some((sst, sinfo)) = npfs_dispatch_irp(
+                                6 /* IRP_MJ_SET_INFORMATION */,
+                                23 /* FilePipeInformation */,
+                                cli_fid,
+                                &pipe_info,
+                                &mut set_out,
+                            ) {
+                                print_str(b"[npfs-svc] C-b IRP_MJ_SET_INFORMATION(FilePipeInformation) -> status=0x");
+                                print_hex(sst as u32);
+                                print_str(b" info=");
+                                print_u64(sinfo);
+                                print_str(b"\n");
+                                check(b"npfs_set_pipe_information", sst == 0 && sinfo == 0, &mut passed);
+                            }
+                        }
                     }
                 }
             }

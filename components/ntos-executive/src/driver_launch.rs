@@ -93,7 +93,7 @@ pub const SH_POOL_USED: u64 = 0x28; // out: pool high-water (u64)
 // IRP dispatch request/reply (executive → FSD, via the shared page).
 pub const SH_REQ_MAJOR: u64 = 0x40; // in:  IRP_MJ_* major function (u64)
 pub const SH_REQ_MINOR: u64 = 0x48; // in:  minor function (u64)
-pub const SH_REQ_FSCTL: u64 = 0x50; // in:  FsControlCode / IoControlCode (u64)
+pub const SH_REQ_FSCTL: u64 = 0x50; // in:  control code or FILE_INFORMATION_CLASS (u64)
 pub const SH_REQ_INLEN: u64 = 0x58; // in:  input buffer length (u64)
 pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
@@ -821,6 +821,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     //  Create/CreatePipe: SecurityContext@iosl+0x08, Options@iosl+0x10, ShareAccess(USHORT)@iosl+0x1a,
     //    Parameters@iosl+0x20.
     //  Read/Write: Length(ULONG)@0x08, Key@0x10, ByteOffset(LARGE_INTEGER)@0x18.
+    //  SetFile: Length(ULONG)@0x08, FileInformationClass (8-aligned) @0x10.
     //  FS/DeviceControl: OutputBufferLength@0x08, InputBufferLength@0x10, IoControlCode@0x18,
     //    Type3InputBuffer@0x20.
     match major {
@@ -858,6 +859,10 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         }
         3 | 4 => {
             write_unaligned((iosl + 0x08) as *mut u32, if major == 4 { inlen } else { outlen } as u32);
+        }
+        6 => {
+            write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
+            write_unaligned((iosl + 0x10) as *mut u32, fsctl as u32);
         }
         0xd | 0xe => {
             write_unaligned((iosl + 0x08) as *mut u32, outlen as u32);

@@ -3151,20 +3151,73 @@ impl NativeSyscallHandler for ExecNtHandler {
                 status as u32
             },
             // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
-            // Length[R9], FileInformationClass[sp+0x28]). lsass' rpcrt4 sets up its \pipe\lsarpc
-            // (FilePipeInformation / FileCompletionInformation for async listen) before FSCTL_PIPE_LISTEN.
-            // Model SUCCESS with a zeroed IO_STATUS_BLOCK so the setup proceeds (pi==4). pi 0-3 stop.
+            // Length[R9], FileInformationClass[sp+0x28]). lsass and winlogon set
+            // FilePipeInformation on typed \pipe\lsarpc / \pipe\ntsvcs handles before listening.
+            // Route those proven paths through isolated npfs instead of blanket-success modeling.
             NativeService::NtSetInformationFile => unsafe {
-                if self.pi != 4 {
+                let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
+                let sp = get_recv_mr(16);
+                let information_class = smss_stack_read(sp + 0x28) as u32;
+                let length = args[3] as usize;
+                let mut payload = [0u8; 32];
+                let payload_len = length.min(payload.len());
+                let payload_ok = payload_len == 0 || self.xas_read(args[2], &mut payload[..payload_len]);
+                if NT_SET_INFORMATION_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[nt-set-information-file] pi="); print_u64(self.pi as u64);
+                    print_str(b" handle=0x"); print_hex(args[0] as u32);
+                    print_str(b" class="); print_u64(information_class as u64);
+                    print_str(b" length="); print_u64(length as u64);
+                    print_str(b" payload_ok="); print_u64(payload_ok as u64);
+                    if information_class == 23 && payload_ok && payload_len >= 8 {
+                        print_str(b" read_mode=");
+                        print_u64(u32::from_le_bytes(payload[0..4].try_into().unwrap()) as u64);
+                        print_str(b" completion_mode=");
+                        print_u64(u32::from_le_bytes(payload[4..8].try_into().unwrap()) as u64);
+                    }
+                    print_str(b" payload=");
+                    if payload_ok {
+                        for &byte in &payload[..payload_len] {
+                            print_hex(byte as u32);
+                            debug_put_char(b' ');
+                        }
+                    }
+                    print_str(b"\n");
+                }
+                if self.pi != 2 && self.pi != 4 {
                     self.stop = true;
                     return 0xC000_0002;
                 }
-                let iosb = args[1]; // RDX = *IO_STATUS_BLOCK
+                let mut information = 0u64;
+                let file_id = self.npfs_file_id_for(args[0]);
+                let status = if information_class != 23 {
+                    0xC000_0003 // STATUS_INVALID_INFO_CLASS
+                } else if length < 8 {
+                    0xC000_0004 // STATUS_INFO_LENGTH_MISMATCH
+                } else if args[2] == 0 || !payload_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if file_id == 0 {
+                    0xC000_0008 // STATUS_INVALID_HANDLE
+                } else {
+                    let mut output = [];
+                    match self.npfs_route_raw(
+                        6 /* IRP_MJ_SET_INFORMATION */,
+                        information_class as u64,
+                        file_id,
+                        &payload[..8],
+                        &mut output,
+                    ) {
+                        Some((driver_status, completed, _)) => {
+                            information = completed;
+                            driver_status as u32
+                        }
+                        None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                    }
+                };
                 if iosb != 0 {
-                    self.xas_write_buf(iosb, &0u32.to_le_bytes()); // Status
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
-                0 // STATUS_SUCCESS
+                status
             },
             // NtFlushBuffersFile(FileHandle[R10], *IoStatusBlock[RDX]). rpcrt4 flushes its \pipe\lsarpc
             // after a write. A synchronous pipe needs no real flush — model SUCCESS (pi==4). pi 0-3 stop.
