@@ -23,6 +23,7 @@ members = [
     "crates/nt-io-manager",
     "crates/nt-io-server",
     "crates/nt-io-client",
+    "crates/nt-io-completion",
     "crates/nt-kernel-abi",
     "crates/nt-pe-loader",
     "crates/nt-compat-exports",
@@ -106,6 +107,7 @@ nt-io-abi = { path = "crates/nt-io-abi" }
 nt-io-manager = { path = "crates/nt-io-manager" }
 nt-io-server = { path = "crates/nt-io-server" }
 nt-io-client = { path = "crates/nt-io-client" }
+nt-io-completion = { path = "crates/nt-io-completion" }
 nt-kernel-abi = { path = "crates/nt-kernel-abi" }
 nt-pe-loader = { path = "crates/nt-pe-loader" }
 nt-compat-exports = { path = "crates/nt-compat-exports" }

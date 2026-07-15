@@ -339,6 +339,26 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
+fn io_completion_family_registers_at_reactos_numbers() {
+    let pairs = [
+        (NativeService::NtCreateIoCompletion, 40u32),
+        (NativeService::NtOpenIoCompletion, 123),
+        (NativeService::NtQueryIoCompletion, 166),
+        (NativeService::NtRemoveIoCompletion, 198),
+        (NativeService::NtSetIoCompletion, 241),
+    ];
+    let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    for (service, ssn) in pairs {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+    }
+    assert_eq!(NativeService::NtCreateIoCompletion.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtOpenIoCompletion.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtQueryIoCompletion.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtRemoveIoCompletion.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtSetIoCompletion.arg_count(), (5, 5));
+}
+
+#[test]
 fn group_b2_out_writing_query_services_register() {
     // Group B2: out-writing query services register at their real Win7 SSNs; the executive drains
     // their queued out-writes after dispatch. QueryVolumeInformationFile reads a stack arg5.

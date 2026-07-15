@@ -339,6 +339,29 @@ fn file_objects_are_typed_and_process_local() {
 }
 
 #[test]
+fn io_completion_objects_are_typed_and_process_local() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let first_handle = pm
+        .insert_handle(first, HandleObject::IoCompletion(3), 0x3)
+        .unwrap();
+    let second_handle = pm
+        .insert_handle(second, HandleObject::IoCompletion(7), 0x1)
+        .unwrap();
+    assert_eq!(first_handle, second_handle);
+    assert_eq!(
+        pm.lookup_handle(first, first_handle),
+        Some(HandleObject::IoCompletion(3))
+    );
+    assert_eq!(
+        pm.lookup_handle(second, second_handle),
+        Some(HandleObject::IoCompletion(7))
+    );
+    assert_eq!(pm.handle_access(first, first_handle), Some(0x3));
+}
+
+#[test]
 fn append_only_handles_never_recycle_a_closed_value() {
     // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
     // executive's per-process DLL registry relies on (a recycled value would collide with a stale

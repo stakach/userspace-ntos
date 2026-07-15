@@ -371,6 +371,12 @@ pub const SSN_NT_ENUMERATE_KEY: u64 = 75;
 pub const SSN_NT_QUERY_KEY: u64 = 167;
 /// ntdll's NtCreateFile SSN (rpcrt4's ncacn_np client opens \Device\NamedPipe\lsarpc; lsass pi 4).
 pub const SSN_NT_CREATE_FILE: u64 = 39;
+/// ReactOS completion-port syscall family (`sysfuncs.lst` line minus one).
+pub const SSN_NT_CREATE_IO_COMPLETION: u64 = 40;
+pub const SSN_NT_OPEN_IO_COMPLETION: u64 = 123;
+pub const SSN_NT_QUERY_IO_COMPLETION: u64 = 166;
+pub const SSN_NT_REMOVE_IO_COMPLETION: u64 = 198;
+pub const SSN_NT_SET_IO_COMPLETION: u64 = 241;
 /// ntdll's NtCreateNamedPipeFile SSN (rpcrt4's ncacn_np server creates \pipe\winreg).
 pub const SSN_NT_CREATE_NAMED_PIPE_FILE: u64 = 46;
 /// ntdll's NtFsControlFile SSN (rpcrt4's pipe listen/connect FSCTLs).
@@ -2306,6 +2312,8 @@ static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 /// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
+static NT_CREATE_IO_COMPLETION_TRACED: AtomicBool = AtomicBool::new(false);
+static NT_REMOVE_IO_COMPLETION_WAIT_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_WRITE_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_READ_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2528,6 +2536,9 @@ struct ExecNtHandler {
     /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
     /// shared across every hosted process (`pi`).
     global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
+    /// Fixed executive completion-port objects and packet queues. SURT remains the cross-component
+    /// transport; CQEs are translated into these NT objects through `enqueue_transport`.
+    io_completion_ports: nt_io_completion::CompletionPortTable<2, 16, 64>,
     /// Per-call context the dispatch loop refreshes before each `dispatch` (Workstream A: the
     /// converged table-driven path carries executive context on the handler rather than a parallel
     /// mechanism). `pi` = process index (0 = smss, 1 = csrss); `stop` = a side-signal a handler
@@ -2754,6 +2765,11 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtEnumerateKey, SSN_NT_ENUMERATE_KEY as u32),
             (NativeService::NtQueryKey, SSN_NT_QUERY_KEY as u32),
             (NativeService::NtCreateFile, SSN_NT_CREATE_FILE as u32),
+            (NativeService::NtCreateIoCompletion, SSN_NT_CREATE_IO_COMPLETION as u32),
+            (NativeService::NtOpenIoCompletion, SSN_NT_OPEN_IO_COMPLETION as u32),
+            (NativeService::NtQueryIoCompletion, SSN_NT_QUERY_IO_COMPLETION as u32),
+            (NativeService::NtRemoveIoCompletion, SSN_NT_REMOVE_IO_COMPLETION as u32),
+            (NativeService::NtSetIoCompletion, SSN_NT_SET_IO_COMPLETION as u32),
             (NativeService::NtWriteFile, 284),
             (NativeService::NtReadFile, 191),
             (NativeService::NtSetInformationFile, 233),

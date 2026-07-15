@@ -58,6 +58,7 @@ impl ExecNtHandler {
                 GLOBAL_ATOM_CAPACITY,
             )
             .unwrap(),
+            io_completion_ports: nt_io_completion::CompletionPortTable::new(),
             pi: 0,
             stop: false,
             next_handle: FAKE_HANDLE,
@@ -270,6 +271,34 @@ impl ExecNtHandler {
         }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
+    }
+    pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let handle = self.pm
+            .insert_handle(pid, nt_process::HandleObject::IoCompletion(object_id), access)
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+    fn io_completion_id_for(&self, handle: u64, required_access: u32) -> Result<u32, u32> {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(nt_io_completion::STATUS_INVALID_HANDLE)?;
+        let object_id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::IoCompletion(object_id)) => object_id,
+            _ => return Err(nt_io_completion::STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(nt_io_completion::STATUS_INVALID_HANDLE)?;
+        if granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(object_id)
     }
     /// General NtCreateThread: hand out a real pool ETHREAD for the caller (`self.pi`) — bind the
     /// caller-supplied start routine + parameter + TEB base (all alloc-free field writes, reset-safe),
@@ -1116,8 +1145,18 @@ impl NativeSyscallHandler for ExecNtHandler {
             // benign. Purely additive: the returned status is unchanged.
             NativeService::NtClose => {
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                    let completion_id = match self
+                        .pm
+                        .lookup_handle(pid, args[0] as nt_process::Handle)
+                    {
+                        Some(nt_process::HandleObject::IoCompletion(id)) => Some(id),
+                        _ => None,
+                    };
                     if self.pm.close_handle(pid, args[0] as nt_process::Handle).is_ok() {
                         PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                        if let Some(id) = completion_id {
+                            let _ = self.io_completion_ports.release(id);
+                        }
                     }
                 }
                 0 // STATUS_SUCCESS
@@ -3127,6 +3166,200 @@ impl NativeSyscallHandler for ExecNtHandler {
                     &nb[..nlen],
                 );
                 status
+            },
+            // NtCreateIoCompletion(*Handle, DesiredAccess, *OA, NumberOfConcurrentThreads).
+            // The NT object and its packet queue live in the executive; SURT is only the transport
+            // which can feed packets through nt-io-completion's field-for-field adapter.
+            NativeService::NtCreateIoCompletion => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
+                let out_handle = args[0];
+                let desired_access = args[1] as u32;
+                let oa = args[2];
+                let concurrency = args[3] as u32;
+                let mut output_probe = [0u8; 8];
+                if out_handle == 0 || !self.xas_read(out_handle, &mut output_probe) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mut oa_header = [0u8; 32];
+                if oa != 0 && !self.xas_read(oa, &mut oa_header) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let attributes = if oa == 0 {
+                    0
+                } else {
+                    u32::from_le_bytes(oa_header[24..28].try_into().unwrap())
+                };
+                let name = if oa == 0 {
+                    alloc::vec::Vec::new()
+                } else {
+                    self.read_objattr_name_pe(oa)
+                };
+                if !NT_CREATE_IO_COMPLETION_TRACED.swap(true, Ordering::Relaxed) {
+                    print_str(b"[nt-create-io-completion] pi="); print_u64(self.pi as u64);
+                    print_str(b" access=0x"); print_hex(desired_access);
+                    print_str(b" oa=0x"); print_hex(oa as u32);
+                    print_str(b" attrs=0x"); print_hex(attributes);
+                    print_str(b" concurrency="); print_u64(concurrency as u64);
+                    print_str(b" name=\"");
+                    for &unit in name.iter().take(64) {
+                        debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+                    }
+                    print_str(b"\"\n");
+                }
+                let created = match self.io_completion_ports.create(
+                    &name,
+                    concurrency,
+                    attributes & 0x40 != 0,
+                ) {
+                    Ok(created) => created,
+                    Err(status) => return status,
+                };
+                let handle = match self.mint_io_completion_handle(created.id, desired_access) {
+                    Some(handle) => handle,
+                    None => {
+                        let _ = self.io_completion_ports.release(created.id);
+                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                };
+                self.xas_write_buf(out_handle, &handle.to_le_bytes());
+                if created.created { nt_io_completion::STATUS_SUCCESS } else { STATUS_OBJECT_NAME_EXISTS }
+            },
+            NativeService::NtOpenIoCompletion => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+                let out_handle = args[0];
+                let desired_access = args[1] as u32;
+                let oa = args[2];
+                let mut output_probe = [0u8; 8];
+                let mut oa_header = [0u8; 32];
+                if out_handle == 0
+                    || !self.xas_read(out_handle, &mut output_probe)
+                    || oa == 0
+                    || !self.xas_read(oa, &mut oa_header)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let attributes = u32::from_le_bytes(oa_header[24..28].try_into().unwrap());
+                let name = self.read_objattr_name_pe(oa);
+                let object_id = match self
+                    .io_completion_ports
+                    .open(&name, attributes & OBJ_CASE_INSENSITIVE != 0)
+                {
+                    Ok(id) => id,
+                    Err(status) => return status,
+                };
+                let handle = match self.mint_io_completion_handle(object_id, desired_access) {
+                    Some(handle) => handle,
+                    None => {
+                        let _ = self.io_completion_ports.release(object_id);
+                        return nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                };
+                self.xas_write_buf(out_handle, &handle.to_le_bytes());
+                nt_io_completion::STATUS_SUCCESS
+            },
+            NativeService::NtSetIoCompletion => {
+                const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
+                let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
+                    Ok(id) => id,
+                    Err(status) => return status,
+                };
+                self.io_completion_ports
+                    .enqueue(
+                        object_id,
+                        nt_io_completion::CompletionPacket {
+                            key_context: args[1],
+                            apc_context: args[2],
+                            status: args[3] as u32,
+                            information: args[4],
+                        },
+                    )
+                    .map_or_else(|status| status, |_| nt_io_completion::STATUS_SUCCESS)
+            },
+            NativeService::NtRemoveIoCompletion => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const IO_COMPLETION_MODIFY_STATE: u32 = 0x2;
+                let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_MODIFY_STATE) {
+                    Ok(id) => id,
+                    Err(status) => return status,
+                };
+                let mut probe = [0u8; 16];
+                if args[1] == 0
+                    || args[2] == 0
+                    || args[3] == 0
+                    || !self.xas_read(args[1], &mut probe[..8])
+                    || !self.xas_read(args[2], &mut probe[..8])
+                    || !self.xas_read(args[3], &mut probe)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let mode = if args[4] == 0 {
+                    nt_io_completion::RemoveMode::Wait
+                } else {
+                    let mut timeout = [0u8; 8];
+                    if !self.xas_read(args[4], &mut timeout) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if i64::from_le_bytes(timeout) == 0 {
+                        nt_io_completion::RemoveMode::Poll
+                    } else {
+                        nt_io_completion::RemoveMode::Wait
+                    }
+                };
+                match self.io_completion_ports.remove(object_id, mode) {
+                    Ok(nt_io_completion::RemoveResult::Packet(packet)) => {
+                        self.xas_write_buf(args[1], &packet.key_context.to_le_bytes());
+                        self.xas_write_buf(args[2], &packet.apc_context.to_le_bytes());
+                        self.xas_write_buf(args[3], &packet.status.to_le_bytes());
+                        self.xas_write_buf(args[3] + 8, &packet.information.to_le_bytes());
+                        nt_io_completion::STATUS_SUCCESS
+                    }
+                    Ok(nt_io_completion::RemoveResult::Empty(status)) => {
+                        if status == nt_io_completion::STATUS_PENDING
+                            && !NT_REMOVE_IO_COMPLETION_WAIT_TRACED.swap(true, Ordering::Relaxed)
+                        {
+                            print_str(b"[nt-remove-io-completion] pi="); print_u64(self.pi as u64);
+                            print_str(b" empty blocking wait -> STATUS_PENDING (reply-cap wait not yet armed)\n");
+                        }
+                        status
+                    }
+                    Err(status) => status,
+                }
+            },
+            NativeService::NtQueryIoCompletion => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+                const IO_COMPLETION_QUERY_STATE: u32 = 0x1;
+                const BASIC_INFO_LEN: u32 = 4;
+                let object_id = match self.io_completion_id_for(args[0], IO_COMPLETION_QUERY_STATE) {
+                    Ok(id) => id,
+                    Err(status) => return status,
+                };
+                if args[4] != 0 {
+                    let mut probe = [0u8; 4];
+                    if !self.xas_read(args[4], &mut probe) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    self.xas_write_buf(args[4], &BASIC_INFO_LEN.to_le_bytes());
+                }
+                if args[1] as u32 != 0 {
+                    return STATUS_INVALID_INFO_CLASS;
+                }
+                if (args[3] as u32) < BASIC_INFO_LEN {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut output_probe = [0u8; 4];
+                if args[2] == 0 || !self.xas_read(args[2], &mut output_probe) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let depth = match self.io_completion_ports.depth(object_id) {
+                    Ok(depth) => depth,
+                    Err(status) => return status,
+                };
+                self.xas_write_buf(args[2], &depth.to_le_bytes());
+                nt_io_completion::STATUS_SUCCESS
             },
             // NtCreateFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], AllocationSize[sp+0x28], FileAttributes[sp+0x30],

@@ -41,6 +41,7 @@ nt-io-abi = { path = "../../crates/nt-io-abi" }
 nt-io-manager = { path = "../../crates/nt-io-manager", features = ["object-manager"] }
 nt-io-server = { path = "../../crates/nt-io-server", features = ["object-manager"] }
 nt-io-client = { path = "../../crates/nt-io-client" }
+nt-io-completion = { path = "../../crates/nt-io-completion" }
 # Real NT CM_RESOURCE_LIST encoding — the resources PnP hands a driver at START.
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # PnP resource-assignment policy — PCI enum + BAR-size probe + CM_RESOURCE_LIST build. The
