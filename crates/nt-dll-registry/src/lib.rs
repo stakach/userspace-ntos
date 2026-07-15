@@ -14,8 +14,8 @@
 //!   the plain System32 search.
 //! - **Handle tracking** — file handle (NtOpenFile) → section handle (NtCreateSection) → mapped view
 //!   (NtMapViewOfSection), each looked up by handle.
-//! - **Base assignment** — each DLL gets a fixed system-wide load slot; the first registered keeps
-//!   its preferred ImageBase (no relocation), so its text is byte-identical and shareable.
+//! - **Base assignment** — each activated DLL gets a stable system-wide base from a bounded compact
+//!   arena; the first registered keeps its preferred ImageBase (no relocation).
 //! - **Faulting-VA lookup** ([`Registry::dll_for_page`]) — which mapped DLL owns a demand-fault
 //!   address, and at what RVA.
 //! - **`SECTION_IMAGE_INFORMATION`** ([`image_info`]) — the 64-byte x64 structure the loader reads
@@ -29,6 +29,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::ops::Range;
+
+/// Windows image allocation granularity.
+pub const ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+/// One x86-64 page table covers 512 4 KiB pages.
+pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
 
 /// Per-process (per-owner) handle capacity **pre-reserved** for each DLL at `register()` time.
 /// Handle VALUES are **process-local** (each hosted process has its own NT handle namespace), so
@@ -66,9 +72,8 @@ pub struct Dll {
     name_buf: [u8; MAX_STEM],
     /// Number of valid bytes in `name_buf`. 0 = a reserved (unactivated) slot.
     name_len: usize,
-    /// Fixed system-wide load base (the VA the view is mapped at in every process). Assigned at
-    /// `register`/`reserve` time from the slotted allocator, so it is collision-free and stable even
-    /// for a slot activated later on demand.
+    /// Fixed system-wide load base. Assigned from the compact arena at activation; zero while the
+    /// metadata slot is reserved but inactive.
     pub base: u64,
     /// Page-aligned image extent (PE `SizeOfImage`), for VA-range containment.
     pub image_size: u64,
@@ -102,39 +107,35 @@ fn slot_mut(v: &mut Vec<u64>, pi: usize) -> &mut u64 {
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     dlls: Vec<Dll>,
+    arena_start: u64,
+    arena_end: u64,
     next_base: u64,
-    slot: u64,
 }
 
 impl Registry {
-    /// A registry that assigns bases starting at `base_start`, one `slot_size`-byte slot per DLL.
-    /// `slot_size` must exceed the largest image (distinct slots ⇒ distinct page-table ranges).
-    pub fn new(base_start: u64, slot_size: u64) -> Self {
-        Self { dlls: Vec::new(), next_base: base_start, slot: slot_size }
+    /// Pack activated images into `[arena_start, arena_end)` at Windows' 64 KiB granularity.
+    pub fn new(arena_start: u64, arena_end: u64) -> Self {
+        assert!(arena_start % ALLOCATION_GRANULARITY == 0);
+        assert!(arena_start < arena_end);
+        Self { dlls: Vec::new(), arena_start, arena_end, next_base: arena_start }
     }
 
     /// Register `name` (lowercase ASCII stem) with its image extent + entry RVA. Assigns the next
-    /// base slot and returns the DLL's index. The first registered keeps `base_start` as its base —
-    /// give it a DLL whose preferred ImageBase equals `base_start` so the loader never relocates it.
+    /// compact base and returns the DLL's index. The first registered keeps `arena_start` as its base.
     pub fn register(&mut self, name: &[u8], image_size: u64, entry_rva: u32) -> usize {
         let i = self.reserve();
-        self.activate(i, name, image_size, entry_rva);
+        assert!(self.activate(i, name, image_size, entry_rva), "DLL VA arena exhausted");
         i
     }
 
-    /// Pre-**reserve** an EMPTY slot: assign it a fixed base (so its VA range is stable + collision-
-    /// free) and pre-allocate its per-pi handle stores, but leave it nameless (`name_len == 0`) so it
-    /// matches nothing until [`activate`](Self::activate)d. Returns the slot index.
+    /// Pre-reserve an EMPTY metadata slot and its per-pi handle stores. It consumes no VA until
+    /// [`activate`](Self::activate)d.
     ///
     /// This is the demand-load enabler: reserving all slots at BOOT (below the executive's per-syscall
     /// `heap_mark`) makes the `dlls` Vec growth + the per-pi handle-store allocations PERSISTENT, so a
-    /// later on-demand `activate` (at syscall time) needs NO heap growth here — only the inline
-    /// `name_buf` fill, which is in-place. The executive then advances `heap_mark` past whatever it
-    /// itself allocated for the load (pool bytes live in a separate cap-mapped arena). See the module
-    /// docs + `PI_RESERVE`.
+    /// later on-demand `activate` needs NO heap growth here — only inline metadata writes and a
+    /// checked compact-arena bump. See the module docs + `PI_RESERVE`.
     pub fn reserve(&mut self) -> usize {
-        let base = self.next_base;
-        self.next_base += self.slot;
         // Pre-reserve the per-pi handle stores to `PI_RESERVE` slots (see [`PI_RESERVE`]).
         let mut file_handle = Vec::new();
         let mut section_handle = Vec::new();
@@ -143,7 +144,7 @@ impl Registry {
         self.dlls.push(Dll {
             name_buf: [0u8; MAX_STEM],
             name_len: 0,
-            base,
+            base: 0,
             image_size: 0,
             entry_rva: 0,
             file_handle,
@@ -153,17 +154,36 @@ impl Registry {
         self.dlls.len() - 1
     }
 
-    /// Fill a reserved slot's identity (stem + geometry) IN PLACE — no heap growth, so it's safe to
-    /// call at syscall time under the bump-heap reset. The base was fixed at [`reserve`](Self::reserve)
-    /// time and is left unchanged. `name` is truncated to [`MAX_STEM`]. Idempotent on the geometry.
-    pub fn activate(&mut self, i: usize, name: &[u8], image_size: u64, entry_rva: u32) {
-        if let Some(d) = self.dlls.get_mut(i) {
-            let n = name.len().min(MAX_STEM);
-            d.name_buf[..n].copy_from_slice(&name[..n]);
-            d.name_len = n;
-            d.image_size = image_size;
-            d.entry_rva = entry_rva;
+    /// Activate a reserved slot and assign a compact stable base. Returns false without claiming the
+    /// slot if the image is empty or would cross the arena end.
+    pub fn activate(&mut self, i: usize, name: &[u8], image_size: u64, entry_rva: u32) -> bool {
+        if image_size == 0 {
+            return false;
         }
+        let Some(existing) = self.dlls.get(i) else {
+            return false;
+        };
+        if existing.name_len != 0 {
+            return existing.image_size == image_size && existing.entry_rva == entry_rva;
+        }
+        let Some(allocation_size) = align_up(image_size, ALLOCATION_GRANULARITY) else {
+            return false;
+        };
+        let Some(next_base) = self.next_base.checked_add(allocation_size) else {
+            return false;
+        };
+        if next_base > self.arena_end {
+            return false;
+        }
+        let d = &mut self.dlls[i];
+        let n = name.len().min(MAX_STEM);
+        d.name_buf[..n].copy_from_slice(&name[..n]);
+        d.name_len = n;
+        d.base = self.next_base;
+        d.image_size = image_size;
+        d.entry_rva = entry_rva;
+        self.next_base = next_base;
+        true
     }
 
     /// The index of the first reserved (unactivated) slot, or `None` if all slots are in use. The
@@ -195,6 +215,29 @@ impl Registry {
     /// The load base of DLL `i` (0 if out of range).
     pub fn base(&self, i: usize) -> u64 {
         self.dlls.get(i).map(|d| d.base).unwrap_or(0)
+    }
+
+    pub fn allocated_end(&self) -> u64 {
+        self.next_base
+    }
+
+    pub fn arena_page_table_count(&self) -> usize {
+        ((self.arena_end - self.arena_start + PAGE_TABLE_SPAN - 1) / PAGE_TABLE_SPAN) as usize
+    }
+
+    /// Half-open page-table-index range covering active DLL `i`, relative to the arena start.
+    pub fn page_table_range(&self, i: usize) -> Option<Range<usize>> {
+        let d = self.dlls.get(i)?;
+        if d.name_len == 0 || d.image_size == 0 {
+            return None;
+        }
+        let end = d.base.checked_add(d.image_size)?;
+        if d.base < self.arena_start || end > self.arena_end {
+            return None;
+        }
+        let first = ((d.base - self.arena_start) / PAGE_TABLE_SPAN) as usize;
+        let last = ((end - self.arena_start + PAGE_TABLE_SPAN - 1) / PAGE_TABLE_SPAN) as usize;
+        Some(first..last)
     }
 
     /// The lowercase stem of DLL `i` (empty if out of range or a reserved slot) — for diagnostics.
@@ -304,6 +347,10 @@ impl Registry {
     }
 }
 
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    value.checked_add(alignment - 1).map(|v| v & !(alignment - 1))
+}
+
 /// True if `hay` contains the byte sub-slice `needle`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > hay.len() {
@@ -352,9 +399,11 @@ pub fn image_info(base: u64, entry_rva: u32, image_size: u32, is_dll: bool) -> [
 mod tests {
     use super::*;
 
-    // csrsrv keeps its preferred base; basesrv/winsrv fall on the next 16 MiB slots.
+    const ARENA_START: u64 = 0x8000_0000;
+    const ARENA_END: u64 = 0x9800_0000;
+
     fn seeded() -> Registry {
-        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut r = Registry::new(ARENA_START, ARENA_END);
         assert_eq!(r.register(b"csrsrv", 0x1_1000, 0x1200), 0);
         assert_eq!(r.register(b"basesrv", 0xD000, 0x2400), 1);
         assert_eq!(r.register(b"winsrv", 0x6_0000, 0x8800), 2);
@@ -362,11 +411,12 @@ mod tests {
     }
 
     #[test]
-    fn base_assignment_is_slotted() {
+    fn base_assignment_is_compact_and_allocation_granular() {
         let r = seeded();
         assert_eq!(r.base(0), 0x8000_0000);
-        assert_eq!(r.base(1), 0x8100_0000);
-        assert_eq!(r.base(2), 0x8200_0000);
+        assert_eq!(r.base(1), 0x8002_0000);
+        assert_eq!(r.base(2), 0x8003_0000);
+        assert_eq!(r.allocated_end(), 0x8009_0000);
         assert_eq!(r.len(), 3);
     }
 
@@ -385,7 +435,7 @@ mod tests {
         // ReactOS ships kernel32_vista.dll / advapi32_vista.dll whose stems are supersets of the
         // base names. Exact identity matching must select each entry independent of registration
         // order rather than depending on a longest-substring heuristic.
-        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut r = Registry::new(ARENA_START, ARENA_END);
         r.register(b"kernel32", 0x2A_8000, 0x1000); // base name registered FIRST
         r.register(b"kernel32_vista", 0x8000, 0x2000);
         r.register(b"advapi32_vista", 0x5A00, 0x3000);
@@ -401,7 +451,7 @@ mod tests {
 
     #[test]
     fn sfc_family_names_never_alias() {
-        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut r = Registry::new(ARENA_START, ARENA_END);
         let sfc = r.register(b"sfc", 0x1000, 0x100);
         let sfcfiles = r.register(b"sfcfiles", 0x2000, 0x200);
         let sfc_os_slot = r.reserve();
@@ -411,7 +461,7 @@ mod tests {
         assert_eq!(r.resolve_name(b"sfc_os.dll"), None);
         assert_eq!(r.resolve_name(b"not-sfc.dll"), None);
 
-        r.activate(sfc_os_slot, b"sfc_os", 0x3000, 0x300);
+        assert!(r.activate(sfc_os_slot, b"sfc_os", 0x3000, 0x300));
         assert_eq!(r.resolve_name(b"sfc_os.dll"), Some(sfc_os_slot));
         assert_eq!(r.resolve_name(b"sfc_os"), Some(sfc_os_slot));
         assert_eq!(r.resolve_name(b"sfc.dll"), Some(sfc));
@@ -529,14 +579,15 @@ mod tests {
     #[test]
     fn page_lookup_needs_a_mapped_view() {
         let mut r = seeded();
+        let basesrv_base = r.base(1);
         // Before mapping, its range doesn't resolve.
-        assert_eq!(r.dll_for_page(0x8100_0000), None);
+        assert_eq!(r.dll_for_page(basesrv_base), None);
         r.set_mapped(1);
         assert!(r.is_mapped(1));
-        assert_eq!(r.dll_for_page(0x8100_0000), Some((1, 0))); // at base → rva 0
-        assert_eq!(r.dll_for_page(0x8100_2345), Some((1, 0x2345)));
-        assert_eq!(r.dll_for_page(0x8100_0000 + 0xD000 - 1), Some((1, 0xCFFF))); // last byte
-        assert_eq!(r.dll_for_page(0x8100_0000 + 0xD000), None); // one past the end
+        assert_eq!(r.dll_for_page(basesrv_base), Some((1, 0)));
+        assert_eq!(r.dll_for_page(basesrv_base + 0x2345), Some((1, 0x2345)));
+        assert_eq!(r.dll_for_page(basesrv_base + 0xD000 - 1), Some((1, 0xCFFF)));
+        assert_eq!(r.dll_for_page(basesrv_base + 0xD000), None);
         assert_eq!(r.dll_for_page(0x8000_0000), None); // csrsrv's range, but it's unmapped
     }
 
@@ -562,12 +613,11 @@ mod tests {
 
     #[test]
     fn reserved_slots_match_nothing_until_activated() {
-        // The demand-load enabler: reserving a slot at boot fixes its base + pre-allocates its
-        // handle stores, but it must resolve to NOTHING (name_len == 0) until activated on demand.
-        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        // Reserving at boot pre-allocates handle stores but consumes no VA and matches nothing.
+        let mut r = Registry::new(ARENA_START, ARENA_END);
         r.register(b"csrsrv", 0x1_1000, 0x1200); // slot 0 = the pinned base 0x8000_0000
-        let free0 = r.reserve(); // slot 1 (base 0x8100_0000), empty
-        let free1 = r.reserve(); // slot 2 (base 0x8200_0000), empty
+        let free0 = r.reserve();
+        let free1 = r.reserve();
         assert_eq!((free0, free1), (1, 2));
         assert!(!r.is_active(free0));
         assert_eq!(r.first_free(), Some(1));
@@ -575,14 +625,13 @@ mod tests {
         // (so the caller knows to demand-load it), and to csrsrv only for csrsrv paths.
         assert_eq!(r.resolve_name(b"\\systemroot\\system32\\version.dll"), None);
         assert_eq!(r.name(free0), b""); // reserved → empty diagnostic name
-        assert_eq!(r.base(free0), 0x8100_0000); // base fixed at reserve time (collision-free)
-        // Activate slot 1 on demand (as the executive would after an FS load) — base UNCHANGED.
-        r.activate(free0, b"version", 0x9000, 0x2100);
+        assert_eq!(r.base(free0), 0);
+        assert!(r.activate(free0, b"version", 0x9000, 0x2100));
         assert!(r.is_active(free0));
-        assert_eq!(r.base(free0), 0x8100_0000); // still its reserved base
+        assert_eq!(r.base(free0), 0x8002_0000);
         assert_eq!(r.resolve_name(b"\\systemroot\\system32\\version.dll"), Some(1));
         assert_eq!(r.name(free0), b"version");
-        assert_eq!(r.image_info(free0), Some(image_info(0x8100_0000, 0x2100, 0x9000, true)));
+        assert_eq!(r.image_info(free0), Some(image_info(0x8002_0000, 0x2100, 0x9000, true)));
         // first_free now points past the activated slot.
         assert_eq!(r.first_free(), Some(2));
     }
@@ -590,13 +639,13 @@ mod tests {
     #[test]
     fn register_is_reserve_plus_activate() {
         // register() must be exactly reserve()+activate() — same base assignment, resolvable name.
-        let mut a = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut a = Registry::new(ARENA_START, ARENA_END);
         a.register(b"csrsrv", 0x1_1000, 0x1200);
         a.register(b"basesrv", 0xD000, 0x2400);
-        let mut b = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut b = Registry::new(ARENA_START, ARENA_END);
         b.register(b"csrsrv", 0x1_1000, 0x1200);
         let i = b.reserve();
-        b.activate(i, b"basesrv", 0xD000, 0x2400);
+        assert!(b.activate(i, b"basesrv", 0xD000, 0x2400));
         assert_eq!(a.base(1), b.base(1));
         assert_eq!(a.name(1), b.name(1));
         assert_eq!(a.image_info(1), b.image_info(1));
@@ -605,7 +654,7 @@ mod tests {
 
     #[test]
     fn all_slots_can_be_reserved_then_first_free_returns_none() {
-        let mut r = Registry::new(0x8000_0000, 0x0100_0000);
+        let mut r = Registry::new(ARENA_START, ARENA_END);
         for _ in 0..4 {
             r.reserve();
         }
@@ -614,21 +663,51 @@ mod tests {
         }
         // Activate all → first_free exhausts.
         for i in 0..4 {
-            r.activate(i, b"x", 0x1000, 0);
+            assert!(r.activate(i, b"x", 0x1000, 0));
         }
         assert_eq!(r.first_free(), None);
     }
 
     #[test]
-    fn distinct_slots_never_overlap() {
-        // A registry-owned invariant: every DLL's [base, base+image_size) fits inside its slot.
+    fn compact_images_never_overlap() {
         let r = seeded();
         for i in 0..r.len() {
             let d = r.get(i).unwrap();
-            assert!(d.image_size <= 0x0100_0000, "image must fit its slot");
             if i + 1 < r.len() {
-                assert!(d.base + d.image_size <= r.base(i + 1), "no overlap into next slot");
+                assert!(d.base + d.image_size <= r.base(i + 1), "images overlap");
             }
         }
+    }
+
+    #[test]
+    fn measured_reactos_images_fit_compactly() {
+        // Measured from the staged ReactOS System32: 449 DLLs consume 0x6f70000 bytes after
+        // 64 KiB alignment; shell32.dll is largest at SizeOfImage 0x899000.
+        const ALIGNED_TOTAL: u64 = 0x6f70_000;
+        assert!(ARENA_END - ARENA_START > ALIGNED_TOTAL);
+        let mut r = Registry::new(ARENA_START, ARENA_END);
+        let shell = r.register(b"shell32", 0x899000, 0x1000);
+        assert_eq!(r.base(shell), ARENA_START);
+        assert_eq!(r.allocated_end(), ARENA_START + 0x8a_0000);
+    }
+
+    #[test]
+    fn image_page_table_range_covers_every_touched_window() {
+        let mut r = Registry::new(ARENA_START, ARENA_END);
+        let csrsrv = r.register(b"csrsrv", 0x1_1000, 0x1200);
+        let kernel32 = r.register(b"kernel32", 0x2b_1000, 0x1000);
+        assert_eq!(r.page_table_range(csrsrv), Some(0..1));
+        assert_eq!(r.page_table_range(kernel32), Some(0..2));
+        assert_eq!(r.arena_page_table_count(), 192);
+    }
+
+    #[test]
+    fn activation_refuses_arena_collision_without_claiming_slot() {
+        let mut r = Registry::new(ARENA_START, ARENA_START + 0x20_0000);
+        let slot = r.reserve();
+        assert!(!r.activate(slot, b"too_big", 0x20_1000, 0));
+        assert!(!r.is_active(slot));
+        assert_eq!(r.base(slot), 0);
+        assert_eq!(r.allocated_end(), ARENA_START);
     }
 }

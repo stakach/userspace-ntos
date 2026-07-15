@@ -116,11 +116,10 @@ pub const WIN32K_ARG_FRAMES: u64 = 4;
 /// USER handle table `gHandleTable`, and the handle-entry array all live, being `UserHeapAlloc`ed)
 /// is RO-mapped so the Win32 client stack (user32/gdi32) can read the SHAREDINFO the USERCONNECT's
 /// `siClient` pointers name. A full 16 MiB window ([`WIN32K_HEAP_FRAMES`]), 2-MiB-aligned, sitting
-/// in the free gap ABOVE the generic DLL registry region and BELOW the NLS section (0xA000_0000).
-/// **Was 0x9000_0000, but the DLL registry now spans 18 slots (16 MiB each from 0x8000_0000 →
-/// 0x9200_0000, incl. lsass's lsasrv/samsrv), so 0x9000_0000 collided with lsasrv's image base →
-/// lsass executed win32k-heap NX pages.** Moved to 0x9800_0000 (2-MiB-aligned, in the 0x9200_0000..
-/// 0xA000_0000 gap, still inside the shared 0x8000_0000..0xC000_0000 1 GiB PD). Delta-relative: the
+/// immediately above the bounded compact DLL arena and below the NLS section (0xA000_0000).
+/// **Was 0x9000_0000, where the former fixed-slot DLL layout collided with it and made lsass execute
+/// win32k-heap NX pages.** 0x9800_0000 is now the explicit DLL-arena end and stays inside the shared
+/// 0x8000_0000..0xC000_0000 1 GiB PD. Delta-relative: the
 /// connect marshaling rewrites `siClient`/`ulSharedDelta` by `WIN32K_HEAP_VADDR - CSRSS_W32_SHARED_VA`,
 /// so moving the base is behavior-preserving for the existing GUI clients (csrss pi 1 / winlogon pi 2).
 pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;

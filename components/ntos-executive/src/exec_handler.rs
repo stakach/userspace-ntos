@@ -413,7 +413,7 @@ impl ExecNtHandler {
             None => return false,
         };
         let reg = &*ctx.reg;
-        let dll_pes = &*ctx.dll_pes;
+        let dll_pes = ctx.dll_pes();
         let mut done = 0usize;
         while done < dst.len() {
             let cur = va + done as u64;
@@ -452,7 +452,7 @@ impl ExecNtHandler {
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
-            let dll_pes = &*ctx.dll_pes;
+            let dll_pes = ctx.dll_pes();
             csrss_out_write(va, val, filled_pages, faults, ctx.scratch_base, reg, dll_pes, ctx.pml4);
         } else {
             smss_copyout(va, &val.to_le_bytes());
@@ -764,7 +764,7 @@ impl ExecNtHandler {
                 &mut *ctx.faults,
                 ctx.scratch_base,
                 &*ctx.reg,
-                &*ctx.dll_pes,
+                ctx.dll_pes(),
                 pml4,
             );
         }
@@ -3283,7 +3283,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let h = self.mint_handle();
                 let reg = &mut *ctx.reg;
-                let dll_pes = &*ctx.dll_pes;
+                let dll_pes = ctx.dll_pes();
                 let filled_pages = &mut *ctx.filled_pages;
                 let faults = &mut *ctx.faults;
                 let sp = get_recv_mr(16);
@@ -3380,7 +3380,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtMapViewOfSection => unsafe {
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
-                let dll_pes = &*ctx.dll_pes;
+                let dll_pes = ctx.dll_pes();
                 let filled_pages = &mut *ctx.filled_pages;
                 let faults = &mut *ctx.faults;
                 let pml4 = ctx.pml4;
@@ -3388,11 +3388,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let sp = get_recv_mr(16);
                 let sect = get_recv_mr(9);
                 if let Some(i) = reg.index_for_section(self.pi, sect) {
-                    // A registry DLL (csrsrv/basesrv/winsrv). Reserve its VA range, hand back its base
-                    // + view size, and let the fault router demand-page it from its PE. All DLL slots
-                    // share the 0x8000_0000 1 GiB PDPT range, so the PD is created once (first mapped
-                    // DLL) and each DLL gets its own PT. csrsrv sits at its preferred ImageBase (no
-                    // relocation); the ServerDlls are loader-relocated.
+                    // Reserve every 2 MiB PT window touched by this DLL's compact VA range. Compact
+                    // neighbors may share a PT and large images may span several.
                     if let Some(cpe) = dll_pes[i].as_ref() {
                         let dbase = reg.base(i);
                         // PER-PROCESS PD/PT reservation: the DLL's fixed base is the same in every
@@ -3401,21 +3398,28 @@ impl NativeSyscallHandler for ExecNtHandler {
                         // reservation on this process's bitmask, not the registry's global `mapped`.
                         let pi = self.pi;
                         let dll_pd_created = &mut *ctx.dll_pd_created;
-                        let dll_mapped_bits = &mut *ctx.dll_mapped_bits;
-                        if dll_mapped_bits[pi] & (1u32 << i) == 0 {
-                            if !dll_pd_created[pi] {
-                                let pd = alloc_slot();
-                                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
-                                let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, dbase, pml4);
-                                dll_pd_created[pi] = true;
-                            }
-                            let pt = alloc_slot();
-                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, dbase, pml4);
-                            dll_mapped_bits[pi] |= 1u32 << i;
-                            // Global flag drives `dll_for_page` VA-range resolution (base-identical).
-                            reg.set_mapped(i);
+                        let dll_pt_bits = &mut *ctx.dll_pt_bits;
+                        if !dll_pd_created[pi] {
+                            let pd = alloc_slot();
+                            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+                            let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, DLL_ARENA_START, pml4);
+                            dll_pd_created[pi] = true;
                         }
+                        if let Some(pt_range) = reg.page_table_range(i) {
+                            for pt_index in pt_range {
+                                let word = pt_index / 64;
+                                let bit = 1u64 << (pt_index % 64);
+                                if dll_pt_bits[pi][word] & bit == 0 {
+                                    let pt = alloc_slot();
+                                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                                    let pt_va = DLL_ARENA_START
+                                        + pt_index as u64 * nt_dll_registry::PAGE_TABLE_SPAN;
+                                    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_va, pml4);
+                                    dll_pt_bits[pi][word] |= bit;
+                                }
+                            }
+                        }
+                        reg.set_mapped(i);
                         let ext = image_extent(cpe);
                         csrss_out_write(get_recv_mr(7), dbase, filled_pages, faults, scratch_base, reg, dll_pes, pml4); // *BaseAddress
                         let vs_ptr = smss_stack_read(sp + 0x38); // *ViewSize

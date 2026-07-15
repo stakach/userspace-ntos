@@ -592,23 +592,31 @@ pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
 /// pi 0..4) are live; the extra headroom is for the post-login processes (userinit, explorer, the
 /// shell, …) that spawn as the boot advances past the login. Every fixed `[_; MAX_PI]` per-pi array
 /// (PM_PIDS/PM_TIDS/PM_POOL_TID, PFILLED, the service_sec_image `procs`/`dll_pd_created`/
-/// `dll_mapped_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
+/// `dll_pt_bits` locals) is sized to this so a 6th/7th hosted process never silently overflows a
 /// per-process slot. The pi-indexed WRITE sites guard `pi < MAX_PI` and panic LOUDLY (never a silent
 /// spin) if a spawn ever exceeds this — bump `MAX_PI` (a scalar cost) or move to a per-pid map. The
 /// per-pi VA-LAYOUT still uses distinct fixed windows per process (SCRATCH_BASE / *_MIRROR_VA above),
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
-/// Total number of nt-dll-registry SLOTS pre-reserved at boot (the `dll_pes` / `dll_pe_store` array
-/// size + the registry's slot count). Each occupies a fixed 16 MiB base slot from 0x8000_0000
-/// (shared 1 GiB PDPT range), demand-paged from its parsed PE. Since Part 3, DLLs load PURELY
-/// ON-DEMAND (no eager `DLL_TABLE`): all slots except the csrsrv pin are RESERVED empty at boot and
-/// ACTIVATED at syscall time when a hosted process's loader first requests a DLL (see
-/// `fs_loader::demand_load_dll`). This is a CAPACITY, not a maintained list — adding a new DLL needs
-/// NO edit here (it demand-loads into a free slot) until the slots run out. NOTE: slot N sits at
-/// 0x8000_0000 + N*16MiB; slot 22 = 0x96000000, still below the win32k client window (0x9800_0000) +
-/// NLS section (0xA000_0000) — keep DLL_REG_COUNT ≤ 23 (0x97000000) so no slot collides with those.
-pub const DLL_REG_COUNT: usize = 23;
+/// Hosted-process DLL VA arena. Images receive stable bases at activation and pack at Windows'
+/// 64 KiB granularity. The arena ends at the win32k client window, stays below NLS at 0xA000_0000,
+/// and remains inside the existing 0x8000_0000..0xC000_0000 1 GiB PD range. csrsrv activates first
+/// and therefore retains its preferred 0x8000_0000 base.
+pub const DLL_ARENA_START: u64 = 0x0000_0000_8000_0000;
+pub const DLL_ARENA_END: u64 = 0x0000_0000_9800_0000;
+pub const DLL_ARENA_PT_COUNT: usize =
+    ((DLL_ARENA_END - DLL_ARENA_START) / nt_dll_registry::PAGE_TABLE_SPAN) as usize;
+pub const DLL_ARENA_PT_WORDS: usize = (DLL_ARENA_PT_COUNT + 63) / 64;
+/// Heap-backed metadata capacity. The staged System32 corpus contains 449 DLLs totaling only
+/// 111 MiB after 64 KiB alignment, so 512 entries cover it while the bounded arena guards VA use.
+pub const DLL_REG_COUNT: usize = 512;
+const _: () = assert!(DLL_ARENA_END == win32k_subsystem::CSRSS_W32_SHARED_VA);
+const _: () = assert!(DLL_ARENA_PT_COUNT == 192);
+const _: () = assert!(DLL_ARENA_PT_WORDS * 64 >= DLL_ARENA_PT_COUNT);
+const _: () = assert!(DLL_ARENA_START >= 0x8000_0000 && DLL_ARENA_END <= 0xC000_0000);
+const _: () = assert!(win32k_subsystem::CSRSS_W32_SHARED_VA
+    + win32k_subsystem::WIN32K_HEAP_FRAMES * 0x1000 <= 0xA000_0000);
 /// Slots PINNED (eagerly loaded + registered at BOOT, NOT demand-loaded). The FLAGGED IRREDUCIBLE
 /// MINIMUM — every OTHER System32 DLL demand-loads on the fly. Two reasons a DLL must be pinned:
 ///   • **csrsrv** (slot 0) — needs base 0x8000_0000 (its preferred ImageBase → relocation delta 0 →
@@ -2465,13 +2473,14 @@ struct ExecLoopCtx {
     img_end: u64,
     nt_base: u64,
     nt_end: u64,
-    /// The 14 loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
+    /// The loadable DLL PEs (csrsrv/basesrv/winsrv + the Win32 client stack), for
     /// `csrss_out_write`'s demand-fill of a not-yet-faulted DLL .data page. Lifetime-erased.
-    dll_pes: *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
+    dll_pes: *const &'static Option<nt_pe_loader::PeFile<'static>>,
+    dll_pes_len: usize,
     /// The mutable backing store for `dll_pes` — the demand-load path (`fs_loader::demand_load_dll`,
     /// called on a `reg.resolve_name` MISS in NtOpenFile) writes a freshly-parsed `PeFile` into a
     /// reserved slot here; `dll_pes[slot]` (a ref AT the slot) then observes it. Raw mut ptr to the
-    /// `service_sec_image` stack array (not the bump heap → the write survives the per-syscall reset).
+    /// pre-sized heap store allocated below the bump-reset mark.
     dll_pe_store: *mut Option<nt_pe_loader::PeFile<'static>>,
     /// csrss's ANONYMOUS (no-file) section — its CSR SharedSection shared memory: the handle
     /// NtCreateSection records + the requested size NtMapViewOfSection backs. Point at the locals.
@@ -2483,12 +2492,14 @@ struct ExecLoopCtx {
     /// loop-locals.
     csrss_anon_base: *mut u64,
     dll_pd_created: *mut [bool; MAX_PI],
-    /// PER-PROCESS bitmask of which registry DLLs have had their VA-range page table reserved in
-    /// THIS process's VSpace (bit i = DLL i mapped in process pi). csrss (pi==1) and winlogon
-    /// (pi==2) each load an overlapping DLL set at the SAME fixed bases but into DISTINCT VSpaces,
-    /// so the PT reservation must be tracked per-process (the registry's global `mapped` flag stays
-    /// for `dll_for_page` VA-range resolution, which is base-identical across processes).
-    dll_mapped_bits: *mut [u32; MAX_PI],
+    /// Per-process bitset of installed 2 MiB page-table windows across the compact DLL arena.
+    dll_pt_bits: *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
+}
+
+impl ExecLoopCtx {
+    unsafe fn dll_pes(&self) -> &'static [&'static Option<nt_pe_loader::PeFile<'static>>] {
+        core::slice::from_raw_parts(self.dll_pes, self.dll_pes_len)
+    }
 }
 
 struct ExecNtHandler {

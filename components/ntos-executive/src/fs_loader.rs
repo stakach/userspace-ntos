@@ -405,7 +405,7 @@ fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
 
 /// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
 /// the real `\reactos\system32` FS, load its bytes into the (reset-safe, cap-mapped) pool, claim a
-/// pre-reserved registry slot, activate it (stem + geometry, keeping its fixed collision-free base),
+/// pre-reserved registry slot, activate it (stem + geometry, assigning a compact collision-free base),
 /// relocate the pool bytes to that base + patch its ImageBase, store the parsed `PeFile` into the
 /// caller's `dll_pe_store` slot, and return the slot index. The demand-fault router + the
 /// NtOpenFile→NtCreateSection→NtMapViewOfSection flow then treat it exactly like a boot-registered
@@ -459,10 +459,12 @@ pub(crate) unsafe fn demand_load_dll(
     let pe = nt_pe_loader::PeFile::parse(bytes).ok()?;
     let ext = image_extent(&pe);
     let entry = pe.entry_point_rva();
-    // Claim the reserved slot: activate its identity (base was fixed at reserve time → collision-free).
-    reg.activate(slot, stem, ext, entry);
+    // Claim the reserved slot and compact VA range. Arena exhaustion is a truthful load failure.
+    if !reg.activate(slot, stem, ext, entry) {
+        return None;
+    }
     let base = reg.base(slot);
-    // Relocate to the slot base + patch OptionalHeader.ImageBase (same as the boot table DLLs).
+    // Relocate to the compact arena base + patch OptionalHeader.ImageBase.
     apply_relocations_to_buf(&pe, va, base);
     let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
     core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);

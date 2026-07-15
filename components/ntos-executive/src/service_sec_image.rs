@@ -69,13 +69,12 @@ pub(crate) unsafe fn service_sec_image(
     let mut lsass_process_handle = 0u64;
     // csrss's loadable DLLs (csrsrv + the ServerDlls basesrv/winsrv) are tracked by the generic
     // nt-dll-registry, built below once their PEs are parsed. The shared page-directory covering the
-    // 0x8000_0000 1 GiB range (all DLL slots live in it) is created on the first NtMapViewOfSection.
+    // 0x8000_0000 1 GiB range (the compact DLL arena lives in it) is created on the first map.
     // Per-process (indexed by pi: 0=smss, 1=csrss, 2=winlogon): the DLL page-directory once-flag +
-    // a bitmask of which registry DLLs have their PT reserved in that process's VSpace. csrss and
-    // winlogon load an overlapping DLL set at identical bases into DISTINCT VSpaces, so each needs
-    // its own PD/PT reservation (the registry's global `mapped` flag stays for VA-range resolution).
+    // a bitset of which arena PT windows are reserved in that process's VSpace. Compact DLLs may
+    // share a PT and large DLLs may span several.
     let mut dll_pd_created = [false; MAX_PI];
-    let mut dll_mapped_bits = [0u32; MAX_PI];
+    let mut dll_pt_bits = [[0u64; DLL_ARENA_PT_WORDS]; MAX_PI];
     // csrss's ANONYMOUS section (no file backing) — its CSR SharedSection shared memory. Tracked by
     // handle + requested size; NtMapViewOfSection reserves a VA range and the fault router
     // demand-pages ZERO frames into it (commit-on-touch).
@@ -166,10 +165,10 @@ pub(crate) unsafe fn service_sec_image(
     //       byte-identical shared text, loader never relocates it). Demand-load assigns slots in
     //       loader-request order, which can't guarantee csrsrv lands at slot 0, so this ONE entry is a
     //       documented pin (DLL_PIN_COUNT). No other DLL cares about its base (all get relocated).
-    //   (2) RESERVE the remaining slots empty (base fixed + per-pi handle stores pre-allocated below
+    //   (2) RESERVE the remaining metadata slots empty (per-pi handle stores pre-allocated below
     //       the heap_mark → the on-demand `activate` at syscall time needs NO heap growth, surviving
-    //       the per-syscall bump-heap reset). `dll_pe_store` is a stack local (also not the bump heap),
-    //       so an on-demand `dll_pe_store[slot] = Some(pe)` is likewise reset-safe. The pool bytes live
+    //       the per-syscall bump-heap reset). `dll_pe_store` is pre-sized below the mark, so an
+    //       on-demand `dll_pe_store[slot] = Some(pe)` is likewise reset-safe. The pool bytes live
     //       in the cap-mapped POOL arena (atomic POOL_NEXT), reset-safe too.
     // Adding a new DLL (userinit/explorer/shell32/…) now needs NO edit here — it demand-loads into a
     // free reserved slot. NO maintained DLL list remains (only the 1-entry csrsrv base pin).
@@ -182,14 +181,16 @@ pub(crate) unsafe fn service_sec_image(
         (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
         (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
     ];
-    // Owned parsed-PE storage (lives for the whole service loop). `dll_pes[i]` holds `&dll_pe_store[i]`
+    // Heap-backed parsed-PE storage (lives for the whole loop without consuming the 16 KiB stack).
+    // `dll_pes[i]` holds `&dll_pe_store[i]`
     // — a stable ref into this array — so the erased `*const [&Option<PeFile>; N]` handed to the
     // handler stays valid when a demand-load later writes `dll_pe_store[slot] = Some(pe)` (the ref
     // points AT the slot, so it observes the new value). Only the LIVE run (ntdll present) mounts the
     // pool/FS + demand-loads; the demo SEC_IMAGE call leaves every slot None.
-    let mut dll_pe_store: [Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT] =
-        [const { None }; DLL_REG_COUNT];
-    let mut reg = nt_dll_registry::Registry::new(0x0000_0000_8000_0000, 0x0000_0000_0100_0000);
+    let mut dll_pe_store: Vec<Option<nt_pe_loader::PeFile<'static>>> =
+        Vec::with_capacity(DLL_REG_COUNT);
+    dll_pe_store.resize_with(DLL_REG_COUNT, || None);
+    let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
     if ntdll.is_some() {
         // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
         for (i, &(stem, path)) in DLL_PINS.iter().enumerate() {
@@ -208,8 +209,7 @@ pub(crate) unsafe fn service_sec_image(
             dll_pe_store[i] = pe;
         }
     }
-    // (2) Reserve the remaining slots empty (base + handle stores pre-allocated at BOOT). On both the
-    // live + demo runs so the registry always has DLL_REG_COUNT slots (base assignment is identical).
+    // (2) Reserve remaining metadata slots. VA is consumed only when a real image activates one.
     for _ in DLL_PIN_COUNT..DLL_REG_COUNT {
         reg.reserve();
     }
@@ -219,8 +219,8 @@ pub(crate) unsafe fn service_sec_image(
     // writes through this ptr are single-threaded + never alias a live `dll_pes[i]` read (the router
     // reads a slot only after it's mapped, which is after it's written).
     let dll_pe_store_ptr = dll_pe_store.as_mut_ptr();
-    let dll_pes: [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT] =
-        core::array::from_fn(|i| &dll_pe_store[i]);
+    let dll_pes: Vec<&Option<nt_pe_loader::PeFile>> =
+        (0..DLL_REG_COUNT).map(|i| &dll_pe_store[i]).collect();
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the rest fall back
     // to the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
@@ -357,7 +357,7 @@ pub(crate) unsafe fn service_sec_image(
             0
         };
         // LOUD overflow guard: `pi` indexes the fixed-size per-process arrays (procs / pfilled /
-        // dll_pd_created / dll_mapped_bits, all sized to MAX_PI). A future 6th/7th hosted process
+        // dll_pd_created / dll_pt_bits, all sized to MAX_PI). A future 6th/7th hosted process
         // adds a badge→pi arm above; if one ever exceeds MAX_PI this panics with a clear message
         // (the panic handler prints file:line) instead of silently corrupting an adjacent array /
         // spinning. Bump MAX_PI (a scalar .bss cost) to admit more processes.
@@ -797,16 +797,16 @@ pub(crate) unsafe fn service_sec_image(
                     img_end,
                     nt_base,
                     nt_end,
-                    dll_pes: &dll_pes as *const [&Option<nt_pe_loader::PeFile>; DLL_REG_COUNT]
-                        as *const ()
-                        as *const [&'static Option<nt_pe_loader::PeFile<'static>>; DLL_REG_COUNT],
+                    dll_pes: dll_pes.as_ptr() as *const &'static Option<nt_pe_loader::PeFile<'static>>,
+                    dll_pes_len: dll_pes.len(),
                     dll_pe_store: dll_pe_store_ptr as *mut ()
                         as *mut Option<nt_pe_loader::PeFile<'static>>,
                     csrss_anon_section_handle: &mut csrss_anon_section_handle as *mut u64,
                     csrss_anon_size: &mut csrss_anon_size as *mut u64,
                     csrss_anon_base: &mut csrss_anon_base as *mut u64,
                     dll_pd_created: &mut dll_pd_created as *mut [bool; MAX_PI],
-                    dll_mapped_bits: &mut dll_mapped_bits as *mut [u32; MAX_PI],
+                    dll_pt_bits: &mut dll_pt_bits
+                        as *mut [[u64; DLL_ARENA_PT_WORDS]; MAX_PI],
                 });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
