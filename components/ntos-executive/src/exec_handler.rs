@@ -67,6 +67,7 @@ impl ExecNtHandler {
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
             wait_park_event: -1,
+            anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
             csr_spawn_request: false,
@@ -842,6 +843,28 @@ impl ExecNtHandler {
         self.obj_ns.push(e);
         Some(self.obj_ns.len() - 1)
     }
+    /// Create a fresh ANONYMOUS (unnamed) event object (kind==2). Each call makes a DISTINCT obj_ns
+    /// entry — no dedup — carrying a unique synthetic name under a private parent (250) so it is never
+    /// found by name-resolution but is still a real, waitable/signalable event. `auto_reset` marks it
+    /// as a SynchronizationEvent (consumed on satisfying wait). Available for future anonymous events
+    /// with a live signaler (rpcrt4's server_ready_event needs the npfs-client-connect frontier before
+    /// its signaler runs, so winlogon's rpcrt4 sync events currently stay bare — see NtCreateEvent).
+    #[allow(dead_code)]
+    pub(crate) fn obj_create_anon_event(&mut self, auto_reset: bool) -> Option<usize> {
+        if self.obj_ns.len() >= self.obj_ns.capacity() {
+            return None;
+        }
+        // Unique 4-byte synthetic name "a" + a 24-bit counter, so obj_child never matches two anon
+        // events (they live under a private parent id 250 that no name walk reaches).
+        let n = self.anon_event_seq;
+        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
+        let name = [b'a', (n & 0xff) as u8, ((n >> 8) & 0xff) as u8, ((n >> 16) & 0xff) as u8];
+        let mut e = ObjEntry::dir(&name, 250);
+        e.kind = 2;
+        e.auto_reset = auto_reset as u8;
+        self.obj_ns.push(e);
+        Some(self.obj_ns.len() - 1)
+    }
     /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
     /// resolve the parent from all but the last component, then insert the leaf. Existing → reused.
     pub(crate) fn obj_create(&mut self, path: &[u8], root_idx: usize, kind: u8, target: &[u8]) -> Option<usize> {
@@ -1483,10 +1506,23 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // pipe handle. npfs's NpFsdFileSystemControl runs the real state machine on the CCB.
                 // FSCTL_PIPE_LISTEN on a server pipe with no client returns STATUS_PIPE_LISTENING
                 // (0x00000000-ish PENDING); we surface npfs's status. pi 0-2 keep the modeled path.
+                let fsctl = smss_stack_read(sp + 0x30); // [sp+0x30] = FsControlCode
                 let mut status: u64 = 0;
+                // ★ winlogon (pi 2) rpcrt4 worker: FSCTL_PIPE_LISTEN (0x110008) MUST report
+                // STATUS_PENDING (0x103), NOT SUCCESS. In rpcrt4_protseq_np_get_wait_array, SUCCESS →
+                // SetEvent(listen_event) → wait_for_new_connection wakes on the listen_event (index>0) →
+                // rpcrt4_spawn_connection derefs a NULL RpcConnection (no real client) → NULL deref.
+                // PENDING → the listen_event stays UNSIGNALLED, so the worker parks on [mgr_event,
+                // listen_event]; the main thread's signal_state_changed SetEvents mgr_event → the worker
+                // wakes on WAIT_OBJECT_0 (index 0) → returns 0 → sets set_ready_event → SetEvents
+                // server_ready_event → the main thread's WaitForSingleObject(server_ready_event) wakes.
+                // This is the correct pending-listen (no synchronous phantom client) that completes the
+                // rpcrt4 two-thread handshake without a real npfs connection.
+                if self.pi == 2 && (fsctl as u32) == 0x0011_0008 {
+                    status = 0x103; // STATUS_PENDING
+                }
                 if self.pi == 3 || self.pi == 4 {
                     let fh = get_recv_mr(9); // R10 = FileHandle
-                    let fsctl = smss_stack_read(sp + 0x30); // [sp+0x30] = FsControlCode
                     let fid = Self::npfs_file_id_for(fh);
                     if fid != 0 {
                         if let Some((st, _)) =
@@ -2032,6 +2068,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // write the handle back, and report STATUS_OBJECT_NAME_EXISTS if it already existed
                 // (CreateEventW's ERROR_ALREADY_EXISTS path). An UNNAMED event (empty OA name) just
                 // mints a bare handle. The PHANDLE (R10) may be a DLL .data global → xas_write_u64.
+                // ★ winlogon (pi 2): rpcrt4's server-thread handshake creates UNNAMED sync events
+                // (server_ready_event / mgr_event). The rpcrt4 server WORKER thread walls on a KNOWN
+                // deeper rpcrt4 frontier (NULL deref at rpcrt4+0x515db in get_wait_array/
+                // rpcrt4_conn_create_pipe — it needs a REAL npfs pipe/client, the same wall the svc
+                // listener hits) BEFORE it can SetEvent(server_ready_event). So parking winlogon's main
+                // thread on server_ready_event would HANG (no live signaler) — a violation of the
+                // no-deadlock guarantee. Therefore winlogon's unnamed rpcrt4 sync events stay BARE
+                // handles (< OBJ_HANDLE_BASE) → NtWaitForSingleObject returns immediate WAIT_0
+                // (documented, byte-identical to winlogon's pre-worker behavior). The worker multiplex +
+                // the REAL array-wait park (Part 1) are still in place for events with a live signaler;
+                // completing winlogon's own RPC server needs the real npfs client-connect frontier (the
+                // svc-listener wall) — a separate increment. See project_real_services SERVICE 10 step 2.
+                if self.pi == 2 {
+                    unsafe {
+                        let out = args[0]; // R10 = *EventHandle
+                        if out != 0 { smss_stack_write(out, h); }
+                    }
+                    return 0;
+                }
                 if self.pi == 3 || self.pi == 4 { unsafe {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
@@ -2260,6 +2315,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     if let Some(e) = self.obj_ns.get(idx) {
                         if e.kind == 2 {
                             if e.signalled != 0 {
+                                let auto = e.auto_reset != 0;
                                 unsafe {
                                     print_str(b"[wait] pi=");
                                     print_u64(self.pi as u64);
@@ -2268,6 +2324,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                                     print_str(b" '");
                                     for &c in e.name() { debug_put_char(c); }
                                     print_str(b"') already SIGNALLED -> immediate WAIT_0\n");
+                                }
+                                // Auto-reset event: consume the signal (NT clears it on satisfying wait).
+                                if auto {
+                                    if let Some(em) = self.obj_ns.get_mut(idx) { em.signalled = 0; }
                                 }
                                 return 0;
                             }

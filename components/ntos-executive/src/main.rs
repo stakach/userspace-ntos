@@ -279,6 +279,16 @@ pub const WL_LISTENER_TRAMP_VA: u64 = SM_TRAMP_VA; // target VSpace
 /// Executive scratch (3 pages) to build the listener thread's TEB/trampoline before copy_cap into
 /// the target VSpace. FILEBUF PT, clear of every other env-scratch VA.
 pub const WL_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1072_0000;
+/// The fault-EP badge for winlogon's rpcrt4 server WORKER thread — the main loop maps it to (pi 2,
+/// worker), switching ACTIVE_STACK_MIRROR to the worker's OWN mirror. Same N-threads multiplex as the
+/// SVC/LSASS listeners; this makes winlogon's RPC server WORKER actually RUN (its wait array →
+/// NtWaitForMultipleObjects parks; the main thread's signal_state_changed wakes it → it SetEvents
+/// server_ready_event → the main thread's WaitForSingleObject(server_ready_event) wakes).
+pub const WINLOGON_WORKER_BADGE: u64 = 11;
+/// Executive-side stack mirror for winlogon's rpcrt4 worker thread (its syscall out-params / stack-arg
+/// reads route to its OWN stack, not winlogon's main-thread stack). Distinct 8-page window (past
+/// LSASS_LISTENER2's 0x1370).
+pub const WINLOGON_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1378_0000;
 // --- services' RPC listener thread (the SCM's ScmStartRpcServer io_thread). Runs in services' OWN
 // pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
 // env-scratch + stack-mirror must be DISTINCT. Unlike WL_LISTENER (suspended), this one RESUMES and
@@ -826,11 +836,29 @@ static WAIT_REPLY_POOL: [AtomicU64; WAIT_REPLY_POOL_N] =
 /// Free/used bitmap for the pool (bit i set = pool[i] is currently the active REPLY_MAIN or is held
 /// by a parked waiter). Managed by wait_park / wait_wake_event.
 static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
-/// The waiter queue: each slot holds (obj_ns event index, stolen reply cap) for one parked waiter.
-/// event_idx == u32::MAX means the slot is free. Fixed-capacity; parking past capacity falls back to
-/// the immediate-return path (documented, never a hang).
+/// The waiter queue: each slot parks one blocked caller.
+///
+/// A single-object wait (NtWaitForSingleObject) records ONE event in slot 0 of its event set
+/// (count 1); a multi-object wait (NtWaitForMultipleObjects) records up to `WAITER_MAX_EVENTS`
+/// obj_ns event indices + a `wait_all` flag. `WAITER_EVENT_IDX[i]` == u32::MAX means the slot is free
+/// (it doubles as event[0]). Fixed-capacity; parking past capacity falls back to the immediate-return
+/// path (documented, never a hang).
 const WAITER_N: usize = 16;
+/// Max events a single multi-object waiter can wait on (NT MAXIMUM_WAIT_OBJECTS is 64; rpcrt4's
+/// np/sock server wait arrays are small — mgr_event + a handful of listen events — so 8 is ample and
+/// keeps the .bss table compact). Waits with more objects fall back to the immediate path.
+const WAITER_MAX_EVENTS: usize = 8;
+/// event[0] of each waiter's set (u32::MAX = free slot). Kept as the slot-free sentinel for backward
+/// compat with the single-object callers/spec.
 static WAITER_EVENT_IDX: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
+/// The FULL event set for a multi-object waiter (event[1..count]; event[0] is WAITER_EVENT_IDX).
+static WAITER_EVENTS: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
+    [const { [const { AtomicU64::new(u64::MAX) }; WAITER_MAX_EVENTS] }; WAITER_N];
+/// Number of events in this waiter's set (1 for a single-object wait).
+static WAITER_EVENT_COUNT: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
+/// Wait mode: 0 = WaitAny (WAIT_TYPE WaitAnyObject — wake on the first signalled event, return its
+/// index as STATUS_WAIT_0+i), 1 = WaitAll (wake only when ALL events are signalled, return WAIT_0).
+static WAITER_WAIT_ALL: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
 static WAITER_REPLY_CAP: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
 /// The parked waiter's syscall resume context (RCX/RSP/RFLAGS): a native-syscall (UnknownSyscall)
 /// fault is resumed by an apply_fault_reply that restores RCX←resume_ip, RSP←sp, RFLAGS←flags and
@@ -905,6 +933,9 @@ static LSASS_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_TID: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Multiplex-event counter for winlogon's rpcrt4 server WORKER thread (badge WINLOGON_WORKER_BADGE).
+/// Proves the worker actually RUNS (not suspended) — spec `exec_winlogon_worker_multiplex`.
+static WL_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set once the main thread has queried the real listener thread's TEB/ClientId via
 /// NtQueryInformationThread(ThreadBasicInformation) — proves the NULL-deref is gone.
 static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
@@ -1610,6 +1641,26 @@ unsafe fn send_on_reply(reply_cptr: u64, msginfo: u64, r0: u64, r1: u64, r2: u64
 /// `wait_wake_event` sends on the stolen cap. Returns true on success; false if the pool/waiter queue
 /// is exhausted (caller must then fall back to an immediate reply → never a hang).
 unsafe fn wait_park(event_idx: usize, resume_ip: u64, sp: u64, flags: u64) -> bool {
+    // Single-object wait = a 1-event WaitAny set.
+    wait_park_multi(&[event_idx], false, resume_ip, sp, flags)
+}
+
+/// GENERAL park: block the current caller on a SET of obj_ns events (`events`), with `wait_all`
+/// selecting WaitAll (wake when all signalled → WAIT_0) vs WaitAny (wake on the first signalled →
+/// WAIT_0+index). Steals this caller's bound reply object (REPLY_MAIN) into a free waiter slot and
+/// rotates a fresh pool object into REPLY_MAIN so subsequent recvs bind a new object. Returns true on
+/// success; false if the pool/queue is exhausted OR the set is too large (`events.len() >
+/// WAITER_MAX_EVENTS`) → the caller must then fall back to an immediate reply (never a hang).
+unsafe fn wait_park_multi(
+    events: &[usize],
+    wait_all: bool,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    if events.is_empty() || events.len() > WAITER_MAX_EVENTS {
+        return false;
+    }
     // Find a free waiter slot.
     let mut wslot = usize::MAX;
     for i in 0..WAITER_N {
@@ -1644,50 +1695,121 @@ unsafe fn wait_park(event_idx: usize, resume_ip: u64, sp: u64, flags: u64) -> bo
     if fresh == 0 {
         return false; // pool exhausted → caller falls back to immediate reply
     }
-    // Commit: record the waiter + its syscall resume context, install the fresh object as the active
-    // recv reply cap.
-    WAITER_EVENT_IDX[wslot].store(event_idx as u64, Ordering::Relaxed);
+    // Commit: record the waiter's event set + its syscall resume context, install the fresh object as
+    // the active recv reply cap.
+    for (k, &ev) in events.iter().enumerate() {
+        WAITER_EVENTS[wslot][k].store(ev as u64, Ordering::Relaxed);
+    }
+    for k in events.len()..WAITER_MAX_EVENTS {
+        WAITER_EVENTS[wslot][k].store(u64::MAX, Ordering::Relaxed);
+    }
+    WAITER_EVENT_COUNT[wslot].store(events.len() as u64, Ordering::Relaxed);
+    WAITER_WAIT_ALL[wslot].store(wait_all as u64, Ordering::Relaxed);
     WAITER_REPLY_CAP[wslot].store(stolen, Ordering::Relaxed);
     WAITER_RESUME_IP[wslot].store(resume_ip, Ordering::Relaxed);
     WAITER_RESUME_SP[wslot].store(sp, Ordering::Relaxed);
     WAITER_RESUME_FLAGS[wslot].store(flags, Ordering::Relaxed);
+    // WAITER_EVENT_IDX doubles as the slot-free sentinel: set it LAST (after the set) so a slot never
+    // looks "used but empty".
+    WAITER_EVENT_IDX[wslot].store(events[0] as u64, Ordering::Relaxed);
     WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
     true
 }
 
-/// WAKE every waiter parked on `event_idx`: reply STATUS_WAIT_0 (0) on each stolen reply cap (resumes
-/// the blocked caller's `NtWaitForSingleObject`), free its waiter slot, and return its reply object to
-/// the pool. Returns the number woken. Called from the NtSetEvent handler after setting `signalled`.
-unsafe fn wait_wake_event(event_idx: usize) -> u64 {
+/// WAKE every waiter whose wait condition is now satisfied, given the obj_ns event table. `just_set`
+/// is the event index just signalled (drives WaitAny index selection). AUTO-RESET events consumed by
+/// a wake have their `signalled` flag cleared (NT auto-reset semantics — e.g. rpcrt4's mgr_event /
+/// server_ready_event). Returns the number woken. Called from the NtSetEvent handler after setting the
+/// event's `signalled` flag.
+unsafe fn wait_wake_event_set(just_set: usize, obj_ns: &mut alloc::vec::Vec<ObjEntry>) -> u64 {
+    let is_signalled = |ev: usize, ns: &alloc::vec::Vec<ObjEntry>| -> bool {
+        ns.get(ev).map(|e| e.kind == 2 && e.signalled != 0).unwrap_or(false)
+    };
     let mut woken = 0u64;
     for i in 0..WAITER_N {
-        if WAITER_EVENT_IDX[i].load(Ordering::Relaxed) == event_idx as u64 {
-            let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
-            if cap != 0 {
-                // Resume the parked NtWaitForSingleObject with STATUS_WAIT_0. The waiter blocked as a
-                // native syscall (UnknownSyscall fault); apply_fault_reply restores RCX←resume_ip,
-                // RSP←sp, RFLAGS←flags (from IPC MR15/16/17) and RAX/r10←status. Re-install the
-                // snapshotted resume context, then reply length 18 (same shape as the live syscall
-                // reply). r10 (status) = 0 = STATUS_WAIT_0.
-                set_reply_mr(15, WAITER_RESUME_IP[i].load(Ordering::Relaxed));
-                set_reply_mr(16, WAITER_RESUME_SP[i].load(Ordering::Relaxed));
-                set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
-                send_on_reply(cap, 18, 0, 0, 0, 0);
-                // Return this reply object to the pool (clear its used bit).
-                for p in 0..WAIT_REPLY_POOL_N {
-                    if WAIT_REPLY_POOL[p].load(Ordering::Relaxed) == cap {
-                        WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << p), Ordering::Relaxed);
-                        break;
+        let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
+        if slot_ev0 == u64::MAX {
+            continue; // free slot
+        }
+        let count = WAITER_EVENT_COUNT[i].load(Ordering::Relaxed) as usize;
+        if count == 0 {
+            continue;
+        }
+        let wait_all = WAITER_WAIT_ALL[i].load(Ordering::Relaxed) != 0;
+        // Does this waiter's condition hold, and if WaitAny, which index fired?
+        let mut wake = false;
+        let mut wake_index = 0u64;
+        if wait_all {
+            // Wake only when ALL events in the set are signalled.
+            let mut all = true;
+            for k in 0..count.min(WAITER_MAX_EVENTS) {
+                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
+                if !is_signalled(ev, obj_ns) {
+                    all = false;
+                    break;
+                }
+            }
+            wake = all;
+            wake_index = 0; // WaitAll returns WAIT_OBJECT_0
+        } else {
+            // WaitAny: the first (lowest-index) signalled event determines the return value. `just_set`
+            // is guaranteed signalled; prefer the lowest index in the set that is signalled.
+            for k in 0..count.min(WAITER_MAX_EVENTS) {
+                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
+                if ev == just_set || is_signalled(ev, obj_ns) {
+                    wake = true;
+                    wake_index = k as u64;
+                    break;
+                }
+            }
+        }
+        if !wake {
+            continue;
+        }
+        // Auto-reset the CONSUMED event (WaitAny: the one at wake_index; WaitAll: all of them) if it's
+        // an auto-reset event, so the next wait blocks again.
+        if wait_all {
+            for k in 0..count.min(WAITER_MAX_EVENTS) {
+                let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
+                if let Some(e) = obj_ns.get_mut(ev) {
+                    if e.kind == 2 && e.auto_reset != 0 {
+                        e.signalled = 0;
                     }
                 }
-                woken += 1;
-                WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
             }
-            WAITER_EVENT_IDX[i].store(u64::MAX, Ordering::Relaxed);
-            WAITER_REPLY_CAP[i].store(0, Ordering::Relaxed);
+        } else {
+            let ev = WAITER_EVENTS[i][wake_index as usize].load(Ordering::Relaxed) as usize;
+            if let Some(e) = obj_ns.get_mut(ev) {
+                if e.kind == 2 && e.auto_reset != 0 {
+                    e.signalled = 0;
+                }
+            }
         }
+        let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
+        if cap != 0 {
+            // Resume the parked wait with STATUS_WAIT_0 + index. The waiter blocked as a native syscall
+            // (UnknownSyscall fault); apply_fault_reply restores RCX←resume_ip, RSP←sp, RFLAGS←flags
+            // (IPC MR15/16/17) and RAX/r10←status. r10 (status) = wake_index = WAIT_OBJECT_0+index.
+            set_reply_mr(15, WAITER_RESUME_IP[i].load(Ordering::Relaxed));
+            set_reply_mr(16, WAITER_RESUME_SP[i].load(Ordering::Relaxed));
+            set_reply_mr(17, WAITER_RESUME_FLAGS[i].load(Ordering::Relaxed));
+            send_on_reply(cap, 18, wake_index, 0, 0, 0);
+            // Return this reply object to the pool (clear its used bit).
+            for p in 0..WAIT_REPLY_POOL_N {
+                if WAIT_REPLY_POOL[p].load(Ordering::Relaxed) == cap {
+                    WAIT_REPLY_POOL_USED.fetch_and(!(1u64 << p), Ordering::Relaxed);
+                    break;
+                }
+            }
+            woken += 1;
+            WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        // Free the slot.
+        WAITER_EVENT_IDX[i].store(u64::MAX, Ordering::Relaxed);
+        WAITER_EVENT_COUNT[i].store(0, Ordering::Relaxed);
+        WAITER_REPLY_CAP[i].store(0, Ordering::Relaxed);
     }
     woken
 }
@@ -2212,6 +2334,11 @@ struct ObjEntry {
     // (services' SCM_START_EVENT/LSA_RPC_SERVER_ACTIVE/…) live here as real executive objects
     // keyed by name; SetEvent/ResetEvent are modelled as flips of this flag.
     signalled: u8,
+    // kind == 2 (event): 1 = auto-reset (CreateEvent bManualReset=FALSE — e.g. rpcrt4's mgr_event /
+    // server_ready_event). When a wait CONSUMES an auto-reset event (a waiter wakes on it), its
+    // `signalled` flag is cleared so a subsequent wait blocks again. 0 = manual-reset (the default —
+    // stays signalled until an explicit ResetEvent; e.g. LSA_RPC_SERVER_ACTIVE).
+    auto_reset: u8,
 }
 impl ObjEntry {
     fn dir(name: &[u8], parent: u8) -> Self {
@@ -2223,6 +2350,7 @@ impl ObjEntry {
             target: [0; 40],
             target_len: 0,
             signalled: 0,
+            auto_reset: 0,
         };
         let n = name.len().min(40);
         e.name[..n].copy_from_slice(&name[..n]);
@@ -2434,6 +2562,9 @@ struct ExecNtHandler {
     /// the wait was satisfied immediately, or the target isn't a parkable real event → immediate
     /// STATUS_WAIT_0 fallback). Reset each dispatch (group-A signal, like spawn_request).
     wait_park_event: i64,
+    /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
+    /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
+    anon_event_seq: u32,
     /// Authentic CSR accept: when winlogon's `NtSecureConnectPort(\Windows\ApiPort)` leaves the broker
     /// connection Pending (Manual), the handler records the broker connection id + the caller's
     /// `*PortHandle` VA here; the loop then drives `csr_rendezvous` (the REAL CsrApiRequestThread
@@ -6350,6 +6481,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             && WAIT_WOKEN_COUNT.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // ★ SERVICE 10 step 2 (Part 2) — winlogon's rpcrt4 server WORKER thread is
+                    // MULTIPLEXED (badge WINLOGON_WORKER_BADGE) and actually RUNS (not suspended): it
+                    // executes its wait array (NtWaitForMultipleObjects) through the N-threads loop.
+                    // WL_WORKER_FAULTS>=1 proves the worker was scheduled + serviced at least once.
+                    check(
+                        b"exec_winlogon_worker_multiplex",
+                        WL_WORKER_FAULTS.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] winlogon rpcrt4 worker multiplex events=0x");
+                    print_hex(WL_WORKER_FAULTS.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] Checkpoint B: LSA_RPC_SERVER_ACTIVE signalled=0x");
                     print_hex(LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) as u32);
                     print_str(b" waiters parked=0x");

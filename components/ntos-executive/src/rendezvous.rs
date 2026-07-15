@@ -287,14 +287,24 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
     })
 }
 
-/// Spawn a REAL thread through the GENERAL NtCreateThread path for a hosted process `pml4` (first
-/// live user: winlogon's RPC listener). `entry_rip`/`param` come from the caller's CONTEXT; `cid_*`
-/// is the real ClientId {caller pid, fresh tid} the ETHREAD carries. Returns the TCB. The thread
-/// faults to the dedicated `WL_LISTENER_FAULT_EP` (no receiver). It is left SUSPENDED (`resume:
-/// false`): its real TEB is mapped + queryable, but it is not scheduled — a "parked before first
-/// instruction" listener. Resuming it into the service loop (so it runs to `FSCTL_PIPE_LISTEN`)
-/// requires a per-thread stack-mirror switch in the main multiplex (the flagged follow-up).
-pub(crate) unsafe fn spawn_wl_listener_thread(pml4: u64, entry_rip: u64, param: u64, cid_proc: u64, cid_thread: u64) -> u64 {
+/// Spawn winlogon's rpcrt4 server WORKER thread (its first NtCreateThread = RPCRT4_server_thread) in
+/// winlogon's VSpace (pi 2) and RESUME it into the main service-loop multiplex — the SERVICE-9 C-c
+/// N-threads pattern applied to winlogon. Faults to a cap minted at [`WINLOGON_WORKER_BADGE`] off the
+/// MAIN service `fault_ep`; the loop sub-selects it as (pi 2, worker) via its OWN stack mirror. This
+/// makes the worker actually RUN its wait array (get_wait_array → NtWaitForMultipleObjects), so the
+/// rpcrt4 two-thread handshake completes: the worker parks on [mgr_event, …], the main thread's
+/// signal_state_changed SetEvents mgr_event → the worker wakes → SetEvents server_ready_event → the
+/// main thread's WaitForSingleObject(server_ready_event) wakes. `entry_rip`/`param` come from the
+/// caller's CONTEXT; `cid_*` is the real ClientId {caller pid, fresh tid}. Returns the TCB.
+pub(crate) unsafe fn spawn_wl_listener_thread(
+    pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+) -> u64 {
+    let worker_ep = mint_badged(main_fault_ep, WINLOGON_WORKER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4,
         entry_rip,
@@ -306,12 +316,12 @@ pub(crate) unsafe fn spawn_wl_listener_thread(pml4: u64, entry_rip: u64, param: 
         ipcbuf_va: WL_LISTENER_IPCBUF_VA,
         tramp_va: WL_LISTENER_TRAMP_VA,
         peb_va: SMSS_PEB_VA,
-        stack_mirror_va: 0, // park-only: no rendezvous writes its stack
-        fault_ep: WL_LISTENER_FAULT_EP.load(Ordering::Relaxed),
+        stack_mirror_va: WINLOGON_WORKER_STACK_MIRROR_VA,
+        fault_ep: worker_ep,
         cid_proc,
         cid_thread,
-        resume: false,
-        prio: 0,
+        resume: true, // run it into the multiplex (the N-threads mechanism)
+        prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
     })
 }
 

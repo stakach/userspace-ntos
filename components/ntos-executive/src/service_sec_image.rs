@@ -303,6 +303,22 @@ pub(crate) unsafe fn service_sec_image(
         let is_svc_listener = badge == SVC_LISTENER_BADGE;
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
+        // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
+        // multiplex. It runs the wait array (NtWaitForMultipleObjects → parks) that the main thread's
+        // signal_state_changed wakes, completing the rpcrt4 server-thread handshake.
+        let is_wl_worker = badge == WINLOGON_WORKER_BADGE;
+        if is_wl_worker {
+            let n = WL_WORKER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                print_str(b"[wl-worker] multiplex event #");
+                print_u64(n);
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b" (N-threads sub-select: pi 2 rpcrt4 worker)\n");
+            }
+        }
         if is_svc_listener {
             let n = SVC_LISTENER_FAULTS.fetch_add(1, Ordering::Relaxed);
             if n < 4 {
@@ -330,7 +346,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         let pi = if badge == CSRSS_BADGE {
             1
-        } else if badge == WINLOGON_BADGE {
+        } else if badge == WINLOGON_BADGE || is_wl_worker {
             2
         } else if badge == SERVICES_BADGE || is_svc_listener {
             3
@@ -369,6 +385,8 @@ pub(crate) unsafe fn service_sec_image(
                 LSASS_LISTENER_STACK_MIRROR_VA
             } else if is_lsass_listener2 {
                 LSASS_LISTENER2_STACK_MIRROR_VA
+            } else if is_wl_worker {
+                WINLOGON_WORKER_STACK_MIRROR_VA
             } else {
                 match pi {
                     1 => CSRSS_STACK_MIRROR_VA,
@@ -464,13 +482,13 @@ pub(crate) unsafe fn service_sec_image(
                 // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
                 // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
                 // stop — the whole point of the per-thread multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 {
-                    print_str(if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
-                    print_str(b" -> PARK listener (its own unrecoverable fault); boot continues\n");
+                    print_str(b" -> PARK thread (its own unrecoverable fault); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -701,6 +719,11 @@ pub(crate) unsafe fn service_sec_image(
             // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
             // the given obj_ns event index (set from nt_handler.wait_park_event after dispatch).
             let mut park_wait_event: i64 = -1;
+            // Array-wait park (NtWaitForMultipleObjects): the resolved obj_ns event set + WaitAll flag.
+            // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
+            let mut park_wait_set = [0usize; 8];
+            let mut park_wait_set_n: usize = 0;
+            let mut park_wait_set_all = false;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -1034,13 +1057,13 @@ pub(crate) unsafe fn service_sec_image(
                     let param = smss_stack_read(ctx_va + 0x80);
                     let tid = PM_LISTENER_TID.load(Ordering::Relaxed);
                     let cid_proc = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
-                    print_str(b"[wl-thread] spawning REAL RPC listener thread: entry=0x");
+                    print_str(b"[wl-thread] spawning REAL rpcrt4 WORKER thread (multiplexed): entry=0x");
                     print_hex((entry_rip >> 32) as u32);
                     print_hex(entry_rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_wl_listener_thread(pml4, entry_rip, param, cid_proc, tid);
+                    let tcb = spawn_wl_listener_thread(procs[2].pml4, entry_rip, param, cid_proc, tid, fault_ep);
                     WL_LISTENER_TCB.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, WL_LISTENER_TEB_VA);
@@ -1049,7 +1072,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" TEB=0x");
                     print_hex((WL_LISTENER_TEB_VA >> 32) as u32);
                     print_hex(WL_LISTENER_TEB_VA as u32);
-                    print_str(b" (suspended; real ETHREAD + TEB, queryable by the main thread)\n");
+                    print_str(b" (RESUMED into multiplex, badge WINLOGON_WORKER_BADGE; real ETHREAD + TEB)\n");
                 }
                 // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
                 // service loop (badge SVC_LISTENER_BADGE). Its faults/syscalls interleave with services'
@@ -1281,23 +1304,29 @@ pub(crate) unsafe fn service_sec_image(
                 let ev_handle = get_recv_mr(9); // R10 = EventHandle
                 if ev_handle >= OBJ_HANDLE_BASE {
                     let idx = (ev_handle - OBJ_HANDLE_BASE) as usize;
+                    let mut is_event = false;
                     if let Some(e) = nt_handler.obj_ns.get_mut(idx) {
                         if e.kind == 2 {
                             e.signalled = 1;
+                            is_event = true;
                             if e.name() == b"lsa_rpc_server_active" {
                                 LSA_RPC_SERVER_ACTIVE_SIGNALLED.store(1, Ordering::Relaxed);
                                 print_str(b"[wait] lsass SIGNALLED LSA_RPC_SERVER_ACTIVE (event #");
                                 print_u64(idx as u64);
                                 print_str(b")\n");
                             }
-                            let woken = wait_wake_event(idx);
-                            if woken > 0 {
-                                print_str(b"[wait] NtSetEvent(event #");
-                                print_u64(idx as u64);
-                                print_str(b") -> WOKE ");
-                                print_u64(woken);
-                                print_str(b" parked waiter(s)\n");
-                            }
+                        }
+                    }
+                    if is_event {
+                        // Wake any parked waiter whose condition is now satisfied (WaitAny/WaitAll over
+                        // its event set). Auto-reset events consumed by a wake are cleared inside.
+                        let woken = wait_wake_event_set(idx, &mut nt_handler.obj_ns);
+                        if woken > 0 {
+                            print_str(b"[wait] NtSetEvent(event #");
+                            print_u64(idx as u64);
+                            print_str(b") -> WOKE ");
+                            print_u64(woken);
+                            print_str(b" parked waiter(s)\n");
                         }
                     }
                 }
@@ -1316,12 +1345,91 @@ pub(crate) unsafe fn service_sec_image(
                 // NtReleaseMutant(196) / NtResetEvent(210) / NtReleaseSemaphore(197) — signaling
                 // no-ops (no real objects modeled). Accept so rpcrt4's server bookkeeping proceeds.
                 result = 0;
-            } else if m0 == 280 && badge == WINLOGON_BADGE {
-                // NtWaitForMultipleObjects (winlogon). rpcrt4's RpcServerListen may wait for its
-                // listener thread to become ready; the listener is a REAL suspended thread (parked),
-                // so report WAIT_0 (satisfied) and let winlogon's MAIN thread proceed to return
-                // RPC_S_OK. (smss's 280 stays PARKED in the badge==0 arm above.)
-                result = 0;
+            } else if m0 == 280 && badge != 0 {
+                // ★ NtWaitForMultipleObjects(ObjectCount=R10, HandleArray=RDX, WaitType=R8,
+                // Alertable=R9, *TimeOut=[sp+0x28]) — REAL array-wait with reply-cap parking (Part 1 of
+                // the winlogon rpcrt4 handshake). WaitType 1 = WaitAny, 0 = WaitAll. This is the
+                // worker-thread half of the rpcrt4 two-thread handshake: the server WORKER thread
+                // (multiplexed via WINLOGON_WORKER_BADGE / SVC/LSASS listeners) runs
+                // rpcrt4_protseq_np_wait_for_new_connection = WaitForMultipleObjects([mgr_event,
+                // listen_events…]). We resolve the handle array to obj_ns events:
+                //   • WaitAny + any already signalled → immediate WAIT_0+index.
+                //   • WaitAll + all signalled → immediate WAIT_0.
+                //   • otherwise, if the set contains at least one REAL event (a live signaler exists —
+                //     the main thread's signal_state_changed SetEvents mgr_event) → PARK on the set
+                //     (steal the reply cap, recv next, wake on NtSetEvent). ★ NO-DEADLOCK: only park
+                //     when a real event is present; a set of only fake handles → immediate WAIT_0.
+                let count = get_recv_mr(9) as usize; // R10 = ObjectCount
+                let harr = m3; // RDX = HandleArray
+                let wait_type = get_recv_mr(7); // R8 = WaitType (1=Any, 0=All)
+                let wait_all = wait_type == 0;
+                let mut events = [0usize; 8];
+                let mut nev = 0usize;
+                let mut any_signalled_idx: i64 = -1; // handle-array index (k) of the first signalled
+                let mut any_signalled_obj: usize = 0; // obj_ns idx of that event (for auto-reset)
+                let mut all_signalled = true;
+                let mut has_real_event = false;
+                if harr != 0 && count > 0 && count <= 64 {
+                    for k in 0..count {
+                        let h = smss_stack_read(harr + (k as u64) * 8);
+                        if h >= OBJ_HANDLE_BASE {
+                            let idx = (h - OBJ_HANDLE_BASE) as usize;
+                            if let Some(e) = nt_handler.obj_ns.get(idx) {
+                                if e.kind == 2 {
+                                    has_real_event = true;
+                                    if nev < 8 {
+                                        events[nev] = idx;
+                                        nev += 1;
+                                    }
+                                    if e.signalled != 0 {
+                                        if any_signalled_idx < 0 {
+                                            any_signalled_idx = k as i64;
+                                            any_signalled_obj = idx;
+                                        }
+                                    } else {
+                                        all_signalled = false;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        // A fake / non-event handle: never signalled by us → WaitAll can't complete.
+                        all_signalled = false;
+                    }
+                }
+                // Consume (auto-reset) an event satisfied on the IMMEDIATE path (NT clears an auto-reset
+                // event that satisfies a wait). WaitAll: clear all consumed auto-reset events.
+                let consume_auto = |obj_ns: &mut alloc::vec::Vec<ObjEntry>, ev: usize| {
+                    if let Some(e) = obj_ns.get_mut(ev) {
+                        if e.kind == 2 && e.auto_reset != 0 { e.signalled = 0; }
+                    }
+                };
+                if wait_all {
+                    if has_real_event && all_signalled && nev == count {
+                        for k in 0..nev { consume_auto(&mut nt_handler.obj_ns, events[k]); }
+                        result = 0; // WAIT_0 (all satisfied)
+                    } else if has_real_event && nev <= 8 {
+                        park_wait_set[..nev].copy_from_slice(&events[..nev]);
+                        park_wait_set_n = nev;
+                        park_wait_set_all = true;
+                        result = 0;
+                    } else {
+                        result = 0; // no real event → immediate WAIT_0 (no live signaler; documented)
+                    }
+                } else {
+                    // WaitAny
+                    if any_signalled_idx >= 0 {
+                        consume_auto(&mut nt_handler.obj_ns, any_signalled_obj);
+                        result = any_signalled_idx as u64; // WAIT_OBJECT_0 + index
+                    } else if has_real_event && nev <= 8 {
+                        park_wait_set[..nev].copy_from_slice(&events[..nev]);
+                        park_wait_set_n = nev;
+                        park_wait_set_all = false;
+                        result = 0;
+                    } else {
+                        result = 0; // no real event to park on → immediate WAIT_0 (documented)
+                    }
+                }
             } else if m0 == 162 {
                 // ★ NtQueryInformationThread(ThreadHandle=R10, ThreadInformationClass=RDX,
                 // ThreadInformation=R8, Length=R9, *ReturnLength=[sp+0x28]). GENERAL (all hosted
@@ -1784,10 +1892,10 @@ pub(crate) unsafe fn service_sec_image(
                 // stopping the whole boot. Recv the next event WITHOUT replying → the listener's seL4
                 // thread stays blocked (its ETHREAD/TEB/stack stay mapped), and lsass' main thread + the
                 // rest of the boot keep advancing. Contained per-thread — the point of the multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 {
-                    print_str(if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
                     print_u64(m0);
-                    print_str(b" -> PARK listener (reached its LPC/RPC receive loop); boot continues\n");
+                    print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -1814,6 +1922,24 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // Pool exhausted → immediate WAIT_0 (documented fallback, never a hang).
                 print_str(b"[wait] park pool exhausted -> immediate WAIT_0 (fallback)\n");
+                result = 0;
+            }
+            // Array-wait park (NtWaitForMultipleObjects): PARK on the resolved event SET (WaitAny/All).
+            // The matching NtSetEvent (signal_state_changed → SetEvent(mgr_event)) wakes it via
+            // wait_wake_event_set, returning WAIT_0+index. Pool/queue exhaustion → immediate fallback.
+            if park_wait_set_n > 0 && reply_main != 0 {
+                if wait_park_multi(&park_wait_set[..park_wait_set_n], park_wait_set_all, resume_ip, sp, flags) {
+                    print_str(b"[wait] pi=");
+                    print_u64(pi as u64);
+                    print_str(b" NtWaitForMultipleObjects(");
+                    print_u64(park_wait_set_n as u64);
+                    print_str(if park_wait_set_all { b" events, WaitAll) UNSIGNALLED -> PARK caller\n" } else { b" events, WaitAny) UNSIGNALLED -> PARK caller\n" });
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
+                print_str(b"[wait] array-park pool exhausted -> immediate WAIT_0 (fallback)\n");
                 result = 0;
             }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
