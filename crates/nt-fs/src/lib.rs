@@ -20,7 +20,7 @@ mod status;
 pub use file_backing::FileBacking;
 pub use fs::{CreateResult, FileSystem, MemFs, StandardInformation, INVALID_HANDLE};
 pub use hive_provider::NtFileHiveIoProvider;
-pub use path::{normalize_separators, MountManager, MEMFS_VOLUME};
+pub use path::{is_named_pipe_path, normalize_separators, MountManager, MEMFS_VOLUME};
 pub use status::*;
 
 #[cfg(test)]

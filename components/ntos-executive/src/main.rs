@@ -58,7 +58,7 @@ mod driver_launch;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
@@ -2304,10 +2304,10 @@ static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
 /// Count of live pipe syscalls (NtCreateNamedPipeFile/NtCreateFile/NtOpenFile/NtFsControlFile/
 /// Read/Write) that were ROUTED THROUGH the isolated npfs component (vs modeled-fake). Observability.
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
-/// Pipe handle -> npfs FILE_OBJECT id (FsContext) map. Fixed-capacity static (survives the per-syscall
-/// bump heap reset — a Vec above the heap mark would be rewound). Slot 0 unused (0 = no handle).
-/// (handle, file_id); handle is the executive-minted value we returned to the caller.
-static mut NPFS_PIPE_HANDLES: [(u64, u64); 32] = [(0, 0); 32];
+/// Bounded file/pipe frontier traces; they preserve exact evidence without flooding serial output.
+static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
+static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
 static FAKE_SYNC_HANDLE: AtomicU64 = AtomicU64::new(0x7000_0000);
 
@@ -5992,15 +5992,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             check(b"npfs_isolated_vspace", dc.pml4 != 0 && dc.pml4 != CAP_INIT_THREAD_VSPACE, &mut passed);
             if dc.finished && (dc.verdict & V_MJ) != 0 {
                 // C2 round-trip: dispatch a REAL IRP_MJ_CREATE_NAMED_PIPE (major 1) to the live
-                // component with a pipe name (UTF-16 "\ntsvcs") — exercising npfs's REAL
+                // component with a private probe pipe (UTF-16 "\ntstest") — exercising npfs's REAL
                 // NpFsdCreateNamedPipe through a real FILE_OBJECT + IO_STACK_LOCATION. Proves the
-                // routing path is real (a fault mid-create lands on npfs's own EP = contained).
-                let name16: [u8; 14] = *b"\\\0n\0t\0s\0v\0c\0s\0";
+                // routing path is real without consuming the live SCM `\ntsvcs` server instance.
+                let name16: [u8; 16] = *b"\\\0n\0t\0s\0t\0e\0s\0t\0";
                 let mut out = [0u8; 16];
                 let r = npfs_dispatch_irp(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, 0, &name16, &mut out);
                 if let Some((st, info)) = r {
                     let srv_fid = driver_launch::npfs_last_file_id();
-                    print_str(b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntsvcs) -> status=0x");
+                    print_str(b"[npfs-svc] C2 dispatch IRP_MJ_CREATE_NAMED_PIPE(\\ntstest) -> status=0x");
                     print_hex(st as u32);
                     print_str(b" info=");
                     print_u64(info);
@@ -6015,14 +6015,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         st == 0 && info == 2 && srv_fid != 0,
                         &mut passed,
                     );
-                    // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntsvcs) must find the FCB via the
+                    // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntstest) must find the FCB via the
                     // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
                     let mut cout = [0u8; 16];
                     if let Some((cst, _cinfo)) =
                         npfs_dispatch_irp(0 /* IRP_MJ_CREATE */, 0, 0, &name16, &mut cout)
                     {
                         let cli_fid = driver_launch::npfs_last_file_id();
-                        print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntsvcs) -> status=0x");
+                        print_str(b"[npfs-svc] C-a connect IRP_MJ_CREATE(\\ntstest) -> status=0x");
                         print_hex(cst as u32);
                         print_str(b" fsctx=0x");
                         print_hex(cli_fid as u32);

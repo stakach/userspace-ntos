@@ -24,6 +24,17 @@ fn mount_resolver() {
 }
 
 #[test]
+fn named_pipe_path_classification_is_exact() {
+    let utf16 = |path: &str| path.encode_utf16().collect::<alloc::vec::Vec<_>>();
+    assert!(is_named_pipe_path(&utf16(r"\??\pipe\ntsvcs")));
+    assert!(is_named_pipe_path(&utf16(r"\DosDevices\pipe\ntsvcs")));
+    assert!(is_named_pipe_path(&utf16(r"\Device\NamedPipe\lsarpc")));
+    assert!(is_named_pipe_path(&utf16(r"\DEVICE\NAMEDPIPE\winreg")));
+    assert!(!is_named_pipe_path(&utf16(r"\SystemRoot\System32\pipe.dll")));
+    assert!(!is_named_pipe_path(&utf16(r"\Device\NamedPipe")));
+}
+
+#[test]
 fn query_attributes_by_path_no_handle() {
     let fs = FileSystem::new(MemFs::with_fixture());
     // A file resolves and reports non-directory — without allocating a handle.

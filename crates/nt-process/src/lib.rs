@@ -130,6 +130,8 @@ pub enum HandleObject {
     Process(ProcessId),
     Thread(ThreadId),
     Section(SectionId),
+    /// An I/O Manager `FILE_OBJECT`. The identifier belongs to the backing filesystem service.
+    File(u64),
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.

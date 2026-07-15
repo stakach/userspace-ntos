@@ -791,6 +791,9 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     write_unaligned(fo as *mut i16, 5); // Type = IO_TYPE_FILE
     write_unaligned((fo + 2) as *mut u16, 0x100);
     write_unaligned((fo + 8) as *mut u64, devobj); // DeviceObject
+    // Follow-up IRPs rebuild a transient FILE_OBJECT around the context returned by CREATE/OPEN.
+    let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+    write_unaligned((fo + 0x18) as *mut u64, file_id); // FsContext
     // FileName UNICODE_STRING @0x58 = { Length=inlen, MaximumLength=inlen+2, Buffer=ARG frame }.
     write_unaligned((fo + 0x58) as *mut u16, inlen as u16); // Length (bytes)
     write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength

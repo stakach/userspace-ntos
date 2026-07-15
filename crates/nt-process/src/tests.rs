@@ -327,6 +327,18 @@ fn handle_values_are_process_local() {
 }
 
 #[test]
+fn file_objects_are_typed_and_process_local() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let first_handle = pm.insert_handle(first, HandleObject::File(41), 1).unwrap();
+    let second_handle = pm.insert_handle(second, HandleObject::File(99), 2).unwrap();
+    assert_eq!(first_handle, second_handle);
+    assert_eq!(pm.lookup_handle(first, first_handle), Some(HandleObject::File(41)));
+    assert_eq!(pm.lookup_handle(second, second_handle), Some(HandleObject::File(99)));
+}
+
+#[test]
 fn append_only_handles_never_recycle_a_closed_value() {
     // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
     // executive's per-process DLL registry relies on (a recycled value would collide with a stale

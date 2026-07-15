@@ -288,7 +288,9 @@ impl NativeService {
             | NtRequestWaitReplyPort
             // Named-pipe / device I/O: the handler writes out-params (FileHandle in R10,
             // IoStatusBlock in R9) via the executive's register/stack helpers; register-only cap.
-            | NtCreateNamedPipeFile | NtFsControlFile => (0, 4),
+            | NtCreateNamedPipeFile => (0, 4),
+            // The filesystem-control handler forwards all native buffer arguments to the FSD.
+            NtFsControlFile => (10, 10),
             _ => (0, 16), // permissive for the rest in v0.1
         }
     }

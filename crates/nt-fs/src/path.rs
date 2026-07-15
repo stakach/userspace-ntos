@@ -92,6 +92,24 @@ pub fn normalize_separators(path: &str) -> String {
     out
 }
 
+/// Whether an NT object path names the named-pipe filesystem, case-insensitively.
+pub fn is_named_pipe_path(path: &[u16]) -> bool {
+    const DOS_PIPE: &[u8] = b"\\??\\pipe\\";
+    const DOS_DEVICES_PIPE: &[u8] = b"\\dosdevices\\pipe\\";
+    const DEVICE_PIPE: &[u8] = b"\\device\\namedpipe\\";
+
+    fn starts_ascii_case_insensitive(path: &[u16], prefix: &[u8]) -> bool {
+        path.len() >= prefix.len()
+            && path.iter().zip(prefix).all(|(&unit, &byte)| {
+                unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte)
+            })
+    }
+
+    starts_ascii_case_insensitive(path, DOS_PIPE)
+        || starts_ascii_case_insensitive(path, DOS_DEVICES_PIPE)
+        || starts_ascii_case_insensitive(path, DEVICE_PIPE)
+}
+
 /// Case-insensitive component-wise prefix test.
 fn path_has_prefix(path: &str, prefix: &str) -> bool {
     let p: Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();

@@ -256,6 +256,19 @@ impl ExecNtHandler {
         self.next_handle += 1;
         h
     }
+    /// Mint a process-local handle backed by a typed filesystem `FILE_OBJECT` identity.
+    pub(crate) fn mint_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let handle = self.pm
+            .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
     /// General NtCreateThread: hand out a real pool ETHREAD for the caller (`self.pi`) — bind the
     /// caller-supplied start routine + parameter + TEB base (all alloc-free field writes, reset-safe),
     /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
@@ -613,36 +626,32 @@ impl ExecNtHandler {
             in_bytes.extend_from_slice(&w.to_le_bytes());
         }
         let mut out = [0u8; 64];
-        let r = driver_launch::npfs_dispatch_irp(major, fsctl, file_id, &in_bytes, &mut out)?;
-        NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
-        let (st, _info) = r;
-        let fid = driver_launch::npfs_last_file_id();
+        let (st, _, fid) = self.npfs_route_raw(major, fsctl, file_id, &in_bytes, &mut out)?;
         Some((st, fid))
     }
 
-    /// Record a pipe handle -> npfs file id (FsContext) in the static table (survives the heap reset).
-    pub(crate) fn npfs_track_handle(handle: u64, file_id: u64) {
-        unsafe {
-            let t = &mut *core::ptr::addr_of_mut!(NPFS_PIPE_HANDLES);
-            for slot in t.iter_mut() {
-                if slot.0 == 0 || slot.0 == handle {
-                    *slot = (handle, file_id);
-                    return;
-                }
-            }
-        }
+    /// Route an npfs IRP with its native byte payload and preserve completion output.
+    pub(crate) unsafe fn npfs_route_raw(
+        &mut self,
+        major: u64,
+        fsctl: u64,
+        file_id: u64,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Option<(i32, u64, u64)> {
+        let (status, information) =
+            driver_launch::npfs_dispatch_irp(major, fsctl, file_id, input, output)?;
+        NPFS_ROUTED_IRPS.fetch_add(1, Ordering::Relaxed);
+        Some((status, information, driver_launch::npfs_last_file_id()))
     }
-    /// Resolve a pipe handle -> npfs file id (0 if not a tracked pipe handle).
-    pub(crate) fn npfs_file_id_for(handle: u64) -> u64 {
-        unsafe {
-            let t = &*core::ptr::addr_of!(NPFS_PIPE_HANDLES);
-            for slot in t.iter() {
-                if slot.0 == handle {
-                    return slot.1;
-                }
-            }
+
+    /// Resolve a process-local typed file handle to npfs's FILE_OBJECT context.
+    pub(crate) fn npfs_file_id_for(&self, handle: u64) -> u64 {
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else { return 0 };
+        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::File(file_id)) => file_id,
+            _ => 0,
         }
-        0
     }
 
     /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
@@ -1632,24 +1641,30 @@ impl NativeSyscallHandler for ExecNtHandler {
             // (it is FATAL otherwise). No real transport — nothing connects to \pipe\winreg in the
             // bring-up; the RPC listener thread (NtCreateThread is a no-op) never runs.
             NativeService::NtCreateNamedPipeFile => unsafe {
-                let h = self.mint_handle();
                 let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
                 // pi==3 (services' SCM RPC server): route the create through the REAL isolated npfs
                 // FSD → NpFsdCreateNamedPipe builds a real FCB/CCB + FILE_OBJECT (server end). pi 0-2
                 // keep the modeled-fake path (byte-identical: winlogon's \pipe\winreg never connects).
                 let mut info: u64 = 2; // FILE_CREATED
+                let mut routed_file_id = 0;
                 if self.pi == 3 || self.pi == 4 {
                     let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
                     let name16 = self.read_objattr_name_pe(oa);
                     let leaf = Self::pipe_leaf16(&name16);
                     if let Some((st, fid)) = self.npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0) {
                         if st == 0 && fid != 0 {
-                            Self::npfs_track_handle(h, fid);
+                            routed_file_id = fid;
                         } else {
                             info = 1; // FILE_OPENED (subsequent instance) — still SUCCESS to rpcrt4
                         }
                     }
                 }
+                let h = if routed_file_id != 0 {
+                    self.mint_file_handle(routed_file_id, args[1] as u32)
+                        .unwrap_or_else(|| self.mint_handle())
+                } else {
+                    self.mint_handle()
+                };
                 // *FileHandle (R10): for services/lsass (pi 3/4) it's a DLL .data global → the cross-AS
                 // writer; for pi 0-2 the legacy stack write is byte-identical.
                 if self.pi == 3 || self.pi == 4 {
@@ -1673,14 +1688,14 @@ impl NativeSyscallHandler for ExecNtHandler {
             // FSCTLs. Report success with a zeroed IoStatusBlock so the listener setup proceeds; no
             // client ever connects, so the actual pipe-listen semantics are irrelevant to bring-up.
             NativeService::NtFsControlFile => unsafe {
-                let sp = get_recv_mr(16);
-                let iosb = smss_stack_read(sp + 0x28); // [sp+0x28] = *IO_STATUS_BLOCK
+                let iosb = args[4];
                 // pi==3: route the FSCTL (FSCTL_PIPE_LISTEN/WAIT/TRANSCEIVE) to npfs for the tracked
                 // pipe handle. npfs's NpFsdFileSystemControl runs the real state machine on the CCB.
                 // FSCTL_PIPE_LISTEN on a server pipe with no client returns STATUS_PIPE_LISTENING
                 // (0x00000000-ish PENDING); we surface npfs's status. pi 0-2 keep the modeled path.
-                let fsctl = smss_stack_read(sp + 0x30); // [sp+0x30] = FsControlCode
+                let fsctl = args[5];
                 let mut status: u64 = 0;
+                let mut information = 0u64;
                 // ★ winlogon (pi 2) rpcrt4 worker: FSCTL_PIPE_LISTEN (0x110008) MUST report
                 // STATUS_PENDING (0x103), NOT SUCCESS. In rpcrt4_protseq_np_get_wait_array, SUCCESS →
                 // SetEvent(listen_event) → wait_for_new_connection wakes on the listen_event (index>0) →
@@ -1694,23 +1709,41 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if self.pi == 2 && (fsctl as u32) == 0x0011_0008 {
                     status = 0x103; // STATUS_PENDING
                 }
-                if self.pi == 3 || self.pi == 4 {
-                    let fh = get_recv_mr(9); // R10 = FileHandle
-                    let fid = Self::npfs_file_id_for(fh);
-                    if fid != 0 {
-                        if let Some((st, _)) =
-                            self.npfs_route(0xd /* IRP_MJ_FILE_SYSTEM_CONTROL */, fsctl, &[], fid)
-                        {
-                            // A listen with no waiting client => STATUS_PIPE_LISTENING(0xC00000B3) /
-                            // PENDING(0x103); rpcrt4 treats non-error as "armed". Report SUCCESS to keep
-                            // the listener-setup path moving (the real connect arrives via the client).
-                            status = if (st as u32) == 0xC00000B3 || (st as u32) == 0x103 { 0 } else { st as u64 };
+                let fid = self.npfs_file_id_for(args[0]);
+                if fid != 0 && !(self.pi == 2 && fsctl as u32 == 0x0011_0008) {
+                    let input_len = (args[7] as usize).min(0x4000);
+                    let output_len = (args[9] as usize).min(0x4000);
+                    let mut input = alloc::vec![0u8; input_len];
+                    let mut output = alloc::vec![0u8; output_len];
+                    if (input_len == 0 || self.xas_read(args[6], &mut input))
+                        && (output_len == 0 || args[8] != 0)
+                    {
+                        if let Some((st, completed, _)) = self.npfs_route_raw(
+                            0xd, fsctl, fid, &input, &mut output,
+                        ) {
+                            status = st as u64;
+                            information = completed;
+                            if completed != 0 && args[8] != 0 {
+                                let copy_len = (completed as usize).min(output.len());
+                                self.xas_write_buf(args[8], &output[..copy_len]);
+                            }
                         }
                     }
                 }
                 if iosb != 0 {
-                    smss_stack_write32(iosb, status as u32); // Status
-                    smss_stack_write(iosb + 8, 0); // Information = 0
+                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                }
+                if self.pi == 2 && fsctl as u32 == 0x0011_0018
+                    && NT_PIPE_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8
+                {
+                    print_str(b"[nt-pipe-wait] fid=0x");
+                    print_hex(fid as u32);
+                    print_str(b" status=0x");
+                    print_hex(status as u32);
+                    print_str(b" input_len=");
+                    print_u64(args[7]);
+                    print_str(b"\n");
                 }
                 status as u32
             },
@@ -3000,40 +3033,70 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtCreateFile(*FileHandle[R10], DesiredAccess[RDX], *OBJECT_ATTRIBUTES[R8],
             // *IoStatusBlock[R9], AllocationSize[sp+0x28], FileAttributes[sp+0x30],
             // ShareAccess[sp+0x38], CreateDisposition[sp+0x40], CreateOptions[sp+0x48], ...).
-            // lsass (pi 4): rpcrt4's ncacn_np endpoint opens \Device\NamedPipe\lsarpc (client-side
-            // NtCreateFile). Route a pipe path through the real isolated npfs FSD (IRP_MJ_CREATE); a
-            // non-pipe open is modeled as a bare-handle success. pi 0-3 stop as before (unregistered).
+            // Route named-pipe client opens through the isolated npfs FSD for every hosted process.
+            // Other file namespaces remain unsupported rather than receiving a fake handle.
             NativeService::NtCreateFile => unsafe {
-                if self.pi != 4 {
-                    self.stop = true;
-                    return 0xC000_0002; // record the SSN + stop (matches the prior unregistered wall)
-                }
                 let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
                 let name16 = self.read_objattr_name_pe(oa);
-                let lc: alloc::vec::Vec<u8> =
-                    name16.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
-                let is_pipe = lc.windows(5).any(|w| w == b"pipe\\")
-                    || lc.windows(9).any(|w| w == b"namedpipe");
-                let h = self.mint_handle();
                 let iosb = get_recv_mr(8); // R9 = *IO_STATUS_BLOCK
-                let mut status: u64 = 0;
-                let mut info: u64 = 1; // FILE_OPENED
-                if is_pipe && driver_launch::npfs_ready() {
-                    let leaf = Self::pipe_leaf16(&name16);
-                    if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
-                        if st == 0 && fid != 0 {
-                            Self::npfs_track_handle(h, fid);
-                        }
-                        status = st as u64;
+                if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
+                    print_str(b"[nt-create-file-frontier] pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" access=0x"); print_hex(args[1] as u32);
+                    print_str(b" attrs=0x"); print_hex(args[5] as u32);
+                    print_str(b" share=0x"); print_hex(args[6] as u32);
+                    print_str(b" disposition=0x"); print_hex(args[7] as u32);
+                    print_str(b" options=0x"); print_hex(args[8] as u32);
+                    print_str(b" name=\"");
+                    for &unit in name16.iter().take(160) {
+                        debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
                     }
+                    print_str(b"\"\n");
                 }
-                self.queue_write(get_recv_mr(9), h); // *FileHandle (DLL .data global → cross-AS writer)
+                let mut status;
+                let mut info = 0u64;
+                if nt_fs::is_named_pipe_path(&name16) {
+                    if args[7] as u32 != nt_fs::FILE_OPEN {
+                        status = nt_fs::STATUS_INVALID_PARAMETER;
+                    } else if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                    } else if let Some((st, file_id)) = self.npfs_route(
+                        0, 0, &Self::pipe_leaf16(&name16), 0,
+                    ) {
+                        status = st as u32;
+                        if status == nt_fs::STATUS_SUCCESS && file_id != 0 {
+                            if let Some(handle) = self.mint_file_handle(file_id, args[1] as u32) {
+                                self.queue_write(args[0], handle);
+                                info = nt_fs::FILE_OPENED as u64;
+                            } else {
+                                status = 0xC000_009A;
+                            }
+                        } else if status == nt_fs::STATUS_SUCCESS {
+                            status = nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                        }
+                    } else {
+                        status = nt_fs::STATUS_OBJECT_PATH_NOT_FOUND;
+                    }
+                } else {
+                    self.stop = true;
+                    status = 0xC000_0002;
+                }
                 if iosb != 0 {
-                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                 }
-                let _ = &mut info;
-                status as u32
+                if self.pi == 2
+                    && NT_CREATE_FILE_WINLOGON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8
+                {
+                    print_str(b"[nt-create-file-winlogon] status=0x"); print_hex(status);
+                    print_str(b" info="); print_u64(info);
+                    print_str(b" name=\"");
+                    for &unit in name16.iter().take(96) {
+                        debug_put_char(if (0x20..0x7f).contains(&unit) { unit as u8 } else { b'?' });
+                    }
+                    print_str(b"\"\n");
+                }
+                status
             },
             // NtWriteFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
             // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). lsass' rpcrt4 writes to
@@ -3049,7 +3112,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let iosb = smss_stack_read(sp + 0x28);
                 let len = smss_stack_read(sp + 0x38);
                 let fh = args[0]; // R10 = FileHandle
-                let fid = Self::npfs_file_id_for(fh);
+                let fid = self.npfs_file_id_for(fh);
                 let mut status: u64 = 0;
                 if fid != 0 {
                     if let Some((st, _)) = self.npfs_route(3 /* IRP_MJ_WRITE */, 0, &[], fid) {
@@ -3074,7 +3137,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let sp = get_recv_mr(16);
                 let iosb = smss_stack_read(sp + 0x28);
                 let fh = args[0];
-                let fid = Self::npfs_file_id_for(fh);
+                let fid = self.npfs_file_id_for(fh);
                 let mut status: u64 = 0;
                 if fid != 0 {
                     if let Some((st, _)) = self.npfs_route(4 /* IRP_MJ_READ */, 0, &[], fid) {
@@ -3135,31 +3198,38 @@ impl NativeSyscallHandler for ExecNtHandler {
                     let oa_probe = get_recv_mr(7);
                     let nm = self.read_objattr_name_pe(oa_probe);
                     let lc: alloc::vec::Vec<u8> = nm.iter().map(|&w| (w as u8).to_ascii_lowercase()).collect();
-                    let is_pipe = lc.windows(5).any(|w| w == b"pipe\\")
-                        || lc.windows(9).any(|w| w == b"namedpipe");
+                    let is_pipe = nt_fs::is_named_pipe_path(&nm);
                     if is_pipe && driver_launch::npfs_ready() {
                         let leaf = Self::pipe_leaf16(&nm);
-                        let h = self.mint_handle();
                         if let Some((st, fid)) = self.npfs_route(0 /* IRP_MJ_CREATE */, 0, &leaf, 0) {
-                            if st == 0 && fid != 0 {
-                                Self::npfs_track_handle(h, fid);
+                            let mut status = st as u32;
+                            let opened_handle = if status == 0 && fid != 0 {
+                                let handle = self.mint_file_handle(fid, args[1] as u32);
+                                if handle.is_none() { status = 0xC000_009A; }
+                                handle
+                            } else {
+                                if status == 0 { status = nt_fs::STATUS_INVALID_DEVICE_REQUEST; }
+                                None
+                            };
+                            if let Some(handle) = opened_handle {
+                                self.queue_write(get_recv_mr(9), handle);
                             }
-                            self.queue_write(get_recv_mr(9), h); // *FileHandle (R10)
                             let iosb = get_recv_mr(8);
                             if iosb != 0 {
-                                self.xas_write_buf(iosb, &(st as u32).to_le_bytes());
-                                self.xas_write_buf(iosb + 8, &1u64.to_le_bytes()); // FILE_OPENED
+                                self.xas_write_buf(iosb, &status.to_le_bytes());
+                                let info = if status == 0 { 1u64 } else { 0 };
+                                self.xas_write_buf(iosb + 8, &info.to_le_bytes());
                             }
                             loader_trace_record(
                                 self.pi,
                                 LoaderOp::OpenFile,
-                                st as u32,
+                                status,
                                 None,
                                 0,
-                                h,
+                                opened_handle.unwrap_or(0),
                                 &lc,
                             );
-                            return st as u32;
+                            return status;
                         }
                     }
                 }
