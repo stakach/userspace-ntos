@@ -5,6 +5,7 @@
 //! fields, and `impl` blocks auto-attach to the type crate-wide.
 #![allow(clippy::all)]
 use crate::*;
+use nt_io_abi::major;
 
 impl ExecNtHandler {
     pub(crate) fn new() -> Self {
@@ -674,6 +675,29 @@ impl ExecNtHandler {
             .handle_access(pid, handle as nt_process::Handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
         if access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(file_id)
+    }
+
+    /// Resolve a typed pipe handle and enforce read access granted at create/open time.
+    pub(crate) fn npfs_read_file_id_for(&self, handle: u64) -> Result<u64, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let file_id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::File(file_id)) if file_id != 0 => file_id,
+            _ => return Err(STATUS_INVALID_HANDLE),
+        };
+        let access = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
         Ok(file_id)
@@ -3198,7 +3222,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         Ok(file_id) => {
                             let mut output = [];
                             match self.npfs_route_raw(
-                                3 /* IRP_MJ_WRITE */,
+                                major::IRP_MJ_WRITE as u64,
                                 0,
                                 file_id,
                                 &payload,
@@ -3275,29 +3299,84 @@ impl NativeSyscallHandler for ExecNtHandler {
                 status
             },
             // NtReadFile(FileHandle[R10], Event[RDX], ApcRoutine[R8], ApcContext[R9],
-            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). rpcrt4's listener reads
-            // from \pipe\lsarpc; with no connected client the read would block (STATUS_PENDING). Route
-            // to npfs (IRP_MJ_READ); report its status. pi 0-3 stop.
+            // *IoStatusBlock[sp+0x28], Buffer[sp+0x30], Length[sp+0x38], ...). Route a typed pipe
+            // through npfs with output capacity (not input bytes), then copy synchronous data back.
             NativeService::NtReadFile => unsafe {
-                if self.pi != 4 {
-                    self.stop = true;
-                    return 0xC000_0002;
-                }
                 let sp = get_recv_mr(16);
                 let iosb = smss_stack_read(sp + 0x28);
+                let buffer = smss_stack_read(sp + 0x30);
+                let len = smss_stack_read(sp + 0x38) as u32 as usize;
                 let fh = args[0];
-                let fid = self.npfs_file_id_for(fh);
-                let mut status: u64 = 0;
-                if fid != 0 {
-                    if let Some((st, _)) = self.npfs_route(4 /* IRP_MJ_READ */, 0, &[], fid) {
-                        status = st as u64;
+                let event = args[1];
+                let apc_routine = args[2];
+                let completion_event = self.validate_io_event(event);
+                let mut iosb_probe = [0u8; 16];
+                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
+                let mut output = alloc::vec![0u8; len.min(transport_capacity)];
+                let mut information = 0u64;
+                let mut routed = false;
+                let status = if !iosb_ok {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if len > transport_capacity {
+                    0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
+                } else if len != 0 && buffer == 0 {
+                    0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if apc_routine != 0 {
+                    0xC000_00BB // STATUS_NOT_SUPPORTED
+                } else if let Err(event_status) = completion_event {
+                    event_status
+                } else {
+                    match self.npfs_read_file_id_for(fh) {
+                        Err(handle_status) => handle_status,
+                        Ok(file_id) => {
+                            match self.npfs_route_raw(
+                                major::IRP_MJ_READ as u64,
+                                0,
+                                file_id,
+                                &[],
+                                &mut output,
+                            ) {
+                                Some((driver_status, completed, _)) => {
+                                    routed = true;
+                                    information = completed;
+                                    let copy_len = (completed as usize).min(output.len());
+                                    if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
+                                        self.xas_write_buf(buffer, &output[..copy_len]);
+                                    }
+                                    driver_status as u32
+                                }
+                                None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                            }
+                        }
+                    }
+                };
+                if iosb_ok {
+                    self.xas_write_buf(iosb, &status.to_le_bytes());
+                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                }
+                if routed && status != 0x0000_0103 {
+                    if let Ok(Some(index)) = completion_event {
+                        if let Some(entry) = self.obj_ns.get_mut(index) {
+                            entry.signalled = 1;
+                            self.io_signal_event = index as i64;
+                        }
                     }
                 }
-                if iosb != 0 {
-                    self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &0u64.to_le_bytes());
+                if NT_READ_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[nt-read-file] pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" handle=0x");
+                    print_hex(fh as u32);
+                    print_str(b" length=");
+                    print_u64(len as u64);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b" info=");
+                    print_u64(information);
+                    print_str(b"\n");
                 }
-                status as u32
+                status
             },
             // NtSetInformationFile(FileHandle[R10], *IoStatusBlock[RDX], FileInformation[R8],
             // Length[R9], FileInformationClass[sp+0x28]). lsass and winlogon set
@@ -3349,7 +3428,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 } else {
                     let mut output = [];
                     match self.npfs_route_raw(
-                        6 /* IRP_MJ_SET_INFORMATION */,
+                        major::IRP_MJ_SET_INFORMATION as u64,
                         information_class as u64,
                         file_id,
                         &payload[..8],

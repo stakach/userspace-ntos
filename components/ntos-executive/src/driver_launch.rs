@@ -21,6 +21,7 @@
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 
 use nt_compat_exports::DriverExportRegistry;
+use nt_io_abi::major;
 
 // Pure, driver-agnostic ntoskrnl byte primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{s_memcpy, s_memset, s_rtl_compare_memory};
@@ -115,6 +116,31 @@ pub const V_REGFS: u32 = 0x20; // IoRegisterFileSystem was called
 pub const FSD_DISPATCH_LABEL: u64 = 0x771;
 
 const POOL_DATA_OFF: u64 = 0x1000;
+const STATUS_PENDING: u32 = 0x0000_0103;
+
+const IRP_MJ_READ: u64 = major::IRP_MJ_READ as u64;
+const IRP_MJ_WRITE: u64 = major::IRP_MJ_WRITE as u64;
+const IRP_MJ_SET_INFORMATION: u64 = major::IRP_MJ_SET_INFORMATION as u64;
+
+#[derive(Clone, Copy)]
+struct PendingIrp {
+    irp: u64,
+    iosl: u64,
+    file_object: u64,
+    data: u64,
+    major: u8,
+}
+
+const PENDING_IRP_CAP: usize = 32;
+static mut PENDING_IRPS: [PendingIrp; PENDING_IRP_CAP] = [PendingIrp {
+    irp: 0,
+    iosl: 0,
+    file_object: 0,
+    data: 0,
+    major: 0,
+}; PENDING_IRP_CAP];
+static mut DATA_TRACE_COUNT: u32 = 0;
+static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
 
@@ -296,9 +322,34 @@ extern "win64" fn s_io_register_file_system(_dev: u64) {
     }
 }
 
-/// `void IoCompleteRequest(PIRP, CCHAR)`. The dispatch shim reads the IRP's IoStatus directly after
-/// the handler returns, so completion is a no-op marker here.
-extern "win64" fn s_io_complete_request(_irp: u64, _boost: u64) {}
+/// `void IoCompleteRequest(PIRP, CCHAR)`. Synchronous requests are reclaimed by `run_irp` after the
+/// dispatch routine returns. A later peer operation can complete an older pending pipe IRP from
+/// npfs's deferred list; reclaim that retained request graph here instead of leaking it forever.
+extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
+        let Some(slot) = table.iter_mut().find(|entry| entry.irp == irp) else {
+            return;
+        };
+        let status = read_unaligned((irp + 0x30) as *const u32);
+        let information = read_unaligned((irp + 0x38) as *const u64);
+        if PEER_COMPLETION_TRACE_COUNT < 8 {
+            PEER_COMPLETION_TRACE_COUNT += 1;
+            print_str(b"[fsd-peer-complete] major=");
+            print_u64(slot.major as u64);
+            print_str(b" status=0x");
+            print_hex(status);
+            print_str(b" info=");
+            print_u64(information);
+            print_str(b"\n");
+        }
+        pool_free(slot.data);
+        pool_free(slot.iosl);
+        pool_free(slot.irp);
+        pool_free(slot.file_object);
+        *slot = PendingIrp { irp: 0, iosl: 0, file_object: 0, data: 0, major: 0 };
+    }
+}
 
 // --- REAL VCB internals: the Unicode prefix table (name -> FCB), generic table, ERESOURCE ---------
 //
@@ -799,12 +850,30 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     write_unaligned((fo + 0x5a) as *mut u16, (inlen + 2) as u16); // MaximumLength
     write_unaligned((fo + 0x60) as *mut u64, FSD_ARG_VADDR); // Buffer = the pipe name (UTF-16)
 
+    // Give every request its own buffered-I/O storage. The ARG frame is transport scratch and is
+    // overwritten by the next dispatch, so it cannot back an IRP retained in an npfs data queue.
+    let data_len = inlen.max(outlen).max(1);
+    let data_capacity = (data_len + 7) & !7;
+    let data = pool_alloc(data_capacity);
+    if data == 0 {
+        pool_free(fo);
+        return (0xC000_009Au32 as i32, 0); // STATUS_INSUFFICIENT_RESOURCES
+    }
+    zero(data, data_capacity);
+    let mut data_index = 0u64;
+    while data_index < inlen {
+        let byte = read_volatile((FSD_ARG_VADDR + data_index) as *const u8);
+        write_volatile((data + data_index) as *mut u8, byte);
+        data_index += 1;
+    }
+
     // IRP (0x120 bytes).
     let irp = pool_alloc(0x120);
     zero(irp, 0x120);
-    // AssociatedIrp.SystemBuffer@0x18 = the ARG frame (buffered I/O in/out).
-    write_unaligned((irp + 0x18) as *mut u64, FSD_ARG_VADDR);
-    write_unaligned((irp + 0x70) as *mut u64, FSD_ARG_VADDR); // UserBuffer
+    // Both buffered-I/O views refer to request-owned storage. Writes/sets arrive through `inlen`;
+    // reads reserve `outlen` and are copied back to the ARG transport only after completion.
+    write_unaligned((irp + 0x18) as *mut u64, data);
+    write_unaligned((irp + 0x70) as *mut u64, data); // UserBuffer
     // CurrentLocation@0x42 = 1, StackCount@0x43 = 1 (IoGetCurrentIrpStackLocation asserts this).
     write_unaligned((irp + 0x42) as *mut u8, 1);
     write_unaligned((irp + 0x43) as *mut u8, 1);
@@ -857,11 +926,13 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 write_unaligned((iosl + 0x20) as *mut u64, params); // Parameters
             }
         }
-        3 | 4 => {
-            // Buffered write bytes arrive as input; buffered reads reserve output capacity.
-            write_unaligned((iosl + 0x08) as *mut u32, if major == 3 { inlen } else { outlen } as u32);
+        IRP_MJ_READ => {
+            write_unaligned((iosl + 0x08) as *mut u32, outlen as u32);
         }
-        6 => {
+        IRP_MJ_WRITE => {
+            write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
+        }
+        IRP_MJ_SET_INFORMATION => {
             write_unaligned((iosl + 0x08) as *mut u32, inlen as u32);
             write_unaligned((iosl + 0x10) as *mut u32, fsctl as u32);
         }
@@ -883,11 +954,42 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
     let fsctx = read_unaligned((fo + 0x18) as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
-    // A pending npfs data-queue entry retains the IRP and may consult its stack/file object when a
-    // peer read completes it. Keep the whole request graph alive; recycling it here makes the next
-    // dispatch overwrite a live queued IRP. Completion-driven reclamation is the next async-I/O
-    // increment; synchronous requests still return every transient allocation immediately.
-    if st as u32 != 0x0000_0103 {
+    if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 8 {
+        DATA_TRACE_COUNT += 1;
+        print_str(b"[fsd-data-result] major=");
+        print_u64(major);
+        print_str(b" length=");
+        print_u64(if major == IRP_MJ_READ { outlen } else { inlen });
+        print_str(b" status=0x");
+        print_hex(st as u32);
+        print_str(b" info=");
+        print_u64(info);
+        print_str(b"\n");
+    }
+    if st as u32 == STATUS_PENDING {
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
+        if let Some(slot) = table.iter_mut().find(|entry| entry.irp == 0) {
+            *slot = PendingIrp {
+                irp,
+                iosl,
+                file_object: fo,
+                data,
+                major: major as u8,
+            };
+        } else {
+            print_str(b"[fsd-host] pending IRP table exhausted\n");
+        }
+    } else {
+        if major == IRP_MJ_READ {
+            let copy_len = info.min(outlen);
+            let mut index = 0u64;
+            while index < copy_len {
+                let byte = read_volatile((data + index) as *const u8);
+                write_volatile((FSD_ARG_VADDR + index) as *mut u8, byte);
+                index += 1;
+            }
+        }
+        pool_free(data);
         pool_free(iosl);
         pool_free(irp);
         pool_free(fo);

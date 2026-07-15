@@ -2308,6 +2308,7 @@ static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_FRONTIER_TRACED: AtomicBool = AtomicBool::new(false);
 static NT_SET_INFORMATION_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_WRITE_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static NT_READ_FILE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_PIPE_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake handle source for modeled sync objects (mutants, etc.) — non-zero, distinct.
