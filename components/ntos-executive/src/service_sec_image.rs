@@ -773,6 +773,26 @@ pub(crate) unsafe fn service_sec_image(
                 // Refresh the handler's per-call executive context, then clear the stop side-signal
                 // + out-write queue so a migrated handler can raise them (group A/B signals).
                 nt_handler.pi = pi;
+                nt_handler.current_badge = badge;
+                nt_handler.current_tid = if is_svc_listener {
+                    SVC_LISTENER_TID.load(Ordering::Relaxed)
+                } else if is_lsass_listener {
+                    LSASS_LISTENER_TID.load(Ordering::Relaxed)
+                } else if is_lsass_listener2 {
+                    LSASS_LISTENER2_TID.load(Ordering::Relaxed)
+                } else if is_lsass_listener3 {
+                    LSASS_LISTENER3_TID.load(Ordering::Relaxed)
+                } else if is_wl_worker {
+                    match badge {
+                        WINLOGON_WORKER2_BADGE => WL_WORKER2_TID.load(Ordering::Relaxed),
+                        WINLOGON_WORKER3_BADGE => WL_WORKER3_TID.load(Ordering::Relaxed),
+                        _ => PM_LISTENER_TID.load(Ordering::Relaxed),
+                    }
+                } else {
+                    PM_TIDS[pi].load(Ordering::Relaxed)
+                };
+                nt_handler.terminate_thread_tid = 0;
+                nt_handler.terminate_thread_current = false;
                 nt_handler.stop = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
@@ -850,6 +870,56 @@ pub(crate) unsafe fn service_sec_image(
                     result = res.status as u64;
                     if nt_handler.stop {
                         handled = false; // handler couldn't service → stop with the SSN recorded
+                    }
+                }
+                // NtTerminateThread policy has marked the real ETHREAD terminated. Tear down only
+                // the matching runtime-thread mechanism; main-thread TCB caps are not retained by
+                // this hosting path, so a self-terminating main thread is left blocked by withholding
+                // its reply. The terminated ETHREAD/TID remains queryable while handles exist, and
+                // PM_POOL_USED deliberately stays claimed, preventing slot/TID aliasing.
+                if nt_handler.terminate_thread_tid != 0 {
+                    let tid = nt_handler.terminate_thread_tid;
+                    let tcb_cell = if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
+                        Some(&WL_LISTENER_TCB)
+                    } else if tid == WL_WORKER2_TID.load(Ordering::Relaxed) {
+                        Some(&WL_WORKER2_TCB)
+                    } else if tid == WL_WORKER3_TID.load(Ordering::Relaxed) {
+                        Some(&WL_WORKER3_TCB)
+                    } else if tid == SVC_LISTENER_TID.load(Ordering::Relaxed) {
+                        Some(&SVC_LISTENER_TCB)
+                    } else if tid == LSASS_LISTENER_TID.load(Ordering::Relaxed) {
+                        Some(&LSASS_LISTENER_TCB)
+                    } else if tid == LSASS_LISTENER2_TID.load(Ordering::Relaxed) {
+                        Some(&LSASS_LISTENER2_TCB)
+                    } else if tid == LSASS_LISTENER3_TID.load(Ordering::Relaxed) {
+                        Some(&LSASS_LISTENER3_TCB)
+                    } else {
+                        (0..MAX_PI)
+                            .find(|&index| tid == PM_TIDS[index].load(Ordering::Relaxed))
+                            .map(|index| &PM_MAIN_TCBS[index])
+                    };
+                    if let Some(cell) = tcb_cell {
+                        let tcb = cell.load(Ordering::Relaxed);
+                        if tcb > 1 {
+                            let suspend = tcb_suspend_r(tcb);
+                            let delete = if suspend == 0 { cnode_delete_r(tcb) } else { u64::MAX };
+                            print_str(b"[thread-term] mechanism tid=");
+                            print_u64(tid);
+                            print_str(b" tcb=0x");
+                            print_hex(tcb as u32);
+                            print_str(b" suspend=");
+                            print_u64(suspend);
+                            print_str(b" delete=");
+                            print_u64(delete);
+                            print_str(b"\n");
+                            if suspend == 0 && delete == 0 {
+                                cell.store(0, Ordering::Relaxed);
+                                PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if nt_handler.terminate_thread_current {
+                        park_caller = true;
                     }
                 }
                 // CM write plane: a handler that mutated the registry overlay (NtCreateKey/
@@ -1352,33 +1422,6 @@ pub(crate) unsafe fn service_sec_image(
                 // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
                 // our diagnostic path.)
                 result = 0; // STATUS_SUCCESS
-            } else if m0 == 267 && (badge == CSRSS_BADGE || badge == SERVICES_BADGE) {
-                // NtTerminateThread(ThreadHandle=R10, ExitStatus=RDX). csrss.exe _main's last act is
-                // NtTerminateThread(NtCurrentThread()) — its init thread exits and CSRSRV's worker
-                // threads (fake here) keep the process alive (csrss.c:93). Park csrss's thread (don't
-                // reply → it stays blocked) so csrss goes quiet and smss drives the rest of init.
-                //
-                // ITEM 2a — LIVE terminate-dispatch: route this real thread-exit through the real
-                // ETHREAD teardown. Resolve the caller's thread by identity — NtCurrentThread()==-2
-                // → THIS process's (pi=1=csrss) main ETHREAD (PM_TIDS[pi]) — and mark it Terminated
-                // via `pm.exit_thread` (marks the ETHREAD signalled + exit status, NO process cascade:
-                // csrss's EPROCESS stays Running, its other threads keep it alive). BEHAVIOR-PRESERVING:
-                // the seL4 outcome is IDENTICAL to the pre-2a park-only fallback (park_caller=true →
-                // the thread stays blocked, never runs again; the process + other processes + the boot
-                // are untouched). `exit_thread` is alloc-free (in-place field writes on a below-mark
-                // ETHREAD node) → safe under the per-syscall heap reset. Args-defensive: the ExitStatus
-                // (RDX=m3) is read directly (no arg-slice → no OOB; the pre-path-2 regression was an
-                // args[1] OOB in a table-registered arm — this stays in the broker arm on purpose so it
-                // never shadows the park behavior).
-                let status = m3 as u32;
-                if let Some(tid) = PM_TIDS.get(pi).map(|t| t.load(Ordering::Relaxed)) {
-                    if tid != 0 && nt_handler.pm.exit_thread(tid as nt_process::ThreadId, status).is_ok() {
-                        PM_TERMINATE_THREAD_LIVE.fetch_add(1, Ordering::Relaxed);
-                        PM_TERMINATE_THREAD_STATE.fetch_or(1 << pi, Ordering::Relaxed);
-                    }
-                }
-                park_caller = true;
-                result = 0;
             } else if m0 == 228 {
                 // NtSetEvent(EventHandle=R10, *PreviousState=RDX).
                 // ★ Checkpoint B: if the handle names a REAL executive named event (obj_ns kind==2),

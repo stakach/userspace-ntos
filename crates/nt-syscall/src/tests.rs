@@ -428,6 +428,17 @@ fn migrated_services_dispatch_and_validate() {
 }
 
 #[test]
+fn terminate_thread_uses_two_argument_native_abi() {
+    assert_eq!(NativeService::NtTerminateThread.arg_count(), (2, 2));
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtTerminateThread, 267)],
+    );
+    let entry = table.lookup(267).unwrap();
+    assert_eq!((entry.min_args, entry.max_args), (2, 2));
+}
+
+#[test]
 fn user_probe_copyin_ranges() {
     let mut p = UserProbe::new();
     p.add_range(0x1_0000, 0x1000, false); // read-only

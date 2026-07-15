@@ -600,6 +600,9 @@ pub(crate) unsafe fn spawn_sec_image(
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
     attach_sched_context(tcb);
+    if (pi as usize) < MAX_PI {
+        PM_MAIN_TCBS[pi as usize].store(tcb, Ordering::Relaxed);
+    }
     let _ = tcb_resume(tcb);
     pml4
 }

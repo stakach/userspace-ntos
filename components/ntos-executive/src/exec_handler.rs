@@ -60,6 +60,10 @@ impl ExecNtHandler {
             .unwrap(),
             io_completion_ports: nt_io_completion::CompletionPortTable::new(),
             pi: 0,
+            current_tid: 0,
+            current_badge: 0,
+            terminate_thread_tid: 0,
+            terminate_thread_current: false,
             stop: false,
             next_handle: FAKE_HANDLE,
             out_writes: [(0, 0); 8],
@@ -173,6 +177,10 @@ impl ExecNtHandler {
                 for (i, &pid) in pids.iter().enumerate() {
                     for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                         if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                            let _ = pm.set_thread_state(
+                                tid,
+                                nt_process::ThreadState::Initialized,
+                            );
                             PM_POOL_TID[i][slot].store(tid as u64, Ordering::Relaxed);
                         }
                     }
@@ -307,6 +315,7 @@ impl ExecNtHandler {
         &mut self,
         entry: u64,
         param: u64,
+        desired_access: u32,
     ) -> Option<(usize, u64, u64)> {
         let pid = self.pm_pid_for_pi(self.pi)?;
         let pool = PM_POOL_TID.get(self.pi)?;
@@ -332,9 +341,15 @@ impl ExecNtHandler {
         let t = tid as nt_process::ThreadId;
         self.pm.set_thread_start_address(t, entry);
         let _ = self.pm.set_thread_state(t, nt_process::ThreadState::Running);
-        let h = match self.pm.insert_handle(pid, nt_process::HandleObject::Thread(t), 0) {
+        let h = match self
+            .pm
+            .insert_handle(pid, nt_process::HandleObject::Thread(t), desired_access)
+        {
             Ok(handle) => handle,
             Err(_) => {
+                let _ = self
+                    .pm
+                    .set_thread_state(t, nt_process::ThreadState::Initialized);
                 used.fetch_and(!(1 << slot), Ordering::Relaxed);
                 return None;
             }
@@ -2157,7 +2172,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let handle = match self.pm.insert_handle(
                             caller_pid,
                             nt_process::HandleObject::Thread(tid),
-                            0,
+                            args[1] as u32,
                         ) {
                             Ok(handle) => handle as u64,
                             Err(status) => return status,
@@ -2197,7 +2212,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let entry = smss_stack_read(ctx_va + 0xF8); // CONTEXT.Rip = StartRoutine
                         let param = smss_stack_read(ctx_va + 0x80); // CONTEXT.Rcx = Parameter
                         if let Some((slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param)
+                            self.nt_create_thread_handle(entry, param, args[1] as u32)
                         {
                             let teb = match slot {
                                 0 => WL_LISTENER_TEB_VA,
@@ -2270,7 +2285,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param)
+                            self.nt_create_thread_handle(entry, param, args[1] as u32)
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
@@ -2303,7 +2318,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param)
+                            self.nt_create_thread_handle(entry, param, args[1] as u32)
                         {
                             self.pm
                                 .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
@@ -2336,7 +2351,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param)
+                            self.nt_create_thread_handle(entry, param, args[1] as u32)
                         {
                             self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                             let pid = self.pm_pid_for_pi(4).unwrap_or(0);
@@ -2364,7 +2379,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
                         if let Some((_slot, tid, handle)) =
-                            self.nt_create_thread_handle(entry, param)
+                            self.nt_create_thread_handle(entry, param, args[1] as u32)
                         {
                             self.pm.set_thread_teb(
                                 tid as nt_process::ThreadId,
@@ -4572,20 +4587,54 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
             }
-            // NtTerminateThread(ThreadHandle, ExitStatus[RDX]) for NtCurrentThread()==-2 → the
-            // caller's main thread. Uses `exit_thread` (NO process cascade — a hosted process's other
-            // threads keep it alive), matching the live broker-arm routing (item 2a). This arm is NOT
-            // table-registered (267 stays in the broker arm to preserve park_caller); it exists so the
-            // policy is exercisable and args-defensive should a future flow register it.
             NativeService::NtTerminateThread => {
+                const THREAD_TERMINATE: u32 = 0x0001;
                 let handle = args.first().copied().unwrap_or(0);
                 let status = args.get(1).copied().unwrap_or(0) as u32;
-                if handle == 0xFFFF_FFFF_FFFF_FFFE {
-                    if let Some(tid) = PM_TIDS.get(self.pi).map(|t| t.load(Ordering::Relaxed)) {
-                        if tid != 0 {
-                            let _ = self.pm.exit_thread(tid as nt_process::ThreadId, status);
-                        }
-                    }
+                let caller_pid = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return nt_process::STATUS_INVALID_HANDLE,
+                };
+                let current_tid = self.current_tid as nt_process::ThreadId;
+                let target = match self.pm.resolve_thread_handle(
+                    caller_pid,
+                    current_tid,
+                    handle,
+                    THREAD_TERMINATE,
+                ) {
+                    Ok(tid) => tid,
+                    Err(status) => return status,
+                };
+                let prior_state = self.pm.thread(target).map(|thread| thread.state);
+                let is_current = target == current_tid;
+                let outcome = if self.pi == 1 && self.pm.main_thread(caller_pid) == Some(target) {
+                    self.pm.exit_thread(target, status)
+                } else {
+                    self.pm.terminate_thread(target, status)
+                };
+                if let Err(status) = outcome {
+                    return status;
+                }
+                self.terminate_thread_tid = target as u64;
+                self.terminate_thread_current = is_current;
+                PM_TERMINATE_THREAD_LIVE.fetch_add(1, Ordering::Relaxed);
+                PM_TERMINATE_THREAD_STATE.fetch_or(1 << self.pi, Ordering::Relaxed);
+                if PM_TERMINATE_THREAD_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[thread-term] badge=");
+                    print_u64(self.current_badge);
+                    print_str(b" pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" caller_tid=");
+                    print_u64(current_tid as u64);
+                    print_str(b" handle=0x");
+                    print_hex(handle as u32);
+                    print_str(b" exit=0x");
+                    print_hex(status);
+                    print_str(b" target_tid=");
+                    print_u64(target as u64);
+                    print_str(if is_current { b" self=1 prior=" } else { b" self=0 prior=" });
+                    print_u64(prior_state.map(|state| state as u64).unwrap_or(u64::MAX));
+                    print_str(b"\n");
                 }
                 0
             }

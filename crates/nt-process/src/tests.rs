@@ -49,6 +49,18 @@ fn system_thread_does_not_exit_process() {
 }
 
 #[test]
+fn dormant_pool_thread_does_not_keep_process_alive() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let pool = pm.create_thread(pid, 0, 0, false).unwrap();
+    pm.set_thread_state(pool, ThreadState::Initialized).unwrap();
+    pm.terminate_thread(main, 7).unwrap();
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Terminated);
+    assert_eq!(pm.thread(pool).unwrap().state, ThreadState::Terminated);
+}
+
+#[test]
 fn exit_thread_marks_thread_without_terminating_process() {
     // The hosted csrss.exe case: its init thread exits via NtTerminateThread while CSRSRV's API
     // worker threads keep the process running. `exit_thread` must mark JUST that ETHREAD terminated
@@ -209,6 +221,62 @@ fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
     let current = pm.query_thread_basic(pid, u64::MAX - 1).unwrap();
     assert_eq!(current.client_id.unique_thread, main);
     assert_eq!(pm.query_thread_basic(pid, 0), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
+fn terminate_thread_handle_resolution_checks_identity_type_and_access() {
+    const THREAD_TERMINATE: u32 = 0x0001;
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let other = pm.create_process("other.exe", None, None);
+    let current = pm.create_thread(caller, 0x1000, 0, false).unwrap();
+    let remote = pm.create_thread(other, 0x2000, 0, false).unwrap();
+
+    assert_eq!(
+        pm.resolve_thread_handle(caller, current, u64::MAX - 1, THREAD_TERMINATE),
+        Ok(current)
+    );
+    let denied = pm
+        .insert_handle(caller, HandleObject::Thread(remote), 0)
+        .unwrap();
+    assert_eq!(
+        pm.resolve_thread_handle(caller, current, denied as u64, THREAD_TERMINATE),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    let allowed = pm
+        .insert_handle(caller, HandleObject::Thread(remote), THREAD_TERMINATE)
+        .unwrap();
+    assert_eq!(
+        pm.resolve_thread_handle(caller, current, allowed as u64, THREAD_TERMINATE),
+        Ok(remote)
+    );
+    assert_eq!(
+        pm.resolve_thread_handle(caller, current, 0, THREAD_TERMINATE),
+        Err(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.resolve_thread_handle(caller, current, u64::MAX, THREAD_TERMINATE),
+        Err(STATUS_INVALID_HANDLE)
+    );
+}
+
+#[test]
+fn terminated_thread_is_reclaimable_only_after_handles_close() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("host.exe", None, None);
+    let main = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let worker = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Thread(worker), 0x1F_FFFF)
+        .unwrap();
+    pm.terminate_thread(worker, 0x1234).unwrap();
+    assert_eq!(pm.thread(worker).unwrap().exit_status, Some(0x1234));
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    assert!(!pm.can_reclaim_thread(worker));
+    pm.close_handle(pid, handle).unwrap();
+    assert!(pm.can_reclaim_thread(worker));
+    assert!(!pm.can_reclaim_thread(main));
+    assert!(!pm.can_reclaim_thread(0xDEAD));
 }
 
 #[test]

@@ -2578,6 +2578,10 @@ struct ExecNtHandler {
     /// sets when it can't service the call, so the loop stops the process (the ladder's
     /// `handled = false; break`).
     pi: usize,
+    current_tid: u64,
+    current_badge: u64,
+    terminate_thread_tid: u64,
+    terminate_thread_current: bool,
     stop: bool,
     /// Monotonic fake-handle allocator for objects the executive doesn't model yet (ports, threads,
     /// events, sections, tokens, files). Persistent across smss + csrss (single source of truth —
@@ -2885,12 +2889,7 @@ fn build_nt_table() -> NativeServiceTable {
             // EPROCESS/ETHREAD nodes in place + a transient consumed-and-dropped Vec → safe under the
             // per-syscall heap reset even if a future flow does hit it.
             (NativeService::NtTerminateProcess, SSN_NT_TERMINATE_PROCESS as u32),
-            // NtTerminateThread is deliberately NOT registered here — it IS issued live (csrss.exe's
-            // init thread self-exits). It stays in the broker arm (`m0 == 267 && badge == CSRSS_BADGE`)
-            // so it keeps setting park_caller (the load-bearing "leave the thread blocked" behavior);
-            // that arm routes the exit through the real ETHREAD teardown (pm.exit_thread, no cascade).
-            // Registering it in the table would shadow the broker arm → drop park_caller (behavior
-            // change) — the exact pre-path-2 regression.
+            (NativeService::NtTerminateThread, SSN_NT_TERMINATE_THREAD as u32),
         ],
     )
 }
@@ -3227,6 +3226,9 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
 static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
+/// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
+static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
 /// creation remains allocation-free. Three slots cover the live lsass worker fan-out.
 const PM_RUNTIME_THREAD_SLOTS: usize = 3;
@@ -3258,9 +3260,10 @@ static PM_TERMINATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// process cascade — csrss keeps running) and parks the seL4 thread, unchanged. >=1 proves the live
 /// thread-exit was routed to the real teardown (not the pre-2a benign park-only fallback).
 static PM_TERMINATE_THREAD_LIVE: AtomicU64 = AtomicU64::new(0);
-/// Bit i set iff pi=i's main ETHREAD is Terminated (signalled) via a live NtTerminateThread. Bit 1
-/// (csrss) is set during a normal boot; bits 0/2 stay clear (smss/winlogon don't self-exit at boot).
+/// Bit i set iff pi=i's ETHREAD is Terminated (signalled) via a live NtTerminateThread.
 static PM_TERMINATE_THREAD_STATE: AtomicU64 = AtomicU64::new(0);
+static PM_TERMINATE_THREAD_TRACE: AtomicU64 = AtomicU64::new(0);
+static PM_TERMINATE_THREAD_TCB_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -6480,15 +6483,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // the live exit fired (>=1) AND csrss's (pi=1) main ETHREAD is marked Terminated,
                     // while smss/winlogon (bits 0/2) are NOT (they don't self-exit at boot) → the exit
                     // was routed to the CORRECT thread by identity, not the whole process.
-                    // csrss (bit 1) AND now services (bit 3, its SCM init thread exits after
-                    // ScmStartRpcServer so the RPC listener runs alone) self-exit; smss/winlogon
-                    // (bits 0/2) never do → the exit is routed to the CORRECT thread by identity.
+                    // csrss (bit 1) and lsass (bit 4) self-exit; smss/winlogon (bits 0/2) do not.
                     let term_state = PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed);
                     check(
                         b"exec_live_terminate_thread_routed",
-                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 1
+                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 2
                             && (term_state & 0b010) != 0
+                            && (term_state & 0b1_0000) != 0
                             && (term_state & 0b101) == 0,
+                        &mut passed,
+                    );
+                    check(
+                        b"exec_live_terminate_thread_tcb_reclaimed",
+                        PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) >= 2,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] item2a live-terminate-thread: count=0x");
@@ -6497,6 +6504,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) as u32);
                     print_str(b" nt-terminate-process-calls=0x");
                     print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
+                    print_str(b" tcb-reclaimed=0x");
+                    print_hex(PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-

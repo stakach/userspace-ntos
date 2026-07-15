@@ -257,9 +257,9 @@ impl NativeService {
     pub fn arg_count(self) -> (u8, u8) {
         use NativeService::*;
         match self {
-            NtClose | NtTerminateThread | NtQuerySystemTime | NtDisplayString
-            | NtDeleteAtom => (1, 1),
-            NtTerminateProcess | NtUnmapViewOfSection | NtQueryDebugFilterState => (2, 2),
+            NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom => (1, 1),
+            NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection
+            | NtQueryDebugFilterState => (2, 2),
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion => (3, 3),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtCreateIoCompletion => (4, 4),

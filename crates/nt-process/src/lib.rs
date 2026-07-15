@@ -24,6 +24,7 @@ pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
@@ -512,6 +513,55 @@ impl ProcessManager {
         })
     }
 
+    /// Resolve a caller-local thread handle for an operation requiring `required_access`.
+    /// `NtCurrentThread` resolves to the supplied scheduling identity rather than assuming the
+    /// process main thread, which is essential once multiple user threads share one process.
+    pub fn resolve_thread_handle(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<ThreadId, u32> {
+        let tid = if handle == u64::MAX - 1 {
+            let current = self.thread(current_tid).ok_or(STATUS_INVALID_HANDLE)?;
+            if current.process_id != caller_pid {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            current_tid
+        } else {
+            let handle = handle as Handle;
+            let tid = match self.lookup_handle(caller_pid, handle) {
+                Some(HandleObject::Thread(tid)) => tid,
+                _ => return Err(STATUS_INVALID_HANDLE),
+            };
+            let granted = self
+                .handle_access(caller_pid, handle)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            if granted & required_access != required_access {
+                return Err(STATUS_ACCESS_DENIED);
+            }
+            tid
+        };
+        self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(tid)
+    }
+
+    /// A terminated ETHREAD may only be recycled after every process handle referring to it has
+    /// closed. Hosts can use this predicate to avoid TID/slot aliasing while reclaiming mechanism
+    /// resources independently of the policy object.
+    pub fn can_reclaim_thread(&self, tid: ThreadId) -> bool {
+        self.thread(tid)
+            .is_some_and(|thread| thread.state == ThreadState::Terminated)
+            && !self.processes.values().any(|process| {
+                process.handles.iter().any(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
+                })
+            })
+    }
+
     /// Bind a thread's start address (spec §10) — a host that pre-creates the main thread as an
     /// identity (before its image entry point is known) sets it once the entry is resolved at the
     /// real spawn. Returns `false` for an unknown thread. Alloc-free (a field write) so it is safe
@@ -576,7 +626,9 @@ impl ProcessManager {
                 .threads
                 .values()
                 .filter(|t| {
-                    t.process_id == pid && !t.is_system_thread && t.state != ThreadState::Terminated
+                    t.process_id == pid
+                        && !t.is_system_thread
+                        && !matches!(t.state, ThreadState::Initialized | ThreadState::Terminated)
                 })
                 .count();
             if remaining == 0 {
