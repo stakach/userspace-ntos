@@ -304,10 +304,14 @@ pub(crate) unsafe fn service_sec_image(
         let is_svc_listener = badge == SVC_LISTENER_BADGE;
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
+        let is_lsass_listener3 = badge == LSASS_LISTENER3_BADGE;
         // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
         // multiplex. It runs the wait array (NtWaitForMultipleObjects → parks) that the main thread's
         // signal_state_changed wakes, completing the rpcrt4 server-thread handshake.
-        let is_wl_worker = badge == WINLOGON_WORKER_BADGE;
+        let is_wl_worker = matches!(
+            badge,
+            WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE
+        );
         if is_wl_worker {
             let n = WL_WORKER_FAULTS.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
@@ -332,11 +336,23 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 3 listener)\n");
             }
         }
-        if is_lsass_listener || is_lsass_listener2 {
-            let ctr = if is_lsass_listener2 { &LSASS_LISTENER2_FAULTS } else { &LSASS_LISTENER_FAULTS };
+        if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 {
+            let ctr = if is_lsass_listener3 {
+                &LSASS_LISTENER3_FAULTS
+            } else if is_lsass_listener2 {
+                &LSASS_LISTENER2_FAULTS
+            } else {
+                &LSASS_LISTENER_FAULTS
+            };
             let n = ctr.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
-                print_str(if is_lsass_listener2 { b"[lsass-listener2] multiplex event #" } else { b"[lsass-listener] multiplex event #" });
+                print_str(if is_lsass_listener3 {
+                    b"[lsass-listener3] multiplex event #"
+                } else if is_lsass_listener2 {
+                    b"[lsass-listener2] multiplex event #"
+                } else {
+                    b"[lsass-listener] multiplex event #"
+                });
                 print_u64(n);
                 print_str(b" label=0x");
                 print_hex((mi >> 12) as u32);
@@ -351,7 +367,11 @@ pub(crate) unsafe fn service_sec_image(
             2
         } else if badge == SERVICES_BADGE || is_svc_listener {
             3
-        } else if badge == LSASS_BADGE || is_lsass_listener || is_lsass_listener2 {
+        } else if badge == LSASS_BADGE
+            || is_lsass_listener
+            || is_lsass_listener2
+            || is_lsass_listener3
+        {
             4
         } else {
             0
@@ -386,8 +406,14 @@ pub(crate) unsafe fn service_sec_image(
                 LSASS_LISTENER_STACK_MIRROR_VA
             } else if is_lsass_listener2 {
                 LSASS_LISTENER2_STACK_MIRROR_VA
+            } else if is_lsass_listener3 {
+                LSASS_LISTENER3_STACK_MIRROR_VA
             } else if is_wl_worker {
-                WINLOGON_WORKER_STACK_MIRROR_VA
+                match badge {
+                    WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA,
+                    WINLOGON_WORKER3_BADGE => WINLOGON_WORKER3_STACK_MIRROR_VA,
+                    _ => WINLOGON_WORKER_STACK_MIRROR_VA,
+                }
             } else {
                 match pi {
                     1 => CSRSS_STACK_MIRROR_VA,
@@ -483,8 +509,8 @@ pub(crate) unsafe fn service_sec_image(
                 // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
                 // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
                 // stop — the whole point of the per-thread multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
@@ -754,10 +780,11 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
-                nt_handler.wl_spawn_request = false;
+                nt_handler.wl_spawn_request = 0;
                 nt_handler.svc_listener_spawn = false;
                 nt_handler.lsass_listener_spawn = false;
                 nt_handler.lsass_listener2_spawn = false;
+                nt_handler.lsass_listener3_spawn = false;
                 nt_handler.wait_park_event = -1;
                 nt_handler.io_signal_event = -1;
                 nt_handler.lpc_rendezvous_conn = 0;
@@ -1057,28 +1084,50 @@ pub(crate) unsafe fn service_sec_image(
                 // seL4 TCB + real TEB and record the TEB base on the ETHREAD (alloc-free). The TCB is
                 // spawned SUSPENDED (a parked listener) — its TEB is mapped + queryable by the main
                 // thread's NtQueryInformationThread(162), which is what unblocks StartRpcServer.
-                if nt_handler.wl_spawn_request && WL_LISTENER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if nt_handler.wl_spawn_request != 0 {
+                    let slot = nt_handler.wl_spawn_request as usize - 1;
+                    let tcb_cell = match slot {
+                        0 => &WL_LISTENER_TCB,
+                        1 => &WL_WORKER2_TCB,
+                        2 => &WL_WORKER3_TCB,
+                        _ => unreachable!(),
+                    };
+                    tcb_cell.store(1, Ordering::Relaxed);
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let entry_rip = smss_stack_read(ctx_va + 0xF8);
                     let param = smss_stack_read(ctx_va + 0x80);
-                    let tid = PM_LISTENER_TID.load(Ordering::Relaxed);
+                    let tid = match slot {
+                        0 => PM_LISTENER_TID.load(Ordering::Relaxed),
+                        1 => WL_WORKER2_TID.load(Ordering::Relaxed),
+                        2 => WL_WORKER3_TID.load(Ordering::Relaxed),
+                        _ => 0,
+                    };
+                    let teb = match slot {
+                        0 => WL_LISTENER_TEB_VA,
+                        1 => WL_WORKER2_TEB_VA,
+                        2 => WL_WORKER3_TEB_VA,
+                        _ => 0,
+                    };
                     let cid_proc = nt_handler.pm_pid_for_pi(2).unwrap_or(0) as u64;
-                    print_str(b"[wl-thread] spawning REAL rpcrt4 WORKER thread (multiplexed): entry=0x");
+                    print_str(b"[wl-thread] spawning REAL worker slot=");
+                    print_u64(slot as u64);
+                    print_str(b" (multiplexed): entry=0x");
                     print_hex((entry_rip >> 32) as u32);
                     print_hex(entry_rip as u32);
                     print_str(b" tid=");
                     print_u64(tid);
                     print_str(b"\n");
-                    let tcb = spawn_wl_listener_thread(procs[2].pml4, entry_rip, param, cid_proc, tid, fault_ep);
-                    WL_LISTENER_TCB.store(tcb, Ordering::Relaxed);
+                    let tcb = spawn_wl_listener_thread(slot, procs[2].pml4, entry_rip, param, cid_proc, tid, fault_ep);
+                    tcb_cell.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
-                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, WL_LISTENER_TEB_VA);
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                     print_str(b"[wl-thread] spawned tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" TEB=0x");
-                    print_hex((WL_LISTENER_TEB_VA >> 32) as u32);
-                    print_hex(WL_LISTENER_TEB_VA as u32);
+                    print_hex((teb >> 32) as u32);
+                    print_hex(teb as u32);
                     print_str(b" (RESUMED into multiplex, badge WINLOGON_WORKER_BADGE; real ETHREAD + TEB)\n");
+                    nt_handler.wl_spawn_request = 0;
                 }
                 // ★ N-threads multiplex: services' RPC listener thread — spawned RESUMED into the main
                 // service loop (badge SVC_LISTENER_BADGE). Its faults/syscalls interleave with services'
@@ -1143,6 +1192,36 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[lsass-thread2] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 10)\n");
+                }
+                if nt_handler.lsass_listener3_spawn
+                    && LSASS_LISTENER3_TCB.swap(1, Ordering::Relaxed) == 0
+                {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let tid = LSASS_LISTENER3_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(4).unwrap_or(0) as u64;
+                    print_str(b"[lsass-thread3] spawning + RESUMING 3rd LSA worker: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_lsass_listener3_thread(
+                        procs[4].pml4,
+                        entry_rip,
+                        param,
+                        cid_proc,
+                        tid,
+                        fault_ep,
+                    );
+                    LSASS_LISTENER3_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler
+                        .pm
+                        .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER3_TEB_VA);
+                    print_str(b"[lsass-thread3] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 14)\n");
                 }
                 // Path B (authentic accept): csrss's NtConnectPort left the broker connection Pending
                 // (Manual). Drive the REAL SmpApiLoop thread through the connection rendezvous (it runs
@@ -1448,59 +1527,91 @@ pub(crate) unsafe fn service_sec_image(
                 let cls = m3; // RDX = ThreadInformationClass
                 let handle = get_recv_mr(9); // R10 = ThreadHandle
                 let buf = get_recv_mr(7); // R8 = ThreadInformation
+                let len = get_recv_mr(8); // R9 = ThreadInformationLength
                 let sp = get_recv_mr(16);
-                if cls == 0 && buf != 0 {
-                    if let Some(tid) = nt_handler.resolve_thread_handle(handle) {
-                        let t = tid as nt_process::ThreadId;
-                        // Real TEB if recorded (the winlogon listener via set_thread_teb); else fall
-                        // back to the caller's per-process main-thread TEB VA (spawn_sec_image set GS
-                        // base = TEB_VA for pi 1-3, SMSS_TEB_VA for smss pi 0) so services' CRT reads a
-                        // valid TebBaseAddress rather than NULL.
-                        let teb = match nt_handler.pm.thread_teb(t) {
-                            Some(v) if v != 0 => v,
-                            _ => {
-                                if pi == 0 {
-                                    SMSS_TEB_VA
-                                } else {
-                                    TEB_VA
-                                }
-                            }
-                        };
-                        let cid = nt_handler
-                            .pm
-                            .client_id(t)
-                            .unwrap_or(nt_process::ClientId { unique_process: 0, unique_thread: 0 });
-                        // THREAD_BASIC_INFORMATION (x64, 0x30 bytes): ExitStatus@0, TebBaseAddress@8,
-                        // ClientId{UniqueProcess@0x10, UniqueThread@0x18}, AffinityMask@0x20,
-                        // Priority@0x28, BasePriority@0x2c. Written via the general out-writer (handles
-                        // a stack local OR a demand-fillable VA).
-                        let tbi: [(u64, u64); 6] = [
-                            (0x00, 0),                          // ExitStatus (STATUS_SUCCESS) + pad
-                            (0x08, teb),                        // TebBaseAddress
-                            (0x10, cid.unique_process as u64),  // ClientId.UniqueProcess
-                            (0x18, cid.unique_thread as u64),   // ClientId.UniqueThread
-                            (0x20, 1),                          // AffinityMask
-                            (0x28, 0),                          // Priority + BasePriority
-                        ];
-                        for (off, v) in tbi {
-                            csrss_out_write(buf + off, v, &mut *filled_pages, &mut faults, scratch_base,
-                                &reg, &dll_pes, pml4);
-                        }
-                        let rl = smss_stack_read(sp + 0x28); // *ReturnLength (optional)
-                        if rl != 0 {
-                            csrss_out_write(rl, 0x30, &mut *filled_pages, &mut faults, scratch_base,
-                                &reg, &dll_pes, pml4);
-                        }
-                        WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
-                        print_str(b"[wl-thread] NtQueryInformationThread(BasicInfo) -> listener TEB=0x");
-                        print_hex((teb >> 32) as u32);
-                        print_hex(teb as u32);
-                        print_str(b" tid=");
-                        print_u64(tid);
-                        print_str(b"\n");
-                    }
+                let return_length = smss_stack_read(sp + 0x28);
+                let trace = THREAD_QUERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                if trace < 8 {
+                    print_str(b"[thread-life] query caller_pi=");
+                    print_u64(pi as u64);
+                    print_str(b" badge=");
+                    print_u64(badge);
+                    print_str(b" handle=0x");
+                    print_hex(handle as u32);
+                    print_str(b" class=");
+                    print_u64(cls);
+                    print_str(b" length=");
+                    print_u64(len);
+                    print_str(b" output=0x");
+                    print_hex(buf as u32);
+                    print_str(b" return_length=0x");
+                    print_hex(return_length as u32);
+                    print_str(b"\n");
                 }
-                result = 0; // STATUS_SUCCESS
+                result = if cls != 0 {
+                    nt_process::STATUS_INVALID_INFO_CLASS as u64
+                } else if len != 0x30 {
+                    if return_length != 0 {
+                        csrss_out_write(return_length, 0x30, &mut *filled_pages, &mut faults,
+                            scratch_base, &reg, &dll_pes, pml4);
+                    }
+                    nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
+                } else if buf == 0 {
+                    0xC000_0005
+                } else if let Some(caller_pid) = nt_handler.pm_pid_for_pi(pi) {
+                    match nt_handler.pm.query_thread_basic(caller_pid, handle) {
+                        Ok(basic) => {
+                            let resolved_tid = basic.client_id.unique_thread as u64;
+                            // Main-thread TEBs predate the ETHREAD convergence and are bound by the
+                            // process spawn. Runtime threads always carry their distinct mapped TEB.
+                            let teb = if basic.teb_base_address != 0 {
+                                basic.teb_base_address
+                            } else if pi == 0 {
+                                SMSS_TEB_VA
+                            } else {
+                                TEB_VA
+                            };
+                            // THREAD_BASIC_INFORMATION (x64, 0x30 bytes): ExitStatus@0,
+                            // TebBaseAddress@8, ClientId@0x10, AffinityMask@0x20, priorities@0x28.
+                            let tbi: [(u64, u64); 6] = [
+                                (0x00, basic.exit_status as u64),
+                                (0x08, teb),
+                                (0x10, basic.client_id.unique_process as u64),
+                                (0x18, resolved_tid),
+                                (0x20, basic.affinity_mask),
+                                (0x28, 0),
+                            ];
+                            for (off, v) in tbi {
+                                csrss_out_write(buf + off, v, &mut *filled_pages, &mut faults,
+                                    scratch_base, &reg, &dll_pes, pml4);
+                            }
+                            if return_length != 0 {
+                                csrss_out_write(return_length, 0x30, &mut *filled_pages, &mut faults,
+                                    scratch_base, &reg, &dll_pes, pml4);
+                            }
+                            WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
+                            print_str(b"[thread-life] query resolved ETHREAD tid=");
+                            print_u64(resolved_tid);
+                            print_str(b" written_teb=0x");
+                            print_hex((teb >> 32) as u32);
+                            print_hex(teb as u32);
+                            let readback_teb = smss_stack_read(buf + 8);
+                            print_str(b" readback_teb=0x");
+                            print_hex((readback_teb >> 32) as u32);
+                            print_hex(readback_teb as u32);
+                            print_str(b"\n");
+                            0
+                        }
+                        Err(status) => {
+                            print_str(b"[thread-life] query unresolved handle status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                            status as u64
+                        }
+                    }
+                } else {
+                    nt_process::STATUS_INVALID_HANDLE as u64
+                };
             } else if m0 == 98 && badge == WINLOGON_BADGE {
                 // NtIsProcessInJob(ProcessHandle=R10, JobHandle=RDX). kernel32's CreateProcessInternalW
                 // prologue (spawning services.exe) queries whether winlogon is in a job (JobHandle=NULL
@@ -1898,8 +2009,8 @@ pub(crate) unsafe fn service_sec_image(
                 // stopping the whole boot. Recv the next event WITHOUT replying → the listener's seL4
                 // thread stays blocked (its ETHREAD/TEB/stack stay mapped), and lsass' main thread + the
                 // rest of the boot keep advancing. Contained per-thread — the point of the multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
+                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
                     print_u64(m0);
                     print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;

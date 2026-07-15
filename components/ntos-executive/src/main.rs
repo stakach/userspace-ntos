@@ -291,6 +291,22 @@ pub const WINLOGON_WORKER_BADGE: u64 = 11;
 /// reads route to its OWN stack, not winlogon's main-thread stack). Distinct 8-page window (past
 /// LSASS_LISTENER2's 0x1370).
 pub const WINLOGON_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1378_0000;
+pub const WL_WORKER2_STACK_BASE: u64 = 0x0000_0100_104C_0000;
+pub const WL_WORKER2_STACK_FRAMES: u64 = 8;
+pub const WL_WORKER2_IPCBUF_VA: u64 = 0x0000_0100_104E_0000;
+pub const WL_WORKER2_TEB_VA: u64 = 0x0000_0100_104F_0000;
+pub const WL_WORKER2_TRAMP_VA: u64 = 0x0000_0100_1051_0000;
+pub const WL_WORKER2_ENV_SCRATCH_VA: u64 = 0x0000_0100_107B_0000;
+pub const WINLOGON_WORKER2_BADGE: u64 = 12;
+pub const WINLOGON_WORKER2_STACK_MIRROR_VA: u64 = 0x0000_0100_1380_0000;
+pub const WL_WORKER3_STACK_BASE: u64 = 0x0000_0100_1052_0000;
+pub const WL_WORKER3_STACK_FRAMES: u64 = 8;
+pub const WL_WORKER3_IPCBUF_VA: u64 = 0x0000_0100_1054_0000;
+pub const WL_WORKER3_TEB_VA: u64 = 0x0000_0100_1055_0000;
+pub const WL_WORKER3_TRAMP_VA: u64 = 0x0000_0100_1057_0000;
+pub const WL_WORKER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107D_0000;
+pub const WINLOGON_WORKER3_BADGE: u64 = 13;
+pub const WINLOGON_WORKER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1388_0000;
 // --- services' RPC listener thread (the SCM's ScmStartRpcServer io_thread). Runs in services' OWN
 // pml4 (pi 3) at the SAME target VSpace VAs as WL_LISTENER (isolated per-VSpace); its executive-side
 // env-scratch + stack-mirror must be DISTINCT. Unlike WL_LISTENER (suspended), this one RESUMES and
@@ -341,6 +357,14 @@ pub const LSASS_LISTENER2_ENV_SCRATCH_VA: u64 = 0x0000_0100_107A_0000;
 pub const LSASS_LISTENER2_STACK_MIRROR_VA: u64 = 0x0000_0100_1370_0000;
 /// The fault-EP badge for lsass' 2nd LSA server thread.
 pub const LSASS_LISTENER2_BADGE: u64 = 10;
+pub const LSASS_LISTENER3_STACK_BASE: u64 = WL_WORKER3_STACK_BASE;
+pub const LSASS_LISTENER3_STACK_FRAMES: u64 = WL_WORKER3_STACK_FRAMES;
+pub const LSASS_LISTENER3_IPCBUF_VA: u64 = WL_WORKER3_IPCBUF_VA;
+pub const LSASS_LISTENER3_TEB_VA: u64 = WL_WORKER3_TEB_VA;
+pub const LSASS_LISTENER3_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
+pub const LSASS_LISTENER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107E_0000;
+pub const LSASS_LISTENER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1390_0000;
+pub const LSASS_LISTENER3_BADGE: u64 = 14;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
@@ -939,10 +963,16 @@ const CSR_STATIC_CID_THREAD: u64 = 0x0000_0000_0000_0248;
 static WL_LISTENER_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 /// The winlogon RPC-listener thread's TCB (0 until winlogon's first NtCreateThread spawns it).
 static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
+static WL_WORKER2_TCB: AtomicU64 = AtomicU64::new(0);
+static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
 /// The listener thread's real ETHREAD tid (a pool ETHREAD popped at NtCreateThread), and a count of
 /// real threads created through the general NtCreateThread path (for the counted spec).
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
+static WL_WORKER2_TID: AtomicU64 = AtomicU64::new(0);
+static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
+static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
 /// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
@@ -956,6 +986,9 @@ static LSASS_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_TID: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER3_TCB: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER3_TID: AtomicU64 = AtomicU64::new(0);
+static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Multiplex-event counter for winlogon's rpcrt4 server WORKER thread (badge WINLOGON_WORKER_BADGE).
 /// Proves the worker actually RUNS (not suspended) — spec `exec_winlogon_worker_multiplex`.
 static WL_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -2585,7 +2618,8 @@ struct ExecNtHandler {
     /// General NtCreateThread: set by winlogon's FIRST `NtCreateThread` (its RPC listener) so the LOOP
     /// spawns the REAL listener thread (`spawn_wl_listener_thread`, which needs winlogon's PML4 + the
     /// caller's SP to read the CONTEXT — loop-resident). Parks on `WL_LISTENER_FAULT_EP`.
-    wl_spawn_request: bool,
+    /// One-based winlogon runtime-thread slot awaiting mechanism construction; zero means none.
+    wl_spawn_request: u8,
     /// General NtCreateThread: set by services' (pi 3) FIRST `NtCreateThread` (the SCM's RPC listener /
     /// rpcrt4 io_thread) so the LOOP spawns + RESUMES the REAL listener thread
     /// (`spawn_svc_listener_thread`, needs services' PML4 + the caller's SP for the CONTEXT). Unlike
@@ -2597,6 +2631,7 @@ struct ExecNtHandler {
     lsass_listener_spawn: bool,
     /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
     lsass_listener2_spawn: bool,
+    lsass_listener3_spawn: bool,
     /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
     /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
     /// event index) instead of replying, and wake it on the matching NtSetEvent. -1 = no park (either
@@ -3192,12 +3227,12 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 /// (identity), like the EPROCESSes — the non-leaking heap solution (BTreeMap/BTreeSet inserts happen
 /// below the per-syscall mark), then the image entry is bound at the real spawn (alloc-free).
 static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// Pool of ONE spare ETHREAD per process (pi 0/1/2/3), pre-created at boot so a RUNTIME NtCreateThread
-/// pops one without a heap-reset-unsafe BTreeMap insert. 0 = unused. (Only winlogon pops one live —
-/// its RPC listener; the array generalizes to any pi.)
-static PM_POOL_TID: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
-/// A SECOND pool ETHREAD for lsass (pi 4), which creates two server threads.
-static PM_POOL_TID2_LSASS: AtomicU64 = AtomicU64::new(0);
+/// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
+/// creation remains allocation-free. Three slots cover the live lsass worker fan-out.
+const PM_RUNTIME_THREAD_SLOTS: usize = 3;
+static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
+    [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
+static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Bit i set iff EPROCESS pi=i has a real main ETHREAD with the right pid, is Running, and its
 /// ClientId resolves — proves each hosted process's main thread is a real nt-process object.
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);

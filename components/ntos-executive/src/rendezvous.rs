@@ -297,6 +297,7 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
 /// main thread's WaitForSingleObject(server_ready_event) wakes. `entry_rip`/`param` come from the
 /// caller's CONTEXT; `cid_*` is the real ClientId {caller pid, fresh tid}. Returns the TCB.
 pub(crate) unsafe fn spawn_wl_listener_thread(
+    slot: usize,
     pml4: u64,
     entry_rip: u64,
     param: u64,
@@ -304,19 +305,53 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> u64 {
-    let worker_ep = mint_badged(main_fault_ep, WINLOGON_WORKER_BADGE);
+    let (scr, teb_va, stack_base, stack_frames, ipcbuf_va, tramp_va, stack_mirror_va, badge) =
+        match slot {
+            0 => (
+                WL_LISTENER_ENV_SCRATCH_VA,
+                WL_LISTENER_TEB_VA,
+                WL_LISTENER_STACK_BASE,
+                WL_LISTENER_STACK_FRAMES,
+                WL_LISTENER_IPCBUF_VA,
+                WL_LISTENER_TRAMP_VA,
+                WINLOGON_WORKER_STACK_MIRROR_VA,
+                WINLOGON_WORKER_BADGE,
+            ),
+            1 => (
+                WL_WORKER2_ENV_SCRATCH_VA,
+                WL_WORKER2_TEB_VA,
+                WL_WORKER2_STACK_BASE,
+                WL_WORKER2_STACK_FRAMES,
+                WL_WORKER2_IPCBUF_VA,
+                WL_WORKER2_TRAMP_VA,
+                WINLOGON_WORKER2_STACK_MIRROR_VA,
+                WINLOGON_WORKER2_BADGE,
+            ),
+            2 => (
+                WL_WORKER3_ENV_SCRATCH_VA,
+                WL_WORKER3_TEB_VA,
+                WL_WORKER3_STACK_BASE,
+                WL_WORKER3_STACK_FRAMES,
+                WL_WORKER3_IPCBUF_VA,
+                WL_WORKER3_TRAMP_VA,
+                WINLOGON_WORKER3_STACK_MIRROR_VA,
+                WINLOGON_WORKER3_BADGE,
+            ),
+            _ => return 0,
+        };
+    let worker_ep = mint_badged(main_fault_ep, badge);
     spawn_hosted_thread(&HostedThread {
         pml4,
         entry_rip,
         param,
-        scr: WL_LISTENER_ENV_SCRATCH_VA,
-        teb_va: WL_LISTENER_TEB_VA,
-        stack_base: WL_LISTENER_STACK_BASE,
-        stack_frames: WL_LISTENER_STACK_FRAMES,
-        ipcbuf_va: WL_LISTENER_IPCBUF_VA,
-        tramp_va: WL_LISTENER_TRAMP_VA,
+        scr,
+        teb_va,
+        stack_base,
+        stack_frames,
+        ipcbuf_va,
+        tramp_va,
         peb_va: SMSS_PEB_VA,
-        stack_mirror_va: WINLOGON_WORKER_STACK_MIRROR_VA,
+        stack_mirror_va,
         fault_ep: worker_ep,
         cid_proc,
         cid_thread,
@@ -418,6 +453,35 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         tramp_va: LSASS_LISTENER2_TRAMP_VA,
         peb_va: SMSS_PEB_VA,
         stack_mirror_va: LSASS_LISTENER2_STACK_MIRROR_VA,
+        fault_ep: listener_ep,
+        cid_proc,
+        cid_thread,
+        resume: true,
+        prio: 105,
+    })
+}
+
+pub(crate) unsafe fn spawn_lsass_listener3_thread(
+    lsass_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+) -> u64 {
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: lsass_pml4,
+        entry_rip,
+        param,
+        scr: LSASS_LISTENER3_ENV_SCRATCH_VA,
+        teb_va: LSASS_LISTENER3_TEB_VA,
+        stack_base: LSASS_LISTENER3_STACK_BASE,
+        stack_frames: LSASS_LISTENER3_STACK_FRAMES,
+        ipcbuf_va: LSASS_LISTENER3_IPCBUF_VA,
+        tramp_va: LSASS_LISTENER3_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: LSASS_LISTENER3_STACK_MIRROR_VA,
         fault_ep: listener_ep,
         cid_proc,
         cid_thread,

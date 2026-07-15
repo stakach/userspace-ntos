@@ -177,6 +177,41 @@ fn runtime_thread_create_with_teb_and_handle() {
 }
 
 #[test]
+fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("winlogon.exe", None, None);
+    pm.reserve_handles(pid, 16);
+    let main = pm.create_thread(pid, 0, 0, false).unwrap();
+    let mut seen = alloc::vec::Vec::new();
+
+    for index in 0..3u64 {
+        let tid = pm.create_thread(pid, 0, index, false).unwrap();
+        let teb = 0x0000_0100_1049_0000 + index * 0x60000;
+        assert!(pm.set_thread_start_address(tid, 0x7ff0_1000 + index * 0x100));
+        assert!(pm.set_thread_teb(tid, teb));
+        let handle = pm.insert_handle(pid, HandleObject::Thread(tid), 0).unwrap();
+        let basic = pm.query_thread_basic(pid, handle as u64).unwrap();
+        assert_eq!(basic.teb_base_address, teb);
+        assert_eq!(
+            basic.client_id,
+            ClientId {
+                unique_process: pid,
+                unique_thread: tid
+            }
+        );
+        seen.push((handle, tid, teb));
+    }
+
+    assert_ne!(seen[0].0, seen[1].0);
+    assert_ne!(seen[1].0, seen[2].0);
+    assert_ne!(seen[0].1, seen[2].1);
+    assert_ne!(seen[0].2, seen[2].2);
+    let current = pm.query_thread_basic(pid, u64::MAX - 1).unwrap();
+    assert_eq!(current.client_id.unique_thread, main);
+    assert_eq!(pm.query_thread_basic(pid, 0), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
 fn close_by_object_tag() {
     // The convergence hybrid: a host tags each entry with its own handle VALUE (Opaque) and closes
     // by that tag on NtClose, without knowing this table's internal slot-handle.

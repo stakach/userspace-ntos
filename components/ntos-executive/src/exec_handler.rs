@@ -68,10 +68,11 @@ impl ExecNtHandler {
             spawn_request: false,
             winlogon_spawn_request: false,
             sm_spawn_request: false,
-            wl_spawn_request: false,
+            wl_spawn_request: 0,
             svc_listener_spawn: false,
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
+            lsass_listener3_spawn: false,
             wait_park_event: -1,
             io_signal_event: -1,
             anon_event_seq: 0,
@@ -162,23 +163,19 @@ impl ExecNtHandler {
                 }
                 PM_MAIN_THREADS_OK.store(mt_ok, Ordering::Relaxed);
                 // General NtCreateThread — pre-create a POOL of extra ETHREADs NOW (at boot, below the
-                // service_sec_image heap mark) so a RUNTIME NtCreateThread can hand one out WITHOUT a
+                // service_sec_image heap mark) so runtime NtCreateThread can hand them out WITHOUT a
                 // BTreeMap insert (which, made during a serviced call above the mark, the per-syscall
                 // bump reset would rewind → corrupt). Runtime create then only pops a pool tid + binds
                 // its start routine/TEB (both alloc-free field writes) → reset-safe. One pool ETHREAD
                 // per process is enough for the current boot (only winlogon creates a runtime thread —
-                // its RPC listener); the array generalizes to any pi. Pool threads are NOT the main
+                // the observed lsass fan-out needs three. Pool threads are NOT the main
                 // thread (main was created first above), so main_thread() is unchanged.
                 for (i, &pid) in pids.iter().enumerate() {
-                    if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                        PM_POOL_TID[i].store(tid as u64, Ordering::Relaxed);
+                    for slot in 0..PM_RUNTIME_THREAD_SLOTS {
+                        if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
+                            PM_POOL_TID[i][slot].store(tid as u64, Ordering::Relaxed);
+                        }
                     }
-                }
-                // lsass creates TWO server threads (StartAuthenticationPort + LsapRmServerThread), so it
-                // needs a SECOND pool ETHREAD (the single-per-pi pool covers the first). Reserved at boot,
-                // below the heap mark, like the rest.
-                if let Ok(tid) = pm.create_thread(lsass_pid, 0, 0, false) {
-                    PM_POOL_TID2_LSASS.store(tid as u64, Ordering::Relaxed);
                 }
                 // Pre-reserve each EPROCESS's handle table NOW (below the service_sec_image heap
                 // mark) so per-syscall `insert_handle` writes into pre-allocated storage and NEVER
@@ -300,43 +297,52 @@ impl ExecNtHandler {
         }
         Ok(object_id)
     }
-    /// General NtCreateThread: hand out a real pool ETHREAD for the caller (`self.pi`) — bind the
-    /// caller-supplied start routine + parameter + TEB base (all alloc-free field writes, reset-safe),
+    /// General NtCreateThread: claim the next real pool ETHREAD for the caller (`self.pi`) — bind the
+    /// caller-supplied start routine + parameter (all alloc-free field writes, reset-safe),
     /// and mint a TYPED `Thread(tid)` handle in the caller's EPROCESS handle table (dense value, so
-    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns `(tid, handle)`
+    /// `NtQueryInformationThread` resolves the handle VALUE → the real ETHREAD). Returns
+    /// `(slot, tid, handle)`
     /// or `None` if the caller has no free pool ETHREAD. The seL4 TCB is spawned separately by the loop.
-    pub(crate) fn nt_create_thread_handle(&mut self, entry: u64, param: u64, teb_base: u64) -> Option<(u64, u64)> {
-        let tid = PM_POOL_TID.get(self.pi)?.load(Ordering::Relaxed);
-        self.nt_create_thread_handle_tid(tid, entry, param, teb_base)
-    }
-    /// As `nt_create_thread_handle` but binds an EXPLICIT pre-created pool tid (for a process that
-    /// creates more than one runtime thread — e.g. lsass' two LSA server threads).
-    pub(crate) fn nt_create_thread_handle_tid(&mut self, tid: u64, entry: u64, param: u64, teb_base: u64) -> Option<(u64, u64)> {
+    pub(crate) fn nt_create_thread_handle(
+        &mut self,
+        entry: u64,
+        param: u64,
+    ) -> Option<(usize, u64, u64)> {
         let pid = self.pm_pid_for_pi(self.pi)?;
+        let pool = PM_POOL_TID.get(self.pi)?;
+        let used = PM_POOL_USED.get(self.pi)?;
+        let mut claimed = used.load(Ordering::Relaxed);
+        let slot = loop {
+            let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| claimed & (1 << slot) == 0)?;
+            match used.compare_exchange_weak(
+                claimed,
+                claimed | (1 << slot),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break slot,
+                Err(now) => claimed = now,
+            }
+        };
+        let tid = pool[slot].load(Ordering::Relaxed);
         if tid == 0 {
+            used.fetch_and(!(1 << slot), Ordering::Relaxed);
             return None;
         }
-        let _ = param; // passed to the thread via the trampoline (RCX); ETHREAD bookkeeping unchanged
         let t = tid as nt_process::ThreadId;
         self.pm.set_thread_start_address(t, entry);
-        self.pm.set_thread_teb(t, teb_base);
         let _ = self.pm.set_thread_state(t, nt_process::ThreadState::Running);
-        let h = self.pm.insert_handle(pid, nt_process::HandleObject::Thread(t), 0).ok()?;
+        let h = match self.pm.insert_handle(pid, nt_process::HandleObject::Thread(t), 0) {
+            Ok(handle) => handle,
+            Err(_) => {
+                used.fetch_and(!(1 << slot), Ordering::Relaxed);
+                return None;
+            }
+        };
+        let _ = param;
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         PM_GENERAL_THREADS_CREATED.fetch_add(1, Ordering::Relaxed);
-        Some((tid, h as u64))
-    }
-    /// Resolve a ThreadHandle VALUE (in the caller's EPROCESS handle table) → the real ETHREAD tid.
-    /// `NtCurrentThread()` (`-2`) → the caller's main ETHREAD. Used by `NtQueryInformationThread`.
-    pub(crate) fn resolve_thread_handle(&self, handle: u64) -> Option<u64> {
-        let caller = self.pm_pid_for_pi(self.pi)?;
-        if handle == 0xFFFF_FFFF_FFFF_FFFE {
-            return self.pm.main_thread(caller).map(|t| t as u64); // NtCurrentThread()
-        }
-        match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
-            Some(nt_process::HandleObject::Thread(t)) => Some(t as u64),
-            _ => None,
-        }
+        Some((slot, tid, h as u64))
     }
     /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
     /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
@@ -2133,29 +2139,121 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // TEB/ClientId (NtQueryInformationThread(162) resolves the typed handle → the ETHREAD).
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 2
-                    && WL_LISTENER_TCB.load(Ordering::Relaxed) == 0
-                    && PM_LISTENER_TID.load(Ordering::Relaxed) == 0
+                    && args[3] != u64::MAX
                 {
                     unsafe {
+                        let caller_pid = match self.pm_pid_for_pi(2) {
+                            Some(pid) => pid,
+                            None => return 0xC000_0008,
+                        };
+                        let target_pid = match self.resolve_process_handle(args[3]) {
+                            Some(pid) => pid,
+                            None => return 0xC000_0008,
+                        };
+                        let tid = match self.pm.main_thread(target_pid) {
+                            Some(tid) => tid,
+                            None => return 0xC000_0008,
+                        };
+                        let handle = match self.pm.insert_handle(
+                            caller_pid,
+                            nt_process::HandleObject::Thread(tid),
+                            0,
+                        ) {
+                            Ok(handle) => handle as u64,
+                            Err(status) => return status,
+                        };
+                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                        self.queue_write(args[0], handle);
                         let sp = get_recv_mr(16);
-                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let cid_ptr = smss_stack_read(sp + 0x28);
+                        if cid_ptr != 0 {
+                            self.queue_write(cid_ptr, target_pid as u64);
+                            self.queue_write(cid_ptr + 8, tid as u64);
+                        }
+                        let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                        if trace < 4 {
+                            print_str(
+                                b"[thread-life] create caller=winlogon badge=4 foreign_process=0x",
+                            );
+                            print_hex(args[3] as u32);
+                            print_str(b" resolved_pid=");
+                            print_u64(target_pid as u64);
+                            print_str(b" main_tid=");
+                            print_u64(tid as u64);
+                            print_str(b" handle=0x");
+                            print_hex(handle as u32);
+                            print_str(b" status=0\n");
+                        }
+                        return 0;
+                    }
+                }
+                if matches!(ctx.service, NativeService::NtCreateThread) && self.pi == 2 {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let cid_ptr = smss_stack_read(sp + 0x28);
+                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let initial_teb = smss_stack_read(sp + 0x38);
+                        let create_suspended = smss_stack_read(sp + 0x40);
                         let entry = smss_stack_read(ctx_va + 0xF8); // CONTEXT.Rip = StartRoutine
                         let param = smss_stack_read(ctx_va + 0x80); // CONTEXT.Rcx = Parameter
-                        if let Some((tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, WL_LISTENER_TEB_VA)
+                        if let Some((slot, tid, handle)) =
+                            self.nt_create_thread_handle(entry, param)
                         {
+                            let teb = match slot {
+                                0 => WL_LISTENER_TEB_VA,
+                                1 => WL_WORKER2_TEB_VA,
+                                2 => WL_WORKER3_TEB_VA,
+                                _ => return 0xC000_009A,
+                            };
+                            self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
                             let pid = self.pm_pid_for_pi(2).unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle = R10
-                            let cid_ptr = smss_stack_read(sp + 0x28); // arg5 = *ClientId
                             if cid_ptr != 0 {
                                 self.queue_write(cid_ptr, pid as u64); // ClientId.UniqueProcess
                                 self.queue_write(cid_ptr + 8, tid); // ClientId.UniqueThread
                             }
-                            PM_LISTENER_TID.store(tid, Ordering::Relaxed);
-                            self.wl_spawn_request = true;
+                            match slot {
+                                0 => PM_LISTENER_TID.store(tid, Ordering::Relaxed),
+                                1 => WL_WORKER2_TID.store(tid, Ordering::Relaxed),
+                                2 => WL_WORKER3_TID.store(tid, Ordering::Relaxed),
+                                _ => {}
+                            }
+                            self.wl_spawn_request = slot as u8 + 1;
+                            let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                            if trace < 4 {
+                                print_str(
+                                    b"[thread-life] create caller=winlogon badge=4 process=0x",
+                                );
+                                print_hex(args[3] as u32);
+                                print_str(b" slot=");
+                                print_u64(slot as u64);
+                                print_str(b" start=0x");
+                                print_hex((entry >> 32) as u32);
+                                print_hex(entry as u32);
+                                print_str(b" teb=0x");
+                                print_hex((teb >> 32) as u32);
+                                print_hex(teb as u32);
+                                print_str(b" initial_teb=0x");
+                                print_hex(initial_teb as u32);
+                                print_str(b" stack_base=0x");
+                                print_hex(smss_stack_read(initial_teb + 0x10) as u32);
+                                print_str(b" stack_limit=0x");
+                                print_hex(smss_stack_read(initial_teb + 0x18) as u32);
+                                print_str(b" alloc_base=0x");
+                                print_hex(smss_stack_read(initial_teb + 0x20) as u32);
+                                print_str(b" handle=0x");
+                                print_hex(handle as u32);
+                                print_str(b" tid=");
+                                print_u64(tid);
+                                print_str(b" suspended=");
+                                print_u64(create_suspended & 0xff);
+                                print_str(b" status=0\n");
+                            }
                             return 0; // SUCCESS (handle/ClientId queued)
                         }
                     }
+                    print_str(b"[thread-life] create caller=winlogon badge=4 status=c000009a (runtime thread pool exhausted)\n");
+                    return 0xC000_009A;
                 }
                 // ★ N-threads multiplex: services' (pi 3) FIRST NtCreateThread = the SCM's RPC listener
                 // (ScmStartRpcServer → rpcrt4 io_thread). Route it through the REAL ETHREAD lifecycle
@@ -2171,9 +2269,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
-                        if let Some((tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, SVC_LISTENER_TEB_VA)
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(entry, param)
                         {
+                            self.pm
+                                .set_thread_teb(tid as nt_process::ThreadId, SVC_LISTENER_TEB_VA);
                             let pid = self.pm_pid_for_pi(3).unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
@@ -2202,9 +2302,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
-                        if let Some((tid, handle)) =
-                            self.nt_create_thread_handle(entry, param, LSASS_LISTENER_TEB_VA)
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(entry, param)
                         {
+                            self.pm
+                                .set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER_TEB_VA);
                             let pid = self.pm_pid_for_pi(4).unwrap_or(0);
                             self.queue_write(args[0], handle); // *ThreadHandle
                             let cid_ptr = smss_stack_read(sp + 0x28);
@@ -2233,10 +2335,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let ctx_va = smss_stack_read(sp + 0x30);
                         let entry = smss_stack_read(ctx_va + 0xF8);
                         let param = smss_stack_read(ctx_va + 0x80);
-                        let tid2 = PM_POOL_TID2_LSASS.load(Ordering::Relaxed);
-                        if let Some((tid, handle)) =
-                            self.nt_create_thread_handle_tid(tid2, entry, param, LSASS_LISTENER2_TEB_VA)
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(entry, param)
                         {
+                            self.pm.set_thread_teb(tid as nt_process::ThreadId, LSASS_LISTENER2_TEB_VA);
                             let pid = self.pm_pid_for_pi(4).unwrap_or(0);
                             self.queue_write(args[0], handle);
                             let cid_ptr = smss_stack_read(sp + 0x28);
@@ -2249,6 +2351,64 @@ impl NativeSyscallHandler for ExecNtHandler {
                             return 0;
                         }
                     }
+                }
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 4
+                    && LSASS_LISTENER2_TID.load(Ordering::Relaxed) != 0
+                    && LSASS_LISTENER3_TCB.load(Ordering::Relaxed) == 0
+                    && LSASS_LISTENER3_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let entry = smss_stack_read(ctx_va + 0xF8);
+                        let param = smss_stack_read(ctx_va + 0x80);
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(entry, param)
+                        {
+                            self.pm.set_thread_teb(
+                                tid as nt_process::ThreadId,
+                                LSASS_LISTENER3_TEB_VA,
+                            );
+                            let pid = self.pm_pid_for_pi(4).unwrap_or(0);
+                            self.queue_write(args[0], handle);
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            LSASS_LISTENER3_TID.store(tid, Ordering::Relaxed);
+                            self.lsass_listener3_spawn = true;
+                            let initial_teb = smss_stack_read(sp + 0x38);
+                            print_str(b"[thread-life] create caller=lsass badge=8 process=0x");
+                            print_hex(args[3] as u32);
+                            print_str(b" slot=2 start=0x");
+                            print_hex((entry >> 32) as u32);
+                            print_hex(entry as u32);
+                            print_str(b" teb=0x");
+                            print_hex((LSASS_LISTENER3_TEB_VA >> 32) as u32);
+                            print_hex(LSASS_LISTENER3_TEB_VA as u32);
+                            print_str(b" initial_teb=0x");
+                            print_hex(initial_teb as u32);
+                            print_str(b" stack_base=0x");
+                            print_hex(smss_stack_read(initial_teb + 0x10) as u32);
+                            print_str(b" stack_limit=0x");
+                            print_hex(smss_stack_read(initial_teb + 0x18) as u32);
+                            print_str(b" alloc_base=0x");
+                            print_hex(smss_stack_read(initial_teb + 0x20) as u32);
+                            print_str(b" handle=0x");
+                            print_hex(handle as u32);
+                            print_str(b" tid=");
+                            print_u64(tid);
+                            print_str(b" status=0\n");
+                            return 0;
+                        }
+                    }
+                }
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && (2..=4).contains(&self.pi)
+                {
+                    return 0xC000_009A;
                 }
                 let h = self.mint_handle();
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)

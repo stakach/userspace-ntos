@@ -20,6 +20,8 @@ use nt_pe_loader::{MappedImage, PeError, PeFile};
 
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
@@ -36,6 +38,17 @@ pub type AddressSpaceId = u32;
 pub struct ClientId {
     pub unique_process: ProcessId,
     pub unique_thread: ThreadId,
+}
+
+/// The architecture-neutral fields returned for `ThreadBasicInformation`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadBasicInformation {
+    pub exit_status: u32,
+    pub teb_base_address: u64,
+    pub client_id: ClientId,
+    pub affinity_mask: u64,
+    pub priority: i32,
+    pub base_priority: i32,
 }
 
 /// Process states (spec §7.1).
@@ -466,6 +479,36 @@ impl ProcessManager {
         self.threads.get(&tid).map(|t| ClientId {
             unique_process: t.process_id,
             unique_thread: tid,
+        })
+    }
+
+    /// Resolve a caller-local thread handle (or `NtCurrentThread`) and return the policy fields used
+    /// by `NtQueryInformationThread(ThreadBasicInformation)`. Buffer validation and wire-format
+    /// copyout remain the syscall host's responsibility.
+    pub fn query_thread_basic(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+    ) -> Result<ThreadBasicInformation, u32> {
+        let tid = if handle == u64::MAX - 1 {
+            self.main_thread(caller_pid).ok_or(STATUS_INVALID_HANDLE)?
+        } else {
+            match self.lookup_handle(caller_pid, handle as Handle) {
+                Some(HandleObject::Thread(tid)) => tid,
+                _ => return Err(STATUS_INVALID_HANDLE),
+            }
+        };
+        let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(ThreadBasicInformation {
+            exit_status: thread.exit_status.unwrap_or(STATUS_SUCCESS),
+            teb_base_address: thread.teb_base,
+            client_id: ClientId {
+                unique_process: thread.process_id,
+                unique_thread: tid,
+            },
+            affinity_mask: 1,
+            priority: 0,
+            base_priority: 0,
         })
     }
 
