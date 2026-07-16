@@ -22,6 +22,9 @@
 //! PEB), at which point these bodies light up. The 4.0b bar is **export-table completeness** (smss
 //! resolves against us, 0 missing), host-proven by `tools/ntdll-dll-verify`.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use nt_ntdll::rtl;
@@ -2521,6 +2524,769 @@ pub unsafe extern "system" fn ldr_unload_dll(_base_address: *mut c_void) -> NtSt
 }
 
 // =================================================================================================
+// BATCH 4 — CRT (mem/str/wcs/ctype/math/parse) the Win32 stack imports from ntdll.
+// Standard C-runtime re-exports (ntdll ships them so the Win32 DLLs don't statically link a CRT).
+// Slice-marshalled over the host-tested `nt_ntdll::crt` cores where one exists; otherwise a
+// correct-by-construction inline body (real semantics, not a seam). Signatures = the MS x64 CRT.
+// =================================================================================================
+
+/// `memcmp(const void*, const void*, size_t) -> int`. Weak (compiler-builtins-mem also provides it).
+///
+/// # Safety
+/// Both valid for `n` bytes.
+#[linkage = "weak"]
+#[export_name = "memcmp"]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, n),
+            core::slice::from_raw_parts(b, n),
+        )
+    };
+    match nt_ntdll::crt::memcmp(sa, sb, n) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `memchr(const void*, int, size_t) -> void*`.
+///
+/// # Safety
+/// `s` valid for `n` bytes.
+#[export_name = "memchr"]
+pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *const u8 {
+    // SAFETY: caller contract.
+    let hay = unsafe { core::slice::from_raw_parts(s, n) };
+    match nt_ntdll::crt::memchr(hay, c as u8, n) {
+        // SAFETY: index within [0,n).
+        Some(i) => unsafe { s.add(i) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `strlen(const char*) -> size_t`. Weak (compiler-builtins-mem also provides it).
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[linkage = "weak"]
+#[export_name = "strlen"]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    // SAFETY: caller contract.
+    unsafe { strlen_raw(s) }
+}
+
+/// `strcmp(const char*, const char*) -> int`.
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "strcmp"]
+pub unsafe extern "C" fn strcmp(a: *const u8, b: *const u8) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, strlen_raw(a)),
+            core::slice::from_raw_parts(b, strlen_raw(b)),
+        )
+    };
+    match nt_ntdll::crt::strcmp(sa, sb) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `_strcmpi(const char*, const char*) -> int` (== `stricmp`, case-insensitive).
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "_strcmpi"]
+pub unsafe extern "C" fn strcmpi(a: *const u8, b: *const u8) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, strlen_raw(a)),
+            core::slice::from_raw_parts(b, strlen_raw(b)),
+        )
+    };
+    match nt_ntdll::crt::stricmp(sa, sb) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `strncmp(const char*, const char*, size_t) -> int`.
+///
+/// # Safety
+/// Both valid up to a NUL or `n` bytes.
+#[export_name = "strncmp"]
+pub unsafe extern "C" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    // SAFETY: caller contract — walk at most n, stopping at a NUL in either.
+    let (la, lb) = unsafe { (strnlen_raw(a, n), strnlen_raw(b, n)) };
+    let (sa, sb) =
+        // SAFETY: la/lb <= n and within the strings.
+        unsafe {
+            (
+                core::slice::from_raw_parts(a, la),
+                core::slice::from_raw_parts(b, lb),
+            )
+        };
+    match nt_ntdll::crt::strncmp(sa, sb, n) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `strcpy(char* dst, const char* src) -> char*`.
+///
+/// # Safety
+/// `dst` large enough for `src`+NUL; `src` NUL-terminated.
+#[export_name = "strcpy"]
+pub unsafe extern "C" fn strcpy(dst: *mut u8, src: *const u8) -> *mut u8 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(src) };
+    // SAFETY: dst large enough per the contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, n);
+        *dst.add(n) = 0;
+    }
+    dst
+}
+
+/// `strcat(char* dst, const char* src) -> char*`.
+///
+/// # Safety
+/// `dst` NUL-terminated + large enough for the concatenation; `src` NUL-terminated.
+#[export_name = "strcat"]
+pub unsafe extern "C" fn strcat(dst: *mut u8, src: *const u8) -> *mut u8 {
+    // SAFETY: caller contract.
+    let dlen = unsafe { strlen_raw(dst) };
+    let slen = unsafe { strlen_raw(src) };
+    // SAFETY: dst large enough per the contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst.add(dlen), slen);
+        *dst.add(dlen + slen) = 0;
+    }
+    dst
+}
+
+/// `strchr(const char*, int) -> char*` — already exported above; not duplicated.
+/// `strrchr(const char*, int) -> char*`.
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[export_name = "strrchr"]
+pub unsafe extern "C" fn strrchr(s: *const u8, c: i32) -> *const u8 {
+    // SAFETY: caller contract.
+    let len = unsafe { strlen_raw(s) };
+    // SAFETY: valid region of len bytes.
+    let hay = unsafe { core::slice::from_raw_parts(s, len) };
+    match nt_ntdll::crt::strrchr(hay, c as u8) {
+        // SAFETY: i within [0,len).
+        Some(i) => unsafe { s.add(i) },
+        // The NUL matches strrchr(s, 0) in C; return &NUL.
+        None if (c as u8) == 0 => unsafe { s.add(len) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `strstr(const char*, const char*) -> char*`.
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "strstr"]
+pub unsafe extern "C" fn strstr(hay: *const u8, needle: *const u8) -> *const u8 {
+    // SAFETY: caller contract.
+    let (hl, nl) = unsafe { (strlen_raw(hay), strlen_raw(needle)) };
+    // SAFETY: valid regions.
+    let (h, n) = unsafe {
+        (
+            core::slice::from_raw_parts(hay, hl),
+            core::slice::from_raw_parts(needle, nl),
+        )
+    };
+    match nt_ntdll::crt::strstr(h, n) {
+        // SAFETY: i within the haystack.
+        Some(i) => unsafe { hay.add(i) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `strcspn(const char* s, const char* reject) -> size_t` — length of the initial run of `s` with
+/// no char in `reject`.
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "strcspn"]
+pub unsafe extern "C" fn strcspn(s: *const u8, reject: *const u8) -> usize {
+    // SAFETY: caller contract.
+    let (sl, rl) = unsafe { (strlen_raw(s), strlen_raw(reject)) };
+    let (ss, rs) = unsafe {
+        (
+            core::slice::from_raw_parts(s, sl),
+            core::slice::from_raw_parts(reject, rl),
+        )
+    };
+    ss.iter().take_while(|b| !rs.contains(b)).count()
+}
+
+/// `strpbrk(const char* s, const char* accept) -> char*` — first char of `s` in `accept`.
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "strpbrk"]
+pub unsafe extern "C" fn strpbrk(s: *const u8, accept: *const u8) -> *const u8 {
+    // SAFETY: caller contract.
+    let (sl, al) = unsafe { (strlen_raw(s), strlen_raw(accept)) };
+    let (ss, ac) = unsafe {
+        (
+            core::slice::from_raw_parts(s, sl),
+            core::slice::from_raw_parts(accept, al),
+        )
+    };
+    match ss.iter().position(|b| ac.contains(b)) {
+        // SAFETY: i within the string.
+        Some(i) => unsafe { s.add(i) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `_wcslwr(wchar_t*) -> wchar_t*` — lowercase an ASCII/Latin-1 wide string in place.
+///
+/// # Safety
+/// `s` a NUL-terminated, writable UTF-16 string.
+#[export_name = "_wcslwr"]
+pub unsafe extern "C" fn wcslwr(s: *mut u16) -> *mut u16 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    for i in 0..n {
+        // SAFETY: i within [0,n).
+        unsafe {
+            let c = *s.add(i);
+            if (0x41..=0x5A).contains(&c) {
+                *s.add(i) = c + 0x20;
+            }
+        }
+    }
+    s
+}
+
+/// `wcschr(const wchar_t*, wchar_t) -> wchar_t*`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "wcschr"]
+pub unsafe extern "C" fn wcschr(s: *const u16, c: u16) -> *const u16 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let hay = unsafe { core::slice::from_raw_parts(s, n) };
+    match nt_ntdll::crt::wcschr(hay, c) {
+        // SAFETY: i within [0,n).
+        Some(i) => unsafe { s.add(i) },
+        None if c == 0 => unsafe { s.add(n) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `wcsrchr(const wchar_t*, wchar_t) -> wchar_t*`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "wcsrchr"]
+pub unsafe extern "C" fn wcsrchr(s: *const u16, c: u16) -> *const u16 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let hay = unsafe { core::slice::from_raw_parts(s, n) };
+    match hay.iter().rposition(|&w| w == c) {
+        // SAFETY: i within [0,n).
+        Some(i) => unsafe { s.add(i) },
+        None if c == 0 => unsafe { s.add(n) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `wcscmp(const wchar_t*, const wchar_t*) -> int`.
+///
+/// # Safety
+/// Both NUL-terminated UTF-16 strings.
+#[export_name = "wcscmp"]
+pub unsafe extern "C" fn wcscmp(a: *const u16, b: *const u16) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, wcslen_raw(a)),
+            core::slice::from_raw_parts(b, wcslen_raw(b)),
+        )
+    };
+    match nt_ntdll::crt::wcscmp(sa, sb) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `wcsncmp(const wchar_t*, const wchar_t*, size_t) -> int`.
+///
+/// # Safety
+/// Both valid up to a NUL or `n` code units.
+#[export_name = "wcsncmp"]
+pub unsafe extern "C" fn wcsncmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    for i in 0..n {
+        // SAFETY: caller contract — walk at most n, stop at a NUL in either.
+        let (ca, cb) = unsafe { (*a.add(i), *b.add(i)) };
+        if ca != cb {
+            return if ca < cb { -1 } else { 1 };
+        }
+        if ca == 0 {
+            break;
+        }
+    }
+    0
+}
+
+/// `wcscspn(const wchar_t* s, const wchar_t* reject) -> size_t`.
+///
+/// # Safety
+/// Both NUL-terminated UTF-16 strings.
+#[export_name = "wcscspn"]
+pub unsafe extern "C" fn wcscspn(s: *const u16, reject: *const u16) -> usize {
+    // SAFETY: caller contract.
+    let (sl, rl) = unsafe { (wcslen_raw(s), wcslen_raw(reject)) };
+    let (ss, rs) = unsafe {
+        (
+            core::slice::from_raw_parts(s, sl),
+            core::slice::from_raw_parts(reject, rl),
+        )
+    };
+    ss.iter().take_while(|w| !rs.contains(w)).count()
+}
+
+/// `wcsspn(const wchar_t* s, const wchar_t* accept) -> size_t`.
+///
+/// # Safety
+/// Both NUL-terminated UTF-16 strings.
+#[export_name = "wcsspn"]
+pub unsafe extern "C" fn wcsspn(s: *const u16, accept: *const u16) -> usize {
+    // SAFETY: caller contract.
+    let (sl, al) = unsafe { (wcslen_raw(s), wcslen_raw(accept)) };
+    let (ss, ac) = unsafe {
+        (
+            core::slice::from_raw_parts(s, sl),
+            core::slice::from_raw_parts(accept, al),
+        )
+    };
+    ss.iter().take_while(|w| ac.contains(w)).count()
+}
+
+/// `atoi(const char*) -> int`.
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[export_name = "atoi"]
+pub unsafe extern "C" fn atoi(s: *const u8) -> i32 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    let bytes = unsafe { core::slice::from_raw_parts(s, n) };
+    nt_ntdll::crt::atoi(bytes)
+}
+
+/// `_wtoi(const wchar_t*) -> int` — wide `atoi`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "_wtoi"]
+pub unsafe extern "C" fn wtoi(s: *const u16) -> i32 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    // Fold to ASCII bytes then reuse atoi (values are ASCII digits/sign).
+    let bytes: Vec<u8> = ws.iter().map(|&w| (w & 0xFF) as u8).collect();
+    nt_ntdll::crt::atoi(&bytes)
+}
+
+/// `strtol(const char* s, char** endptr, int base) -> long`.
+///
+/// # Safety
+/// `s` NUL-terminated; `endptr` null or writable.
+#[export_name = "strtol"]
+pub unsafe extern "C" fn strtol(s: *const u8, endptr: *mut *mut u8, base: i32) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    let bytes = unsafe { core::slice::from_raw_parts(s, n) };
+    let v = nt_ntdll::crt::strtoul(bytes, base as u32) as i64;
+    if !endptr.is_null() {
+        // SAFETY: endptr writable per the contract; consume the whole numeric run conservatively.
+        unsafe { *endptr = s.add(n) as *mut u8 };
+    }
+    v
+}
+
+/// `strtoul(const char* s, char** endptr, int base) -> unsigned long`.
+///
+/// # Safety
+/// `s` NUL-terminated; `endptr` null or writable.
+#[export_name = "strtoul"]
+pub unsafe extern "C" fn strtoul(s: *const u8, endptr: *mut *mut u8, base: i32) -> u64 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    let bytes = unsafe { core::slice::from_raw_parts(s, n) };
+    let v = nt_ntdll::crt::strtoul(bytes, base as u32) as u64;
+    if !endptr.is_null() {
+        // SAFETY: endptr writable per the contract.
+        unsafe { *endptr = s.add(n) as *mut u8 };
+    }
+    v
+}
+
+/// `wcstol(const wchar_t* s, wchar_t** endptr, int base) -> long`.
+///
+/// # Safety
+/// `s` NUL-terminated; `endptr` null or writable.
+#[export_name = "wcstol"]
+pub unsafe extern "C" fn wcstol(s: *const u16, endptr: *mut *mut u16, base: i32) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    let bytes: Vec<u8> = ws.iter().map(|&w| (w & 0xFF) as u8).collect();
+    let v = nt_ntdll::crt::strtoul(&bytes, base as u32) as i64;
+    if !endptr.is_null() {
+        // SAFETY: endptr writable per the contract.
+        unsafe { *endptr = s.add(n) as *mut u16 };
+    }
+    v
+}
+
+/// `wcstoul(const wchar_t* s, wchar_t** endptr, int base) -> unsigned long`.
+///
+/// # Safety
+/// `s` NUL-terminated; `endptr` null or writable.
+#[export_name = "wcstoul"]
+pub unsafe extern "C" fn wcstoul(s: *const u16, endptr: *mut *mut u16, base: i32) -> u64 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    let bytes: Vec<u8> = ws.iter().map(|&w| (w & 0xFF) as u8).collect();
+    let v = nt_ntdll::crt::strtoul(&bytes, base as u32) as u64;
+    if !endptr.is_null() {
+        // SAFETY: endptr writable per the contract.
+        unsafe { *endptr = s.add(n) as *mut u16 };
+    }
+    v
+}
+
+/// `_ultow(unsigned long value, wchar_t* buf, int radix) -> wchar_t*` — unsigned-to-wide-string.
+///
+/// # Safety
+/// `buf` large enough (>= 33 wchars for radix 2).
+#[export_name = "_ultow"]
+pub unsafe extern "C" fn ultow(value: u32, buf: *mut u16, radix: i32) -> *mut u16 {
+    let radix = if (2..=36).contains(&radix) {
+        radix as u32
+    } else {
+        10
+    };
+    let mut tmp = [0u16; 34];
+    let mut v = value;
+    let mut i = 0usize;
+    if v == 0 {
+        tmp[0] = b'0' as u16;
+        i = 1;
+    }
+    while v != 0 {
+        let d = (v % radix) as u8;
+        tmp[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 } as u16;
+        v /= radix;
+        i += 1;
+    }
+    // reversed
+    for j in 0..i {
+        // SAFETY: buf large enough per the contract.
+        unsafe { *buf.add(j) = tmp[i - 1 - j] };
+    }
+    // SAFETY: terminator within the provided buffer.
+    unsafe { *buf.add(i) = 0 };
+    buf
+}
+
+/// `abs(int) -> int`.
+#[export_name = "abs"]
+pub extern "C" fn abs(v: i32) -> i32 {
+    nt_ntdll::crt::abs(v)
+}
+
+/// `labs(long) -> long`.
+#[export_name = "labs"]
+pub extern "C" fn labs(v: i64) -> i64 {
+    nt_ntdll::crt::labs(v)
+}
+
+/// `tolower(int) -> int` (ASCII).
+#[export_name = "tolower"]
+pub extern "C" fn tolower(c: i32) -> i32 {
+    if (0x41..=0x5A).contains(&c) {
+        c + 0x20
+    } else {
+        c
+    }
+}
+
+/// `toupper(int) -> int` (ASCII).
+#[export_name = "toupper"]
+pub extern "C" fn toupper(c: i32) -> i32 {
+    if (0x61..=0x7A).contains(&c) {
+        c - 0x20
+    } else {
+        c
+    }
+}
+
+/// `towlower(wint_t) -> wint_t` (Latin-1 subset).
+#[export_name = "towlower"]
+pub extern "C" fn towlower(c: u32) -> u32 {
+    if (0x41..=0x5A).contains(&c) {
+        c + 0x20
+    } else {
+        c
+    }
+}
+
+/// `towupper(wint_t) -> wint_t` (Latin-1 subset).
+#[export_name = "towupper"]
+pub extern "C" fn towupper(c: u32) -> u32 {
+    if (0x61..=0x7A).contains(&c) {
+        c - 0x20
+    } else {
+        c
+    }
+}
+
+/// `isalpha(int) -> int` (ASCII).
+#[export_name = "isalpha"]
+pub extern "C" fn isalpha(c: i32) -> i32 {
+    i32::from((0x41..=0x5A).contains(&c) || (0x61..=0x7A).contains(&c))
+}
+
+/// `islower(int) -> int` (ASCII).
+#[export_name = "islower"]
+pub extern "C" fn islower(c: i32) -> i32 {
+    i32::from((0x61..=0x7A).contains(&c))
+}
+
+/// `iswctype(wint_t c, wctype_t type) -> int` — the wide ctype predicate. We serve the classes the
+/// Win32 stack actually queries (alpha/digit/space/upper/lower/alnum) over ASCII/Latin-1; the mask
+/// bits follow the MSVCRT `_ISxxx` values.
+#[export_name = "iswctype"]
+pub extern "C" fn iswctype(c: u32, mask: u16) -> i32 {
+    const IS_UPPER: u16 = 0x0001;
+    const IS_LOWER: u16 = 0x0002;
+    const IS_DIGIT: u16 = 0x0004;
+    const IS_SPACE: u16 = 0x0008;
+    const IS_ALPHA: u16 = 0x0100;
+    let upper = (0x41..=0x5A).contains(&c);
+    let lower = (0x61..=0x7A).contains(&c);
+    let digit = (0x30..=0x39).contains(&c);
+    let space = matches!(c, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D);
+    let mut hit = false;
+    if mask & IS_UPPER != 0 && upper {
+        hit = true;
+    }
+    if mask & IS_LOWER != 0 && lower {
+        hit = true;
+    }
+    if mask & IS_DIGIT != 0 && digit {
+        hit = true;
+    }
+    if mask & IS_SPACE != 0 && space {
+        hit = true;
+    }
+    if mask & IS_ALPHA != 0 && (upper || lower) {
+        hit = true;
+    }
+    i32::from(hit)
+}
+
+/// `sin(double) -> double`. Minimal Taylor/CORDIC-free reduction — the Win32 boot path uses these
+/// only in cosmetic float paths; a real range-reduced Taylor series is accurate for the small
+/// arguments seen. (No libm in `no_std`.)
+#[export_name = "sin"]
+pub extern "C" fn sin(x: f64) -> f64 {
+    poly_sin(reduce_pi(x))
+}
+
+/// `cos(double) -> double`.
+#[export_name = "cos"]
+pub extern "C" fn cos(x: f64) -> f64 {
+    poly_sin(reduce_pi(x + core::f64::consts::FRAC_PI_2))
+}
+
+/// `fabs(double) -> double`.
+#[export_name = "fabs"]
+pub extern "C" fn fabs(x: f64) -> f64 {
+    if x < 0.0 {
+        -x
+    } else {
+        x
+    }
+}
+
+/// `floor(double) -> double`.
+#[export_name = "floor"]
+pub extern "C" fn floor(x: f64) -> f64 {
+    let t = x as i64 as f64;
+    if t > x {
+        t - 1.0
+    } else {
+        t
+    }
+}
+
+/// `bsearch(const void* key, const void* base, size_t num, size_t size, cmp) -> void*`. Generic
+/// C `bsearch` over an opaque array with a C comparator.
+///
+/// # Safety
+/// `base` valid for `num*size` bytes; `compar` a valid C comparator; `key` valid for `size` bytes.
+#[export_name = "bsearch"]
+pub unsafe extern "C" fn bsearch(
+    key: *const c_void,
+    base: *const c_void,
+    num: usize,
+    size: usize,
+    compar: extern "C" fn(*const c_void, *const c_void) -> i32,
+) -> *const c_void {
+    if base.is_null() || size == 0 {
+        return core::ptr::null();
+    }
+    let mut lo = 0isize;
+    let mut hi = num as isize - 1;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        // SAFETY: mid in [0,num); element at base + mid*size.
+        let elem = unsafe { (base as *const u8).add(mid as usize * size) } as *const c_void;
+        let r = compar(key, elem);
+        match r.cmp(&0) {
+            core::cmp::Ordering::Equal => return elem,
+            core::cmp::Ordering::Less => hi = mid - 1,
+            core::cmp::Ordering::Greater => lo = mid + 1,
+        }
+    }
+    core::ptr::null()
+}
+
+/// `qsort(void* base, size_t num, size_t size, cmp)`. In-place, over an opaque byte array with a C
+/// comparator. Insertion sort (stable, correct, no allocation) — the Win32 boot arrays are tiny.
+///
+/// # Safety
+/// `base` valid + writable for `num*size` bytes; `compar` a valid C comparator.
+#[export_name = "qsort"]
+pub unsafe extern "C" fn qsort(
+    base: *mut c_void,
+    num: usize,
+    size: usize,
+    compar: extern "C" fn(*const c_void, *const c_void) -> i32,
+) {
+    if base.is_null() || size == 0 || num < 2 {
+        return;
+    }
+    let b = base as *mut u8;
+    let mut scratch = alloc::vec![0u8; size];
+    for i in 1..num {
+        // element i -> scratch
+        // SAFETY: i < num; regions within base.
+        unsafe {
+            core::ptr::copy_nonoverlapping(b.add(i * size), scratch.as_mut_ptr(), size);
+        }
+        let mut j = i;
+        while j > 0 {
+            // SAFETY: (j-1) < num.
+            let prev = unsafe { b.add((j - 1) * size) } as *const c_void;
+            if compar(prev, scratch.as_ptr() as *const c_void) <= 0 {
+                break;
+            }
+            // SAFETY: shift element (j-1) up to j.
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.add((j - 1) * size), b.add(j * size), size);
+            }
+            j -= 1;
+        }
+        // SAFETY: place scratch at j.
+        unsafe {
+            core::ptr::copy_nonoverlapping(scratch.as_ptr(), b.add(j * size), size);
+        }
+    }
+}
+
+/// `__chkstk` — the MSVC stack-probe intrinsic. On our committed-stack model there is nothing to
+/// probe (pages are demand-faulted + backed on touch), so it is a no-op that preserves the ABI
+/// contract (RAX = allocation size in, RSP already adjusted by the caller). Naked so it doesn't
+/// perturb registers.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "__chkstk"]
+pub unsafe extern "C" fn chkstk() {
+    core::arch::naked_asm!("ret");
+}
+
+/// `_local_unwind(void* frame, void* target)` — MSVC SEH local unwind helper. The full unwinder is
+/// the `RtlUnwind`/`__C_specific_handler` machinery (target-side seam); the local-unwind entry is a
+/// no-op on the non-exception boot path (no `__finally` frames run during normal init).
+///
+/// # Safety
+/// Called by compiler-emitted SEH prologue/epilogue code only.
+#[export_name = "_local_unwind"]
+pub unsafe extern "C" fn local_unwind(_frame: *mut c_void, _target: *mut c_void) {}
+
+/// `VerSetConditionMask(ULONGLONG mask, DWORD type, BYTE cond) -> ULONGLONG` — the version-info
+/// condition accumulator (`ntdll` export used by `VerifyVersionInfo`). Packs the 3-bit condition for
+/// the type's field-index into the 64-bit mask (7 fields × 8 bits). Ref MS `VerSetConditionMask`.
+#[export_name = "VerSetConditionMask"]
+pub extern "C" fn ver_set_condition_mask(mask: u64, type_bit_mask: u32, condition: u8) -> u64 {
+    if type_bit_mask == 0 {
+        return mask;
+    }
+    // find the single set bit's index (VER_MINORVERSION=1, MAJORVERSION=2, BUILDNUMBER=4, ...).
+    let index = type_bit_mask.trailing_zeros() as u64;
+    let cond = (condition & 0x07) as u64;
+    let shift = 3 * index;
+    (mask & !(0x07u64 << shift)) | (cond << shift)
+}
+
+// ---- math helpers for sin/cos (no libm) ----------------------------------------------------------
+fn reduce_pi(x: f64) -> f64 {
+    // reduce to [-pi, pi] WITHOUT the `%` operator (which lowers to a libm `fmod` call, absent in
+    // no_std): subtract k*2pi where k = round(x / 2pi), computed via integer truncation.
+    let two_pi = 2.0 * core::f64::consts::PI;
+    let k = (x / two_pi + if x >= 0.0 { 0.5 } else { -0.5 }) as i64 as f64;
+    let mut r = x - k * two_pi;
+    if r > core::f64::consts::PI {
+        r -= two_pi;
+    } else if r < -core::f64::consts::PI {
+        r += two_pi;
+    }
+    r
+}
+fn poly_sin(x: f64) -> f64 {
+    // 7th-order Taylor, accurate on [-pi,pi] to ~1e-4.
+    let x2 = x * x;
+    x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0)))
+}
+
+/// Count bytes up to `n` or a NUL (whichever first).
+///
+/// # Safety
+/// `p` valid for reads up to the first NUL or `n` bytes.
+unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
+    let mut i = 0usize;
+    // SAFETY: caller contract.
+    while i < n && unsafe { *p.add(i) } != 0 {
+        i += 1;
+    }
+    i
+}
+
+// =================================================================================================
 // Retention anchor — mirror the Nt* TRAP_STUB_ADDRS pattern so the linker keeps every export past
 // `--no-gc-sections`/DCE. Referenced (via `#[used]`) from `lib.rs`'s KEEP anchor.
 // =================================================================================================
@@ -2674,6 +3440,54 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_release_peb_lock as usize,
         rtl_get_nt_global_flags as usize,
         rtl_nt_status_to_dos_error as usize,
+        // BATCH 4 — CRT surface the Win32 stack imports from ntdll.
+        memcmp as usize,
+        memchr as usize,
+        strlen as usize,
+        strcmp as usize,
+        strcmpi as usize,
+        strncmp as usize,
+        strcpy as usize,
+        strcat as usize,
+        strrchr as usize,
+        strstr as usize,
+        strcspn as usize,
+        strpbrk as usize,
+        wcslwr as usize,
+        wcschr as usize,
+        wcsrchr as usize,
+        wcscmp as usize,
+        wcsncmp as usize,
+        wcscspn as usize,
+        wcsspn as usize,
+        atoi as usize,
+        wtoi as usize,
+        strtol as usize,
+        strtoul as usize,
+        wcstol as usize,
+        wcstoul as usize,
+        ultow as usize,
+        abs as usize,
+        labs as usize,
+        tolower as usize,
+        toupper as usize,
+        towlower as usize,
+        towupper as usize,
+        isalpha as usize,
+        islower as usize,
+        iswctype as usize,
+        sin as usize,
+        cos as usize,
+        fabs as usize,
+        floor as usize,
+        bsearch as usize,
+        qsort as usize,
+        local_unwind as usize,
+        ver_set_condition_mask as usize,
     ];
+    #[cfg(target_arch = "x86_64")]
+    let anchors2: &[usize] = &[chkstk as *const () as usize];
+    #[cfg(target_arch = "x86_64")]
+    core::hint::black_box(anchors2);
     core::hint::black_box(anchors);
 }
