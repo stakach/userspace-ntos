@@ -117,6 +117,22 @@ pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut
 }
 
 
+/// `RtlSizeHeap` core — the payload size of a live block (from [`process_heap_alloc`]). Returns
+/// `None` for a null / not-live pointer.
+///
+/// # Safety
+/// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`]. Single-threaded loader.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
+    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    unsafe {
+        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+            return h.size_of(ptr);
+        }
+    }
+    None
+}
+
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
 /// `dealloc` route through it; before that (or if it OOMs) `alloc` returns null (honest failure, the
 /// caller's alloc-error path handles it) rather than a fabricated pointer.

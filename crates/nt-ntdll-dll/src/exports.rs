@@ -3288,6 +3288,276 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Rtl* heap family the Win32 stack imports. The process has ONE heap (ours); the
+// HANDLE arg (Peb->ProcessHeap) is honoured as "the process heap". Alloc/free/realloc/size route
+// to the installed first-fit heap; the introspection/lock/tag ops are correct no-ops for a
+// single-threaded single-heap model.
+// =================================================================================================
+
+/// `RtlSizeHeap(PVOID HeapHandle, ULONG Flags, PVOID MemoryPointer) -> SIZE_T` — payload size.
+///
+/// # Safety
+/// `mem` a live block from the process heap (or NULL).
+#[export_name = "RtlSizeHeap"]
+pub unsafe extern "system" fn rtl_size_heap(_heap: *mut c_void, _flags: u32, mem: *mut c_void) -> usize {
+    if mem.is_null() {
+        return usize::MAX; // (SIZE_T)-1 = failure, matching RtlSizeHeap.
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: mem came from the process heap per the contract.
+        match unsafe { crate::process_heap_size(mem as *mut u8) } {
+            Some(n) => n,
+            None => usize::MAX,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        usize::MAX
+    }
+}
+
+/// `RtlValidateHeap(PVOID HeapHandle, ULONG Flags, PVOID MemoryPointer) -> BOOLEAN` — validate the
+/// heap (or a block). Our first-fit heap is internally consistent by construction; return TRUE.
+///
+/// # Safety
+/// `heap`/`mem` valid or NULL.
+#[export_name = "RtlValidateHeap"]
+pub unsafe extern "system" fn rtl_validate_heap(_heap: *mut c_void, _flags: u32, _mem: *mut c_void) -> u8 {
+    1
+}
+
+/// `RtlDestroyHeap(PVOID HeapHandle) -> PVOID` — destroy a heap (returns NULL on success). We have
+/// exactly one process heap that lives for the process lifetime; destroying it would break the
+/// allocator, so we no-op and return the handle unchanged (the "still in use" contract — real
+/// RtlDestroyHeap also refuses to destroy the process heap `Peb->ProcessHeap`).
+///
+/// # Safety
+/// `heap` a heap handle.
+#[export_name = "RtlDestroyHeap"]
+pub unsafe extern "system" fn rtl_destroy_heap(heap: *mut c_void) -> *mut c_void {
+    heap
+}
+
+/// `RtlGetProcessHeaps(ULONG Count, PVOID* Heaps) -> ULONG` — enumerate the process's heaps. We have
+/// one (the process heap = `Peb->ProcessHeap` @ gs:[0x60]->0x30).
+///
+/// # Safety
+/// `heaps` writable for `count` entries.
+#[export_name = "RtlGetProcessHeaps"]
+pub unsafe extern "system" fn rtl_get_process_heaps(count: u32, heaps: *mut *mut c_void) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Read Peb->ProcessHeap: PEB @ gs:[0x60], ProcessHeap @ PEB+0x30.
+        // SAFETY: on-target; the PEB is mapped + gs points at the TEB.
+        let ph = unsafe {
+            let peb: *const u8;
+            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+            *(peb.add(0x30) as *const *mut c_void)
+        };
+        if count >= 1 && !heaps.is_null() {
+            // SAFETY: heaps writable for >= 1 entry per the check.
+            unsafe { *heaps = ph };
+        }
+        1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (count, heaps);
+        0
+    }
+}
+
+macro_rules! heap_noop_bool {
+    ($export:literal, $fn:ident) => {
+        /// A single-threaded single-heap no-op heap op returning TRUE (success).
+        ///
+        /// # Safety
+        /// `heap` a heap handle.
+        #[export_name = $export]
+        pub unsafe extern "system" fn $fn(_heap: *mut c_void) -> u8 {
+            1
+        }
+    };
+}
+heap_noop_bool!("RtlLockHeap", rtl_lock_heap);
+heap_noop_bool!("RtlUnlockHeap", rtl_unlock_heap);
+
+/// `RtlCompactHeap(PVOID HeapHandle, ULONG Flags) -> SIZE_T` — compact + return the largest free
+/// block. No compaction model; return 0 (the documented "size unavailable" value).
+///
+/// # Safety
+/// `heap` a heap handle.
+#[export_name = "RtlCompactHeap"]
+pub unsafe extern "system" fn rtl_compact_heap(_heap: *mut c_void, _flags: u32) -> usize {
+    0
+}
+
+/// `RtlWalkHeap(PVOID HeapHandle, PVOID Entry) -> NTSTATUS` — iterate heap blocks. We don't expose a
+/// walk interface; return STATUS_NO_MORE_ENTRIES (0x8000001A) so the caller's loop terminates
+/// cleanly rather than spinning.
+///
+/// # Safety
+/// `entry` a valid RTL_HEAP_WALK_ENTRY* or NULL.
+#[export_name = "RtlWalkHeap"]
+pub unsafe extern "system" fn rtl_walk_heap(_heap: *mut c_void, _entry: *mut c_void) -> NtStatus {
+    0x8000_001A // STATUS_NO_MORE_ENTRIES
+}
+
+/// `RtlQueryHeapInformation(PVOID HeapHandle, HEAP_INFORMATION_CLASS Class, PVOID Info,
+/// SIZE_T Length, PSIZE_T Return) -> NTSTATUS`. Serves HeapCompatibilityInformation (class 0) = 0
+/// (standard heap); returns STATUS_SUCCESS.
+///
+/// # Safety
+/// `info` writable for `length` bytes; `ret` null or writable.
+#[export_name = "RtlQueryHeapInformation"]
+pub unsafe extern "system" fn rtl_query_heap_information(
+    _heap: *mut c_void,
+    class: u32,
+    info: *mut c_void,
+    length: usize,
+    ret: *mut usize,
+) -> NtStatus {
+    if class == 0 && !info.is_null() && length >= 4 {
+        // HeapCompatibilityInformation: 0 = standard front-end.
+        // SAFETY: info writable for >= 4 bytes per the check.
+        unsafe { *(info as *mut u32) = 0 };
+        if !ret.is_null() {
+            // SAFETY: ret writable.
+            unsafe { *ret = 4 };
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlSetHeapInformation(PVOID HeapHandle, HEAP_INFORMATION_CLASS Class, PVOID Info, SIZE_T Length)
+/// -> NTSTATUS`. No configurable front-end; accept the request (STATUS_SUCCESS) — the observable
+/// contract for a standard heap that ignores the tuning knob.
+///
+/// # Safety
+/// `info` valid for `length` bytes or NULL.
+#[export_name = "RtlSetHeapInformation"]
+pub unsafe extern "system" fn rtl_set_heap_information(
+    _heap: *mut c_void,
+    _class: u32,
+    _info: *mut c_void,
+    _length: usize,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlGetUserInfoHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, PVOID* UserValue,
+/// PULONG UserFlags) -> BOOLEAN` — per-allocation user metadata. Not tracked; return FALSE (no user
+/// value) — never a fabricated value.
+///
+/// # Safety
+/// `user_value`/`user_flags` null or writable.
+#[export_name = "RtlGetUserInfoHeap"]
+pub unsafe extern "system" fn rtl_get_user_info_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _base: *mut c_void,
+    user_value: *mut *mut c_void,
+    user_flags: *mut u32,
+) -> u8 {
+    if !user_value.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *user_value = core::ptr::null_mut() };
+    }
+    if !user_flags.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *user_flags = 0 };
+    }
+    0
+}
+
+/// `RtlSetUserValueHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, PVOID UserValue)
+/// -> BOOLEAN` — set per-allocation user metadata. Not tracked; return FALSE.
+///
+/// # Safety
+/// `base` a live block or NULL.
+#[export_name = "RtlSetUserValueHeap"]
+pub unsafe extern "system" fn rtl_set_user_value_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _base: *mut c_void,
+    _user_value: *mut c_void,
+) -> u8 {
+    0
+}
+
+/// `RtlQueryTagHeap(...)` — heap tag introspection (debug). No tag store; return NULL.
+///
+/// # Safety
+/// Args are the RtlQueryTagHeap ABI; reads no memory here.
+#[export_name = "RtlQueryTagHeap"]
+pub unsafe extern "system" fn rtl_query_tag_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _tag_index: u16,
+    _reset: u8,
+    _tag_name: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+// =================================================================================================
+// BATCH 4 — Etw* trace client. ETW is off in our environment (no trace session). Every Etw* API
+// returns ERROR_SUCCESS (0) / a null handle — the observable "tracing disabled" contract (a real
+// no-provider ETW client behaves the same: registration succeeds, events go nowhere). All take the
+// Win32 error-code convention (ULONG, 0 = success), NOT NTSTATUS.
+// =================================================================================================
+
+macro_rules! etw_ok {
+    ($export:literal, $fn:ident) => {
+        /// ETW trace API — tracing disabled; returns ERROR_SUCCESS (0).
+        ///
+        /// # Safety
+        /// Called with the corresponding Etw* ABI; ignores its args (no trace session).
+        #[export_name = $export]
+        pub unsafe extern "system" fn $fn(
+            _a: u64,
+            _b: u64,
+            _c: u64,
+            _d: u64,
+        ) -> u32 {
+            0
+        }
+    };
+}
+etw_ok!("EtwControlTraceA", etw_control_trace_a);
+etw_ok!("EtwControlTraceW", etw_control_trace_w);
+etw_ok!("EtwCreateTraceInstanceId", etw_create_trace_instance_id);
+etw_ok!("EtwEnableTrace", etw_enable_trace);
+etw_ok!("EtwEnumerateTraceGuids", etw_enumerate_trace_guids);
+etw_ok!("EtwFlushTraceA", etw_flush_trace_a);
+etw_ok!("EtwFlushTraceW", etw_flush_trace_w);
+etw_ok!("EtwGetTraceEnableFlags", etw_get_trace_enable_flags);
+etw_ok!("EtwGetTraceEnableLevel", etw_get_trace_enable_level);
+etw_ok!("EtwGetTraceLoggerHandle", etw_get_trace_logger_handle);
+etw_ok!("EtwNotificationRegistrationA", etw_notification_registration_a);
+etw_ok!("EtwNotificationRegistrationW", etw_notification_registration_w);
+etw_ok!("EtwQueryAllTracesA", etw_query_all_traces_a);
+etw_ok!("EtwQueryAllTracesW", etw_query_all_traces_w);
+etw_ok!("EtwQueryTraceA", etw_query_trace_a);
+etw_ok!("EtwQueryTraceW", etw_query_trace_w);
+etw_ok!("EtwReceiveNotificationsA", etw_receive_notifications_a);
+etw_ok!("EtwReceiveNotificationsW", etw_receive_notifications_w);
+etw_ok!("EtwRegisterTraceGuidsA", etw_register_trace_guids_a);
+etw_ok!("EtwRegisterTraceGuidsW", etw_register_trace_guids_w);
+etw_ok!("EtwStartTraceA", etw_start_trace_a);
+etw_ok!("EtwStartTraceW", etw_start_trace_w);
+etw_ok!("EtwStopTraceA", etw_stop_trace_a);
+etw_ok!("EtwStopTraceW", etw_stop_trace_w);
+etw_ok!("EtwTraceEvent", etw_trace_event);
+etw_ok!("EtwTraceEventInstance", etw_trace_event_instance);
+etw_ok!("EtwTraceMessage", etw_trace_message);
+etw_ok!("EtwTraceMessageVa", etw_trace_message_va);
+etw_ok!("EtwUnregisterTraceGuids", etw_unregister_trace_guids);
+etw_ok!("EtwUpdateTraceA", etw_update_trace_a);
+etw_ok!("EtwUpdateTraceW", etw_update_trace_w);
+
+// =================================================================================================
 // BATCH 4 — Zw* aliases. Zw* and Nt* are identical exports (same SSN, same ABI) — real ntdll
 // exports both names pointing at the same code. We emit a naked tail-`jmp` to the corresponding
 // Nt* export so the Zw name lands in the export directory (transport-agnostic: whatever transport
@@ -4427,6 +4697,58 @@ pub unsafe extern "C" fn export_anchor() {
     ];
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors3);
+    // BATCH 4 — Rtl* heap family.
+    let anchors_heap: &[usize] = &[
+        rtl_size_heap as usize,
+        rtl_validate_heap as usize,
+        rtl_destroy_heap as usize,
+        rtl_get_process_heaps as usize,
+        rtl_lock_heap as usize,
+        rtl_unlock_heap as usize,
+        rtl_compact_heap as usize,
+        rtl_walk_heap as usize,
+        rtl_query_heap_information as usize,
+        rtl_set_heap_information as usize,
+        rtl_get_user_info_heap as usize,
+        rtl_set_user_value_heap as usize,
+        rtl_query_tag_heap as usize,
+    ];
+    core::hint::black_box(anchors_heap);
+    // BATCH 4 — Etw* trace client.
+    let anchors_etw: &[usize] = &[
+        etw_control_trace_a as usize,
+        etw_control_trace_w as usize,
+        etw_create_trace_instance_id as usize,
+        etw_enable_trace as usize,
+        etw_enumerate_trace_guids as usize,
+        etw_flush_trace_a as usize,
+        etw_flush_trace_w as usize,
+        etw_get_trace_enable_flags as usize,
+        etw_get_trace_enable_level as usize,
+        etw_get_trace_logger_handle as usize,
+        etw_notification_registration_a as usize,
+        etw_notification_registration_w as usize,
+        etw_query_all_traces_a as usize,
+        etw_query_all_traces_w as usize,
+        etw_query_trace_a as usize,
+        etw_query_trace_w as usize,
+        etw_receive_notifications_a as usize,
+        etw_receive_notifications_w as usize,
+        etw_register_trace_guids_a as usize,
+        etw_register_trace_guids_w as usize,
+        etw_start_trace_a as usize,
+        etw_start_trace_w as usize,
+        etw_stop_trace_a as usize,
+        etw_stop_trace_w as usize,
+        etw_trace_event as usize,
+        etw_trace_event_instance as usize,
+        etw_trace_message as usize,
+        etw_trace_message_va as usize,
+        etw_unregister_trace_guids as usize,
+        etw_update_trace_a as usize,
+        etw_update_trace_w as usize,
+    ];
+    core::hint::black_box(anchors_etw);
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
     #[cfg(target_arch = "x86_64")]
