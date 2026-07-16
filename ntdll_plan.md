@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · **Step 4.0 (emit the PE32+ ntdll.dll) + 4.0b (smss's FULL ntdll import set exported, 0-missing host-proven) DONE 2026-07-16** (local emit, nt-pe-loader-verified) · Step 4.A next
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0 + 4.0b DONE · **Step 4.A (FIRST LIVE BOOT on OUR ntdll — smss/pi 0, revertible flag, observable marker proven) DONE 2026-07-16** · Step 4.B next
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -702,6 +702,60 @@ ntdll import set 100% covered (0 missing)**, 188 `Nt*` still present (0 missing)
 (as expected; Step 4.A/4.B derives it from the export table, never hardcodes). **The DLL is now a
 complete drop-in for smss — READY FOR 4.A substitution.**
 
-### ☐ Step 4.A — first control: substitute our ntdll for smss (pi 0), prove our Rust runs in-process (a DbgPrint/observable syscall), real-ntdll fallback for pi>=1.
-### ☐ Step 4.B — real LoaderHost (map/write_iat/PEB->Ldr/transfer) + snap smss's ntdll-only imports → smss reaches NtProcessStartup under our ntdll. Point the trampoline at OUR LdrpInitialize RVA.
+### ☑ Step 4.A — first control: our ntdll substituted for smss (pi 0), OUR Rust PROVEN running in-process + a live trap serviced (DONE 2026-07-16)
+**The milestone: our Rust ntdll's `LdrpInitialize` executed in smss's isolated VSpace and issued an
+`int 0x2d` DebugService trap the kernel serviced — the observable line
+`[dbg] nt-ntdll: our Rust LdrpInitialize running in smss (Step 4.A)` appears in the boot log with the
+flag ON.** Committed with the flag OFF → the gate stays green via the real-ntdll fallback. **sel4test
+byte-identical (NO `rust-micro/src` change — only `scripts/make_image.sh`).**
+
+**The staging + substitution mechanism (all executive-side + scripts):**
+- **Staging (scripts-only):** `make_image.sh` (rust-micro) stages `../.tmp/nt-ntdll.dll` (built by
+  `scripts/build_ntdll_dll.sh`) BY PATH at **`\reactos\system32\nt-ntdll.dll`** — a DISTINCT leaf, so
+  the real ReactOS `ntdll.dll` is untouched (the pi>=1 fallback). Absent DLL → the note prints, boot
+  stays on real ntdll (never fails the image build).
+- **The revert flag:** `SMSS_USE_OUR_NTDLL: bool` (main.rs, next to `NTDLL_BASE`). **`false` = the
+  committed-green boot** (real ntdll everywhere). `true` = OUR ntdll for smss/pi 0 only. A `const`, so
+  OFF dead-code-eliminates the substitution branch.
+- **The substitution (main.rs, the live smss spawn ~6700):** with the flag ON, `load_dll_from_fs(
+  OUR_NTDLL_FS_PATH, …)` reads our DLL into the FS pool (a `'static` slice), relocates it to
+  `NTDLL_BASE` (`apply_relocations_to_buf`), and passes OUR `PeFile` as the ntdll arg to BOTH
+  `spawn_sec_image` (so the demand-fault router fills ntdll pages from OUR bytes) and
+  `service_sec_image`. Any failure (load/parse/no-LdrpInitialize) → falls back to real ntdll (a
+  logged miss = still green).
+- **The trampoline LdrpInitialize-RVA derivation (NEVER hardcoded):** `spawn_sec_image` gained an
+  `ldrpinit_rva: u64` param (0 = the real ntdll's fixed `0x8e70`). At smss spawn we call
+  `our_pe.exports()` (nt-pe-loader) → find `"LdrpInitialize"` → its RVA (`0x1050` this build, drifts),
+  and pass it. The trampoline emits `movabs rax, NTDLL_BASE + <that rva>; call rax`. All pi>=1 call
+  sites pass `0` (real ntdll) → byte-identical fallback.
+
+**The observable proof (the deliverable):** the cdylib's `LdrpInitialize` (`crates/nt-ntdll-dll/
+src/lib.rs`), as its FIRST action, emits the 60-byte marker via `int 0x2d; int3` with `eax=1`
+(BREAKPOINT_PRINT), `rcx=msg`, `rdx=len` — the DebugService ABI the kernel already forwards to serial
+(exceptions.rs `error_code==0x16a`). **★ The marker bytes are built on the STACK, NOT a `.rdata`
+static** — the kernel's PRINT handler reads `rcx` DIRECTLY from kernel mode, so the buffer must be on
+an already-mapped page; a fresh `.rdata` page is NOT demand-faulted yet → the first attempt (a
+`.rdata` static) caused a KERNEL #PF at the marker VA (`cr2=NTDLL_BASE+0x5a0d0`). Stack buffer = fixed
+(the stack is mapped at spawn). Boot-log flow with ON: `#PF 0x801050` (instr-fetch = smss enters OUR
+LdrpInitialize, page faults RX in) → the marker prints → LdrpInitialize returns to the trampoline →
+smss chains to its entry `0x572ee0` → calls its IAT `0x848f00` → stops safely at a null-ish deref
+(`[vmf-out]`, `exec_reactos_smss_live_paged`/`_calls_into_ntdll` PASS). The IAT mismatch (smss's IAT
+is resolved against REAL-ntdll export RVAs from `imports.bin`, but OUR export RVAs differ) is EXPECTED
+— 4.B's real loader snaps imports in-process.
+
+**The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → **All specs passed**, gate
+**174/98**, paint **768/768 @ 0x003a6ea5** (verified). Flag ON boot: All specs passed, marker printed,
+gate drops to **142/98** + paint FAILs (smss stops after the marker → doesn't launch csrss/winlogon →
+no desktop paint) — the EXPECTED 4.A behavior (control proven, not the full boot). `nt-ntdll` host
+tests 145/145.
+
+**What 4.B wires next (the real LoaderHost):** replace the cdylib `LdrpInitialize` marker-then-return
+with the live drive of `nt_ntdll::loader::ldrp_initialize` over a real on-target `LoaderHost`:
+`map_image` (demand-load / NtAllocateVirtualMemory + relocate), `write_iat_slot` (snap smss's
+ntdll-only imports IN-PROCESS against OUR export table — fixes the IAT-RVA mismatch that stops 4.A),
+`commit_peb_teb` (the executive already pre-stages these), `transfer_to_entry` (NtContinue/trampoline
+to smss's `NtProcessStartup`). Plus wire the real process heap allocator (swap the cdylib's
+`AbortAllocator` for the `heap`-backed one) so `RtlAllocateHeap`/`RtlCreate*` light up. Goal: smss
+reaches `NtProcessStartup` under OUR ntdll.
+### ☐ Step 4.B — real LoaderHost (map/write_iat/PEB->Ldr/transfer) + snap smss's ntdll-only imports → smss reaches NtProcessStartup under our ntdll. (Trampoline already points at OUR LdrpInitialize RVA — done in 4.A.)
 ### ☐ Step 4.C — parity: smss progresses as far under our ntdll as under real (spawns csrss); add the SSN-50 arm; keep fallback; gate green (174/98, paint 768/768) throughout.

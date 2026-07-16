@@ -281,6 +281,12 @@ pub(crate) unsafe fn spawn_sec_image(
     image_mirror: u64,
     image_path: &[u8],
     cmd_line: &[u8],
+    // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
+    // ReactOS ntdll's is 0x8e70 (its build-fixed RVA); OUR Rust ntdll's is DIFFERENT + not stable
+    // across builds (0x1050 in the current build) — so the caller DERIVES it from OUR DLL's export
+    // table (nt-pe-loader) and passes it here. 0 = use the real-ntdll default (0x8e70), keeping the
+    // pi>=1 / flag-OFF path byte-identical.
+    ldrpinit_rva: u64,
 ) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
@@ -555,7 +561,10 @@ pub(crate) unsafe fn spawn_sec_image(
         tb.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // movabs rdx, NTDLL_BASE
         tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&(NTDLL_BASE + 0x8e70).to_le_bytes()); // movabs rax, LdrpInitialize
+        // Step 4.A: call OUR LdrpInitialize RVA when the caller derived one (ldrpinit_rva != 0);
+        // otherwise the real ReactOS ntdll's fixed 0x8e70 (flag-OFF / pi>=1 — byte-identical).
+        let ldrp_off = if ldrpinit_rva != 0 { ldrpinit_rva } else { 0x8e70 };
+        tb.extend_from_slice(&(NTDLL_BASE + ldrp_off).to_le_bytes()); // movabs rax, LdrpInitialize
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (runs the whole loader, then RETURNS here)
         // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
         // Windows KiUserApcDispatcher would then NtContinue to the image entry; we have no APC

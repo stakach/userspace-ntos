@@ -69,20 +69,57 @@ static KEEP_TRAP_STUBS: &[unsafe extern "C" fn()] = nt_ntdll::trap_stubs::TRAP_S
 #[used]
 static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 
+/// The Step-4.A observable marker bytes, emitted via the `int 0x2d` DebugService (`PRINT`) the
+/// kernel forwards to serial as `[dbg] ...` (see `project_smss_sec_image` +
+/// `rust-micro/src/arch/x86_64/exceptions.rs`). Seeing this line in the boot log PROVES our Rust
+/// ntdll executed IN smss's isolated VSpace and a trap reached the kernel.
+///
+/// ★ These are `u8` LITERALS built onto the STACK at runtime (NOT a `.rdata` static): the kernel's
+/// int-0x2d PRINT handler READS the message buffer (`rcx`) DIRECTLY from kernel mode, so it must sit
+/// on a page already mapped in smss's VSpace. Our LdrpInitialize's `.text` page is demand-faulted in
+/// (that is how we got here), but a fresh `.rdata` page would NOT be mapped yet → the kernel read
+/// would #PF in kernel mode. The stack IS fully mapped at spawn, so a stack buffer is safe.
+const STEP4A_MARKER_LEN: usize = 60;
+
 /// `LdrpInitialize` — the loader entry the executive's spawn trampoline transfers to.
 ///
 /// Real-ntdll ABI (x64): `VOID LdrpInitialize(PCONTEXT Context, PVOID NtDllBase)`. The full live
 /// orchestration ([`nt_ntdll::loader::ldrp_initialize`]) needs an on-target `LoaderHost` (the live
-/// map/IAT/PEB-commit/transfer ops) which Step 4.B wires. For Step 4.0 this export just has to
-/// EXIST at a findable RVA so the trampoline can be pointed at it; the body is a minimal, honest
-/// placeholder that returns to the caller (it does NOT fabricate a completed init).
+/// map/IAT/PEB-commit/transfer ops) which Step 4.B wires.
+///
+/// **Step 4.A — first live control + an observable syscall.** As its FIRST action this emits the
+/// Step-4.A marker via the `int 0x2d` DebugService (`ServiceClass = PRINT`), which our kernel
+/// forwards to the serial log. That single line is the Step-4.A proof: OUR Rust ran in smss's own
+/// VSpace and issued a trap the kernel serviced. After the marker it returns to the trampoline (the
+/// live `LoaderHost` map/IAT/PEB/transfer drive is Step 4.B) — it does NOT fabricate a completed
+/// init; the process will not reach smss's entry until 4.B wires the real loader.
 ///
 /// # Safety
-/// Called by the kernel/trampoline with the loader `CONTEXT`. A no-op-return placeholder until
-/// Step 4.B installs the live path.
+/// Called by the kernel/trampoline with the loader `CONTEXT`. Emits an `int 0x2d` (target x86_64
+/// only) then returns; no live-init side effects until Step 4.B.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn LdrpInitialize(_context: *mut c_void, _ntdll_base: *mut c_void) {
-    // Step 4.B replaces this with the live-host drive of `nt_ntdll::loader::ldrp_initialize`.
+    // Step 4.A observable marker: prove OUR code runs in-process + a trap reaches the kernel.
+    // The kernel's int-0x2d handler forwards RCX(msg)/RDX(len) with EAX=1 (PRINT) to serial and,
+    // on resume, advances RIP past `int 0x2d; int3` (3 bytes) — so we pair them exactly.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Build the marker on the STACK (mapped at spawn) — see STEP4A_MARKER_LEN doc for why not
+        // a .rdata static. "nt-ntdll: our Rust LdrpInitialize running in smss (Step 4.A)\0" (60 B).
+        let marker: [u8; STEP4A_MARKER_LEN] = *b"nt-ntdll: our Rust LdrpInitialize running in smss (Step 4.A)";
+        let msg = marker.as_ptr();
+        core::arch::asm!(
+            "int 0x2d",
+            "int3",
+            in("eax") 1u32, // BREAKPOINT_PRINT
+            in("rcx") msg,
+            in("rdx") STEP4A_MARKER_LEN,
+            options(nostack, preserves_flags),
+        );
+        // Keep the stack buffer live across the asm (it is read by the kernel handler above).
+        core::hint::black_box(&marker);
+    }
+    // Step 4.B replaces the rest with the live-host drive of `nt_ntdll::loader::ldrp_initialize`.
     core::hint::black_box(_context);
     core::hint::black_box(_ntdll_base);
 }

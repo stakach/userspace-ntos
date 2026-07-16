@@ -1119,6 +1119,7 @@ pub(crate) unsafe fn service_sec_image(
                     let cpml4 = spawn_sec_image(
                         1, cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, 0, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize (Step 4.A substitutes only smss/pi 0)
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
@@ -1174,6 +1175,7 @@ pub(crate) unsafe fn service_sec_image(
                         2, wpe, wf_c, NTDLL_BASE, true, 102, 0x0000_0100_107C_0000,
                         WINLOGON_STACK_MIRROR_VA, WINLOGON_HEAP_MIRROR_VA, WINLOGON_IMAGE_MIRROR_VA,
                         WINLOGON_IMAGE_PATH, WINLOGON_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[2].pml4 = wpml4;
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
@@ -1924,6 +1926,7 @@ pub(crate) unsafe fn service_sec_image(
                         3, spe, sf_c, NTDLL_BASE, true, 103, SERVICES_ENV_SCRATCH_VA,
                         SERVICES_STACK_MIRROR_VA, SERVICES_HEAP_MIRROR_VA, SERVICES_IMAGE_MIRROR_VA,
                         SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[3].pml4 = spml4;
                     procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
@@ -1972,6 +1975,7 @@ pub(crate) unsafe fn service_sec_image(
                         4, lpe, lf_c, NTDLL_BASE, true, 104, LSASS_ENV_SCRATCH_VA,
                         LSASS_STACK_MIRROR_VA, LSASS_HEAP_MIRROR_VA, LSASS_IMAGE_MIRROR_VA,
                         LSASS_IMAGE_PATH, LSASS_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize
                     );
                     procs[4].pml4 = lpml4;
                     procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);

@@ -152,6 +152,15 @@ pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 /// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
 /// NTDLL_BASE + each import's export RVA.
 pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
+/// ntdll_plan.md Step 4.A — substitute OUR Rust ntdll (crates/nt-ntdll-dll, staged BY PATH at
+/// `\reactos\system32\nt-ntdll.dll` by make_image.sh) for **smss (pi 0) ONLY**. pi>=1 always uses
+/// the real ReactOS ntdll (the fallback). `true` = smss boots on our ntdll (its `LdrpInitialize`
+/// emits the observable `[dbg] nt-ntdll: ...` marker, then stops at the unwired LoaderHost seams —
+/// Step 4.B wires those). `false` = the committed-green boot (real ntdll everywhere). Landed OFF so
+/// the gate (174/98, paint 768/768) stays green via the fallback; flip ON to observe the marker.
+pub const SMSS_USE_OUR_NTDLL: bool = false;
+/// Path to OUR staged Rust ntdll on the FS (see make_image.sh Step 4.A staging).
+pub const OUR_NTDLL_FS_PATH: &[u8] = b"reactos\\system32\\nt-ntdll.dll";
 /// A hosted process's environment pages (TEB/PEB/params/trampoline). These live in the SAME 2 MiB
 /// image page table (the reserved IMAGE_BASE PT spans [0x40_0000, 0x60_0000)) but must sit BELOW
 /// PE_LOAD_BASE (0x56_0000) so they never collide with the hosted EXE's own image, which loads at
@@ -4912,7 +4921,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     if let Ok(pe) = nt_pe_loader::PeFile::parse(&si_bytes) {
         let si_fault = make_object(OBJ_ENDPOINT);
         let si_fault_c = copy_cap(si_fault);
-        let pml4 = spawn_sec_image(0, &pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+        let pml4 = spawn_sec_image(0, &pe, si_fault_c, 0, false, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", 0);
         let (v, f, _, _, _, _) = service_sec_image(si_fault, pml4, &pe, STORAGE_SHARED_VADDR + 0x4000, None);
         si_verdict = v;
         si_faults = f;
@@ -6697,13 +6706,63 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);
+                // Step 4.A: when SMSS_USE_OUR_NTDLL is set, load OUR Rust ntdll BY PATH from the FS
+                // (staged \reactos\system32\nt-ntdll.dll) and substitute it for smss (pi 0) — pi>=1
+                // keeps the real ReactOS ntdll (the fallback). We DERIVE OUR LdrpInitialize's RVA from
+                // OUR DLL's export table (never hardcode — it drifts across builds; 0x1050 now) so the
+                // spawn trampoline calls OUR loader entry. If the load/parse/derive fails at any step
+                // we fall back to the real ntdll below (miss = green). Our PE bytes live in the FS pool
+                // (a 'static slice) and are relocated to NTDLL_BASE, exactly like the real ntdll.
+                let (our_ntdll, our_ldrp_rva): (Option<nt_pe_loader::PeFile<'static>>, u64) =
+                    if SMSS_USE_OUR_NTDLL {
+                        let (opt_pe, ova) = load_dll_from_fs(OUR_NTDLL_FS_PATH, b"nt-ntdll.dll");
+                        match opt_pe {
+                            Some(opt) => {
+                                // Find LdrpInitialize's RVA in OUR export table.
+                                let rva = opt
+                                    .exports()
+                                    .ok()
+                                    .and_then(|es| {
+                                        es.into_iter()
+                                            .find(|e| e.name == "LdrpInitialize")
+                                            .map(|e| e.rva as u64)
+                                    })
+                                    .unwrap_or(0);
+                                if rva != 0 {
+                                    // Relocate OUR DLL to its load base (the pool VA -> NTDLL_BASE).
+                                    apply_relocations_to_buf(&opt, ova, NTDLL_BASE);
+                                    print_str(b"[ntos-exec] Step 4.A: OUR ntdll for smss, LdrpInitialize RVA=0x");
+                                    print_hex(rva as u32);
+                                    print_str(b"\n");
+                                    (Some(opt), rva)
+                                } else {
+                                    print_str(b"[ntos-exec] Step 4.A: OUR ntdll has no LdrpInitialize export - fallback to real ntdll\n");
+                                    (None, 0)
+                                }
+                            }
+                            None => {
+                                print_str(b"[ntos-exec] Step 4.A: OUR ntdll load/parse failed - fallback to real ntdll\n");
+                                (None, 0)
+                            }
+                        }
+                    } else {
+                        (None, 0)
+                    };
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
                     // absolute self-pointers at the preferred base otherwise.
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
+                    // Select which ntdll smss (pi 0) runs on: OUR Rust ntdll (Step 4.A, flag ON + load
+                    // succeeded) or the real ReactOS ntdll (the committed-green fallback). The demand-
+                    // fault router fills ntdll pages from whichever PE we pass to service_sec_image, and
+                    // the trampoline calls whichever LdrpInitialize RVA we pass to spawn_sec_image.
+                    let use_ours = our_ntdll.is_some();
+                    let smss_ntdll_pe: &nt_pe_loader::PeFile =
+                        our_ntdll.as_ref().unwrap_or(&ntdll_pe);
+                    let smss_ldrp_rva = if use_ours { our_ldrp_rva } else { 0 };
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
-                    let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe");
+                    let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", smss_ldrp_rva);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
                     // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
@@ -6721,12 +6780,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             CAP_INIT_THREAD_VSPACE,
                         );
                     }
+                    // The demand-fault router fills ntdll's pages from THIS PE — pass OUR ntdll when
+                    // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
+                    // from OUR DLL's bytes; otherwise the real ntdll (fallback).
                     let (heap_verdict, sfaults, sfirst, sstop, ntfaults, sssn) = service_sec_image(
                         si_fault,
                         pml4,
                         &pe,
                         SCRATCH_BASE,
-                        Some((NTDLL_BASE, &ntdll_pe)),
+                        Some((NTDLL_BASE, smss_ntdll_pe)),
                     );
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
