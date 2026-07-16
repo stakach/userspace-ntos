@@ -58,8 +58,20 @@ impl Backend {
 pub fn syscall(backend: Backend, ssn: u32, args: &[u64]) -> NtStatus {
     match backend {
         Backend::X86Trap => x86_trap_dispatch(ssn, args),
-        // Declared seams — the real IPC send lands in Step 6.
-        Backend::Sel4Call | Backend::SurtRing => STATUS_NOT_IMPLEMENTED,
+        // The seL4/SURT backends must GATHER every arg (incl. the stack tail) into an IPC message /
+        // ring entry before sending — unlike the trap, which leaves the tail on the caller's stack.
+        // We marshal here (host-tested via `marshal`), then hit the honest send seam: the real IPC
+        // send lands in Step 6. Marshalling-then-NOT_IMPLEMENTED never fabricates a result.
+        Backend::Sel4Call => {
+            let _msg = crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
+            // Real seL4 `Call` to the servicing endpoint carrying `_msg` — Step 6.
+            STATUS_NOT_IMPLEMENTED
+        }
+        Backend::SurtRing => {
+            let _entry = crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
+            // Real SURT ring submission carrying `_entry` — Step 6.
+            STATUS_NOT_IMPLEMENTED
+        }
     }
 }
 

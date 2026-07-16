@@ -101,6 +101,44 @@ fn ssn_anchors_match_reactos_and_executive() {
 }
 
 #[test]
+fn every_service_has_an_exact_arity() {
+    // The marshaller must know how many stack args each service carries; every entry in the SSN
+    // table must have an EXACT arity (not the MAX_STUB_ARGS fallback), else a non-trap transport
+    // would over- or under-gather.
+    for e in NT_SYSCALLS {
+        assert!(
+            NT_ARGC.iter().any(|(n, _)| *n == e.name),
+            "missing arity for {}",
+            e.name
+        );
+        let c = argc_of(e.name);
+        assert!(c <= MAX_STUB_ARGS, "arity of {} exceeds MAX_STUB_ARGS", e.name);
+    }
+    assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len());
+}
+
+#[test]
+fn arity_anchors_and_fallback() {
+    assert_eq!(argc_of("NtClose"), 1);
+    assert_eq!(argc_of("NtCreateFile"), 11);
+    assert_eq!(argc_of("NtWaitForSingleObject"), 3);
+    assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest
+    // Zw* inherits its underlying Nt*'s arity.
+    assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));
+    // Unknown falls back conservatively to MAX_STUB_ARGS (never 0 → never silently drops args).
+    assert_eq!(argc_of("NtNotARealService"), MAX_STUB_ARGS);
+}
+
+#[test]
+fn no_duplicate_argc_names() {
+    for (i, (a, _)) in NT_ARGC.iter().enumerate() {
+        for (b, _) in &NT_ARGC[i + 1..] {
+            assert_ne!(a, b, "duplicate argc entry {}", a);
+        }
+    }
+}
+
+#[test]
 fn alpc_seam_is_reserved_above_the_reactos_range() {
     // ALPC is documented-but-unassigned; its reserved base is well clear of every real SSN.
     let max = NT_SYSCALLS.iter().map(|e| e.ssn).max().unwrap();

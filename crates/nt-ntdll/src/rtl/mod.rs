@@ -11,12 +11,18 @@
 //! Step 2b lands the bulk of the 244-entry `Rtl*` surface. See `ntdll_plan.md` for the categorised
 //! coverage (A pure / A' CRT / B heap / C sync).
 
+pub mod atom;
 pub mod bitmap;
 pub mod convert;
+pub mod encode;
+pub mod environment;
+pub mod exception;
 pub mod guid;
+pub mod image;
 pub mod integer;
 pub mod path;
 pub mod random;
+pub mod security;
 pub mod status;
 pub mod strings;
 pub mod time;

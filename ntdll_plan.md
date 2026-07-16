@@ -294,10 +294,8 @@ never-silent-success). **Proof-of-pattern slice**: 5 fully-wired stubs (`NtClose
 ### Follow-on split (tracked, NOT done here)
 - ☑ **Step 2b** — the bulk `Rtl*` bodies + the CRT re-exports + the heap + the sync primitives.
   **DONE 2026-07-16 — see "Step 2b Results" below.**
-- **Step 2c** — **`Csr*`** (8, over `nt-port-core`), **`Dbg*`** (12, serial-forward/no-op),
-  **`Ki*`** user dispatchers (APC/exception/callback), the full 188 stub *bodies* with the >4-arg
-  stack thunk, and the Category-A `Rtl*` stragglers that need process state or subsystem coupling
-  (see the Step 2b "remaining" list).
+- ☑ **Step 2c** — **`Csr*`** / **`Dbg*`** / **`Ki*`** + the full 188 stub *bodies* + the marshalling
+  + the `Rtl*` stragglers. **DONE 2026-07-16 — see "Step 2c Results" below.**
 - **Step 3** — the loader (`LdrpInitialize` over the `nt-ntdll-layout` structs + `nt-pe-loader`):
   PEB/TEB setup, process-param normalization, `PEB->Ldr` build, recursive import snap incl.
   forwarders, TLS callbacks, `DLL_PROCESS_ATTACH` ordering.
@@ -392,3 +390,102 @@ reuse `nt-kernel-exec::rtl_atom`), **pointer encode/decode** (`RtlEncodePointer`
 — need the process cookie), **image helpers** (`RtlImageNtHeader`/`RtlImageDirectoryEntryToData`/
 `RtlPcToFileHeader` — reuse `nt-pe-loader`), and the **exception raisers** (`RtlRaiseException`/
 `RtlRaiseStatus` — target-only, pair with `Ki*`).
+
+---
+
+## Step 2c Results (landed 2026-07-16)
+
+Completed the ntdll **export surface** — the full 188 `Nt*` stub bodies + arg marshalling,
+`Csr*`/`Dbg*`/`Ki*`, and the state-coupled `Rtl*` stragglers — host-tested, **ZERO boot risk**
+(new modules only; nothing wired into the boot, executive runtime + `rust-micro/src` untouched;
+`nt-ntdll` is a separate `[workspace]` from the executive so it cannot perturb the staged binary —
+verified: `components/ntos-executive/build.sh` stages green after the change). **nt-ntdll: 127
+tests** (up from 68); **nt-syscall-abi: 12** (added the arity table). Clippy-clean (nt-ntdll);
+builds on both the host and the `x86_64-unknown-none` target (the naked trap stubs + all target asm).
+
+### 1. The full 188 `Nt*` trap-stub bodies + arg marshalling
+- **`src/trap_stubs.rs`** — a `generate_trap_stubs!` macro emits all **188** naked x86_64 stubs, each
+  the canonical `mov r10,rcx; mov eax,<ssn>; syscall; ret` (`#[unsafe(naked)]` + `naked_asm!`,
+  `#[cfg(target_arch="x86_64")]`; host builds get only the metadata table). ★ Per the ABI, args >4
+  **stay on the caller's stack** for the trap path — the kernel reads them there, so there is NO
+  stack thunk; the naked `syscall; ret` forwards register + stack args untouched. Host-tested that
+  the generation covers all 188 with the exact SSN + arity, no dup name/SSN, and matches the shared
+  `nt-syscall-abi` table (`generated_ssns_match_the_shared_abi_exactly`).
+- **`src/marshal.rs`** — the arity-driven gatherer for the **non-trap** transports (seL4 `Call` /
+  SURT ring), which — unlike the trap — must GATHER every arg incl. the stack tail into a
+  self-contained IPC message. An `ArgSource` trait (register window + stack window; host mock =
+  `SliceArgSource`/`FlatArgSource`) + `marshal(ssn, argc, src)` → `Marshalled { ssn, args }`.
+  Arity comes from the new **`nt-syscall-abi::NT_ARGC` / `argc_of`** table (every one of the 188 has
+  an exact arity; unknown → conservative `MAX_STUB_ARGS`=14). Host-tested incl. the **>4-arg case**
+  (NtCreateFile = 11 args: 4 reg + 7 stack) and the widest (NtCreateNamedPipeFile = 14). The
+  transport's `Sel4Call`/`SurtRing` arms now **marshal-then-seam** (build the message, then return
+  `STATUS_NOT_IMPLEMENTED` at the honest send seam — never a fabricated result; real send = Step 6).
+
+### 2. `Csr*` (8) — `src/csr.rs`
+CSR client over `nt-port-core`: the `CSR_API_MESSAGE` construction (`CsrApiNumber` =
+`CSR_MAKE_API_NUMBER(dll,api)`, fixed-arg block, `PORT_MESSAGE`-framed length) + the
+**`CSR_CAPTURE_BUFFER`** marshalling (`CsrAllocateCaptureBuffer`/`CsrCaptureMessageBuffer`/
+`CsrFreeCaptureBuffer` — 8-byte-aligned packing + server-relocatable `CapturedPointer` descriptors +
+capacity/pointer-count rejection) + `CsrClientConnectToServer`/`CsrClientCallServer`/
+`CsrGetProcessId`. The actual port SEND is the **LPC seam** (`NtRequestWaitReplyPort` over
+`nt-port-core`, wired later): `call_server` builds the message + returns `STATUS_NOT_IMPLEMENTED`
+(connected) / `STATUS_INVALID_PARAMETER` (unconnected) — the round-trip is NOT faked. Host-tested.
+
+### 3. `Dbg*` (12) — `src/dbg.rs`
+The debug-print family: `render`/`render_with_prefix` reuse the 2b `_snprintf`-core; `DbgPrintEx`
+**component/level filtering** (`ComponentFilter::should_print` — ERROR always, bit-index + masked-
+raw levels, host-tested); `DbgPrompt` request shape (the response goes in **R8** on our kernel — the
+`project_smss_sec_image` fix — modelled, not faked); the `int 0x2d` DebugService `emit` +
+`DbgBreakPoint`/`DbgUserBreakPoint` (`int3`) are `#[cfg(target_arch="x86_64")]`. Host-tests cover
+formatting + level filtering + the prompt shape.
+
+### 4. `Ki*` dispatchers — `src/ki.rs` (+ the SEH machinery in `src/rtl/exception.rs`)
+The four user dispatchers the **kernel jumps to** (0 imported — but load-bearing: APC/SEH/callback
+delivery): `KiUserApcDispatcher` (unpack `(routine,args,CONTEXT)` → call + `NtContinue`),
+`KiUserExceptionDispatcher` (run `RtlDispatchException` → Continue/LastChance/Noncontinuable),
+`KiUserCallbackDispatcher` (the win32k `KeUserModeCallback` bridge — resolve
+`PEB->KernelCallbackTable[ApiIndex]` → call → `NtCallbackReturn`), `KiRaiseUserExceptionDispatcher`.
+The **dispatch LOGIC** is host-tested; the machine-context save + `NtContinue`/`NtCallbackReturn` are
+honest target seams (return `STATUS_NOT_IMPLEMENTED` on the host — no fabricated resume). Paired with
+**`src/rtl/exception.rs`** — the x64 table-based SEH machinery: `RtlDispatchException` (frame walk),
+`RtlUnwind` (2nd pass / `__finally`), `RtlAddFunctionTable`/`RtlLookupFunctionEntry` (`.pdata`
+`RUNTIME_FUNCTION` registry with binary-search lookup). **This is the machinery Step 3's loader
+needs** (SEH + function-table registration during `DLL_PROCESS_ATTACH`).
+
+### 5. `Rtl*` stragglers — delegate/reuse, honest seams
+- **`src/rtl/security.rs`** — SID/ACL/SD family (`RtlLengthSid`/`RtlCreateAcl`/`RtlAddAce`/
+  `RtlCreateSecurityDescriptor`/`RtlSetDaclSecurityDescriptor`/`RtlMapGenericMask`/…) **delegated to
+  `nt-security`** (re-exports its `Sid`/`Acl`/`Ace`/`SecurityDescriptor` — ONE SID model, no copy).
+- **`src/rtl/atom.rs`** — atom tables **reuse `nt-kernel-exec::rtl_atom`** (`OwnedAtomTable`).
+- **`src/rtl/environment.rs`** — env / CWD / full-path (`RtlCreateEnvironment`/
+  `RtlQueryEnvironmentVariable_U`/`RtlSetEnvironmentVariable`/`RtlExpandEnvironmentStrings_U`/
+  `RtlGetCurrentDirectory_U`/`RtlSetCurrentDirectory_U`/`RtlGetFullPathName_U` +
+  `RtlNormalizeProcessParams` over `nt-ntdll-layout`'s `RTL_USER_PROC_PARAMS_NORMALIZED`). Pure logic
+  over an in-Rust env/cwd model; the live-PEB pointer is the documented Step-3 seam.
+- **`src/rtl/encode.rs`** — `RtlEncodePointer`/`RtlDecodePointer` (+ system variants): the exact
+  `rotr64(ptr ^ cookie, cookie&0x3F)` bijection; the process-cookie source is the Step-3 seam.
+- **`src/rtl/image.rs`** — `RtlImageNtHeader`/`RtlImageDirectoryEntryToData`/`RtlImageRvaToVa`/
+  `RtlImageRvaToSection`/`RtlPcToFileHeader` **reuse `nt-pe-loader::PeFile`**.
+
+### ★ SSN reconciliation finding + recommendation (NtCreateProcessEx 50 vs NtCreateProcess 49)
+The imported surface (measured Step 1) contains **`NtCreateProcessEx` (SSN 50)** — the ntdll export
+ReactOS binaries actually link — while the **executive currently dispatches `NtCreateProcess`
+(SSN 49)**. Both are real `sysfuncs.lst` entries (49 = NtCreateProcess, 50 = NtCreateProcessEx). The
+shared `nt-syscall-abi` table honestly carries the **imported** name+SSN (`NtCreateProcessEx`, 50).
+**Recommendation for Step 4 (do NOT change the executive now):** teach the **executive** to dispatch
+**SSN 50 = NtCreateProcessEx** (the arg-superset: `NtCreateProcessEx` adds a `JobMemberLevel` param
+and drops the debug/exception-port pair into flags) and route SSN 49 as a thin shim onto the same
+handler (49's args are a prefix of 50's). Do NOT alias 49→50 in ntdll — our ntdll should emit the
+**real** stub the binary imports (50), and the executive is the one place that already owns the
+create policy, so it's the natural place to learn 50. This keeps ntdll import-by-name faithful and
+localizes the change to the create-dispatch site (which `project_process_convergence` already owns).
+Net: **one executive dispatch arm added at cutover, zero ntdll aliasing.**
+
+### What remains for Step 3 (the loader)
+`LdrpInitialize` over the `nt-ntdll-layout` PEB/TEB/LDR structs + `nt-pe-loader`: PEB/TEB setup at
+the exact offsets, process-param normalization (uses `rtl::environment`), the `PEB->Ldr` module-list
+build, recursive import snap **incl. forwarders** (kills the `_vista`/SxS gaps), TLS callbacks, and
+`DLL_PROCESS_ATTACH` ordering — plus wiring the SEH function-table registration (`rtl::exception`)
+and the process cookie (`rtl::encode`) / live-PEB pointers (`rtl::environment`) that this step's
+stragglers left as documented seams. The syscall/port/context SENDs (Sel4Call/SurtRing/LPC/
+NtContinue) remain the Step-6 transport flip.

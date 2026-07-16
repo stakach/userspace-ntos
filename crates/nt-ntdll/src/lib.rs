@@ -28,8 +28,25 @@
 //!   honest documented keyed-event seam** through [`transport`] — NOT faked (the root fix for the
 //!   `RtlpWaitForCriticalSection` boot deadlock: correct by construction).
 //!
-//! Scope: the full 188 stub *bodies* (>4-arg stack thunk), `Csr*`/`Dbg*`/`Ki*`, and the loader are
-//! tracked follow-ons (Step 2c / Step 3). See `ntdll_plan.md`.
+//! **Step 2c** (this) completes the export surface:
+//! - [`trap_stubs`] — the full **188** `Nt*` trap-stub bodies, macro-generated (`mov r10,rcx;
+//!   mov eax,<ssn>; syscall; ret`), target-only asm with host-tested generation coverage.
+//! - [`marshal`] — arity-driven **argument marshalling** for the non-trap backends (seL4/SURT must
+//!   gather the >4-arg stack tail into an IPC message; host-tested, incl. the widest 14-arg service).
+//! - [`csr`] — the `Csr*` CSR client (CSR_API_MESSAGE + capture-buffer marshalling over
+//!   [`nt_port_core`]; the port send is the honest LPC seam).
+//! - [`dbg`] — the `Dbg*` debug surface (formatting + component/level filtering host-tested; the
+//!   `int 0x2d` DebugService + `int3` breakpoints target-gated).
+//! - [`ki`] — the `Ki*` user dispatchers (APC/exception/callback/raise) the kernel jumps to; the
+//!   dispatch logic is host-tested, `NtContinue`/`NtCallbackReturn` are target seams.
+//! - [`rtl::exception`] — the x64 SEH machinery (`RtlDispatchException`/`RtlUnwind` +
+//!   `RtlAddFunctionTable`/`RtlLookupFunctionEntry`) that [`ki`] and the loader (Step 3) use.
+//! - the `Rtl*` stragglers ([`rtl::security`], [`rtl::atom`], [`rtl::environment`],
+//!   [`rtl::encode`], [`rtl::image`]) delegate to `nt-security` / `nt-kernel-exec::rtl_atom` /
+//!   `nt-ntdll-layout` / `nt-pe-loader`.
+//!
+//! Scope: the loader (`LdrpInitialize`) is Step 3; the real syscall/port/context SENDs are honest
+//! documented seams (Step 6). See `ntdll_plan.md`.
 //!
 //! `no_std` + `alloc`.
 
@@ -40,10 +57,15 @@ extern crate alloc;
 pub use nt_syscall_abi as abi;
 
 pub mod crt;
+pub mod csr;
+pub mod dbg;
 pub mod heap;
+pub mod ki;
+pub mod marshal;
 pub mod rtl;
 pub mod stubs;
 pub mod sync;
+pub mod trap_stubs;
 pub mod transport;
 
 /// `NTSTATUS` — the 32-bit status every `Nt*` stub returns in `rax` (`STATUS_SUCCESS` = 0).
