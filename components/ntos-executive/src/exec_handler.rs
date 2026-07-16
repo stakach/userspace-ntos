@@ -2650,6 +2650,35 @@ impl NativeSyscallHandler for ExecNtHandler {
                         return 0;
                     }
                 }
+                // lsass (pi==4) LSA-init port connects: after \SeRmCommandPort (modeled above), lsass's
+                // LSA/RPC init connects to further ports. If the broker doesn't own the name, connecting
+                // returns OBJECT_NAME_NOT_FOUND → lsass (a CRITICAL process via RtlSetProcessIsCritical)
+                // terminates the WHOLE process with 0xC0000034 (see LsapInitLsa/LsarStartRpcServer).
+                // MODEL any lsass port connect the broker doesn't know as an accepted comm port (mint a
+                // handle + SUCCESS) so LSA init proceeds past the connect toward LsarStartRpcServer /
+                // LSA_RPC_SERVER_ACTIVE. Scoped to pi==4 (services/csrss/winlogon LPC unchanged).
+                // NOTE: this advances lsass PAST the connect into its LSA server-thread creation
+                // (NtCreateThread), which then WALLs at a bad thread-entry fetch (a bare RVA 0x3a288) —
+                // the flagged "N threads per process" lsass-listener multiplex frontier (same class as
+                // winlogon's RPC-listener thread). Kept because it advances lsass + is non-regressive
+                // (gate 165 held); the thread-entry wall is the NEXT batch's frontier.
+                if self.pi == 4 {
+                    let mut nb = [0u8; 48];
+                    let nlen = Self::fold_name(&name16, &mut nb);
+                    print_str(b"[lsass-connect] port=");
+                    print_str(&nb[..nlen.min(48)]);
+                    // Only model if the broker doesn't own the name (a real broker port still routes).
+                    let broker_owns = lpc_client()
+                        .map(|c| matches!(c.connect_port(&name16, 0, &[]), Ok(r) if r.pending || r.handle != 0))
+                        .unwrap_or(false);
+                    if !broker_owns {
+                        let h = self.mint_handle();
+                        self.queue_write(args[0], h);
+                        print_str(b" -> modeled lsass port accept\n");
+                        return 0;
+                    }
+                    print_str(b" (broker-owned)\n");
+                }
                 match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
@@ -4342,6 +4371,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     0
                 } else {
+                    // DIAG (BATCH 23): log lsass's (pi==4) unresolved NtOpenFile — its LSA init opens a
+                    // named object we don't model and bails with OBJECT_NAME_NOT_FOUND. Surface the name.
+                    if self.pi == 4 {
+                        print_str(b"[lsass-open-miss] name=");
+                        print_str(&nb[..nlen.min(80)]);
+                        print_str(b" -> 0xC0000034\n");
+                    }
                     0xC0000034 // no filesystem yet → not found (smss skips / uses defaults)
                 };
                 loader_trace_record(
