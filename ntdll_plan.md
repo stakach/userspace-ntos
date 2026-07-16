@@ -1343,3 +1343,57 @@ PATTERN (a large, parallelizable, frontier-driven batch — NOT a single wall). 
 (the full missing list is reproducible: diff each stack DLL's ntdll-import descriptor vs our export
 table). Reconverge 174/98 + paint once csrss finishes CsrServerInitialization → the CSR↔SM handshake
 → winlogon spawns on our ntdll.
+
+## ☑ SYSTEMATIC PORT — BATCH 4 (DONE): the Win32-stack export surface COMPLETED (0-missing ×11 DLLs)
+
+**Milestone: EVERY Win32-stack DLL resolves its COMPLETE ntdll import set against our exports — 0
+missing.** The BATCH-3 forwarder-follow fix revealed the ~253-export frontier; BATCH 4 closed it in
+bulk (measure-without-booting → thin `#[export_name]` wrappers over existing host-tested bodies +
+honest no-op/seam bodies for the genuinely-missing planes). **DLL grew 284 → 598 exports.**
+
+### The measured gap (reproducible: `llvm-objdump -p` each stack DLL's ntdll-import descriptor +
+### its forwards-to-ntdll exports, union, diff vs our export table)
+Start: **314 distinct missing** across csrsrv/basesrv/winsrv/gdi32/user32/advapi32/rpcrt4/kernel32/
+ws2_32/ws2help/msvcrt. Split by nature: ~most had **existing host-tested `nt-ntdll` bodies** (thin
+C-ABI wrappers) vs a minority **genuinely missing a plane** (SxS/activation-context, timer-queue/
+thread-pool, resource loader, IFEO) → honest export at the correct ABI returning a real failure /
+documented no-op (never a fabricated result). **Committed per-group, host-green** (nt-ntdll stays 157):
+
+| group | count | nature |
+|---|---|---|
+| **CRT** | 44 | mem/str/wcs/ctype/math/parse/qsort/bsearch over `nt_ntdll::crt` + inline (sin/cos avoid libm; memcmp/strlen weak vs compiler-builtins-mem) |
+| **Dbg/Csr/data** | 21 | DbgPrintEx/DbgUi*/vDbgPrintExWithPrefix, the 8 Csr* client (real port send = LPC seam), NlsMb*CodePageTag |
+| **Zw aliases** | 2 | ZwYieldExecution (jmp NtYieldExecution) / ZwCallbackReturn (SSN-22 stub) |
+| **Rtl string/convert** | 21 | UNICODE/ANSI/OEM string + Unicode↔MultiByte/Oem N + sizes + IsTextUnicode + InitCodePageTable |
+| **Rtl heap** | 13 | Size/Validate/Destroy/GetProcessHeaps/Lock/Compact/Walk/Query+Set(Heap/User)Info over our 1 heap |
+| **Etw** | 31 | tracing-disabled no-ops (ERROR_SUCCESS = no-provider ETW) — advapi32's Etw surface |
+| **Rtl mem/bitmap/atom/encode/time/random/SList/misc** | ~58 | over `nt_ntdll::rtl::{bitmap,time,encode,random}` + inline; version(5.2.3790)/error-mode/SList/vectored+function-table/unwind(int3 raise, no-op unwind seams)/ExitUserThread |
+| **Rtl SxS/path/guid/image/handle/resource/timer/debug** | ~49 | SxS honest no-ops (no manifest → SXS_KEY_NOT_FOUND fallback), path/guid/image real bodies, handle-table/resource-lock real inline, timer-queue/thread-pool sentinel no-ops (QueueWorkItem runs inline) |
+| **security (advapi32)** | 51 | new `security_exports.rs`: raw SID/ACL/SECURITY_DESCRIPTOR (absolute+self-relative), access/generic-mask, Se objects (NOT_IMPLEMENTED seams). Sigs vs ReactOS sdk/lib/rtl/{sid,acl,sd,access,priv}.c |
+| **Ldr + path/env/msg** | 24 | loader-lock (uncontended), AddRefDll/GetDllHandleEx/EnumerateLoadedModules (walks PEB->Ldr), Shutdown/IFEO/resource-loader honest fallbacks, Get/SetCurrentDirectory_U (real PEB read/write), GetFullPathName/DosPathNameToRelativeNtPathName |
+
+### The gate (now permanent): `tools/ntdll-dll-verify` asserts 0-missing per stack DLL
+Generalized the smss coverage check to **all 11 stack DLLs** (direct by-name imports + forwards-to-
+ntdll). `build_ntdll_dll.sh` fails if any DLL has a missing import. **All 11 pass 0-missing**
+(kernel32 400 imported incl forwarders, advapi32 190, all 0).
+
+### How far csrss got (boot-confirmed, gate 147/98)
+csrss's loader **cascades the ENTIRE Win32 client stack on our ntdll + snaps 0-missing** (csrsrv/
+basesrv/winsrv/gdi32/user32/advapi32/rpcrt4/kernel32/ws2_32/ws2help/msvcrt all DEMAND-LOADed +
+NtCreateSection + NtMapViewOfSection + import-snapped, `snap resolved=103/87 missing=0`). csrss runs
+**553 service-iters** (was 510 at BATCH 3), reaches **CsrServerInitialization**, spawns the **REAL
+`CsrApiRequestThread`** (entry 0x80001a20, tcb 0xabe3, parks on its first fault to csr_fault_ep),
+services the win32k connect (SSN 0x125a NtUserProcessConnect → STATUS_SUCCESS), NtQueryObject, and a
+thread-terminate — deep into CSR server bring-up on our ntdll.
+
+### ★ THE NEXT FRONTIER = a DEEPER NON-EXPORT WALL (runtime behavior, NOT an export gap)
+csrss now stops at a **user #PF: cr2=0x668 err=4 rip=0x100_0080d2aa** — a **NULL+0x668 read** in
+csrss image space, AFTER CsrServerInitialization spawned the CsrApiRequestThread. This is NOT an
+ntdll export gap (the whole stack snapped 0-missing); it is a **runtime-behavior wall** — a NULL
+struct-pointer deref at field +0x668 (a CSR/TEB/context structure not populated by our seams). The
+export-completion mission is DONE; the path to paint now runs through **CSR server-runtime state**
+(the CsrApiRequestThread multiplex + the CSR↔SM handshake + the connect data plane) and the honest
+seams BATCH 4 left (Csr* LPC send, SxS, thread-pool) becoming live where csrss actually exercises
+them. Diagnose the 0x668 NULL-deref (which struct/field) as the next increment; likely a Csr* client
+or PEB/TEB field the CsrApiRequestThread path reads that our seam returns NULL for. Reconverge
+174/98 + paint once csrss finishes CSR bring-up → the CSR↔SM handshake → winlogon spawns.
