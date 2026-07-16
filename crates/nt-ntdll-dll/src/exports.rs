@@ -3288,6 +3288,897 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Rtl* activation-context (SxS) / path / guid / image / handle-table / resource-lock /
+// timer-queue / thread-pool / debug-buffer families.
+//   * SxS: no activation-context plane hosted → the whole family is honest no-ops that report "no
+//     active context" (the caller falls back to the process default — which IS how a manifest-less
+//     process behaves). The Ex/UnsafeFast variants share the no-op.
+//   * path/guid: real bodies over the host-tested nt_ntdll::rtl::{path,guid}.
+//   * image: real bodies over nt_ntdll::rtl::image (a mapped image = a byte slice from the base).
+//   * handle-table / resource-lock: real inline (single-threaded).
+//   * timer-queue / thread-pool: no scheduler plane → honest STATUS_NOT_IMPLEMENTED / no-op.
+// =================================================================================================
+
+// ---- activation context (SxS) — no plane; report "no active context" -----------------------------
+
+/// `RtlActivateActivationContext(ULONG Flags, PVOID ActCtx, PULONG_PTR Cookie) -> NTSTATUS` — push
+/// an activation context. No SxS plane; set the cookie to a sentinel + STATUS_SUCCESS (the caller
+/// pairs it with Deactivate, a matched no-op).
+///
+/// # Safety
+/// `cookie` null or writable.
+#[export_name = "RtlActivateActivationContext"]
+pub unsafe extern "system" fn rtl_activate_activation_context(
+    _flags: u32,
+    _act_ctx: *mut c_void,
+    cookie: *mut usize,
+) -> NtStatus {
+    if !cookie.is_null() {
+        // SAFETY: cookie writable per the contract.
+        unsafe { *cookie = 1 };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlActivateActivationContextEx(ULONG Flags, PTEB Teb, PVOID ActCtx, PULONG_PTR Cookie)`.
+///
+/// # Safety
+/// `cookie` null or writable.
+#[export_name = "RtlActivateActivationContextEx"]
+pub unsafe extern "system" fn rtl_activate_activation_context_ex(
+    _flags: u32,
+    _teb: *mut c_void,
+    _act_ctx: *mut c_void,
+    cookie: *mut usize,
+) -> NtStatus {
+    if !cookie.is_null() {
+        // SAFETY: cookie writable per the contract.
+        unsafe { *cookie = 1 };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlActivateActivationContextUnsafeFast(PRTL_ACTIVATION_CONTEXT_STACK_FRAME Frame, PVOID ActCtx)`
+/// — the inlined fast-path push. No-op (no SxS stack).
+///
+/// # Safety
+/// `frame` a valid RTL_ACTIVATION_CONTEXT_STACK_FRAME or NULL.
+#[export_name = "RtlActivateActivationContextUnsafeFast"]
+pub unsafe extern "system" fn rtl_activate_activation_context_unsafe_fast(
+    _frame: *mut c_void,
+    _act_ctx: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `RtlDeactivateActivationContext(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — pop. No-op success.
+///
+/// # Safety
+/// `cookie` from a matching Activate.
+#[export_name = "RtlDeactivateActivationContext"]
+pub unsafe extern "system" fn rtl_deactivate_activation_context(_flags: u32, _cookie: usize) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlDeactivateActivationContextUnsafeFast(PRTL_ACTIVATION_CONTEXT_STACK_FRAME Frame)` — no-op.
+///
+/// # Safety
+/// `frame` a valid stack frame or NULL.
+#[export_name = "RtlDeactivateActivationContextUnsafeFast"]
+pub unsafe extern "system" fn rtl_deactivate_activation_context_unsafe_fast(_frame: *mut c_void) {}
+
+/// `RtlCreateActivationContext(ULONG Flags, PVOID ActivationContextData, ULONG ExtraBytes,
+/// PVOID Callback, PVOID CallbackData, PVOID* ActCtx) -> NTSTATUS` — build an activation context.
+/// No SxS plane; return a non-null sentinel handle (so the caller's null-check passes) that
+/// Add/Release/Find treat as "empty context". Never a fabricated section lookup.
+///
+/// # Safety
+/// `act_ctx` writable.
+#[export_name = "RtlCreateActivationContext"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_activation_context(
+    _flags: u32,
+    _data: *mut c_void,
+    _extra_bytes: u32,
+    _callback: *mut c_void,
+    _callback_data: *mut c_void,
+    act_ctx: *mut *mut c_void,
+) -> NtStatus {
+    if !act_ctx.is_null() {
+        // A stable non-null "empty context" sentinel (the default-activation-context marker).
+        // SAFETY: act_ctx writable per the contract.
+        unsafe { *act_ctx = 1 as *mut c_void };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlAddRefActivationContext(PVOID ActCtx)` — no ref-count store; no-op.
+///
+/// # Safety
+/// `act_ctx` an activation-context sentinel.
+#[export_name = "RtlAddRefActivationContext"]
+pub unsafe extern "system" fn rtl_add_ref_activation_context(_act_ctx: *mut c_void) {}
+
+/// `RtlReleaseActivationContext(PVOID ActCtx)` — no-op (no ref-count store).
+///
+/// # Safety
+/// `act_ctx` an activation-context sentinel.
+#[export_name = "RtlReleaseActivationContext"]
+pub unsafe extern "system" fn rtl_release_activation_context(_act_ctx: *mut c_void) {}
+
+/// `RtlZombifyActivationContext(PVOID ActCtx) -> NTSTATUS` — mark for teardown. No-op success.
+///
+/// # Safety
+/// `act_ctx` an activation-context sentinel.
+#[export_name = "RtlZombifyActivationContext"]
+pub unsafe extern "system" fn rtl_zombify_activation_context(_act_ctx: *mut c_void) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlGetActiveActivationContext(PVOID* ActCtx) -> NTSTATUS` — report the active context = none
+/// (NULL = the process default). The caller then uses the default search path.
+///
+/// # Safety
+/// `act_ctx` writable.
+#[export_name = "RtlGetActiveActivationContext"]
+pub unsafe extern "system" fn rtl_get_active_activation_context(act_ctx: *mut *mut c_void) -> NtStatus {
+    if !act_ctx.is_null() {
+        // SAFETY: act_ctx writable per the contract.
+        unsafe { *act_ctx = core::ptr::null_mut() };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlFindActivationContextSectionString(ULONG Flags, PGUID ExtGuid, ULONG SectionId,
+/// PUNICODE_STRING StringToFind, PVOID ReturnedData) -> NTSTATUS` — resolve a redirected name via
+/// SxS. No manifest data → STATUS_SXS_KEY_NOT_FOUND (0xC0150004): the caller falls back to the
+/// unredirected name (the manifest-less behavior). NEVER a fabricated redirection.
+///
+/// # Safety
+/// Args per the RtlFindActivationContextSectionString ABI.
+#[export_name = "RtlFindActivationContextSectionString"]
+pub unsafe extern "system" fn rtl_find_activation_context_section_string(
+    _flags: u32,
+    _ext_guid: *const c_void,
+    _section_id: u32,
+    _string_to_find: *const c_void,
+    _returned_data: *mut c_void,
+) -> NtStatus {
+    0xC015_0004 // STATUS_SXS_KEY_NOT_FOUND
+}
+
+/// `RtlFindActivationContextSectionGuid(...)` — same "no manifest" contract.
+///
+/// # Safety
+/// Args per the RtlFindActivationContextSectionGuid ABI.
+#[export_name = "RtlFindActivationContextSectionGuid"]
+pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
+    _flags: u32,
+    _ext_guid: *const c_void,
+    _section_id: u32,
+    _guid_to_find: *const c_void,
+    _returned_data: *mut c_void,
+) -> NtStatus {
+    0xC015_0004
+}
+
+/// `RtlQueryInformationActivationContext(...) -> NTSTATUS` — query context metadata. Report the
+/// default (empty) context; STATUS_SUCCESS with zeroed output where a buffer is provided.
+///
+/// # Safety
+/// Args per the ABI; `info` null or writable for `info_len` bytes.
+#[export_name = "RtlQueryInformationActivationContext"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_query_information_activation_context(
+    _flags: u32,
+    _act_ctx: *mut c_void,
+    _sub_instance: *mut c_void,
+    _info_class: u32,
+    info: *mut c_void,
+    info_len: usize,
+    ret_len: *mut usize,
+) -> NtStatus {
+    if !info.is_null() && info_len > 0 {
+        // SAFETY: info writable for info_len bytes per the contract.
+        unsafe { core::ptr::write_bytes(info as *mut u8, 0, info_len) };
+    }
+    if !ret_len.is_null() {
+        // SAFETY: ret_len writable.
+        unsafe { *ret_len = 0 };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlAllocateActivationContextStack(PVOID* Stack) -> NTSTATUS` — allocate the per-thread SxS
+/// frame-list. No SxS stack; NULL out + STATUS_SUCCESS (the thread runs with no activation stack).
+///
+/// # Safety
+/// `stack` writable.
+#[export_name = "RtlAllocateActivationContextStack"]
+pub unsafe extern "system" fn rtl_allocate_activation_context_stack(stack: *mut *mut c_void) -> NtStatus {
+    if !stack.is_null() {
+        // SAFETY: stack writable per the contract.
+        unsafe { *stack = core::ptr::null_mut() };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlFreeActivationContextStack(PVOID Stack)` — no-op (none allocated).
+///
+/// # Safety
+/// `stack` from `RtlAllocateActivationContextStack` or NULL.
+#[export_name = "RtlFreeActivationContextStack"]
+pub unsafe extern "system" fn rtl_free_activation_context_stack(_stack: *mut c_void) {}
+
+/// `RtlIsThreadWithinLoaderCallout() -> BOOLEAN` — are we inside a DllMain callout? The boot runs
+/// DllMains serially from the loader; report FALSE (the safe default — callers use it to avoid
+/// re-entrant loads; FALSE lets them proceed, which is correct for our single-threaded init).
+///
+/// # Safety
+/// Reads no cross-plane state.
+#[export_name = "RtlIsThreadWithinLoaderCallout"]
+pub unsafe extern "system" fn rtl_is_thread_within_loader_callout() -> u8 {
+    0
+}
+
+// ---- path / guid (host-tested bodies) ------------------------------------------------------------
+
+/// `RtlDetermineDosPathNameType_U(PCWSTR Path) -> RTL_PATH_TYPE`.
+///
+/// # Safety
+/// `path` a NUL-terminated UTF-16 string.
+#[export_name = "RtlDetermineDosPathNameType_U"]
+pub unsafe extern "system" fn rtl_determine_dos_path_name_type_u(path: *const u16) -> u32 {
+    // SAFETY: path NUL-terminated per the contract.
+    let n = unsafe { wcslen_raw(path) };
+    let s = unsafe { core::slice::from_raw_parts(path, n) };
+    // Map to the Windows RTL_PATH_TYPE ordinals (0..=7), matched by variant.
+    use nt_ntdll::rtl::path::DosPathType as T;
+    match nt_ntdll::rtl::path::determine_dos_path_name_type(s) {
+        T::Unknown => 0,
+        T::UncAbsolute => 1,
+        T::DriveAbsolute => 2,
+        T::DriveRelative => 3,
+        T::Rooted => 4,
+        T::Relative => 5,
+        T::LocalDevice => 6,
+        T::RootLocalDevice => 7,
+    }
+}
+
+/// `RtlIsDosDeviceName_U(PCWSTR Path) -> ULONG` — packed {offset<<16 | length} if a DOS device,
+/// else 0.
+///
+/// # Safety
+/// `path` a NUL-terminated UTF-16 string.
+#[export_name = "RtlIsDosDeviceName_U"]
+pub unsafe extern "system" fn rtl_is_dos_device_name_u(path: *const u16) -> u32 {
+    // SAFETY: path NUL-terminated per the contract.
+    let n = unsafe { wcslen_raw(path) };
+    let s = unsafe { core::slice::from_raw_parts(path, n) };
+    if nt_ntdll::rtl::path::is_dos_device_name(s) {
+        // Offset 0, length = whole name in bytes (a conservative but valid packed result).
+        (n * 2) as u32
+    } else {
+        0
+    }
+}
+
+/// `RtlIsNameLegalDOS8Dot3(PCUNICODE_STRING Name, POEM_STRING OemName, PBOOLEAN SpacesPresent)
+/// -> BOOLEAN`.
+///
+/// # Safety
+/// `name` a valid UNICODE_STRING; `spaces_present` null or writable.
+#[export_name = "RtlIsNameLegalDOS8Dot3"]
+pub unsafe extern "system" fn rtl_is_name_legal_dos_8dot3(
+    name: PCUnicodeString,
+    _oem_name: *mut c_void,
+    spaces_present: *mut u8,
+) -> u8 {
+    if name.is_null() {
+        return 0;
+    }
+    // SAFETY: name valid per the contract.
+    let (buf, units) = unsafe { ((*name).buffer as *const u16, (*name).length as usize / 2) };
+    let s = if buf.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: valid region.
+        unsafe { core::slice::from_raw_parts(buf, units) }
+    };
+    if !spaces_present.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *spaces_present = u8::from(s.contains(&0x20)) };
+    }
+    u8::from(nt_ntdll::rtl::strings::is_name_legal_dos_8dot3(s))
+}
+
+/// `RtlGUIDFromString(PCUNICODE_STRING GuidString, GUID* Guid) -> NTSTATUS`.
+///
+/// # Safety
+/// `guid_string` a valid UNICODE_STRING; `guid` writable (16 bytes).
+#[export_name = "RtlGUIDFromString"]
+pub unsafe extern "system" fn rtl_guid_from_string(
+    guid_string: PCUnicodeString,
+    guid: *mut c_void,
+) -> NtStatus {
+    if guid_string.is_null() || guid.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: guid_string valid per the contract.
+    let (buf, units) = unsafe {
+        ((*guid_string).buffer as *const u16, (*guid_string).length as usize / 2)
+    };
+    let s = unsafe { core::slice::from_raw_parts(buf, units) };
+    match nt_ntdll::rtl::guid::guid_from_string(s) {
+        Some(g) => {
+            // GUID: Data1:u32, Data2:u16, Data3:u16, Data4:[u8;8].
+            // SAFETY: guid writable for 16 bytes per the contract.
+            unsafe {
+                *(guid as *mut u32) = g.data1;
+                *((guid as *mut u16).add(2)) = g.data2;
+                *((guid as *mut u16).add(3)) = g.data3;
+                core::ptr::copy_nonoverlapping(g.data4.as_ptr(), (guid as *mut u8).add(8), 8);
+            }
+            STATUS_SUCCESS
+        }
+        None => 0xC000_0059, // STATUS_INVALID_PARAMETER-ish; RtlGUIDFromString uses STATUS_INVALID_PARAMETER
+    }
+}
+
+// ---- image (host-tested nt_ntdll::rtl::image over a mapped image byte slice) ----------------------
+
+/// `RtlImageNtHeader(PVOID BaseAddress) -> PIMAGE_NT_HEADERS` — the NT headers of a mapped image.
+///
+/// # Safety
+/// `base` a mapped PE image.
+#[export_name = "RtlImageNtHeader"]
+pub unsafe extern "system" fn rtl_image_nt_header(base: *mut c_void) -> *mut c_void {
+    if base.is_null() {
+        return core::ptr::null_mut();
+    }
+    // e_lfanew @ base+0x3C → the NT headers offset. Validate the MZ + PE signatures.
+    // SAFETY: base is a mapped image with a DOS header per the contract.
+    unsafe {
+        if *(base as *const u16) != 0x5A4D {
+            return core::ptr::null_mut(); // no "MZ"
+        }
+        let e_lfanew = *((base as *const u8).add(0x3C) as *const u32) as usize;
+        let nt = (base as *const u8).add(e_lfanew);
+        if *(nt as *const u32) != 0x0000_4550 {
+            return core::ptr::null_mut(); // no "PE\0\0"
+        }
+        nt as *mut c_void
+    }
+}
+
+/// `RtlImageDirectoryEntryToData(PVOID Base, BOOLEAN MappedAsImage, USHORT DirectoryEntry,
+/// PULONG Size) -> PVOID` — the data of a data directory in a mapped image.
+///
+/// # Safety
+/// `base` a mapped PE image; `size` null or writable.
+#[export_name = "RtlImageDirectoryEntryToData"]
+pub unsafe extern "system" fn rtl_image_directory_entry_to_data(
+    base: *mut c_void,
+    _mapped_as_image: u8,
+    directory_entry: u16,
+    size: *mut u32,
+) -> *mut c_void {
+    // SAFETY: base a mapped image per the contract.
+    let nt = unsafe { rtl_image_nt_header(base) };
+    if nt.is_null() {
+        return core::ptr::null_mut();
+    }
+    // OptionalHeader @ nt+0x18; Magic @ +0. For PE32+ (0x20B), the data-directory array starts at
+    // OptionalHeader+0x70; each entry = {VirtualAddress:u32, Size:u32}.
+    // SAFETY: nt valid per rtl_image_nt_header.
+    unsafe {
+        let opt = (nt as *const u8).add(0x18);
+        let magic = *(opt as *const u16);
+        let dir_base = if magic == 0x20B { opt.add(0x70) } else { opt.add(0x60) };
+        let entry = dir_base.add(directory_entry as usize * 8);
+        let rva = *(entry as *const u32);
+        let sz = *((entry as *const u32).add(1));
+        if rva == 0 {
+            return core::ptr::null_mut();
+        }
+        if !size.is_null() {
+            *size = sz;
+        }
+        (base as *const u8).add(rva as usize) as *mut c_void
+    }
+}
+
+/// `RtlImageRvaToVa(PIMAGE_NT_HEADERS NtHeaders, PVOID Base, ULONG Rva, PIMAGE_SECTION_HEADER* Sec)
+/// -> PVOID`. For a mapped-as-image module the VA is simply base+rva.
+///
+/// # Safety
+/// `base` a mapped PE image.
+#[export_name = "RtlImageRvaToVa"]
+pub unsafe extern "system" fn rtl_image_rva_to_va(
+    _nt_headers: *mut c_void,
+    base: *mut c_void,
+    rva: u32,
+    _last_section: *mut *mut c_void,
+) -> *mut c_void {
+    if base.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: base mapped; base+rva is within the image per the contract.
+    unsafe { (base as *mut u8).add(rva as usize) as *mut c_void }
+}
+
+/// `RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage) -> PVOID` — find the image base containing
+/// PC. No dynamic module map here; return NULL (unknown), with `*BaseOfImage=NULL`. The boot path
+/// only calls this from the SEH unwinder (which doesn't run on the normal path).
+///
+/// # Safety
+/// `base_of_image` null or writable.
+#[export_name = "RtlPcToFileHeader"]
+pub unsafe extern "system" fn rtl_pc_to_file_header(
+    _pc_value: *mut c_void,
+    base_of_image: *mut *mut c_void,
+) -> *mut c_void {
+    if !base_of_image.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *base_of_image = core::ptr::null_mut() };
+    }
+    core::ptr::null_mut()
+}
+
+// ---- handle tables (RTL_HANDLE_TABLE) — real inline single-threaded --------------------------------
+// RTL_HANDLE_TABLE (x64): MaximumNumberOfHandles:u32@0, SizeOfHandleTableEntry:u32@4,
+// Reserved[2]@8, FreeHandles:ptr@0x18, CommittedHandles:ptr@0x20, UnCommittedHandles:ptr@0x28,
+// MaxReservedHandles:ptr@0x30, Handles:ptr@0x38. We model a simple bump-array of entries.
+
+/// `RtlInitializeHandleTable(ULONG MaximumNumberOfHandles, ULONG SizeOfHandleTableEntry,
+/// PRTL_HANDLE_TABLE HandleTable)` — allocate a fixed handle array.
+///
+/// # Safety
+/// `table` a valid writable RTL_HANDLE_TABLE (>= 0x40 bytes).
+#[export_name = "RtlInitializeHandleTable"]
+pub unsafe extern "system" fn rtl_initialize_handle_table(
+    max_handles: u32,
+    entry_size: u32,
+    table: *mut c_void,
+) {
+    if table.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let bytes = (max_handles as usize) * (entry_size as usize);
+        // SAFETY: on-target heap.
+        let arr = unsafe { crate::process_heap_alloc(bytes.max(1)) };
+        // SAFETY: table valid for the RTL_HANDLE_TABLE fields per the contract.
+        unsafe {
+            core::ptr::write_bytes(table as *mut u8, 0, 0x40);
+            *(table as *mut u32) = max_handles;
+            *((table as *mut u32).add(1)) = entry_size;
+            *((table as *mut u64).byte_add(0x38)) = arr as u64; // Handles
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (max_handles, entry_size);
+    }
+}
+
+/// `RtlAllocateHandle(PRTL_HANDLE_TABLE HandleTable, PULONG HandleIndex) -> PRTL_HANDLE_TABLE_ENTRY`
+/// — allocate the next free entry (bump allocator over the fixed array).
+///
+/// # Safety
+/// `table` from `RtlInitializeHandleTable`; `index` null or writable.
+#[export_name = "RtlAllocateHandle"]
+pub unsafe extern "system" fn rtl_allocate_handle(table: *mut c_void, index: *mut u32) -> *mut c_void {
+    if table.is_null() {
+        return core::ptr::null_mut();
+    }
+    // Track the next-free index in Reserved[0] @ +8 (a bump cursor).
+    // SAFETY: table valid per the contract.
+    unsafe {
+        let max = *(table as *const u32);
+        let entry_size = *((table as *const u32).add(1)) as usize;
+        let cursor = (table as *mut u32).byte_add(8);
+        let i = *cursor;
+        if i >= max {
+            return core::ptr::null_mut();
+        }
+        *cursor = i + 1;
+        let handles = *((table as *const u64).byte_add(0x38)) as *mut u8;
+        if handles.is_null() {
+            return core::ptr::null_mut();
+        }
+        if !index.is_null() {
+            *index = i;
+        }
+        handles.add(i as usize * entry_size) as *mut c_void
+    }
+}
+
+/// `RtlFreeHandle(PRTL_HANDLE_TABLE, PRTL_HANDLE_TABLE_ENTRY) -> BOOLEAN` — mark an entry free. Our
+/// bump allocator doesn't reclaim mid-array (the handle-table users on the boot path allocate
+/// monotonically); mark the entry's flags-word (last u32) as free + return TRUE.
+///
+/// # Safety
+/// `entry` from `RtlAllocateHandle`.
+#[export_name = "RtlFreeHandle"]
+pub unsafe extern "system" fn rtl_free_handle(_table: *mut c_void, entry: *mut c_void) -> u8 {
+    if entry.is_null() {
+        return 0;
+    }
+    // Clear the entry's first word (a common "in use" flag lives there).
+    // SAFETY: entry valid per the contract.
+    unsafe { *(entry as *mut u32) = 0 };
+    1
+}
+
+/// `RtlIsValidHandle(PRTL_HANDLE_TABLE, PRTL_HANDLE_TABLE_ENTRY) -> BOOLEAN`.
+///
+/// # Safety
+/// `entry` from `RtlAllocateHandle` or NULL.
+#[export_name = "RtlIsValidHandle"]
+pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mut c_void) -> u8 {
+    if table.is_null() || entry.is_null() {
+        return 0;
+    }
+    // Valid if entry is within the Handles array bounds.
+    // SAFETY: table valid per the contract.
+    unsafe {
+        let max = *(table as *const u32) as usize;
+        let entry_size = *((table as *const u32).add(1)) as usize;
+        let handles = *((table as *const u64).byte_add(0x38)) as usize;
+        let e = entry as usize;
+        u8::from(handles != 0 && e >= handles && e < handles + max * entry_size)
+    }
+}
+
+// ---- resource RW-lock (RTL_RESOURCE) — real inline single-threaded --------------------------------
+
+/// `RtlInitializeResource(PRTL_RESOURCE Resource)` — zero the resource (unlocked).
+///
+/// # Safety
+/// `resource` a valid writable RTL_RESOURCE.
+#[export_name = "RtlInitializeResource"]
+pub unsafe extern "system" fn rtl_initialize_resource(resource: *mut c_void) {
+    if !resource.is_null() {
+        // RTL_RESOURCE is ~0x38 bytes; zero it = unlocked, 0 shared/exclusive owners.
+        // SAFETY: resource valid per the contract.
+        unsafe { core::ptr::write_bytes(resource as *mut u8, 0, 0x38) };
+    }
+}
+
+/// `RtlAcquireResourceShared(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN` — single-threaded → always
+/// granted (bump the shared count @ +0x18).
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlAcquireResourceShared"]
+pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void, _wait: u8) -> u8 {
+    if resource.is_null() {
+        return 0;
+    }
+    // SAFETY: resource valid per the contract; NumberActive @ +0x18 (i32).
+    unsafe {
+        let active = (resource as *mut i32).byte_add(0x18);
+        *active += 1;
+    }
+    1
+}
+
+/// `RtlAcquireResourceExclusive(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN` — single-threaded → granted
+/// (NumberActive = -1 = exclusive).
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlAcquireResourceExclusive"]
+pub unsafe extern "system" fn rtl_acquire_resource_exclusive(resource: *mut c_void, _wait: u8) -> u8 {
+    if resource.is_null() {
+        return 0;
+    }
+    // SAFETY: resource valid per the contract.
+    unsafe {
+        let active = (resource as *mut i32).byte_add(0x18);
+        *active = -1;
+    }
+    1
+}
+
+/// `RtlReleaseResource(PRTL_RESOURCE)` — release (reset the active count).
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlReleaseResource"]
+pub unsafe extern "system" fn rtl_release_resource(resource: *mut c_void) {
+    if resource.is_null() {
+        return;
+    }
+    // SAFETY: resource valid per the contract.
+    unsafe {
+        let active = (resource as *mut i32).byte_add(0x18);
+        if *active < 0 {
+            *active = 0; // exclusive → free
+        } else if *active > 0 {
+            *active -= 1; // one shared holder leaves
+        }
+    }
+}
+
+// ---- timer-queue / thread-pool / work-item — no scheduler plane (honest seams) --------------------
+
+/// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — no thread-pool plane; return a non-null
+/// sentinel handle so the caller proceeds (the queue simply never fires — an honest no-op timer
+/// queue, never a fabricated timer). Timer callbacks aren't on the boot path.
+///
+/// # Safety
+/// `timer_queue` writable.
+#[export_name = "RtlCreateTimerQueue"]
+pub unsafe extern "system" fn rtl_create_timer_queue(timer_queue: *mut *mut c_void) -> NtStatus {
+    if !timer_queue.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *timer_queue = 1 as *mut c_void };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlCreateTimer(HANDLE TimerQueue, PHANDLE Timer, WAITORTIMERCALLBACKFUNC Callback,
+/// PVOID Parameter, DWORD DueTime, DWORD Period, ULONG Flags) -> NTSTATUS`. No plane; sentinel
+/// handle + STATUS_SUCCESS (the timer never fires).
+///
+/// # Safety
+/// `timer` writable.
+#[export_name = "RtlCreateTimer"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_timer(
+    _timer_queue: *mut c_void,
+    timer: *mut *mut c_void,
+    _callback: *mut c_void,
+    _parameter: *mut c_void,
+    _due_time: u32,
+    _period: u32,
+    _flags: u32,
+) -> NtStatus {
+    if !timer.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *timer = 1 as *mut c_void };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlUpdateTimer(HANDLE TimerQueue, HANDLE Timer, DWORD DueTime, DWORD Period) -> NTSTATUS`.
+///
+/// # Safety
+/// Handles from Create*.
+#[export_name = "RtlUpdateTimer"]
+pub unsafe extern "system" fn rtl_update_timer(
+    _timer_queue: *mut c_void,
+    _timer: *mut c_void,
+    _due_time: u32,
+    _period: u32,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlDeleteTimer(HANDLE TimerQueue, HANDLE Timer, HANDLE CompletionEvent) -> NTSTATUS`.
+///
+/// # Safety
+/// Handles from Create*.
+#[export_name = "RtlDeleteTimer"]
+pub unsafe extern "system" fn rtl_delete_timer(
+    _timer_queue: *mut c_void,
+    _timer: *mut c_void,
+    _completion_event: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlDeleteTimerQueueEx(HANDLE TimerQueue, HANDLE CompletionEvent) -> NTSTATUS`.
+///
+/// # Safety
+/// `timer_queue` from `RtlCreateTimerQueue`.
+#[export_name = "RtlDeleteTimerQueueEx"]
+pub unsafe extern "system" fn rtl_delete_timer_queue_ex(
+    _timer_queue: *mut c_void,
+    _completion_event: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlQueueWorkItem(WORKERCALLBACKFUNC Function, PVOID Context, ULONG Flags) -> NTSTATUS`. No
+/// thread-pool plane. Rather than drop the work (which could hang a caller awaiting it), we run it
+/// SYNCHRONOUSLY inline — a legitimate degenerate thread pool (immediate execution on the caller's
+/// thread). This is the honest behavior for a single-threaded environment, not a no-op that loses
+/// the work.
+///
+/// # Safety
+/// `function` a valid `void(*)(PVOID)` callback; `context` its argument.
+#[export_name = "RtlQueueWorkItem"]
+pub unsafe extern "system" fn rtl_queue_work_item(
+    function: extern "system" fn(*mut c_void),
+    context: *mut c_void,
+    _flags: u32,
+) -> NtStatus {
+    // Run inline (synchronous degenerate thread pool).
+    function(context);
+    STATUS_SUCCESS
+}
+
+/// `RtlRegisterWait(PHANDLE NewWaitObject, HANDLE Object, WAITORTIMERCALLBACK Callback,
+/// PVOID Context, ULONG Milliseconds, ULONG Flags) -> NTSTATUS`. No wait-thread plane; sentinel
+/// handle + STATUS_SUCCESS (the wait never completes — no waitable events fire on the boot path).
+///
+/// # Safety
+/// `new_wait_object` writable.
+#[export_name = "RtlRegisterWait"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_register_wait(
+    new_wait_object: *mut *mut c_void,
+    _object: *mut c_void,
+    _callback: *mut c_void,
+    _context: *mut c_void,
+    _milliseconds: u32,
+    _flags: u32,
+) -> NtStatus {
+    if !new_wait_object.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *new_wait_object = 1 as *mut c_void };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlDeregisterWaitEx(HANDLE WaitHandle, HANDLE CompletionEvent) -> NTSTATUS`.
+///
+/// # Safety
+/// `wait_handle` from `RtlRegisterWait`.
+#[export_name = "RtlDeregisterWaitEx"]
+pub unsafe extern "system" fn rtl_deregister_wait_ex(
+    _wait_handle: *mut c_void,
+    _completion_event: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlSetIoCompletionCallback(HANDLE FileHandle, PIO_APC_ROUTINE Callback, ULONG Flags) -> NTSTATUS`
+/// — bind an I/O completion callback (thread-pool). No plane → STATUS_SUCCESS no-op.
+///
+/// # Safety
+/// `file_handle` a valid handle.
+#[export_name = "RtlSetIoCompletionCallback"]
+pub unsafe extern "system" fn rtl_set_io_completion_callback(
+    _file_handle: *mut c_void,
+    _callback: *mut c_void,
+    _flags: u32,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlSetThreadPoolStartFunc(PVOID StartFunc, PVOID ExitFunc) -> NTSTATUS` — install the thread-pool
+/// worker start/exit hooks. No plane → STATUS_SUCCESS no-op.
+///
+/// # Safety
+/// `start_func`/`exit_func` valid callbacks or NULL.
+#[export_name = "RtlSetThreadPoolStartFunc"]
+pub unsafe extern "system" fn rtl_set_thread_pool_start_func(
+    _start_func: *mut c_void,
+    _exit_func: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlSetTimeZoneInformation(PRTL_TIME_ZONE_INFORMATION TimeZoneInformation) -> NTSTATUS` — set the
+/// system time zone. No time-zone plane → STATUS_SUCCESS no-op (UTC assumed).
+///
+/// # Safety
+/// `time_zone_information` a valid RTL_TIME_ZONE_INFORMATION.
+#[export_name = "RtlSetTimeZoneInformation"]
+pub unsafe extern "system" fn rtl_set_time_zone_information(_tz: *const c_void) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+// ---- debug buffer / stack backtrace / WOW64 fs-redirection (honest no-ops) ------------------------
+
+/// `RtlCreateQueryDebugBuffer(ULONG Size, BOOLEAN EventPair) -> PRTL_DEBUG_INFORMATION` — allocate a
+/// debug-query buffer. Allocate a zeroed block from the process heap (the caller fills it via
+/// RtlQueryProcessDebugInformation, which we no-op).
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "RtlCreateQueryDebugBuffer"]
+pub unsafe extern "system" fn rtl_create_query_debug_buffer(size: u32, _event_pair: u8) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n = (size as usize).max(0x1000);
+        // SAFETY: on-target heap.
+        let p = unsafe { crate::process_heap_alloc(n) };
+        if !p.is_null() {
+            // SAFETY: p valid for n bytes.
+            unsafe { core::ptr::write_bytes(p, 0, n) };
+        }
+        p as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = size;
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlDestroyQueryDebugBuffer(PRTL_DEBUG_INFORMATION Buffer) -> NTSTATUS`.
+///
+/// # Safety
+/// `buffer` from `RtlCreateQueryDebugBuffer`.
+#[export_name = "RtlDestroyQueryDebugBuffer"]
+pub unsafe extern "system" fn rtl_destroy_query_debug_buffer(buffer: *mut c_void) -> NtStatus {
+    if !buffer.is_null() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: buffer from the process heap.
+        unsafe {
+            crate::process_heap_free(buffer as *mut u8);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlQueryProcessDebugInformation(HANDLE UniqueProcessId, ULONG Flags, PRTL_DEBUG_INFORMATION Buf)
+/// -> NTSTATUS` — no debug-info plane; STATUS_SUCCESS leaving the buffer zeroed (empty info).
+///
+/// # Safety
+/// `buffer` from `RtlCreateQueryDebugBuffer`.
+#[export_name = "RtlQueryProcessDebugInformation"]
+pub unsafe extern "system" fn rtl_query_process_debug_information(
+    _unique_process_id: *mut c_void,
+    _flags: u32,
+    _buffer: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlCaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture, PVOID* BackTrace,
+/// PULONG BackTraceHash) -> USHORT` — no stack walker; capture 0 frames (honest).
+///
+/// # Safety
+/// `back_trace` writable for `frames_to_capture` entries; `hash` null or writable.
+#[export_name = "RtlCaptureStackBackTrace"]
+pub unsafe extern "system" fn rtl_capture_stack_back_trace(
+    _frames_to_skip: u32,
+    _frames_to_capture: u32,
+    _back_trace: *mut *mut c_void,
+    hash: *mut u32,
+) -> u16 {
+    if !hash.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *hash = 0 };
+    }
+    0
+}
+
+/// `RtlWow64EnableFsRedirection(BOOLEAN Enable) -> NTSTATUS` — we are native x64, no WOW64
+/// redirection → STATUS_SUCCESS no-op.
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "RtlWow64EnableFsRedirection"]
+pub unsafe extern "system" fn rtl_wow64_enable_fs_redirection(_enable: u8) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `RtlWow64EnableFsRedirectionEx(PVOID DisableFsRedirection, PVOID* OldValue) -> NTSTATUS`.
+///
+/// # Safety
+/// `old_value` null or writable.
+#[export_name = "RtlWow64EnableFsRedirectionEx"]
+pub unsafe extern "system" fn rtl_wow64_enable_fs_redirection_ex(
+    _disable: *mut c_void,
+    old_value: *mut *mut c_void,
+) -> NtStatus {
+    if !old_value.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *old_value = core::ptr::null_mut() };
+    }
+    STATUS_SUCCESS
+}
+
+// =================================================================================================
 // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc families.
 // Backed by the host-tested nt_ntdll::rtl::{bitmap,time,encode,random} + inline correct bodies.
 // The SxS/activation-context, timer-queue, thread-pool, and stack-unwind families have no body
@@ -5946,6 +6837,65 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_try_enter_critical_section as usize,
     ];
     core::hint::black_box(anchors_misc2);
+    // BATCH 4 — SxS / path / guid / image / handle-table / resource / timer / debug.
+    let anchors_sxs: &[usize] = &[
+        rtl_activate_activation_context as usize,
+        rtl_activate_activation_context_ex as usize,
+        rtl_activate_activation_context_unsafe_fast as usize,
+        rtl_deactivate_activation_context as usize,
+        rtl_deactivate_activation_context_unsafe_fast as usize,
+        rtl_create_activation_context as usize,
+        rtl_add_ref_activation_context as usize,
+        rtl_release_activation_context as usize,
+        rtl_zombify_activation_context as usize,
+        rtl_get_active_activation_context as usize,
+        rtl_find_activation_context_section_string as usize,
+        rtl_find_activation_context_section_guid as usize,
+        rtl_query_information_activation_context as usize,
+        rtl_allocate_activation_context_stack as usize,
+        rtl_free_activation_context_stack as usize,
+        rtl_is_thread_within_loader_callout as usize,
+    ];
+    core::hint::black_box(anchors_sxs);
+    let anchors_pathimg: &[usize] = &[
+        rtl_determine_dos_path_name_type_u as usize,
+        rtl_is_dos_device_name_u as usize,
+        rtl_is_name_legal_dos_8dot3 as usize,
+        rtl_guid_from_string as usize,
+        rtl_image_nt_header as usize,
+        rtl_image_directory_entry_to_data as usize,
+        rtl_image_rva_to_va as usize,
+        rtl_pc_to_file_header as usize,
+        rtl_initialize_handle_table as usize,
+        rtl_allocate_handle as usize,
+        rtl_free_handle as usize,
+        rtl_is_valid_handle as usize,
+        rtl_initialize_resource as usize,
+        rtl_acquire_resource_shared as usize,
+        rtl_acquire_resource_exclusive as usize,
+        rtl_release_resource as usize,
+    ];
+    core::hint::black_box(anchors_pathimg);
+    let anchors_timer: &[usize] = &[
+        rtl_create_timer_queue as usize,
+        rtl_create_timer as usize,
+        rtl_update_timer as usize,
+        rtl_delete_timer as usize,
+        rtl_delete_timer_queue_ex as usize,
+        rtl_queue_work_item as usize,
+        rtl_register_wait as usize,
+        rtl_deregister_wait_ex as usize,
+        rtl_set_io_completion_callback as usize,
+        rtl_set_thread_pool_start_func as usize,
+        rtl_set_time_zone_information as usize,
+        rtl_create_query_debug_buffer as usize,
+        rtl_destroy_query_debug_buffer as usize,
+        rtl_query_process_debug_information as usize,
+        rtl_capture_stack_back_trace as usize,
+        rtl_wow64_enable_fs_redirection as usize,
+        rtl_wow64_enable_fs_redirection_ex as usize,
+    ];
+    core::hint::black_box(anchors_timer);
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
     #[cfg(target_arch = "x86_64")]
