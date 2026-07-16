@@ -926,16 +926,83 @@ pub unsafe extern "system" fn rtl_destroy_process_parameters(_params: *mut c_voi
     STATUS_SUCCESS // nothing allocated by us to free (heap seam)
 }
 
-/// `RtlCreateEnvironment(BOOLEAN Inherit, PVOID *Environment) -> NTSTATUS`. Honest seam.
+/// `RtlCreateEnvironment(BOOLEAN Inherit, PVOID *Environment) -> NTSTATUS`. Step 4.C: real. Allocates
+/// a fresh environment block on the process heap. When `Inherit`, it copies the current process
+/// environment (PEB->ProcessParameters->Environment, a double-wide-NUL-terminated UTF-16 block);
+/// otherwise it creates a minimal empty block (a lone double-wide-NUL). Writes the block pointer to
+/// `*Environment`.
 ///
 /// # Safety
-/// Standard contract.
+/// `environment` a valid writable out-pointer.
 #[export_name = "RtlCreateEnvironment"]
 pub unsafe extern "system" fn rtl_create_environment(
-    _inherit: u8,
-    _environment: *mut *mut c_void,
+    inherit: u8,
+    environment: *mut *mut c_void,
 ) -> NtStatus {
-    STATUS_NO_MEMORY // needs the process heap (Step 4.B)
+    if environment.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The source block + its byte length (incl. the terminating double-NUL) when inheriting.
+        let (src, bytes): (*const u16, usize) = if inherit != 0 {
+            // SAFETY: read NtCurrentPeb() = gs:[0x60] → ProcessParameters(+0x20) → Environment(+0x80).
+            unsafe {
+                let peb: u64;
+                core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+                let params = core::ptr::read((peb + 0x20) as *const u64);
+                if params == 0 {
+                    (core::ptr::null(), 0)
+                } else {
+                    let env = core::ptr::read((params + 0x80) as *const u64) as *const u16;
+                    if env.is_null() {
+                        (core::ptr::null(), 0)
+                    } else {
+                        // Measure to the double-wide-NUL terminator.
+                        let mut n = 0usize;
+                        loop {
+                            let a = core::ptr::read(env.add(n));
+                            let b = core::ptr::read(env.add(n + 1));
+                            n += 1;
+                            if a == 0 && b == 0 {
+                                n += 1; // include the second NUL
+                                break;
+                            }
+                            if n > 0x8000 {
+                                break; // safety cap (128 Ki units)
+                            }
+                        }
+                        (env, n * 2)
+                    }
+                }
+            }
+        } else {
+            (core::ptr::null(), 0)
+        };
+        // Allocate at least an empty block (a lone double-wide-NUL = 4 bytes).
+        let alloc_bytes = if bytes >= 4 { bytes } else { 4 };
+        // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+        let dst = unsafe { crate::process_heap_alloc(alloc_bytes) } as *mut u16;
+        if dst.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        // SAFETY: dst is a fresh alloc_bytes-byte allocation; src (if any) is a valid measured block.
+        unsafe {
+            if !src.is_null() && bytes >= 4 {
+                core::ptr::copy_nonoverlapping(src, dst, bytes / 2);
+            } else {
+                core::ptr::write(dst, 0);
+                core::ptr::write(dst.add(1), 0); // empty block: double-wide-NUL
+            }
+            *environment = dst as *mut c_void;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = inherit;
+        STATUS_NO_MEMORY
+    }
 }
 
 /// `RtlSetEnvironmentVariable(PVOID *Environment, PUNICODE_STRING Name, PUNICODE_STRING Value)`.

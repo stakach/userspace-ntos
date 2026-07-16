@@ -879,6 +879,27 @@ spawn** (the heart of the Session Manager). Still stops at a deeper `NtRaiseHard
 wall is past the SM-loop spawn (SmpInit's subsystem-load / KnownDLLs / the SmpApiLoop that ultimately
 does `SmpExecuteImage → NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss = the 4.C milestone).
 
+**checkpoint 2 committed** (`ffa1e4c`): gate 174/98, paint 768/768, flag OFF.
+
+**IN PROGRESS 2026-07-16 — checkpoint 3 (RtlCreateEnvironment → smss reads its registry environment under OUR ntdll):**
+
+8. **`RtlCreateEnvironment`** (`exports.rs`, real) — allocates an environment block on the process
+   heap. When `Inherit`, copies the current `PEB->ProcessParameters->Environment` (read via
+   `NtCurrentPeb() = gs:[0x60]` → `+0x20` → `+0x80`, measured to the double-wide-NUL); else a minimal
+   empty block. Writes the block to `*Environment`. **After:** smss passes `SmpCreateEnvironmentBlock`'s
+   env creation → does the REAL registry environment reads: `NtOpenKey(125) ×2`, `NtDeleteValueKey(68)`,
+   `NtClose(27)` (new in the ring). smss is now reading its environment from the registry under our ntdll.
+
+**How far smss runs now:** ring `18,237,238,237,237,48,18,55,18,55,37,125,125,68,27,129,12,27,190`.
+smss's `SmpInit → SmpCreateEnvironmentBlock` runs the SM-port + SM-loop-thread spawn AND the
+registry-environment setup (NtOpenKey/NtDeleteValueKey) under OUR ntdll. **Next wall:
+`RtlQueryRegistryValues`** (smss rva 0x9a1f, still a seam) — the table-driven registry reader
+`SmpCreateEnvironmentBlock` uses to read the environment values. It's a large body (the
+`RTL_QUERY_REGISTRY_TABLE` walk + direct/callback dispatch over NtOpenKey/NtQueryValueKey) — its own
+focused increment. Then SmpInit proceeds toward the SmpApiLoop that does
+`SmpExecuteImage → NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss (the 4.C milestone; add
+the SSN-50 arm when smss emits SSN 50 there).
+
 **The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → gate **174/98**, paint
 **768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (ONLY `crates/nt-ntdll-dll` changed;
 NO rust-micro/src, NO executive change; rust-micro submodule clean). `nt-ntdll` host tests **145/145**.
