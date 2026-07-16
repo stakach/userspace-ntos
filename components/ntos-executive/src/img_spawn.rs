@@ -435,6 +435,26 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0xE8) as *mut u32, 0);
         core::ptr::write_volatile((scr + 0x1000 + 0xEC) as *mut u32, 16);
         core::ptr::write_volatile((scr + 0x1000 + 0xF0) as *mut u64, SMSS_PEB_VA + 0x800);
+        // TLS bitmaps. kernel32's TlsAlloc() (thread.c:1112) calls
+        // RtlFindClearBitsAndSet(Peb->TlsBitmap, 1, 0) — a NULL Peb->TlsBitmap #PFs at (rcx)
+        // (SizeOfBitMap read). ws2_32's DllMain (Winsock init) reaches TlsAlloc, so winlogon crashes
+        // here without it. Real LdrpInitializeProcess sets Peb->TlsBitmap = &PebTlsBitmap (an
+        // RTL_BITMAP) with Buffer = Peb->TlsBitmapBits. x64 PEB: TlsBitmap@0x78, TlsBitmapBits[2]@0x80
+        // (64 bits inline), TlsExpansionBitmap@0x238, TlsExpansionBitmapBits[32]@0x240 (1024 bits).
+        // Place the two RTL_BITMAP headers (16 B each) in the PEB page tail PAST the ProcessHeaps
+        // array (@0x800, up to 16*8 = 0x80 bytes → 0x800..0x880). RTL_BITMAP = { ULONG SizeOfBitMap@0;
+        // PULONG Buffer@8 }.
+        // TlsBitmap header @ PEB+0x880 → { 64, &TlsBitmapBits(PEB+0x80) }.
+        core::ptr::write_volatile((scr + 0x1000 + 0x880) as *mut u32, 64); // SizeOfBitMap
+        core::ptr::write_volatile((scr + 0x1000 + 0x888) as *mut u64, SMSS_PEB_VA + 0x80); // Buffer
+        core::ptr::write_volatile((scr + 0x1000 + 0x78) as *mut u64, SMSS_PEB_VA + 0x880); // Peb->TlsBitmap
+        // TlsExpansionBitmap header @ PEB+0x8A0 → { 1024, &TlsExpansionBitmapBits(PEB+0x240) }.
+        core::ptr::write_volatile((scr + 0x1000 + 0x8A0) as *mut u32, 1024); // SizeOfBitMap
+        core::ptr::write_volatile((scr + 0x1000 + 0x8A8) as *mut u64, SMSS_PEB_VA + 0x240); // Buffer
+        core::ptr::write_volatile((scr + 0x1000 + 0x238) as *mut u64, SMSS_PEB_VA + 0x8A0); // Peb->TlsExpansionBitmap
+        // Bit 0 of the main TLS bitmap is reserved (index 0 = the implicit TLS slot); real ntdll sets
+        // it so TlsAlloc never hands out index 0. TlsBitmapBits[0] @ PEB+0x80.
+        core::ptr::write_volatile((scr + 0x1000 + 0x80) as *mut u32, 1);
         // NLS code-page data pointers — LdrpInitializeProcess (ntdll+0x9e81) reads these and
         // passes them to RtlInitNlsTables, which builds the WideChar<->MultiByte tables
         // RtlUnicodeToMultiByteN needs (else it indexes a null table). x64 PEB (verified from the

@@ -236,38 +236,100 @@ unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
 /// On-target; every table entry is a mapped DLL image whose imports have been snapped.
 #[cfg(target_arch = "x86_64")]
 unsafe fn run_process_attach(table: &ModuleTable) {
-    const DLL_PROCESS_ATTACH: u32 = 1;
-    // Snapshot the (base, is_ntdll) list into a fixed stack array FIRST (a DllMain may LdrLoadDll and
-    // mutate MODULE_TABLE mid-iteration; iterate the snapshot, not the live table). Reverse order →
-    // deepest dependencies first (the DFS inserts a parent before its children, so later = leafier).
+    // Post-order DFS: a module's DEPENDENCIES init before it (kernel32 before advapi32 before mpr,
+    // etc.). A per-base visited set dedupes diamonds + breaks cycles. The order matters: mpr's
+    // DllMain calls kernel32 functions, so kernel32 must have run InitCommandLines first. Reverse
+    // insertion order was WRONG (mpr-first → kernel32 uninitialized → crash).
     let count = table.count.min(MODULE_TABLE_CAP);
-    let mut bases = [0u64; MODULE_TABLE_CAP];
-    let mut n = 0usize;
-    let mut idx = count;
-    while idx > 0 {
-        idx -= 1;
-        let m = &table.mods[idx];
-        if m.base == 0 {
-            continue;
-        }
-        // Skip our own ntdll (no C DllMain — would re-enter our stubs).
-        let nl = (m.nlen as usize).min(32);
-        if &m.name[..nl] == b"ntdll" {
-            continue;
-        }
-        bases[n] = m.base;
-        n += 1;
-    }
-    // SAFETY: each base is a mapped, snapped DLL image; single-threaded loader context.
+    let mut visited = [0u64; MODULE_TABLE_CAP];
+    let mut vn = 0usize;
+    // SAFETY: single-threaded loader; each table base is a mapped, snapped image.
     unsafe {
-        for &b in bases.iter().take(n) {
-            let epr = entry_point_rva(b);
-            if epr == 0 {
-                continue; // no entry (resource-only DLL) — nothing to run
+        let mut i = 0usize;
+        while i < count {
+            let b = table.mods[i].base;
+            if b >= 0x1_0000 {
+                attach_dfs(table, b, &mut visited, &mut vn, 0);
             }
-            let _ = call_dll_main(b, DLL_PROCESS_ATTACH);
+            i += 1;
         }
     }
+}
+
+/// Recursively `DLL_PROCESS_ATTACH` `base`'s dependencies (post-order) then `base` itself. `visited`
+/// records already-attached bases (dedupe + cycle break). Skips our own ntdll (no C DllMain).
+///
+/// # Safety
+/// On-target; `base` is a mapped, snapped PE image in this VSpace; `table` bases are mapped images.
+#[cfg(target_arch = "x86_64")]
+unsafe fn attach_dfs(
+    table: &ModuleTable,
+    base: u64,
+    visited: &mut [u64; MODULE_TABLE_CAP],
+    vn: &mut usize,
+    depth: u32,
+) {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    if base < 0x1_0000 || depth > 16 {
+        return;
+    }
+    // Already attached?
+    for &v in visited.iter().take(*vn) {
+        if v == base {
+            return;
+        }
+    }
+    // Mark visited BEFORE recursing (cycle break).
+    if *vn < MODULE_TABLE_CAP {
+        visited[*vn] = base;
+        *vn += 1;
+    }
+    // SAFETY: base is a mapped PE image; the import walk reads mapped headers.
+    unsafe {
+        // Walk this module's imports; for each imported DLL found in the table, recurse first.
+        let (idir_rva, _sz) = data_directory(base, 1);
+        if idir_rva != 0 {
+            let mut desc = base + idir_rva as u64;
+            loop {
+                let name_rva = rd32(desc, 12);
+                let ft = rd32(desc, 16);
+                if name_rva == 0 && ft == 0 {
+                    break;
+                }
+                let mut nb = [0u8; 32];
+                let bn = import_desc_basename(base, name_rva, &mut nb);
+                let dep = table.find(&nb[..bn]);
+                if dep >= 0x1_0000 && dep != base {
+                    attach_dfs(table, dep, visited, vn, depth + 1);
+                }
+                desc += 20; // sizeof(IMAGE_IMPORT_DESCRIPTOR)
+            }
+        }
+        // Skip our own ntdll (no C DllMain).
+        if is_ntdll_base(table, base) {
+            return;
+        }
+        let epr = entry_point_rva(base);
+        if epr == 0 {
+            return; // resource-only DLL — nothing to run
+        }
+        {
+            let mut mb = [0u8; 64];
+            let mut mn = 0usize;
+            for &c in b"DllMain base=0x" {
+                if mn < 64 { mb[mn] = c; mn += 1; }
+            }
+            mn = crate::write_u64_hex(&mut mb, mn, base);
+            crate::dbg_print_bytes(mb.as_ptr(), mn);
+        }
+        let _ = call_dll_main(base, DLL_PROCESS_ATTACH);
+    }
+}
+
+/// True if `base` is our own ntdll (matched by the table's `b"ntdll"` entry) — it has no C DllMain.
+#[cfg(target_arch = "x86_64")]
+fn is_ntdll_base(table: &ModuleTable, base: u64) -> bool {
+    table.find(b"ntdll") == base
 }
 
 /// Compare a NUL-terminated ASCII export name at `base + name_rva` against `want` (ASCII bytes).
