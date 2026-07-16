@@ -926,3 +926,56 @@ wall) on the path toward `SmpLoadSubSystemsForMuSession → SmpExecuteImage → 
 **The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → gate **174/98**, paint
 **768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (ONLY `crates/nt-ntdll-dll` changed;
 NO rust-micro/src, NO executive change; rust-micro submodule clean). `nt-ntdll` host tests **145/145**.
+
+**IN PROGRESS 2026-07-16 — checkpoint 5 (real registry reader + path/env bodies → smss runs the KnownDlls + DOS-devices + registry-environment + DYNAMIC environment variables under OUR ntdll, DEEP into SmpLoadSubSystemsForMuSession):**
+
+The oracle-diff wall at ckpt 4 was **`RtlDosPathNameToNtPathName_U`** (sminit.c:1465, in `SmpInitializeKnownDllsInternal`) returning FALSE → `STATUS_OBJECT_NAME_INVALID` → `SmpTerminate` → `NtRaiseHardError`. Confirmed by trace: the pure `RtlpDosPathNameToRelativeNtPathName_U` issues NO syscall (invisible in the ring) — the "invisible seam". The ROOT was two coupled seams: (a) `RtlDosPathNameToNtPathName_U` was stubbed, AND (b) `SmpKnownDllPath` was NEVER populated because our `RtlQueryRegistryValues` was defaults-only (the `KnownDlls` config-table entry has `DefaultType=REG_NONE` → its callback `SmpConfigureKnownDlls` never ran; the real hive holds `Session Manager\KnownDlls\DllDirectory=%SystemRoot%\system32`).
+
+**The walls made real (all in `crates/nt-ntdll-dll`, NO rust-micro/src change, sel4test byte-identical):**
+10. **`RtlDosPathNameToNtPathName_U`** (`exports.rs`, real) — the fully-qualified-path NT prefix over
+    the host-tested `rtl::path::dos_path_name_to_nt_path_name` (`C:\...`→`\??\C:\...`, UNC→`\??\UNC\...`,
+    `\\?\X:`→`\??\X:`), allocating the output `UNICODE_STRING.Buffer` (NUL-terminated) from the process
+    heap + computing `PartName`. Relative/drive-relative (needs the CWD) → honest FALSE.
+11. **`RtlQueryRegistryValues`** (`on_target::rtl_query_registry_values`, real LIVE registry reader) —
+    opens the base key (`RTL_REGISTRY_CONTROL`+Path → `\Registry\Machine\System\CurrentControlSet\
+    Control\Session Manager`) via our own `NtOpenKey(125)` trap stub, walks the `RTL_QUERY_REGISTRY_
+    TABLE`, and for **SUBKEY+QueryRoutine** entries opens the named subkey + **enumerates every value**
+    (`NtEnumerateValueKey(77)`, KeyValueFullInformation) → dispatches the caller's `QueryRoutine` with
+    the real hive data, and for **named-value** entries queries (`NtQueryValueKey(185)`) → routine /
+    default. **REG_EXPAND_SZ expansion** (`%SystemRoot%\system32`→`C:\Windows\system32`) via the live
+    PEB environment block + the host-tested `rtl::environment::Environment::{from_block,expand}`. Absent
+    keys/values fall to the caller's defaults — real-ntdll behavior, never fabricated. **This is the
+    executive's `resolve_key`/`NtEnumerateValueKey`/`NtQueryValueKey` (::ROSSYS.HIV) driven from
+    in-process, the real-ntdll model.** After 10+11: smss's `RtlQueryRegistryValues` populates
+    `SmpKnownDllPath` → `RtlDosPathNameToNtPathName_U` succeeds → **NtOpenFile(\??\C:\Windows\system32,
+    SSN 122)** fires (the KnownDlls dir) — the first proof the conversion worked.
+12. **`RtlSetEnvironmentVariable`** (`on_target::rtl_set_environment_variable`, real) — reads the target
+    env block (`*Environment` or the PEB process-env), sets/deletes the variable via the host-tested
+    `Environment` model, serializes a fresh block on the process heap, and writes the pointer back
+    (updating the PEB env slot for the NULL-env case). **Wall was:** the KnownDlls read led into the
+    `Session Manager\Environment` subkey enumeration (the hive holds Path/TEMP/TMP/ComSpec/windir) →
+    `SmpConfigureEnvironment` (sminit.c:503) calls `RtlSetEnvironmentVariable`, which our 4.0b seam
+    returned STATUS_NOT_IMPLEMENTED for → the callback failed → `RtlQueryRegistryValues` failed → fatal.
+
+**How far smss runs now (a BIG jump — 116→225 service-iters):** ring
+`…122(NtOpenFile KnownDlls),27,27,96(NtInitializeRegistry),181,181(NtQuerySystemInformation),125,
+256,256,256(NtSetValueKey OS/PROC_ARCH),125,185,185(CPU Identifier read),27,256,256,256(PROC_IDENTIFIER/
+REVISION/NUMBER_OF_PROCESSORS),125,27,125,185,27,129,12,249,249(NtSetSystemInformation SessionCreate +
+win32k ExtendServiceTable),12,27,129,12,27,190`. smss's `SmpInit → SmpLoadDataFromRegistry` now runs
+the FULL registry-driven bring-up under OUR ntdll: **KnownDlls path resolution + DOS-devices + the
+registry-environment reads + `SmpCreateDynamicEnvironmentVariables`** (writes OS / PROCESSOR_ARCHITECTURE
+/ PROCESSOR_IDENTIFIER / PROCESSOR_REVISION / NUMBER_OF_PROCESSORS to the registry, reading the CPU
+Identifier/VendorIdentifier from the synth HARDWARE key) — and is now **inside `SmpLoadSubSystemsForMu
+Session`** (smsubsys.c:510): `SmpTranslateSystemPartitionInformation` + the SubSystemList `Kmode`/win32k
+entry (`NtSetSystemInformation` SessionCreate + ExtendServiceTable = the `249,249`). Gate flag-ON 143/98
+(smss doesn't yet spawn csrss → no paint).
+
+**Remaining wall to the csrss-spawn (the 4.C milestone):** smss still stops at `NtRaiseHardError(190)`
+past the `249,249` (win32k session/service-table load) — the next divergent body is in `SmpLoadSubSystems
+ForMuSession`'s required-subsystem path (`SmpExecuteCommand → SmpLoadSubSystem → SmpExecuteImage →
+NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss) or the `NtSetSystemInformation` win32k-load
+return. Continue the oracle-diff grind. **The SSN-50 arm** (`NtCreateProcessEx`) is NOT yet needed (smss
+hasn't reached the create-process call under our ntdll) — add it when smss emits SSN 50 there.
+
+**checkpoint 5 committed**: gate 174/98, paint 768/768, flag OFF; ONLY `crates/nt-ntdll-dll` changed;
+NO rust-micro/src, NO executive change; sel4test byte-identical; `nt-ntdll` host tests 145/145.

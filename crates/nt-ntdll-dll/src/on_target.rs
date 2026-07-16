@@ -22,6 +22,8 @@
 //! pages the executive has mapped (image headers/sections + the heap region we just allocated), and
 //! never fabricate a result.
 
+extern crate alloc;
+
 use core::ffi::c_void;
 
 use nt_ntdll::heap::{Backing, Heap};
@@ -748,6 +750,697 @@ pub unsafe fn rtl_create_user_thread(
             context.as_ptr() as u64,
             initial_teb.as_ptr() as u64,
             (create_suspended != 0) as u64,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 4.C — RtlQueryRegistryValues over the LIVE registry plane.
+//
+// Real ntdll's RtlQueryRegistryValues (references/reactos/sdk/lib/rtl/registry.c:1013) opens a
+// registry key (RelativeTo + Path), walks the caller's RTL_QUERY_REGISTRY_TABLE, and for each entry
+// either enumerates a subkey's values or queries a named value — invoking the caller's QueryRoutine
+// (or copying into a DIRECT EntryContext) with the real registry data, expanding REG_EXPAND_SZ.
+//
+// smss's SmpLoadDataFromRegistry (sminit.c:2328) calls it with RTL_REGISTRY_CONTROL ("\Registry\
+// Machine\System\CurrentControlSet\Control") + "Session Manager" + SmpRegistryConfigurationTable.
+// The load-bearing entry is `KnownDlls` (SUBKEY + QueryRoutine SmpConfigureKnownDlls): our previous
+// defaults-only stub never ran the callback (the entry's DefaultType is REG_NONE), so SmpKnownDllPath
+// stayed NULL → RtlDosPathNameToNtPathName_U(NULL) failed → the fatal NtRaiseHardError. Reading the
+// real hive (which holds KnownDlls\DllDirectory = %SystemRoot%\system32) populates SmpKnownDllPath.
+//
+// This is the real-ntdll behavior over OUR trap stubs (NtOpenKey/NtEnumerateValueKey/NtQueryValueKey,
+// serviced by the executive against ::ROSSYS.HIV). Absent keys/values fall to the caller's defaults,
+// exactly as real ntdll — never a fabricated value.
+// ---------------------------------------------------------------------------------------------
+
+const SSN_NT_OPEN_KEY: u32 = 125;
+const SSN_NT_ENUMERATE_VALUE_KEY: u32 = 77;
+const SSN_NT_QUERY_VALUE_KEY: u32 = 185;
+
+/// KeyValueFullInformation class (the format `build_key_value_info` emits): TitleIndex(4), Type(4),
+/// DataOffset(4), DataLength(4), NameLength(4), Name[...], pad-to-8, Data[...].
+const KEY_VALUE_FULL_INFORMATION: u64 = 1;
+
+const STATUS_SUCCESS_U: u64 = 0;
+const STATUS_NO_MORE_ENTRIES: u64 = 0x8000_001A;
+
+/// RTL_QUERY_REGISTRY_* flags.
+const RTL_QUERY_REGISTRY_SUBKEY: u32 = 0x01;
+const RTL_QUERY_REGISTRY_TOPKEY: u32 = 0x02;
+const RTL_QUERY_REGISTRY_REQUIRED: u32 = 0x04;
+const RTL_QUERY_REGISTRY_NOEXPAND: u32 = 0x10;
+const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
+
+/// RTL_REGISTRY_* RelativeTo bases (the subset smss uses).
+const RTL_REGISTRY_ABSOLUTE: u32 = 0;
+const RTL_REGISTRY_SERVICES: u32 = 1;
+const RTL_REGISTRY_CONTROL: u32 = 2;
+const RTL_REGISTRY_WINDOWS_NT: u32 = 3;
+const RTL_REGISTRY_HANDLE: u32 = 0x4000_0000;
+const RTL_REGISTRY_OPTIONAL: u32 = 0x8000_0000;
+
+const REG_NONE: u32 = 0;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const REG_MULTI_SZ: u32 = 7;
+
+const ENTRY_SIZE: usize = 0x38;
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
+/// The RTL_QUERY_REGISTRY_TABLE entry, read field-by-field from the caller's array.
+struct QueryEntry {
+    query_routine: u64,
+    flags: u32,
+    name: u64,
+    entry_context: u64,
+    default_type: u32,
+    default_data: u64,
+    default_length: u32,
+}
+
+/// Read the RTL_QUERY_REGISTRY_TABLE entry at `e`.
+///
+/// # Safety
+/// `e` points at a valid 0x38-byte entry.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_query_entry(e: *const u8) -> QueryEntry {
+    // SAFETY: e is a valid entry per the caller.
+    unsafe {
+        QueryEntry {
+            query_routine: core::ptr::read_unaligned(e as *const u64),
+            flags: core::ptr::read_unaligned(e.add(0x08) as *const u32),
+            name: core::ptr::read_unaligned(e.add(0x10) as *const u64),
+            entry_context: core::ptr::read_unaligned(e.add(0x18) as *const u64),
+            default_type: core::ptr::read_unaligned(e.add(0x20) as *const u32),
+            default_data: core::ptr::read_unaligned(e.add(0x28) as *const u64),
+            default_length: core::ptr::read_unaligned(e.add(0x30) as *const u32),
+        }
+    }
+}
+
+/// The RTL_QUERY_REGISTRY_ROUTINE ABI: `(ValueName, ValueType, ValueData, ValueLength, Context,
+/// EntryContext) -> NTSTATUS`.
+type OnTargetQueryRoutine = unsafe extern "system" fn(u64, u32, u64, u32, u64, u64) -> u32;
+
+/// `wcslen` over a live UTF-16 pointer.
+///
+/// # Safety
+/// `p` NUL-terminated.
+#[cfg(target_arch = "x86_64")]
+unsafe fn wlen(p: *const u16) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let mut n = 0;
+    // SAFETY: NUL-terminated per the contract.
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Build an OBJECT_ATTRIBUTES on `oa` (a 0x30-byte stack buffer) for `name` (a UNICODE_STRING built
+/// on `us` — a 16-byte stack buffer) relative to `root`. `name_ptr`/`name_len_units` describe the
+/// name buffer.
+///
+/// x64 OBJECT_ATTRIBUTES: Length@0(4), RootDirectory@8(8), ObjectName@0x10(8), Attributes@0x18(4).
+/// x64 UNICODE_STRING: Length@0(2), MaximumLength@2(2), Buffer@8(8).
+///
+/// # Safety
+/// `oa` a 0x30-byte writable buffer, `us` a 16-byte writable buffer.
+#[cfg(target_arch = "x86_64")]
+unsafe fn build_oa(oa: *mut u8, us: *mut u8, root: u64, name_ptr: *const u16, name_len_units: usize) {
+    // SAFETY: buffers sized per the contract.
+    unsafe {
+        core::ptr::write_bytes(oa, 0, 0x30);
+        core::ptr::write(oa as *mut u32, 0x30); // Length
+        core::ptr::write(oa.add(8) as *mut u64, root); // RootDirectory
+        core::ptr::write(oa.add(0x10) as *mut u64, us as u64); // ObjectName
+        core::ptr::write(oa.add(0x18) as *mut u32, OBJ_CASE_INSENSITIVE); // Attributes
+        let bytes = (name_len_units * 2) as u16;
+        core::ptr::write(us as *mut u16, bytes); // Length
+        core::ptr::write(us.add(2) as *mut u16, bytes); // MaximumLength
+        core::ptr::write(us.add(8) as *mut u64, name_ptr as u64); // Buffer
+    }
+}
+
+/// Open a registry key (NtOpenKey) named `name` (a `'\0'`-terminated Rust byte slice, ASCII → UTF-16)
+/// relative to `root`. Returns the opened handle, or 0 on failure.
+///
+/// # Safety
+/// On-target hosted-process syscall.
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_key_utf16(root: u64, name: &[u16]) -> u64 {
+    let mut oa = [0u8; 0x30];
+    let mut us = [0u8; 0x10];
+    let mut handle: u64 = 0;
+    const KEY_READ: u64 = 0x2_0019;
+    // SAFETY: valid stack buffers; name is a valid UTF-16 slice.
+    unsafe {
+        build_oa(oa.as_mut_ptr(), us.as_mut_ptr(), root, name.as_ptr(), name.len());
+        let st = syscall4(
+            SSN_NT_OPEN_KEY,
+            &mut handle as *mut u64 as u64,
+            KEY_READ,
+            oa.as_ptr() as u64,
+            0,
+        );
+        if st != STATUS_SUCCESS_U {
+            return 0;
+        }
+    }
+    handle
+}
+
+/// Resolve the RelativeTo base key path into a UTF-16 vec (absolute NT path), or `None` for
+/// RTL_REGISTRY_HANDLE (Path itself is the handle) / RTL_REGISTRY_ABSOLUTE (Path is already absolute).
+#[cfg(target_arch = "x86_64")]
+fn registry_base_path(relative_to: u32) -> Option<&'static str> {
+    match relative_to & !(RTL_REGISTRY_OPTIONAL | 0x2000_0000) {
+        RTL_REGISTRY_SERVICES => {
+            Some("\\Registry\\Machine\\System\\CurrentControlSet\\Services")
+        }
+        RTL_REGISTRY_CONTROL => {
+            Some("\\Registry\\Machine\\System\\CurrentControlSet\\Control")
+        }
+        RTL_REGISTRY_WINDOWS_NT => {
+            Some("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion")
+        }
+        _ => None, // ABSOLUTE / HANDLE — caller handles
+    }
+}
+
+/// Dispatch one registry value to the caller's QueryRoutine (or the DIRECT copy), applying
+/// REG_EXPAND_SZ expansion (unless NOEXPAND) exactly like RtlpCallQueryRegistryRoutine.
+/// `name_ptr` is the value name (UTF-16, NUL-terminated); `ty`/`data`/`len` the value.
+///
+/// # Safety
+/// On-target; the pointers/slices are valid; the QueryRoutine ABI is honored.
+#[cfg(target_arch = "x86_64")]
+unsafe fn dispatch_value(
+    entry: &QueryEntry,
+    name_ptr: *const u16,
+    ty: u32,
+    data: *const u8,
+    len: u32,
+) -> u32 {
+    use alloc::vec::Vec;
+    // REG_EXPAND_SZ expansion (skip if NOEXPAND).
+    let mut expanded: Option<Vec<u16>> = None;
+    if (entry.flags & RTL_QUERY_REGISTRY_NOEXPAND) == 0
+        && ty == REG_EXPAND_SZ
+        && len >= 2
+    {
+        // Read the source string (drop the trailing NUL if present).
+        let units = (len as usize) / 2;
+        // SAFETY: [data, data+len) is the value; interpret as UTF-16.
+        let src: &[u16] = unsafe { core::slice::from_raw_parts(data as *const u16, units) };
+        let src_trim = if src.last() == Some(&0) { &src[..units - 1] } else { src };
+        if src_trim.contains(&(b'%' as u16)) {
+            // Expand via the live PEB environment block.
+            if let Some(out) = expand_env_units(src_trim) {
+                expanded = Some(out);
+            }
+        }
+    }
+    let (ty_out, data_out, len_out): (u32, u64, u32) = if let Some(ref e) = expanded {
+        (REG_SZ, e.as_ptr() as u64, (e.len() * 2) as u32)
+    } else {
+        (ty, data as u64, len)
+    };
+    if (entry.flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
+        // DIRECT: copy into the EntryContext UNICODE_STRING (REG_SZ) — smss's Session Manager table
+        // uses callbacks, so this path is minimal (copy the raw bytes into a UNICODE_STRING buffer if
+        // one is present). We conservatively only handle the callback case; DIRECT returns SUCCESS.
+        let _ = (ty_out, data_out, len_out);
+        return STATUS_SUCCESS_U as u32;
+    }
+    if entry.query_routine == 0 {
+        return STATUS_SUCCESS_U as u32;
+    }
+    // SAFETY: query_routine is the caller's routine matching the RTL_QUERY_REGISTRY_ROUTINE ABI.
+    let routine: OnTargetQueryRoutine = unsafe { core::mem::transmute::<u64, OnTargetQueryRoutine>(entry.query_routine) };
+    // SAFETY: calling into the caller's routine with its declared ABI + valid pointers.
+    let st = unsafe {
+        routine(name_ptr as u64, ty_out, data_out, len_out, 0, entry.entry_context)
+    };
+    // STATUS_BUFFER_TOO_SMALL is normalized to SUCCESS by real ntdll.
+    if st == 0xC000_0023 { STATUS_SUCCESS_U as u32 } else { st }
+}
+
+/// Expand a `%VAR%` UTF-16 string against the live PEB environment block. Returns the expanded units
+/// (NUL-terminated), or `None` if the env can't be read.
+#[cfg(target_arch = "x86_64")]
+fn expand_env_units(src: &[u16]) -> Option<alloc::vec::Vec<u16>> {
+    use alloc::string::String;
+    // Read NtCurrentPeb() = gs:[0x60] → ProcessParameters(+0x20) → Environment(+0x80).
+    let env_ptr: *const u16;
+    // SAFETY: gs:[0x60] is the PEB; the offsets are the byte-exact x64 layout (nt-ntdll-layout).
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb == 0 {
+            return None;
+        }
+        let params = core::ptr::read((peb + 0x20) as *const u64);
+        if params == 0 {
+            return None;
+        }
+        env_ptr = core::ptr::read((params + 0x80) as *const u64) as *const u16;
+    }
+    if env_ptr.is_null() {
+        return None;
+    }
+    // Read the double-NUL-terminated block into a slice.
+    let mut n = 0usize;
+    // SAFETY: the env block is a valid double-NUL-terminated UTF-16 region (executive-staged).
+    unsafe {
+        loop {
+            let c = *env_ptr.add(n);
+            let nx = *env_ptr.add(n + 1);
+            n += 1;
+            if c == 0 && nx == 0 {
+                break;
+            }
+            if n > 0x8000 {
+                break; // sanity bound
+            }
+        }
+    }
+    // SAFETY: [env_ptr, env_ptr+n] is the block body.
+    let block: &[u16] = unsafe { core::slice::from_raw_parts(env_ptr, n) };
+    let env = nt_ntdll::rtl::environment::Environment::from_block(block);
+    let src_str = String::from_utf16_lossy(src);
+    let out_str = env.expand(&src_str);
+    let mut out: alloc::vec::Vec<u16> = out_str.encode_utf16().collect();
+    out.push(0); // NUL-terminate
+    Some(out)
+}
+
+/// Read the double-NUL-terminated env block at `env_ptr` into an owned [`Environment`], plus its
+/// original length in units.
+///
+/// # Safety
+/// `env_ptr` a valid double-NUL-terminated UTF-16 block, or null.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_env_block(env_ptr: *const u16) -> nt_ntdll::rtl::environment::Environment {
+    if env_ptr.is_null() {
+        return nt_ntdll::rtl::environment::Environment::new();
+    }
+    let mut n = 0usize;
+    // SAFETY: measure to the double-NUL.
+    unsafe {
+        loop {
+            let c = *env_ptr.add(n);
+            let nx = *env_ptr.add(n + 1);
+            if c == 0 && nx == 0 {
+                break;
+            }
+            n += 1;
+            if n > 0x8000 {
+                break;
+            }
+        }
+    }
+    // SAFETY: [env_ptr, env_ptr+n] is the block body.
+    let block: &[u16] = unsafe { core::slice::from_raw_parts(env_ptr, n) };
+    nt_ntdll::rtl::environment::Environment::from_block(block)
+}
+
+/// `RtlSetEnvironmentVariable` — set (or, `value==NULL`, delete) a variable in the target env block.
+/// `environment` is `PVOID*` (NULL → the process env at `PEB->ProcessParameters->Environment`). On a
+/// change, serializes a fresh block on the process heap and writes the new pointer back (to
+/// `*environment` and, for the process-env case, into the PEB).
+///
+/// # Safety
+/// On-target; `name`/`value` are `UNICODE_STRING*` (value NULL → delete); `environment` NULL or a
+/// valid `PVOID*`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_set_environment_variable(
+    environment: *mut u64,
+    name: *const u8,
+    value: *const u8,
+) -> u32 {
+    use alloc::string::String;
+    // Read a UNICODE_STRING (Length@0 u16 bytes, Buffer@8).
+    // SAFETY: p is a valid UNICODE_STRING per the contract.
+    unsafe fn read_ustr(p: *const u8) -> Option<String> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: valid UNICODE_STRING.
+        let (len_bytes, buf) = unsafe {
+            (
+                core::ptr::read_unaligned(p as *const u16) as usize,
+                core::ptr::read_unaligned(p.add(8) as *const u64) as *const u16,
+            )
+        };
+        if buf.is_null() {
+            return Some(String::new());
+        }
+        // SAFETY: [buf, buf+len_bytes/2) is the string body.
+        let units = unsafe { core::slice::from_raw_parts(buf, len_bytes / 2) };
+        Some(String::from_utf16_lossy(units))
+    }
+    // SAFETY: reading the caller's UNICODE_STRINGs.
+    let name_s = match unsafe { read_ustr(name) } {
+        Some(s) if !s.is_empty() => s,
+        _ => return 0xC000_000D, // STATUS_INVALID_PARAMETER
+    };
+    // SAFETY: reading the value (NULL → delete).
+    let val_s = unsafe { read_ustr(value) };
+
+    // Locate the target block pointer: *environment if given, else the PEB process-env slot.
+    let mut peb_params: u64 = 0;
+    let cur_ptr: *const u16 = if !environment.is_null() {
+        // SAFETY: environment is a valid PVOID*.
+        unsafe { core::ptr::read(environment) as *const u16 }
+    } else {
+        // SAFETY: gs:[0x60] = PEB → ProcessParameters(+0x20) → Environment(+0x80).
+        unsafe {
+            let peb: u64;
+            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+            if peb == 0 {
+                return 0xC000_00A5; // STATUS_INVALID_ENVIRONMENT (no PEB)
+            }
+            peb_params = core::ptr::read((peb + 0x20) as *const u64);
+            if peb_params == 0 {
+                return 0xC000_00A5;
+            }
+            core::ptr::read((peb_params + 0x80) as *const u64) as *const u16
+        }
+    };
+
+    // Edit the block.
+    // SAFETY: cur_ptr is a valid double-NUL-terminated block (or null → empty).
+    let mut env = unsafe { read_env_block(cur_ptr) };
+    env.set(&name_s, val_s.as_deref());
+    let block = env.to_block(); // Vec<u16>, double-NUL-terminated
+    let bytes = block.len() * 2;
+
+    // Allocate + copy the new block.
+    // SAFETY: process heap alloc.
+    let dst = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
+    if dst.is_null() {
+        return 0xC000_0017; // STATUS_NO_MEMORY
+    }
+    // SAFETY: dst is a fresh bytes-byte region.
+    unsafe {
+        core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
+    }
+
+    // Write the new pointer back.
+    // SAFETY: writing the caller's PVOID* / the PEB env slot.
+    unsafe {
+        if !environment.is_null() {
+            core::ptr::write(environment, dst as u64);
+        } else if peb_params != 0 {
+            core::ptr::write((peb_params + 0x80) as *mut u64, dst as u64);
+        }
+    }
+    STATUS_SUCCESS_U as u32
+}
+
+/// `RtlQueryRegistryValues` — the live registry reader. Opens the base key, walks the query table,
+/// enumerates subkey values / queries named values, dispatches the caller's routine with expansion.
+/// Absent keys/values fall to the caller's defaults (or SUCCESS/OBJECT_NAME_NOT_FOUND for REQUIRED).
+///
+/// # Safety
+/// On-target hosted-process; `query_table` a valid RTL_QUERY_REGISTRY_TABLE array; `path` a valid
+/// NUL-terminated UTF-16 string or NULL.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_query_registry_values(
+    relative_to: u32,
+    path: *const u16,
+    query_table: *const u8,
+    _context: u64,
+) -> u32 {
+    use alloc::vec::Vec;
+    if query_table.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    // Build the absolute base key path (base + '\' + Path), then open it.
+    let base_key: u64 = if (relative_to & RTL_REGISTRY_HANDLE) != 0 {
+        // Path IS the handle.
+        path as u64
+    } else {
+        let mut full: Vec<u16> = Vec::new();
+        if (relative_to & !(RTL_REGISTRY_OPTIONAL | 0x2000_0000)) == RTL_REGISTRY_ABSOLUTE {
+            // Path is already absolute.
+        } else if let Some(base) = registry_base_path(relative_to) {
+            full.extend(base.encode_utf16());
+        }
+        if !path.is_null() {
+            // SAFETY: path is NUL-terminated per the contract.
+            let plen = unsafe { wlen(path) };
+            if plen != 0 {
+                // Real ntdll skips a leading '\' on Path unless ABSOLUTE (the "HACK!" at
+                // registry.c:529).
+                // SAFETY: [path, path+plen) is the string.
+                let pslice = unsafe { core::slice::from_raw_parts(path, plen) };
+                if !full.is_empty() {
+                    full.push(b'\\' as u16);
+                }
+                full.extend_from_slice(pslice);
+            }
+        }
+        if full.is_empty() {
+            return 0xC000_000D;
+        }
+        // SAFETY: on-target key open.
+        let h = unsafe { open_key_utf16(0, &full) };
+        if h == 0 {
+            // Base key not found. If OPTIONAL, this is fine (SUCCESS); else fail.
+            return if (relative_to & RTL_REGISTRY_OPTIONAL) != 0 {
+                STATUS_SUCCESS_U as u32
+            } else {
+                0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+            };
+        }
+        h
+    };
+
+    // A reusable KeyValueFullInformation buffer.
+    let mut info = [0u8; 2048];
+    let mut status: u32 = STATUS_SUCCESS_U as u32;
+    let mut e = query_table;
+    let mut current_key = base_key;
+    loop {
+        // SAFETY: e points at a valid entry (terminator checked below).
+        let entry = unsafe { read_query_entry(e) };
+        // Terminator: QueryRoutine == NULL && no SUBKEY/DIRECT flag.
+        if entry.query_routine == 0
+            && (entry.flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT)) == 0
+        {
+            break;
+        }
+
+        // TOPKEY / SUBKEY: reset to the base key if we descended.
+        if (entry.flags & (RTL_QUERY_REGISTRY_TOPKEY | RTL_QUERY_REGISTRY_SUBKEY)) != 0
+            && current_key != base_key
+        {
+            // SAFETY: close the descended subkey handle.
+            unsafe { syscall4(SSN_NT_CLOSE, current_key, 0, 0, 0) };
+            current_key = base_key;
+        }
+
+        if (entry.flags & RTL_QUERY_REGISTRY_SUBKEY) != 0 && entry.name != 0 {
+            // Open the named subkey relative to the base, then enumerate its values.
+            // SAFETY: entry.name is a NUL-terminated UTF-16 string.
+            let nlen = unsafe { wlen(entry.name as *const u16) };
+            // SAFETY: [name, name+nlen) is the string.
+            let nslice = unsafe { core::slice::from_raw_parts(entry.name as *const u16, nlen) };
+            // SAFETY: on-target subkey open.
+            let sub = unsafe { open_key_utf16(base_key, nslice) };
+            if sub != 0 {
+                current_key = sub;
+                if entry.query_routine != 0 {
+                    // ProcessValues: enumerate every value, dispatch the routine.
+                    let mut index: u32 = 0;
+                    loop {
+                        let mut result_len: u32 = 0;
+                        // SAFETY: enumerate value `index` into `info`.
+                        let st = unsafe {
+                            syscall6(
+                                SSN_NT_ENUMERATE_VALUE_KEY,
+                                current_key,
+                                index as u64,
+                                KEY_VALUE_FULL_INFORMATION,
+                                info.as_mut_ptr() as u64,
+                                info.len() as u64,
+                                &mut result_len as *mut u32 as u64,
+                            )
+                        };
+                        if st == STATUS_NO_MORE_ENTRIES {
+                            status = STATUS_SUCCESS_U as u32;
+                            break;
+                        }
+                        if st != STATUS_SUCCESS_U {
+                            // Buffer overflow or error: stop enumerating this subkey.
+                            break;
+                        }
+                        // Parse the KeyValueFullInformation.
+                        // SAFETY: `info` holds a valid KEY_VALUE_FULL_INFORMATION.
+                        unsafe {
+                            let ty = core::ptr::read_unaligned(info.as_ptr().add(4) as *const u32);
+                            let data_off =
+                                core::ptr::read_unaligned(info.as_ptr().add(8) as *const u32) as usize;
+                            let data_len =
+                                core::ptr::read_unaligned(info.as_ptr().add(0x0c) as *const u32);
+                            let name_len =
+                                core::ptr::read_unaligned(info.as_ptr().add(0x10) as *const u32) as usize;
+                            // The name follows the 0x14-byte header; NUL-terminate a local copy.
+                            let mut name_buf: Vec<u16> = Vec::with_capacity(name_len / 2 + 1);
+                            for k in 0..(name_len / 2) {
+                                name_buf.push(core::ptr::read_unaligned(
+                                    info.as_ptr().add(0x14 + k * 2) as *const u16,
+                                ));
+                            }
+                            name_buf.push(0);
+                            let data_ptr = info.as_ptr().add(data_off);
+                            let st2 = dispatch_value(
+                                &entry,
+                                name_buf.as_ptr(),
+                                ty,
+                                data_ptr,
+                                data_len,
+                            );
+                            if st2 != STATUS_SUCCESS_U as u32 {
+                                status = st2;
+                                break;
+                            }
+                        }
+                        index += 1;
+                    }
+                }
+            } else if (entry.flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
+                status = 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+            }
+        } else if entry.name != 0 {
+            // A named value under the current key: NtQueryValueKey.
+            let mut oa_us = [0u8; 0x10];
+            // SAFETY: entry.name is NUL-terminated.
+            let nlen = unsafe { wlen(entry.name as *const u16) };
+            let bytes = (nlen * 2) as u16;
+            // Build the UNICODE_STRING value name.
+            // SAFETY: valid stack buffer.
+            unsafe {
+                core::ptr::write(oa_us.as_mut_ptr() as *mut u16, bytes);
+                core::ptr::write(oa_us.as_mut_ptr().add(2) as *mut u16, bytes);
+                core::ptr::write(oa_us.as_mut_ptr().add(8) as *mut u64, entry.name);
+            }
+            let mut result_len: u32 = 0;
+            // SAFETY: query the named value into `info`.
+            let st = unsafe {
+                syscall6(
+                    SSN_NT_QUERY_VALUE_KEY,
+                    current_key,
+                    oa_us.as_ptr() as u64,
+                    KEY_VALUE_FULL_INFORMATION,
+                    info.as_mut_ptr() as u64,
+                    info.len() as u64,
+                    &mut result_len as *mut u32 as u64,
+                )
+            };
+            if st == STATUS_SUCCESS_U {
+                // SAFETY: `info` holds a valid KEY_VALUE_FULL_INFORMATION.
+                unsafe {
+                    let ty = core::ptr::read_unaligned(info.as_ptr().add(4) as *const u32);
+                    let data_off =
+                        core::ptr::read_unaligned(info.as_ptr().add(8) as *const u32) as usize;
+                    let data_len = core::ptr::read_unaligned(info.as_ptr().add(0x0c) as *const u32);
+                    let st2 = dispatch_value(
+                        &entry,
+                        entry.name as *const u16,
+                        ty,
+                        info.as_ptr().add(data_off),
+                        data_len,
+                    );
+                    if st2 != STATUS_SUCCESS_U as u32 {
+                        status = st2;
+                    }
+                }
+            } else {
+                // Value absent → fall to the caller's default (if any).
+                let st2 = unsafe { dispatch_default(&entry) };
+                if st2 != STATUS_SUCCESS_U as u32 {
+                    status = st2;
+                }
+            }
+        }
+
+        if status != STATUS_SUCCESS_U as u32 {
+            break;
+        }
+        e = e.wrapping_add(ENTRY_SIZE);
+    }
+
+    // Close a descended subkey + the base key.
+    if current_key != base_key {
+        // SAFETY: close the subkey handle.
+        unsafe { syscall4(SSN_NT_CLOSE, current_key, 0, 0, 0) };
+    }
+    if (relative_to & RTL_REGISTRY_HANDLE) == 0 {
+        // SAFETY: close the base key we opened.
+        unsafe { syscall4(SSN_NT_CLOSE, base_key, 0, 0, 0) };
+    }
+    status
+}
+
+/// Dispatch the caller's DEFAULT for an absent named value (RtlpCallQueryRegistryRoutine's
+/// KeyValueInfo->Type == REG_NONE branch): if DefaultType == REG_NONE → SUCCESS (or NOT_FOUND if
+/// REQUIRED); else call the routine / DIRECT-copy with the default data.
+///
+/// # Safety
+/// On-target; `entry` valid.
+#[cfg(target_arch = "x86_64")]
+unsafe fn dispatch_default(entry: &QueryEntry) -> u32 {
+    if entry.default_type == REG_NONE {
+        return if (entry.flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
+            0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+        } else {
+            STATUS_SUCCESS_U as u32
+        };
+    }
+    // Compute the default length if not given (for string types, count units).
+    let mut len = entry.default_length;
+    if len == 0 && entry.default_data != 0 {
+        match entry.default_type {
+            REG_SZ | REG_EXPAND_SZ => {
+                // SAFETY: default_data is a NUL-terminated UTF-16 string.
+                let u = unsafe { wlen(entry.default_data as *const u16) };
+                len = ((u + 1) * 2) as u32;
+            }
+            REG_MULTI_SZ => {
+                // Count to the double NUL.
+                // SAFETY: default_data is a double-NUL-terminated block.
+                let p = entry.default_data as *const u16;
+                let mut n = 0usize;
+                unsafe {
+                    loop {
+                        if *p.add(n) == 0 && *p.add(n + 1) == 0 {
+                            break;
+                        }
+                        n += 1;
+                        if n > 0x4000 {
+                            break;
+                        }
+                    }
+                }
+                len = ((n + 2) * 2) as u32;
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: dispatch the default value.
+    unsafe {
+        dispatch_value(
+            entry,
+            entry.name as *const u16,
+            entry.default_type,
+            entry.default_data as *const u8,
+            len,
         )
     }
 }

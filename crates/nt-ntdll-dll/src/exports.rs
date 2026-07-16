@@ -1010,13 +1010,41 @@ pub unsafe extern "system" fn rtl_create_environment(
 ///
 /// # Safety
 /// Standard contract.
+/// `RtlSetEnvironmentVariable(PVOID *Environment, PUNICODE_STRING Name, PUNICODE_STRING Value)`.
+/// Step 4.C: real over the live process environment. Reads the target block (`*environment` if
+/// non-NULL, else `PEB->ProcessParameters->Environment`), sets/deletes the variable, serializes a
+/// fresh block on the process heap, and writes it back (updating the PEB pointer for the process-env
+/// case). smss's `SmpConfigureEnvironment` (sminit.c:503) calls this per Session Manager\Environment
+/// value while `SmpLoadDataFromRegistry` has the PEB env swapped to `SmpDefaultEnvironment`.
+///
+/// # Safety
+/// `name`/`value` valid `UNICODE_STRING`s (value NULL → delete); `environment` NULL or a valid
+/// writable `PVOID*`.
 #[export_name = "RtlSetEnvironmentVariable"]
 pub unsafe extern "system" fn rtl_set_environment_variable(
-    _environment: *mut *mut c_void,
-    _name: PCUnicodeString,
-    _value: PCUnicodeString,
+    environment: *mut *mut c_void,
+    name: PCUnicodeString,
+    value: PCUnicodeString,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs the live env block (Step 4.B)
+    if name.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; delegate to the live env editor.
+        return unsafe {
+            crate::on_target::rtl_set_environment_variable(
+                environment as *mut u64,
+                name as *const u8,
+                value as *const u8,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (environment, value);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlQueryEnvironmentVariable_U(PVOID Environment, PUNICODE_STRING Name, PUNICODE_STRING Value)`.
@@ -1038,14 +1066,76 @@ pub unsafe extern "system" fn rtl_query_environment_variable_u(
 ///
 /// # Safety
 /// Standard contract.
+/// `RtlDosPathNameToNtPathName_U(PCWSTR DosName, PUNICODE_STRING NtName, PCWSTR *PartName,
+/// PRTL_RELATIVE_NAME_U RelativeName) -> BOOLEAN`. Step 4.C: real for fully-qualified paths.
+///
+/// Real ntdll prefixes a fully-qualified DOS path (`C:\...`, `\\server\...`, `\\?\X:\...`) with the
+/// NT object-manager DOS-devices prefix `\??\` (UNC → `\??\UNC\...`), producing an `NtName` whose
+/// `Buffer` is a NUL-terminated UTF-16 string allocated from the process heap (the caller frees it
+/// via `RtlFreeHeap`). smss calls this at `SmpInitializeKnownDllsInternal` (sminit.c:1465) with
+/// `SmpKnownDllPath` (`C:\Windows\system32`, already env-expanded by `RtlQueryRegistryValues`); the
+/// KnownDlls directory open then targets `\??\C:\Windows\system32`.
+///
+/// The pure prefix/classification is [`rtl::path::dos_path_name_to_nt_path_name`] (host-tested); here
+/// we materialize the `UNICODE_STRING` + heap buffer. `PartName`/`RelativeName` are the drive-relative
+/// helpers smss passes as `NULL` (it never uses them), so we leave them alone. A relative /
+/// drive-relative path (needs the live CWD, not yet threaded) or an alloc failure returns FALSE — the
+/// honest failure, never a fabricated NtName.
+///
+/// # Safety
+/// `dos_name` a NUL-terminated UTF-16 string (or NULL → FALSE); `nt_name` a valid writable
+/// `UNICODE_STRING`.
 #[export_name = "RtlDosPathNameToNtPathName_U"]
 pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
-    _dos_name: *const u16,
-    _nt_name: PUnicodeString,
-    _part_name: *mut *const u16,
+    dos_name: *const u16,
+    nt_name: PUnicodeString,
+    part_name: *mut *const u16,
     _relative_name: *mut c_void,
 ) -> u8 {
-    0 // FALSE — needs the process heap (Step 4.B)
+    if dos_name.is_null() || nt_name.is_null() {
+        return 0;
+    }
+    // SAFETY: dos_name is a NUL-terminated UTF-16 string per the contract.
+    let len = unsafe { wcslen_raw(dos_name) };
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: [dos_name, dos_name+len) is the string body.
+    let input = unsafe { core::slice::from_raw_parts(dos_name, len) };
+    let Some(nt) = rtl::path::dos_path_name_to_nt_path_name(input) else {
+        // Relative / drive-relative (needs the CWD) — honest failure.
+        return 0;
+    };
+    // Allocate a NUL-terminated UTF-16 buffer from the process heap.
+    let n_units = nt.len();
+    let bytes = (n_units + 1) * 2;
+    // SAFETY: process heap alloc (installed at LdrpInitialize). Null on failure.
+    let buf = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: buf is a fresh `bytes`-byte region; copy the units + terminating NUL.
+    unsafe {
+        core::ptr::copy_nonoverlapping(nt.as_ptr(), buf, n_units);
+        core::ptr::write(buf.add(n_units), 0);
+        // Fill the UNICODE_STRING: Length excludes the NUL, MaximumLength includes it.
+        core::ptr::write(core::ptr::addr_of_mut!((*nt_name).length), (n_units * 2) as u16);
+        core::ptr::write(core::ptr::addr_of_mut!((*nt_name).maximum_length), (bytes) as u16);
+        core::ptr::write(core::ptr::addr_of_mut!((*nt_name).buffer), buf as u64);
+    }
+    if !part_name.is_null() {
+        // PartName points at the final component (after the last `\`), or NULL if the path ends in
+        // a separator. Compute over the DOS input tail.
+        // SAFETY: part_name is a valid writable pointer per the contract.
+        unsafe {
+            let last_sep = input.iter().rposition(|&c| c == b'\\' as u16 || c == b'/' as u16);
+            match last_sep {
+                Some(i) if i + 1 < len => core::ptr::write(part_name, dos_name.add(i + 1)),
+                _ => core::ptr::write(part_name, core::ptr::null()),
+            }
+        }
+    }
+    1 // TRUE
 }
 
 /// `RtlDosSearchPath_U(PCWSTR, PCWSTR, PCWSTR, ULONG, PWSTR, PWSTR*) -> ULONG`. Honest seam.
@@ -1096,8 +1186,8 @@ type QueryRoutine = unsafe extern "system" fn(
 #[export_name = "RtlQueryRegistryValues"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_query_registry_values(
-    _relative_to: u32,
-    _path: *const u16,
+    relative_to: u32,
+    path: *const u16,
     query_table: *mut c_void,
     context: *mut c_void,
     _environment: *mut c_void,
@@ -1105,6 +1195,28 @@ pub unsafe extern "system" fn rtl_query_registry_values(
     if query_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // Step 4.C: on-target, drive the LIVE registry (NtOpenKey/NtEnumerateValueKey/NtQueryValueKey
+    // against ::ROSSYS.HIV) so SUBKEY entries (smss's KnownDlls / Environment) run their callbacks
+    // with real hive data + REG_EXPAND_SZ expansion — real-ntdll behavior. Absent keys/values fall
+    // to the caller's defaults inside the on-target reader.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; query_table/path per the contract.
+        return unsafe {
+            crate::on_target::rtl_query_registry_values(
+                relative_to,
+                path,
+                query_table as *const u8,
+                context as u64,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (relative_to, path);
+    }
+    #[allow(unreachable_code)]
+    {
     const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
     const ENTRY_SIZE: usize = 0x38;
     // SAFETY: query_table is a valid RTL_QUERY_REGISTRY_TABLE array per the contract.
@@ -1150,6 +1262,7 @@ pub unsafe extern "system" fn rtl_query_registry_values(
         }
     }
     STATUS_SUCCESS
+    }
 }
 
 // =================================================================================================
