@@ -487,6 +487,7 @@ unsafe fn snap_descriptor_against(
     ilt_rva: u32,
     iat_rva: u32,
     dep_base: u64,
+    table: &mut ModuleTable,
     out: &mut SnapResult,
 ) {
     // SAFETY: caller contract — mapped images, writable IAT.
@@ -498,33 +499,30 @@ unsafe fn snap_descriptor_against(
             if thunk == 0 {
                 break;
             }
-            if thunk & (1u64 << 63) == 0 {
+            // Resolve each thunk to its FINAL absolute address, following forwarders (e.g.
+            // kernel32!GetLastError → "ntdll.RtlGetLastWin32Error"). A forwarder RVA left un-followed
+            // would write the forwarder-STRING address into the IAT → an instruction-fetch fault into
+            // the target's .rdata on the first call (the kernel32+0xa9954 map=8 wall).
+            let addr = if thunk & (1u64 << 63) == 0 {
                 // by name: IMAGE_IMPORT_BY_NAME RVA = thunk & 0x7fffffff; +2 skips the Hint.
                 let ibn_rva = (thunk & 0x7fff_ffff) as u32;
                 let mut namebuf = [0u8; 96];
                 let nlen = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
-                let export_rva = export_rva_by_name(dep_base, &namebuf[..nlen]);
-                if export_rva != 0 {
-                    let addr = dep_base + export_rva as u64;
-                    core::ptr::write_unaligned(iat as *mut u64, addr);
-                    out.resolved += 1;
-                    if out.spot_iat_value == 0 {
-                        out.spot_iat_value = addr;
-                        out.spot_iat_rva = (iat - image_base) as u32;
-                    }
-                } else {
-                    out.missing += 1;
-                }
+                resolve_export_addr(dep_base, false, &namebuf[..nlen], 0, table, 0)
             } else {
                 // by ordinal.
                 let ord = (thunk & 0xffff) as u32;
-                let export_rva = export_rva_by_ordinal(dep_base, ord);
-                if export_rva != 0 {
-                    core::ptr::write_unaligned(iat as *mut u64, dep_base + export_rva as u64);
-                    out.resolved += 1;
-                } else {
-                    out.missing += 1;
+                resolve_export_addr(dep_base, true, &[], ord, table, 0)
+            };
+            if addr != 0 {
+                core::ptr::write_unaligned(iat as *mut u64, addr);
+                out.resolved += 1;
+                if out.spot_iat_value == 0 {
+                    out.spot_iat_value = addr;
+                    out.spot_iat_rva = (iat - image_base) as u32;
                 }
+            } else {
+                out.missing += 1;
             }
             ilt += 8;
             iat += 8;
@@ -556,6 +554,124 @@ unsafe fn export_rva_by_ordinal(base: u64, ordinal: u32) -> u32 {
             return 0;
         }
         rd32(base, addr_of_functions + idx as u64 * 4)
+    }
+}
+
+/// The export directory `(rva, size)` for the mapped PE at `base` — used to classify a resolved
+/// export RVA as a FORWARDER (an RVA that falls INSIDE the export directory is not code/data in the
+/// image; it is a `"TARGETDLL.func"` / `"TARGETDLL.#ordinal"` ASCII string to redirect to).
+///
+/// # Safety
+/// `base` must be a mapped PE image.
+#[cfg(target_arch = "x86_64")]
+unsafe fn export_dir_range(base: u64) -> (u32, u32) {
+    // SAFETY: reading the mapped PE headers per the contract.
+    unsafe { data_directory(base, 0) } // IMAGE_DIRECTORY_ENTRY_EXPORT = 0
+}
+
+/// Is `rva` a FORWARDER for the module at `base`? (RVA inside the export directory range.)
+///
+/// # Safety
+/// `base` must be a mapped PE image.
+#[cfg(target_arch = "x86_64")]
+unsafe fn is_forwarder(base: u64, rva: u32) -> bool {
+    // SAFETY: reading the mapped PE headers per the contract.
+    let (edir_rva, edir_sz) = unsafe { export_dir_range(base) };
+    edir_sz != 0 && rva >= edir_rva && rva < edir_rva + edir_sz
+}
+
+/// Resolve an imported symbol (by name or by ordinal) in the module at `dep_base` to its FINAL
+/// ABSOLUTE virtual address, **following forwarders** (`kernel32!GetLastError` → the forwarder string
+/// `"ntdll.RtlGetLastWin32Error"` → the concrete `ntdll` export). This is the on-target equivalent of
+/// `nt-ntdll::loader::resolve`'s forwarder chain, but over live mapped images + the `MODULE_TABLE`
+/// (loading a forwarder-target DLL if not already present, exactly as `LdrpSnapThunk` does).
+///
+/// Returns the absolute address, or 0 if unresolvable (missing export / target DLL). `depth` guards a
+/// pathological forwarder cycle (real chains are 1-2 hops).
+///
+/// # Safety
+/// `dep_base` must be a mapped PE image; on-target (may load a forwarder-target DLL via syscalls).
+#[cfg(target_arch = "x86_64")]
+unsafe fn resolve_export_addr(
+    dep_base: u64,
+    by_ordinal: bool,
+    name: &[u8],
+    ordinal: u32,
+    table: &mut ModuleTable,
+    depth: u32,
+) -> u64 {
+    if depth > 8 {
+        return 0; // forwarder-cycle / over-deep guard
+    }
+    // SAFETY: mapped-image export walk per the contract.
+    unsafe {
+        let rva = if by_ordinal {
+            export_rva_by_ordinal(dep_base, ordinal)
+        } else {
+            export_rva_by_name(dep_base, name)
+        };
+        if rva == 0 {
+            return 0;
+        }
+        if !is_forwarder(dep_base, rva) {
+            // Concrete export — the common case.
+            return dep_base + rva as u64;
+        }
+        // FORWARDER: the RVA points at an ASCII `"TARGETDLL.func"` / `"TARGETDLL.#ordinal"` string.
+        // Split on the LAST '.' (api-set names can contain dots; ReactOS ones don't, but be exact).
+        let mut fbuf = [0u8; 128];
+        let flen = read_cstr(dep_base, rva, &mut fbuf);
+        let fwd = &fbuf[..flen];
+        let dot = match fwd.iter().rposition(|&c| c == b'.') {
+            Some(d) => d,
+            None => return 0, // malformed forwarder
+        };
+        let (mod_part, sym_part) = (&fwd[..dot], &fwd[dot + 1..]);
+
+        // Lowercase the target module base name (strip a trailing ".dll" if present — forwarders
+        // usually omit it, e.g. "ntdll", but be defensive).
+        let mut tmod = [0u8; 32];
+        let mut tlen = 0usize;
+        for &b in mod_part.iter().take(32) {
+            tmod[tlen] = b.to_ascii_lowercase();
+            tlen += 1;
+        }
+        if tlen >= 4 {
+            let tail = &tmod[tlen - 4..tlen];
+            if tail == b".dll" {
+                tlen -= 4;
+            }
+        }
+        let tmod_lc = &tmod[..tlen];
+
+        // Find the forwarder-target module (load it if not already mapped — as LdrpSnapThunk does).
+        let mut tbase = table.find(tmod_lc);
+        if tbase == 0 {
+            let loaded = load_dependent_dll(tmod_lc);
+            if loaded != 0 {
+                table.insert(tmod_lc, loaded);
+                let mut sink = SnapResult::default();
+                snap_module(loaded, table.find(b"ntdll"), table, &mut sink, depth + 1);
+                tbase = loaded;
+            }
+        }
+        if tbase == 0 {
+            return 0;
+        }
+
+        // Resolve the target symbol IN the target module — by ordinal (`#123`) or by name — RECURSING
+        // (the target may itself be a forwarder).
+        if !sym_part.is_empty() && sym_part[0] == b'#' {
+            let mut ord = 0u32;
+            for &c in &sym_part[1..] {
+                if c.is_ascii_digit() {
+                    ord = ord * 10 + (c - b'0') as u32;
+                }
+            }
+            resolve_export_addr(tbase, true, &[], ord, table, depth + 1)
+        } else {
+            resolve_export_addr(tbase, false, sym_part, 0, table, depth + 1)
+        }
     }
 }
 
@@ -821,7 +937,7 @@ unsafe fn snap_module(
                 }
             }
             if dep_base != 0 {
-                snap_descriptor_against(image_base, ilt_rva, ft, dep_base, out);
+                snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
             } else {
                 // Could not resolve the dependency — count its thunks as missing (honest, not faked).
                 let mut ilt = image_base + ilt_rva as u64;
@@ -978,10 +1094,14 @@ pub unsafe fn ldr_get_procedure_address(
     if base == 0 {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
-    // SAFETY: reading the module's export directory + the optional ANSI_STRING name.
-    let func_rva = unsafe {
+    // SAFETY: reading the module's export directory + the optional ANSI_STRING name, and (for a
+    // forwarded export) resolving the forwarder target over the process-wide MODULE_TABLE — the same
+    // forwarder handling the static import snap does (else a forwarded proc address would be the
+    // forwarder STRING, faulting on the first call).
+    let addr = unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
         if name.is_null() {
-            export_rva_by_ordinal(base, ordinal)
+            resolve_export_addr(base, true, &[], ordinal, table, 0)
         } else {
             // ANSI_STRING { Length(u16)@0, MaximumLength(u16)@2, Buffer(ptr)@8 }.
             let length = core::ptr::read_unaligned(name as *const u16) as usize;
@@ -994,16 +1114,16 @@ pub unsafe fn ldr_get_procedure_address(
                 for i in 0..l {
                     nb[i] = core::ptr::read_unaligned((buffer as *const u8).add(i));
                 }
-                export_rva_by_name(base, &nb[..l])
+                resolve_export_addr(base, false, &nb[..l], 0, table, 0)
             }
         }
     };
-    if func_rva == 0 {
+    if addr == 0 {
         return 0xC000_0139; // STATUS_ENTRYPOINT_NOT_FOUND
     }
     if !address.is_null() {
         // SAFETY: address writable per the contract.
-        unsafe { core::ptr::write_unaligned(address, (base + func_rva as u64) as *mut c_void) };
+        unsafe { core::ptr::write_unaligned(address, addr as *mut c_void) };
     }
     0
 }

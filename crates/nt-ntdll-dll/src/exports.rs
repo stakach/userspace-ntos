@@ -2470,6 +2470,40 @@ pub unsafe extern "system" fn ldr_unload_dll(_base_address: *mut c_void) -> NtSt
 #[used]
 pub static EXPORT_ANCHOR_FN: unsafe extern "C" fn() = export_anchor;
 
+/// `RtlGetLastWin32Error() -> DWORD` — read `TEB.LastErrorValue` (@ 0x068).
+///
+/// This is the ntdll implementation of Win32 `GetLastError`. kernel32's `GetLastError` is a
+/// FORWARDER export to `ntdll.RtlGetLastWin32Error` (as are user32's/advapi32's callers via
+/// kernel32), so once the loader follows forwarders, every `GetLastError` call lands here. The TEB
+/// self-pointer is `gs:[0x30]` (`NtTib.Self`); `LastErrorValue` is a 32-bit field at TEB+0x68
+/// (asserted in `nt-ntdll-layout`).
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlGetLastWin32Error"]
+pub unsafe extern "system" fn rtl_get_last_win32_error() -> u32 {
+    // SAFETY: reads the current thread's TEB (self-pointer @ gs:[0x30]); the LastErrorValue field @
+    // 0x68 is always mapped (the TEB is set up at spawn).
+    unsafe {
+        let teb: u64;
+        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags, readonly));
+        core::ptr::read_volatile((teb + 0x68) as *const u32)
+    }
+}
+
+/// `RtlSetLastWin32Error(DWORD)` — write `TEB.LastErrorValue` (@ 0x068).
+///
+/// The ntdll implementation of Win32 `SetLastError`; kernel32's `SetLastError` forwards to
+/// `ntdll.RtlSetLastWin32Error`.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlSetLastWin32Error"]
+pub unsafe extern "system" fn rtl_set_last_win32_error(error: u32) {
+    // SAFETY: writes the current thread's TEB LastErrorValue @ TEB+0x68 (self-pointer @ gs:[0x30]).
+    unsafe {
+        let teb: u64;
+        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags, readonly));
+        core::ptr::write_volatile((teb + 0x68) as *mut u32, error);
+    }
+}
+
 /// The retention anchor body — see [`EXPORT_ANCHOR_FN`]. Never invoked.
 ///
 /// # Safety
@@ -2564,6 +2598,9 @@ pub unsafe extern "C" fn export_anchor() {
         wcsncpy as usize,
         wcscat as usize,
         wcsnicmp as usize,
+        // BATCH 3 — the Win32 last-error pair (kernel32!GetLastError/SetLastError forward here).
+        rtl_get_last_win32_error as usize,
+        rtl_set_last_win32_error as usize,
     ];
     core::hint::black_box(anchors);
 }
