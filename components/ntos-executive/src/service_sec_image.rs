@@ -2493,6 +2493,24 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
+                // ★ N-processes multiplex (BATCH 17): smss' (badge 0) main thread terminating must NOT
+                // stop the whole boot while a HIGHER hosted process (winlogon) still has pending work.
+                // smss reaches NtRaiseHardError (SSN 190) via SmpTerminate (smss.c:SmpTerminate ->
+                // NtRaiseHardError(STATUS_SYSTEM_PROCESS_TERMINATED) -> NtTerminateProcess) — its death
+                // cry after it has finished spawning csrss + winlogon. In real NT smss then WAITS on the
+                // subsystem handles; here its main thread is done its bring-up job. PARK it (recv next
+                // WITHOUT replying, exactly like a server listener) so winlogon's user32 window-class /
+                // cursor init keeps being serviced instead of freezing at its 0x103d fetch. Behavior-
+                // preserving for smss (it was terminating regardless); unblocks the higher process. This
+                // is the same class of fix as BATCH 10 (a terminal syscall from one process killed the
+                // shared loop), generalized to smss' hard-error path.
+                if badge == 0 && m0 == 190 {
+                    print_str(b"[smss] NtRaiseHardError(190) = SmpTerminate -> PARK smss main; winlogon continues\n");
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 stop_ssn = m0; // an Nt* syscall we don't service yet — stop
                 break;
             }
