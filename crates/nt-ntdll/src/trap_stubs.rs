@@ -269,6 +269,7 @@ generate_trap_stubs! {
     (nt_restore_key, "NtRestoreKey", 212),
     (nt_resume_thread, "NtResumeThread", 214),
     (nt_save_key, "NtSaveKey", 215),
+    (nt_secure_connect_port, "NtSecureConnectPort", 218),
     (nt_set_context_thread, "NtSetContextThread", 221),
     (nt_set_default_hard_error_port, "NtSetDefaultHardErrorPort", 223),
     (nt_set_default_locale, "NtSetDefaultLocale", 224),
@@ -330,7 +331,7 @@ mod tests {
 
     #[test]
     fn generates_all_188_required_stubs() {
-        assert_eq!(TRAP_STUBS.len(), 188);
+        assert_eq!(TRAP_STUBS.len(), 189);
         assert_eq!(TRAP_STUBS.len(), NT_SYSCALLS.len());
     }
 

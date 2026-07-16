@@ -2,8 +2,10 @@
 
 use super::*;
 
-/// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement).
-const REQUIRED_NT_COUNT: usize = 188;
+/// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement = 188)
+/// plus `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally (it
+/// isn't an *import* of any hosted binary, but IS an ntdll-internal syscall → it must be in the table).
+const REQUIRED_NT_COUNT: usize = 189;
 const REQUIRED_ZW_COUNT: usize = 7;
 
 #[test]

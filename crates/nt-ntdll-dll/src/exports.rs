@@ -6926,21 +6926,47 @@ pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
 }
 
 /// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
-/// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. The connect handshake is
-/// the LPC transport seam (`nt_ntdll::csr::CsrPort::connect` builds it); returns
-/// STATUS_NOT_IMPLEMENTED at the honest send seam — never a fabricated connection.
+/// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. Port of ReactOS
+/// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues the 9-arg
+/// `NtSecureConnectPort(\Windows\ApiPort)` (serviced by the executive's `csr_client_connect`) and
+/// copies the returned CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
+/// `DllMain` proceeds past `InitCommandLines()`. On the host (no syscalls) returns
+/// STATUS_NOT_IMPLEMENTED — never a fabricated connection.
 ///
 /// # Safety
 /// The out-params (`connection_info_size`, `server_to_server`) are null or writable.
 #[export_name = "CsrClientConnectToServer"]
 pub unsafe extern "system" fn csr_client_connect_to_server(
-    _object_directory: *const u16,
-    _server_id: u32,
-    _connection_info: *mut c_void,
-    _connection_info_size: *mut u32,
-    _server_to_server: *mut u8,
+    object_directory: *const u16,
+    server_id: u32,
+    connection_info: *mut c_void,
+    connection_info_size: *mut u32,
+    server_to_server: *mut u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+    {
+        // SAFETY: on-target hosted-process; issues NtSecureConnectPort + fills the PEB CSR fields.
+        unsafe {
+            crate::on_target::csr_client_connect_to_server(
+                object_directory,
+                server_id,
+                connection_info,
+                connection_info_size,
+                server_to_server,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "native_transport")))]
+    {
+        let _ = (
+            object_directory,
+            server_id,
+            connection_info,
+            connection_info_size,
+            server_to_server,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `CsrClientCallServer(PCSR_API_MESSAGE Request, PCSR_CAPTURE_BUFFER Capture, CSR_API_NUMBER

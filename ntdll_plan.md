@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17 · BATCH 7 (csr_rendezvous native arm + the LIVE loader now runs `DLL_PROCESS_ATTACH` in dependency order + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first, reaching kernel32's `CsrClientConnectToServer`; next wall = the CSR/base-server connect + `Peb->ReadOnlyStaticServerData` DURING winlogon's loader, gate 149) DONE 2026-07-17** · next wall = winlogon loader-time CSR connect (kernel32 DllMain `CsrClientConnectToServer` → `Peb->ReadOnlyStaticServerData`) → win32k paint
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17 · BATCH 7 (csr_rendezvous native arm + the LIVE loader now runs `DLL_PROCESS_ATTACH` in dependency order + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first, reaching kernel32's `CsrClientConnectToServer`; next wall = the CSR/base-server connect + `Peb->ReadOnlyStaticServerData` DURING winlogon's loader, gate 149) DONE 2026-07-17 · BATCH 8 (NtSecureConnectPort SSN 218 + `CsrClientConnectToServer` = a faithful `CsrpConnectToServer` port issuing the 9-arg NtSecureConnectPort + copying ConnectionInfo→PEB ReadOnlyStaticServerData; + the root-cause `call_dll_main` stack-misalign fix `sub rsp,0x28`→`0x20` that #GP-faulted kernel32's DllMain→CsrClientConnectToServer's aligned SSE spill; + a connect-once guard preventing a reconnect hang → **winlogon's kernel32 DllMain COMPLETES the CSR connect, `exec_winlogon_csr_connect` PASSES, winlogon advances PAST the CSR wall into real win32k NtUser* calls (SSN 4346/4699) + WinMain**, gate 149→150) DONE 2026-07-17** · next wall = win32k desktop-graphics init (winlogon reaches NtUser* but parks on NtWaitForSingleObject before driving `co_IntInitializeDesktopGraphics → IntPaintDesktop`) → the 0x003a6ea5 paint
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1605,3 +1605,65 @@ which calls `NtSecureConnectPort` internally, connect.c:141.) ★ ALSO: **`NtSec
 3. Then kernel32's DllMain reaches `InitCommandLines()` (GetCommandLineA non-NULL) → winlogon's
    entry runs its real `WinMain` → `SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → 0x003a6ea5`.
    The `csr_rendezvous` native arm (this batch) drives csrss's real CsrApiRequestThread accept.
+
+---
+
+## ☑ SYSTEMATIC PORT — BATCH 8 (DONE 2026-07-17): NtSecureConnectPort(218) + CsrClientConnectToServer → winlogon's kernel32 DllMain COMPLETES the CSR connect → winlogon advances PAST the CSR wall into its win32k/WinMain flow (gate 149 → 150; `exec_winlogon_csr_connect` now PASSES)
+
+### 1. NtSecureConnectPort SSN 218 added to the shared ABI + the stub table
+`nt-syscall-abi`: `NT_SYSCALLS` gains `n("NtSecureConnectPort", 218)` (verified vs
+`references/reactos/ntoskrnl/sysfuncs.lst:219` = `NtSecureConnectPort 9`, line 219 = 0-based SSN 218)
++ `NT_ARGC` gains `("NtSecureConnectPort", 9)`. `nt-ntdll::trap_stubs` gains the 189th naked stub
+`(nt_secure_connect_port, "NtSecureConnectPort", 218)`. Counts bumped 188→189 across the tests
+(`nt-syscall-abi` `REQUIRED_NT_COUNT`, `nt-ntdll` stub/trap-stub counts). Host: **nt-ntdll 157 +
+nt-syscall-abi 12 green**; the DLL emit reports **189 Nt* stubs exported (0 missing)** + 599 exports.
+
+### 2. `CsrClientConnectToServer` = a faithful port of ReactOS `CsrpConnectToServer` (on_target.rs)
+`crates/nt-ntdll-dll/src/on_target.rs::csr_client_connect_to_server` (called from the exports.rs
+thunk under `cfg(target_arch="x86_64", feature="native_transport")`; host build = STATUS_NOT_IMPL):
+builds the `\Windows\ApiPort` PortName UNICODE_STRING + the SECURITY_QUALITY_OF_SERVICE + PORT_VIEW
+LpcWrite + REMOTE_PORT_VIEW LpcRead + CSR_API_CONNECTINFO (all STACK locals so the executive's
+stack-mirror writes land — same discipline as `nt_allocate_virtual_memory`; layouts matched to
+`ndk/lpctypes.h` PORT_VIEW = {Length@0,SectionHandle@0x08,ViewSize@0x18,ViewBase@0x20,
+ViewRemoteBase@0x28} + `csr/csrmsg.h` CSR_API_CONNECTINFO x64 = {SharedSectionBase@0x08,
+SharedStaticServerData@0x10,SharedSectionHeap@0x18,ServerProcessId@0x30}), issues the 9-arg
+`NtSecureConnectPort` over a new `native_secure_connect_port` helper (mirrors `native_map_view`: a1..a4
+in the message MR2/MR3/MR4/MR5, a5..a9 on the stack at `[rsp+0x28..0x50]` — a8/ConnectionInformation
+= `sp+0x40`, exactly where the executive's `csr_client_connect` reads it), then on success copies
+`ConnectionInfo.{SharedSectionBase,SharedSectionHeap,SharedStaticServerData}` into the PEB
+(`ReadOnlySharedMemoryBase@0x88 / …Heap@0x90 / ReadOnlyStaticServerData@0x98`) — exactly what
+kernel32's DllMain reads next. We SKIP the real `NtCreateSection` (the executive owns + maps the CSR
+heap view at a fixed VA regardless) + pass NULL SectionHandle/SystemSid (cosmetic on the modeled
+accept path). A `CSR_CONNECTED` `AtomicBool` guard replicates CsrpConnectToServer's `if (!CsrApiPort)`
+→ connect EXACTLY ONCE per process (the 2nd+ call is a no-op success; without it the redundant 2nd
+connect re-drove the executive's CSR rendezvous → **a hang**).
+
+### 3. ★ ROOT-CAUSE FIX — `call_dll_main` stack misalignment (`sub rsp, 0x28` → `0x20`)
+The FIRST boot with the connect implemented #GP-faulted at ntdll RVA 0xf906 = CsrClientConnectToServer's
+prologue `movaps [rsp+0x170]` (an ABI-aligned SSE spill). Root cause: the loader's `call_dll_main`
+shim reserved `sub rsp, 0x28` before `call <DllMain>`. Rust keeps rsp ≡0 mod 16 in a function body;
+`0x28` ≡ 8 mod 16 left rsp ≡ 8 pre-`call` → the DllMain callee (and everything it calls, incl.
+CsrClientConnectToServer) saw rsp ≡ 0 mod 16 = **misaligned by 8** → the first aligned SSE store
+faulted. Fix = reserve `sub rsp, 0x20` (≡0 mod 16 → callee gets the ABI-correct rsp≡8 mod 16). This
+is a real bug the loader carried latently (smss/csrss/csrsrv DllMains happened not to spill aligned
+SSE; kernel32's did). NO KERNEL CHANGE; ntdll-side only.
+
+### How far the boot got (gate 150, boot-verified)
+- **`[csr] pi=2 NtSecureConnectPort(\Windows\ApiPort)`** fires ONCE (the guard prevents the reconnect
+  hang) → the executive's `csr_client_connect` maps winlogon's CSR heap-view + fills the
+  CSR_API_CONNECTINFO → `WINLOGON_CSR_CONNECTED=1` → **`PASS exec_winlogon_csr_connect`** (was FAIL).
+- winlogon's SSN trace advances PAST the connect: `4:218 → 0:175(csrss NtQuerySection) → 4:181 →
+  4:36 → 4:27 → 4:173/4:173 → **4:4346 4:4699 (win32k NtUser* graphics!)** → 4:125(NtOpenKey) →
+  4:185(NtQueryValueKey) → 4:27 → 0:161(NtWaitForSingleObject)`. winlogon demand-faulted **178 pages**
+  (was 95) — it runs its real WinMain deep into win32k desktop init.
+- **Gate 150 / 98** (up from 149). Host: nt-ntdll 157, nt-syscall-abi 12 green.
+
+### ★ THE REMAINING WALL = win32k desktop-graphics init (past the CSR connect, before the paint)
+winlogon now reaches win32k (NtUser* SSNs 4346/4699) but the paint is NOT yet reached:
+`win32k desktop-graphics framebuffer pixels: gfx-init not reached` + `desktop-bg match 0/768`. The
+lazy `co_IntGraphicsCheck → co_AddGuiApp → co_IntInitializeDesktopGraphics → co_IntShowDesktop →
+IntPaintDesktop` chain (see `project_win32k_graphics.md`; the machinery EXISTS) hasn't been triggered
+by winlogon's flow yet — winlogon parks on `NtWaitForSingleObject` before driving the graphics-init
+DC-op. THIS is the NEXT frontier (a NEW wall, not the CSR connect): trace which win32k call winlogon
+stops short of + what it waits on (a worker thread? a registry/font open? a DC alloc?) that would
+drive `NrGuiAppsRunning` → the lazy InitVideo → the 0x003a6ea5 paint (768/768).
