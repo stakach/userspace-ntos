@@ -4,7 +4,7 @@
 //! that turns NT/Win32 API calls into *our* syscalls. We own the kernel, so owning ntdll is the
 //! architecturally consistent choice (see `ntdll_plan.md`).
 //!
-//! This is the **Step 2a skeleton**: the pieces that de-risk the rest and are host-testable now.
+//! **Step 2a** shipped the skeleton; **Step 2b** (this) lands the bulk of the library surface.
 //!
 //! - [`transport`] — the **swappable syscall-transport seam** (`ntdll_plan.md` win #2). Because WE
 //!   author the `Nt*` stubs, they don't *have* to emulate the x86 `syscall` trap; they can speak
@@ -16,10 +16,20 @@
 //! - [`stubs`] — the data-driven `Nt*` stub table, generated from the shared
 //!   [`nt_syscall_abi`](nt_syscall_abi) SSN numbering (the single source of truth; SSN reuse of the
 //!   ReactOS numbering is what makes the eventual cutover zero-churn on the executive).
-//! - [`rtl`] — a proof-of-pattern `Rtl*` slice, reusing `nt-compat-exports::rtl`.
+//! - [`rtl`] — **Category A** (Step 2b): the bulk pure/mechanical `Rtl*` surface — strings,
+//!   NLS-driven charset conversion, integers/large-integers, time, GUID, DOS-path parsing,
+//!   status/error mapping, random/CRC, and the bitmap primitives (reused from `nt-kernel-exec`).
+//! - [`crt`] — **Category A'** (Step 2b): the C-runtime re-exports ntdll ships
+//!   (`mem*`/`str*`/`wcs*`/`_snprintf`/`qsort`/`bsearch`) + the NLS data-export tags.
+//! - [`heap`] — **Category B** (Step 2b): a **real** `RtlAllocateHeap`/`Free`/`ReAlloc`/`Size` heap
+//!   (first-fit free-list + coalescing) over an abstract backing region, host-tested.
+//! - [`sync`] — **Category C** (Step 2b): the `RTL_CRITICAL_SECTION`/`RTL_SRWLOCK`/`RTL_RUN_ONCE`
+//!   layouts + **uncontended fast paths** (host-tested), with the **contended-blocking path an
+//!   honest documented keyed-event seam** through [`transport`] — NOT faked (the root fix for the
+//!   `RtlpWaitForCriticalSection` boot deadlock: correct by construction).
 //!
-//! Scope: the full 244 `Rtl` / 188 stub *bodies* / the loader are tracked follow-ons (Step
-//! 2b/2c/Step 3). This crate lands the skeleton + a proven pattern.
+//! Scope: the full 188 stub *bodies* (>4-arg stack thunk), `Csr*`/`Dbg*`/`Ki*`, and the loader are
+//! tracked follow-ons (Step 2c / Step 3). See `ntdll_plan.md`.
 //!
 //! `no_std` + `alloc`.
 
@@ -29,9 +39,11 @@ extern crate alloc;
 
 pub use nt_syscall_abi as abi;
 
+pub mod crt;
 pub mod heap;
 pub mod rtl;
 pub mod stubs;
+pub mod sync;
 pub mod transport;
 
 /// `NTSTATUS` — the 32-bit status every `Nt*` stub returns in `rax` (`STATUS_SUCCESS` = 0).

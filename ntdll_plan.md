@@ -99,7 +99,7 @@ the deduplicated required export list, grouped by prefix, with per-binary attrib
 turns "1927" into "the N we actually need" → grounds the estimate + defines the build target.
 **Results:** DONE — **545 distinct ntdll exports** imported across the hosted set (see "Step 1 Results" below).
 
-### ◪ Step 2 — `crates/nt-ntdll` skeleton + the shared SSN header  (**2a DONE 2026-07-16**; 2b/2c follow-on)
+### ◪ Step 2 — `crates/nt-ntdll` skeleton + the shared SSN header  (**2a + 2b DONE 2026-07-16**; 2c follow-on)
 - A shared `nt-syscall-abi` SSN table (ntdll ↔ executive — the single source of truth).
 - The `Nt*` stub generator with the **swappable transport backend** (x86-trap | seL4 Call |
   SURT). Start with the existing trap backend for drop-in compat, then add seL4 Call.
@@ -292,12 +292,103 @@ never-silent-success). **Proof-of-pattern slice**: 5 fully-wired stubs (`NtClose
 `nt-compat-exports::rtl`, proving the "re-export, don't reimplement" pattern).
 
 ### Follow-on split (tracked, NOT done here)
-- **Step 2b** — the bulk **244 `Rtl*` bodies** (reuse `nt-kernel-exec`/`nt-compat-exports` where
-  they exist; author the rest) + the **65 CRT/`other` re-exports** (`mem*`/`str*`/`wcs*`/`sprintf`/
-  math + the 3 data exports `NlsMbCodePageTag`/`NlsMbOemCodePageTag`/`vDbgPrintExWithPrefix`).
+- ☑ **Step 2b** — the bulk `Rtl*` bodies + the CRT re-exports + the heap + the sync primitives.
+  **DONE 2026-07-16 — see "Step 2b Results" below.**
 - **Step 2c** — **`Csr*`** (8, over `nt-port-core`), **`Dbg*`** (12, serial-forward/no-op),
   **`Ki*`** user dispatchers (APC/exception/callback), the full 188 stub *bodies* with the >4-arg
-  stack thunk.
+  stack thunk, and the Category-A `Rtl*` stragglers that need process state or subsystem coupling
+  (see the Step 2b "remaining" list).
 - **Step 3** — the loader (`LdrpInitialize` over the `nt-ntdll-layout` structs + `nt-pe-loader`):
   PEB/TEB setup, process-param normalization, `PEB->Ldr` build, recursive import snap incl.
   forwarders, TLS callbacks, `DLL_PROCESS_ATTACH` ordering.
+
+---
+
+## Step 2b Results (landed 2026-07-16)
+
+Ported the bulk of ntdll's library surface into `crates/nt-ntdll`, host-tested with real vectors.
+**ZERO boot risk** — new modules only; nothing wired into the boot, executive runtime + `rust-micro/src`
+untouched. Three green commits on `main`. **68 tests** total (`cargo test -p nt-ntdll`, up from 24),
+clippy clean (nt-ntdll), full workspace builds, and the **executive still builds + stages
+byte-identically** (`components/ntos-executive/build.sh`).
+
+### Category A — pure/mechanical Rtl* (`src/rtl/*`) — DONE, host-tested
+`strings` (Init/Create/Copy/Append/Compare/Equal/Prefix/Upcase/Downcase/Duplicate/Erase/Validate
+UnicodeString + AnsiString + DOS-8.3), `convert` (NLS-table-driven unicode↔ansi↔oem over a
+`CodePage` abstraction — `LATIN1` default exact for ASCII; real 1252/437 PEB tables are a Step-3
+wire-up — + the `*Size`/`Rtlx*Size` variants), `integer` (IntegerToChar/CharToInteger/
+Int64ToUnicodeString + LARGE_INTEGER helpers), `time` (TimeToTimeFields/TimeFieldsToTime/
+*SecondsSince1970, proleptic Gregorian, known-datetime + leap tests), `guid` (GuidToString/
+GUIDFromString roundtrip), `path` (DetermineDosPathNameType_U/DosPathNameToNtPathName_U/
+IsDosDeviceName_U — pure parse), `status` (NtStatusToDosError + TEB-backed Get/SetLast{NtStatus,
+Win32Error} + GetVersion/version-compare), `random` (RtlUniform/RtlRandom LCG + RtlComputeCrc32,
+known-vector), `bitmap` (owned `BitMap` wrapper). **Reuse:** the counted-string core + compare/
+upcase + integer parse/format come from **`nt-compat-exports::rtl`**; the bitmap primitives are
+re-exported from **`nt-kernel-exec::rtl_bitmap`** — not reimplemented. The rest is newly authored
+Category-A logic.
+
+### Category A' — CRT / data re-exports (`src/crt.rs`) — DONE, host-tested
+`mem*` (memcmp/memchr), `str*` (strlen/cmp/stricmp/ncmp/chr/rchr/str), `wcs*` (wcslen/cmp/icmp/chr/
+str), narrow parse (atoi/strtoul), a `_snprintf`-core formatter (`%d %u %x %X %s %c %%`), safe
+generic `qsort`/`bsearch`, `abs`/`labs`, and the data-export tags `NlsMbCodePageTag`/
+`NlsMbOemCodePageTag` (both `false` for the 1252/437 single-byte defaults). Slice-based cores; the
+pointer↔slice marshalling is the loader/CRT layer.
+
+### Category B — the REAL heap (`src/heap.rs`) — DONE, host-tested
+`RtlCreateHeap`/`AllocateHeap`/`FreeHeap`/`ReAllocateHeap`/`SizeHeap`/`DestroyHeap` implemented as a
+**first-fit free-list allocator with boundary tags + forward/backward coalescing** — not a stub
+(it's load-bearing: the loader + every DLL allocates through it). **Design:** each block carries an
+in-band `BlockHeader { size, prev_size, free }` (header padded to the 16-byte
+`MEMORY_ALLOCATION_ALIGNMENT` so payloads land aligned); allocate = first-fit walk + split;
+free = mark + coalesce with physically-adjacent free neighbours via `prev_size` boundary tags;
+reallocate = in-place shrink (split tail) / in-place grow (merge free successor) / allocate-copy-free
+fallback (original preserved on OOM, the Windows contract). The backing region is abstracted behind
+an `unsafe trait Backing` — real process = `NtAllocateVirtualMemory` pages; **host tests = `Vec<u8>`**
+→ fully host-tested (10 tests: alloc/size/free/double-free-reject/no-overlap/coalesce-reuse/
+exhaustion+recover/realloc-grow-in-place+relocate/shrink/create-reject-tiny/destroy). Pointer-
+consuming methods are `unsafe` (they trust the caller's pointer exactly as `RtlFreeHeap`/`RtlSizeHeap`
+do).
+
+### Category C — sync primitives (`src/sync.rs`) — fast-path DONE, blocking-path HONEST SEAM
+`RTL_CRITICAL_SECTION` / `RTL_SRWLOCK` / `RTL_RUN_ONCE` **layouts** (byte-offset-matching what hosted
+binaries read) + the **uncontended fast paths**, host-tested:
+- **CriticalSection** — the interlocked `LockCount` model: free (`-1`→`0`) = `Acquired`, owner
+  re-entry = `Recursed` (bumps `RecursionCount`), another owner = **`Contended`** (registers the
+  waiter, does NOT block/fake); `leave` reports whether a queued waiter must be woken; spin-count
+  flag-bit masking. Tests: uncontended acquire/leave, recursive re-entry, contention classification,
+  non-owner-leave rejection.
+- **SrwLock** — exclusive/shared fast paths (exclusive excludes shared + vice-versa, shared count
+  stacks, underflow rejected).
+- **RunOnce** — Begin/Complete state machine (Run / Pending / AlreadyComplete).
+
+★ **The contended-blocking path is an honest documented seam, NOT faked** — this is the root fix for
+the current `RtlpWaitForCriticalSection` boot deadlock. `WaitSeam::wait_for_ownership` /
+`wake_one` name the exact keyed-event operations (`NtWaitForKeyedEvent` / `NtReleaseKeyedEvent`,
+SSN-resolved via the shared `nt-syscall-abi` table) and route them through the swappable
+`transport`. On the unwired host transport they return `STATUS_NOT_IMPLEMENTED` — **never a
+fabricated acquisition** — so a contended caller can't silently proceed as if it holds the lock. The
+real keyed-event send lands when the wait plane is wired (Step 6 / loader integration). A test
+asserts the seam is *invoked on contention* and does not fake success. **Our CS is correct by
+construction: a real uncontended fast path + an honest blocking seam.**
+
+### Coverage (of the 244 imported Rtl*) + what remains
+The Category-A pure surface + the heap (B) + the sync structures/fast-paths (C) cover the
+**functional bulk** that the early boot / loader / smss path exercises (per `project_smss_sec_image`:
+RtlInitUnicodeString, RtlUnicodeToMultiByteN [NLS], RtlAllocateHeap, process-param normalization,
+the critical-section fast path). **Remaining for Step 2c** (deferred with reason — they need process
+state or subsystem coupling, not "more pure functions"): the **security-descriptor / ACL / SID /
+token** family (`RtlCreateSecurityDescriptor`, `Rtl*Ace`, `RtlAllocateAndInitializeSid`,
+`RtlAdjustPrivilege`, … — belongs over `nt-security`), the **activation-context / SxS** family
+(`RtlActivateActivationContext`, `RtlFindActivationContextSection*` — apphelp/SxS), the
+**environment / current-directory / full-path** family (`RtlCreateEnvironment`,
+`RtlExpandEnvironmentStrings_U`, `RtlGetFullPathName_U`, `RtlDosSearchPath_U`,
+`RtlSetCurrentDirectory_U` — need the PEB process-params + CWD from Step 3), the **registry-shim**
+`Rtlp*` (`RtlpNtOpenKey`/`RtlpNtQueryValueKey`/`RtlpNtSetValueKey` — thin `Nt*Key` wrappers,
+land with the stub bodies), the **timer-queue / thread-pool / work-item** family
+(`RtlCreateTimerQueue`, `RtlQueueWorkItem`, `RtlRegisterWait` — need the thread-pool plane), the
+**handle-table** (`RtlInitializeHandleTable`/`RtlAllocateHandle`), the **resource** RW-lock
+(`RtlInitializeResource` — a heavier cousin of SRW), **atom tables** (`RtlCreateAtomTable` etc. —
+reuse `nt-kernel-exec::rtl_atom`), **pointer encode/decode** (`RtlEncodePointer`/`RtlDecodePointer`
+— need the process cookie), **image helpers** (`RtlImageNtHeader`/`RtlImageDirectoryEntryToData`/
+`RtlPcToFileHeader` — reuse `nt-pe-loader`), and the **exception raisers** (`RtlRaiseException`/
+`RtlRaiseStatus` — target-only, pair with `Ki*`).

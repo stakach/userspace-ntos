@@ -1,6 +1,6 @@
 [package]
 name = "nt-ntdll"
-description = "Our own Rust ntdll.dll skeleton (the userspace half of OUR kernel ABI). Step 2a: the swappable syscall-transport seam (x86-trap implemented target-side; seL4-Call + SURT-ring seams declared) + a data-driven Nt* stub table keyed off the shared nt-syscall-abi SSN numbering + a proof-of-pattern slice of fully-wired Nt* stubs and reused Rtl* primitives. The bulk 188-stub bodies / 244 Rtl / loader are tracked follow-ons (Step 2b/2c/Step 3). no_std + alloc; pure logic host-tested, target-only asm cfg-gated."
+description = "Our own Rust ntdll.dll (the userspace half of OUR kernel ABI). Step 2a: the swappable syscall-transport seam + a data-driven Nt* stub table keyed off the shared nt-syscall-abi SSN numbering. Step 2b: the bulk library surface — Category A pure Rtl* (strings/convert/integer/time/guid/path/status/random/bitmap), Category A' CRT re-exports (mem*/str*/wcs*/_snprintf/qsort/bsearch), Category B a REAL first-fit+coalescing heap over an abstract backing region, and Category C the RTL_CRITICAL_SECTION/SRWLOCK/RUN_ONCE layouts + uncontended fast paths with the contended-blocking path an honest keyed-event transport seam (not faked). The full 188-stub bodies / Csr/Dbg/Ki / loader are tracked follow-ons (Step 2c/Step 3). no_std + alloc; pure logic host-tested, target-only asm cfg-gated."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
