@@ -21,9 +21,15 @@
 
 #![no_std]
 #![allow(internal_features)]
+// `memcpy`/`memset` are exported weak (compiler-builtins-mem also emits them) — needs `linkage`.
+#![feature(linkage)]
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
+
+/// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
+/// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
+pub mod exports;
 
 /// A placeholder global allocator. The [`nt_ntdll`] rlib links `alloc`, so a `cdylib` around it
 /// needs a `#[global_allocator]` to satisfy the linker. At Step 4.0 the DLL runs no allocating code
@@ -54,6 +60,14 @@ static ALLOCATOR: AbortAllocator = AbortAllocator;
 /// this reference itself is never optimized away.
 #[used]
 static KEEP_TRAP_STUBS: &[unsafe extern "C" fn()] = nt_ntdll::trap_stubs::TRAP_STUB_ADDRS;
+
+/// Anchor the Step-4.0b `Rtl*`/`Ldr*`/`Dbg*`/CRT exports (defined in [`exports`]) so the linker
+/// retains them into the DLL export directory. Analogous to [`KEEP_TRAP_STUBS`]: it references
+/// [`exports::EXPORT_ANCHOR_FN`] (a `#[used]` anchor fn that in turn address-of's all 61 exports),
+/// so the whole graph survives DCE. Without this the non-`Nt*` exports (which nothing else in the
+/// cdylib references) would be dropped.
+#[used]
+static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 
 /// `LdrpInitialize` — the loader entry the executive's spawn trampoline transfers to.
 ///

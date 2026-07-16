@@ -111,6 +111,25 @@ fn main() -> ExitCode {
         Err(e) => check(false, &format!("base relocations parse ({e:?})")),
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Step 4.0b — smss import-coverage gate: parse smss.exe's ntdll imports and assert EVERY symbol
+    // it imports from ntdll is present in OUR export table (0 missing). smss statically imports ONLY
+    // ntdll, so this proves our DLL is a complete drop-in for smss (the Step 4.A first target).
+    // ---------------------------------------------------------------------------------------------
+    if let Some(smss_missing) = smss_import_coverage(&names) {
+        check(
+            smss_missing.is_empty(),
+            &format!("smss.exe ntdll import set fully covered ({} missing)", smss_missing.len()),
+        );
+        if !smss_missing.is_empty() {
+            let mut m = smss_missing;
+            m.sort();
+            eprintln!("   MISSING smss ntdll imports (not exported by our DLL): {m:?}");
+        }
+    } else {
+        println!("   [SKIP] smss.exe not found — skipping the smss import-coverage cross-check");
+    }
+
     if ok {
         println!("==> OK: nt-pe-loader can load our ntdll.dll (PE32+/DLL, 188 Nt* + LdrpInitialize, .reloc)");
         ExitCode::SUCCESS
@@ -118,4 +137,42 @@ fn main() -> ExitCode {
         eprintln!("!! verification FAILED");
         ExitCode::FAILURE
     }
+}
+
+/// Parse smss.exe's `ntdll.dll` import descriptor and return the names it imports that are NOT in
+/// `our_exports` (i.e. the missing coverage). Returns `None` if smss.exe can't be found (so the
+/// check is skipped, not failed, in a checkout without the staged ReactOS tree).
+fn smss_import_coverage(our_exports: &std::collections::BTreeSet<&str>) -> Option<Vec<String>> {
+    // Candidate locations for the staged ReactOS smss.exe (relative to CWD = repo root at build).
+    const CANDIDATES: &[&str] = &[
+        "rust-micro/.tmp/reactos/reactos/system32/smss.exe",
+        ".tmp/reactos/reactos/system32/smss.exe",
+    ];
+    let path = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists())?;
+    let bytes = std::fs::read(path).ok()?;
+    let pe = PeFile::parse(&bytes).ok()?;
+    let imports = pe.imports().ok()?;
+
+    // Collect the by-name imports from the ntdll.dll descriptor.
+    let mut ntdll_imports: Vec<String> = Vec::new();
+    for dll in &imports {
+        if dll.name.eq_ignore_ascii_case("ntdll.dll") {
+            for f in &dll.functions {
+                if let nt_pe_loader::ImportRef::ByName { name, .. } = f {
+                    ntdll_imports.push(name.clone());
+                }
+            }
+        }
+    }
+    println!(
+        "==> smss.exe imports {} symbols from ntdll.dll ({})",
+        ntdll_imports.len(),
+        path
+    );
+
+    let missing: Vec<String> = ntdll_imports
+        .into_iter()
+        .filter(|n| !our_exports.contains(n.as_str()))
+        .collect();
+    Some(missing)
 }

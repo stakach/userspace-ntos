@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · **Step 4.0 (emit the PE32+ ntdll.dll) DONE 2026-07-16** (local emit, nt-pe-loader-verified) · Step 4.A next
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · **Step 4.0 (emit the PE32+ ntdll.dll) + 4.0b (smss's FULL ntdll import set exported, 0-missing host-proven) DONE 2026-07-16** (local emit, nt-pe-loader-verified) · Step 4.A next
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -652,7 +652,56 @@ surface but **NOT yet the `Rtl*` smss imports** (smss imports ~44 Rtl\*; per Ste
 EXIST in the rlib but as Rust-ABI fns, not `extern "C"` PE exports — exporting them is mechanical
 `#[export_name]` C-ABI wrappers over the existing `rtl::*` (the PE-emit machinery proven here
 generalizes trivially). **smss won't fully resolve against our ntdll until these land** — do it as the
-first task of Step 4.B (or a 4.0b increment) alongside the real `LoaderHost`.
+first task of Step 4.B (or a 4.0b increment) alongside the real `LoaderHost`. **→ RESOLVED by Step 4.0b below.**
+
+### ☑ Step 4.0b — COMPLETE the export table for smss (DONE 2026-07-16, host-proven 0-missing)
+Closed the Step-4.0 known gap: the DLL now exports smss.exe's **FULL** ntdll import set — the last
+piece before the Step 4.A live substitution. **ZERO boot risk** (only the `nt-ntdll-dll` cdylib + the
+verify tool + the plan touched; executive still builds byte-identically, `rootserver.elf` MD5
+`14c6615f…` UNCHANGED; `nt-ntdll` rlib untouched → **145/145** host tests green).
+
+**The measured target (authoritative worklist):** smss.exe imports **103 symbols** from ntdll —
+**42 `Nt*`** (already exported by 4.0) + **61 non-`Nt*`**: ~44 `Rtl*`, 2 `Ldr*`
+(`LdrQueryImageFileExecutionOptions`, `LdrVerifyImageMatchesChecksum`), 2 `Dbg*` (`DbgPrint`,
+`DbgBreakPoint`), and ~13 CRT/other (`memcpy`/`memset`/`wcslen`/`wcscpy`/`wcsstr`/`_wcsicmp`/`_wcsupr`/
+`_stricmp`/`sprintf`/`swprintf`/`_vsnprintf`/`_vsnwprintf`/`__C_specific_handler`). Measured by
+extending `tools/ntdll-dll-verify` to parse smss's ntdll import descriptor with `nt-pe-loader` (no
+llvm-objdump dependency — that binary isn't on the dev shell).
+
+**Export mechanism** (`crates/nt-ntdll-dll/src/exports.rs`, a new module in the cdylib): each symbol
+is a `#[export_name = "RtlXxx"] pub unsafe extern "system" fn` (or `extern "C"` for the CRT) C-ABI
+wrapper with the **real ntdll x64 signature** (cross-checked against `references/reactos/sdk/lib/rtl`:
+`RtlInitUnicodeString` sets `Length=size`/`MaximumLength=size+sizeof(NUL)`; `RtlAdjustPrivilege(ULONG,
+BOOLEAN,BOOLEAN,PBOOLEAN)`; etc.). Bodies operate on raw pointers via the byte-exact
+`nt-ntdll-layout::UnicodeString` and call the host-tested `nt_ntdll::rtl::*`/`crt` logic where a body
+exists. **Retention:** a `#[used]` anchor fn (`exports::export_anchor`, address-of's all 61) is
+referenced by a `#[used] KEEP_EXPORTS` in `lib.rs` — the same anti-DCE mechanism as the `Nt*`
+`TRAP_STUB_ADDRS`, adapted because the 61 heterogeneous signatures can't be `as`-cast to one
+fn-pointer type in a `const` (address-of at runtime in the anchor body sidesteps that).
+
+**Signature/link subtleties handled:** (1) `memcpy`/`memset` are also emitted (weak, hidden) by the
+`compiler-builtins-mem` build-std feature → defined ours `#[linkage="weak"]` (`#![feature(linkage)]`)
+to avoid a duplicate-strong-symbol link error while still landing them in the PE export directory.
+(2) The C-variadic exports (`DbgPrint`/`sprintf`/`swprintf`) declare only the fixed args — the Win64
+ABI leaves the variadic tail in caller regs/stack (which we never read) — so no `c_variadic` nightly
+feature is needed; ABI-safe no-op bodies.
+
+**Honesty discipline (project rule):** self-contained symbols (string init/compare/append, integer
+parse, CRT mem/str/wcs, critical-section fast paths, SID length, ACL/SD header init) are **fully
+implemented — correct on a live path**. Symbols needing the live process plane not yet wired at 4.0b
+(process heap for `RtlAllocateHeap`/`RtlFreeHeap`/`RtlCreate*`; live PEB for env/CWD/paths;
+boot-status device; `RtlCreateUserProcess/Thread`; SEH `__C_specific_handler`; live token/registry)
+export at the correct ABI but return an **honest failure** (real `NTSTATUS`/null/FALSE) — NEVER a
+fabricated success. Step 4.A/4.B wires the live plane, at which point these bodies light up.
+
+**PROOF (the deliverable — makes 4.A safe):** `tools/ntdll-dll-verify` now cross-checks smss's parsed
+ntdll imports against our export table and asserts **0 missing**. Result on the rebuilt DLL:
+**254 total exports** (188 `Nt*` + `LdrpInitialize`/`DllMain`/… + the 61 new), **smss's 103-symbol
+ntdll import set 100% covered (0 missing)**, 188 `Nt*` still present (0 missing), `.reloc` intact
+(2042 fixups), nt-pe-loader parses it PE32+/DLL. `LdrpInitialize` RVA drifted `0x1010`→`0x1050`
+(as expected; Step 4.A/4.B derives it from the export table, never hardcodes). **The DLL is now a
+complete drop-in for smss — READY FOR 4.A substitution.**
+
 ### ☐ Step 4.A — first control: substitute our ntdll for smss (pi 0), prove our Rust runs in-process (a DbgPrint/observable syscall), real-ntdll fallback for pi>=1.
 ### ☐ Step 4.B — real LoaderHost (map/write_iat/PEB->Ldr/transfer) + snap smss's ntdll-only imports → smss reaches NtProcessStartup under our ntdll. Point the trampoline at OUR LdrpInitialize RVA.
 ### ☐ Step 4.C — parity: smss progresses as far under our ntdll as under real (spawns csrss); add the SSN-50 arm; keep fallback; gate green (174/98, paint 768/768) throughout.

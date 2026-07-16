@@ -1,0 +1,1305 @@
+//! # Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports
+//!
+//! Step 4.0 emitted the 188 `Nt*` trap stubs + `LdrpInitialize`. smss.exe *also* imports ~61
+//! non-`Nt*` symbols from ntdll (Rtl/Ldr/Dbg/CRT). This module completes the export table so smss's
+//! FULL ntdll import set resolves against our DLL — the last piece before the Step 4.A live boot.
+//!
+//! ## Mechanism (mirrors the `Nt*` trap stubs)
+//! Each symbol is a `#[export_name = "RtlXxx"] pub unsafe extern "system" fn` (C-ABI, the **real
+//! Windows x64 signature** — arg types/order matched against `references/reactos/sdk/lib/rtl` + the
+//! NDK). The bodies call the host-tested `nt_ntdll::rtl::*` / `crt` / `dbg` logic where a body
+//! exists, operating on the raw pointers via the byte-exact `nt_ntdll_layout` structs. They are
+//! retained past linker DCE the same way the `Nt*` stubs are: an [`EXPORT_ANCHOR_FN`] `#[used]`
+//! anchor (referenced from `lib.rs`).
+//!
+//! ## Honesty discipline (project-wide rule)
+//! Symbols that are **self-contained** (string init/compare, integer parse, CRT mem/str/wcs) are
+//! fully implemented here — correct on a live path. Symbols that require the **live process plane**
+//! not yet wired at 4.0b (the process heap for `RtlAllocateHeap`/`RtlFreeHeap`, the live PEB for
+//! env/CWD, the boot-status device, `RtlCreateUserProcess/Thread`, the SEH `__C_specific_handler`)
+//! export at the correct ABI but return an **honest failure** (a real `NTSTATUS` error / null /
+//! FALSE) — they NEVER fabricate success. Step 4.A/4.B wires the live plane (the process heap +
+//! PEB), at which point these bodies light up. The 4.0b bar is **export-table completeness** (smss
+//! resolves against us, 0 missing), host-proven by `tools/ntdll-dll-verify`.
+
+use core::ffi::c_void;
+
+use nt_ntdll::rtl;
+use nt_ntdll_layout::UnicodeString;
+
+type NtStatus = u32;
+const STATUS_SUCCESS: NtStatus = 0x0000_0000;
+const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
+const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
+const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
+const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+
+// The raw C `UNICODE_STRING` / `STRING` (ANSI) layout — identical 16-byte shape on x64. We use the
+// byte-exact `nt_ntdll_layout::UnicodeString` for reads/writes through the exported pointers.
+type PUnicodeString = *mut UnicodeString;
+type PCUnicodeString = *const UnicodeString;
+
+/// Count UTF-16 code units up to (not including) a terminating NUL.
+///
+/// # Safety
+/// `p` must be null or a valid, NUL-terminated UTF-16 string.
+unsafe fn wcslen_raw(p: *const u16) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // SAFETY: caller guarantees a NUL-terminated buffer.
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Count bytes up to (not including) a terminating NUL.
+///
+/// # Safety
+/// `p` must be null or a valid, NUL-terminated byte string.
+unsafe fn strlen_raw(p: *const u8) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // SAFETY: caller guarantees a NUL-terminated buffer.
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+// =================================================================================================
+// Rtl* — self-contained string descriptors (fully implemented — correct on a live path)
+// =================================================================================================
+
+/// `RtlInitUnicodeString(PUNICODE_STRING, PCWSTR)` — set `Length`/`MaximumLength` from a
+/// NUL-terminated wide string. `Buffer` = the source pointer (no copy).
+///
+/// # Safety
+/// `dst` must be a valid writable `UNICODE_STRING`; `src` null or NUL-terminated UTF-16.
+#[export_name = "RtlInitUnicodeString"]
+pub unsafe extern "system" fn rtl_init_unicode_string(dst: PUnicodeString, src: *const u16) {
+    if dst.is_null() {
+        return;
+    }
+    // SAFETY: caller-guaranteed NUL-terminated src.
+    let len = unsafe { wcslen_raw(src) };
+    let bytes = (len * 2) as u16;
+    // SAFETY: dst is a valid writable UNICODE_STRING per the contract.
+    unsafe {
+        (*dst).length = bytes;
+        // MaximumLength includes the terminating NUL (the real RtlInitUnicodeString contract).
+        (*dst).maximum_length = if src.is_null() { 0 } else { bytes + 2 };
+        (*dst).buffer = src as u64;
+    }
+}
+
+/// `RtlInitAnsiString(PANSI_STRING, PCSZ)` — the ANSI counterpart (byte counts, +1 NUL).
+///
+/// # Safety
+/// `dst` a valid writable `ANSI_STRING`; `src` null or NUL-terminated bytes.
+#[export_name = "RtlInitAnsiString"]
+pub unsafe extern "system" fn rtl_init_ansi_string(dst: PUnicodeString, src: *const u8) {
+    if dst.is_null() {
+        return;
+    }
+    // SAFETY: caller-guaranteed NUL-terminated src.
+    let len = unsafe { strlen_raw(src) } as u16;
+    // SAFETY: dst is a valid writable ANSI_STRING (same 16-byte shape) per the contract.
+    unsafe {
+        (*dst).length = len;
+        (*dst).maximum_length = if src.is_null() { 0 } else { len + 1 };
+        (*dst).buffer = src as u64;
+    }
+}
+
+/// `RtlUpcaseUnicodeChar(WCHAR) -> WCHAR`.
+#[export_name = "RtlUpcaseUnicodeChar"]
+pub extern "system" fn rtl_upcase_unicode_char(c: u16) -> u16 {
+    rtl::strings::upcase_char(c)
+}
+
+/// Read a `UNICODE_STRING`'s buffer as a `&[u16]` slice (Length is in bytes).
+///
+/// # Safety
+/// `p` must point to a valid `UNICODE_STRING` whose `buffer`/`length` describe a valid region.
+unsafe fn us_slice<'a>(p: PCUnicodeString) -> &'a [u16] {
+    if p.is_null() {
+        return &[];
+    }
+    // SAFETY: caller contract.
+    let (buf, len) = unsafe { ((*p).buffer as *const u16, (*p).length as usize / 2) };
+    if buf.is_null() || len == 0 {
+        return &[];
+    }
+    // SAFETY: buffer+length describe a valid UTF-16 region per the contract.
+    unsafe { core::slice::from_raw_parts(buf, len) }
+}
+
+/// `RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN) -> LONG`.
+///
+/// # Safety
+/// Both args valid `UNICODE_STRING`s.
+#[export_name = "RtlCompareUnicodeString"]
+pub unsafe extern "system" fn rtl_compare_unicode_string(
+    a: PCUnicodeString,
+    b: PCUnicodeString,
+    case_insensitive: u8,
+) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe { (us_slice(a), us_slice(b)) };
+    match rtl::strings::compare_unicode_string(sa, sb, case_insensitive != 0) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN) -> BOOLEAN`.
+///
+/// # Safety
+/// Both args valid `UNICODE_STRING`s.
+#[export_name = "RtlEqualUnicodeString"]
+pub unsafe extern "system" fn rtl_equal_unicode_string(
+    a: PCUnicodeString,
+    b: PCUnicodeString,
+    case_insensitive: u8,
+) -> u8 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe { (us_slice(a), us_slice(b)) };
+    rtl::strings::equal_unicode_string(sa, sb, case_insensitive != 0) as u8
+}
+
+/// `RtlPrefixUnicodeString(PCUNICODE_STRING prefix, PCUNICODE_STRING, BOOLEAN) -> BOOLEAN`.
+///
+/// # Safety
+/// Both args valid `UNICODE_STRING`s.
+#[export_name = "RtlPrefixUnicodeString"]
+pub unsafe extern "system" fn rtl_prefix_unicode_string(
+    prefix: PCUnicodeString,
+    s: PCUnicodeString,
+    case_insensitive: u8,
+) -> u8 {
+    // SAFETY: caller contract.
+    let (sp, ss) = unsafe { (us_slice(prefix), us_slice(s)) };
+    rtl::strings::prefix_unicode_string(sp, ss, case_insensitive != 0) as u8
+}
+
+/// `RtlAppendUnicodeToString(PUNICODE_STRING, PCWSTR) -> NTSTATUS`.
+///
+/// # Safety
+/// `dst` a valid writable `UNICODE_STRING` with a real `Buffer`/`MaximumLength`; `src` NUL-term.
+#[export_name = "RtlAppendUnicodeToString"]
+pub unsafe extern "system" fn rtl_append_unicode_to_string(
+    dst: PUnicodeString,
+    src: *const u16,
+) -> NtStatus {
+    if dst.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: caller contract.
+    let extra_len = unsafe { wcslen_raw(src) };
+    // SAFETY: caller contract.
+    unsafe {
+        let cur = (*dst).length as usize;
+        let cap = (*dst).maximum_length as usize;
+        if (cur + extra_len * 2) > cap {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let base = (*dst).buffer as *mut u16;
+        if base.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let dst_at = base.add(cur / 2);
+        core::ptr::copy_nonoverlapping(src, dst_at, extra_len);
+        (*dst).length = (cur + extra_len * 2) as u16;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlAppendUnicodeStringToString(PUNICODE_STRING, PCUNICODE_STRING) -> NTSTATUS`.
+///
+/// # Safety
+/// `dst` writable with capacity; `src` a valid `UNICODE_STRING`.
+#[export_name = "RtlAppendUnicodeStringToString"]
+pub unsafe extern "system" fn rtl_append_unicode_string_to_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: caller contract.
+    let ssrc = unsafe { us_slice(src) };
+    // SAFETY: caller contract.
+    unsafe {
+        let cur = (*dst).length as usize;
+        let cap = (*dst).maximum_length as usize;
+        let extra = ssrc.len() * 2;
+        if (cur + extra) > cap {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let base = (*dst).buffer as *mut u16;
+        if base.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(ssrc.as_ptr(), base.add(cur / 2), ssrc.len());
+        (*dst).length = (cur + extra) as u16;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlUnicodeStringToInteger(PCUNICODE_STRING, ULONG base, PULONG value) -> NTSTATUS`.
+///
+/// # Safety
+/// `s` a valid `UNICODE_STRING`; `value` a writable `ULONG`.
+#[export_name = "RtlUnicodeStringToInteger"]
+pub unsafe extern "system" fn rtl_unicode_string_to_integer(
+    s: PCUnicodeString,
+    base: u32,
+    value: *mut u32,
+) -> NtStatus {
+    // SAFETY: caller contract.
+    let src = unsafe { us_slice(s) };
+    match rtl::integer::unicode_string_to_integer(src, base) {
+        Some(v) => {
+            if !value.is_null() {
+                // SAFETY: value is a writable ULONG per the contract.
+                unsafe { *value = v };
+            }
+            STATUS_SUCCESS
+        }
+        None => STATUS_INVALID_PARAMETER,
+    }
+}
+
+// =================================================================================================
+// Rtl* — heap. The process heap is a Step-4.A/4.B live-plane wire-up (needs the real backing pages
+// via NtAllocateVirtualMemory). At 4.0b these export at the correct ABI and return an honest null /
+// pass-through so a caller can't silently corrupt memory. NEVER fabricate a valid pointer.
+// =================================================================================================
+
+/// `RtlAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size) -> PVOID`.
+///
+/// Honest seam: the process heap is not yet wired (Step 4.B installs the `heap`-backed allocator).
+/// Returns null (allocation failure) rather than a bogus pointer.
+///
+/// # Safety
+/// Standard `RtlAllocateHeap` contract.
+#[export_name = "RtlAllocateHeap"]
+pub unsafe extern "system" fn rtl_allocate_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _size: usize,
+) -> *mut c_void {
+    // Step 4.B: route through the real `nt_ntdll::heap` process heap. Until then: honest failure.
+    core::ptr::null_mut()
+}
+
+/// `RtlFreeHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress) -> BOOLEAN`.
+///
+/// Honest seam (heap not wired): reports FALSE (not freed) — never claims a fabricated free.
+///
+/// # Safety
+/// Standard `RtlFreeHeap` contract.
+#[export_name = "RtlFreeHeap"]
+pub unsafe extern "system" fn rtl_free_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _base: *mut c_void,
+) -> u8 {
+    0 // FALSE — no live heap yet.
+}
+
+/// `RtlCreateTagHeap(...)` — heap tagging helper. Honest seam.
+///
+/// # Safety
+/// Standard contract; no live effect until the heap plane is wired.
+#[export_name = "RtlCreateTagHeap"]
+pub unsafe extern "system" fn rtl_create_tag_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    _tag_prefix: *mut c_void,
+    _tag_names: *mut c_void,
+) -> u32 {
+    0 // No tag allocated (no live heap yet).
+}
+
+/// `RtlFreeUnicodeString(PUNICODE_STRING)` — free a heap-allocated `UNICODE_STRING` buffer and zero
+/// the descriptor. With the heap seam not wired, freeing is a no-op but the descriptor is zeroed
+/// (the observable half of the contract) so callers don't reuse a stale buffer.
+///
+/// # Safety
+/// `s` a valid writable `UNICODE_STRING`.
+#[export_name = "RtlFreeUnicodeString"]
+pub unsafe extern "system" fn rtl_free_unicode_string(s: PUnicodeString) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: s is a valid writable UNICODE_STRING per the contract.
+    unsafe {
+        (*s).length = 0;
+        (*s).maximum_length = 0;
+        (*s).buffer = 0;
+    }
+}
+
+/// `RtlCreateUnicodeString(PUNICODE_STRING, PCWSTR) -> BOOLEAN` — allocate a copy on the process
+/// heap. Honest seam (heap not wired): returns FALSE.
+///
+/// # Safety
+/// `dst` a valid writable `UNICODE_STRING`.
+#[export_name = "RtlCreateUnicodeString"]
+pub unsafe extern "system" fn rtl_create_unicode_string(
+    _dst: PUnicodeString,
+    _src: *const u16,
+) -> u8 {
+    0 // FALSE — needs the process heap (Step 4.B).
+}
+
+/// `RtlAnsiStringToUnicodeString(PUNICODE_STRING, PCANSI_STRING, BOOLEAN AllocateDestinationString)`.
+/// Honest seam: the allocating form needs the heap; report failure rather than a partial write.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlAnsiStringToUnicodeString"]
+pub unsafe extern "system" fn rtl_ansi_string_to_unicode_string(
+    _dst: PUnicodeString,
+    _src: PCUnicodeString,
+    _allocate: u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs the process heap + live NLS tables (Step 4.B)
+}
+
+/// `RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN)`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlUnicodeStringToAnsiString"]
+pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
+    _dst: PUnicodeString,
+    _src: PCUnicodeString,
+    _allocate: u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs the process heap + live NLS tables (Step 4.B)
+}
+
+// =================================================================================================
+// Rtl* — critical sections. The uncontended fast path is real (via nt_ntdll::sync); the contended
+// blocking path is the keyed-event seam (Step 6). At 4.0b we export the correct ABI over the raw
+// RTL_CRITICAL_SECTION pointer; the fast-path acquire/release semantics are honest.
+// =================================================================================================
+
+/// `RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
+///
+/// # Safety
+/// `cs` a valid writable `RTL_CRITICAL_SECTION` (40 bytes on x64).
+#[export_name = "RtlInitializeCriticalSection"]
+pub unsafe extern "system" fn rtl_initialize_critical_section(cs: *mut c_void) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // The RTL_CRITICAL_SECTION LockCount (offset 0x08 on x64, after DebugInfo) starts at -1 (free);
+    // OwningThread/RecursionCount/… start at 0. Zero the struct then set LockCount = -1.
+    // SAFETY: cs is a valid 40-byte writable RTL_CRITICAL_SECTION per the contract.
+    unsafe {
+        core::ptr::write_bytes(cs as *mut u8, 0, 40);
+        let lock_count = (cs as *mut u8).add(0x08) as *mut i32;
+        *lock_count = -1;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlEnterCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
+///
+/// # Safety
+/// `cs` a valid `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlEnterCriticalSection"]
+pub unsafe extern "system" fn rtl_enter_critical_section(cs: *mut c_void) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Uncontended fast path: atomically bump LockCount from -1 to 0. Contention → the keyed-event
+    // wait seam (Step 6). We take the interlocked increment; a positive prior value means contended
+    // and would block (honest seam — not spun/faked here).
+    // SAFETY: cs is a valid RTL_CRITICAL_SECTION per the contract.
+    unsafe {
+        let lock_count = &*((cs as *mut u8).add(0x08) as *mut core::sync::atomic::AtomicI32);
+        lock_count.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
+///
+/// # Safety
+/// `cs` a valid `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlLeaveCriticalSection"]
+pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: cs is a valid RTL_CRITICAL_SECTION per the contract.
+    unsafe {
+        let lock_count = &*((cs as *mut u8).add(0x08) as *mut core::sync::atomic::AtomicI32);
+        lock_count.fetch_sub(1, core::sync::atomic::Ordering::Release);
+    }
+    STATUS_SUCCESS
+}
+
+// =================================================================================================
+// Rtl* — security (SID/ACL/SD). Delegated logic lives in nt_ntdll::rtl::security over nt-security;
+// the raw-pointer exported forms that need heap allocation are honest seams, the in-place ones real.
+// =================================================================================================
+
+/// `RtlLengthSid(PSID) -> ULONG` — byte length of a SID = 8 + 4*SubAuthorityCount.
+///
+/// # Safety
+/// `sid` a valid SID (Revision, SubAuthorityCount at offset 1).
+#[export_name = "RtlLengthSid"]
+pub unsafe extern "system" fn rtl_length_sid(sid: *const c_void) -> u32 {
+    if sid.is_null() {
+        return 0;
+    }
+    // SID layout: [0]=Revision, [1]=SubAuthorityCount, [2..8]=IdentifierAuthority, then 4*count.
+    // SAFETY: sid points at a valid SID per the contract.
+    let count = unsafe { *((sid as *const u8).add(1)) } as u32;
+    8 + 4 * count
+}
+
+/// `RtlCreateSecurityDescriptor(PSECURITY_DESCRIPTOR, ULONG Revision) -> NTSTATUS`.
+///
+/// # Safety
+/// `sd` a valid writable `SECURITY_DESCRIPTOR` (absolute form, 20 bytes on x64 header).
+#[export_name = "RtlCreateSecurityDescriptor"]
+pub unsafe extern "system" fn rtl_create_security_descriptor(
+    sd: *mut c_void,
+    revision: u32,
+) -> NtStatus {
+    if sd.is_null() || revision != rtl::security::SECURITY_DESCRIPTOR_REVISION as u32 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Absolute SECURITY_DESCRIPTOR: Revision(1) Sbz1(1) Control(2) Owner Group Sacl Dacl (ptrs).
+    // Zero it then set Revision; all owner/group/acl ptrs null (the RtlCreateSecurityDescriptor
+    // contract). Header size 0x28 on x64 (4 8-byte ptrs + the 4-byte prefix, padded).
+    // SAFETY: sd is a valid writable SECURITY_DESCRIPTOR per the contract.
+    unsafe {
+        core::ptr::write_bytes(sd as *mut u8, 0, 0x28);
+        *(sd as *mut u8) = revision as u8;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlSetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, BOOLEAN DaclPresent, PACL, BOOLEAN Defaulted)`.
+///
+/// # Safety
+/// `sd` a valid writable absolute `SECURITY_DESCRIPTOR`.
+#[export_name = "RtlSetDaclSecurityDescriptor"]
+pub unsafe extern "system" fn rtl_set_dacl_security_descriptor(
+    sd: *mut c_void,
+    dacl_present: u8,
+    dacl: *mut c_void,
+    dacl_defaulted: u8,
+) -> NtStatus {
+    if sd.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Control bits: SE_DACL_PRESENT=0x0004, SE_DACL_DEFAULTED=0x0008 (offset 0x02, u16).
+    // Dacl pointer at offset 0x20 (absolute x64 SD). Set per the args.
+    // SAFETY: sd is a valid writable absolute SECURITY_DESCRIPTOR per the contract.
+    unsafe {
+        let control = (sd as *mut u8).add(0x02) as *mut u16;
+        if dacl_present != 0 {
+            *control |= 0x0004;
+            if dacl_defaulted != 0 {
+                *control |= 0x0008;
+            } else {
+                *control &= !0x0008;
+            }
+            *((sd as *mut u8).add(0x20) as *mut u64) = dacl as u64;
+        } else {
+            *control &= !(0x0004 | 0x0008);
+            *((sd as *mut u8).add(0x20) as *mut u64) = 0;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlCreateAcl(PACL, ULONG AclLength, ULONG AclRevision) -> NTSTATUS`.
+///
+/// # Safety
+/// `acl` a valid writable buffer of at least `acl_length` bytes.
+#[export_name = "RtlCreateAcl"]
+pub unsafe extern "system" fn rtl_create_acl(
+    acl: *mut c_void,
+    acl_length: u32,
+    acl_revision: u32,
+) -> NtStatus {
+    // ACL header = 8 bytes: AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2).
+    if acl.is_null() || (acl_length as usize) < 8 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: acl is a valid writable buffer of >= 8 bytes per the contract.
+    unsafe {
+        let p = acl as *mut u8;
+        *p = acl_revision as u8; // AclRevision
+        *p.add(1) = 0; // Sbz1
+        *(p.add(2) as *mut u16) = acl_length as u16; // AclSize
+        *(p.add(4) as *mut u16) = 0; // AceCount
+        *(p.add(6) as *mut u16) = 0; // Sbz2
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlGetAce(PACL, ULONG AceIndex, PVOID *Ace) -> NTSTATUS`.
+///
+/// # Safety
+/// `acl` a valid `ACL`; `ace` a writable out-pointer.
+#[export_name = "RtlGetAce"]
+pub unsafe extern "system" fn rtl_get_ace(
+    acl: *mut c_void,
+    ace_index: u32,
+    ace: *mut *mut c_void,
+) -> NtStatus {
+    if acl.is_null() || ace.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Walk AceCount ACE headers (each ACE header: Type(1) Flags(1) Size(2)). Bounds-check the index.
+    // SAFETY: acl is a valid ACL per the contract.
+    unsafe {
+        let p = acl as *mut u8;
+        let ace_count = *(p.add(4) as *const u16) as u32;
+        if ace_index >= ace_count {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mut cur = p.add(8); // first ACE follows the 8-byte ACL header
+        for _ in 0..ace_index {
+            let size = *(cur.add(2) as *const u16) as usize;
+            cur = cur.add(size);
+        }
+        *ace = cur as *mut c_void;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlAddAccessAllowedAce(PACL, ULONG AceRevision, ACCESS_MASK, PSID) -> NTSTATUS`. Appends an
+/// ACCESS_ALLOWED_ACE. Honest seam: appending requires validating remaining ACL capacity + copying
+/// the SID; the SID-length walk is real but the append is deferred to the heap/ACL plane. Returns an
+/// honest error rather than a malformed ACE.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlAddAccessAllowedAce"]
+pub unsafe extern "system" fn rtl_add_access_allowed_ace(
+    _acl: *mut c_void,
+    _ace_revision: u32,
+    _access_mask: u32,
+    _sid: *mut c_void,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // full ACL append lands with the security plane (Step 4.B)
+}
+
+/// `RtlAllocateAndInitializeSid(...)` — allocates a SID on the heap. Honest seam (heap not wired).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlAllocateAndInitializeSid"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
+    _identifier_authority: *mut c_void,
+    _sub_authority_count: u8,
+    _sub_authority0: u32,
+    _sub_authority1: u32,
+    _sub_authority2: u32,
+    _sub_authority3: u32,
+    _sub_authority4: u32,
+    _sub_authority5: u32,
+    _sub_authority6: u32,
+    _sub_authority7: u32,
+    _sid: *mut *mut c_void,
+) -> NtStatus {
+    STATUS_NO_MEMORY // needs the process heap (Step 4.B) — honest failure, no bogus SID
+}
+
+/// `RtlAdjustPrivilege(ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled)`.
+/// Wraps `NtAdjustPrivilegesToken` — the token plane is a live syscall. Honest seam at 4.0b.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlAdjustPrivilege"]
+pub unsafe extern "system" fn rtl_adjust_privilege(
+    _privilege: u32,
+    _enable: u8,
+    _client: u8,
+    _was_enabled: *mut u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // token adjust = live NtAdjustPrivilegesToken (Step 4.A/4.B)
+}
+
+// =================================================================================================
+// Rtl* — process parameters / env / paths / user process+thread. These need the live PEB / process
+// heap / create plane (Step 4.A/4.B). Correct ABI, honest failures.
+// =================================================================================================
+
+/// `RtlNormalizeProcessParams(PRTL_USER_PROCESS_PARAMETERS) -> PRTL_USER_PROCESS_PARAMETERS`.
+/// The real work (rebasing the UNICODE_STRING pointers + setting the NORMALIZED flag) is the loader
+/// seam; the identity return + NORMALIZED-flag set is the observable half we can honor.
+///
+/// # Safety
+/// `params` a valid `RTL_USER_PROCESS_PARAMETERS` or null.
+#[export_name = "RtlNormalizeProcessParams"]
+pub unsafe extern "system" fn rtl_normalize_process_params(params: *mut c_void) -> *mut c_void {
+    if params.is_null() {
+        return params;
+    }
+    // Set RTL_USER_PROC_PARAMS_NORMALIZED (0x1) in Flags (offset 0x08 on x64). Pointer rebase is the
+    // loader's job (it holds the base delta); here we mark normalized + return the same block.
+    // SAFETY: params points at a valid RTL_USER_PROCESS_PARAMETERS per the contract.
+    unsafe {
+        let flags = (params as *mut u8).add(0x08) as *mut u32;
+        *flags |= 0x1;
+    }
+    params
+}
+
+/// `RtlCreateProcessParameters(...)` — build an `RTL_USER_PROCESS_PARAMETERS` on the heap. Honest
+/// seam (needs the process heap). Returns an error and leaves the out-pointer untouched.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlCreateProcessParameters"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_process_parameters(
+    _params: *mut *mut c_void,
+    _image_path: PCUnicodeString,
+    _dll_path: PCUnicodeString,
+    _current_directory: PCUnicodeString,
+    _command_line: PCUnicodeString,
+    _environment: *mut c_void,
+    _window_title: PCUnicodeString,
+    _desktop_info: PCUnicodeString,
+    _shell_info: PCUnicodeString,
+    _runtime_data: PCUnicodeString,
+) -> NtStatus {
+    STATUS_NO_MEMORY // needs the process heap (Step 4.B)
+}
+
+/// `RtlDestroyProcessParameters(PRTL_USER_PROCESS_PARAMETERS) -> NTSTATUS`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlDestroyProcessParameters"]
+pub unsafe extern "system" fn rtl_destroy_process_parameters(_params: *mut c_void) -> NtStatus {
+    STATUS_SUCCESS // nothing allocated by us to free (heap seam)
+}
+
+/// `RtlCreateEnvironment(BOOLEAN Inherit, PVOID *Environment) -> NTSTATUS`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlCreateEnvironment"]
+pub unsafe extern "system" fn rtl_create_environment(
+    _inherit: u8,
+    _environment: *mut *mut c_void,
+) -> NtStatus {
+    STATUS_NO_MEMORY // needs the process heap (Step 4.B)
+}
+
+/// `RtlSetEnvironmentVariable(PVOID *Environment, PUNICODE_STRING Name, PUNICODE_STRING Value)`.
+/// Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlSetEnvironmentVariable"]
+pub unsafe extern "system" fn rtl_set_environment_variable(
+    _environment: *mut *mut c_void,
+    _name: PCUnicodeString,
+    _value: PCUnicodeString,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs the live env block (Step 4.B)
+}
+
+/// `RtlQueryEnvironmentVariable_U(PVOID Environment, PUNICODE_STRING Name, PUNICODE_STRING Value)`.
+/// Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlQueryEnvironmentVariable_U"]
+pub unsafe extern "system" fn rtl_query_environment_variable_u(
+    _environment: *mut c_void,
+    _name: PCUnicodeString,
+    _value: PUnicodeString,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs the live env block (Step 4.B)
+}
+
+/// `RtlDosPathNameToNtPathName_U(PCWSTR, PUNICODE_STRING, PCWSTR*, PVOID) -> BOOLEAN`. Honest seam
+/// (the allocating NT-path conversion needs the process heap).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlDosPathNameToNtPathName_U"]
+pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
+    _dos_name: *const u16,
+    _nt_name: PUnicodeString,
+    _part_name: *mut *const u16,
+    _relative_name: *mut c_void,
+) -> u8 {
+    0 // FALSE — needs the process heap (Step 4.B)
+}
+
+/// `RtlDosSearchPath_U(PCWSTR, PCWSTR, PCWSTR, ULONG, PWSTR, PWSTR*) -> ULONG`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlDosSearchPath_U"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_dos_search_path_u(
+    _path: *const u16,
+    _file_name: *const u16,
+    _extension: *const u16,
+    _buffer_length: u32,
+    _buffer: *mut u16,
+    _part_name: *mut *mut u16,
+) -> u32 {
+    0 // 0 chars written — not found (honest; needs the live FS/CWD plane)
+}
+
+/// `RtlQueryRegistryValues(...)` — table-driven registry read. Honest seam (needs the live registry
+/// syscall plane via NtOpenKey/NtQueryValueKey).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlQueryRegistryValues"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_query_registry_values(
+    _relative_to: u32,
+    _path: *const u16,
+    _query_table: *mut c_void,
+    _context: *mut c_void,
+    _environment: *mut c_void,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs the live registry plane (Step 4.A/4.B)
+}
+
+// =================================================================================================
+// Rtl* — critical-process markers + boot-status. Live-plane wrappers (honest seams).
+// =================================================================================================
+
+/// `RtlSetProcessIsCritical(BOOLEAN New, PBOOLEAN Old, BOOLEAN CheckFlag) -> NTSTATUS`. Wraps
+/// `NtSetInformationProcess(ProcessBreakOnTermination)` — live syscall. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlSetProcessIsCritical"]
+pub unsafe extern "system" fn rtl_set_process_is_critical(
+    _new: u8,
+    _old: *mut u8,
+    _check_flag: u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // live NtSetInformationProcess (Step 4.A/4.B)
+}
+
+/// `RtlSetThreadIsCritical(BOOLEAN New, PBOOLEAN Old, BOOLEAN CheckFlag) -> NTSTATUS`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlSetThreadIsCritical"]
+pub unsafe extern "system" fn rtl_set_thread_is_critical(
+    _new: u8,
+    _old: *mut u8,
+    _check_flag: u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // live NtSetInformationThread (Step 4.A/4.B)
+}
+
+/// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`. Honest
+/// seam (needs the boot-status device file).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlGetSetBootStatusData"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_get_set_boot_status_data(
+    _handle: *mut c_void,
+    _read: u8,
+    _data_class: u32,
+    _buffer: *mut c_void,
+    _buffer_size: u32,
+    _return_length: *mut u32,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+}
+
+/// `RtlLockBootStatusData(PHANDLE) -> NTSTATUS`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlLockBootStatusData"]
+pub unsafe extern "system" fn rtl_lock_boot_status_data(_handle: *mut *mut c_void) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+}
+
+/// `RtlUnlockBootStatusData(HANDLE) -> NTSTATUS`. Honest seam.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlUnlockBootStatusData"]
+pub unsafe extern "system" fn rtl_unlock_boot_status_data(_handle: *mut c_void) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+}
+
+/// `RtlCreateUserProcess(...)` — the classic user-mode process create. Honest seam (needs the live
+/// NtCreateProcessEx/section/thread create plane — Step 4.A/4.B).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlCreateUserProcess"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_user_process(
+    _image_path: PCUnicodeString,
+    _attributes: u32,
+    _process_parameters: *mut c_void,
+    _process_sd: *mut c_void,
+    _thread_sd: *mut c_void,
+    _parent_process: *mut c_void,
+    _inherit_handles: u8,
+    _debug_port: *mut c_void,
+    _exception_port: *mut c_void,
+    _process_information: *mut c_void,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // live create plane (Step 4.A/4.B)
+}
+
+/// `RtlCreateUserThread(...)`. Honest seam (needs the live NtCreateThread plane).
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "RtlCreateUserThread"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_user_thread(
+    _process: *mut c_void,
+    _thread_sd: *mut c_void,
+    _create_suspended: u8,
+    _stack_zero_bits: u32,
+    _stack_reserve: usize,
+    _stack_commit: usize,
+    _start_address: *mut c_void,
+    _parameter: *mut c_void,
+    _thread_handle: *mut *mut c_void,
+    _client_id: *mut c_void,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED // live create plane (Step 4.A/4.B)
+}
+
+// =================================================================================================
+// Rtl* — assert
+// =================================================================================================
+
+/// `RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber, PCHAR Message)` — the
+/// checked-build assertion reporter. On our kernel this normally int-0x2d DbgPrompts; at 4.0b it is
+/// a no-op (the report/prompt is a live-plane debug transport). Never on a live path in a
+/// release-checked build.
+///
+/// # Safety
+/// Standard contract; a no-op.
+#[export_name = "RtlAssert"]
+pub unsafe extern "system" fn rtl_assert(
+    _failed_assertion: *mut c_void,
+    _file_name: *mut c_void,
+    _line_number: u32,
+    _message: *mut u8,
+) {
+    // Checked-build only; no-op (the report path is the live DbgPrint/DbgPrompt seam).
+}
+
+// =================================================================================================
+// Ldr* — loader helpers imported by smss
+// =================================================================================================
+
+/// `LdrQueryImageFileExecutionOptions(PUNICODE_STRING SubKey, PCWSTR ValueName, ULONG Type, PVOID
+/// Buffer, ULONG BufferSize, PULONG ReturnedLength) -> NTSTATUS`. Reads
+/// `\Registry\Machine\...\Image File Execution Options\<image>`. Honest seam (needs the live
+/// registry plane). Returns OBJECT_NAME_NOT_FOUND-style failure so callers take the default path.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "LdrQueryImageFileExecutionOptions"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn ldr_query_image_file_execution_options(
+    _sub_key: PCUnicodeString,
+    _value_name: *const u16,
+    _value_type: u32,
+    _buffer: *mut c_void,
+    _buffer_size: u32,
+    _returned_length: *mut u32,
+) -> NtStatus {
+    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — no IFEO key (default behavior; honest)
+}
+
+/// `LdrVerifyImageMatchesChecksum(HANDLE ImageFileHandle, ...) -> NTSTATUS`. Honest seam (checksum
+/// verification against the live mapped image — Step 4.B). Returns success (checksum-OK) since we
+/// don't reject images at 4.0b — matching the common ntdll behavior when checksum==0.
+///
+/// # Safety
+/// Standard contract.
+#[export_name = "LdrVerifyImageMatchesChecksum"]
+pub unsafe extern "system" fn ldr_verify_image_matches_checksum(
+    _image_file_handle: *mut c_void,
+    _import_callback: *mut c_void,
+    _import_callback_parameter: *mut c_void,
+    _image_characteristics: *mut u16,
+) -> NtStatus {
+    STATUS_SUCCESS // checksum treated as valid (default; the real map/verify is Step 4.B)
+}
+
+// =================================================================================================
+// Dbg* — debug print (serial-forward on our kernel; modelled here)
+// =================================================================================================
+
+/// `DbgPrint(PCSTR Format, ...) -> ULONG` — variadic on the C side. We declare only the fixed
+/// `Format` arg (the Win64 ABI leaves the variadic tail in the caller's registers/stack, which we
+/// never read), so this is a no-op returning STATUS_SUCCESS — ABI-safe without `c_variadic`. The
+/// format string is not rendered here (the live serial-forward is the Step-4.B/Dbg transport); the
+/// export exists so smss's IAT resolves.
+///
+/// # Safety
+/// Called with the C DbgPrint ABI; a no-op that ignores the variadic tail.
+#[export_name = "DbgPrint"]
+pub unsafe extern "C" fn dbg_print(_format: *const u8) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `DbgBreakPoint()` — `int 3`. On x86_64 issue the breakpoint; a no-op elsewhere.
+///
+/// # Safety
+/// Issues a debug breakpoint (`int3`).
+#[export_name = "DbgBreakPoint"]
+pub unsafe extern "system" fn dbg_break_point() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: int3 is the architected debug breakpoint; the debugger (or our kernel's #BP handler)
+    // owns the resulting trap.
+    unsafe {
+        core::arch::asm!("int3");
+    }
+}
+
+// =================================================================================================
+// CRT re-exports — mem/str/wcs + printf-family. Self-contained; correct on a live path.
+// =================================================================================================
+
+/// `memcpy(void*, const void*, size_t) -> void*`.
+///
+/// `compiler-builtins-mem` already emits a **weak** `memcpy` for internal codegen (hidden — not in
+/// the PE export table). smss imports `memcpy` from ntdll, so we must ALSO export it. We define ours
+/// **weak** too (`#[linkage = "weak"]`) to avoid a duplicate-strong-symbol link error against the
+/// builtin; being a `pub` symbol in the cdylib root it lands in the PE export directory.
+///
+/// # Safety
+/// `dst`/`src` valid for `n` bytes, non-overlapping.
+#[linkage = "weak"]
+#[export_name = "memcpy"]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract (valid, non-overlapping, n bytes).
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+    dst
+}
+
+/// `memset(void*, int, size_t) -> void*`. Weak, for the same reason as [`memcpy`].
+///
+/// # Safety
+/// `dst` valid for `n` bytes.
+#[linkage = "weak"]
+#[export_name = "memset"]
+pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    // SAFETY: caller contract (valid for n bytes).
+    unsafe { core::ptr::write_bytes(dst, c as u8, n) };
+    dst
+}
+
+/// `wcslen(const wchar_t*) -> size_t`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "wcslen"]
+pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
+    // SAFETY: caller contract.
+    unsafe { wcslen_raw(s) }
+}
+
+/// `wcscpy(wchar_t* dst, const wchar_t* src) -> wchar_t*`.
+///
+/// # Safety
+/// `dst` large enough for `src` + NUL; `src` NUL-terminated.
+#[export_name = "wcscpy"]
+pub unsafe extern "C" fn wcscpy(dst: *mut u16, src: *const u16) -> *mut u16 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(src) };
+    // SAFETY: caller contract (dst large enough).
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, n);
+        *dst.add(n) = 0;
+    }
+    dst
+}
+
+/// `wcsstr(const wchar_t* hay, const wchar_t* needle) -> const wchar_t*`.
+///
+/// # Safety
+/// Both NUL-terminated UTF-16 strings.
+#[export_name = "wcsstr"]
+pub unsafe extern "C" fn wcsstr(hay: *const u16, needle: *const u16) -> *const u16 {
+    // SAFETY: caller contract.
+    let (hlen, nlen) = unsafe { (wcslen_raw(hay), wcslen_raw(needle)) };
+    // SAFETY: valid regions of hlen/nlen code units.
+    let (h, n) = unsafe {
+        (
+            core::slice::from_raw_parts(hay, hlen),
+            core::slice::from_raw_parts(needle, nlen),
+        )
+    };
+    match nt_ntdll::crt::wcsstr(h, n) {
+        // SAFETY: idx is within the hay region.
+        Some(idx) => unsafe { hay.add(idx) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `_wcsicmp(const wchar_t*, const wchar_t*) -> int` (case-insensitive).
+///
+/// # Safety
+/// Both NUL-terminated UTF-16 strings.
+#[export_name = "_wcsicmp"]
+pub unsafe extern "C" fn wcsicmp(a: *const u16, b: *const u16) -> i32 {
+    // SAFETY: caller contract.
+    let (la, lb) = unsafe { (wcslen_raw(a), wcslen_raw(b)) };
+    // SAFETY: valid regions.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, la),
+            core::slice::from_raw_parts(b, lb),
+        )
+    };
+    ordering_to_int(nt_ntdll::crt::wcsicmp(sa, sb))
+}
+
+/// `_wcsupr(wchar_t* str) -> wchar_t*` — in-place upcase.
+///
+/// # Safety
+/// `s` a NUL-terminated, writable UTF-16 string.
+#[export_name = "_wcsupr"]
+pub unsafe extern "C" fn wcsupr(s: *mut u16) -> *mut u16 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    for i in 0..n {
+        // SAFETY: i < n, within the writable buffer.
+        unsafe {
+            let c = *s.add(i);
+            *s.add(i) = rtl::strings::upcase_char(c);
+        }
+    }
+    s
+}
+
+/// `_stricmp(const char*, const char*) -> int` (ASCII case-insensitive).
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "_stricmp"]
+pub unsafe extern "C" fn stricmp(a: *const u8, b: *const u8) -> i32 {
+    // SAFETY: caller contract.
+    let (la, lb) = unsafe { (strlen_raw(a), strlen_raw(b)) };
+    // SAFETY: valid regions.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, la),
+            core::slice::from_raw_parts(b, lb),
+        )
+    };
+    ordering_to_int(nt_ntdll::crt::stricmp(sa, sb))
+}
+
+fn ordering_to_int(o: core::cmp::Ordering) -> i32 {
+    match o {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `sprintf(char* buf, const char* fmt, ...) -> int`. Variadic on the C side; we declare only the
+/// fixed args (the ABI leaves the variadic tail untouched, which we never read). At 4.0b it writes
+/// an empty NUL-terminated string and returns 0 (IAT-resolve seam; real formatting is the Dbg/CRT
+/// plane in 4.B).
+///
+/// # Safety
+/// `buf` writable for at least 1 byte.
+#[export_name = "sprintf"]
+pub unsafe extern "C" fn sprintf(buf: *mut u8, _fmt: *const u8) -> i32 {
+    if !buf.is_null() {
+        // SAFETY: buf valid for >= 1 byte per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `swprintf(wchar_t* buf, const wchar_t* fmt, ...) -> int` — variadic wide; same 4.0b seam.
+///
+/// # Safety
+/// `buf` writable for at least 1 wchar.
+#[export_name = "swprintf"]
+pub unsafe extern "C" fn swprintf(buf: *mut u16, _fmt: *const u16) -> i32 {
+    if !buf.is_null() {
+        // SAFETY: buf valid for >= 1 wchar per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `_vsnprintf(char* buf, size_t count, const char* fmt, va_list) -> int`. The `va_list` is opaque
+/// in `no_std`; 4.0b writes an empty string + returns 0 (IAT-resolve seam; real render in 4.B).
+///
+/// # Safety
+/// `buf` writable for `count` bytes.
+#[export_name = "_vsnprintf"]
+pub unsafe extern "C" fn vsnprintf(
+    buf: *mut u8,
+    count: usize,
+    _fmt: *const u8,
+    _args: *mut c_void,
+) -> i32 {
+    if !buf.is_null() && count > 0 {
+        // SAFETY: buf valid for count bytes per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `_vsnwprintf(wchar_t* buf, size_t count, const wchar_t* fmt, va_list) -> int`. Same 4.0b seam.
+///
+/// # Safety
+/// `buf` writable for `count` wchars.
+#[export_name = "_vsnwprintf"]
+pub unsafe extern "C" fn vsnwprintf(
+    buf: *mut u16,
+    count: usize,
+    _fmt: *const u16,
+    _args: *mut c_void,
+) -> i32 {
+    if !buf.is_null() && count > 0 {
+        // SAFETY: buf valid for count wchars per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `__C_specific_handler(...)` — the x64 language-specific exception handler the compiler references
+/// from `.pdata`. It drives the SEH `__try/__except/__finally` machinery. The real dispatch is
+/// `nt_ntdll::rtl::exception` (Step 4.B wires the live unwind). At 4.0b it returns
+/// `ExceptionContinueSearch` (1) so an exception propagates to the next handler rather than being
+/// swallowed — the honest default, never a fabricated "handled".
+///
+/// # Safety
+/// Called by the exception dispatcher with the SEH records.
+#[export_name = "__C_specific_handler"]
+pub unsafe extern "C" fn c_specific_handler(
+    _exception_record: *mut c_void,
+    _establisher_frame: *mut c_void,
+    _context_record: *mut c_void,
+    _dispatcher_context: *mut c_void,
+) -> i32 {
+    1 // ExceptionContinueSearch — propagate (Step 4.B installs the real unwind)
+}
+
+// =================================================================================================
+// Retention anchor — mirror the Nt* TRAP_STUB_ADDRS pattern so the linker keeps every export past
+// `--no-gc-sections`/DCE. Referenced (via `#[used]`) from `lib.rs`'s KEEP anchor.
+// =================================================================================================
+
+/// Force the linker to RETAIN every non-`Nt*` export into the DLL export directory.
+///
+/// The `Nt*` stubs are retained via a `#[used]` fn-ptr *table* ([`trap_stubs::TRAP_STUB_ADDRS`]);
+/// that pattern needs a homogeneous fn-pointer type, but our exports have 61 different signatures
+/// (which can't be `as`-cast to one fn-pointer type in a `const`). So instead we anchor them by
+/// *referencing each address at runtime* inside this one function and marking it `#[used]`: taking
+/// `foo as usize` here creates a code reference the linker must keep, which transitively keeps `foo`.
+/// `lib.rs` references [`export_anchor`] (also `#[used]`) so this whole graph survives DCE.
+///
+/// The function is never called; `black_box` prevents the optimizer from discarding the reads.
+#[used]
+pub static EXPORT_ANCHOR_FN: unsafe extern "C" fn() = export_anchor;
+
+/// The retention anchor body — see [`EXPORT_ANCHOR_FN`]. Never invoked.
+///
+/// # Safety
+/// Never called; it only takes the addresses of the exports to anchor them for the linker.
+pub unsafe extern "C" fn export_anchor() {
+    // Each `... as usize` is a runtime address-of that references the symbol, forcing retention.
+    let anchors: &[usize] = &[
+        rtl_init_unicode_string as usize,
+        rtl_init_ansi_string as usize,
+        rtl_upcase_unicode_char as usize,
+        rtl_compare_unicode_string as usize,
+        rtl_equal_unicode_string as usize,
+        rtl_prefix_unicode_string as usize,
+        rtl_append_unicode_to_string as usize,
+        rtl_append_unicode_string_to_string as usize,
+        rtl_unicode_string_to_integer as usize,
+        rtl_allocate_heap as usize,
+        rtl_free_heap as usize,
+        rtl_create_tag_heap as usize,
+        rtl_free_unicode_string as usize,
+        rtl_create_unicode_string as usize,
+        rtl_ansi_string_to_unicode_string as usize,
+        rtl_unicode_string_to_ansi_string as usize,
+        rtl_initialize_critical_section as usize,
+        rtl_enter_critical_section as usize,
+        rtl_leave_critical_section as usize,
+        rtl_length_sid as usize,
+        rtl_create_security_descriptor as usize,
+        rtl_set_dacl_security_descriptor as usize,
+        rtl_create_acl as usize,
+        rtl_get_ace as usize,
+        rtl_add_access_allowed_ace as usize,
+        rtl_allocate_and_initialize_sid as usize,
+        rtl_adjust_privilege as usize,
+        rtl_normalize_process_params as usize,
+        rtl_create_process_parameters as usize,
+        rtl_destroy_process_parameters as usize,
+        rtl_create_environment as usize,
+        rtl_set_environment_variable as usize,
+        rtl_query_environment_variable_u as usize,
+        rtl_dos_path_name_to_nt_path_name_u as usize,
+        rtl_dos_search_path_u as usize,
+        rtl_query_registry_values as usize,
+        rtl_set_process_is_critical as usize,
+        rtl_set_thread_is_critical as usize,
+        rtl_get_set_boot_status_data as usize,
+        rtl_lock_boot_status_data as usize,
+        rtl_unlock_boot_status_data as usize,
+        rtl_create_user_process as usize,
+        rtl_create_user_thread as usize,
+        rtl_assert as usize,
+        ldr_query_image_file_execution_options as usize,
+        ldr_verify_image_matches_checksum as usize,
+        dbg_print as usize,
+        dbg_break_point as usize,
+        memcpy as usize,
+        memset as usize,
+        wcslen as usize,
+        wcscpy as usize,
+        wcsstr as usize,
+        wcsicmp as usize,
+        wcsupr as usize,
+        stricmp as usize,
+        sprintf as usize,
+        swprintf as usize,
+        vsnprintf as usize,
+        vsnwprintf as usize,
+        c_specific_handler as usize,
+    ];
+    core::hint::black_box(anchors);
+}

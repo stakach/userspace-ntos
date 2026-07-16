@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nt-ntdll = { path = "../nt-ntdll" }
+nt-ntdll-layout = { path = "../nt-ntdll-layout" }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
