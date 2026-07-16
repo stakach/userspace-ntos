@@ -394,12 +394,18 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         cid_thread,
         resume,
         prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
-        // BATCH 6: these listener threads are driven through the MAIN multiplex's badged fault-EP
-        // (trap-frame register layout), not a native-Call rendezvous — keep the trap transport for
-        // now (byte-identical to pre-BATCH-6). Converting them to native is a follow-up once the
-        // SM/CSR handshake lands and the boot reaches winlogon/services/lsass.
-        native: false,
-        ipcbuf_frame: 0,
+        // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
+        // server WORKER thread must too — mirror the BATCH-6 SM/CSR pattern: DON'T set
+        // TCBSetHostedSyscalls (native Call → MR0=SSN, not an UnknownSyscall trap whose m0=RAX is
+        // garbage) and bind its kernel IPC buffer to winlogon's MAIN-thread ipcbuf frame at
+        // IPCBUF_VADDR (the VA the ntdll native stub writes MR4/MR5 to). All three worker slots run
+        // in winlogon's VSpace (pi 2). Its faults still arrive on the badged MAIN fault-EP (the loop's
+        // NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them into the shared servicing body), so the
+        // worker actually RUNS its rpcrt4 RPC-server init + NtSetEvent(s) the event winlogon's main
+        // parks on. Without native:true the worker's first native Call faulted as UnknownSyscall with
+        // SSN=garbage → `[wl-worker] PARK` (never ran its RPC init) → winlogon main stuck on the SAS wait.
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
     })
 }
 

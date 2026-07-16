@@ -1944,3 +1944,64 @@ PAST the SAS wait — the "N threads per process" multiplex frontier (route the 
 signal the events winlogon's main waits on) so WinMain proceeds to InitializeSAS → StartServicesManager
 → StartLsass → SwitchDesktop → co_IntShowDesktop → IntPaintDesktop. `exec_services_spawned`,
 `exec_lsass_spawned`, `exec_win32k_desktop_painted` remain FAIL (as they were pre-fix) pending that.
+
+---
+
+## BATCH 19 Results — the winlogon worker native-multiplex → main unblocks past the SAS-wait (landed 2026-07-17)
+
+**Task:** BATCH 18 left winlogon MAIN parked on an unsignalled WinMain SAS/logon event
+(`NtWaitForSingleObject event #26 'a  '`), because winlogon's rpcrt4 server WORKER thread
+(`spawn_wl_listener_thread`, tid 15) was spawned `native:false` — the documented BATCH-6 follow-up.
+Convert the worker to the native transport so it RUNS its rpcrt4 RPC-server init + signals the event
+winlogon's main parks on → WinMain advances to StartServicesManager.
+
+### THE DIAGNOSIS (each conclusion evidenced from the baseline boot)
+1. **What winlogon's main parks on:** a REAL named event — `[wait] pi=2 NtWaitForSingleObject(event #26
+   'a  ') UNSIGNALLED -> PARK caller (reply-cap park)`. This is winlogon's RPC-server-ready event; the
+   reply-cap parking (Checkpoint B) handles it. winlogon main's parked RIP = ntdll+0x22292.
+2. **Why the worker never signalled it:** the worker WAS resumed (`[thread-life] resume pi=2 slot=0
+   tid=15`) and faulted ONCE, but as `[wl-worker] multiplex event #0 label=0x2` (an **UnknownSyscall
+   trap**, NOT a native Call) with `SSN=1099786334208` (= 0x0100_0080_0000, **garbage** = RAX at the
+   trap). It then `PARK`ed unserviced → it never ran its RPC receive/init → event #26 stayed
+   unsignalled. Root cause = `native:false` + `TCBSetHostedSyscalls` set: OUR ntdll's native
+   `seL4_Call` is forced into an UnknownSyscall fault whose m0=RAX is garbage. EXACTLY the BATCH-6 SM/CSR
+   class of bug, left as the flagged follow-up for winlogon.
+
+### THE FIX (executive-only; `rendezvous.rs::spawn_wl_listener_thread`)
+Mirror BATCH 6: set `native: true` + `ipcbuf_frame: PM_MAIN_IPCBUF[2]` (winlogon = pi 2) — so
+`spawn_hosted_thread` SKIPS `TCBSetHostedSyscalls` and binds the worker's kernel IPC buffer to
+winlogon's MAIN-thread ipcbuf frame at IPCBUF_VADDR (the VA our ntdll native stub writes MR4/MR5 to).
+The worker's faults still arrive on the badged MAIN fault-EP (WINLOGON_WORKER_BADGE); the existing
+`NT_NATIVE_SYSCALL_LABEL` NORMALIZE arm re-labels them into the shared servicing body. **No new
+multiplex/park code — pure REUSE.** No rust-micro/src (kernel) change, no ntdll DLL change (nt-ntdll
+165 / nt-syscall-abi 12 host-green, unchanged).
+
+### RESULT — the rpcrt4 two-thread handshake completes; winlogon main advances past the SAS wait
+The worker now faults native (`label=0x4e54` = NT_NATIVE_SYSCALL_LABEL) and RUNS its RPC init (9
+multiplex events incl. `11:238/11:37/11:88/11:280 NtWaitForMultipleObjects`). The handshake fires:
+winlogon main `NtSetEvent(#24) -> WOKE 1 parked waiter` (the worker) → the worker `NtSetEvent(#26)` →
+winlogon main's `NtWaitForSingleObject(event #26 'a  ') already SIGNALLED -> immediate WAIT_0`.
+**winlogon main is UNBLOCKED past the SAS wait.** Gate **155 → 156** (`exec_wait_reply_cap_park_wake`
+now PASSES — the worker's NtSetEvent woke winlogon main's parked reply-cap wait, Checkpoint B); NO
+regressions; host green (nt-ntdll 165 + nt-syscall-abi 12). committed on `main`.
+
+### winlogon REACHES StartServicesManager → the NEW WALL (CreateProcessW bails; diagnose-first, DEFERRED to next batch)
+Past the SAS wait, WinMain proceeds linearly (winlogon.c:508): `StartServicesManager()` = 
+`CreateProcessW("services.exe", …)`. winlogon main's SSN ring tail = `4:281(RPC-ready wait) →
+4:196(NtReleaseMutant) → 4:98(NtIsProcessInJob) → 4:190(NtRaiseHardError)`. So **StartServicesManager
+WAS called + CreateProcessInternalW STARTED** (NtIsProcessInJob=98 is its first syscall, serviced
+→ 0) — but it BAILED before NtOpenFile/NtCreateSection(SEC_IMAGE)/NtCreateProcessEx(50), and
+`!StartServicesManager()` raised the WinMain hard error (winlogon.c:78 → `NtRaiseHardError`, our
+stop_ssn=190). **services.exe is NOT spawned** (`services (slot 3) demand-faulted 0 pages`);
+`exec_services_spawned/exec_lsass_spawned/exec_win32k_desktop_painted` still FAIL. This is a NEW,
+separate wall = winlogon's kernel32 `CreateProcessInternalW` failing on OUR ntdll between
+NtIsProcessInJob and the section-create (it WORKED in the P5-SERVICES milestone on REAL ntdll — see
+`project_winlogon.md`). **NEXT BATCH (diagnose-first):** why does CreateProcessInternalW bail after
+NtIsProcessInJob(98)→0 with no further traced syscall before the hard error? Candidates: (a)
+NtIsProcessInJob returning `STATUS_SUCCESS`(0) vs the real `STATUS_PROCESS_NOT_IN_JOB`(0x101) trips a
+kernel32 check; (b) a non-syscall path-resolution / RtlDosSearchPath / base-named-objects step fails in
+our ntdll; (c) a missing/mis-serviced syscall in the CreateProcessInternalW prologue. Instrument the
+winlogon `98` arm + disasm the kernel32 CreateProcessInternalW retaddr chain (the `[sec-stop] chain:`
+decode reads smss's mirror, not winlogon's — fix the mirror for a real chain). Then services.exe comes
+up on our ntdll (its loader runs like csrss/winlogon), → StartLsass → WaitForLsass → InitializeSAS →
+SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → the `0x003a6ea5` paint.
