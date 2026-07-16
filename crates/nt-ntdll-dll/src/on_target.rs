@@ -1140,6 +1140,47 @@ unsafe fn snap_module(
             }
             desc += 20;
         }
+        // BATCH 14 — also EAGERLY bind DELAY imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13). A VC++
+        // delay-load leaves the delay-IAT pointing at `__delayLoadHelper2`, which at first call does
+        // `LoadLibrary(szDll)` in real kernel32; in our environment that path fails BEFORE reaching our
+        // ntdll `LdrLoadDll`, so the helper raises `0xC06D007E` (ERROR_MOD_NOT_FOUND). Pre-binding the
+        // delay IAT here (map the DLL + snap the delay INT→IAT like a normal import) means the helper is
+        // never invoked — the delay-imported functions are already resolved. This is the root fix for
+        // winlogon parking at `RtlRaiseException` on kernel32_vista's delay-load of ntdll_vista.dll.
+        // `ImgDelayDescr` (x64, grAttrs&1 => RVA-based): grAttrs@0x00, rvaDLLName@0x04, rvaHmod@0x08,
+        // rvaIAT@0x0C, rvaINT@0x10, rvaBoundIAT@0x14, rvaUnloadIAT@0x18, dwTimeStamp@0x1C (32 bytes).
+        let (ddir_rva, _dsz) = data_directory(image_base, 13);
+        if ddir_rva != 0 {
+            let mut ddesc = image_base + ddir_rva as u64;
+            loop {
+                let name_rva = rd32(ddesc, 4); // rvaDLLName
+                let iat_rva = rd32(ddesc, 12); // rvaIAT
+                let int_rva = rd32(ddesc, 16); // rvaINT
+                if name_rva == 0 && iat_rva == 0 {
+                    break; // terminator
+                }
+                if depth <= 8 && int_rva != 0 && iat_rva != 0 {
+                    let mut base = [0u8; 32];
+                    let bn = import_desc_basename(image_base, name_rva, &mut base);
+                    let dep_name = &base[..bn];
+                    let mut dep_base = table.find(dep_name);
+                    if dep_base == 0 {
+                        let loaded = load_dependent_dll(dep_name);
+                        if loaded != 0 {
+                            table.insert(dep_name, loaded);
+                            snap_module(loaded, ntdll_base, table, out, depth + 1);
+                            dep_base = loaded;
+                        }
+                    }
+                    if dep_base != 0 {
+                        // Snap the delay INT (int_rva) → the delay IAT (iat_rva), exactly like a normal
+                        // import descriptor. The delay-load helper is now bypassed for this DLL.
+                        snap_descriptor_against(image_base, int_rva, iat_rva, dep_base, table, out);
+                    }
+                }
+                ddesc += 32; // sizeof(ImgDelayDescr)
+            }
+        }
     }
 }
 

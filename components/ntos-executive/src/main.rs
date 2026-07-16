@@ -2321,7 +2321,7 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
-unsafe fn get_recv_mr(i: usize) -> u64 {
+pub(crate) unsafe fn get_recv_mr(i: usize) -> u64 {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
 }
@@ -3741,7 +3741,7 @@ static PM_HANDLE_CAP_BOOT: AtomicU64 = AtomicU64::new(0);
 static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
-static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Each hosted process's MAIN-thread IPC buffer FRAME cap (bound at `IPCBUF_VADDR`). Retained so a
 /// runtime NATIVE 2nd thread (SmpApiLoop / CSR-API / listener on OUR ntdll) can bind ITS kernel IPC
 /// buffer to the SAME frame at IPCBUF_VADDR — the VA our ntdll native stub writes MR4/MR5 to

@@ -550,6 +550,146 @@ pub(crate) unsafe fn service_sec_image(
             stop = fip;
             break;
         }
+        // DebugException (label 4 = int3 / #BP). OUR ntdll's `RtlRaiseException` / `RtlRaiseStatus`
+        // seams issue int3. Decode WHAT exception the caller is raising: recover winlogon's full GPRs
+        // (RCX = PEXCEPTION_RECORD arg, RSP), read the EXCEPTION_RECORD from its demand-faulted memory,
+        // and walk the stack for the raise site. m1 = fault_ip for a DebugException fault.
+        if (mi >> 12) == 4 {
+            let bp_ip = m1;
+            let tcb = crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed);
+            if tcb != 0 && ntdll.is_some() {
+                let mut regs = [0u64; 20];
+                crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                let rip = regs[0];
+                let rcx = regs[5];
+                let rsp = regs[1];
+                let raise_rva = if let Some((nb, _)) = ntdll { rip.wrapping_sub(nb) } else { rip };
+                print_str(b"[bp-diag] int3 rva=0x");
+                print_hex(raise_rva as u32);
+                print_str(b" rcx(record*)=0x");
+                print_hex((rcx >> 32) as u32);
+                print_hex(rcx as u32);
+                print_str(b" rsp=0x");
+                print_hex((rsp >> 32) as u32);
+                print_hex(rsp as u32);
+                print_str(b"\n");
+                // Read the EXCEPTION_RECORD (first 0x30 bytes) from winlogon's memory. The record lives
+                // on the raiser's stack → read via the stack mirror (`smss_stack_read`), falling back to
+                // the demand-faulted-page scratch alias for a non-stack record ptr.
+                let stk_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+                let stk_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+                let stk_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+                let read_wl = |va: u64| -> Option<u64> {
+                    unsafe {
+                        if va >= stk_base && va + 8 <= stk_base + stk_size {
+                            return Some(core::ptr::read_volatile(
+                                (stk_mirror + (va - stk_base)) as *const u64,
+                            ));
+                        }
+                        scratch_for(va, filled_pages, faults as usize, scratch_base)
+                            .map(|m| core::ptr::read_volatile(m as *const u64))
+                    }
+                };
+                let mut rec = [0u8; 0x30];
+                let mut got = true;
+                for off in (0..0x30u64).step_by(8) {
+                    if let Some(v) = read_wl(rcx + off) {
+                        rec[off as usize..off as usize + 8].copy_from_slice(&v.to_le_bytes());
+                    } else {
+                        got = false;
+                        break;
+                    }
+                }
+                if got {
+                    let code = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                    let flags = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                    let addr = u64::from_le_bytes([
+                        rec[16], rec[17], rec[18], rec[19], rec[20], rec[21], rec[22], rec[23],
+                    ]);
+                    // NumberParameters @ +0x18 (byte 24); ExceptionInformation[] @ +0x20 (byte 32).
+                    let nparm = u32::from_le_bytes([rec[24], rec[25], rec[26], rec[27]]);
+                    let info0 = u64::from_le_bytes([
+                        rec[32], rec[33], rec[34], rec[35], rec[36], rec[37], rec[38], rec[39],
+                    ]);
+                    let info1 = u64::from_le_bytes([
+                        rec[40], rec[41], rec[42], rec[43], rec[44], rec[45], rec[46], rec[47],
+                    ]);
+                    print_str(b"[bp-diag] EXCEPTION_RECORD code=0x");
+                    print_hex(code);
+                    print_str(b" flags=0x");
+                    print_hex(flags);
+                    print_str(b" addr=0x");
+                    print_hex((addr >> 32) as u32);
+                    print_hex(addr as u32);
+                    print_str(b" nparams=");
+                    print_u64(nparm as u64);
+                    print_str(b" info0=0x");
+                    print_hex((info0 >> 32) as u32);
+                    print_hex(info0 as u32);
+                    print_str(b" info1=0x");
+                    print_hex((info1 >> 32) as u32);
+                    print_hex(info1 as u32);
+                    print_str(b"\n");
+                    // 0xC06D007E = VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND) — a VC++
+                    // delay-load failure. ExceptionInformation[0] points at a DelayLoadInfo whose
+                    // +0x08 (szDll, LPCSTR) names the missing DLL. Dump it.
+                    if code == 0xC06D_007E && info0 != 0 {
+                        // DelayLoadInfo: cb@0, pidd@0x08, ppfn@0x10, szDll(LPCSTR)@0x18.
+                        if let Some(szdll) = read_wl(info0 + 0x18) {
+                            print_str(b"[bp-diag] delayload szDll ptr=0x");
+                            print_hex((szdll >> 32) as u32);
+                            print_hex(szdll as u32);
+                            print_str(b" name=\"");
+                            // Read up to 40 ASCII bytes of the DLL name into a buffer.
+                            let mut name = [0u8; 41];
+                            let mut n = 0usize;
+                            for j in 0..40u64 {
+                                if let Some(w) = read_wl((szdll + j) & !7) {
+                                    let b = ((w >> (8 * ((szdll + j) & 7))) & 0xff) as u8;
+                                    if b == 0 {
+                                        break;
+                                    }
+                                    name[n] = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
+                                    n += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            print_str(&name[..n]);
+                            print_str(b"\"\n");
+                        }
+                    }
+                } else {
+                    print_str(b"[bp-diag] EXCEPTION_RECORD not in a faulted page (rcx unmapped)\n");
+                }
+                // Walk the caller's stack for return addresses in ntdll / DLLs to identify the raise
+                // site (who called RtlRaiseException / RtlRaiseStatus).
+                print_str(b"[bp-diag] callers:");
+                let mut shown = 0;
+                for i in 0..96u64 {
+                    if let Some(v) = read_wl(rsp + i * 8) {
+                        if let Some((nb, npe)) = ntdll {
+                            if v >= nb && v < nb + image_extent(npe) {
+                                print_str(b" n+0x");
+                                print_hex((v - nb) as u32);
+                                shown += 1;
+                            }
+                        }
+                        if v >= 0x8000_0000 && v < 0x8080_0000 {
+                            print_str(b" d+0x");
+                            print_hex(v as u32);
+                            shown += 1;
+                        }
+                        if shown >= 24 {
+                            break;
+                        }
+                    }
+                }
+                print_str(b"\n");
+            }
+            stop = bp_ip;
+            break;
+        }
         if (mi >> 12) == 6 {
             let addr = m1;
             if faults == 0 {

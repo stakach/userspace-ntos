@@ -584,6 +584,35 @@ pub(crate) unsafe fn tcb_read_rip(tcb: u64) -> u64 {
     rip
 }
 
+/// `seL4_TCB_ReadRegisters` (length=20) → the target's full GPR set in `seL4_UserContext` order:
+/// `[rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15, fs_base, gs_base]`. The first 4
+/// words come back in r10/r8/r9/r15; words 4..20 spill into the invoker's IPC buffer (readable via
+/// `get_recv_mr`). Valid rcx/r11 only for #exception-captured threads (`use_iretq_resume`), which an
+/// int3-stopped hosted thread is. Used to recover the EXCEPTION_RECORD ptr (RCX) at RtlRaiseException.
+pub(crate) unsafe fn tcb_read_regs20(tcb: u64, out: &mut [u64; 20]) {
+    let (r0, r1, r2, r3): (u64, u64, u64, u64);
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") (2u64 << 12) | 20 => _, // TCBReadRegisters, msginfo.length=20 (label<<12 | len)
+        inout("r10") 0u64 => r0,   // MR0 in / word 0 (rip) out
+        inout("r8") 20u64 => r1,   // MR1 = count(20) in / word 1 (rsp) out
+        lateout("r9") r2,          // word 2 (rflags)
+        lateout("r15") r3,         // word 3 (rax)
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    out[0] = r0;
+    out[1] = r1;
+    out[2] = r2;
+    out[3] = r3;
+    // Words 4..20 were spilled into the executive's IPC buffer at MR slot i.
+    for (i, slot) in out.iter_mut().enumerate().take(20).skip(4) {
+        *slot = crate::get_recv_mr(i);
+    }
+}
+
 /// Print the win32k call chain (return-address RVAs, deepest first) at a `win32k_dispatch` wall.
 /// Mirrors win32k's ACTIVE stack (fault-time RSP .. stack_top) into the executive's own VSpace and
 /// scans it for return addresses in win32k's image — same technique as the DriverEntry-path backtrace.
