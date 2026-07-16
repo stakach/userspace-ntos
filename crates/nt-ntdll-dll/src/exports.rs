@@ -1065,21 +1065,91 @@ pub unsafe extern "system" fn rtl_dos_search_path_u(
     0 // 0 chars written — not found (honest; needs the live FS/CWD plane)
 }
 
-/// `RtlQueryRegistryValues(...)` — table-driven registry read. Honest seam (needs the live registry
-/// syscall plane via NtOpenKey/NtQueryValueKey).
+/// The `RTL_QUERY_REGISTRY_ROUTINE` callback ABI (x64 system): `(ValueName, ValueType, ValueData,
+/// ValueLength, Context, EntryContext) -> NTSTATUS`.
+type QueryRoutine = unsafe extern "system" fn(
+    *mut u16,   // ValueName
+    u32,        // ValueType
+    *mut c_void, // ValueData
+    u32,        // ValueLength
+    *mut c_void, // Context
+    *mut c_void, // EntryContext
+) -> NtStatus;
+
+/// `RtlQueryRegistryValues(RelativeTo, Path, QueryTable, Context, Environment) -> NTSTATUS`. Step 4.C:
+/// real (default-path). Walks the `RTL_QUERY_REGISTRY_TABLE` array; since our minimal registry plane
+/// holds none of these values, each entry falls to its DEFAULT (the documented behavior when the
+/// registry value is absent): a `RTL_QUERY_REGISTRY_DIRECT` entry copies `DefaultData`
+/// (`DefaultLength` bytes) into `EntryContext`; a callback entry with a non-`REG_NONE` `DefaultType`
+/// invokes `QueryRoutine(Name, DefaultType, DefaultData, DefaultLength, Context, EntryContext)`. This
+/// is exactly what real ntdll does for absent values with supplied defaults — so smss builds its
+/// environment from its compiled-in defaults and proceeds. Returns the first callback error, else
+/// SUCCESS.
+///
+/// x64 `RTL_QUERY_REGISTRY_TABLE` (0x38 bytes): QueryRoutine@0x00, Flags@0x08, Name@0x10,
+/// EntryContext@0x18, DefaultType@0x20, DefaultData@0x28, DefaultLength@0x30. Terminated by an entry
+/// whose QueryRoutine AND Name are both NULL.
 ///
 /// # Safety
-/// Standard contract.
+/// `query_table` a valid `RTL_QUERY_REGISTRY_TABLE` array terminated as above; EntryContext buffers
+/// valid for the DIRECT copies.
 #[export_name = "RtlQueryRegistryValues"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_query_registry_values(
     _relative_to: u32,
     _path: *const u16,
-    _query_table: *mut c_void,
-    _context: *mut c_void,
+    query_table: *mut c_void,
+    context: *mut c_void,
     _environment: *mut c_void,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs the live registry plane (Step 4.A/4.B)
+    if query_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
+    const ENTRY_SIZE: usize = 0x38;
+    // SAFETY: query_table is a valid RTL_QUERY_REGISTRY_TABLE array per the contract.
+    unsafe {
+        let mut e = query_table as *const u8;
+        loop {
+            let query_routine = core::ptr::read_unaligned(e as *const u64);
+            let flags = core::ptr::read_unaligned(e.add(0x08) as *const u32);
+            let name = core::ptr::read_unaligned(e.add(0x10) as *const u64);
+            let entry_context = core::ptr::read_unaligned(e.add(0x18) as *const u64);
+            let default_type = core::ptr::read_unaligned(e.add(0x20) as *const u32);
+            let default_data = core::ptr::read_unaligned(e.add(0x28) as *const u64);
+            let default_length = core::ptr::read_unaligned(e.add(0x30) as *const u32);
+            // Terminator: QueryRoutine == NULL && Name == NULL.
+            if query_routine == 0 && name == 0 {
+                break;
+            }
+            if (flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
+                // DIRECT: copy DefaultData (DefaultLength bytes) straight into EntryContext.
+                if entry_context != 0 && default_data != 0 && default_length != 0 {
+                    core::ptr::copy_nonoverlapping(
+                        default_data as *const u8,
+                        entry_context as *mut u8,
+                        default_length as usize,
+                    );
+                }
+            } else if query_routine != 0 && default_type != 0 {
+                // Callback with the default value (REG_NONE=0 default type → skip, per the contract).
+                let routine: QueryRoutine = core::mem::transmute::<u64, QueryRoutine>(query_routine);
+                let st = routine(
+                    name as *mut u16,
+                    default_type,
+                    default_data as *mut c_void,
+                    default_length,
+                    context,
+                    entry_context as *mut c_void,
+                );
+                if st != STATUS_SUCCESS {
+                    return st;
+                }
+            }
+            e = e.add(ENTRY_SIZE);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 // =================================================================================================

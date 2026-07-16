@@ -900,6 +900,29 @@ focused increment. Then SmpInit proceeds toward the SmpApiLoop that does
 `SmpExecuteImage → NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss (the 4.C milestone; add
 the SSN-50 arm when smss emits SSN 50 there).
 
+**checkpoint 3 committed** (`abae6b0`): gate 174/98, paint 768/768, flag OFF.
+
+**IN PROGRESS 2026-07-16 — checkpoint 4 (RtlQueryRegistryValues → smss runs the object-namespace + subsystem setup under OUR ntdll):**
+
+9. **`RtlQueryRegistryValues`** (`exports.rs`, real default-path) — walks the `RTL_QUERY_REGISTRY_TABLE`
+   array (x64 entry 0x38 bytes: QueryRoutine@0x00, Flags@0x08, Name@0x10, EntryContext@0x18,
+   DefaultType@0x20, DefaultData@0x28, DefaultLength@0x30; NULL/NULL terminator). Since our minimal
+   registry holds none of these values, each entry falls to its DEFAULT (the documented absent-value
+   behavior): `RTL_QUERY_REGISTRY_DIRECT` copies `DefaultData`→`EntryContext`; a callback entry with a
+   non-`REG_NONE` `DefaultType` invokes `QueryRoutine(Name, DefaultType, DefaultData, DefaultLength,
+   Context, EntryContext)`. Returns the first callback error, else SUCCESS. smss builds its environment
+   from its compiled-in defaults + proceeds — exactly real ntdll's absent-value behavior.
+
+**How far smss runs now (a BIG jump):** ring grew to 72 service-iters / 39 faults (19 in ntdll):
+`…125,125,68,27,36,27,36,27,119,36,129,12,27,129,12,27,36,27,129,12,27,190`. New SSNs
+`36=NtCreateDirectoryObject`, `119=NtOpenDirectoryObject` + repeated `129,12,27` (RtlAdjustPrivilege).
+smss's `SmpInit` now runs the **object-manager namespace setup** (creates/opens `\Sessions`/`\??`-style
+directories) + the subsystem-load privilege dance under OUR ntdll — matching the
+`project_smss_sec_image` spec's SmpInit ordering. The SM-loop thread + `\SmApiPort` are up; smss is now
+in the deeper subsystem-load phase. Still stops at a deeper `NtRaiseHardError(190)` (next oracle-diff
+wall) on the path toward `SmpLoadSubSystemsForMuSession → SmpExecuteImage → NtCreateSection(SEC_IMAGE)
+→ NtCreateProcess[Ex]` for csrss (the 4.C milestone; add the SSN-50 arm when smss emits SSN 50 there).
+
 **The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → gate **174/98**, paint
 **768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (ONLY `crates/nt-ntdll-dll` changed;
 NO rust-micro/src, NO executive change; rust-micro submodule clean). `nt-ntdll` host tests **145/145**.
