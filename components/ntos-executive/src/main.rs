@@ -7363,6 +7363,55 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         } else {
             b" px (natural flow did NOT fully re-paint)\n".as_slice()
         });
+
+        // BATCH 10 — RIP-instrument the winlogon user32-init spin. winlogon (pi 2) is PARKED at its
+        // busy-spin by the time the specs run (its ntdll loader quiesced with no faults/syscalls).
+        // Sample its saved RIP twice via seL4_TCB_ReadRegisters and classify against the known
+        // module bases so we can decide (a) OUR ntdll CS bug vs (b) a user32/kernel32 shared-value
+        // poll. If the two samples land in different functions it's a genuine loop; identical = a
+        // tight self-loop. Module bases (from the DEMAND-LOAD log): user32=0x80150000,
+        // kernel32=0x803a0000, gdi32=0x800f0000, advapi32=0x80280000, winsrv=0x80080000,
+        // ntdll=NTDLL_BASE(0x100_0080_0000), winlogon.exe=PE_LOAD_BASE(0x100_0056_0000).
+        let wl_tcb = PM_MAIN_TCBS[2].load(Ordering::Relaxed);
+        if wl_tcb > 1 {
+            for s in 0..3u64 {
+                let rip = unsafe { crate::win32k_glue::tcb_read_rip(wl_tcb) };
+                print_str(b"[batch10] winlogon parked RIP sample #");
+                print_u64(s);
+                print_str(b" = 0x");
+                print_hex((rip >> 32) as u32);
+                print_hex(rip as u32);
+                // Classify + emit the module-relative RVA.
+                let (name, base): (&[u8], u64) = if rip >= NTDLL_BASE && rip < NTDLL_BASE + 0x20_0000 {
+                    (b"ntdll", NTDLL_BASE)
+                } else if rip >= PE_LOAD_BASE && rip < PE_LOAD_BASE + 0x20_0000 {
+                    (b"winlogon.exe", PE_LOAD_BASE)
+                } else if rip >= 0x803a0000 && rip < 0x803a0000 + 0x2b0000 {
+                    (b"kernel32", 0x803a0000)
+                } else if rip >= 0x80150000 && rip < 0x80150000 + 0x130000 {
+                    (b"user32", 0x80150000)
+                } else if rip >= 0x80280000 && rip < 0x80280000 + 0x80000 {
+                    (b"advapi32", 0x80280000)
+                } else if rip >= 0x800f0000 && rip < 0x800f0000 + 0x60000 {
+                    (b"gdi32", 0x800f0000)
+                } else if rip >= 0x80080000 && rip < 0x80080000 + 0x70000 {
+                    (b"winsrv", 0x80080000)
+                } else if rip >= 0x80690000 && rip < 0x80690000 + 0x100000 {
+                    (b"msvcrt", 0x80690000)
+                } else {
+                    (b"?", 0)
+                };
+                print_str(b" (");
+                print_str(name);
+                if base != 0 {
+                    print_str(b"+0x");
+                    print_hex((rip - base) as u32);
+                }
+                print_str(b")\n");
+            }
+        } else {
+            print_str(b"[batch10] winlogon TCB not available for RIP sample\n");
+        }
     }
 
     // SELF-CONTAINED delay specs: exercise the `nt_delay_execution` PUBLIC interface directly

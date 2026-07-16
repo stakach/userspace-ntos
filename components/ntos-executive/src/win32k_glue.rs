@@ -565,6 +565,25 @@ pub(crate) unsafe fn tcb_read_rsp(tcb: u64) -> u64 {
     rsp
 }
 
+/// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's saved RIP (MR0).
+/// Used to sample a PARKED thread's instruction pointer for spin-diagnosis (BATCH 10).
+pub(crate) unsafe fn tcb_read_rip(tcb: u64) -> u64 {
+    let rip: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") 2u64 << 12 => _, // TCBReadRegisters, length 0
+        lateout("r10") rip,           // MR0 = rip
+        lateout("r8") _,              // MR1 = rsp
+        lateout("r9") _,              // MR2 = rax
+        lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    rip
+}
+
 /// Print the win32k call chain (return-address RVAs, deepest first) at a `win32k_dispatch` wall.
 /// Mirrors win32k's ACTIVE stack (fault-time RSP .. stack_top) into the executive's own VSpace and
 /// scans it for return addresses in win32k's image — same technique as the DriverEntry-path backtrace.

@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17 · BATCH 7 (csr_rendezvous native arm + the LIVE loader now runs `DLL_PROCESS_ATTACH` in dependency order + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first, reaching kernel32's `CsrClientConnectToServer`; next wall = the CSR/base-server connect + `Peb->ReadOnlyStaticServerData` DURING winlogon's loader, gate 149) DONE 2026-07-17 · BATCH 8 (NtSecureConnectPort SSN 218 + `CsrClientConnectToServer` = a faithful `CsrpConnectToServer` port issuing the 9-arg NtSecureConnectPort + copying ConnectionInfo→PEB ReadOnlyStaticServerData; + the root-cause `call_dll_main` stack-misalign fix `sub rsp,0x28`→`0x20` that #GP-faulted kernel32's DllMain→CsrClientConnectToServer's aligned SSE spill; + a connect-once guard preventing a reconnect hang → **winlogon's kernel32 DllMain COMPLETES the CSR connect, `exec_winlogon_csr_connect` PASSES, winlogon advances PAST the CSR wall into real win32k NtUser* calls (SSN 4346/4699) + WinMain**, gate 149→150) DONE 2026-07-17** · BATCH 9 (DIAGNOSE-FIRST — the queued winlogon-worker-multiplex hypothesis DISPROVEN by tracing: winlogon blocks FAR earlier, in user32 per-process init inside `CreateWindowStationAndDesktops` — a **contended critical-section spin** right after `NtUserInitializeClientPfnArrays`[0x125B], with NO faults/syscalls; the `0:161` in the ring is smss's terminal wait, not winlogon's; services/lsass NEVER spawn. NO code change — the queued fix was wrong. gate stays 150) DONE 2026-07-17 · **next wall = the contended critical-section blocking path in OUR ntdll (Step 6 sync `WaitSeam`: wire NtWaitForKeyedEvent/NtReleaseKeyedEvent over native seL4-Call + an executive keyed-event handler), OR pin which CS winlogon contends** — only past this do StartRpcServer(the worker thread)/StartServicesManager/StartLsass/WaitForLsass/InitializeSAS/SwitchDesktop/the 0x003a6ea5 paint come into reach
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17 · BATCH 7 (csr_rendezvous native arm + the LIVE loader now runs `DLL_PROCESS_ATTACH` in dependency order + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first, reaching kernel32's `CsrClientConnectToServer`; next wall = the CSR/base-server connect + `Peb->ReadOnlyStaticServerData` DURING winlogon's loader, gate 149) DONE 2026-07-17 · BATCH 8 (NtSecureConnectPort SSN 218 + `CsrClientConnectToServer` = a faithful `CsrpConnectToServer` port issuing the 9-arg NtSecureConnectPort + copying ConnectionInfo→PEB ReadOnlyStaticServerData; + the root-cause `call_dll_main` stack-misalign fix `sub rsp,0x28`→`0x20` that #GP-faulted kernel32's DllMain→CsrClientConnectToServer's aligned SSE spill; + a connect-once guard preventing a reconnect hang → **winlogon's kernel32 DllMain COMPLETES the CSR connect, `exec_winlogon_csr_connect` PASSES, winlogon advances PAST the CSR wall into real win32k NtUser* calls (SSN 4346/4699) + WinMain**, gate 149→150) DONE 2026-07-17** · BATCH 9 (DIAGNOSE-FIRST — the queued winlogon-worker-multiplex hypothesis DISPROVEN by tracing: winlogon blocks FAR earlier, in user32 per-process init inside `CreateWindowStationAndDesktops` — a **contended critical-section spin** right after `NtUserInitializeClientPfnArrays`[0x125B], with NO faults/syscalls; the `0:161` in the ring is smss's terminal wait, not winlogon's; services/lsass NEVER spawn. NO code change — the queued fix was wrong. gate stays 150) DONE 2026-07-17 · BATCH 10 (RIP-INSTRUMENTED — the "user32-init spin" is NOT a CS bug NOR a shared-value poll: it was a PARKED, UNSERVICED instruction-fetch fault at `user32+0x8a940`. RIP-sampled winlogon's parked TCB via seL4_TCB_ReadRegisters = frozen at `0x801da940` [`user32+0x8a940`, err=0x14 = user+instr-fetch]; the single service loop was BREAKING on smss's terminal `NtQueryInformationProcess` [SSN 161 = QueryInfoProcess, NOT NtWaitForSingleObject as BATCH 9 mislabeled] class-44 which did `self.stop=true`, leaving winlogon's higher-priority pending fetch-fault forever unserviced. FIX = drop that `self.stop=true` → return STATUS_INVALID_INFO_CLASS. winlogon now ADVANCES PAST user32 init: new syscalls 4:4576 + more, and walls FURTHER at a REAL `strlen(NULL)` NULL-deref in msvcrt+0x43ca6, gate 150 held, host green 157+12) DONE 2026-07-17 · **next wall = winlogon `strlen(NULL)` at msvcrt+0x43ca6 (a CRT-init call passing a NULL string; caller chain runs through our ntdll into winlogon.exe) — trace who passes NULL + populate the source string; then StartServicesManager/StartLsass/WaitForLsass/InitializeSAS→SwitchDesktop→the 0x003a6ea5 paint**
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1735,3 +1735,60 @@ native:true` multiplex pattern legitimately applies), StartServicesManager, Star
 (the LSA_RPC_SERVER_ACTIVE event — needs lsass running to SetEvent it, lsarpc.c:105), and finally
 InitializeSAS/SwitchDesktop/the 0x003a6ea5 paint come into reach. The worker-multiplex work remains a
 VALID future step for StartRpcServer's listener — just not the current blocker.
+
+---
+
+## ☑ SYSTEMATIC PORT — BATCH 10 (2026-07-17): RIP-INSTRUMENTED the "user32-init spin" — it is NEITHER (a) our CS bug NOR (b) a shared-value poll. It was a PARKED, UNSERVICED instruction-fetch fault, masked by the single service loop breaking on smss's terminal query. One-line fix; winlogon ADVANCES past user32 init. Gate 150 held; host green (nt-ntdll 157 + nt-syscall-abi 12).
+
+### The RIP evidence (the DIAGNOSE-FIRST mandate, satisfied)
+Added a `tcb_read_rip(tcb)` helper (`components/ntos-executive/src/win32k_glue.rs`) = the legacy
+length-0 `seL4_TCB_ReadRegisters` (label 2) returning MR0=saved RIP, and sampled winlogon's PARKED
+TCB (`PM_MAIN_TCBS[2]`) three times at spec-time (`components/ntos-executive/src/main.rs`, in the
+winlogon-paint diagnostic block). All three samples were **IDENTICAL: `0x801da940` = `user32+0x8a940`**
+(module bases from the DEMAND-LOAD log: user32=0x80150000, kernel32=0x803a0000, …). Cross-referenced
+with the KERNEL's own fault print: the LAST winlogon fault was
+`[user #PF: tcb=24 cr2=0x801da940 err=0x14 rip=0x801da940]` — **cr2==rip, err=0x14 = (User | Instr-fetch)**:
+an INSTRUCTION-FETCH page fault. The RIP being frozen EXACTLY at the fault IP (the seL4 restart-IP for
+a page fault is the faulting instruction) proves winlogon was **PARKED at an unserviced fetch-fault,
+NOT busy-spinning**. BATCH 9's "contended critical-section busy-spin" characterization was WRONG.
+
+### The real root cause — (c) a loop-ordering stop, not a ntdll/shared-value bug
+The single-threaded executive service loop multiplexes smss (badge 0) + csrss + winlogon (badge 4) +…
+through ONE `reply_recv` on the shared fault endpoint. winlogon (prio 102) faulted on the fetch at
+`user32+0x8a940`, but the loop then received **smss's terminal `NtQueryInformationProcess` (SSN 161 —
+which is QueryInfoProcess, NOT NtWaitForSingleObject; BATCH 9 mislabeled the `0:161` in the ssn ring)
+with an unmodeled class 44 (ProcessImageInformation)**, whose handler did `self.stop = true`
+(`exec_handler.rs` NtQueryInformationProcess default arm) → `stop_ssn=161`, `break`. So the loop TORE
+DOWN while winlogon's higher-priority fetch-fault sat **undequeued/unserviced** in the endpoint — RIP
+frozen, "no further fault/syscall" (BATCH 9's "silent quiesce"). Neither the CS nor a poll: an
+executive loop-lifetime bug where an unmodeled smss query killed the boot before a live process's
+pending fault could be filled.
+
+### The fix (one line, executive-side; NO rust-micro/src change, NO ntdll change)
+`exec_handler.rs` — the `NtQueryInformationProcess` unmodeled-class arm no longer sets `self.stop = true`;
+it returns **STATUS_INVALID_INFO_CLASS (0xC0000003)** and keeps the class-print diagnostic. The caller
+degrades gracefully AND the loop keeps multiplexing, so winlogon's pending fetch-fault gets serviced.
+(An unmodeled info-class is a per-caller degrade, never a whole-boot stop — the correct policy for a
+multiplexed loop.) The BATCH-10 RIP sampler + `tcb_read_rip` are kept as a permanent, once-at-spec-time
+spin-diagnostic (harmless; guarded on `PM_MAIN_TCBS[2] > 1`).
+
+### How far winlogon got + the NEW wall
+winlogon now runs PAST user32 per-process init (`ClientThreadSetup`/`RegisterClientPFN`/the two
+`InitializeCriticalSection` calls) — the ssn ring advanced from `…4:4699 0:161` (the old wall) to
+`…4:4699 0:161 4:125 4:185 4:27 4:4576 0:27 4:173 4:173 4:125 4:125 4:185 4:27 4:173` (a NEW win32k
+call 4:4576 + more). It now walls at a REAL NULL-deref: `[winlogon vmf] NULL/low deref ip=0x806d3ca6`
+= **`msvcrt+0x43ca6` = `strlen+0x16` (`movsbl (%rax),%eax`, rax=NULL) → winlogon called `strlen(NULL)`**
+(exactly the case the executive's own vmf diagnostic anticipated). The caller chain (retaddrs) runs
+through our ntdll (0x100_00c0xxxx) into winlogon.exe (0x100_00578e80 = winlogon.exe+0x18e80) — a
+CRT-init/env path passing a NULL string. Gate held at 150 (no regression); `cargo test -p nt-ntdll`
+157 + `-p nt-syscall-abi` 12 green.
+
+### ★ THE NEXT FRONTIER (evidence-backed)
+Trace WHO passes NULL into `strlen` (the caller chain above; likely a winlogon CRT-startup env/arg
+copy or a `getenv`-style lookup returning NULL that a copy then `strlen`s). Populate the missing source
+string (an env var / registry value / process-param field our modeled setup leaves NULL) so `strlen`
+gets a valid pointer. Only then do winlogon's `StartServicesManager` (spawns services.exe) →
+`StartLsass` (spawns lsass) → `WaitForLsass` (the `LSA_RPC_SERVER_ACTIVE` cross-process event) →
+`InitializeSAS` → `SwitchDesktop` → `co_IntShowDesktop` → the `0x003a6ea5` desktop paint come into
+reach. The BATCH-6 `spawn_wl_listener_thread native:true` worker-multiplex remains a valid FUTURE step
+for `StartRpcServer`'s RPC listener thread — still not the current blocker.

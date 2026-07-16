@@ -2112,8 +2112,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_str(b" len=");
                     print_u64(args[3]);
                     print_str(b"\n");
-                    self.stop = true; // surfaces the class — stop the process
-                    0xC0000002 // STATUS_NOT_IMPLEMENTED
+                    // BATCH 10: do NOT stop the whole boot on an unmodeled class. Returning
+                    // STATUS_INVALID_INFO_CLASS lets the CALLER degrade gracefully and, crucially,
+                    // keeps the single service loop multiplexing so a HIGHER-priority process's
+                    // pending fault gets serviced. Previously `self.stop=true` here broke the loop on
+                    // smss's terminal ProcessImageInformation(class 44) query, leaving winlogon's
+                    // pending user32-init fetch-fault (user32+0x8a940) forever unserviced — the
+                    // BATCH 9/10 "silent spin". The class print still surfaces the gap for follow-up.
+                    0xC000_0003 // STATUS_INVALID_INFO_CLASS
                 }
             },
             // NtProtectVirtualMemory(Process, *Base, *Size, NewProtect, *OldProtect[arg5]=args[4]).
