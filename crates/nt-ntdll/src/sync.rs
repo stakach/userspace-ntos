@@ -152,6 +152,78 @@ impl CriticalSection {
     }
 }
 
+/// `RTL_CRITICAL_SECTION_DEBUG` (x64 layout, 0x30 bytes — see
+/// `references/reactos/sdk/include/ndk/rtltypes.h`). Every `RtlInitializeCriticalSection(Ex)` that is
+/// NOT `RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO` allocates one of these from the process heap
+/// (`RtlpAllocateDebugInfo`) and stores its address in `RTL_CRITICAL_SECTION.DebugInfo` (offset 0).
+///
+/// This is load-bearing: consumers (e.g. msvcrt's per-locale-category CRT init) dereference
+/// `DebugInfo` and read/write its fields (msvcrt writes `[DebugInfo+0x28]`, the `Flags`/`Spare`
+/// union). A NULL `DebugInfo` faults them. We allocate a real, correctly-sized, zeroed struct — not a
+/// fake — matching real ntdll's `RtlpAllocateDebugInfo` behaviour.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtlCriticalSectionDebug {
+    /// `Type` @ 0x00 — `RTL_CRITSECT_TYPE` (0).
+    pub ty: u16,
+    /// `CreatorBackTraceIndex` @ 0x02.
+    pub creator_back_trace_index: u16,
+    /// `CriticalSection` @ 0x08 — back-pointer to the owning `RTL_CRITICAL_SECTION`.
+    pub critical_section: u64,
+    /// `ProcessLocksList.Flink` @ 0x10.
+    pub process_locks_flink: u64,
+    /// `ProcessLocksList.Blink` @ 0x18.
+    pub process_locks_blink: u64,
+    /// `EntryCount` @ 0x20.
+    pub entry_count: u32,
+    /// `ContentionCount` @ 0x24.
+    pub contention_count: u32,
+    /// The `Flags`/`Spare` union @ 0x28 (msvcrt writes here) + trailing `Creator*`/`SpareWORD`.
+    pub flags_spare: u64,
+}
+
+/// `RTL_CRITSECT_TYPE` (`references/reactos/sdk/include/ndk/rtltypes.h:264`).
+pub const RTL_CRITSECT_TYPE: u16 = 0;
+
+impl RtlCriticalSectionDebug {
+    /// The x64 struct size that must be allocated + valid (msvcrt derefs through `+0x28`).
+    pub const SIZE: usize = 0x30;
+
+    /// Populate a zeroed `RTL_CRITICAL_SECTION_DEBUG` for the critical section at address `cs_addr`,
+    /// exactly as `RtlInitializeCriticalSectionEx` does after `RtlpAllocateDebugInfo`:
+    /// `Type = RTL_CRITSECT_TYPE`, `CriticalSection = cs`, `ProcessLocksList` self-linked (an empty
+    /// list head at `debug_addr+0x10`), all counters/flags zero. `debug_addr` is where the struct
+    /// lives (its `ProcessLocksList` links point at itself, the NT convention for an empty entry
+    /// before it is inserted into the process lock list).
+    pub fn init(cs_addr: u64, debug_addr: u64) -> Self {
+        let locks_list = debug_addr.wrapping_add(0x10);
+        RtlCriticalSectionDebug {
+            ty: RTL_CRITSECT_TYPE,
+            creator_back_trace_index: 0,
+            critical_section: cs_addr,
+            // An empty LIST_ENTRY points its Flink/Blink at itself.
+            process_locks_flink: locks_list,
+            process_locks_blink: locks_list,
+            entry_count: 0,
+            contention_count: 0,
+            flags_spare: 0,
+        }
+    }
+}
+
+// Compile-time proof the x64 layout matches RTL_CRITICAL_SECTION_DEBUG (0x30 bytes, fields at their
+// documented offsets) so the struct we hand a hosted binary is byte-compatible with what it reads.
+const _: () = {
+    assert!(core::mem::size_of::<RtlCriticalSectionDebug>() == 0x30);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, ty) == 0x00);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, critical_section) == 0x08);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, process_locks_flink) == 0x10);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, process_locks_blink) == 0x18);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, entry_count) == 0x20);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, contention_count) == 0x24);
+    assert!(core::mem::offset_of!(RtlCriticalSectionDebug, flags_spare) == 0x28);
+};
+
 /// The **contended-blocking seam** for a critical section. This is the honest home for the path
 /// that literally deadlocks today: instead of faking acquisition, it names the exact keyed-event
 /// operations and routes them through the swappable [`transport`]. Until the wait plane is wired
@@ -362,6 +434,30 @@ mod tests {
     fn cs_spin_count_masked() {
         let cs = CriticalSection::with_spin_count(0x8000_0400);
         assert_eq!(cs.spin_count, 0x400); // flag bits masked off
+    }
+
+    #[test]
+    fn cs_debug_info_is_populated_not_null() {
+        // The fix for the msvcrt locale-init [DebugInfo+0x28] fault: RtlInitializeCriticalSection(Ex)
+        // must allocate a real, correctly-sized, zeroed RTL_CRITICAL_SECTION_DEBUG and set the
+        // fields per RtlpAllocateDebugInfo / RtlInitializeCriticalSectionEx.
+        let cs_addr = 0x0011_2233_4400_0000u64; // where the RTL_CRITICAL_SECTION lives
+        let debug_addr = 0x0055_6677_8800_0000u64; // where the debug struct is allocated
+        let dbg = RtlCriticalSectionDebug::init(cs_addr, debug_addr);
+
+        // Sufficient size so a consumer can write through +0x28 (msvcrt) and past it.
+        assert_eq!(RtlCriticalSectionDebug::SIZE, 0x30);
+        assert!(RtlCriticalSectionDebug::SIZE >= 0x28 + 8);
+
+        // Real fields set exactly as RtlInitializeCriticalSectionEx does.
+        assert_eq!(dbg.ty, RTL_CRITSECT_TYPE);
+        assert_eq!(dbg.critical_section, cs_addr); // back-pointer
+        assert_eq!(dbg.entry_count, 0);
+        assert_eq!(dbg.contention_count, 0);
+        assert_eq!(dbg.flags_spare, 0); // the +0x28 union starts zeroed
+        // Empty LIST_ENTRY: both links point at the list head (debug_addr+0x10).
+        assert_eq!(dbg.process_locks_flink, debug_addr + 0x10);
+        assert_eq!(dbg.process_locks_blink, debug_addr + 0x10);
     }
 
     #[test]

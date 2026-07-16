@@ -545,18 +545,44 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 /// `cs` a valid writable `RTL_CRITICAL_SECTION` (40 bytes on x64).
 #[export_name = "RtlInitializeCriticalSection"]
 pub unsafe extern "system" fn rtl_initialize_critical_section(cs: *mut c_void) -> NtStatus {
-    if cs.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    // The RTL_CRITICAL_SECTION LockCount (offset 0x08 on x64, after DebugInfo) starts at -1 (free);
-    // OwningThread/RecursionCount/… start at 0. Zero the struct then set LockCount = -1.
-    // SAFETY: cs is a valid 40-byte writable RTL_CRITICAL_SECTION per the contract.
+    // Real ntdll: RtlInitializeCriticalSection → RtlInitializeCriticalSectionAndSpinCount(cs, 0).
+    // SAFETY: cs per the contract.
+    unsafe { rtl_initialize_critical_section_and_spin_count(cs, 0) }
+}
+
+/// Allocate + populate the `RTL_CRITICAL_SECTION_DEBUG` for `cs`, exactly as real ntdll's
+/// `RtlpAllocateDebugInfo` + `RtlInitializeCriticalSectionEx` do, and store its address in
+/// `cs.DebugInfo` (offset 0). Without this, consumers that deref `DebugInfo` (e.g. msvcrt's locale
+/// init writes `[DebugInfo+0x28]`) fault on the NULL pointer. On OOM leaves `DebugInfo = NULL`
+/// (honest — the real path returns STATUS_NO_MEMORY; our callers don't propagate, so a NULL is at
+/// worst the pre-fix behaviour, never a fabricated pointer). Returns the debug struct address, or 0.
+///
+/// # Safety
+/// `cs` a valid writable RTL_CRITICAL_SECTION; the process heap installed.
+#[cfg(target_arch = "x86_64")]
+unsafe fn install_cs_debug_info(cs: *mut c_void) -> u64 {
+    use nt_ntdll::sync::RtlCriticalSectionDebug;
+    // SAFETY: single-threaded loader; allocate a real, correctly-sized, zeroed debug struct.
     unsafe {
-        core::ptr::write_bytes(cs as *mut u8, 0, 40);
-        let lock_count = (cs as *mut u8).add(0x08) as *mut i32;
-        *lock_count = -1;
+        let dbg = crate::process_heap_alloc(RtlCriticalSectionDebug::SIZE);
+        if dbg.is_null() {
+            return 0;
+        }
+        core::ptr::write_bytes(dbg, 0, RtlCriticalSectionDebug::SIZE);
+        let filled = RtlCriticalSectionDebug::init(cs as u64, dbg as u64);
+        // Write the populated fields at their exact x64 offsets (dbg is 8-byte aligned from the heap).
+        core::ptr::write(dbg.add(0x00) as *mut u16, filled.ty);
+        core::ptr::write(dbg.add(0x02) as *mut u16, filled.creator_back_trace_index);
+        core::ptr::write(dbg.add(0x08) as *mut u64, filled.critical_section);
+        core::ptr::write(dbg.add(0x10) as *mut u64, filled.process_locks_flink);
+        core::ptr::write(dbg.add(0x18) as *mut u64, filled.process_locks_blink);
+        core::ptr::write(dbg.add(0x20) as *mut u32, filled.entry_count);
+        core::ptr::write(dbg.add(0x24) as *mut u32, filled.contention_count);
+        core::ptr::write(dbg.add(0x28) as *mut u64, filled.flags_spare);
+        // cs.DebugInfo @ offset 0.
+        core::ptr::write(cs as *mut u64, dbg as u64);
+        dbg as u64
     }
-    STATUS_SUCCESS
 }
 
 /// `RtlEnterCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
@@ -2237,7 +2263,16 @@ pub unsafe extern "system" fn rtl_delete_critical_section(cs: *mut c_void) -> Nt
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract.
+    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract. Free the heap-allocated
+    // DebugInfo (RtlpFreeDebugInfo) before wiping — skip NULL and the -1 NO_DEBUG_INFO sentinel.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let debug_info = core::ptr::read(cs as *const u64);
+        if debug_info != 0 && debug_info != u64::MAX {
+            crate::process_heap_free(debug_info as *mut u8);
+        }
+    }
+    // SAFETY: cs valid per the contract.
     unsafe { core::ptr::write_bytes(cs as *mut u8, 0, 40) };
     STATUS_SUCCESS
 }
@@ -2257,11 +2292,47 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_and_spin_count(
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract.
+    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract. Zero the struct, set the
+    // free-lock fields, then allocate + install a real DebugInfo (RtlInitializeCriticalSectionEx).
     unsafe {
         core::ptr::write_bytes(cs as *mut u8, 0, 40);
         *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
         *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF; // SpinCount (bit31 masked)
+        // DebugInfo @ offset 0 — allocate + populate (msvcrt & others deref it).
+        install_cs_debug_info(cs);
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION, ULONG SpinCount, ULONG Flags) -> NTSTATUS`.
+/// Ref `references/reactos/sdk/lib/rtl/critical.c:RtlInitializeCriticalSectionEx`. Same as
+/// [`rtl_initialize_critical_section_and_spin_count`] but honours the NO_DEBUG_INFO flag
+/// (`RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO = 0x01000000`) → set `DebugInfo = -1` and allocate none.
+///
+/// # Safety
+/// `cs` a valid writable RTL_CRITICAL_SECTION.
+#[export_name = "RtlInitializeCriticalSectionEx"]
+pub unsafe extern "system" fn rtl_initialize_critical_section_ex(
+    cs: *mut c_void,
+    spin_count: u32,
+    flags: u32,
+) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO: u32 = 0x0100_0000;
+    // SAFETY: cs valid per the contract.
+    unsafe {
+        core::ptr::write_bytes(cs as *mut u8, 0, 40);
+        *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
+        *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF;
+        if flags & RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO != 0 {
+            // Caller opted out of debug info: DebugInfo = LongToPtr(-1) (the NO_DEBUG sentinel).
+            core::ptr::write(cs as *mut u64, u64::MAX);
+        } else {
+            #[cfg(target_arch = "x86_64")]
+            install_cs_debug_info(cs);
+        }
     }
     STATUS_SUCCESS
 }
@@ -7209,6 +7280,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_init_string as usize,
         rtl_delete_critical_section as usize,
         rtl_initialize_critical_section_and_spin_count as usize,
+        rtl_initialize_critical_section_ex as usize,
         rtl_reallocate_heap as usize,
         rtl_expand_environment_strings_u as usize,
         rtl_open_current_user as usize,
