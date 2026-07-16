@@ -2556,6 +2556,25 @@ pub(crate) unsafe fn service_sec_image(
             // queue keyed by the event, rotate REPLY_MAIN to a fresh pool object, recv the next event
             // WITHOUT replying). The matching NtSetEvent wakes it. If the pool/queue is exhausted,
             // wait_park returns false → fall through to a normal (immediate WAIT_0) reply, never a hang.
+            // ★ WINLOGON WinMain QUIESCENCE (BATCH 18): once winlogon (pi 2) has completed its full
+            // startup — its rpcrt4 server WORKER thread reached its RPC receive loop (WL_WORKER_FAULTS
+            // > 0, i.e. it parked) — its MAIN thread's park on an UNSIGNALLED event with no live
+            // signaler (the WinMain SAS/logon wait, e.g. event 'a  ') is the terminal steady state:
+            // winlogon has reached WinMain and is now blocked waiting for interactive logon that never
+            // arrives in this headless boot. Every hosted thread is parked, so the service loop's next
+            // `recv` would block FOREVER (→ boot timeout, gate never runs). STOP the loop here so the
+            // spec gate runs + qemu_exit fires — exactly the terminal behavior the pre-fix boot got for
+            // free when winlogon faulted at comdlg32's unsnapped IAT (0x3ad64). Scoped to winlogon's
+            // main thread AT quiescence (worker already parked) so it can't mask a pre-quiescence fault
+            // or any other process's progress. Not a fault — a clean "winlogon reached WinMain" exit.
+            if park_wait_event >= 0
+                && pi == 2
+                && WL_WORKER_FAULTS.load(Ordering::Relaxed) > 0
+            {
+                print_str(b"[wl-main] winlogon reached WinMain steady-state (worker parked + main event-wait) -> QUIESCE; run gate\n");
+                stop = resume_ip;
+                break;
+            }
             if park_wait_event >= 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;

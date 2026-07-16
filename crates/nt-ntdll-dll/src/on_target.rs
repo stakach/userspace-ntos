@@ -154,6 +154,26 @@ unsafe fn rd32(base: u64, off: u64) -> u32 {
     unsafe { core::ptr::read_unaligned((base + off) as *const u32) }
 }
 
+/// Force-fault every 4 KiB page in `[start, start+len)` into the current process's VSpace by reading
+/// one byte per page (volatile so the compiler can't elide it). Used before walking a dependency's
+/// export tables: the executive demand-fills hosted DLL pages PER PROCESS, and an untouched export
+/// array/name page reads back as zeros → a silent export-walk miss. Touching first fills them.
+///
+/// # Safety
+/// `[start, start+len)` must be a reserved/mappable range in this VSpace (a mapped PE image extent).
+unsafe fn touch_range(start: u64, len: u64) {
+    // SAFETY: reads are within the dependency image's mapped extent (the export data directory lies
+    // inside the image); each read faults-and-fills the page if absent.
+    unsafe {
+        let mut p = start & !0xFFFu64;
+        let end = start + len;
+        while p < end {
+            let _ = core::ptr::read_volatile(p as *const u8);
+            p += 0x1000;
+        }
+    }
+}
+
 /// The `(virtual_address, size)` of data directory `idx` in a mapped PE at `base`.
 ///
 /// # Safety
@@ -242,21 +262,23 @@ unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
 /// dereferences a NULL command line (`strdup(GetCommandLineA())` → `strlen(NULL)`).
 ///
 /// # Safety
-/// On-target; every table entry is a mapped DLL image whose imports have been snapped.
+/// On-target; every table entry is a mapped DLL image whose imports have been snapped. `table` is a
+/// valid `*mut ModuleTable` uniquely owned by the single-threaded loader (used mutably to RE-SNAP a
+/// module's imports immediately before its DllMain — see [`attach_dfs`]).
 #[cfg(target_arch = "x86_64")]
-unsafe fn run_process_attach(table: &ModuleTable) {
+unsafe fn run_process_attach(table: *mut ModuleTable) {
     // Post-order DFS: a module's DEPENDENCIES init before it (kernel32 before advapi32 before mpr,
     // etc.). A per-base visited set dedupes diamonds + breaks cycles. The order matters: mpr's
     // DllMain calls kernel32 functions, so kernel32 must have run InitCommandLines first. Reverse
     // insertion order was WRONG (mpr-first → kernel32 uninitialized → crash).
-    let count = table.count.min(MODULE_TABLE_CAP);
-    let mut visited = [0u64; MODULE_TABLE_CAP];
-    let mut vn = 0usize;
-    // SAFETY: single-threaded loader; each table base is a mapped, snapped image.
+    // SAFETY: single-threaded loader uniquely owns `table`; each base is a mapped, snapped image.
     unsafe {
+        let count = (*table).count.min(MODULE_TABLE_CAP);
+        let mut visited = [0u64; MODULE_TABLE_CAP];
+        let mut vn = 0usize;
         let mut i = 0usize;
         while i < count {
-            let b = table.mods[i].base;
+            let b = (*table).mods[i].base;
             if b >= 0x1_0000 {
                 attach_dfs(table, b, &mut visited, &mut vn, 0);
             }
@@ -269,10 +291,11 @@ unsafe fn run_process_attach(table: &ModuleTable) {
 /// records already-attached bases (dedupe + cycle break). Skips our own ntdll (no C DllMain).
 ///
 /// # Safety
-/// On-target; `base` is a mapped, snapped PE image in this VSpace; `table` bases are mapped images.
+/// On-target; `base` is a mapped, snapped PE image in this VSpace; `table` (a `*mut ModuleTable`
+/// uniquely owned by the single-threaded loader) holds mapped images.
 #[cfg(target_arch = "x86_64")]
 unsafe fn attach_dfs(
-    table: &ModuleTable,
+    table: *mut ModuleTable,
     base: u64,
     visited: &mut [u64; MODULE_TABLE_CAP],
     vn: &mut usize,
@@ -293,7 +316,7 @@ unsafe fn attach_dfs(
         visited[*vn] = base;
         *vn += 1;
     }
-    // SAFETY: base is a mapped PE image; the import walk reads mapped headers.
+    // SAFETY: base is a mapped PE image; the import walk reads mapped headers; `table` uniquely owned.
     unsafe {
         // Walk this module's imports; for each imported DLL found in the table, recurse first.
         let (idir_rva, _sz) = data_directory(base, 1);
@@ -307,7 +330,7 @@ unsafe fn attach_dfs(
                 }
                 let mut nb = [0u8; 32];
                 let bn = import_desc_basename(base, name_rva, &mut nb);
-                let dep = table.find(&nb[..bn]);
+                let dep = (*table).find(&nb[..bn]);
                 if dep >= 0x1_0000 && dep != base {
                     attach_dfs(table, dep, visited, vn, depth + 1);
                 }
@@ -315,12 +338,26 @@ unsafe fn attach_dfs(
             }
         }
         // Skip our own ntdll (no C DllMain).
-        if is_ntdll_base(table, base) {
+        if is_ntdll_base(&*table, base) {
             return;
         }
         let epr = entry_point_rva(base);
         if epr == 0 {
             return; // resource-only DLL — nothing to run
+        }
+        // ★ RE-SNAP this module's imports RIGHT BEFORE its DllMain runs. The executive demand-fills a
+        // hosted DLL's per-process pages (headers/.rdata/.idata/IAT) lazily and from the ON-DISK PE
+        // (raw, un-snapped thunks); a page we snapped earlier (during the static import walk) can be
+        // re-faulted later in the loader and RE-FILLED from the PE, silently reverting our IAT writes
+        // (observed: comdlg32's kernel32 IAT slot held our resolved 0x803c14f0 immediately after the
+        // snap, then read back the raw 0x3ad64 by DllMain time). Re-snapping here — on the same thread,
+        // immediately before the `jmp *IAT[..]`, so the pages are freshly resident — makes the IAT the
+        // DllMain sees authoritative. `snap_module` is idempotent (re-resolves + re-writes each thunk),
+        // de-dupes loads via the table, and is cheap for an already-mapped graph.
+        let ntdll_base = (*table).find(b"ntdll");
+        if ntdll_base != 0 {
+            let mut sink = SnapResult::default();
+            snap_module(base, ntdll_base, &mut *table, &mut sink, 0);
         }
         {
             let mut mb = [0u8; 64];
@@ -373,10 +410,25 @@ unsafe fn name_eq(base: u64, name_rva: u32, want: &[u8]) -> bool {
 unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
     // SAFETY: reading the mapped export directory per the contract.
     unsafe {
-        let (edir_rva, _edir_sz) = data_directory(base, 0); // IMAGE_DIRECTORY_ENTRY_EXPORT = 0
+        let (edir_rva, edir_sz) = data_directory(base, 0); // IMAGE_DIRECTORY_ENTRY_EXPORT = 0
         if edir_rva == 0 {
             return 0;
         }
+        // ★ Force-fault the WHOLE export directory region into THIS process's VSpace before the walk.
+        // The executive demand-faults each hosted DLL page-by-page PER PROCESS; a dependency's export
+        // tables (Export Directory + AddressOfNames/Functions/NameOrdinals + the name strings — all
+        // inside the export data-directory range in PE images we host) may not yet be present in the
+        // CURRENT process's VSpace when we snap against it. An unfaulted array/name page reads back as
+        // a zero page (no synchronous fault-and-fill on read here) → `name_eq` mismatches → the walk
+        // silently returns 0 → the IAT slot is left at its raw ILT value → a later `jmp *IAT[..]` faults
+        // to a bare RVA. (Observed: comdlg32's kernel32 `GetSystemTimeAsFileTime` [name idx 458, deep in
+        // kernel32's 982-name table] resolved fine in csrss's VSpace but returned 0 in winlogon's — a
+        // pure per-VSpace demand-paging gap, NOT an export-table math bug: the direct AoNO[458]/AoF[ord]
+        // read gave the correct 0x214f0 once the page was touched.) Touching every page here forces the
+        // executive's fault router to fill them from the dependency's parsed PE, so the walk sees the
+        // real tables. This is the general fix — it makes EVERY export resolution robust against the
+        // lazy per-process fill, not just this one symbol.
+        touch_range(base + edir_rva as u64, edir_sz as u64);
         let ed = base + edir_rva as u64;
         let number_of_names = rd32(ed, 0x18);
         let addr_of_functions = rd32(ed, 0x1c) as u64; // AddressOfFunctions RVA
@@ -542,10 +594,17 @@ unsafe fn read_cstr(base: u64, rva: u32, buf: &mut [u8]) -> usize {
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_MAP_VIEW_OF_SECTION: u32 = 113;
 
-/// The largest dependency graph we resolve in one process (csrss's is tiny: ntdll + csrsrv; leave
-/// headroom for csrsrv's own deps + future ServerDlls).
+/// The largest dependency graph we resolve in one process. ★ winlogon's runtime graph is LARGE — it
+/// LoadLibrary's the crypto/UI stack (comdlg32, shell32, comctl32, wintrust, crypt32, dbghelp, …) so
+/// **55+ distinct DLLs** load in one process. The table MUST hold every loaded module: it is the
+/// dedup key (`find` → skip re-map) AND the DFS `run_process_attach` module set. At cap 32 the table
+/// OVERFLOWED — `insert` silently dropped the 33rd+ module, so `find` later returned 0 for it → the
+/// executive RE-MAPPED that DLL fresh over its VA (a new SEC_IMAGE view with a RAW, unsnapped IAT),
+/// and its `DllMain` then `jmp`ed through an unsnapped import thunk to a bare RVA (comdlg32's
+/// `GetSystemTimeAsFileTime` = 0x3ad64). Sized well above the observed 55 for headroom (csrss's tiny
+/// graph is unaffected; the cost is a larger static table + a deeper DFS `visited`/`entry_vas`).
 #[cfg(target_arch = "x86_64")]
-const MODULE_TABLE_CAP: usize = 32;
+const MODULE_TABLE_CAP: usize = 256;
 
 /// A loaded dependent module: its lowercased base name (`.dll` optional, ≤ 31 bytes) + mapped base.
 /// The image we started snapping from (the EXE, `image_base`) is seeded as entry 0; ntdll as entry 1.
@@ -708,10 +767,12 @@ unsafe fn snap_descriptor_against(
 unsafe fn export_rva_by_ordinal(base: u64, ordinal: u32) -> u32 {
     // SAFETY: reading the mapped export directory.
     unsafe {
-        let (edir_rva, _sz) = data_directory(base, 0);
+        let (edir_rva, edir_sz) = data_directory(base, 0);
         if edir_rva == 0 {
             return 0;
         }
+        // Force-fault the export dir region first (same per-VSpace lazy-fill fix as export_rva_by_name).
+        touch_range(base + edir_rva as u64, edir_sz as u64);
         let ed = base + edir_rva as u64;
         let ordinal_base = rd32(ed, 0x10);
         let number_of_functions = rd32(ed, 0x14);
@@ -1062,8 +1123,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     // CRT startup does strdup(GetCommandLineA()), which strlen(NULL)-faults without this.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped, snapped DLL images.
     unsafe {
-        let table = &*core::ptr::addr_of!(MODULE_TABLE);
-        run_process_attach(table);
+        run_process_attach(core::ptr::addr_of_mut!(MODULE_TABLE));
     }
     out
 }

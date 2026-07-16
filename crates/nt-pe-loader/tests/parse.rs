@@ -335,6 +335,150 @@ fn malformed_images_are_rejected_without_panic() {
     assert!(PeFile::parse(&b[..0x50]).is_err());
 }
 
+// --- export-directory walk (the name -> AddressOfNameOrdinals -> AddressOfFunctions indirection) --
+//
+// Regression cover for the ntdll loader export-resolution walk (nt-ntdll-dll on_target.rs mirrors
+// this exact indirection). The BATCH-18 boot bug was a per-VSpace demand-paging gap, not the math —
+// but the walk math (a HIGH name index resolved via AoNO[i] -> AoF[ord], a FORWARDER export whose
+// func RVA falls inside the export dir range, and the FIRST/LAST boundary names) is the load-bearing
+// correctness this test pins so a future edit to the indirection (off-by-one, ordinal-base, name<->
+// ordinal swap) is caught host-side. Modeled on the real kernel32 case that regressed:
+// GetSystemTimeAsFileTime at a high name index resolving to a concrete .text RVA.
+#[test]
+fn export_directory_walk_resolves_high_index_forwarder_and_boundaries() {
+    // Build a .edata section holding a synthetic IMAGE_EXPORT_DIRECTORY with N names. We deliberately
+    // make the WANTED name a HIGH index (like kernel32's GetSystemTimeAsFileTime @ name-index 458) and
+    // give AddressOfNameOrdinals a non-identity permutation so a name<->ordinal or ordinal-base bug
+    // would mis-resolve. One export is a FORWARDER (its func RVA points INSIDE the export dir range).
+    const EDATA_VA: u32 = 0x2000;
+    const N: u32 = 300; // > 256 so a u8/u16 index bug surfaces; "high index" like the real case
+    const HIGH: u32 = 199; // the name index we assert resolves correctly (deep in the table)
+
+    // Section-local layout (all RVAs = EDATA_VA + local):
+    //   0x00                 IMAGE_EXPORT_DIRECTORY (40 bytes)
+    //   0x28                 AddressOfFunctions   [N] u32
+    //   0x28 + N*4           AddressOfNames       [N] u32
+    //   0x28 + N*8           AddressOfNameOrdinals[N] u16
+    //   names_start          the NUL-terminated name strings
+    //   fwd_str              a forwarder target string "OTHER.Func" (inside the dir range)
+    let aof_local = 0x28u32;
+    let aon_local = aof_local + N * 4;
+    let aono_local = aon_local + N * 4;
+    let names_local = aono_local + N * 2;
+
+    let mut sec = vec![0u8; names_local as usize];
+
+    // Emit the name strings; record each name's local offset. name[i] = "exp<i>", except:
+    //   HIGH -> "GetSystemTimeAsFileTime" (the marquee high-index case)
+    //   0    -> "AFirst" (first boundary)
+    //   N-1  -> "ZLast"  (last boundary)
+    //   1    -> "FwdExport" (a forwarder)
+    let mut name_local = Vec::with_capacity(N as usize);
+    let mut cur = names_local as usize;
+    let push_name = |sec: &mut Vec<u8>, cur: &mut usize, s: &[u8]| -> u32 {
+        let at = *cur as u32;
+        sec.extend_from_slice(s);
+        sec.push(0);
+        *cur = sec.len();
+        at
+    };
+    for i in 0..N {
+        let s: Vec<u8> = match i {
+            0 => b"AFirst".to_vec(),
+            1 => b"FwdExport".to_vec(),
+            HIGH => b"GetSystemTimeAsFileTime".to_vec(),
+            x if x == N - 1 => b"ZLast".to_vec(),
+            _ => {
+                let mut v = b"exp".to_vec();
+                v.extend_from_slice(i.to_string().as_bytes());
+                v
+            }
+        };
+        name_local.push(push_name(&mut sec, &mut cur, &s));
+    }
+    // The forwarder target string lives INSIDE the export dir range so it classifies as a forwarder.
+    let fwd_str_local = {
+        let at = sec.len() as u32;
+        sec.extend_from_slice(b"OTHER.Func");
+        sec.push(0);
+        at
+    };
+    let edata_size = sec.len() as u32; // the export data-directory size (dir range = [VA, VA+size))
+
+    // AddressOfFunctions: give each ordinal a distinct, checkable RVA in .text (0x1000-based), EXCEPT
+    // the forwarder ordinal whose "RVA" points at fwd_str_local (inside the dir range).
+    // AddressOfNameOrdinals: a NON-identity map (ordinal = N-1-i) so an identity assumption fails.
+    let text_rva = |ord: u32| 0x1000 + ord * 0x10; // concrete export RVA for ordinal `ord`
+    for i in 0..N {
+        let ord = N - 1 - i; // non-identity permutation
+        // AddressOfNames[i] = the name-string RVA.
+        put_u32(&mut sec, (aon_local + i * 4) as usize, EDATA_VA + name_local[i as usize]);
+        // AddressOfNameOrdinals[i] = ord (u16).
+        put_u16(&mut sec, (aono_local + i * 2) as usize, ord as u16);
+    }
+    // AddressOfFunctions[ord] for every ordinal.
+    for i in 0..N {
+        let ord = N - 1 - i;
+        let func_rva = if i == 1 {
+            // the "FwdExport" name maps (via AoNO) to ordinal `ord`; make THAT ordinal a forwarder.
+            EDATA_VA + fwd_str_local
+        } else {
+            text_rva(ord)
+        };
+        put_u32(&mut sec, (aof_local + ord * 4) as usize, func_rva);
+    }
+
+    // IMAGE_EXPORT_DIRECTORY header.
+    put_u32(&mut sec, 16, 5); // Base (ordinal base) — deliberately != 0/1 to catch a base bug
+    put_u32(&mut sec, 20, N); // NumberOfFunctions
+    put_u32(&mut sec, 24, N); // NumberOfNames
+    put_u32(&mut sec, 28, EDATA_VA + aof_local); // AddressOfFunctions
+    put_u32(&mut sec, 32, EDATA_VA + aon_local); // AddressOfNames
+    put_u32(&mut sec, 36, EDATA_VA + aono_local); // AddressOfNameOrdinals
+
+    let edata = Sec {
+        name: *b".edata\0\0",
+        va: EDATA_VA,
+        chars: 0x4000_0040, // INITIALIZED_DATA | READ
+        data: sec,
+    };
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x4000,
+        &[text_section(0x1000, vec![0x90, 0xC3]), edata],
+        &[(0, EDATA_VA, edata_size)], // data dir 0 = export, size = the dir range
+    );
+
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    let exports = pe.exports().unwrap();
+    let find = |name: &str| exports.iter().find(|e| e.name == name).cloned();
+
+    // High-index name resolves to the concrete RVA of ITS ordinal (via the non-identity AoNO map).
+    let gst = find("GetSystemTimeAsFileTime").expect("high-index export must be found");
+    let gst_ord = N - 1 - HIGH; // AoNO[HIGH]
+    assert_eq!(gst.rva, 0x1000 + gst_ord * 0x10, "high-index func RVA via AoNO/AoF");
+    assert_eq!(gst.ordinal, 5u16.wrapping_add(gst_ord as u16), "ordinal = base + AoNO index");
+
+    // Boundary names (first + last in the name array) resolve correctly.
+    let first = find("AFirst").expect("first export"); // name index 0 -> ordinal N-1
+    assert_eq!(first.rva, 0x1000 + (N - 1) * 0x10);
+    let last = find("ZLast").expect("last export"); // name index N-1 -> ordinal 0
+    assert_eq!(last.rva, 0x1000);
+
+    // The forwarder export is present; its RVA is inside the export-dir range (a forwarder string),
+    // NOT a concrete .text RVA — the on-target resolver follows it, but the parser reports the RVA.
+    let fwd = find("FwdExport").expect("forwarder export");
+    assert!(
+        fwd.rva >= EDATA_VA && fwd.rva < EDATA_VA + edata_size,
+        "forwarder RVA {:#x} must fall inside the export dir range [{:#x},{:#x})",
+        fwd.rva, EDATA_VA, EDATA_VA + edata_size
+    );
+
+    // Every one of the N names resolved (no silent drop at a high index / boundary).
+    assert_eq!(exports.len(), N as usize, "all names resolved");
+}
+
 // --- fuzz-safety: parsing arbitrary / mutated bytes never panics (spec §7.2) --
 
 use proptest::prelude::*;

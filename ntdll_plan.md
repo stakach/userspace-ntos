@@ -1870,3 +1870,77 @@ The `RtlRaiseException` int3 is **GONE**. `NtMapViewOfSection ntdll_vista -> bas
 
 ### How far winlogon got + the NEW wall
 The gdi32+0x3f0cc wall is GONE. `[w32disp] win32k-internal unbacked low VA 0x02000000 -> zero-fill`, then `SSN 0x106c -> status=0x00050045` (a real bitmap handle, SUCCESS-range — NOT the 0xc0000001 wall). winlogon then issues MORE win32k GDI calls — SSN ring extended `…4:4204 0:27 4:4277 0:129 4:4157 0:12 4:4157 0:27 4:4276 0:190` (new NtGdi SSNs **0x10b5/0x103d×2/0x10b4** = stock-object + cursor GDI init; win32k prints `SYSTEMCUR(ARROW) == NULL` — the system arrow cursor isn't loaded yet). winlogon now parks in **`user32+0x9f327`** (`[batch10]` RIP samples = 0x801ef327; user32 @0x80150000) — a user32 client-init frontier PAST gdi32 process-attach (inside `CreateWindowStationAndDesktops`'s window-class/cursor setup). **Gate held identical 150 PASS / 98 FAIL**, kernel "All specs passed!", host green (nt-ntdll 165). **NEXT FRONTIER: user32+0x9f327 — winlogon's user32 per-process window-class/cursor init (the `SYSTEMCUR(ARROW) == NULL` hints the system cursor/class registration needs servicing). Diagnose-first (disasm user32+0x9f327 + trace which NtUser call it stops short of / what it waits on). Likely a win32k NtUserGetSystemCursor / class-registration / a shared value the connect left unset.** Remaining path to paint: user32 window-class/cursor init → winlogon WinMain → InitializeSAS → StartServicesManager (services.exe) + StartLsass (lsass) → SwitchDesktop → the 0x003a6ea5 desktop paint.
+
+---
+
+## BATCH 18 Results — the comdlg32 export-resolution wall (DIAGNOSE-FIRST, landed 2026-07-17)
+
+**Symptom (from BATCH 17):** winlogon parks at bare RVA `0x3ad64` after `comdlg32.dll`'s DllMain runs
+(`[vmf-out] fsr=20 err=0x14` user-instr-fetch). `0x3ad64` = comdlg32's IAT slot for its 65th kernel32
+import `GetSystemTimeAsFileTime` (name index 458 in kernel32's 982-name export table) left at its RAW
+`IMAGE_IMPORT_BY_NAME` RVA — an unsnapped thunk `jmp *IAT[..]` into a bare RVA.
+
+### THE DIAGNOSIS — three distinct root causes, each evidenced (not the initial "export-walk math bug" hypothesis)
+The export-table MATH is CORRECT (proven offline AND on-target: `RET ord=0x1ca(458) func=0x214f0`;
+`name_eq` matches at i=458). The wall was NOT a name/ordinal/forwarder walk bug. It was THREE loader
+bugs stacked, each pinned with on-target dumps:
+
+1. **Per-VSpace demand-paging gap in the export walk.** The executive demand-faults each hosted DLL's
+   pages PER PROCESS. When comdlg32 was snapped against kernel32 IN WINLOGON's VSpace, kernel32's
+   export name-array / name-string pages weren't resident yet → the walk read a ZERO page → `name_eq`
+   mismatched → `export_rva_by_name` returned 0 → the IAT slot was counted `missing` + left RAW.
+   (Evidence: `GSTAFT img=0x81920000 … addr=0x0` for comdlg32 but `addr=0x803c14f0` for the SAME
+   kernel32 in other VSpaces; a direct `AoNO[458]/AoF[ord]` probe read the correct `0x214f0` once the
+   page was touched.) **FIX:** `touch_range(export_dir)` — force-fault the whole export data-directory
+   region (dir + AoF/AoN/AoNO + name strings all lie inside it) before the walk, in BOTH
+   `export_rva_by_name` and `export_rva_by_ordinal`. General fix: makes EVERY export resolution robust
+   against the lazy per-process fill.
+
+2. **`MODULE_TABLE_CAP` overflow (32 → 256).** winlogon's runtime graph loads **55+ distinct DLLs**
+   (comdlg32/shell32/comctl32/wintrust/crypt32/dbghelp/…). At cap 32 the loader's module table
+   OVERFLOWED — `insert` silently dropped the 33rd+ module, so `find` later returned 0 for it → the
+   executive RE-MAPPED that DLL fresh over its VA (a new SEC_IMAGE view with a RAW, unsnapped IAT).
+   comdlg32 was re-mapped 3× (2 static-snapped + 1 raw), and the raw one's DllMain ran.
+   **FIX:** raise the cap to 256 (well above 55) so every module dedups + snaps once.
+
+3. **Snapped IAT pages REVERT (the load-bearing one).** Even with (1)+(2), comdlg32's IAT slot held
+   our resolved `0x803c14f0` immediately after the snap (readback proved it) but READ BACK the RAW
+   `0x3ad64` by DllMain time — the executive re-faulted comdlg32's IAT page and RE-FILLED it from the
+   on-disk PE (raw thunks), silently reverting our writes. **FIX:** RE-SNAP a module's imports in
+   `attach_dfs` RIGHT BEFORE its DllMain runs (on the same thread, pages freshly resident) so the IAT
+   the DllMain sees is authoritative. `snap_module` is idempotent + table-deduped → cheap.
+
+### Host test (captures the walk math the bug touched)
+`crates/nt-pe-loader/tests/parse.rs::export_directory_walk_resolves_high_index_forwarder_and_boundaries`:
+a synthetic export directory with a **HIGH name index** (like the real 458), a **non-identity**
+AddressOfNameOrdinals permutation, a non-trivial **ordinal Base (5)**, a **forwarder** (func RVA inside
+the export dir range), and **first/last boundary** names — asserts each resolves to the correct RVA +
+ordinal. Pins the name→AoNO→AoF indirection so an off-by-one / base / name↔ordinal swap is caught
+host-side. `cargo test -p nt-pe-loader` = 12 (parse 9 incl. this), `nt-ntdll` = 165, all green.
+
+### The NEW wall + the executive quiescence exit (so the gate still runs)
+With the fix, comdlg32's DllMain COMPLETES and winlogon advances DRAMATICALLY past it: it runs its
+real CRT/WinMain init, **spawns its real rpcrt4 server WORKER thread** (tid 15, real ETHREAD+TEB),
+reaches its RPC receive loop, and its MAIN thread parks on an UNSIGNALLED WinMain SAS/logon event
+(`NtWaitForSingleObject event #26 'a  '`) — the genuine "reached WinMain, waiting for interactive
+logon" steady state. With every hosted thread parked, the executive service loop's next `recv` blocked
+FOREVER → boot TIMED OUT → the spec gate never ran (a regression). **FIX (executive-side,
+`service_sec_image.rs`):** when winlogon (pi 2) parks on an unsignalled event AND its worker has
+already parked (`WL_WORKER_FAULTS > 0`), treat it as WinMain QUIESCENCE and STOP the loop → the gate
+runs + qemu_exit fires (mirrors the terminal behavior the pre-fix boot got for free when winlogon
+faulted at 0x3ad64). Scoped to winlogon-main-at-quiescence so it can't mask an earlier fault.
+
+### Result
+`0x3ad64` fault GONE. Boot exits cleanly (no timeout). **Gate 150 → 155 PASS / 22 FAIL — NO
+regressions, 5 newly passing** (`exec_general_nt_create_thread`, `exec_kbd_layout_opened`,
+`exec_rpc_listener_thread_real`, `exec_winlogon_rpc_pipe`, `exec_winlogon_worker_multiplex`).
+NO rust-micro/src (kernel) change — ntdll (`on_target.rs`) + executive (`service_sec_image.rs`) + a
+host test only.
+
+### Remaining path to paint
+winlogon now quiesces at its WinMain SAS-wait BEFORE driving StartServicesManager (services.exe) /
+StartLsass (lsass) / SwitchDesktop. To reach the `0x003a6ea5` desktop paint, winlogon must be driven
+PAST the SAS wait — the "N threads per process" multiplex frontier (route the worker's RPC receive +
+signal the events winlogon's main waits on) so WinMain proceeds to InitializeSAS → StartServicesManager
+→ StartLsass → SwitchDesktop → co_IntShowDesktop → IntPaintDesktop. `exec_services_spawned`,
+`exec_lsass_spawned`, `exec_win32k_desktop_painted` remain FAIL (as they were pre-fix) pending that.
