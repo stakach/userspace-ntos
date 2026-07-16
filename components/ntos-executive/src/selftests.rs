@@ -11,11 +11,11 @@ use crate::*;
 /// Returns a bitmask of proven properties (all set = 0b11_1111 = the mechanism works). This is the
 /// reclamation MECHANISM the coordinator asked to prove before (optionally) applying it live.
 ///
-/// `RECLAIM_VA`: an unused page of smss's 8-PT demand-fill scratch span (0x…1100_0000..0x…1200_0000,
-/// mapped into the executive's OWN VSpace); smss faulted ~136 pages (offsets < 0x9_0000), so page
-/// 3000 (offset 0xBB8_000) is free + its PT exists → a safe, isolated frame-map/unmap target.
+/// `RECLAIM_VA`: an unused page of smss's demand-fill scratch window (`SMSS_SCRATCH_BASE`, 16 PTs =
+/// 8192 pages, mapped into the executive's OWN VSpace); smss faulted ~136 pages (offsets < 0x9_0000),
+/// so page 3000 (offset 0xBB8_000) is free + its PT exists → a safe, isolated frame-map/unmap target.
 pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
-    const RECLAIM_VA: u64 = 0x0000_0100_1100_0000 + 3000 * 0x1000;
+    const RECLAIM_VA: u64 = SMSS_SCRATCH_BASE + 3000 * 0x1000;
     let mut ok = 0u64;
 
     // (bit0) Carve a THROWAWAY child untyped — 2^16 = 64 KiB (room for ~16 x 4 KiB frames) — out of
@@ -266,7 +266,7 @@ pub(crate) unsafe fn alpc_cross_vspace_selftest() -> u64 {
     // (base + 3000*0x1000, PT index 5) — offsets 3001..3003 share that resident PT, so mapping a
     // fresh frame there succeeds (a page_map to an absent PT would silently fail → the executive
     // would then fault writing the trampoline; staying in the proven PT avoids that).
-    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
+    const SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE;
     let write_scratch_a = SCRATCH_BASE + 3001 * 0x1000;
     let write_scratch_b = SCRATCH_BASE + 3002 * 0x1000;
     let win_va = SCRATCH_BASE + 3003 * 0x1000;

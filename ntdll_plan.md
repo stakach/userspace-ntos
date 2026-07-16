@@ -2151,3 +2151,77 @@ lsass's per-fault cost / lift the iters cap once lsass's work is bounded, then w
 Residual FAILs = the LSA/SCM/paint frontier (`exec_lsass_lsa_init_running`, `exec_lsass_signals_lsa_rpc_active`,
 `exec_services_named_events`, `exec_win32k_desktop_painted`). Diagnostics retained (fire once at stop):
 `[wl-ring]` (winlogon's isolated SSN sequence), `[wl-190]` (hard-error arg decode), `[wl-createproc]`.
+
+## ☑ BATCH 22 Results — the demand-fault PERF FIX (batch bulk-fill + scratch-VA decoupling via widened per-process windows) → boot ~3× faster, lsass pages 2× deeper, winlogon PARKS on `lsa_rpc_server_active`; gate 164 → 165 (landed 2026-07-17)
+
+**Task:** the binding constraint was BOOT-TIME BUDGET, not walls — under QEMU TCG each demand fault is a
+full fault-EP round-trip (~4/s), so a big DLL image page-by-page dominated; lsass's LSA-init DLL tree
+ran past the 500s timeout (exit 124). Cut the fault ROUND-TRIP count so lsass fits in budget → drive it
+toward `LSA_RPC_SERVER_ACTIVE` → winlogon `WaitForLsass` → the paint.
+
+### THE PERF FIX (three coupled executive-side changes; NO rust-micro/src kernel change)
+1. **BATCH bulk-fill** (`service_sec_image.rs`): on an image page fault, fill+map a forward RUN of up to
+   `BATCH_PAGES=4` consecutive same-image pages (bounded by the containing image's extent: main image →
+   `img_end`; a registered DLL → `base + image_size`; ntdll → `nt_end`) in the ONE fault round-trip.
+   Every extra page is filled EXACTLY as its own demand fault would (same `fill_image_page`/rights/
+   cache/mirror/`filled_pages` bookkeeping) — pure correctness preservation — so the process finds the
+   next pages already present and does NOT re-fault them. Extra pages are pre-mapped only when provably
+   unmapped in this process (per-process page not in `filled_pages`; shared page not in `dll_cache`) so
+   we never double-map; per-process pre-fill stops once `filled_pages` (256) is exhausted (past that a
+   page's mapped-state is unknowable → a re-map would fail harmlessly with map=8 but waste a frame). The
+   FAULTING page (bi==0) keeps the full original logic incl. the shared-cache HIT path.
+2. **Widened + re-spaced per-process demand-scratch windows** (`main.rs`): each fresh fill takes a UNIQUE
+   monotonic scratch slot (`scratch_base + faults*0x1000`) — seL4 records the mapping on the frame OBJECT,
+   so a slot can't be reused without an unmap; unique slots are the proven model (a throwaway-copy +
+   CNodeDelete transient-slot scheme was TRIED and REVERTED — it hit `seL4_DeleteFirst` because the frame
+   object was double-mapped). The old scheme packed all 5 processes into one 8-PT span (0x1100..0x1200)
+   with ~512-page inter-process spacing — far too tight now that lsass pages in thousands. Each process
+   now gets its OWN 64 MiB window (`SMSS_SCRATCH_BASE = 0x…_2100_0000` + k×`DEMAND_SCRATCH_WINDOW`
+   0x400_0000) in the free high VA region PAST the executive heap (`allocator::HEAP_BASE=0x2000_0000`,
+   2 MiB) and every other mapping, inside the first 1 GiB PD (0..0x4000_0000, already present). PTs mapped
+   per-window at spawn via new `map_demand_scratch_pts` (16 PTs = 8192 pages > `FAULT_CAP`). ★ ROOT CAUSE
+   of an intermediate spin: the first window base 0x2000_0000 COLLIDED with the executive's own heap →
+   every scratch map failed `DeleteFirst` → the fill wrote to stale memory → the process re-faulted the
+   same page forever (60000 map-fails). Fixed by relocating the base past the heap.
+3. **`FAULT_CAP` 2000→6000 + iters backstop 5000→60000** (`service_sec_image.rs`): the per-process fault
+   backstop is now a frame-budget/runaway guard (not a scratch limit — scratch bounded by the 16-PT
+   window), sized so lsass's full LSA-init tree fits; the iters cap is lifted because the per-page cost is
+   bounded. `selftests.rs` RECLAIM_VA / the ALPC-cross-vspace scratch re-pointed to `SMSS_SCRATCH_BASE`
+   (the old 0x1100 span is no longer mapped).
+
+### RESULT — measured (baseline c193889 vs BATCH 22)
+| metric | baseline | BATCH 22 |
+|---|---|---|
+| boot wall (in-budget, exit 3) | ~106 s | ~35 s @5000 iters / ~130 s running the full deeper boot |
+| lsass demand-faulted pages | 331 | **501–772** (run-variant; 2× deeper into LSA init) |
+| winlogon pages | 969 | 1365–1788 |
+| shared_frames / shared_hits | 500 / 349 | 1084 / 616 |
+| gate | 164/98 | **165/98** (+`exec_winlogon_rpc_pipe`) |
+| winlogon end-state | parked mid user32 init | **PARKS on `lsa_rpc_server_active` (WaitForLsass), then QUIESCE** |
+| map-fail spam | 0 | 0 (after the >256 pre-fill guard) |
+
+The batch cut per-page round-trips ~3× (boot 106s→35s at the same 5000-iter cap); with the iters cap then
+lifted, the deeper boot runs the full 5-process bring-up in ~130s (well under 500s). No correctness
+regression — every process still reaches (in fact PAST) its prior frontier. nt-ntdll host tests unchanged
+green (167 + nt-syscall-abi 12). Executive-side only (no rust-micro/src). ⚠ SEL4 LESSON: a page frame's
+mapping is tracked on the frame OBJECT — a slot can't be reused without an explicit unmap, and mapping the
+same object at two VAs via cap copies works ACROSS VSpaces (scratch + process) but a second map in the
+SAME VSpace fails DeleteFirst; unique monotonic scratch slots are the proven pattern.
+
+### NEXT WALL (the LSA/paint frontier — a multi-wall grind) — the boot QUIESCES naturally (exit 3)
+With the budget no longer the constraint, the boot now advances to a NATURAL quiesce: winlogon reaches
+WinMain steady-state and **PARKS on the `lsa_rpc_server_active` named event** (the Checkpoint-B reply-cap
+park — exactly the WaitForLsass wait), and all threads park. lsass spawns + runs its ntdll loader + gets
+lsasrv/samsrv DEMAND-LOADED, but its MAIN thread (like services) enters a REPETITIVE win32k call loop in
+its user32 DllMain — `8:4157`/`8:4276` (NtUserFindExistingCursorIcon + a sibling NtUser), the same
+non-interactive-process cursor/class-init loop BATCH 16/17 hit for winlogon (`SYSTEMCUR(ARROW)==NULL`).
+These SSNs are SERVICED (no WALL), but the loop never completes for a non-GUI process → lsass never
+reaches lsasrv's `LsaInitializeRpcServer` → never `SetEvent(lsa_rpc_server_active)` → winlogon stays
+parked. Residual FAILs unchanged: `exec_lsass_lsa_init_running`, `exec_lsass_signals_lsa_rpc_active`,
+`exec_services_named_events`, `exec_win32k_desktop_painted`. **NEXT (a diagnose-first multi-wall grind, the
+frontier): break lsass's (+ services') user32-DllMain win32k cursor/class loop** — determine what the
+loop polls (a class/cursor that never registers for a non-interactive winstation) and either satisfy it or
+park lsass's main thread past it (like the winlogon user32 init unblock) so lsass runs on to lsasrv's LSA
+init → `LSA_RPC_SERVER_ACTIVE` → winlogon's parked WaitForLsass wakes → `InitializeSAS → SwitchDesktop →
+co_IntShowDesktop → IntPaintDesktop → the 0x003a6ea5 paint`. The win32k paint machinery + the WaitForLsass
+wake plane already EXIST (reuse). The perf fix is the coherent committed terminus of BATCH 22.

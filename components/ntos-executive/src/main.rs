@@ -605,28 +605,36 @@ pub const FRAMEBUFBUF_FRAMES: u64 = 8;
 /// Fault-endpoint badge for the second hosted process (csrss). smss's fault cap is an unbadged
 /// copy (badge 0); csrss's is minted at this badge so the single service loop can tell them apart.
 pub const CSRSS_BADGE: u64 = 2;
-/// csrss's demand-fault scratch region in the executive's VSpace — a non-overlapping window inside
-/// smss's already-mapped 8-PT scratch range (smss uses [0x1_1100_0000 .. +256 pages]; PT k=4 backs
-/// this), so no extra page tables are needed.
-pub const CSRSS_SCRATCH_BASE: u64 = 0x0000_0100_1180_0000;
+// ★ BATCH 22 demand-fault scratch layout. The old scheme packed all 5 processes' scratch into the
+// single 8-PT span 0x1100..0x1200 with ~512-page inter-process spacing — too tight now that the
+// BATCH bulk-fill lets a process (lsass) page in its full LSA-init DLL tree (thousands of pages;
+// each fill takes a UNIQUE monotonic scratch slot). Each process now gets its OWN 64 MiB window
+// (0x400_0000 = 16384 pages, well above FAULT_CAP) in the free high VA region past all other
+// executive mappings (POOL_VADDR 0x1500, SRVBUF 0x1400, win32k pools 0x0A00 — all far below
+// 0x2000). Their page tables are mapped per-window at spawn (see `map_demand_scratch_pts`).
+pub const DEMAND_SCRATCH_WINDOW: u64 = 0x0400_0000; // 64 MiB per process
+// Base sits PAST the executive's own heap (`allocator::HEAP_BASE` = 0x2000_0000, 2 MiB) and every
+// other executive mapping, and the 5 × 64 MiB windows (→ 0x3500_0000) stay inside the first 1 GiB
+// page directory (0..0x4000_0000, already present — the heap + old scratch PTs live in it), so
+// `map_demand_scratch_pts` needs to create only PTs, not a fresh PD/PDPT.
+pub const SMSS_SCRATCH_BASE: u64 = 0x0000_0100_2100_0000;
+/// csrss's demand-fault scratch window (own 64 MiB, PTs mapped at spawn).
+pub const CSRSS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the THIRD hosted process (winlogon). Distinct from smss (0) + csrss (2).
 pub const WINLOGON_BADGE: u64 = 4;
-/// winlogon's demand-fault scratch — PT 6 of smss's already-mapped 8-PT scratch range
-/// (0x1100..0x1200); smss uses PT 0 (0x1100), csrss PT 4 (0x1180). PT 6 (0x11C0) is clear of both
-/// (csrss realistically uses < 0x40 PTs of headroom), so no extra page tables are needed.
-pub const WINLOGON_SCRATCH_BASE: u64 = 0x0000_0100_11C0_0000;
+/// winlogon's demand-fault scratch window (own 64 MiB).
+pub const WINLOGON_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 2 * DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the FOURTH hosted process (services.exe). Distinct from smss (0) /
 /// csrss (2) / winlogon (4).
 pub const SERVICES_BADGE: u64 = 6;
-/// services.exe's demand-fault scratch — PT 2 of smss's already-mapped 8-PT scratch range
-/// (0x1100..0x1200); PT0 smss / PT4 csrss / PT6 winlogon → PT2 (0x1140) is free + pre-mapped.
-pub const SERVICES_SCRATCH_BASE: u64 = 0x0000_0100_1140_0000;
+/// services.exe's demand-fault scratch window (own 64 MiB).
+pub const SERVICES_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 3 * DEMAND_SCRATCH_WINDOW;
 /// Fault-endpoint badge for the FIFTH hosted process (lsass.exe). Distinct from smss(0)/csrss(2)/
 /// winlogon(4)/services(6)/SVC_LISTENER(7).
 pub const LSASS_BADGE: u64 = 8;
-/// lsass.exe's demand-fault scratch — PT 3 of smss's already-mapped 8-PT scratch range
-/// (0x1100..0x1200); PT0 smss / PT2 services / PT4 csrss / PT6 winlogon → PT3 (0x1160) is free.
-pub const LSASS_SCRATCH_BASE: u64 = 0x0000_0100_1160_0000;
+/// lsass.exe's demand-fault scratch window (own 64 MiB) — sized so lsass's full LSA-init DLL tree
+/// (lsasrv/samsrv/msv1_0 + deps) can page in without overflowing into a neighbour's scratch.
+pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDOW;
 /// Upper bound on the number of hosted-process slots (process index `pi`) the executive's fixed-size
 /// per-process arrays are sized for. The 5 current processes (smss/csrss/winlogon/services/lsass =
 /// pi 0..4) are live; the extra headroom is for the post-login processes (userinit, explorer, the
@@ -1206,6 +1214,17 @@ unsafe fn make_object(obj: u64) -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, obj, 0, 1, s);
     s
+}
+/// Map the page tables backing one hosted process's 64 MiB demand-fault scratch window
+/// (`*_SCRATCH_BASE`) in the executive's own VSpace. Each demand fill takes a UNIQUE monotonic
+/// scratch slot within this window (`scratch_base + faults*0x1000`), so it must cover FAULT_CAP
+/// pages; 16 PTs = 8192 pages > FAULT_CAP (6000). Called once per process at spawn.
+pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
+    for k in 0..16u64 {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, base + k * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+    }
 }
 // --- ITEM 2b: seL4 MECHANISM teardown (reclamation) invocations, SYS_CALL so they RETURN the error
 // label (0 = success). `TCBSuspend`=12 / `CNodeDelete`=23 (kernel InvocationLabel). CNodeDelete on a
@@ -6803,21 +6822,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", smss_ldrp_rva);
                     // Demand-fault scratch: each filled image/ntdll page keeps a persistent
                     // executive mapping (indexed by fill order, for syscall copy-out to smss pages),
-                    // so the region grows one page per fault. The old 0x6C scratch shared the FILEBUF
-                    // PT and collided with the env buffer at 0x74 after ~128 faults — smss runs far
-                    // deeper into ntdll now, so give it an ISOLATED range with its own page tables
-                    // (8 PTs = 4096 pages) that can't collide with any other executive mapping.
-                    const SCRATCH_BASE: u64 = 0x0000_0100_1100_0000;
-                    for k in 0..8u64 {
-                        let pt = alloc_slot();
-                        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-                        let _ = paging_struct_map(
-                            pt,
-                            LBL_X86_PAGE_TABLE_MAP,
-                            SCRATCH_BASE + k * 0x20_0000,
-                            CAP_INIT_THREAD_VSPACE,
-                        );
-                    }
+                    // so the region grows one page per fault. BATCH 22: smss now uses its own 64 MiB
+                    // demand-scratch window (SMSS_SCRATCH_BASE) with 16 pre-mapped PTs, matching the
+                    // widened per-process layout — clear of every other executive mapping.
+                    const SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE;
+                    map_demand_scratch_pts(SCRATCH_BASE);
                     // The demand-fault router fills ntdll's pages from THIS PE — pass OUR ntdll when
                     // substituting so smss's ntdll pages (incl. OUR LdrpInitialize .text) fault in
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).

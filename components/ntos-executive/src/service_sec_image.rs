@@ -24,6 +24,10 @@ pub(crate) unsafe fn service_sec_image(
     };
     let mut verdict = 0u64;
     let mut faults = 0u64;
+    // Per-process demand-fault backstop (see the use sites). BATCH-22: raised from 2000 now that the
+    // persistent scratch VA is decoupled from this count (bounded ≤256 slots) — it's a frame-budget /
+    // runaway guard only, sized to let lsass's full LSA-init DLL tree page in within the frame pool.
+    const FAULT_CAP: u64 = 6000;
     let mut first = 0u64;
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
@@ -341,7 +345,14 @@ pub(crate) unsafe fn service_sec_image(
         // and the specs (incl. exec_services_spawned) run; services' full SCM bring-up is the next
         // batch's frontier. Backstop only — each process still PROGRESSES (advancing faults), not
         // spinning (verified: cr2 sweeps the whole DLL space at the loader's snap RIP, never repeats).
-        if iters > 5000 {
+        // BATCH 22: the demand-fault BATCH bulk-fill (fill a run of consecutive same-image pages per
+        // fault-EP round-trip) + the scratch-VA decoupling cut the per-page round-trip cost ~3× (boot
+        // 106s→~35s @5000 iters). With the per-process fault cost now bounded (FAULT_CAP + batching),
+        // the iters backstop is lifted so lsass's full LSA-init DLL tree (lsasrv/samsrv/msv1_0 + deps)
+        // can grind to LSA_RPC_SERVER_ACTIVE inside the 500s TCG budget → winlogon WaitForLsass wake →
+        // InitializeSAS → SwitchDesktop → the 0x003a6ea5 paint. Still a runaway backstop, not the
+        // functional terminus.
+        if iters > 60000 {
             stop = m1;
             break;
         }
@@ -873,78 +884,153 @@ pub(crate) unsafe fn service_sec_image(
                 stop = addr; // outside both images (unresolved / null deref) — stop safely
                 break;
             };
-            if faults >= 2000 {
+            // Per-process demand-fault backstop. With the BATCH-22 scratch-VA decoupling (persistent
+            // scratch bounded to ≤256 slots regardless of this count) this is now purely a
+            // frame-budget / runaway guard, not a scratch limit — raised so lsass's full LSA-init DLL
+            // tree (lsasrv/samsrv/msv1_0 + deps, thousands of pages) fits.
+            if faults >= FAULT_CAP {
                 stop = addr;
                 break;
             }
-            let rva = (page - base) as u32;
-            // SHAREABLE = a registered DLL's executable text (not the per-process main image at
-            // PE_LOAD_BASE, and an RX page). Such a page is byte-identical across processes (each DLL
-            // is loaded at a fixed base + pre-relocated), so it's filled ONCE into a frame and that
-            // frame is mapped READ-ONLY (RX) into every process that faults it — real image sharing.
-            let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
-            let cached = if shareable { dll_cache_get(page) } else { 0 };
-            let (frame, rights) = if cached != 0 {
-                DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
-                (cached, 2u64) // shared text → RX, no fill, no fresh frame
+            // ★ BATCH BULK-FILL (BATCH 22 perf fix): under QEMU TCG each demand fault is a full
+            // fault-EP round-trip (~4/s), so a big DLL image page-by-page dominates the boot budget
+            // (lsass' LSA-init DLL tree ran past the 500s timeout). Instead of filling ONLY the
+            // faulting page, fill+map a forward RUN of consecutive same-image pages in this one
+            // round-trip. Every extra page is filled EXACTLY as its own demand fault would (same
+            // fill_image_page/rights/cache/mirror/filled_pages bookkeeping) — pure correctness
+            // preservation — so when the process resumes it finds the next pages already present and
+            // does NOT re-fault them. This cuts the per-process round-trip count by ~BATCH×.
+            //
+            // The `end` bound is the containing image's extent (main image → img_end; a registered
+            // DLL → base + image_size; ntdll → nt_end). Extra pages are only PRE-filled when they are
+            // genuinely unmapped in THIS process — a per-process page not yet in `filled_pages`, and a
+            // shared-text page not yet in the global `dll_cache` — so we never double-map. The
+            // FAULTING page (batch index 0) keeps the full original logic incl. the shared-cache HIT
+            // path; extra pages take the fresh-fill path (a shared page already cached is left to a
+            // normal later fault — correct, just unbatched).
+            const BATCH_PAGES: u64 = 4;
+            let img_hi = if base == PE_LOAD_BASE {
+                img_end
+            } else if base == nt_base {
+                nt_end
+            } else if let Some((di, _)) = reg.dll_for_page(page) {
+                reg.base(di) + reg.get(di).map(|d| d.image_size).unwrap_or(0)
             } else {
-                // MISS (shared, first process) or a per-process page: fill a fresh frame.
-                let scratch = scratch_base + faults * 0x1000;
-                let (f, fe) = alloc_frame_r();
-                let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                let r = fill_image_page(tpe, rva, scratch);
-                if fe != 0 || se != 0 {
-                    print_str(b"[map-fail] rva=0x");
-                    print_hex(rva);
-                    print_str(b" retype=");
-                    print_u64(fe);
-                    print_str(b" smap=");
-                    print_u64(se);
-                    print_str(b" faults=");
-                    print_u64(faults);
-                    print_str(b"\n");
+                base
+            };
+            let mut bi: u64 = 0;
+            while bi < BATCH_PAGES {
+                let bpage = page + bi * 0x1000;
+                if bpage >= img_hi || bpage < base {
+                    break;
                 }
-                if shareable {
-                    dll_cache_put(page, f); // this frame becomes the shared copy for all processes
+                if faults >= FAULT_CAP {
+                    break;
+                }
+                let rva = (bpage - base) as u32;
+                // SHAREABLE = a registered DLL's executable text (not the per-process main image at
+                // PE_LOAD_BASE, and an RX page). Byte-identical across processes (each DLL loaded at a
+                // fixed base + pre-relocated) → filled ONCE into a frame, mapped READ-ONLY (RX) into
+                // every process that faults it — real image sharing.
+                let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
+                let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                // For batch pages PAST the faulting one (bi>0), only PRE-fill genuinely-unmapped
+                // pages: a per-process page already recorded in `filled_pages`, or a shared page not
+                // cached here yet but already mapped, must be skipped so we never double-map. The
+                // faulting page (bi==0) always proceeds (it faulted → it is NOT mapped).
+                if bi > 0 {
+                    if !shareable {
+                        // Per-process page. Its mapped-set is tracked only in the 256-entry
+                        // `filled_pages`; once a process has faulted ≥256 pages that table is full, so a
+                        // page's mapped-state is no longer knowable → DON'T pre-map (a re-map of an
+                        // already-present page fails harmlessly with map=8 but wastes a frame). Below
+                        // 256, skip a page already recorded as filled+mapped.
+                        if faults as usize >= filled_pages.len() {
+                            break; // tracking exhausted — stop pre-filling this per-process image
+                        }
+                        let already = (0..(faults as usize).min(filled_pages.len()))
+                            .any(|k| filled_pages[k] == bpage);
+                        if already {
+                            bi += 1;
+                            continue;
+                        }
+                    } else if cached != 0 {
+                        // shared page already has a frame; whether THIS process has it mapped is not
+                        // tracked — skip pre-mapping to avoid a double-map, let it fault normally.
+                        bi += 1;
+                        continue;
+                    }
+                }
+                let (frame, rights) = if cached != 0 {
+                    DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
+                    (cached, 2u64) // shared text → RX, no fill, no fresh frame
                 } else {
-                    // Per-process page (main image, or DLL headers/rdata/data/IAT): record it for
-                    // copy-out via its scratch alias, and mirror the main image so smss_copyin can
-                    // read static-string args from .rdata.
-                    if (faults as usize) < filled_pages.len() {
-                        filled_pages[faults as usize] = page;
+                    // MISS (shared, first process) or a per-process page: fill a fresh frame `f`,
+                    // mapped at a UNIQUE monotonic scratch slot (seL4 records the mapping on the frame
+                    // object, so a slot must not be reused without an unmap — unique slots are the
+                    // proven model; a COPY of `f` is what gets mapped into the process). The BATCH does
+                    // not change the TOTAL distinct pages a process fills (only WHEN, in fewer
+                    // round-trips), so scratch consumption matches the pre-batch baseline; the widened
+                    // + re-spaced per-process scratch windows (see *_SCRATCH_BASE) give room for the
+                    // higher counts lsass's LSA-init tree reaches.
+                    let scratch = scratch_base + faults * 0x1000;
+                    let (f, fe) = alloc_frame_r();
+                    let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    let r = fill_image_page(tpe, rva, scratch);
+                    if fe != 0 || se != 0 {
+                        print_str(b"[map-fail] rva=0x");
+                        print_hex(rva);
+                        print_str(b" retype=");
+                        print_u64(fe);
+                        print_str(b" smap=");
+                        print_u64(se);
+                        print_str(b" faults=");
+                        print_u64(faults);
+                        print_str(b"\n");
                     }
-                    if pi >= 1 {
-                        // Record this GUI client's (csrss pi 1 / winlogon pi 2) frame so win32k can
-                        // identity-map + read/write it per-client (a client pointer into user32/gdi32
-                        // .data — e.g. the PFNCLIENT arrays — the client's stack-built OBJECT_ATTRIBUTES,
-                        // or its own image). The frame is shared with the executive's scratch, so it
-                        // holds the client's LIVE runtime data, not the (zeroed) PE static content.
-                        csrss_frame_put(pi as u64, page, f);
-                    }
-                    if base == PE_LOAD_BASE {
-                        let off = page - PE_LOAD_BASE;
-                        if off < IMAGE_MIRROR_WINDOW {
-                            let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-                            let _ = page_map(copy_cap(f), mirror + off, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    if shareable {
+                        dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
+                    } else {
+                        // Per-process page (main image, or DLL headers/rdata/data/IAT): record it for
+                        // copy-out via its scratch alias, and mirror the main image so smss_copyin can
+                        // read static-string args from .rdata.
+                        if (faults as usize) < filled_pages.len() {
+                            filled_pages[faults as usize] = bpage;
+                        }
+                        if pi >= 1 {
+                            // Record this GUI client's (csrss pi 1 / winlogon pi 2) frame so win32k can
+                            // identity-map + read/write it per-client (a client pointer into user32/gdi32
+                            // .data — e.g. the PFNCLIENT arrays — the client's stack-built OBJECT_ATTRIBUTES,
+                            // or its own image). The frame is shared with the executive's scratch, so it
+                            // holds the client's LIVE runtime data, not the (zeroed) PE static content.
+                            csrss_frame_put(pi as u64, bpage, f);
+                        }
+                        if base == PE_LOAD_BASE {
+                            let off = bpage - PE_LOAD_BASE;
+                            if off < IMAGE_MIRROR_WINDOW {
+                                let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+                                let _ = page_map(copy_cap(f), mirror + off, RW_NX, CAP_INIT_THREAD_VSPACE);
+                            }
                         }
                     }
+                    faults += 1; // a fill consumed a scratch slot; shared HITs do not
+                    (f, if shareable { 2 } else { r })
+                };
+                // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
+                let (cc, ce) = copy_cap_r(frame);
+                let me = page_map_r(cc, bpage, rights, pml4);
+                if ce != 0 || me != 0 {
+                    print_str(b"[map-fail] va=0x");
+                    print_hex(bpage as u32);
+                    print_str(b" copy=");
+                    print_u64(ce);
+                    print_str(b" map=");
+                    print_u64(me);
+                    print_str(b" shared=");
+                    print_u64(shareable as u64);
+                    print_str(b"\n");
                 }
-                faults += 1; // a fill consumed a scratch slot; shared HITs do not
-                (f, if shareable { 2 } else { r })
-            };
-            // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
-            let (cc, ce) = copy_cap_r(frame);
-            let me = page_map_r(cc, page, rights, pml4);
-            if ce != 0 || me != 0 {
-                print_str(b"[map-fail] va=0x");
-                print_hex(page as u32);
-                print_str(b" copy=");
-                print_u64(ce);
-                print_str(b" map=");
-                print_u64(me);
-                print_str(b" shared=");
-                print_u64(shareable as u64);
-                print_str(b"\n");
+                bi += 1;
             }
             procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
@@ -1345,6 +1431,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[1].pml4 = cpml4;
                     procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
                     procs[1].scratch_base = CSRSS_SCRATCH_BASE;
+                    map_demand_scratch_pts(CSRSS_SCRATCH_BASE); // own 64 MiB scratch window PTs
                     // Bind csrss's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(1, PE_LOAD_BASE + cpe.entry_point_rva() as u64);
@@ -1399,6 +1486,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[2].pml4 = wpml4;
                     procs[2].img_end = PE_LOAD_BASE + image_extent(wpe);
                     procs[2].scratch_base = WINLOGON_SCRATCH_BASE;
+                    map_demand_scratch_pts(WINLOGON_SCRATCH_BASE); // own 64 MiB scratch window PTs
                     // Bind winlogon's pre-created main ETHREAD to its real image entry — pm at spawn.
                     nt_handler
                         .bind_main_thread_entry(2, PE_LOAD_BASE + wpe.entry_point_rva() as u64);
@@ -1453,6 +1541,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[3].pml4 = spml4;
                     procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
                     procs[3].scratch_base = SERVICES_SCRATCH_BASE;
+                    map_demand_scratch_pts(SERVICES_SCRATCH_BASE); // own 64 MiB scratch window PTs
                     nt_handler.bind_main_thread_entry(3, PE_LOAD_BASE + spe.entry_point_rva() as u64);
                     services_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(3)) {
                         (Some(wl_pid), Some(sv_pid)) => {
@@ -1501,6 +1590,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[4].pml4 = lpml4;
                     procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
                     procs[4].scratch_base = LSASS_SCRATCH_BASE;
+                    map_demand_scratch_pts(LSASS_SCRATCH_BASE); // own 64 MiB scratch window PTs
                     nt_handler.bind_main_thread_entry(4, PE_LOAD_BASE + lpe.entry_point_rva() as u64);
                     lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
                         (Some(wl_pid), Some(ls_pid)) => {
