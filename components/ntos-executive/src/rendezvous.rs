@@ -678,6 +678,27 @@ pub(crate) unsafe fn csr_rendezvous(
             print_str(b"[csr-rdv] WALL: guard exhausted\n");
             break;
         }
+        // BATCH 7: the CSR-API thread (CsrApiRequestThread) runs on OUR ntdll's NATIVE seL4-Call
+        // transport (spawn_csr_loop_thread sets native: true), so its Nt* syscalls arrive as a native
+        // `Call` (label NT_NATIVE_SYSCALL_LABEL), NOT an UnknownSyscall fault (label 2). NORMALIZE it
+        // into the label-2 register-slot layout the accept body below reads — mirroring sm_rendezvous:
+        // MR0=SSN, MR1=rsp, MR2/MR3=arg1/arg2, MR4/MR5=arg3/arg4 (from the executive's recv IPC buffer)
+        // → the fault frame slots R10@9=arg1, R8@7=arg3, R9@8=arg4, SP@16=rsp, FLAGS@17=0; re-label 2.
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0; // MR0
+            let rsp = m1; // MR1 = caller rsp
+            let arg1 = m2; // MR2
+            let arg3 = get_recv_mr(4); // MR4 (IPC buffer)
+            let arg4 = get_recv_mr(5); // MR5 (IPC buffer)
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn; // the accept body reads ssn = m0
+            m2 = 0; // resume_ip unused for a native reply (no fault restart)
+            mi = (2u64 << 12) | (mi & 0x7F);
+        }
         let label = mi >> 12;
         if label == 6 {
             let page = m1 & !0xFFFu64;

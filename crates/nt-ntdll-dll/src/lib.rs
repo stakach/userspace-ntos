@@ -310,7 +310,7 @@ pub unsafe extern "C" fn LdrpInitialize(
 
 /// Append `v` as decimal into `buf[n..]`; return the new length. Stack-only (no alloc).
 #[cfg(target_arch = "x86_64")]
-fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
+pub(crate) fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
     if v == 0 {
         if n < buf.len() {
             buf[n] = b'0';
@@ -338,7 +338,7 @@ fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
 
 /// Append `v` as 16-hex-digit into `buf[n..]`; return the new length. Stack-only (no alloc).
 #[cfg(target_arch = "x86_64")]
-fn write_u64_hex(buf: &mut [u8; 64], mut n: usize, v: u64) -> usize {
+pub(crate) fn write_u64_hex(buf: &mut [u8; 64], mut n: usize, v: u64) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for i in (0..16).rev() {
         let nib = ((v >> (i * 4)) & 0xf) as usize;

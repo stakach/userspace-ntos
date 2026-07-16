@@ -171,6 +171,105 @@ unsafe fn data_directory(base: u64, idx: u64) -> (u32, u32) {
     }
 }
 
+/// The `AddressOfEntryPoint` RVA of a mapped PE image (0 if none). OptionalHeader+16 on both PE32/32+.
+///
+/// # Safety
+/// `base` must be a mapped PE image (DOS + NT headers readable).
+#[cfg(target_arch = "x86_64")]
+unsafe fn entry_point_rva(base: u64) -> u32 {
+    // SAFETY: reading the mapped PE headers per the contract.
+    unsafe {
+        let e_lfanew = rd32(base, 0x3c) as u64;
+        let opt = base + e_lfanew + 24; // OptionalHeader
+        rd32_at(opt + 16) // AddressOfEntryPoint
+    }
+}
+
+/// Read a `u32` at an absolute address.
+///
+/// # Safety
+/// `addr` must be a mapped, readable address.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rd32_at(addr: u64) -> u32 {
+    // SAFETY: caller guarantees the address is mapped.
+    unsafe { core::ptr::read_unaligned(addr as *const u32) }
+}
+
+/// Invoke a module's `DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)` with the
+/// Windows x64 ABI (rcx=base, rdx=reason, r8=reserved). Returns the `BOOL` in EAX. A tiny naked-free
+/// asm shim; the reserved arg is NULL (dynamic-load convention gives non-NULL only for static links,
+/// but ReactOS DllMains ignore it during ATTACH).
+///
+/// # Safety
+/// `entry_va` must be the mapped, executable entry point of a real DLL in this VSpace.
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
+    let ret: u64;
+    // SAFETY: entry_va is a mapped executable DLL entry; the callee follows the Win64 ABI. We
+    // provide 0x20 shadow space + keep rsp 16-aligned across the call.
+    unsafe {
+        let entry = base + entry_point_rva(base) as u64;
+        core::arch::asm!(
+            "sub rsp, 0x28",
+            "xor r8d, r8d",
+            "call {entry}",
+            "add rsp, 0x28",
+            entry = in(reg) entry,
+            in("rcx") base,
+            in("rdx") reason as u64,
+            lateout("rax") ret,
+            lateout("rcx") _, lateout("rdx") _, lateout("r8") _, lateout("r9") _,
+            lateout("r10") _, lateout("r11") _,
+        );
+    }
+    ret
+}
+
+/// Run `DLL_PROCESS_ATTACH` for every loaded DEPENDENT DLL (not the EXE, not our own ntdll), in
+/// reverse discovery order (leaf dependencies first — the DFS `snap_module` inserts a parent before
+/// its children, so the LAST-inserted entries are the deepest leaves). This is the live
+/// `LdrpRunInitializeRoutines` seam: kernel32's `DllMain` runs `InitCommandLines()` (→
+/// `GetCommandLineA`), msvcrt's runs its CRT `_acmdln` setup, etc. Without it winlogon's CRT startup
+/// dereferences a NULL command line (`strdup(GetCommandLineA())` → `strlen(NULL)`).
+///
+/// # Safety
+/// On-target; every table entry is a mapped DLL image whose imports have been snapped.
+#[cfg(target_arch = "x86_64")]
+unsafe fn run_process_attach(table: &ModuleTable) {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    // Snapshot the (base, is_ntdll) list into a fixed stack array FIRST (a DllMain may LdrLoadDll and
+    // mutate MODULE_TABLE mid-iteration; iterate the snapshot, not the live table). Reverse order →
+    // deepest dependencies first (the DFS inserts a parent before its children, so later = leafier).
+    let count = table.count.min(MODULE_TABLE_CAP);
+    let mut bases = [0u64; MODULE_TABLE_CAP];
+    let mut n = 0usize;
+    let mut idx = count;
+    while idx > 0 {
+        idx -= 1;
+        let m = &table.mods[idx];
+        if m.base == 0 {
+            continue;
+        }
+        // Skip our own ntdll (no C DllMain — would re-enter our stubs).
+        let nl = (m.nlen as usize).min(32);
+        if &m.name[..nl] == b"ntdll" {
+            continue;
+        }
+        bases[n] = m.base;
+        n += 1;
+    }
+    // SAFETY: each base is a mapped, snapped DLL image; single-threaded loader context.
+    unsafe {
+        for &b in bases.iter().take(n) {
+            let epr = entry_point_rva(b);
+            if epr == 0 {
+                continue; // no entry (resource-only DLL) — nothing to run
+            }
+            let _ = call_dll_main(b, DLL_PROCESS_ATTACH);
+        }
+    }
+}
+
 /// Compare a NUL-terminated ASCII export name at `base + name_rva` against `want` (ASCII bytes).
 ///
 /// # Safety
@@ -862,7 +961,16 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     // (2) Snap the EXE's imports against our export table + any dependent DLLs (csrsrv for csrss).
     // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
-    unsafe { snap_all_imports(smss_base, ntdll_base) }
+    let out = unsafe { snap_all_imports(smss_base, ntdll_base) };
+    // (3) Run DLL_PROCESS_ATTACH for every dependent DLL (the live LdrpRunInitializeRoutines seam).
+    // kernel32's DllMain runs InitCommandLines() so GetCommandLineA is non-NULL — winlogon's msvcrt
+    // CRT startup does strdup(GetCommandLineA()), which strlen(NULL)-faults without this.
+    // SAFETY: single-threaded loader; MODULE_TABLE holds mapped, snapped DLL images.
+    unsafe {
+        let table = &*core::ptr::addr_of!(MODULE_TABLE);
+        run_process_attach(table);
+    }
+    out
 }
 
 /// Snap `image_base`'s FULL import table (all descriptors) against OUR ntdll + any dependent DLLs,

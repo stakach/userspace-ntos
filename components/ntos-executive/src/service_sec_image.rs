@@ -582,13 +582,44 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
-                print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
+                print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else if pi == 2 { b"[winlogon vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
                 print_hex((m0 >> 32) as u32);
                 print_hex(m0 as u32);
                 print_str(b" addr=0x");
                 print_hex((addr >> 32) as u32);
                 print_hex(addr as u32);
                 print_str(b" (dll_rva = ip - dll_base; user32@0x84000000, gdi32@0x85000000)\n");
+                // DIAG (BATCH 7): dump the fault frame RSP + the caller return addresses so we can
+                // identify who passed NULL (e.g. strlen(NULL) during msvcrt CRT init). At strlen+0x16
+                // the frame is `sub rsp,0x18` deep so the return addr is at [rsp+0x18]; also dump a
+                // small window of the stack to see the call chain.
+                {
+                    let sp = get_recv_mr(16);
+                    print_str(b"[winlogon vmf] rsp=0x");
+                    print_hex((sp >> 32) as u32);
+                    print_hex(sp as u32);
+                    print_str(b" retaddrs[");
+                    // Scan up the stack for the first plausible RETURN ADDRESSES (msvcrt 0x806xxxxx,
+                    // our ntdll 0x100_00xxxxxx, or another mapped DLL 0x80xxxxxx) so we see the caller
+                    // chain that reached strlen(NULL).
+                    let mut k: u64 = 0;
+                    let mut printed: u64 = 0;
+                    while k < 96 && printed < 10 {
+                        let v = smss_stack_read(sp + k * 8);
+                        let is_ntdll = v >= 0x0000_0100_0000_0000 && v < 0x0000_0100_0100_0000;
+                        let is_dll = v >= 0x8000_0000 && v < 0x8100_0000;
+                        if is_ntdll || is_dll {
+                            print_str(b" +0x");
+                            print_hex((k * 8) as u32);
+                            print_str(b":0x");
+                            print_hex((v >> 32) as u32);
+                            print_hex(v as u32);
+                            printed += 1;
+                        }
+                        k += 1;
+                    }
+                    print_str(b" ]\n");
+                }
                 stop = addr;
                 break;
             }
