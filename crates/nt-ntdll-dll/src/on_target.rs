@@ -350,6 +350,382 @@ unsafe fn read_cstr(base: u64, rva: u32, buf: &mut [u8]) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// BATCH 2 — the recursive dependent-DLL loader (Ldr live-op).
+//
+// smss imports ONLY ntdll, so its `LdrpInitialize` never needed to load a dependent DLL. csrss
+// (the current frontier) statically imports **csrsrv.dll** (`CsrServerInitialization`) in addition
+// to ntdll. Its IAT slot for the csrsrv import stays at the raw ILT value (a low RVA, e.g. 0x2440)
+// until the loader resolves it — and csrss's first act is to CALL `CsrServerInitialization`, so an
+// unresolved slot faults as an instruction-fetch at that low address (the observed 0x2440 wall).
+//
+// Real ntdll's `LdrpInitialize` → `LdrpWalkImportDescriptor` walks EVERY import descriptor: for each
+// dependency not already loaded, it maps the DLL (the executive services NtOpenFile →
+// NtCreateSection(SEC_IMAGE) → NtMapViewOfSection, assigning csrsrv its pinned base 0x8000_0000),
+// snaps THAT DLL's own imports (recursively), then snaps the current module's thunks against the
+// dependency's exports. We do the same IN-PROCESS over our mapped-image RVA walker + our own Nt*
+// stubs. The `MODULE_TABLE` de-dupes loads (name → base) so a diamond / repeat dependency maps once
+// and recursion terminates.
+// ---------------------------------------------------------------------------------------------
+
+/// `NtMapViewOfSection` SSN (shared `nt-syscall-abi` table).
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_MAP_VIEW_OF_SECTION: u32 = 113;
+
+/// The largest dependency graph we resolve in one process (csrss's is tiny: ntdll + csrsrv; leave
+/// headroom for csrsrv's own deps + future ServerDlls).
+#[cfg(target_arch = "x86_64")]
+const MODULE_TABLE_CAP: usize = 32;
+
+/// A loaded dependent module: its lowercased base name (`.dll` optional, ≤ 31 bytes) + mapped base.
+/// The image we started snapping from (the EXE, `image_base`) is seeded as entry 0; ntdll as entry 1.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone)]
+struct LoadedMod {
+    /// Lowercased base name bytes (no path, no NUL) — e.g. `b"csrsrv"` / `b"ntdll"`.
+    name: [u8; 32],
+    /// Byte length of `name`.
+    nlen: u8,
+    /// The module's mapped base VA (0 = empty slot).
+    base: u64,
+}
+
+/// The per-drive module table (single-threaded loader; a process's LdrpInitialize runs once, on one
+/// thread, before any other thread exists). Not shared across processes — each spawn re-runs the
+/// drive fresh in its own VSpace.
+#[cfg(target_arch = "x86_64")]
+struct ModuleTable {
+    mods: [LoadedMod; MODULE_TABLE_CAP],
+    count: usize,
+}
+
+/// The PROCESS-WIDE loaded-module table. Single-threaded loader context (the process's LdrpInitialize
+/// + all subsequent `LdrLoadDll`/`LdrGetDllHandle` calls run before any competing thread touches it —
+/// csrsrv's CsrLoadServerDll runs on the main thread during CsrServerInitialization). Seeded by
+/// [`snap_all_imports`] (ntdll + the EXE's static deps), then extended by runtime `LdrLoadDll`.
+#[cfg(target_arch = "x86_64")]
+static mut MODULE_TABLE: ModuleTable = ModuleTable {
+    mods: [LoadedMod {
+        name: [0u8; 32],
+        nlen: 0,
+        base: 0,
+    }; MODULE_TABLE_CAP],
+    count: 0,
+};
+
+#[cfg(target_arch = "x86_64")]
+impl ModuleTable {
+    /// Insert `(name, base)` (name already lowercased, no `.dll` suffix). Ignores overflow + dups.
+    fn insert(&mut self, name: &[u8], base: u64) {
+        if self.find(name) != 0 {
+            return; // already present
+        }
+        if self.count >= MODULE_TABLE_CAP {
+            return;
+        }
+        let mut m = LoadedMod {
+            name: [0u8; 32],
+            nlen: 0,
+            base,
+        };
+        let n = name.len().min(32);
+        m.name[..n].copy_from_slice(&name[..n]);
+        m.nlen = n as u8;
+        self.mods[self.count] = m;
+        self.count += 1;
+    }
+
+    /// Find a loaded module by lowercased base name; returns its base (0 if absent).
+    fn find(&self, name: &[u8]) -> u64 {
+        for m in &self.mods[..self.count] {
+            if m.nlen as usize == name.len() && &m.name[..name.len()] == name {
+                return m.base;
+            }
+        }
+        0
+    }
+}
+
+/// Lowercase an import descriptor's DLL name into `out` and STRIP a trailing `.dll`; returns the
+/// base-name length written. (e.g. `"CSRSRV.dll"` → `b"csrsrv"`, len 6.)
+///
+/// # Safety
+/// `base + name_rva` must be a mapped NUL-terminated ASCII string.
+#[cfg(target_arch = "x86_64")]
+unsafe fn import_desc_basename(base: u64, name_rva: u32, out: &mut [u8; 32]) -> usize {
+    let mut raw = [0u8; 64];
+    // SAFETY: caller contract.
+    let n = unsafe { read_cstr(base, name_rva, &mut raw) };
+    let mut n = n.min(32 + 4); // room to strip ".dll"
+    // Strip a trailing ".dll" (case-insensitive).
+    if n >= 4 {
+        let tail = &raw[n - 4..n];
+        if tail[0] == b'.'
+            && tail[1].to_ascii_lowercase() == b'd'
+            && tail[2].to_ascii_lowercase() == b'l'
+            && tail[3].to_ascii_lowercase() == b'l'
+        {
+            n -= 4;
+        }
+    }
+    let n = n.min(32);
+    for i in 0..n {
+        out[i] = raw[i].to_ascii_lowercase();
+    }
+    n
+}
+
+/// Snap ONE import descriptor's thunks against `dep_base`'s export directory (direct in-process IAT
+/// writes). Returns `(resolved, missing)`. `image_base` is the module whose IAT we patch;
+/// `ilt_rva`/`iat_rva` are its descriptor's OriginalFirstThunk/FirstThunk.
+///
+/// # Safety
+/// All three bases must be mapped PE images; `image_base`'s IAT pages must be writable.
+#[cfg(target_arch = "x86_64")]
+unsafe fn snap_descriptor_against(
+    image_base: u64,
+    ilt_rva: u32,
+    iat_rva: u32,
+    dep_base: u64,
+    out: &mut SnapResult,
+) {
+    // SAFETY: caller contract — mapped images, writable IAT.
+    unsafe {
+        let mut ilt = image_base + ilt_rva as u64;
+        let mut iat = image_base + iat_rva as u64;
+        loop {
+            let thunk = core::ptr::read_unaligned(ilt as *const u64);
+            if thunk == 0 {
+                break;
+            }
+            if thunk & (1u64 << 63) == 0 {
+                // by name: IMAGE_IMPORT_BY_NAME RVA = thunk & 0x7fffffff; +2 skips the Hint.
+                let ibn_rva = (thunk & 0x7fff_ffff) as u32;
+                let mut namebuf = [0u8; 96];
+                let nlen = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
+                let export_rva = export_rva_by_name(dep_base, &namebuf[..nlen]);
+                if export_rva != 0 {
+                    let addr = dep_base + export_rva as u64;
+                    core::ptr::write_unaligned(iat as *mut u64, addr);
+                    out.resolved += 1;
+                    if out.spot_iat_value == 0 {
+                        out.spot_iat_value = addr;
+                        out.spot_iat_rva = (iat - image_base) as u32;
+                    }
+                } else {
+                    out.missing += 1;
+                }
+            } else {
+                // by ordinal.
+                let ord = (thunk & 0xffff) as u32;
+                let export_rva = export_rva_by_ordinal(dep_base, ord);
+                if export_rva != 0 {
+                    core::ptr::write_unaligned(iat as *mut u64, dep_base + export_rva as u64);
+                    out.resolved += 1;
+                } else {
+                    out.missing += 1;
+                }
+            }
+            ilt += 8;
+            iat += 8;
+        }
+    }
+}
+
+/// Resolve an export **by ordinal** in the mapped PE at `base` → its target RVA (0 if absent).
+///
+/// # Safety
+/// `base` must be a mapped PE image.
+#[cfg(target_arch = "x86_64")]
+unsafe fn export_rva_by_ordinal(base: u64, ordinal: u32) -> u32 {
+    // SAFETY: reading the mapped export directory.
+    unsafe {
+        let (edir_rva, _sz) = data_directory(base, 0);
+        if edir_rva == 0 {
+            return 0;
+        }
+        let ed = base + edir_rva as u64;
+        let ordinal_base = rd32(ed, 0x10);
+        let number_of_functions = rd32(ed, 0x14);
+        let addr_of_functions = rd32(ed, 0x1c) as u64;
+        if ordinal < ordinal_base {
+            return 0;
+        }
+        let idx = ordinal - ordinal_base;
+        if idx >= number_of_functions {
+            return 0;
+        }
+        rd32(base, addr_of_functions + idx as u64 * 4)
+    }
+}
+
+/// Load a dependent DLL BY NAME (the executive resolves it against the real `\reactos\system32` FS +
+/// its DLL registry, assigning the module its fixed base — csrsrv → 0x8000_0000). Issues
+/// `NtOpenFile → NtCreateSection(SEC_IMAGE) → NtMapViewOfSection`; returns the mapped base (0 on
+/// failure). `name_lc` is the lowercased base name (no `.dll`); we build a `<name>.dll` path leaf.
+///
+/// # Safety
+/// On-target hosted process; issues real syscalls the executive services.
+#[cfg(target_arch = "x86_64")]
+unsafe fn load_dependent_dll(name_lc: &[u8]) -> u64 {
+    // Build a NUL-terminated UTF-16 leaf `<name>.dll` for the OBJECT_ATTRIBUTES.ObjectName. The
+    // executive's NtOpenFile matches the DLL by a substring of the object name (reg.resolve_name /
+    // demand_load_dll), so a bare leaf suffices.
+    let mut wname = [0u16; 40];
+    let mut wn = 0usize;
+    for &b in name_lc.iter().take(32) {
+        wname[wn] = b as u16;
+        wn += 1;
+    }
+    for &b in b".dll" {
+        wname[wn] = b as u16;
+        wn += 1;
+    }
+    // UNICODE_STRING { Length, MaximumLength, Buffer } (x64: u16,u16,pad,ptr).
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        _pad: u32,
+        buffer: u64,
+    }
+    let us = UnicodeString {
+        length: (wn * 2) as u16,
+        maximum_length: (wn * 2) as u16,
+        _pad: 0,
+        buffer: wname.as_ptr() as u64,
+    };
+
+    // NtOpenFile(image) → NtCreateSection(SEC_IMAGE): reuse rtlp_map_file (opens by name, closes the
+    // file, leaves the SEC_IMAGE handle in `section`).
+    let mut section: u64 = 0;
+    // SAFETY: on-target; us is a valid UNICODE_STRING*, section a writable stack local.
+    let st = unsafe {
+        rtlp_map_file(
+            core::ptr::addr_of!(us) as *const u8,
+            0x40, // OBJ_CASE_INSENSITIVE
+            core::ptr::addr_of_mut!(section),
+        )
+    };
+    if (st as i32) < 0 || section == 0 {
+        return 0;
+    }
+
+    // NtMapViewOfSection(Section, NtCurrentProcess(), &BaseAddress, ZeroBits=0, CommitSize=0,
+    //                    &SectionOffset=NULL, &ViewSize, InheritDisposition=1, AllocationType=0,
+    //                    Protect=PAGE_EXECUTE_READ). The executive writes the DLL's fixed registry
+    // base into *BaseAddress and its extent into *ViewSize. *BaseAddress MUST be a stack local (the
+    // executive writes it through its stack mirror).
+    let mut base_address: u64 = 0;
+    let mut view_size: u64 = 0;
+    // SAFETY: on-target syscall; stack-local out-params.
+    let st = unsafe {
+        syscall_map_view(
+            section,
+            NT_CURRENT_PROCESS,
+            core::ptr::addr_of_mut!(base_address) as u64,
+            0,
+            0,
+            0,
+            core::ptr::addr_of_mut!(view_size) as u64,
+            1,      // ViewShare
+            0,      // AllocationType
+            0x20,   // PAGE_EXECUTE_READ
+        )
+    };
+    if (st as i32) < 0 {
+        return 0;
+    }
+    base_address
+}
+
+/// `NtMapViewOfSection` — a dedicated 10-arg caller (its arity exceeds syscall8's 8). Uses the same
+/// register/stack ABI: a1..a4 → R10/RDX/R8/R9, a5..a10 → `[rsp+0x28..0x50]`.
+///
+/// # Safety
+/// On-target hosted-process syscall; out-param pointers must be valid.
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn syscall_map_view(
+    section: u64,
+    process: u64,
+    base_address: u64,
+    zero_bits: u64,
+    commit_size: u64,
+    section_offset: u64,
+    view_size: u64,
+    inherit: u64,
+    alloc_type: u64,
+    protect: u64,
+) -> u64 {
+    let status: u64;
+    // SAFETY: a hosted-process syscall trap serviced by the executive.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x58",
+            "mov qword ptr [rsp+0x28], {a5}",
+            "mov qword ptr [rsp+0x30], {a6}",
+            "mov qword ptr [rsp+0x38], {a7}",
+            "mov qword ptr [rsp+0x40], {a8}",
+            "mov qword ptr [rsp+0x48], {a9}",
+            "mov qword ptr [rsp+0x50], {a10}",
+            "mov r10, {a1}",
+            "mov rdx, {a2}",
+            "mov r8,  {a3}",
+            "mov r9,  {a4}",
+            "mov eax, {ssn:e}",
+            "syscall",
+            "add rsp, 0x58",
+            ssn = in(reg) SSN_NT_MAP_VIEW_OF_SECTION,
+            a1 = in(reg) section, a2 = in(reg) process, a3 = in(reg) base_address, a4 = in(reg) zero_bits,
+            a5 = in(reg) commit_size, a6 = in(reg) section_offset, a7 = in(reg) view_size,
+            a8 = in(reg) inherit, a9 = in(reg) alloc_type, a10 = in(reg) protect,
+            out("rax") status,
+            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// `NtMapViewOfSection` over the NATIVE seL4-Call transport (10 args). MR0=SSN, MR1=rsp, MR2=a1,
+/// MR3=a2, MR4=a3, MR5=a4 (IPC buffer), a5..a10 on the stack `[rsp+0x28..0x50]` (read by the
+/// executive via its mirror) — identical stack layout to the trap path, so the executive's handler
+/// (which reads a5+ from the stack) is unchanged.
+///
+/// # Safety
+/// On-target hosted-process syscall.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn syscall_map_view(
+    section: u64,
+    process: u64,
+    base_address: u64,
+    zero_bits: u64,
+    commit_size: u64,
+    section_offset: u64,
+    view_size: u64,
+    inherit: u64,
+    alloc_type: u64,
+    protect: u64,
+) -> u64 {
+    // native_syscall8 handles a1..a4 in the message + a5..a8 on the stack; a9/a10 need two more
+    // stack slots. We place ALL six tail args on the stack ourselves and issue the native Call with
+    // a1..a4 in the message. Build the request array as native_syscall8 does but with the extra tail.
+    // SAFETY: on-target native transport.
+    unsafe {
+        native_map_view(
+            section,
+            process,
+            base_address,
+            zero_bits,
+            [commit_size, section_offset, view_size, inherit, alloc_type, protect],
+        )
+    }
+}
+
 /// The full Step-4.B in-process loader drive. Returns the snap result (for the boot-log proof).
 ///
 /// 1. Create the process heap (installs it via [`crate::install_process_heap`]).
@@ -367,9 +743,269 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     if let Some(heap) = unsafe { create_process_heap() } {
         crate::install_process_heap(heap);
     }
-    // (2) Snap smss's imports against our export table (the 4.A IAT-mismatch fix).
-    // SAFETY: on-target mapped-image walk + IAT write.
-    unsafe { snap_smss_imports(smss_base, ntdll_base) }
+    // (2) Snap the EXE's imports against our export table + any dependent DLLs (csrsrv for csrss).
+    // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
+    // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
+    unsafe { snap_all_imports(smss_base, ntdll_base) }
+}
+
+/// Snap `image_base`'s FULL import table (all descriptors) against OUR ntdll + any dependent DLLs,
+/// recursively — the real `LdrpWalkImportDescriptor`. For each descriptor:
+///   * `ntdll` → resolve against `ntdll_base` (OUR export table, already mapped).
+///   * any OTHER DLL → LOAD it (NtOpenFile → NtCreateSection(SEC_IMAGE) → NtMapViewOfSection; the
+///     executive assigns its fixed base), recursively snap ITS imports, then snap this descriptor
+///     against the loaded DLL's exports.
+/// A `ModuleTable` de-dupes loads (name → base) so a diamond / repeat dependency maps once + recursion
+/// terminates. Returns the aggregate [`SnapResult`] (for the boot-log proof).
+///
+/// # Safety
+/// On-target; `image_base`/`ntdll_base` are mapped PE images in this VSpace.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn snap_all_imports(image_base: u64, ntdll_base: u64) -> SnapResult {
+    let mut out = SnapResult::default();
+    // SAFETY: single-threaded loader context — MODULE_TABLE is touched only on the main thread while
+    // LdrpInitialize runs (no other thread exists yet). The recursive helper honours the contract.
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
+        table.insert(b"ntdll", ntdll_base);
+        snap_module(image_base, ntdll_base, table, &mut out, 0);
+    }
+    out
+}
+
+/// The recursive per-module snap (see [`snap_all_imports`]). `depth` guards against a pathological
+/// import cycle (real import graphs are acyclic module-wise; the guard is belt-and-braces).
+///
+/// # Safety
+/// On-target; `image_base`/`ntdll_base` mapped PE images.
+#[cfg(target_arch = "x86_64")]
+unsafe fn snap_module(
+    image_base: u64,
+    ntdll_base: u64,
+    table: &mut ModuleTable,
+    out: &mut SnapResult,
+    depth: u32,
+) {
+    if depth > 8 {
+        return; // cycle / over-deep guard — csrss's graph is 2 deep at most
+    }
+    // SAFETY: reading the mapped import directory + writing the mapped RW IAT per the contract.
+    unsafe {
+        let (idir_rva, _sz) = data_directory(image_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
+        if idir_rva == 0 {
+            return;
+        }
+        let mut desc = image_base + idir_rva as u64;
+        loop {
+            let oft = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
+            let name_rva = rd32(desc, 12); // Name RVA
+            let ft = rd32(desc, 16); // FirstThunk (IAT) RVA
+            if name_rva == 0 && ft == 0 {
+                break; // terminator
+            }
+            let ilt_rva = if oft != 0 { oft } else { ft };
+
+            // Resolve this dependency's base: ntdll / an already-loaded module / load it now.
+            let mut base = [0u8; 32];
+            let bn = import_desc_basename(image_base, name_rva, &mut base);
+            let dep_name = &base[..bn];
+            let mut dep_base = table.find(dep_name);
+            if dep_base == 0 {
+                // Not loaded yet — map it (the executive assigns its fixed registry base), record it,
+                // then recursively snap ITS imports before we snap this module against it.
+                let loaded = load_dependent_dll(dep_name);
+                if loaded != 0 {
+                    table.insert(dep_name, loaded);
+                    snap_module(loaded, ntdll_base, table, out, depth + 1);
+                    dep_base = loaded;
+                }
+            }
+            if dep_base != 0 {
+                snap_descriptor_against(image_base, ilt_rva, ft, dep_base, out);
+            } else {
+                // Could not resolve the dependency — count its thunks as missing (honest, not faked).
+                let mut ilt = image_base + ilt_rva as u64;
+                while core::ptr::read_unaligned(ilt as *const u64) != 0 {
+                    out.missing += 1;
+                    ilt += 8;
+                }
+            }
+            desc += 20;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// BATCH 2 — the runtime loader Ldr* drivers (LdrLoadDll / LdrGetDllHandle / LdrGetProcedureAddress).
+//
+// csrsrv's `CsrLoadServerDll` calls `LdrLoadDll` to bring up its ServerDlls (basesrv/winsrv), then
+// `LdrGetProcedureAddress` to find each ServerDll's entry (`ServerDllInitialization`). These reuse
+// the same in-process machinery as the static-import snap: load-by-name + snap-imports + the export
+// walker, over the process-wide MODULE_TABLE.
+// ---------------------------------------------------------------------------------------------
+
+/// Read a `UNICODE_STRING`'s wide `Buffer` into a lowercased ASCII base name (`.dll` stripped) — the
+/// key MODULE_TABLE uses. Returns the byte length written (0 on a null/empty string).
+///
+/// # Safety
+/// `us` a valid `UNICODE_STRING*` (Length @0 u16, Buffer @8 ptr).
+#[cfg(target_arch = "x86_64")]
+unsafe fn unicode_basename_lc(us: *const c_void, out: &mut [u8; 32]) -> usize {
+    if us.is_null() {
+        return 0;
+    }
+    // SAFETY: us is a valid UNICODE_STRING per the contract.
+    unsafe {
+        let length = core::ptr::read_unaligned(us as *const u16) as usize; // Length (bytes)
+        let buffer = core::ptr::read_unaligned((us as *const u8).add(8) as *const u64); // Buffer
+        if buffer == 0 || length == 0 {
+            return 0;
+        }
+        let nchars = length / 2;
+        // Find the last path separator so we key by the leaf name.
+        let mut start = 0usize;
+        for i in 0..nchars {
+            let c = core::ptr::read_unaligned((buffer as *const u16).add(i));
+            if c == b'\\' as u16 || c == b'/' as u16 {
+                start = i + 1;
+            }
+        }
+        let mut n = 0usize;
+        for i in start..nchars {
+            let c = core::ptr::read_unaligned((buffer as *const u16).add(i)) as u32;
+            if c > 0x7f {
+                break;
+            }
+            if n < 32 {
+                out[n] = (c as u8).to_ascii_lowercase();
+                n += 1;
+            }
+        }
+        // Strip a trailing ".dll".
+        if n >= 4
+            && out[n - 4] == b'.'
+            && out[n - 3] == b'd'
+            && out[n - 2] == b'l'
+            && out[n - 1] == b'l'
+        {
+            n -= 4;
+        }
+        n
+    }
+}
+
+/// `LdrLoadDll` in-process driver — load `dll_name` (map + recursively snap its imports), record it in
+/// MODULE_TABLE, write its base to `*base_addr`. Returns STATUS_SUCCESS / STATUS_DLL_NOT_FOUND.
+///
+/// # Safety
+/// On-target; `dll_name` a valid `UNICODE_STRING*`; `base_addr` writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void) -> u32 {
+    let mut name = [0u8; 32];
+    // SAFETY: dll_name a valid UNICODE_STRING per the contract.
+    let n = unsafe { unicode_basename_lc(dll_name, &mut name) };
+    if n == 0 {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let dep = &name[..n];
+    // SAFETY: single-threaded loader; MODULE_TABLE touched only here + snap.
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
+        // Already loaded? Return its base.
+        let existing = table.find(dep);
+        let base = if existing != 0 {
+            existing
+        } else {
+            let loaded = load_dependent_dll(dep);
+            if loaded == 0 {
+                return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+            }
+            table.insert(dep, loaded);
+            // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
+            let ntdll_base = table.find(b"ntdll");
+            let mut out = SnapResult::default();
+            snap_module(loaded, ntdll_base, table, &mut out, 0);
+            loaded
+        };
+        if !base_addr.is_null() {
+            core::ptr::write_unaligned(base_addr, base as *mut c_void);
+        }
+    }
+    0 // STATUS_SUCCESS
+}
+
+/// `LdrGetDllHandle` in-process driver — return the base of an already-loaded module (does NOT load).
+///
+/// # Safety
+/// On-target; `dll_name` a valid `UNICODE_STRING*`; `dll_handle` writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_get_dll_handle(dll_name: *const c_void, dll_handle: *mut *mut c_void) -> u32 {
+    let mut name = [0u8; 32];
+    // SAFETY: dll_name a valid UNICODE_STRING per the contract.
+    let n = unsafe { unicode_basename_lc(dll_name, &mut name) };
+    if n == 0 {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    // SAFETY: single-threaded loader table read.
+    let base = unsafe {
+        let table = &*core::ptr::addr_of!(MODULE_TABLE);
+        table.find(&name[..n])
+    };
+    if base == 0 {
+        return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+    }
+    if !dll_handle.is_null() {
+        // SAFETY: dll_handle writable per the contract.
+        unsafe { core::ptr::write_unaligned(dll_handle, base as *mut c_void) };
+    }
+    0
+}
+
+/// `LdrGetProcedureAddress` in-process driver — resolve an export (by name via the `ANSI_STRING`, or
+/// by ordinal if `name` is NULL) in the mapped module at `base_address`.
+///
+/// # Safety
+/// On-target; `base_address` a mapped module; `name` a valid `ANSI_STRING*` or NULL; `address`
+/// writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_get_procedure_address(
+    base_address: *mut c_void,
+    name: *const c_void,
+    ordinal: u32,
+    address: *mut *mut c_void,
+) -> u32 {
+    let base = base_address as u64;
+    if base == 0 {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    // SAFETY: reading the module's export directory + the optional ANSI_STRING name.
+    let func_rva = unsafe {
+        if name.is_null() {
+            export_rva_by_ordinal(base, ordinal)
+        } else {
+            // ANSI_STRING { Length(u16)@0, MaximumLength(u16)@2, Buffer(ptr)@8 }.
+            let length = core::ptr::read_unaligned(name as *const u16) as usize;
+            let buffer = core::ptr::read_unaligned((name as *const u8).add(8) as *const u64);
+            if buffer == 0 || length == 0 {
+                0
+            } else {
+                let mut nb = [0u8; 96];
+                let l = length.min(96);
+                for i in 0..l {
+                    nb[i] = core::ptr::read_unaligned((buffer as *const u8).add(i));
+                }
+                export_rva_by_name(base, &nb[..l])
+            }
+        }
+    };
+    if func_rva == 0 {
+        return 0xC000_0139; // STATUS_ENTRYPOINT_NOT_FOUND
+    }
+    if !address.is_null() {
+        // SAFETY: address writable per the contract.
+        unsafe { core::ptr::write_unaligned(address, (base + func_rva as u64) as *mut c_void) };
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -522,6 +1158,76 @@ unsafe fn native_syscall8(
             "syscall",
             "add rsp, 0x48",
             "mov {status}, r10",                // reply MR0 = NTSTATUS (IPC return ABI: r10)
+            req = in(reg) req.as_ptr(),
+            status = out(reg) status,
+            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
+            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
+            options(nostack),
+        );
+    }
+    status
+}
+
+/// `NtMapViewOfSection` (10 args) over the NATIVE seL4-Call transport. Same message shape as
+/// [`native_syscall8`] (MR0=SSN, MR1=rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4) but the SIX tail args
+/// (a5..a10 = commit_size/section_offset/view_size/inherit/alloc_type/protect) go on the stack at
+/// `[rsp+0x28..0x50]` — the exact slots the executive's map handler reads (a5=`sp+0x28`,
+/// a6/SectionOffset=`sp+0x30`, a7/ViewSize=`sp+0x38`, …). a3 (*BaseAddress) lands in MR4 →
+/// `set_recv_mr(7)` → the `get_recv_mr(7)` the handler reads.
+///
+/// # Safety
+/// On-target hosted-process; the out-param pointers (base_address/view_size) are valid stack locals.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) -> u64 {
+    // MR4/MR5 = a3/a4 into the IPC buffer (plain Rust — no live registers across the Call).
+    // SAFETY: IPCBUF_VADDR is this process's mapped IPC buffer; MR4/MR5 at +0x28/+0x30.
+    unsafe {
+        core::ptr::write_volatile((IPCBUF_VADDR + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((IPCBUF_VADDR + 0x30) as *mut u64, a4);
+    }
+    // req: [0]=SSN(MR0) [1]=a1(MR2) [2]=a2(MR3) [3..9]=the six stack tail args.
+    let req: [u64; 9] = [
+        SSN_NT_MAP_VIEW_OF_SECTION as u64,
+        a1,
+        a2,
+        tail[0],
+        tail[1],
+        tail[2],
+        tail[3],
+        tail[4],
+        tail[5],
+    ];
+    let status: u64;
+    // SAFETY: a native seL4 Call serviced by the executive. `req` is a valid readable stack array;
+    // the asm reserves the ABI frame, copies the 6 tail args to [rsp+0x28..0x50] (the mirror-read
+    // slots), sets the register message (MR0=r10, MR1=rsp, MR2=r9, MR3=r15), and Calls.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x58",
+            "mov rax, [{req} + 0x18]", // tail[0] (a5)
+            "mov [rsp+0x28], rax",
+            "mov rax, [{req} + 0x20]", // tail[1] (a6)
+            "mov [rsp+0x30], rax",
+            "mov rax, [{req} + 0x28]", // tail[2] (a7)
+            "mov [rsp+0x38], rax",
+            "mov rax, [{req} + 0x30]", // tail[3] (a8)
+            "mov [rsp+0x40], rax",
+            "mov rax, [{req} + 0x38]", // tail[4] (a9)
+            "mov [rsp+0x48], rax",
+            "mov rax, [{req} + 0x40]", // tail[5] (a10)
+            "mov [rsp+0x50], rax",
+            "mov r10, [{req} + 0x00]", // MR0 = SSN
+            "mov r9,  [{req} + 0x08]", // MR2 = a1
+            "mov r15, [{req} + 0x10]", // MR3 = a2
+            "mov r8, rsp",             // MR1 = caller rsp
+            "mov edi, 6",              // rdi = CT_FAULT cap slot
+            "mov esi, 0x04E54006",     // rsi = (0x4E54<<12)|6
+            "mov rdx, -1",             // rdx = SysCall
+            "syscall",
+            "add rsp, 0x58",
+            "mov {status}, r10",
             req = in(reg) req.as_ptr(),
             status = out(reg) status,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,

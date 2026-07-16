@@ -1904,6 +1904,308 @@ pub unsafe extern "C" fn c_specific_handler(
 }
 
 // =================================================================================================
+// BATCH 2 — csrsrv.dll's ntdll imports (the 12 our export table was missing). csrss statically
+// imports csrsrv.dll (CsrServerInitialization); once BATCH 2's recursive loader (on_target.rs)
+// loads + snaps csrsrv, csrsrv's OWN 76 ntdll imports must all resolve. These 12 close the gap:
+// pure Rtl (RtlFreeSid/RtlGetDaclSecurityDescriptor/RtlCharToInteger/RtlUnhandledExceptionFilter/
+// RtlCreateHeap), CRT (memmove/strchr/strncpy), and the loader Ldr* (LdrLoadDll/LdrGetDllHandle/
+// LdrGetProcedureAddress/LdrUnloadDll). Sources cited per body.
+// =================================================================================================
+
+/// `RtlFreeSid(PSID) -> PVOID` — free a SID allocated by `RtlAllocateAndInitializeSid` and return
+/// NULL. Ported from `references/reactos/sdk/lib/rtl/sid.c:186` (`RtlpFreeMemory(Sid); return NULL`).
+/// Our `RtlAllocateAndInitializeSid` allocates from the process heap, so this frees back to it.
+///
+/// # Safety
+/// `sid` a pointer previously returned by `RtlAllocateAndInitializeSid`, or NULL.
+#[export_name = "RtlFreeSid"]
+pub unsafe extern "system" fn rtl_free_sid(sid: *mut c_void) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !sid.is_null() {
+            // SAFETY: `sid` came from RtlAllocateAndInitializeSid (our heap); single-threaded loader.
+            unsafe {
+                crate::process_heap_free(sid as *mut u8);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = sid;
+    core::ptr::null_mut() // RtlFreeSid always returns NULL
+}
+
+/// `RtlGetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR, PBOOLEAN DaclPresent, PACL* Dacl,
+/// PBOOLEAN DaclDefaulted) -> NTSTATUS`. Ported from `references/reactos/sdk/lib/rtl/sd.c:199`.
+/// Absolute (non-self-relative) SD only — the form csrsrv builds via
+/// RtlCreateSecurityDescriptor + RtlSetDaclSecurityDescriptor (Dacl at offset 0x20 is a POINTER).
+///
+/// # Safety
+/// `sd` a valid absolute `SECURITY_DESCRIPTOR`; the out-pointers valid + writable.
+#[export_name = "RtlGetDaclSecurityDescriptor"]
+pub unsafe extern "system" fn rtl_get_dacl_security_descriptor(
+    sd: *const c_void,
+    dacl_present: *mut u8,
+    dacl: *mut *mut c_void,
+    dacl_defaulted: *mut u8,
+) -> NtStatus {
+    if sd.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: sd is a valid absolute SD; out-pointers writable per the contract.
+    unsafe {
+        // Revision @0, Control @0x02 (u16). SECURITY_DESCRIPTOR_REVISION = 1.
+        if *(sd as *const u8) != rtl::security::SECURITY_DESCRIPTOR_REVISION {
+            return 0xC000_0002; // STATUS_UNKNOWN_REVISION
+        }
+        let control = *((sd as *const u8).add(0x02) as *const u16);
+        let present = (control & 0x0004) == 0x0004; // SE_DACL_PRESENT
+        if !dacl_present.is_null() {
+            *dacl_present = present as u8;
+        }
+        if present {
+            // Dacl pointer @0x20 (absolute SD x64).
+            if !dacl.is_null() {
+                *dacl = *((sd as *const u8).add(0x20) as *const *mut c_void);
+            }
+            if !dacl_defaulted.is_null() {
+                *dacl_defaulted = ((control & 0x0008) == 0x0008) as u8; // SE_DACL_DEFAULTED
+            }
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlCharToInteger(PCSZ, ULONG base, PULONG value) -> NTSTATUS`. Ported from
+/// `references/reactos/sdk/lib/rtl/unicode.c:261` (skip whitespace, +/- sign, `0x`/`0o`/`0b`/`0`
+/// auto-base when `base==0`, accumulate digits, reject an invalid base).
+///
+/// # Safety
+/// `str` a NUL-terminated byte string; `value` writable (or NULL).
+#[export_name = "RtlCharToInteger"]
+pub unsafe extern "system" fn rtl_char_to_integer(
+    str_ptr: *const u8,
+    base: u32,
+    value: *mut u32,
+) -> NtStatus {
+    if str_ptr.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: NUL-terminated byte string per the contract.
+    let len = unsafe { strlen_raw(str_ptr) };
+    // SAFETY: valid region of `len` bytes.
+    let s = unsafe { core::slice::from_raw_parts(str_ptr, len) };
+    match nt_ntdll::rtl::integer::char_to_integer(s, base) {
+        Some(v) => {
+            if !value.is_null() {
+                // SAFETY: `value` writable per the contract.
+                unsafe { *value = v };
+            }
+            STATUS_SUCCESS
+        }
+        None => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `RtlCreateHeap(ULONG Flags, PVOID Base, SIZE_T Reserve, SIZE_T Commit, PVOID Lock, PVOID Params)
+/// -> PVOID`. We run a SINGLE process heap (installed by `LdrpInitialize`); every `RtlAllocateHeap`
+/// ignores the handle and routes to it. So a create returns a non-null sentinel handle (the process
+/// heap's identity) — callers store + pass it back, and our alloc/free ignore it. Never fabricates a
+/// second real arena; the one heap is real (ref `references/reactos/sdk/lib/rtl/heap.c:RtlCreateHeap`
+/// which returns the HEAP*; ours collapses to the single process heap by design).
+///
+/// # Safety
+/// Standard `RtlCreateHeap` contract.
+#[export_name = "RtlCreateHeap"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_heap(
+    _flags: u32,
+    _base: *mut c_void,
+    _reserve: usize,
+    _commit: usize,
+    _lock: *mut c_void,
+    _params: *mut c_void,
+) -> *mut c_void {
+    // A stable non-null sentinel identifying "the process heap". RtlAllocateHeap ignores the handle
+    // and uses the single installed heap, so the value only needs to be non-null + consistent.
+    0x1 as *mut c_void
+}
+
+/// `RtlUnhandledExceptionFilter(PEXCEPTION_POINTERS) -> LONG`. Ref
+/// `references/reactos/sdk/lib/rtl/libsupp.c` — the top-level filter returns
+/// `EXCEPTION_CONTINUE_SEARCH` (0) when no debugger/handler wants it. We return 0 so an unhandled
+/// exception propagates (honest; the real fatal-error path is the executive's, not fabricated here).
+///
+/// # Safety
+/// Called by the SEH machinery with EXCEPTION_POINTERS.
+#[export_name = "RtlUnhandledExceptionFilter"]
+pub unsafe extern "system" fn rtl_unhandled_exception_filter(_ptrs: *mut c_void) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// `memmove(void* dst, const void* src, size_t n) -> void*` — overlap-safe copy. csrsrv imports it
+/// from ntdll. `core::ptr::copy` is memmove semantics (handles overlap). Weak (like memcpy/memset):
+/// `compiler-builtins-mem` also emits a `memmove`, so ours must be weak to avoid a duplicate-strong
+/// link error while still landing in the PE export directory.
+///
+/// # Safety
+/// `dst`/`src` valid for `n` bytes.
+#[linkage = "weak"]
+#[export_name = "memmove"]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract; copy is overlap-safe (memmove).
+    unsafe { core::ptr::copy(src, dst, n) };
+    dst
+}
+
+/// `strchr(const char* s, int c) -> char*` — first occurrence of `c` (or NULL). Uses the host-tested
+/// `nt_ntdll::crt::strchr`.
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[export_name = "strchr"]
+pub unsafe extern "C" fn strchr(s: *const u8, c: i32) -> *const u8 {
+    if s.is_null() {
+        return core::ptr::null();
+    }
+    // SAFETY: NUL-terminated per the contract.
+    let len = unsafe { strlen_raw(s) };
+    // SAFETY: valid region of `len` bytes.
+    let sl = unsafe { core::slice::from_raw_parts(s, len) };
+    match nt_ntdll::crt::strchr(sl, c as u8) {
+        // SAFETY: idx within [0, len).
+        Some(idx) => unsafe { s.add(idx) },
+        // strchr matches the terminating NUL when c==0.
+        None if (c as u8) == 0 => unsafe { s.add(len) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `strncpy(char* dst, const char* src, size_t n) -> char*` — copy up to `n` bytes, NUL-padding the
+/// tail if `src` is shorter (the C contract).
+///
+/// # Safety
+/// `dst` valid for `n` bytes; `src` NUL-terminated.
+#[export_name = "strncpy"]
+pub unsafe extern "C" fn strncpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract.
+    unsafe {
+        let mut i = 0usize;
+        // Copy until NUL or n.
+        while i < n {
+            let c = *src.add(i);
+            *dst.add(i) = c;
+            if c == 0 {
+                break;
+            }
+            i += 1;
+        }
+        // NUL-pad the remainder.
+        while i < n {
+            *dst.add(i) = 0;
+            i += 1;
+        }
+    }
+    dst
+}
+
+// -------------------------------------------------------------------------------------------------
+// The loader Ldr* — csrsrv's CsrLoadServerDll uses these to load its ServerDlls (basesrv/winsrv) +
+// resolve their entry points. Wired to the on-target recursive loader (on_target.rs).
+// -------------------------------------------------------------------------------------------------
+
+/// `LdrLoadDll(PWSTR SearchPath, PULONG DllCharacteristics, PUNICODE_STRING DllName, PVOID* BaseAddr)
+/// -> NTSTATUS`. Ref `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrLoadDll` → LdrpLoadDll. Loads the
+/// named DLL (map + snap its imports recursively) and returns its base. Driven by the on-target
+/// loader ([`crate::on_target::ldr_load_dll`]).
+///
+/// # Safety
+/// `dll_name` a valid `UNICODE_STRING*`; `base_addr` a writable `PVOID*`.
+#[export_name = "LdrLoadDll"]
+pub unsafe extern "system" fn ldr_load_dll(
+    _search_path: *mut u16,
+    _characteristics: *mut u32,
+    dll_name: PCUnicodeString,
+    base_addr: *mut *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; dll_name a valid UNICODE_STRING, base_addr writable.
+        unsafe { crate::on_target::ldr_load_dll(dll_name as *const c_void, base_addr) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dll_name, base_addr);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrGetDllHandle(PWSTR Path, PULONG Flags, PUNICODE_STRING DllName, PVOID* DllHandle) -> NTSTATUS`.
+/// Ref `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrGetDllHandle` — return the base of an
+/// ALREADY-LOADED DLL (does NOT load). Driven by the on-target module table.
+///
+/// # Safety
+/// `dll_name` a valid `UNICODE_STRING*`; `dll_handle` writable.
+#[export_name = "LdrGetDllHandle"]
+pub unsafe extern "system" fn ldr_get_dll_handle(
+    _path: *mut u16,
+    _flags: *mut u32,
+    dll_name: PCUnicodeString,
+    dll_handle: *mut *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; dll_name a valid UNICODE_STRING, dll_handle writable.
+        unsafe { crate::on_target::ldr_get_dll_handle(dll_name as *const c_void, dll_handle) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dll_name, dll_handle);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrGetProcedureAddress(PVOID BaseAddress, PANSI_STRING Name, ULONG Ordinal, PVOID* Address)`.
+/// Ref `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrGetProcedureAddress` — resolve an export (by
+/// name or ordinal) in a loaded module. Driven by the on-target export walker.
+///
+/// # Safety
+/// `base_address` a mapped module; `name` a valid `ANSI_STRING*` (or NULL for by-ordinal); `address`
+/// writable.
+#[export_name = "LdrGetProcedureAddress"]
+pub unsafe extern "system" fn ldr_get_procedure_address(
+    base_address: *mut c_void,
+    name: *const c_void,
+    ordinal: u32,
+    address: *mut *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; base a mapped module, name an ANSI_STRING*/NULL, address writable.
+        unsafe {
+            crate::on_target::ldr_get_procedure_address(base_address, name, ordinal, address)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (base_address, name, ordinal, address);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Ref
+/// `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrUnloadDll`. We keep loaded modules mapped for the
+/// process lifetime (no ref-count teardown yet — the ServerDlls live forever), so this reports
+/// SUCCESS without unmapping (the observable contract for a still-referenced DLL). Not a fabricated
+/// result: real ntdll also keeps a DLL mapped while its ref-count > 0.
+///
+/// # Safety
+/// `base_address` a previously-loaded module base.
+#[export_name = "LdrUnloadDll"]
+pub unsafe extern "system" fn ldr_unload_dll(_base_address: *mut c_void) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+// =================================================================================================
 // Retention anchor — mirror the Nt* TRAP_STUB_ADDRS pattern so the linker keeps every export past
 // `--no-gc-sections`/DCE. Referenced (via `#[used]`) from `lib.rs`'s KEEP anchor.
 // =================================================================================================
@@ -1990,6 +2292,19 @@ pub unsafe extern "C" fn export_anchor() {
         vsnprintf as usize,
         vsnwprintf as usize,
         c_specific_handler as usize,
+        // BATCH 2 — csrsrv's 12 ntdll imports.
+        rtl_free_sid as usize,
+        rtl_get_dacl_security_descriptor as usize,
+        rtl_char_to_integer as usize,
+        rtl_create_heap as usize,
+        rtl_unhandled_exception_filter as usize,
+        memmove as usize,
+        strchr as usize,
+        strncpy as usize,
+        ldr_load_dll as usize,
+        ldr_get_dll_handle as usize,
+        ldr_get_procedure_address as usize,
+        ldr_unload_dll as usize,
     ];
     core::hint::black_box(anchors);
 }
