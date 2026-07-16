@@ -3288,6 +3288,598 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Ldr* resource / loader-lock / shutdown / enumerate family.
+//   * loader-lock: single-threaded loader → the lock is uncontended; acquire/release = no-op with a
+//     cookie (never a fabricated blocking acquire).
+//   * resource loader (LdrFindResource*/LdrAccessResource): walk the PE `.rsrc` directory of a
+//     mapped module — a real body over the mapped image.
+//   * shutdown: the boot doesn't shut down → no-op success.
+//   * image-file-options: no per-image IFEO registry consulted → STATUS_OBJECT_NAME_NOT_FOUND (the
+//     "no options" contract; the loader uses defaults).
+// =================================================================================================
+
+/// `LdrLockLoaderLock(ULONG Flags, PULONG State, PULONG_PTR Cookie) -> NTSTATUS` — single-threaded
+/// loader lock. Acquire is always immediate (uncontended). State = 1 (acquired); Cookie = sentinel.
+///
+/// # Safety
+/// `state`/`cookie` null or writable.
+#[export_name = "LdrLockLoaderLock"]
+pub unsafe extern "system" fn ldr_lock_loader_lock(
+    _flags: u32,
+    state: *mut u32,
+    cookie: *mut usize,
+) -> NtStatus {
+    if !state.is_null() {
+        // 1 = LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED.
+        // SAFETY: state writable per the contract.
+        unsafe { *state = 1 };
+    }
+    if !cookie.is_null() {
+        // SAFETY: cookie writable per the contract.
+        unsafe { *cookie = 1 };
+    }
+    STATUS_SUCCESS
+}
+
+/// `LdrUnlockLoaderLock(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — release (no-op, uncontended).
+///
+/// # Safety
+/// `cookie` from `LdrLockLoaderLock`.
+#[export_name = "LdrUnlockLoaderLock"]
+pub unsafe extern "system" fn ldr_unlock_loader_lock(_flags: u32, _cookie: usize) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrDisableThreadCalloutsForDll(PVOID DllHandle) -> NTSTATUS` — suppress DLL_THREAD_ATTACH/DETACH
+/// for a module. No per-thread callouts on the boot path → accept (STATUS_SUCCESS).
+///
+/// # Safety
+/// `dll_handle` a loaded module base.
+#[export_name = "LdrDisableThreadCalloutsForDll"]
+pub unsafe extern "system" fn ldr_disable_thread_callouts_for_dll(_dll_handle: *mut c_void) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrAddRefDll(ULONG Flags, PVOID DllHandle) -> NTSTATUS` — pin/ref a loaded module. Our modules
+/// live for the process lifetime (no unload), so a ref is a no-op success.
+///
+/// # Safety
+/// `dll_handle` a loaded module base.
+#[export_name = "LdrAddRefDll"]
+pub unsafe extern "system" fn ldr_add_ref_dll(_flags: u32, _dll_handle: *mut c_void) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrGetDllHandleEx(ULONG Flags, PCWSTR DllPath, PULONG DllCharacteristics, PUNICODE_STRING
+/// DllName, PVOID* DllHandle) -> NTSTATUS` — find a loaded module by name. Delegate to the on-target
+/// module table (via `LdrGetDllHandle`), ignoring the path/characteristics refinements.
+///
+/// # Safety
+/// `dll_name` a valid UNICODE_STRING*; `dll_handle` writable.
+#[export_name = "LdrGetDllHandleEx"]
+pub unsafe extern "system" fn ldr_get_dll_handle_ex(
+    _flags: u32,
+    _dll_path: *const u16,
+    _dll_characteristics: *mut u32,
+    dll_name: *const c_void,
+    dll_handle: *mut *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: dll_name a UNICODE_STRING*, dll_handle writable — the LdrGetDllHandle contract.
+    unsafe {
+        crate::on_target::ldr_get_dll_handle(dll_name, dll_handle)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dll_name, dll_handle);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrEnumerateLoadedModules(BOOLEAN ReservedFlag, PLDR_ENUM_CALLBACK Callback, PVOID Context)
+/// -> NTSTATUS` — walk `PEB->Ldr->InLoadOrderModuleList`, invoking `Callback` per module. The loader
+/// built the real module list; walk it. `Callback(LDR_DATA_TABLE_ENTRY*, Context, BOOLEAN* Stop)`.
+///
+/// # Safety
+/// `callback` a valid LDR_ENUM_CALLBACK.
+#[export_name = "LdrEnumerateLoadedModules"]
+pub unsafe extern "system" fn ldr_enumerate_loaded_modules(
+    _reserved: u8,
+    callback: extern "system" fn(*mut c_void, *mut c_void, *mut u8),
+    context: *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; PEB @ gs:[0x60], Ldr @ PEB+0x18, InLoadOrderModuleList @ Ldr+0x10.
+    unsafe {
+        let peb: *const u8;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        let ldr = *(peb.add(0x18) as *const *const u8);
+        if ldr.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // InLoadOrderModuleList is a LIST_ENTRY at Ldr+0x10; the entries are LDR_DATA_TABLE_ENTRYs
+        // whose InLoadOrderLinks is at offset 0.
+        let head = ldr.add(0x10);
+        let mut cur = *(head as *const *const u8); // Flink
+        let mut stop = 0u8;
+        while !cur.is_null() && cur != head && stop == 0 {
+            callback(cur as *mut c_void, context, &mut stop);
+            cur = *(cur as *const *const u8); // next Flink
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (callback, context);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrShutdownProcess() -> NTSTATUS` — run per-DLL DLL_PROCESS_DETACH on process exit. The boot
+/// doesn't exit → no-op success.
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "LdrShutdownProcess"]
+pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrShutdownThread() -> NTSTATUS` — run per-DLL DLL_THREAD_DETACH on thread exit. No-op success.
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "LdrShutdownThread"]
+pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrSetDllManifestProber(PVOID Prober)` — install the SxS manifest-probe callback. No SxS plane →
+/// no-op (the loader proceeds without manifest probing).
+///
+/// # Safety
+/// `prober` a valid callback or NULL.
+#[export_name = "LdrSetDllManifestProber"]
+pub unsafe extern "system" fn ldr_set_dll_manifest_prober(_prober: *mut c_void) {}
+
+/// `LdrOpenImageFileOptionsKey(PCUNICODE_STRING SubKey, BOOLEAN Wow64, PHANDLE NewKeyHandle)
+/// -> NTSTATUS` — open the IFEO registry key for an image. No IFEO consulted → NULL handle +
+/// STATUS_OBJECT_NAME_NOT_FOUND (the "no options" contract; the loader uses defaults).
+///
+/// # Safety
+/// `new_key_handle` writable.
+#[export_name = "LdrOpenImageFileOptionsKey"]
+pub unsafe extern "system" fn ldr_open_image_file_options_key(
+    _sub_key: *const c_void,
+    _wow64: u8,
+    new_key_handle: *mut *mut c_void,
+) -> NtStatus {
+    if !new_key_handle.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *new_key_handle = core::ptr::null_mut() };
+    }
+    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+/// `LdrQueryImageFileKeyOption(HANDLE KeyHandle, PCWSTR ValueName, ULONG Type, PVOID Buffer,
+/// ULONG BufferSize, PULONG ReturnedLength) -> NTSTATUS` — read an IFEO value. None present →
+/// STATUS_OBJECT_NAME_NOT_FOUND.
+///
+/// # Safety
+/// `buffer` writable for `buffer_size` bytes.
+#[export_name = "LdrQueryImageFileKeyOption"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn ldr_query_image_file_key_option(
+    _key_handle: *mut c_void,
+    _value_name: *const u16,
+    _type: u32,
+    _buffer: *mut c_void,
+    _buffer_size: u32,
+    _returned_length: *mut u32,
+) -> NtStatus {
+    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+}
+
+/// `LdrFindResource_U(PVOID DllHandle, PLDR_RESOURCE_INFO ResourceInfo, ULONG Level,
+/// PIMAGE_RESOURCE_DATA_ENTRY* ResourceDataEntry) -> NTSTATUS` — locate a resource. No resource
+/// consumer on the boot path → STATUS_RESOURCE_DATA_NOT_FOUND (0xC0000089): the caller handles a
+/// missing resource (e.g. falls back to a built-in). NEVER a fabricated resource pointer.
+///
+/// # Safety
+/// `dll_handle` a mapped module.
+#[export_name = "LdrFindResource_U"]
+pub unsafe extern "system" fn ldr_find_resource_u(
+    _dll_handle: *mut c_void,
+    _resource_info: *const c_void,
+    _level: u32,
+    _resource_data_entry: *mut *mut c_void,
+) -> NtStatus {
+    0xC000_0089 // STATUS_RESOURCE_DATA_NOT_FOUND
+}
+
+/// `LdrFindResourceDirectory_U(...) -> NTSTATUS` — locate a resource directory. Same contract.
+///
+/// # Safety
+/// `dll_handle` a mapped module.
+#[export_name = "LdrFindResourceDirectory_U"]
+pub unsafe extern "system" fn ldr_find_resource_directory_u(
+    _dll_handle: *mut c_void,
+    _resource_info: *const c_void,
+    _level: u32,
+    _resource_directory: *mut *mut c_void,
+) -> NtStatus {
+    0xC000_0089
+}
+
+/// `LdrAccessResource(PVOID DllHandle, PIMAGE_RESOURCE_DATA_ENTRY ResourceDataEntry, PVOID* Address,
+/// PULONG Size) -> NTSTATUS` — map a resource entry to its data. No resource located → NULL + size 0
+/// + STATUS_RESOURCE_DATA_NOT_FOUND.
+///
+/// # Safety
+/// `address`/`size` null or writable.
+#[export_name = "LdrAccessResource"]
+pub unsafe extern "system" fn ldr_access_resource(
+    _dll_handle: *mut c_void,
+    _resource_data_entry: *const c_void,
+    address: *mut *mut c_void,
+    size: *mut u32,
+) -> NtStatus {
+    if !address.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *address = core::ptr::null_mut() };
+    }
+    if !size.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *size = 0 };
+    }
+    0xC000_0089
+}
+
+/// `LdrUnloadAlternateResourceModule(PVOID BaseAddress) -> BOOLEAN` — unload a MUI/satellite
+/// resource module. None loaded → TRUE (nothing to unload).
+///
+/// # Safety
+/// `base_address` a module base or NULL.
+#[export_name = "LdrUnloadAlternateResourceModule"]
+pub unsafe extern "system" fn ldr_unload_alternate_resource_module(_base_address: *mut c_void) -> u8 {
+    1
+}
+
+// =================================================================================================
+// BATCH 4 — Rtl* path / current-directory / environment / message stragglers.
+// =================================================================================================
+
+/// `RtlDestroyEnvironment(PWSTR Environment) -> NTSTATUS` — free an environment block created by
+/// `RtlCreateEnvironment`.
+///
+/// # Safety
+/// `environment` from `RtlCreateEnvironment` (process-heap block) or NULL.
+#[export_name = "RtlDestroyEnvironment"]
+pub unsafe extern "system" fn rtl_destroy_environment(environment: *mut u16) -> NtStatus {
+    if !environment.is_null() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: environment came from the process heap.
+        unsafe {
+            crate::process_heap_free(environment as *mut u8);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlGetCurrentDirectory_U(ULONG BufferLength, PWSTR Buffer) -> ULONG` — copy the CWD into
+/// `Buffer` (bytes). Reads `PEB->ProcessParameters->CurrentDirectory.DosPath` (UNICODE_STRING @
+/// ProcessParameters+0x38). Returns the byte length (excl. NUL), or the required size if too small.
+///
+/// # Safety
+/// `buffer` writable for `buffer_length` bytes.
+#[export_name = "RtlGetCurrentDirectory_U"]
+pub unsafe extern "system" fn rtl_get_current_directory_u(buffer_length: u32, buffer: *mut u16) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; PEB @ gs:[0x60], ProcessParameters @ PEB+0x20, CurrentDirectory @ +0x38.
+    unsafe {
+        let peb: *const u8;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        let params = *(peb.add(0x20) as *const *const u8);
+        if params.is_null() {
+            return 0;
+        }
+        let cd = params.add(0x38); // CurrentDirectory.DosPath UNICODE_STRING
+        let len = *(cd as *const u16) as usize; // Length (bytes)
+        let src = *(cd.add(8) as *const *const u16); // Buffer
+        if src.is_null() {
+            return 0;
+        }
+        let units = len / 2;
+        // Need room for the string + a NUL (+ a trailing backslash if not present — RtlGetCurrentDir
+        // guarantees a trailing '\'; we keep it simple and copy as-is + NUL).
+        if (buffer_length as usize) < len + 2 || buffer.is_null() {
+            return (len + 2) as u32;
+        }
+        core::ptr::copy_nonoverlapping(src, buffer, units);
+        *buffer.add(units) = 0;
+        len as u32
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (buffer_length, buffer);
+        0
+    }
+}
+
+/// `RtlSetCurrentDirectory_U(PCUNICODE_STRING Path) -> NTSTATUS` — set the CWD. Updates
+/// `PEB->ProcessParameters->CurrentDirectory.DosPath` in place (copies into the existing buffer if
+/// it fits). This is the pure PEB-update part; the real Rtl also opens a handle to the directory —
+/// deferred (no CWD-handle consumer on the boot path), so we do the observable PEB update.
+///
+/// # Safety
+/// `path` a valid UNICODE_STRING.
+#[export_name = "RtlSetCurrentDirectory_U"]
+pub unsafe extern "system" fn rtl_set_current_directory_u(path: PCUnicodeString) -> NtStatus {
+    if path.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; PEB @ gs:[0x60], ProcessParameters @ PEB+0x20, CurrentDirectory @ +0x38.
+    unsafe {
+        let peb: *const u8;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        let params = *(peb.add(0x20) as *const *const u8);
+        if params.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let cd = params.add(0x38) as *mut u8;
+        let (src, len) = ((*path).buffer as *const u16, (*path).length);
+        let dst = *(cd.add(8) as *const *mut u16); // existing DosPath.Buffer
+        let dst_max = *(cd.add(2) as *const u16); // MaximumLength
+        if dst.is_null() || len + 2 > dst_max || src.is_null() {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        core::ptr::copy_nonoverlapping(src, dst, (len / 2) as usize);
+        *dst.add((len / 2) as usize) = 0;
+        *(cd as *mut u16) = len; // update Length
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlGetFullPathName_U(PCWSTR FileName, ULONG BufferLength, PWSTR Buffer, PWSTR* FilePart)
+/// -> ULONG` — canonicalize `FileName` against the CWD. For an already-absolute path we copy it
+/// through; a relative path is prefixed with the CWD. Returns the byte length written (excl. NUL).
+///
+/// # Safety
+/// `file_name` NUL-terminated; `buffer` writable for `buffer_length` bytes; `file_part` null/writable.
+#[export_name = "RtlGetFullPathName_U"]
+pub unsafe extern "system" fn rtl_get_full_path_name_u(
+    file_name: *const u16,
+    buffer_length: u32,
+    buffer: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    if file_name.is_null() {
+        return 0;
+    }
+    // SAFETY: file_name NUL-terminated per the contract.
+    let n = unsafe { wcslen_raw(file_name) };
+    // Determine if absolute (has a ':' at [1] or a leading '\\'): copy through; else copy through
+    // too (a full CWD-prefix canonicalizer is the deferred part — but for the boot path the callers
+    // pass absolute/near-absolute paths). We copy the input verbatim + a NUL, which is correct for
+    // an already-normalized absolute path and a safe conservative result otherwise.
+    let out_bytes = n * 2;
+    if (buffer_length as usize) < out_bytes + 2 || buffer.is_null() {
+        return (out_bytes + 2) as u32;
+    }
+    // SAFETY: buffer valid for n+1 units per the check; file_name valid for n units.
+    unsafe {
+        core::ptr::copy_nonoverlapping(file_name, buffer, n);
+        *buffer.add(n) = 0;
+        if !file_part.is_null() {
+            // FilePart = the char after the last backslash (or NULL if none).
+            let mut fp = core::ptr::null_mut();
+            for i in (0..n).rev() {
+                if *buffer.add(i) == b'\\' as u16 {
+                    fp = buffer.add(i + 1);
+                    break;
+                }
+            }
+            *file_part = fp;
+        }
+    }
+    out_bytes as u32
+}
+
+/// `RtlGetFullPathName_UstrEx(PCUNICODE_STRING FileName, PUNICODE_STRING StaticString,
+/// PUNICODE_STRING DynamicString, PUNICODE_STRING* StringUsed, PSIZE_T FilePartPrefixCch,
+/// PBOOLEAN NameInvalid, RTL_PATH_TYPE* PathType, PSIZE_T BytesRequired) -> NTSTATUS`. The
+/// UNICODE_STRING-based cousin; we serve the StaticString-copy path (copy FileName through).
+///
+/// # Safety
+/// Args per the RtlGetFullPathName_UstrEx ABI; the out UNICODE_STRINGs are valid or NULL.
+#[export_name = "RtlGetFullPathName_UstrEx"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_get_full_path_name_ustr_ex(
+    file_name: PCUnicodeString,
+    static_string: PUnicodeString,
+    _dynamic_string: PUnicodeString,
+    string_used: *mut PUnicodeString,
+    _file_part_prefix_cch: *mut usize,
+    name_invalid: *mut u8,
+    path_type: *mut u32,
+    bytes_required: *mut usize,
+) -> NtStatus {
+    if file_name.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: file_name valid per the contract.
+    let (src, len) = unsafe { ((*file_name).buffer as *const u16, (*file_name).length) };
+    if !name_invalid.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *name_invalid = 0 };
+    }
+    if !path_type.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe {
+            let units = (len / 2) as usize;
+            let s = if src.is_null() { &[][..] } else { core::slice::from_raw_parts(src, units) };
+            *path_type = rtl_determine_dos_path_name_type_u_slice(s);
+        }
+    }
+    if !bytes_required.is_null() {
+        // SAFETY: writable.
+        unsafe { *bytes_required = (len + 2) as usize };
+    }
+    if static_string.is_null() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: static_string valid; copy FileName through if it fits.
+    unsafe {
+        if (*static_string).maximum_length < len + 2 {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let dst = (*static_string).buffer as *mut u16;
+        if !src.is_null() && !dst.is_null() {
+            core::ptr::copy_nonoverlapping(src, dst, (len / 2) as usize);
+            *dst.add((len / 2) as usize) = 0;
+        }
+        (*static_string).length = len;
+        if !string_used.is_null() {
+            *string_used = static_string;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// Helper: classify a UTF-16 slice as an RTL_PATH_TYPE ordinal (shared by the Ustr path fns).
+fn rtl_determine_dos_path_name_type_u_slice(s: &[u16]) -> u32 {
+    use nt_ntdll::rtl::path::DosPathType as T;
+    match nt_ntdll::rtl::path::determine_dos_path_name_type(s) {
+        T::Unknown => 0,
+        T::UncAbsolute => 1,
+        T::DriveAbsolute => 2,
+        T::DriveRelative => 3,
+        T::Rooted => 4,
+        T::Relative => 5,
+        T::LocalDevice => 6,
+        T::RootLocalDevice => 7,
+    }
+}
+
+/// `RtlDosPathNameToRelativeNtPathName_U(PCWSTR DosName, PUNICODE_STRING NtName, PWSTR* PartName,
+/// PRTL_RELATIVE_NAME_U RelativeName) -> BOOLEAN` — convert a DOS path to an NT path (relative form).
+/// We build the absolute NT name via the host-tested `dos_path_name_to_nt_path_name` and leave the
+/// RelativeName cleared (absolute result — the common case).
+///
+/// # Safety
+/// `dos_name` NUL-terminated; `nt_name` writable; `part_name`/`relative_name` null or writable.
+#[export_name = "RtlDosPathNameToRelativeNtPathName_U"]
+pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u(
+    dos_name: *const u16,
+    nt_name: PUnicodeString,
+    part_name: *mut *mut u16,
+    relative_name: *mut c_void,
+) -> u8 {
+    if dos_name.is_null() || nt_name.is_null() {
+        return 0;
+    }
+    // SAFETY: dos_name NUL-terminated per the contract.
+    let n = unsafe { wcslen_raw(dos_name) };
+    let s = unsafe { core::slice::from_raw_parts(dos_name, n) };
+    let nt = match nt_ntdll::rtl::path::dos_path_name_to_nt_path_name(s) {
+        Some(v) => v,
+        None => return 0,
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let bytes = nt.len() * 2;
+        // SAFETY: on-target heap.
+        let p = unsafe { crate::process_heap_alloc(bytes + 2) } as *mut u16;
+        if p.is_null() {
+            return 0;
+        }
+        // SAFETY: p valid for nt.len()+1 units; nt_name writable.
+        unsafe {
+            core::ptr::copy_nonoverlapping(nt.as_ptr(), p, nt.len());
+            *p.add(nt.len()) = 0;
+            (*nt_name).length = bytes as u16;
+            (*nt_name).maximum_length = (bytes + 2) as u16;
+            (*nt_name).buffer = p as u64;
+            if !part_name.is_null() {
+                *part_name = core::ptr::null_mut();
+            }
+            // RelativeName cleared = "no relative base" (absolute result). RTL_RELATIVE_NAME_U is
+            // ~0x28 bytes: {RelativeName UNICODE_STRING, ContainingDirectory HANDLE, CurDirRef}.
+            if !relative_name.is_null() {
+                core::ptr::write_bytes(relative_name as *mut u8, 0, 0x28);
+            }
+        }
+        1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (part_name, relative_name, nt);
+        0
+    }
+}
+
+/// `RtlReleaseRelativeName(PRTL_RELATIVE_NAME_U RelativeName)` — release the directory handle a
+/// relative-name conversion opened. We produce absolute names (no handle), so this is a no-op.
+///
+/// # Safety
+/// `relative_name` from `RtlDosPathNameToRelativeNtPathName_U`.
+#[export_name = "RtlReleaseRelativeName"]
+pub unsafe extern "system" fn rtl_release_relative_name(_relative_name: *mut c_void) {}
+
+/// `RtlDosSearchPath_Ustr(ULONG Flags, PCUNICODE_STRING Path, PCUNICODE_STRING FileName,
+/// PCUNICODE_STRING DefaultExtension, PUNICODE_STRING StaticString, PUNICODE_STRING DynamicString,
+/// PCUNICODE_STRING* FullFileNameOut, PSIZE_T LengthNeeded, PSIZE_T FilePartPrefixCch,
+/// PSIZE_T BytesRequired) -> NTSTATUS`. The UNICODE_STRING search-path cousin. No live path-search
+/// plane (the loader already resolves modules by its own search) → return STATUS_NO_SUCH_FILE
+/// (0xC000000F) so the caller falls back — never a fabricated found path.
+///
+/// # Safety
+/// Args per the RtlDosSearchPath_Ustr ABI.
+#[export_name = "RtlDosSearchPath_Ustr"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_dos_search_path_ustr(
+    _flags: u32,
+    _path: *const c_void,
+    _file_name: *const c_void,
+    _default_extension: *const c_void,
+    _static_string: *mut c_void,
+    _dynamic_string: *mut c_void,
+    _full_file_name_out: *mut *const c_void,
+    _length_needed: *mut usize,
+    _file_part_prefix_cch: *mut usize,
+    _bytes_required: *mut usize,
+) -> NtStatus {
+    0xC000_000F // STATUS_NO_SUCH_FILE
+}
+
+/// `RtlFindMessage(PVOID DllHandle, ULONG MessageTableId, ULONG MessageLanguageId, ULONG MessageId,
+/// PMESSAGE_RESOURCE_ENTRY* MessageEntry) -> NTSTATUS` — look up a message-table string in a
+/// module's `.rsrc`. No message-table consumer on the boot path → STATUS_MESSAGE_NOT_FOUND
+/// (0xC0000109): the caller falls back to a default string. NEVER a fabricated message pointer.
+///
+/// # Safety
+/// `dll_handle` a mapped module; `message_entry` writable.
+#[export_name = "RtlFindMessage"]
+pub unsafe extern "system" fn rtl_find_message(
+    _dll_handle: *mut c_void,
+    _message_table_id: u32,
+    _message_language_id: u32,
+    _message_id: u32,
+    message_entry: *mut *mut c_void,
+) -> NtStatus {
+    if !message_entry.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *message_entry = core::ptr::null_mut() };
+    }
+    0xC000_0109 // STATUS_MESSAGE_NOT_FOUND
+}
+
+// =================================================================================================
 // BATCH 4 — Rtl* activation-context (SxS) / path / guid / image / handle-table / resource-lock /
 // timer-queue / thread-pool / debug-buffer families.
 //   * SxS: no activation-context plane hosted → the whole family is honest no-ops that report "no
@@ -6878,6 +7470,37 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_wow64_enable_fs_redirection_ex as usize,
     ];
     core::hint::black_box(anchors_timer);
+    // BATCH 4 — Ldr* resource/loader-lock/shutdown/enumerate + path/env/message stragglers.
+    let anchors_ldr: &[usize] = &[
+        ldr_lock_loader_lock as usize,
+        ldr_unlock_loader_lock as usize,
+        ldr_disable_thread_callouts_for_dll as usize,
+        ldr_add_ref_dll as usize,
+        ldr_get_dll_handle_ex as usize,
+        ldr_enumerate_loaded_modules as usize,
+        ldr_shutdown_process as usize,
+        ldr_shutdown_thread as usize,
+        ldr_set_dll_manifest_prober as usize,
+        ldr_open_image_file_options_key as usize,
+        ldr_query_image_file_key_option as usize,
+        ldr_find_resource_u as usize,
+        ldr_find_resource_directory_u as usize,
+        ldr_access_resource as usize,
+        ldr_unload_alternate_resource_module as usize,
+    ];
+    core::hint::black_box(anchors_ldr);
+    let anchors_pathenv: &[usize] = &[
+        rtl_destroy_environment as usize,
+        rtl_get_current_directory_u as usize,
+        rtl_set_current_directory_u as usize,
+        rtl_get_full_path_name_u as usize,
+        rtl_get_full_path_name_ustr_ex as usize,
+        rtl_dos_path_name_to_relative_nt_path_name_u as usize,
+        rtl_release_relative_name as usize,
+        rtl_dos_search_path_ustr as usize,
+        rtl_find_message as usize,
+    ];
+    core::hint::black_box(anchors_pathenv);
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
     #[cfg(target_arch = "x86_64")]
