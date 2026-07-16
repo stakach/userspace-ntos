@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader → csrss cascades the FULL Win32 client stack on OUR ntdll; 23 new csrsrv+basesrv exports) DONE 2026-07-16** · next wall = executive-side page-rights (`map=8`), then BATCH 3 (winsrv/Win32-stack surface)
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17** · next wall = the executive `sm_rendezvous` accept (the real SmpApiLoop on our ntdll — `[sm-rdv] WALL: unexpected SSN`), then winlogon + paint
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1397,3 +1397,62 @@ seams BATCH 4 left (Csr* LPC send, SxS, thread-pool) becoming live where csrss a
 them. Diagnose the 0x668 NULL-deref (which struct/field) as the next increment; likely a Csr* client
 or PEB/TEB field the CsrApiRequestThread path reads that our seam returns NULL for. Reconverge
 174/98 + paint once csrss finishes CSR bring-up → the CSR↔SM handshake → winlogon spawns.
+
+---
+
+## ☑ SYSTEMATIC PORT — BATCH 5 (DONE 2026-07-17): the `#PF cr2=0x668` root-caused (an ntdll env-block bug, NOT a CSR-runtime seam) + fixed → smss drives to the CSR↔SM `NtConnectPort` handshake
+
+### ★ THE ROOT CAUSE (diagnosed with disasm + ReactOS-source evidence — the BATCH-4 hypothesis was WRONG)
+BATCH 4 guessed the `cr2=0x668 err=4 rip=0x100_0080d2aa` was a CSR-runtime struct field in **csrss image
+space** read by the CsrApiRequestThread. **It is NOT.** `rip=0x0000_0100_0080_d2aa` = **`NTDLL_BASE`
+(`0x100_0080_0000`, `main.rs:154`) + RVA `0xd2aa`** — i.e. the fault is in **OUR ntdll**, not csrss.
+`llvm-objdump -d` at `.text` VMA `0x18000d2aa` places it inside
+`nt_ntdll_dll::on_target::rtl_create_user_process`, at the `read_env_units` scan
+`movzwl (%rsi)` where `%rsi = [params+0x80]` = `RTL_USER_PROCESS_PARAMETERS.Environment`. **`%rsi =
+0x668`** → the fault. And the `sec-stop` badge confirms it: **`badge=0 (smss)`**, last SSNs
+`… 0:175 (NtQuerySection) … 0:161 (NtQueryInformationProcess)` = exactly `RtlCreateUserProcess`'s
+call chain, then the deref. So it is **smss** (not csrss) running **our** `RtlCreateUserProcess` to
+spawn its next child, faulting on the child's environment pointer.
+
+**Why 0x668:** `params[+0x80]` held a small OFFSET (`0x668`), not a VA. Our
+`normalize`/`denormalize` (`crates/nt-ntdll/src/rtl/process_params.rs`) INCORRECTLY rebased the
+`Environment` field alongside the 8 `UNICODE_STRING` Buffers. **ReactOS
+`RtlNormalizeProcessParams`/`RtlDeNormalizeProcessParams` (`sdk/lib/rtl/ppb.c`) touch ONLY the 8
+string Buffers** — the `NORMALIZE`/`DENORMALIZE` macros never list `Environment`. In real ntdll
+`Environment` is ALWAYS a live VA (`RtlCreateProcessParameters` sets `Param->Environment = Dest`, a
+VA, and denormalize leaves it alone; `RtlpInitEnvironment` derefs it directly, `process.c:102`).
+Our denormalize turned the built VA into the raw offset `0x668`, which `RtlpInitEnvironment` then
+dereferenced as a VA → `#PF cr2=0x668`. **So the responsible seam was our own
+`RtlNormalize/DeNormalizeProcessParams` + `RtlCreateProcessParameters` — an ntdll bug, not a
+missing CSR plane.**
+
+### THE FIX (ReactOS-faithful, host-tested)
+- **`process_params.rs`**: `normalize`/`denormalize` no longer touch `OFF_ENVIRONMENT` (ppb.c parity
+  — only the 8 string Buffers are rebased). The pure builder is VA-agnostic so it still stores
+  `Environment` as an offset internally.
+- **`on_target.rs` `rtl_create_process_parameters`**: after copying the block to the heap `dst`, it
+  now fixes `Environment` to the live VA `dst + environment_offset` (matching ppb.c
+  `Param->Environment = Dest`); a zero offset (no env) leaves the field NULL.
+- Host test `normalize_denormalize_roundtrip` updated to assert `Environment` is untouched across the
+  whole normalize→denormalize round-trip. **nt-ntdll 157/157 green.**
+
+### How far the boot got (boot-verified)
+The `cr2=0x668` fault is **GONE**. smss completes `RtlpInitEnvironment` (the
+`NtAllocateVirtualMemory`/`NtWriteVirtualMemory` env-block writes now SUCCEED) + the child spawn,
+advances **iters 553 → 573**, and drives all the way to the **CSR↔SM handshake**:
+`NtConnectPort` (SSN 33). The new `sec-stop` is `label=2 m0=0x21(=33) stop_ssn=33` with a VALID high
+VA in m1 (not a NULL/low deref). The SSN trace now shows the full `RtlCreateUserProcess` completing
++ a long tail (`…0:18 0:287 0:287…0:129 0:181 0:33` = Allocate/Write/MapView/QuerySysInfo/ConnectPort).
+
+### ★ THE NEXT FRONTIER = the executive `sm_rendezvous` accept (NOT an ntdll gap)
+smss's main thread hits `NtConnectPort` (\SmApiPort); the executive's `sm_rendezvous`
+(`rendezvous.rs`) fires (`[sm-rdv] csrss NtConnectPort pending (conn=5) -> driving the real
+SmpApiLoop accept`) but WALLs: `[sm-rdv] WALL: unexpected SSN=1099786334208` (=`0x0000_0100_0000_0080`)
+→ `rendezvous produced no client handle`. The real `SmpApiLoop` thread (ReactOS smss code) running on
+OUR ntdll issues a first syscall whose SSN the rendezvous state machine (which expects
+SetInfoThread/QueryInfoProcess/ReplyWaitReceive/AcceptConnect/CompleteConnect) doesn't recognize —
+m0 reads as a high-canonical VA (`0x100_..._0080`), not a bare SSN. This is a **rendezvous-transport /
+SmpApiLoop-thread-setup** issue in the EXISTING executive machinery (reuse, don't rebuild), and needs
+the lldb/gdb-stub RIP-on-the-loop-thread investigation the plan describes (which syscall the loop
+actually issues + why m0 is a VA). Reconverge 174/98 + paint once the SM accept completes → winlogon
+spawns → win32k paints `0x003a6ea5`.
