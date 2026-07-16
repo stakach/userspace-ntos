@@ -456,10 +456,40 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             }
             if foreign {
                 // Map the CALLER's (csrss's) own frame for this page into win32k at the identical VA.
-                // False = the page isn't backed by a recorded csrss frame (win32k would read garbage,
-                // or it's a PML4[2] client range needing per-SSN marshaling) — stop cleanly.
+                // False = the page isn't backed by a recorded csrss frame.
                 if !map_csrss_page_into_win32k(page, client_pi, host_pml4) {
-                    return (0xC000_0001u32 as i32, false);
+                    // ★ DISCRIMINATE a genuine client user pointer from a win32k-INTERNAL working
+                    // buffer. Every hosted-process user region lives in PML4[2] (>= 0x100_0000_0000:
+                    // PE_LOAD_BASE / NTDLL_BASE / STACK_BASE / SMSS_ALLOC_VA / the executive-issued
+                    // allocations). A fault BELOW that range (PML4[0], e.g. 0x0200_0000) with NO
+                    // recorded client frame is NOT a client pointer at all — it is a bits/surface
+                    // buffer win32k itself materialized (a source SURFOBJ.pvScan0 the GDI blit path
+                    // built) whose VA no host allocator backed. Back it as win32k-own zero memory so
+                    // the blit reads a defined (blank) buffer instead of walling — the correct handling
+                    // for a win32k-internal working page (a stock/DDB bitmap-init blit source during
+                    // gdi32 process-attach). Bounded by DEMAND_CAP. A GENUINE unbacked high client
+                    // pointer (>= PML4[2], no frame) still walls — that would be real garbage.
+                    let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
+                    if win32k_internal_low {
+                        if demand < 60 {
+                            print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
+                            print_hex((page >> 32) as u32);
+                            print_hex(page as u32);
+                            print_str(b" -> zero-fill (blit source buffer)\n");
+                        }
+                        ensure_w32_client_paging(page, host_pml4);
+                        let f = alloc_frame();
+                        let _ = page_map(f, page, RW_NX, host_pml4);
+                    } else {
+                        print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
+                        print_hex((page >> 32) as u32);
+                        print_hex(page as u32);
+                        print_str(b" client_pi=");
+                        print_u64(client_pi);
+                        print_str(b"\n");
+                        win32k_dispatch_backtrace();
+                        return (0xC000_0001u32 as i32, false);
+                    }
                 }
             } else {
                 // A win32k-own demand-pageable page (past the image tail / session arena / the
