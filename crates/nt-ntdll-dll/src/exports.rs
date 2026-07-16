@@ -4133,24 +4133,7 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
     STATUS_SUCCESS
 }
 
-/// `RtlCaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture, PVOID* BackTrace,
-/// PULONG BackTraceHash) -> USHORT` — no stack walker; capture 0 frames (honest).
-///
-/// # Safety
-/// `back_trace` writable for `frames_to_capture` entries; `hash` null or writable.
-#[export_name = "RtlCaptureStackBackTrace"]
-pub unsafe extern "system" fn rtl_capture_stack_back_trace(
-    _frames_to_skip: u32,
-    _frames_to_capture: u32,
-    _back_trace: *mut *mut c_void,
-    hash: *mut u32,
-) -> u16 {
-    if !hash.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *hash = 0 };
-    }
-    0
-}
+// `RtlCaptureStackBackTrace` is provided by the security_exports module (part of that family).
 
 /// `RtlWow64EnableFsRedirection(BOOLEAN Enable) -> NTSTATUS` — we are native x64, no WOW64
 /// redirection → STATUS_SUCCESS no-op.
@@ -6891,7 +6874,6 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_create_query_debug_buffer as usize,
         rtl_destroy_query_debug_buffer as usize,
         rtl_query_process_debug_information as usize,
-        rtl_capture_stack_back_trace as usize,
         rtl_wow64_enable_fs_redirection as usize,
         rtl_wow64_enable_fs_redirection_ex as usize,
     ];

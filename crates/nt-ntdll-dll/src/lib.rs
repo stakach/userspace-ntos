@@ -33,6 +33,10 @@ use nt_ntdll::heap::Heap;
 /// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
 pub mod exports;
 
+/// BATCH 4 — the raw SID/ACL/SECURITY_DESCRIPTOR ntdll security exports (advapi32's surface).
+/// See [`security_exports`].
+pub mod security_exports;
+
 /// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
 #[cfg(target_arch = "x86_64")]
 pub mod on_target;
@@ -197,6 +201,11 @@ static KEEP_TRAP_STUBS: &[unsafe extern "C" fn()] = nt_ntdll::trap_stubs::TRAP_S
 /// cdylib references) would be dropped.
 #[used]
 static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
+
+/// Anchor the BATCH-4 security exports (defined in [`security_exports`]) — same DCE-retention
+/// pattern as [`KEEP_EXPORTS`].
+#[used]
+static KEEP_SECURITY_EXPORTS: unsafe extern "C" fn() = security_exports::SECURITY_EXPORT_ANCHOR_FN;
 
 /// The Step-4.A observable marker bytes, emitted via the `int 0x2d` DebugService (`PRINT`) the
 /// kernel forwards to serial as `[dbg] ...` (see `project_smss_sec_image` +
