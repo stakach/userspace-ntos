@@ -3060,6 +3060,14 @@ struct ExecNtHandler {
     /// Like `spawn_request` but for the 3rd hosted process: NtCreateProcess recognised winlogon's
     /// SEC_IMAGE section, so the loop spawns winlogon (badge WINLOGON_BADGE) after dispatch.
     winlogon_spawn_request: bool,
+    /// Like `spawn_request` but for the 4th hosted process: winlogon's Win32 `NtCreateProcessEx`
+    /// (SSN 50, `StartServicesManager`) recognised the services.exe SEC_IMAGE section, so the loop
+    /// spawns services (badge SERVICES_BADGE) after dispatch.
+    services_spawn_request: bool,
+    /// Like `spawn_request` but for the 5th hosted process: winlogon's Win32 `NtCreateProcessEx`
+    /// (SSN 50, `StartLsass`) recognised the lsass.exe SEC_IMAGE section, so the loop spawns lsass
+    /// (badge LSASS_BADGE) after dispatch.
+    lsass_spawn_request: bool,
     /// Path B (authentic SM accept): set by the FIRST smss `NtCreateThread` (an `SmpApiLoop` worker)
     /// so the LOOP spawns the REAL SM-loop thread (`spawn_sm_loop_thread` — it needs smss's PML4 +
     /// the caller's SP to read the CONTEXT/PortHandle, which stay loop-resident). Mirrors `spawn_request`.

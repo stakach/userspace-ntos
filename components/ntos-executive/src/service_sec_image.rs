@@ -328,7 +328,16 @@ pub(crate) unsafe fn service_sec_image(
         // budget now covers services' full DllMain/CRT bring-up too — raised 3000→5000 so services
         // reaches its real SCM entry (ScmMain) rather than starving at the old ceiling. Verified
         // each process still PROGRESSES (new SSNs / advancing demand-faults), not spinning.
-        if iters > 8000 {
+        // BATCH 20: services.exe now SPAWNS (winlogon's CreateProcessInternalW no longer bails — the
+        // relative-path fix) and runs its FULL ntdll loader — but it pulls in an ENORMOUS dependency
+        // tree (57 modules: crypt32/dbghelp/libtiff/wintrust/…), each snapping+relocating hundreds of
+        // pages via demand faults. Under TCG (~4 faults/s) fully loading services would take >2000s.
+        // The gate-relevant work (winlogon → SwitchDesktop → paint + services SPAWNING + its loader
+        // STARTING) is complete well before that. Cap at 5000 iters so the boot TERMINATES in-budget
+        // and the specs (incl. exec_services_spawned) run; services' full SCM bring-up is the next
+        // batch's frontier. Backstop only — each process still PROGRESSES (advancing faults), not
+        // spinning (verified: cr2 sweeps the whole DLL space at the loader's snap RIP, never repeats).
+        if iters > 5000 {
             stop = m1;
             break;
         }
@@ -1063,6 +1072,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
+                nt_handler.services_spawn_request = false;
+                nt_handler.lsass_spawn_request = false;
                 nt_handler.sm_spawn_request = false;
                 nt_handler.wl_spawn_request = 0;
                 nt_handler.svc_listener_spawn = false;
@@ -1411,6 +1422,97 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(winlogon_process_handle as u32);
                     print_str(b"; its ntdll loader now multiplexed into this loop\n");
                     WINLOGON_SPAWNED.store(1, Ordering::Relaxed);
+                }
+                // winlogon's Win32 NtCreateProcessEx(50) StartServicesManager — spawn services.exe (the
+                // 4th hosted process). SSN 50 is table-routed to exec_handler's NtCreateProcess handler,
+                // which validated the services.exe SEC_IMAGE section + set services_spawn_request; the
+                // actual spawn lives here (it needs fault_ep + procs[]/mirrors — loop-resident). Mirrors
+                // the winlogon_spawn_request block above.
+                if nt_handler.services_spawn_request
+                    && SERVICES_SPAWNED.swap(1, Ordering::Relaxed) == 0
+                    && services_pe.is_some()
+                {
+                    let sf_c = mint_badged(fault_ep, SERVICES_BADGE);
+                    let spe = services_pe.as_ref().unwrap();
+                    const SERVICES_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\services.exe";
+                    const SERVICES_CMD_LINE: &[u8] = b"services.exe";
+                    let spml4 = spawn_sec_image(
+                        3, spe, sf_c, NTDLL_BASE, true, 103, SERVICES_ENV_SCRATCH_VA,
+                        SERVICES_STACK_MIRROR_VA, SERVICES_HEAP_MIRROR_VA, SERVICES_IMAGE_MIRROR_VA,
+                        SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize
+                    );
+                    procs[3].pml4 = spml4;
+                    procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
+                    procs[3].scratch_base = SERVICES_SCRATCH_BASE;
+                    nt_handler.bind_main_thread_entry(3, PE_LOAD_BASE + spe.entry_point_rva() as u64);
+                    services_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(3)) {
+                        (Some(wl_pid), Some(sv_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                wl_pid,
+                                nt_process::HandleObject::Process(sv_pid),
+                                0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle;
+                                nt_handler.next_handle += 1;
+                                g
+                            })
+                        }
+                        _ => {
+                            let g = nt_handler.next_handle;
+                            nt_handler.next_handle += 1;
+                            g
+                        }
+                    };
+                    smss_stack_write(get_recv_mr(9), services_process_handle); // *ProcessHandle (R10)
+                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
+                    print_hex((services_process_handle >> 32) as u32);
+                    print_hex(services_process_handle as u32);
+                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
+                } else if nt_handler.services_spawn_request && services_process_handle != 0 {
+                    // Idempotent re-create: return the same handle.
+                    smss_stack_write(get_recv_mr(9), services_process_handle);
+                }
+                // winlogon's StartLsass NtCreateProcessEx(50) — spawn lsass.exe (the 5th hosted process).
+                if nt_handler.lsass_spawn_request
+                    && LSASS_SPAWNED.swap(1, Ordering::Relaxed) == 0
+                    && lsass_pe.is_some()
+                {
+                    let lf_c = mint_badged(fault_ep, LSASS_BADGE);
+                    let lpe = lsass_pe.as_ref().unwrap();
+                    const LSASS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\lsass.exe";
+                    const LSASS_CMD_LINE: &[u8] = b"lsass.exe";
+                    let lpml4 = spawn_sec_image(
+                        4, lpe, lf_c, NTDLL_BASE, true, 104, LSASS_ENV_SCRATCH_VA,
+                        LSASS_STACK_MIRROR_VA, LSASS_HEAP_MIRROR_VA, LSASS_IMAGE_MIRROR_VA,
+                        LSASS_IMAGE_PATH, LSASS_CMD_LINE,
+                        0, // pi>=1: real ntdll LdrpInitialize
+                    );
+                    procs[4].pml4 = lpml4;
+                    procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
+                    procs[4].scratch_base = LSASS_SCRATCH_BASE;
+                    nt_handler.bind_main_thread_entry(4, PE_LOAD_BASE + lpe.entry_point_rva() as u64);
+                    lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
+                        (Some(wl_pid), Some(ls_pid)) => {
+                            let h = nt_handler.pm.insert_handle(
+                                wl_pid, nt_process::HandleObject::Process(ls_pid), 0,
+                            );
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                            h.map(|v| v as u64).unwrap_or_else(|_| {
+                                let g = nt_handler.next_handle; nt_handler.next_handle += 1; g
+                            })
+                        }
+                        _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
+                    };
+                    smss_stack_write(get_recv_mr(9), lsass_process_handle); // *ProcessHandle (R10)
+                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
+                    print_hex((lsass_process_handle >> 32) as u32);
+                    print_hex(lsass_process_handle as u32);
+                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
+                } else if nt_handler.lsass_spawn_request && lsass_process_handle != 0 {
+                    smss_stack_write(get_recv_mr(9), lsass_process_handle);
                 }
                 // Path B: smss's first NtCreateThread (an SmpApiLoop worker) — spawn the REAL SM-loop
                 // thread in smss's VSpace. Read the CONTEXT off smss's stack: the NtCreateThread ABI
@@ -2100,110 +2202,6 @@ pub(crate) unsafe fn service_sec_image(
                 // allowed WITHOUT loading apphelp.dll or running the shim engine. No app-compat state is
                 // modeled; SUCCESS is the "no shim needed" answer. (BasepShimCacheCheckBypass is a
                 // hardcoded FALSE in ReactOS, so this single SUCCESS short-circuits the whole path.)
-                result = 0;
-            } else if m0 == 50 && badge == WINLOGON_BADGE {
-                // NtCreateProcessEx(*ProcessHandle[R10], DesiredAccess[RDX], OA[R8], ParentProcess[R9],
-                // Flags[sp+0x28], SectionHandle[sp+0x30], DebugPort[sp+0x38], ExceptionPort[sp+0x40]).
-                // winlogon's kernel32 CreateProcessInternalW creates services.exe — the 4th hosted
-                // process (StartServicesManager). The Win32 path (unlike smss's native
-                // RtlCreateUserProcess) builds the child AS via cross-process syscalls
-                // (NtAllocateVirtualMemory/NtWriteVirtualMemory/NtCreateThread against the child
-                // handle); in our hosted model spawn_sec_image already builds services.exe's REAL
-                // env/stack/thread, so those cross-process calls are benign no-ops. Here we validate the
-                // SectionHandle names the tracked services.exe SEC_IMAGE, then spawn services (badge
-                // SERVICES_BADGE, pi 3) with its own VSpace/mirrors/scratch at prio 103.
-                let sect = smss_stack_read(sp + 0x30); // SectionHandle
-                if services_section_handle != 0
-                    && sect == services_section_handle
-                    && services_pe.is_some()
-                    && SERVICES_SPAWNED.swap(1, Ordering::Relaxed) == 0
-                {
-                    let sf_c = mint_badged(fault_ep, SERVICES_BADGE);
-                    let spe = services_pe.as_ref().unwrap();
-                    const SERVICES_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\services.exe";
-                    const SERVICES_CMD_LINE: &[u8] = b"services.exe";
-                    let spml4 = spawn_sec_image(
-                        3, spe, sf_c, NTDLL_BASE, true, 103, SERVICES_ENV_SCRATCH_VA,
-                        SERVICES_STACK_MIRROR_VA, SERVICES_HEAP_MIRROR_VA, SERVICES_IMAGE_MIRROR_VA,
-                        SERVICES_IMAGE_PATH, SERVICES_CMD_LINE,
-                        0, // pi>=1: real ntdll LdrpInitialize
-                    );
-                    procs[3].pml4 = spml4;
-                    procs[3].img_end = PE_LOAD_BASE + image_extent(spe);
-                    procs[3].scratch_base = SERVICES_SCRATCH_BASE;
-                    // Bind services' pre-created main ETHREAD to its real image entry — pm at spawn.
-                    nt_handler.bind_main_thread_entry(3, PE_LOAD_BASE + spe.entry_point_rva() as u64);
-                    // Record services' process handle in winlogon's (pi 2) EPROCESS table as a typed
-                    // Process object; the returned dense value IS winlogon's handle (path 1b).
-                    services_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(3)) {
-                        (Some(wl_pid), Some(sv_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                wl_pid,
-                                nt_process::HandleObject::Process(sv_pid),
-                                0,
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle;
-                                nt_handler.next_handle += 1;
-                                g
-                            })
-                        }
-                        _ => {
-                            let g = nt_handler.next_handle;
-                            nt_handler.next_handle += 1;
-                            g
-                        }
-                    };
-                    smss_stack_write(get_recv_mr(9), services_process_handle); // *ProcessHandle (R10)
-                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x");
-                    print_hex((services_process_handle >> 32) as u32);
-                    print_hex(services_process_handle as u32);
-                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                } else if lsass_section_handle != 0
-                    && sect == lsass_section_handle
-                    && lsass_pe.is_some()
-                    && LSASS_SPAWNED.swap(1, Ordering::Relaxed) == 0
-                {
-                    // winlogon's StartLsass CreateProcessW(L"lsass.exe") — the 5th hosted process (badge
-                    // LSASS_BADGE, pi 4), prio 104 (> services 103) so it runs when others park.
-                    let lf_c = mint_badged(fault_ep, LSASS_BADGE);
-                    let lpe = lsass_pe.as_ref().unwrap();
-                    const LSASS_IMAGE_PATH: &[u8] = b"\\SystemRoot\\System32\\lsass.exe";
-                    const LSASS_CMD_LINE: &[u8] = b"lsass.exe";
-                    let lpml4 = spawn_sec_image(
-                        4, lpe, lf_c, NTDLL_BASE, true, 104, LSASS_ENV_SCRATCH_VA,
-                        LSASS_STACK_MIRROR_VA, LSASS_HEAP_MIRROR_VA, LSASS_IMAGE_MIRROR_VA,
-                        LSASS_IMAGE_PATH, LSASS_CMD_LINE,
-                        0, // pi>=1: real ntdll LdrpInitialize
-                    );
-                    procs[4].pml4 = lpml4;
-                    procs[4].img_end = PE_LOAD_BASE + image_extent(lpe);
-                    procs[4].scratch_base = LSASS_SCRATCH_BASE;
-                    nt_handler.bind_main_thread_entry(4, PE_LOAD_BASE + lpe.entry_point_rva() as u64);
-                    lsass_process_handle = match (nt_handler.pm_pid_for_pi(2), nt_handler.pm_pid_for_pi(4)) {
-                        (Some(wl_pid), Some(ls_pid)) => {
-                            let h = nt_handler.pm.insert_handle(
-                                wl_pid, nt_process::HandleObject::Process(ls_pid), 0,
-                            );
-                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-                            h.map(|v| v as u64).unwrap_or_else(|_| {
-                                let g = nt_handler.next_handle; nt_handler.next_handle += 1; g
-                            })
-                        }
-                        _ => { let g = nt_handler.next_handle; nt_handler.next_handle += 1; g }
-                    };
-                    smss_stack_write(get_recv_mr(9), lsass_process_handle); // *ProcessHandle (R10)
-                    print_str(b"[ntos-exec] NtCreateProcessEx: spawned lsass.exe (badge 8) -> handle 0x");
-                    print_hex((lsass_process_handle >> 32) as u32);
-                    print_hex(lsass_process_handle as u32);
-                    print_str(b"; its ntdll loader now multiplexed into this loop\n");
-                } else if services_process_handle != 0 && sect == services_section_handle {
-                    // Idempotent (a second create should not re-spawn): return the same handle.
-                    smss_stack_write(get_recv_mr(9), services_process_handle);
-                } else if lsass_process_handle != 0 && sect == lsass_section_handle {
-                    smss_stack_write(get_recv_mr(9), lsass_process_handle);
-                }
                 result = 0;
             } else if m0 == 195 {
                 // NtRegisterThreadTerminatePort(PortHandle=R10). kernel32's CsrNewThread() — the LAST

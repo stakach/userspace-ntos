@@ -105,6 +105,53 @@ pub fn dos_path_name_to_nt_path_name(path: &[u16]) -> Option<Vec<u16>> {
     Some(out)
 }
 
+/// Resolve a possibly-relative DOS `name` to an absolute NT path, using `cwd` (a fully-qualified DOS
+/// directory, e.g. `C:\Windows`) as the base for relative / rooted forms. This is the CWD-aware
+/// cousin of [`dos_path_name_to_nt_path_name`]: real ntdll's `RtlDosPathNameToRelativeNtPathName_U`
+/// first canonicalises the DOS name against `PEB->ProcessParameters->CurrentDirectory.DosPath`
+/// (via `RtlGetFullPathName_Ustr`) THEN prefixes `\??\`. Without this a relative image name like
+/// `services.exe` (winlogon's `CreateProcessW("services.exe")`) yields `None` and CreateProcessInternalW
+/// bails with `ERROR_PATH_NOT_FOUND` before ever issuing `NtOpenFile`.
+///
+/// Handled forms:
+/// - already-absolute (drive-absolute / UNC / local-device) → delegate to
+///   [`dos_path_name_to_nt_path_name`] (CWD unused).
+/// - plain relative (`services.exe`, `sub\file`) → `cwd \ name`, then `\??\` prefix.
+/// - rooted (`\dir\file`, no drive) → take the drive from `cwd`, then `drive\dir\file`.
+/// - drive-relative (`C:file`) → not resolvable without a per-drive CWD table → `None`.
+///
+/// `cwd` must itself be drive-absolute (`X:\...`); otherwise `None`.
+pub fn dos_path_name_to_nt_path_name_rel(name: &[u16], cwd: &[u16]) -> Option<Vec<u16>> {
+    match determine_dos_path_name_type(name) {
+        DosPathType::DriveAbsolute | DosPathType::UncAbsolute | DosPathType::LocalDevice => {
+            dos_path_name_to_nt_path_name(name)
+        }
+        DosPathType::Relative => {
+            // Require an absolute CWD to anchor against.
+            if determine_dos_path_name_type(cwd) != DosPathType::DriveAbsolute {
+                return None;
+            }
+            let mut dos: Vec<u16> = cwd.to_vec();
+            // Ensure a single separator between cwd and name.
+            if !dos.last().is_some_and(|&c| is_sep(c)) {
+                dos.push(b'\\' as u16);
+            }
+            dos.extend_from_slice(name);
+            dos_path_name_to_nt_path_name(&dos)
+        }
+        DosPathType::Rooted => {
+            // `\dir\file` inherits the drive from cwd (e.g. `C:`), giving `C:\dir\file`.
+            if determine_dos_path_name_type(cwd) != DosPathType::DriveAbsolute {
+                return None;
+            }
+            let mut dos: Vec<u16> = cwd[..2].to_vec(); // "X:"
+            dos.extend_from_slice(name); // name starts with '\'
+            dos_path_name_to_nt_path_name(&dos)
+        }
+        _ => None,
+    }
+}
+
 /// `RtlIsDosDeviceName_U`: recognise a reserved DOS device name (case-insensitive, with an optional
 /// extension, e.g. `CON`, `NUL.txt`, `COM1`, `LPT3`). Returns `true` if the path names a device.
 pub fn is_dos_device_name(path: &[u16]) -> bool {
@@ -173,6 +220,39 @@ mod tests {
                    "\\??\\C:\\x");
         // Relative can't be resolved without the CWD → None.
         assert!(dos_path_name_to_nt_path_name(&u("rel\\path")).is_none());
+    }
+
+    #[test]
+    fn nt_path_rel() {
+        // The winlogon → services.exe case: relative name + CWD C:\Windows.
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("C:\\Windows")).unwrap()),
+            "\\??\\C:\\Windows\\services.exe"
+        );
+        // CWD with a trailing separator → no double backslash.
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("C:\\Windows\\")).unwrap()),
+            "\\??\\C:\\Windows\\services.exe"
+        );
+        // Nested relative.
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name_rel(&u("sub\\a.exe"), &u("C:\\Windows")).unwrap()),
+            "\\??\\C:\\Windows\\sub\\a.exe"
+        );
+        // Already-absolute → CWD ignored.
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name_rel(&u("D:\\x\\y.exe"), &u("C:\\Windows")).unwrap()),
+            "\\??\\D:\\x\\y.exe"
+        );
+        // Rooted (no drive) inherits the CWD drive.
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name_rel(&u("\\dir\\f.exe"), &u("C:\\Windows")).unwrap()),
+            "\\??\\C:\\dir\\f.exe"
+        );
+        // A non-absolute CWD can't anchor a relative name.
+        assert!(dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("Windows")).is_none());
+        // Drive-relative (per-drive CWD) is unsupported → None.
+        assert!(dos_path_name_to_nt_path_name_rel(&u("C:services.exe"), &u("C:\\Windows")).is_none());
     }
 
     #[test]

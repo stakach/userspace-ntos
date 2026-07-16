@@ -59,6 +59,33 @@ unsafe fn wcslen_raw(p: *const u16) -> usize {
     n
 }
 
+/// Read `PEB->ProcessParameters->CurrentDirectory.DosPath` (the process CWD, e.g. `C:\Windows`) as a
+/// `Vec<u16>`. Empty when unavailable. Used to anchor a relative image name in the DOS→NT path
+/// conversion (real ntdll canonicalises against this CWD before prefixing `\??\`).
+#[cfg(target_arch = "x86_64")]
+fn peb_current_directory() -> alloc::vec::Vec<u16> {
+    // SAFETY: gs:[0x60] = PEB; +0x20 = ProcessParameters; +0x38 = CurrentDirectory.DosPath
+    // UNICODE_STRING (Length@0x00 u16, Buffer@0x08 u64) — the byte-exact x64 layout.
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let params = core::ptr::read((peb + 0x20) as *const u64);
+        if params == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let ustr = (params + 0x38) as *const u8;
+        let len_bytes = core::ptr::read_unaligned(ustr as *const u16) as usize;
+        let buf = core::ptr::read_unaligned(ustr.add(8) as *const u64) as *const u16;
+        if buf.is_null() || len_bytes == 0 {
+            return alloc::vec::Vec::new();
+        }
+        core::slice::from_raw_parts(buf, len_bytes / 2).to_vec()
+    }
+}
+
 /// Count bytes up to (not including) a terminating NUL.
 ///
 /// # Safety
@@ -1294,8 +1321,17 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
     }
     // SAFETY: [dos_name, dos_name+len) is the string body.
     let input = unsafe { core::slice::from_raw_parts(dos_name, len) };
-    let Some(nt) = rtl::path::dos_path_name_to_nt_path_name(input) else {
-        // Relative / drive-relative (needs the CWD) — honest failure.
+    // Resolve relative/rooted names against the process CWD (real ntdll canonicalises against
+    // PEB->ProcessParameters->CurrentDirectory.DosPath); absolute paths ignore the CWD.
+    #[cfg(target_arch = "x86_64")]
+    let nt_opt = {
+        let cwd = peb_current_directory();
+        rtl::path::dos_path_name_to_nt_path_name_rel(input, &cwd)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let nt_opt = rtl::path::dos_path_name_to_nt_path_name(input);
+    let Some(nt) = nt_opt else {
+        // Drive-relative (needs a per-drive CWD table) / malformed — honest failure.
         return 0;
     };
     // Allocate a NUL-terminated UTF-16 buffer from the process heap.
@@ -3773,7 +3809,7 @@ pub unsafe extern "system" fn rtl_get_full_path_name_u(
 pub unsafe extern "system" fn rtl_get_full_path_name_ustr_ex(
     file_name: PCUnicodeString,
     static_string: PUnicodeString,
-    _dynamic_string: PUnicodeString,
+    dynamic_string: PUnicodeString,
     string_used: *mut PUnicodeString,
     _file_part_prefix_cch: *mut usize,
     name_invalid: *mut u8,
@@ -3789,37 +3825,79 @@ pub unsafe extern "system" fn rtl_get_full_path_name_ustr_ex(
         // SAFETY: writable per the contract.
         unsafe { *name_invalid = 0 };
     }
+    // Canonicalise FileName against the process CWD to a FULL DOS path (real ntdll's core). The input
+    // classification (path_type) reflects the ORIGINAL name; the resolved full path is what's copied
+    // out. kernel32's CreateProcessInternalW calls this with StaticString=NULL + DynamicString set for
+    // a relative image name (`services.exe`) — so the DynamicString allocation path is load-bearing.
+    let name_units = if src.is_null() {
+        alloc::vec::Vec::new()
+    } else {
+        // SAFETY: [src, src+len/2) is the FileName body.
+        unsafe { core::slice::from_raw_parts(src, (len / 2) as usize).to_vec() }
+    };
     if !path_type.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe {
-            let units = (len / 2) as usize;
-            let s = if src.is_null() { &[][..] } else { core::slice::from_raw_parts(src, units) };
-            *path_type = rtl_determine_dos_path_name_type_u_slice(s);
-        }
+        // SAFETY: writable per the contract. Classify the ORIGINAL name.
+        unsafe { *path_type = rtl_determine_dos_path_name_type_u_slice(&name_units) };
     }
+
+    #[cfg(target_arch = "x86_64")]
+    let full = {
+        let cwd = peb_current_directory();
+        nt_ntdll::rtl::environment::full_path_units(&name_units, &cwd)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let full = name_units.clone();
+
+    let full_bytes = (full.len() * 2) as u16;
     if !bytes_required.is_null() {
-        // SAFETY: writable.
-        unsafe { *bytes_required = (len + 2) as usize };
+        // SAFETY: writable. Bytes needed for the full path + NUL.
+        unsafe { *bytes_required = (full_bytes + 2) as usize };
     }
-    if static_string.is_null() {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: static_string valid; copy FileName through if it fits.
+
+    // Prefer StaticString if it fits; else allocate a DynamicString (the caller frees it via
+    // RtlFreeUnicodeString → RtlFreeHeap). Real ntdll uses exactly this static-then-dynamic policy.
+    // SAFETY: the out UNICODE_STRINGs are valid-or-NULL per the contract.
     unsafe {
-        if (*static_string).maximum_length < len + 2 {
-            return STATUS_BUFFER_TOO_SMALL;
+        let write_into = |dst_buf: *mut u16| {
+            if !dst_buf.is_null() && !full.is_empty() {
+                core::ptr::copy_nonoverlapping(full.as_ptr(), dst_buf, full.len());
+                *dst_buf.add(full.len()) = 0;
+            } else if !dst_buf.is_null() {
+                *dst_buf = 0;
+            }
+        };
+        if !static_string.is_null() && (*static_string).maximum_length >= full_bytes + 2 {
+            write_into((*static_string).buffer as *mut u16);
+            (*static_string).length = full_bytes;
+            if !string_used.is_null() {
+                *string_used = static_string;
+            }
+            return STATUS_SUCCESS;
         }
-        let dst = (*static_string).buffer as *mut u16;
-        if !src.is_null() && !dst.is_null() {
-            core::ptr::copy_nonoverlapping(src, dst, (len / 2) as usize);
-            *dst.add((len / 2) as usize) = 0;
+        if !dynamic_string.is_null() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let buf = crate::process_heap_alloc((full_bytes + 2) as usize) as *mut u16;
+                if buf.is_null() {
+                    return STATUS_NO_MEMORY;
+                }
+                write_into(buf);
+                (*dynamic_string).length = full_bytes;
+                (*dynamic_string).maximum_length = full_bytes + 2;
+                (*dynamic_string).buffer = buf as u64;
+                if !string_used.is_null() {
+                    *string_used = dynamic_string;
+                }
+                return STATUS_SUCCESS;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
         }
-        (*static_string).length = len;
-        if !string_used.is_null() {
-            *string_used = static_string;
-        }
+        // Neither out-string usable.
+        STATUS_BUFFER_TOO_SMALL
     }
-    STATUS_SUCCESS
 }
 
 /// Helper: classify a UTF-16 slice as an RTL_PATH_TYPE ordinal (shared by the Ustr path fns).
@@ -3857,6 +3935,19 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u(
     // SAFETY: dos_name NUL-terminated per the contract.
     let n = unsafe { wcslen_raw(dos_name) };
     let s = unsafe { core::slice::from_raw_parts(dos_name, n) };
+    // Resolve a relative/rooted image name against the process CWD (real ntdll canonicalises against
+    // PEB->ProcessParameters->CurrentDirectory.DosPath before prefixing `\??\`). Absolute paths ignore
+    // the CWD. This is winlogon's `CreateProcessW("services.exe")` path — a relative name that must
+    // become `\??\C:\Windows\services.exe`, else CreateProcessInternalW bails with ERROR_PATH_NOT_FOUND.
+    #[cfg(target_arch = "x86_64")]
+    let nt = {
+        let cwd = peb_current_directory();
+        match nt_ntdll::rtl::path::dos_path_name_to_nt_path_name_rel(s, &cwd) {
+            Some(v) => v,
+            None => return 0,
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
     let nt = match nt_ntdll::rtl::path::dos_path_name_to_nt_path_name(s) {
         Some(v) => v,
         None => return 0,

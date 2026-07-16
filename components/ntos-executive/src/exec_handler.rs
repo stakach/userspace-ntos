@@ -71,6 +71,8 @@ impl ExecNtHandler {
             loop_ctx: None,
             spawn_request: false,
             winlogon_spawn_request: false,
+            services_spawn_request: false,
+            lsass_spawn_request: false,
             sm_spawn_request: false,
             wl_spawn_request: 0,
             svc_listener_spawn: false,
@@ -928,7 +930,13 @@ impl ExecNtHandler {
         let mut pending = false;
         if let Some(c) = lpc_client() {
             if let Ok(r) = c.connect_port(name16, 2, &[]) {
-                if r.pending && r.connection_id != 0 {
+                // ★ AUTHENTIC rendezvous accept is scoped to winlogon (pi 2) — csrss's REAL
+                // CsrApiRequestThread accepts ONE pending connect (winlogon's) then parks; there is no
+                // second acceptor for services (pi 3) yet, so driving `csr_rendezvous` for pi>=3 would
+                // spin the nested accept loop forever. services+ take the MODELED accept (a minted
+                // client handle + the mapped CSR view/static-data below) so their bring-up proceeds;
+                // wiring a per-client CSR acceptor for services is the SCM batch's frontier.
+                if self.pi == 2 && r.pending && r.connection_id != 0 {
                     self.csr_rendezvous_conn = r.connection_id;
                     self.csr_rendezvous_out = porthandle_ptr;
                     pending = true;
@@ -4803,6 +4811,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && (*ctx.winlogon_pe).is_some()
                 {
                     self.winlogon_spawn_request = true; // loop spawns winlogon (3rd process)
+                    0
+                } else if self.pi == 2
+                    && *ctx.services_section_handle != 0
+                    && sect == *ctx.services_section_handle
+                    && (*ctx.services_pe).is_some()
+                {
+                    // winlogon's Win32 NtCreateProcessEx(50) StartServicesManager — loop spawns
+                    // services.exe (4th process). SSN 50 routes here (registered in the native table),
+                    // so the spawn body lives in the loop's flag-consumption block (mirrors winlogon).
+                    self.services_spawn_request = true;
+                    0
+                } else if self.pi == 2
+                    && *ctx.lsass_section_handle != 0
+                    && sect == *ctx.lsass_section_handle
+                    && (*ctx.lsass_pe).is_some()
+                {
+                    // winlogon's Win32 NtCreateProcessEx(50) StartLsass — loop spawns lsass.exe (5th).
+                    self.lsass_spawn_request = true;
                     0
                 } else {
                     self.stop = true; // not a known section / not staged -> clean stop

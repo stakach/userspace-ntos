@@ -184,6 +184,24 @@ impl CurrentDirectory {
     }
 }
 
+/// `RtlGetFullPathName_U` over UTF-16 units (the on-target form): resolve `name` against `cwd`
+/// (a fully-qualified DOS directory, e.g. `C:\Windows`). Absolute paths pass through; a rooted
+/// driveless path (`\foo`) takes the cwd drive; a relative path is appended to the cwd; `.`/`..`
+/// collapse. Forward slashes are normalised to backslashes. Returns the full DOS path (no trailing
+/// NUL). This is what `RtlGetFullPathName_UstrEx` writes to its StaticString/DynamicString out-param.
+pub fn full_path_units(name: &[u16], cwd: &[u16]) -> Vec<u16> {
+    // Convert both to lossy Strings for the pure logic (paths are ASCII-ish DOS paths; any non-BMP is
+    // preserved via char round-trip). Using String keeps ONE canonicalization implementation.
+    let name_s = String::from_utf16_lossy(name);
+    let cwd_s = String::from_utf16_lossy(cwd);
+    let mut cd = CurrentDirectory::default();
+    if !cwd_s.is_empty() {
+        cd.set(&cwd_s);
+    }
+    let full = cd.full_path(&name_s);
+    full.encode_utf16().map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c }).collect()
+}
+
 /// Whether a DOS path is absolute (`X:\...` drive-absolute or `\\...` UNC).
 pub fn is_absolute(p: &str) -> bool {
     let b = p.as_bytes();
@@ -323,6 +341,20 @@ mod tests {
         assert_eq!(cd.full_path("\\temp\\x"), "C:\\temp\\x");
         // .. collapses.
         assert_eq!(cd.full_path("..\\drivers"), "C:\\Windows\\drivers");
+    }
+
+    #[test]
+    fn full_path_units_resolution() {
+        let u = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let s = |v: &[u16]| -> String { String::from_utf16(v).unwrap() };
+        // winlogon → services.exe: relative name resolved against C:\Windows.
+        assert_eq!(s(&full_path_units(&u("services.exe"), &u("C:\\Windows"))), "C:\\Windows\\services.exe");
+        // Absolute passes through.
+        assert_eq!(s(&full_path_units(&u("D:\\x\\y.exe"), &u("C:\\Windows"))), "D:\\x\\y.exe");
+        // Rooted driveless takes the cwd drive.
+        assert_eq!(s(&full_path_units(&u("\\dir\\f"), &u("C:\\Windows"))), "C:\\dir\\f");
+        // Forward slashes normalise to backslashes.
+        assert_eq!(s(&full_path_units(&u("sub/f.exe"), &u("C:\\Windows"))), "C:\\Windows\\sub\\f.exe");
     }
 
     #[test]

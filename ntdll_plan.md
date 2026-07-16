@@ -2005,3 +2005,80 @@ winlogon `98` arm + disasm the kernel32 CreateProcessInternalW retaddr chain (th
 decode reads smss's mirror, not winlogon's — fix the mirror for a real chain). Then services.exe comes
 up on our ntdll (its loader runs like csrss/winlogon), → StartLsass → WaitForLsass → InitializeSAS →
 SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → the `0x003a6ea5` paint.
+
+---
+
+## ☑ BATCH 20 Results — CreateProcessInternalW's relative-path bail fixed → services.exe SPAWNS (landed 2026-07-17)
+
+**Task (diagnose-first):** winlogon reached `StartServicesManager` and its kernel32
+`CreateProcessInternalW("services.exe")` STARTED (`NtIsProcessInJob(98)→0` serviced) but BAILED before
+`NtOpenFile`/`NtCreateSection(SEC_IMAGE)`/`NtCreateProcessEx(50)` with no further traced syscall →
+`!StartServicesManager()` → WinMain hard error (`NtRaiseHardError`, stop_ssn=190). services.exe was
+NOT spawned. Root-cause why + fix → services.exe spawns on our ntdll.
+
+### THE DIAGNOSIS (two coupled root causes, each evidenced from the boot trace)
+The `[sec-stop]` decode ALREADY reads the faulting process's mirror (`ACTIVE_STACK_MIRROR` is set
+per-`pi` before servicing — the BATCH-19 "reads smss's mirror" claim was stale; the terminal stop is
+winlogon's own 190, `pi=2`, so the decode was already winlogon's). The winlogon SSN ring tail
+`… 4:196 4:98 4:190` confirmed the bail sits between NtIsProcessInJob(98) and the section-create,
+in the PURE (non-syscall) ntdll path resolution `RtlDosPathNameToRelativeNtPathName_U` (proc.c:2647)
+→ `RtlGetFullPathName_UstrEx` (proc.c:2674). Candidate **(b)** — path resolution — NOT (a)
+NtIsProcessInJob's status. **TWO gaps in OUR ntdll's path Rtl, disproven-then-proven with an `[R2N]`
+stack-buffer DbgPrint marker:**
+1. **`RtlDosPathNameToRelativeNtPathName_U` returned FALSE for a RELATIVE name.** `services.exe` is
+   `RtlPathTypeRelative`; our impl called `dos_path_name_to_nt_path_name` which returns `None` for any
+   non-absolute path → BOOLEAN FALSE → CreateProcessInternalW `SetLastError(ERROR_PATH_NOT_FOUND)` →
+   bail. **The `[R2N:9/5/9]` marker (cwd_len≥9 / pathtype=5=Relative / namelen≥9) with NO `[R2N-NO]`
+   after the fix proved the resolve then succeeded.**
+2. **`RtlGetFullPathName_UstrEx` didn't serve the DynamicString (StaticString=NULL) path NOR resolve
+   relative paths.** proc.c calls it `(&SxsWin32ExePath, NULL_static, &PathBufferString_dynamic, …)`;
+   our impl returned `STATUS_BUFFER_TOO_SMALL` whenever StaticString was NULL → the SECOND bail
+   (proc.c:2682) after fix #1 let it get that far. The winlogon ring then advanced to
+   `4:98 4:122 4:52 … 4:19 4:19 4:122 4:50` — reaching NtOpenFile(122)+NtCreateSection(52)+**NtCreateProcessEx(50)**.
+3. **NtCreateProcessEx(50) itself then stopped (stop_ssn=50)** — a THIRD, structural gap: SSN 50 is
+   registered in the executive's `NativeServiceTable` (routed to exec_handler's `NtCreateProcess`
+   handler, which only spawned for `pi==0`=smss→csrss/winlogon), so the services-spawn arm in
+   `service_sec_image.rs` (`m0==50 && badge==WINLOGON_BADGE`) was **DEAD CODE** (table-routing bypassed
+   it). The handler `self.stop=true`'d for winlogon's create.
+
+### THE FIX (executive + ntdll crates; NO rust-micro/src, no kernel change)
+- **`nt-ntdll::rtl::path::dos_path_name_to_nt_path_name_rel(name, cwd)`** (host-tested) — CWD-aware:
+  relative → `cwd\name`, rooted → cwd-drive + name, absolute → passthrough; `RtlDosPathNameToRelativeNtPathName_U`
+  reads `PEB->ProcessParameters->CurrentDirectory.DosPath` (gs:[0x60]→+0x20→+0x38, new `peb_current_directory`)
+  and uses it. Same wiring added to `RtlDosPathNameToNtPathName_U`.
+- **`nt-ntdll::rtl::environment::full_path_units(name, cwd)`** (host-tested) — the UTF-16 `RtlGetFullPathName_U`
+  core (over the existing `CurrentDirectory::full_path`); `RtlGetFullPathName_UstrEx` now canonicalises
+  FileName against the PEB CWD and writes it to StaticString-if-it-fits **else a heap-allocated
+  DynamicString** (the real static-then-dynamic policy).
+- **exec_handler `NtCreateProcess` handler** now, for `pi==2` (winlogon) matching the tracked
+  services.exe / lsass.exe SEC_IMAGE section, sets new `services_spawn_request` / `lsass_spawn_request`
+  flags (instead of `self.stop`); the service loop consumes them and runs `spawn_sec_image` (badge 6 /
+  badge 8, pi 3/4) — the spawn bodies MOVED from the dead broker arm into the loop's flag-consumption
+  block (mirrors `winlogon_spawn_request`). The dead `m0==50` broker arm was deleted.
+- **CSR connect scoped to winlogon (pi 2):** services' (pi 3) `NtSecureConnectPort(\Windows\ApiPort)`
+  takes the MODELED accept (minted client handle + mapped CSR view/static-data) instead of driving
+  `csr_rendezvous` — csrss's real CsrApiRequestThread accepts ONE pending connect (winlogon's) then
+  parks; a per-client CSR acceptor for services is the SCM batch's frontier. (Without this the nested
+  rendezvous spun forever → boot never terminated.)
+- **Loop iters backstop 8000→5000** so the boot TERMINATES in-budget under TCG (services pulls a 57-DLL
+  tree — crypt32/dbghelp/libtiff/wintrust — each snapping hundreds of pages at ~4 faults/s; the
+  gate-relevant work is done well before that; full SCM bring-up is next batch).
+
+### RESULT — services.exe SPAWNS + runs its loader; gate 156 → 160
+`[ntos-exec] NtCreateProcessEx: spawned services.exe (badge 6) -> handle 0x204`. services.exe runs its
+FULL ntdll loader on OUR ntdll: `snap resolved=6996 missing=7`, 57 modules in `PebLdr`, **387 demand-
+faulted pages**, kernel32/advapi32 DllMains + a huge transitive tree, reaching its
+`NtSecureConnectPort(\Windows\ApiPort)` CSR connect (BATCH-8-analogous). **New PASSES (4):**
+`exec_services_spawned`, `exec_services_loader_running`, `exec_services_csr_connect`,
+`exec_services_win32k_connect` → gate **156 → 160**. No regressions (all winlogon specs still PASS).
+Host green (nt-ntdll 167 [+2: `nt_path_rel`, `full_path_units_resolution`] + nt-syscall-abi 12).
+Committed on `main`.
+
+### NEXT WALL (services' SCM bring-up → the paint) — diagnose-first, deferred
+services.exe is up but does NOT yet run its real SCM (`ScmMain`) to completion, and **lsass is NOT
+spawned** (`StartLsass` needs services further along / winlogon's InitializeSAS chain). Remaining path
+to the `0x003a6ea5` paint: services' SCM + lsass on our ntdll → winlogon `WaitForLsass` → `InitializeSAS`
+→ `SwitchDesktop` → co_IntShowDesktop → IntPaintDesktop. Residual FAILs are the SCM/lsass frontier
+(`exec_lsass_spawned`, `exec_services_named_events`, `exec_win32k_desktop_painted`). The services CSR
+accept is currently MODELED (per-client CSR acceptor = the SCM batch); the iters cap (5000) may need
+lifting once services' per-fault cost drops or its work is bounded.
