@@ -35,6 +35,9 @@ use nt_ntdll::heap::{Backing, Heap};
 /// `NtAllocateVirtualMemory` SSN (shared `nt-syscall-abi` table).
 const SSN_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 18;
 
+/// `STATUS_NO_MEMORY`.
+const STATUS_NO_MEMORY: u64 = 0xC000_0017;
+
 /// `MEM_COMMIT | MEM_RESERVE`.
 const MEM_COMMIT_RESERVE: u32 = 0x0000_3000;
 /// `PAGE_READWRITE`.
@@ -604,6 +607,147 @@ pub unsafe fn rtl_set_thread_is_critical(new: u8, old: *mut u8, _check_flag: u8)
             THREAD_BREAK_ON_TERMINATION,
             &value as *const u32 as u64,
             core::mem::size_of::<u32>() as u64,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 4.C — RtlCreateUserThread over the live NtCreateThread plane.
+//
+// Real ntdll `RtlCreateUserThread` allocates a stack, builds an INITIAL_TEB + a CONTEXT (Rip =
+// StartAddress, Rcx = Parameter, Rsp = stack top), and calls `NtCreateThread`. Our executive's smss
+// (pi 0) NtCreateThread handler reads Context* at [rsp+0x30] (arg6), then Context.Rip@0xF8 =
+// StartAddress and Context.Rcx@0x80 = Parameter, and spawns the REAL SmpApiLoop thread in smss's
+// VSpace (`spawn_sm_loop_thread`). So building that exact CONTEXT + issuing NtCreateThread here is the
+// honest live implementation — smss's SM API worker thread actually gets created.
+// ---------------------------------------------------------------------------------------------
+
+const SSN_NT_CREATE_THREAD: u32 = 55;
+/// `THREAD_ALL_ACCESS`.
+const THREAD_ALL_ACCESS: u64 = 0x001F_FFFF;
+/// The thread stack reserve (default when the caller passes 0).
+const DEFAULT_THREAD_STACK: usize = 0x10_0000; // 1 MiB
+/// CONTEXT.Rcx / .Rsp / .Rip byte offsets (amd64), and INITIAL_TEB stack fields — mirror
+/// `nt_thread_start`'s constants (the executive reads the same offsets).
+const CTX_RCX: usize = 0x80;
+const CTX_RSP: usize = 0x98;
+const CTX_RIP: usize = 0xF8;
+/// The amd64 CONTEXT record size (enough to hold through RIP@0xF8 + the extended area the kernel may
+/// touch); 0x4D0 is the real `sizeof(CONTEXT)` on x64.
+const CONTEXT_SIZE: usize = 0x4D0;
+
+/// An 8-arg syscall trap (arg1..4 registers; arg5..8 on the stack at [rsp+0x28/0x30/0x38/0x40]).
+///
+/// # Safety
+/// On-target hosted-process syscall; args must satisfy the target syscall's contract.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn syscall8(
+    ssn: u32,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+) -> u64 {
+    let status: u64;
+    // SAFETY: a hosted-process syscall trap serviced by the executive.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x48",
+            "mov qword ptr [rsp+0x28], {a5}",
+            "mov qword ptr [rsp+0x30], {a6}",
+            "mov qword ptr [rsp+0x38], {a7}",
+            "mov qword ptr [rsp+0x40], {a8}",
+            "mov r10, {a1}",
+            "mov rdx, {a2}",
+            "mov r8,  {a3}",
+            "mov r9,  {a4}",
+            "mov eax, {ssn:e}",
+            "syscall",
+            "add rsp, 0x48",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1, a2 = in(reg) a2, a3 = in(reg) a3, a4 = in(reg) a4,
+            a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
+            out("rax") status,
+            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// `RtlCreateUserThread(Process, ThreadSD, CreateSuspended, StackZeroBits, StackReserve, StackCommit,
+/// StartAddress, Parameter, ThreadHandle, ClientId) -> NTSTATUS`. The live implementation.
+///
+/// Allocates a thread stack from the process heap-adjacent VM (`NtAllocateVirtualMemory`), builds the
+/// amd64 CONTEXT (`Rip=StartAddress, Rcx=Parameter, Rsp=stack top`) + an INITIAL_TEB, then calls
+/// `NtCreateThread`. The executive reads Context.Rip/Rcx and spawns the real thread; it writes
+/// `*ThreadHandle` (arg1) and `*ClientId` (arg5). Returns the `NtCreateThread` status.
+///
+/// # Safety
+/// On-target hosted-process; `thread_handle`/`client_id` valid writable out-pointers (or null for cid).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rtl_create_user_thread(
+    process: u64,
+    _thread_sd: u64,
+    create_suspended: u8,
+    _stack_zero_bits: u32,
+    stack_reserve: usize,
+    _stack_commit: usize,
+    start_address: u64,
+    parameter: u64,
+    thread_handle: *mut u64,
+    client_id: *mut u64,
+) -> u64 {
+    // Allocate the thread stack.
+    let stack_size = if stack_reserve != 0 {
+        stack_reserve
+    } else {
+        DEFAULT_THREAD_STACK
+    };
+    // SAFETY: on-target VM syscall.
+    let stack_base = unsafe { nt_allocate_virtual_memory(stack_size) };
+    if stack_base == 0 {
+        return STATUS_NO_MEMORY;
+    }
+    // stack grows down: top = base + size (16-aligned, minus a shadow).
+    let stack_top = (stack_base + stack_size as u64) & !0xF;
+
+    // Build the CONTEXT record on the current stack (zeroed, then Rip/Rcx/Rsp set). It must live long
+    // enough for the executive's stack-mirror read during the syscall — a stack local of this fn.
+    let mut context = [0u8; CONTEXT_SIZE];
+    // SAFETY: writing within the fixed-size context buffer at the known amd64 offsets.
+    unsafe {
+        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RCX) as *mut u64, parameter);
+        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RSP) as *mut u64, stack_top);
+        core::ptr::write_unaligned(context.as_mut_ptr().add(CTX_RIP) as *mut u64, start_address);
+    }
+    // INITIAL_TEB: { _, StackBase(0x10), StackLimit(0x18), AllocatedStackBase(0x20), _ }.
+    let mut initial_teb = [0u64; 8];
+    initial_teb[2] = stack_base + stack_size as u64; // StackBase @0x10
+    initial_teb[3] = stack_base; // StackLimit @0x18
+    initial_teb[4] = stack_base; // AllocatedStackBase @0x20
+
+    // NtCreateThread(&ThreadHandle, THREAD_ALL_ACCESS, ObjectAttributes=NULL, ProcessHandle,
+    //                &ClientId, &Context, &InitialTeb, CreateSuspended).
+    // SAFETY: on-target; all pointers are valid stack locals / the caller's out-params.
+    unsafe {
+        syscall8(
+            SSN_NT_CREATE_THREAD,
+            thread_handle as u64,
+            THREAD_ALL_ACCESS,
+            0, // ObjectAttributes = NULL
+            process,
+            client_id as u64,
+            context.as_ptr() as u64,
+            initial_teb.as_ptr() as u64,
+            (create_suspended != 0) as u64,
         )
     }
 }

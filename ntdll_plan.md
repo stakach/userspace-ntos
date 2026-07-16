@@ -845,4 +845,40 @@ Keep the fallback + the gate green (174/98, paint 768/768) throughout.
 
 **Remaining walls to the csrss-spawn (the 4.C milestone):** smss still stops at `NtRaiseHardError(190)` — a deeper SmpInit function (smss rva 0x5fc0's caller / the `NtCreatePort(\SmApiPort)` + `RtlCreateUserThread` SM-API path at rva ~0x8148/0x81fc, or an object-namespace / registry body) returns a status smss treats as fatal. Continue the oracle-diff grind: find the next divergent body, make it real, repeat, until smss reaches `SmpExecuteImage → NtOpenFile(csrss) → NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]`. **The SSN-50 arm** (`NtCreateProcessEx`) is NOT yet needed (smss hasn't reached the create-process call under our ntdll) — add it when smss emits SSN 50 there.
 
-**The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → gate **174/98**, paint **768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (ONLY `crates/nt-ntdll-dll` changed; NO rust-micro/src, NO executive change; rust-micro submodule clean). `nt-ntdll` host tests **145/145**.
+**checkpoint 1 committed** (`ec07ac9`): gate 174/98, paint 768/768, flag OFF.
+
+**IN PROGRESS 2026-07-16 — checkpoint 2 (SID/ACL builders + RtlCreateUserThread → smss SPAWNS its real SM API loop thread under OUR ntdll):**
+
+Continuing the grind past checkpoint 1's SmpInit-early stop. The next walls, all in smss's
+**`SmpInit`** (`SmpCreateSecurityDescriptors` + the SM-port/worker-thread setup):
+
+5. **`RtlAllocateAndInitializeSid`** (`exports.rs`, real) — allocates `8 + 4*count` bytes from the
+   process heap and writes a well-formed SID (Revision=1, SubAuthorityCount, 6-byte IdentifierAuthority,
+   the sub-authorities). Rejects `count > 8` (STATUS_INVALID_SID).
+6. **`RtlAddAccessAllowedAce`** (`exports.rs`, real) — appends a well-formed `ACCESS_ALLOWED_ACE`
+   (Type=0, Flags=0, Size, Mask, Sid) after the ACL's existing ACEs, bumps AceCount, with an honest
+   `AclSize` capacity check (STATUS_ALLOTTED_SPACE_EXCEEDED). (`RtlCreateSecurityDescriptor`/
+   `RtlSetDaclSecurityDescriptor`/`RtlLengthSid`/`RtlCreateAcl`/`RtlGetAce` were ALREADY real.)
+   **After 5+6:** smss passes `SmpCreateSecurityDescriptors` → **creates `\SmApiPort`** (`NtCreatePort`,
+   SSN 48 now in the ring) + `NtCreateEvent`.
+7. **`RtlCreateUserThread`** (`exports.rs` → new `on_target::rtl_create_user_thread` + a `syscall8`
+   trap helper) — the LIVE `NtCreateThread(55)` path: allocates a thread stack
+   (`NtAllocateVirtualMemory`), builds the amd64 **CONTEXT** (`Rip@0xF8=StartAddress`, `Rcx@0x80=Parameter`,
+   `Rsp@0x98=stack top`) + an INITIAL_TEB, then issues `NtCreateThread(&ThreadHandle, THREAD_ALL_ACCESS,
+   NULL, ProcessHandle, &ClientId, &Context, &InitialTeb, CreateSuspended)`. The executive's smss (pi 0)
+   NtCreateThread handler reads that exact CONTEXT and **spawns the REAL SmpApiLoop thread** in smss's
+   VSpace (`spawn_sm_loop_thread`). **★ PROVEN in the boot log:**
+   `[sm-loop] spawning REAL SmpApiLoop thread: ctx=0x…105c36f0 entry=0x…56c5d0 port=0x…e` +
+   `[sm-loop] spawned tcb=0x9f2a` — smss's SM API worker thread ACTUALLY spawns under OUR ntdll (the
+   CONTEXT we built was read correctly). Ring now `18,237,238,237,237,48,18,55,18,55,37,129,12,27,190`
+   (two `18,55` = RtlCreateUserThread's stack-alloc + NtCreateThread, ×2 threads). Gate flag-ON 145/98.
+
+**How far smss runs now:** its real `NtProcessStartup → SmpInit` runs the FULL core-SM bring-up under
+OUR ntdll — process-critical, security descriptors, **`\SmApiPort` creation, and the SM API loop thread
+spawn** (the heart of the Session Manager). Still stops at a deeper `NtRaiseHardError(190)` — the next
+wall is past the SM-loop spawn (SmpInit's subsystem-load / KnownDLLs / the SmpApiLoop that ultimately
+does `SmpExecuteImage → NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss = the 4.C milestone).
+
+**The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → gate **174/98**, paint
+**768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (ONLY `crates/nt-ntdll-dll` changed;
+NO rust-micro/src, NO executive change; rust-micro submodule clean). `nt-ntdll` host tests **145/145**.

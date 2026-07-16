@@ -727,43 +727,117 @@ pub unsafe extern "system" fn rtl_get_ace(
     STATUS_SUCCESS
 }
 
-/// `RtlAddAccessAllowedAce(PACL, ULONG AceRevision, ACCESS_MASK, PSID) -> NTSTATUS`. Appends an
-/// ACCESS_ALLOWED_ACE. Honest seam: appending requires validating remaining ACL capacity + copying
-/// the SID; the SID-length walk is real but the append is deferred to the heap/ACL plane. Returns an
-/// honest error rather than a malformed ACE.
+/// `RtlAddAccessAllowedAce(PACL, ULONG AceRevision, ACCESS_MASK, PSID) -> NTSTATUS`. Step 4.C: real.
+/// Appends an `ACCESS_ALLOWED_ACE { AceType=0, AceFlags=0, AceSize, Mask, Sid }` after the ACL's
+/// existing ACEs, bumping `AceCount`. Validates the ACE fits within `AclSize` (STATUS_ALLOTTED_SPACE_
+/// EXCEEDED otherwise) — the honest capacity check, no malformed ACE.
 ///
 /// # Safety
-/// Standard contract.
+/// `acl` a valid writable `ACL` with capacity `AclSize`; `sid` a valid SID.
 #[export_name = "RtlAddAccessAllowedAce"]
 pub unsafe extern "system" fn rtl_add_access_allowed_ace(
-    _acl: *mut c_void,
+    acl: *mut c_void,
     _ace_revision: u32,
-    _access_mask: u32,
-    _sid: *mut c_void,
+    access_mask: u32,
+    sid: *mut c_void,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // full ACL append lands with the security plane (Step 4.B)
+    if acl.is_null() || sid.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: acl is a valid ACL, sid a valid SID, per the contract.
+    unsafe {
+        // SID length = 8 + 4*SubAuthorityCount (byte at sid+1).
+        let sid_len = 8 + 4 * (*((sid as *const u8).add(1)) as usize);
+        // ACCESS_ALLOWED_ACE: Header{Type(1) Flags(1) Size(2)} + Mask(4) + Sid.
+        let ace_size = 4 + 4 + sid_len;
+        let p = acl as *mut u8;
+        let acl_size = *(p.add(2) as *const u16) as usize; // total ACL bytes available
+        let ace_count = *(p.add(4) as *const u16);
+        // Walk to the byte after the last existing ACE (start = header end = +8).
+        let mut cur = p.add(8);
+        for _ in 0..ace_count {
+            let sz = *(cur.add(2) as *const u16) as usize;
+            cur = cur.add(sz);
+        }
+        let used = cur as usize - p as usize;
+        if used + ace_size > acl_size {
+            return 0xC000_0099; // STATUS_ALLOTTED_SPACE_EXCEEDED
+        }
+        // Write the ACE.
+        *cur = 0; // ACCESS_ALLOWED_ACE_TYPE
+        *cur.add(1) = 0; // AceFlags
+        *(cur.add(2) as *mut u16) = ace_size as u16; // AceSize
+        *(cur.add(4) as *mut u32) = access_mask; // Mask
+        core::ptr::copy_nonoverlapping(sid as *const u8, cur.add(8), sid_len); // SidStart
+        // Bump AceCount.
+        *(p.add(4) as *mut u16) = ace_count + 1;
+    }
+    STATUS_SUCCESS
 }
 
-/// `RtlAllocateAndInitializeSid(...)` — allocates a SID on the heap. Honest seam (heap not wired).
+/// `RtlAllocateAndInitializeSid(PSID_IDENTIFIER_AUTHORITY, UCHAR SubAuthorityCount, sa0..sa7,
+/// PSID *Sid) -> NTSTATUS`. Step 4.C: real. Allocates `8 + 4*count` bytes from the process heap and
+/// writes a well-formed SID: `Revision=1`, `SubAuthorityCount=count`, the 6-byte IdentifierAuthority,
+/// then `count` sub-authorities. Rejects `count > 8` (STATUS_INVALID_SID).
 ///
 /// # Safety
-/// Standard contract.
+/// `identifier_authority` a valid 6-byte `SID_IDENTIFIER_AUTHORITY`; `sid` a writable out-pointer.
 #[export_name = "RtlAllocateAndInitializeSid"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
-    _identifier_authority: *mut c_void,
-    _sub_authority_count: u8,
-    _sub_authority0: u32,
-    _sub_authority1: u32,
-    _sub_authority2: u32,
-    _sub_authority3: u32,
-    _sub_authority4: u32,
-    _sub_authority5: u32,
-    _sub_authority6: u32,
-    _sub_authority7: u32,
-    _sid: *mut *mut c_void,
+    identifier_authority: *mut c_void,
+    sub_authority_count: u8,
+    sub_authority0: u32,
+    sub_authority1: u32,
+    sub_authority2: u32,
+    sub_authority3: u32,
+    sub_authority4: u32,
+    sub_authority5: u32,
+    sub_authority6: u32,
+    sub_authority7: u32,
+    sid: *mut *mut c_void,
 ) -> NtStatus {
-    STATUS_NO_MEMORY // needs the process heap (Step 4.B) — honest failure, no bogus SID
+    if identifier_authority.is_null() || sid.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if sub_authority_count > 8 {
+        return 0xC000_0078; // STATUS_INVALID_SID
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let count = sub_authority_count as usize;
+        let size = 8 + 4 * count;
+        // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+        let p = unsafe { crate::process_heap_alloc(size) };
+        if p.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        let subs = [
+            sub_authority0, sub_authority1, sub_authority2, sub_authority3, sub_authority4,
+            sub_authority5, sub_authority6, sub_authority7,
+        ];
+        // SID: Revision(1)=1, SubAuthorityCount(1)=count, IdentifierAuthority(6), SubAuthority[count].
+        // SAFETY: p is a fresh `size`-byte allocation; identifier_authority is a valid 6-byte auth.
+        unsafe {
+            *p = 1; // SID_REVISION
+            *p.add(1) = sub_authority_count;
+            core::ptr::copy_nonoverlapping(identifier_authority as *const u8, p.add(2), 6);
+            let sub_ptr = p.add(8) as *mut u32;
+            for (i, &s) in subs.iter().take(count).enumerate() {
+                core::ptr::write_unaligned(sub_ptr.add(i), s);
+            }
+            *sid = p as *mut c_void;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            sub_authority0, sub_authority1, sub_authority2, sub_authority3, sub_authority4,
+            sub_authority5, sub_authority6, sub_authority7,
+        );
+        STATUS_NO_MEMORY
+    }
 }
 
 /// `RtlAdjustPrivilege(ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled)`.
@@ -1048,25 +1122,55 @@ pub unsafe extern "system" fn rtl_create_user_process(
     STATUS_NOT_IMPLEMENTED // live create plane (Step 4.A/4.B)
 }
 
-/// `RtlCreateUserThread(...)`. Honest seam (needs the live NtCreateThread plane).
+/// `RtlCreateUserThread(Process, ThreadSD, CreateSuspended, StackZeroBits, StackReserve, StackCommit,
+/// StartAddress, Parameter, ThreadHandle, ClientId) -> NTSTATUS`. Step 4.C: routes to the LIVE
+/// `NtCreateThread` plane (allocates a stack, builds CONTEXT{Rip=Start,Rcx=Param,Rsp=top} +
+/// INITIAL_TEB, issues NtCreateThread). The executive reads the CONTEXT and spawns the real thread
+/// (smss's SmpApiLoop worker) in the caller's VSpace.
 ///
 /// # Safety
-/// Standard contract.
+/// Standard contract; `thread_handle` a writable out-pointer, `client_id` null or writable.
 #[export_name = "RtlCreateUserThread"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_create_user_thread(
-    _process: *mut c_void,
-    _thread_sd: *mut c_void,
-    _create_suspended: u8,
-    _stack_zero_bits: u32,
-    _stack_reserve: usize,
-    _stack_commit: usize,
-    _start_address: *mut c_void,
-    _parameter: *mut c_void,
-    _thread_handle: *mut *mut c_void,
-    _client_id: *mut c_void,
+    process: *mut c_void,
+    thread_sd: *mut c_void,
+    create_suspended: u8,
+    stack_zero_bits: u32,
+    stack_reserve: usize,
+    stack_commit: usize,
+    start_address: *mut c_void,
+    parameter: *mut c_void,
+    thread_handle: *mut *mut c_void,
+    client_id: *mut c_void,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // live create plane (Step 4.A/4.B)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; routes to the live NtCreateThread. thread_handle/client_id are the
+        // caller's out-pointers; the executive writes *ThreadHandle + *ClientId through its mirror.
+        unsafe {
+            crate::on_target::rtl_create_user_thread(
+                process as u64,
+                thread_sd as u64,
+                create_suspended,
+                stack_zero_bits,
+                stack_reserve,
+                stack_commit,
+                start_address as u64,
+                parameter as u64,
+                thread_handle as *mut u64,
+                client_id as *mut u64,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            process, thread_sd, create_suspended, stack_zero_bits, stack_reserve, stack_commit,
+            start_address, parameter, thread_handle, client_id,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 // =================================================================================================
