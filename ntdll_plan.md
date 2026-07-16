@@ -1703,28 +1703,35 @@ parked) → a hard user-mode block, not a budget cutoff. **`services.exe` is NEV
    cross-process named event `LSA_RPC_SERVER_ACTIVE`, which lsasrv signals via SetEvent at
    dll/win32/lsasrv/lsarpc.c:105 — a SECOND, later wall), then InitializeSAS (578) → SwitchDesktop → paint.
 
-### The precise block: a contended critical-section spin in user32 init
+### The precise block: a PURE user-mode busy-spin in user32 init (NOT the keyed-event seam)
 Disassembled user32 at the last-fault RVA 0x8a940 (imagebase 0x7ffb2000000): it's a tiny init helper
 that calls **`kernel32!InitializeCriticalSection` TWICE** then `mov eax,1; ret` (it inits two user32
-CSes — e.g. gcsUserApiHook/gcsHooks). That call returns; winlogon continues into already-resident code
-and then spins with **NO faults and NO syscalls** — the signature of a **contended
-`RtlEnterCriticalSection` whose blocking path never actually blocks/wakes.** This is EXACTLY the Step
-2c "honest seam" we documented: our ntdll's contended CS path (`RtlpWaitForCriticalSection` →
-`NtWaitForKeyedEvent` / `NtReleaseKeyedEvent`, `crates/nt-ntdll/src/sync.rs`) returns
-STATUS_NOT_IMPLEMENTED on the un-wired native transport — so a contended waiter spins forever. winlogon
-got THIS far because uncontended CS acquisition (the fast path) works; it hits the FIRST genuinely
-contended CS here in user32's per-process init and dead-spins. (Single-threaded winlogon contending a
-CS implies a CS left LOCKED by a prior op — needs pinning which CS + why it's held.)
+CSes — e.g. gcsUserApiHook/gcsHooks; resolved via the IAT thunk at 0xa1ffa → IAT slot 0xa44f0 =
+kernel32!InitializeCriticalSection). That call returns; winlogon continues into already-resident code
+and then spins with **NO faults AND NO syscalls** — a **pure user-mode busy-spin**. ★ IMPORTANT
+REFINEMENT: the ssn ring shows **NO `NtWaitForKeyedEvent`(292)/`NtReleaseKeyedEvent`(291)** — so
+winlogon is NOT reaching `RtlpWaitForCriticalSection`'s keyed-event block. It's stuck in a
+BEFORE-keyed-event busy loop: either the CS spin-count fast-path spin (`RtlEnterCriticalSection`'s
+`YieldProcessor` loop testing `LockCount`) that never exits, or a user32 `while(!flag) YieldProcessor()`
+poll on a shared flag another thread should set. Since winlogon is single-threaded here, a flag/CS a
+second thread must release can never resolve — so the block is EITHER (a) a real bug in OUR ntdll's
+`RtlEnterCriticalSection`/`RtlpWaitForCriticalSection` LockCount state machine (it loops instead of
+falling through to the keyed-event wait — check `crates/nt-ntdll*/src/sync.rs`'s target-side CS body,
+NOT just the host fast-path), OR (b) user32 init genuinely waiting on csrss/win32k to set a shared
+value that our modeled connect didn't populate. Pinning it needs live instrumentation of winlogon's
+spin RIP (gdb-stub RIP sample, or an executive counter on winlogon's post-0x125B fault/no-progress).
 
 ### ★ THE REAL NEXT FRONTIER (re-scoped, evidence-backed)
-NOT the worker multiplex. The immediate wall is the **contended critical-section blocking path in our
-ntdll** (Step 6 / the sync `WaitSeam`): wire `NtWaitForKeyedEvent`/`NtReleaseKeyedEvent` over the
-native seL4-Call transport + an executive keyed-event handler so a contended `RtlEnterCriticalSection`
-actually blocks-then-wakes instead of spinning — OR first pin exactly which CS winlogon contends (and
-whether it's a left-locked-CS bug in a prior op) via live instrumentation (log winlogon's post-0x125B
-CS ops / the `NtWaitForKeyedEvent` SSN when it fires). Only past this do StartRpcServer (the worker
-thread — where the BATCH-6 native-multiplex pattern legitimately applies), StartServicesManager,
-StartLsass, WaitForLsass (the LSA_RPC_SERVER_ACTIVE event, needs lsass running to signal it), and
-finally InitializeSAS/SwitchDesktop/the 0x003a6ea5 paint come into reach. The worker-multiplex work
-(spawn_wl_listener_thread `native:true`) remains a VALID future step for StartRpcServer's RPC listener
-thread — just not the current blocker.
+NOT the worker multiplex. The immediate wall is a **user-mode busy-spin in user32 per-process init**,
+reached right after two `InitializeCriticalSection` calls, with NO keyed-event syscall — so START by
+**instrumenting winlogon's spin RIP** (executive: on winlogon (badge 4), when it stops producing
+faults/syscalls, sample its TCB's saved RIP via the kernel, or use the QEMU gdb-stub to halt + read
+RIP; then map RIP−user32_base to a user32 function). That tells you whether it's (a) OUR ntdll's
+`RtlEnterCriticalSection` spin/state-machine looping (fix the CS body in `crates/nt-ntdll*/src/sync.rs`
++ wire the keyed-event fall-through over native seL4-Call + an executive keyed-event handler), or (b)
+user32 polling a csrss/win32k-set shared value our modeled connect left unset (populate it). Only past
+this do StartRpcServer (the RPC listener thread — where the BATCH-6 `spawn_wl_listener_thread
+native:true` multiplex pattern legitimately applies), StartServicesManager, StartLsass, WaitForLsass
+(the LSA_RPC_SERVER_ACTIVE event — needs lsass running to SetEvent it, lsarpc.c:105), and finally
+InitializeSAS/SwitchDesktop/the 0x003a6ea5 paint come into reach. The worker-multiplex work remains a
+VALID future step for StartRpcServer's listener — just not the current blocker.
