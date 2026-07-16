@@ -14,8 +14,15 @@ authors = ["Stephen von Takach <steve@place.technology>"]
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# ntdll_plan Step 6.A — the native seL4-Call transport, ON by default for the DLL emit. The
+# executive gates which ntdll a process runs at spawn (our-ntdll smss = native; real ntdll/pi>=1 =
+# trap). Forwards to nt-ntdll's `native_transport` (which flips the Nt* stub bodies + on_target).
+default = ["native_transport"]
+native_transport = ["nt-ntdll/native_transport"]
+
 [dependencies]
-nt-ntdll = { path = "../nt-ntdll" }
+nt-ntdll = { path = "../nt-ntdll", default-features = false }
 nt-ntdll-layout = { path = "../nt-ntdll-layout" }
 
 [lints.clippy]

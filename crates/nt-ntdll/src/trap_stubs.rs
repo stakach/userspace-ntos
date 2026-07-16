@@ -44,7 +44,10 @@ pub struct TrapStubMeta {
 macro_rules! generate_trap_stubs {
     ( $( ($fn:ident, $name:literal, $ssn:literal) ),* $(,)? ) => {
         $(
-            #[cfg(target_arch = "x86_64")]
+            // ── TRAP transport (default): `mov r10,rcx; mov eax,<ssn>; syscall; ret` ────────────
+            // Faults as UnknownSyscall → serviced via the fault EP. Kept as the fallback (real ntdll
+            // / pi>=1). Selected when the `native_transport` feature is OFF.
+            #[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
             #[unsafe(naked)]
             // Export under the REAL Windows `Nt*` name (not the snake_case fn ident), so the PE
             // export directory lists `NtClose`/`NtCreateFile`/… — the names hosted binaries import.
@@ -55,6 +58,42 @@ macro_rules! generate_trap_stubs {
                     "mov r10, rcx",
                     concat!("mov eax, ", stringify!($ssn)),
                     "syscall",
+                    "ret",
+                );
+            }
+
+            // ── NATIVE seL4-Call transport (ntdll_plan Step 6.A) ────────────────────────────────
+            // A real native seL4 `Call(CT_FAULT)` carrying the NT_NATIVE_SYSCALL request message
+            // (SSN + rsp + 4 register args), reading NTSTATUS from the reply MR0. See
+            // `crate::native_call` for the wire layout. Selected when `native_transport` is ON.
+            //
+            // Windows-ABI entry: rcx=arg1, rdx=arg2, r8=arg3, r9=arg4, args5+ on the stack; rsp at
+            // entry points AT the return address (caller's stack args at [rsp+0x28]…). We capture
+            // that rsp (MR1) so the executive reads stack args + writes stack out-params via its
+            // mirror — a native Call transfers no rsp/stack (unlike the UnknownSyscall fault frame).
+            #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+            #[unsafe(naked)]
+            #[export_name = $name]
+            /// Generated `Nt*` native-Call stub (seL4 `Call` on CT_FAULT; NTSTATUS in reply MR0).
+            pub extern "C" fn $fn() {
+                core::arch::naked_asm!(
+                    // Stash args3/4 into the IPC buffer as MR4/MR5 (only 4 MRs ride in registers).
+                    // IPC buffer word[i] = MR i at byte (8 + i*8); MR4 @ +0x28, MR5 @ +0x30.
+                    "movabs rax, 0x00000100105FB000",   // IPCBUF_VADDR (fixed per-process VA)
+                    "mov qword ptr [rax + 0x28], r8",   // MR4 = arg3
+                    "mov qword ptr [rax + 0x30], r9",   // MR5 = arg4
+                    // Build the register message. Capture rsp (MR1) BEFORE any push.
+                    "mov r8, rsp",                      // MR1 = caller rsp
+                    "mov r9, rcx",                      // MR2 = arg1 (rcx)
+                    "mov r15, rdx",                     // MR3 = arg2 (rdx)
+                    concat!("mov r10d, ", stringify!($ssn)), // MR0 = SSN
+                    "mov edi, 6",                       // rdi = CT_FAULT cap slot
+                    // rsi = msginfo = (NT_NATIVE_SYSCALL_LABEL<<12) | length(6) = 0x4E54_6006.
+                    "mov esi, 0x4E546006",
+                    "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
+                    "syscall",                          // native seL4 Call → executive Recv/Reply
+                    // Reply: MR0 (r10) = NTSTATUS. Move to rax (the C return register) and ret.
+                    "mov rax, r10",
                     "ret",
                 );
             }

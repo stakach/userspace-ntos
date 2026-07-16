@@ -63,6 +63,7 @@ pub mod heap;
 pub mod ki;
 pub mod loader;
 pub mod marshal;
+pub mod native_call;
 pub mod rtl;
 pub mod stubs;
 pub mod sync;

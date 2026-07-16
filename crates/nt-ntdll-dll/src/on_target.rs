@@ -55,45 +55,29 @@ const NT_CURRENT_PROCESS: u64 = u64::MAX; // (HANDLE)-1
 ///
 /// Returns the committed base VA, or 0 on failure.
 ///
+/// This delegates to the generic 6-arg helper, so it flips between the TRAP and native seL4-Call
+/// transports with the rest of the surface (ntdll_plan Step 6.A).
+///
 /// # Safety
-/// Issues a real syscall trap serviced by the executive; only valid on-target in a hosted process.
+/// Issues a real syscall serviced by the executive; only valid on-target in a hosted process.
 #[cfg(target_arch = "x86_64")]
 unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
     let mut base: u64 = 0; // 0 = let the executive pick the per-process bump base
     let mut region: u64 = size_in as u64;
-    let status: u64;
-    // x64 native syscall ABI: arg1=RCX(→R10)=ProcessHandle, arg2=RDX=&BaseAddress, arg3=R8=ZeroBits,
-    // arg4=R9=&RegionSize, arg5/arg6 on the stack = AllocationType, Protect. The naked `Nt*` stub
-    // form is `mov r10,rcx; mov eax,ssn; syscall`; we inline the equivalent, placing the two stack
-    // args at [rsp+0x28]/[rsp+0x30] (past the 0x20 shadow + return slot) per the Windows x64 ABI.
-    // SAFETY: a hosted-process syscall trap; base/region are valid stack locals for the out-writes.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x38",
-            "mov qword ptr [rsp+0x28], {atype}",
-            "mov qword ptr [rsp+0x30], {prot}",
-            "mov r10, {proc}",         // arg1: ProcessHandle
-            "mov rdx, {pbase}",        // arg2: &BaseAddress
-            "xor r8d, r8d",            // arg3: ZeroBits = 0
-            "mov r9, {psize}",         // arg4: &RegionSize
-            "mov eax, {ssn}",
-            "syscall",
-            "add rsp, 0x38",
-            ssn = const SSN_NT_ALLOCATE_VIRTUAL_MEMORY,
-            proc = in(reg) NT_CURRENT_PROCESS,
-            pbase = in(reg) &mut base as *mut u64,
-            psize = in(reg) &mut region as *mut u64,
-            atype = in(reg) MEM_COMMIT_RESERVE as u64,
-            prot = in(reg) PAGE_READWRITE as u64,
-            out("rax") status,
-            out("rcx") _,
-            out("r11") _,
-            out("r10") _,
-            out("r8") _,
-            out("r9") _,
-            clobber_abi("system"),
-        );
-    }
+    // arg1=ProcessHandle, arg2=&BaseAddress, arg3=ZeroBits, arg4=&RegionSize, arg5=AllocationType,
+    // arg6=Protect. The executive reads/writes *BaseAddress + *RegionSize through its stack mirror.
+    // SAFETY: base/region are valid stack locals for the out-writes.
+    let status = unsafe {
+        syscall6(
+            SSN_NT_ALLOCATE_VIRTUAL_MEMORY,
+            NT_CURRENT_PROCESS,
+            &mut base as *mut u64 as u64,
+            0,
+            &mut region as *mut u64 as u64,
+            MEM_COMMIT_RESERVE as u64,
+            PAGE_READWRITE as u64,
+        )
+    };
     if status == 0 {
         base
     } else {
@@ -407,11 +391,11 @@ const TOKEN_ADJUST_PRIVILEGES_QUERY: u32 = 0x28;
 /// `SE_PRIVILEGE_ENABLED`.
 const SE_PRIVILEGE_ENABLED: u32 = 0x2;
 
-/// A general 4-register-arg syscall trap (`arg1..arg4` in RCX/RDX/R8/R9; `mov r10,rcx; syscall`).
+/// A general 4-register-arg syscall (`arg1..arg4`). TRAP transport (fallback): `mov r10,rcx; syscall`.
 ///
 /// # Safety
 /// On-target hosted-process syscall; the args must satisfy the target syscall's contract.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
 #[inline]
 unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let status: u64;
@@ -439,11 +423,88 @@ unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     status
 }
 
-/// A general 6-arg syscall trap (arg1..4 in registers, arg5/arg6 on the stack at `[rsp+0x28/0x30]`).
+/// A general 4-register-arg syscall (`arg1..arg4`). NATIVE seL4-Call transport (ntdll_plan Step 6.A):
+/// a real native `Call(CT_FAULT)` carrying the NT_NATIVE_SYSCALL request; NTSTATUS from reply MR0.
+/// Delegates to the 6-arg helper with zero stack args (a3/a4 ride in MR4/MR5).
+///
+/// # Safety
+/// On-target hosted-process syscall; the args must satisfy the target syscall's contract.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    // SAFETY: forwarding to the native 6-arg helper (a5/a6 = 0, unused by a 4-arg service).
+    unsafe { native_syscall(ssn, a1, a2, a3, a4, 0, 0) }
+}
+
+/// The NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A). Builds the NT_NATIVE_SYSCALL
+/// REQUEST message and issues a real native seL4 `Call(CT_FAULT)`:
+///   MR0=SSN, MR1=caller-rsp, MR2=a1, MR3=a2, MR4=a3, MR5=a4  (a5/a6 → stack at [rsp+0x28/0x30]).
+/// The executive Recv's it (label 0x4E54), decodes SSN+args (reading a5+ AND writing stack out-params
+/// through its stack mirror — hence MR1=rsp), services via ExecNtHandler, and replies MR0=NTSTATUS.
+///
+/// The stack args a5/a6 are placed at `[rsp+0x28]/[rsp+0x30]` exactly as the Windows x64 ABI + the
+/// trap path do, and `rsp` is captured into MR1 AFTER reserving that frame — so the executive's
+/// `smss_stack_read(rsp+0x28+…)` finds them. All register out-params (`&base`/`&handle`/…) are
+/// pointers into the caller's mapped stack, written by the executive through the same mirror — no
+/// out-param-in-reply needed for this transport cut (that layers on later).
+///
+/// # Safety
+/// On-target hosted-process; args satisfy the service contract; register out-param pointers are
+/// valid stack locals in the caller's frame.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn native_syscall(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    // IPC buffer MR4/MR5 = a3/a4 (only 4 MRs ride in registers; MR4+ go via the IPC buffer).
+    // IPCBUF_VADDR is a fixed per-process VA; MR i lives at byte (8 + i*8): MR4 @ +0x28, MR5 @ +0x30.
+    const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+    let status: u64;
+    // SAFETY: a native seL4 Call; the executive services it via Recv/Reply on the fault EP. The
+    // stack-frame reservation holds a5/a6 for the executive's mirror read; rsp (MR1) is captured
+    // after the reservation so the offsets match the executive's `sp+0x28` reads.
+    unsafe {
+        core::arch::asm!(
+            // Reserve the ABI stack frame + place a5/a6 where the executive reads them.
+            "sub rsp, 0x38",
+            "mov qword ptr [rsp+0x28], {a5}",   // stack arg5
+            "mov qword ptr [rsp+0x30], {a6}",   // stack arg6
+            // MR4/MR5 (a3/a4) into the IPC buffer.
+            "movabs r11, {ipcbuf}",
+            "mov qword ptr [r11 + 0x28], {a3}", // MR4 = arg3
+            "mov qword ptr [r11 + 0x30], {a4}", // MR5 = arg4
+            // Register message: MR0=SSN(r10), MR1=rsp(r8), MR2=a1(r9), MR3=a2(r15).
+            "mov r8, rsp",                      // MR1 = caller rsp (points at the reserved frame)
+            "mov r10d, {ssn:e}",                // MR0 = SSN
+            "mov r9,  {a1}",                    // MR2 = arg1
+            "mov r15, {a2}",                    // MR3 = arg2
+            "mov edi, 6",                       // rdi = CT_FAULT cap slot
+            "mov esi, 0x4E546006",              // rsi = (0x4E54<<12)|6
+            "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
+            "syscall",
+            "add rsp, 0x38",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
+            a3 = in(reg) a3,
+            a4 = in(reg) a4,
+            a5 = in(reg) a5,
+            a6 = in(reg) a6,
+            ipcbuf = const IPCBUF_VADDR,
+            // Reply MR0 (NTSTATUS) comes back in r10 (the IPC return ABI). Capture it.
+            out("r10") status,
+            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
+            out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// A general 6-arg syscall. TRAP transport (fallback): arg1..4 registers, arg5/arg6 on the stack.
 ///
 /// # Safety
 /// On-target hosted-process syscall; args must satisfy the target syscall's contract.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
 #[inline]
 unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     let status: u64;
@@ -473,6 +534,18 @@ unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         );
     }
     status
+}
+
+/// A general 6-arg syscall. NATIVE seL4-Call transport (ntdll_plan Step 6.A) — delegates to
+/// [`native_syscall`] (a5/a6 at `[rsp+0x28/0x30]`, MR1=rsp).
+///
+/// # Safety
+/// On-target hosted-process syscall; args must satisfy the target syscall's contract.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    // SAFETY: forwarding to the native primitive.
+    unsafe { native_syscall(ssn, a1, a2, a3, a4, a5, a6) }
 }
 
 /// `RtlAdjustPrivilege(Privilege, Enable, CurrentThread, WasEnabled)` — the live-token implementation.
@@ -638,11 +711,11 @@ const CTX_RIP: usize = 0xF8;
 /// touch); 0x4D0 is the real `sizeof(CONTEXT)` on x64.
 const CONTEXT_SIZE: usize = 0x4D0;
 
-/// An 8-arg syscall trap (arg1..4 registers; arg5..8 on the stack at [rsp+0x28/0x30/0x38/0x40]).
+/// An 8-arg syscall. TRAP transport (fallback): arg1..4 registers; arg5..8 on the stack.
 ///
 /// # Safety
 /// On-target hosted-process syscall; args must satisfy the target syscall's contract.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn syscall8(
@@ -677,6 +750,61 @@ unsafe fn syscall8(
             a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
             out("rax") status,
             out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// An 8-arg syscall. NATIVE seL4-Call transport (ntdll_plan Step 6.A): MR0=SSN, MR1=rsp, MR2=a1,
+/// MR3=a2, MR4=a3, MR5=a4 (IPC buffer), and a5..a8 on the stack at `[rsp+0x28/0x30/0x38/0x40]` (read
+/// by the executive via its mirror). Same request as [`native_syscall`] but with two more stack args.
+///
+/// # Safety
+/// On-target hosted-process syscall; args must satisfy the target syscall's contract.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn syscall8(
+    ssn: u32,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+) -> u64 {
+    const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+    let status: u64;
+    // SAFETY: native seL4 Call; the executive reads a5..a8 + writes stack out-params via its mirror.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x48",
+            "mov qword ptr [rsp+0x28], {a5}",
+            "mov qword ptr [rsp+0x30], {a6}",
+            "mov qword ptr [rsp+0x38], {a7}",
+            "mov qword ptr [rsp+0x40], {a8}",
+            "movabs r11, {ipcbuf}",
+            "mov qword ptr [r11 + 0x28], {a3}", // MR4 = arg3
+            "mov qword ptr [r11 + 0x30], {a4}", // MR5 = arg4
+            "mov r8, rsp",                      // MR1 = caller rsp
+            "mov r10d, {ssn:e}",                // MR0 = SSN
+            "mov r9,  {a1}",                    // MR2 = arg1
+            "mov r15, {a2}",                    // MR3 = arg2
+            "mov edi, 6",                       // rdi = CT_FAULT
+            "mov esi, 0x4E546006",              // rsi = (0x4E54<<12)|6
+            "mov rdx, -1",                      // rdx = SysCall
+            "syscall",
+            "add rsp, 0x48",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1, a2 = in(reg) a2, a3 = in(reg) a3, a4 = in(reg) a4,
+            a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
+            ipcbuf = const IPCBUF_VADDR,
+            out("r10") status,
+            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
+            out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
             clobber_abi("system"),
         );
     }

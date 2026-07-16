@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# ntdll_plan Step 6.A — flip the Nt* stub transport from the x86 UnknownSyscall trap to a native
+# seL4 `Call` on the service endpoint (CT_FAULT). OFF = the trap fallback (real ntdll / pi>=1).
+native_transport = []
+
 [dependencies]
 nt-syscall-abi = { path = "../nt-syscall-abi" }
 nt-ntdll-layout = { workspace = true }

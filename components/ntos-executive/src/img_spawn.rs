@@ -610,13 +610,26 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = tcb_set_gs_base(tcb, SMSS_TEB_VA);
     }
     let _ = tcb_set_priority(tcb, prio);
-    // Mark this a HOSTED thread: the kernel turns EVERY `syscall` it issues into an UnknownSyscall
-    // fault to the executive, never a native seL4 dispatch. Without this, NT syscalls whose arg2
-    // (RDX) collides with a seL4 syscall number are misdispatched by the kernel and never reach us —
-    // e.g. NtMapViewOfSection passes ProcessHandle = NtCurrentProcess() = -1 in RDX, and the kernel
-    // reads RDX as the syscall number where -1 == SysCall, so the map silently never faults here.
+    // Transport selection (ntdll_plan Step 6.A):
+    //  * TRAP transport (real ntdll, or OUR ntdll on the trap path): mark this a HOSTED thread so the
+    //    kernel turns EVERY `syscall` it issues into an UnknownSyscall fault to the executive, never a
+    //    native seL4 dispatch. Without this, NT syscalls whose arg2 (RDX) collides with a seL4 syscall
+    //    number are misdispatched — e.g. NtMapViewOfSection passes ProcessHandle=NtCurrentProcess()=-1
+    //    in RDX, and the kernel reads RDX as the syscall number where -1==SysCall, so the map silently
+    //    never faults here.
+    //  * NATIVE seL4-Call transport (OUR ntdll, Step 6.A): DON'T set the hosted flag. OUR ntdll's Nt*
+    //    stubs issue a real native seL4 `Call(CT_FAULT)` (rdx=-1=SysCall → dispatched natively by the
+    //    kernel), carrying SSN+args in the message; the executive Recv's it on the same fault EP. Since
+    //    OUR ntdll owns EVERY syscall (each stub is our code doing a seL4_Call, never a raw Windows
+    //    `syscall`), the process never issues a syscall that would need the hosted-fault path. NO
+    //    kernel change — the per-thread hosted flag simply stays clear.
+    // The `ldrpinit_rva != 0` signal is true ONLY for the our-ntdll smss spawn (pi 0, flag ON); every
+    // other spawn (demo + all pi>=1 fallback) passes 0 → keeps TCBSetHostedSyscalls → byte-identical.
+    let native_transport = ldrpinit_rva != 0;
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    if !native_transport {
+        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    }
     attach_sched_context(tcb);
     if (pi as usize) < MAX_PI {
         PM_MAIN_TCBS[pi as usize].store(tcb, Ordering::Relaxed);
