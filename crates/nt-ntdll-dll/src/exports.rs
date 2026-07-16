@@ -36,6 +36,7 @@ const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 
 // The raw C `UNICODE_STRING` / `STRING` (ANSI) layout — identical 16-byte shape on x64. We use the
 // byte-exact `nt_ntdll_layout::UnicodeString` for reads/writes through the exported pointers.
@@ -3287,6 +3288,619 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Rtl* string / convert family the Win32 stack imports.
+// Raw UNICODE_STRING / ANSI_STRING (both the 16-byte {Length:u16, MaximumLength:u16, _pad:u32,
+// Buffer:u64} shape) wrappers over the host-tested nt_ntdll::rtl string/convert cores. Single-byte
+// code-page default (1252/437) → 1 UTF-16 unit per ANSI byte.
+// =================================================================================================
+
+/// `RtlCopyUnicodeString(PUNICODE_STRING dst, PCUNICODE_STRING src)` — copy up to
+/// `dst->MaximumLength` bytes; sets `dst->Length`.
+///
+/// # Safety
+/// `dst` a valid writable UNICODE_STRING with a buffer of `MaximumLength` bytes; `src` valid/NULL.
+#[export_name = "RtlCopyUnicodeString"]
+pub unsafe extern "system" fn rtl_copy_unicode_string(dst: PUnicodeString, src: PCUnicodeString) {
+    if dst.is_null() {
+        return;
+    }
+    // SAFETY: dst valid per the contract.
+    let (dbuf, dmax) = unsafe { ((*dst).buffer as *mut u16, (*dst).maximum_length as usize) };
+    if src.is_null() {
+        // SAFETY: dst valid.
+        unsafe { (*dst).length = 0 };
+        return;
+    }
+    // SAFETY: src valid per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u16, (*src).length as usize) };
+    let n = core::cmp::min(slen, dmax) & !1; // byte length, even
+    if !dbuf.is_null() && !sbuf.is_null() {
+        // SAFETY: copy n bytes; both within their buffers.
+        unsafe { core::ptr::copy_nonoverlapping(sbuf as *const u8, dbuf as *mut u8, n) };
+    }
+    // NUL-terminate if room.
+    if n + 2 <= dmax && !dbuf.is_null() {
+        // SAFETY: room for a terminator per the check.
+        unsafe { *dbuf.add(n / 2) = 0 };
+    }
+    // SAFETY: dst valid.
+    unsafe { (*dst).length = n as u16 };
+}
+
+/// `RtlUpcaseUnicodeString(PUNICODE_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` — uppercase.
+///
+/// # Safety
+/// `dst` writable; `src` valid.
+#[export_name = "RtlUpcaseUnicodeString"]
+pub unsafe extern "system" fn rtl_upcase_unicode_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src valid per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u16, (*src).length as usize / 2) };
+    let src_slice = if sbuf.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: valid region of slen units.
+        unsafe { core::slice::from_raw_parts(sbuf, slen) }
+    };
+    let up = rtl::strings::upcase_unicode_string(src_slice);
+    let out_bytes = up.len() * 2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst valid per the contract.
+        let dbuf = if allocate != 0 {
+            // SAFETY: on-target heap.
+            let p = unsafe { crate::process_heap_alloc(out_bytes + 2) } as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            // SAFETY: dst valid.
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = (out_bytes + 2) as u16;
+            }
+            p
+        } else {
+            // SAFETY: dst valid.
+            unsafe {
+                if (*dst).maximum_length < out_bytes as u16 {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                (*dst).buffer as *mut u16
+            }
+        };
+        // SAFETY: dbuf valid for up.len() units.
+        unsafe {
+            core::ptr::copy_nonoverlapping(up.as_ptr(), dbuf, up.len());
+            (*dst).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, out_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlDuplicateUnicodeString(ULONG Flags, PCUNICODE_STRING src, PUNICODE_STRING dst)` — allocate a
+/// copy. Flags bit 1 = add-NUL. Ref `sdk/lib/rtl/unicode.c:RtlDuplicateUnicodeString`.
+///
+/// # Safety
+/// `src` valid; `dst` writable.
+#[export_name = "RtlDuplicateUnicodeString"]
+pub unsafe extern "system" fn rtl_duplicate_unicode_string(
+    flags: u32,
+    src: PCUnicodeString,
+    dst: PUnicodeString,
+) -> NtStatus {
+    if src.is_null() || dst.is_null() || flags > 3 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src valid per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u16, (*src).length as usize) };
+    let add_nul = flags & 1 != 0;
+    if slen == 0 && flags & 2 == 0 {
+        // Empty result, NULL buffer (RTL_DUPLICATE_UNICODE_STRING_NULL_TERMINATE not set).
+        // SAFETY: dst valid.
+        unsafe {
+            (*dst).length = 0;
+            (*dst).maximum_length = 0;
+            (*dst).buffer = 0;
+        }
+        return STATUS_SUCCESS;
+    }
+    let alloc_bytes = slen + if add_nul { 2 } else { 0 };
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target heap.
+        let p = unsafe { crate::process_heap_alloc(alloc_bytes.max(2)) } as *mut u8;
+        if p.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        // SAFETY: copy slen bytes; buffers valid.
+        unsafe {
+            if !sbuf.is_null() && slen > 0 {
+                core::ptr::copy_nonoverlapping(sbuf as *const u8, p, slen);
+            }
+            if add_nul {
+                *(p.add(slen) as *mut u16) = 0;
+            }
+            (*dst).length = slen as u16;
+            (*dst).maximum_length = alloc_bytes as u16;
+            (*dst).buffer = p as u64;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (sbuf, alloc_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlCreateUnicodeStringFromAsciiz(PUNICODE_STRING dst, PCSZ src) -> BOOLEAN` — widen a
+/// NUL-terminated ASCII string into a freshly-allocated UNICODE_STRING.
+///
+/// # Safety
+/// `dst` writable; `src` a NUL-terminated byte string.
+#[export_name = "RtlCreateUnicodeStringFromAsciiz"]
+pub unsafe extern "system" fn rtl_create_unicode_string_from_asciiz(
+    dst: PUnicodeString,
+    src: *const u8,
+) -> u8 {
+    if dst.is_null() {
+        return 0;
+    }
+    // SAFETY: src NUL-terminated per the contract.
+    let n = unsafe { strlen_raw(src) };
+    let out_bytes = n * 2;
+    if out_bytes + 2 > 0xFFFF {
+        return 0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target heap.
+        let p = unsafe { crate::process_heap_alloc(out_bytes + 2) } as *mut u16;
+        if p.is_null() {
+            return 0;
+        }
+        // SAFETY: widen each byte; buffers valid.
+        unsafe {
+            for i in 0..n {
+                *p.add(i) = rtl::convert::ansi_char_to_unicode_char(*src.add(i));
+            }
+            *p.add(n) = 0;
+            (*dst).length = out_bytes as u16;
+            (*dst).maximum_length = (out_bytes + 2) as u16;
+            (*dst).buffer = p as u64;
+        }
+        1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (n, out_bytes);
+        0
+    }
+}
+
+/// `RtlFreeAnsiString(PANSI_STRING)` — free a heap-allocated ANSI string.
+///
+/// # Safety
+/// `s` a valid ANSI_STRING whose Buffer came from the process heap (or NULL Buffer).
+#[export_name = "RtlFreeAnsiString"]
+pub unsafe extern "system" fn rtl_free_ansi_string(s: PUnicodeString) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: s valid per the contract.
+    let buf = unsafe { (*s).buffer };
+    if buf != 0 {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: buf came from the process heap.
+        unsafe {
+            crate::process_heap_free(buf as *mut u8);
+        }
+        // SAFETY: s valid.
+        unsafe {
+            (*s).length = 0;
+            (*s).maximum_length = 0;
+            (*s).buffer = 0;
+        }
+    }
+}
+
+/// `RtlInitAnsiStringEx(PANSI_STRING dst, PCSZ src) -> NTSTATUS` — like RtlInitAnsiString but
+/// rejects a string >= 0xFFFF bytes.
+///
+/// # Safety
+/// `dst` writable; `src` null or NUL-terminated.
+#[export_name = "RtlInitAnsiStringEx"]
+pub unsafe extern "system" fn rtl_init_ansi_string_ex(dst: PUnicodeString, src: *const u8) -> NtStatus {
+    if dst.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src per the contract.
+    let len = unsafe { strlen_raw(src) };
+    if len > 0xFFFE {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    }
+    // SAFETY: dst valid.
+    unsafe {
+        (*dst).length = len as u16;
+        (*dst).maximum_length = if src.is_null() { 0 } else { (len + 1) as u16 };
+        (*dst).buffer = src as u64;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlInitUnicodeStringEx(PUNICODE_STRING dst, PCWSTR src) -> NTSTATUS`.
+///
+/// # Safety
+/// `dst` writable; `src` null or NUL-terminated UTF-16.
+#[export_name = "RtlInitUnicodeStringEx"]
+pub unsafe extern "system" fn rtl_init_unicode_string_ex(
+    dst: PUnicodeString,
+    src: *const u16,
+) -> NtStatus {
+    if dst.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src per the contract.
+    let units = unsafe { wcslen_raw(src) };
+    if units > 0x7FFE {
+        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+    }
+    let bytes = (units * 2) as u16;
+    // SAFETY: dst valid.
+    unsafe {
+        (*dst).length = bytes;
+        (*dst).maximum_length = if src.is_null() { 0 } else { bytes + 2 };
+        (*dst).buffer = src as u64;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlAnsiCharToUnicodeChar(PUCHAR* SourceCharacter) -> WCHAR` — widen one ANSI char + advance the
+/// source pointer.
+///
+/// # Safety
+/// `src` a valid `PUCHAR*` pointing at a readable byte.
+#[export_name = "RtlAnsiCharToUnicodeChar"]
+pub unsafe extern "system" fn rtl_ansi_char_to_unicode_char(src: *mut *const u8) -> u16 {
+    if src.is_null() {
+        return 0;
+    }
+    // SAFETY: src valid per the contract.
+    unsafe {
+        let p = *src;
+        let b = *p;
+        *src = p.add(1);
+        rtl::convert::ansi_char_to_unicode_char(b)
+    }
+}
+
+/// `RtlIntegerToUnicodeString(ULONG Value, ULONG Base, PUNICODE_STRING dst) -> NTSTATUS`.
+///
+/// # Safety
+/// `dst` a valid writable UNICODE_STRING with a buffer.
+#[export_name = "RtlIntegerToUnicodeString"]
+pub unsafe extern "system" fn rtl_integer_to_unicode_string(
+    value: u32,
+    base: u32,
+    dst: PUnicodeString,
+) -> NtStatus {
+    if dst.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let base = if base == 0 { 10 } else { base };
+    let digits = match rtl::integer::integer_to_unicode(value, base) {
+        Some(d) => d,
+        None => return STATUS_INVALID_PARAMETER,
+    };
+    let out_bytes = digits.len() * 2;
+    // SAFETY: dst valid per the contract.
+    unsafe {
+        if (*dst).maximum_length < (out_bytes + 2) as u16 {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        let dbuf = (*dst).buffer as *mut u16;
+        if dbuf.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(digits.as_ptr(), dbuf, digits.len());
+        *dbuf.add(digits.len()) = 0;
+        (*dst).length = out_bytes as u16;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlUnicodeToMultiByteN(PCHAR MbStr, ULONG MbSize, PULONG BytesInMbStr, PCWCH UnicodeStr,
+/// ULONG BytesInUnicodeStr) -> NTSTATUS` — UTF-16 → single-byte code page.
+///
+/// # Safety
+/// `mb_str` writable for `mb_size` bytes; `unicode_str` valid for `bytes_in_unicode` bytes;
+/// `bytes_out` null or writable.
+#[export_name = "RtlUnicodeToMultiByteN"]
+pub unsafe extern "system" fn rtl_unicode_to_multi_byte_n(
+    mb_str: *mut u8,
+    mb_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    let units = bytes_in_unicode as usize / 2;
+    let n = core::cmp::min(units, mb_size as usize);
+    // SAFETY: unicode_str valid for `units`; mb_str writable for `mb_size`.
+    unsafe {
+        for i in 0..n {
+            let c = *unicode_str.add(i);
+            *mb_str.add(i) = if c < 0x100 { c as u8 } else { b'?' };
+        }
+        if !bytes_out.is_null() {
+            *bytes_out = n as u32;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlUnicodeToOemN(...)` — identical to MultiByteN for our single-byte OEM (437) default path.
+///
+/// # Safety
+/// As `RtlUnicodeToMultiByteN`.
+#[export_name = "RtlUnicodeToOemN"]
+pub unsafe extern "system" fn rtl_unicode_to_oem_n(
+    oem_str: *mut u8,
+    oem_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    // SAFETY: same contract.
+    unsafe {
+        rtl_unicode_to_multi_byte_n(oem_str, oem_size, bytes_out, unicode_str, bytes_in_unicode)
+    }
+}
+
+/// `RtlMultiByteToUnicodeN(PWCH UnicodeStr, ULONG UnicodeSize, PULONG BytesInUnicodeStr,
+/// PCCH MbStr, ULONG BytesInMbStr) -> NTSTATUS` — single-byte code page → UTF-16.
+///
+/// # Safety
+/// `unicode_str` writable for `unicode_size` bytes; `mb_str` valid for `bytes_in_mb` bytes.
+#[export_name = "RtlMultiByteToUnicodeN"]
+pub unsafe extern "system" fn rtl_multi_byte_to_unicode_n(
+    unicode_str: *mut u16,
+    unicode_size: u32,
+    bytes_out: *mut u32,
+    mb_str: *const u8,
+    bytes_in_mb: u32,
+) -> NtStatus {
+    let max_units = unicode_size as usize / 2;
+    let n = core::cmp::min(bytes_in_mb as usize, max_units);
+    // SAFETY: buffers valid per the contract.
+    unsafe {
+        for i in 0..n {
+            *unicode_str.add(i) = rtl::convert::ansi_char_to_unicode_char(*mb_str.add(i));
+        }
+        if !bytes_out.is_null() {
+            *bytes_out = (n * 2) as u32;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlUnicodeToMultiByteSize(PULONG BytesInMbStr, PCWCH UnicodeStr, ULONG BytesInUnicodeStr)`.
+///
+/// # Safety
+/// `bytes_out` writable; `unicode_str` valid for `bytes_in_unicode` bytes.
+#[export_name = "RtlUnicodeToMultiByteSize"]
+pub unsafe extern "system" fn rtl_unicode_to_multi_byte_size(
+    bytes_out: *mut u32,
+    _unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    if bytes_out.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Single-byte: 1 output byte per UTF-16 unit.
+    // SAFETY: bytes_out writable.
+    unsafe { *bytes_out = bytes_in_unicode / 2 };
+    STATUS_SUCCESS
+}
+
+/// `RtlOemStringToUnicodeString(PUNICODE_STRING dst, PCOEM_STRING src, BOOLEAN Allocate)`.
+/// Same single-byte widen as the ANSI variant.
+///
+/// # Safety
+/// As `RtlAnsiStringToUnicodeString`.
+#[export_name = "RtlOemStringToUnicodeString"]
+pub unsafe extern "system" fn rtl_oem_string_to_unicode_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    // SAFETY: same 16-byte STRING shape + single-byte code page.
+    unsafe { rtl_ansi_string_to_unicode_string(dst, src, allocate) }
+}
+
+/// `RtlUnicodeStringToOemString(POEM_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` —
+/// narrow UTF-16 → single-byte OEM.
+///
+/// # Safety
+/// `dst` writable STRING; `src` valid UNICODE_STRING.
+#[export_name = "RtlUnicodeStringToOemString"]
+pub unsafe extern "system" fn rtl_unicode_string_to_oem_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src valid per the contract.
+    let (sbuf, sunits) = unsafe { ((*src).buffer as *const u16, (*src).length as usize / 2) };
+    let out_bytes = sunits + 1; // + NUL
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst valid per the contract.
+        let dbuf = if allocate != 0 {
+            // SAFETY: on-target heap.
+            let p = unsafe { crate::process_heap_alloc(out_bytes) } as *mut u8;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            // SAFETY: dst valid.
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = out_bytes as u16;
+            }
+            p
+        } else {
+            // SAFETY: dst valid.
+            unsafe {
+                if (*dst).maximum_length < out_bytes as u16 {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                (*dst).buffer as *mut u8
+            }
+        };
+        // SAFETY: buffers valid per the checks.
+        unsafe {
+            for i in 0..sunits {
+                let c = *sbuf.add(i);
+                *dbuf.add(i) = if c < 0x100 { c as u8 } else { b'?' };
+            }
+            *dbuf.add(sunits) = 0;
+            (*dst).length = sunits as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, out_bytes, sbuf);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlIsTextUnicode(PVOID Buffer, INT Size, INT* Result) -> BOOLEAN` — heuristic UTF-16 detection.
+/// We apply the standard IS_TEXT_UNICODE_STATISTICS heuristic: even byte count + a majority of
+/// zero high-bytes ⇒ likely UTF-16LE.
+///
+/// # Safety
+/// `buffer` valid for `size` bytes; `result` null or writable.
+#[export_name = "RtlIsTextUnicode"]
+pub unsafe extern "system" fn rtl_is_text_unicode(
+    buffer: *const c_void,
+    size: i32,
+    result: *mut i32,
+) -> u8 {
+    if buffer.is_null() || size < 2 {
+        if !result.is_null() {
+            // SAFETY: result writable.
+            unsafe { *result = 0 };
+        }
+        return 0;
+    }
+    let n = size as usize;
+    // SAFETY: buffer valid for n bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, n) };
+    let even = n % 2 == 0;
+    let units = n / 2;
+    let mut zero_hi = 0usize;
+    for i in 0..units {
+        if bytes[i * 2 + 1] == 0 {
+            zero_hi += 1;
+        }
+    }
+    let likely = even && units > 0 && zero_hi * 2 >= units;
+    if !result.is_null() {
+        // IS_TEXT_UNICODE_STATISTICS = 0x2.
+        // SAFETY: result writable.
+        unsafe { *result = if likely { 0x2 } else { 0 } };
+    }
+    u8::from(likely)
+}
+
+/// `RtlxUnicodeStringToAnsiSize(PCUNICODE_STRING src) -> ULONG` — ANSI byte length incl. NUL.
+///
+/// # Safety
+/// `src` a valid UNICODE_STRING.
+#[export_name = "RtlxUnicodeStringToAnsiSize"]
+pub unsafe extern "system" fn rtlx_unicode_string_to_ansi_size(src: PCUnicodeString) -> u32 {
+    if src.is_null() {
+        return 0;
+    }
+    // SAFETY: src valid.
+    let units = unsafe { (*src).length as usize / 2 };
+    (units + 1) as u32
+}
+
+/// `RtlxUnicodeStringToOemSize(PCUNICODE_STRING src) -> ULONG`.
+///
+/// # Safety
+/// As `RtlxUnicodeStringToAnsiSize`.
+#[export_name = "RtlxUnicodeStringToOemSize"]
+pub unsafe extern "system" fn rtlx_unicode_string_to_oem_size(src: PCUnicodeString) -> u32 {
+    // SAFETY: same contract.
+    unsafe { rtlx_unicode_string_to_ansi_size(src) }
+}
+
+/// `RtlxAnsiStringToUnicodeSize(PCANSI_STRING src) -> ULONG` — UTF-16 byte length incl. NUL.
+///
+/// # Safety
+/// `src` a valid ANSI_STRING.
+#[export_name = "RtlxAnsiStringToUnicodeSize"]
+pub unsafe extern "system" fn rtlx_ansi_string_to_unicode_size(src: PCUnicodeString) -> u32 {
+    if src.is_null() {
+        return 0;
+    }
+    // SAFETY: src valid.
+    let bytes = unsafe { (*src).length as usize };
+    ((bytes + 1) * 2) as u32
+}
+
+/// `RtlxOemStringToUnicodeSize(PCOEM_STRING src) -> ULONG`.
+///
+/// # Safety
+/// As `RtlxAnsiStringToUnicodeSize`.
+#[export_name = "RtlxOemStringToUnicodeSize"]
+pub unsafe extern "system" fn rtlx_oem_string_to_unicode_size(src: PCUnicodeString) -> u32 {
+    // SAFETY: same contract.
+    unsafe { rtlx_ansi_string_to_unicode_size(src) }
+}
+
+/// `RtlInitCodePageTable(PUSHORT TableBase, PCPTABLEINFO CodePageTable)` — initialize an
+/// NLS code-page table descriptor from the raw NLS table base. We serve the single-byte-default
+/// path: mark the descriptor as a single-byte (SBCS) code page. The Win32 stack reads only the
+/// MaximumCharacterSize / DBCS flags on the boot path.
+///
+/// # Safety
+/// `table` a valid NLS table base; `cp_table` a writable CPTABLEINFO.
+#[export_name = "RtlInitCodePageTable"]
+pub unsafe extern "system" fn rtl_init_code_page_table(
+    _table: *const u16,
+    cp_table: *mut c_void,
+) {
+    if cp_table.is_null() {
+        return;
+    }
+    // CPTABLEINFO: CodePage:u16@0, MaximumCharacterSize:u16@2, DefaultChar:u16@4, ... DBCSCodePage@?.
+    // Zero the descriptor then set MaximumCharacterSize=1 (SBCS) + CodePage=1252.
+    // SAFETY: cp_table writable (>= 0x20 bytes per CPTABLEINFO).
+    unsafe {
+        core::ptr::write_bytes(cp_table as *mut u8, 0, 0x20);
+        *(cp_table as *mut u16) = 1252; // CodePage
+        *((cp_table as *mut u16).add(1)) = 1; // MaximumCharacterSize (SBCS)
+        *((cp_table as *mut u16).add(2)) = b'?' as u16; // DefaultChar
+    }
+}
+
+// =================================================================================================
 // BATCH 4 — Dbg* / Csr* / data exports the Win32 stack imports from ntdll.
 // The Dbg* family is the debugger/trace client: on our target the debug output forwards to the
 // kernel serial log via the int-0x2d DebugService (the DbgPrint path); the DbgUi* debugger-attach
@@ -3726,6 +4340,28 @@ pub unsafe extern "C" fn export_anchor() {
         csr_new_thread as usize,
         &NLS_MB_CODE_PAGE_TAG as *const u8 as usize,
         &NLS_MB_OEM_CODE_PAGE_TAG as *const u8 as usize,
+        // BATCH 4 — Rtl* string / convert family.
+        rtl_copy_unicode_string as usize,
+        rtl_upcase_unicode_string as usize,
+        rtl_duplicate_unicode_string as usize,
+        rtl_create_unicode_string_from_asciiz as usize,
+        rtl_free_ansi_string as usize,
+        rtl_init_ansi_string_ex as usize,
+        rtl_init_unicode_string_ex as usize,
+        rtl_ansi_char_to_unicode_char as usize,
+        rtl_integer_to_unicode_string as usize,
+        rtl_unicode_to_multi_byte_n as usize,
+        rtl_unicode_to_oem_n as usize,
+        rtl_multi_byte_to_unicode_n as usize,
+        rtl_unicode_to_multi_byte_size as usize,
+        rtl_oem_string_to_unicode_string as usize,
+        rtl_unicode_string_to_oem_string as usize,
+        rtl_is_text_unicode as usize,
+        rtlx_unicode_string_to_ansi_size as usize,
+        rtlx_unicode_string_to_oem_size as usize,
+        rtlx_ansi_string_to_unicode_size as usize,
+        rtlx_oem_string_to_unicode_size as usize,
+        rtl_init_code_page_table as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
