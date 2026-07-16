@@ -33,7 +33,7 @@ use core::mem::{offset_of, size_of};
 
 /// `LIST_ENTRY` — a doubly-linked list node (`ntdef.h`). 16 bytes on x64.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct ListEntry {
     /// Forward link.
     pub flink: u64,
@@ -44,7 +44,7 @@ pub struct ListEntry {
 /// `UNICODE_STRING` — a counted UTF-16 string descriptor (`ntdef.h`). 16 bytes on x64 (the 4-byte
 /// gap after `maximum_length` is real x64 padding before the 8-byte `buffer` pointer).
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct UnicodeString {
     /// Used length in **bytes** (not code units, not NUL-terminated).
     pub length: u16,
@@ -88,7 +88,7 @@ pub struct NtTib {
 /// `PEB_LDR_DATA` — the loader's per-process module bookkeeping, reached via `PEB->Ldr`
 /// (`ldrtypes.h`). The three `LIST_ENTRY` module lists are what the loader / debuggers walk.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PebLdrData {
     /// Structure length.
     pub length: u32,
@@ -114,7 +114,7 @@ pub struct PebLdrData {
 /// `LDR_DATA_TABLE_ENTRY` — one loaded module (`ldrtypes.h`). The `InMemoryOrderLinks` name/offset
 /// is hard-coded into WinDbg for PEB dumping, so the head layout is fixed.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct LdrDataTableEntry {
     /// Load-order links.
     pub in_load_order_links: ListEntry,

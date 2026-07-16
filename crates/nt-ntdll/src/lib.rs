@@ -61,6 +61,7 @@ pub mod csr;
 pub mod dbg;
 pub mod heap;
 pub mod ki;
+pub mod loader;
 pub mod marshal;
 pub mod rtl;
 pub mod stubs;

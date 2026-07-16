@@ -19,7 +19,9 @@ mod relocs;
 mod rva;
 
 pub use exports::ExportedSymbol;
-pub use headers::{DataDirectory, Headers, Section};
+pub use headers::{
+    DataDirectory, Headers, Section, DIRECTORY_ENTRY_EXPORT, DIRECTORY_ENTRY_TLS,
+};
 pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
 pub use relocs::{RelocKind, Relocation};
@@ -190,6 +192,20 @@ impl<'a> PeFile<'a> {
     /// Parse the export directory (spec §13.6). Returns the module's named exports with RVAs.
     pub fn exports(&self) -> Result<alloc::vec::Vec<ExportedSymbol>, PeError> {
         exports::parse_exports(self.bytes, &self.headers, &self.sections)
+    }
+
+    /// Read a NUL-terminated ASCII string at `rva` (via the section table). Used by the loader to
+    /// read forwarder strings (`"TARGETDLL.func"`) out of the export directory.
+    pub fn cstr_at_rva(&self, rva: u32) -> Result<alloc::string::String, PeError> {
+        let raw = rva::cstr_at_rva(self.bytes, &self.sections, rva)?;
+        Ok(alloc::string::String::from_utf8_lossy(raw).into_owned())
+    }
+
+    /// True if the image has a TLS directory (data dir 9) — its TLS callbacks must run around
+    /// `DLL_PROCESS_ATTACH`. The loader records this; invoking the callbacks is a live seam.
+    pub fn has_tls_directory(&self) -> bool {
+        let dir = self.headers.data_directory(headers::DIRECTORY_ENTRY_TLS);
+        dir.virtual_address != 0 && dir.size != 0
     }
 
     /// Read `len` raw file bytes at `rva` (via the section table), without materialising a full

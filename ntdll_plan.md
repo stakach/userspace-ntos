@@ -112,10 +112,12 @@ turns "1927" into "the N we actually need" → grounds the estimate + defines th
 byte-for-byte (separate `[workspace]`). **2b/2c = the bulk port** (244 Rtl bodies / 188 stub
 bodies / Csr/Dbg/Ki / the 65 CRT re-exports). **Step 3 = the loader.**
 
-### ☐ Step 3 — the loader + PEB/TEB/LDR layout
+### ◪ Step 3 — the loader + PEB/TEB/LDR layout  (**engine DONE, host-tested 2026-07-16 — see "Step 3 Results"**)
 Our `LdrpInitialize`: PEB/TEB setup (exact offsets), process-param normalization, build the
 `PEB->Ldr` module list, recursive import snap (incl. **forwarders** — kills the `_vista` pins
 + the SxS/apphelp gaps), TLS callbacks, `DLL_PROCESS_ATTACH` ordering. Reuse `nt-pe-loader`.
+**Engine landed host-tested (18 new tests, `nt-ntdll` 127→145); the live map/call/gs paths are
+honest `LoaderHost` seams (Step 4 wires them).**
 
 ### ☐ Step 4 — PROVE parity on ONE process (smss), real-ntdll fallback kept
 Boot smss on OUR ntdll; every other process stays on real ntdll. Green gate + paint intact.
@@ -489,3 +491,91 @@ build, recursive import snap **incl. forwarders** (kills the `_vista`/SxS gaps),
 and the process cookie (`rtl::encode`) / live-PEB pointers (`rtl::environment`) that this step's
 stragglers left as documented seams. The syscall/port/context SENDs (Sel4Call/SurtRing/LPC/
 NtContinue) remain the Step-6 transport flip.
+
+---
+
+## Step 3 Results (landed 2026-07-16 — the loader ENGINE, host-tested, forwarders PROVEN)
+
+The host-testable **graph engine** at the heart of `LdrpInitialize` — import resolution incl.
+**forwarders**, `DLL_PROCESS_ATTACH` ordering, `PEB->Ldr` construction, and the orchestration —
+lands in a new `crates/nt-ntdll/src/loader/` module set, **host-tested over mock modules**, with the
+live map/call/gs paths honest `LoaderHost` seams (Step 4). **ZERO boot risk** — new modules only;
+nothing wired into the boot, executive runtime + `rust-micro/src` untouched (nt-ntdll is a separate
+`[workspace]` from the executive, verified: `components/ntos-executive/build.sh` stages green). **18
+new tests (`nt-ntdll` 127 → 145)**; clippy-clean (nt-ntdll); builds on host + `x86_64-unknown-none`.
+
+### 1. The module graph + import resolution incl. FORWARDERS — `loader/module.rs` + `loader/resolve.rs`
+- **`module.rs`** — `LoadedModule` (base VA + parsed export/import tables) + `LoaderState` (the
+  module set, keyed **case-insensitively** with an implied `.dll` suffix — the real Ldr's
+  `LdrpFindLoadedDllByName` behavior). `LoadedModule::from_pe` builds it from an `nt-pe-loader`
+  `PeFile` (reusing `parse_exports`/`parse_imports`) and **detects forwarders**: an export whose RVA
+  falls inside the export-directory range is a `"TARGETDLL.func"` / `"TARGETDLL.#ordinal"` string
+  (parsed by `parse_forwarder`, splitting on the LAST `.` so api-set DLL names with dots work).
+  `LoadedModule::mock` builds a synthetic module for the host graph tests.
+- **`resolve.rs`** — `LdrpSnapThunk`-equivalent: `snap_module`/`snap_all` resolve every import against
+  the loaded set (name or ordinal → concrete address), and **★ recursive forwarder resolution**
+  follows chains `A→B→C` with **cycle detection** (an on-chain repeat or a >16-hop depth → a
+  structured `ResolveError::ForwarderCycle`, never a spin). **★ THE MARQUEE PROOF** (`forwarder_
+  resolves_vista_pattern`): a mock `foo.dll` exporting `Bar` as a forwarder to `foo_vista.dll!Bar`
+  resolves to `foo_vista`'s concrete `Bar` **WITHOUT any pinning hack** — the 3 documented `_vista`
+  pins are obsolete + this generalizes (chain, by-ordinal, cycle all tested). Missing module/export
+  = `ResolveError::ModuleNotFound` / `ExportNotFound` (real STATUS, not the demand-load spin).
+
+### 2. Dependency ordering for `DLL_PROCESS_ATTACH` — `loader/order.rs`
+`initialization_order` = a **post-order DFS** over the import graph → dependencies-before-dependents
+(the `InInitializationOrderModuleList` order). **Cycle-tolerant**: an on-stack back-edge is broken
+(init in load order within a cycle — the real Ldr rule), so the traversal always terminates with a
+total order. Host-tested: a **diamond** (`app→{b,c}→d`: d before b/c before app) + a **cycle**
+(`b↔c` terminates, all modules present). NOTE: a forwarder target is loaded + initialized but is not
+an import edge, so it is not ordered by the import graph (matches the real Ldr).
+
+### 3. `PEB->Ldr` construction + list threading — `loader/peb.rs`
+`build_ldr` materializes one `LDR_DATA_TABLE_ENTRY` per module (over `nt-ntdll-layout`'s byte-exact
+structs) and **threads all three `LIST_ENTRY` lists** — `InLoadOrder`/`InMemoryOrder` (@ entry
++0x00/+0x10) + `InInitializationOrder` (@ +0x20) — circularly through the `PEB_LDR_DATA` head (@
++0x10/+0x20/+0x30), by **absolute VA** (model VAs host-side; a scratch alloc live). Host-tested by
+**walking** the built `InLoadOrder`/`InInitializationOrder` lists (follow flinks from the head) and
+recovering the modules in the right order — the exact traversal a hosted binary / debugger does.
+Entry fields (dll_base/entry_point/size_of_image/base_dll_name length) asserted. (Added `Default`
+derives to the four layout structs so the entries can be constructed from outside the layout crate
+without touching the private `_pad` fields — no layout change.)
+
+### 4. `LdrpInitialize` orchestration + the `LoaderHost` seam — `loader/init.rs` + `loader/host.rs`
+`ldrp_initialize(state, params, host)` ties it together in the real Ldr order: (1) normalize params
+(`rtl::environment::normalize_flags` → NORMALIZED bit), (2) compute the process cookie
+(`compute_process_cookie`, deterministic-from-seed host-side, non-zero), (3) map every module, (4)
+resolve ALL imports incl. forwarders + write each IAT slot, (5) compute the ATTACH order, (6) build
+`PEB->Ldr` + commit PEB/TEB, (7) run TLS callbacks + `DLL_PROCESS_ATTACH` in dependency order (the
+EXE gets no DllMain — its entry is the transfer target), (8) transfer to the entry. A `DllMain`
+returning FALSE → `STATUS_DLL_INIT_FAILED`; a missing dep → `STATUS_DLL_NOT_FOUND`. **All host-tested
+over a mock set + a recording `MockHost`** (asserts exactly what the loader drove: mapped 4,
+NtClose IAT write = the forwarded ntdll_vista address, DllMain order deps-first, PEB/TEB committed,
+transferred to app's entry).
+
+**★ The `LoaderHost` seam** (`host.rs`) — the honest boundary between the host-testable engine and
+the four live-process ops: `map_image` (NtAllocateVirtualMemory + copy/relocate + NtProtect),
+`write_iat_slot`, `call_dll_main` / `run_tls_callbacks` (transfer into target code),
+`commit_peb_teb` (gs-relative writes), `transfer_to_entry` (NtContinue-style). **`MockHost`** records
+the drive (host tests); **`NullHost`** returns `STATUS_NOT_IMPLEMENTED` for every op — the invariant
+proof (`null_host_never_fakes_a_live_operation`) that the engine **NEVER fabricates a live result**.
+The real on-target host is Step 4.
+
+**★ apphelp — the correct behavior** (`ShimPolicy`): the loader loads the shim engine (`apphelp.dll`)
+**only if a shim database matched** (`ShimPolicy::LoadShimEngine`); the default `NoShims` does NOT
+load apphelp — the *correct* Windows behavior, replacing the executive's ad-hoc apphelp denylist
+hack (`project_full_fs.md`). Owning the loader makes this a policy decision, host-tested both ways.
+
+### What Step 4 must wire (the live path)
+- **The real `LoaderHost` impl** (on-target): `map_image` = the demand-load / NtAllocateVirtualMemory
+  path (reuse `nt-pe-loader::MappedImage` + `relocations`); `write_iat_slot` = a raw write into the
+  live image; `call_dll_main` / `run_tls_callbacks` = a control transfer with the `CONTEXT`;
+  `commit_peb_teb` = the gs-relative PEB/TEB writes (the byte-exact offsets are in `nt-ntdll-layout`);
+  `transfer_to_entry` = the `NtContinue`/trampoline hand-off. The `LdrDataTableEntry` name-buffer VAs
+  + the `RTL_USER_PROCESS_PARAMETERS` UNICODE_STRING pointer-rebase (denormalize→normalize) also
+  land here (the model leaves `buffer` = 0).
+- **The executive-side SSN-50 arm** (`NtCreateProcessEx` — see the Step 2c reconciliation): teach the
+  executive to dispatch SSN 50 (49 as a prefix shim) so our ntdll's real imported stub routes.
+- **The transport flip** (Step 6): the syscall/port/context SENDs (Sel4Call/SurtRing/LPC/NtContinue)
+  from x86-trap to native seL4 Call/SURT once parity holds.
+- Wire the SEH function-table registration (`rtl::exception::FunctionTable::add`) during ATTACH + the
+  process cookie into `rtl::encode`'s `RtlEncodePointer`.
