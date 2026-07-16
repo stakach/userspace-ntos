@@ -3288,6 +3288,63 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Zw* aliases. Zw* and Nt* are identical exports (same SSN, same ABI) — real ntdll
+// exports both names pointing at the same code. We emit a naked tail-`jmp` to the corresponding
+// Nt* export so the Zw name lands in the export directory (transport-agnostic: whatever transport
+// the Nt* stub uses, the Zw alias inherits it).
+// =================================================================================================
+
+/// `ZwYieldExecution` — alias of `NtYieldExecution` (SSN 288). Naked `jmp NtYieldExecution`.
+///
+/// # Safety
+/// Tail-calls the `NtYieldExecution` stub (same ABI); no local state.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "ZwYieldExecution"]
+pub unsafe extern "C" fn zw_yield_execution() {
+    core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::nt_yield_execution);
+}
+
+/// `ZwCallbackReturn` — alias of `NtCallbackReturn` (SSN 22). `NtCallbackReturn` is not in the 188
+/// trap-stub set (it's a Ki-adjacent stub); emit a direct native/trap stub here under BOTH names is
+/// unnecessary — the Win32 boot path calls `ZwCallbackReturn` only from `KiUserCallbackDispatcher`,
+/// which we service via the callback seam. Provide the export as a trap stub (SSN 22).
+///
+/// # Safety
+/// Issues the NtCallbackReturn syscall (SSN 22, trap ABI).
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
+#[unsafe(naked)]
+#[export_name = "ZwCallbackReturn"]
+pub unsafe extern "C" fn zw_callback_return() {
+    core::arch::naked_asm!("mov r10, rcx", "mov eax, 22", "syscall", "ret");
+}
+
+/// `ZwCallbackReturn` (native seL4-Call transport variant) — SSN 22.
+///
+/// # Safety
+/// Issues the NtCallbackReturn native seL4 Call (SSN 22).
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[unsafe(naked)]
+#[export_name = "ZwCallbackReturn"]
+pub unsafe extern "C" fn zw_callback_return() {
+    core::arch::naked_asm!(
+        "movabs rax, 0x00000100105FB000",
+        "mov qword ptr [rax + 0x28], r8",
+        "mov qword ptr [rax + 0x30], r9",
+        "mov r8, rsp",
+        "mov r9, rcx",
+        "mov r15, rdx",
+        "mov r10d, 22",
+        "mov edi, 6",
+        "mov esi, 0x04E54006",
+        "mov rdx, -1",
+        "syscall",
+        "mov rax, r10",
+        "ret",
+    );
+}
+
+// =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
 // Raw UNICODE_STRING / ANSI_STRING (both the 16-byte {Length:u16, MaximumLength:u16, _pad:u32,
 // Buffer:u64} shape) wrappers over the host-tested nt_ntdll::rtl string/convert cores. Single-byte
@@ -4363,6 +4420,13 @@ pub unsafe extern "C" fn export_anchor() {
         rtlx_oem_string_to_unicode_size as usize,
         rtl_init_code_page_table as usize,
     ];
+    #[cfg(target_arch = "x86_64")]
+    let anchors3: &[usize] = &[
+        zw_yield_execution as *const () as usize,
+        zw_callback_return as *const () as usize,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    core::hint::black_box(anchors3);
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
     #[cfg(target_arch = "x86_64")]
