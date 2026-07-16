@@ -64,6 +64,42 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
     }
 }
 
+/// `RtlAllocateHeap` core — allocate `size` payload bytes from the installed process heap. The
+/// `HeapHandle` the caller passes (`Peb->ProcessHeap`) is ignored: during the smss bring-up the
+/// process has exactly one heap (ours), so routing every `RtlAllocateHeap` to it is correct. Returns
+/// null on OOM / before the heap is installed (an honest allocation failure — never a bogus pointer).
+///
+/// # Safety
+/// Single-threaded loader context (smss is one thread until it spawns csrss).
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
+    // SAFETY: single-threaded loader access to the installed heap.
+    unsafe {
+        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+            return h.allocate(size).unwrap_or(core::ptr::null_mut());
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// `RtlFreeHeap` core — free `ptr` (returned by [`process_heap_alloc`]) back to the process heap.
+/// Returns `true` if the block was freed. A null `ptr` or a not-live pointer returns `false`.
+///
+/// # Safety
+/// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`] (the real `RtlFreeHeap`
+/// trusts the caller's pointer identically). Single-threaded loader context.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
+    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    unsafe {
+        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+            return h.free(ptr);
+        }
+    }
+    false
+}
+
+
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
 /// `dealloc` route through it; before that (or if it OOMs) `alloc` returns null (honest failure, the
 /// caller's alloc-error path handles it) rather than a fabricated pointer.

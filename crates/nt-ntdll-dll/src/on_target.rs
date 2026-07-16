@@ -383,6 +383,231 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     unsafe { snap_smss_imports(smss_base, ntdll_base) }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Step 4.C — RtlAdjustPrivilege over the live token plane.
+//
+// The real ntdll `RtlAdjustPrivilege` opens the process (or thread) token, builds a one-entry
+// TOKEN_PRIVILEGES, and calls `NtAdjustPrivilegesToken`. Our executive services `NtOpenProcessToken`
+// + `NtAdjustPrivilegesToken` + `NtClose` (as success no-ops for the smss bring-up), so routing the
+// real syscalls here is the honest live-plane implementation (not a fabricated success) — it issues
+// the actual token syscalls the real ntdll would, through our own trap stubs.
+// ---------------------------------------------------------------------------------------------
+
+const SSN_NT_OPEN_PROCESS_TOKEN: u32 = 129;
+const SSN_NT_ADJUST_PRIVILEGES_TOKEN: u32 = 12;
+const SSN_NT_CLOSE: u32 = 27;
+
+/// `TOKEN_ADJUST_PRIVILEGES (0x20) | TOKEN_QUERY (0x08)`.
+const TOKEN_ADJUST_PRIVILEGES_QUERY: u32 = 0x28;
+/// `SE_PRIVILEGE_ENABLED`.
+const SE_PRIVILEGE_ENABLED: u32 = 0x2;
+
+/// A general 4-register-arg syscall trap (`arg1..arg4` in RCX/RDX/R8/R9; `mov r10,rcx; syscall`).
+///
+/// # Safety
+/// On-target hosted-process syscall; the args must satisfy the target syscall's contract.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let status: u64;
+    // SAFETY: a hosted-process syscall trap serviced by the executive.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x28",
+            "mov r10, {a1}",
+            "mov rdx, {a2}",
+            "mov r8,  {a3}",
+            "mov r9,  {a4}",
+            "mov eax, {ssn:e}",
+            "syscall",
+            "add rsp, 0x28",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
+            a3 = in(reg) a3,
+            a4 = in(reg) a4,
+            out("rax") status,
+            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// A general 6-arg syscall trap (arg1..4 in registers, arg5/arg6 on the stack at `[rsp+0x28/0x30]`).
+///
+/// # Safety
+/// On-target hosted-process syscall; args must satisfy the target syscall's contract.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    let status: u64;
+    // SAFETY: a hosted-process syscall trap serviced by the executive.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x38",
+            "mov qword ptr [rsp+0x28], {a5}",
+            "mov qword ptr [rsp+0x30], {a6}",
+            "mov r10, {a1}",
+            "mov rdx, {a2}",
+            "mov r8,  {a3}",
+            "mov r9,  {a4}",
+            "mov eax, {ssn:e}",
+            "syscall",
+            "add rsp, 0x38",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
+            a3 = in(reg) a3,
+            a4 = in(reg) a4,
+            a5 = in(reg) a5,
+            a6 = in(reg) a6,
+            out("rax") status,
+            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// `RtlAdjustPrivilege(Privilege, Enable, CurrentThread, WasEnabled)` — the live-token implementation.
+///
+/// Opens the process token (the `CurrentThread` thread-token variant is not needed by smss and
+/// degrades to the process token), builds a one-entry `TOKEN_PRIVILEGES { count=1, luid={priv,0},
+/// attrs=Enable?ENABLED:0 }`, calls `NtAdjustPrivilegesToken`, closes the token, and reports the prior
+/// enabled state in `*was_enabled`. Returns the `NtAdjustPrivilegesToken` status.
+///
+/// # Safety
+/// On-target hosted-process; `was_enabled` is null or a valid writable byte.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_adjust_privilege(
+    privilege: u32,
+    enable: u8,
+    _current_thread: u8,
+    was_enabled: *mut u8,
+) -> u64 {
+    // NtOpenProcessToken(NtCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &TokenHandle).
+    let mut token: u64 = 0;
+    // SAFETY: on-target token syscall; &token is a valid stack out-param (the executive writes it
+    // through its stack mirror, matching NtOpenProcessToken's *TokenHandle out).
+    let st_open = unsafe {
+        syscall4(
+            SSN_NT_OPEN_PROCESS_TOKEN,
+            NT_CURRENT_PROCESS,
+            TOKEN_ADJUST_PRIVILEGES_QUERY as u64,
+            &mut token as *mut u64 as u64,
+            0,
+        )
+    };
+    // TOKEN_PRIVILEGES on the stack: PrivilegeCount(u32) + LUID_AND_ATTRIBUTES{ LUID(low u32,high
+    // i32), Attributes(u32) }. Laid out as [count, luid_low, luid_high, attrs] u32s (16 bytes).
+    let new_state: [u32; 4] = [
+        1,                                                  // PrivilegeCount
+        privilege,                                          // Luid.LowPart (SE_*_PRIVILEGE index)
+        0,                                                  // Luid.HighPart
+        if enable != 0 { SE_PRIVILEGE_ENABLED } else { 0 }, // Attributes
+    ];
+    let mut old_state: [u32; 4] = [0; 4];
+    let mut ret_len: u32 = 0;
+    // NtAdjustPrivilegesToken(Token, DisableAll=FALSE, &NewState, sizeof(OldState), &OldState,
+    //                         &ReturnLength).
+    // SAFETY: on-target token syscall; the buffers are valid stack locals.
+    let st_adj = unsafe {
+        syscall6(
+            SSN_NT_ADJUST_PRIVILEGES_TOKEN,
+            token,
+            0, // DisableAllPrivileges = FALSE
+            new_state.as_ptr() as u64,
+            core::mem::size_of::<[u32; 4]>() as u64,
+            old_state.as_mut_ptr() as u64,
+            &mut ret_len as *mut u32 as u64,
+        )
+    };
+    // NtClose(Token).
+    // SAFETY: on-target; closing the token handle we opened.
+    if st_open == 0 {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, token, 0, 0, 0) };
+    }
+    if !was_enabled.is_null() {
+        // Report whether the privilege was previously enabled (from OldState if it came back).
+        let prev = (old_state[3] & SE_PRIVILEGE_ENABLED) != 0;
+        // SAFETY: was_enabled is a valid writable byte per the contract.
+        unsafe { core::ptr::write(was_enabled, prev as u8) };
+    }
+    // The executive services the token plane as success no-ops; report the adjust status (which is
+    // STATUS_SUCCESS there). If the open failed, surface that instead.
+    if st_open != 0 { st_open } else { st_adj }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 4.C — RtlSetProcessIsCritical / RtlSetThreadIsCritical over the live info-class plane.
+//
+// Real ntdll calls NtSetInformationProcess(ProcessBreakOnTermination) / NtSetInformationThread
+// (ThreadBreakOnTermination) with a ULONG boolean. The executive services both info-set syscalls
+// (success no-ops), so routing the real syscalls here is the honest implementation — it issues the
+// actual SetInformation the real ntdll would, not a fabricated success.
+// ---------------------------------------------------------------------------------------------
+
+const SSN_NT_SET_INFORMATION_PROCESS: u32 = 237;
+const SSN_NT_SET_INFORMATION_THREAD: u32 = 238;
+/// `ProcessBreakOnTermination` info class.
+const PROCESS_BREAK_ON_TERMINATION: u64 = 0x1D;
+/// `ThreadBreakOnTermination` info class.
+const THREAD_BREAK_ON_TERMINATION: u64 = 0x12;
+/// `NtCurrentThread()` pseudo-handle `(HANDLE)-2`.
+const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
+
+/// `RtlSetProcessIsCritical(New, Old, CheckFlag)` — set/clear ProcessBreakOnTermination via a live
+/// `NtSetInformationProcess`. `*old` (if non-null) reports the prior state (best-effort: 0, since the
+/// executive doesn't return a queried prior value). Returns the syscall status.
+///
+/// # Safety
+/// On-target hosted-process; `old` null or a valid writable byte.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_set_process_is_critical(new: u8, old: *mut u8, _check_flag: u8) -> u64 {
+    if !old.is_null() {
+        // SAFETY: caller-provided writable byte.
+        unsafe { core::ptr::write(old, 0) };
+    }
+    let value: u32 = (new != 0) as u32;
+    // NtSetInformationProcess(NtCurrentProcess(), ProcessBreakOnTermination, &value, sizeof(ULONG)).
+    // SAFETY: on-target syscall; &value is a valid stack in-param.
+    unsafe {
+        syscall4(
+            SSN_NT_SET_INFORMATION_PROCESS,
+            NT_CURRENT_PROCESS,
+            PROCESS_BREAK_ON_TERMINATION,
+            &value as *const u32 as u64,
+            core::mem::size_of::<u32>() as u64,
+        )
+    }
+}
+
+/// `RtlSetThreadIsCritical(New, Old, CheckFlag)` — set/clear ThreadBreakOnTermination via a live
+/// `NtSetInformationThread`.
+///
+/// # Safety
+/// On-target hosted-process; `old` null or a valid writable byte.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_set_thread_is_critical(new: u8, old: *mut u8, _check_flag: u8) -> u64 {
+    if !old.is_null() {
+        // SAFETY: caller-provided writable byte.
+        unsafe { core::ptr::write(old, 0) };
+    }
+    let value: u32 = (new != 0) as u32;
+    // NtSetInformationThread(NtCurrentThread(), ThreadBreakOnTermination, &value, sizeof(ULONG)).
+    // SAFETY: on-target syscall; &value is a valid stack in-param.
+    unsafe {
+        syscall4(
+            SSN_NT_SET_INFORMATION_THREAD,
+            NT_CURRENT_THREAD,
+            THREAD_BREAK_ON_TERMINATION,
+            &value as *const u32 as u64,
+            core::mem::size_of::<u32>() as u64,
+        )
+    }
+}
+
 /// Suppress "unused" for the c_void alias on non-target hosts (the module is target-gated in use).
 #[allow(dead_code)]
 type _Unused = *mut c_void;

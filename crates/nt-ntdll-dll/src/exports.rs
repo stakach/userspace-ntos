@@ -292,11 +292,28 @@ pub unsafe extern "system" fn rtl_unicode_string_to_integer(
 #[export_name = "RtlAllocateHeap"]
 pub unsafe extern "system" fn rtl_allocate_heap(
     _heap: *mut c_void,
-    _flags: u32,
-    _size: usize,
+    flags: u32,
+    size: usize,
 ) -> *mut c_void {
-    // Step 4.B: route through the real `nt_ntdll::heap` process heap. Until then: honest failure.
-    core::ptr::null_mut()
+    // Step 4.C: route through the real `nt_ntdll::heap` process heap installed in-process by
+    // LdrpInitialize (the `HeapHandle` is ignored — smss's process has exactly one heap). Honors
+    // HEAP_ZERO_MEMORY (0x8); returns null on OOM / before the heap is installed (honest failure).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: single-threaded loader context; the heap is installed by LdrpInitialize.
+        let p = unsafe { crate::process_heap_alloc(size) };
+        if !p.is_null() && (flags & 0x8) != 0 {
+            // HEAP_ZERO_MEMORY: the allocator does not zero; do it here.
+            // SAFETY: `p` is a fresh `size`-byte allocation from our heap.
+            unsafe { core::ptr::write_bytes(p, 0, size) };
+        }
+        p as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (flags, size);
+        core::ptr::null_mut()
+    }
 }
 
 /// `RtlFreeHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress) -> BOOLEAN`.
@@ -309,9 +326,27 @@ pub unsafe extern "system" fn rtl_allocate_heap(
 pub unsafe extern "system" fn rtl_free_heap(
     _heap: *mut c_void,
     _flags: u32,
-    _base: *mut c_void,
+    base: *mut c_void,
 ) -> u8 {
-    0 // FALSE — no live heap yet.
+    // Step 4.C: free back to the in-process heap. A null pointer is a benign no-op success (the
+    // real RtlFreeHeap returns TRUE for NULL). Ignores the HeapHandle (single heap, as alloc does).
+    #[cfg(target_arch = "x86_64")]
+    {
+        if base.is_null() {
+            return 1; // TRUE — RtlFreeHeap(_, _, NULL) is a no-op success.
+        }
+        // SAFETY: `base` came from RtlAllocateHeap/ReAllocateHeap (our heap); single-threaded.
+        if unsafe { crate::process_heap_free(base as *mut u8) } {
+            1
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = base;
+        0
+    }
 }
 
 /// `RtlCreateTagHeap(...)` — heap tagging helper. Honest seam.
@@ -361,30 +396,137 @@ pub unsafe extern "system" fn rtl_create_unicode_string(
 }
 
 /// `RtlAnsiStringToUnicodeString(PUNICODE_STRING, PCANSI_STRING, BOOLEAN AllocateDestinationString)`.
-/// Honest seam: the allocating form needs the heap; report failure rather than a partial write.
+/// Step 4.C: real. Widens the ANSI source (LATIN1/ASCII-exact code page) to UTF-16 and writes it into
+/// `dst`. If `allocate != 0` the destination buffer is obtained from the process heap; otherwise `dst`
+/// must already point at a `MaximumLength`-byte buffer (STATUS_BUFFER_TOO_SMALL if too small). The
+/// result is NUL-terminated (the real contract). `AnsiString`/`UnicodeString` share the 16-byte shape.
 ///
 /// # Safety
-/// Standard contract.
+/// `dst`/`src` are valid `UNICODE_STRING`/`ANSI_STRING` per the contract.
 #[export_name = "RtlAnsiStringToUnicodeString"]
 pub unsafe extern "system" fn rtl_ansi_string_to_unicode_string(
-    _dst: PUnicodeString,
-    _src: PCUnicodeString,
-    _allocate: u8,
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs the process heap + live NLS tables (Step 4.B)
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src is a valid ANSI_STRING (same 16-byte shape) per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u8, (*src).length as usize) };
+    // Widened UTF-16 byte length + a NUL terminator (2 bytes). Reject a >0xFFFF result (the
+    // UNICODE_STRING Length is a u16).
+    let out_units = slen; // ANSI→UTF-16 is 1 unit per byte for a single-byte code page
+    let out_bytes = out_units * 2;
+    let with_nul = out_bytes + 2;
+    if with_nul > 0xFFFF {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst is a valid writable UNICODE_STRING per the contract.
+        let dbuf = if allocate != 0 {
+            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+            let p = unsafe { crate::process_heap_alloc(with_nul) } as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = with_nul as u16;
+            }
+            p
+        } else {
+            // Caller-provided buffer: needs room for the widened chars + NUL.
+            unsafe {
+                if (*dst).maximum_length < with_nul as u16 {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                (*dst).buffer as *mut u16
+            }
+        };
+        // Widen each byte and write, then NUL-terminate.
+        // SAFETY: sbuf..sbuf+slen and dbuf..dbuf+out_units+1 are valid per the checks above.
+        unsafe {
+            for i in 0..out_units {
+                let b = core::ptr::read(sbuf.add(i));
+                core::ptr::write(dbuf.add(i), rtl::convert::ansi_char_to_unicode_char(b));
+            }
+            core::ptr::write(dbuf.add(out_units), 0); // NUL
+            (*dst).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, sbuf, out_units);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN)`. Honest seam.
+/// `RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN AllocateDestinationString)`.
+/// Step 4.C: real. Narrows the UTF-16 source to ANSI bytes (LATIN1/ASCII-exact code page; an
+/// unrepresentable unit becomes `?`) and writes it into `dst`. If `allocate != 0` the buffer comes
+/// from the process heap; otherwise `dst` must already hold a `MaximumLength`-byte buffer
+/// (STATUS_BUFFER_TOO_SMALL if too small). NUL-terminated. `AnsiString`/`UnicodeString` share the
+/// 16-byte shape.
 ///
 /// # Safety
-/// Standard contract.
+/// `dst`/`src` are valid `ANSI_STRING`/`UNICODE_STRING` per the contract.
 #[export_name = "RtlUnicodeStringToAnsiString"]
 pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
-    _dst: PUnicodeString,
-    _src: PCUnicodeString,
-    _allocate: u8,
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs the process heap + live NLS tables (Step 4.B)
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src is a valid UNICODE_STRING per the contract.
+    let sunits = unsafe { us_slice(src) };
+    let out_bytes = rtl::convert::unicode_to_multi_byte_size(sunits); // 1 byte per unit (single-byte cp)
+    let with_nul = out_bytes + 1;
+    if with_nul > 0xFFFF {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst is a valid writable ANSI_STRING per the contract.
+        let dbuf = if allocate != 0 {
+            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+            let p = unsafe { crate::process_heap_alloc(with_nul) };
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = with_nul as u16;
+            }
+            p
+        } else {
+            unsafe {
+                if (*dst).maximum_length < with_nul as u16 {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                (*dst).buffer as *mut u8
+            }
+        };
+        // Narrow via the default LATIN1 code page + NUL-terminate.
+        // SAFETY: dbuf..dbuf+out_bytes+1 is valid per the checks above.
+        unsafe {
+            for (i, &c) in sunits.iter().enumerate() {
+                core::ptr::write(dbuf.add(i), rtl::convert::CodePage::LATIN1.narrow_unit(c));
+            }
+            core::ptr::write(dbuf.add(out_bytes), 0); // NUL
+            (*dst).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, dst, sunits, out_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 // =================================================================================================
@@ -625,18 +767,32 @@ pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
 }
 
 /// `RtlAdjustPrivilege(ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled)`.
-/// Wraps `NtAdjustPrivilegesToken` — the token plane is a live syscall. Honest seam at 4.0b.
+/// Step 4.C: routes to the LIVE token plane (opens the process token, calls
+/// `NtAdjustPrivilegesToken`, closes it) via our own trap stubs — the executive services these. This
+/// is what real ntdll does; the executive currently models the token plane as success no-ops, so the
+/// privilege adjust reports STATUS_SUCCESS and smss's SmpInit proceeds instead of hard-erroring.
 ///
 /// # Safety
-/// Standard contract.
+/// Standard contract; `was_enabled` null or a valid writable byte.
 #[export_name = "RtlAdjustPrivilege"]
 pub unsafe extern "system" fn rtl_adjust_privilege(
-    _privilege: u32,
-    _enable: u8,
-    _client: u8,
-    _was_enabled: *mut u8,
+    privilege: u32,
+    enable: u8,
+    client: u8,
+    was_enabled: *mut u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // token adjust = live NtAdjustPrivilegesToken (Step 4.A/4.B)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target hosted-process; routes through the live token syscalls.
+        unsafe {
+            crate::on_target::rtl_adjust_privilege(privilege, enable, client, was_enabled) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (privilege, enable, client, was_enabled);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 // =================================================================================================
@@ -796,11 +952,20 @@ pub unsafe extern "system" fn rtl_query_registry_values(
 /// Standard contract.
 #[export_name = "RtlSetProcessIsCritical"]
 pub unsafe extern "system" fn rtl_set_process_is_critical(
-    _new: u8,
-    _old: *mut u8,
-    _check_flag: u8,
+    new: u8,
+    old: *mut u8,
+    check_flag: u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // live NtSetInformationProcess (Step 4.A/4.B)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; routes to the live NtSetInformationProcess(ProcessBreakOnTermination).
+        unsafe { crate::on_target::rtl_set_process_is_critical(new, old, check_flag) as NtStatus }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (new, old, check_flag);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlSetThreadIsCritical(BOOLEAN New, PBOOLEAN Old, BOOLEAN CheckFlag) -> NTSTATUS`. Honest seam.
@@ -809,11 +974,20 @@ pub unsafe extern "system" fn rtl_set_process_is_critical(
 /// Standard contract.
 #[export_name = "RtlSetThreadIsCritical"]
 pub unsafe extern "system" fn rtl_set_thread_is_critical(
-    _new: u8,
-    _old: *mut u8,
-    _check_flag: u8,
+    new: u8,
+    old: *mut u8,
+    check_flag: u8,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // live NtSetInformationThread (Step 4.A/4.B)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; routes to the live NtSetInformationThread(ThreadBreakOnTermination).
+        unsafe { crate::on_target::rtl_set_thread_is_critical(new, old, check_flag) as NtStatus }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (new, old, check_flag);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`. Honest
