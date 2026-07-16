@@ -9,6 +9,11 @@ use crate::*;
 /// MIRRORED into the executive so `sm_rendezvous` can write its syscall out-params. It faults to
 /// `SM_FAULT_EP` (no standing receiver) and is resumed at spawn → PARKS on its first fault.
 pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_handle: u64) -> u64 {
+    // BATCH 6: smss (pi 0) runs on OUR ntdll's NATIVE seL4-Call transport, so its SmpApiLoop 2nd
+    // thread must too — DON'T set TCBSetHostedSyscalls (native Call → MR0=SSN) and bind its kernel
+    // IPC buffer to smss's MAIN-thread ipcbuf frame at IPCBUF_VADDR (the VA the ntdll native stub
+    // writes MR4/MR5 to). Without this the SM-loop thread's native Call faults as UnknownSyscall with
+    // m0=RAX garbage → `[sm-rdv] WALL: unexpected SSN`.
     spawn_hosted_thread(&HostedThread {
         pml4: smss_pml4,
         entry_rip,
@@ -27,6 +32,8 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         cid_thread: 0,
         resume: true,
         prio: 0,
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[0].load(Ordering::Relaxed),
     })
 }
 
@@ -126,6 +133,27 @@ pub(crate) unsafe fn sm_rendezvous(
         if guard > 8000 {
             print_str(b"[sm-rdv] WALL: guard exhausted\n");
             break;
+        }
+        // BATCH 6: the SM-loop thread runs on OUR ntdll's NATIVE seL4-Call transport, so its Nt*
+        // syscalls arrive as a native `Call` (label NT_NATIVE_SYSCALL_LABEL), NOT an UnknownSyscall
+        // fault (label 2). NORMALIZE it into the label-2 register-slot layout the accept body below
+        // reads — exactly like the main service loop (`service_sec_image.rs`): MR0=SSN, MR1=rsp,
+        // MR2/MR3=arg1/arg2, MR4/MR5=arg3/arg4 (from the executive's recv IPC buffer) → the fault
+        // frame slots R10@9=arg1, R8@7=arg3, R9@8=arg4, SP@16=rsp, FLAGS@17=0; then re-label as 2.
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0; // MR0
+            let rsp = m1; // MR1 = caller rsp
+            let arg1 = m2; // MR2
+            let arg3 = get_recv_mr(4); // MR4 (IPC buffer)
+            let arg4 = get_recv_mr(5); // MR5 (IPC buffer)
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn; // the accept body reads ssn = m0
+            m2 = 0; // resume_ip unused for a native reply (no fault restart)
+            mi = (2u64 << 12) | (mi & 0x7F);
         }
         let label = mi >> 12;
         if label == 6 {
@@ -286,6 +314,10 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         cid_thread: CSR_STATIC_CID_THREAD,
         resume: false,
         prio: 0,
+        // BATCH 6: csrss (pi 2) also runs on OUR native ntdll → the CSR-API thread uses the native
+        // transport, bound to csrss's main-thread ipcbuf frame at IPCBUF_VADDR.
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
     })
 }
 
@@ -362,6 +394,12 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         cid_thread,
         resume,
         prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
+        // BATCH 6: these listener threads are driven through the MAIN multiplex's badged fault-EP
+        // (trap-frame register layout), not a native-Call rendezvous — keep the trap transport for
+        // now (byte-identical to pre-BATCH-6). Converting them to native is a follow-up once the
+        // SM/CSR handshake lands and the boot reaches winlogon/services/lsass.
+        native: false,
+        ipcbuf_frame: 0,
     })
 }
 
@@ -400,6 +438,9 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         cid_thread,
         resume,
         prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
+        // BATCH 6 follow-up: trap transport for now (badged-fault multiplex).
+        native: false,
+        ipcbuf_frame: 0,
     })
 }
 
@@ -438,6 +479,9 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         cid_thread,
         resume,
         prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
+        // BATCH 6 follow-up: trap transport for now (badged-fault multiplex).
+        native: false,
+        ipcbuf_frame: 0,
     })
 }
 
@@ -472,6 +516,8 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         cid_thread,
         resume,
         prio: 105,
+        native: false,
+        ipcbuf_frame: 0,
     })
 }
 
@@ -504,6 +550,8 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
         cid_thread,
         resume,
         prio: 105,
+        native: false,
+        ipcbuf_frame: 0,
     })
 }
 

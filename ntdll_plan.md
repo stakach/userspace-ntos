@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17** · next wall = the executive `sm_rendezvous` accept (the real SmpApiLoop on our ntdll — `[sm-rdv] WALL: unexpected SSN`), then winlogon + paint
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17** · next wall = winlogon's post-loader CSR connect (csr_rendezvous needs the same native arm) → win32k paint
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1456,3 +1456,68 @@ SmpApiLoop-thread-setup** issue in the EXISTING executive machinery (reuse, don'
 the lldb/gdb-stub RIP-on-the-loop-thread investigation the plan describes (which syscall the loop
 actually issues + why m0 is a VA). Reconverge 174/98 + paint once the SM accept completes → winlogon
 spawns → win32k paints `0x003a6ea5`.
+
+---
+
+## ☑ SYSTEMATIC PORT — BATCH 6 (DONE 2026-07-17): the 2nd-thread NATIVE transport → the SM accept completes → the CSR↔SM handshake → csrss + winlogon SPAWN (gate 149, up from 147)
+
+### ★ THE ROOT CAUSE (three-part transport gap for RUNTIME 2nd threads — evidence-backed)
+The SmpApiLoop thread is a RUNTIME `NtCreateThread` thread spawned by the executive via
+`spawn_sm_loop_thread → spawn_hosted_thread` (`main.rs:3503`). Its native `seL4_Call` arrived at
+`sm_rendezvous` as an UnknownSyscall fault with `ssn=m0=0x100_0000_0080` (a VA), because:
+1. **`spawn_hosted_thread` set `TCBSetHostedSyscalls` UNCONDITIONALLY** (`main.rs:3581-3582`) — the
+   OPPOSITE of the MAIN thread (`img_spawn.rs:650-654` SKIPS it for the native transport). With the
+   flag SET, the kernel (`syscall_entry.rs:598-604`, `force_unknown = hosted_syscalls`) forces the
+   thread's native `seL4_Call` (`rdx=-1=SysCall`, MR0=r10=SSN) into an UnknownSyscall FAULT. The
+   fault frame maps `m0=MR0=regs[0]=RAX` (`fault.rs:434`). Our native stub puts the SSN in **r10**,
+   never `mov eax,ssn`, so RAX = leftover garbage VA (`0x100_0000_0080`) → the `unexpected SSN` WALL
+   (`rendezvous.rs:228`, which reads `ssn=m0`).
+2. **The SM-loop thread's kernel IPC buffer was bound to `SM_IPCBUF_VA` (0x1048_0000)**, but OUR
+   ntdll's native stub writes MR4/MR5 (args ≥3) to the hardcoded `IPCBUF_VADDR` (0x105F_B000, the
+   MAIN thread's) → arg3 (the `NtQueryInformationProcess` PROCESS_BASIC_INFORMATION out-buf) would be
+   garbage even after fixing (1).
+3. **`sm_rendezvous` only had a `label==2` (fault) arm** reading `ssn=m0`; a native Call arrives as
+   `label == NT_NATIVE_SYSCALL_LABEL (0x4E54)` with the MR0=SSN/MR1=rsp/MR2..=args layout, which the
+   fault arm never normalized.
+
+### THE FIX (executive-only — NO kernel change; the main-thread native machinery, generalized)
+- **`HostedThread` gains `native: bool` + `ipcbuf_frame: u64`** (`main.rs`). `spawn_hosted_thread`:
+  when `native`, (a) SKIPS `TCBSetHostedSyscalls` (native Call → MR0=SSN, exactly like the main
+  thread), and (b) binds the thread's kernel IPC buffer to the process MAIN thread's ipcbuf FRAME at
+  `IPCBUF_VADDR` (reused via `copy_cap`, NOT a fresh frame at `ipcbuf_va` — they share the VSpace and
+  never run concurrently during a rendezvous, so the shared VA→frame mapping is correct and the
+  kernel picks up the MR4/MR5 the native stub wrote there).
+- **`img_spawn.rs` stashes each process's main ipcbuf frame** in a new `PM_MAIN_IPCBUF[pi]`
+  (`main.rs`) so the runtime native thread can reuse it.
+- **`spawn_sm_loop_thread` passes `native: true` + `PM_MAIN_IPCBUF[0]`** (smss = pi 0);
+  `spawn_csr_loop_thread` passes `native: true` + `PM_MAIN_IPCBUF[2]` (csrss = pi 2). The
+  winlogon/services/lsass listener spawners keep `native: false` (they're driven through the MAIN
+  multiplex's BADGED fault-EP, a trap-frame layout — a documented BATCH-6 follow-up, not yet reached).
+- **`sm_rendezvous` gains a native NORMALIZE arm** (`rendezvous.rs`, mirroring `service_sec_image.rs`'s
+  main-loop native arm): on `label == NT_NATIVE_SYSCALL_LABEL` it stages MR0=SSN, MR1=rsp,
+  MR2/MR3=arg1/arg2, MR4/MR5=arg3/arg4 (from the executive's recv IPC buffer) into the fault-frame
+  slots the existing accept body reads (R10@9/R8@7/R9@8/SP@16/FLAGS@17), then re-labels to 2 so the
+  UNCHANGED accept body runs. The reply (`send_on_reply(reply,18,result,…)`) already fans MR0→r10 for
+  a native (pending-fault==0) caller — the same normal-IPC-reply the main loop uses — so no reply
+  change was needed. **NO KERNEL CHANGE.**
+
+### How far the boot got (boot-verified, gate 149/28)
+- `[sm-rdv] csrss NtConnectPort pending (conn=5) -> driving the real SmpApiLoop accept`
+- **`[sm-rdv] AUTHENTIC accept complete: client handle=…0011 -> csrss NtConnectPort SUCCESS`** — the
+  `unexpected SSN` WALL is GONE; the SmpApiLoop thread's native syscalls (SetInfoThread /
+  QueryInfoProcess / ReplyWaitReceive / AcceptConnect / CompleteConnect) all parse + service.
+- **csrss spawned** (badge 2, 146 pages) + **winlogon spawned** (pi 4) and runs its ENTIRE Win32
+  loader — user32/gdi32/kernel32/advapi32/rpcrt4/ws2_32/ws2help/msvcrt/userenv/mpr all
+  open+section+map with `first_failure=none` (115 pages). `exec_winlogon_staged/_spawned/_loader_runs`
+  PASS.
+- **Gate 149 PASS / 28 FAIL** (up from ~147, RED reconverging). Host: nt-ntdll 157, nt-syscall-abi 12.
+
+### ★ THE NEXT FRONTIER = winlogon's post-loader flow (toward its CSR connect → win32k paint)
+winlogon (pi 4) stops after its loader at `label=6 m0=0x806d3ca6 exc#=4` in its OWN image
+(0x800…-based) — its post-loader `WinMain`/init toward `NtSecureConnectPort(\Windows\ApiPort)` (the
+CSR connect, `exec_winlogon_csr_connect` still FAILs). Two BATCH-6 follow-ups converge here: (a) the
+winlogon CSR connect needs the **csrss CsrApiRequestThread** — its `spawn_csr_loop_thread` is now
+`native: true`, so `csr_rendezvous` needs the SAME native NORMALIZE arm `sm_rendezvous` got; (b) the
+winlogon/services/lsass **listener threads** (still `native: false`) will need converting to the
+native transport once the multiplex reaches them. Reconverge 174/98 + `0x003a6ea5` paint once
+winlogon's CSR connect completes → `co_IntShowDesktop → IntPaintDesktop`.

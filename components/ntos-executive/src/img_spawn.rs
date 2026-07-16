@@ -655,6 +655,10 @@ pub(crate) unsafe fn spawn_sec_image(
     attach_sched_context(tcb);
     if (pi as usize) < MAX_PI {
         PM_MAIN_TCBS[pi as usize].store(tcb, Ordering::Relaxed);
+        // BATCH 6: retain this main thread's IPC buffer FRAME so a runtime NATIVE 2nd thread
+        // (SmpApiLoop/CSR-API on OUR ntdll) can bind ITS kernel IPC buffer to the SAME frame at
+        // IPCBUF_VADDR — the VA the ntdll native stub writes MR4/MR5 to.
+        PM_MAIN_IPCBUF[pi as usize].store(ipcbuf, Ordering::Relaxed);
     }
     let _ = tcb_resume(tcb);
     pml4

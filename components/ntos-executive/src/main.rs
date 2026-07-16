@@ -3490,6 +3490,17 @@ struct HostedThread {
     /// processes so that, once services' main thread parks (NtTerminateThread), the listener is the
     /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
     prio: u8,
+    /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this 2nd thread runs on
+    /// OUR ntdll's native transport just like the process's MAIN thread: DON'T set the per-thread
+    /// `TCBSetHostedSyscalls` flag (so its `seL4_Call` dispatches natively → MR0=SSN, not an
+    /// UnknownSyscall fault whose m0=RAX is garbage), and bind its kernel IPC buffer at the SAME
+    /// `IPCBUF_VADDR` the ntdll native stub writes MR4/MR5 to — reusing the process main thread's
+    /// ipcbuf FRAME (they share the VSpace and never run concurrently during a rendezvous, so the
+    /// shared VA→frame mapping is safe; a fresh frame at `ipcbuf_va` would either collide with the
+    /// main thread's mapping or leave MR4/MR5 where the kernel doesn't read them). `ipcbuf_frame`
+    /// (non-zero) is that reused frame cap; when 0 (trap/park-only threads) a fresh frame is used.
+    native: bool,
+    ipcbuf_frame: u64,
 }
 
 /// Spawn a REAL 2nd (or Nth) thread in a hosted process's VSpace — the GENERAL hosted-thread
@@ -3547,9 +3558,18 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
     let _ = page_map(copy_cap(teb2), t.teb_va + 0x1000, RW_NX, t.pml4);
-    // IPC buffer (its own frame + VA; the main thread owns IPCBUF_VADDR).
-    let ipcbuf = alloc_frame();
-    let _ = page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4);
+    // IPC buffer. NATIVE transport (BATCH 6): reuse the process MAIN thread's ipcbuf FRAME at
+    // IPCBUF_VADDR (already mapped in the shared VSpace) so OUR ntdll's native stub — which writes
+    // MR4/MR5 to the hardcoded IPCBUF_VADDR and reads its reply there — hits the SAME frame the
+    // kernel binds to this TCB. Don't remap the VA (it's already mapped by the main thread's spawn).
+    // Trap/park-only threads (ipcbuf_frame==0): a fresh frame at t.ipcbuf_va, as before.
+    let (ipcbuf, ipcbuf_bind_va) = if t.native && t.ipcbuf_frame != 0 {
+        (copy_cap(t.ipcbuf_frame), IPCBUF_VADDR)
+    } else {
+        let f = alloc_frame();
+        let _ = page_map(f, t.ipcbuf_va, RW_NX, t.pml4);
+        (f, t.ipcbuf_va)
+    };
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let tramp = alloc_frame();
     let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -3574,12 +3594,18 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, t.ipcbuf_va, ipcbuf, 0);
+    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_bind_va, ipcbuf, 0);
     let _ = tcb_write_registers(tcb, t.tramp_va, t.stack_base + t.stack_frames * 0x1000 - 16, 0);
     let _ = tcb_set_gs_base(tcb, t.teb_va);
     let _ = tcb_set_priority(tcb, if t.prio != 0 { t.prio as u64 } else { 100 });
+    // Transport (ntdll_plan Step 6.A / BATCH 6): a NATIVE thread must NOT get the hosted-syscalls
+    // flag — with it set the kernel forces its native `seL4_Call` into an UnknownSyscall fault whose
+    // m0=RAX (garbage), so the rendezvous reads a bogus SSN. Cleared, the Call dispatches natively
+    // (MR0=r10=SSN) exactly like the process's MAIN thread. Trap threads keep the flag (byte-id).
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    if !t.native {
+        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
+    }
     attach_sched_context(tcb);
     if t.resume {
         let _ = tcb_resume(tcb);
@@ -3716,6 +3742,11 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Root-CNode TCB caps backing each hosted process main thread, retained so a successful
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
+/// Each hosted process's MAIN-thread IPC buffer FRAME cap (bound at `IPCBUF_VADDR`). Retained so a
+/// runtime NATIVE 2nd thread (SmpApiLoop / CSR-API / listener on OUR ntdll) can bind ITS kernel IPC
+/// buffer to the SAME frame at IPCBUF_VADDR — the VA our ntdll native stub writes MR4/MR5 to
+/// (BATCH 6). They share the VSpace and never run concurrently during a rendezvous.
+pub(crate) static PM_MAIN_IPCBUF: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
 /// creation remains allocation-free. Three slots cover the live lsass worker fan-out.
 const PM_RUNTIME_THREAD_SLOTS: usize = 3;
