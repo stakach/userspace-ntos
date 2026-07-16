@@ -1576,13 +1576,32 @@ kernel32's `DllMain` reaches `InitCommandLines()` ONLY after `CsrClientConnectTo
 connect FAILS (SSN trace shows `4:266 NtTerminateProcess` = kernel32 bailing on the failed
 connect), so `InitCommandLines` never runs → `GetCommandLineA()==NULL` → the strlen(NULL) at
 winlogon's entry. The executive HAS the machinery (`ExecNtHandler::csr_client_connect` services
-`NtSecureConnectPort(\Windows\ApiPort)` via `csr_rendezvous` + maps the CSR heap-view + the
-`ReadOnlyStaticServerData` array with a `BASE_STATIC_SERVER_DATA[1]`), but it's not completing for
-kernel32's connect during winlogon's **loader** (run_process_attach) — likely (a) the connect SSN
-kernel32 emits (`NtConnectPort 33` vs `NtSecureConnectPort 218`) isn't the one that reaches
-`csr_client_connect`, or (b) the `Peb->ReadOnlyStaticServerData` (PEB@0x280 on x64) isn't
-populated yet at loader time / kernel32 fails earlier in `CsrClientConnectToServer`. NEXT STEP:
-trace winlogon's connect SSN + whether `csr_client_connect` fires during the loader; make the CSR
-connect succeed (populate `Peb->ReadOnlyStaticServerData` + drive the `csr_rendezvous` accept for
-the loader-time connect) → kernel32 reaches `InitCommandLines` → winlogon's entry runs its real
-`WinMain` → `SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → 0x003a6ea5`.
+`NtSecureConnectPort(\Windows\ApiPort)` = SSN 218 via `csr_rendezvous` + maps the CSR heap-view +
+the `ReadOnlyStaticServerData` array with a `BASE_STATIC_SERVER_DATA[1]`), and already fills the
+CSR_API_CONNECTINFO out-param (SharedStaticServerData@+0x10 = WINLOGON_CSR_STATIC_VA,
+SharedSectionBase@+0x08, ServerProcessId@+0x30). ★ **THE PRECISE BLOCKER (disasm + the winlogon SSN
+trace):** winlogon (badge 4) NEVER issues SSN 218 — it goes straight to `4:266 NtTerminateProcess`,
+because **`CsrClientConnectToServer` is an ntdll export = OURS, and
+`crates/nt-ntdll-dll/src/exports.rs::csr_client_connect_to_server` is a `STATUS_NOT_IMPLEMENTED`
+STUB.** kernel32's DllMain gets that failure and terminates before `InitCommandLines`. (Confirmed:
+kernel32.dll imports NO `Nt*ConnectPort` — the connect lives INSIDE ntdll's `CsrpConnectToServer`,
+which calls `NtSecureConnectPort` internally, connect.c:141.) ★ ALSO: **`NtSecureConnectPort`
+(SSN 218) is NOT in our stub set / `nt-syscall-abi` table nor exported by our ntdll** (only
+`NtConnectPort` SSN 33 is).
+
+### NEXT STEP (the direct unblock to the paint) — implement our ntdll `CsrClientConnectToServer`
+1. **Add the `NtSecureConnectPort` SSN-218 stub** to `nt-ntdll::trap_stubs` + `nt-syscall-abi`
+   (name→ssn + argc=9). The native-transport naked stub already captures rsp, so the executive
+   reads args 5-9 off the caller's stack via its mirror; a Windows-ABI call places them there.
+2. **Implement `csr_client_connect_to_server`** (port `CsrpConnectToServer`, connect.c:43): build a
+   `\Windows\ApiPort`-under-ObjectDirectory `UNICODE_STRING PortName` (arg2/RDX), a `PORT_VIEW
+   LpcWrite` (arg4/R9), a `SECURITY_QUALITY_OF_SERVICE` (arg3/R8), a `CSR_API_CONNECTINFO`
+   (arg8 = [sp+0x40]) + its length (arg9), issue `NtSecureConnectPort(&CsrApiPort, &PortName, &Qos,
+   &LpcWrite, SystemSid, &LpcRead, NULL, &ConnectionInfo, &ConnectionInfoLength)` — the executive's
+   `csr_client_connect` fills ConnectionInfo — then copy `ConnectionInfo.SharedStaticServerData` →
+   `Peb->ReadOnlyStaticServerData`, `SharedSectionBase` → `ReadOnlySharedMemoryBase`, and
+   `RtlCreateHeap` over LpcWrite.ViewBase. Return STATUS_SUCCESS. (Args must be STACK locals so the
+   executive's mirror reads/writes land — same discipline as `on_target::nt_allocate_virtual_memory`.)
+3. Then kernel32's DllMain reaches `InitCommandLines()` (GetCommandLineA non-NULL) → winlogon's
+   entry runs its real `WinMain` → `SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → 0x003a6ea5`.
+   The `csr_rendezvous` native arm (this batch) drives csrss's real CsrApiRequestThread accept.
