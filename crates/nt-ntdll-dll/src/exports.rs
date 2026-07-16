@@ -592,6 +592,74 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
     STATUS_SUCCESS
 }
 
+/// The current process's PEB (self-pointer @ `gs:[0x60]`).
+///
+/// # Safety
+/// On-target x86_64; the PEB is mapped at spawn.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn current_peb() -> u64 {
+    let peb: u64;
+    // SAFETY: gs:[0x60] is the TEB->ProcessEnvironmentBlock self-pointer, set up at spawn.
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
+    }
+    peb
+}
+
+/// `RtlAcquirePebLock()` — enter `PEB->FastPebLock` (a `RTL_CRITICAL_SECTION*` @ PEB+0x38).
+///
+/// kernel32's early init (and many Rtl paths) serialize PEB access through this lock. Single-threaded
+/// process bring-up ⇒ the uncontended fast path is correct; contention routes to the same
+/// critical-section seam as `RtlEnterCriticalSection`.
+///
+/// # Safety
+/// On-target x86_64; the PEB + its FastPebLock are mapped.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlAcquirePebLock"]
+pub unsafe extern "system" fn rtl_acquire_peb_lock() {
+    // SAFETY: PEB @ gs:[0x60]; FastPebLock ptr @ PEB+0x38 (nt-ntdll-layout).
+    unsafe {
+        let cs = core::ptr::read((current_peb() + 0x38) as *const *mut c_void);
+        if !cs.is_null() {
+            let _ = rtl_enter_critical_section(cs);
+        }
+    }
+}
+
+/// `RtlReleasePebLock()` — leave `PEB->FastPebLock`.
+///
+/// # Safety
+/// On-target x86_64; the PEB + its FastPebLock are mapped.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlReleasePebLock"]
+pub unsafe extern "system" fn rtl_release_peb_lock() {
+    // SAFETY: PEB @ gs:[0x60]; FastPebLock ptr @ PEB+0x38.
+    unsafe {
+        let cs = core::ptr::read((current_peb() + 0x38) as *const *mut c_void);
+        if !cs.is_null() {
+            let _ = rtl_leave_critical_section(cs);
+        }
+    }
+}
+
+/// `RtlGetNtGlobalFlags() -> ULONG` — read `PEB->NtGlobalFlag` (@ PEB+0xBC on x64).
+///
+/// # Safety
+/// On-target x86_64; the PEB is mapped.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlGetNtGlobalFlags"]
+pub unsafe extern "system" fn rtl_get_nt_global_flags() -> u32 {
+    // SAFETY: PEB @ gs:[0x60]; NtGlobalFlag @ PEB+0xBC (nt-ntdll-layout).
+    unsafe { core::ptr::read((current_peb() + 0xBC) as *const u32) }
+}
+
+/// `RtlNtStatusToDosError(NTSTATUS) -> ULONG` — map an NTSTATUS to a Win32 error (`nt-ntdll` logic).
+#[export_name = "RtlNtStatusToDosError"]
+pub extern "system" fn rtl_nt_status_to_dos_error(status: u32) -> u32 {
+    rtl::status::nt_status_to_dos_error(status)
+}
+
 // =================================================================================================
 // Rtl* — security (SID/ACL/SD). Delegated logic lives in nt_ntdll::rtl::security over nt-security;
 // the raw-pointer exported forms that need heap allocation are honest seams, the in-place ones real.
@@ -2601,6 +2669,11 @@ pub unsafe extern "C" fn export_anchor() {
         // BATCH 3 — the Win32 last-error pair (kernel32!GetLastError/SetLastError forward here).
         rtl_get_last_win32_error as usize,
         rtl_set_last_win32_error as usize,
+        // BATCH 3 ckpt 2 — kernel32 early-init PEB-lock + global-flags + status-to-dos.
+        rtl_acquire_peb_lock as usize,
+        rtl_release_peb_lock as usize,
+        rtl_get_nt_global_flags as usize,
+        rtl_nt_status_to_dos_error as usize,
     ];
     core::hint::black_box(anchors);
 }
