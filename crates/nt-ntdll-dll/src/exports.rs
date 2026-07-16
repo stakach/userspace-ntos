@@ -3287,6 +3287,226 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Dbg* / Csr* / data exports the Win32 stack imports from ntdll.
+// The Dbg* family is the debugger/trace client: on our target the debug output forwards to the
+// kernel serial log via the int-0x2d DebugService (the DbgPrint path); the DbgUi* debugger-attach
+// surface is a no-op (no user-mode debugger present). Csr* is the CSR client — the real port send
+// is the LPC transport seam (nt_ntdll::csr builds the message); the export exists so the IAT
+// resolves + the call is ABI-safe. Data exports are the NLS/prefix globals hosted binaries read.
+// =================================================================================================
+
+/// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Variadic; we declare
+/// only the fixed args (the Win64 variadic tail is left in the caller's registers/stack, unread).
+/// ABI-safe no-op returning STATUS_SUCCESS — the export exists so the Win32 stack's IAT resolves
+/// (kernel32!DbgPrintEx was the immediate frontier). The live render/serial-forward is the Dbg
+/// transport seam (as with `DbgPrint`).
+///
+/// # Safety
+/// Called with the C DbgPrintEx ABI; ignores the variadic tail.
+#[export_name = "DbgPrintEx"]
+pub unsafe extern "C" fn dbg_print_ex(_component: u32, _level: u32, _format: *const u8) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `vDbgPrintExWithPrefix(PCSTR Prefix, ULONG ComponentId, ULONG Level, PCSTR Format, va_list)
+/// -> ULONG`. The `va_list`-taking core of the DbgPrintEx family. `va_list` is opaque in `no_std`;
+/// ABI-safe no-op returning STATUS_SUCCESS (IAT-resolve; live render = the Dbg transport seam).
+///
+/// # Safety
+/// Called with the ntdll `vDbgPrintExWithPrefix` ABI; ignores the `va_list`.
+#[export_name = "vDbgPrintExWithPrefix"]
+pub unsafe extern "C" fn vdbg_print_ex_with_prefix(
+    _prefix: *const u8,
+    _component: u32,
+    _level: u32,
+    _format: *const u8,
+    _args: *mut c_void,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `DbgPrompt(PCSTR Prompt, PCH Response, ULONG Length) -> ULONG` — prompt the debugger for input.
+/// No debugger is attached, so we return an empty response (0 bytes read) — the observable
+/// no-debugger contract.
+///
+/// # Safety
+/// `response` writable for `length` bytes.
+#[export_name = "DbgPrompt"]
+pub unsafe extern "C" fn dbg_prompt(_prompt: *const u8, response: *mut u8, length: u32) -> u32 {
+    if !response.is_null() && length > 0 {
+        // SAFETY: response valid for length bytes per the contract.
+        unsafe { *response = 0 };
+    }
+    0
+}
+
+macro_rules! dbgui_noop {
+    ($export:literal, $fn:ident) => {
+        /// `DbgUi*` debugger-attach surface — no user-mode debugger present; returns
+        /// STATUS_SUCCESS / a null handle. The export exists so the Win32 stack's IAT resolves.
+        ///
+        /// # Safety
+        /// Called with the corresponding ntdll `DbgUi*` ABI; a no-op with no live debug object.
+        #[export_name = $export]
+        pub unsafe extern "system" fn $fn(
+            _a: *mut c_void,
+            _b: *mut c_void,
+            _c: *mut c_void,
+            _d: *mut c_void,
+        ) -> NtStatus {
+            STATUS_SUCCESS
+        }
+    };
+}
+dbgui_noop!("DbgUiConnectToDbg", dbg_ui_connect_to_dbg);
+dbgui_noop!("DbgUiContinue", dbg_ui_continue);
+dbgui_noop!("DbgUiConvertStateChangeStructure", dbg_ui_convert_state_change_structure);
+dbgui_noop!("DbgUiDebugActiveProcess", dbg_ui_debug_active_process);
+dbgui_noop!("DbgUiStopDebugging", dbg_ui_stop_debugging);
+dbgui_noop!("DbgUiIssueRemoteBreakin", dbg_ui_issue_remote_breakin);
+dbgui_noop!("DbgUiWaitStateChange", dbg_ui_wait_state_change);
+
+/// `DbgUiGetThreadDebugObject() -> HANDLE` — returns the current thread's debug object (none) = NULL.
+///
+/// # Safety
+/// Reads no memory; returns a NULL handle (no debug object bound).
+#[export_name = "DbgUiGetThreadDebugObject"]
+pub unsafe extern "system" fn dbg_ui_get_thread_debug_object() -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+// ---- Csr* — the CSR client. The real port send is the LPC transport seam. -------------------------
+
+/// `CsrGetProcessId() -> HANDLE` — the CSR (csrss) process id. Not yet published to the client PEB;
+/// returns 0 (unresolved) — never a fabricated pid. The export exists so the IAT resolves.
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "CsrGetProcessId"]
+pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
+/// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. The connect handshake is
+/// the LPC transport seam (`nt_ntdll::csr::CsrPort::connect` builds it); returns
+/// STATUS_NOT_IMPLEMENTED at the honest send seam — never a fabricated connection.
+///
+/// # Safety
+/// The out-params (`connection_info_size`, `server_to_server`) are null or writable.
+#[export_name = "CsrClientConnectToServer"]
+pub unsafe extern "system" fn csr_client_connect_to_server(
+    _object_directory: *const u16,
+    _server_id: u32,
+    _connection_info: *mut c_void,
+    _connection_info_size: *mut u32,
+    _server_to_server: *mut u8,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `CsrClientCallServer(PCSR_API_MESSAGE Request, PCSR_CAPTURE_BUFFER Capture, CSR_API_NUMBER
+/// ApiNumber, ULONG RequestLength) -> NTSTATUS`. The port round-trip is the LPC transport seam;
+/// returns STATUS_NOT_IMPLEMENTED — never a fabricated reply.
+///
+/// # Safety
+/// `request` a valid `CSR_API_MESSAGE*`; `capture` null or a valid capture buffer.
+#[export_name = "CsrClientCallServer"]
+pub unsafe extern "system" fn csr_client_call_server(
+    _request: *mut c_void,
+    _capture: *mut c_void,
+    _api_number: u32,
+    _request_length: u32,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `CsrAllocateCaptureBuffer(ULONG ArgumentCount, ULONG BufferSize) -> PCSR_CAPTURE_BUFFER`.
+/// Allocates a capture buffer on the process heap (the marshalling plane `nt_ntdll::csr` models).
+/// Until the CSR heap plane is wired we return NULL (allocation unavailable) — never a dangling
+/// buffer.
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "CsrAllocateCaptureBuffer"]
+pub unsafe extern "system" fn csr_allocate_capture_buffer(
+    _argument_count: u32,
+    _buffer_size: u32,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `CsrFreeCaptureBuffer(PCSR_CAPTURE_BUFFER CaptureBuffer)`. Frees a buffer from
+/// `CsrAllocateCaptureBuffer` (none allocated yet → no-op).
+///
+/// # Safety
+/// `capture_buffer` null or a buffer from `CsrAllocateCaptureBuffer`.
+#[export_name = "CsrFreeCaptureBuffer"]
+pub unsafe extern "system" fn csr_free_capture_buffer(_capture_buffer: *mut c_void) {}
+
+/// `CsrCaptureMessageBuffer(PCSR_CAPTURE_BUFFER CaptureBuffer, PVOID MessageBuffer, ULONG Length,
+/// PVOID* CapturedBuffer) -> PCSR_CAPTURE_BUFFER`. Captures a pointer arg into the buffer. Seam:
+/// returns NULL (no capture buffer plane) — never a fabricated captured pointer.
+///
+/// # Safety
+/// `captured_buffer` null or writable.
+#[export_name = "CsrCaptureMessageBuffer"]
+pub unsafe extern "system" fn csr_capture_message_buffer(
+    _capture_buffer: *mut c_void,
+    _message_buffer: *mut c_void,
+    _length: u32,
+    _captured_buffer: *mut *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `CsrAllocateMessagePointer(PCSR_CAPTURE_BUFFER CaptureBuffer, ULONG Length, PVOID* Pointer)
+/// -> ULONG`. Reserves `Length` bytes in the capture buffer. Seam: returns 0 bytes.
+///
+/// # Safety
+/// `pointer` null or writable.
+#[export_name = "CsrAllocateMessagePointer"]
+pub unsafe extern "system" fn csr_allocate_message_pointer(
+    _capture_buffer: *mut c_void,
+    _length: u32,
+    pointer: *mut *mut c_void,
+) -> u32 {
+    if !pointer.is_null() {
+        // SAFETY: pointer writable per the contract.
+        unsafe { *pointer = core::ptr::null_mut() };
+    }
+    0
+}
+
+/// `CsrNewThread() -> NTSTATUS` — register a new thread with the CSR client runtime (marks the TEB
+/// CSR fields). No CSR client runtime state to update yet → STATUS_SUCCESS (the observable no-op:
+/// the thread simply isn't CSR-registered, which the boot path tolerates).
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "CsrNewThread"]
+pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
+    STATUS_SUCCESS
+}
+
+// ---- Data exports — the NLS multi-byte code-page tags hosted binaries read. -----------------------
+//
+// `NlsMbCodePageTag` / `NlsMbOemCodePageTag` are BOOLEANs: TRUE iff the ANSI / OEM code page is a
+// MULTI-byte (DBCS) code page. Our defaults (1252 ANSI / 437 OEM) are BOTH single-byte, so both are
+// FALSE — matching `nt_ntdll::crt`'s single-byte-default tags. Exported as data (a `#[used]`
+// `#[no_mangle]` static under the real name).
+
+/// `BOOLEAN NlsMbCodePageTag` — FALSE (the 1252 ANSI default is single-byte).
+#[used]
+#[export_name = "NlsMbCodePageTag"]
+pub static NLS_MB_CODE_PAGE_TAG: u8 = 0;
+
+/// `BOOLEAN NlsMbOemCodePageTag` — FALSE (the 437 OEM default is single-byte).
+#[used]
+#[export_name = "NlsMbOemCodePageTag"]
+pub static NLS_MB_OEM_CODE_PAGE_TAG: u8 = 0;
+
+// =================================================================================================
 // Retention anchor — mirror the Nt* TRAP_STUB_ADDRS pattern so the linker keeps every export past
 // `--no-gc-sections`/DCE. Referenced (via `#[used]`) from `lib.rs`'s KEEP anchor.
 // =================================================================================================
@@ -3484,6 +3704,28 @@ pub unsafe extern "C" fn export_anchor() {
         qsort as usize,
         local_unwind as usize,
         ver_set_condition_mask as usize,
+        // BATCH 4 — Dbg* / Csr* surface.
+        dbg_print_ex as usize,
+        vdbg_print_ex_with_prefix as usize,
+        dbg_prompt as usize,
+        dbg_ui_connect_to_dbg as usize,
+        dbg_ui_continue as usize,
+        dbg_ui_convert_state_change_structure as usize,
+        dbg_ui_debug_active_process as usize,
+        dbg_ui_stop_debugging as usize,
+        dbg_ui_issue_remote_breakin as usize,
+        dbg_ui_wait_state_change as usize,
+        dbg_ui_get_thread_debug_object as usize,
+        csr_get_process_id as usize,
+        csr_client_connect_to_server as usize,
+        csr_client_call_server as usize,
+        csr_allocate_capture_buffer as usize,
+        csr_free_capture_buffer as usize,
+        csr_capture_message_buffer as usize,
+        csr_allocate_message_pointer as usize,
+        csr_new_thread as usize,
+        &NLS_MB_CODE_PAGE_TAG as *const u8 as usize,
+        &NLS_MB_OEM_CODE_PAGE_TAG as *const u8 as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
