@@ -1005,6 +1005,9 @@ static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+/// BATCH 25 — count of fixup-preserving re-maps (a re-faulted per-process image page re-mapped from
+/// its already-filled frame instead of re-filled from the raw PE, so reloc/IAT-snap fixups survive).
+static FIXUP_REMAP_N: AtomicU64 = AtomicU64::new(0);
 /// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
 /// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);

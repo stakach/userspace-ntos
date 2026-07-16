@@ -863,6 +863,53 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"..0x");
                 print_hex((STACK_BASE + STACK_FRAMES * 0x1000) as u32);
                 print_str(b")\n");
+                // On an INSTRUCTION-FETCH fault (ip==addr, both a bare low RVA) execution CALLed/JMPed
+                // through a bad/truncated code pointer. Read the faulting thread's real GPRs + walk its
+                // stack (TCB rsp) for return addresses in any mapped module — this identifies the CALLER
+                // (module + RVA) whose indirect transfer landed on the bare RVA. General class-of-wall
+                // diagnostic (BATCH 24/25: lsass rpcrt4 `0x3a288`); applies to any process at quiescence.
+                if m0 == addr && addr < 0x8000_0000 {
+                    let tcb = crate::PM_MAIN_TCBS[pi as usize].load(Ordering::Relaxed);
+                    if tcb != 0 {
+                        let mut regs = [0u64; 20];
+                        crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                        // seL4 x86_64 UserContext order: [0]rip [1]rsp [2]rflags [3]rax [4]rbx [5]rcx
+                        // [6]rdx [7]rsi [8]rdi [9]rbp [10]r8..[17]r15.
+                        print_str(b"[vmf-out] regs: rip=0x");
+                        print_hex(regs[0] as u32);
+                        print_str(b" rsp=0x");
+                        print_hex((regs[1] >> 32) as u32);
+                        print_hex(regs[1] as u32);
+                        print_str(b" rax=0x");
+                        print_hex((regs[3] >> 32) as u32);
+                        print_hex(regs[3] as u32);
+                        print_str(b" rcx=0x");
+                        print_hex((regs[5] >> 32) as u32);
+                        print_hex(regs[5] as u32);
+                        print_str(b"\n");
+                        // Walk the REAL stack (TCB rsp) for return addresses (ntdll 0x100_00xxxxxx / a
+                        // mapped DLL 0x80xxxxxx). The nearest one identifies the faulting caller.
+                        let rsp = regs[1];
+                        print_str(b"[vmf-out] instr-fetch [rsp..]:");
+                        let mut k: u64 = 0;
+                        let mut printed: u64 = 0;
+                        while k < 64 && printed < 12 {
+                            let v = smss_stack_read(rsp + k * 8);
+                            let is_ntdll = v >= 0x0000_0100_0000_0000 && v < 0x0000_0100_0100_0000;
+                            let is_dll = v >= 0x8000_0000 && v < 0x8080_0000;
+                            if is_ntdll || is_dll {
+                                print_str(b" +0x");
+                                print_hex((k * 8) as u32);
+                                print_str(b":0x");
+                                print_hex((v >> 32) as u32);
+                                print_hex(v as u32);
+                                printed += 1;
+                            }
+                            k += 1;
+                        }
+                        print_str(b"\n");
+                    }
+                }
                 // ★ Checkpoint B containment: once lsass has signaled LSA_RPC_SERVER_ACTIVE (its
                 // essential init is done), an unrecoverable fault on lsass' MAIN thread (badge 8) —
                 // e.g. rpcrt4 NdrSimpleTypeUnmarshall dereferencing a bogus RPC request buffer
@@ -934,6 +981,47 @@ pub(crate) unsafe fn service_sec_image(
                 // every process that faults it — real image sharing.
                 let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                // ★ BATCH 25 — FIXUP-SURVIVAL (the general correctness fix). A per-process image page
+                // (a DLL's headers/.rdata/.idata/IAT or the main image) is filled ONCE from the raw
+                // on-disk PE, then the ON-TARGET ntdll loader applies base RELOCATIONS + snaps the IAT
+                // by WRITING into that mapped frame (in-process). Those fixups live ONLY in the frame,
+                // NOT in the on-disk PE. If such a page is later RE-FAULTED at runtime (its mapping was
+                // dropped / never landed / the demand loader re-touches it) and we naively re-FILL it
+                // from the raw PE, we DISCARD the loader's fixups — a snapped IAT slot reverts to its
+                // raw ILT thunk (a bare IMAGE_IMPORT_BY_NAME RVA), a relocated pointer loses its base.
+                // OBSERVED (lsass, BATCH 24): kernel32's ntdll-IAT page (RVA 0x77000, in .rdata → RW)
+                // reverted → CloseHandle's `call *[IAT]` jumped to the bare RVA 0x3a288 (should be
+                // NTDLL_BASE+0x3a288) → instr-fetch fault, before SetEvent(LSA_RPC_SERVER_ACTIVE).
+                // FIX: for the FAULTING per-process page (bi==0), if this process already has a frame
+                // recorded for it (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every
+                // pi>=1 process), RE-MAP that SAME frame (which holds the loader's in-memory fixups)
+                // instead of filling a fresh raw frame. `csrss_frame_get` falls back to the shared DLL
+                // cache, so restrict to `!shareable` (a genuine per-process frame the caller recorded).
+                if bi == 0 && !shareable && pi >= 1 {
+                    let existing = csrss_frame_get(pi as u64, bpage);
+                    if existing != 0 && existing != dll_cache_get(bpage) {
+                        // A previously-filled per-process frame for THIS page → re-map it (preserving
+                        // fixups). rights: per-process image pages are RW_NX (non-exec sections) here.
+                        let (cc, ce) = copy_cap_r(existing);
+                        let me = page_map_r(cc, bpage, RW_NX, pml4);
+                        let n = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
+                        if n < 16 {
+                            print_str(b"[fixup-remap] pi=");
+                            print_u64(pi as u64);
+                            print_str(b" page=0x");
+                            print_hex(bpage as u32);
+                            print_str(b" frame preserved (copy=");
+                            print_u64(ce);
+                            print_str(b" map=");
+                            print_u64(me);
+                            print_str(b")\n");
+                        }
+                        // Do NOT bump `faults` (no scratch slot consumed) or re-record — the frame is
+                        // already tracked. Advance to the next batch page.
+                        bi += 1;
+                        continue;
+                    }
+                }
                 // For batch pages PAST the faulting one (bi>0), only PRE-fill genuinely-unmapped
                 // pages: a per-process page already recorded in `filled_pages`, or a shared page not
                 // cached here yet but already mapped, must be skipped so we never double-map. The
@@ -2707,11 +2795,22 @@ pub(crate) unsafe fn service_sec_image(
             // free when winlogon faulted at comdlg32's unsnapped IAT (0x3ad64). Scoped to winlogon's
             // main thread AT quiescence (worker already parked) so it can't mask a pre-quiescence fault
             // or any other process's progress. Not a fault — a clean "winlogon reached WinMain" exit.
+            //
+            // ★ BATCH 25 — LSA-NOT-YET-SIGNALLED GUARD. winlogon's WinMain does `WaitForLsass` (parks on
+            // the LSA_RPC_SERVER_ACTIVE event) BEFORE `InitializeSAS → SwitchDesktop → the desktop paint`.
+            // If we QUIESCE while lsass has not yet signalled, we stop the loop before lsass'
+            // `SetEvent(LSA_RPC_SERVER_ACTIVE)` can wake winlogon into SwitchDesktop → the paint never
+            // runs. So: while `LSA_RPC_SERVER_ACTIVE_SIGNALLED == 0`, DON'T quiesce — fall through to the
+            // Checkpoint-B `wait_park` so winlogon parks in a WAKEABLE state (its reply cap held in the
+            // event's waiter queue), and the later NtSetEvent(lsa_rpc_server_active) resumes it into
+            // SwitchDesktop. Only once lsass HAS signalled (winlogon has been woken + driven past
+            // SwitchDesktop to its genuinely-terminal SAS-logon wait) do we quiesce to run the gate.
             if park_wait_event >= 0
                 && pi == 2
                 && WL_WORKER_FAULTS.load(Ordering::Relaxed) > 0
+                && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
             {
-                print_str(b"[wl-main] winlogon reached WinMain steady-state (worker parked + main event-wait) -> QUIESCE; run gate\n");
+                print_str(b"[wl-main] winlogon reached WinMain steady-state (worker parked + main event-wait, LSA signalled) -> QUIESCE; run gate\n");
                 stop = resume_ip;
                 break;
             }
