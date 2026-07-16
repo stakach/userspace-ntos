@@ -60,6 +60,15 @@ pub struct ZwAlias {
 /// No entry uses this yet; it exists so the choice is documented at the ABI seam, not ad-hoc.
 pub const ALPC_SSN_BASE: u32 = 0x1000;
 
+/// ntdll_plan Step 6.A — the msginfo LABEL that marks a REQUEST as an NT native seL4-Call syscall
+/// (our ntdll's `Nt*` stub → the executive over a real seL4 `Call`, NOT a Windows-`syscall`
+/// UnknownSyscall trap). ASCII `"NT"` (0x4E54) — well clear of the kernel fault-type labels
+/// (`UnknownSyscall`=2, `UserException`=3, `VMFault`=6), so the executive's service loop tells a
+/// native-syscall message from a fault message by `mi>>12`. The single source of truth shared by OUR
+/// ntdll (the stub side) and the executive (the recv side). See `nt_ntdll::native_call` for the full
+/// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
+pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
+
 /// The complete `Nt*` SSN table: the **188** distinct `Nt*` exports imported across the current
 /// hosted ReactOS x64 set (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
 /// rpcrt4/csrsrv/basesrv/winsrv/… — measured 2026-07-16, see `ntdll_plan.md` Step 1 Results),

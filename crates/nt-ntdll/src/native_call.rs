@@ -34,7 +34,8 @@
 /// The msginfo LABEL that marks a REQUEST as an NT native-syscall (not a fault). ASCII `"NT"` (0x4E54)
 /// — well clear of the kernel fault-type labels (`UnknownSyscall`=2, `UserException`=3, `VMFault`=6),
 /// so the executive's recv loop can tell a native-syscall message from a fault message by `mi>>12`.
-pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
+/// Re-exported from the shared `nt-syscall-abi` (the single source of truth ntdll ↔ executive share).
+pub use nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
 
 /// The CSpace slot (in the hosted process's CNode) holding the SEND cap to the service endpoint.
 /// This is the SAME `CT_FAULT` slot the executive's `spawn_sec_image` already populates with a cap to

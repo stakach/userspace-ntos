@@ -89,7 +89,7 @@ macro_rules! generate_trap_stubs {
                     concat!("mov r10d, ", stringify!($ssn)), // MR0 = SSN
                     "mov edi, 6",                       // rdi = CT_FAULT cap slot
                     // rsi = msginfo = (NT_NATIVE_SYSCALL_LABEL<<12) | length(6) = 0x4E54_6006.
-                    "mov esi, 0x4E546006",
+                    "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, len 6
                     "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
                     "syscall",                          // native seL4 Call → executive Recv/Reply
                     // Reply: MR0 (r10) = NTSTATUS. Move to rax (the C return register) and ret.

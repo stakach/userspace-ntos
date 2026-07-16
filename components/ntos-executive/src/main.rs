@@ -158,7 +158,7 @@ pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
 /// emits the observable `[dbg] nt-ntdll: ...` marker, then stops at the unwired LoaderHost seams —
 /// Step 4.B wires those). `false` = the committed-green boot (real ntdll everywhere). Landed OFF so
 /// the gate (174/98, paint 768/768) stays green via the fallback; flip ON to observe the marker.
-pub const SMSS_USE_OUR_NTDLL: bool = false;
+pub const SMSS_USE_OUR_NTDLL: bool = true;
 /// Path to OUR staged Rust ntdll on the FS (see make_image.sh Step 4.A staging).
 pub const OUR_NTDLL_FS_PATH: &[u8] = b"reactos\\system32\\nt-ntdll.dll";
 /// A hosted process's environment pages (TEB/PEB/params/trampoline). These live in the SAME 2 MiB
@@ -2333,6 +2333,15 @@ unsafe fn set_reply_mr(i: usize, v: u64) {
 unsafe fn get_recv_mr(i: usize) -> u64 {
     let base = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
+}
+/// Stage a value into the executive's IPC-buffer RECEIVE MR slot `i` (ntdll_plan Step 6.A). Used to
+/// NORMALIZE a native-seL4-Call NT_NATIVE_SYSCALL message into the register-slot layout the
+/// `(mi>>12)==2` UnknownSyscall service arm reads (which reads args from the fault frame's saved
+/// register slots via `get_recv_mr`), so the native transport reuses that arm's full servicing body
+/// unchanged. Same address math as `set_reply_mr`/`get_recv_mr` (MR `i` at byte `8 + i*8`).
+unsafe fn set_recv_mr(i: usize, v: u64) {
+    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
 
 /// Issue an IRQ-handler cap for a real IOAPIC `pin`, delivering `IRQ_VECTOR`, into

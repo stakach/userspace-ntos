@@ -455,46 +455,78 @@ unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_syscall(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
-    // IPC buffer MR4/MR5 = a3/a4 (only 4 MRs ride in registers; MR4+ go via the IPC buffer).
-    // IPCBUF_VADDR is a fixed per-process VA; MR i lives at byte (8 + i*8): MR4 @ +0x28, MR5 @ +0x30.
-    const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+    // SAFETY: forwarding to the general native primitive (a7/a8 = 0, unused by a ≤6-arg service).
+    unsafe { native_syscall8(ssn, a1, a2, a3, a4, a5, a6, 0, 0) }
+}
+
+/// The IPC buffer fixed per-process VA. MR `i` lives at byte `8 + i*8`; MR4 @ +0x28, MR5 @ +0x30.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+
+/// The general NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A) — up to 8 args.
+///
+/// Register-pressure discipline: only the essential values are held live across the asm. MR4/MR5
+/// (a3/a4) are written to the IPC buffer with plain Rust BEFORE the asm; the 4 register message
+/// words + the stack args (a5..a8) are passed through a small on-stack `req` array which the asm
+/// reads (a single `in(reg)` pointer), and the asm copies a5..a8 to `[rsp+0x28..0x40]` (the Windows
+/// x64 ABI stack-arg slots the executive's mirror reads) then Calls.
+///
+/// # Safety
+/// On-target hosted-process; the register out-param pointers (in a1..a4) are valid stack locals.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn native_syscall8(
+    ssn: u32,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+) -> u64 {
+    // MR4/MR5 = a3/a4 into the IPC buffer (plain Rust — no live registers needed across the Call).
+    // SAFETY: IPCBUF_VADDR is this process's mapped IPC buffer frame; MR4/MR5 at +0x28/+0x30.
+    unsafe {
+        core::ptr::write_volatile((IPCBUF_VADDR + 0x28) as *mut u64, a3);
+        core::ptr::write_volatile((IPCBUF_VADDR + 0x30) as *mut u64, a4);
+    }
+    // The register message words + the stack args, laid out for the asm to consume via ONE pointer:
+    //   [0]=SSN(MR0)  [1]=a1(MR2)  [2]=a2(MR3)  [3]=a5  [4]=a6  [5]=a7  [6]=a8
+    let req: [u64; 7] = [ssn as u64, a1, a2, a5, a6, a7, a8];
     let status: u64;
-    // SAFETY: a native seL4 Call; the executive services it via Recv/Reply on the fault EP. The
-    // stack-frame reservation holds a5/a6 for the executive's mirror read; rsp (MR1) is captured
-    // after the reservation so the offsets match the executive's `sp+0x28` reads.
+    // SAFETY: a native seL4 Call serviced by the executive. `req` is a valid readable stack array;
+    // the asm reserves the ABI stack frame, copies a5..a8 to [rsp+0x28..0x40] (the mirror-read
+    // slots), sets the register message (MR0=r10, MR1=rsp, MR2=r9, MR3=r15), and Calls. rsp (MR1) is
+    // captured AFTER the frame reservation so the executive's `sp+0x28` reads land on a5..a8.
     unsafe {
         core::arch::asm!(
-            // Reserve the ABI stack frame + place a5/a6 where the executive reads them.
-            "sub rsp, 0x38",
-            "mov qword ptr [rsp+0x28], {a5}",   // stack arg5
-            "mov qword ptr [rsp+0x30], {a6}",   // stack arg6
-            // MR4/MR5 (a3/a4) into the IPC buffer.
-            "movabs r11, {ipcbuf}",
-            "mov qword ptr [r11 + 0x28], {a3}", // MR4 = arg3
-            "mov qword ptr [r11 + 0x30], {a4}", // MR5 = arg4
-            // Register message: MR0=SSN(r10), MR1=rsp(r8), MR2=a1(r9), MR3=a2(r15).
+            "sub rsp, 0x48",
+            "mov rax, [{req} + 0x18]",          // a5
+            "mov [rsp+0x28], rax",
+            "mov rax, [{req} + 0x20]",          // a6
+            "mov [rsp+0x30], rax",
+            "mov rax, [{req} + 0x28]",          // a7
+            "mov [rsp+0x38], rax",
+            "mov rax, [{req} + 0x30]",          // a8
+            "mov [rsp+0x40], rax",
+            "mov r10, [{req} + 0x00]",          // MR0 = SSN
+            "mov r9,  [{req} + 0x08]",          // MR2 = a1
+            "mov r15, [{req} + 0x10]",          // MR3 = a2
             "mov r8, rsp",                      // MR1 = caller rsp (points at the reserved frame)
-            "mov r10d, {ssn:e}",                // MR0 = SSN
-            "mov r9,  {a1}",                    // MR2 = arg1
-            "mov r15, {a2}",                    // MR3 = arg2
             "mov edi, 6",                       // rdi = CT_FAULT cap slot
-            "mov esi, 0x4E546006",              // rsi = (0x4E54<<12)|6
-            "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
+            "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, length 6
+            "mov rdx, -1",                      // rdx = SysCall
             "syscall",
-            "add rsp, 0x38",
-            ssn = in(reg) ssn,
-            a1 = in(reg) a1,
-            a2 = in(reg) a2,
-            a3 = in(reg) a3,
-            a4 = in(reg) a4,
-            a5 = in(reg) a5,
-            a6 = in(reg) a6,
-            ipcbuf = const IPCBUF_VADDR,
-            // Reply MR0 (NTSTATUS) comes back in r10 (the IPC return ABI). Capture it.
-            out("r10") status,
+            "add rsp, 0x48",
+            "mov {status}, r10",                // reply MR0 = NTSTATUS (IPC return ABI: r10)
+            req = in(reg) req.as_ptr(),
+            status = out(reg) status,
             out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-            clobber_abi("system"),
+            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
+            options(nostack),
         );
     }
     status
@@ -776,39 +808,8 @@ unsafe fn syscall8(
     a7: u64,
     a8: u64,
 ) -> u64 {
-    const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
-    let status: u64;
-    // SAFETY: native seL4 Call; the executive reads a5..a8 + writes stack out-params via its mirror.
-    unsafe {
-        core::arch::asm!(
-            "sub rsp, 0x48",
-            "mov qword ptr [rsp+0x28], {a5}",
-            "mov qword ptr [rsp+0x30], {a6}",
-            "mov qword ptr [rsp+0x38], {a7}",
-            "mov qword ptr [rsp+0x40], {a8}",
-            "movabs r11, {ipcbuf}",
-            "mov qword ptr [r11 + 0x28], {a3}", // MR4 = arg3
-            "mov qword ptr [r11 + 0x30], {a4}", // MR5 = arg4
-            "mov r8, rsp",                      // MR1 = caller rsp
-            "mov r10d, {ssn:e}",                // MR0 = SSN
-            "mov r9,  {a1}",                    // MR2 = arg1
-            "mov r15, {a2}",                    // MR3 = arg2
-            "mov edi, 6",                       // rdi = CT_FAULT
-            "mov esi, 0x4E546006",              // rsi = (0x4E54<<12)|6
-            "mov rdx, -1",                      // rdx = SysCall
-            "syscall",
-            "add rsp, 0x48",
-            ssn = in(reg) ssn,
-            a1 = in(reg) a1, a2 = in(reg) a2, a3 = in(reg) a3, a4 = in(reg) a4,
-            a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
-            ipcbuf = const IPCBUF_VADDR,
-            out("r10") status,
-            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-            clobber_abi("system"),
-        );
-    }
-    status
+    // SAFETY: forwarding to the general native primitive.
+    unsafe { native_syscall8(ssn, a1, a2, a3, a4, a5, a6, a7, a8) }
 }
 
 /// `RtlCreateUserThread(Process, ThreadSD, CreateSuspended, StackZeroBits, StackReserve, StackCommit,

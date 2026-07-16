@@ -772,6 +772,35 @@ pub(crate) unsafe fn service_sec_image(
             m3 = nm3;
             continue;
         }
+        // ntdll_plan Step 6.A — NATIVE seL4-Call transport. OUR ntdll (native-transport smss) does a
+        // real seL4 `Call(CT_FAULT)` instead of a Windows-`syscall` UnknownSyscall trap. The request
+        // carries: MR0=SSN(m0), MR1=caller-rsp(m1), MR2=arg1(m2), MR3=arg2(m3), MR4=arg3(recv_mr[4]),
+        // MR5=arg4(recv_mr[5]); args5+ stay on the caller's stack (read via the mirror using rsp). We
+        // NORMALIZE it into the fault-frame register slots the `(mi>>12)==2` arm reads, then re-label
+        // the message as UnknownSyscall (2) so it flows through that arm's FULL servicing body
+        // unchanged (dispatch + out-writes + spawn/park/delay post-actions). The reply is a NORMAL IPC
+        // reply (the native caller has NO pending fault): `reply_recv_badge(..,result,..)` fans
+        // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0; // MR0
+            let rsp = m1; // MR1 = caller rsp (for stack args + stack out-param mirror writes)
+            let arg1 = m2; // MR2
+            let arg2 = m3; // MR3
+            let arg3 = get_recv_mr(4); // MR4 (IPC buffer)
+            let arg4 = get_recv_mr(5); // MR5 (IPC buffer)
+            // Stage the fault-frame register slots the `==2` arm reads: R10@9=arg1, R8@7=arg3,
+            // R9@8=arg4, SP@16=rsp, FLAGS@17=0. (arg2 is read directly from `m3`.)
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            // m0 stays = SSN; m2 becomes resume_ip (unused for a native reply — no fault restart).
+            m0 = ssn;
+            m2 = 0;
+            // Re-label as UnknownSyscall so the shared servicing arm below runs.
+            mi = (2u64 << 12) | (mi & 0x7F);
+        }
         if (mi >> 12) == 2 {
             // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
             // sentinel; otherwise it's a REAL Nt* system call to service.
