@@ -6870,28 +6870,71 @@ pub unsafe extern "system" fn rtlx_oem_string_to_unicode_size(src: PCUnicodeStri
 }
 
 /// `RtlInitCodePageTable(PUSHORT TableBase, PCPTABLEINFO CodePageTable)` — initialize an
-/// NLS code-page table descriptor from the raw NLS table base. We serve the single-byte-default
-/// path: mark the descriptor as a single-byte (SBCS) code page. The Win32 stack reads only the
-/// MaximumCharacterSize / DBCS flags on the boot path.
+/// NLS code-page table descriptor from the raw NLS table base. Faithful port of ReactOS
+/// `sdk/lib/rtl/nls.c:RtlInitCodePageTable`: copy the `NLS_FILE_HEADER` fields, then compute the
+/// `MultiByteTable` / `WideCharTable` / `DBCSRanges` / `DBCSOffsets` pointers RELATIVE to the mapped
+/// table base. kernel32's `IntGetCodePageEntry` maps the `\Nls\NlsSectionCP<n>` section then calls
+/// this to build the descriptor; `IntMultiByteToWideChar` / `IntWideCharToMultiByte` then index
+/// `MultiByteTable[]` / `WideCharTable[]`. The prior stub zeroed the descriptor and left
+/// `MultiByteTable` NULL → kernel32 dereferenced a NULL table (`movzwl (rdx,rax,2)` at
+/// kernel32+0x7167e, cr2=0) during winlogon's codepage init. See `nt_ntdll::nls`.
 ///
 /// # Safety
-/// `table` a valid NLS table base; `cp_table` a writable CPTABLEINFO.
+/// `table` a valid NLS table base (a mapped `.nls` view); `cp_table` a writable CPTABLEINFO
+/// (>= 0x40 bytes).
 #[export_name = "RtlInitCodePageTable"]
 pub unsafe extern "system" fn rtl_init_code_page_table(
-    _table: *const u16,
+    table: *const u16,
     cp_table: *mut c_void,
 ) {
-    if cp_table.is_null() {
+    if cp_table.is_null() || table.is_null() {
         return;
     }
-    // CPTABLEINFO: CodePage:u16@0, MaximumCharacterSize:u16@2, DefaultChar:u16@4, ... DBCSCodePage@?.
-    // Zero the descriptor then set MaximumCharacterSize=1 (SBCS) + CodePage=1252.
-    // SAFETY: cp_table writable (>= 0x20 bytes per CPTABLEINFO).
+    // NLS_FILE_HEADER (all USHORT): HeaderSize@0, CodePage@1, MaximumCharacterSize@2, DefaultChar@3,
+    // UniDefaultChar@4, TransDefaultChar@5, TransUniDefaultChar@6, LeadByte[MAXIMUM_LEADBYTES=12]@7.
+    //
+    // CPTABLEINFO byte layout (x64): CodePage:u16@0x00, MaximumCharacterSize:u16@0x02,
+    // DefaultChar:u16@0x04, UniDefaultChar:u16@0x06, TransDefaultChar:u16@0x08,
+    // TransUniDefaultChar:u16@0x0A, DBCSCodePage:u16@0x0C, LeadByte[12]@0x0E..0x1A, (pad) →
+    // MultiByteTable:PUSHORT@0x20, WideCharTable:PVOID@0x28, DBCSRanges:PUSHORT@0x30,
+    // DBCSOffsets:PUSHORT@0x38 (total 0x40).
+    // SAFETY: table points at a mapped NLS view; cp_table writable for >= 0x40 bytes.
     unsafe {
-        core::ptr::write_bytes(cp_table as *mut u8, 0, 0x20);
-        *(cp_table as *mut u16) = 1252; // CodePage
-        *((cp_table as *mut u16).add(1)) = 1; // MaximumCharacterSize (SBCS)
-        *((cp_table as *mut u16).add(2)) = b'?' as u16; // DefaultChar
+        let hdr = table; // PUSHORT view of the NLS_FILE_HEADER
+        let header_size = *hdr as usize; // HeaderSize (in USHORTs)
+        core::ptr::write_bytes(cp_table as *mut u8, 0, 0x40);
+        let cp = cp_table as *mut u8;
+        // Copy the header scalar fields.
+        *(cp.add(0x00) as *mut u16) = *hdr.add(1); // CodePage
+        *(cp.add(0x02) as *mut u16) = *hdr.add(2); // MaximumCharacterSize
+        *(cp.add(0x04) as *mut u16) = *hdr.add(3); // DefaultChar
+        *(cp.add(0x06) as *mut u16) = *hdr.add(4); // UniDefaultChar
+        *(cp.add(0x08) as *mut u16) = *hdr.add(5); // TransDefaultChar
+        *(cp.add(0x0A) as *mut u16) = *hdr.add(6); // TransUniDefaultChar
+        // LeadByte[MAXIMUM_LEADBYTES=12] — the 12 bytes at header USHORT index 7 (byte 0x0E).
+        core::ptr::copy_nonoverlapping(
+            (hdr as *const u8).add(0x0E),
+            cp.add(0x0E),
+            12, // MAXIMUM_LEADBYTES
+        );
+        // MultiByteTable = TableBase + HeaderSize + 1 (in USHORTs), i.e. just past the header block.
+        let multibyte = hdr.add(header_size + 1);
+        // WideCharTable = MultiByteTable + TableBase[HeaderSize] (the size word preceding it).
+        let widechar = hdr.add(header_size + 1 + (*hdr.add(header_size) as usize)) as *const c_void;
+        *(cp.add(0x20) as *mut *const u16) = multibyte; // MultiByteTable
+        *(cp.add(0x28) as *mut *const c_void) = widechar; // WideCharTable
+        // Glyph table (256 wchars) present? If MultiByteTable[256] == 0, no glyph table.
+        let dbcs_ranges = if *multibyte.add(256) == 0 {
+            multibyte.add(256 + 1)
+        } else {
+            multibyte.add(256 + 1 + 256)
+        };
+        *(cp.add(0x30) as *mut *const u16) = dbcs_ranges; // DBCSRanges
+        if *dbcs_ranges != 0 {
+            *(cp.add(0x0C) as *mut u16) = 1; // DBCSCodePage = 1
+            *(cp.add(0x38) as *mut *const u16) = dbcs_ranges.add(1); // DBCSOffsets
+        }
+        // else: DBCSCodePage = 0, DBCSOffsets = NULL (already zeroed).
     }
 }
 
