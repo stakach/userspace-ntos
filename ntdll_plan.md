@@ -1023,3 +1023,82 @@ still 4.0b seams. `RtlCreateProcessParameters` is a pure heap/struct-builder (a 
 `references/reactos/sdk/lib/rtl/process.c`); if the create-process SYSCALL out-param/marshalling breaks,
 that's a TRANSPORT wall → flag for Step 6 (the seL4 `Call`/SURT flip; marshalling already host-tested in
 `marshal.rs`). **Add the executive SSN-50 (`NtCreateProcessEx`) arm when smss emits SSN 50 there.**
+
+## ★ PIVOT (user, 2026-07-16) — retire the oracle-diff GRIND; go SYSTEMATIC + flip the transport
+Two directives: (1) **switch to Step 6 regardless** (flip the syscall transport off x86-trap) — the trap-path grind hit/approached syscall-marshalling friction (out-param write-back via the executive stack-mirror, wide-arg, servicing), which a proper transport eliminates; (2) **focus entirely on PORTING ReactOS ntdll → our Rust ntdll, TEST-DRIVEN**: for each function, port ReactOS's apitests if they exist (`references/reactos/modules/rostests/apitests/ntdll/`) OR write input/output validation tests, THEN port the function body from ReactOS source (`references/reactos/sdk/lib/rtl` for Rtl*, `references/reactos/dll/ntdll` for Ldr*/loader). Retire the reactive oracle-diff grind (Step 4.C paused at ckpt 6 `bb7fd4a`; smss ran deep into SmpInit under our ntdll — 10 real bodies; flag OFF committed green). The systematic port SUBSUMES the grind: instead of discovering walls one boot at a time, port the surface methodically + host-test it, so smss (then all 5 processes) runs on a COMPLETE, tested ntdll.
+### ☐ Step 6 — flip the transport (RECON-FIRST; the crux: a hosted process's `syscall` all fault via TCBSetHostedSyscalls, so "native seL4 Call" from our ntdll ALSO faults unless the design changes). Design the transport that eliminates the grind friction (native seL4 Call to a service endpoint / SURT ring / or cleaner-reply-over-fault with out-params returned as VALUES in the reply + written in-process by our ntdll), incl. the TCBSetHostedSyscalls + kernel-change question. The seL4/SURT arg-marshalling is ALREADY host-tested (Step 2c `marshal.rs` + `transport.rs` Sel4Call/SurtRing seams); the missing piece is the executive RECEIVE path. RECON → design → build, flag-gated, committed green.
+### ☐ Systematic Rtl/Ldr body port (test-driven) — port the ReactOS ntdll surface methodically into `crates/nt-ntdll`, batched by module (string/path/env/time/security/heap/loader), each function: (apitest OR new I/O test) + ported body. On the clean transport (after Step 6). This is the bulk; highly parallelizable (independent functions).
+
+## ★ DECISION (user, 2026-07-16) — NATIVE transport (option A), do it right; spec-break PERMITTED
+Chosen: **Step 6.A native seL4 Call transport** (win #2's architectural purity — NO fault-trap emulation), NOT the pragmatic 6.C. **"Don't worry about the spec for now"** — the sel4test byte-identity + the 174/98 boot gate constraint is LIFTED: we may make kernel changes + break the boot/specs while switching the transport and re-implementing, then RECONVERGE the specs. Sequence (user): **(1) switch the transport over → (2) re-implement the ENTIRE ntdll (test-driven port) → (3) get the specs running again → (4) finish the DLL → THEN grind (bring processes up on the complete ntdll).**
+### Native transport design (6.A) — investigate the no-kernel-change path FIRST
+The crux is TCBSetHostedSyscalls (makes every `syscall` fault). ★ HYPOTHESIS to validate first: for OUR-ntdll processes, simply DON'T set TCBSetHostedSyscalls + grant a service-endpoint cap → the ntdll stub's `seL4_Call` works NATIVELY (our ntdll owns every syscall, so the process never does a raw Windows syscall) → possibly NO kernel change. If a kernel change IS needed, make it (spec-break permitted; extern-rootserver-gate cleanly if feasible). Build: spawn grants SERVICE_EP cap into the process CSpace; ntdll `transport.rs` Sel4Call arm does real seL4_Call (marshal SSN+args via the host-tested `marshal.rs` into the IPC message); executive service loop Recv's the IPC message (decode SSN+args from msg regs, NOT a fault frame), services via ExecNtHandler, Reply with status + out-param VALUES in msg regs; ntdll writes out-params to caller pointers IN-PROCESS (no stack-mirror). Prove smss's syscalls flow over seL4 Call (no fault), out-params clean, smss runs >= as far as on the trap transport. Host tests green; commit recoverable increments; the flag still gates our-ntdll vs real-ntdll (fallback kept).
+### Then: full test-driven ntdll port (all Rtl/Ldr bodies) → reconverge specs → finish DLL.
+
+## Step 6.A — NATIVE seL4 Call transport (IN PROGRESS 2026-07-16)
+
+### ★ KERNEL-CHANGE DECISION: NO KERNEL CHANGE NEEDED (hypothesis VALIDATED)
+Recon of `rust-micro/src/arch/x86_64/syscall_entry.rs::rust_syscall_dispatch`:
+- Lines 598-604: `force_unknown = current_tcb.hosted_syscalls`. The `TCBSetHostedSyscalls` flag
+  (label 66) is a **per-thread** opt-in. When it is NOT set, `Syscall::from_i32(rdx)` dispatches the
+  syscall NATIVELY — including `SysCall = -1` (the seL4 `Call`). Only when the flag IS set does EVERY
+  syscall fault as `UnknownSyscall`.
+- The generated `Syscall` enum (`codegen/syscall.xml` → `SysCall = -1`): a native seL4 `Call` puts
+  `rdx = -1` (SysCall), `rdi = ep_cap_slot`, `rsi = msginfo`, `r10/r8/r9/r15 = MR0..3`. `handle_syscall`
+  routes `SysCall` → `handle_send(blocking, call=true)` → resolves the cap in `rdi`, finds the
+  Endpoint, `send_ipc` do_call → the executive's `Recv` on that endpoint wakes with the message.
+So: for OUR-ntdll smss, if we (a) do NOT call `TCBSetHostedSyscalls`, and (b) grant a cap to the
+service endpoint into smss's CSpace, then our ntdll's `Nt*` stubs issue a **real native seL4 `Call`**
+— NOT a Windows-`syscall` UnknownSyscall fault. Our ntdll owns EVERY syscall (each stub is our code),
+so smss never issues a raw Windows `syscall` that would need the fault path. **No kernel change.**
+The fallback (real-ntdll / pi>=1) keeps `TCBSetHostedSyscalls` + the trap path, byte-identical.
+
+### The service endpoint = the fault EP (reuse, don't add)
+The executive's `service_sec_image` loop already `Recv`s on `si_fault` (smss's fault EP), and smss's
+CSpace already holds a cap to it at slot `CT_FAULT` (=6) (granted by `spawn_sec_image` via
+`CNODE_COPY`, used as the TCB's fault handler). Our ntdll `seL4_Call`s that SAME endpoint at
+`CT_FAULT`. The executive's recv loop then receives EITHER a fault message (real-ntdll path / pi>=1:
+`mi>>12 ∈ {2,3,6}`) OR our native-syscall message (`mi>>12 == NT_NATIVE_SYSCALL_LABEL`). The badge
+still selects the process. No second endpoint, no extra cap-grant plumbing — the existing fault EP +
+its CT_FAULT cap IS the service channel.
+
+### The REQUEST / REPLY message layout (`NT_NATIVE_SYSCALL_LABEL = 0x4E54` = "NT")
+REQUEST (ntdll → executive), msginfo label = `NT_NATIVE_SYSCALL_LABEL`, length 6:
+- MR0 = SSN (the Windows service number)
+- MR1 = caller RSP (so the executive reads stack args 5+ AND writes stack out-params via its EXISTING
+  stack mirror — a native `Call` does NOT transfer rsp/stack, unlike the UnknownSyscall fault frame)
+- MR2 = arg1 (RCX→R10 in the native ABI)
+- MR3 = arg2 (RDX)
+- MR4 = arg3 (R8)
+- MR5 = arg4 (R9)
+REPLY (executive → ntdll), length 1:
+- MR0 = NTSTATUS
+Wire mapping (matches the executive's `recv_full_r12`/`reply_recv` register plumbing): rsi=msginfo,
+r10=MR0, r8=MR1, r9=MR2, r15=MR3, IPC-buffer[4]=MR4, [5]=MR5. Reply: r10=MR0=NTSTATUS.
+
+### Out-params: kept on the EXISTING stack/heap/image MIRROR (minimal, provable native cut)
+The plan's ideal friction-killer is out-params-as-VALUES written in-process by ntdll. But the
+executive has ~100+ SSN handlers that all write out-params through the stack/heap/image MIRROR
+(`smss_copyout`/`smss_stack_write`). Rewriting all of them to value-return is the systematic port's
+job (next). For THIS transport cut, ntdll passes the SAME pointer args (into smss's mapped memory) in
+the message, and the executive services with the SAME handlers writing through the SAME mirror — the
+out-params still land in smss's memory, but now over a native `Call` instead of a fault. The mirror
+works because MR1 carries RSP. This proves the native transport end-to-end with zero handler churn;
+the pure value-return layers on top later, handler-by-handler, during the systematic port.
+
+### The build (flag-gated on our-ntdll; fallback + real-ntdll trap path kept)
+1. **Spawn setup** (`img_spawn.rs`): a new `hosted_native: bool` param to `spawn_sec_image` — when
+   set (our-ntdll smss), SKIP the `TCBSetHostedSyscalls` invocation (so native `Call` works) and
+   ensure CT_FAULT holds a SEND-capable cap (it already does). Flag-OFF / pi>=1: unchanged (byte-id).
+2. **ntdll transport** (`nt-ntdll-dll/src/on_target.rs`): the THREE syscall helpers (`syscall4`/
+   `syscall6`/`syscall8`) + `nt_allocate_virtual_memory` + the naked trap stubs (`trap_stubs.rs` via
+   `exports.rs`) switch from `mov eax,ssn; syscall` to a native `seL4_Call(CT_FAULT)` building the
+   REQUEST message, reading MR0 (NTSTATUS) from the reply. A `cfg`/const `NATIVE_TRANSPORT` picks
+   native vs trap so the fallback stays.
+3. **Executive recv** (`service_sec_image.rs`): the recv loop gains a `mi>>12 == NT_NATIVE_SYSCALL_LABEL`
+   arm ALONGSIDE the fault arms — decode SSN=MR0, rsp=MR1, args from MR2..5 + stack, dispatch via the
+   SAME `nt_dispatcher`/`ExecNtHandler`, reply MR0 = NTSTATUS. The `(mi>>12)==2` UnknownSyscall arm
+   stays for the real-ntdll / pi>=1 fallback.
+4. **PROVE**: flag-ON boot log shows smss's syscalls arriving as `NT_NATIVE_SYSCALL_LABEL` messages
+   (NOT `[unknown syscall]` faults), serviced + replied, smss ≥ its trap-transport depth
+   (deep into SmpInit).
