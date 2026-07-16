@@ -2831,6 +2831,21 @@ static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
 /// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
+/// Count of faked non-interactive-service (services/lsass) user32-init class/cursor calls
+/// (NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4). A NON-interactive
+/// service's user32 DllMain still runs RegisterSystemClasses, but win32k's shared system cursors
+/// (gasyscur) are NEVER loaded for it (only winlogon's INTERACTIVE SwitchDesktop → co_IntLoadDefaultCursors
+/// loads them) → NtUserFindExistingCursorIcon returns NULL forever → user32's per-class LoadCursor
+/// fallback + RegisterClassExWOW never satisfy their "have a system cursor" precondition → the loop
+/// never advances → the service never finishes process-attach → lsass never reaches LsaInitializeRpcServer
+/// → never SetEvent(lsa_rpc_server_active) → winlogon's WaitForLsass parks forever (the deadlock).
+/// FIX: for services/lsass (badges 6/8 — NOT winlogon, whose real GUI path is untouched) SATISFY the
+/// loop's precondition without dragging in the interactive-winsta cursor fork: return a non-NULL
+/// HCURSOR from 0x103d and a fresh class atom from 0x10b4, so user32's RegisterSystemClasses completes
+/// and the service advances to its real (LSA/SCM) init. Mirrors the winlogon 0x125c keyboard-layout fake.
+pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the services/lsass 0x10b4 fake.
+pub(crate) static SVC_FAKE_CLASS_ATOM: AtomicU64 = AtomicU64::new(0xC100);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).

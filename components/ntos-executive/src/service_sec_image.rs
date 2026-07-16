@@ -2462,10 +2462,38 @@ pub(crate) unsafe fn service_sec_image(
                 // `if (LoadKeyboardLayoutW(...))`), so return the US layout HKL MAKELONG(0x0409,0x0409)
                 // WITHOUT dispatching — win32k's post-paint window state stays clean (the counted paint
                 // already fired at SSN 0x1288 above).
+                // ★ NON-INTERACTIVE SERVICE user32-init cursor/class fake (services=6 / lsass=8).
+                // A service's user32 DllMain runs RegisterSystemClasses, but win32k's shared system
+                // cursors (gasyscur) are ONLY loaded by winlogon's INTERACTIVE SwitchDesktop ->
+                // co_IntLoadDefaultCursors -> NtUserSetSystemCursor. A service on a non-interactive
+                // (WSS_NOIO) winstation never triggers that, so NtUserFindExistingCursorIcon (0x103d)
+                // returns NULL forever and NtUserRegisterClassExWOW (0x10b4) can't satisfy its cursor
+                // precondition -> the per-class registration loop never advances -> the service never
+                // finishes process-attach -> lsass never reaches LsaInitializeRpcServer ->
+                // never SetEvent(lsa_rpc_server_active) -> winlogon's WaitForLsass deadlocks. Since a
+                // service is non-interactive and never creates a real window, SATISFY the loop's
+                // preconditions here (do NOT route to win32k, which drags in the interactive-winsta
+                // cursor fork winlogon owns): 0x103d -> a non-NULL synthetic HCURSOR so user32's
+                // LoadCursor short-circuits; 0x10b4 -> a fresh RTL_ATOM (0xC1xx) so the class registers.
+                // Gated to services/lsass ONLY — winlogon's real GUI path is untouched.
+                // Gate to LSASS ONLY (badge 8), NOT services: faking services' cursor/class calls too
+                // perturbs the multiplex timing that lets winlogon's StartLsass run + spawn lsass (an
+                // over-broad fake regressed lsass spawn). lsass is the process whose completed user32
+                // init is on the critical path to LSA_RPC_SERVER_ACTIVE → winlogon's WaitForLsass wake.
+                let svc_noninteractive = badge == LSASS_BADGE;
                 let (st, ok) = if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
                     (0x0409_0409i32, true)
+                } else if m0 == 0x103d && svc_noninteractive {
+                    // NtUserFindExistingCursorIcon -> a non-NULL cached HCURSOR (user handle-ish value).
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    (0x0001_0005i32, true)
+                } else if m0 == 0x10b4 && svc_noninteractive {
+                    // NtUserRegisterClassExWOW -> a fresh class atom so RegisterSystemClasses advances.
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
+                    ((atom & 0xFFFF) as i32, true)
                 } else {
                     win32k_dispatch(m0, d_a0, d_a1, a2, a3)
                 };
