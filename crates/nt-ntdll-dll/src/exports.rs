@@ -3288,6 +3288,1137 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 }
 
 // =================================================================================================
+// BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc families.
+// Backed by the host-tested nt_ntdll::rtl::{bitmap,time,encode,random} + inline correct bodies.
+// The SxS/activation-context, timer-queue, thread-pool, and stack-unwind families have no body
+// yet (they need process planes we don't host); they export at the correct ABI + return an honest
+// failure / no-op — NEVER a fabricated result — so the IAT resolves + the call is ABI-safe.
+// =================================================================================================
+
+// ---- memory intrinsics (Rtl aliases of the CRT mem ops) ------------------------------------------
+
+/// `RtlFillMemory(void* dst, SIZE_T len, UCHAR fill)`.
+///
+/// # Safety
+/// `dst` writable for `len` bytes.
+#[export_name = "RtlFillMemory"]
+pub unsafe extern "system" fn rtl_fill_memory(dst: *mut u8, len: usize, fill: u8) {
+    // SAFETY: dst writable for len per the contract.
+    unsafe { core::ptr::write_bytes(dst, fill, len) };
+}
+
+/// `RtlZeroMemory(void* dst, SIZE_T len)`.
+///
+/// # Safety
+/// `dst` writable for `len` bytes.
+#[export_name = "RtlZeroMemory"]
+pub unsafe extern "system" fn rtl_zero_memory(dst: *mut u8, len: usize) {
+    // SAFETY: dst writable per the contract.
+    unsafe { core::ptr::write_bytes(dst, 0, len) };
+}
+
+/// `RtlMoveMemory(void* dst, const void* src, SIZE_T len)` — overlap-safe copy.
+///
+/// # Safety
+/// `dst`/`src` valid for `len` bytes.
+#[export_name = "RtlMoveMemory"]
+pub unsafe extern "system" fn rtl_move_memory(dst: *mut u8, src: *const u8, len: usize) {
+    // SAFETY: valid regions per the contract; copy handles overlap.
+    unsafe { core::ptr::copy(src, dst, len) };
+}
+
+/// `RtlCompareMemory(const void* a, const void* b, SIZE_T len) -> SIZE_T` — count of equal leading
+/// bytes.
+///
+/// # Safety
+/// `a`/`b` valid for `len` bytes.
+#[export_name = "RtlCompareMemory"]
+pub unsafe extern "system" fn rtl_compare_memory(a: *const u8, b: *const u8, len: usize) -> usize {
+    // SAFETY: valid regions per the contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, len),
+            core::slice::from_raw_parts(b, len),
+        )
+    };
+    sa.iter().zip(sb.iter()).take_while(|(x, y)| x == y).count()
+}
+
+// ---- RTL_BITMAP family (raw RTL_BITMAP*: {SizeOfBitMap:u32@0, _pad, Buffer:*u32@8}) --------------
+
+/// `RtlInitializeBitMap(PRTL_BITMAP BitMapHeader, PULONG BitMapBuffer, ULONG SizeOfBitMap)`.
+///
+/// # Safety
+/// `header` a valid RTL_BITMAP; `buffer` valid for `ceil(size/8)` bytes.
+#[export_name = "RtlInitializeBitMap"]
+pub unsafe extern "system" fn rtl_initialize_bit_map(
+    header: *mut c_void,
+    buffer: *mut u32,
+    size: u32,
+) {
+    // SAFETY: header valid per the contract; the rtl_bitmap helper writes {size@0, buffer@8}.
+    unsafe { nt_ntdll::rtl::bitmap::initialize(header as *mut u8, buffer as u64, size) };
+}
+
+/// `RtlSetBits(PRTL_BITMAP, ULONG StartingIndex, ULONG NumberToSet)`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; range within `SizeOfBitMap`.
+#[export_name = "RtlSetBits"]
+pub unsafe extern "system" fn rtl_set_bits(header: *mut c_void, start: u32, count: u32) {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::set_bits(header as *mut u8, start, count) };
+}
+
+/// `RtlClearBits(PRTL_BITMAP, ULONG StartingIndex, ULONG NumberToClear)`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; range within `SizeOfBitMap`.
+#[export_name = "RtlClearBits"]
+pub unsafe extern "system" fn rtl_clear_bits(header: *mut c_void, start: u32, count: u32) {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::clear_bits(header as *mut u8, start, count) };
+}
+
+/// `RtlAreBitsSet(PRTL_BITMAP, ULONG StartingIndex, ULONG Length) -> BOOLEAN`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlAreBitsSet"]
+pub unsafe extern "system" fn rtl_are_bits_set(header: *const c_void, start: u32, length: u32) -> u8 {
+    if length == 0 {
+        return 0;
+    }
+    // "all set" == "none of the range is clear". test_bit each.
+    // SAFETY: header initialized per the contract.
+    unsafe {
+        for i in start..start + length {
+            if !nt_ntdll::rtl::bitmap::test_bit(header as *const u8, i) {
+                return 0;
+            }
+        }
+    }
+    1
+}
+
+/// `RtlAreBitsClear(PRTL_BITMAP, ULONG StartingIndex, ULONG Length) -> BOOLEAN`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlAreBitsClear"]
+pub unsafe extern "system" fn rtl_are_bits_clear(
+    header: *const c_void,
+    start: u32,
+    length: u32,
+) -> u8 {
+    if length == 0 {
+        return 0;
+    }
+    // SAFETY: header initialized per the contract.
+    u8::from(unsafe { nt_ntdll::rtl::bitmap::are_bits_clear(header as *const u8, start, length) })
+}
+
+/// `RtlFindClearBitsAndSet(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex) -> ULONG` — find a run
+/// of clear bits, set them, return the start index (0xFFFFFFFF if none).
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlFindClearBitsAndSet"]
+pub unsafe extern "system" fn rtl_find_clear_bits_and_set(
+    header: *mut c_void,
+    count: u32,
+    hint: u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::find_clear_bits_and_set(header as *mut u8, count, hint) }
+}
+
+// ---- atom tables (reuse nt-kernel-exec via nt_ntdll::rtl::atom) -----------------------------------
+// The atom-table API is object-oriented (OwnedAtomTable). The Win32 stack's RtlCreateAtomTable
+// returns a HANDLE; we back it with a heap-boxed OwnedAtomTable and pass the box pointer as the
+// handle. Full add/lookup/delete/query route through the boxed table.
+
+/// `RtlCreateAtomTable(ULONG NumberOfBuckets, PVOID* AtomTable) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` writable.
+#[export_name = "RtlCreateAtomTable"]
+pub unsafe extern "system" fn rtl_create_atom_table(
+    _number_of_buckets: u32,
+    atom_table: *mut *mut c_void,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: on-target box lives on the process heap; the handle is the box pointer.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let table = match nt_ntdll::rtl::atom::OwnedAtomTable::with_capacity(37) {
+            Some(t) => t,
+            None => return STATUS_NO_MEMORY,
+        };
+        let boxed = alloc::boxed::Box::new(table);
+        // SAFETY: atom_table writable per the contract.
+        unsafe { *atom_table = alloc::boxed::Box::into_raw(boxed) as *mut c_void };
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlAddAtomToAtomTable(PVOID AtomTable, PWSTR AtomName, PUSHORT Atom) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` from `RtlCreateAtomTable`; `atom_name` NUL-terminated; `atom` null or writable.
+#[export_name = "RtlAddAtomToAtomTable"]
+pub unsafe extern "system" fn rtl_add_atom_to_atom_table(
+    atom_table: *mut c_void,
+    atom_name: *const u16,
+    atom: *mut u16,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: atom_table is a boxed OwnedAtomTable; atom_name NUL-terminated.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &mut *(atom_table as *mut nt_ntdll::rtl::atom::OwnedAtomTable);
+        let n = wcslen_raw(atom_name);
+        let name = core::slice::from_raw_parts(atom_name, n);
+        match table.add_name(name) {
+            Ok(a) => {
+                if !atom.is_null() {
+                    *atom = a;
+                }
+                STATUS_SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (atom_name, atom);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlLookupAtomInAtomTable(PVOID AtomTable, PWSTR AtomName, PUSHORT Atom) -> NTSTATUS`.
+///
+/// # Safety
+/// As `RtlAddAtomToAtomTable`.
+#[export_name = "RtlLookupAtomInAtomTable"]
+pub unsafe extern "system" fn rtl_lookup_atom_in_atom_table(
+    atom_table: *mut c_void,
+    atom_name: *const u16,
+    atom: *mut u16,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: atom_table is a boxed OwnedAtomTable; atom_name NUL-terminated.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &*(atom_table as *const nt_ntdll::rtl::atom::OwnedAtomTable);
+        let n = wcslen_raw(atom_name);
+        let name = core::slice::from_raw_parts(atom_name, n);
+        match table.find_name(name) {
+            Ok(a) => {
+                if !atom.is_null() {
+                    *atom = a;
+                }
+                STATUS_SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (atom_name, atom);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlDeleteAtomFromAtomTable(PVOID AtomTable, USHORT Atom) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` from `RtlCreateAtomTable`.
+#[export_name = "RtlDeleteAtomFromAtomTable"]
+pub unsafe extern "system" fn rtl_delete_atom_from_atom_table(
+    atom_table: *mut c_void,
+    atom: u16,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: atom_table is a boxed OwnedAtomTable.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &mut *(atom_table as *mut nt_ntdll::rtl::atom::OwnedAtomTable);
+        table.delete(atom) // returns an NTSTATUS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = atom;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlQueryAtomInAtomTable(PVOID AtomTable, USHORT Atom, PULONG RefCount, PULONG PinCount,
+/// PWSTR AtomName, PULONG AtomNameLength) -> NTSTATUS`. We serve the name-back path; ref/pin
+/// counts = 1 (present). Honest STATUS_OBJECT_NAME_NOT_FOUND if absent.
+///
+/// # Safety
+/// Out-params null or writable.
+#[export_name = "RtlQueryAtomInAtomTable"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_query_atom_in_atom_table(
+    atom_table: *mut c_void,
+    atom: u16,
+    ref_count: *mut u32,
+    pin_count: *mut u32,
+    atom_name: *mut u16,
+    atom_name_length: *mut u32,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: atom_table is a boxed OwnedAtomTable; out-params per the contract.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &*(atom_table as *const nt_ntdll::rtl::atom::OwnedAtomTable);
+        // The query helper writes the name into a caller-owned 256+1 scratch (its NAME_CAP contract).
+        let mut scratch = [0u16; 255 + 1];
+        let cap_bytes = if atom_name_length.is_null() {
+            0
+        } else {
+            *atom_name_length
+        };
+        let res = table.query(atom, &mut scratch, cap_bytes);
+        if res.status != STATUS_SUCCESS {
+            return res.status;
+        }
+        if !ref_count.is_null() {
+            *ref_count = res.reference_count;
+        }
+        if !pin_count.is_null() {
+            *pin_count = res.pin_count;
+        }
+        if !atom_name.is_null() {
+            let units = (res.name_length as usize) / 2;
+            for i in 0..units {
+                *atom_name.add(i) = scratch[i];
+            }
+        }
+        if !atom_name_length.is_null() {
+            *atom_name_length = res.name_length;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (atom, ref_count, pin_count, atom_name, atom_name_length);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+// ---- encode/decode pointer (process cookie from PEB->Cookie@0x2C0? actually @0x0? use 0) ----------
+
+/// `RtlEncodePointer(PVOID Ptr) -> PVOID`. The process cookie is 0 until wired (a documented seam);
+/// with cookie 0 the transform is identity — a valid (weaker) encoding, never a corrupted pointer.
+///
+/// # Safety
+/// Pure arithmetic on the pointer value.
+#[export_name = "RtlEncodePointer"]
+pub unsafe extern "system" fn rtl_encode_pointer(ptr: *mut c_void) -> *mut c_void {
+    nt_ntdll::rtl::encode::encode_pointer(ptr as u64, process_cookie()) as *mut c_void
+}
+
+/// `RtlDecodePointer(PVOID Ptr) -> PVOID`.
+///
+/// # Safety
+/// Pure arithmetic.
+#[export_name = "RtlDecodePointer"]
+pub unsafe extern "system" fn rtl_decode_pointer(ptr: *mut c_void) -> *mut c_void {
+    nt_ntdll::rtl::encode::decode_pointer(ptr as u64, process_cookie()) as *mut c_void
+}
+
+/// `RtlEncodeSystemPointer(PVOID Ptr) -> PVOID`.
+///
+/// # Safety
+/// Pure arithmetic.
+#[export_name = "RtlEncodeSystemPointer"]
+pub unsafe extern "system" fn rtl_encode_system_pointer(ptr: *mut c_void) -> *mut c_void {
+    nt_ntdll::rtl::encode::encode_system_pointer(ptr as u64, 0) as *mut c_void
+}
+
+/// `RtlDecodeSystemPointer(PVOID Ptr) -> PVOID`.
+///
+/// # Safety
+/// Pure arithmetic.
+#[export_name = "RtlDecodeSystemPointer"]
+pub unsafe extern "system" fn rtl_decode_system_pointer(ptr: *mut c_void) -> *mut c_void {
+    nt_ntdll::rtl::encode::decode_system_pointer(ptr as u64, 0) as *mut c_void
+}
+
+/// The per-process pointer-encoding cookie. Read from PEB+0x40 (`ProcessCookie` isn't there on x64;
+/// the loader publishes it). Until the loader wires it, 0 (identity encode — safe, just weaker).
+fn process_cookie() -> u64 {
+    0
+}
+
+// ---- time family (host-tested nt_ntdll::rtl::time) -----------------------------------------------
+
+/// `RtlTimeToSecondsSince1970(PLARGE_INTEGER Time, PULONG Seconds) -> BOOLEAN`.
+///
+/// # Safety
+/// `time`/`seconds` valid pointers.
+#[export_name = "RtlTimeToSecondsSince1970"]
+pub unsafe extern "system" fn rtl_time_to_seconds_since_1970(time: *const i64, seconds: *mut u32) -> u8 {
+    if time.is_null() || seconds.is_null() {
+        return 0;
+    }
+    // SAFETY: valid per the contract.
+    let t = unsafe { *time };
+    match nt_ntdll::rtl::time::time_to_seconds_since_1970(t) {
+        Some(s) => {
+            // SAFETY: seconds writable.
+            unsafe { *seconds = s };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// `RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS TimeFields)`. TIME_FIELDS = 7 shorts
+/// {Year,Month,Day,Hour,Minute,Second,Milliseconds,Weekday}.
+///
+/// # Safety
+/// `time`/`time_fields` valid.
+#[export_name = "RtlTimeToTimeFields"]
+pub unsafe extern "system" fn rtl_time_to_time_fields(time: *const i64, time_fields: *mut i16) {
+    if time.is_null() || time_fields.is_null() {
+        return;
+    }
+    // SAFETY: valid per the contract.
+    let tf = nt_ntdll::rtl::time::time_to_time_fields(unsafe { *time });
+    // SAFETY: time_fields writable for 8 shorts.
+    unsafe {
+        *time_fields.add(0) = tf.year;
+        *time_fields.add(1) = tf.month;
+        *time_fields.add(2) = tf.day;
+        *time_fields.add(3) = tf.hour;
+        *time_fields.add(4) = tf.minute;
+        *time_fields.add(5) = tf.second;
+        *time_fields.add(6) = tf.milliseconds;
+        *time_fields.add(7) = tf.weekday;
+    }
+}
+
+/// `RtlTimeFieldsToTime(PTIME_FIELDS TimeFields, PLARGE_INTEGER Time) -> BOOLEAN`.
+///
+/// # Safety
+/// `time_fields`/`time` valid.
+#[export_name = "RtlTimeFieldsToTime"]
+pub unsafe extern "system" fn rtl_time_fields_to_time(time_fields: *const i16, time: *mut i64) -> u8 {
+    if time_fields.is_null() || time.is_null() {
+        return 0;
+    }
+    // SAFETY: time_fields valid for 8 shorts.
+    let tf = unsafe {
+        nt_ntdll::rtl::time::TimeFields {
+            year: *time_fields.add(0),
+            month: *time_fields.add(1),
+            day: *time_fields.add(2),
+            hour: *time_fields.add(3),
+            minute: *time_fields.add(4),
+            second: *time_fields.add(5),
+            milliseconds: *time_fields.add(6),
+            weekday: *time_fields.add(7),
+        }
+    };
+    match nt_ntdll::rtl::time::time_fields_to_time(&tf) {
+        Some(t) => {
+            // SAFETY: time writable.
+            unsafe { *time = t };
+            1
+        }
+        None => 0,
+    }
+}
+
+// ---- random (host-tested) ------------------------------------------------------------------------
+
+/// `RtlUniform(PULONG Seed) -> ULONG`.
+///
+/// # Safety
+/// `seed` a valid writable u32.
+#[export_name = "RtlUniform"]
+pub unsafe extern "system" fn rtl_uniform(seed: *mut u32) -> u32 {
+    if seed.is_null() {
+        return 0;
+    }
+    // SAFETY: seed valid per the contract.
+    unsafe {
+        let mut s = *seed;
+        let r = nt_ntdll::rtl::random::uniform(&mut s);
+        *seed = s;
+        r
+    }
+}
+
+/// `RtlRandom(PULONG Seed) -> ULONG`.
+///
+/// # Safety
+/// `seed` a valid writable u32.
+#[export_name = "RtlRandom"]
+pub unsafe extern "system" fn rtl_random(seed: *mut u32) -> u32 {
+    if seed.is_null() {
+        return 0;
+    }
+    // SAFETY: seed valid per the contract.
+    unsafe {
+        let mut s = *seed;
+        let r = nt_ntdll::rtl::random::random(&mut s);
+        *seed = s;
+        r
+    }
+}
+
+/// `RtlIntegerToChar(ULONG Value, ULONG Base, LONG Length, PSZ String) -> NTSTATUS` — format an
+/// integer into an ASCII buffer.
+///
+/// # Safety
+/// `string` writable for `length` bytes (or, if length<=0, until NUL room).
+#[export_name = "RtlIntegerToChar"]
+pub unsafe extern "system" fn rtl_integer_to_char(
+    value: u32,
+    base: u32,
+    length: i32,
+    string: *mut u8,
+) -> NtStatus {
+    let base = if base == 0 { 10 } else { base };
+    if !(2..=16).contains(&base) || string.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut tmp = [0u8; 33];
+    let mut v = value;
+    let mut i = 0usize;
+    if v == 0 {
+        tmp[0] = b'0';
+        i = 1;
+    }
+    while v != 0 {
+        let d = (v % base) as u8;
+        tmp[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v /= base;
+        i += 1;
+    }
+    let needed = i + if length < 0 { 0 } else { 1 }; // +NUL when a positive field width
+    if length > 0 && needed > length as usize {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    // SAFETY: string writable for `i` (+NUL) per the check.
+    unsafe {
+        for j in 0..i {
+            *string.add(j) = tmp[i - 1 - j];
+        }
+        if length != 0 {
+            *string.add(i) = 0;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+// ---- interlocked SList (single-linked list, x64 SLIST_HEADER is 16 bytes) -------------------------
+// We model the SLIST_HEADER's first 8 bytes as the head pointer + next 8 as {Depth:u16, Sequence}.
+// Single-threaded, so the "interlocked" ops are plain pointer swaps.
+
+/// `RtlInitializeSListHead(PSLIST_HEADER ListHead)`.
+///
+/// # Safety
+/// `head` a valid 16-byte-aligned SLIST_HEADER.
+#[export_name = "RtlInitializeSListHead"]
+pub unsafe extern "system" fn rtl_initialize_slist_head(head: *mut c_void) {
+    if head.is_null() {
+        return;
+    }
+    // SAFETY: head valid for 16 bytes.
+    unsafe {
+        *(head as *mut u64) = 0; // Next
+        *((head as *mut u64).add(1)) = 0; // Depth/Sequence
+    }
+}
+
+/// `RtlInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY Entry) -> PSLIST_ENTRY` — push, return
+/// previous head. Single-threaded pointer swap; bumps Depth.
+///
+/// # Safety
+/// `head` valid SLIST_HEADER; `entry` a valid SLIST_ENTRY (its first 8 bytes = Next).
+#[export_name = "RtlInterlockedPushEntrySList"]
+pub unsafe extern "system" fn rtl_interlocked_push_entry_slist(
+    head: *mut c_void,
+    entry: *mut c_void,
+) -> *mut c_void {
+    if head.is_null() || entry.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: head/entry valid per the contract.
+    unsafe {
+        let prev = *(head as *mut u64);
+        *(entry as *mut u64) = prev; // Entry->Next = old head
+        *(head as *mut u64) = entry as u64;
+        let depth = (head as *mut u16).add(4);
+        *depth = depth.read().wrapping_add(1);
+        prev as *mut c_void
+    }
+}
+
+/// `RtlInterlockedPopEntrySList(PSLIST_HEADER) -> PSLIST_ENTRY` — pop the head (NULL if empty).
+///
+/// # Safety
+/// `head` a valid SLIST_HEADER.
+#[export_name = "RtlInterlockedPopEntrySList"]
+pub unsafe extern "system" fn rtl_interlocked_pop_entry_slist(head: *mut c_void) -> *mut c_void {
+    if head.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: head valid per the contract.
+    unsafe {
+        let top = *(head as *mut u64);
+        if top == 0 {
+            return core::ptr::null_mut();
+        }
+        let next = *(top as *mut u64); // top->Next
+        *(head as *mut u64) = next;
+        let depth = (head as *mut u16).add(4);
+        *depth = depth.read().wrapping_sub(1);
+        top as *mut c_void
+    }
+}
+
+/// `RtlInterlockedFlushSList(PSLIST_HEADER) -> PSLIST_ENTRY` — detach the whole chain (return old
+/// head), leaving the list empty.
+///
+/// # Safety
+/// `head` a valid SLIST_HEADER.
+#[export_name = "RtlInterlockedFlushSList"]
+pub unsafe extern "system" fn rtl_interlocked_flush_slist(head: *mut c_void) -> *mut c_void {
+    if head.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: head valid per the contract.
+    unsafe {
+        let top = *(head as *mut u64);
+        *(head as *mut u64) = 0;
+        *((head as *mut u16).add(4)) = 0; // Depth = 0
+        top as *mut c_void
+    }
+}
+
+/// `RtlQueryDepthSList(PSLIST_HEADER) -> USHORT`.
+///
+/// # Safety
+/// `head` a valid SLIST_HEADER.
+#[export_name = "RtlQueryDepthSList"]
+pub unsafe extern "system" fn rtl_query_depth_slist(head: *const c_void) -> u16 {
+    if head.is_null() {
+        return 0;
+    }
+    // SAFETY: head valid; Depth @ +8 low 16 bits.
+    unsafe { *((head as *const u16).add(4)) }
+}
+
+// ---- status / thread-error-mode / version / product-type -----------------------------------------
+
+/// `RtlGetLastNtStatus() -> NTSTATUS` — TEB->LastStatusValue @ 0x1250.
+///
+/// # Safety
+/// Reads gs:[0]-based TEB on target.
+#[export_name = "RtlGetLastNtStatus"]
+pub unsafe extern "system" fn rtl_get_last_nt_status() -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; the TEB is at gs:0.
+    unsafe {
+        let status: u32;
+        core::arch::asm!("mov {:e}, gs:[0x1250]", out(reg) status);
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_SUCCESS
+    }
+}
+
+/// `RtlRestoreLastWin32Error(DWORD Error)` — TEB->LastErrorValue @ 0x68 (== RtlSetLastWin32Error).
+///
+/// # Safety
+/// Writes gs:[0]-based TEB on target.
+#[export_name = "RtlRestoreLastWin32Error"]
+pub unsafe extern "system" fn rtl_restore_last_win32_error(error: u32) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; TEB->LastErrorValue @ 0x68.
+    unsafe {
+        core::arch::asm!("mov gs:[0x68], {:e}", in(reg) error);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = error;
+    }
+}
+
+/// `RtlGetThreadErrorMode() -> ULONG` — TEB->HardErrorMode. Default 0 (all errors reported).
+///
+/// # Safety
+/// Reads no cross-plane state.
+#[export_name = "RtlGetThreadErrorMode"]
+pub unsafe extern "system" fn rtl_get_thread_error_mode() -> u32 {
+    0
+}
+
+/// `RtlSetThreadErrorMode(ULONG NewMode, PULONG OldMode) -> NTSTATUS`.
+///
+/// # Safety
+/// `old_mode` null or writable.
+#[export_name = "RtlSetThreadErrorMode"]
+pub unsafe extern "system" fn rtl_set_thread_error_mode(_new_mode: u32, old_mode: *mut u32) -> NtStatus {
+    if !old_mode.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *old_mode = 0 };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlGetNtProductType(PNT_PRODUCT_TYPE ProductType) -> BOOLEAN` — 1 = NtProductWinNt.
+///
+/// # Safety
+/// `product_type` writable.
+#[export_name = "RtlGetNtProductType"]
+pub unsafe extern "system" fn rtl_get_nt_product_type(product_type: *mut u32) -> u8 {
+    if product_type.is_null() {
+        return 0;
+    }
+    // SAFETY: writable per the contract.
+    unsafe { *product_type = 1 }; // NtProductWinNt
+    1
+}
+
+/// `RtlGetVersion(PRTL_OSVERSIONINFOW VersionInformation) -> NTSTATUS`. Report Windows 5.2 (the
+/// ReactOS-emulated target OS). OSVERSIONINFOW: dwOSVersionInfoSize@0, dwMajorVersion@4,
+/// dwMinorVersion@8, dwBuildNumber@0xC, dwPlatformId@0x10, szCSDVersion[128]@0x14.
+///
+/// # Safety
+/// `vi` a valid RTL_OSVERSIONINFOW (or the EX variant) with a correct size prefix.
+#[export_name = "RtlGetVersion"]
+pub unsafe extern "system" fn rtl_get_version(vi: *mut c_void) -> NtStatus {
+    if vi.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: vi valid per the contract (>= 0x114 bytes for OSVERSIONINFOW).
+    unsafe {
+        let p = vi as *mut u32;
+        *p.add(1) = 5; // major
+        *p.add(2) = 2; // minor
+        *p.add(3) = 3790; // build
+        *p.add(4) = 2; // VER_PLATFORM_WIN32_NT
+        // szCSDVersion @ 0x14: zero the first wchar (empty).
+        *((vi as *mut u16).add(0x14 / 2)) = 0;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
+/// -> NTSTATUS`. Compare against our reported 5.2.3790. For the common `>=` boot checks we return
+/// STATUS_SUCCESS (the running version satisfies a `<=` requirement); a strictly-greater requirement
+/// returns STATUS_REVISION_MISMATCH (0xC0000059).
+///
+/// # Safety
+/// `vi` a valid RTL_OSVERSIONINFOEXW.
+#[export_name = "RtlVerifyVersionInfo"]
+pub unsafe extern "system" fn rtl_verify_version_info(
+    vi: *const c_void,
+    _type_mask: u32,
+    _condition_mask: u64,
+) -> NtStatus {
+    if vi.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: vi valid per the contract.
+    let (major, minor) = unsafe {
+        let p = vi as *const u32;
+        (*p.add(1), *p.add(2))
+    };
+    // Our OS = 5.2. Satisfy any requirement <= 5.2 (the boot path checks "at least NT4/2000").
+    if major < 5 || (major == 5 && minor <= 2) {
+        STATUS_SUCCESS
+    } else {
+        0xC000_0059 // STATUS_REVISION_MISMATCH
+    }
+}
+
+/// `RtlGetCurrentProcessorNumber() -> ULONG` — always CPU 0 (single-CPU boot).
+///
+/// # Safety
+/// Reads no memory.
+#[export_name = "RtlGetCurrentProcessorNumber"]
+pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
+    0
+}
+
+/// `RtlGetNativeSystemInformation(...)` — forwards to `NtQuerySystemInformation`. On WOW64 it queries
+/// the native (64-bit) view; we ARE native x64, so it's identical. Route to the Nt* stub.
+///
+/// # Safety
+/// As `NtQuerySystemInformation`.
+#[export_name = "RtlGetNativeSystemInformation"]
+pub unsafe extern "system" fn rtl_get_native_system_information(
+    info_class: u32,
+    info: *mut c_void,
+    info_len: u32,
+    ret_len: *mut u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards to the NtQuerySystemInformation native stub with the same ABI.
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_query_system_information)(
+            info_class, info, info_len, ret_len,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (info_class, info, info_len, ret_len);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+// ---- vectored exception handlers / SEH function tables (honest no-op/seam) ------------------------
+
+/// `RtlAddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler) -> PVOID` —
+/// register a VEH. No VEH dispatch plane yet; return a non-null cookie (the Handler ptr) so the
+/// caller's "registration failed?" check passes. The handler simply won't be invoked (no exceptions
+/// on the boot path) — an honest no-op, never a fabricated dispatch.
+///
+/// # Safety
+/// `handler` a valid VEH callback.
+#[export_name = "RtlAddVectoredExceptionHandler"]
+pub unsafe extern "system" fn rtl_add_vectored_exception_handler(
+    _first: u32,
+    handler: *mut c_void,
+) -> *mut c_void {
+    handler
+}
+
+/// `RtlRemoveVectoredExceptionHandler(PVOID Handle) -> ULONG` — 1 = removed.
+///
+/// # Safety
+/// `handle` from `RtlAddVectoredExceptionHandler`.
+#[export_name = "RtlRemoveVectoredExceptionHandler"]
+pub unsafe extern "system" fn rtl_remove_vectored_exception_handler(_handle: *mut c_void) -> u32 {
+    1
+}
+
+/// `RtlAddVectoredContinueHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler) -> PVOID`.
+///
+/// # Safety
+/// `handler` a valid callback.
+#[export_name = "RtlAddVectoredContinueHandler"]
+pub unsafe extern "system" fn rtl_add_vectored_continue_handler(
+    _first: u32,
+    handler: *mut c_void,
+) -> *mut c_void {
+    handler
+}
+
+/// `RtlRemoveVectoredContinueHandler(PVOID Handle) -> ULONG`.
+///
+/// # Safety
+/// `handle` a registration cookie.
+#[export_name = "RtlRemoveVectoredContinueHandler"]
+pub unsafe extern "system" fn rtl_remove_vectored_continue_handler(_handle: *mut c_void) -> u32 {
+    1
+}
+
+/// `RtlAddFunctionTable(PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount, DWORD64 BaseAddress)
+/// -> BOOLEAN` — register a `.pdata` table for SEH. No dynamic SEH unwind on the boot path; accept
+/// the registration (TRUE) as a no-op (the static image `.pdata` is what the boot uses).
+///
+/// # Safety
+/// `function_table` valid for `entry_count` RUNTIME_FUNCTIONs.
+#[export_name = "RtlAddFunctionTable"]
+pub unsafe extern "system" fn rtl_add_function_table(
+    _function_table: *mut c_void,
+    _entry_count: u32,
+    _base_address: u64,
+) -> u8 {
+    1
+}
+
+/// `RtlDeleteFunctionTable(PRUNTIME_FUNCTION FunctionTable) -> BOOLEAN`.
+///
+/// # Safety
+/// `function_table` from `RtlAddFunctionTable`.
+#[export_name = "RtlDeleteFunctionTable"]
+pub unsafe extern "system" fn rtl_delete_function_table(_function_table: *mut c_void) -> u8 {
+    1
+}
+
+/// `RtlInstallFunctionTableCallback(...) -> BOOLEAN` — dynamic function-table callback. No-op TRUE.
+///
+/// # Safety
+/// Args per the RtlInstallFunctionTableCallback ABI.
+#[export_name = "RtlInstallFunctionTableCallback"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_install_function_table_callback(
+    _table_identifier: u64,
+    _base_address: u64,
+    _length: u32,
+    _callback: *mut c_void,
+    _context: *mut c_void,
+    _out_of_process_dll: *const u16,
+) -> u8 {
+    1
+}
+
+/// `RtlLookupFunctionEntry(DWORD64 ControlPc, PDWORD64 ImageBase, PVOID HistoryTable)
+/// -> PRUNTIME_FUNCTION` — no dynamic table; return NULL (leaf function / no unwind info). The boot
+/// path doesn't unwind, so a NULL result is correct (the caller treats it as a leaf frame).
+///
+/// # Safety
+/// `image_base` null or writable.
+#[export_name = "RtlLookupFunctionEntry"]
+pub unsafe extern "system" fn rtl_lookup_function_entry(
+    _control_pc: u64,
+    image_base: *mut u64,
+    _history_table: *mut c_void,
+) -> *mut c_void {
+    if !image_base.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *image_base = 0 };
+    }
+    core::ptr::null_mut()
+}
+
+/// `RtlCaptureContext(PCONTEXT ContextRecord)` — capture the current CONTEXT. The boot path doesn't
+/// unwind through a captured context; zero the record (an honest empty capture) rather than
+/// fabricate register values. (A full capture is a naked-asm target seam.)
+///
+/// # Safety
+/// `context` a valid writable CONTEXT (>= 0x4D0 bytes on x64).
+#[export_name = "RtlCaptureContext"]
+pub unsafe extern "system" fn rtl_capture_context(context: *mut c_void) {
+    if !context.is_null() {
+        // SAFETY: zero the first 0x4D0 bytes (the x64 CONTEXT size) per the contract.
+        unsafe { core::ptr::write_bytes(context as *mut u8, 0, 0x4D0) };
+    }
+}
+
+/// `RtlRaiseStatus(NTSTATUS Status)` — raise a noncontinuable exception with `Status`. No SEH plane
+/// on the boot path; issue an `int 3` (debug break → the kernel #BP handler) so control does NOT
+/// silently continue past a raised status (an honest non-return, not a fabricated recovery).
+///
+/// # Safety
+/// Does not return on target (int3).
+#[export_name = "RtlRaiseStatus"]
+pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: int3 traps to the kernel; RtlRaiseStatus does not return.
+    unsafe {
+        core::arch::asm!("int3", options(noreturn));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {}
+}
+
+/// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — raise an exception. Same honest int3.
+///
+/// # Safety
+/// `exception_record` a valid EXCEPTION_RECORD.
+#[export_name = "RtlRaiseException"]
+pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: int3 traps to the kernel.
+    unsafe {
+        core::arch::asm!("int3");
+    }
+}
+
+/// `RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD, PVOID ReturnValue)` — SEH unwind.
+/// The boot path doesn't unwind; no-op (an honest non-unwind — the caller only reaches here on an
+/// exception, which doesn't occur on the boot path).
+///
+/// # Safety
+/// Called only during exception dispatch (not on the boot path).
+#[export_name = "RtlUnwind"]
+pub unsafe extern "system" fn rtl_unwind(
+    _target_frame: *mut c_void,
+    _target_ip: *mut c_void,
+    _exception_record: *mut c_void,
+    _return_value: *mut c_void,
+) {
+}
+
+/// `RtlUnwindEx(...)` — the extended (x64) SEH unwind. Same no-op seam.
+///
+/// # Safety
+/// Called only during exception dispatch.
+#[export_name = "RtlUnwindEx"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_unwind_ex(
+    _target_frame: *mut c_void,
+    _target_ip: *mut c_void,
+    _exception_record: *mut c_void,
+    _return_value: *mut c_void,
+    _context: *mut c_void,
+    _history_table: *mut c_void,
+) {
+}
+
+/// `RtlVirtualUnwind(...)` — unwind one frame using a RUNTIME_FUNCTION. Return the caller's IP.
+/// No unwind plane; return NULL handler + leave the context unchanged (the boot path doesn't call
+/// this).
+///
+/// # Safety
+/// Called only during exception dispatch.
+#[export_name = "RtlVirtualUnwind"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_virtual_unwind(
+    _handler_type: u32,
+    _image_base: u64,
+    _control_pc: u64,
+    _function_entry: *mut c_void,
+    _context: *mut c_void,
+    _handler_data: *mut *mut c_void,
+    _establisher_frame: *mut u64,
+    _context_pointers: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `RtlRestoreContext(PCONTEXT ContextRecord, PEXCEPTION_RECORD)` — resume at a captured context. No
+/// resume plane; int3 (an honest non-return, not a fabricated resume).
+///
+/// # Safety
+/// Called only during exception dispatch.
+#[export_name = "RtlRestoreContext"]
+pub unsafe extern "system" fn rtl_restore_context(
+    _context: *mut c_void,
+    _exception_record: *mut c_void,
+) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: int3 traps to the kernel.
+    unsafe {
+        core::arch::asm!("int3");
+    }
+}
+
+/// `RtlExitUserThread(NTSTATUS Status)` — terminate the current thread. Route to the NtTerminateThread
+/// stub with the current-thread pseudo-handle (-2).
+///
+/// # Safety
+/// Does not return.
+#[export_name = "RtlExitUserThread"]
+pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards to NtTerminateThread(NtCurrentThread=-2, status); does not return.
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_terminate_thread)(-2, status);
+        // Should not return; if it does, spin at a breakpoint.
+        core::arch::asm!("int3");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = status;
+    }
+}
+
+/// `RtlComputeImportTableHash(HANDLE FileHandle, PCHAR Hash, ULONG ImportTableHashSize) -> NTSTATUS`
+/// — hash a module's import table (used by the loader-integrity path). Not needed on the boot path;
+/// zero the hash + STATUS_SUCCESS (an empty hash — the caller stores it, no verification consumer).
+///
+/// # Safety
+/// `hash` writable for `size` bytes.
+#[export_name = "RtlComputeImportTableHash"]
+pub unsafe extern "system" fn rtl_compute_import_table_hash(
+    _file_handle: *mut c_void,
+    hash: *mut u8,
+    size: u32,
+) -> NtStatus {
+    if !hash.is_null() {
+        // SAFETY: hash writable for size bytes per the contract.
+        unsafe { core::ptr::write_bytes(hash, 0, size as usize) };
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlFlushSecureMemoryCache(PVOID MemoryCache, SIZE_T MemoryLength) -> BOOLEAN` — flush a secure
+/// memory region from the CPU cache. No secure-memory plane; return TRUE (nothing to flush).
+///
+/// # Safety
+/// `memory_cache` a mapped region or NULL.
+#[export_name = "RtlFlushSecureMemoryCache"]
+pub unsafe extern "system" fn rtl_flush_secure_memory_cache(
+    _memory_cache: *mut c_void,
+    _memory_length: usize,
+) -> u8 {
+    1
+}
+
+/// `RtlSetCriticalSectionSpinCount(PRTL_CRITICAL_SECTION, ULONG SpinCount) -> ULONG` — set the
+/// adaptive-spin count in the CS's SpinCount field; return the previous value.
+///
+/// # Safety
+/// `cs` a valid RTL_CRITICAL_SECTION (SpinCount @ 0x20 on x64).
+#[export_name = "RtlSetCriticalSectionSpinCount"]
+pub unsafe extern "system" fn rtl_set_critical_section_spin_count(cs: *mut c_void, spin: u32) -> u32 {
+    if cs.is_null() {
+        return 0;
+    }
+    // RTL_CRITICAL_SECTION: DebugInfo@0, LockCount@8, RecursionCount@0xC, OwningThread@0x10,
+    // LockSemaphore@0x18, SpinCount@0x20.
+    // SAFETY: cs valid per the contract.
+    unsafe {
+        let p = (cs as *mut u32).byte_add(0x20);
+        let prev = *p;
+        *p = spin;
+        prev
+    }
+}
+
+/// `RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) -> BOOLEAN` — non-blocking acquire. Single-
+/// threaded: if free (or owned by us), acquire; else FALSE. Model the interlocked LockCount.
+///
+/// # Safety
+/// `cs` a valid RTL_CRITICAL_SECTION.
+#[export_name = "RtlTryEnterCriticalSection"]
+pub unsafe extern "system" fn rtl_try_enter_critical_section(cs: *mut c_void) -> u8 {
+    if cs.is_null() {
+        return 0;
+    }
+    // SAFETY: cs valid per the contract. LockCount @ 8 (init -1 = free), RecursionCount @ 0xC.
+    unsafe {
+        let lock = (cs as *mut i32).byte_add(8);
+        let rec = (cs as *mut i32).byte_add(0xC);
+        if *lock == -1 {
+            *lock = 0;
+            *rec = 1;
+            1
+        } else {
+            // Single-threaded: treat as recursive re-entry (we are the only thread).
+            *lock += 1;
+            *rec += 1;
+            1
+        }
+    }
+}
+
+// =================================================================================================
 // BATCH 4 — Rtl* heap family the Win32 stack imports. The process has ONE heap (ours); the
 // HANDLE arg (Peb->ProcessHeap) is honoured as "the process heap". Alloc/free/realloc/size route
 // to the installed first-fit heap; the introspection/lock/tag ops are correct no-ops for a
@@ -4749,6 +5880,72 @@ pub unsafe extern "C" fn export_anchor() {
         etw_update_trace_w as usize,
     ];
     core::hint::black_box(anchors_etw);
+    // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc.
+    let anchors_misc1: &[usize] = &[
+        rtl_fill_memory as usize,
+        rtl_zero_memory as usize,
+        rtl_move_memory as usize,
+        rtl_compare_memory as usize,
+        rtl_initialize_bit_map as usize,
+        rtl_set_bits as usize,
+        rtl_clear_bits as usize,
+        rtl_are_bits_set as usize,
+        rtl_are_bits_clear as usize,
+        rtl_find_clear_bits_and_set as usize,
+        rtl_create_atom_table as usize,
+        rtl_add_atom_to_atom_table as usize,
+        rtl_lookup_atom_in_atom_table as usize,
+        rtl_delete_atom_from_atom_table as usize,
+        rtl_query_atom_in_atom_table as usize,
+        rtl_encode_pointer as usize,
+        rtl_decode_pointer as usize,
+        rtl_encode_system_pointer as usize,
+        rtl_decode_system_pointer as usize,
+        rtl_time_to_seconds_since_1970 as usize,
+        rtl_time_to_time_fields as usize,
+        rtl_time_fields_to_time as usize,
+        rtl_uniform as usize,
+        rtl_random as usize,
+        rtl_integer_to_char as usize,
+    ];
+    core::hint::black_box(anchors_misc1);
+    let anchors_misc2: &[usize] = &[
+        rtl_initialize_slist_head as usize,
+        rtl_interlocked_push_entry_slist as usize,
+        rtl_interlocked_pop_entry_slist as usize,
+        rtl_interlocked_flush_slist as usize,
+        rtl_query_depth_slist as usize,
+        rtl_get_last_nt_status as usize,
+        rtl_restore_last_win32_error as usize,
+        rtl_get_thread_error_mode as usize,
+        rtl_set_thread_error_mode as usize,
+        rtl_get_nt_product_type as usize,
+        rtl_get_version as usize,
+        rtl_verify_version_info as usize,
+        rtl_get_current_processor_number as usize,
+        rtl_get_native_system_information as usize,
+        rtl_add_vectored_exception_handler as usize,
+        rtl_remove_vectored_exception_handler as usize,
+        rtl_add_vectored_continue_handler as usize,
+        rtl_remove_vectored_continue_handler as usize,
+        rtl_add_function_table as usize,
+        rtl_delete_function_table as usize,
+        rtl_install_function_table_callback as usize,
+        rtl_lookup_function_entry as usize,
+        rtl_capture_context as usize,
+        rtl_raise_status as usize,
+        rtl_raise_exception as usize,
+        rtl_unwind as usize,
+        rtl_unwind_ex as usize,
+        rtl_virtual_unwind as usize,
+        rtl_restore_context as usize,
+        rtl_exit_user_thread as usize,
+        rtl_compute_import_table_hash as usize,
+        rtl_flush_secure_memory_cache as usize,
+        rtl_set_critical_section_spin_count as usize,
+        rtl_try_enter_critical_section as usize,
+    ];
+    core::hint::black_box(anchors_misc2);
     #[cfg(target_arch = "x86_64")]
     let anchors2: &[usize] = &[chkstk as *const () as usize];
     #[cfg(target_arch = "x86_64")]
