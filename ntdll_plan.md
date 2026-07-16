@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17** · next wall = winlogon's post-loader CSR connect (csr_rendezvous needs the same native arm) → win32k paint
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader) DONE · BATCH 3 (`map=8` root-cause) DONE · BATCH 4 (Win32-stack export surface COMPLETE, 598 exports, 0-missing ×11) DONE · BATCH 5 (the `#PF cr2=0x668` env-block wall root-caused + fixed; smss now drives to the CSR↔SM `NtConnectPort` handshake) DONE 2026-07-17 · BATCH 6 (the 2nd-thread NATIVE transport: `spawn_hosted_thread` was setting `TCBSetHostedSyscalls` on the SmpApiLoop thread → its native Call faulted as UnknownSyscall with m0=RAX garbage; fixed with a per-thread `native` flag + main-ipcbuf-frame reuse + a `sm_rendezvous` native NORMALIZE arm → **SM accept completes, CSR↔SM handshake, csrss + winlogon SPAWN**, gate 149) DONE 2026-07-17 · BATCH 7 (csr_rendezvous native arm + the LIVE loader now runs `DLL_PROCESS_ATTACH` in dependency order + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first, reaching kernel32's `CsrClientConnectToServer`; next wall = the CSR/base-server connect + `Peb->ReadOnlyStaticServerData` DURING winlogon's loader, gate 149) DONE 2026-07-17** · next wall = winlogon loader-time CSR connect (kernel32 DllMain `CsrClientConnectToServer` → `Peb->ReadOnlyStaticServerData`) → win32k paint
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1521,3 +1521,68 @@ winlogon CSR connect needs the **csrss CsrApiRequestThread** — its `spawn_csr_
 winlogon/services/lsass **listener threads** (still `native: false`) will need converting to the
 native transport once the multiplex reaches them. Reconverge 174/98 + `0x003a6ea5` paint once
 winlogon's CSR connect completes → `co_IntShowDesktop → IntPaintDesktop`.
+
+---
+
+## ☑ SYSTEMATIC PORT — BATCH 7 (DONE 2026-07-17): csr_rendezvous native arm + the LIVE loader runs DLL_PROCESS_ATTACH (dependency order) + PEB TLS bitmaps → winlogon runs its FULL DllMain chain kernel32-first → the CSR-connect frontier (gate 149)
+
+### 1. csr_rendezvous native NORMALIZE arm (rendezvous.rs)
+Mirrored BATCH 6's `sm_rendezvous` native arm into `csr_rendezvous`: the CsrApiRequestThread
+is `native: true` (`spawn_csr_loop_thread`), so its `Nt*` syscalls arrive as a native seL4
+`Call` (label `NT_NATIVE_SYSCALL_LABEL = 0x4E54`), not a label-2 UnknownSyscall fault. The arm
+stages MR0=SSN, MR1=rsp, MR2/MR3=arg1/arg2, MR4/MR5=arg3/arg4 into the fault-frame slots the
+accept body reads (R10@9/R8@7/R9@8/SP@16/FLAGS@17), then re-labels to 2 so the UNCHANGED accept
+body runs. No kernel change.
+
+### 2. ★ ROOT CAUSE of winlogon's post-loader wall (was `label=6 m0=0x806d3ca6 exc#=4`)
+Traced via disasm: `0x806d3ca6` = **msvcrt.dll!strlen+0x16** (`movsbl (%rax)` with rax=0), i.e.
+**`strlen(NULL)`**. The caller chain (stack-scan of the fault RSP, walking winlogon's stack
+mirror): winlogon ENTRY (RVA 0x18e60 = AddressOfEntryPoint) → msvcrt CRT `_initterm` init
+(0x1f080) → `strdup(GetCommandLineA())` → `strlen(NULL)`. **`GetCommandLineA()` returned NULL**
+because kernel32's `BaseAnsiCommandLine.Buffer` was never set: `InitCommandLines()`
+(→`RtlUnicodeStringToAnsiString`) runs in kernel32's `DllMain`, and **the LIVE on-target loader
+(`on_target::ldrp_drive`) only snapped imports + installed the heap — it NEVER called
+`DLL_PROCESS_ATTACH`.** (The host-tested `loader/init.rs` engine computes the order + calls
+`host.call_dll_main`, but the live `ldrp_drive` used `snap_all_imports` only.) smss/csrss didn't
+need it; winlogon (kernel32 + msvcrt CRT) does.
+
+### 3. THE FIX — run DLL_PROCESS_ATTACH in DEPENDENCY ORDER (on_target.rs)
+Added `run_process_attach()` / `attach_dfs()`: after `snap_all_imports`, a **post-order DFS**
+over the `MODULE_TABLE` — for each module, walk its import descriptors, recurse into each
+imported DLL (found in the table) FIRST, then call the module's own `DllMain(DLL_PROCESS_ATTACH)`
+(Win64 ABI shim: rcx=base, rdx=1, r8=0). A per-base visited set dedupes diamonds + breaks
+cycles; our own ntdll + the EXE + resource-only (no-entry) DLLs are skipped. ★ ORDER MATTERS:
+reverse-insertion order was WRONG (mpr-first → kernel32 uninitialized → crash). Now for winlogon
+the order is **kernel32, gdi32, advapi32_vista, kernel32_vista, msvcrt, ws2help, ws2_32, rpcrt4,
+advapi32, user32, userenv, mpr** — kernel32 first, as the real Ldr does.
+
+### 4. PEB TLS bitmaps (img_spawn.rs)
+kernel32's `TlsAlloc()` (thread.c:1112) calls `RtlFindClearBitsAndSet(Peb->TlsBitmap, 1, 0)`; a
+NULL `Peb->TlsBitmap` #PFs reading `SizeOfBitMap` (found: ws2_32's DllMain reaches TlsAlloc).
+Init the two RTL_BITMAPs in the PEB page tail (past ProcessHeaps@0x800): x64
+`Peb->TlsBitmap@0x78 → {SizeOfBitMap=64, Buffer=&TlsBitmapBits@0x80}`,
+`Peb->TlsExpansionBitmap@0x238 → {1024, &TlsExpansionBitmapBits@0x240}`; bit 0 reserved.
+
+### How far the boot got (gate 149, no regression)
+winlogon now runs its ENTIRE 12-DLL DllMain chain (kernel32 first, verified by the
+`DllMain base=0x…` trace) + the SSN trace shows real registry (125/185) + win32k (4346/4699/4576)
+activity. smss/csrss stay green with the DllMain-calling loader (csrsrv's DllMain runs for csrss).
+Host: nt-ntdll 157, nt-syscall-abi 12 green.
+
+### ★ THE NEXT FRONTIER = the CSR/base-server connect DURING winlogon's LOADER
+kernel32's `DllMain` reaches `InitCommandLines()` ONLY after `CsrClientConnectToServer` succeeds
+(dllmain.c:139): it connects to `\Windows\ApiPort`, then `ASSERT(Peb->ReadOnlyStaticServerData)` +
+`BaseStaticServerData = Peb->ReadOnlyStaticServerData[BASESRV=1]`. In our host the loader-time
+connect FAILS (SSN trace shows `4:266 NtTerminateProcess` = kernel32 bailing on the failed
+connect), so `InitCommandLines` never runs → `GetCommandLineA()==NULL` → the strlen(NULL) at
+winlogon's entry. The executive HAS the machinery (`ExecNtHandler::csr_client_connect` services
+`NtSecureConnectPort(\Windows\ApiPort)` via `csr_rendezvous` + maps the CSR heap-view + the
+`ReadOnlyStaticServerData` array with a `BASE_STATIC_SERVER_DATA[1]`), but it's not completing for
+kernel32's connect during winlogon's **loader** (run_process_attach) — likely (a) the connect SSN
+kernel32 emits (`NtConnectPort 33` vs `NtSecureConnectPort 218`) isn't the one that reaches
+`csr_client_connect`, or (b) the `Peb->ReadOnlyStaticServerData` (PEB@0x280 on x64) isn't
+populated yet at loader time / kernel32 fails earlier in `CsrClientConnectToServer`. NEXT STEP:
+trace winlogon's connect SSN + whether `csr_client_connect` fires during the loader; make the CSR
+connect succeed (populate `Peb->ReadOnlyStaticServerData` + drive the `csr_rendezvous` accept for
+the loader-time connect) → kernel32 reaches `InitCommandLines` → winlogon's entry runs its real
+`WinMain` → `SwitchDesktop → co_IntShowDesktop → IntPaintDesktop → 0x003a6ea5`.
