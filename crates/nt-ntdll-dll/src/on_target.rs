@@ -1049,12 +1049,15 @@ unsafe fn read_env_block(env_ptr: *const u16) -> nt_ntdll::rtl::environment::Env
         return nt_ntdll::rtl::environment::Environment::new();
     }
     let mut n = 0usize;
-    // SAFETY: measure to the double-NUL.
+    // SAFETY: measure to the double-NUL, INCLUDING the first terminating NUL so `from_block` sees the
+    // closing NUL of the last variable (it only emits a var on a NUL; without the trailing NUL the
+    // last variable would be silently dropped).
     unsafe {
         loop {
             let c = *env_ptr.add(n);
             let nx = *env_ptr.add(n + 1);
             if c == 0 && nx == 0 {
+                n += 1; // include the first NUL of the double-NUL so the last var terminates
                 break;
             }
             n += 1;
@@ -1063,7 +1066,7 @@ unsafe fn read_env_block(env_ptr: *const u16) -> nt_ntdll::rtl::environment::Env
             }
         }
     }
-    // SAFETY: [env_ptr, env_ptr+n] is the block body.
+    // SAFETY: [env_ptr, env_ptr+n] is the block body (incl. the last var's terminating NUL).
     let block: &[u16] = unsafe { core::slice::from_raw_parts(env_ptr, n) };
     nt_ntdll::rtl::environment::Environment::from_block(block)
 }
@@ -1160,6 +1163,195 @@ pub unsafe fn rtl_set_environment_variable(
         }
     }
     STATUS_SUCCESS_U as u32
+}
+
+const SSN_NT_QUERY_ATTRIBUTES_FILE: u32 = 145;
+
+/// `RtlQueryEnvironmentVariable_U(Environment, Name, Value)` — look up `Name` in the env block and
+/// copy the value into `Value->Buffer`. Returns SUCCESS / STATUS_BUFFER_TOO_SMALL / STATUS_VARIABLE_
+/// NOT_FOUND. `environment` NULL → the PEB process-env.
+///
+/// # Safety
+/// On-target; `name` a UNICODE_STRING*, `value` a UNICODE_STRING* with a MaximumLength Buffer.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_query_environment_variable_u(
+    environment: *const u16,
+    name: *const u8,
+    value: *mut u8,
+) -> u32 {
+    use alloc::string::String;
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+    const STATUS_VARIABLE_NOT_FOUND: u32 = 0xC000_0100;
+    // Read the Name UNICODE_STRING.
+    // SAFETY: name is a valid UNICODE_STRING.
+    let (name_bytes, name_buf) = unsafe {
+        (
+            core::ptr::read_unaligned(name as *const u16) as usize,
+            core::ptr::read_unaligned(name.add(8) as *const u64) as *const u16,
+        )
+    };
+    if name_buf.is_null() {
+        return STATUS_VARIABLE_NOT_FOUND;
+    }
+    // SAFETY: [name_buf, name_buf+name_bytes/2) is the name.
+    let name_units = unsafe { core::slice::from_raw_parts(name_buf, name_bytes / 2) };
+    let name_s = String::from_utf16_lossy(name_units);
+
+    // Resolve the env block pointer.
+    let env_ptr: *const u16 = if !environment.is_null() {
+        environment
+    } else {
+        // SAFETY: PEB env.
+        unsafe {
+            let peb: u64;
+            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+            if peb == 0 {
+                return STATUS_VARIABLE_NOT_FOUND;
+            }
+            let params = core::ptr::read((peb + 0x20) as *const u64);
+            if params == 0 {
+                return STATUS_VARIABLE_NOT_FOUND;
+            }
+            core::ptr::read((params + 0x80) as *const u64) as *const u16
+        }
+    };
+    // SAFETY: env_ptr is a valid double-NUL block (or null → empty).
+    let env = unsafe { read_env_block(env_ptr) };
+    let val = match env.query(&name_s) {
+        Some(v) => v,
+        None => return STATUS_VARIABLE_NOT_FOUND,
+    };
+    let val_units: alloc::vec::Vec<u16> = val.encode_utf16().collect();
+
+    // Read Value->MaximumLength + Buffer.
+    // SAFETY: value is a valid UNICODE_STRING with a MaximumLength Buffer.
+    unsafe {
+        let max_bytes = core::ptr::read_unaligned(value.add(2) as *const u16) as usize;
+        let out_buf = core::ptr::read_unaligned(value.add(8) as *const u64) as *mut u16;
+        let needed_bytes = val_units.len() * 2;
+        if needed_bytes + 2 > max_bytes {
+            // Doesn't fit (incl. the NUL). Report the required char count in Length.
+            core::ptr::write_unaligned(value as *mut u16, val_units.len() as u16);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        core::ptr::copy_nonoverlapping(val_units.as_ptr(), out_buf, val_units.len());
+        core::ptr::write(out_buf.add(val_units.len()), 0); // NUL
+        core::ptr::write_unaligned(value as *mut u16, needed_bytes as u16); // Length
+    }
+    STATUS_SUCCESS_U as u32
+}
+
+/// `RtlDosSearchPath_U(Path, FileName, Extension, BufferLength, Buffer, PartName)` — search each
+/// `;`-separated dir in `Path` for `FileName` (+`Extension` if no dot), probing existence via
+/// NtQueryAttributesFile. On the first hit writes the DOS path into `Buffer`, sets `*PartName`, and
+/// returns the byte length written; 0 = not found.
+///
+/// # Safety
+/// On-target; pointers per the contract.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_dos_search_path_u(
+    path: *const u16,
+    file_name: *const u16,
+    extension: *const u16,
+    buffer_length: u32,
+    buffer: *mut u16,
+    part_name: *mut *mut u16,
+) -> u32 {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    // SAFETY: NUL-terminated inputs.
+    let path_s = unsafe { utf16_to_string(path) };
+    let file_s = unsafe { utf16_to_string(file_name) };
+    let ext_s = if extension.is_null() {
+        String::new()
+    } else {
+        // SAFETY: NUL-terminated.
+        unsafe { utf16_to_string(extension) }
+    };
+    if file_s.is_empty() {
+        return 0;
+    }
+    // Append the extension only if FileName has no '.'.
+    let has_dot = file_s.contains('.');
+    let leaf = if has_dot || ext_s.is_empty() {
+        file_s.clone()
+    } else {
+        let mut l = file_s.clone();
+        l.push_str(&ext_s);
+        l
+    };
+    // Try each ';'-separated directory.
+    for dir in path_s.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        // Build the candidate DOS path: dir (strip trailing '\') + '\' + leaf.
+        let mut cand = String::from(dir.trim_end_matches('\\'));
+        cand.push('\\');
+        cand.push_str(&leaf);
+        // Convert to an NT path (\??\...) for NtQueryAttributesFile.
+        let cand_units: Vec<u16> = cand.encode_utf16().collect();
+        let Some(nt) = nt_ntdll::rtl::path::dos_path_name_to_nt_path_name(&cand_units) else {
+            continue;
+        };
+        // Build OBJECT_ATTRIBUTES + UNICODE_STRING + FILE_BASIC_INFORMATION on the stack.
+        let mut nt_nul: Vec<u16> = nt.clone();
+        nt_nul.push(0);
+        let mut oa = [0u8; 0x30];
+        let mut us = [0u8; 0x10];
+        let mut basic = [0u8; 0x28]; // FILE_BASIC_INFORMATION: 4×i64 times + FileAttributes@0x20
+        // SAFETY: build the OA/US for the candidate NT path.
+        let exists = unsafe {
+            build_oa(oa.as_mut_ptr(), us.as_mut_ptr(), 0, nt.as_ptr(), nt.len());
+            let st = syscall4(
+                SSN_NT_QUERY_ATTRIBUTES_FILE,
+                oa.as_ptr() as u64,
+                basic.as_mut_ptr() as u64,
+                0,
+                0,
+            );
+            st == STATUS_SUCCESS_U
+        };
+        if exists {
+            // Write the DOS candidate into Buffer (NUL-terminated) if it fits.
+            let need = (cand_units.len() + 1) * 2;
+            if need > buffer_length as usize {
+                return 0;
+            }
+            // SAFETY: buffer is a buffer_length-byte writable region.
+            unsafe {
+                core::ptr::copy_nonoverlapping(cand_units.as_ptr(), buffer, cand_units.len());
+                core::ptr::write(buffer.add(cand_units.len()), 0);
+                if !part_name.is_null() {
+                    // *PartName points at the leaf (after the last '\').
+                    let last = cand_units
+                        .iter()
+                        .rposition(|&c| c == b'\\' as u16)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    core::ptr::write(part_name, buffer.add(last));
+                }
+            }
+            return (cand_units.len() * 2) as u32;
+        }
+    }
+    0
+}
+
+/// Read a NUL-terminated UTF-16 pointer into an owned String.
+///
+/// # Safety
+/// `p` NUL-terminated (or null → empty).
+#[cfg(target_arch = "x86_64")]
+unsafe fn utf16_to_string(p: *const u16) -> alloc::string::String {
+    if p.is_null() {
+        return alloc::string::String::new();
+    }
+    // SAFETY: NUL-terminated.
+    let n = unsafe { wlen(p) };
+    // SAFETY: [p, p+n) is the body.
+    let units = unsafe { core::slice::from_raw_parts(p, n) };
+    alloc::string::String::from_utf16_lossy(units)
 }
 
 /// `RtlQueryRegistryValues` — the live registry reader. Opens the base key, walks the query table,

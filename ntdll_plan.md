@@ -977,5 +977,49 @@ NtCreateSection(SEC_IMAGE) → NtCreateProcess[Ex]` for csrss) or the `NtSetSyst
 return. Continue the oracle-diff grind. **The SSN-50 arm** (`NtCreateProcessEx`) is NOT yet needed (smss
 hasn't reached the create-process call under our ntdll) — add it when smss emits SSN 50 there.
 
-**checkpoint 5 committed**: gate 174/98, paint 768/768, flag OFF; ONLY `crates/nt-ntdll-dll` changed;
-NO rust-micro/src, NO executive change; sel4test byte-identical; `nt-ntdll` host tests 145/145.
+**checkpoint 5 committed** (`5d069dd`): gate 174/98, paint 768/768, flag OFF; ONLY `crates/nt-ntdll-dll`
+changed; NO rust-micro/src, NO executive change; sel4test byte-identical; `nt-ntdll` host tests 145/145.
+
+**IN PROGRESS 2026-07-16 — checkpoint 6 (env-block off-by-one fix + search-path/env-query bodies → smss REACHES the csrss create-process chain `SmpExecuteImage` under OUR ntdll):**
+
+The ckpt-5 wall was `RtlDosPathNameToNtPathName_U(SmpKnownDllPath)` (fixed). smss then ran deep into
+`SmpLoadSubSystemsForMuSession` (win32k `Kmode` NtSetSystemInformation ×2) and stopped at the
+required-subsystem `SmpExecuteCommand(csrss) → SmpParseCommandLine`, which resolves csrss's image path
+purely in RTL (`RtlQueryEnvironmentVariable_U(Path)` + `RtlDosSearchPath_U`) — both 4.0b seams.
+**Diagnosed via a temporary int-0x2d marker (`[qenv:Path=MISS nvars=02]`): `SmpDefaultEnvironment` held
+only 2 vars, missing `Path`.** Root cause = an **off-by-one in `on_target::read_env_block`**: it
+measured to the double-NUL but EXCLUDED the first terminating NUL, so `Environment::from_block` (which
+emits a var only on a NUL) silently DROPPED the last variable of every block → each
+`RtlSetEnvironmentVariable` reserialization lost a var → the env never grew past 2-3. (This body/logic
+class translated from `references/reactos/sdk/lib/rtl/{env.c,registry.c,path.c}`.)
+
+**The walls made real (all in `crates/nt-ntdll-dll` + one pure host helper/test in `crates/nt-ntdll`,
+NO rust-micro/src change, sel4test byte-identical):**
+13. **`read_env_block` off-by-one fix** — include the first NUL of the double-NUL so `from_block` emits
+    the last variable. Host-regression-test `from_block_keeps_last_var_when_slice_includes_terminating_
+    nul` in `nt-ntdll` (146 tests). After the fix the env grows correctly (`[setenv]` 04→05→…→10) and
+    `RtlQueryEnvironmentVariable_U(Path)` → **HIT**.
+14. **`RtlQueryEnvironmentVariable_U`** (`on_target`, real) — looks up `Name` in the env block
+    (`Environment` arg or the PEB process-env), copies the value into `Value->Buffer` (up to
+    `Value->MaximumLength`), sets `Value->Length`, returns STATUS_BUFFER_TOO_SMALL / VARIABLE_NOT_FOUND.
+    (translated from `env.c:659`.) smss's `SmpParseCommandLine` reads `Path` from `SmpDefaultEnvironment`.
+15. **`RtlDosSearchPath_U`** (`on_target`, real) — searches each `;`-separated dir in `Path` for
+    `FileName`(+`Extension` if no dot), probing existence via `NtQueryAttributesFile(145)` (the executive
+    resolves csrss.exe against the real `\reactos` FS); writes the DOS hit into `Buffer` + `*PartName`.
+    smss finds `csrss.exe` on the `Path`.
+
+**How far smss runs now (the parity signal — REACHED the create-process chain):** ring
+`…249,249,12,27,145(NtQueryAttributesFile=RtlDosSearchPath csrss probe),37(NtCreateEvent=SmpLoadSubSystem
+subsystem event),228(NtWaitForSingleObject),129,12,27,190`. smss's `SmpLoadSubSystemsForMuSession →
+SmpExecuteCommand(csrss) → SmpParseCommandLine` now **RESOLVES csrss.exe** (RtlDosSearchPath HIT via
+NtQueryAttributesFile) → enters **`SmpLoadSubSystem`** (creates the subsystem NtCreateEvent) → calls
+**`SmpExecuteImage`** (smss.c:30) — the csrss create-process chain. Gate flag-ON 145/98.
+
+**Remaining wall = the create-process chain BODIES (the 4.C milestone, next increment):** `SmpExecuteImage`
+calls **`RtlCreateProcessParameters`** (smss.c:47) then **`RtlCreateUserProcess`** (smss.c:92) — BOTH
+still 4.0b seams. `RtlCreateProcessParameters` is a pure heap/struct-builder (a BODY wall — write it).
+`RtlCreateUserProcess` is the body that ISSUES `NtCreateSection(SEC_IMAGE)` + `NtCreateProcess[Ex]` +
+`NtCreateThread` — if its LOGIC is the gap it's a BODY wall (write + translate from
+`references/reactos/sdk/lib/rtl/process.c`); if the create-process SYSCALL out-param/marshalling breaks,
+that's a TRANSPORT wall → flag for Step 6 (the seL4 `Call`/SURT flip; marshalling already host-tested in
+`marshal.rs`). **Add the executive SSN-50 (`NtCreateProcessEx`) arm when smss emits SSN 50 there.**

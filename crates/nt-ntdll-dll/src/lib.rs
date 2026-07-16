@@ -180,7 +180,7 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 /// `msg`/`len` must describe a mapped, readable buffer (a stack local at the call site).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn dbg_print_bytes(msg: *const u8, len: usize) {
+pub(crate) unsafe fn dbg_print_bytes(msg: *const u8, len: usize) {
     // SAFETY: msg/len describe a mapped stack buffer per the contract.
     unsafe {
         core::arch::asm!(

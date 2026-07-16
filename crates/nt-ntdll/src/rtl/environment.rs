@@ -71,6 +71,16 @@ impl Environment {
         out
     }
 
+    /// The number of variables (diagnostic).
+    pub fn vars_len(&self) -> usize {
+        self.vars.len()
+    }
+
+    /// The first variable's name (diagnostic).
+    pub fn first_name(&self) -> Option<&str> {
+        self.vars.first().map(|(k, _)| k.as_str())
+    }
+
     /// `RtlQueryEnvironmentVariable_U` — case-insensitive lookup.
     pub fn query(&self, name: &str) -> Option<&str> {
         self.vars
@@ -259,6 +269,29 @@ mod tests {
         let e2 = Environment::from_block(&block);
         assert_eq!(e2.query("A"), Some("1"));
         assert_eq!(e2.query("B"), Some("22"));
+    }
+
+    #[test]
+    fn from_block_keeps_last_var_when_slice_includes_terminating_nul() {
+        // The on-target `read_env_block` measures to the double-NUL and must INCLUDE the first NUL of
+        // the double-NUL so `from_block` emits the LAST variable (it only emits on a NUL). This test
+        // pins that: a block `SystemRoot=C:\Windows\0Path=C:\WinSys\0\0` sliced to include the first
+        // terminating NUL (index of the second-to-last unit) must yield BOTH vars.
+        let mut e = Environment::new();
+        e.set("SystemRoot", Some("C:\\Windows"));
+        e.set("Path", Some("C:\\WinSys"));
+        let block = e.to_block(); // ...Path=C:\WinSys\0\0
+        // Emulate read_env_block's slice: up to AND INCLUDING the first NUL of the double-NUL
+        // (block.len()-1 drops only the final lone NUL, keeping the last var's own NUL).
+        let sliced = &block[..block.len() - 1];
+        let e2 = Environment::from_block(sliced);
+        assert_eq!(e2.vars_len(), 2, "last variable must not be dropped");
+        assert_eq!(e2.query("SystemRoot"), Some("C:\\Windows"));
+        assert_eq!(e2.query("Path"), Some("C:\\WinSys"));
+        // And the buggy slice (dropping the last var's NUL too) drops Path — the regression guard.
+        let over_trimmed = &block[..block.len() - 2 - "C:\\WinSys".len() - 1];
+        let e3 = Environment::from_block(over_trimmed);
+        assert!(e3.query("Path").is_none());
     }
 
     #[test]

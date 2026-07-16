@@ -1052,13 +1052,41 @@ pub unsafe extern "system" fn rtl_set_environment_variable(
 ///
 /// # Safety
 /// Standard contract.
+/// `RtlQueryEnvironmentVariable_U(PVOID Environment, PCUNICODE_STRING Name, PUNICODE_STRING Value)`.
+/// Step 4.C: real. Looks up `Name` in the env block (`Environment`, or the PEB process-env if NULL),
+/// copies the value into `Value->Buffer` (up to `Value->MaximumLength`), sets `Value->Length`, and
+/// returns STATUS_BUFFER_TOO_SMALL (with the required char count in `Value->Length`) if it doesn't
+/// fit, STATUS_VARIABLE_NOT_FOUND if absent. smss's `SmpParseCommandLine` (smutil.c:323) uses this to
+/// read `Path` from `SmpDefaultEnvironment`.
+///
+/// # Safety
+/// `name` a valid `UNICODE_STRING`; `value` a valid `UNICODE_STRING` with a `MaximumLength`-sized
+/// `Buffer`; `environment` NULL or a valid env block.
 #[export_name = "RtlQueryEnvironmentVariable_U"]
 pub unsafe extern "system" fn rtl_query_environment_variable_u(
-    _environment: *mut c_void,
-    _name: PCUnicodeString,
-    _value: PUnicodeString,
+    environment: *mut c_void,
+    name: PCUnicodeString,
+    value: PUnicodeString,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs the live env block (Step 4.B)
+    if name.is_null() || value.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; delegate to the live env reader.
+        return unsafe {
+            crate::on_target::rtl_query_environment_variable_u(
+                environment as *const u16,
+                name as *const u8,
+                value as *mut u8,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = environment;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlDosPathNameToNtPathName_U(PCWSTR, PUNICODE_STRING, PCWSTR*, PVOID) -> BOOLEAN`. Honest seam
@@ -1138,21 +1166,49 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
     1 // TRUE
 }
 
-/// `RtlDosSearchPath_U(PCWSTR, PCWSTR, PCWSTR, ULONG, PWSTR, PWSTR*) -> ULONG`. Honest seam.
+/// `RtlDosSearchPath_U(PCWSTR Path, PCWSTR FileName, PCWSTR Extension, ULONG BufferLength, PWSTR
+/// Buffer, PWSTR *PartName) -> ULONG`. Step 4.C: real over the live FS. Searches each `;`-separated
+/// directory in `Path` for `FileName` (appending `Extension` when `FileName` has no `.`), probing
+/// existence via `NtQueryAttributesFile` (the executive resolves it against the real `\reactos` FS);
+/// on the first hit it writes the full DOS path into `Buffer`, sets `*PartName` to the file component,
+/// and returns the byte length written (0 = not found). smss's `SmpParseCommandLine` (smutil.c:360)
+/// uses this to locate `csrss.exe` on the `Path`.
 ///
 /// # Safety
-/// Standard contract.
+/// `path`/`file_name` NUL-terminated UTF-16; `buffer` a `buffer_length`-byte writable region;
+/// `part_name` NULL or a valid `PWSTR*`.
 #[export_name = "RtlDosSearchPath_U"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_dos_search_path_u(
-    _path: *const u16,
-    _file_name: *const u16,
-    _extension: *const u16,
-    _buffer_length: u32,
-    _buffer: *mut u16,
-    _part_name: *mut *mut u16,
+    path: *const u16,
+    file_name: *const u16,
+    extension: *const u16,
+    buffer_length: u32,
+    buffer: *mut u16,
+    part_name: *mut *mut u16,
 ) -> u32 {
-    0 // 0 chars written — not found (honest; needs the live FS/CWD plane)
+    if path.is_null() || file_name.is_null() || buffer.is_null() {
+        return 0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; delegate to the live-FS search.
+        return unsafe {
+            crate::on_target::rtl_dos_search_path_u(
+                path,
+                file_name,
+                extension,
+                buffer_length,
+                buffer,
+                part_name,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (extension, buffer_length, part_name);
+        0
+    }
 }
 
 /// The `RTL_QUERY_REGISTRY_ROUTINE` callback ABI (x64 system): `(ValueName, ValueType, ValueData,
