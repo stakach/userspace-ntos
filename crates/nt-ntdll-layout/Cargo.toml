@@ -1,0 +1,11 @@
+[package]
+name = "nt-ntdll-layout"
+description = "The byte-exact x64 PEB/TEB/LDR/process-parameter layout our ntdll and the executive must present to hosted binaries (they poke TEB+0x1258, walk PEB->Ldr, read the NLS ptrs at PEB+0xA0/0xA8/0xB0, etc.). #[repr(C)] structs with STATIC offset assertions (const-eval offset_of) cross-checked against the ReactOS NDK C_ASSERTs (references/reactos/sdk/include/ndk/peb_teb.h) + the offsets reverse-engineered live in project_smss_sec_image. no_std, no alloc — pure layout."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

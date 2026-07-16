@@ -1,0 +1,15 @@
+[package]
+name = "nt-ntdll"
+description = "Our own Rust ntdll.dll skeleton (the userspace half of OUR kernel ABI). Step 2a: the swappable syscall-transport seam (x86-trap implemented target-side; seL4-Call + SURT-ring seams declared) + a data-driven Nt* stub table keyed off the shared nt-syscall-abi SSN numbering + a proof-of-pattern slice of fully-wired Nt* stubs and reused Rtl* primitives. The bulk 188-stub bodies / 244 Rtl / loader are tracked follow-ons (Step 2b/2c/Step 3). no_std + alloc; pure logic host-tested, target-only asm cfg-gated."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-syscall-abi = { path = "../nt-syscall-abi" }
+nt-compat-exports = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

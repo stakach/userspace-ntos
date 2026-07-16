@@ -1,0 +1,11 @@
+[package]
+name = "nt-syscall-abi"
+description = "The single source of truth for the Nt*/Zw* system-service-number (SSN) ABI shared between our ntdll (crates/nt-ntdll) and the NT executive. The SSN numbering is the ReactOS `ntoskrnl/sysfuncs.lst`-derived index (SSN = line#, 0-based) — the SAME numbering the executive already dispatches on — so owning ntdll is zero-churn on the executive. A data-driven name<->SSN table covering the 188 Nt* + 7 Zw* the current hosted ReactOS set imports, plus a documented (reserved-but-unassigned) ALPC seam. Pure data, no_std, host-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

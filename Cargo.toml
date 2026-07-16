@@ -76,6 +76,9 @@ members = [
     "crates/nt-loader-trace",
     "crates/nt-delay-execution",
     "crates/nt-thread-start",
+    "crates/nt-syscall-abi",
+    "crates/nt-ntdll-layout",
+    "crates/nt-ntdll",
     "tools/driver-import-report",
 ]
 exclude = [
@@ -160,3 +163,6 @@ nt-driver-test-fixtures = { path = "crates/nt-driver-test-fixtures" }
 nt-loader-trace = { path = "crates/nt-loader-trace" }
 nt-delay-execution = { path = "crates/nt-delay-execution" }
 nt-thread-start = { path = "crates/nt-thread-start" }
+nt-syscall-abi = { path = "crates/nt-syscall-abi" }
+nt-ntdll-layout = { path = "crates/nt-ntdll-layout" }
+nt-ntdll = { path = "crates/nt-ntdll" }
