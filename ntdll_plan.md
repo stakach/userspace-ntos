@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0 + 4.0b DONE · Step 4.A DONE · **Step 4.B (in-process LoaderHost: real heap + import snap against OUR export table + transfer → smss reaches NtProcessStartup under OUR ntdll) DONE 2026-07-16** · Step 4.C next
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0/4.0b/4.A/4.B DONE · Step 6.A native transport DONE · real-ntdll fallback RETIRED (our DLL IS `ntdll.dll`) · **SYSTEMATIC PORT: BATCH 1 (smss spawns csrss) DONE · BATCH 2 (recursive dependent-DLL loader → csrss cascades the FULL Win32 client stack on OUR ntdll; 23 new csrsrv+basesrv exports) DONE 2026-07-16** · next wall = executive-side page-rights (`map=8`), then BATCH 3 (winsrv/Win32-stack surface)
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -1228,3 +1228,65 @@ NtCreateProcess handler (49's args are a prefix of 50's; SectionHandle is arg6 =
 3. **loader (`Ldr*`)** — the `nt-ntdll/src/loader/` engine is host-tested; wire the remaining live
    `LoaderHost` ops as processes need them.
 Reconverge the 174/98 gate + paint once winlogon completes its bring-up on our ntdll.
+
+## ☑ SYSTEMATIC PORT — BATCH 2: the recursive dependent-DLL loader + the Win32-stack ntdll surface
+**Milestone: csrss's loader cascades the FULL Win32 client stack on OUR ntdll.** The frontier was
+csrss stopping at a NULL/low-deref (`ip=0x2440`) = its unresolved `csrsrv.dll!CsrServerInitialization`
+IAT slot. smss imports ONLY ntdll, so our `LdrpInitialize` only snapped the ntdll descriptor; csrss
+also statically imports **csrsrv.dll**, which was never loaded/snapped. Fixed by wiring the real
+`LdrpWalkImportDescriptor` recursion into the on-target loader.
+
+### The recursive loader (`crates/nt-ntdll-dll/src/on_target.rs`)
+- **`snap_all_imports`/`snap_module`** — walk EVERY import descriptor. `ntdll` → snap against our
+  export table (as before); any OTHER DLL → **load it** (NtOpenFile → NtCreateSection(SEC_IMAGE) →
+  NtMapViewOfSection; the executive assigns its pinned/fixed base — csrsrv @ 0x8000_0000, then
+  basesrv/winsrv/gdi32/user32/… demand-loaded up the arena), recursively snap ITS imports, then snap
+  this descriptor against the loaded DLL's exports. A process-wide **`MODULE_TABLE`** (name→base)
+  de-dupes loads so a diamond/repeat dep maps once + recursion terminates.
+- **`syscall_map_view`/`native_map_view`** — NtMapViewOfSection (SSN 113, 10 args) over BOTH the trap
+  + native seL4-Call transports (the 6 tail args on the stack at the exact slots the executive's map
+  handler reads; a3=`*BaseAddress` in MR4 → `set_recv_mr(7)`).
+- **`export_rva_by_ordinal`** + by-ordinal thunk snap.
+- **Ldr* runtime drivers** (`LdrLoadDll`/`LdrGetDllHandle`/`LdrGetProcedureAddress`/`LdrUnloadDll`) —
+  csrsrv's `CsrLoadServerDll` uses these to bring up its ServerDlls; same load+snap+export-walk
+  machinery over the MODULE_TABLE.
+
+### Functions ported this batch (23 new exports; ReactOS source cited)
+| batch | functions | source |
+|---|---|---|
+| **ckpt 1** (csrsrv's 12 missing) | `RtlFreeSid`, `RtlGetDaclSecurityDescriptor`, `RtlCharToInteger`, `RtlCreateHeap`, `RtlUnhandledExceptionFilter`, `memmove`(weak)/`strchr`/`strncpy`, `LdrLoadDll`/`LdrGetDllHandle`/`LdrGetProcedureAddress`/`LdrUnloadDll` | `sid.c:186`, `sd.c:199`, `unicode.c:261`, single-heap sentinel, `libsupp.c`; `ldrapi.c` for the Ldr* |
+| **ckpt 2** (basesrv's 11 missing) | `RtlCopyLuid`, `RtlInitString`, `RtlDeleteCriticalSection`, `RtlInitializeCriticalSectionAndSpinCount`, `RtlReAllocateHeap`, `RtlExpandEnvironmentStrings_U`, `RtlOpenCurrentUser`, `_snwprintf`/`wcsncpy`/`wcscat`/`_wcsnicmp` | `luid.c:19`, `critical.c`, heap `reallocate` (+ new `process_heap_realloc`), `env.c:264`, `registry.c:702` |
+
+The pure bodies delegate to the host-tested `nt_ntdll::{rtl::*,crt,heap}` logic (tests already green);
+the exports are thin C-ABI wrappers (target-only, boot-verified). Live drivers (env-expand /
+current-user key) issue real syscalls over our own Nt* stubs.
+
+### How far csrss runs now (the parity signal)
+csrss's `LdrpInitialize` snaps csrss+csrsrv (resolved=103/87, **missing=0**), runs
+`CsrServerInitialization` → `CsrLoadServerDll` → **`LdrLoadDll` cascades the entire dependency graph
+on OUR ntdll**: csrsrv → basesrv → winsrv → gdi32 → user32 → advapi32 → rpcrt4 → kernel32 → ws2_32 →
+ws2help → msvcrt — **all DEMAND-LOADed + NtCreateSection + NtMapViewOfSection + import-snapped**.
+csrss runs **2374 service-iters** (was 333 at ckpt 1, 2 at the start), ~2000 demand-paged pages deep.
+
+### The next wall = EXECUTIVE-side (NOT an ntdll port gap)
+csrss now stops at a demand-fault **`[map-fail] map=8` at `kernel32+0xa9954`** (va 0x80449000),
+`exc#=21` — err `0x15` = present+user+**instr-fetch** = a **protection fault executing an NX-mapped
+page**. The executive's `page_rights` (`img_spawn.rs:244`) classified a `.text` page of a multi-MB DLL
+as RW_NX (a `virtual_size` section-span rounding edge for the big DLLs — kernel32 is 2.7 MB), so the
+code page maps non-executable. This is an **executive demand-paging / page-rights issue for the full
+Win32 stack**, to be fixed executive-side (the ntdll loader did its job — the whole stack mapped +
+snapped 0-missing). Committed: **ckpt 1 `9f171a6`, ckpt 2 `0af3d04`**. Gate 144 pass / 33 fail
+(reconverging — the downstream winlogon/paint specs await csrss completing). nt-ntdll host tests 157;
+DLL emits 278 exports (was 255 at BATCH 1).
+
+### BATCH 3 candidates (the path to reconvergence)
+1. **[executive] the `map=8`/page-rights fix** — the immediate csrss unblock (executive-side, not
+   ntdll). Then csrss finishes CsrServerInitialization + the CSR↔SM handshake → winlogon spawns.
+2. **winsrv's ~19 remaining ntdll imports** — winsrv (loaded, will snap once reached) needs
+   `RtlDuplicateUnicodeString`, the `RtlInitializeResource`/`RtlAcquireResource*` RW-lock family,
+   `RtlCopyUnicodeString`, `RtlNtStatusToDosError`, `RtlExitUserThread`, `RtlFindMessage`,
+   `RtlAnsiCharToUnicodeChar`, the bitmap family (`RtlAreBitsSet/Clear`, `RtlInitializeBitMap`,
+   `RtlSetBits`), `NlsMbCodePageTag` (data) — mostly pure (`nt-ntdll` bodies exist), port per the pattern.
+3. **the Win32 client stack's ntdll imports** (gdi32/user32/advapi32/rpcrt4/kernel32/msvcrt) — the big
+   surface; port as each DLL's DllMain/init exercises it (frontier-driven). Reconverge 174/98 + paint
+   once winlogon completes its bring-up on our ntdll.
