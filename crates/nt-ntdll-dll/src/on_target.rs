@@ -2076,6 +2076,129 @@ pub unsafe fn rtl_query_environment_variable_u(
     STATUS_SUCCESS_U as u32
 }
 
+/// `RtlExpandEnvironmentStrings_U(Environment, Source, Destination, ReturnLength)` — replace each
+/// `%VAR%` in `Source` with its value from the env block (`Environment` or the live PEB process-env),
+/// writing into `Destination->Buffer` (up to `Destination->MaximumLength`, NUL-terminated). Sets
+/// `Destination->Length` + `*ReturnLength` (the required byte count incl. NUL). STATUS_BUFFER_TOO_SMALL
+/// if it doesn't fit. Ported from `references/reactos/sdk/lib/rtl/env.c:264` (over the host-tested
+/// `Environment::expand`).
+///
+/// # Safety
+/// On-target; `source`/`destination` valid `UNICODE_STRING*`; `return_length` writable (or NULL).
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_expand_environment_strings_u(
+    environment: *const u16,
+    source: *const u8,
+    destination: *mut u8,
+    return_length: *mut u32,
+) -> u32 {
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    if source.is_null() || destination.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Read Source UNICODE_STRING.
+    // SAFETY: source is a valid UNICODE_STRING.
+    let src_units: alloc::vec::Vec<u16> = unsafe {
+        let len = core::ptr::read_unaligned(source as *const u16) as usize / 2;
+        let buf = core::ptr::read_unaligned(source.add(8) as *const u64) as *const u16;
+        if buf.is_null() {
+            alloc::vec::Vec::new()
+        } else {
+            core::slice::from_raw_parts(buf, len).to_vec()
+        }
+    };
+    // Expand against the env (custom `environment` block if given, else the live PEB env).
+    let expanded = if !environment.is_null() {
+        use alloc::string::String;
+        // SAFETY: caller-supplied double-NUL block.
+        let env = unsafe { read_env_block(environment) };
+        let s = String::from_utf16_lossy(&src_units);
+        let mut v: alloc::vec::Vec<u16> = env.expand(&s).encode_utf16().collect();
+        v.push(0);
+        v
+    } else {
+        expand_env_units(&src_units).unwrap_or_else(|| {
+            let mut v = src_units.clone();
+            v.push(0);
+            v
+        })
+    };
+    // expanded includes the trailing NUL; body length = expanded.len()-1.
+    let body_units = expanded.len().saturating_sub(1);
+    let needed_bytes = (body_units + 1) * 2; // incl. NUL
+    if !return_length.is_null() {
+        // SAFETY: writable per the contract.
+        unsafe { *return_length = needed_bytes as u32 };
+    }
+    // SAFETY: destination is a valid UNICODE_STRING with a MaximumLength Buffer.
+    unsafe {
+        let max_bytes = core::ptr::read_unaligned(destination.add(2) as *const u16) as usize;
+        let out = core::ptr::read_unaligned(destination.add(8) as *const u64) as *mut u16;
+        if needed_bytes > max_bytes || out.is_null() {
+            core::ptr::write_unaligned(destination as *mut u16, (body_units * 2) as u16); // Length
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        core::ptr::copy_nonoverlapping(expanded.as_ptr(), out, expanded.len());
+        core::ptr::write_unaligned(destination as *mut u16, (body_units * 2) as u16); // Length
+    }
+    0 // STATUS_SUCCESS
+}
+
+/// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Ported from
+/// `references/reactos/sdk/lib/rtl/registry.c:702` — open the current-user registry key. We open the
+/// default user key `\Registry\User\.Default` via our own `NtOpenKey(125)` trap (the executive's
+/// registry plane services it), writing the handle to `*key_handle`. (The real body first tries
+/// `\Registry\User\<SID>` from the thread token, then falls back to `.Default`; our single-user boot
+/// uses the fallback directly — behavior-equivalent for basesrv's init read.)
+///
+/// # Safety
+/// On-target; `key_handle` writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_open_current_user(desired_access: u32, key_handle: *mut u64) -> u32 {
+    // Build the UNICODE_STRING "\Registry\User\.Default" (UTF-16, NUL-terminated).
+    const PATH: &[u8] = b"\\Registry\\User\\.Default";
+    let mut wpath = [0u16; 32];
+    for (i, &b) in PATH.iter().enumerate() {
+        wpath[i] = b as u16;
+    }
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        _pad: u32,
+        buffer: u64,
+    }
+    let us = UnicodeString {
+        length: (PATH.len() * 2) as u16,
+        maximum_length: (PATH.len() * 2) as u16,
+        _pad: 0,
+        buffer: wpath.as_ptr() as u64,
+    };
+    let oa = ObjectAttributes {
+        length: core::mem::size_of::<ObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: core::ptr::addr_of!(us) as u64,
+        attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        _p1: 0,
+        security_descriptor: 0,
+        security_qos: 0,
+    };
+    // NtOpenKey(&KeyHandle, DesiredAccess, &OA).
+    // SAFETY: on-target; all pointers valid stack locals; key_handle writable.
+    let st = unsafe {
+        syscall4(
+            SSN_NT_OPEN_KEY,
+            key_handle as u64,
+            desired_access as u64,
+            core::ptr::addr_of!(oa) as u64,
+            0,
+        )
+    } as u32;
+    st
+}
+
 /// `RtlDosSearchPath_U(Path, FileName, Extension, BufferLength, Buffer, PartName)` — search each
 /// `;`-separated dir in `Path` for `FileName` (+`Extension` if no dot), probing existence via
 /// NtQueryAttributesFile. On the first hit writes the DOS path into `Buffer`, sets `*PartName`, and

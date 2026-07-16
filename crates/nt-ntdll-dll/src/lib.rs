@@ -99,6 +99,23 @@ pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
     false
 }
 
+/// `RtlReAllocateHeap` core — grow/shrink `ptr` to `new_size` in the process heap (in-place when
+/// possible, else allocate-copy-free, preserving the original on OOM — the Windows contract). Returns
+/// the (possibly relocated) pointer, or null on OOM / before the heap is installed.
+///
+/// # Safety
+/// `ptr` must have come from [`process_heap_alloc`]/`process_heap_realloc`. Single-threaded loader.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    unsafe {
+        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+            return h.reallocate(ptr, new_size).unwrap_or(core::ptr::null_mut());
+        }
+    }
+    core::ptr::null_mut()
+}
+
 
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
 /// `dealloc` route through it; before that (or if it OOMs) `alloc` returns null (honest failure, the

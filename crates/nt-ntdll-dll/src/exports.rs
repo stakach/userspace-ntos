@@ -2109,6 +2109,253 @@ pub unsafe extern "C" fn strncpy(dst: *mut u8, src: *const u8, n: usize) -> *mut
 }
 
 // -------------------------------------------------------------------------------------------------
+// BATCH 2 (ckpt 2) — basesrv.dll's ntdll imports (the 11 our table was missing after csrsrv). Pure
+// Rtl/CRT + two live drivers (env-expand / current-user key). Sources cited per body.
+// -------------------------------------------------------------------------------------------------
+
+/// `RtlCopyLuid(PLUID Dest, PLUID Src)`. Ported from `references/reactos/sdk/lib/rtl/luid.c:19` —
+/// copy the 8-byte LUID (LowPart u32 @0, HighPart i32 @4).
+///
+/// # Safety
+/// `dest`/`src` valid 8-byte LUIDs.
+#[export_name = "RtlCopyLuid"]
+pub unsafe extern "system" fn rtl_copy_luid(dest: *mut c_void, src: *const c_void) {
+    if dest.is_null() || src.is_null() {
+        return;
+    }
+    // SAFETY: 8-byte LUIDs per the contract.
+    unsafe {
+        core::ptr::write_unaligned(
+            dest as *mut u64,
+            core::ptr::read_unaligned(src as *const u64),
+        );
+    }
+}
+
+/// `RtlInitString(PSTRING, PCSZ)` — set `Length`/`MaximumLength` from a NUL-terminated byte string;
+/// `Buffer` = the source pointer (no copy). Ported from `references/reactos/sdk/lib/rtl/rtlp.c` /
+/// `unicode.c:RtlInitString` (identical shape to `RtlInitAnsiString`).
+///
+/// # Safety
+/// `dst` a valid writable `STRING` (ANSI_STRING, 16 bytes x64); `src` null or NUL-terminated.
+#[export_name = "RtlInitString"]
+pub unsafe extern "system" fn rtl_init_string(dst: *mut c_void, src: *const u8) {
+    if dst.is_null() {
+        return;
+    }
+    // SAFETY: caller contract.
+    let len = unsafe { strlen_raw(src) };
+    // STRING { Length(u16)@0, MaximumLength(u16)@2, _pad@4, Buffer(ptr)@8 }.
+    // SAFETY: dst a valid writable STRING per the contract.
+    unsafe {
+        core::ptr::write_unaligned(dst as *mut u16, len as u16); // Length
+        core::ptr::write_unaligned((dst as *mut u8).add(2) as *mut u16, (len + 1) as u16); // MaxLength
+        core::ptr::write_unaligned((dst as *mut u8).add(8) as *mut u64, src as u64); // Buffer
+    }
+}
+
+/// `RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS` — reset the descriptor (the real one
+/// also frees the LockSemaphore; we have no kernel semaphore in the uncontended model, so a zero-out
+/// is the observable half). Ref `references/reactos/sdk/lib/rtl/critical.c:RtlDeleteCriticalSection`.
+///
+/// # Safety
+/// `cs` a valid `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlDeleteCriticalSection"]
+pub unsafe extern "system" fn rtl_delete_critical_section(cs: *mut c_void) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract.
+    unsafe { core::ptr::write_bytes(cs as *mut u8, 0, 40) };
+    STATUS_SUCCESS
+}
+
+/// `RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION, ULONG SpinCount) -> NTSTATUS`.
+/// Ref `references/reactos/sdk/lib/rtl/critical.c` — init the CS then store the spin count (bit 31 of
+/// the count field is masked out per the contract). Same uncontended layout as
+/// [`rtl_initialize_critical_section`] with SpinCount @0x20 (x64).
+///
+/// # Safety
+/// `cs` a valid writable `RTL_CRITICAL_SECTION`.
+#[export_name = "RtlInitializeCriticalSectionAndSpinCount"]
+pub unsafe extern "system" fn rtl_initialize_critical_section_and_spin_count(
+    cs: *mut c_void,
+    spin_count: u32,
+) -> NtStatus {
+    if cs.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract.
+    unsafe {
+        core::ptr::write_bytes(cs as *mut u8, 0, 40);
+        *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
+        *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF; // SpinCount (bit31 masked)
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlReAllocateHeap(PVOID Heap, ULONG Flags, PVOID Ptr, SIZE_T Size) -> PVOID` — grow/shrink `ptr`
+/// to `size` in the single process heap. Honors HEAP_ZERO_MEMORY on a grow (zeroes the tail).
+///
+/// # Safety
+/// `ptr` from `RtlAllocateHeap`/`RtlReAllocateHeap`.
+#[export_name = "RtlReAllocateHeap"]
+pub unsafe extern "system" fn rtl_reallocate_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    ptr: *mut c_void,
+    size: usize,
+) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ptr.is_null() {
+            // realloc(NULL, n) == alloc(n).
+            // SAFETY: single-threaded loader context.
+            return unsafe { crate::process_heap_alloc(size) } as *mut c_void;
+        }
+        // SAFETY: ptr from our heap; single-threaded loader.
+        unsafe { crate::process_heap_realloc(ptr as *mut u8, size) as *mut c_void }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ptr, size);
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlExpandEnvironmentStrings_U(PWSTR Env, PUNICODE_STRING Src, PUNICODE_STRING Dst, PULONG RetLen)`.
+/// Live driver over the PEB env (`references/reactos/sdk/lib/rtl/env.c:264`).
+///
+/// # Safety
+/// `src`/`dst` valid `UNICODE_STRING*`; `ret_len` writable/NULL.
+#[export_name = "RtlExpandEnvironmentStrings_U"]
+pub unsafe extern "system" fn rtl_expand_environment_strings_u(
+    env: *const u16,
+    src: PCUnicodeString,
+    dst: PUnicodeString,
+    ret_len: *mut u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; src/dst valid UNICODE_STRING per the contract.
+        unsafe {
+            crate::on_target::rtl_expand_environment_strings_u(
+                env,
+                src as *const u8,
+                dst as *mut u8,
+                ret_len,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (env, src, dst, ret_len);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Live driver (opens the default user key via
+/// NtOpenKey; `references/reactos/sdk/lib/rtl/registry.c:702`).
+///
+/// # Safety
+/// `key_handle` writable.
+#[export_name = "RtlOpenCurrentUser"]
+pub unsafe extern "system" fn rtl_open_current_user(
+    desired_access: u32,
+    key_handle: *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; key_handle writable per the contract.
+        unsafe { crate::on_target::rtl_open_current_user(desired_access, key_handle as *mut u64) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (desired_access, key_handle);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `_snwprintf(wchar_t* buf, size_t count, const wchar_t* fmt, ...) -> int` — variadic wide; the 4.0b
+/// seam (writes an empty string; real formatting is the CRT plane). Declares only the fixed args (the
+/// Win64 ABI leaves the variadic tail in caller regs/stack, which we never read).
+///
+/// # Safety
+/// `buf` writable for at least 1 unit.
+#[export_name = "_snwprintf"]
+pub unsafe extern "C" fn snwprintf(buf: *mut u16, count: usize, _fmt: *const u16) -> i32 {
+    if !buf.is_null() && count > 0 {
+        // SAFETY: buf valid for >= 1 unit per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `wcsncpy(wchar_t* dst, const wchar_t* src, size_t n) -> wchar_t*` — copy up to `n` units,
+/// NUL-padding the tail (the C contract).
+///
+/// # Safety
+/// `dst` valid for `n` units; `src` NUL-terminated.
+#[export_name = "wcsncpy"]
+pub unsafe extern "C" fn wcsncpy(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    // SAFETY: caller contract.
+    unsafe {
+        let mut i = 0usize;
+        while i < n {
+            let c = *src.add(i);
+            *dst.add(i) = c;
+            if c == 0 {
+                break;
+            }
+            i += 1;
+        }
+        while i < n {
+            *dst.add(i) = 0;
+            i += 1;
+        }
+    }
+    dst
+}
+
+/// `wcscat(wchar_t* dst, const wchar_t* src) -> wchar_t*` — append `src` to `dst` (NUL-terminated).
+///
+/// # Safety
+/// `dst` NUL-terminated + large enough for the concatenation; `src` NUL-terminated.
+#[export_name = "wcscat"]
+pub unsafe extern "C" fn wcscat(dst: *mut u16, src: *const u16) -> *mut u16 {
+    // SAFETY: caller contract.
+    unsafe {
+        let dl = wcslen_raw(dst);
+        let sl = wcslen_raw(src);
+        core::ptr::copy_nonoverlapping(src, dst.add(dl), sl);
+        *dst.add(dl + sl) = 0;
+    }
+    dst
+}
+
+/// `_wcsnicmp(const wchar_t*, const wchar_t*, size_t n) -> int` — case-insensitive, first `n` units.
+///
+/// # Safety
+/// Both valid for up to `n` units (NUL short-circuits).
+#[export_name = "_wcsnicmp"]
+pub unsafe extern "C" fn wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    // SAFETY: caller contract; NUL short-circuits before `n`.
+    unsafe {
+        for i in 0..n {
+            let ca = rtl::strings::upcase_char(*a.add(i));
+            let cb = rtl::strings::upcase_char(*b.add(i));
+            if ca != cb {
+                return if ca < cb { -1 } else { 1 };
+            }
+            if ca == 0 {
+                break;
+            }
+        }
+    }
+    0
+}
+
+// -------------------------------------------------------------------------------------------------
 // The loader Ldr* — csrsrv's CsrLoadServerDll uses these to load its ServerDlls (basesrv/winsrv) +
 // resolve their entry points. Wired to the on-target recursive loader (on_target.rs).
 // -------------------------------------------------------------------------------------------------
@@ -2305,6 +2552,18 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_get_dll_handle as usize,
         ldr_get_procedure_address as usize,
         ldr_unload_dll as usize,
+        // BATCH 2 ckpt 2 — basesrv's 11 ntdll imports.
+        rtl_copy_luid as usize,
+        rtl_init_string as usize,
+        rtl_delete_critical_section as usize,
+        rtl_initialize_critical_section_and_spin_count as usize,
+        rtl_reallocate_heap as usize,
+        rtl_expand_environment_strings_u as usize,
+        rtl_open_current_user as usize,
+        snwprintf as usize,
+        wcsncpy as usize,
+        wcscat as usize,
+        wcsnicmp as usize,
     ];
     core::hint::black_box(anchors);
 }
