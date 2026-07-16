@@ -27,30 +27,90 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 
+use nt_ntdll::heap::Heap;
+
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
 /// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
 pub mod exports;
 
-/// A placeholder global allocator. The [`nt_ntdll`] rlib links `alloc`, so a `cdylib` around it
-/// needs a `#[global_allocator]` to satisfy the linker. At Step 4.0 the DLL runs no allocating code
-/// (the exports are trap stubs + a placeholder `LdrpInitialize`), so this allocator is never called
-/// on a live path — it is a link-time requirement. Step 4.B replaces it with the real
-/// `RtlAllocateHeap`-backed allocator (the process heap from [`nt_ntdll::heap`]). It aborts if ever
-/// actually invoked so a stray allocation can't silently corrupt memory.
-struct AbortAllocator;
+/// Step 4.B — the on-target IN-PROCESS loader drive (real heap + import snap). See [`on_target`].
+#[cfg(target_arch = "x86_64")]
+pub mod on_target;
 
-// SAFETY: every method aborts rather than returning a bogus pointer; there is no live allocation at
-// Step 4.0, so no valid allocation contract needs to be upheld yet.
-unsafe impl GlobalAlloc for AbortAllocator {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        // No heap at Step 4.0. Return null → the caller's alloc-error path (which also aborts).
-        core::ptr::null_mut()
+/// The process heap backing type installed at Step 4.B (a real `NtAllocateVirtualMemory` region).
+#[cfg(target_arch = "x86_64")]
+type ProcessHeap = Heap<on_target::HeapBacking>;
+
+/// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). Single-threaded
+/// during load (smss is one thread until it spawns), so a `static mut` accessed only from the loader
+/// thread is sound. `None` until `LdrpInitialize` creates it; a global-alloc call before then falls
+/// back to a null (allocation-failure) return — the honest behavior (never a bogus pointer).
+///
+/// NOTE: the heap type is target-gated (`HeapBacking` is target-only), so this cell only exists on
+/// x86_64; on the host build the allocator is a no-op abort cell (there is no live allocation off
+/// target anyway).
+#[cfg(target_arch = "x86_64")]
+static mut PROCESS_HEAP: Option<ProcessHeap> = None;
+
+/// Install the process heap (called once by [`LdrpInitialize`] after `NtAllocateVirtualMemory`).
+///
+/// # Safety
+/// Called once, single-threaded, during process load before any concurrent allocation.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn install_process_heap(heap: ProcessHeap) {
+    // SAFETY: single-threaded loader context; installed exactly once before concurrent use.
+    unsafe {
+        core::ptr::addr_of_mut!(PROCESS_HEAP).write(Some(heap));
     }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+/// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
+/// `dealloc` route through it; before that (or if it OOMs) `alloc` returns null (honest failure, the
+/// caller's alloc-error path handles it) rather than a fabricated pointer.
+struct ProcessHeapAllocator;
+
+// SAFETY: on-target, `alloc` returns either a valid pointer from the installed first-fit heap or
+// null; `dealloc` frees a pointer the same heap handed out. Off-target it is a pure null-returning
+// stub (no live allocation exists there). No fabricated pointers.
+unsafe impl GlobalAlloc for ProcessHeapAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: single-threaded loader access to the installed heap.
+            unsafe {
+                if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+                    // The heap guarantees 16-byte alignment; larger alignments over-allocate to fit.
+                    let want = layout.size().max(1) + layout.align().saturating_sub(1);
+                    return h.allocate(want).unwrap_or(core::ptr::null_mut());
+                }
+            }
+            core::ptr::null_mut()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = layout;
+            core::ptr::null_mut()
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: single-threaded loader access; ptr came from this heap.
+            unsafe {
+                if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
+                    let _ = h.free(ptr);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = ptr;
+        }
+    }
 }
 
 #[global_allocator]
-static ALLOCATOR: AbortAllocator = AbortAllocator;
+static ALLOCATOR: ProcessHeapAllocator = ProcessHeapAllocator;
 
 /// Anchor the 188 `Nt*` trap stubs so the linker retains them into the DLL export directory.
 ///
@@ -74,54 +134,142 @@ static KEEP_EXPORTS: unsafe extern "C" fn() = exports::EXPORT_ANCHOR_FN;
 /// `rust-micro/src/arch/x86_64/exceptions.rs`). Seeing this line in the boot log PROVES our Rust
 /// ntdll executed IN smss's isolated VSpace and a trap reached the kernel.
 ///
-/// ★ These are `u8` LITERALS built onto the STACK at runtime (NOT a `.rdata` static): the kernel's
-/// int-0x2d PRINT handler READS the message buffer (`rcx`) DIRECTLY from kernel mode, so it must sit
-/// on a page already mapped in smss's VSpace. Our LdrpInitialize's `.text` page is demand-faulted in
-/// (that is how we got here), but a fresh `.rdata` page would NOT be mapped yet → the kernel read
-/// would #PF in kernel mode. The stack IS fully mapped at spawn, so a stack buffer is safe.
-const STEP4A_MARKER_LEN: usize = 60;
-
-/// `LdrpInitialize` — the loader entry the executive's spawn trampoline transfers to.
-///
-/// Real-ntdll ABI (x64): `VOID LdrpInitialize(PCONTEXT Context, PVOID NtDllBase)`. The full live
-/// orchestration ([`nt_ntdll::loader::ldrp_initialize`]) needs an on-target `LoaderHost` (the live
-/// map/IAT/PEB-commit/transfer ops) which Step 4.B wires.
-///
-/// **Step 4.A — first live control + an observable syscall.** As its FIRST action this emits the
-/// Step-4.A marker via the `int 0x2d` DebugService (`ServiceClass = PRINT`), which our kernel
-/// forwards to the serial log. That single line is the Step-4.A proof: OUR Rust ran in smss's own
-/// VSpace and issued a trap the kernel serviced. After the marker it returns to the trampoline (the
-/// live `LoaderHost` map/IAT/PEB/transfer drive is Step 4.B) — it does NOT fabricate a completed
-/// init; the process will not reach smss's entry until 4.B wires the real loader.
+/// Emit a NUL-free byte marker to the serial log via the `int 0x2d` DebugService (`PRINT`) the
+/// kernel forwards (see `project_smss_sec_image`). The buffer MUST live on the STACK (an
+/// already-mapped page): the kernel's PRINT handler reads `rcx` DIRECTLY from kernel mode, so a
+/// not-yet-faulted `.rdata` page would #PF in the kernel. Pairs `int 0x2d; int3` (the kernel advances
+/// RIP by 3 on resume).
 ///
 /// # Safety
-/// Called by the kernel/trampoline with the loader `CONTEXT`. Emits an `int 0x2d` (target x86_64
-/// only) then returns; no live-init side effects until Step 4.B.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn LdrpInitialize(_context: *mut c_void, _ntdll_base: *mut c_void) {
-    // Step 4.A observable marker: prove OUR code runs in-process + a trap reaches the kernel.
-    // The kernel's int-0x2d handler forwards RCX(msg)/RDX(len) with EAX=1 (PRINT) to serial and,
-    // on resume, advances RIP past `int 0x2d; int3` (3 bytes) — so we pair them exactly.
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Build the marker on the STACK (mapped at spawn) — see STEP4A_MARKER_LEN doc for why not
-        // a .rdata static. "nt-ntdll: our Rust LdrpInitialize running in smss (Step 4.A)\0" (60 B).
-        let marker: [u8; STEP4A_MARKER_LEN] = *b"nt-ntdll: our Rust LdrpInitialize running in smss (Step 4.A)";
-        let msg = marker.as_ptr();
+/// `msg`/`len` must describe a mapped, readable buffer (a stack local at the call site).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dbg_print_bytes(msg: *const u8, len: usize) {
+    // SAFETY: msg/len describe a mapped stack buffer per the contract.
+    unsafe {
         core::arch::asm!(
             "int 0x2d",
             "int3",
             in("eax") 1u32, // BREAKPOINT_PRINT
             in("rcx") msg,
-            in("rdx") STEP4A_MARKER_LEN,
+            in("rdx") len,
             options(nostack, preserves_flags),
         );
-        // Keep the stack buffer live across the asm (it is read by the kernel handler above).
-        core::hint::black_box(&marker);
     }
-    // Step 4.B replaces the rest with the live-host drive of `nt_ntdll::loader::ldrp_initialize`.
+}
+
+/// `LdrpInitialize` — the loader entry the executive's spawn trampoline transfers to.
+///
+/// Real-ntdll ABI (x64): `VOID LdrpInitialize(PCONTEXT Context, PVOID NtDllBase)`. Our Step-4.B
+/// trampoline additionally passes **smss's image base in `R8`** (the C-ABI 3rd arg `smss_base`) —
+/// the real ntdll ignores SystemArgument2, but our in-process loader needs it to snap smss's imports
+/// against OUR export table (see [`on_target`]).
+///
+/// **Step 4.B — the live in-process loader drive.** Runs IN smss's VSpace (Step 4.A proved control
+/// reaches here + a trap is serviced). It:
+/// 1. emits a diagnostic marker (the 4.A proof line, kept),
+/// 2. creates the **process heap** (`NtAllocateVirtualMemory` → serviced) + installs the global
+///    allocator, then
+/// 3. **snaps smss's ntdll imports in-process** against OUR export directory — writing our export
+///    addresses directly into smss's IAT slots (fixing the 4.A IAT-RVA mismatch).
+/// 4. emits a second marker reporting the snap result, then returns to the trampoline, which chains
+///    to smss's real entry (`NtProcessStartup`) — now running under OUR ntdll.
+///
+/// It never fabricates a completed init; each step is real (heap committed, IAT written) or an
+/// honest no-op (a missing base → skip, logged).
+///
+/// # Safety
+/// Called by the kernel/trampoline with `(Context, NtDllBase, smss_base)`. Issues syscall traps +
+/// in-process image reads/writes (target x86_64 only).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn LdrpInitialize(
+    _context: *mut c_void,
+    ntdll_base: *mut c_void,
+    smss_base: *mut c_void,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // (1) The Step-4.A proof line (kept as a diagnostic; stack buffer — see dbg_print_bytes).
+        let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
+        // SAFETY: on-target, marker is a mapped stack buffer.
+        unsafe { dbg_print_bytes(marker.as_ptr(), marker.len()) };
+
+        let ntdll = ntdll_base as u64;
+        let smss = smss_base as u64;
+        if smss != 0 && ntdll != 0 {
+            // (2)+(3) Real heap + in-process import snap against OUR export table.
+            // SAFETY: on-target; both are mapped PE images in this VSpace.
+            let res = unsafe { on_target::ldrp_drive(smss, ntdll) };
+
+            // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
+            // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).
+            let mut buf = [0u8; 64];
+            let mut n = 0usize;
+            let put = |buf: &mut [u8; 64], n: &mut usize, b: &[u8]| {
+                for &c in b {
+                    if *n < buf.len() {
+                        buf[*n] = c;
+                        *n += 1;
+                    }
+                }
+            };
+            put(&mut buf, &mut n, b"nt-ntdll: snap resolved=");
+            n = write_u32_dec(&mut buf, n, res.resolved);
+            put(&mut buf, &mut n, b" missing=");
+            n = write_u32_dec(&mut buf, n, res.missing);
+            put(&mut buf, &mut n, b" spot=0x");
+            n = write_u64_hex(&mut buf, n, res.spot_iat_value);
+            // SAFETY: on-target, buf is a mapped stack buffer.
+            unsafe { dbg_print_bytes(buf.as_ptr(), n) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ntdll_base, smss_base);
+    }
     core::hint::black_box(_context);
-    core::hint::black_box(_ntdll_base);
+}
+
+/// Append `v` as decimal into `buf[n..]`; return the new length. Stack-only (no alloc).
+#[cfg(target_arch = "x86_64")]
+fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
+    if v == 0 {
+        if n < buf.len() {
+            buf[n] = b'0';
+            n += 1;
+        }
+        return n;
+    }
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut x = v;
+    while x > 0 {
+        digits[d] = b'0' + (x % 10) as u8;
+        d += 1;
+        x /= 10;
+    }
+    while d > 0 {
+        d -= 1;
+        if n < buf.len() {
+            buf[n] = digits[d];
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Append `v` as 16-hex-digit into `buf[n..]`; return the new length. Stack-only (no alloc).
+#[cfg(target_arch = "x86_64")]
+fn write_u64_hex(buf: &mut [u8; 64], mut n: usize, v: u64) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in (0..16).rev() {
+        let nib = ((v >> (i * 4)) & 0xf) as usize;
+        if n < buf.len() {
+            buf[n] = HEX[nib];
+            n += 1;
+        }
+    }
+    n
 }
 
 /// `DllMainCRTStartup` — the DLL entry point the PE loader calls. Normally the CRT supplies this

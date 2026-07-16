@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0 + 4.0b DONE · **Step 4.A (FIRST LIVE BOOT on OUR ntdll — smss/pi 0, revertible flag, observable marker proven) DONE 2026-07-16** · Step 4.B next
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · Step 4.0 + 4.0b DONE · Step 4.A DONE · **Step 4.B (in-process LoaderHost: real heap + import snap against OUR export table + transfer → smss reaches NtProcessStartup under OUR ntdll) DONE 2026-07-16** · Step 4.C next
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -757,5 +757,76 @@ ntdll-only imports IN-PROCESS against OUR export table — fixes the IAT-RVA mis
 to smss's `NtProcessStartup`). Plus wire the real process heap allocator (swap the cdylib's
 `AbortAllocator` for the `heap`-backed one) so `RtlAllocateHeap`/`RtlCreate*` light up. Goal: smss
 reaches `NtProcessStartup` under OUR ntdll.
-### ☐ Step 4.B — real LoaderHost (map/write_iat/PEB->Ldr/transfer) + snap smss's ntdll-only imports → smss reaches NtProcessStartup under our ntdll. (Trampoline already points at OUR LdrpInitialize RVA — done in 4.A.)
-### ☐ Step 4.C — parity: smss progresses as far under our ntdll as under real (spawns csrss); add the SSN-50 arm; keep fallback; gate green (174/98, paint 768/768) throughout.
+### ☑ Step 4.B — the in-process LoaderHost: real heap + import snap against OUR export table + transfer → smss reaches NtProcessStartup under OUR ntdll (DONE 2026-07-16)
+**The milestone: our Rust ntdll's `LdrpInitialize` ran IN smss's VSpace, created a real process heap
+(`NtAllocateVirtualMemory` → serviced), SNAPPED all 103 of smss's ntdll imports against OUR export
+table (direct in-process IAT writes), then returned to the trampoline which chained to smss's real
+entry — `smss reached NtProcessStartup and called back into OUR ntdll via the snapped IAT`.**
+Committed with the flag OFF → the gate stays green via the real-ntdll fallback. **sel4test
+byte-identical.**
+
+**★ IN-PROCESS architecture (the recon's external-loader lean was wrong — this matches real ntdll):**
+our `LdrpInitialize` runs in smss's own VSpace (4.A proved a trap from here is serviced), so the
+LoaderHost does its work IN-PROCESS: (a) DIRECT memory reads/writes to already-mapped pages (smss's
+IAT, our export dir), and (b) our own `Nt*` syscall stubs for kernel ops (the heap via
+`NtAllocateVirtualMemory`). It does NOT touch executive-side primitives (`smss_copyout` etc.) — those
+are for an executive-driven loader, which is NOT how ntdll works. smss imports ONLY ntdll, and BOTH
+smss + ntdll are already mapped by the executive → `map_image` is a no-op; the only real work is the
+heap + the import snap + the transfer.
+
+**What landed (all cdylib + one executive trampoline line; NO `rust-micro/src` change):**
+- **`crates/nt-ntdll-dll/src/on_target.rs`** — the in-process drive:
+  - **`nt_allocate_virtual_memory(size)`** — an inline `Nt*` trap caller (`mov r10,rcx; mov eax,18;
+    syscall`) for `NtAllocateVirtualMemory`. ★ `*BaseAddress`(RDX)/`*RegionSize`(R9) are STACK locals
+    — the executive reads/writes them through its stack mirror (matches its NtAllocateVirtualMemory
+    handler exactly). The two extra args (Type/Protect) sit at `[rsp+0x28]`/`[rsp+0x30]`.
+  - **process heap** — `nt_ntdll::heap::Heap` (the host-tested first-fit free-list allocator) over a
+    1 MiB `NtAllocateVirtualMemory` region, installed as the cdylib's `#[global_allocator]` (replaced
+    the 4.0 `AbortAllocator`). So the loader's `alloc` works in-process, as real ntdll creates the
+    process heap early. A pre-install alloc returns null (honest failure, never a bogus pointer).
+  - **a minimal MAPPED-IMAGE PE walker (by RVA)** — in-process every image is already MAPPED, so
+    RVA == offset-from-base (unlike `nt-pe-loader::PeFile`, which parses a FLAT FILE using section
+    *file* offsets — wrong for a mapped image). `export_rva_by_name` walks OUR export directory
+    (`AddressOfNames`/`AddressOfNameOrdinals`/`AddressOfFunctions`); `snap_smss_imports` walks smss's
+    import descriptor array, and for the ntdll descriptor resolves each name→our-export-RVA and writes
+    `NTDLL_BASE + rva` into the IAT slot (`*(iat) = addr`, a direct in-process write — the slot page is
+    `.rdata` RW_NX + demand-faulted).
+- **`crates/nt-ntdll-dll/src/lib.rs`** — `LdrpInitialize(Context, NtDllBase, smss_base)` now DRIVES:
+  marker → `on_target::ldrp_drive(smss_base, ntdll_base)` (heap + snap) → a second marker reporting
+  the snap result → return to the trampoline. The `#[global_allocator]` is the real process heap.
+- **`components/ntos-executive/src/img_spawn.rs`** (the ONE executive change, flag-gated so flag-OFF
+  is byte-identical) — the spawn trampoline passes **smss's image base in R8** (the LdrpInitialize C-ABI
+  3rd arg) when calling OUR LdrpInitialize (`ldrpinit_rva != 0`); the real ntdll path still emits
+  `xor r8d,r8d` (byte-identical). Our loader needs smss's base to find its import dir (real ntdll gets
+  it from the PEB, which our minimal in-process path doesn't walk yet).
+
+**The IMPORT-SNAP proof (the deliverable):** flag-ON boot log —
+`[dbg] nt-ntdll: Step 4.B in-process loader drive (LdrpInit)` then
+`[dbg] nt-ntdll: snap resolved=103 missing=0 spot=0x0000010000803060`. **All 103 of smss's ntdll
+imports resolved (0 missing) against OUR export table**, and the spot IAT slot now holds
+`0x1_0080_3060` = `NTDLL_BASE(0x1_0080_0000) + 0x3060` — a value that POINTS INTO OUR ntdll's exports
+(fixing the 4.A IAT-RVA mismatch, where the executive had pre-snapped against REAL-ntdll RVAs).
+
+**How far smss runs under OUR ntdll (the parity signal):** immediately after the snap the boot log
+shows `#PF rip=0x…572ee0` (instr-fetch) = **smss's real entry `NtProcessStartup`** (PE_LOAD_BASE
+`0x…560000` + entry RVA `0x12ee0`) executing under OUR ntdll, then `rip=0x…561150`/`…572ffb` (smss
+`.text` running) and `rip=0x…808260` = **smss CALLING BACK INTO OUR ntdll** (`NTDLL_BASE + 0x8260`)
+through the freshly-snapped IAT — cross-module control into our loader/RTL. **smss reached its entry
+and drives our ntdll's exported surface.** (vs real-ntdll smss, which runs the full LdrpInitialize
+process bring-up → SmpInit → spawns csrss; ours reaches the entry + the first exported-ntdll calls =
+the point where 4.C's parity work — the `Rtl*`/`Nt*` bodies smss's `NtProcessStartup` exercises —
+picks up.)
+
+**The committed state (default OFF) + gate:** `SMSS_USE_OUR_NTDLL=false` → the real-ntdll fallback →
+gate **174/98**, paint **768/768 @ 0x003a6ea5** (verified). **sel4test byte-identical** (the only
+executive change is inside the `ldrpinit_rva != 0` branch, dead on flag-OFF; no `rust-micro/src`
+change). `nt-ntdll` host tests **145/145**. Flag ON reproduces the snap + entry proof above.
+
+**What 4.C wires next (parity → spawn csrss):** smss's `NtProcessStartup` now runs under OUR ntdll +
+calls our exported surface; 4.C brings the exercised `Rtl*`/`Nt*`/`Ldr*` BODIES to real-ntdll parity
+(the 4.0b honest seams — `RtlAllocateHeap` now HAS a live process heap to route to; process-param
+normalization; the loader-module list `PEB->Ldr` a real binary walks) so smss progresses as far under
+our ntdll as under real (SmpInit → SmpExecuteImage → `NtCreateProcessEx` for csrss). Add the executive
+**SSN-50 arm** (`NtCreateProcessEx` — 49's args are a prefix of 50's; see the Step 2c reconciliation).
+Keep the fallback + the gate green (174/98, paint 768/768) throughout.
+### ☐ Step 4.C — parity: smss progresses as far under our ntdll as under real (spawns csrss); add the SSN-50 arm; keep fallback; gate green (174/98, paint 768/768) throughout. (4.B reached NtProcessStartup + snapped IAT; 4.C = the exercised Rtl*/Nt* body parity now that the process heap is live + the SSN-50 create arm.)

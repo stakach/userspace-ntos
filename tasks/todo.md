@@ -1,35 +1,44 @@
-# Task: SERVICE 10 step 2 — real NtWaitForMultipleObjects + multiplex winlogon's rpcrt4 worker
+# Step 4.B — wire our ntdll's REAL loader live (in-process LoaderHost)
 
-Baseline: main @ 371bc8c, gate 169/96, paint 768/768 @ 0x003a6ea5, sel4test byte-identical, exit 3.
+Baseline: main @ 83e1084, gate 174/98, paint 768/768 @ 0x003a6ea5, sel4test byte-identical.
 
-## Plan
-- [x] Part 1: make NtWaitForMultipleObjects (SSN 280) a REAL array-wait with reply-cap parking
-      (WaitAny/WaitAll, auto-reset event semantics, no-deadlock fallback to immediate).
-- [x] Part 2: multiplex winlogon's rpcrt4 server WORKER thread (badge WINLOGON_WORKER_BADGE,
-      own stack-mirror/TEB, resumed into the loop) instead of leaving it suspended.
-- [x] Contain the worker's own unrecoverable fault (park it) so the boot continues.
-- [x] Land green, paint intact, no hang.
+## Goal
+Replace the 4.A marker-then-return in the cdylib's `LdrpInitialize` with a real
+in-process drive: heap over NtAllocateVirtualMemory + snap smss's ntdll-only imports
+against OUR export table (direct IAT writes) + transfer to smss's entry (NtProcessStartup).
+Flag-gated (SMSS_USE_OUR_NTDLL); committed state green via flag OFF.
 
-## Review
-- Part 1 DONE: generalized the Checkpoint-B waiter machinery to a SET of events
-  (WAITER_EVENTS[16][8] + WAITER_EVENT_COUNT + WAITER_WAIT_ALL); `wait_park_multi` + a rewritten
-  `wait_wake_event_set(just_set, &mut obj_ns)` that wakes on WaitAny (first signalled → WAIT_0+idx)
-  or WaitAll (all signalled → WAIT_0) and AUTO-RESETS consumed SynchronizationEvents. `wait_park`
-  is now a 1-event wrapper. New ObjEntry.auto_reset field. The 280 handler resolves the handle
-  array → obj_ns events, satisfies immediately or parks (no-deadlock: only parks when the set holds
-  a real event with a live signaler; else immediate WAIT_0, documented). smss's badge-0 280 park
-  kept unchanged.
-- Part 2 DONE + PROVEN: `spawn_wl_listener_thread` now RESUMES the rpcrt4 worker into the loop with
-  a badged fault EP (WINLOGON_WORKER_BADGE=11) + its own stack mirror (WINLOGON_WORKER_STACK_MIRROR_VA)
-  at prio 106. Loop sub-selects `is_wl_worker` → pi 2 + the worker's stack mirror. Worker fault
-  containment added (both the NULL-deref and blocking-syscall park arms). Spec
-  `exec_winlogon_worker_multiplex` (WL_WORKER_FAULTS>=1) passes: the worker ran 2 multiplex events.
-- ★ KEY FINDING (the memory was WRONG): winlogon's `4:122` loop is NOT NtWaitForMultipleObjects —
-  SSN 122 = NtOpenFile (ReactOS sysfuncs line 123 → SSN 122). NtWaitForMultipleObjects = SSN 280.
-  winlogon's stop is a DLL-LOAD loop (OpenFile→CreateSection→MapView→Protect→Flush, +QueryAttributes/
-  QueryPerfCounter) that OVERFLOWS the stack (cr2=0x105b0ff0 below STACK_GROWTH_FLOOR) — NOT a wait.
-  So the real winlogon frontier is a loader/stack issue, a SEPARATE increment from the wait work.
-- Result: gate 170/96 (+1 exec_winlogon_worker_multiplex), 0 FAIL, paint 768/768, exit 3, no hang,
-  sel4test byte-identical (submodule clean). winlogon's own trajectory unchanged (same DLL-load stop
-  at iters 5217, was 5215 — +2 worker events). The wait infrastructure (Part 1) + worker multiplex
-  (Part 2) are correct and in place; winlogon advancing needs the loader/stack frontier next.
+## Architecture (in-process, like real ntdll)
+- Our LdrpInitialize runs IN smss's VSpace (4.A proved it).
+- Nt* stubs = syscall trap → serviced by executive (NtAllocateVirtualMemory works).
+- smss + ntdll BOTH already mapped by the executive. map_image = no-op.
+- IAT pages are RW (.rdata) + demand-faulted → direct in-process writes OK.
+- Resolve smss's imports against OUR export directory (mapped at NTDLL_BASE).
+
+## Slices
+### Slice 1 — heap + in-process import snap
+- [ ] cdylib `syscalls` module: NtAllocateVirtualMemory in-process caller.
+- [ ] Real #[global_allocator] over nt_ntdll::heap on an NtAllocateVirtualMemory region.
+- [ ] In-process mapped-PE walk: our export dir (name→rva) + smss import dir + IAT slot rvas.
+- [ ] Snap: write NTDLL_BASE+export_rva into each smss ntdll IAT slot (direct in-proc write).
+- [ ] LdrpInitialize: marker → heap → snap → return to trampoline.
+- [ ] Boot flag ON: heap ok + IAT snapped. COMMIT flag OFF (green).
+
+### Slice 2 — transfer to entry
+- [ ] Trampoline chains to smss entry (RCX=PEB) → NtProcessStartup under our ntdll.
+- [ ] Boot flag ON: smss reaches NtProcessStartup, first syscalls appear. COMMIT flag OFF.
+
+## Verify
+- Gate green flag OFF: 174/98 + paint 768/768; sel4test byte-identical; cargo test -p nt-ntdll = 145.
+
+## Review (DONE 2026-07-16)
+- Slice 1 + Slice 2 BOTH landed in one pass.
+- Flag ON boot log: `snap resolved=103 missing=0 spot=0x0000010000803060` (all smss ntdll imports
+  snapped in-process against OUR export table; spot IAT points into our ntdll = NTDLL_BASE+0x3060).
+- smss reached NtProcessStartup (rip=0x…572ee0) + called back into our ntdll (rip=0x…808260) via the
+  snapped IAT.
+- Committed flag OFF: gate 174/98, paint 768/768 @ 0x003a6ea5, exit=3. sel4test byte-identical (only
+  executive change is inside the ldrpinit_rva!=0 branch, dead on flag-OFF; no rust-micro/src change).
+- nt-ntdll host tests 145/145. DLL rebuilt (254 exports, LdrpInitialize RVA 0x1050, 2048 relocs).
+- Files: crates/nt-ntdll-dll/src/on_target.rs (new), crates/nt-ntdll-dll/src/lib.rs (heap allocator +
+  LdrpInitialize drive), components/ntos-executive/src/img_spawn.rs (R8=smss base, flag-gated).

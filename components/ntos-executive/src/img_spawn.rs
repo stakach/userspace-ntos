@@ -559,7 +559,16 @@ pub(crate) unsafe fn spawn_sec_image(
         // ntdll DllBase null → LdrpAllocateModuleEntry(RtlImageNtHeader(0)=0) returned null.
         tb.extend_from_slice(&[0x48, 0xBA]);
         tb.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // movabs rdx, NTDLL_BASE
-        tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
+        // Step 4.B: OUR ntdll's in-process LoaderHost snaps smss's imports against OUR export table,
+        // which needs smss's own image base. Pass it in R8 (SystemArgument2) when calling OUR
+        // LdrpInitialize (ldrpinit_rva != 0). The real ReactOS ntdll ignores SystemArgument2, but to
+        // keep the flag-OFF / pi>=1 path BYTE-IDENTICAL we still emit `xor r8d,r8d` there.
+        if ldrpinit_rva != 0 {
+            tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
+            tb.extend_from_slice(&PE_LOAD_BASE.to_le_bytes()); // R8 = smss image base
+        } else {
+            tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
+        }
         tb.extend_from_slice(&[0x48, 0xB8]);
         // Step 4.A: call OUR LdrpInitialize RVA when the caller derived one (ldrpinit_rva != 0);
         // otherwise the real ReactOS ntdll's fixed 0x8e70 (flag-OFF / pi>=1 — byte-identical).
