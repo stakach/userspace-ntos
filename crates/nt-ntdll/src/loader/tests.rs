@@ -340,6 +340,68 @@ fn peb_ldr_lists_thread_and_walk_back() {
 }
 
 #[test]
+fn circular_links_close_the_list_and_walk_terminates() {
+    // The shared primitive both the host model and the on-target PEB->Ldr builder use.
+    let head = 0x1000u64;
+    let nodes = [0x2000u64, 0x2400, 0x2800];
+    let (h, m) = peb::circular_links(head, &nodes);
+    // Head → first, head.blink → last.
+    assert_eq!(h.flink, 0x2000);
+    assert_eq!(h.blink, 0x2800);
+    // First: blink=head, flink=second.
+    assert_eq!(m[0].blink, head);
+    assert_eq!(m[0].flink, 0x2400);
+    // Middle.
+    assert_eq!(m[1].blink, 0x2000);
+    assert_eq!(m[1].flink, 0x2800);
+    // Last: flink=head (closes circularly — NEVER a NULL flink, the kernel32 GetModuleFileNameW bug).
+    assert_eq!(m[2].blink, 0x2400);
+    assert_eq!(m[2].flink, head);
+
+    // Simulate the actual walk `GetModuleFileNameW` does: follow flinks from head, expect to visit
+    // all 3 nodes and return to the head (terminate) — with NO NULL flink en route.
+    let node_link = |va: u64| {
+        nodes
+            .iter()
+            .position(|&n| n == va)
+            .map(|i| m[i])
+            .expect("node present")
+    };
+    let mut cur = h.flink;
+    let mut visited = 0usize;
+    while cur != head {
+        assert_ne!(cur, 0, "NULL flink during walk — the exact GetModuleFileNameW fault");
+        visited += 1;
+        cur = node_link(cur).flink;
+        assert!(visited <= 3, "walk did not terminate — list not closed");
+    }
+    assert_eq!(visited, 3);
+}
+
+#[test]
+fn circular_links_empty_list_points_at_head() {
+    // An empty list head points at itself — a valid, walk-terminating (immediately) empty list.
+    let (h, m) = peb::circular_links(0x9000, &[]);
+    assert_eq!(h.flink, 0x9000);
+    assert_eq!(h.blink, 0x9000);
+    assert!(m.is_empty());
+}
+
+#[test]
+fn circular_links_incremental_runtime_add_reappends() {
+    // Models the on-target "LdrLoadDll appends a runtime module" case: rethreading the SAME list with
+    // one more node keeps the walk complete + terminating (the runtime module appears at the tail).
+    let head = 0x1000u64;
+    let before = [0x2000u64, 0x2400];
+    let (_h0, _m0) = peb::circular_links(head, &before);
+    let after = [0x2000u64, 0x2400, 0x2800]; // secur32 appended
+    let (h, m) = peb::circular_links(head, &after);
+    assert_eq!(h.blink, 0x2800, "runtime module is the new list tail");
+    assert_eq!(m[2].flink, head, "new tail closes the list");
+    assert_eq!(m[1].flink, 0x2800, "prior tail now links to the runtime module");
+}
+
+#[test]
 fn ldr_entry_fields_are_populated() {
     let mut st = LoaderState::new();
     let mut m = LoadedModule::mock("ntdll.dll", 0xABCD_0000, vec![], vec![]);

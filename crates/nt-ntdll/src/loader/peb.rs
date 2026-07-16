@@ -214,6 +214,58 @@ enum ListSel {
     Init,
 }
 
+/// The `(flink, blink)` pair for one `LIST_ENTRY` node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct NodeLinks {
+    /// Forward link (VA of the next node).
+    pub flink: u64,
+    /// Backward link (VA of the previous node).
+    pub blink: u64,
+}
+
+/// ★ The **pure** circular doubly-linked-list threading primitive — the single source of truth for
+/// how a Windows `LIST_ENTRY` chain is closed. Given the head node's VA and the ordered list of
+/// member-node VAs, it returns the head's `(flink, blink)` plus each member's `(flink, blink)` such
+/// that:
+///   * `head.flink` → first member (or the head itself when empty),
+///   * `head.blink` → last member (or the head itself when empty),
+///   * member `k`'s `flink` → member `k+1` (or the head after the last),
+///   * member `k`'s `blink` → member `k-1` (or the head before the first).
+///
+/// This is exactly the closure a hosted binary / debugger walk (`GetModuleFileNameW`,
+/// `LdrGetDllHandle`, the WinDbg `!peb`) relies on: following `flink`s from the head returns every
+/// member and terminates back at the head (never a NULL flink). Both the host-model [`build_ldr`]
+/// AND the on-target `PEB->Ldr` builder thread their lists through THIS function, so the link math
+/// is authored + tested once.
+pub fn circular_links(head_va: u64, node_vas: &[u64]) -> (NodeLinks, Vec<NodeLinks>) {
+    let count = node_vas.len();
+    if count == 0 {
+        // Empty list: the head points at itself (a valid, walk-terminating empty list).
+        return (
+            NodeLinks {
+                flink: head_va,
+                blink: head_va,
+            },
+            Vec::new(),
+        );
+    }
+    let mut members = Vec::with_capacity(count);
+    for k in 0..count {
+        let flink = if k + 1 == count {
+            head_va
+        } else {
+            node_vas[k + 1]
+        };
+        let blink = if k == 0 { head_va } else { node_vas[k - 1] };
+        members.push(NodeLinks { flink, blink });
+    }
+    let head = NodeLinks {
+        flink: node_vas[0],
+        blink: node_vas[count - 1],
+    };
+    (head, members)
+}
+
 /// Thread one list (in `order`) circularly through the head at `head_node_va`, each entry's list
 /// node at `entry_va[mi] + node_off`. Sets each entry's `flink`/`blink` for the selected list.
 fn thread_list(
@@ -224,7 +276,8 @@ fn thread_list(
     node_off: u64,
     sel: ListSel,
 ) {
-    let node_va = |mi: usize| entry_va[mi] + node_off;
+    // The ordered list-node VAs (each entry's LIST_ENTRY for this list lives at entry_va + node_off).
+    let node_vas: Vec<u64> = order.iter().map(|&mi| entry_va[mi] + node_off).collect();
     // Precompute each ordered module's index into `entries` (entries are in load order; matched by
     // VA) so we don't hold an immutable borrow of `entries` while mutating it below.
     let ei_of: Vec<usize> = order
@@ -237,26 +290,17 @@ fn thread_list(
         })
         .collect();
 
-    let count = order.len();
-    for k in 0..count {
-        let prev_va = if k == 0 {
-            head_node_va
-        } else {
-            node_va(order[k - 1])
-        };
-        let next_va = if k + 1 == count {
-            head_node_va
-        } else {
-            node_va(order[k + 1])
-        };
+    // Thread via the SHARED circular-link primitive (same math the on-target builder uses).
+    let (_head, member_links) = circular_links(head_node_va, &node_vas);
+    for (k, nl) in member_links.iter().enumerate() {
         let ei = ei_of[k];
         let links = match sel {
             ListSel::Load => &mut entries[ei].entry.in_load_order_links,
             ListSel::Memory => &mut entries[ei].entry.in_memory_order_links,
             ListSel::Init => &mut entries[ei].entry.in_initialization_order_links,
         };
-        links.flink = next_va;
-        links.blink = prev_va;
+        links.flink = nl.flink;
+        links.blink = nl.blink;
     }
 }
 
@@ -278,17 +322,11 @@ fn build_head_links(
         ListSel::Init => (link_offsets::HEAD_IN_INIT_ORDER, link_offsets::ENTRY_IN_INIT_ORDER),
     };
     let head_va = layout.ldr_va + head_off;
-    if order.is_empty() {
-        return ListEntry {
-            flink: head_va,
-            blink: head_va,
-        };
-    }
-    let first = entry_va[order[0]] + node_off;
-    let last = entry_va[order[order.len() - 1]] + node_off;
+    let node_vas: Vec<u64> = order.iter().map(|&mi| entry_va[mi] + node_off).collect();
+    let (head, _members) = circular_links(head_va, &node_vas);
     ListEntry {
-        flink: first,
-        blink: last,
+        flink: head.flink,
+        blink: head.blink,
     }
 }
 

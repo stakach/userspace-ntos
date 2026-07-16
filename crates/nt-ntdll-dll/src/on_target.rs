@@ -1046,6 +1046,17 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
     let out = unsafe { snap_all_imports(smss_base, ntdll_base) };
+    // (2.5) BUILD `PEB->Ldr` (PEB+0x18) — the three circularly-linked LDR_DATA_TABLE_ENTRY lists,
+    // one entry per loaded module (the EXE + ntdll + every cascaded/delay DLL now in MODULE_TABLE).
+    // Real ntdll's LdrpInitializeProcess builds this BEFORE running init routines, and hosted code
+    // (kernel32's GetModuleFileNameW / LdrGetDllHandle, WinDbg) walks it. Without it, `Peb->Ldr` is
+    // NULL → GetModuleFileNameW(NULL)'s `[Peb->Ldr]+0x10` InLoadOrder walk derefs NULL+0x10 (the
+    // kernel32+0xff13 wall). `image_base` (the EXE) is recorded as list entry 0.
+    // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
+    unsafe {
+        let table = &*core::ptr::addr_of!(MODULE_TABLE);
+        build_peb_ldr(table, smss_base);
+    }
     // (3) Run DLL_PROCESS_ATTACH for every dependent DLL (the live LdrpRunInitializeRoutines seam).
     // kernel32's DllMain runs InitCommandLines() so GetCommandLineA is non-NULL — winlogon's msvcrt
     // CRT startup does strdup(GetCommandLineA()), which strlen(NULL)-faults without this.
@@ -1185,6 +1196,317 @@ unsafe fn snap_module(
 }
 
 // ---------------------------------------------------------------------------------------------
+// BATCH 15 — build + maintain `PEB->Ldr` (the three LDR_DATA_TABLE_ENTRY module lists).
+//
+// Real ntdll's LdrpInitializeProcess allocates a PEB_LDR_DATA + one LDR_DATA_TABLE_ENTRY per loaded
+// module and threads them into three circular doubly-linked lists (InLoadOrder / InMemoryOrder /
+// InInitializationOrder), then sets `Peb->Ldr` (PEB+0x18). Hosted code walks these: kernel32's
+// GetModuleFileNameW(NULL) follows `Peb->Ldr->InLoadOrderModuleList` to find the entry whose DllBase
+// matches; WinDbg's `!peb` reads them; LdrGetDllHandle walks them. Without them `Peb->Ldr` is NULL
+// and the walk derefs NULL+0x10 (the kernel32+0xff13 wall).
+//
+// We build them IN-PROCESS from MODULE_TABLE (+ the EXE base), over a process-lifetime page region
+// (bump-allocated so the entry VAs are persistent — a runtime LdrLoadDll appends another entry and
+// re-threads). The circular link math is `nt_ntdll::loader::peb::circular_links` (the SAME
+// host-tested primitive the model `build_ldr` uses) — link math authored + tested once.
+//
+// x64 LDR_DATA_TABLE_ENTRY field offsets (nt-ntdll-layout static-asserts):
+//   InLoadOrderLinks@0x00, InMemoryOrderLinks@0x10, InInitializationOrderLinks@0x20,
+//   DllBase@0x30, EntryPoint@0x38, SizeOfImage@0x40, FullDllName@0x48 (UNICODE_STRING),
+//   BaseDllName@0x58, Flags@0x68, LoadCount@0x6C, TlsIndex@0x6E.
+// PEB_LDR_DATA: Length@0x00, Initialized@0x04, SsHandle@0x08, InLoadOrderModuleList@0x10,
+//   InMemoryOrderModuleList@0x20, InInitializationOrderModuleList@0x30.
+// UNICODE_STRING: Length@0x00(u16), MaximumLength@0x02(u16), Buffer@0x08(ptr).
+// ---------------------------------------------------------------------------------------------
+
+/// Size of one `LDR_DATA_TABLE_ENTRY` we materialize (x64; the layout crate's full struct is 0x70+;
+/// round to 0x80 for alignment headroom).
+#[cfg(target_arch = "x86_64")]
+const LDR_ENTRY_SIZE: u64 = 0x80;
+/// Size of the `PEB_LDR_DATA` head (round to 0x60).
+#[cfg(target_arch = "x86_64")]
+const PEB_LDR_DATA_SIZE: u64 = 0x60;
+/// The process-lifetime region reserved for the Ldr head + entries + name buffers. Ample for the
+/// full winlogon module set (~300 loader entries observed) at ~0x80 struct + name bytes each.
+#[cfg(target_arch = "x86_64")]
+const LDR_REGION_SIZE: usize = 0x8_0000; // 512 KiB
+
+/// The maximum modules we thread into PEB->Ldr in one process.
+#[cfg(target_arch = "x86_64")]
+const LDR_MAX_ENTRIES: usize = 512;
+
+/// Process-lifetime state for the built PEB->Ldr: the bump region, the head VA, and the persistent
+/// per-module entry VAs (so a runtime LdrLoadDll can append + re-thread). Single-threaded loader
+/// context (LdrpInitialize + subsequent LdrLoadDll all run before/serialized on the main thread).
+#[cfg(target_arch = "x86_64")]
+struct LdrState {
+    /// The bump-allocation cursor VA within the reserved region (0 = not yet initialized).
+    cursor: u64,
+    /// One-past-the-end of the reserved region.
+    region_end: u64,
+    /// The `PEB_LDR_DATA` head VA (0 = not yet built).
+    ldr_va: u64,
+    /// Per-module `LDR_DATA_TABLE_ENTRY` VAs, in load order.
+    entry_vas: [u64; LDR_MAX_ENTRIES],
+    /// Number of entries threaded.
+    count: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+static mut LDR_STATE: LdrState = LdrState {
+    cursor: 0,
+    region_end: 0,
+    ldr_va: 0,
+    entry_vas: [0u64; LDR_MAX_ENTRIES],
+    count: 0,
+};
+
+/// Bump `n` bytes (16-aligned) from the Ldr region; returns the VA (0 on exhaustion).
+///
+/// # Safety
+/// On-target; `LDR_STATE` region must be reserved (cursor != 0). Single-threaded loader.
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_bump(n: u64) -> u64 {
+    // SAFETY: single-threaded loader touches LDR_STATE only here + build_peb_ldr.
+    unsafe {
+        let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+        let aligned = (st.cursor + 15) & !15u64;
+        if aligned + n > st.region_end {
+            return 0; // exhausted — honest failure, never overrun the region
+        }
+        st.cursor = aligned + n;
+        aligned
+    }
+}
+
+/// The `SizeOfImage` (OptionalHeader+56) of a mapped PE at `base` (0 if unreadable).
+///
+/// # Safety
+/// `base` must be a mapped PE image (DOS + NT headers readable).
+#[cfg(target_arch = "x86_64")]
+unsafe fn size_of_image(base: u64) -> u32 {
+    // SAFETY: reading the mapped PE headers per the contract.
+    unsafe {
+        let e_lfanew = rd32(base, 0x3c) as u64;
+        let opt = base + e_lfanew + 24; // OptionalHeader
+        rd32_at(opt + 56) // SizeOfImage
+    }
+}
+
+/// Materialize ONE `LDR_DATA_TABLE_ENTRY` at a freshly-bumped VA for the module `base` with base name
+/// `name_lc` (lowercased, no `.dll`). Fills DllBase / EntryPoint / SizeOfImage / LoadCount / a
+/// `FullDllName` + `BaseDllName` UNICODE_STRING (both pointing at heap-copied UTF-16 `<name>.dll`).
+/// The `LIST_ENTRY` links are left zero here (threaded by [`thread_ldr_lists`]). Returns the entry VA
+/// (0 on region exhaustion).
+///
+/// # Safety
+/// On-target; `base` a mapped PE image; the Ldr region is reserved.
+#[cfg(target_arch = "x86_64")]
+unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
+    // SAFETY: bump-alloc + raw writes into the reserved process-lifetime region.
+    unsafe {
+        let entry = ldr_bump(LDR_ENTRY_SIZE);
+        if entry == 0 {
+            return 0;
+        }
+        // Zero the entry struct.
+        for i in 0..(LDR_ENTRY_SIZE / 8) {
+            core::ptr::write_unaligned((entry + i * 8) as *mut u64, 0);
+        }
+        // Build a UTF-16 "<name>.dll" name buffer in the region (persistent). The FullDllName is the
+        // same leaf here (a full path would need the resolved DLL path; the leaf satisfies the
+        // GetModuleFileNameW/LdrGetDllHandle base-name match + is non-NULL for walkers).
+        let nchars = name_lc.len() + 4; // + ".dll"
+        let name_bytes = (nchars * 2) as u64;
+        let namebuf = ldr_bump(name_bytes + 2); // + NUL
+        if namebuf == 0 {
+            return 0;
+        }
+        let mut w = 0u64;
+        for &c in name_lc {
+            core::ptr::write_unaligned((namebuf + w) as *mut u16, c as u16);
+            w += 2;
+        }
+        for &c in b".dll" {
+            core::ptr::write_unaligned((namebuf + w) as *mut u16, c as u16);
+            w += 2;
+        }
+        core::ptr::write_unaligned((namebuf + w) as *mut u16, 0); // NUL
+
+        core::ptr::write_unaligned((entry + 0x30) as *mut u64, base); // DllBase
+        let epr = entry_point_rva(base);
+        let ep = if epr != 0 { base + epr as u64 } else { 0 };
+        core::ptr::write_unaligned((entry + 0x38) as *mut u64, ep); // EntryPoint
+        core::ptr::write_unaligned((entry + 0x40) as *mut u32, size_of_image(base)); // SizeOfImage
+
+        // FullDllName @0x48, BaseDllName @0x58 — both UNICODE_STRING{Length,MaxLength,_,Buffer}.
+        let ustr = |off: u64| {
+            core::ptr::write_unaligned((entry + off) as *mut u16, name_bytes as u16); // Length
+            core::ptr::write_unaligned((entry + off + 2) as *mut u16, name_bytes as u16); // MaximumLength
+            core::ptr::write_unaligned((entry + off + 8) as *mut u64, namebuf); // Buffer
+        };
+        ustr(0x48); // FullDllName
+        ustr(0x58); // BaseDllName
+        core::ptr::write_unaligned((entry + 0x6C) as *mut u16, 1u16); // LoadCount = 1
+        entry
+    }
+}
+
+/// (Re)thread the three PEB->Ldr circular lists over the current `LDR_STATE.entry_vas[..count]`,
+/// using the shared [`nt_ntdll::loader::peb::circular_links`] primitive, and (re)publish the head's
+/// three list-head `LIST_ENTRY`s. Load / memory / init order all use insertion order here (a faithful
+/// model — the real memory order is by base VA but the threading is identical + walkers key by
+/// DllBase, not position).
+///
+/// # Safety
+/// On-target; `LDR_STATE.ldr_va` + all `entry_vas[..count]` are in the reserved region.
+#[cfg(target_arch = "x86_64")]
+unsafe fn thread_ldr_lists() {
+    use nt_ntdll::loader::peb::circular_links;
+    // SAFETY: single-threaded loader; the region VAs are mapped + reserved.
+    unsafe {
+        let st = &*core::ptr::addr_of!(LDR_STATE);
+        let ldr_va = st.ldr_va;
+        let count = st.count.min(LDR_MAX_ENTRIES);
+        // Each list threads through a DIFFERENT LIST_ENTRY offset within the entry + head.
+        // (entry node offset, head list-head offset).
+        let lists: [(u64, u64); 3] = [
+            (0x00, 0x10), // InLoadOrder:  entry@0x00, head@0x10
+            (0x10, 0x20), // InMemoryOrder:entry@0x10, head@0x20
+            (0x20, 0x30), // InInitOrder:  entry@0x20, head@0x30
+        ];
+        for &(node_off, head_off) in &lists {
+            let head_node_va = ldr_va + head_off;
+            // Build the ordered list of this list's node VAs.
+            let mut node_vas = [0u64; LDR_MAX_ENTRIES];
+            for i in 0..count {
+                node_vas[i] = st.entry_vas[i] + node_off;
+            }
+            let (head, members) = circular_links(head_node_va, &node_vas[..count]);
+            // Head's list-head LIST_ENTRY.
+            core::ptr::write_unaligned((head_node_va) as *mut u64, head.flink);
+            core::ptr::write_unaligned((head_node_va + 8) as *mut u64, head.blink);
+            // Each member's LIST_ENTRY.
+            for (i, nl) in members.iter().enumerate() {
+                let node = st.entry_vas[i] + node_off;
+                core::ptr::write_unaligned(node as *mut u64, nl.flink);
+                core::ptr::write_unaligned((node + 8) as *mut u64, nl.blink);
+            }
+        }
+    }
+}
+
+/// Build `PEB->Ldr` from the current module set (`table` = MODULE_TABLE) plus the EXE at
+/// `exe_base` (which is NOT in MODULE_TABLE — MODULE_TABLE holds only dependencies). Reserves a
+/// process-lifetime region, materializes the head + one entry per module (EXE first, so a
+/// GetModuleFileNameW(NULL) InLoadOrder walk returns the EXE), threads the three lists, and sets
+/// `Peb->Ldr` (PEB+0x18).
+///
+/// Order: the EXE is list entry 0 (real ntdll puts the image first in load order). Then ntdll, then
+/// the remaining dependencies in MODULE_TABLE insertion order (a faithful model of load order).
+///
+/// # Safety
+/// On-target; `exe_base` + every `table` base are mapped PE images; the process heap is installed;
+/// `gs:[0x60]` = PEB (byte-exact x64 layout).
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
+    // SAFETY: on-target; reserve the region + raw writes into it + the gs-relative PEB write.
+    unsafe {
+        // Reserve the process-lifetime region for the head + entries + name buffers.
+        let region = nt_allocate_virtual_memory(LDR_REGION_SIZE);
+        if region == 0 {
+            return; // honest: no region → no Ldr (the walk still faults, but we didn't fabricate)
+        }
+        {
+            let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+            st.cursor = region;
+            st.region_end = region + LDR_REGION_SIZE as u64;
+            st.count = 0;
+        }
+        // Head first.
+        let ldr_va = ldr_bump(PEB_LDR_DATA_SIZE);
+        if ldr_va == 0 {
+            return;
+        }
+        // Zero + fill the fixed head fields.
+        for i in 0..(PEB_LDR_DATA_SIZE / 8) {
+            core::ptr::write_unaligned((ldr_va + i * 8) as *mut u64, 0);
+        }
+        core::ptr::write_unaligned((ldr_va) as *mut u32, PEB_LDR_DATA_SIZE as u32); // Length
+        core::ptr::write_unaligned((ldr_va + 4) as *mut u32, 1u32); // Initialized = TRUE
+        {
+            let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+            st.ldr_va = ldr_va;
+        }
+
+        // Entry 0 = the EXE (its base name from its own PE export dir isn't reliable; derive a leaf
+        // from a fixed "image" tag — GetModuleFileNameW(NULL) matches by DllBase, not by name).
+        add_ldr_module(exe_base, b"image");
+
+        // Then every module in MODULE_TABLE (ntdll + all deps), skipping any whose base == exe_base.
+        for m in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+            if m.base >= 0x1_0000 && m.base != exe_base {
+                add_ldr_module(m.base, &m.name[..m.nlen as usize]);
+            }
+        }
+
+        // Thread the three lists over all recorded entries.
+        thread_ldr_lists();
+
+        // Publish `Peb->Ldr` (PEB+0x18).
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb != 0 {
+            core::ptr::write_volatile((peb + 0x18) as *mut u64, ldr_va);
+        }
+
+        {
+            // Boot-log proof: "PebLdr va=0x.. n=N".
+            let st = &*core::ptr::addr_of!(LDR_STATE);
+            let mut mb = [0u8; 64];
+            let mut mn = 0usize;
+            for &c in b"PebLdr va=0x" {
+                if mn < 64 { mb[mn] = c; mn += 1; }
+            }
+            mn = crate::write_u64_hex(&mut mb, mn, ldr_va);
+            for &c in b" n=" {
+                if mn < 64 { mb[mn] = c; mn += 1; }
+            }
+            mn = crate::write_u32_dec(&mut mb, mn, st.count as u32);
+            crate::dbg_print_bytes(mb.as_ptr(), mn);
+        }
+    }
+}
+
+/// Record one module in `LDR_STATE` (materialize its entry; do NOT thread yet). De-dupes by base.
+///
+/// # Safety
+/// On-target; `base` a mapped PE image; the Ldr region is reserved.
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_ldr_module(base: u64, name_lc: &[u8]) {
+    // SAFETY: single-threaded loader; region reserved.
+    unsafe {
+        let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+        // De-dupe: already recorded?
+        for i in 0..st.count {
+            let e = st.entry_vas[i];
+            if core::ptr::read_unaligned((e + 0x30) as *const u64) == base {
+                return;
+            }
+        }
+        if st.count >= LDR_MAX_ENTRIES {
+            return;
+        }
+        let entry = build_ldr_entry(base, name_lc);
+        if entry == 0 {
+            return;
+        }
+        st.entry_vas[st.count] = entry;
+        st.count += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // BATCH 2 — the runtime loader Ldr* drivers (LdrLoadDll / LdrGetDllHandle / LdrGetProcedureAddress).
 //
 // csrsrv's `CsrLoadServerDll` calls `LdrLoadDll` to bring up its ServerDlls (basesrv/winsrv), then
@@ -1274,6 +1596,21 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
             let ntdll_base = table.find(b"ntdll");
             let mut out = SnapResult::default();
             snap_module(loaded, ntdll_base, table, &mut out, 0);
+            // BATCH 15 — link the runtime-loaded module (+ any deps it pulled in) into PEB->Ldr so a
+            // later GetModuleFileNameW / LdrGetDllHandle walk finds it + still terminates circularly.
+            // Re-thread from the FULL MODULE_TABLE (add_ldr_module de-dupes) to catch transitive deps
+            // snap_module just mapped, not only `loaded` itself.
+            {
+                let mut i = 0usize;
+                while i < table.count.min(MODULE_TABLE_CAP) {
+                    let m = table.mods[i];
+                    if m.base >= 0x1_0000 {
+                        add_ldr_module(m.base, &m.name[..m.nlen as usize]);
+                    }
+                    i += 1;
+                }
+                thread_ldr_lists();
+            }
             loaded
         };
         if !base_addr.is_null() {
