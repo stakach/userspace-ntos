@@ -1148,7 +1148,7 @@ pub(crate) unsafe fn service_sec_image(
                     let cpml4 = spawn_sec_image(
                         1, cpe, cf_c, NTDLL_BASE, true, 101, 0x0000_0100_1078_0000,
                         CSRSS_STACK_MIRROR_VA, CSRSS_HEAP_MIRROR_VA, 0, CSRSS_IMAGE_PATH, CSRSS_CMD_LINE,
-                        0, // pi>=1: real ntdll LdrpInitialize (Step 4.A substitutes only smss/pi 0)
+                        0, // 0 → effective_ldrp_rva resolves to OUR ntdll's derived LdrpInitialize RVA
                     );
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.

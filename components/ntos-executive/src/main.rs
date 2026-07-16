@@ -152,15 +152,6 @@ pub const PE_LOAD_BASE: u64 = 0x0000_0100_0056_0000;
 /// Where ntdll.dll is (to be) mapped in a loaded process's VSpace — smss's IAT is resolved to
 /// NTDLL_BASE + each import's export RVA.
 pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
-/// ntdll_plan.md Step 4.A — substitute OUR Rust ntdll (crates/nt-ntdll-dll, staged BY PATH at
-/// `\reactos\system32\nt-ntdll.dll` by make_image.sh) for **smss (pi 0) ONLY**. pi>=1 always uses
-/// the real ReactOS ntdll (the fallback). `true` = smss boots on our ntdll (its `LdrpInitialize`
-/// emits the observable `[dbg] nt-ntdll: ...` marker, then stops at the unwired LoaderHost seams —
-/// Step 4.B wires those). `false` = the committed-green boot (real ntdll everywhere). Landed OFF so
-/// the gate (174/98, paint 768/768) stays green via the fallback; flip ON to observe the marker.
-pub const SMSS_USE_OUR_NTDLL: bool = true;
-/// Path to OUR staged Rust ntdll on the FS (see make_image.sh Step 4.A staging).
-pub const OUR_NTDLL_FS_PATH: &[u8] = b"reactos\\system32\\nt-ntdll.dll";
 /// A hosted process's environment pages (TEB/PEB/params/trampoline). These live in the SAME 2 MiB
 /// image page table (the reserved IMAGE_BASE PT spans [0x40_0000, 0x60_0000)) but must sit BELOW
 /// PE_LOAD_BASE (0x56_0000) so they never collide with the hosted EXE's own image, which loads at
@@ -3360,6 +3351,12 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtMapViewOfSection, 113),
             // Workstream A batch 10 (group C): csrss spawn (table-dispatched-with-post-action).
             (NativeService::NtCreateProcess, SSN_NT_CREATE_PROCESS as u32),
+            // ntdll port BATCH 1: our Rust ntdll's RtlCreateUserProcess issues the IMPORTED stub
+            // NtCreateProcessEx (SSN 50) — the ntdll export ReactOS binaries actually link — where the
+            // real ntdll would issue NtCreateProcess (49). 49's args are a prefix of 50's (50 adds a
+            // trailing JobMemberLevel, which smss passes as 0), so route SSN 50 to the SAME
+            // NtCreateProcess handler. See ntdll_plan.md Step 2c reconciliation.
+            (NativeService::NtCreateProcess, 50),
             // ITEM 2a — live terminate-dispatch. NtTerminateProcess IS registered: it is NOT issued
             // during a normal boot (the 3 hosted processes never self-terminate — verified: registering
             // it keeps the boot byte-identical), so routing it to the real pm.terminate_process teardown
@@ -6715,60 +6712,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);
-                // Step 4.A: when SMSS_USE_OUR_NTDLL is set, load OUR Rust ntdll BY PATH from the FS
-                // (staged \reactos\system32\nt-ntdll.dll) and substitute it for smss (pi 0) — pi>=1
-                // keeps the real ReactOS ntdll (the fallback). We DERIVE OUR LdrpInitialize's RVA from
-                // OUR DLL's export table (never hardcode — it drifts across builds; 0x1050 now) so the
-                // spawn trampoline calls OUR loader entry. If the load/parse/derive fails at any step
-                // we fall back to the real ntdll below (miss = green). Our PE bytes live in the FS pool
-                // (a 'static slice) and are relocated to NTDLL_BASE, exactly like the real ntdll.
-                let (our_ntdll, our_ldrp_rva): (Option<nt_pe_loader::PeFile<'static>>, u64) =
-                    if SMSS_USE_OUR_NTDLL {
-                        let (opt_pe, ova) = load_dll_from_fs(OUR_NTDLL_FS_PATH, b"nt-ntdll.dll");
-                        match opt_pe {
-                            Some(opt) => {
-                                // Find LdrpInitialize's RVA in OUR export table.
-                                let rva = opt
-                                    .exports()
-                                    .ok()
-                                    .and_then(|es| {
-                                        es.into_iter()
-                                            .find(|e| e.name == "LdrpInitialize")
-                                            .map(|e| e.rva as u64)
-                                    })
-                                    .unwrap_or(0);
-                                if rva != 0 {
-                                    // Relocate OUR DLL to its load base (the pool VA -> NTDLL_BASE).
-                                    apply_relocations_to_buf(&opt, ova, NTDLL_BASE);
-                                    print_str(b"[ntos-exec] Step 4.A: OUR ntdll for smss, LdrpInitialize RVA=0x");
-                                    print_hex(rva as u32);
-                                    print_str(b"\n");
-                                    (Some(opt), rva)
-                                } else {
-                                    print_str(b"[ntos-exec] Step 4.A: OUR ntdll has no LdrpInitialize export - fallback to real ntdll\n");
-                                    (None, 0)
-                                }
-                            }
-                            None => {
-                                print_str(b"[ntos-exec] Step 4.A: OUR ntdll load/parse failed - fallback to real ntdll\n");
-                                (None, 0)
-                            }
-                        }
-                    } else {
-                        (None, 0)
-                    };
+                // OUR Rust ntdll IS `\reactos\system32\ntdll.dll` (make_image stages ours under that
+                // name; the real ReactOS ntdll is NOT on the image). So the ntdll bytes the storage
+                // host read into NTDLLBUF are OURS — no separate load, no flag, no fallback. We DERIVE
+                // LdrpInitialize's RVA from the loaded ntdll's export table (never hardcode — it drifts
+                // across builds) and pass it to the spawn trampoline so it calls OUR loader entry.
                 if let Ok(ntdll_pe) = nt_pe_loader::PeFile::parse(ntdll_bytes) {
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
                     // absolute self-pointers at the preferred base otherwise.
                     apply_relocations_to_buf(&ntdll_pe, NTDLLBUF_VADDR, NTDLL_BASE);
-                    // Select which ntdll smss (pi 0) runs on: OUR Rust ntdll (Step 4.A, flag ON + load
-                    // succeeded) or the real ReactOS ntdll (the committed-green fallback). The demand-
-                    // fault router fills ntdll pages from whichever PE we pass to service_sec_image, and
-                    // the trampoline calls whichever LdrpInitialize RVA we pass to spawn_sec_image.
-                    let use_ours = our_ntdll.is_some();
-                    let smss_ntdll_pe: &nt_pe_loader::PeFile =
-                        our_ntdll.as_ref().unwrap_or(&ntdll_pe);
-                    let smss_ldrp_rva = if use_ours { our_ldrp_rva } else { 0 };
+                    // Derive OUR LdrpInitialize RVA from the (single, ours) ntdll export table.
+                    let smss_ldrp_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "LdrpInitialize")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
+                    // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
+                    // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
+                    // transport — our ntdll is the ntdll for all of them, not just smss.
+                    img_spawn::OUR_LDRP_RVA.store(smss_ldrp_rva, Ordering::Relaxed);
+                    print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
+                    print_hex(smss_ldrp_rva as u32);
+                    print_str(b"\n");
+                    let smss_ntdll_pe: &nt_pe_loader::PeFile = &ntdll_pe;
                     // setup_env=true: a PEB + process params + trampoline so smss's entry gets a
                     // non-null PEB in RCX and runs its real startup (past the RtlAssert/null-deref).
                     let pml4 = spawn_sec_image(0, &pe, si_fault_c, NTDLL_BASE, true, 100, 0x0000_0100_1074_0000, SMSS_STACK_MIRROR_VA, SMSS_HEAP_MIRROR_VA, 0, b"\\SystemRoot\\System32\\smss.exe", b"smss.exe", smss_ldrp_rva);

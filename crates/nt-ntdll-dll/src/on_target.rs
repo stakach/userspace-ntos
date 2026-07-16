@@ -1766,6 +1766,635 @@ unsafe fn dispatch_default(entry: &QueryEntry) -> u32 {
     }
 }
 
+// =================================================================================================
+// RtlCreateProcessParameters — build the RTL_USER_PROCESS_PARAMETERS block on the process heap.
+// Ported from references/reactos/sdk/lib/rtl/ppb.c (pure builder in nt_ntdll::rtl::process_params).
+// =================================================================================================
+
+/// Read a caller `UNICODE_STRING*` into an owned UTF-16 body (None if `p` is NULL). Reads
+/// `Length`@0 (bytes) + `Buffer`@8.
+///
+/// # Safety
+/// `p` is NULL or a valid `UNICODE_STRING`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_ustr_units(p: *const u8) -> Option<alloc::vec::Vec<u16>> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: valid UNICODE_STRING per the contract.
+    let (len_bytes, buf) = unsafe {
+        (
+            core::ptr::read_unaligned(p as *const u16) as usize,
+            core::ptr::read_unaligned(p.add(8) as *const u64) as *const u16,
+        )
+    };
+    if buf.is_null() || len_bytes == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
+    // SAFETY: [buf, buf+len_bytes/2) is the string body.
+    let units = unsafe { core::slice::from_raw_parts(buf, len_bytes / 2) };
+    Some(units.to_vec())
+}
+
+/// `RtlCreateProcessParameters` — build the `RTL_USER_PROCESS_PARAMETERS` block for a child process on
+/// the process heap (de-normalized, per ppb.c), writing the block base to `*process_parameters`.
+///
+/// Ports `references/reactos/sdk/lib/rtl/ppb.c:RtlCreateProcessParameters`: the NULL substitutions
+/// (UserMode: DllPath / CurrentDirectory / Environment default to the live
+/// `PEB->ProcessParameters->{DllPath, CurrentDirectory.DosPath, Environment}`; CommandLine defaults to
+/// ImagePathName; WindowTitle/DesktopInfo/ShellInfo default to the EmptyString; RuntimeData to the
+/// NullString) then the pure block layout ([`nt_ntdll::rtl::process_params::create_process_parameters`]).
+///
+/// # Safety
+/// On-target; `image_path` a valid `UNICODE_STRING*`; the other string args NULL or valid
+/// `UNICODE_STRING*`; `environment` NULL or a UTF-16 double-NUL block; `process_parameters` a writable
+/// `PVOID*`.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rtl_create_process_parameters(
+    process_parameters: *mut u64,
+    image_path: *const u8,
+    dll_path: *const u8,
+    current_directory: *const u8,
+    command_line: *const u8,
+    environment: *const u16,
+    window_title: *const u8,
+    desktop_info: *const u8,
+    shell_info: *const u8,
+    runtime_data: *const u8,
+) -> u32 {
+    use nt_ntdll::rtl::process_params::{
+        create_process_parameters, denormalize, ParamString, ParamsInput,
+    };
+    if process_parameters.is_null() || image_path.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+
+    // Read the live PEB → ProcessParameters (for the UserMode NULL substitutions).
+    // SAFETY: gs:[0x60] is the PEB; ProcessParameters @ +0x20.
+    let peb_params: u64 = unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        if peb == 0 { 0 } else { core::ptr::read((peb + 0x20) as *const u64) }
+    };
+
+    // --- ImagePathName (required). ---
+    // SAFETY: image_path is a valid UNICODE_STRING.
+    let image = unsafe { read_ustr_units(image_path) }.unwrap_or_default();
+
+    // --- CommandLine: NULL → ImagePathName (ppb.c). ---
+    // SAFETY: command_line NULL or valid.
+    let cmd = unsafe { read_ustr_units(command_line) }.unwrap_or_else(|| image.clone());
+
+    // --- DllPath: NULL → PEB->ProcessParameters->DllPath (+0x50). ---
+    // SAFETY: dll_path NULL or valid; the PEB DllPath is a valid UNICODE_STRING when peb_params != 0.
+    let dll = unsafe { read_ustr_units(dll_path) }.unwrap_or_else(|| {
+        if peb_params != 0 {
+            // SAFETY: PEB->ProcessParameters + 0x50 = DllPath UNICODE_STRING.
+            unsafe { read_ustr_units((peb_params + 0x50) as *const u8) }.unwrap_or_default()
+        } else {
+            alloc::vec::Vec::new()
+        }
+    });
+
+    // --- CurrentDirectory: NULL → PEB->ProcessParameters->CurrentDirectory.DosPath (+0x38). ---
+    // SAFETY: current_directory NULL or valid; PEB CurrentDirectory is valid when peb_params != 0.
+    let cwd = unsafe { read_ustr_units(current_directory) }.unwrap_or_else(|| {
+        if peb_params != 0 {
+            // SAFETY: PEB->ProcessParameters + 0x38 = CurrentDirectory.DosPath UNICODE_STRING.
+            unsafe { read_ustr_units((peb_params + 0x38) as *const u8) }.unwrap_or_default()
+        } else {
+            alloc::vec::Vec::new()
+        }
+    });
+
+    // --- Environment: NULL → PEB->ProcessParameters->Environment (+0x80). ---
+    let env_ptr: *const u16 = if !environment.is_null() {
+        environment
+    } else if peb_params != 0 {
+        // SAFETY: PEB->ProcessParameters + 0x80 = Environment PVOID.
+        unsafe { core::ptr::read((peb_params + 0x80) as *const u64) as *const u16 }
+    } else {
+        core::ptr::null()
+    };
+    // SAFETY: env_ptr NULL or a valid double-NUL UTF-16 block.
+    let env_units = unsafe { read_env_units(env_ptr) };
+
+    // --- The optional strings: NULL → EmptyString (or NullString for RuntimeData). ---
+    // SAFETY: each NULL or a valid UNICODE_STRING.
+    let title = unsafe { read_ustr_units(window_title) };
+    let desktop = unsafe { read_ustr_units(desktop_info) };
+    let shell = unsafe { read_ustr_units(shell_info) };
+    let runtime = unsafe { read_ustr_units(runtime_data) };
+
+    let to_param = |o: Option<alloc::vec::Vec<u16>>| match o {
+        Some(v) => ParamString::new(&v),
+        None => ParamString::empty(),
+    };
+
+    let input = ParamsInput {
+        image_path_name: ParamString::new(&image),
+        dll_path: if dll.is_empty() { ParamString::empty() } else { ParamString::new(&dll) },
+        current_directory: if cwd.is_empty() { ParamString::empty() } else { ParamString::new(&cwd) },
+        command_line: ParamString::new(&cmd),
+        window_title: to_param(title),
+        desktop_info: to_param(desktop),
+        shell_info: to_param(shell),
+        // RuntimeData NULL → NullString ({0,0,NULL}), never EmptyString.
+        runtime_data: match runtime {
+            Some(v) if !v.is_empty() => ParamString::new(&v),
+            _ => ParamString::null_string(),
+        },
+        environment: env_units,
+    };
+
+    let mut built = create_process_parameters(&input);
+    // The pure builder produces a de-normalized block already; ensure it (idempotent).
+    denormalize(&mut built.block, 0);
+
+    // Copy onto the process heap.
+    let total = built.block.len();
+    // SAFETY: process heap installed by LdrpInitialize.
+    let dst = unsafe { crate::process_heap_alloc(total) };
+    if dst.is_null() {
+        return 0xC000_0017; // STATUS_INSUFFICIENT_RESOURCES
+    }
+    // SAFETY: dst is a fresh `total`-byte region.
+    unsafe {
+        core::ptr::copy_nonoverlapping(built.block.as_ptr(), dst, total);
+        core::ptr::write(process_parameters, dst as u64);
+    }
+    0 // STATUS_SUCCESS
+}
+
+/// Measure a double-NUL UTF-16 environment block and return an owned copy INCLUDING the terminating
+/// double-NUL (so the pure builder copies it verbatim). Empty (NULL) → empty vec.
+///
+/// # Safety
+/// `env_ptr` NULL or a valid double-NUL UTF-16 block.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_env_units(env_ptr: *const u16) -> alloc::vec::Vec<u16> {
+    if env_ptr.is_null() {
+        return alloc::vec::Vec::new();
+    }
+    let mut n = 0usize;
+    // SAFETY: measure to the double-NUL, including BOTH terminating NULs.
+    unsafe {
+        loop {
+            let a = *env_ptr.add(n);
+            let b = *env_ptr.add(n + 1);
+            if a == 0 && b == 0 {
+                n += 2; // include the terminating double-NUL
+                break;
+            }
+            n += 1;
+            if n > 0x8000 {
+                n += 2;
+                break;
+            }
+        }
+        core::slice::from_raw_parts(env_ptr, n).to_vec()
+    }
+}
+
+// =================================================================================================
+// RtlCreateUserProcess — the classic user-mode process create (ported from process.c:194).
+// Drives NtOpenFile→NtCreateSection(SEC_IMAGE)→NtCreateProcessEx→NtQuerySection→
+// NtQueryInformationProcess→RtlpInitEnvironment(NtAllocate/WriteVirtualMemory)→RtlCreateUserThread.
+// This is smss's SmpExecuteImage (smss.c:92) csrss-spawn path. Transport-heavy (all syscalls); the
+// per-call out-params ride the executive's stack mirror exactly as our other on_target drivers.
+// =================================================================================================
+
+/// `NtCreateSection` SSN.
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_CREATE_SECTION: u32 = 52;
+/// `NtOpenFile` SSN.
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_OPEN_FILE: u32 = 122;
+/// `NtCreateProcessEx` SSN (the imported create; 49's args are a prefix — see ntdll_plan Step 2c).
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_CREATE_PROCESS_EX: u32 = 50;
+/// `NtQuerySection` SSN.
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_QUERY_SECTION: u32 = 175;
+/// `NtQueryInformationProcess` SSN.
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_QUERY_INFORMATION_PROCESS: u32 = 161;
+/// `SECTION_ALL_ACCESS`.
+#[cfg(target_arch = "x86_64")]
+const SECTION_ALL_ACCESS: u64 = 0x000F_0000 | 0x1F;
+/// `PAGE_EXECUTE`.
+#[cfg(target_arch = "x86_64")]
+const PAGE_EXECUTE: u64 = 0x10;
+/// `SEC_IMAGE`.
+#[cfg(target_arch = "x86_64")]
+const SEC_IMAGE: u64 = 0x0100_0000;
+/// `PROCESS_ALL_ACCESS`.
+#[cfg(target_arch = "x86_64")]
+const PROCESS_ALL_ACCESS: u64 = 0x001F_0FFF;
+/// `SYNCHRONIZE | FILE_EXECUTE | FILE_READ_DATA`.
+#[cfg(target_arch = "x86_64")]
+const FILE_EXECUTE_READ: u64 = 0x0010_0000 | 0x0020 | 0x0001;
+/// `FILE_SHARE_READ | FILE_SHARE_DELETE`.
+#[cfg(target_arch = "x86_64")]
+const FILE_SHARE_READ_DELETE: u64 = 0x0001 | 0x0004;
+/// `FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE`.
+#[cfg(target_arch = "x86_64")]
+const FILE_OPEN_FLAGS: u64 = 0x0020 | 0x0040;
+/// `SectionImageInformation` class (NtQuerySection).
+#[cfg(target_arch = "x86_64")]
+const SECTION_IMAGE_INFORMATION: u64 = 1;
+/// `ProcessBasicInformation` class.
+#[cfg(target_arch = "x86_64")]
+const PROCESS_BASIC_INFORMATION: u64 = 0;
+
+/// A minimal `OBJECT_ATTRIBUTES` (x64, 0x30 bytes): Length@0, RootDirectory@8, ObjectName@0x10,
+/// Attributes@0x18, SecurityDescriptor@0x20, SecurityQoS@0x28.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    _p0: u32,
+    root_directory: u64,
+    object_name: u64,
+    attributes: u32,
+    _p1: u32,
+    security_descriptor: u64,
+    security_qos: u64,
+}
+
+/// `RtlpMapFile` (process.c:20): NtOpenFile(image) → NtCreateSection(SEC_IMAGE) → NtClose(file). On
+/// success `*section` holds the SEC_IMAGE handle.
+///
+/// # Safety
+/// On-target; `image_file_name` a valid `UNICODE_STRING*`; `section` a writable `HANDLE*`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtlp_map_file(image_file_name: *const u8, attributes: u32, section: *mut u64) -> u32 {
+    let mut h_file: u64 = 0;
+    let mut iosb: [u64; 2] = [0; 2];
+    let oa = ObjectAttributes {
+        length: core::mem::size_of::<ObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: image_file_name as u64,
+        // OBJ_CASE_INSENSITIVE (0x40) | OBJ_INHERIT (0x02) masked from attributes.
+        attributes: attributes & (0x40 | 0x02),
+        _p1: 0,
+        security_descriptor: 0,
+        security_qos: 0,
+    };
+    // NtOpenFile(&hFile, DesiredAccess, &OA, &IoStatusBlock, ShareAccess, OpenOptions).
+    // SAFETY: on-target syscall; all pointers are valid stack locals / the caller's UNICODE_STRING.
+    let st = unsafe {
+        syscall6(
+            SSN_NT_OPEN_FILE,
+            core::ptr::addr_of_mut!(h_file) as u64,
+            FILE_EXECUTE_READ,
+            core::ptr::addr_of!(oa) as u64,
+            core::ptr::addr_of_mut!(iosb) as u64,
+            FILE_SHARE_READ_DELETE,
+            FILE_OPEN_FLAGS,
+        )
+    } as u32;
+    if (st as i32) < 0 {
+        return st;
+    }
+    // NtCreateSection(&Section, SECTION_ALL_ACCESS, OA=NULL, MaxSize=NULL, PAGE_EXECUTE, SEC_IMAGE,
+    //                 hFile).
+    // SAFETY: on-target syscall.
+    let st = unsafe {
+        syscall8(
+            SSN_NT_CREATE_SECTION,
+            section as u64,
+            SECTION_ALL_ACCESS,
+            0,
+            0,
+            PAGE_EXECUTE,
+            SEC_IMAGE,
+            h_file,
+            0,
+        )
+    } as u32;
+    // ZwClose(hFile).
+    // SAFETY: on-target; 27 = NtClose.
+    unsafe {
+        syscall4(27, h_file, 0, 0, 0);
+    }
+    st
+}
+
+/// `RtlCreateUserProcess` (process.c:194) — create a process + its (suspended) initial thread from an
+/// image path + a (normalized) `RTL_USER_PROCESS_PARAMETERS`. Fills the caller's
+/// `RTL_USER_PROCESS_INFORMATION` (Length/ProcessHandle/ThreadHandle/ClientId/ImageInformation).
+///
+/// # Safety
+/// On-target; `image_file_name` a valid `UNICODE_STRING*`; `process_parameters` a normalized params
+/// block; `process_information` a writable `RTL_USER_PROCESS_INFORMATION` (≥ 0x60 bytes on x64).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rtl_create_user_process(
+    image_file_name: *const u8,
+    attributes: u32,
+    process_parameters: *mut u8,
+    _process_sd: u64,
+    thread_sd: u64,
+    parent_process: u64,
+    inherit_handles: u8,
+    debug_port: u64,
+    exception_port: u64,
+    process_information: *mut u8,
+) -> u32 {
+    if image_file_name.is_null() || process_information.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+
+    // --- RtlpMapFile: open the image + create its SEC_IMAGE section. ---
+    let mut h_section: u64 = 0;
+    // SAFETY: on-target.
+    let st = unsafe { rtlp_map_file(image_file_name, attributes, &mut h_section) };
+    if (st as i32) < 0 {
+        return st;
+    }
+
+    // RTL_USER_PROCESS_INFORMATION x64 layout:
+    //   Size@0x00 (already set by caller), ProcessHandle@0x08, ThreadHandle@0x10,
+    //   ClientId@0x18 (16 bytes), ImageInformation@0x28 (SECTION_IMAGE_INFORMATION, 0x40 bytes).
+    let pinfo = process_information;
+    // SAFETY: pinfo is a valid RTL_USER_PROCESS_INFORMATION.
+    let (ph_ptr, th_ptr, cid_ptr, imginfo_ptr) = unsafe {
+        (
+            pinfo.add(0x08) as *mut u64,
+            pinfo.add(0x10) as *mut u64,
+            pinfo.add(0x18) as *mut u64,
+            pinfo.add(0x28),
+        )
+    };
+
+    let parent = if parent_process != 0 { parent_process } else { NT_CURRENT_PROCESS };
+
+    // --- NtCreateProcessEx(&ProcessHandle, PROCESS_ALL_ACCESS, OA=NULL, ParentProcess, Flags=0,
+    //     SectionHandle, DebugPort, ExceptionPort, JobMemberLevel=0). ---
+    // (ZwCreateProcess in process.c maps to NtCreateProcessEx=50, the imported stub — the executive's
+    // SSN-50 arm reads these; 49's args are a prefix.)
+    // SAFETY: on-target syscall; ph_ptr is the caller's out-handle slot (written via the mirror).
+    let st = unsafe {
+        native_syscall_ge5(
+            SSN_NT_CREATE_PROCESS_EX,
+            &[
+                ph_ptr as u64,
+                PROCESS_ALL_ACCESS,
+                0, // ObjectAttributes
+                parent,
+                (inherit_handles != 0) as u64, // Flags: InheritHandles → PS_INHERIT_HANDLES bit path
+                h_section,
+                debug_port,
+                exception_port,
+                0, // JobMemberLevel
+            ],
+        )
+    } as u32;
+    if (st as i32) < 0 {
+        // SAFETY: close the section on failure.
+        unsafe { syscall4(27, h_section, 0, 0, 0) };
+        return st;
+    }
+
+    // --- NtQuerySection(hSection, SectionImageInformation, &ImageInformation, size, NULL). ---
+    // SAFETY: on-target; imginfo_ptr is a 0x40-byte slot in the caller's struct.
+    let st = unsafe {
+        syscall6(
+            SSN_NT_QUERY_SECTION,
+            h_section,
+            SECTION_IMAGE_INFORMATION,
+            imginfo_ptr as u64,
+            0x40,
+            0,
+            0,
+        )
+    } as u32;
+    if (st as i32) < 0 {
+        // SAFETY: close both handles.
+        unsafe {
+            syscall4(27, core::ptr::read(ph_ptr), 0, 0, 0);
+            syscall4(27, h_section, 0, 0, 0);
+        }
+        return st;
+    }
+
+    // --- NtQueryInformationProcess(ProcessHandle, ProcessBasicInformation, &PBI, size, NULL). ---
+    // PROCESS_BASIC_INFORMATION x64: ExitStatus@0, PebBaseAddress@0x08, ... (0x30 bytes).
+    let mut pbi = [0u64; 6];
+    // SAFETY: on-target; read the process handle the create wrote.
+    let process_handle = unsafe { core::ptr::read(ph_ptr) };
+    // SAFETY: on-target syscall.
+    let st = unsafe {
+        syscall6(
+            SSN_NT_QUERY_INFORMATION_PROCESS,
+            process_handle,
+            PROCESS_BASIC_INFORMATION,
+            pbi.as_mut_ptr() as u64,
+            (pbi.len() * 8) as u64,
+            0,
+            0,
+        )
+    } as u32;
+    if (st as i32) < 0 {
+        // SAFETY: close both handles.
+        unsafe {
+            syscall4(27, process_handle, 0, 0, 0);
+            syscall4(27, h_section, 0, 0, 0);
+        }
+        return st;
+    }
+    let peb_base = pbi[1]; // PebBaseAddress @ +0x08
+
+    // --- RtlpInitEnvironment: write the environment + parameter block into the child + point
+    //     Peb->ProcessParameters at it (process.c:68). ---
+    // SAFETY: on-target; drives NtAllocate/NtWriteVirtualMemory in the child.
+    let st = unsafe {
+        rtlp_init_environment(process_handle, peb_base, process_parameters)
+    };
+    if (st as i32) < 0 {
+        // SAFETY: close both handles.
+        unsafe {
+            syscall4(27, process_handle, 0, 0, 0);
+            syscall4(27, h_section, 0, 0, 0);
+        }
+        return st;
+    }
+
+    // --- RtlCreateUserThread(ProcessHandle, ThreadSD, CreateSuspended=TRUE, ..., TransferAddress,
+    //     PebBaseAddress, &ThreadHandle, &ClientId). ---
+    // SECTION_IMAGE_INFORMATION: TransferAddress@0x00, ..., MaximumStackSize@0x18, CommittedStackSize@
+    // 0x20 (x64). Read them from the queried block.
+    // SAFETY: imginfo_ptr is the 0x40-byte SECTION_IMAGE_INFORMATION we queried above.
+    let (transfer, max_stack, _commit_stack) = unsafe {
+        (
+            core::ptr::read_unaligned(imginfo_ptr as *const u64),
+            core::ptr::read_unaligned(imginfo_ptr.add(0x18) as *const u64),
+            core::ptr::read_unaligned(imginfo_ptr.add(0x20) as *const u64),
+        )
+    };
+    // SAFETY: on-target; th_ptr/cid_ptr are the caller's out-slots.
+    let st = unsafe {
+        rtl_create_user_thread(
+            process_handle,
+            thread_sd,
+            1, // CreateSuspended = TRUE (process.c: the first thread is created suspended)
+            0,
+            max_stack as usize,
+            0,
+            transfer,
+            peb_base,
+            th_ptr,
+            cid_ptr,
+        )
+    } as u32;
+    // ZwClose(hSection) (process.c:386) — regardless of thread-create success/failure it closes it.
+    // SAFETY: on-target.
+    unsafe { syscall4(27, h_section, 0, 0, 0) };
+    if (st as i32) < 0 {
+        // SAFETY: close the process handle on thread-create failure.
+        unsafe { syscall4(27, process_handle, 0, 0, 0) };
+        return st;
+    }
+    0 // STATUS_SUCCESS
+}
+
+/// `RtlpInitEnvironment` (process.c:68): allocate + write the environment block and the parameter
+/// block into the child process, then point `Peb->ProcessParameters` at the written block.
+///
+/// # Safety
+/// On-target; `process_handle` a valid child; `peb_base` the child PEB VA; `params` the caller's
+/// (normalized) parameter block.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtlp_init_environment(process_handle: u64, peb_base: u64, params: *mut u8) -> u32 {
+    if params.is_null() {
+        return 0xC000_000D;
+    }
+    // Read Length @ +0x04, MaximumLength @ +0x00, Environment @ +0x80 from the params block.
+    // SAFETY: params is a valid RTL_USER_PROCESS_PARAMETERS.
+    let (max_len, length, env_ptr) = unsafe {
+        (
+            core::ptr::read_unaligned(params as *const u32) as usize,
+            core::ptr::read_unaligned(params.add(0x04) as *const u32) as usize,
+            core::ptr::read_unaligned(params.add(0x80) as *const u64) as *const u16,
+        )
+    };
+
+    // Environment: measure + allocate in the child + write + rebase the params' Environment pointer.
+    if !env_ptr.is_null() {
+        // SAFETY: env_ptr is a double-NUL block.
+        let env_units = unsafe { read_env_units(env_ptr) };
+        let env_bytes = env_units.len() * 2;
+        if env_bytes != 0 {
+            // SAFETY: allocate in the child.
+            let base = unsafe { nt_allocate_in_process(process_handle, env_bytes) };
+            if base == 0 {
+                return 0xC000_0017;
+            }
+            // SAFETY: write the env block into the child.
+            let st = unsafe {
+                nt_write_virtual_memory(process_handle, base, env_units.as_ptr() as u64, env_bytes)
+            };
+            if (st as i32) < 0 {
+                return st;
+            }
+            // ProcessParameters->Environment = base (in OUR copy, which we write below).
+            // SAFETY: params + 0x80 is the Environment pointer.
+            unsafe { core::ptr::write_unaligned(params.add(0x80) as *mut u64, base) };
+        }
+    }
+
+    // Allocate the parameter block in the child + write `Length` bytes.
+    // SAFETY: allocate MaximumLength bytes in the child.
+    let param_base = unsafe { nt_allocate_in_process(process_handle, max_len) };
+    if param_base == 0 {
+        return 0xC000_0017;
+    }
+    // SAFETY: write the parameter block.
+    let st = unsafe { nt_write_virtual_memory(process_handle, param_base, params as u64, length) };
+    if (st as i32) < 0 {
+        return st;
+    }
+    // Peb->ProcessParameters = param_base (PEB + 0x20 on x64).
+    let mut base_local = param_base;
+    // SAFETY: write the child PEB's ProcessParameters slot.
+    let st = unsafe {
+        nt_write_virtual_memory(
+            process_handle,
+            peb_base + 0x20,
+            core::ptr::addr_of_mut!(base_local) as u64,
+            8,
+        )
+    };
+    if (st as i32) < 0 {
+        return st;
+    }
+    0
+}
+
+/// `NtAllocateVirtualMemory` in another process (`process_handle`), MEM_COMMIT|MEM_RESERVE / RW. Returns
+/// the base VA (0 on failure). Like [`nt_allocate_virtual_memory`] but with an explicit process handle.
+///
+/// # Safety
+/// On-target syscall.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_allocate_in_process(process_handle: u64, size_in: usize) -> u64 {
+    let mut base: u64 = 0;
+    let mut size: u64 = size_in as u64;
+    // NtAllocateVirtualMemory(ProcessHandle, &BaseAddress, 0, &RegionSize, MEM_COMMIT|MEM_RESERVE,
+    //                         PAGE_READWRITE).
+    // SAFETY: on-target; base/size are stack locals the executive reads/writes via its mirror.
+    let st = unsafe {
+        syscall6(
+            SSN_NT_ALLOCATE_VIRTUAL_MEMORY,
+            process_handle,
+            core::ptr::addr_of_mut!(base) as u64,
+            0,
+            core::ptr::addr_of_mut!(size) as u64,
+            0x1000 | 0x2000, // MEM_COMMIT | MEM_RESERVE
+            0x04,            // PAGE_READWRITE
+        )
+    } as u32;
+    if (st as i32) < 0 {
+        return 0;
+    }
+    base
+}
+
+/// `NtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytes, NULL)`.
+///
+/// # Safety
+/// On-target syscall; `buffer` points at `bytes` valid source bytes.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_write_virtual_memory(process_handle: u64, base: u64, buffer: u64, bytes: usize) -> u32 {
+    // SAFETY: on-target syscall (277 = NtWriteVirtualMemory in the shared table).
+    unsafe {
+        syscall6(SSN_NT_WRITE_VIRTUAL_MEMORY_REAL, process_handle, base, buffer, bytes as u64, 0, 0)
+            as u32
+    }
+}
+
+/// `NtWriteVirtualMemory` SSN (shared table).
+#[cfg(target_arch = "x86_64")]
+const SSN_NT_WRITE_VIRTUAL_MEMORY_REAL: u32 = 287;
+
+/// `NtCreateProcessEx` has 9 args (the 9th = JobMemberLevel). We drive it via [`syscall8`] with the
+/// first 8 args; the executive's SSN-50 arm reads args 1..8 (JobMemberLevel=0 is the common case and
+/// the 8-arg window carries SectionHandle/DebugPort/ExceptionPort). If a non-zero JobMemberLevel is
+/// ever needed a 9-arg native stub can be added; smss always passes 0.
+///
+/// # Safety
+/// On-target syscall; `args` satisfies the target's contract (≥ 8 entries expected).
+#[cfg(target_arch = "x86_64")]
+unsafe fn native_syscall_ge5(ssn: u32, args: &[u64]) -> u64 {
+    let a = |i: usize| *args.get(i).unwrap_or(&0);
+    // SAFETY: on-target; a1..a4 → registers, a5..a8 → stack tail (the mirror-read slots). arg 9
+    // (JobMemberLevel) is 0 for every smss create — not carried.
+    unsafe { syscall8(ssn, a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7)) }
+}
+
 /// Suppress "unused" for the c_void alias on non-target hosts (the module is target-gated in use).
 #[allow(dead_code)]
 type _Unused = *mut c_void;

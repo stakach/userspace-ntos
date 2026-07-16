@@ -1160,3 +1160,71 @@ NtCreateProcessEx` csrss spawn. Add the executive **SSN-50** (`NtCreateProcessEx
 The out-param VALUE-return (retiring the stack mirror per handler) is an optional cleanliness pass on
 top of the working transport. The seL4/SURT arg-marshalling in `marshal.rs` remains available for a
 future IPC-buffer-batched or async surface.
+
+---
+
+## ★ RETIRE THE REAL-NTDLL FALLBACK (user, 2026-07-16) — our ntdll IS `ntdll.dll`, no fallback
+Directive: "just give our dll the same name as the reactos one; don't leave any fallback paths; don't
+even copy the reactos ntdll to the image." DONE:
+- **make_image.sh**: our Rust ntdll (`.tmp/nt-ntdll.dll`) is staged AS `\reactos\system32\ntdll.dll`,
+  OVERWRITING the ReactOS one from the recursive tree copy. No `nt-ntdll.dll` leaf, no flat
+  `::NTDLL.DLL`. Real ReactOS ntdll bytes never persist on the image. Build fails hard if our DLL
+  isn't built (it is now THE ntdll).
+- **Executive**: removed `SMSS_USE_OUR_NTDLL` + `OUR_NTDLL_FS_PATH` + the flag/fallback branch. The
+  storage host reads `ntdll.dll` (= ours) into NTDLLBUF as before; the executive DERIVES
+  `LdrpInitialize`'s RVA from the loaded ntdll's export table (never hardcodes the retired real-ntdll
+  `0x8e70`) and publishes it to `img_spawn::OUR_LDRP_RVA`, so EVERY hosted SEC_IMAGE spawn
+  (smss + csrss/winlogon/services/lsass) calls OUR LdrpInitialize + uses the native seL4-Call
+  transport uniformly (`effective_ldrp_rva(explicit) = explicit ?: OUR_LDRP_RVA`).
+
+## ☑ SYSTEMATIC PORT — BATCH 1: process-launch Rtl group (test-driven) + THE PORT PATTERN
+**Milestone: smss runs FULLY on OUR ntdll and SPAWNS csrss** (SmpExecuteImage →
+RtlCreateProcessParameters → RtlCreateUserProcess → NtCreateSection(SEC_IMAGE, 52) →
+NtCreateProcessEx(50) → `[ntos-exec] NtCreateProcess: spawned csrss (badge 2)`). csrss then runs on
+OUR ntdll too (its own LdrpInitialize snaps its 10 ntdll imports, then NtAllocateVirtualMemory/
+NtSetInformationProcess). nt-ntdll host tests **157** (+7). Gate 146/98 (spec-break, permitted).
+
+### ★ THE PORT PATTERN (the repeatable 6 steps — copy this for every later batch)
+1. **Identify** the ReactOS source (`file:function`) + its exact prototype/semantics. Rtl bodies live
+   in `references/reactos/sdk/lib/rtl/`; loader/Ldr in `references/reactos/dll/ntdll/`.
+2. **Tests first.** If a ReactOS apitest exists (`references/reactos/modules/rostests/apitests/ntdll/`
+   — e.g. `RtlDosPathNameToNtPathName_U.c`, `RtlGetFullPathName_U.c`), port its cases; else WRITE I/O
+   validation tests (known input → expected output, derived from the C semantics). Every ported body
+   gets host tests in `crates/nt-ntdll` (`#[cfg(test)]`, run under `cargo test -p nt-ntdll`).
+3. **Port the body** to `crates/nt-ntdll/src/rtl/` as PURE logic over `nt-ntdll-layout` structs (real
+   edge cases + error codes; reuse existing helpers, don't duplicate). For a state-coupled/syscall body
+   (live PEB/heap/create plane), the pure part lives in `nt-ntdll` and the live driver in
+   `crates/nt-ntdll-dll/src/on_target.rs` (target-only, over our `Nt*` stubs).
+4. **Export** the C-ABI wrapper in `crates/nt-ntdll-dll/src/exports.rs`
+   (`#[export_name = "RtlXxx"] pub unsafe extern "system" fn`, real x64 signature; add it to the
+   `export_anchor` list so DCE keeps it). Non-`Nt*` new exports bump the DLL export count.
+5. **Host-green**: `cargo test -p nt-ntdll` (new tests + all prior). `./scripts/build_ntdll_dll.sh`
+   (emits + verifies the PE32+; asserts smss's import set 0-missing).
+6. **Boot-verify**: `components/ntos-executive/build.sh` → `rust-micro/scripts/build_kernel.sh
+   extern-rootserver` → `run_specs.sh`. Grep the log for the SSN ring / `[dbg] nt-ntdll: snap
+   resolved` / `spawned csrss` / `stop_ssn` to confirm smss (then each process) runs further. Since
+   our ntdll is now THE ntdll (no fallback), the boot directly exercises the ported bodies.
+
+### Functions ported this batch (ReactOS source cited + tests)
+| function | source | tests | where |
+|---|---|---|---|
+| `RtlCreateProcessParameters` | `sdk/lib/rtl/ppb.c:49` (+ `RtlpCopyParameterString`) | 6 new I/O tests (no apitest): image/cmdline placement, current-dir trailing `\`, EmptyString-vs-NullString, env-after-strings, layout-offset cross-check vs `nt-ntdll-layout`, all-buffers-within-block | pure builder `rtl/process_params.rs`; live wrapper `on_target::rtl_create_process_parameters` (PEB NULL-subst + heap copy); export `exports.rs` |
+| `RtlDestroyProcessParameters` | `ppb.c:242` | (covered by build) | export → `process_heap_free` |
+| `RtlNormalizeProcessParams` | `ppb.c:280` | `normalize_denormalize_roundtrip` | pure `process_params::normalize`; export rebases Buffers+Environment |
+| `RtlDeNormalizeProcessParams` | `ppb.c:255` | (same roundtrip test) | pure `process_params::denormalize`; NEW export (+1 = 255 total) |
+| `RtlCreateUserProcess` | `process.c:194` (+ `RtlpMapFile:20`, `RtlpInitEnvironment:68`) | transport-heavy driver, boot-verified (spawns csrss) | `on_target::rtl_create_user_process` — NtOpenFile→NtCreateSection(SEC_IMAGE)→NtCreateProcessEx(50)→NtQuerySection→NtQueryInformationProcess→NtAllocate/NtWriteVirtualMemory→RtlCreateUserThread |
+
+### The executive SSN-50 arm (added — smss emitted SSN 50)
+Our `RtlCreateUserProcess` issues the IMPORTED stub **NtCreateProcessEx (SSN 50)** (not `NtCreateProcess` 49).
+Added `(NativeService::NtCreateProcess, 50)` to `build_nt_table()` so SSN 50 dispatches to the existing
+NtCreateProcess handler (49's args are a prefix of 50's; SectionHandle is arg6 = `sp+0x30` in both).
+`crates/nt-syscall-abi` already carried `NtCreateProcessEx=50`.
+
+### NEXT BATCHES (remaining Rtl/loader modules, by spec-priority)
+1. **csrss's surface** — csrss now runs on our ntdll (frontier). Port the Rtl bodies csrss/csrsrv
+   exercise (it stops early after 2 syscalls). Then winlogon/services/lsass, each climbing on our ntdll.
+2. **string / time / security / registry Rtl** — the pure modules (`unicode.c`, `time.c`, SD/ACL/SID,
+   `registry.c`) — highly parallelizable (independent functions), fan out per the pattern.
+3. **loader (`Ldr*`)** — the `nt-ntdll/src/loader/` engine is host-tested; wire the remaining live
+   `LoaderHost` ops as processes need them.
+Reconverge the 174/98 gate + paint once winlogon completes its bring-up on our ntdll.

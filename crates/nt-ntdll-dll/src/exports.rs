@@ -874,9 +874,10 @@ pub unsafe extern "system" fn rtl_adjust_privilege(
 // heap / create plane (Step 4.A/4.B). Correct ABI, honest failures.
 // =================================================================================================
 
-/// `RtlNormalizeProcessParams(PRTL_USER_PROCESS_PARAMETERS) -> PRTL_USER_PROCESS_PARAMETERS`.
-/// The real work (rebasing the UNICODE_STRING pointers + setting the NORMALIZED flag) is the loader
-/// seam; the identity return + NORMALIZED-flag set is the observable half we can honor.
+/// `RtlNormalizeProcessParams(PRTL_USER_PROCESS_PARAMETERS) -> PRTL_USER_PROCESS_PARAMETERS`
+/// (ppb.c:280). BATCH 1: real — rebases each non-null `UNICODE_STRING.Buffer` + `Environment` OFFSET
+/// to `params + offset` and sets the `NORMALIZED` flag (no-op if already normalized). The block's own
+/// base is `params` (the block is self-relative). Returns `params`.
 ///
 /// # Safety
 /// `params` a valid `RTL_USER_PROCESS_PARAMETERS` or null.
@@ -885,45 +886,110 @@ pub unsafe extern "system" fn rtl_normalize_process_params(params: *mut c_void) 
     if params.is_null() {
         return params;
     }
-    // Set RTL_USER_PROC_PARAMS_NORMALIZED (0x1) in Flags (offset 0x08 on x64). Pointer rebase is the
-    // loader's job (it holds the base delta); here we mark normalized + return the same block.
-    // SAFETY: params points at a valid RTL_USER_PROCESS_PARAMETERS per the contract.
-    unsafe {
-        let flags = (params as *mut u8).add(0x08) as *mut u32;
-        *flags |= 0x1;
-    }
+    // SAFETY: params points at a valid block whose length covers the header (Length @ +0x04).
+    let len = unsafe { core::ptr::read((params as *const u8).add(0x04) as *const u32) } as usize;
+    // Normalize over the header extent (the pure step only touches the UNICODE_STRING fields, all
+    // within the fixed header — a header-sized view suffices).
+    let hdr = nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE.min(len.max(nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE));
+    // SAFETY: [params, params+hdr) covers the header UNICODE_STRING fields.
+    let block = unsafe { core::slice::from_raw_parts_mut(params as *mut u8, hdr) };
+    nt_ntdll::rtl::process_params::normalize(block, params as u64);
     params
 }
 
-/// `RtlCreateProcessParameters(...)` — build an `RTL_USER_PROCESS_PARAMETERS` on the heap. Honest
-/// seam (needs the process heap). Returns an error and leaves the out-pointer untouched.
+/// `RtlDeNormalizeProcessParams(PRTL_USER_PROCESS_PARAMETERS) -> PRTL_USER_PROCESS_PARAMETERS`
+/// (ppb.c:255) — the inverse of [`rtl_normalize_process_params`]. BATCH 1: real.
 ///
 /// # Safety
-/// Standard contract.
+/// `params` a valid `RTL_USER_PROCESS_PARAMETERS` or null.
+#[export_name = "RtlDeNormalizeProcessParams"]
+pub unsafe extern "system" fn rtl_denormalize_process_params(params: *mut c_void) -> *mut c_void {
+    if params.is_null() {
+        return params;
+    }
+    let hdr = nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE;
+    // SAFETY: [params, params+hdr) covers the header UNICODE_STRING fields.
+    let block = unsafe { core::slice::from_raw_parts_mut(params as *mut u8, hdr) };
+    nt_ntdll::rtl::process_params::denormalize(block, params as u64);
+    params
+}
+
+/// `RtlCreateProcessParameters(...)` — build an `RTL_USER_PROCESS_PARAMETERS` block on the process
+/// heap (BATCH 1: real, ported from `references/reactos/sdk/lib/rtl/ppb.c`). Does the ppb.c NULL
+/// substitutions (UserMode: DllPath/CurrentDirectory/Environment from the live PEB; CommandLine ←
+/// ImagePathName; WindowTitle/DesktopInfo/ShellInfo ← EmptyString; RuntimeData ← NullString), lays out
+/// the header + packed strings + environment via the host-tested
+/// [`nt_ntdll::rtl::process_params::create_process_parameters`], returns the block DE-normalized
+/// (Buffers as offsets), and writes the block base to `*ProcessParameters`. smss's `SmpExecuteImage`
+/// (smss.c:47) calls this to build csrss's parameter block.
+///
+/// # Safety
+/// `params` a writable `PVOID*`; `image_path` a valid `UNICODE_STRING*`; the other string args NULL or
+/// valid `UNICODE_STRING*`; `environment` NULL or a UTF-16 double-NUL block.
 #[export_name = "RtlCreateProcessParameters"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_create_process_parameters(
-    _params: *mut *mut c_void,
-    _image_path: PCUnicodeString,
-    _dll_path: PCUnicodeString,
-    _current_directory: PCUnicodeString,
-    _command_line: PCUnicodeString,
-    _environment: *mut c_void,
-    _window_title: PCUnicodeString,
-    _desktop_info: PCUnicodeString,
-    _shell_info: PCUnicodeString,
-    _runtime_data: PCUnicodeString,
+    params: *mut *mut c_void,
+    image_path: PCUnicodeString,
+    dll_path: PCUnicodeString,
+    current_directory: PCUnicodeString,
+    command_line: PCUnicodeString,
+    environment: *mut c_void,
+    window_title: PCUnicodeString,
+    desktop_info: PCUnicodeString,
+    shell_info: PCUnicodeString,
+    runtime_data: PCUnicodeString,
 ) -> NtStatus {
-    STATUS_NO_MEMORY // needs the process heap (Step 4.B)
+    if params.is_null() || image_path.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; routes to the ppb.c-ported builder over the process heap + live PEB.
+        unsafe {
+            crate::on_target::rtl_create_process_parameters(
+                params as *mut u64,
+                image_path as *const u8,
+                dll_path as *const u8,
+                current_directory as *const u8,
+                command_line as *const u8,
+                environment as *const u16,
+                window_title as *const u8,
+                desktop_info as *const u8,
+                shell_info as *const u8,
+                runtime_data as *const u8,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            image_path, dll_path, current_directory, command_line, environment, window_title,
+            desktop_info, shell_info, runtime_data,
+        );
+        STATUS_NO_MEMORY
+    }
 }
 
-/// `RtlDestroyProcessParameters(PRTL_USER_PROCESS_PARAMETERS) -> NTSTATUS`. Honest seam.
+/// `RtlDestroyProcessParameters(PRTL_USER_PROCESS_PARAMETERS) -> NTSTATUS` (ppb.c:242 =
+/// `RtlFreeHeap(RtlGetProcessHeap(), 0, ProcessParameters)`). BATCH 1: real — frees the block
+/// [`rtl_create_process_parameters`] allocated back to the process heap.
 ///
 /// # Safety
-/// Standard contract.
+/// `params` a block returned by [`rtl_create_process_parameters`] or null.
 #[export_name = "RtlDestroyProcessParameters"]
-pub unsafe extern "system" fn rtl_destroy_process_parameters(_params: *mut c_void) -> NtStatus {
-    STATUS_SUCCESS // nothing allocated by us to free (heap seam)
+pub unsafe extern "system" fn rtl_destroy_process_parameters(params: *mut c_void) -> NtStatus {
+    if params.is_null() {
+        return STATUS_SUCCESS;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: params came from process_heap_alloc via rtl_create_process_parameters.
+        unsafe {
+            crate::process_heap_free(params as *mut u8);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 /// `RtlCreateEnvironment(BOOLEAN Inherit, PVOID *Environment) -> NTSTATUS`. Step 4.C: real. Allocates
@@ -1406,26 +1472,65 @@ pub unsafe extern "system" fn rtl_unlock_boot_status_data(_handle: *mut c_void) 
     STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
 }
 
-/// `RtlCreateUserProcess(...)` — the classic user-mode process create. Honest seam (needs the live
-/// NtCreateProcessEx/section/thread create plane — Step 4.A/4.B).
+/// `RtlCreateUserProcess(...)` — the classic user-mode process create (BATCH 1: real, ported from
+/// `references/reactos/sdk/lib/rtl/process.c:194`). Drives the full csrss-spawn chain:
+/// `RtlpMapFile` (NtOpenFile → NtCreateSection SEC_IMAGE) → NtCreateProcessEx(50) → NtQuerySection
+/// (SectionImageInformation) → NtQueryInformationProcess (ProcessBasicInformation) →
+/// `RtlpInitEnvironment` (NtAllocate/NtWriteVirtualMemory the env + param block into the child, point
+/// `Peb->ProcessParameters` at it) → `RtlCreateUserThread` (the suspended initial thread at the image
+/// TransferAddress). Fills the caller's `RTL_USER_PROCESS_INFORMATION`. smss's `SmpExecuteImage`
+/// (smss.c:92) calls this to spawn csrss (then every subsystem/service).
+///
+/// This is the transport-heavy driver — every step is a syscall, out-params ride the executive's stack
+/// mirror (as our other on_target drivers do). It needs the executive **SSN-50 (NtCreateProcessEx)**
+/// arm to be serviced (see ntdll_plan Step 2c/4).
 ///
 /// # Safety
-/// Standard contract.
+/// `image_path` a valid `UNICODE_STRING*`; `process_parameters` a normalized params block;
+/// `process_information` a writable `RTL_USER_PROCESS_INFORMATION` (≥ 0x60 bytes).
 #[export_name = "RtlCreateUserProcess"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_create_user_process(
-    _image_path: PCUnicodeString,
-    _attributes: u32,
-    _process_parameters: *mut c_void,
-    _process_sd: *mut c_void,
-    _thread_sd: *mut c_void,
-    _parent_process: *mut c_void,
-    _inherit_handles: u8,
-    _debug_port: *mut c_void,
-    _exception_port: *mut c_void,
-    _process_information: *mut c_void,
+    image_path: PCUnicodeString,
+    attributes: u32,
+    process_parameters: *mut c_void,
+    process_sd: *mut c_void,
+    thread_sd: *mut c_void,
+    parent_process: *mut c_void,
+    inherit_handles: u8,
+    debug_port: *mut c_void,
+    exception_port: *mut c_void,
+    process_information: *mut c_void,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // live create plane (Step 4.A/4.B)
+    if image_path.is_null() || process_information.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; routes to the process.c-ported create driver over our syscall stubs.
+        unsafe {
+            crate::on_target::rtl_create_user_process(
+                image_path as *const u8,
+                attributes,
+                process_parameters as *mut u8,
+                process_sd as u64,
+                thread_sd as u64,
+                parent_process as u64,
+                inherit_handles,
+                debug_port as u64,
+                exception_port as u64,
+                process_information as *mut u8,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            attributes, process_parameters, process_sd, thread_sd, parent_process, inherit_handles,
+            debug_port, exception_port,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlCreateUserThread(Process, ThreadSD, CreateSuspended, StackZeroBits, StackReserve, StackCommit,
@@ -1851,6 +1956,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_allocate_and_initialize_sid as usize,
         rtl_adjust_privilege as usize,
         rtl_normalize_process_params as usize,
+        rtl_denormalize_process_params as usize,
         rtl_create_process_parameters as usize,
         rtl_destroy_process_parameters as usize,
         rtl_create_environment as usize,

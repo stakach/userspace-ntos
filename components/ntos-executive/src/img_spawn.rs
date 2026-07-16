@@ -5,6 +5,24 @@
 #![allow(clippy::all)]
 use crate::*;
 
+/// OUR Rust ntdll's `LdrpInitialize` RVA, derived once at boot from the loaded ntdll's export table
+/// (main.rs) — our ntdll is `\reactos\system32\ntdll.dll` for EVERY process, so all SEC_IMAGE spawns
+/// call this RVA (never the retired real-ntdll fixed 0x8e70). 0 until set. Since it is non-zero for
+/// all hosted spawns, it also selects the NATIVE seL4-Call transport uniformly (see `spawn_sec_image`).
+pub(crate) static OUR_LDRP_RVA: AtomicU64 = AtomicU64::new(0);
+
+/// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
+/// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE
+/// ntdll); if neither is set the spawn can't produce a working trampoline, so 0 is returned and the
+/// caller (setup_env) falls back to the raw entry.
+pub(crate) fn effective_ldrp_rva(explicit: u64) -> u64 {
+    if explicit != 0 {
+        explicit
+    } else {
+        OUR_LDRP_RVA.load(Ordering::Relaxed)
+    }
+}
+
 /// Build a PE32+/x86_64 image. `sections` = (name8, va, chars, data); `dirs` = (index, rva,
 /// size). Mirrors nt-pe-loader's own test builder (crates/nt-pe-loader/tests/parse.rs).
 pub(crate) unsafe fn build_pe(
@@ -563,16 +581,20 @@ pub(crate) unsafe fn spawn_sec_image(
         // which needs smss's own image base. Pass it in R8 (SystemArgument2) when calling OUR
         // LdrpInitialize (ldrpinit_rva != 0). The real ReactOS ntdll ignores SystemArgument2, but to
         // keep the flag-OFF / pi>=1 path BYTE-IDENTICAL we still emit `xor r8d,r8d` there.
-        if ldrpinit_rva != 0 {
+        // Our ntdll's in-process LoaderHost snaps the child's imports against OUR export table, which
+        // needs the child's own image base — pass it in R8 (SystemArgument2). (Our ntdll is THE ntdll
+        // for every process, so this is always taken.)
+        let eff_ldrp = effective_ldrp_rva(ldrpinit_rva);
+        if eff_ldrp != 0 {
             tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
-            tb.extend_from_slice(&PE_LOAD_BASE.to_le_bytes()); // R8 = smss image base
+            tb.extend_from_slice(&PE_LOAD_BASE.to_le_bytes()); // R8 = child image base
         } else {
             tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
         }
         tb.extend_from_slice(&[0x48, 0xB8]);
-        // Step 4.A: call OUR LdrpInitialize RVA when the caller derived one (ldrpinit_rva != 0);
-        // otherwise the real ReactOS ntdll's fixed 0x8e70 (flag-OFF / pi>=1 — byte-identical).
-        let ldrp_off = if ldrpinit_rva != 0 { ldrpinit_rva } else { 0x8e70 };
+        // Call OUR LdrpInitialize RVA (derived from the loaded ntdll's export table — never hardcoded;
+        // the retired real-ntdll fixed 0x8e70 is gone since our ntdll IS the ntdll).
+        let ldrp_off = eff_ldrp;
         tb.extend_from_slice(&(NTDLL_BASE + ldrp_off).to_le_bytes()); // movabs rax, LdrpInitialize
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (runs the whole loader, then RETURNS here)
         // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
@@ -623,9 +645,9 @@ pub(crate) unsafe fn spawn_sec_image(
     //    OUR ntdll owns EVERY syscall (each stub is our code doing a seL4_Call, never a raw Windows
     //    `syscall`), the process never issues a syscall that would need the hosted-fault path. NO
     //    kernel change — the per-thread hosted flag simply stays clear.
-    // The `ldrpinit_rva != 0` signal is true ONLY for the our-ntdll smss spawn (pi 0, flag ON); every
-    // other spawn (demo + all pi>=1 fallback) passes 0 → keeps TCBSetHostedSyscalls → byte-identical.
-    let native_transport = ldrpinit_rva != 0;
+    // Our ntdll is THE ntdll for every hosted process, so the NATIVE seL4-Call transport is selected
+    // uniformly (the effective LdrpInitialize RVA is non-zero for every SEC_IMAGE spawn once derived).
+    let native_transport = effective_ldrp_rva(ldrpinit_rva) != 0;
     const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
     if !native_transport {
         let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_HOSTED_SYSCALLS << 12, 0, 0, 0);
