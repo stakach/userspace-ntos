@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub use nt_syscall_abi as abi;
 
+pub mod heap;
 pub mod rtl;
 pub mod stubs;
 pub mod transport;
