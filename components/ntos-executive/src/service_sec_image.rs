@@ -40,6 +40,10 @@ pub(crate) unsafe fn service_sec_image(
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
     let mut ssn_ring_badge = [0u8; 32];
+    // winlogon-main-only ring (badge==WINLOGON_BADGE) — isolate winlogon's sequence from the
+    // services (badge 6) noise that dominates the shared ring, to diagnose the StartLsass wall.
+    let mut wl_ring = [0u16; 48];
+    let mut wl_ri = 0usize;
     let mut ssn_ri = 0usize;
     // Distinct fake handles for objects we don't model yet (ports/threads/events/sections) now live
     // on `nt_handler.next_handle` (Workstream A group A) — a single monotonic source shared by the
@@ -991,6 +995,10 @@ pub(crate) unsafe fn service_sec_image(
             ssn_ring[ssn_ri % 32] = m0 as u16;
             ssn_ring_badge[ssn_ri % 32] = badge as u8;
             ssn_ri += 1;
+            if badge == WINLOGON_BADGE {
+                wl_ring[wl_ri % 48] = m0 as u16;
+                wl_ri += 1;
+            }
             let resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
@@ -2509,6 +2517,22 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
+                if badge == WINLOGON_BADGE && m0 == 190 {
+                    // DIAG (BATCH 21): winlogon's hard-error site — dump raw args while its mirror
+                    // is active (ErrorStatus=R10, param0=[stack], caller=[rsp]).
+                    print_str(b"[wl-190] R10=0x");
+                    print_hex((get_recv_mr(9) >> 32) as u32);
+                    print_hex(get_recv_mr(9) as u32);
+                    print_str(b" RDX=0x");
+                    print_hex(m3 as u32);
+                    print_str(b" R8=0x");
+                    print_hex(get_recv_mr(7) as u32);
+                    print_str(b" sp=0x");
+                    print_hex(get_recv_mr(16) as u32);
+                    print_str(b" [sp]=0x");
+                    print_hex(smss_stack_read(get_recv_mr(16)) as u32);
+                    print_str(b"\n");
+                }
                 stop_ssn = m0; // an Nt* syscall we don't service yet — stop
                 break;
             }
@@ -2806,6 +2830,13 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b":");
         print_u64(ssn_ring[k % 32] as u64);
     }
+    // winlogon-main-only SSN sequence (badge 4), oldest first — isolates the StartLsass wall.
+    print_str(b"\n[wl-ring]");
+    let wl_n = if wl_ri < 48 { 0 } else { wl_ri - 48 };
+    for k in wl_n..wl_ri {
+        print_str(b" ");
+        print_u64(wl_ring[k % 48] as u64);
+    }
     // NtWriteVirtualMemory(287) diagnostic: dump the args + scan the caller's stack for smss/ntdll
     // return addresses to identify which routine issued it (RtlCreateUserProcess param-inject?).
     if stop_ssn == 287 {
@@ -2851,20 +2882,24 @@ pub(crate) unsafe fn service_sec_image(
         print_hex(smss_stack_read(get_recv_mr(8)) as u32);
         print_str(b" caller=0x");
         print_hex(smss_stack_read(get_recv_mr(16)) as u32);
-        // Scan the stack for ntdll return addresses to reconstruct the call chain that produced
-        // the failure status.
+        // Scan the stack for ntdll AND kernel32 return addresses to reconstruct the call chain that
+        // produced the failure status (winlogon's CreateProcessW hard-error path is kernel32 code).
         let sp = get_recv_mr(16);
         print_str(b" chain:");
         let mut shown = 0;
-        for i in 0..96u64 {
+        for i in 0..160u64 {
             let v = smss_stack_read(sp + i * 8);
             if v >= NTDLL_BASE && v < NTDLL_BASE + 0xf4000 {
-                print_str(b" 0x");
+                print_str(b" n+0x");
                 print_hex((v - NTDLL_BASE) as u32);
                 shown += 1;
-                if shown >= 12 {
-                    break;
-                }
+            } else if v >= 0x803a0000 && v < 0x803a0000 + 0x2b0000 {
+                print_str(b" k32+0x");
+                print_hex((v - 0x803a0000) as u32);
+                shown += 1;
+            }
+            if shown >= 20 {
+                break;
             }
         }
     }

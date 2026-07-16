@@ -4796,6 +4796,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let sp = get_recv_mr(16);
                 let sect = smss_stack_read(sp + 0x30); // SectionHandle
+                if self.pi == 2 {
+                    print_str(b"[wl-createproc] pi=2 sect=0x");
+                    print_hex(sect as u32);
+                    print_str(b" services_sect=0x");
+                    print_hex(*ctx.services_section_handle as u32);
+                    print_str(b" lsass_sect=0x");
+                    print_hex(*ctx.lsass_section_handle as u32);
+                    print_str(b" lsass_pe=");
+                    print_u64((*ctx.lsass_pe).is_some() as u64);
+                    print_str(b"\n");
+                }
                 // NtCreateProcess(csrss/winlogon) is issued ONLY by smss (pi 0); scope so a dense
                 // section handle of the same value in another process can't trigger a spawn (1b).
                 if self.pi == 0

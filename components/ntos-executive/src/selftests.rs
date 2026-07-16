@@ -26,9 +26,17 @@ pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
     }
 
     // (bit1) FRAME RECLAMATION via Untyped-return. Allocate 4 KiB frames from the child until it is
-    // EXHAUSTED (round 1, count K); CNodeDelete every one (kernel rolls the child's free_index back);
-    // then allocate again INTO THE SAME SLOTS (round 2). round2 == round1 (and K >= 8) proves the
-    // deletes returned the full capacity to the untyped — the hard "return-to-Untyped" reclamation.
+    // EXHAUSTED (round 1, count K); CNodeDelete every one; then RESET the child untyped
+    // (CNodeRevoke on the child cap = revoke all descendants + roll free_index back to 0) and
+    // allocate again INTO THE SAME SLOTS (round 2). round2 == round1 (and K >= 8) proves the child
+    // returned its full capacity — the hard "return-to-Untyped" reclamation.
+    //
+    // ★ BATCH 21: plain CNodeDelete of the frames did NOT roll the child's free_index back under the
+    // deeper 5-process boot (lsass now spawned): round-2 retypes failed with seL4_NotEnoughMemory
+    // (free_index stuck at capacity though every frame delete succeeded). An explicit CNodeRevoke on
+    // the child cap is the definitive reset (it is exactly what the kernel's own "500 alloc/free
+    // cycles reclaim untyped free_index" test exercises) — robust regardless of how full/fragmented
+    // the parent CAP_INIT_UNTYPED is at this (deeper) stop point.
     let mut fslots = [0u64; 20];
     let mut round1 = 0usize;
     while round1 < fslots.len() {
@@ -45,16 +53,18 @@ pub(crate) unsafe fn reclaim_mechanism_selftest() -> u64 {
             deleted_all = false;
         }
     }
+    // Revoke the child untyped: drops any straggler descendants AND resets its free_index to 0.
+    let revoked = cnode_revoke_r(child) == 0;
     let mut round2 = 0usize;
     while round2 < round1 {
-        // Reuse the round-1 slot (now Null after delete): proves the slot AND the untyped bytes
-        // are both reclaimed. A fresh retype into a freed slot must succeed.
+        // Retype into the round-1 slot (Null after delete): proves the child's capacity is fully
+        // reclaimed. A fresh retype into a freed slot must succeed.
         if untyped_retype_from_r(child, OBJ_X86_4K_PAGE, PAGING_BITS, 1, fslots[round2]) != 0 {
             break;
         }
         round2 += 1;
     }
-    if deleted_all && round1 >= 8 && round2 == round1 {
+    if deleted_all && revoked && round1 >= 8 && round2 == round1 {
         ok |= 1 << 1;
     }
     // Clean up round-2 frames before the child is deleted.

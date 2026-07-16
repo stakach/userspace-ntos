@@ -3119,8 +3119,13 @@ pub unsafe fn rtl_query_environment_variable_u(
         let out_buf = core::ptr::read_unaligned(value.add(8) as *const u64) as *mut u16;
         let needed_bytes = val_units.len() * 2;
         if needed_bytes + 2 > max_bytes {
-            // Doesn't fit (incl. the NUL). Report the required char count in Length.
-            core::ptr::write_unaligned(value as *mut u16, val_units.len() as u16);
+            // Doesn't fit (incl. the NUL). Report the required BYTE count in Length (UNICODE_STRING
+            // Length is in bytes, NOT chars — env.c:685 `Value->Length = ReturnLength * sizeof(WCHAR)`
+            // on the STATUS_BUFFER_TOO_SMALL path, EXCLUDING the terminating NUL). kernel32's
+            // BasepComputeProcessPath re-allocates `EnvPath.Length + sizeof(WCHAR)` and re-queries;
+            // returning the CHAR count here (half the bytes) under-allocated → the re-query failed
+            // BUFFER_TOO_SMALL again → BaseComputeProcessDllPath returned NULL → CreateProcessW bailed.
+            core::ptr::write_unaligned(value as *mut u16, needed_bytes as u16);
             return STATUS_BUFFER_TOO_SMALL;
         }
         core::ptr::copy_nonoverlapping(val_units.as_ptr(), out_buf, val_units.len());

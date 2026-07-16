@@ -1071,7 +1071,7 @@ pub unsafe extern "system" fn rtl_create_process_parameters(
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: on-target; routes to the ppb.c-ported builder over the process heap + live PEB.
-        unsafe {
+        return unsafe {
             crate::on_target::rtl_create_process_parameters(
                 params as *mut u64,
                 image_path as *const u8,
@@ -1084,7 +1084,7 @@ pub unsafe extern "system" fn rtl_create_process_parameters(
                 shell_info as *const u8,
                 runtime_data as *const u8,
             ) as NtStatus
-        }
+        };
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

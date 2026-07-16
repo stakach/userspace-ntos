@@ -1249,6 +1249,26 @@ unsafe fn cnode_delete_r(idx: u64) -> u64 {
     );
     reply >> 12
 }
+/// CNodeRevoke on the cap at `idx` under the root CNode: delete all its descendants (and, for an
+/// Untyped cap, roll its `free_index` back to 0 = full-capacity reclamation). Mirror of
+/// `cnode_delete_r`; used by the reclamation self-test to definitively reset a throwaway child
+/// untyped between fill rounds (plain per-object delete didn't reset free_index under a deeper boot).
+const LBL_CNODE_REVOKE: u64 = 22;
+unsafe fn cnode_revoke_r(idx: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_THREAD_CNODE => _,
+        inout("rsi") LBL_CNODE_REVOKE << 12 => reply,
+        inout("r10") idx => _, // a2 = slot index under the root CNode
+        inout("r8") 0u64 => _, // a3 = depth (ignored; msginfo length 0 → WORD_BITS)
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
 /// Retype `num` objects of `obj` (size `bits`) from an ARBITRARY untyped cap `untyped` into `dest`.
 /// (`untyped_retype_r` hardcodes `CAP_INIT_UNTYPED`; the reclamation self-test carves + fills a
 /// throwaway CHILD untyped.) Returns the error label (0 = success; non-zero once the untyped is

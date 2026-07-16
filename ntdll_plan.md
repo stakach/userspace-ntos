@@ -2082,3 +2082,72 @@ to the `0x003a6ea5` paint: services' SCM + lsass on our ntdll → winlogon `Wait
 (`exec_lsass_spawned`, `exec_services_named_events`, `exec_win32k_desktop_painted`). The services CSR
 accept is currently MODELED (per-client CSR acceptor = the SCM batch); the iters cap (5000) may need
 lifting once services' per-fault cost drops or its work is bounded.
+
+---
+
+## ☑ BATCH 21 Results — the `RtlQueryEnvironmentVariable_U` byte-vs-char Length bug → StartServicesManager/StartLsass SUCCEED → lsass.exe SPAWNS on our ntdll (landed 2026-07-17)
+
+**Task (diagnose-first):** BATCH 20 spawned services.exe but winlogon then raised `NtRaiseHardError`
+(stop_ssn=190) and **lsass never spawned**. Root-cause why + drive winlogon past StartServicesManager
+→ StartLsass → spawn lsass.
+
+### THE DIAGNOSIS (each conclusion evidenced from the boot trace)
+1. **Where winlogon walls:** decoded the terminal `NtRaiseHardError` args at the CALL site (while
+   winlogon's stack mirror is active): `R10 = 0xC000021A = STATUS_SYSTEM_PROCESS_TERMINATED` — the
+   winlogon.c `!StartServicesManager()` failure path (winlogon.c:508). A **winlogon-main-only SSN ring**
+   (badge 4, isolated from the services badge-6 noise that dominates the shared ring) showed winlogon
+   issues exactly ONE `NtCreateProcessEx(50)` (services) then `27 27 27 190` — it bailed in kernel32's
+   `CreateProcessInternalW` right after NtCreateProcessEx SUCCEEDED (reply status 0, `spawned services.exe
+   (badge 6)`), with NO `NtOpenFile`/`NtCreateSection`/second `NtCreateProcessEx` for lsass. **StartLsass
+   was never reached — StartServicesManager returned FALSE.**
+2. **The bail is in the PURE ntdll path** (no syscall between `50` and `190`): markers on OUR ntdll's
+   `RtlCreateProcessParameters` (never called for winlogon's CreateProcessW) + `RtlQueryEnvironmentVariable_U`
+   (called, returned `0xC0000023 STATUS_BUFFER_TOO_SMALL` in PAIRS — the first query then the re-query
+   BOTH `TOO_SMALL`) pinned it to `kernel32!BasepComputeProcessPath` (path.c:163) → `BaseComputeProcessDllPath`
+   returning NULL → `BasePushProcessParameters` returns FALSE → CreateProcessInternalW `goto Quickie` → FALSE.
+3. **★ ROOT CAUSE: `RtlQueryEnvironmentVariable_U`'s STATUS_BUFFER_TOO_SMALL path reported the required
+   length in CHARS, not BYTES.** `UNICODE_STRING.Length` is in BYTES (`sdk/lib/rtl/env.c:685`
+   `Value->Length = ReturnLength * sizeof(WCHAR)`). Our `on_target.rs::rtl_query_environment_variable_u`
+   wrote `val_units.len()` (char count) instead of `val_units.len() * 2` (byte count). kernel32's
+   BasepComputeProcessPath then allocated `EnvPath.Length + sizeof(WCHAR)` = HALF the needed size → the
+   re-query STILL didn't fit → `Status` stayed BUFFER_TOO_SMALL at Quickie → PathBuffer freed → NULL.
+
+### THE FIX (ntdll-side, 1-line semantic; NO rust-micro/src kernel change)
+`crates/nt-ntdll-dll/src/on_target.rs::rtl_query_environment_variable_u` — on the BUFFER_TOO_SMALL path
+write `needed_bytes` (`val_units.len() * 2`, byte count excl. NUL) to `Value->Length`, per env.c:685.
+This is the ONLY change to the ntdll DLL. nt-ntdll host tests unchanged-green (167) + nt-syscall-abi (12).
+
+### RESULT — StartServicesManager + StartLsass both SUCCEED; lsass.exe SPAWNS; gate 160 → 164
+With the byte-count fix, winlogon's `CreateProcessInternalW(services)` COMPLETES (`BasePushProcessParameters`
+→ `RtlCreateProcessParameters` → NtAllocate/NtWrite into the services child + `NtCreateThread(55)`),
+StartServicesManager returns TRUE, then **StartLsass's `CreateProcessW("lsass.exe")` runs the SAME path →
+`NtOpenFile(lsass.exe) → NtCreateSection(SEC_IMAGE) → NtCreateProcessEx(50)` → lsass.exe SPAWNS (badge 8)**
+and runs its ntdll loader (**331 demand-faulted pages**, its full DLL tree). The winlogon SSN ring now shows
+BOTH CreateProcessW flows (`…50 [services push+thread] 27 27 27 27  98 122 52 175 19 19 50 [lsass]`).
+**New PASSES (4):** `exec_lsass_spawned`, `exec_lsass_loader_running`, `exec_main_thread_bound_at_spawn`,
+`exec_eprocess_linked_mechanism` → gate **160 → 164 PASS / 13 FAIL, exit 3 clean, NO regressions**.
+
+**Second fix (same batch, executive-side — a reclaim self-test regression the deeper boot exposed):**
+`exec_sel4_reclaim_mechanism`'s frame-reclamation proof (bit1) broke under the deeper 5-process boot
+(`round1=16 round2=0`, `seL4_NotEnoughMemory` on the round-2 retype though every frame delete succeeded):
+plain per-object `CNodeDelete` did NOT roll the throwaway child untyped's `free_index` back at the deeper
+stop point. FIX = an explicit **`CNodeRevoke` on the child untyped** between the fill rounds (the definitive
+free_index reset — exactly what the kernel's own "500 alloc/free cycles" test uses), via a new
+`cnode_revoke_r` helper (`LBL_CNODE_REVOKE=22`, mirror of `cnode_delete_r`). Robust regardless of parent
+untyped fullness → `round2=16`, spec PASSES again. NO rust-micro/src kernel change (userspace helper only).
+
+### NEXT WALL (services' SCM + lsass LSA init → the paint) — the boot terminates naturally (exit 3)
+The loop stops (iters~4026) on **services' (badge 6) win32k call `0x103d` (NtUserFindExistingCursorIcon,
+from its user32 DllMain window-class/cursor init)** — services isn't a GUI client with a desktop, so
+win32k_dispatch WALLs it. This is AFTER winlogon has spawned lsass, so the gate-164 checkpoint (services +
+lsass BOTH spawned on our ntdll) is coherent + terminates. Remaining path to `0x003a6ea5`: winlogon
+`WaitForLsass` (parks on `LSA_RPC_SERVER_ACTIVE`, Checkpoint B reply-cap park) ← lsass grinds its full LSA
+init (lsasrv/samsrv/msv1_0) to signal it → `InitializeSAS` → `SwitchDesktop` → co_IntShowDesktop →
+IntPaintDesktop. NOTE: parking services' win32k wall (to let the loop keep servicing lsass) was TRIED and
+REVERTED — it removed the natural stop and lsass's huge DLL grind ran past the 500s TCG timeout (exit 124);
+the natural services-win32k-wall stop at iters~4026 is the coherent in-budget terminus. Reaching the actual
+paint needs lsass's full LSA bring-up (many faults) to fit the budget — the next batch's frontier (bound
+lsass's per-fault cost / lift the iters cap once lsass's work is bounded, then wire the WaitForLsass wake).
+Residual FAILs = the LSA/SCM/paint frontier (`exec_lsass_lsa_init_running`, `exec_lsass_signals_lsa_rpc_active`,
+`exec_services_named_events`, `exec_win32k_desktop_painted`). Diagnostics retained (fire once at stop):
+`[wl-ring]` (winlogon's isolated SSN sequence), `[wl-190]` (hard-error arg decode), `[wl-createproc]`.
