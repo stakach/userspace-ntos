@@ -130,6 +130,36 @@ fn main() -> ExitCode {
         println!("   [SKIP] smss.exe not found — skipping the smss import-coverage cross-check");
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // BATCH 4 — Win32-stack import-coverage gate: for EACH DLL the csrss cascade loads, assert its
+    // COMPLETE ntdll import set (direct imports + forwards-to-ntdll) is present in OUR export table
+    // (0 missing). This is the export-completion bar for the whole client stack (like the smss check
+    // generalized). A DLL absent from the checkout is skipped (not failed).
+    // ---------------------------------------------------------------------------------------------
+    const STACK_DLLS: &[&str] = &[
+        "csrsrv", "basesrv", "winsrv", "gdi32", "user32", "advapi32", "rpcrt4", "kernel32",
+        "ws2_32", "ws2help", "msvcrt",
+    ];
+    for dll in STACK_DLLS {
+        match stack_dll_import_coverage(dll, &names) {
+            Some((imported, missing)) => {
+                check(
+                    missing.is_empty(),
+                    &format!(
+                        "{dll}.dll ntdll import set fully covered ({imported} imported, {} missing)",
+                        missing.len()
+                    ),
+                );
+                if !missing.is_empty() {
+                    let mut m = missing;
+                    m.sort();
+                    eprintln!("   MISSING {dll} ntdll imports (not exported by our DLL): {m:?}");
+                }
+            }
+            None => println!("   [SKIP] {dll}.dll not found — skipping its import-coverage cross-check"),
+        }
+    }
+
     if ok {
         println!("==> OK: nt-pe-loader can load our ntdll.dll (PE32+/DLL, 188 Nt* + LdrpInitialize, .reloc)");
         ExitCode::SUCCESS
@@ -137,6 +167,63 @@ fn main() -> ExitCode {
         eprintln!("!! verification FAILED");
         ExitCode::FAILURE
     }
+}
+
+/// Parse a Win32-stack DLL's `ntdll.dll` imports (BY-NAME import descriptor + any exports that
+/// FORWARD to `ntdll.X`, which also require us to export `X`) and return `(imported_count,
+/// missing_names)`. `None` if the DLL isn't in the checkout.
+fn stack_dll_import_coverage(
+    dll: &str,
+    our_exports: &std::collections::BTreeSet<&str>,
+) -> Option<(usize, Vec<String>)> {
+    let candidates = [
+        format!("rust-micro/.tmp/reactos/reactos/system32/{dll}.dll"),
+        format!(".tmp/reactos/reactos/system32/{dll}.dll"),
+    ];
+    let path = candidates.iter().find(|p| std::path::Path::new(p).exists())?;
+    let bytes = std::fs::read(path).ok()?;
+    let pe = PeFile::parse(&bytes).ok()?;
+
+    let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // (1) direct by-name imports from the ntdll.dll descriptor.
+    if let Ok(imports) = pe.imports() {
+        for d in &imports {
+            if d.name.eq_ignore_ascii_case("ntdll.dll") {
+                for f in &d.functions {
+                    if let nt_pe_loader::ImportRef::ByName { name, .. } = f {
+                        needed.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // (2) exports that FORWARD to ntdll.X (e.g. kernel32!GetLastError -> ntdll.RtlGetLastWin32Error):
+    // resolving the DLL requires us to export X too. A forwarder export's RVA falls inside the export
+    // directory range and its target string is `"TARGETDLL.func"`.
+    if let Ok(exports) = pe.exports() {
+        let dir = pe.headers().data_directory(nt_pe_loader::DIRECTORY_ENTRY_EXPORT);
+        let (lo, hi) = (dir.virtual_address, dir.virtual_address + dir.size);
+        for e in &exports {
+            if e.rva >= lo && e.rva < hi {
+                if let Ok(s) = pe.cstr_at_rva(e.rva) {
+                    if let Some((tgt_dll, tgt_fn)) = s.rsplit_once('.') {
+                        if tgt_dll.eq_ignore_ascii_case("ntdll") && !tgt_fn.starts_with('#') {
+                            needed.insert(tgt_fn.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let imported = needed.len();
+    let missing: Vec<String> = needed
+        .into_iter()
+        .filter(|n| !our_exports.contains(n.as_str()))
+        .collect();
+    Some((imported, missing))
 }
 
 /// Parse smss.exe's `ntdll.dll` import descriptor and return the names it imports that are NOT in
