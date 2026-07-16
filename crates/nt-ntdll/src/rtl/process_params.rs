@@ -321,9 +321,17 @@ fn write_string_record(block: &mut [u8], field: usize, length: u16, max: u16, bu
     write_u64(block, field + US_BUFFER, buffer);
 }
 
-/// `RtlNormalizeProcessParams` — rebase each non-null `Buffer` offset to `base + offset` and the
-/// `Environment` pointer, setting the `NORMALIZED` flag. Idempotent (no-op if already normalized).
-/// Operates on the flat block in place.
+/// `RtlNormalizeProcessParams` — rebase each non-null string `Buffer` offset to `base + offset`,
+/// setting the `NORMALIZED` flag. Idempotent (no-op if already normalized). Operates on the flat
+/// block in place.
+///
+/// ★ The `Environment` field (`OFF_ENVIRONMENT`) is DELIBERATELY NOT rebased here — matching ReactOS
+/// `RtlNormalizeProcessParams`/`RtlDeNormalizeProcessParams` (sdk/lib/rtl/ppb.c), whose
+/// `NORMALIZE`/`DENORMALIZE` macros cover ONLY the 8 `UNICODE_STRING` Buffers. In real ntdll
+/// `Environment` is ALWAYS a live VA (`RtlCreateProcessParameters` sets `Param->Environment = Dest`,
+/// a VA, and denormalize leaves it untouched). Rebasing it here corrupted the field: a subsequently-
+/// denormalized block carried `Environment = offset` (e.g. `0x668`), which `RtlpInitEnvironment`
+/// then dereferenced as a VA → `#PF cr2=0x668`.
 pub fn normalize(block: &mut [u8], base: u64) {
     let flags = read_u32(block, OFF_FLAGS);
     if flags & RTL_USER_PROC_PARAMS_NORMALIZED != 0 {
@@ -335,15 +343,12 @@ pub fn normalize(block: &mut [u8], base: u64) {
             write_u64(block, field + US_BUFFER, b + base);
         }
     }
-    let env = read_u64(block, OFF_ENVIRONMENT);
-    if env != 0 {
-        write_u64(block, OFF_ENVIRONMENT, env + base);
-    }
     write_u32(block, OFF_FLAGS, flags | RTL_USER_PROC_PARAMS_NORMALIZED);
 }
 
 /// `RtlDeNormalizeProcessParams` — the inverse of [`normalize`]: subtract `base` from each non-null
-/// `Buffer` + `Environment` and clear the `NORMALIZED` flag. No-op if already de-normalized.
+/// string `Buffer` and clear the `NORMALIZED` flag. No-op if already de-normalized. Like
+/// [`normalize`], the `Environment` field is NOT rebased (ReactOS ppb.c parity — see [`normalize`]).
 pub fn denormalize(block: &mut [u8], base: u64) {
     let flags = read_u32(block, OFF_FLAGS);
     if flags & RTL_USER_PROC_PARAMS_NORMALIZED == 0 {
@@ -354,10 +359,6 @@ pub fn denormalize(block: &mut [u8], base: u64) {
         if b != 0 {
             write_u64(block, field + US_BUFFER, b - base);
         }
-    }
-    let env = read_u64(block, OFF_ENVIRONMENT);
-    if env != 0 {
-        write_u64(block, OFF_ENVIRONMENT, env - base);
     }
     write_u32(block, OFF_FLAGS, flags & !RTL_USER_PROC_PARAMS_NORMALIZED);
 }
@@ -553,7 +554,10 @@ mod tests {
         assert_eq!(read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED,
                    RTL_USER_PROC_PARAMS_NORMALIZED);
         assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off + BASE);
-        assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off + BASE);
+        // ★ ReactOS ppb.c parity: normalize/denormalize NEVER touch `Environment` — it stays exactly
+        // as the pure builder left it (an offset here; a live VA once the export fixes it up). This is
+        // the root fix for the `#PF cr2=0x668` (a denormalized `Environment` offset deref'd as a VA).
+        assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off);
         // Idempotent.
         normalize(&mut built.block, BASE);
         assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off + BASE);
@@ -561,6 +565,7 @@ mod tests {
         denormalize(&mut built.block, BASE);
         assert_eq!(read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED, 0);
         assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off);
+        // Environment untouched across the whole round-trip.
         assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off);
         // A NULL buffer (RuntimeData) stays NULL through both.
         assert_eq!(read_u64(&built.block, OFF_RUNTIME_DATA + US_BUFFER), 0);

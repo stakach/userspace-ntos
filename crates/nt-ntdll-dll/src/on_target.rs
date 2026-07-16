@@ -2858,8 +2858,11 @@ pub unsafe fn rtl_create_process_parameters(
     };
 
     let mut built = create_process_parameters(&input);
-    // The pure builder produces a de-normalized block already; ensure it (idempotent).
+    // The pure builder produces a de-normalized block already (string Buffers = offsets); ensure it
+    // (idempotent). NOTE: the builder stores `Environment` as an OFFSET (it is VA-agnostic); the VA
+    // fix-up happens below once we know the heap `dst`.
     denormalize(&mut built.block, 0);
+    let env_off = built.environment_offset;
 
     // Copy onto the process heap.
     let total = built.block.len();
@@ -2871,6 +2874,14 @@ pub unsafe fn rtl_create_process_parameters(
     // SAFETY: dst is a fresh `total`-byte region.
     unsafe {
         core::ptr::copy_nonoverlapping(built.block.as_ptr(), dst, total);
+        // ★ ReactOS ppb.c: `Param->Environment = Dest` — Environment is a LIVE VA, never an offset,
+        // and normalize/denormalize NEVER touch it. The pure builder only knows the offset, so the
+        // export (which knows the heap VA) performs the VA fix-up here. `RtlpInitEnvironment` /
+        // `RtlCreateUserProcess` dereference this field directly; leaving it an offset (e.g. 0x668)
+        // faulted (#PF cr2=0x668). A zero offset means "no environment" → leave the field NULL.
+        if env_off != 0 {
+            core::ptr::write((dst as u64 + 0x80) as *mut u64, dst as u64 + env_off);
+        }
         core::ptr::write(process_parameters, dst as u64);
     }
     0 // STATUS_SUCCESS
