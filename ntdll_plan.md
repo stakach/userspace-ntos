@@ -1290,3 +1290,56 @@ DLL emits 278 exports (was 255 at BATCH 1).
 3. **the Win32 client stack's ntdll imports** (gdi32/user32/advapi32/rpcrt4/kernel32/msvcrt) — the big
    surface; port as each DLL's DllMain/init exercises it (frontier-driven). Reconverge 174/98 + paint
    once winlogon completes its bring-up on our ntdll.
+
+## ☑ SYSTEMATIC PORT — BATCH 3 (in progress): the `map=8` wall root-caused (NOT executive) + the Win32-stack ntdll surface
+
+### ★ ROOT CAUSE of the `map=8` @ `kernel32+0xa9954` — diagnosis (a) ntdll-loader, NOT (b) executive
+The BATCH-2 note GUESSED the `map=8`/instr-fetch @ `kernel32+0xa9954` (va 0x80449000, err
+0x15 = present+user+**instr-fetch**) was an executive page-rights bug (a `.text` page mis-classified
+RW_NX). **That was WRONG.** RVA 0xa9954 is squarely in kernel32's **`.rdata`** (0x77000..0xaf412) —
+which the executive **correctly** maps NX. The bytes at that RVA are the ASCII forwarder string
+**`"ntdll.RtlGetLastWin32Error"`**: `kernel32!GetLastError` is a **FORWARDER export** (its func RVA
+0xa9954 falls inside kernel32's export directory 0xa5600..0xac840). So an instruction-fetch into
+`.rdata` = a **call through a slot that resolved to the forwarder STRING, not the forwarded target** =
+diagnosis **(a): an ntdll loader export-resolution bug.** (No oracle-boot needed — the binary + the PE
+export table pinned it unambiguously: the fault RVA IS the forwarder string RVA of a forwarded export.)
+
+The on-target recursive loader (`crates/nt-ntdll-dll/src/on_target.rs`) resolved each import to an RVA
+and wrote `dep_base + rva` into the IAT **without detecting/following forwarders** (its comment even
+said "forwarders NOT expected — our ntdll's exports are all concrete", true for smss's ntdll-only
+imports but FALSE now that it snaps kernel32/user32/… which forward to ntdll). The host-side engine
+`nt-ntdll::loader::resolve` already followed forwarders (the `_vista` proof), but the minimal
+on-target walker did not.
+
+### The fix (ckpt 1, commit `e41203b` — host tests 157, gate 146/98)
+- **`resolve_export_addr(dep_base, by_ordinal, name/ord, table, depth)`** — resolves an export to its
+  FINAL absolute address, following forwarders: if the resolved RVA is inside the export-dir range
+  (`is_forwarder`), parse `"TARGETDLL.func"` / `"TARGETDLL.#ord"`, find/**load** TARGETDLL via the
+  process-wide `MODULE_TABLE` (as `LdrpSnapThunk` does), and recurse (a target may itself forward;
+  depth-guarded). `snap_descriptor_against` + `ldr_get_procedure_address` route through it.
+- Added the two forwarder-TARGET exports our ntdll lacked: **`RtlGetLastWin32Error`/`RtlSetLastWin32Error`**
+  (read/write `TEB.LastErrorValue` @ 0x68 via `gs:[0x30]`) — the ntdll impl of Win32 Get/SetLastError.
+
+**Result:** the kernel32+0xa9954 map=8 wall is GONE. csrss's loader cascades AND **executes** the full
+Win32 client stack (csrsrv→basesrv→winsrv→gdi32→user32→advapi32→rpcrt4→kernel32→ws2_32→ws2help→msvcrt)
+on our ntdll, running 504→510 service-iters deep.
+
+### ckpt 2 (commit `896713f`): kernel32 early-init exports — csrss past `RtlAcquirePebLock`
+The next walls were **more MISSING ntdll exports** (not forwarders): kernel32 imports `RtlAcquirePebLock`
+(IAT slot left at its IMAGE_IMPORT_BY_NAME RVA `0xadd38` → instr-fetch fault). Added the immediate
+early-init exports: **`RtlAcquirePebLock`/`RtlReleasePebLock`** (enter/leave `PEB->FastPebLock` @
+PEB+0x38, PEB self @ `gs:[0x60]`), **`RtlGetNtGlobalFlags`** (PEB+0xBC), **`RtlNtStatusToDosError`**.
+csrss now advances to iters=510, next wall = `kernel32!DbgPrintEx`. DLL 284 exports.
+
+### ★ THE FRONTIER (measured): 253 more distinct missing ntdll exports across the Win32 stack
+The forwarder fix + the whole stack now snapping revealed the real BATCH-3 surface: **257 distinct
+ntdll exports the loaded Win32 stack imports that our ntdll did NOT export** (now 253 after ckpt 2's 4).
+Grouped: ~150 `Rtl*` (security SD/ACL/SID family for advapi32; heap Size/Destroy/Validate/Lock;
+activation-context/SxS for kernel32; timer-queue/work-item; bitmap; string size/convert; time), the
+`Ldr*` resource/loader-lock/shutdown family, `Csr*` (8, `nt-ntdll::csr` bodies exist), `Dbg*`
+(DbgPrintEx/DbgUi*), and ~60 CRT (`memcmp`/`strlen`/`wcs*`/`qsort`/math). **~most already have
+host-tested `nt-ntdll` bodies** → the exports are thin C-ABI `#[export_name]` wrappers per THE PORT
+PATTERN (a large, parallelizable, frontier-driven batch — NOT a single wall). Fan out per-module
+(the full missing list is reproducible: diff each stack DLL's ntdll-import descriptor vs our export
+table). Reconverge 174/98 + paint once csrss finishes CsrServerInitialization → the CSR↔SM handshake
+→ winlogon spawns on our ntdll.
