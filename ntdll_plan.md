@@ -1026,7 +1026,7 @@ that's a TRANSPORT wall → flag for Step 6 (the seL4 `Call`/SURT flip; marshall
 
 ## ★ PIVOT (user, 2026-07-16) — retire the oracle-diff GRIND; go SYSTEMATIC + flip the transport
 Two directives: (1) **switch to Step 6 regardless** (flip the syscall transport off x86-trap) — the trap-path grind hit/approached syscall-marshalling friction (out-param write-back via the executive stack-mirror, wide-arg, servicing), which a proper transport eliminates; (2) **focus entirely on PORTING ReactOS ntdll → our Rust ntdll, TEST-DRIVEN**: for each function, port ReactOS's apitests if they exist (`references/reactos/modules/rostests/apitests/ntdll/`) OR write input/output validation tests, THEN port the function body from ReactOS source (`references/reactos/sdk/lib/rtl` for Rtl*, `references/reactos/dll/ntdll` for Ldr*/loader). Retire the reactive oracle-diff grind (Step 4.C paused at ckpt 6 `bb7fd4a`; smss ran deep into SmpInit under our ntdll — 10 real bodies; flag OFF committed green). The systematic port SUBSUMES the grind: instead of discovering walls one boot at a time, port the surface methodically + host-test it, so smss (then all 5 processes) runs on a COMPLETE, tested ntdll.
-### ☐ Step 6 — flip the transport (RECON-FIRST; the crux: a hosted process's `syscall` all fault via TCBSetHostedSyscalls, so "native seL4 Call" from our ntdll ALSO faults unless the design changes). Design the transport that eliminates the grind friction (native seL4 Call to a service endpoint / SURT ring / or cleaner-reply-over-fault with out-params returned as VALUES in the reply + written in-process by our ntdll), incl. the TCBSetHostedSyscalls + kernel-change question. The seL4/SURT arg-marshalling is ALREADY host-tested (Step 2c `marshal.rs` + `transport.rs` Sel4Call/SurtRing seams); the missing piece is the executive RECEIVE path. RECON → design → build, flag-gated, committed green.
+### ☑ Step 6 — flip the transport → NATIVE seL4 Call (DONE — see "Step 6.A" below). NO kernel change: the crux (TCBSetHostedSyscalls faults every `syscall`) is dissolved by simply NOT setting that per-thread flag for our-ntdll smss (our ntdll owns every syscall, so it never issues a raw Windows `syscall`). smss's syscalls now flow over a real native seL4 `Call(CT_FAULT)`, serviced by the executive's new NT_NATIVE_SYSCALL recv arm, reaching the SAME deep-SmpInit depth (stop_ssn=190) as the trap transport. Out-params kept on the existing stack mirror (MR1=rsp) for a zero-handler-churn cut; value-return layers on later. `marshal.rs`/SURT stay available for a future batched/async surface.
 ### ☐ Systematic Rtl/Ldr body port (test-driven) — port the ReactOS ntdll surface methodically into `crates/nt-ntdll`, batched by module (string/path/env/time/security/heap/loader), each function: (apitest OR new I/O test) + ported body. On the clean transport (after Step 6). This is the bulk; highly parallelizable (independent functions).
 
 ## ★ DECISION (user, 2026-07-16) — NATIVE transport (option A), do it right; spec-break PERMITTED
@@ -1102,3 +1102,61 @@ the pure value-return layers on top later, handler-by-handler, during the system
 4. **PROVE**: flag-ON boot log shows smss's syscalls arriving as `NT_NATIVE_SYSCALL_LABEL` messages
    (NOT `[unknown syscall]` faults), serviced + replied, smss ≥ its trap-transport depth
    (deep into SmpInit).
+
+### ✅ DONE — the native transport is LIVE (proven end-to-end, 2026-07-16)
+**MILESTONE: smss's syscalls flow over a real native seL4 `Call` — NO fault-trap emulation — and it
+runs AT LEAST as deep as on the trap transport (identical SmpInit depth, `stop_ssn=190`).**
+
+**What landed (3 recoverable, host-tested commits on `main`):**
+- **ckpt 1** — the kernel-change investigation (NO change needed, validated) + this design.
+- **ckpt 2** — the ntdll stub side: `crates/nt-ntdll/src/native_call.rs` (the wire layout, host-tested),
+  the 188 naked `Nt*` stubs' native-Call variant (`trap_stubs.rs`, `feature = native_transport`), and
+  `nt-ntdll-dll/on_target.rs`'s `syscall4/6/8` + `nt_allocate_virtual_memory` flipped to a
+  `native_syscall8` primitive (MR4/5 via the IPC buffer, args via a stack `req` array to stay within
+  register pressure). `native_transport` feature (default ON for the DLL emit).
+- **ckpt 3** — the executive side + PROOF: `img_spawn.rs` skips `TCBSetHostedSyscalls` for the native
+  spawn (gated on `ldrpinit_rva != 0` = our-ntdll smss only → all fallbacks byte-identical); the fault
+  EP + its `CT_FAULT` cap double as the service channel (no second endpoint). `service_sec_image.rs`
+  gained the `mi>>12 == NT_NATIVE_SYSCALL_LABEL` recv arm that NORMALIZES the native message into the
+  fault-frame register slots the `(mi>>12)==2` UnknownSyscall arm reads (`set_recv_mr`), then re-labels
+  to 2 so the FULL existing servicing body (dispatch + out-writes + spawn/park/delay post-actions) runs
+  UNCHANGED. `NT_NATIVE_SYSCALL_LABEL = 0x4E54` lives in `nt-syscall-abi` (single source of truth).
+
+**The out-param FRICTION-KILLER (this cut):** ntdll passes the SAME pointer args (into smss's mapped
+memory) in the message; the executive services with the SAME handlers writing out-params through the
+SAME stack/heap/image MIRROR (MR1 carries rsp, so the mirror reads/writes work). The reply is a NORMAL
+IPC reply (the native caller has `pending_fault == 0`, so the kernel's normal `deliver_message` fans
+`result → MR0 → the caller's r10`, which the native stub reads as NTSTATUS — NOT the register-restoring
+fault reply). The pure out-params-as-VALUES (no mirror) layers on later, handler-by-handler, during the
+systematic body port — the transport is proven without touching the ~100 handlers.
+
+**PROOF (flag-ON boot log, `/tmp/step6a.log`):**
+- `[dbg] nt-ntdll: snap resolved=103 missing=0` — our LdrpInitialize ran + snapped smss's IAT.
+- **ZERO `[unknown syscall]` after the loader snap** (grep: 0 occurrences past that line; the 18 before
+  are the demo SEC_IMAGE trap-path test + the kernel specs, NOT the live smss). Every one of smss's
+  ~130 syscalls arrived as a native seL4 `Call` (raw label 0x4E54, re-labeled to 2 internally).
+- `[sec-stop] badge=0 (smss) … iters=246 … stop_ssn=190 ssns: 0:96 0:181 0:181 0:125 0:256 0:256 0:256
+  0:125 0:185 0:185 0:27 … 0:129 0:12 0:249 0:249 … 0:145 0:37 0:228 0:129 0:12 0:27 0:190` — the SAME
+  deep-SmpInit progression as trap-transport ckpt 6: registry env + CPU keys + KnownDlls/DOS-devices +
+  dynamic env + `[sm-loop] spawned tcb` (the SM API loop thread) + the csrss create-process probe
+  (145/37/228), stopping at the SAME `NtRaiseHardError(190)` wall.
+- `LIVE ReactOS smss+env: faulted 57 page(s) (33 in ntdll) … ntalloc_serviced=3`; the 5 smss live specs
+  PASS (`exec_reactos_smss_live_paged/_calls_into_ntdll/ldrinit_runs_deep/creates_heap/reads_image`).
+
+**Spec/boot state (spec-break, as permitted):** flag `SMSS_USE_OUR_NTDLL = true` → gate **141/98**
+(smss doesn't yet spawn csrss under the transport-only cut → no desktop paint — the EXPECTED state,
+same as trap-transport ckpt 6's 143-145). Flag-OFF (real-ntdll trap) is the untouched fallback: the
+executive's native arm is dormant (no native message arrives) and `native_transport = ldrpinit_rva!=0`
+is 0, so the real-ntdll / pi>=1 path keeps `TCBSetHostedSyscalls` + the trap path. Host tests:
+`nt-ntdll` 150, `nt-syscall-abi` 12. **RECONVERGE later** (user sequence step 3): the 174/98 gate + paint
+return once the systematic body port brings smss (then all 5 processes) far enough on the native
+transport to spawn csrss again.
+
+**What the systematic body port wires next (user sequence steps 2+4):** with the clean native
+transport in place, port the ReactOS `Rtl*`/`Ldr*` bodies test-driven into `crates/nt-ntdll` (apitest OR
+I/O test + ported body, batched by module), so smss's `NtRaiseHardError(190)` wall dissolves into the
+`SmpExecuteImage → RtlCreateProcessParameters → RtlCreateUserProcess → NtCreateSection(SEC_IMAGE) →
+NtCreateProcessEx` csrss spawn. Add the executive **SSN-50** (`NtCreateProcessEx`) arm when smss emits it.
+The out-param VALUE-return (retiring the stack mirror per handler) is an optional cleanliness pass on
+top of the working transport. The seL4/SURT arg-marshalling in `marshal.rs` remains available for a
+future IPC-buffer-batched or async surface.
