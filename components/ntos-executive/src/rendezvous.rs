@@ -485,9 +485,16 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         cid_thread,
         resume,
         prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
-        // BATCH 6 follow-up: trap transport for now (badged-fault multiplex).
-        native: false,
-        ipcbuf_frame: 0,
+        // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
+        // thread must too — mirror BATCH 6/19 (winlogon's RPC listener). Without native:true the thread's
+        // first native Call faulted as UnknownSyscall with SSN=garbage (0x100_0080_0000 = RAX at trap) →
+        // `[lsass-listener] PARK (unserviced)` → then a stray fault at a garbage stack RIP. Set native →
+        // its Call dispatches (MR0=r10=SSN) + bind its kernel IPC buffer to lsass' MAIN-thread ipcbuf
+        // frame at IPCBUF_VADDR (the VA our ntdll native stub writes MR4/MR5 to). Its faults still arrive
+        // on the badged MAIN fault-EP (the loop's NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them),
+        // so it actually RUNS LsarStartRpcServer → SetEvent(LSA_RPC_SERVER_ACTIVE).
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
     })
 }
 
@@ -522,8 +529,9 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         cid_thread,
         resume,
         prio: 105,
-        native: false,
-        ipcbuf_frame: 0,
+        // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
     })
 }
 
@@ -556,8 +564,9 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
         cid_thread,
         resume,
         prio: 105,
-        native: false,
-        ipcbuf_frame: 0,
+        // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
     })
 }
 
