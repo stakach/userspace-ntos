@@ -46,7 +46,9 @@ macro_rules! generate_trap_stubs {
         $(
             #[cfg(target_arch = "x86_64")]
             #[unsafe(naked)]
-            #[no_mangle]
+            // Export under the REAL Windows `Nt*` name (not the snake_case fn ident), so the PE
+            // export directory lists `NtClose`/`NtCreateFile`/… — the names hosted binaries import.
+            #[export_name = $name]
             /// Generated `Nt*` trap stub: `mov r10,rcx; mov eax,<ssn>; syscall; ret`.
             pub extern "C" fn $fn() {
                 core::arch::naked_asm!(
@@ -61,6 +63,18 @@ macro_rules! generate_trap_stubs {
         /// The full generated trap-stub coverage table (metadata; the naked bodies are target-only).
         pub const TRAP_STUBS: &[TrapStubMeta] = &[
             $( TrapStubMeta { name: $name, ssn: $ssn, argc: 0 }, )*
+        ];
+
+        /// A `#[used]` array of every naked trap stub's address. Referencing the stubs here forces
+        /// the linker to RETAIN them when this rlib is linked into the [`nt-ntdll-dll`] cdylib —
+        /// otherwise dead-code elimination would drop the `Nt*` exports (nothing else references the
+        /// naked bodies). Target-only (the naked bodies only exist on x86_64). Not host-tested (it's
+        /// a linker-retention anchor, not logic); the coverage of the same set is under test via
+        /// [`TRAP_STUBS`].
+        #[cfg(target_arch = "x86_64")]
+        #[used]
+        pub static TRAP_STUB_ADDRS: &[unsafe extern "C" fn()] = &[
+            $( $fn, )*
         ];
     };
 }

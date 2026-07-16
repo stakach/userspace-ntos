@@ -1,0 +1,16 @@
+[package]
+name = "ntdll-dll-verify"
+description = "Standalone host tool (Step 4.0 proof): parse our emitted PE32+ ntdll.dll with the EXECUTIVE'S OWN loader (nt-pe-loader::PeFile) and assert it is PE32+, IMAGE_FILE_DLL, exports all 188 Nt* + LdrpInitialize, and carries a base-relocation directory. This is the real compatibility check — if our own loader can read it, the executive can load it (Step 4.B). Runs on the host without seL4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ntdll-dll-verify"
+path = "src/main.rs"
+
+[dependencies]
+nt-pe-loader = { path = "../../crates/nt-pe-loader" }
+nt-syscall-abi = { path = "../../crates/nt-syscall-abi" }

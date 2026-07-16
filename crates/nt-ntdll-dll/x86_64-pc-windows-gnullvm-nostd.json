@@ -1,0 +1,68 @@
+{
+  "abi": "llvm",
+  "abi-return-struct-as-int": true,
+  "allows-weak-linkage": false,
+  "arch": "x86_64",
+  "binary-format": "coff",
+  "cpu": "x86-64",
+  "crt-objects-fallback": "mingw",
+  "crt-static-allows-dylibs": true,
+  "crt-static-respected": true,
+  "data-layout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "dll-prefix": "",
+  "dll-suffix": ".dll",
+  "dll-tls-export": false,
+  "dynamic-linking": true,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "env": "gnu",
+  "exe-suffix": ".exe",
+  "features": "+cmpxchg16b,+sse3,+lahfsahf",
+  "has-thread-local": true,
+  "is-like-windows": true,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "x86_64-pc-windows-gnu",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "64-bit x86 MinGW (Windows 10+), LLVM ABI",
+    "host_tools": true,
+    "std": true,
+    "tier": 2
+  },
+  "no-default-libraries": false,
+  "os": "windows",
+  "plt-by-default": false,
+  "pre-link-args": {
+    "gnu": [
+      "-m",
+      "i386pep"
+    ],
+    "gnu-cc": [
+      "-nolibc",
+      "--unwindlib=none",
+      "-m64"
+    ],
+    "gnu-lld": [
+      "-m",
+      "i386pep"
+    ],
+    "gnu-lld-cc": [
+      "-nolibc",
+      "--unwindlib=none",
+      "-m64"
+    ]
+  },
+  "requires-uwtable": true,
+  "target-family": [
+    "windows"
+  ],
+  "target-mcount": "_mcount",
+  "target-pointer-width": 64,
+  "vendor": "pc",
+  "link-self-contained": {
+    "components": [
+      "linker"
+    ]
+  }
+}

@@ -80,11 +80,16 @@ members = [
     "crates/nt-ntdll-layout",
     "crates/nt-ntdll",
     "tools/driver-import-report",
+    "tools/ntdll-dll-verify",
 ]
 exclude = [
     "rust-micro",
     "crates/ntos-root",
     "references",
+    # nt-ntdll-dll is a no_std PE32+ cdylib: it can only build for the custom windows-gnullvm target
+    # (via `scripts/build_ntdll_dll.sh`), never for the host, so it has its own [workspace] and is
+    # excluded here — the same convention as the bare-metal crates above.
+    "crates/nt-ntdll-dll",
 ]
 
 [workspace.package]

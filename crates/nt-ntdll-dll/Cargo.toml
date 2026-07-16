@@ -1,0 +1,21 @@
+[package]
+name = "nt-ntdll-dll"
+description = "Step 4.0: the PE32+ DLL wrapper around the host-tested `nt-ntdll` rlib. A thin `cdylib` (no_std, panic=abort, no CRT startup) whose sole job is to EMIT a loadable ntdll.dll — it force-references the 188 `Nt*` trap stubs (so they land in the PE export directory under their real Windows names) and exports `LdrpInitialize` at a findable RVA (the trampoline hand-off point for Step 4.B). NOT wired into the boot; built for a custom no-CRT windows-gnullvm target and verified with `nt-pe-loader`. Kept as a SEPARATE crate + its OWN [workspace] (it never builds for the host) so `nt-ntdll` stays an rlib whose 145 host tests keep running under `cargo test`."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stakach/userspace-ntos"
+authors = ["Stephen von Takach <steve@place.technology>"]
+
+# Own workspace — this crate is excluded from the main workspace (it only builds for the custom
+# windows PE target). Keeps `cargo build --workspace` (host) from trying to compile a no_std cdylib.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nt-ntdll = { path = "../nt-ntdll" }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

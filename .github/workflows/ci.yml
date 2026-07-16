@@ -47,3 +47,23 @@ jobs:
             -Z json-target-spec \
             --target triplet.json \
             --release
+
+  ntdll-dll:
+    name: ntdll.dll (PE32+ emit + verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-pc-windows-gnullvm
+      - name: build + verify the PE32+ ntdll.dll (Step 4.0)
+        # Emits .tmp/nt-ntdll.dll (188 Nt* + LdrpInitialize + .reloc) via the bundled rust-lld
+        # (no mingw needed) and parses it with the executive's own nt-pe-loader.
+        run: ./scripts/build_ntdll_dll.sh
+      - name: upload the emitted ntdll.dll artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nt-ntdll-dll
+          path: .tmp/nt-ntdll.dll
+          if-no-files-found: error

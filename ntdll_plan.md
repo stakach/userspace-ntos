@@ -1,6 +1,6 @@
 # nt-ntdll — a Rust ntdll.dll (our userspace kernel-ABI half)
 
-**Status:** PLANNING · Step 1 (measure the import surface) DONE (2026-07-16) · Step 2 next
+**Status:** PLANNING · Steps 1/2a/2b/2c/3 DONE · **Step 4.0 (emit the PE32+ ntdll.dll) DONE 2026-07-16** (local emit, nt-pe-loader-verified) · Step 4.A next
 **Owner:** rust-micro / userspace-ntos
 **Decision (2026-07-16, user):** build our OWN ntdll.dll in Rust, exporting the same
 surface as ReactOS ntdll (source: `references/reactos/dll/ntdll` + `sdk/lib/rtl`), so we
@@ -579,3 +579,80 @@ hack (`project_full_fs.md`). Owning the loader makes this a policy decision, hos
   from x86-trap to native seL4 Call/SURT once parity holds.
 - Wire the SEH function-table registration (`rtl::exception::FunctionTable::add`) during ATTACH + the
   process cookie into `rtl::encode`'s `RtlEncodePointer`.
+
+## Step 4 Plan (from recon, 2026-07-16)
+The executive currently acts as an EXTERNAL loader for the real ntdll. Key recon findings:
+- **The executive does NOT snap imports** — the real ntdll's `LdrpSnapThunk` does it IN-PROCESS. So OUR ntdll's loader owns import snapping (our `loader/resolve.rs` already does). The executive only demand-maps pages (`fill_image_page` img_spawn.rs:239-266) + registers modules in `nt-dll-registry`.
+- **The executive PRE-STAGES TEB/PEB/params/NLS/KUSER at spawn** (img_spawn.rs:346-532) → `commit_peb_teb` is largely already done; our loader mainly builds `PEB->Ldr` + snaps imports. gs-base set to `SMSS_TEB_VA` at TCB creation (img_spawn.rs:592).
+- **smss statically imports ONLY ntdll** → snapping smss's imports resolves against OUR OWN export table (no other DLLs to load) = the cleanest first target.
+- **The trampoline** (img_spawn.rs:542-574) calls `LdrpInitialize @ NTDLL_BASE+0x8e70` (REAL ntdll's RVA — Step 4 must use OUR LdrpInitialize's RVA), then chains to smss entry with RCX=PEB.
+- **Substitution point**: `spawn_sec_image(pi, pe, ..., ntdll_base, ...)` (img_spawn.rs:271) — for pi 0 pass OUR ntdll PE; keep real ntdll for pi>=1 (fallback). Call site service_sec_image.rs:96-142.
+- **LoaderHost→executive map**: `map_image`→fill_image_page/apply_relocations_to_buf(img_spawn.rs:835-871); `write_iat_slot`→smss_copyout(img_spawn.rs:652-661)/stack-mirror; `commit_peb_teb`→already pre-staged; `transfer_to_entry`→the trampoline's `call entry` (img_spawn.rs:568). Our loader OWNS snap; executive provides memory+registration.
+- **SSN-50 reconciliation**: add `NtCreateProcessEx`(50) to nt-syscall enum + `SSN_NT_CREATE_PROCESS_EX=50` (main.rs) + dispatch arm (exec_handler.rs ~4781; 49's args are a prefix of 50's).
+
+### ☑ Step 4.0 — EMIT nt-ntdll as a loadable PE32+ DLL (DONE 2026-07-16, LOCAL emit, host-verified)
+Make `nt-ntdll` build to a PE32+ DLL with a correct EXPORT directory + relocations + no_std + no CRT.
+**LANDED (local emit on macOS — no mingw, no CI needed):** a **verified PE32+ ntdll.dll** is produced
+by a reproducible script + parsed by the executive's OWN loader. **ZERO boot risk** — no boot wiring;
+executive still builds byte-identically (`rootserver.elf` MD5 `14c6615f…` unchanged); `nt-ntdll`
+host tests still **145/145** green.
+
+**Design fork resolved → the CLEAN way (wrapper crate, NOT crate-type on the rlib):** a NEW thin
+`crates/nt-ntdll-dll` **cdylib** wraps the host-tested `nt-ntdll` **rlib** — so the rlib keeps its
+145 `cargo test` host tests (a cdylib crate-type would have conflicted). It is its **OWN `[workspace]`**
++ **excluded** from the main workspace (a no_std PE cdylib can't build for the host, so
+`cargo build --workspace` must not try — same convention as the bare-metal crates).
+
+**The working build invocation** (`scripts/build_ntdll_dll.sh`, fully reproducible):
+- **Target:** a **custom JSON target** `crates/nt-ntdll-dll/x86_64-pc-windows-gnullvm-nostd.json`
+  derived from `x86_64-pc-windows-gnullvm` with the **mingw import libs stripped**
+  (`late-link-args` dropped: no `-lmingw32/-lmingwex/-lmsvcrt/-lkernel32/-luser32`) and the **CRT
+  startup objects removed** (`*-link-objects*` dropped) → no mingw toolchain needed on macOS.
+- **Linker = the BUNDLED `rust-lld`** (`linker="rust-lld"`, `linker-flavor="gnu-lld"`,
+  `link-self-contained.components=["linker"]`). (`x86_64-pc-windows-gnullvm` FIRST-choice would have
+  used `x86_64-w64-mingw32-clang` which isn't on macOS; the custom spec + rust-lld avoids it.)
+- **Flags:** `-Z build-std=core,alloc,panic_abort` + `-Z build-std-features=compiler-builtins-mem`
+  (supplies `memcpy/memcmp/…` since we drop msvcrt) + `-Z json-target-spec`; `RUSTFLAGS` =
+  `-Zunstable-options -Cpanic=immediate-abort` (no_std, no unwinder — this nightly's panic strategy
+  is `immediate-abort`, NOT the old `panic_immediate_abort` build-std feature) +
+  `-Clink-arg=--no-gc-sections` (**load-bearing**: `--gc-sections` collected the base-reloc chunks →
+  empty `.reloc`; `--no-gc-sections` keeps a real `.reloc`). `--release` (742→734 KB; debug is ~6 MB
+  of DWARF).
+- **The cdylib provides the no-CRT runtime bits** (`src/lib.rs`): a `#[panic_handler]`, a placeholder
+  `#[global_allocator]` (the rlib links `alloc`; Step 4.B swaps in the real `heap`-backed one),
+  `DllMain`/`DllMainCRTStartup` (the entry, so no CRT `_DllMainCRTStartup` dep), `fma`/`fmaf` stubs
+  (libm float-traits pull them; never on a live path), and a `#[used]` `KEEP_TRAP_STUBS` anchoring
+  the rlib's new `#[used] TRAP_STUB_ADDRS` fn-ptr table so the linker RETAINS all 188 stubs.
+- **Export mechanism:** changed the `generate_trap_stubs!` macro's `#[no_mangle]` → **`#[export_name = $name]`** so the PE export directory lists the REAL Windows names (`NtClose`, not `nt_close`).
+  Host tests unaffected (they test the metadata table, not the symbol names).
+
+**The export directory (verified):** **193 total exports = 188 `Nt*` + `LdrpInitialize` + `DllMain` +
+`DllMainCRTStartup` + `fma` + `fmaf`**. `objdump` + our own loader confirm **all 188 `Nt*` present, 0
+missing**; spot-checks `NtClose/NtCreateFile/NtOpenFile/NtDelayExecution/NtWaitForSingleObject/
+NtProtectVirtualMemory` all present. **`LdrpInitialize` RVA = `0x1010`** (release build; NOT
+stable across builds — Step 4.B/4.A must derive it from the export table, never hardcode it).
+
+**objdump proof:** `file` → `PE32+ executable (DLL) (GUI) x86-64, for MS Windows`; Magic `0x020b`
+(PE32+); Characteristics `0x2022` (**IMAGE_FILE_DLL**); DllCharacteristics `0x160`
+(DYNAMIC_BASE+NX+HIGH_ENTROPY); sections **`.text .rdata .data .pdata .reloc`** (+ `.edata` export
+dir); image_base `0x180000000`; subsystem 2 (GUI).
+
+**★ Real compatibility proof — the executive's OWN loader parses it:** new host tool
+`tools/ntdll-dll-verify` runs `nt-pe-loader::PeFile::parse` over the DLL and asserts PE32+ +
+IMAGE_FILE_DLL + all 188 Nt* + LdrpInitialize exported + a non-empty base-reloc dir → **PASS
+(2040 reloc fixups parse cleanly)**. If our loader can read it, the executive can load it (Step 4.B).
+Wired into the build script as the hard gate.
+
+**Staged DLL path (for Step 4.A to substitute): `.tmp/nt-ntdll.dll`** (gitignored build artifact;
+regenerate with `./scripts/build_ntdll_dll.sh`). CI fallback also added
+(`.github/workflows/ci.yml` job `ntdll-dll` builds + verifies + uploads the artifact on Linux).
+
+**⚠ KNOWN GAP (tracked for Step 4.B, NOT part of the 4.0 gate):** the DLL exports the **Nt\* + Ldrp**
+surface but **NOT yet the `Rtl*` smss imports** (smss imports ~44 Rtl\*; per Step 1). The Rtl bodies
+EXIST in the rlib but as Rust-ABI fns, not `extern "C"` PE exports — exporting them is mechanical
+`#[export_name]` C-ABI wrappers over the existing `rtl::*` (the PE-emit machinery proven here
+generalizes trivially). **smss won't fully resolve against our ntdll until these land** — do it as the
+first task of Step 4.B (or a 4.0b increment) alongside the real `LoaderHost`.
+### ☐ Step 4.A — first control: substitute our ntdll for smss (pi 0), prove our Rust runs in-process (a DbgPrint/observable syscall), real-ntdll fallback for pi>=1.
+### ☐ Step 4.B — real LoaderHost (map/write_iat/PEB->Ldr/transfer) + snap smss's ntdll-only imports → smss reaches NtProcessStartup under our ntdll. Point the trampoline at OUR LdrpInitialize RVA.
+### ☐ Step 4.C — parity: smss progresses as far under our ntdll as under real (spawns csrss); add the SSN-50 arm; keep fallback; gate green (174/98, paint 768/768) throughout.

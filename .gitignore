@@ -2,3 +2,5 @@ target/
 Cargo.lock
 /references/
 .DS_Store
+# Build artifacts staged by scripts/build_ntdll_dll.sh (the emitted ntdll.dll etc.).
+/.tmp/
