@@ -117,7 +117,7 @@ unsafe impl Backing for HeapBacking {
 /// # Safety
 /// On-target only; issues the allocation syscall.
 #[cfg(target_arch = "x86_64")]
-unsafe fn create_process_heap() -> Option<Heap<HeapBacking>> {
+unsafe fn create_process_heap() -> Option<(Heap<HeapBacking>, u64)> {
     // SAFETY: on-target hosted-process syscall.
     let base = unsafe { nt_allocate_virtual_memory(PROCESS_HEAP_SIZE) };
     if base == 0 {
@@ -127,6 +127,7 @@ unsafe fn create_process_heap() -> Option<Heap<HeapBacking>> {
         base: base as *mut u8,
         len: PROCESS_HEAP_SIZE,
     })
+    .map(|h| (h, base))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1023,10 +1024,23 @@ unsafe fn syscall_map_view(
 /// On-target only; `smss_base`/`ntdll_base` mapped PE images.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
-    // (1) Process heap — install it so `alloc` works for any engine code that needs it.
-    // SAFETY: on-target syscall.
-    if let Some(heap) = unsafe { create_process_heap() } {
+    // (1) Process heap — install it so `alloc` works for any engine code that needs it, AND publish
+    // its base into `Peb->ProcessHeap` (x64 PEB+0x30). Real ntdll's LdrpInitializeProcess sets
+    // `Peb->ProcessHeap = RtlCreateHeap(...)`; kernel32's `GetProcessHeap()` returns exactly that
+    // field. msvcrt's DllMain `_heap_init` calls `GetProcessHeap()` and, if NULL, returns FALSE →
+    // its whole CRT process-attach bails BEFORE setting `_acmdln = strdup(GetCommandLineA())`, so
+    // winlogon's later `__getmainargs → _setargv → strlen(_acmdln=NULL)` NULL-derefs. Publishing the
+    // heap base here makes GetProcessHeap non-NULL → msvcrt's attach completes → `_acmdln` set.
+    // SAFETY: on-target syscall + gs:[0x60] = PEB (byte-exact x64 layout).
+    if let Some((heap, heap_base)) = unsafe { create_process_heap() } {
         crate::install_process_heap(heap);
+        unsafe {
+            let peb: u64;
+            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+            if peb != 0 {
+                core::ptr::write_volatile((peb + 0x30) as *mut u64, heap_base); // Peb->ProcessHeap
+            }
+        }
     }
     // (2) Snap the EXE's imports against our export table + any dependent DLLs (csrsrv for csrss).
     // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
