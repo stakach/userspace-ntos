@@ -85,6 +85,12 @@ impl ExecNtHandler {
             delay_interval_100ns: 0,
             delay_alertable: false,
             io_signal_event: -1,
+            pipe_park_fid: 0,
+            pipe_park_buffer_va: 0,
+            pipe_park_buffer_len: 0,
+            pipe_park_iosb_va: 0,
+            pipe_park_transceive: false,
+            pipe_write_redrive: false,
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
@@ -1971,9 +1977,29 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
-                if iosb != 0 {
+                // BATCH 33: an FSCTL_PIPE_TRANSCEIVE (write-then-read) on a real npfs pipe that returns
+                // PENDING has no response bytes yet → PARK this caller keyed by the reading end fid, and
+                // re-drive it when the peer writes the response (the loop steals the reply cap; the
+                // response is delivered to args[8]/IOSB at re-drive, so SUPPRESS the PENDING IOSB here).
+                if fid != 0
+                    && (fsctl as u32) == 0x0011_C017
+                    && (status as u32) == 0x0000_0103
+                    && args[8] != 0
+                {
+                    self.pipe_park_fid = fid;
+                    self.pipe_park_buffer_va = args[8];
+                    self.pipe_park_buffer_len = args[9] as u32;
+                    self.pipe_park_iosb_va = iosb;
+                    self.pipe_park_transceive = true;
+                }
+                if iosb != 0 && self.pipe_park_fid == 0 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                }
+                // A TRANSCEIVE that COMPLETED synchronously (it wrote request bytes into npfs) may also
+                // satisfy the peer's parked read — ask the loop to re-drive.
+                if fid != 0 && (fsctl as u32) == 0x0011_C017 && (status as u32) != 0x0000_0103 {
+                    self.pipe_write_redrive = true;
                 }
                 if self.pi == 2 && fsctl as u32 == 0x0011_0018
                     && NT_PIPE_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8
@@ -3961,6 +3987,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                             self.io_signal_event = index as i64;
                         }
                     }
+                    // BATCH 33: the bytes are now queued in npfs on the PEER end. Ask the loop to
+                    // re-drive every parked pipe read — npfs's FCB pairing wakes the peer's reader.
+                    self.pipe_write_redrive = true;
                 }
                 if trace {
                     print_str(b"[nt-write-file] pi=");
@@ -4026,6 +4055,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let mut output = alloc::vec![0u8; len.min(transport_capacity)];
                 let mut information = 0u64;
                 let mut routed = false;
+                let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
                 let status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if len > transport_capacity {
@@ -4054,6 +4084,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                                     if driver_status as u32 != 0x0000_0103 && copy_len != 0 {
                                         self.xas_write_buf(buffer, &output[..copy_len]);
                                     }
+                                    if driver_status as u32 == 0x0000_0103 {
+                                        pending_read_fid = file_id;
+                                    }
                                     driver_status as u32
                                 }
                                 None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
@@ -4061,7 +4094,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 };
-                if iosb_ok {
+                // BATCH 33: a real npfs pipe read with no data yet → PARK this caller (withhold the
+                // reply, steal its reply cap keyed by this reading end's fid) and re-drive it when the
+                // peer writes. The loop performs the reply-cap steal (resume ctx is loop-resident); the
+                // IOSB / completion are written at re-drive, so SUPPRESS the PENDING IOSB write here.
+                if pending_read_fid != 0 {
+                    self.pipe_park_fid = pending_read_fid;
+                    self.pipe_park_buffer_va = buffer;
+                    self.pipe_park_buffer_len = len as u32;
+                    self.pipe_park_iosb_va = iosb;
+                    self.pipe_park_transceive = false;
+                }
+                if iosb_ok && pending_read_fid == 0 {
                     self.xas_write_buf(iosb, &status.to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }

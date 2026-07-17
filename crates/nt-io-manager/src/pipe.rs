@@ -542,6 +542,162 @@ impl PipeRegistry {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipe-pending completion: the cross-thread park/re-drive bookkeeping (BATCH 33)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The live executive runs the REAL isolated npfs.sys as its pipe data plane. A
+// blocking pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE on an empty pipe returns
+// STATUS_PENDING and, previously, was returned straight to the caller with no
+// re-drive — so a server listener parked on its receive never woke when the peer
+// wrote, and the client's own read got RPC_X_BAD_STUB_DATA.
+//
+// The fix generalizes the EVENT park/wake edge (a caller blocks with its seL4
+// reply cap withheld; a later signal replies to that cap to wake the thread) to
+// pipe data. The seL4-cap side (steal REPLY_MAIN, snapshot RCX/RSP/RFLAGS, send
+// on the stolen cap) stays in the executive — it needs kernel invocations. The
+// PURE bookkeeping (which reads are parked, their npfs file-id + user
+// buffer/IOSB VAs + owning process + resume context) lives here so it is
+// host-testable: park-on-empty, re-drive-on-peer-write, re-armable (a slot frees
+// after a wake and can be re-parked for the next PDU), and bidirectional (server
+// and client sides park independently, keyed by their own file-id).
+//
+// The executive does NOT have a peer→reader map (npfs pairs the ends internally
+// by name), so on ANY pipe write it re-drives EVERY parked reader: it re-issues
+// each parked read against npfs and completes the ones that now return data —
+// npfs's own FCB pairing decides which reader actually has bytes. `drain_all`
+// hands the executive the full set of parked waiters to re-drive; `complete`
+// frees the slots that were satisfied. Idempotent: a re-read that is still
+// PENDING leaves the waiter parked (the executive simply doesn't call
+// `complete` for it).
+
+/// One parked pipe read awaiting peer data. All fields are the executive-side
+/// context needed to complete the read when data arrives: the npfs `file_id`
+/// (the reading end's `FsContext`) to re-issue the read against, the owning
+/// process index + thread id (whose VSpace/stack-mirror the bytes land in), the
+/// user `buffer`/`iosb` VAs, the buffer length, the seL4 reply cap held for the
+/// blocked thread, and its native-syscall resume context (RCX/RSP/RFLAGS). The
+/// pure table treats them as opaque `u64`s — only `file_id` participates in the
+/// table's own logic (as the slot key); the rest are carried verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PipeWaiter {
+    /// npfs `FsContext` of the READING end this waiter is blocked on (the slot key).
+    pub file_id: u64,
+    /// Owning process index (which VSpace / stack-mirror to write the bytes into).
+    pub pi: u32,
+    /// The blocked thread id (for diagnostics / targeted cancel).
+    pub tid: u64,
+    /// The caller's fault-EP badge (which per-thread reply/mirror context to restore).
+    pub badge: u64,
+    /// User buffer VA the read data must be copied into.
+    pub buffer_va: u64,
+    /// User buffer capacity (bytes).
+    pub buffer_len: u32,
+    /// User IO_STATUS_BLOCK VA (status + information written on completion).
+    pub iosb_va: u64,
+    /// The stolen seL4 MCS reply cap that resumes the blocked thread.
+    pub reply_cap: u64,
+    /// Native-syscall resume context: RCX (return IP), RSP, RFLAGS.
+    pub resume_ip: u64,
+    pub resume_sp: u64,
+    pub resume_flags: u64,
+    /// `true` if this waiter parked on FSCTL_PIPE_TRANSCEIVE (must re-read then
+    /// return via the FSCTL output path), `false` for a plain NtReadFile.
+    pub is_transceive: bool,
+}
+
+/// A fixed-capacity, heap-free, reset-safe table of parked pipe reads. Mirrors
+/// the executive's `PENDING_IRPS` / event-waiter-table style (a `.bss` static, no
+/// allocation, bounded). Parking past capacity fails (the caller then returns the
+/// PENDING status directly — degraded, never a hang), exactly like the event
+/// waiter pool exhausting.
+#[derive(Clone, Debug)]
+pub struct PipeWaiterTable<const N: usize> {
+    slots: [Option<PipeWaiter>; N],
+}
+
+impl<const N: usize> Default for PipeWaiterTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> PipeWaiterTable<N> {
+    pub const fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    /// Park `w` in a free slot. Returns the slot index, or `None` if the table is
+    /// full (caller degrades to returning PENDING directly — never a hang).
+    ///
+    /// Re-armable by construction: a slot freed by [`complete`](Self::complete) or
+    /// [`cancel_thread`](Self::cancel_thread) becomes `None` and is immediately
+    /// reusable for the next PDU's read on the same or a different file-id.
+    pub fn park(&mut self, w: PipeWaiter) -> Option<usize> {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(w);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Number of currently parked waiters.
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.is_none())
+    }
+
+    /// A snapshot copy of every parked waiter, for the executive to re-drive on a
+    /// peer write. Copies (not references) so the executive can call npfs +
+    /// `complete` without borrowing the table across its `&mut self` npfs route.
+    /// Order is stable (slot order) so re-drives are deterministic.
+    pub fn drain_all(&self) -> impl Iterator<Item = (usize, PipeWaiter)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|w| (i, w)))
+    }
+
+    /// The parked waiter in `slot`, if any (peek without removing).
+    pub fn get(&self, slot: usize) -> Option<PipeWaiter> {
+        self.slots.get(slot).copied().flatten()
+    }
+
+    /// Free `slot` after its read was satisfied (the executive re-read npfs,
+    /// copied the bytes into the waiter's buffer, and replied to its reply cap).
+    /// Returns the freed waiter, or `None` if the slot was already empty (a
+    /// double-complete — benign, the write re-drive may race a slot).
+    pub fn complete(&mut self, slot: usize) -> Option<PipeWaiter> {
+        self.slots.get_mut(slot).and_then(|s| s.take())
+    }
+
+    /// Cancel + free any waiter owned by `tid` (thread teardown). Returns the
+    /// count freed.
+    pub fn cancel_thread(&mut self, tid: u64) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.map(|w| w.tid) == Some(tid) {
+                *slot = None;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Is there already a parked read on `file_id`? (Guards double-parking the
+    /// same reading end — a listener that re-issues its read while still parked.)
+    pub fn parked_on(&self, file_id: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.map(|w| w.file_id) == Some(file_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -549,6 +705,122 @@ mod tests {
 
     fn dx() -> PipeRegistry {
         PipeRegistry::new()
+    }
+
+    fn wtr(file_id: u64, pi: u32, tid: u64) -> PipeWaiter {
+        PipeWaiter {
+            file_id,
+            pi,
+            tid,
+            badge: pi as u64,
+            buffer_va: 0x1000 + file_id,
+            buffer_len: 256,
+            iosb_va: 0x2000 + file_id,
+            reply_cap: 0x40 + file_id,
+            resume_ip: 0x3000 + file_id,
+            resume_sp: 0x4000 + file_id,
+            resume_flags: 0x202,
+            is_transceive: false,
+        }
+    }
+
+    #[test]
+    fn pipe_waiter_park_on_empty_records_context() {
+        let mut t = PipeWaiterTable::<8>::new();
+        assert!(t.is_empty());
+        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xAA));
+        assert!(!t.parked_on(0xBB));
+        let w = t.get(slot).unwrap();
+        assert_eq!(w.file_id, 0xAA);
+        assert_eq!(w.pi, 3);
+        assert_eq!(w.reply_cap, 0x40 + 0xAA);
+        assert_eq!(w.buffer_va, 0x1000 + 0xAA);
+        assert_eq!(w.iosb_va, 0x2000 + 0xAA);
+    }
+
+    #[test]
+    fn pipe_waiter_wake_on_peer_write_drains_and_completes() {
+        // The server listener parks reading server-fid; a peer write re-drives:
+        // drain_all yields the parked read, and complete() frees it after the
+        // executive fills the bytes + replies.
+        let mut t = PipeWaiterTable::<8>::new();
+        let slot = t.park(wtr(0xAA, 3, 7)).unwrap();
+        let drained: std::vec::Vec<_> = t.drain_all().collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, slot);
+        assert_eq!(drained[0].1.file_id, 0xAA);
+        // Executive re-read npfs (got data), copied it out, replied → complete.
+        let done = t.complete(slot).unwrap();
+        assert_eq!(done.file_id, 0xAA);
+        assert!(t.is_empty());
+        // Double-complete is benign (a racing write re-drive).
+        assert!(t.complete(slot).is_none());
+    }
+
+    #[test]
+    fn pipe_waiter_re_armable_across_successive_pdus() {
+        // MSRPC is multi-round-trip: after the bind_ack reply the listener loops
+        // back and re-parks on the SAME reading end for the request PDU. The slot
+        // freed by the first completion must be re-usable.
+        let mut t = PipeWaiterTable::<4>::new();
+        let s1 = t.park(wtr(0xAA, 3, 7)).unwrap();
+        t.complete(s1).unwrap(); // bind read satisfied
+        assert!(t.is_empty());
+        let s2 = t.park(wtr(0xAA, 3, 7)).unwrap(); // request read re-parks
+        assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xAA));
+        t.complete(s2).unwrap();
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn pipe_waiter_bidirectional_client_and_server_park_independently() {
+        // Both ends can be parked at once (server reading the request, client
+        // reading the response), keyed by their own file-id; completing one does
+        // not disturb the other.
+        let mut t = PipeWaiterTable::<8>::new();
+        let server = t.park(wtr(0xAA, 3, 7)).unwrap(); // svc listener reads server end
+        let client = t.park(wtr(0xBB, 2, 4)).unwrap(); // winlogon reads client end
+        assert_eq!(t.len(), 2);
+        assert!(t.parked_on(0xAA) && t.parked_on(0xBB));
+        // A write re-drives both; only the one whose npfs re-read has data completes.
+        let all: std::vec::Vec<_> = t.drain_all().collect();
+        assert_eq!(all.len(), 2);
+        // Complete the server side only (client still PENDING).
+        assert_eq!(t.complete(server).unwrap().file_id, 0xAA);
+        assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xBB));
+        assert!(!t.parked_on(0xAA));
+        // Client completes on the next write.
+        assert_eq!(t.complete(client).unwrap().file_id, 0xBB);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn pipe_waiter_park_fails_when_full_never_hangs() {
+        // Capacity exhaustion returns None (caller degrades to returning PENDING
+        // directly), never overwrites a live waiter.
+        let mut t = PipeWaiterTable::<2>::new();
+        assert!(t.park(wtr(0xAA, 3, 7)).is_some());
+        assert!(t.park(wtr(0xBB, 3, 8)).is_some());
+        assert!(t.park(wtr(0xCC, 3, 9)).is_none());
+        assert_eq!(t.len(), 2);
+        // Freeing one re-opens a slot.
+        t.complete(0).unwrap();
+        assert!(t.park(wtr(0xCC, 3, 9)).is_some());
+    }
+
+    #[test]
+    fn pipe_waiter_cancel_thread_frees_all_its_slots() {
+        let mut t = PipeWaiterTable::<8>::new();
+        t.park(wtr(0xAA, 3, 7)).unwrap();
+        t.park(wtr(0xBB, 3, 7)).unwrap(); // same tid, 2nd end
+        t.park(wtr(0xCC, 2, 4)).unwrap(); // different thread
+        assert_eq!(t.cancel_thread(7), 2);
+        assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xCC));
     }
 
     #[test]

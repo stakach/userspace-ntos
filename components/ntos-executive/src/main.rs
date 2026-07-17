@@ -934,6 +934,20 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 /// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// ─── BATCH 33: pipe-pending completion (park a pending pipe read, re-drive on peer write) ─────────
+/// The parked-pipe-read table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
+/// pipe read / FSCTL_PIPE_LISTEN / TRANSCEIVE returned STATUS_PENDING is parked here — its seL4 reply
+/// cap withheld (stolen into a pool like the event waiters), keyed by the reading end's npfs file-id
+/// — and re-driven when the peer writes. `.bss`-resident (no heap), single-threaded executive (no
+/// races). Cap 16 = ample for the SCM/LSA/CSR RPC listeners + their clients parked concurrently.
+const PIPE_WAITER_N: usize = 16;
+static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_N> =
+    nt_io_manager::PipeWaiterTable::new();
+/// Proof/diagnostic counters (specs + boot log): pipe reads parked, and woken by a peer write.
+static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
 const DELAY_TIMER_IRQ: u64 = 12;
@@ -3257,6 +3271,22 @@ struct ExecNtHandler {
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
+    /// BATCH 33 — pipe-pending completion edge. Set by NtReadFile / NtFsControlFile(FSCTL_PIPE_LISTEN
+    /// / TRANSCEIVE) when the npfs pipe returns STATUS_PENDING: the LOOP must PARK this caller
+    /// (steal its reply cap into the PipeWaiterTable keyed by the reading end's npfs file-id, rotate
+    /// REPLY_MAIN to a fresh pool object) instead of returning PENDING, and re-drive it when the peer
+    /// writes. `pipe_park_fid` = the reading end's npfs `FsContext` (0 = no park request). The rest is
+    /// the completion context the re-drive needs (user buffer/IOSB VAs + capacity + transceive flag).
+    /// Reset each dispatch (group-A signal, like `io_signal_event`).
+    pipe_park_fid: u64,
+    pipe_park_buffer_va: u64,
+    pipe_park_buffer_len: u32,
+    pipe_park_iosb_va: u64,
+    pipe_park_transceive: bool,
+    /// BATCH 33 — set by NtWriteFile when a write completes into npfs (non-PENDING): the LOOP must
+    /// re-drive EVERY parked pipe read (re-issue each against npfs; npfs's own FCB pairing decides
+    /// which reader now has bytes) and wake the satisfied ones. `false` = no re-drive requested.
+    pipe_write_redrive: bool,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,

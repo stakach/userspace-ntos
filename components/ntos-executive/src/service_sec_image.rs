@@ -2,6 +2,7 @@
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
 use crate::*;
+use nt_io_abi::major;
 
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
 /// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
@@ -1379,6 +1380,13 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_wait_set_all = false;
             let mut park_wait_deadline: Option<u64> = None;
             let mut park_delay_deadline: Option<u64> = None;
+            // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
+            // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
+            let mut park_pipe_fid: u64 = 0;
+            let mut park_pipe_buffer_va: u64 = 0;
+            let mut park_pipe_buffer_len: u32 = 0;
+            let mut park_pipe_iosb_va: u64 = 0;
+            let mut park_pipe_transceive = false;
             // Every syscall path, including the still hand-wired ladder below, resolves process-local
             // handles through ExecNtHandler. Refresh caller identity before choosing table vs ladder;
             // doing this only inside table dispatch left a runtime worker using whichever process ran
@@ -1444,6 +1452,12 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
                 nt_handler.io_signal_event = -1;
+                nt_handler.pipe_park_fid = 0;
+                nt_handler.pipe_park_buffer_va = 0;
+                nt_handler.pipe_park_buffer_len = 0;
+                nt_handler.pipe_park_iosb_va = 0;
+                nt_handler.pipe_park_transceive = false;
+                nt_handler.pipe_write_redrive = false;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -1639,6 +1653,24 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.io_signal_event >= 0 {
                     let event = nt_handler.io_signal_event as usize;
                     let _ = wait_wake_event_set(event, &mut nt_handler.events);
+                }
+                // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
+                // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
+                // write (done HERE, before the writer's own reply — npfs already queued the bytes).
+                if nt_handler.pipe_park_fid != 0 {
+                    park_pipe_fid = nt_handler.pipe_park_fid;
+                    park_pipe_buffer_va = nt_handler.pipe_park_buffer_va;
+                    park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
+                    park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
+                    park_pipe_transceive = nt_handler.pipe_park_transceive;
+                }
+                if nt_handler.pipe_write_redrive {
+                    let woken = pipe_redrive_all(&mut nt_handler);
+                    if woken != 0 && PIPE_REDRIVE_TRACE_COUNT.load(Ordering::Relaxed) <= 20 {
+                        print_str(b"[pipe-redrive] peer write woke ");
+                        print_u64(woken);
+                        print_str(b" parked reader(s)\n");
+                    }
                 }
                 // Control-flow post-action (group C): NtCreateProcess validated the csrss section and
                 // asked the loop to spawn the subsystem process (needs fault_ep + the per-badge
@@ -3178,6 +3210,60 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 }
             }
+            // BATCH 33 — PIPE-PENDING PARK: a real npfs pipe read / TRANSCEIVE returned STATUS_PENDING
+            // (no data yet). Steal this caller's reply cap into the PipeWaiterTable keyed by the reading
+            // end fid (rotate REPLY_MAIN to a fresh pool object), recv the next event WITHOUT replying —
+            // the caller stays blocked in-kernel. A later peer write re-drives it (pipe_redrive_all).
+            // Pool/table exhaustion → fall through to the immediate reply with STATUS_PENDING (degraded,
+            // never a hang). This REPLACES the old listener drop-park for pipe receives.
+            if park_pipe_fid != 0 && reply_main != 0 {
+                if pipe_wait_park(
+                    park_pipe_fid,
+                    pi as u32,
+                    nt_handler.current_tid,
+                    badge,
+                    park_pipe_buffer_va,
+                    park_pipe_buffer_len,
+                    park_pipe_iosb_va,
+                    park_pipe_transceive,
+                    resume_ip,
+                    sp,
+                    flags,
+                ) {
+                    print_str(b"[pipe-park] badge=");
+                    print_u64(badge);
+                    print_str(b" fid=0x");
+                    print_hex(park_pipe_fid as u32);
+                    print_str(b" -> PARK reader (re-driven on peer write)\n");
+                    // Quiesce accounting: a top-level process (winlogon) parked on a pipe read whose
+                    // peer may never write is quiesce-relevant — if every live process is now parked
+                    // (crash OR wait OR pipe) with no runnable signaler, break to the gate rather than
+                    // block the loop's recv forever. A listener/worker sub-thread parking is NOT
+                    // quiesce-relevant (its parent process may still run + write).
+                    if pi_is_top_level(badge) {
+                        mark_wait_parked!(pi, resume_ip);
+                        // Terminal-state backstop (mirrors the WinMain steady-state QUIESCE at the event
+                        // park below): winlogon's SCM-RPC read parking AFTER LSA is signalled is its
+                        // genuine steady state for now — its rpcrt4 ncacn_np SERVER peer (services' SCM
+                        // listener) is an ASYNC event-driven server (it does NOT do a blocking pipe read
+                        // the write re-drive can complete), so no signaler wakes this read yet. Run the
+                        // gate rather than block the loop's recv forever (the pre-batch boot quiesced
+                        // here too, when winlogon crash-parked on RPC_X_BAD_STUB_DATA). See BATCH 33.
+                        if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
+                            print_str(b"[wl-main] winlogon SCM-RPC read parked (async server peer, no pipe-read signaler) + LSA signalled -> QUIESCE; run gate\n");
+                            stop = resume_ip;
+                            break;
+                        }
+                    }
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                } else {
+                    print_str(b"[pipe-park] park unavailable -> return STATUS_PENDING\n");
+                    result = 0x0000_0103; // STATUS_PENDING (degraded fallback)
+                }
+            }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
                 recv_full_r12(fault_ep, reply_main)
             } else if (routed_win32k || routed_lpc || routed_csr) && reply_main != 0 {
@@ -3474,6 +3560,238 @@ pub(crate) unsafe fn service_sec_image(
     // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
     // exec_reactos_smss_* checks are about smss specifically. csrss's counts are in the sec-stop line.
     (verdict, procs[0].faults, procs[0].first, stop, procs[0].ntfaults, stop_ssn)
+}
+
+/// BATCH 33 — the (stack_base, stack_size, stack_mirror_va, heap_mirror_va, image_mirror_va) for the
+/// thread identified by `badge` (its per-thread stack + its process's heap/image mirror windows). This
+/// is the SAME selection the main service loop makes at each iteration (`service_sec_image` ~585-650);
+/// the pipe re-drive reuses it to point the copyout helpers (`smss_copyout` via `xas_write_buf`) at a
+/// PARKED reader's own VSpace mirrors while the WRITER is the active process. `pi` = the reader's
+/// process index (0 smss, 1 csrss, 2 winlogon, 3 services, 4 lsass).
+#[inline]
+fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
+    let (stack_base, stack_frames, stack_mirror) = match badge {
+        SVC_LISTENER_BADGE => (
+            SVC_LISTENER_STACK_BASE,
+            SVC_LISTENER_STACK_FRAMES,
+            SVC_LISTENER_STACK_MIRROR_VA,
+        ),
+        LSASS_LISTENER_BADGE => (
+            LSASS_LISTENER_STACK_BASE,
+            LSASS_LISTENER_STACK_FRAMES,
+            LSASS_LISTENER_STACK_MIRROR_VA,
+        ),
+        LSASS_LISTENER2_BADGE => (
+            LSASS_LISTENER2_STACK_BASE,
+            LSASS_LISTENER2_STACK_FRAMES,
+            LSASS_LISTENER2_STACK_MIRROR_VA,
+        ),
+        LSASS_LISTENER3_BADGE => (
+            LSASS_LISTENER3_STACK_BASE,
+            LSASS_LISTENER3_STACK_FRAMES,
+            LSASS_LISTENER3_STACK_MIRROR_VA,
+        ),
+        WINLOGON_WORKER2_BADGE => (
+            WL_WORKER2_STACK_BASE,
+            WL_WORKER2_STACK_FRAMES,
+            WINLOGON_WORKER2_STACK_MIRROR_VA,
+        ),
+        WINLOGON_WORKER3_BADGE => (
+            WL_WORKER3_STACK_BASE,
+            WL_WORKER3_STACK_FRAMES,
+            WINLOGON_WORKER3_STACK_MIRROR_VA,
+        ),
+        WINLOGON_WORKER_BADGE => (
+            WL_LISTENER_STACK_BASE,
+            WL_LISTENER_STACK_FRAMES,
+            WINLOGON_WORKER_STACK_MIRROR_VA,
+        ),
+        _ => {
+            // A top-level process MAIN thread — keyed by pi like the loop's default arm.
+            let smv = match pi {
+                1 => CSRSS_STACK_MIRROR_VA,
+                2 => WINLOGON_STACK_MIRROR_VA,
+                3 => SERVICES_STACK_MIRROR_VA,
+                4 => LSASS_STACK_MIRROR_VA,
+                _ => SMSS_STACK_MIRROR_VA,
+            };
+            (STACK_BASE, STACK_FRAMES, smv)
+        }
+    };
+    let heap_mirror = match pi {
+        1 => CSRSS_HEAP_MIRROR_VA,
+        2 => WINLOGON_HEAP_MIRROR_VA,
+        3 => SERVICES_HEAP_MIRROR_VA,
+        4 => LSASS_HEAP_MIRROR_VA,
+        _ => SMSS_HEAP_MIRROR_VA,
+    };
+    let image_mirror = match pi {
+        1 => CSRSS_IMAGE_MIRROR_VA,
+        2 => WINLOGON_IMAGE_MIRROR_VA,
+        3 => SERVICES_IMAGE_MIRROR_VA,
+        4 => LSASS_IMAGE_MIRROR_VA,
+        _ => IMAGE_MIRROR_VA,
+    };
+    (stack_base, stack_frames * 0x1000, stack_mirror, heap_mirror, image_mirror)
+}
+
+/// BATCH 33 — PARK a caller whose npfs pipe read returned STATUS_PENDING. Mirrors the event
+/// `wait_park_multi` reply-cap steal EXACTLY (steal the active REPLY_MAIN, rotate a fresh pool object
+/// into REPLY_MAIN so the next recv binds a new object), but records the wait in the PipeWaiterTable
+/// keyed by the reading end's npfs file-id instead of an obj_ns event index. Returns true on success;
+/// false if the pool or the waiter table is exhausted (caller then returns PENDING directly — degraded
+/// but never a hang). The stolen cap resumes the blocked thread when the peer writes (`pipe_redrive_all`).
+unsafe fn pipe_wait_park(
+    file_id: u64,
+    pi: u32,
+    tid: u64,
+    badge: u64,
+    buffer_va: u64,
+    buffer_len: u32,
+    iosb_va: u64,
+    is_transceive: bool,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    // Find a FREE pool object to become the new active REPLY_MAIN (same rotation as wait_park_multi).
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let mut fresh = 0u64;
+    let mut fresh_bit = 0usize;
+    for i in 0..WAIT_REPLY_POOL_N {
+        if used & (1u64 << i) == 0 {
+            let cp = WAIT_REPLY_POOL[i].load(Ordering::Relaxed);
+            if cp != 0 {
+                fresh = cp;
+                fresh_bit = i;
+                break;
+            }
+        }
+    }
+    if fresh == 0 {
+        return false; // pool exhausted → caller returns PENDING directly
+    }
+    let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+    let parked = table.park(nt_io_manager::PipeWaiter {
+        file_id,
+        pi,
+        tid,
+        badge,
+        buffer_va,
+        buffer_len,
+        iosb_va,
+        reply_cap: stolen,
+        resume_ip,
+        resume_sp: sp,
+        resume_flags: flags,
+        is_transceive,
+    });
+    if parked.is_none() {
+        return false; // table exhausted → caller returns PENDING directly
+    }
+    // Commit the reply-cap rotation only after the waiter is recorded.
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    PIPE_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// BATCH 33 — RE-DRIVE every parked pipe read after a peer write. The executive has no peer→reader
+/// map (npfs pairs the two ends internally by name), so on ANY completed pipe write we re-issue EVERY
+/// parked read against npfs: npfs's own FCB pairing makes the reader whose peer just wrote return data
+/// (non-PENDING) while the others stay PENDING. For each reader that now has bytes we copy them into
+/// its buffer + fill its IOSB (through ITS OWN VSpace mirrors — switched in for the copyout, since the
+/// active process is the WRITER, then restored) and reply to its stolen reply cap (restoring its
+/// native-syscall resume context, exactly like the event wake), then free the slot. Idempotent: a read
+/// still PENDING leaves the waiter parked (re-armable for the next PDU / write). Returns woken count.
+unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
+    // Snapshot the active-mirror context + handler identity so we can restore after each re-drive.
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take(); // copyout via mirrors only during the re-drive
+    let mut woken = 0u64;
+    let table = &*core::ptr::addr_of!(PIPE_WAITERS);
+    let snapshot: alloc::vec::Vec<(usize, nt_io_manager::PipeWaiter)> = table.drain_all().collect();
+    for (slot, w) in snapshot {
+        // Re-issue this reader's read against npfs; if still PENDING, leave it parked.
+        let want = (w.buffer_len as usize).min(transport_capacity).max(1);
+        let mut output = alloc::vec![0u8; want];
+        let (status, completed) = match nt_handler.npfs_route_raw(
+            major::IRP_MJ_READ as u64,
+            0,
+            w.file_id,
+            &[],
+            &mut output,
+        ) {
+            Some((st, info, _)) => (st as u32, info),
+            None => continue,
+        };
+        if status == 0x0000_0103 {
+            continue; // still PENDING → stays parked (re-armable)
+        }
+        // Data (or a terminal status) available. Point the copyout at the READER's VSpace mirrors.
+        let (sb, ss, smv, hmv, imv) = mirror_ctx_for(w.badge, w.pi as usize);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        nt_handler.pi = w.pi as usize;
+        let copy_len = (completed as usize).min(output.len());
+        if status == 0 && copy_len != 0 && w.buffer_va != 0 {
+            nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
+        }
+        if w.iosb_va != 0 {
+            nt_handler.xas_write_buf(w.iosb_va, &status.to_le_bytes());
+            nt_handler.xas_write_buf(w.iosb_va + 8, &(completed as u64).to_le_bytes());
+        }
+        // Wake the blocked thread on its stolen reply cap — restore RCX/RSP/RFLAGS (MR15/16/17) and
+        // return `status` in MR0 (→ RAX/r10), exactly like the event wake.
+        let cap = w.reply_cap;
+        if cap != 0 {
+            set_reply_mr(15, w.resume_ip);
+            set_reply_mr(16, w.resume_sp);
+            set_reply_mr(17, w.resume_flags);
+            send_on_reply(cap, 18, status as u64, 0, 0, 0);
+            release_reply_pool_cap(cap);
+        }
+        // Free the slot (re-armable for the next PDU).
+        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+        table_mut.complete(slot);
+        woken += 1;
+        PIPE_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        if PIPE_REDRIVE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[pipe-redrive] WOKE reader fid=0x");
+            print_hex(w.file_id as u32);
+            print_str(b" pi=");
+            print_u64(w.pi as u64);
+            print_str(b" badge=");
+            print_u64(w.badge);
+            print_str(b" status=0x");
+            print_hex(status);
+            print_str(b" bytes=");
+            print_u64(completed);
+            print_str(b"\n");
+        }
+    }
+    // Restore the writer's active-mirror context + handler identity.
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.loop_ctx = saved_ctx;
+    woken
 }
 
 /// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's

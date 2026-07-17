@@ -444,9 +444,16 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         cid_thread,
         resume,
         prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
-        // BATCH 6 follow-up: trap transport for now (badged-fault multiplex).
-        native: false,
-        ipcbuf_frame: 0,
+        // BATCH 33: services (pi 3) runs on OUR ntdll's NATIVE seL4-Call transport, so its SCM RPC
+        // listener thread must too — mirror the BATCH 24 lsass-listener fix (was BATCH-6 native:false,
+        // whose first native Call faulted as UnknownSyscall with SSN=garbage 0x100_105f_b000 →
+        // `[svc-listener] blocking server syscall -> PARK (drop)` before it ever created/read its
+        // \pipe\ntsvcs server end). native:true + its kernel IPC buffer bound to services' MAIN-thread
+        // ipcbuf frame (the VA our ntdll native stub writes MR4/MR5 to) makes its Call dispatch
+        // (MR0=r10=SSN), so it runs its rpcrt4 ncacn_np receive loop (FSCTL_PIPE_LISTEN + NtReadFile on
+        // the server pipe) — the reads the pipe-pending park/re-drive edge then completes.
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
     })
 }
 
