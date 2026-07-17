@@ -3225,6 +3225,40 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(m0);
                     print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    // BATCH 40: a PURE-SERVER listener (services pi3 / lsass pi4) reaching its RPC
+                    // receive loop is a terminal cooperative park (it blocks forever waiting for a
+                    // client, and by now its process' main thread is done its bring-up). Count its
+                    // OWNER process toward the all-parked quiesce so the boot reaches the gate once
+                    // every live process is parked — otherwise (now that winlogon crosses msgina and no
+                    // longer CRASHES to trigger a quiesce) the main loop blocks in recv forever after
+                    // the last listener parks. EXCLUDE is_wl_worker: it shares winlogon's badge whose
+                    // MAIN thread has its own SCM-RPC-read quiesce path — marking winlogon here while its
+                    // main is still active would quiesce prematurely. mark_wait_parked! only breaks at
+                    // true all-parked deadlock; otherwise it just records the bit and recv proceeds.
+                    if is_svc_listener {
+                        // The SCM listener parking → no live signaler for winlogon's SCM read.
+                        SVC_LISTENER_PARKED.store(1, Ordering::Relaxed);
+                    }
+                    if !is_wl_worker {
+                        mark_wait_parked!(pi, m0);
+                    }
+                    // BATCH 40 terminal backstop: once winlogon has CROSSED its msgina GINA init
+                    // (WINLOGON_KEY_OPENED > 0 — WlxInitialize got a non-NULL context, no
+                    // WlxShutdown(NULL) crash) AND lsass has signalled LSA_RPC_SERVER_ACTIVE, the boot
+                    // has reached steady state: the only remaining live top-level processes are the
+                    // persistent SCM/LSA/CSR RPC SERVERS with no live terminating client. A server
+                    // listener parking here (SSN=24 = its blocking receive) means it will block forever
+                    // waiting for a client the (crashed/parked) clients will never send — so the main
+                    // loop's next recv would hang forever (winlogon no longer CRASHES to trigger the
+                    // old msgina-wall quiesce). QUIESCE to the gate. Gated on the msgina-crossed +
+                    // LSA-signalled steady state so it never fires during live bring-up.
+                    if WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
+                        && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[quiesce] server listener parked + winlogon crossed msgina GINA init + LSA signalled -> steady state -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
@@ -3456,7 +3490,11 @@ pub(crate) unsafe fn service_sec_image(
                         let scm_server_live = pi == 2
                             && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                             && PIPE_LISTEN_SIGNALLED_COUNT.load(Ordering::Relaxed) != 0
-                            && SVC_LISTENER_TERMINATED.load(Ordering::Relaxed) == 0;
+                            && SVC_LISTENER_TERMINATED.load(Ordering::Relaxed) == 0
+                            // BATCH 40: a PARKED listener (persistent-server world) is no longer a live
+                            // signaler either — treat it like TERMINATED so winlogon's read-park becomes
+                            // terminal and the boot quiesces (else the loop's recv hangs forever).
+                            && SVC_LISTENER_PARKED.load(Ordering::Relaxed) == 0;
                         if !scm_server_live {
                             mark_wait_parked!(pi, resume_ip);
                             // Terminal backstop: winlogon's SCM read parking with NO live server signaler

@@ -1208,6 +1208,12 @@ impl ExecNtHandler {
         {
             return Some(SYNTH_CPU_KEY);
         }
+        // \Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Winlogon — the SOFTWARE
+        // hive isn't on the image; back this one key's EXISTENCE (msgina GetRegistrySettings). See
+        // SYNTH_WINLOGON_KEY.
+        if is_winlogon_key_comps(&comps[2..]) {
+            return Some(SYNTH_WINLOGON_KEY);
+        }
         None
     }
     /// Does a `\SystemRoot\System32` file with this probe's leaf name exist? Extracts the leaf (last
@@ -1432,6 +1438,57 @@ impl NativeSyscallHandler for ExecNtHandler {
                 for &w in &name16 {
                     if let Some(c) = char::from_u32(w as u32) {
                         path.push(c);
+                    }
+                }
+                // winlogon (pi 2) — msgina's `GetRegistrySettings` (WlxInitialize) opens the Winlogon
+                // key `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`. advapi32's
+                // `RegOpenKeyExW(HKLM, subkey)` first maps HKLM by opening `\Registry\Machine`, then
+                // opens the subkey relative to that handle. BOTH names are `RTL_CONSTANT_STRING`
+                // literals in `.rdata` pages winlogon/advapi32 never touch, so the pi==2 copyin mirror
+                // returns EMPTY for each → recover the real name from the backing PE image
+                // (`read_objattr_name_pe`, cross-AS via the registered DLL). Two exact, scoped matches:
+                //   (a) `\Registry\Machine` predefined-HKLM open → hand back MACHINE_ROOT_HANDLE so
+                //       advapi32's HKLM mapping SUCCEEDS. (Post-`SERVICES_CREATE_STARTED` the generic
+                //       empty-name branch below returns NOT_FOUND — which BROKE this open → the msgina
+                //       WlxShutdown(NULL) crash. Matching the recovered name distinguishes it from the
+                //       BasepIsProcessAllowed AppCertDlls empty-name open that must still miss.)
+                //   (b) the Winlogon subkey (relative to MACHINE_ROOT_HANDLE) → back its existence with
+                //       SYNTH_WINLOGON_KEY so the open succeeds and value reads miss (msgina applies its
+                //       documented registry defaults) → WlxInitialize writes `*pWlxContext` (non-NULL) →
+                //       GinaInit succeeds → no HandleShutdown → no WlxShutdown(NULL).
+                // Both are EXACT-name matches scoped to pi==2, so no other paint-time HKLM open outcome
+                // changes (broadly succeeding HKLM opens regressed the desktop paint; see the
+                // keyboard-layout note on MACHINE_ROOT_HANDLE).
+                if self.pi == 2 {
+                    let eff_name = if !path.is_empty() {
+                        path.clone()
+                    } else {
+                        let pe_name = self.read_objattr_name_pe(oa);
+                        let mut s = alloc::string::String::new();
+                        for &w in &pe_name {
+                            if let Some(c) = char::from_u32(w as u32) {
+                                s.push(c);
+                            }
+                        }
+                        s
+                    };
+                    if is_winlogon_key(&eff_name) {
+                        WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
+                        let h = self.intern_key_handle(SYNTH_WINLOGON_KEY);
+                        self.xas_write_u64(args[0], h);
+                        return 0; // STATUS_SUCCESS — Winlogon key exists (values default via miss)
+                    }
+                    // Exact `\Registry\Machine` predefined-HKLM open (rd absolute) → sentinel handle.
+                    if root_dir < KEY_HANDLE_BASE {
+                        let comps: alloc::vec::Vec<&str> =
+                            eff_name.split('\\').filter(|c| !c.is_empty()).collect();
+                        if comps.len() == 2
+                            && comps[0].eq_ignore_ascii_case("Registry")
+                            && comps[1].eq_ignore_ascii_case("Machine")
+                        {
+                            self.xas_write_u64(args[0], MACHINE_ROOT_HANDLE);
+                            return 0; // STATUS_SUCCESS — HKLM predefined root
+                        }
                     }
                 }
                 // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
@@ -1920,6 +1977,26 @@ impl NativeSyscallHandler for ExecNtHandler {
                         if n >= SCM_NTSVCS_CREATE_CAP {
                             if n == SCM_NTSVCS_CREATE_CAP {
                                 print_str(b"[nt-create-named-pipe] pi=3 \\ntsvcs re-create cap reached -> STATUS_PIPE_NOT_AVAILABLE (listener parks; boot quiesces)\n");
+                            }
+                            if iosb != 0 {
+                                self.xas_write_buf(iosb, &0xC00000ACu32.to_le_bytes()); // Status
+                                self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
+                            }
+                            self.queue_write(get_recv_mr(9), 0); // *FileHandle = NULL
+                            return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
+                        }
+                    }
+                    // BATCH 40: same re-create cap for lsass' `\lsarpc` LSA RPC server (pi 4). Once
+                    // winlogon crosses msgina GINA init and drives its logon flow, lsass re-creates the
+                    // `\lsarpc` server pipe unboundedly (no live terminating client under TCG) → the boot
+                    // never quiesces. Cap → STATUS_PIPE_NOT_AVAILABLE → the LSA listener parks → gate.
+                    let is_lsarpc = leaf.len() >= 7
+                        && leaf[1..7].iter().zip(b"lsarpc".iter()).all(|(&w, &c)| w as u8 == c);
+                    if self.pi == 4 && is_lsarpc {
+                        let n = LSA_LSARPC_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n >= LSA_LSARPC_CREATE_CAP {
+                            if n == LSA_LSARPC_CREATE_CAP {
+                                print_str(b"[nt-create-named-pipe] pi=4 \\lsarpc re-create cap reached -> STATUS_PIPE_NOT_AVAILABLE (LSA listener parks; boot quiesces)\n");
                             }
                             if iosb != 0 {
                                 self.xas_write_buf(iosb, &0xC00000ACu32.to_le_bytes()); // Status

@@ -1008,6 +1008,12 @@ static PIPE_LISTEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// signaler: winlogon's SCM read-park is then terminal → quiesce (run the gate) rather than hang the
 /// loop's recv. See the winlogon SCM-read-park guard.
 pub(crate) static SVC_LISTENER_TERMINATED: AtomicU64 = AtomicU64::new(0);
+/// BATCH 40: set once the SCM (`\ntsvcs`, pi 3) listener has cooperatively PARKED on its RPC receive
+/// loop (reached its blocking server syscall). Like SVC_LISTENER_TERMINATED, a parked listener is no
+/// longer a live signaler for winlogon's SCM read — so winlogon's SCM-RPC read-park becomes terminal
+/// and the boot can QUIESCE to the gate. (Distinct from TERMINATED: the persistent-server world parks
+/// the listener rather than exiting it.)
+pub(crate) static SVC_LISTENER_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Set once winlogon's main thread has parked on its SCM-RPC pipe read (waiting for bind_ack). Used so
 /// the loop can QUIESCE the moment the SCM listener terminates (no signaler left) even though winlogon
 /// parked earlier while the server was still live — avoids a hung recv. Cleared is never needed (once
@@ -3031,6 +3037,17 @@ const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 /// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
 /// cell offset, so it never collides with a hive key.
 const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
+/// Sentinel `KeyRef` for the synthesized `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`
+/// key. Our staged registry backs only the SYSTEM hive (`\Registry\Machine\System\…`, ::ROSSYS.HIV);
+/// the SOFTWARE hive is not on the image. msgina's `GetRegistrySettings` (WlxInitialize) opens this
+/// Winlogon key and, on failure, returns FALSE → WlxInitialize frees its GINA_CONTEXT and never
+/// writes `*pWlxContext` (stays NULL) → GinaInit FALSE → winlogon's WinMain calls
+/// `HandleShutdown → WlxShutdown(NULL)` → NULL-deref at msgina RVA 0x95f8. GetRegistrySettings only
+/// needs the key to OPEN (every value it reads via ReadRegDwordValue/RegQueryValueExW tolerates a
+/// missing value and applies a documented default), so we back the key's EXISTENCE with this sentinel
+/// and let NtQueryValueKey miss (→ defaults). Far above any real regf cell offset (like SYNTH_CPU_KEY),
+/// so it never collides with a hive key.
+const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
 /// `key_handles` stores a `KeyRef` (u32). A real hive `KeyRef` is an hbin-relative cell offset
 /// (well under the ~204 KiB hive size). A `KeyRef` in the range `[OVERLAY_KEY_TAG,
 /// OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` instead names an OVERLAY (created) key — its low bits are the
@@ -3078,6 +3095,32 @@ fn is_keyboard_layout_key(path: &str) -> bool {
     let lc = path.to_ascii_lowercase();
     lc.contains("keyboard layouts\\")
 }
+/// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
+/// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
+/// so no other Software subkey is spuriously satisfied — see SYNTH_WINLOGON_KEY / the paint-safety
+/// note on the keyboard-layout fix (broadly succeeding HKLM opens regressed the desktop paint).
+pub(crate) fn is_winlogon_key_comps(comps: &[&str]) -> bool {
+    comps.len() == 5
+        && comps[0].eq_ignore_ascii_case("Software")
+        && comps[1].eq_ignore_ascii_case("Microsoft")
+        && comps[2].eq_ignore_ascii_case("Windows NT")
+        && comps[3].eq_ignore_ascii_case("CurrentVersion")
+        && comps[4].eq_ignore_ascii_case("Winlogon")
+}
+/// True if `path` (a backslash-delimited key path, with or without a leading `\` and with or without
+/// a `\Registry\Machine\` prefix) is the Winlogon key. Tolerates both the absolute
+/// `\Registry\Machine\Software\...\Winlogon` and the HKLM-relative `Software\...\Winlogon` forms.
+pub(crate) fn is_winlogon_key(path: &str) -> bool {
+    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+    if is_winlogon_key_comps(&comps) {
+        return true;
+    }
+    // Absolute form: strip a leading Registry\Machine.
+    comps.len() == 7
+        && comps[0].eq_ignore_ascii_case("Registry")
+        && comps[1].eq_ignore_ascii_case("Machine")
+        && is_winlogon_key_comps(&comps[2..])
+}
 /// True for a path under the LSA SECURITY hive or the SAM hive (`\Registry\Machine\SECURITY[...]` or
 /// `\Registry\Machine\SAM[...]`) — lsass' LsapOpenServiceKey / samsrv's SampInitDatabase open these,
 /// which our staged SYSTEM hive doesn't contain (real ReactOS creates them at setup). The executive
@@ -3089,6 +3132,10 @@ pub(crate) fn is_lsa_hive_path(path: &str) -> bool {
 /// Count of `HKLM\...\Keyboard Layouts\<KLID>` opens serviced (drives the `exec_kbd_layout_opened`
 /// spec — proves winlogon's InitKeyboardLayouts fallback reached its layout key).
 static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+/// Count of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` opens satisfied via
+/// SYNTH_WINLOGON_KEY (BATCH 40 — msgina's GetRegistrySettings). Proves winlogon crossed the msgina
+/// GINA-init wall (WlxInitialize wrote a non-NULL context instead of GinaInit-fail → WlxShutdown(NULL)).
+pub(crate) static WINLOGON_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
 /// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
@@ -3130,6 +3177,15 @@ static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
 /// (covers the full multi-PDU conversation + several re-listens) so it never truncates a live handshake.
 static SCM_NTSVCS_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
 const SCM_NTSVCS_CREATE_CAP: u64 = 24;
+/// lsass' LSA RPC server (`\lsarpc`, pi 4) has the SAME unbounded server-instance re-create shape as
+/// the SCM `\ntsvcs` pipe: once winlogon crosses its msgina GINA init (BATCH 40) and drives further
+/// into its logon flow, lsass' LsarStartRpcServer keeps re-creating the `\lsarpc` server pipe with no
+/// live terminating client under TCG, so the boot never quiesces. Cap the re-creates identically →
+/// STATUS_PIPE_NOT_AVAILABLE so the LSA listener parks (mirrors out-of-instances) and the boot reaches
+/// the gate cleanly. Generous (covers the full LSA handshake + several re-listens); pi 4 + `\lsarpc`
+/// scoped so no other pipe is affected.
+static LSA_LSARPC_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+const LSA_LSARPC_CREATE_CAP: u64 = 6;
 /// Count of live pipe syscalls (NtCreateNamedPipeFile/NtCreateFile/NtOpenFile/NtFsControlFile/
 /// Read/Write) that were ROUTED THROUGH the isolated npfs component (vs modeled-fake). Observability.
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
