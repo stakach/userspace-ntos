@@ -2851,6 +2851,25 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(h as u32);
                     print_str(b"\n");
                     (h as i32, true)
+                } else if m0 == 0x10bd && svc_noninteractive {
+                    // ★ NON-INTERACTIVE SERVICE NtUserGetClassInfo (0x10bd — w32ksvc64.h) for lsass.
+                    // ROOT of the whole GDI-blit family: win32k's class-lookup path
+                    // (IntGetAndReferenceClass, class.c:1461) does
+                    //   `if (!(pti->ppi->W32PF_flags & W32PF_CLASSESREGISTERED)) UserRegisterSystemClasses();`
+                    // and lsass' PROCESSINFO never has W32PF_CLASSESREGISTERED set (we faked the class
+                    // registration, never ran the REAL UserRegisterSystemClasses), so EVERY class call
+                    // (GetClassInfo, and any window-create) RE-triggers UserRegisterSystemClasses → the
+                    // interactive stock-object/cursor EngCopyBits (RVA 0x1cbdd8) runaway blit. Since our
+                    // single-threaded host shares ONE PROCESSINFO across clients (setup_dispatch_context),
+                    // we cannot set W32PF_CLASSESREGISTERED globally without breaking winlogon's REAL
+                    // interactive class registration (needed for the paint). So short-circuit lsass'
+                    // NtUserGetClassInfo → FALSE (0, class-not-found) WITHOUT dispatching: user32's
+                    // GetClassInfoExW treats it as an unregistered class (benign for a non-interactive
+                    // service that never creates windows) and does NOT reach the class-lookup that runs
+                    // UserRegisterSystemClasses. Scoped to lsass (badge 8); winlogon's real 0x10bd untouched.
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] lsass NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
+                    (0, true)
                 } else {
                     win32k_dispatch(m0, d_a0, d_a1, a2, a3)
                 };
