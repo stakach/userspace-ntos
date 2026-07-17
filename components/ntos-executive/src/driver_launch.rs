@@ -142,6 +142,43 @@ static mut PENDING_IRPS: [PendingIrp; PENDING_IRP_CAP] = [PendingIrp {
 static mut DATA_TRACE_COUNT: u32 = 0;
 static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 
+// BATCH 37 — completed-pending-READ stash. When a pipe READ goes STATUS_PENDING, npfs retains the
+// read IRP in its inbound queue (QueueState=ReadEntries) and the EXECUTIVE parks the caller. The
+// peer's later WRITE is serviced by npfs's OWN NpWriteDataQueue fast path, which copies the write
+// payload DIRECTLY into that pending read IRP's buffer and completes it via IoCompleteRequest —
+// synchronously, during the write call. So by the time control returns to the executive the read data
+// is IN the freed read IRP and the inbound queue is drained; a FRESH re-drive read would find nothing
+// (or stale bytes). Capture the completed read's bytes here, keyed by the reader's fid, so the
+// executive's pipe re-drive delivers THESE bytes to the parked reader instead of re-reading. The read
+// result buffer npfs fills for a pending read is the IRP's user buffer (== our `data`, METHOD_NEITHER).
+const COMPLETED_READ_CAP: usize = 8;
+const COMPLETED_READ_BYTES: usize = 4096;
+#[derive(Clone, Copy)]
+struct CompletedRead {
+    fid: u64,
+    status: u32,
+    info: u64,
+    len: usize,
+    bytes: [u8; COMPLETED_READ_BYTES],
+}
+static mut COMPLETED_READS: [CompletedRead; COMPLETED_READ_CAP] = [CompletedRead {
+    fid: 0,
+    status: 0,
+    info: 0,
+    len: 0,
+    bytes: [0u8; COMPLETED_READ_BYTES],
+}; COMPLETED_READ_CAP];
+
+/// Take (consume) a stashed completed-pending-read for `fid`, if any. Returns `(status, info, bytes)`.
+pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
+    let table = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
+    let slot = table.iter_mut().find(|e| e.fid == fid && e.fid != 0)?;
+    let bytes = slot.bytes[..slot.len].to_vec();
+    let out = (slot.status, slot.info, bytes);
+    slot.fid = 0;
+    Some(out)
+}
+
 // --- host-side pool allocator (the trampolines run in the component) --------------------------
 
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
@@ -329,10 +366,38 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(PENDING_IRPS);
         let Some(slot) = table.iter_mut().find(|entry| entry.irp == irp) else {
+            if PEER_COMPLETION_TRACE_COUNT < 8 {
+                PEER_COMPLETION_TRACE_COUNT += 1;
+                print_str(b"[fsd-peer-complete] IRP=0x");
+                print_hex((irp >> 32) as u32);
+                print_hex(irp as u32);
+                print_str(b" NOT in pending table\n");
+            }
             return;
         };
         let status = read_unaligned((irp + 0x30) as *const u32);
         let information = read_unaligned((irp + 0x38) as *const u64);
+        // BATCH 37: a completing pending READ carries the peer's just-written payload in its IRP
+        // buffer (npfs's NpWriteDataQueue fast path copies straight into the pending read IRP). Stash
+        // those bytes keyed by the reader's fid so the executive's pipe re-drive delivers them to the
+        // parked reader (a fresh re-drive read would miss — npfs already drained the queue into THIS
+        // IRP). npfs completes the read into the IRP's user buffer (== `slot.data`, METHOD_NEITHER).
+        if slot.major as u64 == IRP_MJ_READ {
+            let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
+            let n = (information as usize).min(COMPLETED_READ_BYTES);
+            let ctable = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
+            if let Some(cslot) = ctable.iter_mut().find(|e| e.fid == 0) {
+                cslot.fid = fid;
+                cslot.status = status;
+                cslot.info = information;
+                cslot.len = n;
+                let mut i = 0usize;
+                while i < n {
+                    cslot.bytes[i] = read_volatile((slot.data + i as u64) as *const u8);
+                    i += 1;
+                }
+            }
+        }
         if PEER_COMPLETION_TRACE_COUNT < 8 {
             PEER_COMPLETION_TRACE_COUNT += 1;
             print_str(b"[fsd-peer-complete] major=");
@@ -905,8 +970,18 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             write_unaligned((sec_ctx + 0x08) as *mut u64, access_state); // AccessState
             write_unaligned((sec_ctx + 0x10) as *mut u32, 0x001F_01FF); // DesiredAccess = all
             write_unaligned((iosl + 0x08) as *mut u64, sec_ctx); // SecurityContext
-            // Options: Disposition (FILE_CREATE=2) in the high byte, CreateOptions in the low 24.
-            let disposition: u32 = if major == 1 { 2 } else { 1 }; // create-named-pipe=FILE_CREATE, open=FILE_OPEN
+            // Options: Disposition in the high byte, CreateOptions in the low 24.
+            // BATCH 37: CREATE_NAMED_PIPE must use FILE_OPEN_IF (3), NOT FILE_CREATE (2) — this is
+            // exactly what Win32 CreateNamedPipe / NtCreateNamedPipeFile pass (kernel32 npipe.c:393).
+            // npfs's NpCreateExistingNamedPipe (create.c:594) returns STATUS_ACCESS_DENIED for a 2nd+
+            // instance opened with FILE_CREATE, while FILE_OPEN_IF opens-or-creates for both the new
+            // FCB (NpCreateNewNamedPipe accepts anything but FILE_OPEN) AND every subsequent instance.
+            // With FILE_CREATE the SCM listener's post-accept `rpcrt4_conn_create_pipe` re-create
+            // (2nd \ntsvcs instance) failed → its re-listen failed → the rpcrt4 server thread entered
+            // shutdown and called rpcrt4_conn_close_read on the just-handed-off connection, setting
+            // conn->read_closed=1, so the per-connection worker's rpcrt4_conn_np_read skipped NtReadFile
+            // and the bind was never read. Client opens (major 0) still use FILE_OPEN (1).
+            let disposition: u32 = if major == 1 { 3 } else { 1 }; // create-named-pipe=FILE_OPEN_IF, open=FILE_OPEN
             write_unaligned((iosl + 0x10) as *mut u32, disposition << 24);
             write_unaligned((iosl + 0x1a) as *mut u16, 3); // ShareAccess = FILE_SHARE_READ|WRITE (full duplex)
             if major == 1 {
@@ -954,7 +1029,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     // FsContext lands in the FILE_OBJECT; report it as the opaque file id (for future read/write).
     let fsctx = read_unaligned((fo + 0x18) as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *mut u64, fsctx);
-    if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 8 {
+    if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
         print_u64(major);

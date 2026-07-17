@@ -1155,6 +1155,8 @@ static SVC_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).
 pub(crate) static SVC_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
+/// BATCH 37 DIAG: per-SSN trace counter for the SCM per-connection worker.
+pub(crate) static SCM_WORKER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// lsass' LSA server thread — same shape as SVC_LISTENER, for pi 4 (the N-threads multiplex).
 static LSASS_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER_TID: AtomicU64 = AtomicU64::new(0);

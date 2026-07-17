@@ -1021,6 +1021,36 @@ mod tests {
     }
 
     #[test]
+    fn message_mode_client_write_server_partial_read_overflow() {
+        // BATCH 37: rpcrt4's ncacn_np server reads a DCE/RPC bind PDU from a MESSAGE-mode pipe by
+        // first reading only the 16-byte common header of the (72-byte) message, which must return the
+        // FIRST 16 bytes WITH a truncation flag (npfs STATUS_BUFFER_OVERFLOW), leaving the remaining
+        // 56 bytes queued for the next read. The executive's pipe re-drive must copy those partial
+        // bytes to the reader even though the status is not SUCCESS — this reproduces that contract.
+        let mut r = dx();
+        let params = PipeParams {
+            pipe_type: FILE_PIPE_MESSAGE_TYPE,
+            ..PipeParams::default()
+        };
+        let s = r.create_server_pipe("ntsvcs", params).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("ntsvcs").unwrap();
+        // A 72-byte "bind PDU": a recognizable header then filler.
+        let mut bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00,
+                                 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        bind.extend((16u8..72).map(|i| i));
+        assert_eq!(r.pipe_write(c, &bind).unwrap(), 72);
+        // Server reads only the 16-byte common header → the FIRST 16 real bytes + truncation flag.
+        let (hdr, more) = r.pipe_read(s, 16).unwrap();
+        assert_eq!(&hdr, &bind[..16], "partial read must return the real header bytes, not garbage");
+        assert!(more, "a 16-of-72 message read must flag BUFFER_OVERFLOW (more)");
+        // The remaining 56 bytes of the SAME message are still queued and read next.
+        let (rest, more2) = r.pipe_read(s, 256).unwrap();
+        assert_eq!(&rest, &bind[16..]);
+        assert!(!more2);
+    }
+
+    #[test]
     fn bidirectional_queues_are_isolated() {
         let mut r = dx();
         let s = r.create_server_pipe("p", PipeParams::default()).unwrap();

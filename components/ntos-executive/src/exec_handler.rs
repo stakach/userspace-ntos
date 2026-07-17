@@ -2667,16 +2667,19 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // VA (0x1075) FIXED it: with the route ENABLED the worker RUNS its real rpcrt4 entry (4
                 // native syscalls incl. NtQueryInformationThread, label 0x4e54 NOT a fault) and winlogon
                 // crosses the wire with its 72-byte RPC bind PDU (proven `/tmp/boot36fix.log`).
-                // STILL GATED OFF for a DOWNSTREAM reason (a NEW, later wall, not the fixed fault): the
-                // rpcrt4 per-connection worker EXITS (NtTerminateThread exit=0) after its self-inspection
-                // syscalls WITHOUT reading the bind / writing bind_ack — it isn't yet wired to the
-                // accepted server-pipe endpoint (the flagged "N threads per process" connection-context
-                // follow-up). With the route ON, winlogon then parks reading bind_ack and every thread
-                // is parked → the main loop blocks with no clean quiesce → HANG to timeout. So while the
-                // TRAMPOLINE FIX is permanent (the 0x1075 VA above), the ROUTE stays OFF (fall through to
-                // 0xC000_009A = baseline clean-boot) until the worker's accepted-connection context is
-                // wired so it reads the bind + writes bind_ack. Flip to `true` then.
-                const SCM_WORKER_ROUTE_ENABLED: bool = false;
+                // ★ BATCH 37 — ENABLED. The BATCH-36 "worker exits without reading the bind" wall is
+                // FIXED: it was `conn->read_closed == 1`, set by the rpcrt4 SERVER thread's premature
+                // shutdown (`rpcrt4_conn_close_read` over `cps->connections`) because its post-accept
+                // RE-LISTEN failed — our `NtCreateNamedPipeFile` returned STATUS_ACCESS_DENIED for the
+                // 2nd `\ntsvcs` instance (hardcoded FILE_CREATE; real CreateNamedPipe uses FILE_OPEN_IF,
+                // fixed in driver_launch.rs). With that fixed the listener stays alive, `read_closed`
+                // stays 0, and the worker RUNS `rpcrt4_conn_np_read → NtReadFile(conn->pipe, 16)` and is
+                // re-driven on winlogon's bind write (the batch-33 pipe park + FIX-2 overflow copyout).
+                // The boot stays GREEN (worker reads then exits cleanly; listener alive; clean quiesce),
+                // so the route is left ON. bind_ack does not YET flow — see the BATCH 38 NEXT WALL in
+                // ntdll_plan.md (npfs returns wrong bytes for the server read: the pending ReadEntry is
+                // not reconciled with the peer WriteEntry in our synthetic-IRP npfs host).
+                const SCM_WORKER_ROUTE_ENABLED: bool = true;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 3
@@ -2952,7 +2955,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         };
                         self.xas_write_u64(out, event_handle);
                         let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                        if trace < 32 {
+                        if trace < 64 || self.current_badge == 15 {
                             print_str(b"[event] create pi=");
                             print_u64(self.pi as u64);
                             print_str(b" badge=");

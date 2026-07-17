@@ -1373,6 +1373,22 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
+            // BATCH 37 DIAG: trace the SCM per-connection worker's native SSNs to reveal exactly why it
+            // exits before reading the bind (the self-inspection syscalls + which handle it reads/exits on).
+            if is_scm_worker {
+                let dn = SCM_WORKER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 32 {
+                    print_str(b"[scm-worker-ssn] #");
+                    print_u64(dn);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
         }
         if (mi >> 12) == 2 {
             // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
@@ -3865,15 +3881,28 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         // Re-issue this reader's read against npfs; if still PENDING, leave it parked.
         let want = (w.buffer_len as usize).min(transport_capacity).max(1);
         let mut output = alloc::vec![0u8; want];
-        let (status, completed) = match nt_handler.npfs_route_raw(
-            major::IRP_MJ_READ as u64,
-            0,
-            w.file_id,
-            &[],
-            &mut output,
-        ) {
-            Some((st, info, _)) => (st as u32, info),
-            None => continue,
+        // BATCH 37: FIRST check for a completed-pending-read stash for this fid. When this reader's
+        // original read went PENDING, npfs retained the read IRP; the peer WRITE already completed it
+        // (copying the payload into THAT IRP) — so a fresh re-drive read would find the queue drained
+        // and return garbage/PENDING. `take_completed_read` hands back the exact bytes npfs delivered
+        // to the pending read IRP (this is how the rpcrt4 worker gets winlogon's bind PDU).
+        let (status, completed) = if let Some((st, info, bytes)) =
+            driver_launch::take_completed_read(w.file_id)
+        {
+            let n = (bytes.len()).min(output.len());
+            output[..n].copy_from_slice(&bytes[..n]);
+            (st, info)
+        } else {
+            match nt_handler.npfs_route_raw(
+                major::IRP_MJ_READ as u64,
+                0,
+                w.file_id,
+                &[],
+                &mut output,
+            ) {
+                Some((st, info, _)) => (st as u32, info),
+                None => continue,
+            }
         };
         if status == 0x0000_0103 {
             continue; // still PENDING → stays parked (re-armable)
@@ -3887,7 +3916,13 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
         nt_handler.pi = w.pi as usize;
         let copy_len = (completed as usize).min(output.len());
-        if status == 0 && copy_len != 0 && w.buffer_va != 0 {
+        // BATCH 37: copy the delivered bytes for SUCCESS *and* STATUS_BUFFER_OVERFLOW (0x80000005) —
+        // a message-mode read of a message larger than the buffer returns the partial bytes WITH
+        // overflow (rpcrt4 reads the 16-byte common header of a 72-byte bind PDU this way, then reads
+        // the remainder). Gating the copyout on `status == 0` left the reader's buffer zeroed on
+        // overflow, so rpcrt4's RPCRT4_ValidateCommonHeader saw an all-zero header and failed. Only a
+        // hard error / PENDING leaves the buffer untouched.
+        if (status == 0 || status == 0x8000_0005) && copy_len != 0 && w.buffer_va != 0 {
             nt_handler.xas_write_buf(w.buffer_va, &output[..copy_len]);
         }
         if w.iosb_va != 0 {
