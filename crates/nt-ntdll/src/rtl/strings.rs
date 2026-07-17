@@ -253,6 +253,24 @@ mod tests {
     }
 
     #[test]
+    fn create_unicode_string_nul_terminated_lengths() {
+        // RtlCreateUnicodeString semantics (unicode.c:2306): Size = (len+1)*2; Length = Size-2;
+        // MaximumLength = Size; Buffer is a NUL-terminated copy. Mirrors the on-target export
+        // (nt-ntdll-dll/src/exports.rs rtl_create_unicode_string) which uses process_heap_alloc.
+        let s = create_unicode_string(&u("ntsvcs"));
+        assert_eq!(s.length, 12); // 6 units * 2 bytes, excludes the NUL
+        assert_eq!(s.maximum_length, 14); // includes the trailing NUL
+        assert_eq!(s.as_units(), &u("ntsvcs")[..]);
+        assert_eq!(*s.buffer.last().unwrap(), 0); // NUL-terminated
+
+        // Empty source: an empty NUL-terminated string (Length 0, capacity for the NUL only).
+        let e = create_unicode_string(&u(""));
+        assert_eq!(e.length, 0);
+        assert_eq!(e.maximum_length, 2);
+        assert_eq!(*e.buffer.last().unwrap(), 0);
+    }
+
+    #[test]
     fn create_from_asciiz() {
         let s = create_unicode_string_from_asciiz(b"Btn\0garbage");
         assert_eq!(s.as_units(), &u("Btn")[..]);

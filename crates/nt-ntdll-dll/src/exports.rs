@@ -413,17 +413,78 @@ pub unsafe extern "system" fn rtl_free_unicode_string(s: PUnicodeString) {
     }
 }
 
-/// `RtlCreateUnicodeString(PUNICODE_STRING, PCWSTR) -> BOOLEAN` — allocate a copy on the process
-/// heap. Honest seam (heap not wired): returns FALSE.
+/// `RtlCreateUnicodeString(PUNICODE_STRING UniDest, PCWSTR Source) -> BOOLEAN` — allocate a
+/// NUL-terminated copy of `Source` on the process heap and describe it in `*UniDest`. Faithful port
+/// of `references/reactos/sdk/lib/rtl/unicode.c:2306`:
+///   `Size = (wcslen(Source) + 1) * sizeof(WCHAR)`; if `Size > MAXUSHORT` return FALSE; allocate
+///   `Size` bytes (FALSE if that fails); copy `Size` bytes (incl. the NUL); set
+///   `MaximumLength = Size`, `Length = Size - sizeof(WCHAR)`; return TRUE.
+///
+/// This is a REAL export (it was a FALSE-returning stub): ReactOS's `CreateNestedKey`
+/// (dll/win32/advapi32/reg/reg.c:961) IGNORES the BOOLEAN and dereferences `UniDest->Buffer`
+/// unconditionally, so a stub left `Buffer` uninitialized → a wild `wcsrchr` deref. services.exe's
+/// SCM `ScmCreateLastKnownGoodControlSet` reaches that path when its control-set key open returns
+/// STATUS_OBJECT_NAME_NOT_FOUND.
 ///
 /// # Safety
-/// `dst` a valid writable `UNICODE_STRING`.
+/// `dst` is a valid writable `UNICODE_STRING`; `src` (if non-NULL) is a valid NUL-terminated PCWSTR.
 #[export_name = "RtlCreateUnicodeString"]
 pub unsafe extern "system" fn rtl_create_unicode_string(
-    _dst: PUnicodeString,
-    _src: *const u16,
+    dst: PUnicodeString,
+    src: *const u16,
 ) -> u8 {
-    0 // FALSE — needs the process heap (Step 4.B).
+    if dst.is_null() {
+        return 0; // FALSE
+    }
+    // A NULL source describes an empty string (Buffer=NULL, both lengths 0) — TRUE. The real routine
+    // would fault in wcslen(NULL); we defensively normalize (callers that pass NULL want an empty
+    // string) so the seam never dereferences a wild pointer.
+    if src.is_null() {
+        // SAFETY: dst is a valid writable UNICODE_STRING per the contract.
+        unsafe {
+            (*dst).length = 0;
+            (*dst).maximum_length = 0;
+            (*dst).buffer = 0;
+        }
+        return 1; // TRUE
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: src is a valid NUL-terminated PCWSTR per the contract.
+        let src_units = unsafe {
+            let mut n = 0usize;
+            while core::ptr::read(src.add(n)) != 0 {
+                n += 1;
+            }
+            n
+        };
+        // Size = (len + 1) * 2 bytes (including the NUL). A UNICODE_STRING length is a u16.
+        let size = (src_units + 1) * 2;
+        if size > 0xFFFF {
+            return 0; // FALSE
+        }
+        // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+        let p = unsafe { crate::process_heap_alloc(size) } as *mut u16;
+        if p.is_null() {
+            return 0; // FALSE
+        }
+        // Copy src_units + the NUL terminator.
+        // SAFETY: p..p+src_units+1 and src..src+src_units+1 are valid per the checks above.
+        unsafe {
+            for i in 0..=src_units {
+                core::ptr::write(p.add(i), core::ptr::read(src.add(i)));
+            }
+            (*dst).buffer = p as u64;
+            (*dst).maximum_length = size as u16;
+            (*dst).length = (size - 2) as u16;
+        }
+        1 // TRUE
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = src;
+        0 // FALSE (host build — no process heap)
+    }
 }
 
 /// `RtlAnsiStringToUnicodeString(PUNICODE_STRING, PCANSI_STRING, BOOLEAN AllocateDestinationString)`.
