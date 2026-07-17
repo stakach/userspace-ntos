@@ -2767,11 +2767,21 @@ pub(crate) unsafe fn service_sec_image(
                 // cursor fork winlogon owns): 0x103d -> a non-NULL synthetic HCURSOR so user32's
                 // LoadCursor short-circuits; 0x10b4 -> a fresh RTL_ATOM (0xC1xx) so the class registers.
                 // Gated to services/lsass ONLY — winlogon's real GUI path is untouched.
-                // Gate to LSASS ONLY (badge 8), NOT services: faking services' cursor/class calls too
-                // perturbs the multiplex timing that lets winlogon's StartLsass run + spawn lsass (an
-                // over-broad fake regressed lsass spawn). lsass is the process whose completed user32
-                // init is on the critical path to LSA_RPC_SERVER_ACTIVE → winlogon's WaitForLsass wake.
-                let svc_noninteractive = badge == LSASS_BADGE;
+                // ★ BATCH 32: extend the gate to SERVICES (badge 6) as well as LSASS (badge 8). Both
+                // are NON-INTERACTIVE services on a WSS_NOIO window station — neither creates a real
+                // window nor does GDI drawing, so both must take the light non-interactive user32-init
+                // path instead of tripping win32k's interactive cursor/class/stock-object EngCopyBits
+                // runaway blit (RVA 0x1cbdd8). The prior LSASS-only gate was because, in an EARLIER
+                // batch, lsass had not yet spawned and faking services' calls perturbed the multiplex
+                // timing that let winlogon's StartLsass run. That concern is now STALE: lsass fully
+                // spawns AND signals LSA_RPC_SERVER_ACTIVE BEFORE services even reaches its user32
+                // init (verified in the boot log — winlogon's WaitForLsass wakes, then loads
+                // sfc/msgina, then opens \pipe\ntsvcs), so faking services' GDI-blit family no longer
+                // races lsass spawn. services.exe is now ON the critical path: it is the SCM and must
+                // run its main thread to ScmStartRpcServer → NtCreateNamedPipeFile(\pipe\ntsvcs), which
+                // it can only reach if its user32 process-attach class-registration loop COMPLETES
+                // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
+                let svc_noninteractive = badge == LSASS_BADGE || badge == SERVICES_BADGE;
                 let (st, ok) = if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
@@ -2811,7 +2821,7 @@ pub(crate) unsafe fn service_sec_image(
                     // is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it moved the
                     // hang to 0x11e0 by breaking winlogon's interactive init).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] lsass NtUserInitializeClientPfnArrays(0x125b) FAKED (non-interactive service, no GDI blit) -> STATUS_SUCCESS\n");
+                    print_str(b"[win32k-svc] svc NtUserInitializeClientPfnArrays(0x125b) FAKED (non-interactive service, no GDI blit) -> STATUS_SUCCESS\n");
                     (0, true)
                 } else if m0 == 0x11e0 && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h) for lsass.
@@ -2828,7 +2838,7 @@ pub(crate) unsafe fn service_sec_image(
                     // GdiProcessSetup checks the BOOL) and skips the interactive stock-object blit. Scoped
                     // to lsass (badge 8) — winlogon's real NtGdiInit path is untouched.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] lsass NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
+                    print_str(b"[win32k-svc] svc NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
                     (1, true)
                 } else if (m0 == 0x106c || m0 == 0x10b5) && svc_noninteractive {
                     // ★ NON-INTERACTIVE SERVICE GDI object-creation (0x106c NtGdiCreateBitmap /
@@ -2845,7 +2855,7 @@ pub(crate) unsafe fn service_sec_image(
                     // is the next diagnosed wall (a service normally does not).
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] lsass NtGdi obj-create(0x");
+                    print_str(b"[win32k-svc] svc NtGdi obj-create(0x");
                     print_hex(m0 as u32);
                     print_str(b") FAKED (non-interactive service, no GDI blit) -> handle 0x");
                     print_hex(h as u32);
@@ -2868,7 +2878,7 @@ pub(crate) unsafe fn service_sec_image(
                     // service that never creates windows) and does NOT reach the class-lookup that runs
                     // UserRegisterSystemClasses. Scoped to lsass (badge 8); winlogon's real 0x10bd untouched.
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-                    print_str(b"[win32k-svc] lsass NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
+                    print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
                     (0, true)
                 } else {
                     win32k_dispatch(m0, d_a0, d_a1, a2, a3)
