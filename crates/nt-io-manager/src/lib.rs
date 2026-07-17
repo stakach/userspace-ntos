@@ -53,6 +53,7 @@ pub use irp::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pipe::{
+    pipe_name_hash, AsyncListen, AsyncListenTable,
     PipeConnection, PipeEnd, PipeFcb, PipeHandle, PipeParams, PipeRegistry, PipeState, PipeWaiter,
     PipeWaiterTable,
     FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,

@@ -948,6 +948,69 @@ static mut PIPE_WAITERS: nt_io_manager::PipeWaiterTable<PIPE_WAITER_N> =
 static PIPE_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+// ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
+/// Pending async server-side `FSCTL_PIPE_LISTEN`s (host-tested `nt_io_manager::AsyncListenTable`). The
+/// ncacn_np rpcrt4 server posts an OVERLAPPED FSCTL_PIPE_LISTEN (STATUS_PENDING while no client) with a
+/// completion EVENT, then parks on `NtWaitForMultipleObjects([mgr_event, listen_event])` — it does NOT
+/// block on a pipe read. When the client (winlogon) connects/writes, the executive completes the
+/// pending listen + SIGNALs its event (via the existing `wait_wake_event_set` NtSetEvent path) so the
+/// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. `.bss`, cap 8.
+const PIPE_ASYNC_LISTEN_N: usize = 8;
+static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_N> =
+    nt_io_manager::AsyncListenTable::new();
+/// Proof/diagnostic counters: server listens armed, and completed (client connect → event signalled).
+static PIPE_LISTEN_ARMED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_LISTEN_SIGNALLED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_LISTEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Set once the SCM RPC listener thread (svc-listener, badge 7) has TERMINATED. rpcrt4's ncacn_np
+/// listener, after accepting winlogon's connect, spawns a per-connection WORKER thread (NtCreateThread)
+/// to service the bind/request and re-parks its OWN listen — then the listener may exit. The
+/// per-connection worker (which would read the bind + write bind_ack) is NOT yet spawned into the
+/// multiplex (the "N threads per process" follow-up), so once the listener is gone there is no live SCM
+/// signaler: winlogon's SCM read-park is then terminal → quiesce (run the gate) rather than hang the
+/// loop's recv. See the winlogon SCM-read-park guard.
+pub(crate) static SVC_LISTENER_TERMINATED: AtomicU64 = AtomicU64::new(0);
+/// Set once winlogon's main thread has parked on its SCM-RPC pipe read (waiting for bind_ack). Used so
+/// the loop can QUIESCE the moment the SCM listener terminates (no signaler left) even though winlogon
+/// parked earlier while the server was still live — avoids a hung recv. Cleared is never needed (once
+/// winlogon SCM-parks it stays the terminal steady state for this boot).
+pub(crate) static WINLOGON_SCM_PARKED: AtomicU64 = AtomicU64::new(0);
+/// A tiny fid → pipe-leaf-name-hash map, populated at `NtCreateNamedPipeFile` (server) and queried at
+/// FSCTL_PIPE_LISTEN arm time — so the async-listen record carries the pipe name-hash and a client
+/// connect completes ONLY the matching-name server listen. Fixed cap, `.bss`, single-threaded.
+const PIPE_FID_NAME_N: usize = 32;
+static PIPE_FID_NAME_FID: [AtomicU64; PIPE_FID_NAME_N] = [const { AtomicU64::new(0) }; PIPE_FID_NAME_N];
+static PIPE_FID_NAME_HASH: [AtomicU64; PIPE_FID_NAME_N] = [const { AtomicU64::new(0) }; PIPE_FID_NAME_N];
+/// Record (or update) `fid → name_hash`. Replaces an existing entry for `fid`.
+pub(crate) fn pipe_fid_name_remember(fid: u64, name_hash: u64) {
+    if fid == 0 {
+        return;
+    }
+    // Update existing.
+    for i in 0..PIPE_FID_NAME_N {
+        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == fid {
+            PIPE_FID_NAME_HASH[i].store(name_hash, Ordering::Relaxed);
+            return;
+        }
+    }
+    // Insert into a free slot.
+    for i in 0..PIPE_FID_NAME_N {
+        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == 0 {
+            PIPE_FID_NAME_FID[i].store(fid, Ordering::Relaxed);
+            PIPE_FID_NAME_HASH[i].store(name_hash, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+/// The name-hash recorded for `fid` (0 = unknown).
+pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
+    for i in 0..PIPE_FID_NAME_N {
+        if PIPE_FID_NAME_FID[i].load(Ordering::Relaxed) == fid {
+            return PIPE_FID_NAME_HASH[i].load(Ordering::Relaxed);
+        }
+    }
+    0
+}
 const DELAY_WAITER_N: usize = WAIT_REPLY_POOL_N - 1;
 const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
 const DELAY_TIMER_IRQ: u64 = 12;
@@ -1060,6 +1123,8 @@ pub(crate) fn bump_progress() {
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// BATCH 34 DIAG: per-SSN trace counter for the svc-listener (bounded print of its native SSNs).
+pub(crate) static SVC_LISTENER_SSN_TRACE: AtomicU64 = AtomicU64::new(0);
 /// lsass' LSA server thread — same shape as SVC_LISTENER, for pi 4 (the N-threads multiplex).
 static LSASS_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
@@ -3287,6 +3352,24 @@ struct ExecNtHandler {
     /// re-drive EVERY parked pipe read (re-issue each against npfs; npfs's own FCB pairing decides
     /// which reader now has bytes) and wake the satisfied ones. `false` = no re-drive requested.
     pipe_write_redrive: bool,
+    /// BATCH 34 — the async ncacn_np SERVER completion edge. rpcrt4's ncacn_np server does NOT block
+    /// on a plain pipe read; it posts an OVERLAPPED `NtFsControlFile(FSCTL_PIPE_LISTEN)` (which returns
+    /// STATUS_PENDING when no client is connected yet) with an EVENT handle for completion, then parks
+    /// on `NtWaitForMultipleObjects([mgr_event, listen_event])`. When a client (winlogon) connects +
+    /// writes, the pending listen must complete and its EVENT be signalled so the server's wait-array
+    /// wakes. `pipe_listen_fid` = the server end's npfs `FsContext` (0 = no pending-listen request);
+    /// `pipe_listen_event_handle` = the overlapped completion Event handle (RDX); `pipe_listen_iosb_va`
+    /// = the listen IO_STATUS_BLOCK VA (filled SUCCESS on completion). Reset each dispatch.
+    pipe_listen_fid: u64,
+    pipe_listen_event_handle: u64,
+    pipe_listen_iosb_va: u64,
+    /// BATCH 34 — set (to the connected pipe's leaf name-hash) by a client pipe CONNECT
+    /// (NtOpenFile/NtCreateFile IRP_MJ_CREATE on a pipe) that pairs with a server end. The LOOP then
+    /// completes the pending async server listen FOR THAT SAME PIPE NAME (fills its IOSB SUCCESS +
+    /// signals its completion event → the server's NtWaitForMultipleObjects wakes and reads the
+    /// client's first PDU). 0 = no listen-completion requested. Name-scoped so a connect to `\ntsvcs`
+    /// never spuriously wakes the `\lsarpc`/`\samr` servers (which would spin their rpcrt4 loop).
+    pipe_connect_redrive: u64,
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
@@ -7134,10 +7217,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // reusable mechanism (lsass + any multi-thread process). Proven: its real TCB exists
                     // (mechanism live) — with it + the real npfs pipe, rpcrt4 gets PAST the 0x2c8 deref
                     // and the SCM RPC server goes live (the boot advances to winlogon's StartLsass).
+                    // BATCH 34: the listener is proven by the multiplex having SERVICED its faults (it ran
+                    // its rpcrt4 ncacn_np server: created its listen event, posted FSCTL_PIPE_LISTEN,
+                    // woke on winlogon's connect, spawned its per-connection worker). Its TCB may be 0
+                    // AFTER it legitimately terminated (rpcrt4's listener exits once it hands the
+                    // connection to a worker) — so assert it RAN (real TID + faults serviced), not that
+                    // its TCB is still live. (Pre-batch-34 the listener never terminated, so tcb>1 held;
+                    // now that the real terminate path runs, faults-serviced is the durable proof.)
                     check(
                         b"exec_svc_rpc_listener_multiplex",
-                        SVC_LISTENER_TCB.load(Ordering::Relaxed) > 1
-                            && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0,
+                        SVC_LISTENER_TID.load(Ordering::Relaxed) != 0
+                            && SVC_LISTENER_FAULTS.load(Ordering::Relaxed) >= 4,
                         &mut passed,
                     );
                     print_str(b"[ntos-exec] C-c N-threads multiplex: svc-listener tcb=0x");

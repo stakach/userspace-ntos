@@ -1335,6 +1335,23 @@ pub(crate) unsafe fn service_sec_image(
             m2 = 0;
             // Re-label as UnknownSyscall so the shared servicing arm below runs.
             mi = (2u64 << 12) | (mi & 0x7F);
+            // BATCH 34 DIAG: trace every SERVER listener SSN so the boot log reveals the exact
+            // rpcrt4 ncacn_np server-side wait model (NtCreateNamedPipeFile / FSCTL_PIPE_LISTEN /
+            // overlapped NtReadFile / NtWaitForMultipleObjects). Bounded so it never floods.
+            if is_svc_listener {
+                let dn = SVC_LISTENER_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                if dn < 24 {
+                    print_str(b"[svc-listener-ssn] #");
+                    print_u64(dn);
+                    print_str(b" ssn=");
+                    print_u64(ssn);
+                    print_str(b" arg1=0x");
+                    print_hex(arg1 as u32);
+                    print_str(b" arg2=0x");
+                    print_hex(arg2 as u32);
+                    print_str(b"\n");
+                }
+            }
         }
         if (mi >> 12) == 2 {
             // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
@@ -1458,6 +1475,10 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_park_iosb_va = 0;
                 nt_handler.pipe_park_transceive = false;
                 nt_handler.pipe_write_redrive = false;
+                nt_handler.pipe_listen_fid = 0;
+                nt_handler.pipe_listen_event_handle = 0;
+                nt_handler.pipe_listen_iosb_va = 0;
+                nt_handler.pipe_connect_redrive = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
                 nt_handler.csr_spawn_request = false;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -1530,6 +1551,13 @@ pub(crate) unsafe fn service_sec_image(
                 // the caller through the normal tail below.
                 match nt_handler.post_action {
                     ExecPostAction::TerminateCurrentThread { tid } => {
+                        // BATCH 34: if the SCM RPC listener (svc-listener, badge 7) terminates, mark the
+                        // SCM server no-longer-live so winlogon's SCM read-park becomes terminal (quiesce)
+                        // instead of hanging the loop's recv (no signaler left until the per-connection
+                        // worker is routed — the flagged N-threads follow-up).
+                        if is_svc_listener {
+                            SVC_LISTENER_TERMINATED.store(1, Ordering::Relaxed);
+                        }
                         let reply_dropped = drop_current_syscall_reply();
                         let mechanism_deleted =
                             terminate_hosted_thread_mechanism(tid, &mut delay_queue);
@@ -1547,6 +1575,17 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].first = first;
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
+                        // BATCH 34: the SCM listener just exited AND winlogon is already SCM-read-parked
+                        // (waiting for bind_ack). No signaler remains (the per-connection worker isn't
+                        // routed yet — the N-threads follow-up), so the loop's next recv would hang.
+                        // QUIESCE now → run the gate + clean qemu_exit instead of blocking to timeout.
+                        if is_svc_listener
+                            && WINLOGON_SCM_PARKED.load(Ordering::Relaxed) != 0
+                        {
+                            print_str(b"[wl-main] SCM listener exited while winlogon SCM-read-parked (no worker routed yet) -> QUIESCE; run gate\n");
+                            stop = m1;
+                            break;
+                        }
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) =
                             recv_full_r12(fault_ep, new_reply);
@@ -1663,6 +1702,22 @@ pub(crate) unsafe fn service_sec_image(
                     park_pipe_buffer_len = nt_handler.pipe_park_buffer_len;
                     park_pipe_iosb_va = nt_handler.pipe_park_iosb_va;
                     park_pipe_transceive = nt_handler.pipe_park_transceive;
+                }
+                // ★ BATCH 34: a client CONNECT to a pipe with a pending async server FSCTL_PIPE_LISTEN
+                // for the SAME pipe name completes that listen — signal its completion event so the
+                // server's NtWaitForMultipleObjects wakes and reads the client's first PDU (the bind).
+                // Name-scoped (pipe_connect_redrive carries the connected pipe's leaf name-hash) so a
+                // connect to \ntsvcs never spuriously wakes the \lsarpc/\samr servers. Only a CONNECT
+                // (not a write) completes a listen — a write re-drives parked reads (below), which is
+                // the correct edge once the connection is established.
+                if nt_handler.pipe_connect_redrive != 0 {
+                    let connect_name_hash = nt_handler.pipe_connect_redrive;
+                    let listens = pipe_listen_complete_named(&mut nt_handler, connect_name_hash);
+                    if listens != 0 {
+                        print_str(b"[pipe-listen] completed ");
+                        print_u64(listens);
+                        print_str(b" pending server listen(s) on client connect\n");
+                    }
                 }
                 if nt_handler.pipe_write_redrive {
                     let woken = pipe_redrive_all(&mut nt_handler);
@@ -3241,18 +3296,38 @@ pub(crate) unsafe fn service_sec_image(
                     // block the loop's recv forever. A listener/worker sub-thread parking is NOT
                     // quiesce-relevant (its parent process may still run + write).
                     if pi_is_top_level(badge) {
-                        mark_wait_parked!(pi, resume_ip);
-                        // Terminal-state backstop (mirrors the WinMain steady-state QUIESCE at the event
-                        // park below): winlogon's SCM-RPC read parking AFTER LSA is signalled is its
-                        // genuine steady state for now — its rpcrt4 ncacn_np SERVER peer (services' SCM
-                        // listener) is an ASYNC event-driven server (it does NOT do a blocking pipe read
-                        // the write re-drive can complete), so no signaler wakes this read yet. Run the
-                        // gate rather than block the loop's recv forever (the pre-batch boot quiesced
-                        // here too, when winlogon crash-parked on RPC_X_BAD_STUB_DATA). See BATCH 33.
-                        if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
-                            print_str(b"[wl-main] winlogon SCM-RPC read parked (async server peer, no pipe-read signaler) + LSA signalled -> QUIESCE; run gate\n");
-                            stop = resume_ip;
-                            break;
+                        // ★ BATCH 34 — the SCM server round-trip is now LIVE. winlogon's SCM-RPC read
+                        // parking (recoverable, re-drivable) is NO LONGER terminal once its ncacn_np
+                        // SERVER peer (services' SCM listener) has been connected: a client connect
+                        // completed the server's async FSCTL_PIPE_LISTEN + signalled its event, so the
+                        // svc-listener is a RUNNABLE (non-top-level, badge 7) signaler that will read the
+                        // bind PDU and write bind_ack — which re-drives THIS parked read (batch-33 edge).
+                        // The all-top-level-parked quiesce test does NOT see the runnable svc-listener, so
+                        // marking winlogon parked here would falsely quiesce. So while the server is live
+                        // (a listen was signalled), DON'T mark_wait_parked! (skip the immediate quiesce)
+                        // — just continue the loop's recv: the runnable server produces events, and the
+                        // 45s wall-clock progress watchdog still stops the loop cleanly if it truly stalls.
+                        // The SCM server is LIVE only while its listener is signalled AND still running
+                        // (not terminated). Once the listener exits — and until its per-connection worker
+                        // is routed into the multiplex (the flagged N-threads follow-up) — there is no
+                        // signaler for winlogon's SCM read, so parking is terminal → quiesce.
+                        let scm_server_live = pi == 2
+                            && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                            && PIPE_LISTEN_SIGNALLED_COUNT.load(Ordering::Relaxed) != 0
+                            && SVC_LISTENER_TERMINATED.load(Ordering::Relaxed) == 0;
+                        if !scm_server_live {
+                            mark_wait_parked!(pi, resume_ip);
+                            // Terminal backstop: winlogon's SCM read parking with NO live server signaler
+                            // (no listen ever signalled, or the listener has exited) after LSA is signalled
+                            // is its steady state — run the gate rather than block recv forever.
+                            if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
+                                print_str(b"[wl-main] winlogon SCM-RPC read parked (no live server signaler) + LSA signalled -> QUIESCE; run gate\n");
+                                stop = resume_ip;
+                                break;
+                            }
+                        } else {
+                            WINLOGON_SCM_PARKED.store(1, Ordering::Relaxed);
+                            print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
                         }
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -3792,6 +3867,90 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     woken
+}
+
+/// The badge of the RPC LISTENER thread for a server process index (pi 3 → services' SCM listener,
+/// pi 4 → lsass' LSA listener). The async listen's completion IOSB + its wait-array live on the
+/// listener thread's OWN stack/TEB, so the copyout must use the listener's mirror context.
+#[inline]
+fn listener_badge_for_pi(pi: u32) -> u64 {
+    match pi {
+        3 => SVC_LISTENER_BADGE,
+        4 => LSASS_LISTENER_BADGE,
+        _ => 0,
+    }
+}
+
+/// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` matching `name_hash` after a
+/// client CONNECT to that same pipe name. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
+/// FSCTL_PIPE_LISTEN (STATUS_PENDING, no client) with a completion EVENT, then parked on
+/// `NtWaitForMultipleObjects([mgr_event, listen_event])`. The client just connected (npfs paired the
+/// ends by name), so ONE matching pending listen is now satisfied: fill its listen IOSB
+/// `{Status=SUCCESS, Information=0}` in the SERVER's VSpace (switch in the listener's mirror context
+/// for the copyout, then restore) and SIGNAL its completion event via the EXISTING `wait_wake_event_set`
+/// NtSetEvent wake path — waking the server's wait-array so it reads the client's first PDU (the bind).
+/// Name-scoped so a `\ntsvcs` connect never wakes `\lsarpc`/`\samr` (which would spin their rpcrt4
+/// accept loop). Returns 1 if a listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
+/// FSCTL_PIPE_LISTEN for the next client (a NEW record). Completes ONE listen per connect (one client).
+unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: u64) -> u64 {
+    // Find the matching pending listen (name-scoped); take it (consumed once per client connect).
+    let l = {
+        let table_mut = &mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS);
+        match table_mut.complete_by_name(name_hash) {
+            Some(l) => l,
+            None => return 0,
+        }
+    };
+    let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+    let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+    let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
+    let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
+    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
+    let saved_pi = nt_handler.pi;
+    let saved_ctx = nt_handler.loop_ctx.take();
+    let mut completed = 0u64;
+    {
+        // Point the IOSB copyout at the SERVER listener's VSpace mirrors.
+        let badge = listener_badge_for_pi(l.pi);
+        let (sb, ss, smv, hmv, imv) = mirror_ctx_for(badge, l.pi as usize);
+        ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
+        ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
+        ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
+        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
+        nt_handler.pi = l.pi as usize;
+        // Fill the listen IO_STATUS_BLOCK: {Status=STATUS_SUCCESS, Information=0}.
+        if l.iosb_va != 0 {
+            nt_handler.xas_write_buf(l.iosb_va, &0u32.to_le_bytes());
+            nt_handler.xas_write_buf(l.iosb_va + 8, &0u64.to_le_bytes());
+        }
+        // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
+        // the exact NtSetEvent wake path: set the event's `signalled` flag then wake_event_set.
+        if l.event_obj_idx != u64::MAX {
+            let idx = l.event_obj_idx as usize;
+            let _ = nt_handler.events.set_existing(idx as u64);
+            let woken = wait_wake_event_set(idx, &mut nt_handler.events);
+            if PIPE_LISTEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+                print_str(b"[pipe-listen] COMPLETE server fid=0x");
+                print_hex(l.server_file_id as u32);
+                print_str(b" signalled event_obj=0x");
+                print_hex(idx as u32);
+                print_str(b" -> woke ");
+                print_u64(woken);
+                print_str(b" server wait(s)\n");
+            }
+        }
+        completed += 1;
+        PIPE_LISTEN_SIGNALLED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
+    ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
+    ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
+    ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
+    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
+    nt_handler.pi = saved_pi;
+    nt_handler.loop_ctx = saved_ctx;
+    completed
 }
 
 /// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's

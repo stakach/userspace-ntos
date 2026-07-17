@@ -698,6 +698,161 @@ impl<const N: usize> PipeWaiterTable<N> {
     }
 }
 
+// ─── BATCH 34: the async ncacn_np SERVER completion edge ──────────────────────────────────────────
+//
+// rpcrt4's ncacn_np SERVER is async/event-driven: it does NOT block on a plain pipe read. It posts an
+// OVERLAPPED `NtFsControlFile(FSCTL_PIPE_LISTEN)` on the server pipe end — which returns STATUS_PENDING
+// while no client is connected (NpSetListeningPipeState → IoMarkIrpPending, see the real npfs
+// statesup.c:222) — carrying an EVENT handle for completion, then parks on
+// `NtWaitForMultipleObjects([mgr_event, listen_event])`. When a client connects (IRP_MJ_CREATE), npfs
+// completes the queued listen IRP with SUCCESS; the RPC layer's completion event must then be SIGNALLED
+// so the server's wait-array wakes → it reads the client's bind PDU → rpcrt4 emits bind_ack.
+//
+// The executive needs a small record keyed by the SERVER end's npfs `file_id` that carries the obj_ns
+// EVENT index to signal (resolved at listen time, in the server's own handle table) + the listen IOSB
+// VA to fill on completion. This is the pure, host-tested model of that record + its table; the
+// executive wires the signal through its EXISTING `wait_wake_event_set` (NtSetEvent → WOKE parked
+// waiter) path, exactly like an `NtSetEvent`.
+
+/// A pending async server-side `FSCTL_PIPE_LISTEN` awaiting a client connect. Keyed by the SERVER
+/// end's npfs `file_id`. On the peer connect/write the executive completes it: fills `iosb_va` with
+/// SUCCESS (in the server's VSpace) and signals `event_obj_idx` (waking the server's wait-array).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AsyncListen {
+    /// npfs `FsContext` of the SERVER end that posted FSCTL_PIPE_LISTEN (the slot key).
+    pub server_file_id: u64,
+    /// The obj_ns EVENT index (resolved in the SERVER's handle table at listen time) to SIGNAL on
+    /// completion — the overlapped listen's completion Event. `u64::MAX` = no event (rare).
+    pub event_obj_idx: u64,
+    /// The server process index (whose VSpace the listen IOSB is written into).
+    pub pi: u32,
+    /// The listener thread's fault-EP badge (for the mirror-context switch during the IOSB copyout).
+    pub badge: u64,
+    /// The listen IO_STATUS_BLOCK VA (filled `{Status=SUCCESS, Information=0}` on completion).
+    pub iosb_va: u64,
+    /// A stable hash of the SERVER pipe leaf name (`\ntsvcs`, `\lsarpc`, …). A client connect
+    /// completes ONLY the listen whose `name_hash` matches the connected pipe — so connecting to
+    /// `\ntsvcs` does NOT spuriously wake `\lsarpc`/`\samr` servers. 0 = unset (matches any).
+    pub name_hash: u64,
+}
+
+/// A tiny stable FNV-1a hash of a pipe leaf name (UTF-16 units, case-insensitive on ASCII). Used to
+/// match a client connect to the specific armed server listen for the same pipe name.
+pub fn pipe_name_hash(name16: &[u16]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &w in name16 {
+        let c = if (b'A' as u16..=b'Z' as u16).contains(&w) { w + 32 } else { w };
+        h ^= c as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// A fixed-capacity, heap-free, reset-safe table of pending async server listens. Same `.bss` static
+/// shape as [`PipeWaiterTable`]. One entry per server pipe end awaiting a client connect.
+#[derive(Clone, Debug)]
+pub struct AsyncListenTable<const N: usize> {
+    slots: [Option<AsyncListen>; N],
+}
+
+impl<const N: usize> Default for AsyncListenTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> AsyncListenTable<N> {
+    pub const fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    /// Record a pending async listen. If an entry already exists for `server_file_id`, it is REPLACED
+    /// (a re-armed listen after a prior completion updates the event/iosb). Returns the slot index, or
+    /// `None` if the table is full.
+    pub fn arm(&mut self, l: AsyncListen) -> Option<usize> {
+        // Replace an existing entry for the same server end (re-arm).
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.map(|e| e.server_file_id) == Some(l.server_file_id) {
+                *slot = Some(l);
+                return Some(i);
+            }
+        }
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(l);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Number of pending listens.
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.is_none())
+    }
+
+    /// A snapshot copy of every pending listen (slot, record), for the executive to complete+signal.
+    pub fn drain_all(&self) -> impl Iterator<Item = (usize, AsyncListen)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|l| (i, l)))
+    }
+
+    /// The pending listen on `server_file_id`, if any (peek).
+    pub fn find(&self, server_file_id: u64) -> Option<AsyncListen> {
+        self.slots
+            .iter()
+            .find_map(|s| s.filter(|l| l.server_file_id == server_file_id))
+    }
+
+    /// Is there a pending listen on `server_file_id`?
+    pub fn armed(&self, server_file_id: u64) -> bool {
+        self.find(server_file_id).is_some()
+    }
+
+    /// Complete + free the listen on `server_file_id` (a client connected). Returns the completed
+    /// record so the caller can signal its event + fill its IOSB. `None` if none was armed.
+    pub fn complete(&mut self, server_file_id: u64) -> Option<AsyncListen> {
+        for slot in self.slots.iter_mut() {
+            if slot.map(|l| l.server_file_id) == Some(server_file_id) {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Free by slot index (used after a `drain_all` completion pass).
+    pub fn free(&mut self, slot: usize) -> Option<AsyncListen> {
+        self.slots.get_mut(slot).and_then(|s| s.take())
+    }
+
+    /// The `server_file_id` recorded in `slot`, if any (peek without removing).
+    pub fn get_slot_id(&self, slot: usize) -> Option<u64> {
+        self.slots.get(slot).copied().flatten().map(|l| l.server_file_id)
+    }
+
+    /// Complete + free the FIRST pending listen matching `name_hash` (a client connected to that
+    /// specific pipe name). `name_hash == 0` or a stored `name_hash == 0` matches any (unset). Returns
+    /// the completed record so the caller can signal its event + fill its IOSB. `None` if no match —
+    /// so a connect to `\ntsvcs` does NOT complete `\lsarpc`/`\samr` server listens. Idempotent: the
+    /// matched listen is consumed once; a fresh re-arm (re-post) is a NEW record.
+    pub fn complete_by_name(&mut self, name_hash: u64) -> Option<AsyncListen> {
+        for slot in self.slots.iter_mut() {
+            if let Some(l) = *slot {
+                if name_hash == 0 || l.name_hash == 0 || l.name_hash == name_hash {
+                    return slot.take();
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -1090,5 +1245,115 @@ mod tests {
             NtStatus::INVALID_PARAMETER
         );
         assert_eq!(r.pipe_read(s, 8).unwrap().0, b"ok");
+    }
+
+    // ─── BATCH 34: async ncacn_np server listen-completion table ──────────────────────────────────
+
+    fn al(server_file_id: u64, event_obj_idx: u64) -> AsyncListen {
+        AsyncListen {
+            server_file_id,
+            event_obj_idx,
+            pi: 3,
+            badge: 7,
+            iosb_va: 0x9000 + server_file_id,
+            name_hash: 0,
+        }
+    }
+
+    fn al_named(server_file_id: u64, event_obj_idx: u64, name: &[u16]) -> AsyncListen {
+        AsyncListen {
+            name_hash: pipe_name_hash(name),
+            ..al(server_file_id, event_obj_idx)
+        }
+    }
+
+    #[test]
+    fn async_listen_arm_records_and_finds() {
+        let mut t = AsyncListenTable::<8>::new();
+        assert!(t.is_empty());
+        let slot = t.arm(al(0xE802D50, 42)).unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(t.armed(0xE802D50));
+        assert!(!t.armed(0xDEAD));
+        let l = t.find(0xE802D50).unwrap();
+        assert_eq!(l.event_obj_idx, 42);
+        assert_eq!(l.pi, 3);
+        assert_eq!(l.iosb_va, 0x9000 + 0xE802D50);
+        assert_eq!(t.get_slot_id(slot), Some(0xE802D50));
+    }
+
+    #[test]
+    fn async_listen_complete_signals_event_and_frees() {
+        // The core Part-B edge modeled: a peer connect completes the server's pending listen; the
+        // executive then signals `event_obj_idx` via its NtSetEvent wake path. complete() yields the
+        // record (carrying the event to signal + the iosb to fill) exactly once, then the slot is free.
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al(0xE802D50, 42)).unwrap();
+        let done = t.complete(0xE802D50).expect("armed listen completes");
+        assert_eq!(done.event_obj_idx, 42, "carries the event index to SIGNAL");
+        assert_eq!(done.iosb_va, 0x9000 + 0xE802D50, "carries the listen IOSB to fill");
+        // Consumed exactly once — no double-signal.
+        assert!(t.complete(0xE802D50).is_none());
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn async_listen_rearm_replaces_same_server() {
+        // rpcrt4 re-posts FSCTL_PIPE_LISTEN with a fresh completion event after the previous connect
+        // completed (successive clients). Re-arming the same server end REPLACES the record (no leak),
+        // so the NEXT connect signals the NEW event, not a stale one.
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al(0xE802D50, 42)).unwrap();
+        t.arm(al(0xE802D50, 99)).unwrap(); // re-arm same server, new event
+        assert_eq!(t.len(), 1, "re-arm does not leak a second slot");
+        assert_eq!(t.find(0xE802D50).unwrap().event_obj_idx, 99);
+    }
+
+    #[test]
+    fn async_listen_drain_all_and_free() {
+        let mut t = AsyncListenTable::<8>::new();
+        let s0 = t.arm(al(0xA, 1)).unwrap();
+        let _s1 = t.arm(al(0xB, 2)).unwrap();
+        let drained: std::vec::Vec<_> = t.drain_all().collect();
+        assert_eq!(drained.len(), 2);
+        t.free(s0);
+        assert_eq!(t.len(), 1);
+        assert!(!t.armed(0xA));
+        assert!(t.armed(0xB));
+    }
+
+    #[test]
+    fn async_listen_full_never_hangs() {
+        let mut t = AsyncListenTable::<2>::new();
+        assert!(t.arm(al(1, 10)).is_some());
+        assert!(t.arm(al(2, 20)).is_some());
+        // Third DISTINCT server end → table full → None (caller degrades, never a hang).
+        assert!(t.arm(al(3, 30)).is_none());
+    }
+
+    #[test]
+    fn async_listen_complete_by_name_is_specific() {
+        // The key regression guard: a client connecting to \ntsvcs must complete ONLY the \ntsvcs
+        // server listen, NOT the \lsarpc/\samr ones (spuriously waking them makes their rpcrt4 loop).
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
+        let samr: std::vec::Vec<u16> = "\\samr".encode_utf16().collect();
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
+        t.arm(al_named(0xB, 2, &lsarpc)).unwrap();
+        t.arm(al_named(0xC, 3, &samr)).unwrap();
+        // Connect to \ntsvcs → completes ONLY the ntsvcs listen (event 1).
+        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
+        assert_eq!(done.event_obj_idx, 1);
+        assert_eq!(t.len(), 2, "lsarpc + samr listens are untouched");
+        assert!(t.armed(0xB));
+        assert!(t.armed(0xC));
+        // Case-insensitive match.
+        let ntsvcs_uc: std::vec::Vec<u16> = "\\NTSVCS".encode_utf16().collect();
+        assert_eq!(pipe_name_hash(&ntsvcs), pipe_name_hash(&ntsvcs_uc));
+        // A connect to a name with NO armed listen completes nothing.
+        let unknown: std::vec::Vec<u16> = "\\nope".encode_utf16().collect();
+        assert!(t.complete_by_name(pipe_name_hash(&unknown)).is_none());
+        assert_eq!(t.len(), 2);
     }
 }

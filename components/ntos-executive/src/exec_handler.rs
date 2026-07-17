@@ -91,6 +91,10 @@ impl ExecNtHandler {
             pipe_park_iosb_va: 0,
             pipe_park_transceive: false,
             pipe_write_redrive: false,
+            pipe_listen_fid: 0,
+            pipe_listen_event_handle: 0,
+            pipe_listen_iosb_va: 0,
+            pipe_connect_redrive: 0,
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
@@ -1898,9 +1902,23 @@ impl NativeSyscallHandler for ExecNtHandler {
                     let oa = get_recv_mr(7); // R8 = *OBJECT_ATTRIBUTES
                     let name16 = self.read_objattr_name_pe(oa);
                     let leaf = Self::pipe_leaf16(&name16);
+                    // BATCH 34 DIAG: confirm the server FCB is created for the SCM pipe (\ntsvcs).
+                    let mut nm_ascii = [b'.'; 24];
+                    for (i, &w) in leaf.iter().take(24).enumerate() {
+                        let b = w as u8;
+                        nm_ascii[i] = if b.is_ascii_graphic() { b } else { b'.' };
+                    }
+                    print_str(b"[nt-create-named-pipe] pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" leaf=");
+                    print_str(&nm_ascii);
+                    print_str(b"\n");
                     if let Some((st, fid)) = self.npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0) {
                         if st == 0 && fid != 0 {
                             routed_file_id = fid;
+                            // BATCH 34: remember this server fid → its pipe leaf name-hash, so a client
+                            // connect completes ONLY the matching-name server listen (not every armed one).
+                            crate::pipe_fid_name_remember(fid, nt_io_manager::pipe_name_hash(&leaf));
                         } else {
                             info = 1; // FILE_OPENED (subsequent instance) — still SUCCESS to rpcrt4
                         }
@@ -1953,11 +1971,26 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // server_ready_event → the main thread's WaitForSingleObject(server_ready_event) wakes.
                 // This is the correct pending-listen (no synchronous phantom client) that completes the
                 // rpcrt4 two-thread handshake without a real npfs connection.
-                if self.pi == 2 && (fsctl as u32) == 0x0011_0008 {
+                //
+                // ★ BATCH 34 — the SAME invariant for the pi 3/4 REAL ncacn_np SERVER (services'/lsass'
+                // SCM/LSA listeners). rpcrt4_protseq_np_get_wait_array posts FSCTL_PIPE_LISTEN on EACH
+                // listener pipe; if it returns SUCCESS/STATUS_PIPE_CONNECTED it does `SetEvent(event)`
+                // IMMEDIATELY → wait_for_new_connection wakes → rpcrt4_spawn_connection → handoff →
+                // rpcrt4_conn_create_pipe creates a NEW instance → get_wait_array posts FSCTL_PIPE_LISTEN
+                // on it → SUCCESS again → SetEvent → an INFINITE create-instance runaway (observed: 894
+                // `\ntsvcs` creates). The listen MUST return STATUS_PENDING for a freshly-created server
+                // instance with no client — then the listener parks on NtWaitForMultipleObjects, and ONLY
+                // our explicit event-signal on a REAL client connect (pipe_listen_complete_named) wakes
+                // it with io_status.Status = SUCCESS → it spawns exactly ONE connection per real client.
+                // So force PENDING + arm the async listen for pi 3/4 too (don't route the LISTEN to
+                // npfs's state machine, which returns CONNECTED/SUCCESS for the just-handed-off instance).
+                let is_pipe_listen = (fsctl as u32) == 0x0011_0008;
+                let force_pending_listen = is_pipe_listen && (self.pi == 2 || self.pi == 3 || self.pi == 4);
+                if force_pending_listen {
                     status = 0x103; // STATUS_PENDING
                 }
                 let fid = self.npfs_file_id_for(args[0]);
-                if fid != 0 && !(self.pi == 2 && fsctl as u32 == 0x0011_0008) {
+                if fid != 0 && !force_pending_listen {
                     let input_len = (args[7] as usize).min(0x4000);
                     let output_len = (args[9] as usize).min(0x4000);
                     let mut input = alloc::vec![0u8; input_len];
@@ -1992,7 +2025,56 @@ impl NativeSyscallHandler for ExecNtHandler {
                     self.pipe_park_iosb_va = iosb;
                     self.pipe_park_transceive = true;
                 }
-                if iosb != 0 && self.pipe_park_fid == 0 {
+                // ★ BATCH 34 — the async ncacn_np SERVER completion edge. A server (pi 3/4) posting an
+                // OVERLAPPED FSCTL_PIPE_LISTEN (0x110008) that npfs returns STATUS_PENDING for (no client
+                // yet, NpSetListeningPipeState → IoMarkIrpPending) does NOT block on this syscall — the
+                // thread continues to NtWaitForMultipleObjects([mgr_event, listen_event]). Record the
+                // pending async listen keyed by the SERVER fid, carrying the completion EVENT (RDX =
+                // args[1], resolved to its obj_ns index in the SERVER's OWN handle table NOW while `pi`
+                // names the server) + the listen IOSB VA. On the peer connect/write the loop completes it
+                // (fills the IOSB SUCCESS + signals the event → the server's wait-array wakes). SUPPRESS
+                // the PENDING IOSB write here (overlapped: the IOSB is written at completion, not now).
+                if (self.pi == 3 || self.pi == 4)
+                    && (fsctl as u32) == 0x0011_0008
+                    && (status as u32) == 0x0000_0103
+                    && fid != 0
+                {
+                    // Resolve the overlapped completion Event (RDX = args[1]) to an obj_ns index in the
+                    // server's handle table. May be 0/absent (APC-mode); then event_obj_idx = u64::MAX.
+                    let event_obj_idx = if args[1] != 0 {
+                        self.event_index_for_handle(args[1], 0).map(|i| i as u64).unwrap_or(u64::MAX)
+                    } else {
+                        u64::MAX
+                    };
+                    let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
+                    if table
+                        .arm(nt_io_manager::AsyncListen {
+                            server_file_id: fid,
+                            event_obj_idx,
+                            pi: self.pi as u32,
+                            // The listener badge is derived from pi at completion (pi 3 → SVC_LISTENER,
+                            // pi 4 → LSASS_LISTENER); store 0 as a placeholder.
+                            badge: 0,
+                            iosb_va: iosb,
+                            // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
+                            // client connect completes ONLY the matching-name listen.
+                            name_hash: crate::pipe_fid_name_hash(fid),
+                        })
+                        .is_some()
+                    {
+                        crate::PIPE_LISTEN_ARMED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[pipe-listen] ARMED server fid=0x");
+                        print_hex(fid as u32);
+                        print_str(b" event_obj=0x");
+                        print_hex(event_obj_idx as u32);
+                        print_str(b" pi=");
+                        print_u64(self.pi as u64);
+                        print_str(b"\n");
+                    }
+                    // Overlapped: DON'T write the PENDING IOSB now — it's filled on completion.
+                    self.pipe_listen_fid = fid;
+                }
+                if iosb != 0 && self.pipe_park_fid == 0 && self.pipe_listen_fid == 0 {
                     self.xas_write_buf(iosb, &(status as u32).to_le_bytes());
                     self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
@@ -3877,6 +3959,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                             if let Some(handle) = self.mint_file_handle(file_id, args[1] as u32) {
                                 self.queue_write(args[0], handle);
                                 info = nt_fs::FILE_OPENED as u64;
+                                // ★ BATCH 34: client CONNECT (winlogon's NtCreateFile on \pipe\ntsvcs)
+                                // paired with the server end by name → complete the pending async
+                                // server listen FOR THAT PIPE NAME (signal its completion event → the
+                                // SCM listener's NtWaitForMultipleObjects wakes to read the bind PDU).
+                                self.pipe_connect_redrive =
+                                    nt_io_manager::pipe_name_hash(&Self::pipe_leaf16(&name16));
                             } else {
                                 status = 0xC000_009A;
                             }
@@ -4289,6 +4377,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                             };
                             if let Some(handle) = opened_handle {
                                 self.queue_write(get_recv_mr(9), handle);
+                                // ★ BATCH 34: a successful client CONNECT (IRP_MJ_CREATE paired the
+                                // client to a server end by name in npfs) must complete the pending
+                                // async server FSCTL_PIPE_LISTEN FOR THAT PIPE NAME — signal its
+                                // completion event so the server's NtWaitForMultipleObjects wakes and
+                                // reads the client's PDU. Name-scoped (no spurious cross-server wake).
+                                if status == 0 {
+                                    self.pipe_connect_redrive = nt_io_manager::pipe_name_hash(&leaf);
+                                }
                             }
                             let iosb = get_recv_mr(8);
                             if iosb != 0 {
