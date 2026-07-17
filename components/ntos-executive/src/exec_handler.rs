@@ -2208,7 +2208,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
                 // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).
-                let name16 = if self.pi == 3 || self.pi == 4 {
+                // BATCH 41 — winlogon (pi 2) too: msgina's L"DefaultPassword" value name is a msgina.dll
+                // `.rdata` literal, so recover it cross-AS from the PE (the mirror-only smss_read_ustr
+                // returns empty for it). read_ustr_pe uses xas_read → resolves any resident/PE page.
+                let name16 = if self.pi == 2 || self.pi == 3 || self.pi == 4 {
                     self.read_ustr_pe(args[1])
                 } else {
                     smss_read_ustr(args[1])
@@ -2221,6 +2224,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
+                } else if self.pi == 2
+                    && key == SYNTH_WINLOGON_KEY
+                    && name_lc == "defaultpassword"
+                {
+                    // BATCH 41 — satisfy msgina's GetRegistrySettings DefaultPassword read (msgina.c:216)
+                    // with an EMPTY REG_SZ (a single UTF-16 NUL). This makes `rc == ERROR_SUCCESS` so
+                    // `if (rc) GetLsaDefaultPassword(...)` (msgina.c:223) is NOT taken → no LsaOpenPolicy
+                    // → no `\pipe\lsarpc` RPC bind → winlogon does not stall (nor raise an RPC exception
+                    // our ntdll can't dispatch) inside GinaInit. An empty auto-logon password is a
+                    // legitimate value; AutoAdminLogon defaults FALSE so it is never used to log in.
+                    WINLOGON_DEFPWD_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    Some((1u32 /* REG_SZ */, alloc::vec![0u8, 0u8]))
                 } else if let Some(oidx) = overlay_key_idx(key) {
                     // Overlay (created) key: its own set values FIRST, then shadow the base hive by
                     // the overlay key's path (so a created-then-read of a pre-existing key still

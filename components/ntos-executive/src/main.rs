@@ -3136,6 +3136,21 @@ static KBD_LAYOUT_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
 /// SYNTH_WINLOGON_KEY (BATCH 40 — msgina's GetRegistrySettings). Proves winlogon crossed the msgina
 /// GINA-init wall (WlxInitialize wrote a non-NULL context instead of GinaInit-fail → WlxShutdown(NULL)).
 pub(crate) static WINLOGON_KEY_OPENED: AtomicU64 = AtomicU64::new(0);
+/// BATCH 41 — count of winlogon `DefaultPassword` value reads satisfied with an empty REG_SZ (proves
+/// the LSA-RPC-avoidance crossing). During GinaInit, msgina's `GetRegistrySettings` (msgina.c:216)
+/// reads `HKLM\...\Winlogon\DefaultPassword`; ONLY when that read FAILS does it call
+/// `GetLsaDefaultPassword` (msgina.c:223), whose `LsaOpenPolicy` binds `ncacn_np:\pipe\lsarpc`
+/// (advapi32/sec/lsa.c:53) and blocks reading the bind_ack. lsass hosts NO per-connection LSA RPC
+/// worker (its listeners only re-arm+exit — unlike services' SCM \ntsvcs worker), so the bind read
+/// stalled forever inside GinaInit; when we completed it as broken-pipe, rpcrt4 raised an RPC
+/// exception (RPC_S_CALL_FAILED 0x6be) that our ntdll's stubbed RtlRaiseException cannot dispatch to
+/// rpcrt4's `RpcTryExcept` → winlogon parked on the int3. So AVOID the RPC entirely at its source:
+/// satisfy the `DefaultPassword` value read with an EMPTY REG_SZ (a legitimate value — a system with
+/// no stored auto-logon password) so `GetRegistrySettings`'s `if (rc) GetLsaDefaultPassword(...)`
+/// (msgina.c:223) is NOT taken. `GetRegistrySettings` returns TRUE, GinaInit completes without the
+/// lsarpc RPC, and winlogon advances into its post-GinaInit logon flow (InitializeSAS → the SAS
+/// window → the desktop-switch paint). Scoped to winlogon's SYNTH_WINLOGON_KEY / DefaultPassword ONLY.
+pub(crate) static WINLOGON_DEFPWD_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Count of faked `NtUserLoadKeyboardLayoutEx` (SSN 0x125c) calls — winlogon's InitKeyboardLayouts
 /// gets a non-NULL HKL back without routing to win32k's interactive-winsta keyboard-layout fork.
 static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
