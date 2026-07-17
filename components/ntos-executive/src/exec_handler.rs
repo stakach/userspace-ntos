@@ -76,6 +76,7 @@ impl ExecNtHandler {
             sm_spawn_request: false,
             wl_spawn_request: 0,
             svc_listener_spawn: false,
+            scm_worker_spawn: false,
             lsass_listener_spawn: false,
             lsass_listener2_spawn: false,
             lsass_listener3_spawn: false,
@@ -2644,6 +2645,70 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
+                // ★ BATCH 35 — N-threads multiplex: services' (pi 3) SECOND NtCreateThread = the SCM
+                // RPC listener's PER-CONNECTION worker (rpcrt4 `RPCRT4_new_client`, spawned on
+                // winlogon's accepted connection). BEFORE this batch it fell to the 0xC000_009A
+                // fallthrough below → the worker never spawned → nobody read winlogon's bind PDU / wrote
+                // bind_ack → the SCM RPC round-trip stalled. Route it like the listener: pop a pool
+                // ETHREAD (services' slot 1; slot 0 = listener), set its OWN TEB, queue *ThreadHandle +
+                // ClientId, and signal the LOOP to spawn it RESUMED with a badged fault EP
+                // (SCM_WORKER_BADGE) so it runs into the main multiplex — its faults sub-select to
+                // (pi 3, scm-worker) via its OWN stack mirror/TEB, and its blocking pipe reads park +
+                // re-drive on winlogon's write (the existing batch-33/34 edges, badge-general).
+                // ★ BATCH 35 FRONTIER GUARD. The full per-connection-worker routing (recognizer + spawn
+                // RESUMED into the multiplex at SCM_WORKER_BADGE with its own TEB/stack-mirror/fault-EP,
+                // + the badge sub-select / mirror_ctx / pipe-park paths) is BUILT. It is gated OFF here
+                // because the hosted-thread trampoline faults at ENTRY when a 3rd native thread in
+                // services' VSpace actually runs it: a reproducible cr2=0 VMFault at the worker's
+                // trampoline VA despite a byte-perfect, successfully-mapped RX trampoline (page_map_r=0),
+                // INDEPENDENT of the VA window (cluster block AND a fresh dedicated-PT 0x1100_0000
+                // window both fault identically), the transport (native AND trap fault the same), and
+                // resume timing (spawn-resumed AND suspended-then-NtResumeThread both fault). It needs a
+                // kernel gdb-stub session on the worker TCB's VSpace binding at the fault. Letting the
+                // worker's NtCreateThread SUCCEED makes rpcrt4 hand off to a worker that never runs →
+                // winlogon later walls on its own rpcrt4 worker TEB → the loop hangs (no clean quiesce),
+                // so while OFF we fall through to the pre-batch 0xC000_009A (baseline clean-boot). Flip
+                // this const to `true` (+ resume=true in the loop spawn) once the fault is root-caused.
+                const SCM_WORKER_ROUTE_ENABLED: bool = false;
+                if SCM_WORKER_ROUTE_ENABLED
+                    && matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 3
+                    && SVC_LISTENER_TID.load(Ordering::Relaxed) != 0
+                    && SCM_WORKER_TCB.load(Ordering::Relaxed) == 0
+                    && SCM_WORKER_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30); // arg6 = Context*
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                        {
+                            self.pm
+                                .set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
+                            let pid = self.pm_pid_for_pi(3).unwrap_or(0);
+                            self.queue_write(args[0], handle); // *ThreadHandle
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            SCM_WORKER_TID.store(tid, Ordering::Relaxed);
+                            self.scm_worker_spawn = true;
+                            print_str(b"[scm-worker] recognized services' 2nd NtCreateThread = per-connection RPC worker: entry=0x");
+                            print_hex((start.rip >> 32) as u32);
+                            print_hex(start.rip as u32);
+                            print_str(b" tid=");
+                            print_u64(tid);
+                            print_str(b"\n");
+                            return 0;
+                        }
+                    }
+                }
                 if matches!(ctx.service, NativeService::NtCreateThread)
                     && (2..=4).contains(&self.pi)
                 {
@@ -3014,6 +3079,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     return 0;
                 };
+                // BATCH 35: the SCM per-connection worker is routed into the multiplex but left
+                // SUSPENDED (its trampoline-entry fault is unresolved — see the frontier note). rpcrt4
+                // calls NtResumeThread on it; report SUCCESS with previous=1 (so rpcrt4 believes the
+                // worker resumed) but DON'T actually tcb_resume it (that would run the broken trampoline
+                // and destabilise the boot). Clears its suspended bit so the ETHREAD state stays coherent.
+                let scm_worker_tid = SCM_WORKER_TID.load(Ordering::Relaxed);
+                if scm_worker_tid != 0 && tid == scm_worker_tid {
+                    let bit = 1u64 << slot;
+                    PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed);
+                    if args[1] != 0 {
+                        self.queue_write(args[1], 1);
+                    }
+                    print_str(b"[scm-worker] NtResumeThread -> SUCCESS (not resumed; trampoline-entry fault, see frontier)\n");
+                    return 0;
+                }
                 let bit = 1u64 << slot;
                 let previous = if PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
                     1

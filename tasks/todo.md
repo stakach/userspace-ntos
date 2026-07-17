@@ -1,3 +1,19 @@
+# BATCH 35 — route the SCM per-connection RPC worker into the multiplex
+
+## Review
+- ROOT CAUSE of the stall: services' 2nd NtCreateThread (the per-connection worker, ssn 55)
+  hit exec_handler's `(2..=4).contains → return 0xC000_009A` fallthrough → worker never spawned.
+- BUILT the full dynamic-worker routing (SCM_WORKER_BADGE=15 + dedicated VAs + spawn_scm_worker_thread
+  + recognizer + loop spawn + multiplex sub-select + mirror_ctx + NtResumeThread guard + terminate cell).
+- BLOCKER: a running 3rd native hosted thread in services' VSpace faults at its trampoline VA
+  (cr2=0, INDEPENDENT of VA window / transport / resume-timing; trampoline is byte-perfect + mapped
+  with page_map_r=0). Needs a kernel gdb-stub on the worker TCB VSpace/CNode binding.
+- GUARD: `const SCM_WORKER_ROUTE_ENABLED = false` (exec_handler.rs) — falls through to baseline
+  0xC000_009A → clean quiesce. Gate 175 (≥174), clean qemu_exit, no regression, host green.
+- Flip the const + resume=true once the trampoline fault is root-caused → round-trip fires.
+
+---
+
 # BATCH 34 — async ncacn_np server-completion edge + real paired server FCB
 
 ## Confirmed server wait model (boot34a.log evidence)

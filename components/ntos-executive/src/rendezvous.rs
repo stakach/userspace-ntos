@@ -457,6 +457,50 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     })
 }
 
+/// BATCH 35 — spawn services' SCM per-connection RPC WORKER thread (rpcrt4 `RPCRT4_new_client`,
+/// created by the SCM listener via its SECOND NtCreateThread on an accepted connection) in services'
+/// VSpace (pi 3) and RESUME it into the main service-loop multiplex. Faults to a cap minted at
+/// [`SCM_WORKER_BADGE`] off the MAIN service `fault_ep`; the loop sub-selects it as (pi 3, scm-worker)
+/// via its OWN stack mirror/TEB (distinct from services' main thread AND its listener). This is the
+/// thread that reads winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — its blocking pipe
+/// reads park via `pipe_wait_park` and re-drive on winlogon's write via `pipe_redrive_all` (which is
+/// already badge-general through `mirror_ctx_for`). A clone of `spawn_svc_listener_thread` with the
+/// SCM_WORKER VA window; native transport (services runs on OUR ntdll) + its kernel IPC buffer bound
+/// to services' MAIN-thread ipcbuf frame (the VA our ntdll native stub writes MR4/MR5 to).
+pub(crate) unsafe fn spawn_scm_worker_thread(
+    svc_pml4: u64,
+    entry_rip: u64,
+    arg0: u64,
+    arg1: u64,
+    cid_proc: u64,
+    cid_thread: u64,
+    main_fault_ep: u64,
+    resume: bool,
+) -> u64 {
+    let worker_ep = mint_badged(main_fault_ep, SCM_WORKER_BADGE);
+    spawn_hosted_thread(&HostedThread {
+        pml4: svc_pml4,
+        entry_rip,
+        arg0,
+        arg1,
+        scr: SCM_WORKER_ENV_SCRATCH_VA,
+        teb_va: SCM_WORKER_TEB_VA,
+        stack_base: SCM_WORKER_STACK_BASE,
+        stack_frames: SCM_WORKER_STACK_FRAMES,
+        ipcbuf_va: SCM_WORKER_IPCBUF_VA,
+        tramp_va: SCM_WORKER_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: SCM_WORKER_STACK_MIRROR_VA,
+        fault_ep: worker_ep,
+        cid_proc,
+        cid_thread,
+        resume,
+        prio: 104, // same band as the listener (above winlogon/services main threads)
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
+    })
+}
+
 /// Spawn lsass' LSA server thread (StartAuthenticationPort / LsapRmServerThread, created by lsass'
 /// LsapInitDatabase via NtCreateThread) in lsass' VSpace (pi 4) and RESUME it into the main service-loop
 /// multiplex — the SERVICE-9 C-c pattern replicated for lsass. Faults to a cap minted at

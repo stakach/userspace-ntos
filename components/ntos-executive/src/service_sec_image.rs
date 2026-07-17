@@ -484,6 +484,10 @@ pub(crate) unsafe fn service_sec_image(
         // thread — same VSpace/image/pml4 as services' main thread, but a DIFFERENT stack + TEB. It's
         // resolved to pi 3 here; the per-thread stack mirror is switched below (is_svc_listener).
         let is_svc_listener = badge == SVC_LISTENER_BADGE;
+        // BATCH 35: services' SCM per-connection RPC worker (pi 3, its OWN stack mirror/TEB) — the
+        // N-threads multiplex generalized to a DYNAMICALLY-spawned worker (not a pre-created pool
+        // listener). It reads winlogon's bind PDU + writes bind_ack; resolved to pi 3 like the listener.
+        let is_scm_worker = badge == SCM_WORKER_BADGE;
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
         let is_lsass_listener3 = badge == LSASS_LISTENER3_BADGE;
@@ -518,6 +522,18 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 3 listener)\n");
             }
         }
+        if is_scm_worker {
+            let n = SCM_WORKER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                print_str(b"[scm-worker] multiplex event #");
+                print_u64(n);
+                print_str(b" label=0x");
+                print_hex((mi >> 12) as u32);
+                print_str(b" m1=0x");
+                print_hex(m1 as u32);
+                print_str(b" (N-threads sub-select: pi 3 per-connection worker)\n");
+            }
+        }
         if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 {
             let ctr = if is_lsass_listener3 {
                 &LSASS_LISTENER3_FAULTS
@@ -547,7 +563,7 @@ pub(crate) unsafe fn service_sec_image(
             1
         } else if badge == WINLOGON_BADGE || is_wl_worker {
             2
-        } else if badge == SERVICES_BADGE || is_svc_listener {
+        } else if badge == SERVICES_BADGE || is_svc_listener || is_scm_worker {
             3
         } else if badge == LSASS_BADGE
             || is_lsass_listener
@@ -585,6 +601,8 @@ pub(crate) unsafe fn service_sec_image(
         // own stack, not the other process's.
         let (active_stack_base, active_stack_frames) = if is_svc_listener {
             (SVC_LISTENER_STACK_BASE, SVC_LISTENER_STACK_FRAMES)
+        } else if is_scm_worker {
+            (SCM_WORKER_STACK_BASE, SCM_WORKER_STACK_FRAMES)
         } else if is_lsass_listener {
             (LSASS_LISTENER_STACK_BASE, LSASS_LISTENER_STACK_FRAMES)
         } else if is_lsass_listener2 {
@@ -607,6 +625,9 @@ pub(crate) unsafe fn service_sec_image(
                 // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
                 // stack-arg reads land on its own stack, not services' main-thread stack).
                 SVC_LISTENER_STACK_MIRROR_VA
+            } else if is_scm_worker {
+                // BATCH 35: the SCM worker's OWN stack mirror (its bind-PDU read buffer / out-params).
+                SCM_WORKER_STACK_MIRROR_VA
             } else if is_lsass_listener {
                 // Per-thread sub-selection: lsass' LSA server thread's OWN stack mirror (distinct from
                 // lsass' main-thread stack).
@@ -856,8 +877,8 @@ pub(crate) unsafe fn service_sec_image(
                 // blocked, its ETHREAD/TEB stay mapped) and CONTINUE the loop so services' main thread
                 // + winlogon keep advancing (winlogon → StartLsass). Contained per-thread, not a boot
                 // stop — the whole point of the per-thread multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
+                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] wall ip=0x" } else if is_scm_worker { b"[scm-worker] wall ip=0x" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] wall ip=0x" } else { b"[svc-listener] wall ip=0x" });
                     print_hex((m0 >> 32) as u32);
                     print_hex(m0 as u32);
                     print_str(b" addr=0x");
@@ -1412,6 +1433,8 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.current_badge = badge;
             nt_handler.current_tid = if is_svc_listener {
                 SVC_LISTENER_TID.load(Ordering::Relaxed)
+            } else if is_scm_worker {
+                SCM_WORKER_TID.load(Ordering::Relaxed)
             } else if is_lsass_listener {
                 LSASS_LISTENER_TID.load(Ordering::Relaxed)
             } else if is_lsass_listener2 {
@@ -1576,9 +1599,10 @@ pub(crate) unsafe fn service_sec_image(
                         procs[pi].ntfaults = ntfaults;
                         pfilled[pi] = *filled_pages;
                         // BATCH 34: the SCM listener just exited AND winlogon is already SCM-read-parked
-                        // (waiting for bind_ack). No signaler remains (the per-connection worker isn't
-                        // routed yet — the N-threads follow-up), so the loop's next recv would hang.
-                        // QUIESCE now → run the gate + clean qemu_exit instead of blocking to timeout.
+                        // (waiting for bind_ack). No live signaler remains (BATCH 35 routes the
+                        // per-connection worker but it PARKS on a trampoline-entry fault — see the frontier
+                        // note; it does not yet write bind_ack), so QUIESCE now → run the gate + clean
+                        // qemu_exit instead of blocking to timeout.
                         if is_svc_listener
                             && WINLOGON_SCM_PARKED.load(Ordering::Relaxed) != 0
                         {
@@ -2112,6 +2136,39 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[svc-thread] spawned + resumed tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (runs into the main multiplex, badge 7)\n");
+                }
+                // ★ BATCH 35: services' SCM per-connection RPC WORKER thread — spawned RESUMED into the
+                // main service loop (badge SCM_WORKER_BADGE). Its faults sub-select to (pi 3, scm-worker)
+                // by badge → its OWN stack mirror/TEB. This is the thread that reads winlogon's bind PDU
+                // and writes bind_ack; its pipe reads park (pipe_wait_park) + re-drive on winlogon's write.
+                if nt_handler.scm_worker_spawn && SCM_WORKER_TCB.swap(1, Ordering::Relaxed) == 0 {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let start = nt_thread_start::Amd64ThreadContext::read(
+                        |address| smss_stack_read(address),
+                        ctx_va,
+                    );
+                    let tid = SCM_WORKER_TID.load(Ordering::Relaxed);
+                    let cid_proc = nt_handler.pm_pid_for_pi(3).unwrap_or(0) as u64;
+                    // Spawn RESUMED into the multiplex, like the SVC/LSASS listeners. This block only
+                    // runs when the recognizer sets `scm_worker_spawn` (gated by SCM_WORKER_ROUTE_ENABLED
+                    // in exec_handler.rs — currently OFF pending the trampoline-entry fault; see the
+                    // BATCH 35 frontier note). When enabled, the worker runs into the loop at badge 15
+                    // (own stack mirror/TEB), reads winlogon's bind PDU, and writes bind_ack.
+                    print_str(b"[scm-worker] spawning + RESUMING REAL per-connection RPC worker: entry=0x");
+                    print_hex((start.rip >> 32) as u32);
+                    print_hex(start.rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_scm_worker_thread(
+                        procs[3].pml4, start.rip, start.rcx, start.rdx, cid_proc, tid, fault_ep,
+                        true,
+                    );
+                    SCM_WORKER_TCB.store(tcb, Ordering::Relaxed);
+                    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, SCM_WORKER_TEB_VA);
+                    print_str(b"[scm-worker] spawned + resumed tcb=0x");
+                    print_hex(tcb as u32);
+                    print_str(b" (runs into the main multiplex, badge 15)\n");
                 }
                 // ★ N-threads multiplex: lsass' (pi 4) LSA server thread — spawned RESUMED into the main
                 // service loop (badge LSASS_LISTENER_BADGE). Same shape as the svc listener; its faults
@@ -3081,8 +3138,8 @@ pub(crate) unsafe fn service_sec_image(
                 // stopping the whole boot. Recv the next event WITHOUT replying → the listener's seL4
                 // thread stays blocked (its ETHREAD/TEB/stack stay mapped), and lsass' main thread + the
                 // rest of the boot keep advancing. Contained per-thread — the point of the multiplex.
-                if is_svc_listener || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
-                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
+                if is_svc_listener || is_scm_worker || is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 || is_wl_worker {
+                    print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_scm_worker { b"[scm-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
                     print_u64(m0);
                     print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
@@ -3308,9 +3365,12 @@ pub(crate) unsafe fn service_sec_image(
                         // — just continue the loop's recv: the runnable server produces events, and the
                         // 45s wall-clock progress watchdog still stops the loop cleanly if it truly stalls.
                         // The SCM server is LIVE only while its listener is signalled AND still running
-                        // (not terminated). Once the listener exits — and until its per-connection worker
-                        // is routed into the multiplex (the flagged N-threads follow-up) — there is no
-                        // signaler for winlogon's SCM read, so parking is terminal → quiesce.
+                        // (not terminated). BATCH 35 routes the per-connection RPC worker into the
+                        // multiplex, but until the worker's trampoline-entry fault is resolved (it PARKS
+                        // unrecoverably — see the BATCH 35 frontier note) it is NOT a live signaler, so we
+                        // do NOT treat a spawned-but-faulted worker as keeping the server live (that would
+                        // hang the loop's recv with no signaler → boot timeout). Once the listener exits
+                        // there is no signaler for winlogon's SCM read, so parking is terminal → quiesce.
                         let scm_server_live = pi == 2
                             && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                             && PIPE_LISTEN_SIGNALLED_COUNT.load(Ordering::Relaxed) != 0
@@ -3651,6 +3711,11 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
             SVC_LISTENER_STACK_FRAMES,
             SVC_LISTENER_STACK_MIRROR_VA,
         ),
+        SCM_WORKER_BADGE => (
+            SCM_WORKER_STACK_BASE,
+            SCM_WORKER_STACK_FRAMES,
+            SCM_WORKER_STACK_MIRROR_VA,
+        ),
         LSASS_LISTENER_BADGE => (
             LSASS_LISTENER_STACK_BASE,
             LSASS_LISTENER_STACK_FRAMES,
@@ -3963,7 +4028,7 @@ fn owner_top_badge(badge: u64) -> u64 {
         WINLOGON_BADGE | WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
             WINLOGON_BADGE
         }
-        SERVICES_BADGE | SVC_LISTENER_BADGE => SERVICES_BADGE,
+        SERVICES_BADGE | SVC_LISTENER_BADGE | SCM_WORKER_BADGE => SERVICES_BADGE,
         LSASS_BADGE | LSASS_LISTENER_BADGE | LSASS_LISTENER2_BADGE | LSASS_LISTENER3_BADGE => {
             LSASS_BADGE
         }

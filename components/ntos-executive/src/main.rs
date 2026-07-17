@@ -366,6 +366,28 @@ pub const LSASS_LISTENER3_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
 pub const LSASS_LISTENER3_ENV_SCRATCH_VA: u64 = 0x0000_0100_107E_0000;
 pub const LSASS_LISTENER3_STACK_MIRROR_VA: u64 = 0x0000_0100_1390_0000;
 pub const LSASS_LISTENER3_BADGE: u64 = 14;
+// --- BATCH 35: services' SCM per-connection RPC WORKER thread (rpcrt4 RPCRT4_new_client, created by
+// the SCM listener via its SECOND NtCreateThread). Runs in services' OWN pml4 (pi 3) at a DISTINCT
+// target-VSpace VA window (a distinct TEB → distinct GS base, distinct stack/tramp/ipcbuf from the
+// SVC_LISTENER which reuses the SM_* VAs) plus distinct executive-side env-scratch + stack-mirror.
+// Same multiplex, badge SCM_WORKER_BADGE. It uses services' pool ETHREAD slot 1 (slot 0 = listener).
+// The target-VSpace window reuses the LSASS_LISTENER3/WL_WORKER3 cluster block (0x1052 stack / 0x1055
+// teb / 0x1057 tramp) — a PROVEN running-thread layout inside the shared WORK_CLUSTER PT (which
+// spawn_sec_image already created in services' pml4). Distinct from SVC_LISTENER (SM block, 0x1044).
+pub const SCM_WORKER_STACK_BASE: u64 = WL_WORKER3_STACK_BASE; // services VSpace (own pml4), 0x1052
+pub const SCM_WORKER_STACK_FRAMES: u64 = 8;
+pub const SCM_WORKER_IPCBUF_VA: u64 = WL_WORKER3_IPCBUF_VA;
+pub const SCM_WORKER_TEB_VA: u64 = WL_WORKER3_TEB_VA;
+pub const SCM_WORKER_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
+/// Executive scratch (3 pages) — distinct from every other thread's (free gap between WL_WORKER2's
+/// 0x107B and WL_WORKER3's 0x107D). FILEBUF PT.
+pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_107C_0000;
+/// Executive-side stack mirror for the SCM worker (its syscall out-params / stack-arg reads / the
+/// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
+pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
+/// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
+/// (pi 3, scm-worker), switching ACTIVE_STACK_MIRROR to the worker's mirror. N-threads sub-selection.
+pub const SCM_WORKER_BADGE: u64 = 15;
 /// ntdll's NtAllocateVirtualMemory system-service number (from its export stub).
 pub const SSN_NT_ALLOCATE_VM: u64 = 0x12;
 /// ReactOS x64 `ntoskrnl/sysfuncs.lst` zero-based service numbers for the global atom family.
@@ -1136,6 +1158,15 @@ static LSASS_LISTENER2_FAULTS: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER3_TCB: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER3_TID: AtomicU64 = AtomicU64::new(0);
 static LSASS_LISTENER3_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// BATCH 35: services' (pi 3) SCM per-connection RPC WORKER thread — spawned DYNAMICALLY by the SCM
+/// RPC listener via its SECOND NtCreateThread (rpcrt4 `RPCRT4_new_client` per accepted connection).
+/// It runs into the SAME service-loop multiplex keyed by [`SCM_WORKER_BADGE`] (its own stack
+/// mirror/TEB, distinct from services' main thread AND its listener). It is the thread that reads
+/// winlogon's bind PDU off `\pipe\ntsvcs` and writes bind_ack — so routing it (not drop-parking its
+/// NtCreateThread with 0xC000009A) is what closes the bind→bind_ack→RROpenSCManagerW round-trip.
+static SCM_WORKER_TCB: AtomicU64 = AtomicU64::new(0);
+static SCM_WORKER_TID: AtomicU64 = AtomicU64::new(0);
+static SCM_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Multiplex-event counter for winlogon's rpcrt4 server WORKER thread (badge WINLOGON_WORKER_BADGE).
 /// Proves the worker actually RUNS (not suspended) — spec `exec_winlogon_worker_multiplex`.
 static WL_WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -2262,6 +2293,8 @@ fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
         Some(&WL_WORKER3_TCB)
     } else if tid == SVC_LISTENER_TID.load(Ordering::Relaxed) {
         Some(&SVC_LISTENER_TCB)
+    } else if tid == SCM_WORKER_TID.load(Ordering::Relaxed) {
+        Some(&SCM_WORKER_TCB)
     } else if tid == LSASS_LISTENER_TID.load(Ordering::Relaxed) {
         Some(&LSASS_LISTENER_TCB)
     } else if tid == LSASS_LISTENER2_TID.load(Ordering::Relaxed) {
@@ -3312,6 +3345,11 @@ struct ExecNtHandler {
     /// (`spawn_svc_listener_thread`, needs services' PML4 + the caller's SP for the CONTEXT). Unlike
     /// the winlogon listener this one runs into the main multiplex (badge SVC_LISTENER_BADGE).
     svc_listener_spawn: bool,
+    /// BATCH 35: set by services' (pi 3) SECOND `NtCreateThread` (the SCM listener's per-connection
+    /// rpcrt4 worker, `RPCRT4_new_client`) so the LOOP spawns + RESUMES the REAL worker thread
+    /// (`spawn_scm_worker_thread`) into the main multiplex (badge SCM_WORKER_BADGE). This is the
+    /// thread that reads winlogon's bind PDU and writes bind_ack (closing the SCM RPC round-trip).
+    scm_worker_spawn: bool,
     /// General NtCreateThread: set by lsass' (pi 4) FIRST `NtCreateThread` (an LSA server thread —
     /// StartAuthenticationPort / LsapRmServerThread) so the LOOP spawns + RESUMES the REAL thread
     /// (`spawn_lsass_listener_thread`) into the main multiplex (badge LSASS_LISTENER_BADGE).
