@@ -2718,7 +2718,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // route flipped ON, and the OFF path is byte-identical to the BATCH-37 green boot (gate
                 // 174). NEXT WALL = winlogon's post-OpenSCManager GUI null-deref + the SCM server's
                 // persistent-thread lifecycle (the terminate specs need updating for a SUCCEEDING RPC).
-                const SCM_WORKER_ROUTE_ENABLED: bool = false;
+                const SCM_WORKER_ROUTE_ENABLED: bool = true;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 3

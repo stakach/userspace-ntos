@@ -164,6 +164,14 @@ pub const NTDLL_BASE: u64 = 0x0000_0100_0080_0000;
 /// Layout (below PE_LOAD_BASE, distinct pages, in the reserved image PT): TEB @0x51 (2 pages),
 /// params+env @0x52 (2 pages), PEB @0x53 (1 page), trampoline @0x55 (1 page).
 pub const SMSS_TRAMP_VA: u64 = 0x0000_0100_0055_0000;
+/// A per-hosted-process page holding a minimal client-side win32k DESKTOPINFO + a zeroed desktop
+/// WND, mapped at spawn (BATCH 39). user32's `GetThreadDesktopInfo()` reads
+/// `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and `GetThreadDesktopWnd()` then derefs
+/// `pDeskInfo->spwnd` (DESKTOPINFO+0x10). Without a non-NULL pDeskInfo an interactive client
+/// (winlogon) NULL-derefs at `[pDeskInfo+0x10]` (cr2=0x10). This page provides a readable
+/// DESKTOPINFO whose spwnd points at a zeroed WND (bracketed by pvDesktopBase/Limit, ulClientDelta=0
+/// so `DesktopPtrToUser(spwnd)` returns it unchanged). See BATCH 39 in ntdll_plan.md.
+pub const SMSS_DESKINFO_VA: u64 = 0x0000_0100_0054_0000;
 pub const SMSS_PEB_VA: u64 = 0x0000_0100_0053_0000;
 pub const SMSS_PARAMS_VA: u64 = 0x0000_0100_0052_0000;
 pub const SMSS_TEB_VA: u64 = 0x0000_0100_0051_0000;
@@ -4252,6 +4260,20 @@ static PM_TERMINATE_THREAD_NO_REPLY: AtomicU64 = AtomicU64::new(0);
 /// the first dropped reply. Their difference proves unrelated callers continued making progress.
 static PM_TERMINATE_THREAD_BADGES: AtomicU64 = AtomicU64::new(0);
 static PM_POST_TERM_CONTINUED_BADGES: AtomicU64 = AtomicU64::new(0);
+/// BATCH 39 — direct NtTerminateThread self-test result (post-loop, throwaway EPROCESS + threads).
+/// This proves the REAL terminate MECHANISM (handle resolution + terminate/exit + TCB-reclaim
+/// gating + no-cascade + unrelated-thread continuation) independently of any live SCM-RPC thread
+/// lifecycle. It REPLACES the batch-38 `exec_live_terminate_thread_*` specs, which counted live
+/// self-exits of the SCM worker/listener — those threads now PERSIST as servers once the SCM RPC
+/// succeeds (route ON), so the live self-exit count is no longer a stable invariant. Bitmask:
+///   0x01 typed Thread handle w/ THREAD_TERMINATE resolves to the target tid
+///   0x02 wrong-access Thread handle is rejected (STATUS_ACCESS_DENIED)
+///   0x04 NULL/current pseudo-handle resolves to the caller's current thread
+///   0x08 terminate_thread marks the ETHREAD Terminated (signalled) with the exit status
+///   0x10 TCB is NOT reclaimable while a process handle still refers to it, IS after it closes
+///   0x20 exit_thread (no-cascade) terminates the init thread yet the EPROCESS stays Running
+///   0x40 an unrelated live thread in the same process keeps running past the terminate
+static PM_TERMINATE_THREAD_SELFTEST: AtomicU64 = AtomicU64::new(0);
 /// ITEM 2b — seL4 MECHANISM-teardown (reclamation) self-test result (post-loop). Bitmask (0b11_1111
 /// = all proven): child untyped carved / frame Untyped-return reclamation (retype→delete→retype ==)
 /// / TCB suspend+delete / PML4+CNode delete / frame-unmap-on-delete / child untyped returned.
@@ -7538,57 +7560,55 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         PM_LIFECYCLE_OK.load(Ordering::Relaxed) == 0b11_1111,
                         &mut passed,
                     );
-                    // ITEM 2a — LIVE terminate-dispatch: csrss.exe's init thread self-exits via
-                    // NtTerminateThread(NtCurrentThread()) during the real boot, and the executive now
-                    // routes that live exit through the real ETHREAD teardown (pm.exit_thread, no
-                    // cascade — csrss's EPROCESS stays Running). `exec_live_terminate_thread_routed` =
-                    // the live exit fired (>=1) AND csrss's (pi=1) main ETHREAD is marked Terminated,
-                    // while smss/winlogon (bits 0/2) are NOT (they don't self-exit at boot) → the exit
-                    // was routed to the CORRECT thread by identity, not the whole process.
-                    // csrss (bit 1), services (bit 3), and lsass (bit 4) self-exit;
-                    // smss/winlogon (bits 0/2) do not.
-                    let term_state = PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed);
+                    // ITEM 2a (BATCH 39 REWRITE) — direct NtTerminateThread MECHANISM specs. These
+                    // previously observed the LIVE self-exit of hosted threads (csrss init thread + the
+                    // SCM worker/listener). With the SCM ncacn_np RPC now SUCCEEDING (route ON), the SCM
+                    // worker/listener PERSIST as servers instead of self-exiting on a broken connection,
+                    // so a live self-exit COUNT is no longer a stable invariant (it was, in effect,
+                    // asserting the RPC-broken teardown). The specs are rewritten to drive an EXPLICIT
+                    // throwaway process+thread create→terminate (`PM_TERMINATE_THREAD_SELFTEST`, run
+                    // post-loop) that exercises the SAME real terminate path the handler uses
+                    // (`resolve_terminate_thread_handle` + `terminate_thread`/`exit_thread` +
+                    // `can_reclaim_thread`) — decoupled from the SCM-RPC lifecycle, still meaningful.
+                    let term_self = PM_TERMINATE_THREAD_SELFTEST.load(Ordering::Relaxed);
+                    // routed: a typed Thread handle w/ THREAD_TERMINATE resolves to the target, a
+                    // wrong-access handle is rejected, the NULL/current pseudo-handle resolves to the
+                    // caller, and terminate marks JUST that ETHREAD Terminated+signalled (0x01|02|04|08).
                     check(
                         b"exec_live_terminate_thread_routed",
-                        PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) >= 3
-                            && (term_state & 0b010) != 0
-                            && (term_state & 0b1000) != 0
-                            && (term_state & 0b1_0000) != 0
-                            && (term_state & 0b101) == 0,
+                        term_self & (0x01 | 0x02 | 0x04 | 0x08) == (0x01 | 0x02 | 0x04 | 0x08),
                         &mut passed,
                     );
+                    // tcb_reclaimed: the terminated ETHREAD's TCB is NOT reclaimable while a process
+                    // handle still refers to it, and IS reclaimable after that handle closes (0x10).
                     check(
                         b"exec_live_terminate_thread_tcb_reclaimed",
-                        PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) >= 3,
+                        term_self & 0x10 != 0,
                         &mut passed,
                     );
-                    let terminated_badges = PM_TERMINATE_THREAD_BADGES.load(Ordering::Relaxed);
-                    let continued_badges = PM_POST_TERM_CONTINUED_BADGES.load(Ordering::Relaxed);
+                    // no_reply: the no-cascade exit_thread path (csrss "CSRSRV keeps us going" shape) —
+                    // an init thread exits yet the EPROCESS stays Running because a worker remains (0x20).
                     check(
                         b"exec_live_terminate_thread_no_reply",
-                        PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) >= 3,
+                        term_self & 0x20 != 0,
                         &mut passed,
                     );
+                    // unrelated_continued: an unrelated live thread in the SAME process keeps running
+                    // past the victim's termination — per-thread, not per-process, teardown (0x40).
                     check(
                         b"exec_live_terminate_thread_unrelated_continued",
-                        continued_badges & !terminated_badges != 0,
+                        term_self & 0x40 != 0,
                         &mut passed,
                     );
-                    print_str(b"[ntos-exec] item2a live-terminate-thread: count=0x");
+                    print_str(b"[ntos-exec] item2a terminate-thread-selftest bits=0x");
+                    print_hex(term_self as u32);
+                    print_str(b" live-count=0x");
                     print_hex(PM_TERMINATE_THREAD_LIVE.load(Ordering::Relaxed) as u32);
                     print_str(b" ethread-terminated-bits=0x");
                     print_hex(PM_TERMINATE_THREAD_STATE.load(Ordering::Relaxed) as u32);
                     print_str(b" nt-terminate-process-calls=0x");
                     print_hex(PM_TERMINATE_CALLS.load(Ordering::Relaxed) as u32);
-                    print_str(b" tcb-reclaimed=0x");
-                    print_hex(PM_TERMINATE_THREAD_TCB_RECLAIMED.load(Ordering::Relaxed) as u32);
-                    print_str(b" no-reply=0x");
-                    print_hex(PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) as u32);
-                    print_str(b" term-badges=0x");
-                    print_hex(terminated_badges as u32);
-                    print_str(b" continued-badges=0x");
-                    print_hex(continued_badges as u32);
-                    print_str(b"\n");
+                    print_str(b")\n");
                     // ITEM 2b — seL4 MECHANISM teardown (reclamation) proven end-to-end on a THROWAWAY
                     // untyped/caps: the kernel's CNodeDelete does full reclamation (TCB suspend, frame-
                     // PTE unmap, pool-slot release, AND parent-Untyped free_index rollback = return-to-

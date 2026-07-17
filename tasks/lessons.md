@@ -45,3 +45,37 @@
   can't hide. lsass's 3 listeners worked only because their scratch VAs (0x1079/107A/107E) happened to be
   genuinely free; the "3rd thread" framing was a red herring. Fix = one-line VA change (0x107C → 0x1075,
   a real free gap), pure executive, no rust-micro change.
+
+## BATCH 39 — diagnose a NULL-deref CHAIN at the actual null, not the "obvious" pointer
+Symptom: winlogon crash-parks at user32 `GetThreadDesktopWnd` (RVA 0x50009, `mov rax,[rax+0x10]`,
+cr2=0x10). The instruction reads `[pDeskInfo+0x10]`, so it LOOKS like `pDeskInfo` (TEB+0x820) is NULL.
+I seeded pDeskInfo — the fault PERSISTED. A **fault-time read-back diagnostic** (read the pointer via
+the executive's persistent TEB alias, print it, then RESUME) proved pDeskInfo was ALREADY my seeded
+value, so it was NOT the null. The real null was ONE call earlier: `GetThreadDesktopInfo()` returns
+NULL when its guard `GetW32ThreadInfo()` (`[TEB+0x78]`=Win32ThreadInfo) is NULL — SHORT-CIRCUITING
+before it ever reads pDeskInfo. So `rax==0` at the fault. LESSON: for a `mov rax,[rax+off]` NULL-deref,
+`rax` is the RETURN VALUE of the preceding call — trace THAT function's control flow (it may return NULL
+from an early guard on a DIFFERENT field), don't assume the field named in the faulting instruction is
+the null one. A one-line fault-time readback of the suspected pointer disproves the wrong hypothesis in
+a single boot. Fix = seed BOTH TEB.Win32ThreadInfo(+0x78) AND CLIENTINFO.pDeskInfo(+0x820).
+
+## BATCH 39 — win32k's IntSetThreadDesktop ELSE branch actively CLEARS client CLIENTINFO
+A spawn-time TEB seed of Win32ThreadInfo/pDeskInfo is not enough: win32k's real `IntSetThreadDesktop`
+(desktop.c:3456), run KeStackAttachProcess'd to the client during `NtUserProcessConnect`, takes its
+ELSE branch (client `pti->rpdesk==NULL` in our host) and sets `pci->pDeskInfo=NULL` — clobbering the
+seed. Reliable fix = LAZILY REPAIR at the exact fault (scoped to `rip==<site> && cr2==<off>`) via the
+executive's persistent alias of the client's TEB frame (env-scratch base `0x…107C_0000`, never unmapped
+after spawn) + `reply_recv_badge` to re-run the faulting instruction. Idempotent, source-faithful.
+
+## BATCH 39 — a SUCCEEDING RPC changes thread lifecycle → lifecycle-observing specs must be re-anchored
+Specs that COUNT live self-exits of server threads (SCM worker/listener) were implicitly asserting the
+BROKEN-RPC teardown. Once the RPC succeeds those threads PERSIST as servers → the count drops → the
+specs go red. Re-anchor them to a DIRECT throwaway create→terminate self-test (same real mechanism:
+`resolve_terminate_thread_handle`/`terminate_thread`/`exit_thread`/`can_reclaim_thread`), decoupled from
+the RPC lifecycle. Keep the spec NAMES (gate count stable) but assert the mechanism, not the trajectory.
+
+## BATCH 39 — route-ON needs a "driving-process crash → quiesce" so the boot reaches the gate
+When the top interactive process (winlogon) crash-parks at its GUI/login frontier, the remaining live
+top-level processes are just idle RPC servers (SCM/LSA) with no client left — the loop blocks in `recv`
+forever → timeout. Add: `pi==2 crash && LSA signalled -> mark crash_parked + stop + break` so the gate
+runs cleanly. This is the "break-on-winlogon-crash quiesce."

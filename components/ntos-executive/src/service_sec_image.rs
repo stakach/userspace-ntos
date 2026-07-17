@@ -890,6 +890,37 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
+                // BATCH 39 — winlogon's user32 GetThreadDesktopWnd (user32 RVA 0x50009 = base
+                // 0x80150000 -> 0x801a0009) derefs `pci->pDeskInfo->spwnd` (`mov rax,[rax+0x10]`, cr2=0x10)
+                // and NULL-derefs because win32k's IntSetThreadDesktop ELSE branch (desktop.c:3456) cleared
+                // the client `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) during winlogon's NtUserProcessConnect
+                // (our host doesn't wire the per-thread desktop-heap view). Lazily REPAIR the missing client
+                // DESKTOPINFO pointer at the exact fault (via the executive's persistent alias of winlogon's
+                // TEB frame) and RESUME — the retry reads `[SMSS_DESKINFO_VA+0x10]` = the seeded spwnd and
+                // GetThreadDesktopWnd returns a valid (zeroed) desktop window, so winlogon advances into its
+                // GUI/login init instead of crash-parking. Idempotent + scoped to this exact fault site.
+                if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
+                    const WLSCR: u64 = 0x0000_0100_107C_0000;
+                    // The NULL is `GetThreadDesktopInfo()` returning NULL because `GetW32ThreadInfo()`
+                    // (`[TEB+0x78]` = TEB.Win32ThreadInfo) is NULL (its guard short-circuits BEFORE it
+                    // reads pDeskInfo) — so `GetThreadDesktopWnd` faults at `[NULL+0x10]`, cr2=0x10. Seed
+                    // BOTH: TEB.Win32ThreadInfo (TEB+0x78) non-NULL so GetW32ThreadInfo returns non-NULL,
+                    // AND TEB.Win32ClientInfo.pDeskInfo (TEB+0x820) -> the client DESKTOPINFO (+ulClientDelta
+                    // 0). Point Win32ThreadInfo at the readable DESKTOPINFO page (non-NULL, mapped).
+                    let cur = core::ptr::read_volatile((WLSCR + 0x78) as *const u64);
+                    core::ptr::write_volatile((WLSCR + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
+                    core::ptr::write_volatile((WLSCR + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
+                    core::ptr::write_volatile((WLSCR + 0x828) as *mut u64, 0); // ulClientDelta
+                    print_str(b"[wl-deskinfo-fixup] GetThreadDesktopWnd Win32ThreadInfo was 0x");
+                    print_hex(cur as u32);
+                    print_str(b" -> reseeded Win32ThreadInfo+pDeskInfo=0x");
+                    print_hex(SMSS_DESKINFO_VA as u32);
+                    print_str(b"; RESUME winlogon\n");
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 print_str(if pi == 1 { b"[csrss vmf] NULL/low deref ip=0x" } else if pi == 2 { b"[winlogon vmf] NULL/low deref ip=0x" } else { b"[smss vmf] NULL/low deref ip=0x" });
                 print_hex((m0 >> 32) as u32);
                 print_hex(m0 as u32);
@@ -927,6 +958,23 @@ pub(crate) unsafe fn service_sec_image(
                         k += 1;
                     }
                     print_str(b" ]\n");
+                }
+                // BATCH 39 — winlogon (pi 2) is the process the whole boot drives toward; once it has
+                // crossed OpenSCManager (the SCM RPC round-trip) and reached its GUI/login init, the
+                // remaining "live" top-level processes (services / lsass) are just the SCM + LSA RPC
+                // SERVERS with no live client left. So when winlogon hits an unrecoverable crash AT its
+                // GUI/login frontier (its next wall past OpenSCManager — currently msgina.dll's login
+                // flow, RVA 0x95f8), with LSA already signalled (steady state), QUIESCE to the gate
+                // instead of blocking the loop's recv forever (the servers can't advance without
+                // winlogon). This makes the route-ON boot reach the gate cleanly (BATCH 38 flagged this
+                // as the "break-on-winlogon-crash quiesce"). Mark winlogon crash-parked first so the
+                // gate's crash state is honest.
+                if pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0 {
+                    crash_parked |= 1u64 << owner_top_badge(badge);
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
+                    stop = m0;
+                    break;
                 }
                 // Unrecoverable NULL/low deref on a top-level process thread — a crash. Park+log
                 // (the per-process detail above already printed; park_and_log adds the [parked] line).
@@ -3127,6 +3175,24 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
                 print_hex(st as u32);
                 print_str(b"\n");
+                // BATCH 39 — REASSERT winlogon's client CLIENTINFO.pDeskInfo after any win32k call.
+                // spawn_sec_image seeds TEB.Win32ClientInfo.pDeskInfo (TEB+0x820) with a valid client
+                // DESKTOPINFO so an interactive client's user32 GetThreadDesktopWnd() (RVA 0x50009,
+                // `mov rax,[pDeskInfo+0x10]`) doesn't NULL-deref. BUT win32k's real IntSetThreadDesktop
+                // (desktop.c:3456), run KeStackAttachProcess'd to winlogon during NtUserProcessConnect,
+                // takes its ELSE branch (winlogon's pti->rpdesk is NULL in our host — the per-thread
+                // desktop-heap view isn't wired) and CLEARS `pci->pDeskInfo = NULL`, re-introducing the
+                // crash. The executive still holds winlogon's TEB frame mapped at its env-scratch base
+                // (WINLOGON_SCR_BASE+0x820, never unmapped after spawn), so re-write it here after every
+                // winlogon (pi 2) win32k dispatch — cheap, idempotent, keeps pDeskInfo valid by the time
+                // winlogon returns to user mode. (Only pi 2 is interactive + hits GetThreadDesktopWnd;
+                // the non-interactive services/lsass short-circuit before their user32 desktop path.)
+                if pi == 2 {
+                    const WINLOGON_SCR_BASE: u64 = 0x0000_0100_107C_0000;
+                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
+                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
+                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, 0); // ulClientDelta
+                }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
                 // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
                 // seeds the host prerequisites the display init depends on (the system font +
@@ -3403,6 +3469,16 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         } else {
                             WINLOGON_SCM_PARKED.store(1, Ordering::Relaxed);
+                            // BATCH 39 — defense-in-depth REASSERT of winlogon's client CLIENTINFO on the
+                            // SCM-RPC read-park path (winlogon's LAST activity before its post-OpenSCManager
+                            // GUI init calls user32 GetThreadDesktopWnd). win32k's IntSetThreadDesktop ELSE
+                            // branch clears TEB.Win32ThreadInfo(+0x78)/pDeskInfo(+0x820); re-seed via the
+                            // executive's persistent alias of winlogon's TEB frame. (The primary guarantee
+                            // is the spawn seed + the fault-time repair; this keeps the window minimal.)
+                            const WLSCR: u64 = 0x0000_0100_107C_0000;
+                            core::ptr::write_volatile((WLSCR + 0x78) as *mut u64, SMSS_DESKINFO_VA);
+                            core::ptr::write_volatile((WLSCR + 0x820) as *mut u64, SMSS_DESKINFO_VA);
+                            core::ptr::write_volatile((WLSCR + 0x828) as *mut u64, 0);
                             print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
                         }
                     }
@@ -3496,6 +3572,118 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         PM_LIFECYCLE_OK.store(life_ok, Ordering::Relaxed);
+
+        // BATCH 39 — direct NtTerminateThread MECHANISM self-test (throwaway EPROCESS + threads).
+        // Drives the exact terminate path the handler uses (`resolve_terminate_thread_handle` +
+        // `terminate_thread`/`exit_thread` + `can_reclaim_thread`) WITHOUT depending on any live
+        // hosted-thread self-exit. This replaces the batch-38 live-lifecycle terminate specs: with
+        // the SCM RPC succeeding (route ON), the SCM worker/listener PERSIST as servers instead of
+        // self-exiting, so a live self-exit COUNT is no longer a stable invariant. Runs post-loop on
+        // throwaway processes/threads only → the 5 hosted processes are untouched (byte-identical).
+        {
+            use nt_process::{HandleObject, ProcessState, ThreadState};
+            const THREAD_TERMINATE: u32 = 0x0001;
+            let mut term_ok = 0u64;
+            let parent = nt_handler.pm_pid_for_pi(0);
+            // Process A: two threads. `victim` is terminated via a typed Thread handle; `bystander`
+            // must keep running (proves per-thread, not per-process, termination).
+            let pa = nt_handler.pm.create_process("term-selftest-a.exe", parent, None);
+            if let (Ok(victim), Ok(bystander)) = (
+                nt_handler.pm.create_thread(pa, 0x2000, 0, false),
+                nt_handler.pm.create_thread(pa, 0x3000, 0, false),
+            ) {
+                // A typed Thread handle with THREAD_TERMINATE resolves to the target tid.
+                let hv = nt_handler
+                    .pm
+                    .insert_handle(pa, HandleObject::Thread(victim), THREAD_TERMINATE)
+                    .ok();
+                if let Some(hv) = hv {
+                    if nt_handler.pm.resolve_terminate_thread_handle(
+                        pa,
+                        bystander,
+                        hv as u64,
+                        THREAD_TERMINATE,
+                    ) == Ok(victim)
+                    {
+                        term_ok |= 0x01;
+                    }
+                }
+                // A Thread handle WITHOUT THREAD_TERMINATE is rejected (access check enforced).
+                if let Ok(hna) = nt_handler
+                    .pm
+                    .insert_handle(pa, HandleObject::Thread(victim), 0)
+                {
+                    if nt_handler
+                        .pm
+                        .resolve_terminate_thread_handle(pa, bystander, hna as u64, THREAD_TERMINATE)
+                        .is_err()
+                    {
+                        term_ok |= 0x02;
+                    }
+                    let _ = nt_handler.pm.close_handle(pa, hna);
+                }
+                // The NULL/current pseudo-handle form (kernel32!ExitThread) resolves to the caller.
+                if nt_handler
+                    .pm
+                    .resolve_terminate_thread_handle(pa, victim, 0, THREAD_TERMINATE)
+                    == Ok(victim)
+                {
+                    term_ok |= 0x04;
+                }
+                // Terminate the victim: it becomes Terminated (signalled) with the exit status; the
+                // bystander stays Ready and the EPROCESS is NOT cascaded (a live thread remains).
+                if nt_handler.pm.terminate_thread(victim, 0xDEAD).is_ok()
+                    && nt_handler
+                        .pm
+                        .thread(victim)
+                        .is_some_and(|t| t.state == ThreadState::Terminated && t.exit_status == Some(0xDEAD))
+                    && nt_handler.pm.is_thread_signaled(victim)
+                    && nt_handler
+                        .pm
+                        .thread(bystander)
+                        .is_some_and(|t| t.state != ThreadState::Terminated)
+                    && nt_handler
+                        .pm
+                        .process(pa)
+                        .is_some_and(|p| p.state == ProcessState::Running)
+                {
+                    term_ok |= 0x08;
+                    term_ok |= 0x40; // the unrelated bystander thread continued
+                }
+                // TCB-reclaim gating: while a process handle still refers to the terminated victim it
+                // must NOT be reclaimable (TID/slot aliasing hazard); after every such handle closes
+                // it becomes reclaimable. Mirrors the handler's live TCB-reclaim guard.
+                if let Some(hv) = hv {
+                    let blocked = !nt_handler.pm.can_reclaim_thread(victim);
+                    let _ = nt_handler.pm.close_handle(pa, hv);
+                    if blocked && nt_handler.pm.can_reclaim_thread(victim) {
+                        term_ok |= 0x10;
+                    }
+                }
+            }
+            // Process B: exercise the NO-CASCADE exit_thread path the handler uses for a process
+            // whose OTHER threads keep it alive (the csrss "CSRSRV keeps us going" shape). The init
+            // thread exits but a worker thread remains → the EPROCESS stays Running.
+            let pb = nt_handler.pm.create_process("term-selftest-b.exe", parent, None);
+            if let (Ok(init), Ok(_worker)) = (
+                nt_handler.pm.create_thread(pb, 0x4000, 0, false),
+                nt_handler.pm.create_thread(pb, 0x5000, 0, false),
+            ) {
+                if nt_handler.pm.exit_thread(init, 0x1).is_ok()
+                    && nt_handler
+                        .pm
+                        .thread(init)
+                        .is_some_and(|t| t.state == ThreadState::Terminated)
+                    && nt_handler
+                        .pm
+                        .process(pb)
+                        .is_some_and(|p| p.state == ProcessState::Running)
+                {
+                    term_ok |= 0x20;
+                }
+            }
+            PM_TERMINATE_THREAD_SELFTEST.store(term_ok, Ordering::Relaxed);
+        }
 
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
