@@ -2964,6 +2964,23 @@ fn registry_base_path(relative_to: u32) -> Option<&'static str> {
     }
 }
 
+/// Does the NUL-terminated UTF-16 `name_ptr` equal the ASCII `want` (case-sensitive)?
+#[cfg(target_arch = "x86_64")]
+unsafe fn name_is(name_ptr: *const u16, want: &[u8]) -> bool {
+    if name_ptr.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < want.len() {
+        let c = unsafe { *name_ptr.add(i) };
+        if c != want[i] as u16 {
+            return false;
+        }
+        i += 1;
+    }
+    unsafe { *name_ptr.add(i) == 0 }
+}
+
 /// Dispatch one registry value to the caller's QueryRoutine (or the DIRECT copy), applying
 /// REG_EXPAND_SZ expansion (unless NOEXPAND) exactly like RtlpCallQueryRegistryRoutine.
 /// `name_ptr` is the value name (UTF-16, NUL-terminated); `ty`/`data`/`len` the value.
@@ -2979,6 +2996,59 @@ unsafe fn dispatch_value(
     len: u32,
 ) -> u32 {
     use alloc::vec::Vec;
+    // REG_MULTI_SZ split (skip if NOEXPAND) — faithful port of ReactOS `RtlpCallQueryRegistryRoutine`
+    // (sdk/lib/rtl/registry.c:254): a multi-string value is dispatched ONE SUB-STRING AT A TIME, each
+    // with Type=REG_SZ and Length = that sub-string's byte length INCLUDING its terminating NUL. This
+    // is exactly what auth-package enumeration relies on: lsass' `LsapAddAuthPackage` reads the
+    // `Lsa\Authentication Packages` MULTI_SZ and does `PackageName.Length = ValueLength - sizeof(WCHAR)`
+    // per string → without the split it would receive the WHOLE blob (`msv1_0\0\0`) as one call and
+    // build a garbage DLL name (`msv1_0<NUL>.dll`) that misses the FS. With the split it gets `msv1_0\0`
+    // (14 bytes) → name `msv1_0` → the msv1_0.dll load resolves. General: applies to every MULTI_SZ
+    // callback query, not just auth packages.
+    // `ObjectDirectories` (smss' Session-Manager config) is the ONE carve-out (see the block below);
+    // its callback iterates the blob internally + issues object-namespace syscalls, so it works with
+    // the whole blob AND must NOT be split here (an executive stack-mirror fragility during the
+    // concurrent SmpApiLoop-thread spawn corrupts smss' stack on the extra syscall — flagged as an
+    // executive follow-up, not an ntdll bug). Every OTHER MULTI_SZ callback query IS split, faithfully.
+    if (entry.flags & RTL_QUERY_REGISTRY_NOEXPAND) == 0
+        && ty == REG_MULTI_SZ
+        && len >= 4
+        && !unsafe { name_is(name_ptr, b"ObjectDirectories") }
+    {
+        let units = (len as usize) / 2;
+        // SAFETY: [data, data+len) is the value body; interpret as UTF-16.
+        let blob: &[u16] = unsafe { core::slice::from_raw_parts(data as *const u16, units) };
+        // ValueEnd = Data + Length - 2*sizeof(NUL): stop before the block's terminating empty string.
+        // (units - 2 leaves off the final double-NUL, matching registry.c's `ValueEnd`.)
+        let value_end = units.saturating_sub(2);
+        let mut start = 0usize;
+        let mut status = STATUS_SUCCESS_U as u32;
+        while start < value_end {
+            // Advance past this sub-string's terminating NUL (registry.c: `while (*p++);`).
+            let mut p = start;
+            while p < units && blob[p] != 0 {
+                p += 1;
+            }
+            p += 1; // include the terminating NUL, exactly like `p` post-incremented past it
+            let sub_len_bytes = ((p - start) * 2) as u32; // Length INCLUDING the NUL
+            // SAFETY: the sub-string [start,p) lies within the value body; call the routine as REG_SZ.
+            let st = unsafe {
+                dispatch_value(
+                    entry,
+                    name_ptr,
+                    REG_SZ,
+                    (data as *const u16).add(start) as *const u8,
+                    sub_len_bytes,
+                )
+            };
+            if st != STATUS_SUCCESS_U as u32 {
+                status = st;
+                break;
+            }
+            start = p;
+        }
+        return status;
+    }
     // REG_EXPAND_SZ expansion (skip if NOEXPAND).
     let mut expanded: Option<Vec<u16>> = None;
     if (entry.flags & RTL_QUERY_REGISTRY_NOEXPAND) == 0
