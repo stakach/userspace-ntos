@@ -2926,6 +2926,14 @@ static KBD_LAYOUT_LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SVC_USER32_FAKE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Monotonic fake class-atom allocator (0xC000.. RTL_ATOM range) for the services/lsass 0x10b4 fake.
 pub(crate) static SVC_FAKE_CLASS_ATOM: AtomicU64 = AtomicU64::new(0xC100);
+/// Monotonic fake GDI-handle allocator for the non-interactive-service (lsass) GDI-object-creation
+/// SSNs (0x106c NtGdiCreateBitmap / 0x10b5 NtGdiGetStockObject). A non-interactive service's GUI-DLL
+/// DllMains (comctl32/uxtheme) create cached GDI objects but never draw with them; routing these into
+/// win32k trips the same EngCopyBits (RVA 0x1cbdd8) runaway blit that 0x125b/0x11e0 did (garbage
+/// SURFOBJ dims for our faked service GDI state). Return a synthetic non-NULL GDI handle (upper byte
+/// mimics the interactive path's 0x00050048/0x0010004a GDI-handle shape) so the client stores a
+/// plausible handle and its DllMain proceeds — the same non-interactive-service short-circuit pattern.
+pub(crate) static SVC_FAKE_GDI_HANDLE: AtomicU64 = AtomicU64::new(0x0050_0100);
 /// Count of NtEnumerateKey calls modeled as empty (STATUS_NO_MORE_ENTRIES).
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).

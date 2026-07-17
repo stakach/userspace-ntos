@@ -2830,6 +2830,27 @@ pub(crate) unsafe fn service_sec_image(
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] lsass NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
                     (1, true)
+                } else if (m0 == 0x106c || m0 == 0x10b5) && svc_noninteractive {
+                    // ★ NON-INTERACTIVE SERVICE GDI object-creation (0x106c NtGdiCreateBitmap /
+                    // 0x10b5 NtGdiGetStockObject — w32ksvc64.h) for lsass. After 0x125b/0x11e0, lsass'
+                    // GUI-DLL DllMains (comctl32/uxtheme) create cached GDI objects; routing these into
+                    // win32k trips the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit (a fault-FREE spin the
+                    // executive cannot interrupt — it's blocked in win32k_dispatch's recv). A non-interactive
+                    // service creates these objects but NEVER draws with them, so return a synthetic non-NULL
+                    // GDI handle (mimicking the interactive path's 0x00050048/0x0010004a GDI-handle shape) so
+                    // the client's DllMain stores a plausible handle and proceeds — the same
+                    // non-interactive-service short-circuit as 0x103d/0x10b4/0x125b/0x11e0. Scoped to lsass
+                    // (badge 8); the interactive clients' real routed 0x106c/0x10b5 (BATCH 16, bounded via
+                    // zero-fill) are untouched. If a service later performs a REAL blit with the handle that
+                    // is the next diagnosed wall (a service normally does not).
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    let h = SVC_FAKE_GDI_HANDLE.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] lsass NtGdi obj-create(0x");
+                    print_hex(m0 as u32);
+                    print_str(b") FAKED (non-interactive service, no GDI blit) -> handle 0x");
+                    print_hex(h as u32);
+                    print_str(b"\n");
+                    (h as i32, true)
                 } else {
                     win32k_dispatch(m0, d_a0, d_a1, a2, a3)
                 };
