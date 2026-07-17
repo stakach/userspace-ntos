@@ -890,14 +890,35 @@ pub(crate) unsafe fn service_sec_image(
                         // Walk the REAL stack (TCB rsp) for return addresses (ntdll 0x100_00xxxxxx / a
                         // mapped DLL 0x80xxxxxx). The nearest one identifies the faulting caller.
                         let rsp = regs[1];
+                        // ★ TRUNC PROBE: [rsp] is the return address the CALLER pushed with its
+                        // `call [mem]` that jumped to the bare RVA. Print [rsp+0..0x20] unconditionally
+                        // so the immediate caller (module+RVA) is visible.
+                        print_str(b"[trunc] top-of-stack:");
+                        {
+                            let mut j: u64 = 0;
+                            while j < 4 {
+                                let v = smss_stack_read(rsp + j * 8);
+                                print_str(b" [rsp+0x");
+                                print_hex((j * 8) as u32);
+                                print_str(b"]=0x");
+                                print_hex((v >> 32) as u32);
+                                print_hex(v as u32);
+                                j += 1;
+                            }
+                            print_str(b"\n");
+                        }
                         print_str(b"[vmf-out] instr-fetch [rsp..]:");
                         let mut k: u64 = 0;
                         let mut printed: u64 = 0;
                         while k < 64 && printed < 12 {
                             let v = smss_stack_read(rsp + k * 8);
                             let is_ntdll = v >= 0x0000_0100_0000_0000 && v < 0x0000_0100_0100_0000;
-                            let is_dll = v >= 0x8000_0000 && v < 0x8080_0000;
-                            if is_ntdll || is_dll {
+                            // Widen to ALL mapped DLLs (0x8000_0000..0x8300_0000 covers rpcrt4/lsasrv/…)
+                            // + lsass.exe/heap (0x100_0056_0000..0x100_00d0_0000) so the immediate
+                            // rpcrt4/lsasrv caller + the heap dispatch object are captured.
+                            let is_dll = v >= 0x8000_0000 && v < 0x8300_0000;
+                            let is_lsass = v >= 0x0000_0100_0055_0000 && v < 0x0000_0100_00d0_0000;
+                            if is_ntdll || is_dll || is_lsass {
                                 print_str(b" +0x");
                                 print_hex((k * 8) as u32);
                                 print_str(b":0x");

@@ -6373,6 +6373,41 @@ pub unsafe extern "C" fn zw_callback_return() {
     );
 }
 
+// -------------------------------------------------------------------------------------------------
+// BATCH 27 — the Zw* aliases the lsass authentication tree (lsasrv/samsrv/msv1_0/secur32) imports.
+// Zw* and Nt* are identical exports (same SSN, same ABI) — a naked tail-`jmp` to the Nt* trap/native
+// stub so the Zw name lands in the export directory and inherits whatever transport the Nt* stub
+// uses. WITHOUT these exports the on-target loader leaves the importer's IAT slot at the RAW
+// IMAGE_IMPORT_BY_NAME thunk (a bare `.rdata` RVA), and the first `call *[IAT]` jumps to that bare
+// RVA → an instruction-fetch fault (the `0x3a288` = lsasrv's unresolved `ntdll!RtlpNtOpenKey` wall).
+// =================================================================================================
+
+/// Emit a naked `Zw*` alias that tail-`jmp`s to the matching `Nt*` trap/native stub.
+macro_rules! zw_alias {
+    ($fn:ident, $name:literal, $nt:ident) => {
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        #[export_name = $name]
+        #[doc = concat!("`", $name, "` — alias of the matching `Nt*` stub (naked tail-`jmp`).")]
+        pub unsafe extern "C" fn $fn() {
+            core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::$nt);
+        }
+    };
+}
+
+zw_alias!(zw_close, "ZwClose", nt_close);
+zw_alias!(zw_connect_port, "ZwConnectPort", nt_connect_port);
+zw_alias!(zw_create_event, "ZwCreateEvent", nt_create_event);
+zw_alias!(zw_create_key, "ZwCreateKey", nt_create_key);
+zw_alias!(zw_enumerate_key, "ZwEnumerateKey", nt_enumerate_key);
+zw_alias!(zw_enumerate_value_key, "ZwEnumerateValueKey", nt_enumerate_value_key);
+zw_alias!(zw_free_virtual_memory, "ZwFreeVirtualMemory", nt_free_virtual_memory);
+zw_alias!(zw_open_event, "ZwOpenEvent", nt_open_event);
+zw_alias!(zw_query_value_key, "ZwQueryValueKey", nt_query_value_key);
+zw_alias!(zw_request_wait_reply_port, "ZwRequestWaitReplyPort", nt_request_wait_reply_port);
+zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
+zw_alias!(zw_wait_for_single_object, "ZwWaitForSingleObject", nt_wait_for_single_object);
+
 // =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
 // Raw UNICODE_STRING / ANSI_STRING (both the 16-byte {Length:u16, MaximumLength:u16, _pad:u32,
@@ -6470,6 +6505,202 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (allocate, out_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+// =================================================================================================
+// BATCH 27 — the six Rtl* stragglers the lsass tree (lsasrv/msv1_0/samlib/netapi32) imports.
+// Faithful ports of the ReactOS sdk/lib/rtl bodies; leaving any unexported would strand the
+// importer's IAT slot at a raw by-name thunk (the same 0x3a288-class instruction-fetch fault).
+// =================================================================================================
+
+/// `RtlEraseUnicodeString(PUNICODE_STRING String)` — zero the buffer + clear Length
+/// (`sdk/lib/rtl/unicode.c:1722`).
+///
+/// # Safety
+/// `string` a valid writable UNICODE_STRING (or NULL).
+#[export_name = "RtlEraseUnicodeString"]
+pub unsafe extern "system" fn rtl_erase_unicode_string(string: PUnicodeString) {
+    if string.is_null() {
+        return;
+    }
+    // SAFETY: string valid per the contract.
+    unsafe {
+        let buf = (*string).buffer as *mut u8;
+        let max = (*string).maximum_length as usize;
+        if !buf.is_null() && max != 0 {
+            core::ptr::write_bytes(buf, 0, max);
+            (*string).length = 0;
+        }
+    }
+}
+
+/// `RtlValidateUnicodeString(ULONG Flags, PCUNICODE_STRING String)` — validate shape
+/// (`sdk/lib/rtl/unicode.c:2558`). Flags must be 0; a NULL string is VALID; else Buffer/Length/
+/// MaximumLength must be consistent + WCHAR-aligned.
+///
+/// # Safety
+/// `string` a valid UNICODE_STRING or NULL.
+#[export_name = "RtlValidateUnicodeString"]
+pub unsafe extern "system" fn rtl_validate_unicode_string(
+    flags: u32,
+    string: PCUnicodeString,
+) -> NtStatus {
+    if flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if string.is_null() {
+        return STATUS_SUCCESS;
+    }
+    // SAFETY: string valid per the contract.
+    let (buf, len, max) =
+        unsafe { ((*string).buffer, (*string).length, (*string).maximum_length) };
+    let empty_but_nonzero = buf == 0 && (len != 0 || max != 0);
+    if !empty_but_nonzero && (len % 2 == 0) && (max % 2 == 0) && (len <= max) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_PARAMETER
+    }
+}
+
+/// `RtlSecondsSince1970ToTime(ULONG SecondsSince1970, PLARGE_INTEGER Time)` — convert to NT time
+/// (`sdk/lib/rtl/time.c:406`): `Time = Seconds * TICKSPERSEC + TICKSTO1970`.
+///
+/// # Safety
+/// `time` a valid writable LARGE_INTEGER (i64).
+#[export_name = "RtlSecondsSince1970ToTime"]
+pub unsafe extern "system" fn rtl_seconds_since_1970_to_time(
+    seconds_since_1970: u32,
+    time: *mut i64,
+) {
+    const TICKSPERSEC: i64 = 10_000_000;
+    const TICKSTO1970: i64 = 0x019D_B1DE_D53E_8000;
+    if time.is_null() {
+        return;
+    }
+    // SAFETY: time writable per the contract.
+    unsafe { core::ptr::write_unaligned(time, seconds_since_1970 as i64 * TICKSPERSEC + TICKSTO1970) };
+}
+
+/// `RtlCopyLuidAndAttributesArray(ULONG Count, PLUID_AND_ATTRIBUTES Src, PLUID_AND_ATTRIBUTES Dest)`
+/// — copy `Count` LUID_AND_ATTRIBUTES (12 bytes each: LUID(8) + Attributes(4)) (`sdk/lib/rtl/luid.c:33`).
+///
+/// # Safety
+/// `src`/`dest` valid arrays of `count` LUID_AND_ATTRIBUTES.
+#[export_name = "RtlCopyLuidAndAttributesArray"]
+pub unsafe extern "system" fn rtl_copy_luid_and_attributes_array(
+    count: u32,
+    src: *const u8,
+    dest: *mut u8,
+) {
+    if src.is_null() || dest.is_null() {
+        return;
+    }
+    // LUID_AND_ATTRIBUTES = { LUID Luid(8); ULONG Attributes(4); } = 12 bytes, no tail padding in the array.
+    let bytes = (count as usize) * 12;
+    // SAFETY: both arrays hold `count` entries per the contract.
+    unsafe { core::ptr::copy_nonoverlapping(src, dest, bytes) };
+}
+
+/// `RtlRunDecodeUnicodeString(UCHAR Hash, PUNICODE_STRING String)` — in-place XOR-decode
+/// (`sdk/lib/rtl/encode.c:20`), the inverse of `RtlRunEncodeUnicodeString`. Operates on the raw
+/// BYTES of the buffer (Length is a byte count).
+///
+/// # Safety
+/// `string` a valid UNICODE_STRING whose Buffer holds Length bytes.
+#[export_name = "RtlRunDecodeUnicodeString"]
+pub unsafe extern "system" fn rtl_run_decode_unicode_string(hash: u8, string: PUnicodeString) {
+    if string.is_null() {
+        return;
+    }
+    // SAFETY: string valid per the contract.
+    unsafe {
+        let ptr = (*string).buffer as *mut u8;
+        let len = (*string).length;
+        if ptr.is_null() {
+            return;
+        }
+        if len > 1 {
+            let mut i = len;
+            while i > 1 {
+                let a = core::ptr::read(ptr.add((i - 1) as usize));
+                let b = core::ptr::read(ptr.add((i - 2) as usize));
+                core::ptr::write(ptr.add((i - 1) as usize), a ^ b ^ hash);
+                i -= 1;
+            }
+        }
+        if len >= 1 {
+            let a = core::ptr::read(ptr);
+            core::ptr::write(ptr, a ^ (hash | 0x43));
+        }
+    }
+}
+
+/// `RtlUpcaseUnicodeStringToOemString(POEM_STRING OemDest, PCUNICODE_STRING UniSource, BOOLEAN Alloc)`
+/// — uppercase + narrow to OEM (`sdk/lib/rtl/unicode.c:2069`). OEM_STRING shares the UNICODE_STRING
+/// 16-byte layout (Buffer is `char*`). Single-byte OEM code page (437) narrow, upcasing per the
+/// NLS-driven `upcase_char`. Allocates OemDest->Buffer when `alloc` (freed by RtlFreeOemString).
+///
+/// # Safety
+/// `oem_dest` writable OEM_STRING; `uni_source` valid UNICODE_STRING.
+#[export_name = "RtlUpcaseUnicodeStringToOemString"]
+pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
+    oem_dest: PUnicodeString,
+    uni_source: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    if oem_dest.is_null() || uni_source.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: uni_source valid per the contract.
+    let (sbuf, sunits) =
+        unsafe { ((*uni_source).buffer as *const u16, (*uni_source).length as usize / 2) };
+    let src = if sbuf.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: valid region of sunits units per the contract.
+        unsafe { core::slice::from_raw_parts(sbuf, sunits) }
+    };
+    // Upcase then narrow each unit to a single OEM byte (437). Length excludes the NUL; the buffer
+    // needs Length + 1 for the terminator.
+    let oem_len = src.len(); // 1 OEM byte per unit (single-byte cp)
+    if oem_len + 1 > 0xFFFF {
+        return 0xC000_0011; // STATUS_INVALID_PARAMETER_2 domain (Length > MAXUSHORT)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: oem_dest writable per the contract.
+        let dbuf = unsafe {
+            if allocate != 0 {
+                let p = crate::process_heap_alloc(oem_len + 1) as *mut u8;
+                if p.is_null() {
+                    return STATUS_NO_MEMORY;
+                }
+                (*oem_dest).buffer = p as u64;
+                (*oem_dest).maximum_length = (oem_len + 1) as u16;
+                p
+            } else {
+                if oem_len >= (*oem_dest).maximum_length as usize {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                (*oem_dest).buffer as *mut u8
+            }
+        };
+        // SAFETY: dbuf valid for oem_len + 1 bytes per the alloc/overflow checks.
+        unsafe {
+            for (i, &u) in src.iter().enumerate() {
+                let up = rtl::strings::upcase_char(u);
+                core::ptr::write(dbuf.add(i), rtl::convert::CodePage::LATIN1.narrow_unit(up));
+            }
+            core::ptr::write(dbuf.add(oem_len), 0);
+            (*oem_dest).length = oem_len as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = allocate;
         STATUS_NOT_IMPLEMENTED
     }
 }

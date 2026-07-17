@@ -2644,6 +2644,150 @@ pub unsafe fn rtl_create_user_thread(
 }
 
 // ---------------------------------------------------------------------------------------------
+// BATCH 27 — the RtlpNt* registry shims the lsass tree (lsasrv) imports. Thin wrappers over the
+// Nt*Key syscalls (references/reactos/sdk/lib/rtl/registry.c:913-1006), issued through OUR trap/
+// native transport (serviced by the executive against ::ROSSYS.HIV). WITHOUT these exports the
+// on-target loader leaves lsasrv's `ntdll!RtlpNtOpenKey` IAT slot at the raw by-name thunk (a bare
+// `.rdata` RVA 0x3a288) → lsasrv `call *[IAT]` jumps into garbage → the instruction-fetch fault
+// that blocked LSA init before `SetEvent(LSA_RPC_SERVER_ACTIVE)`.
+// ---------------------------------------------------------------------------------------------
+
+/// `KEY_VALUE_PARTIAL_INFORMATION` (x64): TitleIndex(4), Type(4), DataLength(4), Data[...]. The
+/// `Data` field starts at offset 0x0C (= `FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data)`).
+const KVPI_DATA_OFFSET: u64 = 0x0C;
+/// `KeyValuePartialInformation` class.
+const KEY_VALUE_PARTIAL_INFORMATION: u64 = 2;
+const SSN_NT_SET_VALUE_KEY: u32 = 256;
+const STATUS_NO_MEMORY_U: u64 = 0xC000_0017;
+const STATUS_BUFFER_OVERFLOW_U: u64 = 0x8000_0005;
+
+/// An empty inline `UNICODE_STRING { Length:0, MaximumLength:0, _pad:0, Buffer:NULL }` (the
+/// nameless-default-value name used by the `RtlpNt*Value*` shims). Returns its address for a syscall
+/// `PUNICODE_STRING` argument. `slot` is caller-owned storage (must outlive the call).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn empty_unicode_string(slot: &mut [u64; 2]) -> u64 {
+    slot[0] = 0; // Length(u16) | MaximumLength(u16) | pad(u32)
+    slot[1] = 0; // Buffer(u64) = NULL
+    slot.as_ptr() as u64
+}
+
+/// `RtlpNtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
+/// ULONG Unused)` — mask off OBJ_PERMANENT|OBJ_EXCLUSIVE, then `NtOpenKey` (registry.c:913).
+///
+/// # Safety
+/// `key_handle` writable; `object_attributes` a valid OBJECT_ATTRIBUTES or NULL.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtOpenKey"]
+pub unsafe extern "system" fn rtlp_nt_open_key(
+    key_handle: u64,
+    desired_access: u64,
+    object_attributes: u64,
+    _unused: u64,
+) -> u32 {
+    // OBJECT_ATTRIBUTES.Attributes @ +0x10 (ULONG). Clear OBJ_PERMANENT(0x10)|OBJ_EXCLUSIVE(0x20).
+    if object_attributes != 0 {
+        // SAFETY: OA valid per the contract; Attributes is a ULONG at +0x10.
+        unsafe {
+            let attr_ptr = (object_attributes + 0x10) as *mut u32;
+            let a = core::ptr::read_unaligned(attr_ptr);
+            core::ptr::write_unaligned(attr_ptr, a & !(0x10 | 0x20));
+        }
+    }
+    // SAFETY: NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes) — SSN 125, 3 args.
+    unsafe { syscall4(SSN_NT_OPEN_KEY, key_handle, desired_access, object_attributes, 0) as u32 }
+}
+
+/// `RtlpNtQueryValueKey(HANDLE KeyHandle, PULONG Type, PVOID Data, PULONG DataLength, ULONG Unused)`
+/// — query the key's DEFAULT (nameless) value via `NtQueryValueKey(KeyValuePartialInformation)`,
+/// returning Type + copying Data (registry.c:934). Allocates a partial-info buffer on the process
+/// heap, exactly as real ntdll.
+///
+/// # Safety
+/// `type_out`/`data`/`data_length` writable or NULL per the ABI.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtQueryValueKey"]
+pub unsafe extern "system" fn rtlp_nt_query_value_key(
+    key_handle: u64,
+    type_out: u64,
+    data: u64,
+    data_length: u64,
+    _unused: u64,
+) -> u32 {
+    // BufferLength = (*DataLength if given) + FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data).
+    let mut buffer_length: u64 = 0;
+    if data_length != 0 {
+        // SAFETY: writable ULONG per the ABI.
+        buffer_length = unsafe { core::ptr::read_unaligned(data_length as *const u32) } as u64;
+    }
+    buffer_length += KVPI_DATA_OFFSET;
+    // SAFETY: heap allocation for the partial-info buffer (freed below).
+    let value_info = unsafe { crate::process_heap_alloc(buffer_length as usize) };
+    if value_info.is_null() {
+        return STATUS_NO_MEMORY_U as u32;
+    }
+    let vi = value_info as u64;
+    let mut result_length: u32 = 0;
+    // SAFETY: NtQueryValueKey(KeyHandle, &ValueName(empty), KeyValuePartialInformation, ValueInfo,
+    // BufferLength, &ResultLength) — SSN 185, 6 args.
+    let status = unsafe {
+        let mut name_slot = [0u64; 2];
+        let name = empty_unicode_string(&mut name_slot);
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            name,
+            KEY_VALUE_PARTIAL_INFORMATION,
+            vi,
+            buffer_length,
+            &mut result_length as *mut u32 as u64,
+        )
+    };
+    let ok = (status as i32) >= 0; // NT_SUCCESS
+    if ok || status == STATUS_BUFFER_OVERFLOW_U {
+        // SAFETY: reading the partial-info Type@+4 / DataLength@+8; writing the caller's out-params.
+        unsafe {
+            let vtype = core::ptr::read_unaligned((vi + 4) as *const u32);
+            let vlen = core::ptr::read_unaligned((vi + 8) as *const u32);
+            if data_length != 0 {
+                core::ptr::write_unaligned(data_length as *mut u32, vlen);
+            }
+            if type_out != 0 {
+                core::ptr::write_unaligned(type_out as *mut u32, vtype);
+            }
+            if ok && data != 0 {
+                core::ptr::copy_nonoverlapping((vi + KVPI_DATA_OFFSET) as *const u8, data as *mut u8, vlen as usize);
+            }
+        }
+    }
+    // SAFETY: free the buffer allocated above.
+    unsafe { crate::process_heap_free(value_info) };
+    status as u32
+}
+
+/// `RtlpNtSetValueKey(HANDLE KeyHandle, ULONG Type, PVOID Data, ULONG DataLength)` — set the key's
+/// DEFAULT (nameless) value via `NtSetValueKey` (registry.c:989).
+///
+/// # Safety
+/// `data` a valid buffer of `data_length` bytes or NULL.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlpNtSetValueKey"]
+pub unsafe extern "system" fn rtlp_nt_set_value_key(
+    key_handle: u64,
+    type_val: u64,
+    data: u64,
+    data_length: u64,
+) -> u32 {
+    // SAFETY: NtSetValueKey(KeyHandle, &ValueName(empty), TitleIndex=0, Type, Data, DataLength) —
+    // SSN 256, 6 args.
+    unsafe {
+        let mut name_slot = [0u64; 2];
+        let name = empty_unicode_string(&mut name_slot);
+        syscall6(SSN_NT_SET_VALUE_KEY, key_handle, name, 0, type_val, data, data_length) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Step 4.C — RtlQueryRegistryValues over the LIVE registry plane.
 //
 // Real ntdll's RtlQueryRegistryValues (references/reactos/sdk/lib/rtl/registry.c:1013) opens a
