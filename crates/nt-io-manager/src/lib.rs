@@ -29,6 +29,7 @@ mod irp;
 mod mock_driver;
 mod object_port;
 mod open;
+mod pipe;
 mod projection;
 mod read_write;
 mod store;
@@ -51,6 +52,14 @@ pub use irp::{
 };
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
+pub use pipe::{
+    PipeConnection, PipeEnd, PipeFcb, PipeHandle, PipeParams, PipeRegistry, PipeState,
+    FILE_PIPE_BYTE_STREAM_MODE, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_CLIENT_END,
+    FILE_PIPE_FULL_DUPLEX, FILE_PIPE_INBOUND, FILE_PIPE_MESSAGE_MODE, FILE_PIPE_MESSAGE_TYPE,
+    FILE_PIPE_OUTBOUND, FILE_PIPE_SERVER_END, STATUS_INSTANCE_NOT_AVAILABLE, STATUS_PIPE_BUSY,
+    STATUS_PIPE_CONNECTED, STATUS_PIPE_DISCONNECTED, STATUS_PIPE_LISTENING,
+    STATUS_PIPE_NOT_AVAILABLE,
+};
 pub use store::{GenStore, IoId};
 
 #[cfg(feature = "object-manager")]
