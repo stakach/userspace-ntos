@@ -6701,6 +6701,55 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 print_str(b"\n");
                                 check(b"npfs_set_pipe_information", sst == 0 && sinfo == 0, &mut passed);
                             }
+
+                            // ★ C-c: the CONNECTION DATA PLANE. With a real connected server<->client
+                            // pair (srv_fid + cli_fid on \ntstest), prove REAL cross-end data flow:
+                            // IRP_MJ_WRITE on the SERVER end must land in the CLIENT end's read queue
+                            // (server->client / OUTBOUND), and vice versa. This is the load-bearing
+                            // rpcrt4 Ndr transport (a REAL connection object, not a synthetic mint).
+                            let payload = *b"NDR-PLANE"; // 9 bytes, exact write length
+                            let mut wnone = [];
+                            let srv_write = npfs_dispatch_irp(
+                                4 /* IRP_MJ_WRITE */, 0, srv_fid, &payload, &mut wnone);
+                            let mut rbuf = [0u8; 16];
+                            let cli_read = npfs_dispatch_irp(
+                                3 /* IRP_MJ_READ */, 0, cli_fid, &[], &mut rbuf);
+                            let mut s2c_ok = false;
+                            if let (Some((wst, winfo)), Some((rst, rinfo))) = (srv_write, cli_read) {
+                                print_str(b"[npfs-svc] C-c DATA-PLANE srv-write status=0x");
+                                print_hex(wst as u32);
+                                print_str(b" wrote=");
+                                print_u64(winfo);
+                                print_str(b" | cli-read status=0x");
+                                print_hex(rst as u32);
+                                print_str(b" read=");
+                                print_u64(rinfo);
+                                print_str(b" bytes=");
+                                for &b in rbuf.iter().take(9) {
+                                    print_hex(b as u32);
+                                }
+                                print_str(b"\n");
+                                // server->client: client read back exactly what server wrote.
+                                s2c_ok = wst == 0
+                                    && rst == 0
+                                    && rinfo == 9
+                                    && rbuf[..9] == payload[..9];
+                            }
+                            check(b"exec_pipe_data_plane_server_to_client", s2c_ok, &mut passed);
+
+                            // client->server: reverse direction (INBOUND) through the same connection.
+                            let creq = *b"RPC-REQ"; // 7 bytes, exact write length
+                            let mut cwnone = [];
+                            let cli_write = npfs_dispatch_irp(
+                                4 /* IRP_MJ_WRITE */, 0, cli_fid, &creq, &mut cwnone);
+                            let mut sbuf = [0u8; 16];
+                            let srv_read = npfs_dispatch_irp(
+                                3 /* IRP_MJ_READ */, 0, srv_fid, &[], &mut sbuf);
+                            let mut c2s_ok = false;
+                            if let (Some((wst2, _)), Some((rst2, rinfo2))) = (cli_write, srv_read) {
+                                c2s_ok = wst2 == 0 && rst2 == 0 && rinfo2 == 7 && sbuf[..7] == creq[..7];
+                            }
+                            check(b"exec_pipe_data_plane_client_to_server", c2s_ok, &mut passed);
                         }
                     }
                 }
