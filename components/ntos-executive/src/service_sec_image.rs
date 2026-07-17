@@ -284,6 +284,94 @@ pub(crate) unsafe fn service_sec_image(
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+    // ★ FAULT ISOLATION (generalized park-and-log). An UNHANDLED / UNRECOVERABLE fault in ONE hosted
+    // process must PARK THAT PROCESS (with a clear one-line log) and let the shared loop CONTINUE
+    // servicing the others — a process crash does not halt the kernel (fundamental OS fault isolation).
+    // This replaces the recurring whack-a-mole of adding a bespoke park arm per new terminal wall
+    // (smss-190, the listener-parks, the lsass-post-signal park, …). `crash_parked` is a bitmask of
+    // top-level process badges (0/2/4/6/8, all < 64) that have hit an unrecoverable crash; a parked
+    // process's further faults are re-parked WITHOUT re-logging (the `already` guard). QUIESCE
+    // (break → gate) only when no live top-level process can make forward progress — every live one
+    // is crash-parked (so `recv` would block forever). Cooperative parks (wait/delay/listener) are a
+    // DIFFERENT, wakeable state and are left as-is; only a real crash sets a `crash_parked` bit.
+    let mut crash_parked: u64 = 0;
+    // Cooperative-wait bitmask: top-level process badges currently parked in a WAKEABLE wait
+    // (NtWaitForSingleObject/MultipleObjects on an unsignalled event, or a lsass-post-signal
+    // containment park). A wait-parked process CAN still be woken by a RUNNING process's NtSetEvent,
+    // so it stays in the live set — UNLESS every live process is now parked (crash OR wait), in which
+    // case no signaler remains → deadlock → quiesce. Cleared at loop-top when the process produces an
+    // event (it's running again). This closes the quiesce gap: winlogon WaitForLsass-parked + lsass
+    // server-thread-parked + services crash-parked would otherwise block `recv` forever (boot timeout,
+    // gate never runs). See the `maybe_quiesce_all_parked!` uses at the wait-park sites.
+    let mut wait_parked: u64 = 0;
+    // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
+    // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
+    // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
+    // now crash-parked, break → the gate runs + qemu_exit) else recv-next WITHOUT replying (the
+    // faulting thread stays blocked in-kernel, exactly like the cooperative listener-park) and
+    // continue the loop for another badge. Uses the surrounding loop locals directly (single call
+    // site style), so it must be invoked where they are all in scope.
+    macro_rules! park_and_log {
+        ($pi:expr, $label:expr, $ip:expr, $cr2:expr) => {{
+            let __pi: usize = $pi;
+            let __owner = owner_top_badge(badge);
+            let __bit = 1u64 << __owner;
+            let __already = (crash_parked & __bit) != 0;
+            crash_parked |= __bit;
+            if !__already {
+                print_str(b"[parked] pi=");
+                print_u64(__pi as u64);
+                print_str(b" badge=");
+                print_u64(badge);
+                print_str(b" fault=");
+                print_str($label);
+                print_str(b" ip=0x");
+                print_hex((($ip as u64) >> 32) as u32);
+                print_hex($ip as u32);
+                print_str(b" cr2=0x");
+                print_hex((($cr2 as u64) >> 32) as u32);
+                print_hex($cr2 as u32);
+                print_str(b" -> PARK process (unrecoverable); loop continues\n");
+            }
+            procs[__pi].faults = faults;
+            procs[__pi].first = first;
+            procs[__pi].ntfaults = ntfaults;
+            pfilled[__pi] = *filled_pages;
+            // QUIESCE: no live top-level process can still fault → nothing left to serve.
+            if (live_top_badges() & !crash_parked) == 0 {
+                print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
+                stop = $ip as u64;
+                break;
+            }
+            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            badge = nb;
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            m2 = nm2;
+            m3 = nm3;
+            // Diverges: park_and_log! always exits the current loop iteration (never yields a value).
+            continue
+        }};
+    }
+    // mark_wait_parked!(pi): record that this top-level process is now cooperatively wait-parked, and
+    // if EVERY live top-level process is now parked (crash OR wait) — i.e. no runnable thread remains
+    // to signal any waiter — QUIESCE (break → the gate runs). Called right before a wait-park's
+    // recv-without-reply. Non-diverging in the common case (just sets the bit); breaks only at true
+    // all-parked deadlock. `$ip` is used as the reported stop value.
+    macro_rules! mark_wait_parked {
+        ($pi:expr, $ip:expr) => {{
+            let __owner = owner_top_badge(badge);
+            wait_parked |= 1u64 << __owner;
+            if (live_top_badges() & !(crash_parked | wait_parked)) == 0 {
+                print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
+                stop = $ip as u64;
+                let _ = $pi;
+                break;
+            }
+        }};
+    }
     loop {
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
@@ -438,6 +526,9 @@ pub(crate) unsafe fn service_sec_image(
         } else {
             0
         };
+        // This process is producing an event → it's running, not wait-parked. Clear its cooperative
+        // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
+        wait_parked &= !(1u64 << owner_top_badge(badge));
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
             PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
         }
@@ -571,8 +662,8 @@ pub(crate) unsafe fn service_sec_image(
             if skipped {
                 continue;
             }
-            stop = fip;
-            break;
+            // Unhandled CPU exception (label 3) at a non-skippable site — a real crash. Park+log.
+            park_and_log!(pi, b"cpu-exception(3)", fip, fip);
         }
         // DebugException (label 4 = int3 / #BP). OUR ntdll's `RtlRaiseException` / `RtlRaiseStatus`
         // seams issue int3. Decode WHAT exception the caller is raising: recover winlogon's full GPRs
@@ -711,8 +802,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 print_str(b"\n");
             }
-            stop = bp_ip;
-            break;
+            // Unhandled int3/#BP (a RtlRaiseException the loader/process can't recover) — a crash. Park+log.
+            park_and_log!(pi, b"debug-exception(4)", bp_ip, bp_ip);
         }
         if (mi >> 12) == 6 {
             let addr = m1;
@@ -784,8 +875,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     print_str(b" ]\n");
                 }
-                stop = addr;
-                break;
+                // Unrecoverable NULL/low deref on a top-level process thread — a crash. Park+log
+                // (the per-process detail above already printed; park_and_log adds the [parked] line).
+                park_and_log!(pi, b"null-deref", m0, addr);
             }
             // Dynamic stack growth (Windows guard-page style): a fault just below the committed
             // stack commits a fresh zeroed page and restarts, so smss's stack grows on demand
@@ -943,22 +1035,32 @@ pub(crate) unsafe fn service_sec_image(
                     && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                 {
                     print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
+                    // Terminal for lsass main — count toward quiesce (lsass has done its signalling job).
+                    crash_parked |= 1u64 << owner_top_badge(badge);
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    if (live_top_badges() & !(crash_parked | wait_parked)) == 0 {
+                        print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
+                        stop = addr;
+                        break;
+                    }
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
-                stop = addr; // outside both images (unresolved / null deref) — stop safely
-                break;
+                // Unrecoverable fault outside every mapped image/DLL/scratch/stack (a truncated code
+                // pointer / bad address the diagnostics above symbolized) — a real crash. Park+log.
+                // park_and_log! diverges (type `!`) so this arm yields no value — match type is satisfied.
+                park_and_log!(pi, b"vmf-out", m0, addr)
             };
             // Per-process demand-fault backstop. With the BATCH-22 scratch-VA decoupling (persistent
             // scratch bounded to ≤256 slots regardless of this count) this is now purely a
             // frame-budget / runaway guard, not a scratch limit — raised so lsass's full LSA-init DLL
             // tree (lsasrv/samsrv/msv1_0 + deps, thousands of pages) fits.
             if faults >= FAULT_CAP {
-                stop = addr;
-                break;
+                // This process exhausted its per-process demand-fault budget (runaway / frame-pool
+                // guard) — treat as unrecoverable for THIS process: park+log, let the others proceed.
+                park_and_log!(pi, b"fault-cap", m0, addr);
             }
             // ★ BATCH BULK-FILL (BATCH 22 perf fix): under QEMU TCG each demand fault is a full
             // fault-EP round-trip (~4/s), so a big DLL image page-by-page dominates the boot budget
@@ -2739,6 +2841,9 @@ pub(crate) unsafe fn service_sec_image(
                 // shared loop), generalized to smss' hard-error path.
                 if badge == 0 && m0 == 190 {
                     print_str(b"[smss] NtRaiseHardError(190) = SmpTerminate -> PARK smss main; winlogon continues\n");
+                    // Terminal for smss (its bring-up job is done) — count it toward quiesce so the
+                    // loop can cleanly exit once every other live process is parked too.
+                    crash_parked |= 1u64 << owner_top_badge(badge);
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -2760,8 +2865,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(smss_stack_read(get_recv_mr(16)) as u32);
                     print_str(b"\n");
                 }
-                stop_ssn = m0; // an Nt* syscall we don't service yet — stop
-                break;
+                // An Nt* syscall we don't service yet AND can't safely fake a result for — the process
+                // can't make progress. Record the SSN for the report line, then park+log this process
+                // (unrecoverable for it) and let the shared loop keep servicing the others.
+                stop_ssn = m0;
+                park_and_log!(pi, b"unhandled-syscall", m0, m0);
             }
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
@@ -2847,6 +2955,12 @@ pub(crate) unsafe fn service_sec_image(
                     park_wait_deadline,
                 ) {
                     delay_timer_rearm(&delay_queue);
+                    // An INDEFINITE (no-deadline) wait by a top-level process is quiesce-relevant: if
+                    // every live process is now parked, no signaler remains → run the gate. A
+                    // deadline-bounded wait is timer-woken, so it never deadlocks — don't count it.
+                    if park_wait_deadline.is_none() && pi_is_top_level(badge) {
+                        mark_wait_parked!(pi, resume_ip);
+                    }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -2877,6 +2991,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" NtWaitForMultipleObjects(");
                     print_u64(park_wait_set_n as u64);
                     print_str(if park_wait_set_all { b" events, WaitAll) UNSIGNALLED -> PARK caller\n" } else { b" events, WaitAny) UNSIGNALLED -> PARK caller\n" });
+                    if park_wait_deadline.is_none() && pi_is_top_level(badge) {
+                        mark_wait_parked!(pi, resume_ip);
+                    }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
@@ -2908,8 +3025,8 @@ pub(crate) unsafe fn service_sec_image(
             m3 = nm3;
             continue;
         }
-        stop = m1; // a non-VMFault, non-syscall (e.g. #GP) — stop
-        break;
+        // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
+        park_and_log!(pi, b"other-fault", m1, m1);
     }
     // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
     // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
@@ -3182,4 +3299,62 @@ pub(crate) unsafe fn service_sec_image(
     // (slot 1) commonly halts it now that it runs, and the caller's "smss faulted N" line + the
     // exec_reactos_smss_* checks are about smss specifically. csrss's counts are in the sec-stop line.
     (verdict, procs[0].faults, procs[0].first, stop, procs[0].ntfaults, stop_ssn)
+}
+
+/// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's
+/// crash belongs to its parent process for quiesce accounting). Top-level: smss=0, csrss=2,
+/// winlogon=4, services=6, lsass=8.
+#[inline]
+fn owner_top_badge(badge: u64) -> u64 {
+    match badge {
+        CSRSS_BADGE => CSRSS_BADGE,
+        WINLOGON_BADGE | WINLOGON_WORKER_BADGE | WINLOGON_WORKER2_BADGE | WINLOGON_WORKER3_BADGE => {
+            WINLOGON_BADGE
+        }
+        SERVICES_BADGE | SVC_LISTENER_BADGE => SERVICES_BADGE,
+        LSASS_BADGE | LSASS_LISTENER_BADGE | LSASS_LISTENER2_BADGE | LSASS_LISTENER3_BADGE => {
+            LSASS_BADGE
+        }
+        _ => 0, // smss (badge 0) + anything else
+    }
+}
+
+/// A top-level process badge (its MAIN thread), not a listener/worker sub-thread. Only a top-level
+/// process's indefinite wait is quiesce-relevant (a sub-thread listener parks cooperatively but its
+/// parent process may still run).
+#[inline]
+fn pi_is_top_level(badge: u64) -> bool {
+    matches!(
+        badge,
+        0 | CSRSS_BADGE | WINLOGON_BADGE | SERVICES_BADGE | LSASS_BADGE
+    )
+}
+
+/// The bitmask of LIVE top-level process badges (smss is always live; the rest once SPAWNED).
+/// Used by the quiesce test: the boot has no forward progress possible once every live top-level
+/// process is crash-parked (so the loop's next `recv` would block on the fault-EP forever).
+#[inline]
+unsafe fn live_top_badges() -> u64 {
+    let mut m = 1u64 << 0; // smss always live
+    if WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= (1u64 << CSRSS_BADGE) | (1u64 << WINLOGON_BADGE);
+    } else if csrss_is_live() {
+        m |= 1u64 << CSRSS_BADGE;
+    }
+    if SERVICES_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= 1u64 << SERVICES_BADGE;
+    }
+    if LSASS_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= 1u64 << LSASS_BADGE;
+    }
+    m
+}
+
+/// csrss is live as soon as smss spawns it (winlogon then follows). Approximated by CSRSS having
+/// demand-faulted — but to avoid threading `procs` here, csrss liveness is folded into the
+/// WINLOGON_SPAWNED gate above (csrss always spawns before winlogon). This returns false so the
+/// only extra bit is added via WINLOGON_SPAWNED; kept as a seam for a future explicit CSRSS_SPAWNED.
+#[inline]
+fn csrss_is_live() -> bool {
+    false
 }
