@@ -2785,6 +2785,51 @@ pub(crate) unsafe fn service_sec_image(
                     SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
                     let atom = SVC_FAKE_CLASS_ATOM.fetch_add(1, Ordering::Relaxed);
                     ((atom & 0xFFFF) as i32, true)
+                } else if m0 == 0x125b && svc_noninteractive {
+                    // ★ NON-INTERACTIVE SERVICE NtUserInitializeClientPfnArrays (lsass, badge 8).
+                    // THE win32k 0x125b TERMINUS FIX (diagnose-first, fork (b): non-interactive path).
+                    // The REAL wall (root-caused by reading win32k's OWN faulting RIP at the hang): win32k
+                    // spins forever in the GDI scanline-copy loop `EngCopyBits` at RVA 0x1cbdd8 (the
+                    // `pvScan0 + y*lDelta + x*4` blit inner loop, confirmed by disasm) — NOT in
+                    // NtUserInitializeClientPfnArrays' trivial `RtlCopyMemory(&gpsi->apfnClient*, ...)`
+                    // body, but in the cursor/icon/stock-object bitmap-init blit the SERVICE user32
+                    // process-attach drags in (NtUserFindExistingCursorIcon 0x103d /
+                    // NtUserRegisterClassExWOW 0x10b4 / NtGdiCreateBitmap 0x106c → an EngCopyBits over a
+                    // SURFOBJ whose dimensions are garbage for our faked service cursor/class state → an
+                    // UNBOUNDED copy). With all its source pages zero-filled it stops faulting and just
+                    // spins → the executive blocks in win32k_dispatch's recv forever (all vCPUs
+                    // kernel-idle = the addendum's observation). lsass is a NON-INTERACTIVE service on a
+                    // WSS_NOIO window station (winsta.c) — it never creates a real window/desktop, so it
+                    // must NOT drive win32k's INTERACTIVE cursor/icon/GDI path (faithful to the real
+                    // non-interactive-service user32 init). NtUserInitializeClientPfnArrays is trivial
+                    // server-side (copy 3 client PFN arrays into the already-initialized gpsi under the
+                    // USER lock — `if (ClientPfnInit) return STATUS_SUCCESS`, and ClientPfnInit is ALREADY
+                    // TRUE from winlogon's interactive 0x125b); the CLIENT only checks the returned
+                    // NTSTATUS. So SATISFY it here with STATUS_SUCCESS WITHOUT dispatching into win32k —
+                    // exactly the same reasoning already applied+documented for 0x103d/0x10b4 above.
+                    // Scoped to lsass ONLY (badge 8) so winlogon's REAL interactive 0x125b + paint path
+                    // is untouched (a blanket 0x125b fake was tried+reverted in BATCH 28: it moved the
+                    // hang to 0x11e0 by breaking winlogon's interactive init).
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] lsass NtUserInitializeClientPfnArrays(0x125b) FAKED (non-interactive service, no GDI blit) -> STATUS_SUCCESS\n");
+                    (0, true)
+                } else if m0 == 0x11e0 && svc_noninteractive {
+                    // ★ NON-INTERACTIVE SERVICE NtGdiInit (0x11e0, GdiInit — w32ksvc64.h) for lsass.
+                    // The 0x125b fix advanced lsass to its NEXT interactive win32k SSN = NtGdiInit, which
+                    // hit the SAME EngCopyBits (RVA 0x1cbdd8) runaway blit spin (win32k's GDI stock-object /
+                    // DDB bitmap-init blit — the source SURFOBJ dimensions are garbage for our faked
+                    // service cursor/class/GDI state). This is the EXACT "moved the hang to 0x11e0" BATCH 28
+                    // saw — now understood: a non-interactive service issues a SEQUENCE of interactive
+                    // user32/gdi32-init SSNs, each tripping the blit; each must take the non-interactive
+                    // light path. NtGdiInit is a per-process "init GDI" that returns BOOL; the REAL
+                    // interactive winlogon's NtGdiInit returned TRUE(1) in the SAME boot (proper stock
+                    // state → no runaway blit). A non-interactive service does NO GDI drawing, so returning
+                    // TRUE(1) WITHOUT dispatching is byte-behavior-identical for the client (gdi32
+                    // GdiProcessSetup checks the BOOL) and skips the interactive stock-object blit. Scoped
+                    // to lsass (badge 8) — winlogon's real NtGdiInit path is untouched.
+                    SVC_USER32_FAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[win32k-svc] lsass NtGdiInit(0x11e0) FAKED (non-interactive service, no GDI stock blit) -> TRUE\n");
+                    (1, true)
                 } else {
                     win32k_dispatch(m0, d_a0, d_a1, a2, a3)
                 };
