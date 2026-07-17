@@ -377,13 +377,22 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         };
         let status = read_unaligned((irp + 0x30) as *const u32);
         let information = read_unaligned((irp + 0x38) as *const u64);
-        // BATCH 37: a completing pending READ carries the peer's just-written payload in its IRP
-        // buffer (npfs's NpWriteDataQueue fast path copies straight into the pending read IRP). Stash
-        // those bytes keyed by the reader's fid so the executive's pipe re-drive delivers them to the
-        // parked reader (a fresh re-drive read would miss — npfs already drained the queue into THIS
-        // IRP). npfs completes the read into the IRP's user buffer (== `slot.data`, METHOD_NEITHER).
+        // BATCH 37/38: a completing pending READ carries the peer's just-written payload in its IRP
+        // buffer. Stash those bytes keyed by the reader's fid so the executive's pipe re-drive delivers
+        // them to the parked reader (a fresh re-drive read would miss — npfs already drained the queue
+        // into THIS IRP). ★ BATCH 38 FIX: npfs's `NpWriteDataQueue` completing a *Buffered* read entry
+        // does NOT copy into our original `slot.data` — it ALLOCATES a FRESH pool buffer, copies the
+        // write payload into it, then REASSIGNS `WriteIrp->AssociatedIrp.SystemBuffer = Buffer` and sets
+        // IRP_DEALLOCATE_BUFFER|IRP_BUFFERED_IO|IRP_INPUT_OPERATION (writesup.c:131-135). So the real
+        // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
+        // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
+        // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
         if slot.major as u64 == IRP_MJ_READ {
             let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
+            // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
+            // it). Fall back to our original buffer only if npfs left it in place.
+            let sysbuf = read_unaligned((irp + 0x18) as *const u64);
+            let src = if sysbuf != 0 { sysbuf } else { slot.data };
             let n = (information as usize).min(COMPLETED_READ_BYTES);
             let ctable = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
             if let Some(cslot) = ctable.iter_mut().find(|e| e.fid == 0) {
@@ -393,7 +402,7 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
                 cslot.len = n;
                 let mut i = 0usize;
                 while i < n {
-                    cslot.bytes[i] = read_volatile((slot.data + i as u64) as *const u8);
+                    cslot.bytes[i] = read_volatile((src + i as u64) as *const u8);
                     i += 1;
                 }
             }
@@ -677,6 +686,14 @@ fn register_fsd_trampolines() {
     reg.bind("IoCreateSymbolicLink", s_io_create_symbolic_link as usize as u64);
     reg.bind("IoRegisterFileSystem", s_io_register_file_system as usize as u64);
     reg.bind("IoCompleteRequest", s_io_complete_request as usize as u64);
+    // npfs.sys's PE actually imports the fastcall alias `IofCompleteRequest` (the `IoCompleteRequest`
+    // macro compiles to it). On x64 there is ONE calling convention, so `Irp`/`PriorityBoost` still
+    // arrive in RCX/RDX — the same `extern "win64"` trampoline serves both. Without THIS binding the
+    // import fell to the `s_true` fail-soft no-op: when a peer WRITE satisfied a pending pipe READ,
+    // npfs's `NpCompleteDeferredIrps` "completed" the read IRP into a no-op, so the executive never
+    // learned the read finished (never stashed the delivered bytes), and the re-drive fresh read hit
+    // the drained queue and returned uninitialized pool (`d0 16 d0 16 …`). BATCH 38 root cause.
+    reg.bind("IofCompleteRequest", s_io_complete_request as usize as u64);
     // Rtl Unicode prefix table (nt_kernel_exec::np_prefix) — the VCB name→FCB map
     reg.bind("RtlInitializeUnicodePrefix", s_rtl_init_unicode_prefix as usize as u64);
     reg.bind("RtlInsertUnicodePrefix", s_rtl_insert_unicode_prefix as usize as u64);

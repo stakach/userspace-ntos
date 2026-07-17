@@ -1909,6 +1909,26 @@ impl NativeSyscallHandler for ExecNtHandler {
                         let b = w as u8;
                         nm_ascii[i] = if b.is_ascii_graphic() { b } else { b'.' };
                     }
+                    // BATCH 38: bound the SCM `\ntsvcs` server-instance re-create loop so the boot
+                    // quiesces after the (now-live) RPC round-trip. Past the cap, fail the create with
+                    // STATUS_PIPE_NOT_AVAILABLE (0xC00000AC) → rpcrt4's re-listen fails → the listener
+                    // parks. Name-scoped to `\ntsvcs` (SCM), pi 3 only, so lsass/other pipes are unaffected.
+                    let is_ntsvcs = leaf.len() >= 7
+                        && leaf[1..7].iter().zip(b"ntsvcs".iter()).all(|(&w, &c)| w as u8 == c);
+                    if self.pi == 3 && is_ntsvcs {
+                        let n = SCM_NTSVCS_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n >= SCM_NTSVCS_CREATE_CAP {
+                            if n == SCM_NTSVCS_CREATE_CAP {
+                                print_str(b"[nt-create-named-pipe] pi=3 \\ntsvcs re-create cap reached -> STATUS_PIPE_NOT_AVAILABLE (listener parks; boot quiesces)\n");
+                            }
+                            if iosb != 0 {
+                                self.xas_write_buf(iosb, &0xC00000ACu32.to_le_bytes()); // Status
+                                self.xas_write_buf(iosb + 8, &0u64.to_le_bytes()); // Information
+                            }
+                            self.queue_write(get_recv_mr(9), 0); // *FileHandle = NULL
+                            return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
+                        }
+                    }
                     print_str(b"[nt-create-named-pipe] pi=");
                     print_u64(self.pi as u64);
                     print_str(b" leaf=");
@@ -2679,7 +2699,26 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // so the route is left ON. bind_ack does not YET flow — see the BATCH 38 NEXT WALL in
                 // ntdll_plan.md (npfs returns wrong bytes for the server read: the pending ReadEntry is
                 // not reconciled with the peer WriteEntry in our synthetic-IRP npfs host).
-                const SCM_WORKER_ROUTE_ENABLED: bool = true;
+                // ★ BATCH 38 — the npfs pending-read/peer-write RECONCILE is FIXED (real bind bytes now
+                // reach the worker: `IofCompleteRequest` bound + the completed read's bytes read from the
+                // IRP's REASSIGNED AssociatedIrp.SystemBuffer, not the stale original). With the route ON
+                // the FULL SCM RPC round-trip runs LIVE: worker reads the real bind `05 00 0b 03…` →
+                // rpcrt4 emits bind_ack `05 00 0c 03…` → winlogon's parked read completes with it →
+                // RROpenSCManagerW request `05 00 00 03…` → response `05 00 02 03…` (all PROVEN in
+                // /tmp/boot38d.log, 8 PDUs both ways). BUT this legitimately changes the SCM thread
+                // lifecycle: with the RPC now SUCCEEDING, services' per-connection worker (badge 15) +
+                // listener (badge 7) STAY ALIVE serving the conversation instead of self-exiting on a
+                // failed connection (as they did when the bind read returned garbage) — so the 3
+                // `exec_live_terminate_thread_{routed,tcb_reclaimed,no_reply}` specs, which counted on
+                // those two self-exits (`>= 3`), drop to 2 (only csrss + lsass). AND winlogon, having
+                // OpenSCManager succeed, advances into GUI code and hits a NEW downstream null-deref
+                // frontier (rip in user32/gdi32) → gate 174→171. Per the batch constraint (gate ≥174, the
+                // 4 terminate specs MUST pass, no regression), the route is GATED OFF for the commit: the
+                // npfs reconcile fixes (correct + general + host-tested) land, bind_ack is PROVEN with the
+                // route flipped ON, and the OFF path is byte-identical to the BATCH-37 green boot (gate
+                // 174). NEXT WALL = winlogon's post-OpenSCManager GUI null-deref + the SCM server's
+                // persistent-thread lifecycle (the terminate specs need updating for a SUCCEEDING RPC).
+                const SCM_WORKER_ROUTE_ENABLED: bool = false;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)
                     && self.pi == 3

@@ -1051,6 +1051,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_read_completed_by_peer_write_returns_queue_bytes_not_stale() {
+        // BATCH 38 — reproduces the pending-read/peer-write RECONCILE contract that the executive's
+        // synthetic-IRP npfs host was violating. A server read issued when the queue is EMPTY must NOT
+        // return a stale/uninitialized buffer; once the peer (client) writes, the SAME logical read must
+        // return the REAL queued bytes. The clean DataQueue model is the source of truth: a read that
+        // finds nothing yields empty (the executive parks the caller), and the later write fills the
+        // queue so the re-driven read drains the ACTUAL bytes. (The executive bug was reading the read
+        // IRP's ORIGINAL buffer instead of the buffer npfs REASSIGNED into AssociatedIrp.SystemBuffer on
+        // completion, so the reader got 16 zero bytes; this model asserts the byte-exact reconcile.)
+        let mut r = dx();
+        let params = PipeParams { pipe_type: FILE_PIPE_MESSAGE_TYPE, ..PipeParams::default() };
+        let s = r.create_server_pipe("ntsvcs", params).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("ntsvcs").unwrap();
+        // Server reads FIRST (queue empty) — models the read that goes STATUS_PENDING and parks.
+        let (empty, more0) = r.pipe_read(s, 16).unwrap();
+        assert!(empty.is_empty(), "a read of an empty queue must return NO bytes (not stale garbage)");
+        assert!(!more0);
+        // Peer write arrives; the re-driven read must now return the REAL queued header bytes.
+        let bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00,
+                             0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        assert_eq!(r.pipe_write(c, &bind).unwrap(), 16);
+        let (hdr, more) = r.pipe_read(s, 16).unwrap();
+        assert_eq!(&hdr, &bind, "re-driven read must drain the ACTUAL queue bytes, not a stale buffer");
+        assert!(!more, "an exact-size read of a 16-byte message does not overflow");
+    }
+
+    #[test]
+    fn write_72_then_read_16_then_read_56_message_partial() {
+        // BATCH 38 — the rpcrt4 header-then-body read pattern against a MESSAGE-mode pipe: a 72-byte
+        // write, a 16-byte read (returns the first 16 WITH overflow), then a 56-byte read (drains the
+        // rest, no overflow). Asserts the message-mode partial-read semantics the reconcile relies on.
+        let mut r = dx();
+        let params = PipeParams { pipe_type: FILE_PIPE_MESSAGE_TYPE, ..PipeParams::default() };
+        let s = r.create_server_pipe("p", params).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("p").unwrap();
+        let mut bind: Vec<u8> = [0x05u8, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00,
+                                 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00].to_vec();
+        bind.extend(16u8..72);
+        assert_eq!(r.pipe_write(c, &bind).unwrap(), 72);
+        let (h, more1) = r.pipe_read(s, 16).unwrap();
+        assert_eq!(&h, &bind[..16]);
+        assert!(more1, "16-of-72 must flag BUFFER_OVERFLOW (more)");
+        let (rest, more2) = r.pipe_read(s, 56).unwrap();
+        assert_eq!(&rest, &bind[16..], "the remaining 56 bytes of the SAME message");
+        assert!(!more2, "the message is now fully drained");
+        assert_eq!(r.readable_bytes(s).unwrap(), 0);
+    }
+
+    #[test]
     fn bidirectional_queues_are_isolated() {
         let mut r = dx();
         let s = r.create_server_pipe("p", PipeParams::default()).unwrap();

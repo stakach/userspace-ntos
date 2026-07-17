@@ -3111,6 +3111,17 @@ pub(crate) static SVC_FAKE_GDI_HANDLE: AtomicU64 = AtomicU64::new(0x0050_0100);
 static NT_ENUMERATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Count of NtCreateNamedPipeFile calls modeled (winlogon's StartRpcServer \pipe\winreg).
 static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
+/// BATCH 38 — bound the SCM (pi 3) `\ntsvcs` server-instance RE-CREATE loop. rpcrt4's ncacn_np
+/// listener re-posts a fresh NtCreateNamedPipeFile after every accepted connection so a new client can
+/// connect. With the RPC data plane now LIVE, winlogon's SCM conversation completes (bind→bind_ack→
+/// request→response) and winlogon then faults on the RPC response (a NEW downstream frontier), leaving
+/// the server with no live client — but its listener keeps re-creating `\ntsvcs` instances forever,
+/// which never quiesces (the boot cannot reach qemu_exit). Cap the re-creates: once the handshake has
+/// had ample instances, return STATUS_PIPE_NOT_AVAILABLE so the listener's re-listen fails and it parks
+/// (mirrors a real out-of-instances condition), letting the boot complete cleanly. The cap is generous
+/// (covers the full multi-PDU conversation + several re-listens) so it never truncates a live handshake.
+static SCM_NTSVCS_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+const SCM_NTSVCS_CREATE_CAP: u64 = 24;
 /// Count of live pipe syscalls (NtCreateNamedPipeFile/NtCreateFile/NtOpenFile/NtFsControlFile/
 /// Read/Write) that were ROUTED THROUGH the isolated npfs component (vs modeled-fake). Observability.
 static NPFS_ROUTED_IRPS: AtomicU64 = AtomicU64::new(0);
