@@ -1008,6 +1008,39 @@ static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// BATCH 25 — count of fixup-preserving re-maps (a re-faulted per-process image page re-mapped from
 /// its already-filled frame instead of re-filled from the raw PE, so reloc/IAT-snap fixups survive).
 static FIXUP_REMAP_N: AtomicU64 = AtomicU64::new(0);
+/// (B) SPIN WATCHDOG for the win32k dispatch. A hosted GUI client (notably csrss's user32
+/// RegisterSystemClasses loop) can call the SAME win32k SSN over and over when win32k WALLs the
+/// call (returns STATUS_UNSUCCESSFUL / asserts) — a NON-terminating loop that issues syscalls (so it
+/// is NOT crash-parked and NOT wait-parked) and would spin the shared service loop until the TCG
+/// timeout, so the boot never reaches the gate. The watchdog records the last (badge, SSN) win32k
+/// dispatch + a consecutive-repeat count; when one client repeats the SAME SSN past a generous
+/// threshold (well beyond any legitimate class/cursor-init loop) it is a live-lock → the client is
+/// parked (like a crash) so the loop can make progress / quiesce.
+/// Per-client TOTAL win32k dispatch counters (indexed by pi). Some win32k live-locks return
+/// STATUS_SUCCESS on every call yet never satisfy the client's loop condition (csrss's user32
+/// RegisterSystemClasses re-registering the same cursor/class forever because win32k's assert-skips
+/// leave the class table inconsistent), so a consecutive-WALL watchdog can't catch them. A TOTAL
+/// budget does: a client's real win32k init is bounded (a few hundred calls); past a generous ceiling
+/// it is a live-lock → park the client so the loop quiesces + the gate runs. Sized to MAX_PI.
+pub(crate) static W32_TOTAL_DISPATCH: [AtomicU64; MAX_PI] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; MAX_PI]
+};
+/// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
+/// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
+/// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
+/// large window of iterations with NO epoch bump AND no live process is still demand-faulting (only
+/// re-parks / a slow win32k live-lock churn remains), forward progress is impossible → QUIESCE (break
+/// → run the gate + qemu_exit). This is the robust termination backstop: cooperatively-parked
+/// processes (lsass listener wait / winlogon WaitForLsass) + a stuck client that keeps issuing
+/// syscalls (so it is neither crash- nor wait-parked) would otherwise block the loop's recv forever.
+/// Bumping it on real progress keeps a genuinely-advancing boot alive; a stall means the gate should
+/// run with whatever was reached (all remaining walls visible in the [parked] list).
+pub(crate) static PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
+#[inline]
+pub(crate) fn bump_progress() {
+    PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
 /// services' RPC listener thread — its TCB (0 until services' NtCreateThread spawns it) + a request
 /// flag the loop reads to spawn+RESUME it, and a count of listener faults serviced (multiplex proof).
 static SVC_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
@@ -1084,6 +1117,45 @@ unsafe fn dll_cache_put(va: u64, fr: u64) {
         core::ptr::write(vas.add(n), va);
         core::ptr::write(frs.add(n), fr);
         core::ptr::write(core::ptr::addr_of_mut!(DLL_CACHE_N), n + 1);
+    }
+}
+
+// --- EAGER IMAGE-MAP completion tracking ---------------------------------------------------------
+// (A) EAGER IMAGE-MAPPING. Under QEMU TCG each demand-fault is a full fault-EP round-trip (~6/s), so
+// paging a big DLL image in one-page-at-a-time (or in small BATCH runs) dominates the boot budget
+// (the full 5-process load exceeds the 500s TCG window). The fix: the FIRST time a process faults
+// into a given image, fill+map the WHOLE image extent in that ONE round-trip (same total frames —
+// each page gets a frame either way — just UPFRONT, so the process never demand-faults that image's
+// code pages again). To keep this O(pages) (not O(pages^2) via the linear `filled_pages` scan) and
+// to run exactly ONCE per (process, image), we record the (pi, image_base) pairs already eagerly
+// filled. A tiny fixed set — there are only ~165 distinct DLLs across the whole boot, and each is
+// eager-filled at most once per process that maps it. Keyed by (pi as u8, image_base). Accessed via
+// raw pointers (static_mut_refs lint) — single-threaded executive, no races.
+const EAGER_DONE_CAP: usize = 4096;
+static mut EAGER_DONE_PI: [u8; EAGER_DONE_CAP] = [0; EAGER_DONE_CAP];
+static mut EAGER_DONE_BASE: [u64; EAGER_DONE_CAP] = [0; EAGER_DONE_CAP];
+static mut EAGER_DONE_N: usize = 0;
+/// True if this (pi, image_base) has already been eagerly whole-image filled (so the fault path
+/// should NOT re-eager it — just service the single faulting page, e.g. a runtime re-fault whose
+/// frame the fixup-remap path preserves).
+pub(crate) unsafe fn eager_done(pi: u64, base: u64) -> bool {
+    let n = core::ptr::read(core::ptr::addr_of!(EAGER_DONE_N));
+    let pis = core::ptr::addr_of!(EAGER_DONE_PI) as *const u8;
+    let bases = core::ptr::addr_of!(EAGER_DONE_BASE) as *const u64;
+    for i in 0..n {
+        if core::ptr::read(bases.add(i)) == base && core::ptr::read(pis.add(i)) as u64 == pi {
+            return true;
+        }
+    }
+    false
+}
+/// Record that (pi, image_base) has been eagerly whole-image filled.
+pub(crate) unsafe fn eager_mark(pi: u64, base: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(EAGER_DONE_N));
+    if n < EAGER_DONE_CAP {
+        core::ptr::write((core::ptr::addr_of_mut!(EAGER_DONE_PI) as *mut u8).add(n), pi as u8);
+        core::ptr::write((core::ptr::addr_of_mut!(EAGER_DONE_BASE) as *mut u64).add(n), base);
+        core::ptr::write(core::ptr::addr_of_mut!(EAGER_DONE_N), n + 1);
     }
 }
 
@@ -1223,7 +1295,12 @@ unsafe fn make_object(obj: u64) -> u64 {
 /// scratch slot within this window (`scratch_base + faults*0x1000`), so it must cover FAULT_CAP
 /// pages; 16 PTs = 8192 pages > FAULT_CAP (6000). Called once per process at spawn.
 pub(crate) unsafe fn map_demand_scratch_pts(base: u64) {
-    for k in 0..16u64 {
+    // 32 PTs × 2 MiB = the FULL 64 MiB DEMAND_SCRATCH_WINDOW (16384 scratch slots). Raised from 16
+    // (32 MiB / 8192 slots) for (A) EAGER IMAGE-MAP: an eager whole-image fill front-loads every
+    // per-process page of a process's DLL tree into scratch in one pass, so a service (lsass loads
+    // ~57 DLLs) can need well over 8192 slots. Backing the full window keeps the fresh-fill's unique
+    // monotonic scratch slot (`scratch_base + faults*0x1000`) inside mapped PTs. Cheap (16 extra PTs).
+    for k in 0..32u64 {
         let pt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
         let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, base + k * 0x20_0000, CAP_INIT_THREAD_VSPACE);

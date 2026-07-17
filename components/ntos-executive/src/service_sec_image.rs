@@ -27,7 +27,12 @@ pub(crate) unsafe fn service_sec_image(
     // Per-process demand-fault backstop (see the use sites). BATCH-22: raised from 2000 now that the
     // persistent scratch VA is decoupled from this count (bounded ≤256 slots) — it's a frame-budget /
     // runaway guard only, sized to let lsass's full LSA-init DLL tree page in within the frame pool.
-    const FAULT_CAP: u64 = 6000;
+    // Per-process fresh-fill ceiling. Each fresh fill consumes a UNIQUE monotonic scratch slot
+    // (`scratch_base + faults*0x1000`), so this must stay under the per-process scratch window
+    // (now 64 MiB = 16384 slots, see map_demand_scratch_pts). (A) EAGER IMAGE-MAP front-loads a
+    // process's whole DLL tree, so raised 6000→15000 (headroom under 16384) to let lsass's full
+    // LSA-init tree page in eagerly without hitting the cap. Runaway/frame-pool guard only.
+    const FAULT_CAP: u64 = 15000;
     let mut first = 0u64;
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
@@ -372,7 +377,33 @@ pub(crate) unsafe fn service_sec_image(
             }
         }};
     }
+    // (B) GLOBAL PROGRESS-STALL WATCHDOG state — WALL-CLOCK based (iteration counts are useless here:
+    // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
+    // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
+    // is the monotonic time (100ns units) at the last epoch bump (a NEW demand-load / fresh page fill /
+    // event / paint = real forward progress). If NO progress happens for STALL_BUDGET_100NS of
+    // WALL-CLOCK time, forward progress is impossible (every live process cooperatively parked with no
+    // signaler, or a slow win32k live-lock that WALLs without loading/filling anything new) → QUIESCE
+    // (break → run the gate + qemu_exit). Generous enough that a genuinely-advancing (even if slow)
+    // boot phase — which keeps filling pages / loading DLLs — never trips; only a true stall does.
+    const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
+    let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
+    let mut last_progress_t = monotonic_time_100ns();
     loop {
+        // Progress-stall accounting: reset the wall-clock window on any epoch bump (real forward
+        // progress); quiesce if no progress for STALL_BUDGET_100NS.
+        {
+            let ep = PROGRESS_EPOCH.load(Ordering::Relaxed);
+            let now = monotonic_time_100ns();
+            if ep != last_progress_epoch {
+                last_progress_epoch = ep;
+                last_progress_t = now;
+            } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
+                print_str(b"[quiesce] no forward progress for ~45s wall-clock (no new load/fill/event/paint) -> run gate\n");
+                stop = m1;
+                break;
+            }
+        }
         if badge == DELAY_TIMER_BADGE {
             if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
                 let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
@@ -1078,7 +1109,6 @@ pub(crate) unsafe fn service_sec_image(
             // FAULTING page (batch index 0) keeps the full original logic incl. the shared-cache HIT
             // path; extra pages take the fresh-fill path (a shared page already cached is left to a
             // normal later fault — correct, just unbatched).
-            const BATCH_PAGES: u64 = 4;
             let img_hi = if base == PE_LOAD_BASE {
                 img_end
             } else if base == nt_base {
@@ -1088,12 +1118,33 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 base
             };
+            // ★ (A) EAGER IMAGE-MAP. The FIRST time this process faults into an image (`base`), fill+map
+            // the WHOLE image extent `[base, img_hi)` in this ONE round-trip instead of a small forward
+            // RUN — same total frames, just UPFRONT, so the process never demand-faults that image's code
+            // pages again (the dominant TCG cost: each per-page fault is a full fault-EP round-trip). On a
+            // LATER fault into an already-eager image (a runtime re-touch / a fixup re-fault), fall back to
+            // the small forward BATCH from the faulting page (the fixup-remap path preserves its frame).
+            // The per-page body below is IDENTICAL for both — it just walks a wider window. `eager_mark`
+            // makes this run exactly ONCE per (pi, image), so the whole-image pass is O(pages), not
+            // O(pages^2): we start from `base`, and each page's mapped-state is checked via the scalable
+            // (pi,page) frame map / shared cache — NOT the 256-entry `filled_pages` linear scan.
+            let do_eager = img_hi > base && !eager_done(pi as u64, base);
+            let (batch_start, batch_pages) = if do_eager {
+                eager_mark(pi as u64, base);
+                (base, (img_hi - base) / 0x1000)
+            } else {
+                const FORWARD_RUN: u64 = 4;
+                (page, FORWARD_RUN)
+            };
             let mut bi: u64 = 0;
-            while bi < BATCH_PAGES {
-                let bpage = page + bi * 0x1000;
+            while bi < batch_pages {
+                let bpage = batch_start + bi * 0x1000;
                 if bpage >= img_hi || bpage < base {
                     break;
                 }
+                // The single page that actually FAULTED (present in every window). Only this page is
+                // guaranteed unmapped; every other page must be checked before (re)mapping.
+                let is_fault_page = bpage == page;
                 if faults >= FAULT_CAP {
                     break;
                 }
@@ -1115,62 +1166,55 @@ pub(crate) unsafe fn service_sec_image(
                 // OBSERVED (lsass, BATCH 24): kernel32's ntdll-IAT page (RVA 0x77000, in .rdata → RW)
                 // reverted → CloseHandle's `call *[IAT]` jumped to the bare RVA 0x3a288 (should be
                 // NTDLL_BASE+0x3a288) → instr-fetch fault, before SetEvent(LSA_RPC_SERVER_ACTIVE).
-                // FIX: for the FAULTING per-process page (bi==0), if this process already has a frame
-                // recorded for it (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every
-                // pi>=1 process), RE-MAP that SAME frame (which holds the loader's in-memory fixups)
-                // instead of filling a fresh raw frame. `csrss_frame_get` falls back to the shared DLL
-                // cache, so restrict to `!shareable` (a genuine per-process frame the caller recorded).
-                if bi == 0 && !shareable && pi >= 1 {
+                // FIX: for a per-process page THIS process already has a frame recorded for
+                // (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every pi>=1 process),
+                // RE-MAP that SAME frame (which holds the loader's in-memory fixups) instead of filling a
+                // fresh raw frame. `csrss_frame_get` falls back to the shared DLL cache, so restrict to
+                // `!shareable` (a genuine per-process frame the caller recorded). Applies to ANY page in
+                // the window (not just the faulting one) so an eager whole-image pass re-maps, never
+                // re-fills, a page whose fixups already landed.
+                if !shareable && pi >= 1 {
                     let existing = csrss_frame_get(pi as u64, bpage);
                     if existing != 0 && existing != dll_cache_get(bpage) {
-                        // A previously-filled per-process frame for THIS page → re-map it (preserving
-                        // fixups). rights: per-process image pages are RW_NX (non-exec sections) here.
-                        let (cc, ce) = copy_cap_r(existing);
-                        let me = page_map_r(cc, bpage, RW_NX, pml4);
-                        let n = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
-                        if n < 16 {
-                            print_str(b"[fixup-remap] pi=");
-                            print_u64(pi as u64);
-                            print_str(b" page=0x");
-                            print_hex(bpage as u32);
-                            print_str(b" frame preserved (copy=");
-                            print_u64(ce);
-                            print_str(b" map=");
-                            print_u64(me);
-                            print_str(b")\n");
+                        if is_fault_page {
+                            // A previously-filled per-process frame for THE FAULTING page → re-map it
+                            // (preserving fixups). rights: per-process image pages are RW_NX here.
+                            let (cc, ce) = copy_cap_r(existing);
+                            let me = page_map_r(cc, bpage, RW_NX, pml4);
+                            let n = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
+                            if n < 16 {
+                                print_str(b"[fixup-remap] pi=");
+                                print_u64(pi as u64);
+                                print_str(b" page=0x");
+                                print_hex(bpage as u32);
+                                print_str(b" frame preserved (copy=");
+                                print_u64(ce);
+                                print_str(b" map=");
+                                print_u64(me);
+                                print_str(b")\n");
+                            }
                         }
-                        // Do NOT bump `faults` (no scratch slot consumed) or re-record — the frame is
-                        // already tracked. Advance to the next batch page.
+                        // Already backed by a recorded per-process frame → it is (or was) mapped; do NOT
+                        // re-fill/double-map a non-faulting page. Advance. (No `faults` bump — no fill.)
                         bi += 1;
                         continue;
                     }
                 }
-                // For batch pages PAST the faulting one (bi>0), only PRE-fill genuinely-unmapped
-                // pages: a per-process page already recorded in `filled_pages`, or a shared page not
-                // cached here yet but already mapped, must be skipped so we never double-map. The
-                // faulting page (bi==0) always proceeds (it faulted → it is NOT mapped).
-                if bi > 0 {
-                    if !shareable {
-                        // Per-process page. Its mapped-set is tracked only in the 256-entry
-                        // `filled_pages`; once a process has faulted ≥256 pages that table is full, so a
-                        // page's mapped-state is no longer knowable → DON'T pre-map (a re-map of an
-                        // already-present page fails harmlessly with map=8 but wastes a frame). Below
-                        // 256, skip a page already recorded as filled+mapped.
-                        if faults as usize >= filled_pages.len() {
-                            break; // tracking exhausted — stop pre-filling this per-process image
-                        }
-                        let already = (0..(faults as usize).min(filled_pages.len()))
-                            .any(|k| filled_pages[k] == bpage);
-                        if already {
-                            bi += 1;
-                            continue;
-                        }
-                    } else if cached != 0 {
-                        // shared page already has a frame; whether THIS process has it mapped is not
-                        // tracked — skip pre-mapping to avoid a double-map, let it fault normally.
-                        bi += 1;
-                        continue;
-                    }
+                // A non-faulting page must only be (pre)filled if it is genuinely UNMAPPED in this
+                // process. The faulting page always proceeds (it faulted → it is NOT mapped). For a
+                // shared page, `cached != 0` means a frame exists.
+                //  - In the small FORWARD-RUN (non-eager) path, THIS process may already have the
+                //    cached shared page mapped (it's a re-entry) → skip pre-mapping to avoid a
+                //    double-map; let it fault normally if unmapped.
+                //  - In the EAGER whole-image path (`do_eager` = the FIRST time this pi maps this
+                //    image), the page is NOT yet mapped in this pi, so MAP the cached shared frame into
+                //    THIS process here (cheap: a copy_cap + page_map, no fill, no fresh frame). This is
+                //    the key eager win for a SECOND+ process mapping a DLL a prior process already
+                //    filled: it gets every RX text page mapped in ONE round-trip, never demand-faulting
+                //    that DLL's code. (The map falls through to the `cached != 0` arm below.)
+                if !is_fault_page && shareable && cached != 0 && !do_eager {
+                    bi += 1;
+                    continue;
                 }
                 let (frame, rights) = if cached != 0 {
                     DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1187,7 +1231,13 @@ pub(crate) unsafe fn service_sec_image(
                     let scratch = scratch_base + faults * 0x1000;
                     let (f, fe) = alloc_frame_r();
                     let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                    let r = fill_image_page(tpe, rva, scratch);
+                    // ★ ROBUSTNESS (must precede the fill): fill_image_page WRITES the PE bytes THROUGH
+                    // the scratch alias. If alloc_frame_r / page_map_r failed (untyped pool or CNode
+                    // slots exhausted — the frame pressure eager-map front-loads), the scratch VA is
+                    // NOT mapped, and an unconditional write here faults the EXECUTIVE ITSELF (tcb=3,
+                    // no fault handler → the whole boot dies). Guard the fill on a successful map, and
+                    // break out of this image's batch so the faulting thread is handled below (it will
+                    // re-fault or park) instead of taking the executive down.
                     if fe != 0 || se != 0 {
                         print_str(b"[map-fail] rva=0x");
                         print_hex(rva);
@@ -1197,8 +1247,10 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(se);
                         print_str(b" faults=");
                         print_u64(faults);
-                        print_str(b"\n");
+                        print_str(b" (alloc/map FAILED - skip fill, likely frame-pool pressure)\n");
+                        break;
                     }
+                    let r = fill_image_page(tpe, rva, scratch);
                     if shareable {
                         dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
                     } else {
@@ -1225,6 +1277,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     faults += 1; // a fill consumed a scratch slot; shared HITs do not
+                    bump_progress(); // (B) a fresh page filled = real memory progress (resets stall)
                     (f, if shareable { 2 } else { r })
                 };
                 // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
@@ -2583,6 +2636,33 @@ pub(crate) unsafe fn service_sec_image(
                 // send_on_reply(REPLY_MAIN)) is caller-agnostic: REPLY_MAIN is bound to THIS caller at
                 // its recv, so the routed reply resumes exactly services (no reply-spin).
                 W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+                // ★ (B) SPIN WATCHDOG. A GUI client can live-lock a run of win32k calls that never
+                // terminates — either all WALLing (csrss's user32 RegisterSystemClasses hammering
+                // NtUserFindExistingCursorIcon 0x103d / NtUserRegisterClassExWOW 0x10b4 when win32k
+                // asserts) OR each returning STATUS_SUCCESS yet never satisfying the loop condition (the
+                // assert-skips leave win32k's class table inconsistent so the same cursor/class is
+                // re-registered forever). It keeps issuing syscalls so it is neither crash- nor
+                // wait-parked → without this it spins the shared loop to the TCG timeout and the boot
+                // never reaches the gate. A TOTAL per-client win32k-dispatch budget catches BOTH cases:
+                // a client's real win32k init is bounded (a few hundred calls), so past a generous
+                // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
+                // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
+                {
+                    const W32_TOTAL_LIMIT: u64 = 500;
+                    let total = W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed) + 1;
+                    if total >= W32_TOTAL_LIMIT {
+                        print_str(b"[w32-spin] pi=");
+                        print_u64(pi as u64);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" last SSN=0x");
+                        print_hex(m0 as u32);
+                        print_str(b" exceeded ");
+                        print_u64(total);
+                        print_str(b" total win32k dispatches (live-lock) -> PARK\n");
+                        park_and_log!(pi, b"win32k-spin", m0, m0);
+                    }
+                }
                 // Phase 2c Milestone C: a win32k NtUser/NtGdi system call (SSN >= 0x1000) issued by
                 // csrss (winsrv's UserServerDllInitialization) OR by winlogon (its user32 DllMain's
                 // NtUserProcessConnect + WinMain's window-station/desktop calls) — the SECOND hosted

@@ -469,6 +469,7 @@ pub(crate) unsafe fn demand_load_dll(
     let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
     core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
     *store.add(slot) = Some(pe);
+    crate::bump_progress(); // (B) a NEW DLL loaded = unambiguous forward progress (resets stall)
     print_str(b"[ntos-exec] DEMAND-LOAD ");
     print_str(stem);
     print_str(b" (");
