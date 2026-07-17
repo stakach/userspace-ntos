@@ -2655,20 +2655,27 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // (SCM_WORKER_BADGE) so it runs into the main multiplex — its faults sub-select to
                 // (pi 3, scm-worker) via its OWN stack mirror/TEB, and its blocking pipe reads park +
                 // re-drive on winlogon's write (the existing batch-33/34 edges, badge-general).
-                // ★ BATCH 35 FRONTIER GUARD. The full per-connection-worker routing (recognizer + spawn
+                // ★ BATCH 36 FRONTIER GUARD. The full per-connection-worker routing (recognizer + spawn
                 // RESUMED into the multiplex at SCM_WORKER_BADGE with its own TEB/stack-mirror/fault-EP,
-                // + the badge sub-select / mirror_ctx / pipe-park paths) is BUILT. It is gated OFF here
-                // because the hosted-thread trampoline faults at ENTRY when a 3rd native thread in
-                // services' VSpace actually runs it: a reproducible cr2=0 VMFault at the worker's
-                // trampoline VA despite a byte-perfect, successfully-mapped RX trampoline (page_map_r=0),
-                // INDEPENDENT of the VA window (cluster block AND a fresh dedicated-PT 0x1100_0000
-                // window both fault identically), the transport (native AND trap fault the same), and
-                // resume timing (spawn-resumed AND suspended-then-NtResumeThread both fault). It needs a
-                // kernel gdb-stub session on the worker TCB's VSpace binding at the fault. Letting the
-                // worker's NtCreateThread SUCCEED makes rpcrt4 hand off to a worker that never runs →
-                // winlogon later walls on its own rpcrt4 worker TEB → the loop hangs (no clean quiesce),
-                // so while OFF we fall through to the pre-batch 0xC000_009A (baseline clean-boot). Flip
-                // this const to `true` (+ resume=true in the loop spawn) once the fault is root-caused.
+                // + the badge sub-select / mirror_ctx / pipe-park paths) is BUILT, and the BATCH-35
+                // trampoline-entry `cr2=0` fault is now ROOT-CAUSED + FIXED: it was NOT a kernel bug but
+                // an executive VA COLLISION — `SCM_WORKER_ENV_SCRATCH_VA` was 0x107C = winlogon's
+                // process-spawn env-scratch (never unmapped), so `spawn_hosted_thread`'s alias map of the
+                // worker's trampoline frame returned a SILENT `seL4_DeleteFirst` (SYS_SEND-hidden), the
+                // bytes were written to winlogon's stale frame, and the worker's REAL trampoline frame
+                // stayed ZERO → executed `add [rax],al` (rax=0) → read of 0. Moving the scratch to a free
+                // VA (0x1075) FIXED it: with the route ENABLED the worker RUNS its real rpcrt4 entry (4
+                // native syscalls incl. NtQueryInformationThread, label 0x4e54 NOT a fault) and winlogon
+                // crosses the wire with its 72-byte RPC bind PDU (proven `/tmp/boot36fix.log`).
+                // STILL GATED OFF for a DOWNSTREAM reason (a NEW, later wall, not the fixed fault): the
+                // rpcrt4 per-connection worker EXITS (NtTerminateThread exit=0) after its self-inspection
+                // syscalls WITHOUT reading the bind / writing bind_ack — it isn't yet wired to the
+                // accepted server-pipe endpoint (the flagged "N threads per process" connection-context
+                // follow-up). With the route ON, winlogon then parks reading bind_ack and every thread
+                // is parked → the main loop blocks with no clean quiesce → HANG to timeout. So while the
+                // TRAMPOLINE FIX is permanent (the 0x1075 VA above), the ROUTE stays OFF (fall through to
+                // 0xC000_009A = baseline clean-boot) until the worker's accepted-connection context is
+                // wired so it reads the bind + writes bind_ack. Flip to `true` then.
                 const SCM_WORKER_ROUTE_ENABLED: bool = false;
                 if SCM_WORKER_ROUTE_ENABLED
                     && matches!(ctx.service, NativeService::NtCreateThread)

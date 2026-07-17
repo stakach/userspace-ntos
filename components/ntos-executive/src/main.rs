@@ -379,9 +379,17 @@ pub const SCM_WORKER_STACK_FRAMES: u64 = 8;
 pub const SCM_WORKER_IPCBUF_VA: u64 = WL_WORKER3_IPCBUF_VA;
 pub const SCM_WORKER_TEB_VA: u64 = WL_WORKER3_TEB_VA;
 pub const SCM_WORKER_TRAMP_VA: u64 = WL_WORKER3_TRAMP_VA;
-/// Executive scratch (3 pages) — distinct from every other thread's (free gap between WL_WORKER2's
-/// 0x107B and WL_WORKER3's 0x107D). FILEBUF PT.
-pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_107C_0000;
+/// Executive scratch (3 pages: TEB / TEB2 / trampoline). BATCH 36 ROOT-CAUSE FIX: this WAS 0x107C,
+/// which COLLIDES with **winlogon's process-spawn env-scratch** (`spawn_sec_image` for winlogon uses
+/// scr_base 0x107C — service_sec_image.rs, documented at the `winlogon-spawn (0x107C)` note). Those
+/// spawn-env frames are mapped at winlogon's spawn and NEVER unmapped, so `spawn_hosted_thread`'s
+/// executive-side alias map `page_map(tramp, scr+0x2000)` for the SCM worker hit an already-occupied
+/// leaf PTE → kernel returned `seL4_DeleteFirst` (8); the trampoline bytes were written into
+/// winlogon's STALE env frame while the worker's REAL trampoline frame stayed ZERO → mapped into
+/// services' VSpace zero-filled → the worker executed `00 00` (= `add [rax],al`, rax=0) at entry =
+/// the reproducible `cr2=0` READ fault (err=4) at the trampoline VA. 0x1075 is a genuinely-free gap
+/// (between smss-spawn 0x1074 and services-env 0x1076), still inside the FILEBUF PT (0x1060..0x107F).
+pub const SCM_WORKER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1075_0000;
 /// Executive-side stack mirror for the SCM worker (its syscall out-params / stack-arg reads / the
 /// bind-PDU read buffer land on its OWN stack). Distinct 8-page window (past LSASS_LISTENER3's 0x1390).
 pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
@@ -1384,6 +1392,57 @@ unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
         inout("r10") vaddr => _,
         inout("r8") rights => _,
         inout("r9") vspace => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// SYS_CALL variant of `tcb_set_space` — returns the invocation error label (0 = success).
+/// (a2=fault_ep, a3=cnode, a4=vspace, per LBL_TCB_SET_SPACE.)
+unsafe fn tcb_set_space_r(target: u64, fault_ep: u64, cnode: u64, vspace: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_SET_SPACE << 12 => reply,
+        inout("r10") fault_ep => _,
+        inout("r8") cnode => _,
+        inout("r9") vspace => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// SYS_CALL variant of `tcb_set_ipc_buffer` — returns the invocation error label (0 = success).
+/// (legacy ABI: a2=vaddr, a3=frame_cptr.)
+unsafe fn tcb_set_ipc_buffer_r(target: u64, vaddr: u64, frame: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_SET_IPC_BUFFER << 12 => reply,
+        inout("r10") vaddr => _,
+        inout("r8") frame => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
+}
+/// SYS_CALL variant of `tcb_write_registers` (legacy length==0 shape) — returns the error label.
+/// (a2=rip, a3=rsp, a4=arg0.)
+unsafe fn tcb_write_registers_r(target: u64, rip: u64, rsp: u64, arg0: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") target => _,
+        inout("rsi") LBL_TCB_WRITE_REGISTERS << 12 => reply,
+        inout("r10") rip => _,
+        inout("r8") rsp => _,
+        inout("r9") arg0 => _,
         lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
@@ -3802,6 +3861,11 @@ struct HostedThread {
     /// (non-zero) is that reused frame cap; when 0 (trap/park-only threads) a fresh frame is used.
     native: bool,
     ipcbuf_frame: u64,
+    /// BATCH 36 DIAG: when true, `spawn_hosted_thread` uses the SYS_CALL/`_r` variants for the
+    /// resource-critical invocations (retype/copy/map/set_space/write_registers/set_ipc/resume)
+    /// and PRINTS every non-zero error label — to surface the silent SYS_SEND failure that leaves
+    /// the 3rd hosted thread with a bad RSP/RIP (cr2=0 trampoline fault). Off = fire-and-forget.
+    diag: bool,
 }
 
 /// Spawn a REAL 2nd (or Nth) thread in a hosted process's VSpace — the GENERAL hosted-thread
@@ -3872,8 +3936,12 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         (f, t.ipcbuf_va)
     };
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
-    let tramp = alloc_frame();
-    let _ = page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let (tramp, e_tramp_frame) = if t.diag { alloc_frame_r() } else { (alloc_frame(), 0) };
+    let e_tramp_exec_map = if t.diag {
+        page_map_r(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
+    } else {
+        page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
+    };
     let tb = nt_thread_start::Amd64ThreadContext {
         rip: t.entry_rip,
         rsp: 0,
@@ -3884,21 +3952,100 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     for (j, &b) in tb.iter().enumerate() {
         core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
     }
-    let _ = page_map(copy_cap(tramp), t.tramp_va, /* RX */ 2, t.pml4);
+    let tramp_tgt_cap = copy_cap(tramp);
+    let e_tramp_tgt_map = if t.diag {
+        page_map_r(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4)
+    } else {
+        page_map(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4)
+    };
+    if t.diag {
+        // Read the FIRST 8 bytes back through what we WROTE (executive alias) AND through a FRESH,
+        // independent alias of the SAME `tramp` frame mapped at a throwaway VA — if these disagree, the
+        // executive-side write and the target map are hitting DIFFERENT physical frames (the silent
+        // SYS_SEND alias-map failure that leaves the target trampoline zero-filled → cr2=0 at entry).
+        let wrote = core::ptr::read_volatile((scr + 0x2000) as *const u64);
+        let verify_va = scr + 0x3000; // 4th page of this thread's scratch PT — unused, same PT so mapped
+        let fresh = copy_cap(tramp);
+        let e_fresh = page_map_r(fresh, verify_va, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let via_fresh = if e_fresh == 0 {
+            core::ptr::read_volatile(verify_va as *const u64)
+        } else {
+            0xDEAD_DEAD_DEAD_DEADu64
+        };
+        print_str(b"[spawn-diag] tramp_frame_retype=");
+        print_u64(e_tramp_frame);
+        print_str(b" exec_map=");
+        print_u64(e_tramp_exec_map);
+        print_str(b" tgt_map=");
+        print_u64(e_tramp_tgt_map);
+        print_str(b" fresh_map=");
+        print_u64(e_fresh);
+        print_str(b"\n[spawn-diag] tramp[0..8] wrote=0x");
+        print_hex((wrote >> 32) as u32);
+        print_hex(wrote as u32);
+        print_str(b" via_fresh_alias=0x");
+        print_hex((via_fresh >> 32) as u32);
+        print_hex(via_fresh as u32);
+        print_str(b" (must match; expect 0x...48b9)\n");
+    }
     // CNode (PML4 + the dedicated fault EP) + TCB.
     let raw = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    // BATCH 36 DIAG: only the diag thread uses the SYS_CALL/`_r` error-returning variants (to surface
+    // a silent SYS_SEND failure); every other spawn keeps the byte-identical SYS_SEND fire-and-forget
+    // path so the baseline boot is unchanged.
+    let e_cn = if t.diag {
+        untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw)
+    } else {
+        untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw)
+    };
     let cnode = alloc_slot();
     let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, t.pml4, 0);
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, copy_cap(t.fault_ep), 0);
     let tcb = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
-    let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_bind_va, ipcbuf, 0);
-    let _ = tcb_write_registers(tcb, t.tramp_va, t.stack_base + t.stack_frames * 0x1000 - 16, 0);
+    let new_sp = t.stack_base + t.stack_frames * 0x1000 - 16;
+    let (e_tcb, e_space, e_ipc, e_regs) = if t.diag {
+        let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+        let e_space = tcb_set_space_r(tcb, CT_FAULT, cnode, t.pml4);
+        let e_ipc = tcb_set_ipc_buffer_r(tcb, ipcbuf_bind_va, ipcbuf);
+        let e_regs = tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0);
+        (e_tcb, e_space, e_ipc, e_regs)
+    } else {
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+        let _ = tcb_set_space(tcb, CT_FAULT, cnode, t.pml4);
+        let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, ipcbuf_bind_va, ipcbuf, 0);
+        let _ = tcb_write_registers(tcb, t.tramp_va, new_sp, 0);
+        (0, 0, 0, 0)
+    };
     let _ = tcb_set_gs_base(tcb, t.teb_va);
     let _ = tcb_set_priority(tcb, if t.prio != 0 { t.prio as u64 } else { 100 });
+    if t.diag {
+        print_str(b"[spawn-diag] tcb=0x");
+        print_hex(tcb as u32);
+        print_str(b" cnode_retype=");
+        print_u64(e_cn);
+        print_str(b" tcb_retype=");
+        print_u64(e_tcb);
+        print_str(b" set_space=");
+        print_u64(e_space);
+        print_str(b" set_ipc=");
+        print_u64(e_ipc);
+        print_str(b" write_regs=");
+        print_u64(e_regs);
+        print_str(b"\n[spawn-diag] tramp_va=0x");
+        print_hex((t.tramp_va >> 32) as u32);
+        print_hex(t.tramp_va as u32);
+        print_str(b" new_sp=0x");
+        print_hex((new_sp >> 32) as u32);
+        print_hex(new_sp as u32);
+        print_str(b" pml4=0x");
+        print_hex(t.pml4 as u32);
+        print_str(b" ipcbuf=0x");
+        print_hex(ipcbuf as u32);
+        print_str(b" fault_ep=0x");
+        print_hex(t.fault_ep as u32);
+        print_str(b"\n");
+    }
     // Transport (ntdll_plan Step 6.A / BATCH 6): a NATIVE thread must NOT get the hosted-syscalls
     // flag — with it set the kernel forces its native `seL4_Call` into an UnknownSyscall fault whose
     // m0=RAX (garbage), so the rendezvous reads a bogus SSN. Cleared, the Call dispatches natively

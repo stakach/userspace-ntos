@@ -34,6 +34,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         prio: 0,
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[0].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -318,6 +319,7 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         // transport, bound to csrss's main-thread ipcbuf frame at IPCBUF_VADDR.
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -406,6 +408,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
         // SSN=garbage → `[wl-worker] PARK` (never ran its RPC init) → winlogon main stuck on the SAS wait.
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -454,6 +457,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
         // the server pipe) — the reads the pipe-pending park/re-drive edge then completes.
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -498,6 +502,7 @@ pub(crate) unsafe fn spawn_scm_worker_thread(
         prio: 104, // same band as the listener (above winlogon/services main threads)
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[3].load(Ordering::Relaxed),
+        diag: true, // BATCH 36 DIAG: surface silent SYS_SEND spawn errors for the 3rd hosted thread
     })
 }
 
@@ -546,6 +551,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
         // so it actually RUNS LsarStartRpcServer → SetEvent(LSA_RPC_SERVER_ACTIVE).
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -583,6 +589,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
         // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
@@ -618,6 +625,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
         // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
         native: true,
         ipcbuf_frame: PM_MAIN_IPCBUF[4].load(Ordering::Relaxed),
+        diag: false,
     })
 }
 
