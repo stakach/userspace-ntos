@@ -2994,6 +2994,7 @@ unsafe fn dispatch_value(
     ty: u32,
     data: *const u8,
     len: u32,
+    context: u64,
 ) -> u32 {
     use alloc::vec::Vec;
     // REG_MULTI_SZ split (skip if NOEXPAND) — faithful port of ReactOS `RtlpCallQueryRegistryRoutine`
@@ -3039,6 +3040,7 @@ unsafe fn dispatch_value(
                     REG_SZ,
                     (data as *const u16).add(start) as *const u8,
                     sub_len_bytes,
+                    context,
                 )
             };
             if st != STATUS_SUCCESS_U as u32 {
@@ -3085,8 +3087,13 @@ unsafe fn dispatch_value(
     // SAFETY: query_routine is the caller's routine matching the RTL_QUERY_REGISTRY_ROUTINE ABI.
     let routine: OnTargetQueryRoutine = unsafe { core::mem::transmute::<u64, OnTargetQueryRoutine>(entry.query_routine) };
     // SAFETY: calling into the caller's routine with its declared ABI + valid pointers.
+    // Forward the caller's `Context` (the argument passed to RtlQueryRegistryValues) as the
+    // routine's 5th parameter, exactly like RtlpCallQueryRegistryRoutine (registry.c:289): the
+    // routine receives (Name, Type, Data, Length, Context, EntryContext). Previously hardcoded to
+    // 0, which NULLed lsass' `LsapAddAuthPackage` Context (=&PackageId) → `*Id` NULL-deref at
+    // authpackage.c:297 (Package->LsaApInitializePackage(*Id, ...)).
     let st = unsafe {
-        routine(name_ptr as u64, ty_out, data_out, len_out, 0, entry.entry_context)
+        routine(name_ptr as u64, ty_out, data_out, len_out, context, entry.entry_context)
     };
     // STATUS_BUFFER_TOO_SMALL is normalized to SUCCESS by real ntdll.
     if st == 0xC000_0023 { STATUS_SUCCESS_U as u32 } else { st }
@@ -3597,7 +3604,7 @@ pub unsafe fn rtl_query_registry_values(
     relative_to: u32,
     path: *const u16,
     query_table: *const u8,
-    _context: u64,
+    context: u64,
 ) -> u32 {
     use alloc::vec::Vec;
     if query_table.is_null() {
@@ -3728,6 +3735,7 @@ pub unsafe fn rtl_query_registry_values(
                                 ty,
                                 data_ptr,
                                 data_len,
+                                context,
                             );
                             if st2 != STATUS_SUCCESS_U as u32 {
                                 status = st2;
@@ -3779,6 +3787,7 @@ pub unsafe fn rtl_query_registry_values(
                         ty,
                         info.as_ptr().add(data_off),
                         data_len,
+                        context,
                     );
                     if st2 != STATUS_SUCCESS_U as u32 {
                         status = st2;
@@ -3786,7 +3795,7 @@ pub unsafe fn rtl_query_registry_values(
                 }
             } else {
                 // Value absent → fall to the caller's default (if any).
-                let st2 = unsafe { dispatch_default(&entry) };
+                let st2 = unsafe { dispatch_default(&entry, context) };
                 if st2 != STATUS_SUCCESS_U as u32 {
                     status = st2;
                 }
@@ -3818,7 +3827,7 @@ pub unsafe fn rtl_query_registry_values(
 /// # Safety
 /// On-target; `entry` valid.
 #[cfg(target_arch = "x86_64")]
-unsafe fn dispatch_default(entry: &QueryEntry) -> u32 {
+unsafe fn dispatch_default(entry: &QueryEntry, context: u64) -> u32 {
     if entry.default_type == REG_NONE {
         return if (entry.flags & RTL_QUERY_REGISTRY_REQUIRED) != 0 {
             0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
@@ -3864,6 +3873,7 @@ unsafe fn dispatch_default(entry: &QueryEntry) -> u32 {
             entry.default_type,
             entry.default_data as *const u8,
             len,
+            context,
         )
     }
 }
