@@ -416,6 +416,27 @@ const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
 /// switch's effect.
 pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
 
+/// win32k `.data` global `NrGuiAppsRunning` (guicheck.c:17) RVA — the lazy-graphics-init gate counter.
+/// `co_AddGuiApp` triggers `co_IntInitializeDesktopGraphics` only on the 0→1 transition. We READ it to
+/// diagnose whether winlogon's SwitchGDI DC-op fires the lazy InitVideo (paint) or is short-circuited.
+pub const NR_GUI_APPS_RUNNING_RVA: u64 = 0x20be88;
+
+/// SSN NtUserSwitchDesktop — SSDT idx 0x288 (== `WIN32K_SERVICE_BASE + 0x288`).
+pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
+/// SSN NtUserRedrawWindow — SSDT idx 0x012 (w32ksvc64.h: `SVC_(UserRedrawWindow, 4) // 0x1012`).
+pub const SSN_NT_USER_REDRAW_WINDOW: u64 = 0x1012;
+
+/// `co_IntGraphicsCheck(BOOL Create)` RVA (guicheck.c) — win32k's AUTHENTIC lazy-graphics entry.
+/// Disasm-confirmed for THIS build (0.4.17): prologue at 0x7a100 does
+/// `W32Data = PsGetCurrentProcessWin32Process(); if (Create && !(W32PF_CREATEDWINORDC|W32PF_MANUALGUICHECK))
+///  co_AddGuiApp(W32Data);` where `co_AddGuiApp` (RVA 0x7a080) sets W32PF_CREATEDWINORDC, does
+/// `InterlockedIncrement(&NrGuiAppsRunning@0x20be88)` and, on the 0→1 transition, calls
+/// `co_IntInitializeDesktopGraphics` (RVA 0xfca10) — the REAL InitVideo (framebuf surface + SM_CX/CYSCREEN)
+/// whose tail runs `co_IntShowDesktop(IntGetActiveDesktop(), SM_CX, SM_CY, TRUE)` = the authentic
+/// IntPaintDesktop that blits 0x003a6ea5 via framebuf's EngCopyBits. This is the exact call win32k makes
+/// from `DceCreateDisplayDC` (windc.c:44) on the first display-DC alloc.
+pub const CO_INT_GRAPHICS_CHECK_RVA: u64 = 0x7a100;
+
 /// NtUserCreateWindowStation — SSDT idx 0x22f (w32ksvc64.h), RVA read from the registered SSDT.
 pub const NT_USER_CREATE_WINDOW_STATION_RVA: u64 = 0xfa710;
 /// NtUserCreateDesktop — SSDT idx 0x22d, calls IntCreateDesktop (RVA 0x657f0).
@@ -2721,6 +2742,27 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
     let sh = WIN32K_SHARED_VADDR;
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
+    // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
+    // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
+    // returns TRUE with ZERO paint work — desktop.c:2996); (2) NrGuiAppsRunning (if != 0, co_AddGuiApp's
+    // lazy co_IntInitializeDesktopGraphics won't run on the 0→1 transition → SM_CXSCREEN stays 0 → blit
+    // no-ops). a0 (the HDESK) is the switch target.
+    if ssn == SSN_NT_USER_SWITCH_DESKTOP {
+        let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
+        let target_body = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
+        let ngui = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
+        print_str(b"[win32k-paint] PRE-SwitchDesktop hDesk=0x");
+        print_hex(a0 as u32);
+        print_str(b" target_body=0x");
+        print_hex((target_body >> 32) as u32);
+        print_hex(target_body as u32);
+        print_str(b" gpdeskInputDesktop=0x");
+        print_hex((gpdesk >> 32) as u32);
+        print_hex(gpdesk as u32);
+        print_str(b" NrGuiAppsRunning=0x");
+        print_hex(ngui);
+        print_str(if gpdesk != 0 && gpdesk == target_body { b" [ALREADY-CURRENT!]\n" } else { b"\n" });
+    }
     let ret = if nargs <= 4 {
         let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
         f(a0, a1, a2, a3)
@@ -2742,6 +2784,92 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             s(15),
         )
     };
+
+    // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
+    //
+    // ROOT CAUSE (instruction-confirmed, NtUserSwitchDesktop RVA 0x6c2f8/0x6c579): winlogon's switch is
+    // the FIRST switch, so `gpdeskInputDesktop == NULL` on entry → win32k computes `bRedrawDesktop = FALSE`
+    // (the `if (gpdeskInputDesktop != NULL)` VISIBLE-check branch is skipped) → `co_IntShowDesktop` runs
+    // with SWP_NOREDRAW → NO `co_UserRedrawWindow` → NO WM_ERASEBKGND → NO GetDC → NO `co_IntGraphicsCheck`
+    // → `NrGuiAppsRunning` stays 0 → `co_IntInitializeDesktopGraphics` (InitVideo) NEVER runs → SM_CX/CYSCREEN
+    // stay 0 → IntPaintDesktop blits to a 0×0 surface (0/768 px). The counter proves it: NrGuiAppsRunning=0
+    // both before AND after winlogon's switch.
+    //
+    // In real Windows the lazy InitVideo fires from winlogon's first GUI display-DC alloc
+    // (`DceCreateDisplayDC → co_IntGraphicsCheck(TRUE)`, windc.c:44) once a message loop pumps the desktop
+    // window's WM_PAINT/WM_ERASEBKGND. Our single-threaded host short-circuits the SAS window's WINDOWPROC
+    // callbacks (BATCH 45) and never runs a message loop, so that natural DC-alloc never happens. The
+    // FAITHFUL trigger — the SAME function win32k itself calls — is `co_IntGraphicsCheck(TRUE)`: it runs the
+    // REAL `co_AddGuiApp → co_IntInitializeDesktopGraphics` (framebuf surface init via PDEVOBJ_lChangeDisplay
+    // Settings + IntGdiCreateDC(L"DISPLAY") + IntCreatePrimarySurface) whose tail does
+    // `co_IntShowDesktop(IntGetActiveDesktop()=gpdeskInputDesktop, SM_CX, SM_CY, bRedraw=TRUE)` = the genuine
+    // IntPaintDesktop that blits 0x003a6ea5 to the BOOTBOOT framebuffer through framebuf.dll's EngCopyBits.
+    // NOTHING is faked — win32k's own GDI paints the pixels; we only supply the DC-alloc trigger our missing
+    // message loop would otherwise supply, at the authentic point (right after the desktop is made current).
+    if ssn == SSN_NT_USER_SWITCH_DESKTOP {
+        let gpdesk = read_volatile((WIN32K_CODE_VA + GPDESK_INPUT_DESKTOP_RVA) as *const u64);
+        let ngui = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
+        print_str(b"[win32k-paint] POST-SwitchDesktop ret=0x");
+        print_hex(ret as u32);
+        print_str(b" gpdeskInputDesktop=0x");
+        print_hex((gpdesk >> 32) as u32);
+        print_hex(gpdesk as u32);
+        print_str(b" NrGuiAppsRunning=0x");
+        print_hex(ngui);
+        print_str(b"\n");
+        // Fire the lazy graphics init exactly once, when a desktop is current (gpdeskInputDesktop set) and
+        // InitVideo has not yet run (NrGuiAppsRunning == 0). co_IntGraphicsCheck's own W32PF_CREATEDWINORDC
+        // guard makes a repeat call a no-op, but gating on ngui==0 keeps the log clean and matches the real
+        // first-DC-alloc semantics.
+        if gpdesk != 0 && ngui == 0 {
+            print_str(b"[win32k-paint] driving co_IntGraphicsCheck(TRUE) -> InitVideo + IntPaintDesktop...\n");
+            let gfx: extern "win64" fn(u64) -> i32 =
+                core::mem::transmute((WIN32K_CODE_VA + CO_INT_GRAPHICS_CHECK_RVA) as *const ());
+            let gret = gfx(1);
+            let ngui2 = read_volatile((WIN32K_CODE_VA + NR_GUI_APPS_RUNNING_RVA) as *const u32);
+            print_str(b"[win32k-paint] co_IntGraphicsCheck ret=0x");
+            print_hex(gret as u32);
+            print_str(b" NrGuiAppsRunning=0x");
+            print_hex(ngui2);
+            print_str(b"\n");
+
+            // FULL-DESKTOP REPAINT. InitVideo's own `co_IntShowDesktop(pdesk, 1024, 768, TRUE)` GREW the
+            // desktop window from the default 640×480 (winlogon's FIRST bRedraw=FALSE switch pre-showed it at
+            // the boot-default SM_CX/CYSCREEN) to full 1024×768. co_WinPosSetWindowPos preserves the old
+            // 640×480 area (SWP bitblt) and RDW_INVALIDATE only invalidates the newly-exposed L-region → the
+            // top-left 640×480 keeps its NEVER-painted (magenta) content (observed: 468/768, an L-shape with a
+            // 640×480 top-left hole). Force a WHOLE-desktop erase so IntPaintDesktop repaints the FULL screen:
+            // invoke win32k's own `NtUserRedrawWindow(hwndDesktop, NULL, NULL,
+            // RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_ALLCHILDREN)` — this is exactly the whole-desktop
+            // repaint path win32k uses on WM_SYSCOLORCHANGE (desktop.c DesktopWindowProc) → DesktopWindowProc
+            // WM_ERASEBKGND → IntPaintDesktop over the full clip box. The pixels are still painted by win32k's
+            // real GDI, not by us. The desktop HWND is `gpdesk->pDeskInfo->spwnd->head.h` (WND HEAD.h @ spwnd+0).
+            let pdeskinfo = read_volatile((gpdesk + 0x08) as *const u64); // DESKTOP.pDeskInfo
+            let spwnd = if pdeskinfo != 0 { read_volatile((pdeskinfo + 0x10) as *const u64) } else { 0 };
+            let hwnd_desktop = if spwnd != 0 { read_volatile(spwnd as *const u64) } else { 0 }; // WND HEAD.h
+            if hwnd_desktop != 0 {
+                // RDW_INVALIDATE(0x1)|RDW_ERASE(0x4)|RDW_UPDATENOW(0x100)|RDW_ALLCHILDREN(0x80) = 0x185.
+                const RDW_FULL: u64 = 0x1 | 0x4 | 0x100 | 0x80;
+                let ssdt_base = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+                let ridx = SSN_NT_USER_REDRAW_WINDOW - WIN32K_SERVICE_BASE;
+                let rh = read_volatile((ssdt_base + ridx * 8) as *const u64);
+                if rh != 0 {
+                    let redraw: extern "win64" fn(u64, u64, u64, u64) -> i32 =
+                        core::mem::transmute(rh as *const ());
+                    let rret = redraw(hwnd_desktop, 0, 0, RDW_FULL);
+                    print_str(b"[win32k-paint] NtUserRedrawWindow(hwndDesktop=0x");
+                    print_hex(hwnd_desktop as u32);
+                    print_str(b", RDW_FULL) ret=0x");
+                    print_hex(rret as u32);
+                    print_str(b"\n");
+                } else {
+                    print_str(b"[win32k-paint] WARN: NtUserRedrawWindow SSN unresolved\n");
+                }
+            } else {
+                print_str(b"[win32k-paint] WARN: no desktop HWND (spwnd null) - full repaint skipped\n");
+            }
+        }
+    }
 
     // Stand up the winsta->desktop parent linkage our Ob layer does not populate. A hosted client's
     // (winlogon's) natural CreateDesktop returns a real DESKTOP body (IntCreateDesktop builds its

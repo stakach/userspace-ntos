@@ -4459,6 +4459,12 @@ const FB_SAMPLE_COUNT: u64 = 24 * 32;
 /// fully RETIRED — winlogon's own DC-op drives BOTH the display init (co_IntGraphicsCheck ->
 /// co_IntInitializeDesktopGraphics) and this paint; this is the sole source of the counted spec.
 static WINLOGON_NATURAL_PAINT: AtomicU64 = AtomicU64::new(0);
+/// Once-guard (BATCH 46): winlogon issues its interactive NtUserSwitchDesktop TWICE (both to the same
+/// Default desktop). Only the FIRST is a real transition that drives the InitVideo + IntPaintDesktop
+/// paint; the SECOND is win32k's `pdesk == gpdeskInputDesktop` already-current early-return (zero paint
+/// work). The magenta-clear + readback must run ONLY on the painting switch, else the second switch wipes
+/// the fb back to magenta and re-reads 0/768. Set to 1 once the paint has been sampled.
+pub(crate) static WINLOGON_PAINT_DONE: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
 /// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
 /// is the value the Phase-0a magenta (0x00FF00FF) test pattern must flip to when the desktop is

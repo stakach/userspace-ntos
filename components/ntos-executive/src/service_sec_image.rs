@@ -2963,7 +2963,12 @@ pub(crate) unsafe fn service_sec_image(
                 // proves winlogon's co_IntShowDesktop -> co_UserRedrawWindow -> DesktopWindowProc
                 // WM_ERASEBKGND -> IntPaintDesktop re-painted 0x003a6ea5 by the AUTHENTIC boot flow
                 // (BOOTBOOT -> kernel -> smss -> csrss -> winlogon -> win32k), not a stale scaffold paint.
-                let winlogon_switch = m0 == 0x1288 && badge == WINLOGON_BADGE;
+                // ★ BATCH 46 — only the FIRST winlogon switch is the real (painting) transition; the second
+                // is win32k's `pdesk == gpdeskInputDesktop` already-current no-op (zero paint work). Gate the
+                // magenta-clear + readback on WINLOGON_PAINT_DONE so the already-current second switch does
+                // NOT wipe the painted fb back to magenta and re-read 0/768.
+                let winlogon_switch =
+                    m0 == 0x1288 && badge == WINLOGON_BADGE && WINLOGON_PAINT_DONE.load(Ordering::Relaxed) == 0;
                 if winlogon_switch {
                     let fb = FB_VADDR as *mut u32;
                     for i in 0..(1024u64 * 768) {
@@ -3153,6 +3158,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"/768 (px0=0x");
                     print_hex(sample0);
                     print_str(b")\n");
+                    // Latch: this painting switch is done. The next winlogon 0x1288 (already-current no-op)
+                    // must NOT clear/re-read the fb (it would wipe the paint we just sampled).
+                    WINLOGON_PAINT_DONE.store(1, Ordering::Relaxed);
                 }
                 if has_buf && ok && st == 0 {
                     // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client —
