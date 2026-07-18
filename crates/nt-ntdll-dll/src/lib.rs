@@ -41,6 +41,11 @@ pub mod security_exports;
 #[cfg(target_arch = "x86_64")]
 pub mod on_target;
 
+/// BATCH 42 — real x64 table-based SEH dispatch (the live raise → dispatch → language-handler →
+/// unwind machinery over the pure `nt_ntdll::rtl::exception` core). See [`seh`].
+#[cfg(target_arch = "x86_64")]
+pub mod seh;
+
 /// The process heap backing type installed at Step 4.B (a real `NtAllocateVirtualMemory` region).
 #[cfg(target_arch = "x86_64")]
 type ProcessHeap = Heap<on_target::HeapBacking>;

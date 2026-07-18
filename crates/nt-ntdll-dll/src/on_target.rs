@@ -675,6 +675,107 @@ impl ModuleTable {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// SEH support: RtlLookupFunctionEntry over the loaded module set.
+//
+// The x64 SEH unwinder (`nt_ntdll::rtl::exception`) needs, for an absolute control PC: the
+// containing image base + the covering `RUNTIME_FUNCTION` from that image's `.pdata`
+// (IMAGE_DIRECTORY_ENTRY_EXCEPTION). We scan every loaded module (the EXE + MODULE_TABLE) whose
+// mapped `[base, base+SizeOfImage)` contains the PC, then binary-search its `.pdata`.
+// ---------------------------------------------------------------------------------------------
+
+/// The EXE (root) image base — set by [`ldrp_drive`]. Not in `MODULE_TABLE` (which holds only
+/// dependencies), so tracked separately for the SEH module scan.
+#[cfg(target_arch = "x86_64")]
+static mut EXE_BASE: u64 = 0;
+
+/// Run-once guard for the BATCH 42 live SEH self-test (first hosted process only).
+#[cfg(target_arch = "x86_64")]
+static mut SEH_SELFTEST_DONE: bool = false;
+
+/// `IMAGE_DIRECTORY_ENTRY_EXCEPTION`.
+#[cfg(target_arch = "x86_64")]
+const DIRECTORY_ENTRY_EXCEPTION: u64 = 3;
+
+/// Find the image base whose mapped extent contains `pc` (scans the EXE + every `MODULE_TABLE`
+/// module). Returns 0 if `pc` is in no known module.
+///
+/// # Safety
+/// Reads mapped PE headers of each loaded module.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_containing_image(pc: u64) -> u64 {
+    // SAFETY: single-threaded loader context; module images stay mapped for the process lifetime.
+    unsafe {
+        let exe = EXE_BASE;
+        if exe != 0 && pc >= exe {
+            let sz = size_of_image(exe) as u64;
+            if sz != 0 && pc < exe + sz {
+                return exe;
+            }
+        }
+        let table = &*core::ptr::addr_of!(MODULE_TABLE);
+        for m in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+            if m.base == 0 || pc < m.base {
+                continue;
+            }
+            let sz = size_of_image(m.base) as u64;
+            if sz != 0 && pc < m.base + sz {
+                return m.base;
+            }
+        }
+    }
+    0
+}
+
+/// `RtlLookupFunctionEntry`'s core: given an absolute control PC, find `(image_base,
+/// RVA of the RUNTIME_FUNCTION)` for the covering function by binary-searching the containing
+/// module's `.pdata`. Returns `(image_base, begin, end, unwind_info)` or `None` (leaf / no entry).
+///
+/// # Safety
+/// Reads mapped PE headers + `.pdata` of the containing module.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_lookup_function(pc: u64) -> Option<(u64, u32, u32, u32)> {
+    // SAFETY: mapped-image reads per the contract.
+    unsafe {
+        let base = seh_containing_image(pc);
+        if base == 0 {
+            return None;
+        }
+        let (pdata_rva, pdata_sz) = data_directory(base, DIRECTORY_ENTRY_EXCEPTION);
+        if pdata_rva == 0 || pdata_sz < 12 {
+            return None; // no exception directory (a leaf-only module)
+        }
+        // Fault the .pdata pages in (they may not have been demand-filled yet).
+        touch_range(base + pdata_rva as u64, pdata_sz as u64);
+        let count = (pdata_sz / 12) as usize;
+        let rva = (pc - base) as u32;
+        // Binary search over the sorted RUNTIME_FUNCTION rows (12 bytes each: begin,end,unwind).
+        let read_row = |i: usize| -> (u32, u32, u32) {
+            let row = base + pdata_rva as u64 + (i as u64) * 12;
+            (
+                rd32_at(row),
+                rd32_at(row + 4),
+                rd32_at(row + 8),
+            )
+        };
+        let (mut lo, mut hi) = (0usize, count);
+        let mut found: Option<(u32, u32, u32)> = None;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (b, e, u) = read_row(mid);
+            if rva < b {
+                hi = mid;
+            } else if rva >= e {
+                lo = mid + 1;
+            } else {
+                found = Some((b, e, u));
+                break;
+            }
+        }
+        found.map(|(b, e, u)| (base, b, e, u))
+    }
+}
+
 /// Lowercase an import descriptor's DLL name into `out` and STRIP a trailing `.dll`; returns the
 /// base-name length written. (e.g. `"CSRSRV.dll"` → `b"csrsrv"`, len 6.)
 ///
@@ -1085,6 +1186,12 @@ unsafe fn syscall_map_view(
 /// On-target only; `smss_base`/`ntdll_base` mapped PE images.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
+    // Record the EXE base for RtlLookupFunctionEntry (the EXE is NOT in MODULE_TABLE, which holds
+    // only dependencies). The SEH unwinder must cover a fault PC in the EXE's own code too.
+    // SAFETY: single-threaded loader; written once before any thread that reads it.
+    unsafe {
+        EXE_BASE = smss_base;
+    }
     // (1) Process heap — install it so `alloc` works for any engine code that needs it, AND publish
     // its base into `Peb->ProcessHeap` (x64 PEB+0x30). Real ntdll's LdrpInitializeProcess sets
     // `Peb->ProcessHeap = RtlCreateHeap(...)`; kernel32's `GetProcessHeap()` returns exactly that
@@ -1117,6 +1224,17 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     unsafe {
         let table = &*core::ptr::addr_of!(MODULE_TABLE);
         build_peb_ldr(table, smss_base);
+    }
+    // (2.6) BATCH 42 — LIVE SEH self-test: validate the REAL RtlLookupFunctionEntry +
+    // RtlVirtualUnwind against our own compiled `.pdata`/`.xdata` (proves the live table walk +
+    // unwind-code interpretation on real hardware). Run ONCE (first hosted process). Prints one
+    // `[seh-selftest]` line to serial; non-fatal (only reads + unwinds a synthetic frame).
+    // SAFETY: MODULE_TABLE holds our mapped ntdll; the self-test only captures + unwinds.
+    unsafe {
+        if !SEH_SELFTEST_DONE {
+            SEH_SELFTEST_DONE = true;
+            crate::seh::run_selftest();
+        }
     }
     // (3) Run DLL_PROCESS_ATTACH for every dependent DLL (the live LdrpRunInitializeRoutines seam).
     // kernel32's DllMain runs InitCommandLines() so GetCommandLineA is non-NULL — winlogon's msvcrt
@@ -1820,6 +1938,38 @@ unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 unsafe fn syscall4(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     // SAFETY: forwarding to the native 6-arg helper (a5/a6 = 0, unused by a 4-arg service).
     unsafe { native_syscall(ssn, a1, a2, a3, a4, 0, 0) }
+}
+
+/// SEH seam: a 2-arg syscall (`NtContinue(CONTEXT*, alertable)`). Transport-agnostic — delegates to
+/// [`syscall4`] which flips between the trap + native transports with the rest of the surface.
+///
+/// # Safety
+/// On-target hosted-process syscall; `a1` must satisfy the target syscall's contract.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_syscall2(ssn: u32, a1: u64, a2: u64) -> u64 {
+    // SAFETY: forwarding to the general 4-arg helper (a3/a4 unused).
+    unsafe { syscall4(ssn, a1, a2, 0, 0) }
+}
+
+/// SEH seam: a 3-arg syscall (`NtRaiseException(record, context, first_chance)`).
+///
+/// # Safety
+/// On-target hosted-process syscall; the args must satisfy the target syscall's contract.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_syscall3(ssn: u32, a1: u64, a2: u64, a3: u64) -> u64 {
+    // SAFETY: forwarding to the general 4-arg helper (a4 unused).
+    unsafe { syscall4(ssn, a1, a2, a3, 0) }
+}
+
+/// SEH seam: the `(virtual_address, size)` of data directory `idx` in a mapped PE at `base`
+/// (public wrapper over [`data_directory`] for the SEH module).
+///
+/// # Safety
+/// `base` must be a mapped PE image (DOS + NT headers readable).
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn data_directory_pub(base: u64, idx: u64) -> (u32, u32) {
+    // SAFETY: mapped-image header read.
+    unsafe { data_directory(base, idx) }
 }
 
 /// The NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A). Builds the NT_NATIVE_SYSCALL

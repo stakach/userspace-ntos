@@ -2080,22 +2080,36 @@ pub unsafe extern "C" fn vsnwprintf(
     0
 }
 
-/// `__C_specific_handler(...)` — the x64 language-specific exception handler the compiler references
-/// from `.pdata`. It drives the SEH `__try/__except/__finally` machinery. The real dispatch is
-/// `nt_ntdll::rtl::exception` (Step 4.B wires the live unwind). At 4.0b it returns
-/// `ExceptionContinueSearch` (1) so an exception propagates to the next handler rather than being
-/// swallowed — the honest default, never a fabricated "handled".
+/// `__C_specific_handler(ExceptionRecord*, EstablisherFrame, ContextRecord*, DispatcherContext*)`
+/// — the x64 C-SEH language handler the compiler references from `.pdata`. BATCH 42 wires the REAL
+/// implementation ([`crate::seh::c_specific_handler`]): it walks the `SCOPE_TABLE`, runs the
+/// `__try/__except` filters + `__finally` blocks, and on `EXECUTE_HANDLER` unwinds to the `__except`
+/// body via `RtlUnwindEx`. Faithful to ReactOS's `__C_specific_handler`.
 ///
 /// # Safety
 /// Called by the exception dispatcher with the SEH records.
 #[export_name = "__C_specific_handler"]
 pub unsafe extern "C" fn c_specific_handler(
-    _exception_record: *mut c_void,
-    _establisher_frame: *mut c_void,
-    _context_record: *mut c_void,
-    _dispatcher_context: *mut c_void,
+    exception_record: *mut c_void,
+    establisher_frame: *mut c_void,
+    context_record: *mut c_void,
+    dispatcher_context: *mut c_void,
 ) -> i32 {
-    1 // ExceptionContinueSearch — propagate (Step 4.B installs the real unwind)
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SEH ABI; the dispatcher passed valid records.
+    unsafe {
+        return crate::seh::c_specific_handler(
+            exception_record,
+            establisher_frame as u64,
+            context_record as *mut u8,
+            dispatcher_context,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (exception_record, establisher_frame, context_record, dispatcher_context);
+        1 // ExceptionContinueSearch (no live plane off target)
+    }
 }
 
 // =================================================================================================
@@ -5873,34 +5887,56 @@ pub unsafe extern "system" fn rtl_install_function_table_callback(
 }
 
 /// `RtlLookupFunctionEntry(DWORD64 ControlPc, PDWORD64 ImageBase, PVOID HistoryTable)
-/// -> PRUNTIME_FUNCTION` — no dynamic table; return NULL (leaf function / no unwind info). The boot
-/// path doesn't unwind, so a NULL result is correct (the caller treats it as a leaf frame).
+/// -> PRUNTIME_FUNCTION` — BATCH 42: the REAL lookup ([`crate::seh::rtl_lookup_function_entry`]).
+/// Finds the module whose mapped extent contains `ControlPc`, binary-searches its `.pdata`
+/// (`IMAGE_DIRECTORY_ENTRY_EXCEPTION`), writes `*ImageBase`, and returns a pointer to the covering
+/// `RUNTIME_FUNCTION` (NULL = a leaf frame with no entry).
 ///
 /// # Safety
-/// `image_base` null or writable.
+/// `image_base` null or writable; `control_pc` a code address.
 #[export_name = "RtlLookupFunctionEntry"]
 pub unsafe extern "system" fn rtl_lookup_function_entry(
-    _control_pc: u64,
+    control_pc: u64,
     image_base: *mut u64,
-    _history_table: *mut c_void,
+    history_table: *mut c_void,
 ) -> *mut c_void {
-    if !image_base.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *image_base = 0 };
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: mapped-image lookup; image_base writable per the contract.
+    unsafe {
+        return crate::seh::rtl_lookup_function_entry(control_pc, image_base, history_table);
     }
-    core::ptr::null_mut()
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (control_pc, history_table);
+        if !image_base.is_null() {
+            unsafe { *image_base = 0 };
+        }
+        core::ptr::null_mut()
+    }
 }
 
-/// `RtlCaptureContext(PCONTEXT ContextRecord)` — capture the current CONTEXT. The boot path doesn't
-/// unwind through a captured context; zero the record (an honest empty capture) rather than
-/// fabricate register values. (A full capture is a naked-asm target seam.)
+/// `RtlCaptureContext(PCONTEXT ContextRecord)` — BATCH 42: a REAL naked capture of the live register
+/// file into `*ContextRecord` (RCX = the CONTEXT ptr; matches the Windows x64 ABI). Delegates to the
+/// naked [`crate::seh::capture_context`].
 ///
 /// # Safety
-/// `context` a valid writable CONTEXT (>= 0x4D0 bytes on x64).
+/// `context` (RCX) a valid writable CONTEXT (>= 0x4D0 bytes on x64).
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "RtlCaptureContext"]
+pub unsafe extern "C" fn rtl_capture_context() {
+    // RCX already holds the CONTEXT*; tail-jump to the real capture (same ABI).
+    core::arch::naked_asm!("jmp {cap}", cap = sym crate::seh::capture_context);
+}
+
+/// Host build: no live registers to capture — zero the record (honest empty capture).
+///
+/// # Safety
+/// `context` a valid writable CONTEXT.
+#[cfg(not(target_arch = "x86_64"))]
 #[export_name = "RtlCaptureContext"]
 pub unsafe extern "system" fn rtl_capture_context(context: *mut c_void) {
     if !context.is_null() {
-        // SAFETY: zero the first 0x4D0 bytes (the x64 CONTEXT size) per the contract.
         unsafe { core::ptr::write_bytes(context as *mut u8, 0, 0x4D0) };
     }
 }
@@ -5922,25 +5958,77 @@ pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
     {}
 }
 
-/// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — raise an exception. Same honest int3.
+/// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — BATCH 42: the REAL software raise
+/// ([`crate::seh::rtl_raise_exception`]): capture the CONTEXT at the raise site, set
+/// `record->ExceptionAddress`, dispatch through the live stack, and on unhandled last-chance the
+/// kernel (never a silent continue). This is the path rpcrt4's `RpcRaiseException` lands on.
 ///
 /// # Safety
 /// `exception_record` a valid EXCEPTION_RECORD.
 #[export_name = "RtlRaiseException"]
-pub unsafe extern "system" fn rtl_raise_exception(_exception_record: *mut c_void) {
+pub unsafe extern "system" fn rtl_raise_exception(exception_record: *mut c_void) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: int3 traps to the kernel.
+    // SAFETY: valid EXCEPTION_RECORD; the real raise dispatches or last-chances.
     unsafe {
-        core::arch::asm!("int3");
+        crate::seh::rtl_raise_exception(exception_record);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = exception_record;
     }
 }
 
-/// `RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD, PVOID ReturnValue)` — SEH unwind.
-/// The boot path doesn't unwind; no-op (an honest non-unwind — the caller only reaches here on an
-/// exception, which doesn't occur on the boot path).
+/// `RtlDispatchException(PEXCEPTION_RECORD, PCONTEXT) -> BOOLEAN` — BATCH 42: the REAL first-pass
+/// dispatch ([`crate::seh::rtl_dispatch_exception`]) over the live stack. Returns TRUE if a handler
+/// continued execution, FALSE if unhandled.
 ///
 /// # Safety
-/// Called only during exception dispatch (not on the boot path).
+/// `record`/`context` valid.
+#[export_name = "RtlDispatchException"]
+pub unsafe extern "system" fn rtl_dispatch_exception(record: *mut c_void, context: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: valid records; dispatches over the live stack.
+    unsafe {
+        return crate::seh::rtl_dispatch_exception(record, context as *mut u8) as u8;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (record, context);
+        0
+    }
+}
+
+/// `RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD, PVOID ReturnValue)` — the legacy
+/// 4-arg SEH unwind (a thin wrapper over `RtlUnwindEx` with a freshly captured CONTEXT). BATCH 42:
+/// real — captures the CONTEXT, then delegates to [`crate::seh::rtl_unwind_ex`].
+///
+/// # Safety
+/// Called during exception dispatch; `target_frame`/`target_ip` from the search pass.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlUnwind"]
+pub unsafe extern "system" fn rtl_unwind(
+    target_frame: *mut c_void,
+    target_ip: *mut c_void,
+    exception_record: *mut c_void,
+    return_value: *mut c_void,
+) {
+    // SAFETY: capture the current context, then unwind to (target_ip, target_frame).
+    unsafe {
+        let mut ctx = [0u8; 0x4D0];
+        crate::seh::capture_context(ctx.as_mut_ptr());
+        crate::seh::rtl_unwind_ex(
+            target_frame as u64,
+            target_ip as u64,
+            exception_record,
+            return_value as u64,
+            ctx.as_mut_ptr(),
+            core::ptr::null_mut(),
+        );
+    }
+}
+
+/// Host build: no unwind plane — no-op.
+#[cfg(not(target_arch = "x86_64"))]
 #[export_name = "RtlUnwind"]
 pub unsafe extern "system" fn rtl_unwind(
     _target_frame: *mut c_void,
@@ -5950,57 +6038,121 @@ pub unsafe extern "system" fn rtl_unwind(
 ) {
 }
 
-/// `RtlUnwindEx(...)` — the extended (x64) SEH unwind. Same no-op seam.
+/// `RtlUnwindEx(TargetFrame, TargetIp, ExceptionRecord, ReturnValue, ContextRecord, HistoryTable)`
+/// — BATCH 42: the REAL second pass ([`crate::seh::rtl_unwind_ex`]): run the intervening `__finally`
+/// blocks, then transfer control to the `__except` body. Does not return.
 ///
 /// # Safety
-/// Called only during exception dispatch.
+/// Called during exception dispatch; `context` a valid CONTEXT.
 #[export_name = "RtlUnwindEx"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_unwind_ex(
-    _target_frame: *mut c_void,
-    _target_ip: *mut c_void,
-    _exception_record: *mut c_void,
-    _return_value: *mut c_void,
-    _context: *mut c_void,
-    _history_table: *mut c_void,
+    target_frame: *mut c_void,
+    target_ip: *mut c_void,
+    exception_record: *mut c_void,
+    return_value: *mut c_void,
+    context: *mut c_void,
+    history_table: *mut c_void,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: valid context; the real unwind runs finallys + transfers control.
+    unsafe {
+        crate::seh::rtl_unwind_ex(
+            target_frame as u64,
+            target_ip as u64,
+            exception_record,
+            return_value as u64,
+            context as *mut u8,
+            history_table,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (target_frame, target_ip, exception_record, return_value, context, history_table);
+    }
 }
 
-/// `RtlVirtualUnwind(...)` — unwind one frame using a RUNTIME_FUNCTION. Return the caller's IP.
-/// No unwind plane; return NULL handler + leave the context unchanged (the boot path doesn't call
-/// this).
+/// `RtlVirtualUnwind(HandlerType, ImageBase, ControlPc, FunctionEntry, ContextRecord, HandlerData*,
+/// EstablisherFrame*, ContextPointers) -> PEXCEPTION_ROUTINE` — BATCH 42: the REAL single-frame
+/// unwind ([`crate::seh::rtl_virtual_unwind`]): parse the `.xdata`, apply the unwind codes, update
+/// `*ContextRecord`, and return the language handler (+ `*HandlerData`) or NULL.
 ///
 /// # Safety
-/// Called only during exception dispatch.
+/// Called during exception dispatch; all pointers valid per the SEH ABI.
 #[export_name = "RtlVirtualUnwind"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_virtual_unwind(
-    _handler_type: u32,
-    _image_base: u64,
-    _control_pc: u64,
-    _function_entry: *mut c_void,
-    _context: *mut c_void,
-    _handler_data: *mut *mut c_void,
-    _establisher_frame: *mut u64,
-    _context_pointers: *mut c_void,
+    handler_type: u32,
+    image_base: u64,
+    control_pc: u64,
+    function_entry: *mut c_void,
+    context: *mut c_void,
+    handler_data: *mut *mut c_void,
+    establisher_frame: *mut u64,
+    context_pointers: *mut c_void,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: valid records per the SEH ABI.
+    unsafe {
+        return crate::seh::rtl_virtual_unwind(
+            handler_type,
+            image_base,
+            control_pc,
+            function_entry as *const u8,
+            context as *mut u8,
+            handler_data,
+            establisher_frame,
+            context_pointers,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (handler_type, image_base, control_pc, function_entry, context, handler_data,
+            establisher_frame, context_pointers);
+        core::ptr::null_mut()
+    }
 }
 
-/// `RtlRestoreContext(PCONTEXT ContextRecord, PEXCEPTION_RECORD)` — resume at a captured context. No
-/// resume plane; int3 (an honest non-return, not a fabricated resume).
+/// `KiUserExceptionDispatcher(PEXCEPTION_RECORD, PCONTEXT)` — the entry the kernel/executive jumps to
+/// for a delivered exception. BATCH 42: dispatches through the real machinery
+/// ([`crate::seh::ki_user_exception_dispatcher`]). (The software raise path lands here via
+/// `RtlRaiseException`; the hardware-fault redirection onto this entry is scoped-deferred executive
+/// work — see the `seh` module doc.)
 ///
 /// # Safety
-/// Called only during exception dispatch.
+/// `record`/`context` valid (a stacked EXCEPTION_RECORD + CONTEXT).
+#[export_name = "KiUserExceptionDispatcher"]
+pub unsafe extern "system" fn ki_user_exception_dispatcher(record: *mut c_void, context: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: valid delivered records.
+    unsafe {
+        crate::seh::ki_user_exception_dispatcher(record, context as *mut u8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (record, context);
+    }
+}
+
+/// `RtlRestoreContext(PCONTEXT ContextRecord, PEXCEPTION_RECORD)` — resume at a captured context.
+/// BATCH 42: real — resumes the context via `NtContinue` (does not return). The unwind path also
+/// resumes internally; this export is the standalone entry.
+///
+/// # Safety
+/// `context` a valid CONTEXT to resume.
 #[export_name = "RtlRestoreContext"]
 pub unsafe extern "system" fn rtl_restore_context(
-    _context: *mut c_void,
+    context: *mut c_void,
     _exception_record: *mut c_void,
 ) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: int3 traps to the kernel.
+    // SAFETY: resume the captured context (NtContinue).
     unsafe {
-        core::arch::asm!("int3");
+        crate::seh::seh_nt_continue(context as *mut u8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = context;
     }
 }
 
@@ -7929,6 +8081,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_unwind_ex as usize,
         rtl_virtual_unwind as usize,
         rtl_restore_context as usize,
+        rtl_dispatch_exception as usize,
+        ki_user_exception_dispatcher as usize,
         rtl_exit_user_thread as usize,
         rtl_compute_import_table_hash as usize,
         rtl_flush_secure_memory_cache as usize,
