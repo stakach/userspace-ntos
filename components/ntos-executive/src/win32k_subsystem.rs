@@ -215,6 +215,30 @@ pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
 pub const GPTI_DESKTOP_THREAD_RVA: u64 = 0x20b538;
 /// THREADINFO->ppi offset (confirmed by the disasm above: `mov rax,[rax+0x58]`).
 const THREADINFO_PPI_OFF: u64 = 0x58;
+/// PROCESSINFO->ptiList offset (win32.h: the first PROCESSINFO field after the W32PROCESS prefix).
+/// Disasm-confirmed at CreateCallProc RVA 0x4dc92 (`mov r8,[pi+0xd8]` feeding
+/// `UserCreateObject(ht, Desktop, pi->ptiList, …)`). Our hosted PROCESSINFO leaves it NULL, so the
+/// class call-proc path deref'd a NULL thread (`pti->ppi`, pti+0x58) at RVA 0xfd3fd.
+const PROCESSINFO_PTILIST_OFF: u64 = 0xD8;
+/// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
+/// MessageQueue@0x60, KeyboardLayout@0x68, pcti@0x70, **rpdesk@0x78**, pDeskInfo@0x80). The thread's
+/// currently-assigned DESKTOP object — `IntSetThreadDesktop` sets it (desktop.c:3428).
+const THREADINFO_RPDESK_OFF: u64 = 0x78;
+/// THREADINFO->pDeskInfo offset (win32.h, immediately after rpdesk). The DESKTOPINFO of the thread's
+/// assigned desktop — `IntSetThreadDesktop` copies it from `rpdesk->pDeskInfo` (desktop.c:3430).
+///
+/// CORRECTION (BATCH 43, disasm + subagent verified): the `NtUserGetClassInfo` (0x10bd) fault at
+/// executive-RVA 0x4f5e3 is NOT `pti->pDeskInfo`. Resolving the ImageBase offset (objdump VMA =
+/// executive-RVA + 0x10000; win32k.sys ImageBase == 0x10000), RVA 0x4f5e3 disassembles to
+/// `mov rax,[rsp+0x40]; mov rcx,[rax+0x80]; call RtlAllocateHeap` = the inlined `DesktopHeapAlloc`,
+/// where `rax` is a **DESKTOP** (NULL) and `[rax+0x80]` is `DESKTOP.pheapDesktop` (see
+/// [`DESKTOP_PHEAP_OFF`]) — the two just happen to collide at +0x80. The real fix is a non-NULL
+/// `pti->rpdesk` (a DESKTOP with a non-NULL pheapDesktop), which the class call-proc path
+/// (`UserGetCPD`, callproc.c:139) falls back to when the class has `rpdeskParent==NULL`.
+const THREADINFO_PDESKINFO_OFF: u64 = 0x80;
+/// THREADINFO->pClientInfo offset (win32.h, after pDeskInfo). `IntSetThreadDesktop` also updates the
+/// client-side `pci->pDeskInfo` (desktop.c:3434) from this.
+const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
 
 /// win32k `.data` global `gpdeskInputDesktop` (desktop.c:52) RVA. `IntGetActiveDesktop()` returns it
 /// (desktop.c:1287); `co_IntShowDesktop` (winsta.c:340) derefs `Desktop->pDeskInfo->spwnd` and faults
@@ -246,6 +270,14 @@ pub const INPUT_WINDOW_STATION_RVA: u64 = 0x20c068;
 /// check; and RVA 0x6c281 `mov rcx,[pdesk+0x20]; cmp sessionId,[rcx]` = winsta->dwSessionId@0).
 pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 
+/// DESKTOP.pheapDesktop offset (`desktop.h` `struct _DESKTOP`: dwSessionId@0, pDeskInfo@8,
+/// ListEntry@0x10, rpwinstaParent@0x20, ..., hsectionDesktop@0x78, **pheapDesktop@0x80**). The
+/// per-desktop USER heap handle `DesktopHeapAlloc → RtlAllocateHeap(pdesk->pheapDesktop, ...)` uses
+/// (callproc.c CreateCallProc / object.c AllocDeskProcObject). A NULL here is the REAL cr2=0x80 fault
+/// at win32k RVA 0x4f5e3 (`mov rax,[rsp+0x40]=pdesk; mov rcx,[rax+0x80]=pheapDesktop; call
+/// RtlAllocateHeap`). Matches `nt_object_manager::win32k_ob::desktop` (pheapDesktop@0x80).
+pub const DESKTOP_PHEAP_OFF: u64 = 0x80;
+
 /// SSN of NtUserCreateDesktop (WIN32K_SERVICE_BASE 0x1000 + SSDT idx 0x22d). When a hosted client
 /// (winlogon) drives its own CreateWindowStation→CreateDesktop→SwitchDesktop chain, its
 /// naturally-created DESKTOP objects come through the routed `dispatch_ssn` path; our Ob layer does
@@ -254,6 +286,12 @@ pub const DESKTOP_RPWINSTA_PARENT_OFF: u64 = 0x20;
 /// `create_winsta_and_desktop` does for the Default desktop — else NtUserSwitchDesktop NULL-derefs it
 /// (RVA 0x6c281→0x6c285). See the `dispatch_ssn` fixup.
 pub const SSN_NT_USER_CREATE_DESKTOP: u64 = 0x122d;
+
+/// `NtUserSetThreadDesktop` (SSN 0x1092, w32ksvc64.h) → `IntSetThreadDesktop` (desktop.c:3295), the
+/// REAL thread↔desktop connection: it sets `pti->rpdesk` + `pti->pDeskInfo`. winlogon's WlxActivate
+/// user thread drives it (wlx.c:1077 `SetThreadDesktop(hdeskWinlogon)`). We latch the fields it sets
+/// (post-dispatch) so the per-dispatch reassert can protect `pti->pDeskInfo` for the class path.
+pub const SSN_NT_USER_SET_THREAD_DESKTOP: u64 = 0x1092;
 
 /// The IPC message label the dispatch loop uses when it `seL4_Call`s the executive to signal
 /// ready/done. win32k is NOT a hosted TCB (its trampolines issue real seL4 syscalls for serial), so
@@ -2500,6 +2538,49 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             }
         }
     }
+    // ★ BATCH 43 — LATCH the thread↔desktop connection winlogon's OWN NtUserSetThreadDesktop makes.
+    //
+    // `NtUserSetThreadDesktop` (SSN 0x1092 → IntSetThreadDesktop) is where winlogon connects its
+    // interactive thread to the Default desktop: on its `if (pdesk != NULL)` branch it sets
+    // `pti->rpdesk = pdesk; pti->pDeskInfo = pti->rpdesk->pDeskInfo;` (desktop.c:3428/3430). We DO NOT
+    // pre-seed those fields (doing so flips its own `if (pti->rpdesk != NULL)` class-migration branch,
+    // desktop.c:3404, into an unmapped-desktop-heap fault) — we let win32k's real handler do the bind,
+    // then READ BACK the fields it set and LATCH them (BOUND_DESK_*). The dispatch_loop then re-asserts
+    // them before every subsequent dispatch, so a LATER `NtUserProcessConnect` (0x10FA) whose inner
+    // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->pDeskInfo` can't leave the
+    // thread disconnected before the next `NtUserGetClassInfo` (0x10bd) reads `[pti+0x80]` — the wall.
+    if ssn == SSN_NT_USER_SET_THREAD_DESKTOP && ret != 0 {
+        let pti = {
+            let t = read_volatile(SLOT_W32THREAD as *const u64);
+            if t == 0 { PH_W32THREAD_VA } else { t }
+        };
+        let rpdesk = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+        let pdeskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
+        if rpdesk != 0 && pdeskinfo != 0 {
+            BOUND_DESK_BODY = rpdesk;
+            BOUND_DESK_PDESKINFO = pdeskinfo;
+            // Ensure the bound DESKTOP has a NON-NULL `pheapDesktop` (DESKTOP+0x80, desktop.h). The class
+            // call-proc path `UserGetCPD → CreateCallProc → DesktopHeapAlloc` (callproc.c:143,
+            // object.c:103) does `RtlAllocateHeap(pdesk->pheapDesktop, ...)` — and our win32k
+            // `RtlAllocateHeap` import is bound to `s_rtl_allocate_heap`, which IGNORES the handle and
+            // bumps the shared session arena, so the handle only needs to be non-NULL to avoid the
+            // `mov rcx,[pdesk+0x80]; call RtlAllocateHeap(NULL,...)` NULL-handle path. (This is the REAL
+            // deref at RVA 0x4f5e3 — `Desktop->pheapDesktop`, NOT `pti->pDeskInfo`; see the corrected
+            // comment at THREADINFO_PDESKINFO_OFF.)
+            if read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
+                write_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
+            }
+            print_str(b"[win32k-host] NtUserSetThreadDesktop latched: pti->rpdesk=0x");
+            print_hex((rpdesk >> 32) as u32);
+            print_hex(rpdesk as u32);
+            print_str(b" pti->pDeskInfo=0x");
+            print_hex((pdeskinfo >> 32) as u32);
+            print_hex(pdeskinfo as u32);
+            print_str(b" pheapDesktop=0x");
+            print_hex(read_volatile((rpdesk + DESKTOP_PHEAP_OFF) as *const u64) as u32);
+            print_str(b"\n");
+        }
+    }
     ret
 }
 
@@ -2606,10 +2687,20 @@ unsafe fn setup_dispatch_context() {
             write_volatile((desk_thread + THREADINFO_PPI_OFF) as *mut u64, ppi);
             init_threadinfo_placeholder(desk_thread);
             write_volatile(gpti_cell, desk_thread);
+            // Link the dispatch thread into `ppi->ptiList` (PROCESSINFO+0xD8, disasm-confirmed:
+            // CreateCallProc RVA 0x4dc92 `mov r8,[pi+0xd8]`). Real win32k links each thread here in
+            // thread-init (IntLinkThreadInfo / CreateThreadInfo). Our host never did, so
+            // `CreateCallProc → UserCreateObject(ht, Desktop, pi->ptiList, …) → AllocDeskProcObject`
+            // received a NULL `pti` and NULL-deref'd `pti->ppi` (pti+0x58) at RVA 0xfd3fd (cr2=0x58) —
+            // the win32k `NtUserGetClassInfo` class-call-proc wall. Point it at the dispatch W32THREAD
+            // (which has a valid ->ppi) so AllocDeskProcObject gets a real thread.
+            if read_volatile((ppi + PROCESSINFO_PTILIST_OFF) as *const u64) == 0 {
+                write_volatile((ppi + PROCESSINFO_PTILIST_OFF) as *mut u64, desk_thread);
+            }
             print_str(b"[win32k-host] gptiDesktopThread = dispatch thread (ppi=0x");
             print_hex((ppi >> 32) as u32);
             print_hex(ppi as u32);
-            print_str(b")\n");
+            print_str(b" ptiList linked)\n");
         }
     }
 }
@@ -2828,6 +2919,47 @@ unsafe fn create_winsta_and_desktop() {
         print_hex((spwnd >> 32) as u32);
         print_hex(spwnd as u32);
         print_str(b")\n");
+
+        // ★ BIND THE DISPATCH THREAD TO THE DESKTOP — the REAL `IntSetThreadDesktop` connection.
+        //
+        // The switch above sets the GLOBAL `gpdeskInputDesktop`, but does NOT connect the CURRENT
+        // thread's win32k `THREADINFO` (`pti`) to the desktop. In real Windows that connection is done
+        // by winlogon's `SetThreadDesktop(Default) → NtUserSetThreadDesktop → IntSetThreadDesktop`
+        // (desktop.c:3428/3430), whose core is exactly:
+        //     pti->rpdesk    = pdesk;                    // desktop.c:3428
+        //     pti->pDeskInfo = pti->rpdesk->pDeskInfo;   // desktop.c:3430
+        //     pci->pDeskInfo = pti->pDeskInfo - ulClientDelta;   // desktop.c:3434 (delta 0 in-host)
+        // Our host merges winlogon's interactive thread onto the single shared dispatch W32THREAD
+        // (`SLOT_W32THREAD`), and winlogon's own NtUserSetThreadDesktop can't drive the real
+        // IntSetThreadDesktop body end-to-end (it needs the desktop-heap view / pcti alloc our host
+        // doesn't map). So we perform the SAME two field assignments here, directly on the dispatch
+        // W32THREAD, using the REAL created DESKTOP body + its real `pDeskInfo` (DESKTOP+0x08). This is
+        // the thread↔desktop connection win32k's checked `NtUserGetClassInfo` helper asserts on:
+        // `mov rcx,[pti+0x80]` (pti->pDeskInfo) — NULL before this, a real DESKTOPINFO after.
+        let pti = {
+            let t = read_volatile(SLOT_W32THREAD as *const u64);
+            if t == 0 { PH_W32THREAD_VA } else { t }
+        };
+        let desk_pdeskinfo = read_volatile((desk_body + 0x08) as *const u64); // DESKTOP.pDeskInfo
+        write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, desk_body); // pti->rpdesk = pdesk
+        write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, desk_pdeskinfo); // = rpdesk->pDeskInfo
+        // Latch for per-dispatch re-assertion (see BOUND_DESK_* + dispatch_loop top).
+        BOUND_DESK_BODY = desk_body;
+        BOUND_DESK_PDESKINFO = desk_pdeskinfo;
+        // Mirror the client side (pci->pDeskInfo), ulClientDelta == 0 in our single-AS host.
+        let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+        if pci != 0 {
+            // CLIENTINFO.pDeskInfo @ +0x20 (ntuser.h: CI_flags@0, cSpins@8, dwExpWinVer@0x10,
+            // dwCompatFlags@0x14, dwCompatFlags2@0x18, dwTIFlags@0x1C, pDeskInfo@0x20).
+            write_volatile((pci + 0x20) as *mut u64, desk_pdeskinfo);
+        }
+        print_str(b"[win32k-host] IntSetThreadDesktop(Default): pti->rpdesk=0x");
+        print_hex((desk_body >> 32) as u32);
+        print_hex(desk_body as u32);
+        print_str(b" pti->pDeskInfo=0x");
+        print_hex((desk_pdeskinfo >> 32) as u32);
+        print_hex(desk_pdeskinfo as u32);
+        print_str(b"\n");
     } else {
         print_str(b"[win32k-host] WARN: no desktop/winsta body - gpdeskInputDesktop unset\n");
     }
@@ -2836,6 +2968,15 @@ unsafe fn create_winsta_and_desktop() {
 /// Once-guard: the post-NtUserInitialize host-prerequisite seed (system font + WinSta0/Default Ob
 /// objects) runs a single time. Single-threaded component → a plain `static mut` bool suffices.
 static mut DESKTOP_GFX_SEEDED: bool = false;
+
+/// The DESKTOP body + its DESKTOPINFO (`rpdesk->pDeskInfo`) the dispatch thread is bound to, latched
+/// by `create_winsta_and_desktop`'s IntSetThreadDesktop-equivalent. Re-asserted onto the shared
+/// dispatch W32THREAD at the top of every dispatch so an intervening win32k `IntSetThreadDesktop`
+/// ELSE branch (which clears `pti->pDeskInfo` when it can't map the desktop-heap view — the exact
+/// pre-BATCH-43 wall) can't leave the thread disconnected before the NEXT syscall body reads
+/// `pti->pDeskInfo`. Zero until the seed runs.
+static mut BOUND_DESK_BODY: u64 = 0;
+static mut BOUND_DESK_PDESKINFO: u64 = 0;
 
 unsafe fn dispatch_loop() -> ! {
     // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
@@ -2865,6 +3006,39 @@ unsafe fn dispatch_loop() -> ! {
             let head = t + 0x2d8;
             write_volatile(head as *mut u64, head);
             write_volatile((head + 8) as *mut u64, head);
+            // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
+            // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
+            // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent dispatch body runs.
+            //
+            // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
+            // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
+            // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
+            // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
+            // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
+            // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
+            // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
+            // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
+            // re-opens exactly this wall — so we restore both here (idempotent).
+            //
+            // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
+            // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
+            // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
+            // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
+            if BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
+                if BOUND_DESK_BODY != 0 {
+                    write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
+                    // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
+                    // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
+                    if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
+                        write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
+                    }
+                }
+                write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
+                let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+                if pci != 0 {
+                    write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
+                }
+            }
         }
         if ssn == SSN_NT_USER_INITIALIZE_REAL {
             // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are

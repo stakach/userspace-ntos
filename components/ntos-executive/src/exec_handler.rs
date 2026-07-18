@@ -2006,11 +2006,22 @@ impl NativeSyscallHandler for ExecNtHandler {
                             return 0xC00000AC; // STATUS_PIPE_NOT_AVAILABLE
                         }
                     }
-                    print_str(b"[nt-create-named-pipe] pi=");
-                    print_u64(self.pi as u64);
-                    print_str(b" leaf=");
-                    print_str(&nm_ascii);
-                    print_str(b"\n");
+                    // BATCH 43: throttle this per-create diagnostic. The SCM `\ntsvcs` (and `\lsarpc`)
+                    // server-instance re-listen loop fires it ~24× each; serial writes are the dominant
+                    // per-round-trip cost under TCG, and once winlogon CROSSES its win32k class wall
+                    // (BATCH 43) the heavier real SAS-window work + these repeated log lines no longer fit
+                    // the 620s boot budget. Print only the FIRST 3 creates per pi (enough to prove the
+                    // server FCB path), then suppress — reclaiming budget so the boot quiesces + gates.
+                    {
+                        let n = NAMED_PIPE_LOG_COUNT[self.pi & 7].fetch_add(1, Ordering::Relaxed);
+                        if n < 3 {
+                            print_str(b"[nt-create-named-pipe] pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" leaf=");
+                            print_str(&nm_ascii);
+                            print_str(b"\n");
+                        }
+                    }
                     if let Some((st, fid)) = self.npfs_route(1 /* IRP_MJ_CREATE_NAMED_PIPE */, 0, &leaf, 0) {
                         if st == 0 && fid != 0 {
                             routed_file_id = fid;

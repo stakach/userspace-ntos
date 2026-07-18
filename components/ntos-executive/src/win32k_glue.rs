@@ -537,7 +537,12 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
                 && core::ptr::read_volatile(ip as *const u8) == 0xCD
                 && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
             if is_int2c && rw != 0 && skips < 4000 {
-                if skips < 40 {
+                // BATCH 43: gate the assert-skip diagnostic on a GLOBAL counter (was a per-dispatch local
+                // `skips`, so it re-armed 40 lines every dispatch → hundreds of serial lines). Serial
+                // writes dominate the TCG per-round-trip cost and the boot budget is tight now that
+                // winlogon crosses its win32k class wall; print the first 40 assert-skips TOTAL, then
+                // suppress. The 4000 per-dispatch `skips` bound (a looping assert still walls) is unchanged.
+                if crate::W32_ASSERT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
                     print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
                     print_hex(ip.wrapping_sub(code_va) as u32);
                     print_str(b"\n");

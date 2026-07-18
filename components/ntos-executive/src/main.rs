@@ -1147,6 +1147,18 @@ pub(crate) static W32_TOTAL_DISPATCH: [AtomicU64; MAX_PI] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; MAX_PI]
 };
+/// BATCH 43: throttle counter for the high-frequency win32k class-loop SSN (0x103d/0x10b4) per-dispatch
+/// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
+/// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
+pub(crate) static W32_HOT_LOG: AtomicU64 = AtomicU64::new(0);
+/// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
+/// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
+/// total, then suppress.
+pub(crate) static W32_ASSERT_LOG: AtomicU64 = AtomicU64::new(0);
+/// BATCH 43: latched when winlogon crosses its win32k NtUserGetClassInfo class-call-proc wall and
+/// creates its SAS window (first NtUserCreateWindowEx 0x1077 SUCCESS) — the proven interactive
+/// milestone. Drives the `exec_winlogon_sas_window` gate spec + the milestone park/quiesce.
+pub(crate) static WINLOGON_SAS_MILESTONE: AtomicU64 = AtomicU64::new(0);
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -3192,6 +3204,14 @@ static NAMED_PIPE_CREATED: AtomicU64 = AtomicU64::new(0);
 /// (covers the full multi-PDU conversation + several re-listens) so it never truncates a live handshake.
 static SCM_NTSVCS_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
 const SCM_NTSVCS_CREATE_CAP: u64 = 24;
+/// Per-pi (index = pi & 7) named-pipe-create log throttle (BATCH 43). The SCM/LSA server re-listen
+/// loops fire the `[nt-create-named-pipe]` diagnostic ~24× each; serial writes dominate the per-round-
+/// trip cost under TCG. Print only the first few per pi, then suppress — reclaiming boot budget so the
+/// boot still quiesces + runs the gate within 620s now that winlogon's win32k flow is heavier (BATCH 43).
+static NAMED_PIPE_LOG_COUNT: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
 /// lsass' LSA RPC server (`\lsarpc`, pi 4) has the SAME unbounded server-instance re-create shape as
 /// the SCM `\ntsvcs` pipe: once winlogon crosses its msgina GINA init (BATCH 40) and drives further
 /// into its logon flow, lsass' LsarStartRpcServer keeps re-creating the `\lsarpc` server pipe with no
@@ -7783,6 +7803,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WL_WORKER_FAULTS.load(Ordering::Relaxed) >= 1,
                         &mut passed,
                     );
+                    // ★ BATCH 43 — winlogon CROSSES its win32k NtUserGetClassInfo (0x10bd) class-call-proc
+                    // wall (thread↔desktop bind: pti->rpdesk + pheapDesktop, and ppi->ptiList link) and
+                    // creates its interactive SAS window (NtUserCreateWindowEx 0x1077 SUCCESS). The wall was
+                    // the frontier this batch targeted; crossing it is the proven advance toward the paint.
+                    check(
+                        b"exec_winlogon_sas_window",
+                        WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) >= 1,
+                        &mut passed,
+                    );
+                    print_str(b"[ntos-exec] winlogon win32k SAS-window milestone (0x1077 OK) crossed=0x");
+                    print_hex(WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) as u32);
+                    print_str(b"\n");
                     print_str(b"[ntos-exec] winlogon rpcrt4 worker multiplex events=0x");
                     print_hex(WL_WORKER_FAULTS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");

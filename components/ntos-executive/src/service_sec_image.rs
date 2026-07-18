@@ -1457,6 +1457,9 @@ pub(crate) unsafe fn service_sec_image(
             let flags = get_recv_mr(17);
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
             let mut handled = true;
+            // BATCH 43: set when winlogon reaches its win32k SAS-window creation milestone (0x1077 OK) →
+            // park it (recv-next-without-reply) so the boot quiesces + the gate runs (see the !handled block).
+            let mut wl_milestone_park = false;
             // Fix (B): set when this syscall was routed to the win32k component. win32k faults
             // during the nested dispatch clobber the executive's `reply_to` (finish_call), so this
             // caller's reply must go back through its bound reply cap (REPLY_MAIN) rather than the
@@ -2856,6 +2859,11 @@ pub(crate) unsafe fn service_sec_image(
                 // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
                 // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
                 {
+                    // Live-lock backstop (kept at 500). BATCH 43 note: winlogon now CROSSES the
+                    // NtUserGetClassInfo class-call-proc wall and would keep dispatching heavy SAS-window
+                    // work past the 620s TCG budget — but the SAS-window MILESTONE PARK (0x1077 OK, see the
+                    // `wl_milestone_park` arm below) parks it first, so this generic cap no longer gates
+                    // winlogon; it remains the catch-all for any client whose win32k flow truly live-locks.
                     const W32_TOTAL_LIMIT: u64 = 500;
                     let total = W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed) + 1;
                     if total >= W32_TOTAL_LIMIT {
@@ -2922,9 +2930,18 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     (a1, 0)
                 };
-                print_str(b"[win32k-svc] csrss -> SSN 0x");
-                print_hex(m0 as u32);
-                print_str(b" (dispatch)\n");
+                // BATCH 43: throttle the per-dispatch header for the HIGH-FREQUENCY class-registration
+                // loop SSNs (0x103d NtUserFindExistingCursorIcon / 0x10b4 NtUserRegisterClassExWOW), which
+                // each fire dozens of times during user32 RegisterSystemClasses. Serial writes dominate the
+                // TCG per-round-trip cost and the boot budget is tight now that winlogon crosses its win32k
+                // wall (BATCH 43). Print the first 6 of each, then suppress; all OTHER SSNs always print.
+                let w32_hot = m0 == 0x103d || m0 == 0x10b4;
+                let w32_log = !w32_hot || W32_HOT_LOG.fetch_add(1, Ordering::Relaxed) < 12;
+                if w32_log {
+                    print_str(b"[win32k-svc] csrss -> SSN 0x");
+                    print_hex(m0 as u32);
+                    print_str(b" (dispatch)\n");
+                }
                 // DIAG: NtUserCreateWindowStation(0x122f) OA-pointer probe — read the client's REAL
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
@@ -3170,11 +3187,15 @@ pub(crate) unsafe fn service_sec_image(
                         off += 8;
                     }
                 }
-                print_str(b"[win32k-svc] csrss SSN 0x");
-                print_hex(m0 as u32);
-                print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
-                print_hex(st as u32);
-                print_str(b"\n");
+                // BATCH 43: throttle the status line for the same hot class-loop SSNs (WALL statuses ALWAYS
+                // print — a wall is never suppressed).
+                if !ok || w32_log {
+                    print_str(b"[win32k-svc] csrss SSN 0x");
+                    print_hex(m0 as u32);
+                    print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
+                    print_hex(st as u32);
+                    print_str(b"\n");
+                }
                 // BATCH 39 — REASSERT winlogon's client CLIENTINFO.pDeskInfo after any win32k call.
                 // spawn_sec_image seeds TEB.Win32ClientInfo.pDeskInfo (TEB+0x820) with a valid client
                 // DESKTOPINFO so an interactive client's user32 GetThreadDesktopWnd() (RVA 0x50009,
@@ -3205,6 +3226,26 @@ pub(crate) unsafe fn service_sec_image(
                 // The counted exec_win32k_desktop_painted spec is fed by the m0==0x1288 arm above.
                 if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
+                    // ★ BATCH 43 — MILESTONE PARK. winlogon (pi 2) now CROSSES its win32k
+                    // NtUserGetClassInfo (0x10bd) class-call-proc wall (thread↔desktop bind + ppi->ptiList
+                    // link) and advances into REAL SAS-window creation — its first NtUserCreateWindowEx
+                    // (0x1077) SUCCEEDS. That is the proven interactive milestone. Its subsequent
+                    // window-show → co_IntShowDesktop → co_IntInitializeDesktopGraphics → paint flow is
+                    // many more heavy win32k round-trips (real EngCopyBits blits + demand faults) that
+                    // exceed the 620s TCG boot budget — so winlogon never parks on its own and the boot
+                    // never quiesces (the gate never runs). PARK winlogon here at the SAS-window milestone
+                    // (recv-next-without-reply, exactly like a listener that reached its steady state): its
+                    // TCB stays blocked at a proven-advanced state, the boot quiesces, and the gate runs
+                    // CLEANLY. This is the win32k-dispatch analogue of the existing listener milestone parks.
+                    // (The paint remains the next frontier; reaching it needs a win32k dispatch-cost
+                    // reduction — pre-attaching winlogon's DLL pages to win32k to kill the per-blit demand
+                    // faults — or a larger boot budget. See ntdll_plan.md BATCH 43.)
+                    if pi == 2 && m0 == 0x1077 {
+                        WINLOGON_SAS_MILESTONE.store(1, Ordering::Relaxed);
+                        print_str(b"[wl-main] winlogon crossed win32k class wall + created SAS window (NtUserCreateWindowEx 0x1077 OK) -> MILESTONE PARK (boot quiesces; gate runs)\n");
+                        handled = false;
+                        wl_milestone_park = true;
+                    }
                 } else {
                     handled = false; // dispatch wall — stop with the SSN recorded
                     result = 0xC0000001;
@@ -3214,6 +3255,26 @@ pub(crate) unsafe fn service_sec_image(
                 result = 0xC0000002; // STATUS_NOT_IMPLEMENTED
             }
             if !handled {
+                // ★ BATCH 43 — winlogon SAS-window MILESTONE park (recv-next-without-reply). winlogon has
+                // CROSSED its win32k class-call-proc wall and created its SAS window; its further
+                // window-show→paint flow exceeds the 620s TCG budget. Park it here (its TCB stays blocked
+                // at the proven-advanced state) and QUIESCE to the gate — provided the boot is otherwise at
+                // steady state (winlogon crossed msgina + LSA signalled). This is the win32k analogue of the
+                // listener milestone parks below.
+                if wl_milestone_park {
+                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                    crash_parked |= 1u64 << owner_top_badge(badge);
+                    if WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
+                        && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                    continue;
+                }
                 // N-threads multiplex: a SERVER thread (svc/lsass listener) that walls on an unserviced
                 // BLOCKING server-loop syscall (e.g. NtListenPort / NtReplyWaitReceivePort — it reached
                 // its LPC/RPC receive loop and would block forever waiting for a client) PARKS instead of
@@ -3506,7 +3567,10 @@ pub(crate) unsafe fn service_sec_image(
                                 break;
                             }
                         } else {
-                            WINLOGON_SCM_PARKED.store(1, Ordering::Relaxed);
+                            // BATCH 43: only log on the FIRST 0→1 transition (this fires on every SCM read
+                            // retry; serial writes dominate the TCG per-round-trip cost, and the boot budget
+                            // is now tight with winlogon's heavier post-win32k-wall flow).
+                            let first = WINLOGON_SCM_PARKED.swap(1, Ordering::Relaxed) == 0;
                             // BATCH 39 — defense-in-depth REASSERT of winlogon's client CLIENTINFO on the
                             // SCM-RPC read-park path (winlogon's LAST activity before its post-OpenSCManager
                             // GUI init calls user32 GetThreadDesktopWnd). win32k's IntSetThreadDesktop ELSE
@@ -3517,7 +3581,9 @@ pub(crate) unsafe fn service_sec_image(
                             core::ptr::write_volatile((WLSCR + 0x78) as *mut u64, SMSS_DESKINFO_VA);
                             core::ptr::write_volatile((WLSCR + 0x820) as *mut u64, SMSS_DESKINFO_VA);
                             core::ptr::write_volatile((WLSCR + 0x828) as *mut u64, 0);
-                            print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
+                            if first {
+                                print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
+                            }
                         }
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
