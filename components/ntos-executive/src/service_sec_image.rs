@@ -3106,7 +3106,15 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[win32k-svc] svc NtUserGetClassInfo(0x10bd) FAKED (non-interactive service, skip UserRegisterSystemClasses blit) -> FALSE\n");
                     (0, true)
                 } else {
-                    win32k_dispatch(m0, d_a0, d_a1, a2, a3)
+                    // ★ BATCH 44 — marshal the win64 STACK-ARG TAIL for WIDE win32k SSNs. `sp` is the
+                    // client's syscall-entry stack pointer (MR16). The kernel captures the faulting
+                    // thread's RSP into MR16 (see the NtQueryInformationThread return_length read at
+                    // sp+0x28 above), so args 5..N live at [sp+0x28], [sp+0x30], … per win64. For a wide
+                    // SSN (nargs>4) win32k_dispatch_wide reads args 5..N from the client stack; for the
+                    // common nargs<=4 case it is byte-identical to the old register-only dispatch.
+                    let sp = get_recv_mr(16);
+                    let nargs = win32k_subsystem::win32k_ssn_argc(m0);
+                    win32k_glue::win32k_dispatch_wide(m0, d_a0, d_a1, a2, a3, sp, nargs)
                 };
                 if winlogon_switch {
                     // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
@@ -3226,23 +3234,32 @@ pub(crate) unsafe fn service_sec_image(
                 // The counted exec_win32k_desktop_painted spec is fed by the m0==0x1288 arm above.
                 if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
-                    // ★ BATCH 43 — MILESTONE PARK. winlogon (pi 2) now CROSSES its win32k
-                    // NtUserGetClassInfo (0x10bd) class-call-proc wall (thread↔desktop bind + ppi->ptiList
-                    // link) and advances into REAL SAS-window creation — its first NtUserCreateWindowEx
-                    // (0x1077) SUCCEEDS. That is the proven interactive milestone. Its subsequent
-                    // window-show → co_IntShowDesktop → co_IntInitializeDesktopGraphics → paint flow is
-                    // many more heavy win32k round-trips (real EngCopyBits blits + demand faults) that
-                    // exceed the 620s TCG boot budget — so winlogon never parks on its own and the boot
-                    // never quiesces (the gate never runs). PARK winlogon here at the SAS-window milestone
-                    // (recv-next-without-reply, exactly like a listener that reached its steady state): its
-                    // TCB stays blocked at a proven-advanced state, the boot quiesces, and the gate runs
-                    // CLEANLY. This is the win32k-dispatch analogue of the existing listener milestone parks.
-                    // (The paint remains the next frontier; reaching it needs a win32k dispatch-cost
-                    // reduction — pre-attaching winlogon's DLL pages to win32k to kill the per-blit demand
-                    // faults — or a larger boot budget. See ntdll_plan.md BATCH 43.)
-                    if pi == 2 && m0 == 0x1077 {
+                    // ★ BATCH 45 — SAS-window milestone gated on a REAL HWND (st != 0). Root cause found in
+                    // BATCH 44/45: the BATCH-43 "0x1077 OK" was a FALSE POSITIVE — the executive forwarded
+                    // only the 4 register args to `NtUserCreateWindowEx` (15 args), so win32k read hMenu
+                    // (11th arg, on the stack) as GARBAGE → `ERROR_INVALID_MENU_HANDLE` → NULL HWND. `ok`
+                    // only meant "the handler ran to DONE", not "valid window". FIX: the win64 STACK-ARG
+                    // TAIL is now marshaled (win32k_dispatch_wide + win32k_ssn_argc) AND the WM_NCCREATE
+                    // WINDOWPROC callback returns Result=TRUE (s_ke_user_mode_callback api=0), so 0x1077
+                    // returns a real HWND. Winlogon then runs THROUGH: UserSetLogonNotifyWindow (0x127c) +
+                    // UnregisterClass (0x10bf) = InitializeSAS COMPLETE. Record the HWND milestone here.
+                    if pi == 2 && m0 == 0x1077 && st != 0 {
                         WINLOGON_SAS_MILESTONE.store(1, Ordering::Relaxed);
-                        print_str(b"[wl-main] winlogon crossed win32k class wall + created SAS window (NtUserCreateWindowEx 0x1077 OK) -> MILESTONE PARK (boot quiesces; gate runs)\n");
+                        print_str(b"[wl-main] winlogon created SAS window (NtUserCreateWindowEx 0x1077 -> HWND 0x");
+                        print_hex(st as u32);
+                        print_str(b")\n");
+                    }
+                    // ★ BATCH 45 — QUIESCE at the InitializeSAS-complete milestone. `UserSetLogonNotifyWindow`
+                    // (0x127c) is winlogon's DEFINING final interactive step: it registers its logon-notify
+                    // window, which happens exactly once after the SAS window exists. Past this, winlogon
+                    // enters its SAS message loop (an infinite NtUserGetMessage wait we don't service) and
+                    // never returns to the executive → the boot would never quiesce and the gate never runs
+                    // (the BATCH-44 620s timeout). This is the win32k analogue of the listener milestone
+                    // parks below: winlogon's TCB stays blocked at this proven-advanced steady state, the boot
+                    // quiesces, and the gate runs cleanly. Gated on the SAS HWND milestone so we only park
+                    // once winlogon actually created its window (never on the old NULL-HWND failure path).
+                    if pi == 2 && m0 == 0x127c && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0 {
+                        print_str(b"[wl-main] winlogon registered logon-notify window (UserSetLogonNotifyWindow 0x127c) = InitializeSAS complete -> MILESTONE PARK (boot quiesces; gate runs)\n");
                         handled = false;
                         wl_milestone_park = true;
                     }

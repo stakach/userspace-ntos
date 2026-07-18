@@ -374,6 +374,26 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
 /// then demand-page the handler's faults until the component issues its NEXT dispatch Call = "done".
 /// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32, bool) {
+    win32k_dispatch_wide(ssn, a0, a1, a2, a3, 0, 0)
+}
+
+/// Like [`win32k_dispatch`] but marshals the win64 STACK-ARG TAIL for WIDE SSNs (args 5+). The x64
+/// win64 ABI passes args 1-4 in rcx/rdx/r8/r9 and args 5..N on the CALLER's stack at
+/// `[rsp+0x28], [rsp+0x30], …` (rsp = the syscall-entry stack pointer). `caller_sp` is the client's
+/// stack pointer at the syscall (get_recv_mr(16)); `nargs` is the handler's TOTAL arg count. For
+/// `nargs<=4` this is byte-identical to the old register-only dispatch. For a wide SSN (e.g.
+/// NtUserCreateWindowEx = 15 args) we read stack args 5..N from the client's stack via
+/// `smss_stack_read` and stage them into SH_REQ_A4.. so win32k's `dispatch_ssn` can rebuild a real
+/// N-arg win64 call — the FIX for the garbage-hMenu wall (BATCH 44).
+pub(crate) unsafe fn win32k_dispatch_wide(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    nargs: u64,
+) -> (i32, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     if w_fault == 0 {
@@ -390,6 +410,17 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A2) as *mut u64, a2);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A3) as *mut u64, a3);
+    // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
+    // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.
+    let staged = if nargs > 4 && caller_sp != 0 { nargs.min(16) } else { 0 };
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_NARGS) as *mut u64, staged);
+    let mut i = 4u64;
+    while i < staged {
+        // arg (i+1) is the (i-3)-th stack slot at [rsp + 0x28 + (i-4)*8].
+        let v = crate::img_spawn::smss_stack_read(caller_sp + 0x28 + (i - 4) * 8);
+        core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A4 + (i - 4) * 8) as *mut u64, v);
+        i += 1;
+    }
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *mut i32, 0);
     let code_va = win32k_subsystem::WIN32K_CODE_VA;
     // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps

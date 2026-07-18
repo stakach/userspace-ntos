@@ -159,6 +159,170 @@ pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
 pub const SH_REQ_STATUS: u64 = 0x78; // out: handler NTSTATUS (i32)
 pub const SH_REQ_SEQ: u64 = 0x80; // out: completed-request counter (u64) — observability
 pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
+// ★ BATCH 44 — STACK-ARG TAIL for WIDE win32k SSNs. The x64 win64 ABI passes args 1-4 in rcx/rdx/r8/r9
+// and args 5+ on the caller's stack. `dispatch_ssn` originally forwarded ONLY the 4 register args, so a
+// handler like `NtUserCreateWindowEx` (15 args) read args 5-15 (incl. hMenu) from win32k's OWN leftover
+// stack = GARBAGE -> `ERROR_INVALID_MENU_HANDLE` -> NULL HWND -> winlogon's InitializeSAS fails ->
+// UnregisterClass + NtTerminateProcess (the root cause of the "post-SAS silent" wall). The executive
+// now reads the caller's stack args 5-N and marshals them here; `dispatch_ssn` reconstructs a real
+// N-arg win64 call. SH_REQ_A4..A14 hold args 5-15 (u64 each); SH_REQ_NARGS is the TOTAL arg count.
+pub const SH_REQ_A4: u64 = 0x90; // in:  handler arg4 (1st stack arg)
+pub const SH_REQ_NARGS: u64 = 0xF0; // in:  total handler arg count (0/<=4 => register-only, as before)
+// Compile-time invariants for the stack-arg-tail region (host-verified at build):
+//  - SH_REQ_A4 must sit ABOVE the last register field (SH_FONT_SIZE=0x88) so it never aliases.
+//  - The widest SSN is 16 args (SH_REQ_A4 holds args 5..16 = 12 u64 slots = 0x90..0xF0), which must
+//    END exactly at SH_REQ_NARGS with no overlap — i.e. NARGS = A4 + 12*8.
+const _: () = assert!(SH_REQ_A4 > SH_FONT_SIZE);
+const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + 12 * 8);
+
+/// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
+/// + user32/gdi32 actually issue; verified: 0x1077=CreateWindowEx, 0x10bd=GetClassInfo,
+/// 0x1288=SwitchDesktop, 0x125a=Initialize, 0x10fa=ProcessConnect all match the live trace). Returns
+/// 0 for SSNs with <=4 args (register-only — the vast majority + the default), so the dispatch is
+/// byte-identical to the pre-BATCH-44 path unless the handler genuinely needs stack args. This is the
+/// GENERAL fix for the "garbage stack arg" wall (root cause: NtUserCreateWindowEx read hMenu from
+/// win32k's own leftover stack -> ERROR_INVALID_MENU_HANDLE -> NULL HWND -> winlogon SAS-init fail).
+pub fn win32k_ssn_argc(ssn: u64) -> u64 {
+    match ssn {
+        0x1001 => 5, // UserPeekMessage
+        0x1007 => 7, // UserMessageCall
+        0x1008 => 11, // GdiBitBlt
+        0x101b => 7, // UserBuildHwndList
+        0x101f => 5, // GdiIntersectClipRect
+        0x1023 => 7, // UserSetWindowPos
+        0x1028 => 16, // GdiSetDIBitsToDeviceInternal
+        0x1030 => 12, // GdiStretchBlt
+        0x1037 => 9, // GdiExtTextOutW
+        0x1046 => 6, // GdiDoPalette
+        0x1047 => 5, // GdiPolyPolyDraw
+        0x1049 => 5, // UserEnumDisplayMonitors
+        0x104e => 6, // UserGetIconInfo
+        0x1052 => 8, // UserDeferWindowPos
+        0x1059 => 6, // GdiPatBlt
+        0x105c => 5, // GdiHfontCreate
+        0x105d => 6, // UserMoveWindow
+        0x105f => 11, // UserDrawIconEx
+        0x1064 => 7, // GdiD3dDrawPrimitives2
+        0x1068 => 13, // GdiMaskBlt
+        0x1069 => 7, // GdiGetWidthTable
+        0x106a => 7, // UserScrollDC
+        0x106b => 5, // UserGetObjectInformation
+        0x106c => 5, // GdiCreateBitmap
+        0x106e => 5, // UserFindWindowEx
+        0x106f => 5, // GdiPolyPatBlt
+        0x1072 => 5, // GdiTransformPoints
+        0x1075 => 6, // GdiCreateDIBBrush
+        0x1077 => 15, // UserCreateWindowEx
+        0x107a => 7, // UserToUnicodeEx
+        0x107d => 12, // GdiAlphaBlend
+        0x1082 => 16, // GdiStretchDIBitsInternal
+        0x1086 => 9, // GdiGetDIBitsInternal
+        0x108d => 6, // UserSetWindowsHookEx
+        0x1091 => 5, // GdiRectangle
+        0x1095 => 5, // GdiGetTextExtent
+        0x1098 => 5, // UserCalcMenuBar
+        0x1099 => 6, // UserThunkedMenuItemInfo
+        0x109a => 5, // GdiExcludeClipRect
+        0x109b => 9, // GdiCreateDIBSection
+        0x10a0 => 11, // GdiCreateDIBitmapInternal
+        0x10a4 => 7, // GdiEnumFontOpen
+        0x10a5 => 5, // GdiEnumFontChunk
+        0x10a7 => 8, // GdiDdCreateSurface
+        0x10af => 11, // GdiExtCreatePen
+        0x10b4 => 7, // UserRegisterClassExWOW
+        0x10bd => 5, // UserGetClassInfo
+        0x10c2 => 8, // UserScrollWindowEx
+        0x10c7 => 6, // GdiDdCreateSurfaceObject
+        0x10cb => 6, // GdiGetCharWidthW
+        0x10cf => 8, // UserBitBltSysBmp
+        0x10db => 5, // GdiGetFontData
+        0x10de => 7, // GdiOpenDCW
+        0x10ea => 5, // GdiSetVirtualResolution
+        0x10ee => 6, // UserRealInternalGetMessage
+        0x10f2 => 6, // UserPaintMenuBar
+        0x10f7 => 6, // UserGetAltTabInfo
+        0x1109 => 8, // UserSetWinEventHook
+        0x1113 => 5, // UserDdeInitialize
+        0x1116 => 5, // GdiAddFontMemResourceEx
+        0x111c => 8, // GdiExtEscape
+        0x112a => 6, // GdiAddFontResourceW
+        0x112d => 6, // GdiAngleArc
+        0x112f => 10, // GdiArcInternal
+        0x1136 => 5, // GdiCLIPOBJ_cEnumStart
+        0x113a => 8, // GdiCheckBitmapBits
+        0x113d => 6, // GdiColorCorrectPalette
+        0x113f => 8, // GdiCreateColorTransform
+        0x1143 => 6, // GdiCreateRoundRectRgn
+        0x1144 => 6, // GdiCreateServerMetaFile
+        0x114f => 8, // GdiDdCreateD3DBuffer
+        0x1156 => 5, // GdiDdFlip
+        0x1165 => 11, // GdiDdQueryDirectDrawObject
+        0x1187 => 6, // GdiDxgGenericThunk
+        0x1188 => 5, // GdiEllipse
+        0x118c => 7, // GdiEngAlphaBlend
+        0x118e => 11, // GdiEngBitBlt
+        0x1191 => 6, // GdiEngCopyBits
+        0x1192 => 6, // GdiEngCreateBitmap
+        0x1196 => 6, // GdiEngCreatePalette
+        0x119c => 7, // GdiEngFillPath
+        0x119d => 10, // GdiEngGradientFill
+        0x119e => 9, // GdiEngLineTo
+        0x11a1 => 5, // GdiEngPaint
+        0x11a2 => 11, // GdiEngPlgBlt
+        0x11a3 => 11, // GdiEngStretchBlt
+        0x11a4 => 13, // GdiEngStretchBltROP
+        0x11a5 => 10, // GdiEngStrokeAndFillPath
+        0x11a6 => 8, // GdiEngStrokePath
+        0x11a7 => 10, // GdiEngTextOut
+        0x11a8 => 8, // GdiEngTransparentBlt
+        0x11ab => 7, // GdiEudcLoadUnloadLink
+        0x11ac => 5, // GdiExtFloodFill
+        0x11ae => 5, // GdiFONTOBJ_cGetGlyphs
+        0x11b8 => 5, // GdiFrameRgn
+        0x11b9 => 5, // GdiFullscreenControl
+        0x11bb => 6, // GdiGetCharABCWidthsW
+        0x11bc => 6, // GdiGetCharacterPlacementW
+        0x11c5 => 7, // GdiGetEmbUFI
+        0x11c8 => 7, // GdiGetFontResourceInfoInternalW
+        0x11ca => 5, // GdiGetGlyphIndicesW
+        0x11cb => 6, // GdiGetGlyphIndicesWInternal
+        0x11cc => 8, // GdiGetGlyphOutline
+        0x11d5 => 7, // GdiGetServerMetaFileBits
+        0x11d7 => 5, // GdiGetStats
+        0x11d8 => 5, // GdiGetStringBitmapW
+        0x11d9 => 8, // GdiGetTextExtentExW
+        0x11da => 6, // GdiGetUFI
+        0x11db => 10, // GdiGetUFIPathname
+        0x11dc => 6, // GdiGradientFill
+        0x11de => 6, // GdiHT_Get8BPPMaskPalette
+        0x11df => 8, // GdiIcmBrushInfo
+        0x11e2 => 5, // GdiMakeFontDir
+        0x11f0 => 11, // GdiPlgBlt
+        0x11f6 => 6, // GdiRemoveFontResourceW
+        0x11f8 => 5, // GdiResetDC
+        0x11fa => 7, // GdiRoundRect
+        0x1200 => 6, // GdiScaleViewportExtEx
+        0x1201 => 6, // GdiScaleWindowExtEx
+        0x1210 => 5, // GdiSetRectRgn
+        0x1219 => 11, // GdiTransparentBlt
+        0x1220 => 5, // GdiXFORMOBJ_bApplyXform
+        0x122d => 5, // UserCreateDesktop
+        0x122f => 7, // UserCreateWindowStation
+        0x1236 => 5, // UserDragObject
+        0x1239 => 7, // UserDrawCaptionTemp
+        0x123a => 5, // UserDrawMenuBarTemp
+        0x124e => 5, // UserGetMouseMovePointsEx
+        0x1251 => 5, // UserGetRawInputData
+        0x1259 => 12, // UserInitTask
+        0x125c => 7, // UserLoadKeyboardLayoutEx
+        0x1277 => 5, // UserSetImeHotKey
+        0x128a => 6, // UserTrackPopupMenuEx
+        0x1291 => 10, // UserUpdateLayeredWindow
+        0x1299 => 6, // UserWin32PoolAllocationStats
+        _ => 0,
+    }
+}
+
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
@@ -1960,6 +2124,20 @@ unsafe fn patch_ke_get_current_irql() {
 // point *OutputBuffer at it, set *OutputLength, return STATUS_SUCCESS. (The caller pre-seeds
 // *OutputLength with the exact struct size it will RtlMoveMemory back, so honour it.)
 const USER32_CB_LOADDEFAULTCURSORS: u32 = 3;
+// USER32_CALLBACK_WINDOWPROC (u32cb.h:9) — the CLIENT window-proc dispatch (WM_NCCREATE / WM_CREATE /
+// WM_NCCALCSIZE etc.). co_IntCallWindowProc (callback.c:351,373) RtlMoveMemory's the OUTPUT buffer back
+// over the input Arguments then reads the window-proc LRESULT from `Arguments->Result`. Zeroing the
+// output (the init-callback path) yields Result=0 → WM_NCCREATE returns FALSE → co_UserCreateWindowEx
+// "NCCREATE message failed" → NULL HWND. So for the WINDOWPROC api we PRESERVE the input Arguments
+// (copy input→output, incl. the trailing lParam/CREATESTRUCT buffer) and write the correct DefWindowProc
+// LRESULT at Result (offset 0x38). See WINDOWPROC_CALLBACK_ARGUMENTS (callback.h:21): x64 layout is
+// Proc@0 IsAnsiProc@8 Wnd@0x10 Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38.
+const USER32_CB_WINDOWPROC: u32 = 0;
+const WPCA_MSG: u64 = 0x18; // UINT Msg
+const WPCA_RESULT: u64 = 0x38; // LRESULT Result
+// WINDOWPROC_CALLBACK_ARGUMENTS x64 layout invariant (callback.h:21): Proc@0 IsAnsiProc@8 Wnd@0x10
+// Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38. Result is the 8th 8-byte slot.
+const _: () = assert!(WPCA_RESULT == 7 * 8 && WPCA_MSG == 3 * 8);
 extern "win64" fn s_ke_user_mode_callback(
     api: u32,
     _input: u64,
@@ -2000,6 +2178,36 @@ extern "win64" fn s_ke_user_mode_callback(
         // LOADDEFAULTCURSORS: *ResultPointer must be an HCURSOR* → first 8 bytes = the HCURSOR (NULL).
         // (Already zeroed; the buffer itself is the &HCURSOR win32k reads via `mov rax,[rax]`.)
         let _ = api == USER32_CB_LOADDEFAULTCURSORS;
+        if api == USER32_CB_WINDOWPROC && _input != 0 && input_len as u64 >= WPCA_RESULT + 8 {
+            // WINDOWPROC dispatch: PRESERVE the input Arguments (Proc/Wnd/Msg/lParam + trailing
+            // CREATESTRUCT so co_IntCallWindowProc's RtlMoveMemory write-back to lParam is valid) and
+            // stamp the correct DefWindowProc LRESULT. Copy the whole input over the zeroed output.
+            let n = (input_len as u64).min(size);
+            let mut j = 0u64;
+            while j + 8 <= n {
+                write_volatile((buf + j) as *mut u64, read_volatile((_input + j) as *const u64));
+                j += 8;
+            }
+            while j < n {
+                write_volatile((buf + j) as *mut u8, read_volatile((_input + j) as *const u8));
+                j += 1;
+            }
+            // DefWindowProc LRESULT: TRUE(1) for the window-create messages (WM_NCCREATE=0x81 /
+            // WM_CREATE=0x01 return TRUE to CONTINUE creation); WM_NCCALCSIZE=0x83 returns 0. Default to
+            // TRUE so an unmodelled create-message doesn't abort the window. This is the invisible 0x0
+            // WS_POPUP SAS window's create path — DefWindowProc's real result.
+            let msg = read_volatile((_input + WPCA_MSG) as *const u32);
+            let result: u64 = match msg {
+                0x0083 => 0, // WM_NCCALCSIZE -> 0
+                _ => 1,      // WM_NCCREATE / WM_CREATE / etc. -> TRUE (continue creation)
+            };
+            write_volatile((buf + WPCA_RESULT) as *mut u64, result);
+            print_str(b"[win32k-host] WINDOWPROC cb msg=0x");
+            print_hex(msg);
+            print_str(b" -> Result=");
+            print_u64(result);
+            print_str(b"\n");
+        }
         if !out_buf.is_null() {
             write_volatile(out_buf, buf);
         }
@@ -2505,8 +2713,35 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     if handler == 0 {
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
-    let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
-    let ret = f(a0, a1, a2, a3);
+    // ★ BATCH 44 — reconstruct a genuine N-arg win64 call for WIDE SSNs (args 5+ on the stack). The
+    // executive marshaled the caller's stack args into SH_REQ_A4.. and set SH_REQ_NARGS. For nargs<=4
+    // (the common case) this is byte-identical to the old 4-register call. For a wide SSN (e.g.
+    // NtUserCreateWindowEx = 15 args) we transmute to the exact-arity fn type so Rust/LLVM places
+    // args 5..N on the stack per win64 — delivering hMenu et al. correctly instead of garbage.
+    let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
+    let sh = WIN32K_SHARED_VADDR;
+    let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
+    let ret = if nargs <= 4 {
+        let f: extern "win64" fn(u64, u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
+        f(a0, a1, a2, a3)
+    } else if nargs <= 8 {
+        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> i32 =
+            core::mem::transmute(handler as *const ());
+        f(a0, a1, a2, a3, s(4), s(5), s(6), s(7))
+    } else if nargs <= 12 {
+        let f: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> i32 =
+            core::mem::transmute(handler as *const ());
+        f(a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11))
+    } else {
+        // Up to 16 args (covers NtUserCreateWindowEx = 15). Extra tail entries are 0 (unused).
+        let f: extern "win64" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+        ) -> i32 = core::mem::transmute(handler as *const ());
+        f(
+            a0, a1, a2, a3, s(4), s(5), s(6), s(7), s(8), s(9), s(10), s(11), s(12), s(13), s(14),
+            s(15),
+        )
+    };
 
     // Stand up the winsta->desktop parent linkage our Ob layer does not populate. A hosted client's
     // (winlogon's) natural CreateDesktop returns a real DESKTOP body (IntCreateDesktop builds its
