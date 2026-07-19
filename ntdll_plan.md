@@ -3085,6 +3085,36 @@ window + a modal pump) → a fresh cascade of walls that will likely NOT quiesce
 several more batches; this is a multi-batch subsystem, not a one-shot. Deferred as the next desktop-UI
 batch. Boot left GREEN at the message-loop park (184/98) — the proven, quiescent steady state.
 
+### B-FRONTIER RESOLVED (2026-07-20, gate 185/98) — desktop-heap CLIENT-WINDOW mapping → SASWindowProc RUNS
+
+Implemented the desktop-heap client-window mapping (executive-only). **`DispatchMessageW(WLX_WM_SAS)` now
+resolves the SAS window CLIENT-SIDE and runs the real `SASWindowProc → DispatchSAS`.** Proven: DispatchSAS
+at `STATE_INIT` set `Session->LogonState = STATE_LOGGED_OFF (1)` (the executive reads it back = 1, was 0)
+then called `WlxDisplaySASNotice` and returned to the message loop → re-parks cleanly. Gate **185/98**,
+RUNEXIT=3, paint 768/768.
+
+Three-part fix (`win32k_subsystem.rs` / `service_sec_image.rs` / `win32k_glue.rs` / `main.rs`):
+1. **Two client windows, not one.** All window objects (PWND/CLS/handle-table) are `s_rtl_allocate_heap`ed
+   from the ONE USER heap (`WIN32K_HEAP_VADDR`, already RO-mapped into winlogon at `CSRSS_W32_SHARED_VA`).
+   But the DESKTOP body + its DESKTOPINFO are `pool_alloc`ed from a SEPARATE arena (`WIN32K_POOL_VADDR`) —
+   NOT mapped. Added `map_win32k_pool_into_csrss` (RO-map the POOL at `CSRSS_W32_POOL_VA=0x9900_0000`) so
+   `pci->pDeskInfo` is client-readable.
+2. **CLIENTINFO seed** (the placeholder-DESKTOPINFO reassert was replaced): `pDeskInfo = DESKTOPINFO −
+   pool_delta`, `Win32ThreadInfo = pti` (== window `head.pti` → IntCallMessageProc same-thread check passes),
+   `ulClientDelta = USER-heap delta` (DesktopPtrToUser maps PWND/pcls/spwnd). win32k publishes the DESKTOPINFO
+   + pti server VAs via new shared-page fields `SH_SAS_DESKINFO/PTI` and sets the DESKTOPINFO's
+   `pvDesktopBase/pvDesktopLimit` to bracket the whole USER heap (the fast-path range check).
+3. **WM_CREATE Session persist.** The synthetic KeUserModeCallback WINDOWPROC stub never ran the real
+   WM_CREATE `SetWindowLongPtr(GWLP_USERDATA, Session)`, so client-side `GetWindowLongPtr` → 0 →
+   `DispatchSAS(NULL)` crash. The bridge now resolves HWND→PWND via the published `SH_SAS_AHELIST` (USER
+   handle table, index=`(hwnd&0xffff−0x20)>>1`) and stores `CREATESTRUCT.lpCreateParams` (Session) into the
+   real PWND's dwUserData (WND+0x110).
+
+**NEXT FRONTIER:** `WlxDisplaySASNotice` ran but issued NO new win32k syscalls (headless host, no CAD input;
+its `DisplaySASNotice` notice dialog didn't block). The real logon flow needs a Ctrl+Alt+Del SAS at
+`STATE_LOGGED_OFF` → next WLX_WM_SAS → `WlxLoggedOutSAS` (msgina logon dialog + credential UI). Driving a
+synthetic 2nd SAS (or the notice dialog's DialogBox pump) is the next desktop-UI batch.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface

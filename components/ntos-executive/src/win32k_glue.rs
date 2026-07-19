@@ -53,6 +53,50 @@ pub(crate) unsafe fn map_win32k_heap_into_csrss(pml4: u64, pi: usize) -> u64 {
     delta
 }
 
+/// RO-map win32k's POOL arena ([`win32k_subsystem::WIN32K_POOL_VADDR`] — where the DESKTOP body + its
+/// DESKTOPINFO are `pool_alloc`ed) into the GUI client `pi`'s VSpace at
+/// [`win32k_subsystem::CSRSS_W32_POOL_VA`], so user32's client-side `DesktopPtrToUser` can read the
+/// bound DESKTOPINFO (`pci->pDeskInfo->pvDesktopBase/pvDesktopLimit`) — the desktop-heap client-window
+/// mapping (the DESKTOPINFO lives in the POOL, NOT the RO-mapped USER heap). Per-pi guarded, mirroring
+/// [`map_win32k_heap_into_csrss`]. Returns the pool server→client delta.
+pub(crate) unsafe fn map_win32k_pool_into_csrss(pml4: u64, pi: usize) -> u64 {
+    let delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
+    // Validate the frame base BEFORE consuming the per-pi guard bit: a base-not-yet-stored call must
+    // NOT latch the bit (it would leave the POOL unmapped on a later real call → an unmapped
+    // pci->pDeskInfo deref). On the live path pool_base is stored at bring-up before any dispatch.
+    let pool_base = WIN32K_POOL_FRAME_BASE.load(Ordering::Relaxed);
+    if pool_base == 0 {
+        return delta;
+    }
+    let bit = 1u64 << pi;
+    if WIN32K_POOL_CLIENT_MAPPED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return delta; // already mapped into this process's VSpace
+    }
+    const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER;
+    let frames = win32k_subsystem::WIN32K_POOL_FRAMES;
+    for p in 0..(frames + 511) / 512 {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            win32k_subsystem::CSRSS_W32_POOL_VA + p * 0x20_0000,
+            pml4,
+        );
+    }
+    for i in 0..frames {
+        let cp = copy_cap(pool_base + i);
+        let _ = page_map(cp, win32k_subsystem::CSRSS_W32_POOL_VA + i * 0x1000, RO_NX, pml4);
+    }
+    print_str(b"[win32k-svc] RO-mapped win32k POOL into csrss @0x");
+    print_hex(win32k_subsystem::CSRSS_W32_POOL_VA as u32);
+    print_str(b" (pool-delta=0x");
+    print_hex((delta >> 32) as u32);
+    print_hex(delta as u32);
+    print_str(b")\n");
+    delta
+}
+
 // --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---
 // win32k-side paging structures provisioned for the shared client window, and pages already mapped,
 // keyed by a level-tagged aligned index (SYS_SEND paging_struct_map is fire-and-forget so we can't

@@ -283,5 +283,38 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
 - [x] Result: winlogon posts WLX_WM_SAS + GetMessage RETRIEVES it (real win32k `co_IntGetPeekMessage`,
   status=1) + DispatchMessage + re-polls empty queue = steady state. New MESSAGE-LOOP MILESTONE PARK;
   counted spec `exec_winlogon_sas_message_pumped`. Gate 184/98, RUNEXIT=3, paint 768/768.
-- [ ] NEXT: `NtUserDispatchMessage` (0x1002) does not yet invoke `SASWindowProc` via the KeUserModeCallback
-  WINDOWPROC bridge → `DispatchSAS → WlxLoggedOutSAS` (msgina logon dialog) body not yet executed.
+- [x] SUPERSEDED (re-diagnosed 2026-07-20): the SAS dispatch is CLIENT-SIDE (user32 `IntCallMessageProc`,
+  message.c:1990 — NO syscall / NO KeUserModeCallback), NOT `NtUserDispatchMessage`. See below.
+
+## Desktop/logon-UI frontier — win32k desktop-heap CLIENT-WINDOW mapping → SASWindowProc RUNS (2026-07-20, gate 185/98)
+- [x] Diagnosed: `DispatchMessageW(WLX_WM_SAS)` runs `SASWindowProc` CLIENT-SIDE via
+  `user32!IntCallMessageProc` (message.c:1990) — `ValidateHwnd(0x2002e)` → `DesktopPtrToUser` must resolve
+  the SAS PWND out of win32k's heap into winlogon's client view. Our host mapped only a placeholder
+  DESKTOPINFO → ValidateHwnd NULL → DispatchMessageW returned 0 → SASWindowProc never ran (invisible in trace).
+- [x] KEY FINDING: our host allocates ALL window objects (PWND/CLS/handle-table) from the ONE USER heap
+  (`WIN32K_HEAP_VADDR`, `s_rtl_allocate_heap` ignores the desktop-heap handle) — already RO-mapped into
+  winlogon at `CSRSS_W32_SHARED_VA`. BUT the DESKTOP body + its DESKTOPINFO come from `pool_alloc`
+  (`WIN32K_POOL_VADDR`) — a SEPARATE arena NOT mapped into clients. So two windows must be readable client-side.
+- [x] REAL FIX (executive-only; win32k_subsystem.rs/service_sec_image.rs/win32k_glue.rs/main.rs):
+  1. **RO-map win32k's POOL** into winlogon at `CSRSS_W32_POOL_VA=0x9900_0000` (`map_win32k_pool_into_csrss`)
+     so the bound DESKTOPINFO (`pci->pDeskInfo`) is client-readable — the USER heap was already mapped.
+  2. **Seed winlogon's TEB.Win32ClientInfo** (was forced to a placeholder each dispatch): `pDeskInfo` =
+     `BOUND_DESK_PDESKINFO − pool_delta`, `Win32ThreadInfo` = dispatch `pti` (== window `head.pti`, so
+     IntCallMessageProc's same-thread check passes), `ulClientDelta` = USER-heap delta (maps PWND/pcls/spwnd).
+     win32k publishes DESKTOPINFO+pti server VAs via new shared-page fields `SH_SAS_DESKINFO/PTI` and sets the
+     DESKTOPINFO's `pvDesktopBase/pvDesktopLimit` to bracket the whole USER heap (range check accepts any PWND).
+  3. **WM_CREATE callback bridge persists the Session** into `WND.dwUserData` (WND+0x110): the synthetic
+     KeUserModeCallback WINDOWPROC stub never ran the real WM_CREATE `SetWindowLongPtr(GWLP_USERDATA, Session)`,
+     so client-side `GetWindowLongPtr` returned 0 → `DispatchSAS(NULL)` crash. The bridge now resolves HWND→PWND
+     via the published `SH_SAS_AHELIST` (USER handle table, index=(hwnd&0xffff−0x20)>>1) and stores
+     `CREATESTRUCT.lpCreateParams` (the Session) into the real PWND's dwUserData.
+- [x] RESULT: `SASWindowProc` RUNS client-side (was proven mid-batch by the crash moving from user32
+  DispatchMessageW → winlogon+0x55a0 = DispatchSAS). DispatchSAS at `STATE_INIT` sets
+  `Session->LogonState = STATE_LOGGED_OFF (1)` + calls `WlxDisplaySASNotice`, then RETURNS to the message loop
+  and re-parks cleanly. PROOF: the executive reads `Session->LogonState==1` (was 0) via winlogon's own heap
+  mirror → new counted spec `exec_winlogon_sas_windowproc_ran`. Gate **185/98**, RUNEXIT=3, sentinel,
+  paint 768/768, `exec_winlogon_sas_message_pumped` still PASS. Boot QUIESCES at the message-loop park.
+- [ ] NEXT FRONTIER: `WlxDisplaySASNotice` ran but issued no NEW win32k syscalls (headless host, no CAD input —
+  its `DisplaySASNotice` notice dialog didn't block). The actual logon flow needs a real Ctrl+Alt+Del SAS:
+  `STATE_LOGGED_OFF` → next WLX_WM_SAS → `WlxLoggedOutSAS` (msgina logon dialog + credential UI). Driving a
+  synthetic 2nd SAS (or the notice dialog's DialogBox pump) is the next desktop-UI batch.

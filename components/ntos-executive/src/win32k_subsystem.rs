@@ -121,6 +121,18 @@ pub const WIN32K_ARG_FRAMES: u64 = 4;
 /// so moving the base is behavior-preserving for the existing GUI clients (csrss pi 1 / winlogon pi 2).
 pub const CSRSS_W32_SHARED_VA: u64 = 0x0000_0000_9800_0000;
 
+/// The GUI-client-side VA where win32k's POOL arena ([`WIN32K_POOL_VADDR`] — where the DESKTOP body +
+/// its DESKTOPINFO are `pool_alloc`ed) is RO-mapped, so user32's client-side `DesktopPtrToUser` can
+/// read `pci->pDeskInfo->pvDesktopBase/pvDesktopLimit` (the DESKTOPINFO lives in the POOL, NOT the
+/// USER heap). Sits immediately ABOVE the 16 MiB USER-heap window (0x9800_0000..0x9900_0000) and below
+/// the NLS section (0xA000_0000), inside the shared 0x8000_0000..0xC000_0000 1 GiB PD. The client VA of
+/// a pool object = its server VA − ([`WIN32K_POOL_VADDR`] − `CSRSS_W32_POOL_VA`).
+pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
+// The USER-heap window (16 MiB) must end at or below the POOL window base so the two client windows
+// never overlap; the POOL window (8 MiB) must end below the NLS section (0xA000_0000).
+const _: () = assert!(CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000 <= CSRSS_W32_POOL_VA);
+const _: () = assert!(CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
+
 // USERCONNECT / SHAREDINFO x64 field offsets (references/reactos win32ss/include/ntuser.h): a
 // USERCONNECT is { ULONG ulVersion; ULONG ulCurrentVersion; DWORD dwDispatchCount; SHAREDINFO
 // siClient; } with siClient (8-byte aligned) at +0x10, and SHAREDINFO = { PSERVERINFO psi; PVOID
@@ -171,6 +183,29 @@ pub const SH_REQ_NARGS: u64 = 0xF0; // in:  total handler arg count (0/<=4 => re
 //    END exactly at SH_REQ_NARGS with no overlap — i.e. NARGS = A4 + 12*8.
 const _: () = assert!(SH_REQ_A4 > SH_FONT_SIZE);
 const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + 12 * 8);
+
+// ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING (SAS DispatchMessageW client-side resolution). win32k
+// publishes, per dispatch, the two server-VA facts the executive needs to seed the GUI client's
+// TEB.Win32ClientInfo so user32's `ValidateHwnd`/`DesktopPtrToUser`/`IntCallMessageProc` resolve a
+// real window PWND out of win32k's (unified USER+desktop) heap into the client's RO-mapped view:
+//   - SH_SAS_DESKINFO: the bound DESKTOP's DESKTOPINFO server VA (winlogon's CLIENTINFO.pDeskInfo =
+//     this − delta; its pvDesktopBase/pvDesktopLimit are set to bracket the whole heap so
+//     DesktopPtrToUser's range check accepts any heap-resident PWND/CLS).
+//   - SH_SAS_PTI: the dispatch THREADINFO server VA (== the window's `head.pti`); the client's
+//     TEB.Win32ThreadInfo must equal it so IntCallMessageProc's `Wnd->head.pti == GetW32ThreadInfo()`
+//     same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY → the proc never runs).
+// Both are 0 until the desktop is bound (BOUND_DESK_* latched). Written above SH_REQ_NARGS.
+pub const SH_SAS_DESKINFO: u64 = 0x100; // out: bound DESKTOPINFO server VA (u64)
+pub const SH_SAS_PTI: u64 = 0x108; // out: dispatch THREADINFO server VA (== window head.pti) (u64)
+// The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
+// USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
+// can resolve a HWND → its PWND (handles[(hwnd&0xffff − 0x20)>>1].ptr) to persist WND.dwUserData.
+pub const SH_SAS_AHELIST: u64 = 0x110; // in: gSharedInfo.aheList (USER_HANDLE_TABLE) server VA (u64)
+// The SAS window's Session pointer (CreateWindowEx lpCreateParams), published by win32k's WM_CREATE
+// callback bridge; the executive reads winlogon's `Session->LogonState` (Session+0x118) through it to
+// PROVE SASWindowProc → DispatchSAS ran client-side (STATE_INIT→STATE_LOGGED_OFF after the SAS).
+pub const SH_SAS_SESSION: u64 = 0x118; // out: winlogon SAS-window Session VA (u64)
+const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
 /// + user32/gdi32 actually issue; verified: 0x1077=CreateWindowEx, 0x10bd=GetClassInfo,
@@ -2220,6 +2255,66 @@ extern "win64" fn s_ke_user_mode_callback(
             // TRUE so an unmodelled create-message doesn't abort the window. This is the invisible 0x0
             // WS_POPUP SAS window's create path — DefWindowProc's real result.
             let msg = read_volatile((_input + WPCA_MSG) as *const u32);
+            // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING — WM_CREATE persists the Session into WND.dwUserData.
+            // In real Windows the window-creation WM_CREATE runs the CLIENT's real window proc (e.g.
+            // winlogon's SASWindowProc), whose WM_CREATE does `SetWindowLongPtr(hwnd, GWLP_USERDATA,
+            // ((CREATESTRUCT*)lParam)->lpCreateParams)` (sas.c:1572-1575) — the Session pointer. Our host
+            // SYNTHESIZES this callback (it doesn't RIP-redirect into the client proc), so that store
+            // never happens → later, when the SAS window's real SASWindowProc runs CLIENT-SIDE for
+            // WLX_WM_SAS, `GetWindowLongPtr(GWLP_USERDATA)` (= client-side ValidateHwnd(hwnd)->dwUserData)
+            // returns 0 → DispatchSAS(NULL) → null-deref. Reproduce the authentic WM_CREATE effect here:
+            // WINDOWPROC_CALLBACK_ARGUMENTS { … Wnd@0x10, wParam@0x20, lParam@0x28 }; for WM_CREATE
+            // lParam → CREATESTRUCT, whose lpCreateParams@0x00 = the Session. Store it into the kernel
+            // PWND's dwUserData (WND+0x110, x64: after head(0x28)+state..fnid(0x20)+5*spwnd(0x28)+
+            // rcWindow/rcClient(0x20)+lpfnWndProc/pcls/hrgnUpdate(0x18)+PropListHead/Items(0x18)+
+            // pSBInfo/SystemMenu/IDMenu/hrgnClip/hrgnNewFrame(0x28)+strName(0x10)+cbwndExtra(0x8)+
+            // spwndLastActive/hImc(0x10) = 0x110). win32k owns the heap RW, so the write takes; winlogon
+            // sees it in its RO client mapping → GetWindowLongPtr returns the real Session.
+            const WPCA_WND: u64 = 0x10; // HWND (a handle value, NOT a PWND)
+            const WPCA_LPARAM: u64 = 0x28;
+            const WND_DWUSERDATA_OFF: u64 = 0x110;
+            if msg == 0x0001 {
+                let hwnd = read_volatile((_input + WPCA_WND) as *const u64);
+                let lparam = read_volatile((_input + WPCA_LPARAM) as *const u64);
+                // Resolve HWND → PWND via the USER handle table (gSharedInfo.aheList, published by the
+                // executive from the USERCONNECT). handles@0x00, nb_handles@0x10; USER_HANDLE_ENTRY:
+                // ptr@0x00, sizeof 0x18 (ptr,pti,type,flags,generation). index = (hwnd&0xffff−0x20)>>1.
+                let ahelist = read_volatile((WIN32K_SHARED_VADDR + SH_SAS_AHELIST) as *const u64);
+                let mut pwnd = 0u64;
+                if ahelist != 0 && (hwnd & 0xffff) >= 0x20 {
+                    let handles = read_volatile(ahelist as *const u64);
+                    let nb = read_volatile((ahelist + 0x10) as *const u32) as u64;
+                    let index = ((hwnd & 0xffff) - 0x20) >> 1;
+                    if handles != 0 && index < nb {
+                        let entry = handles + index * 0x18;
+                        // Only accept a live TYPE_WINDOW(1) entry (USER_HANDLE_ENTRY.type @ +0x10) —
+                        // a freed/wrong-type slot (type==0/other) must NOT be dereferenced+written (ReactOS
+                        // handle_to_entry returns NULL for type==0). Guards against type-confusion if this
+                        // path is ever reused for an arbitrary HWND.
+                        if read_volatile((entry + 0x10) as *const u8) == 1 {
+                            pwnd = read_volatile(entry as *const u64);
+                        }
+                    }
+                }
+                if pwnd != 0 && lparam != 0 {
+                    // CREATESTRUCT.lpCreateParams @ +0x00 = the Session pointer.
+                    let create_params = read_volatile(lparam as *const u64);
+                    if create_params != 0 {
+                        write_volatile((pwnd + WND_DWUSERDATA_OFF) as *mut u64, create_params);
+                        // Publish the Session VA so the executive can read LogonState (proof of the
+                        // client-side SASWindowProc→DispatchSAS run).
+                        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_SESSION) as *mut u64, create_params);
+                        print_str(b"[win32k-host] WM_CREATE stored Session 0x");
+                        print_hex((create_params >> 32) as u32);
+                        print_hex(create_params as u32);
+                        print_str(b" into WND+0x110 (dwUserData) hwnd=0x");
+                        print_hex(hwnd as u32);
+                        print_str(b" pwnd=0x");
+                        print_hex(pwnd as u32);
+                        print_str(b"\n");
+                    }
+                }
+            }
             let result: u64 = match msg {
                 0x0083 => 0, // WM_NCCALCSIZE -> 0
                 _ => 1,      // WM_NCCREATE / WM_CREATE / etc. -> TRUE (continue creation)
@@ -2796,6 +2891,27 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             if pci != 0 {
                 write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
             }
+            // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING — bracket the bound DESKTOPINFO's window range over
+            // the WHOLE unified USER/desktop heap. In real win32k IntCreateDesktop sets
+            // pvDesktopBase/pvDesktopLimit to the per-desktop heap's [base,limit); our host allocates
+            // every window/class/handle-entry out of the single shared arena at WIN32K_HEAP_VADDR
+            // (s_rtl_allocate_heap ignores the desktop-heap handle). So the client-side
+            // DesktopPtrToUser range check (Ptr in [base,limit) → Ptr-ulClientDelta) must accept any
+            // heap-resident PWND/CLS: set base=heap start, limit=heap end. Idempotent (only sets when
+            // still zero). DESKTOPINFO: pvDesktopBase@0x00, pvDesktopLimit@0x08 (ntuser.h).
+            if read_volatile(BOUND_DESK_PDESKINFO as *const u64) == 0 {
+                write_volatile(BOUND_DESK_PDESKINFO as *mut u64, WIN32K_HEAP_VADDR);
+                write_volatile(
+                    (BOUND_DESK_PDESKINFO + 0x08) as *mut u64,
+                    WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
+                );
+            }
+            // Publish the two server-VA facts the executive needs to seed the GUI client's
+            // TEB.Win32ClientInfo (pDeskInfo = DESKTOPINFO−delta; Win32ThreadInfo = pti == head.pti),
+            // so user32's client-side ValidateHwnd/IntCallMessageProc resolve the SAS window and run
+            // its real SASWindowProc without a syscall. Written every dispatch (cheap, coherent frame).
+            write_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64, BOUND_DESK_PDESKINFO);
+            write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, t);
         }
     }
     if ssn == SSN_NT_USER_INITIALIZE_REAL {

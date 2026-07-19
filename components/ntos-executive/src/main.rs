@@ -1178,6 +1178,17 @@ pub(crate) static WINLOGON_SAS_MILESTONE: AtomicU64 = AtomicU64::new(0);
 /// message / user input). Drives the `exec_winlogon_sas_message_loop` gate spec + the message-loop
 /// milestone park (the boot quiesces here deterministically instead of racing the SCM/LSA backstop).
 pub(crate) static WINLOGON_MSGLOOP_MILESTONE: AtomicU64 = AtomicU64::new(0);
+/// Latched (=1) the first time the executive seeds winlogon's TEB.Win32ClientInfo with the REAL
+/// desktop-heap client-window mapping (pDeskInfo = bound DESKTOPINFO − delta, Win32ThreadInfo =
+/// head.pti, ulClientDelta = delta) so user32's client-side ValidateHwnd/DesktopPtrToUser resolve the
+/// SAS PWND. Just gates the one-time diagnostic; the seed itself is re-applied every winlogon dispatch.
+pub(crate) static WINLOGON_DESKHEAP_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// The winlogon `Session->LogonState` the executive reads AFTER the first WLX_WM_SAS is dispatched —
+/// the evidence that `DispatchMessageW(WLX_WM_SAS)` resolved the SAS window client-side and RAN the
+/// real `SASWindowProc → DispatchSAS`, which at `STATE_INIT` sets `LogonState = STATE_LOGGED_OFF (1)`
+/// (sas.c:1336). 0 = STATE_INIT (SASWindowProc never advanced the state / didn't run); non-zero proves
+/// the whole client-side chain executed. Drives `exec_winlogon_sas_windowproc_ran`.
+pub(crate) static WINLOGON_SAS_LOGONSTATE: AtomicU64 = AtomicU64::new(0);
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -4482,9 +4493,17 @@ static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
 /// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
 /// GUI client's VSpace (the gSharedInfo client-mapping).
 static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+/// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR — where the DESKTOP body + its DESKTOPINFO
+/// live, `pool_alloc`ed). Retained so the desktop-heap client-window mapping can copy_cap + RO-map the
+/// pool into a GUI client's VSpace, making the bound DESKTOPINFO (winlogon's CLIENTINFO.pDeskInfo)
+/// client-readable — needed for user32's client-side DesktopPtrToUser (it reads pdi->pvDesktopBase).
+static WIN32K_POOL_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// 0 until win32k's USER heap arena has been RO-mapped into csrss (one-time; guards re-mapping on a
 /// second NtUserProcessConnect from the same client).
 static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// Per-pi bit set once win32k's POOL arena has been RO-mapped into that GUI client's VSpace (the
+/// desktop-heap client-window mapping — makes the bound DESKTOPINFO client-readable).
+static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
 /// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
 /// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
@@ -6825,6 +6844,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             let pool_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_POOL_FRAMES { let _ = alloc_frame(); }
+            WIN32K_POOL_FRAME_BASE.store(pool_base, Ordering::Relaxed);
             let data_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES { let _ = alloc_frame(); }
             let shared = alloc_frame();
@@ -8390,6 +8410,30 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         b"exec_winlogon_sas_message_pumped",
         WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
             && WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed) >= 2,
+        &mut passed,
+    );
+
+    // --- PROOF the win32k desktop-heap CLIENT-WINDOW mapping resolved the SAS window CLIENT-SIDE and
+    // RAN the real SASWindowProc → DispatchSAS. DispatchMessageW(WLX_WM_SAS) runs the window proc
+    // entirely client-side (user32 IntCallMessageProc, message.c:1990 — NO syscall): it needs
+    // ValidateHwnd(0x2002e)/DesktopPtrToUser to resolve the SAS PWND out of win32k's heap into
+    // winlogon's RO-mapped view. This batch wired that: (1) RO-mapped win32k's USER heap (PWND/CLS +
+    // handle table) AND POOL (the DESKTOPINFO) into winlogon; (2) seeded winlogon's TEB.Win32ClientInfo
+    // (pDeskInfo = DESKTOPINFO−pool_delta, Win32ThreadInfo = head.pti, ulClientDelta = heap_delta) so
+    // DesktopPtrToUser maps the heap pointers + IntCallMessageProc's same-thread check passes; (3) the
+    // WM_CREATE callback bridge persists the Session into WND.dwUserData (HWND→PWND via the handle table)
+    // so GetWindowLongPtr(GWLP_USERDATA) returns the real Session. With all three, SASWindowProc runs
+    // (was: ValidateHwnd NULL → DispatchMessageW 0 → proc never ran, invisible in the trace). PROOF:
+    // DispatchSAS at STATE_INIT sets Session->LogonState = STATE_LOGGED_OFF (sas.c:1336); the executive
+    // reads it (WINLOGON_SAS_LOGONSTATE = the observed non-zero LogonState) through winlogon's own heap page.
+    // != STATE_INIT (0) proves the full client-side SASWindowProc → DispatchSAS chain executed.
+    print_str(b"[winlogon] post-SAS DispatchSAS LogonState (STATE_INIT=0 -> LOGGED_OFF=1): ");
+    print_u64(WINLOGON_SAS_LOGONSTATE.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_sas_windowproc_ran",
+        WINLOGON_DESKHEAP_MAPPED.load(Ordering::Relaxed) != 0
+            && WINLOGON_SAS_LOGONSTATE.load(Ordering::Relaxed) != 0,
         &mut passed,
     );
 

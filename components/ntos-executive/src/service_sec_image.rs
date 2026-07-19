@@ -2871,6 +2871,38 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(m0 as u32);
                         print_str(b") -> dispatching to retrieve the posted WLX_WM_SAS (co_IntGetPeekMessage)\n");
                     } else {
+                        // ★ PROOF the client-side SASWindowProc → DispatchSAS RAN. Between GetMessage#1
+                        // (which returned WLX_WM_SAS) and this GetMessage#2, winlogon ran
+                        // DispatchMessageW(&Msg) CLIENT-SIDE (message.c:1990, no syscall): ValidateHwnd
+                        // (0x2002e) resolved the SAS PWND out of the RO-mapped heap, IntCallMessageProc
+                        // called the real SASWindowProc, which dispatched WLX_WM_SAS → DispatchSAS
+                        // (sas.c:1333). At STATE_INIT (0), DispatchSAS sets Session->LogonState =
+                        // STATE_LOGGED_OFF (1) then calls WlxDisplaySASNotice (sas.c:1336-1337). Read
+                        // winlogon's Session->LogonState (Session+0x118, published by the WM_CREATE bridge)
+                        // through its already-faulted heap page: != STATE_INIT proves the whole client-side
+                        // chain executed (before the desktop-heap client-window mapping it was invisible —
+                        // ValidateHwnd returned NULL → DispatchMessageW returned 0 → SASWindowProc never ran).
+                        let session = core::ptr::read_volatile(
+                            (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+                        );
+                        if session != 0 {
+                            const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
+                            // winlogon's Session is on its early heap (SMSS_ALLOC_VA 2 MiB window), which
+                            // the ACTIVE heap mirror maps (pi 2 is active here) → smss_copyin reads it.
+                            let mut ls = [0u8; 4];
+                            if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut ls) {
+                                let logon_state = u32::from_le_bytes(ls);
+                                print_str(b"[wl-main] post-DispatchSAS Session->LogonState=0x");
+                                print_hex(logon_state);
+                                print_str(b" (STATE_INIT=0 -> STATE_LOGGED_OFF=1 proves SASWindowProc->DispatchSAS ran)\n");
+                                // STATE_INIT is 0; any non-zero == DispatchSAS advanced the state machine.
+                                if logon_state != 0 {
+                                    WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
+                                }
+                            } else {
+                                print_str(b"[wl-main] post-DispatchSAS Session read miss (not in heap mirror)\n");
+                            }
+                        }
                         print_str(b"[wl-main] winlogon GetMessage on EMPTY SAS queue (post-WlxLoggedOutSAS) -> MESSAGE-LOOP MILESTONE PARK (boot quiesces; gate runs)\n");
                         handled = false;
                         wl_milestone_park = true;
@@ -3225,6 +3257,25 @@ pub(crate) unsafe fn service_sec_image(
                     // The handler's own shift (0 in this single-AS host; be robust anyway): recover
                     // the raw server VA before applying our delta.
                     let hd = core::ptr::read_volatile((arg + win32k_subsystem::UC_SI_DELTA) as *const u64);
+                    // Publish the RAW server-VA aheList (USER handle table) so win32k's WM_CREATE callback
+                    // bridge can resolve a HWND → its PWND to persist WND.dwUserData (the Session), for the
+                    // client-side SASWindowProc. Capture it before the delta rewrite below.
+                    {
+                        let ahe_client = core::ptr::read_volatile(
+                            (arg + win32k_subsystem::UC_SI_AHELIST) as *const u64,
+                        );
+                        if ahe_client != 0 {
+                            let ahe_server = ahe_client.wrapping_add(hd);
+                            if ahe_server >= heap_lo && ahe_server < heap_hi {
+                                core::ptr::write_volatile(
+                                    (win32k_subsystem::WIN32K_SHARED_VADDR
+                                        + win32k_subsystem::SH_SAS_AHELIST)
+                                        as *mut u64,
+                                    ahe_server,
+                                );
+                            }
+                        }
+                    }
                     for off in [win32k_subsystem::UC_SI_PSI, win32k_subsystem::UC_SI_AHELIST] {
                         let client = core::ptr::read_volatile((arg + off) as *const u64);
                         if client != 0 {
@@ -3269,9 +3320,56 @@ pub(crate) unsafe fn service_sec_image(
                 // the non-interactive services/lsass short-circuit before their user32 desktop path.)
                 if pi == 2 {
                     const WINLOGON_SCR_BASE: u64 = 0x0000_0100_107C_0000;
-                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
-                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
-                    core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, 0); // ulClientDelta
+                    // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has bound the Default desktop it
+                    // publishes (per dispatch, via the coherent shared page) the DESKTOPINFO server VA
+                    // (SH_SAS_DESKINFO) + the dispatch THREADINFO server VA (SH_SAS_PTI == every window's
+                    // head.pti). Seed winlogon's TEB.Win32ClientInfo so user32's client-side
+                    // ValidateHwnd/DesktopPtrToUser/IntCallMessageProc resolve a real heap-resident PWND
+                    // (the SAS window) into winlogon's RO-mapped heap view and run its real SASWindowProc
+                    // WITHOUT a syscall (DispatchMessageW message.c:1990 — the SAS-dispatch mechanism):
+                    //   - Win32ThreadInfo (TEB+0x78) = pti (server VA) — must EQUAL Wnd->head.pti so
+                    //     IntCallMessageProc's same-thread check passes (else ERROR_MESSAGE_SYNC_ONLY).
+                    //   - CLIENTINFO.pDeskInfo (TEB+0x820) = DESKTOPINFO − delta (its client VA in the
+                    //     RO-mapped heap window at CSRSS_W32_SHARED_VA).
+                    //   - CLIENTINFO.ulClientDelta (TEB+0x828) = delta, so DesktopPtrToUser maps every
+                    //     heap-resident server pointer (PWND/pcls/spwnd) → its client VA (server−delta).
+                    // The DESKTOPINFO's pvDesktopBase/pvDesktopLimit (win32k-side, RO-shared) bracket the
+                    // whole heap so the range check accepts any heap pointer. Falls back to the
+                    // placeholder DESKTOPINFO until the desktop is bound (SH_SAS_DESKINFO still 0).
+                    let sas_deskinfo = core::ptr::read_volatile(
+                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_DESKINFO) as *const u64,
+                    );
+                    let sas_pti = core::ptr::read_volatile(
+                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_PTI) as *const u64,
+                    );
+                    // ulClientDelta = the USER-heap delta: DesktopPtrToUser applies it to the PWND/pcls/
+                    // spwnd pointers, which are DesktopHeapAlloc'ed = in the RO-mapped USER heap window.
+                    let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
+                    // The DESKTOPINFO itself is `pool_alloc`ed = in the POOL, mapped at its own delta.
+                    let pool_delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
+                    if sas_deskinfo != 0 && sas_pti != 0 {
+                        // Ensure the POOL is RO-mapped into winlogon so pci->pDeskInfo is readable client-side.
+                        let _ = win32k_glue::map_win32k_pool_into_csrss(pml4, pi);
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, sas_pti); // Win32ThreadInfo == head.pti
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, sas_deskinfo - pool_delta); // pDeskInfo (POOL client VA)
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, delta); // ulClientDelta (USER-heap delta)
+                        if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                            print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
+                            print_hex(((sas_deskinfo - pool_delta) >> 32) as u32);
+                            print_hex((sas_deskinfo - pool_delta) as u32);
+                            print_str(b" pti=0x");
+                            print_hex((sas_pti >> 32) as u32);
+                            print_hex(sas_pti as u32);
+                            print_str(b" ulClientDelta=0x");
+                            print_hex((delta >> 32) as u32);
+                            print_hex(delta as u32);
+                            print_str(b"\n");
+                        }
+                    } else {
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
+                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, 0); // ulClientDelta
+                    }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
                 // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
