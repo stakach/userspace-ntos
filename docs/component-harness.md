@@ -1,7 +1,12 @@
 # Unified Component-Runtime Harness — Design Note
 
-Status: DESIGN + PLAN ONLY (no `.rs` edits). Gate at authorship: **180/98, fully green.**
-Author: design pass. Implementer follows `tasks/todo.md` (Phase B) after review.
+Status: **IMPLEMENTED — Phase B complete.** The design below was fully realised: the FSD (npfs,
+both instances + a 2nd by-path IRP driver) and win32k are now migrated onto the shared
+`component_main`/`component_pump` harness (Steps 1/2/4/4.5 DONE; see `tasks/todo.md`). Gate at
+authorship: **180/98**; current gate after the migration + Phase-A consolidation: **183/98, fully
+green** (clean `qemu_exit`, `exec_win32k_desktop_painted` 768/768, `exec_fsd_on_shared_harness` +
+`exec_win32k_on_shared_harness` PASS). The rest of this note reads as the design of record; the
+consolidated final state is summarised in **§6** below.
 
 All file:line citations are to `components/ntos-executive/src/` unless noted.
 
@@ -551,3 +556,43 @@ fixture staged by path, spawned by `load_driver(path, Fsd)`, that registers `IRP
 (`exec_second_irp_driver_via_harness`) asserts it entered DriverEntry, built its MajorFunction table in
 its OWN isolated VSpace (distinct PML4 from npfs), and completed an IRP — all with zero driver-specific
 executive code. This directly exercises G1+G2+G3.
+
+---
+
+## 6. Consolidated final state (Phase B DONE + Phase A tidy)
+
+The design above is IMPLEMENTED. The end-state, tight:
+
+**Unified harness (Family A — persistent dispatch servers).** Both the FSD (npfs.sys) and win32k
+run on ONE shared component-side entry `component_main` + ONE executive-side pump `component_pump`
+(`spawn_hosts.rs`), replacing the retired bespoke `dispatch_loop`/`send_done`/`recv_req` loops. The
+win32k-only specifics (client-memory attach, foreign-frame sharing, wide-arg marshal, int-0x2c
+assert-skip, REPLY_W32 nested-reply) survive VERBATIM behind `HostCaps` capability flags on the
+pump, so the FSD (all flags false) degenerates to the old npfs loop exactly. Proven durable by
+`exec_fsd_on_shared_harness` (IRP dispatches through the pump) + `exec_win32k_on_shared_harness`
+(syscall dispatches) + the paint gate `exec_win32k_desktop_painted` (768/768).
+
+**Multi-driver substrate.** `load_driver(fs, path, class)` is the reusable by-path driver loader:
+stage a `.sys` + declare a `DriverSpec { path, class }` and it runs on the SAME harness with zero
+bespoke code. `DriverClass` → caps/regions via `caps_and_layout_for` (the ONLY per-class code): `Fsd`
+(default IRP server), `Filter` + `Device` (future-wiring seams, `#[allow(dead_code)]`), and
+`GuiSyscallServer` (win32k's unique privileged class — kept its Syscall substrate, not routed
+through the IRP builder). Reuse is proven by `exec_second_irp_driver_via_harness` (a 2nd by-path IRP
+driver, `IrpFsdTest.sys`, in its OWN isolated PML4). Family B (driver-host + KMDF fixtures) stays on
+its thin one-shot `run_once` shape — a test-lifecycle fixture, NOT a general driver path.
+
+**Isolated vs. deliberately in-executive.**
+* ISOLATED as their own seL4 components (own VSpace/CSpace/TCB): the four SURT-brokered managers —
+  Object (`server.rs`), Config/registry (`cm_server.rs`), I/O (`io_server.rs`), LPC broker
+  (`lpc_server.rs`) — each stood up via `stand_up_service` and exercised by counted `exec_ob_*/
+  exec_cm_*/exec_io_*/exec_lpc_*` specs; plus win32k, npfs, and any by-path driver via
+  `spawn_component`.
+* DELIBERATELY IN THE EXECUTIVE (the trusted root): the Process Manager (`nt-process` — "can't
+  isolate away the thing that manufactures isolation"; it mints VSpace/CSpace/TCB from Untyped) and
+  the native-syscall dispatch seam that hosts smss/csrss/winlogon. See MEMORY
+  `project_process_convergence` for the rationale.
+
+**Diagnostics.** Grind-era verbose trace prints (the winlogon loader-trace ring in
+`loader_trace_diag.rs`; per-fault demand-map traces in `component_pump`) are gated behind the
+OFF-by-default `debug-trace` cargo feature. The default build ships clean serial but keeps every
+milestone marker, spec PASS/FAIL line, and the `N/98 ... checks passed` gate summary.

@@ -236,3 +236,24 @@ executive/rust-micro change (test-only additions in the crates). All three targe
     `HARNESS_*_DISPATCHES` selection): in `ntos-executive`, a `#![no_std] #![no_main]` seL4 binary with a
     custom target + its own workspace + zero host-test harness. `cargo test` cannot target it, and adding
     a test module is an executive src change (forbidden). Genuinely not host-testable here.
+
+## Phase A — executive-tidy consolidation batch (DONE)
+Four gate-verified tidy items on the executive (no rust-micro/src change; behavior-preserving). Gate
+**183/98** green, RUNEXIT=3, `microtest sentinel`, `exec_win32k_desktop_painted` 768/768,
+`exec_fsd_on_shared_harness` + `exec_win32k_on_shared_harness` PASS.
+- [x] **1. Dual-path server modules — caller-graph.** VERDICT: all four SURT server-side modules
+  (`server`/`cm_server`/`io_server`/`lpc_server`) are LIVE — each `*_entry` fn is passed by fn-ptr into
+  `stand_up_service()` (main.rs:5144/5184/5205/5235) and exercised by the counted `exec_ob_*/exec_cm_*/
+  exec_io_*/exec_lpc_*` specs. NOT dead duplicates → deleted nothing (kill-list §6 resolved).
+- [x] **2. Annotate intentional future-wiring seams.** `#[allow(dead_code)]` + a one-line rationale on:
+  `DriverClass::Filter`, `HostCaps::{usermode_callback,wide_arg_marshal}`, `ComponentDescriptor.caps`,
+  `SpawnedComponent.cnode`, `Win32kPe.image_base`, `GrantedDevice.device` — all now stop warning +
+  read as intentional (matching the pre-existing `DriverClass::Device` annotation).
+- [x] **3. Gate grind-era verbose diagnostics behind `debug-trace` (OFF by default).** New cargo
+  feature; `loader_trace_diag` fully `#[cfg]`-gated (no-op stubs when off); per-fault demand-map traces
+  + the int-0x2c skip diagnostic guarded by `const DEBUG_TRACE = cfg!(feature="debug-trace")`. Milestone
+  markers, spec PASS/FAIL, and the gate summary stay UNGATED (did not over-gate — verified in the boot
+  serial). `build.sh` forwards args so `--features debug-trace` re-enables. Both feature states compile.
+- [x] **4. Docs.** `docs/component-harness.md` header → IMPLEMENTED + a tight §6 consolidated-state note
+  (unified harness, multi-driver substrate, isolated-vs-in-executive, diagnostics); `ntdll_plan.md`
+  gained a one-line "consolidation complete" footer pointing at §6.

@@ -2900,3 +2900,10 @@ The paint frontier is now **`NtUserSwitchDesktop`'s IntPaintDesktop not painting
 
 ### Verify
 Gate **175/98**, clean qemu_exit (RUNEXIT=3, sentinel matched). 5 processes spawn; lsass signals LSA_RPC_SERVER_ACTIVE; all 4 `exec_live_terminate_thread_*` PASS; SEH self-test PASS (`[seh-selftest] live RtlVirtualUnwind PASS`); `exec_winlogon_worker_multiplex` + `exec_delay_execution_*` PASS; **`exec_winlogon_sas_window` PASS** (was FAIL in the WIP boot). The 5 FAILs (`exec_nic_tx_dma_writeback`/`exec_nic_confined_dma`/`exec_csr_message_plane`/`exec_npfs_flush_pending`/`exec_win32k_desktop_painted`) are the documented baseline set — NO new FAILs (identical set to the WIP boot minus the now-passing SAS spec). Executive-only (no rust-micro/src change; sel4test byte-identical).
+
+---
+
+*Footer (Phase A consolidation complete): this file is a historical batch log. The unified
+component-runtime harness (FSD + win32k on the shared `component_main`/`component_pump`, the
+multi-driver by-path substrate, and what's isolated vs. deliberately in-executive) is documented in
+`docs/component-harness.md` §6.*
