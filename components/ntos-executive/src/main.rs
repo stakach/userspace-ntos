@@ -7280,6 +7280,49 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 c2s_ok = wst2 == 0 && rst2 == 0 && rinfo2 == 7 && sbuf[..7] == creq[..7];
                             }
                             check(b"exec_pipe_data_plane_client_to_server", c2s_ok, &mut passed);
+
+                            // ★ C-d: a REAL flush-behind-queued-write that npfs PENDS. NpCommonFlushBuffers
+                            // (npfs/flushbuf.c) inspects the pipe end's DataQueue: a FLUSH on the SERVER end
+                            // checks DataQueue[OUTBOUND], on the CLIENT end DataQueue[INBOUND]. If that queue
+                            // is in state WriteEntries (queued write data no reader has drained yet), the
+                            // flush IRP is QUEUED behind the writes (NpAddDataQueueEntry) → STATUS_PENDING;
+                            // an empty queue returns SUCCESS synchronously. So: WRITE a payload onto one end
+                            // (it sits in that end's write queue — no matching read yet), then FLUSH the SAME
+                            // end BEFORE draining → npfs genuinely returns 0x103. Do it in BOTH directions so
+                            // a real flush pends TWICE, then drain the queues (the matching reads) to complete
+                            // the pended flush IRPs. This is the real npfs write-blocks-flush semantics, driven
+                            // through the isolated npfs.sys IRP path — not a modeled shortcut.
+                            let mut fnone = [];
+                            // Direction 1 — server end: queue an OUTBOUND write, flush before the client reads.
+                            let _ = npfs_dispatch_irp(4 /* WRITE */, 0, srv_fid, b"FLUSH-A", &mut fnone);
+                            let mut fout1 = [];
+                            let srv_flush = npfs_dispatch_irp(9 /* IRP_MJ_FLUSH_BUFFERS */, 0, srv_fid, &[], &mut fout1);
+                            let srv_flush_pended = matches!(srv_flush, Some((st, _)) if st as u32 == 0x0000_0103);
+                            if srv_flush_pended {
+                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Drain direction 1 (the client read completes the queued write + the pended flush).
+                            let mut fdrain1 = [0u8; 16];
+                            let _ = npfs_dispatch_irp(3 /* READ */, 0, cli_fid, &[], &mut fdrain1);
+
+                            // Direction 2 — client end: queue an INBOUND write, flush before the server reads.
+                            let _ = npfs_dispatch_irp(4 /* WRITE */, 0, cli_fid, b"FLUSH-B", &mut fnone);
+                            let mut fout2 = [];
+                            let cli_flush = npfs_dispatch_irp(9 /* IRP_MJ_FLUSH_BUFFERS */, 0, cli_fid, &[], &mut fout2);
+                            let cli_flush_pended = matches!(cli_flush, Some((st, _)) if st as u32 == 0x0000_0103);
+                            if cli_flush_pended {
+                                NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let mut fdrain2 = [0u8; 16];
+                            let _ = npfs_dispatch_irp(3 /* READ */, 0, srv_fid, &[], &mut fdrain2);
+
+                            print_str(b"[npfs-svc] C-d FLUSH-PENDING srv_pended=");
+                            print_u64(srv_flush_pended as u64);
+                            print_str(b" cli_pended=");
+                            print_u64(cli_flush_pended as u64);
+                            print_str(b" pend_count=");
+                            print_u64(NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.load(Ordering::Relaxed));
+                            print_str(b"\n");
                         }
                     }
                 }
