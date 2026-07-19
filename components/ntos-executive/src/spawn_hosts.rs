@@ -551,7 +551,7 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
                     || (addr >= 0x10000
                         && !in_image
                         && crate::csrss_frame_get(ch.client_pi, page) != 0);
-                if demand < W32_FAULT_LOG_LIMIT {
+                if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
                     crate::print_str(b"[w32disp] fault #");
                     crate::print_u64(demand);
                     crate::print_str(b" ip=0x");
@@ -580,7 +580,7 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
                         let win32k_internal_low =
                             page < 0x0000_0100_0000_0000 && page >= 0x10000;
                         if win32k_internal_low {
-                            if demand < W32_FAULT_LOG_LIMIT {
+                            if crate::DEBUG_TRACE && demand < W32_FAULT_LOG_LIMIT {
                                 crate::print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
                                 crate::print_hex((page >> 32) as u32);
                                 crate::print_hex(page as u32);
@@ -611,7 +611,7 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
                 demand += 1;
             } else {
                 // ── FSD / generic demand-map (byte-identical to the old inline loop).
-                if ch.trace_faults && faults <= 40 {
+                if crate::DEBUG_TRACE && ch.trace_faults && faults <= 40 {
                     crate::print_str(b"[svc] fault #");
                     crate::print_u64(faults);
                     crate::print_str(b" ip=0x");
@@ -664,7 +664,11 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
                 && core::ptr::read_volatile(ip as *const u8) == 0xCD
                 && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
             if is_int2c && ch.reply_cap != 0 && skips < W32_ASSERT_SKIP_BOUND {
-                if crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40 {
+                // Verbose grind-era trace: the per-skip int-0x2c diagnostic (bounded to 40). Gated
+                // behind `debug-trace` — pure noise once the boot is stable, not load-bearing.
+                if crate::DEBUG_TRACE
+                    && crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40
+                {
                     crate::print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
                     crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
                     crate::print_str(b"\n");

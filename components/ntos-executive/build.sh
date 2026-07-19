@@ -6,13 +6,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Extra args are forwarded to cargo — e.g. `./build.sh --features debug-trace` to enable
+# the grind-era verbose trace diagnostics. The DEFAULT build (no args) is feature-off = ships.
 cargo +nightly build \
   -Z build-std=core,alloc \
   -Z build-std-features=compiler-builtins-mem \
   -Z unstable-options \
   -Z json-target-spec \
   --target triplet.json \
-  --release
+  --release \
+  "$@"
 
 mkdir -p ../../rust-micro/.tmp
 cp target/triplet/release/ntos-executive ../../rust-micro/.tmp/rootserver.elf

@@ -13,6 +13,13 @@ publish = false
 name = "ntos-executive"
 path = "src/main.rs"
 
+[features]
+# Grind-era verbose trace diagnostics (winlogon loader-trace ring dump + per-fault
+# demand-map / throttled trace prints). OFF by default → clean serial. The milestone
+# markers, spec PASS/FAIL lines, and the gate summary are NEVER gated by this.
+default = []
+debug-trace = []
+
 [dependencies]
 # Kernel ABI + SURT transport.
 sel4-rt = { path = "../../rust-micro/crates/sel4-rt" }

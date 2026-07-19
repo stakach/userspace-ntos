@@ -1152,6 +1152,10 @@ pub(crate) static W32_TOTAL_DISPATCH: [AtomicU64; MAX_PI] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; MAX_PI]
 };
+/// Compile-time gate for grind-era VERBOSE trace diagnostics (per-fault demand-map / throttled
+/// per-dispatch trace prints). OFF by default → clean serial; enable with `--features debug-trace`.
+/// NEVER gates milestone markers, spec PASS/FAIL, or the gate summary — only verbose trace noise.
+pub(crate) const DEBUG_TRACE: bool = cfg!(feature = "debug-trace");
 /// BATCH 43: throttle counter for the high-frequency win32k class-loop SSN (0x103d/0x10b4) per-dispatch
 /// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
 /// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
