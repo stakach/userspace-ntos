@@ -2844,6 +2844,38 @@ pub(crate) unsafe fn service_sec_image(
                     || badge == LSASS_BADGE)
             {
                 routed_win32k = true;
+                // ★ winlogon SAS MESSAGE-LOOP milestone. After InitializeSAS completes, WinMain posts
+                // WLX_WM_SAS and enters `while (GetMessageW(&Msg, SASWindow, …))` (winlogon.c:608) — its
+                // genuine steady state, where it blocks waiting for a SAS message / user input (Ctrl-Alt-Del).
+                // The first UserGetMessage (0x1006) / UserPeekMessage (0x1001) AFTER the SAS milestone marks
+                // reaching this loop. Real win32k's GetMessage would BLOCK winlogon's thread in
+                // co_MsqWaitForNewMessages (no message pending, no input source in this headless host) — which
+                // in our single-threaded model would block the WHOLE executive service loop. So PARK winlogon
+                // here (recv-next-without-reply, like the SAS-window milestone park): its TCB stays blocked at
+                // this proven-advanced steady state, the boot quiesces deterministically, and the gate runs.
+                if pi == 2
+                    && (m0 == 0x1006 || m0 == 0x1001)
+                    && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+                {
+                    // The FIRST GetMessage after the SAS milestone should RETRIEVE the just-posted
+                    // WLX_WM_SAS from the SAS window's PostedMessagesListHead and return it → winlogon
+                    // TranslateMessage/DispatchMessageW → SASWindowProc → DispatchSAS → WlxLoggedOutSAS.
+                    // So DISPATCH the first GetMessage to win32k's real co_IntGetPeekMessage (the queue is
+                    // non-empty, so it won't block). PARK from the SECOND GetMessage onward: once the SAS
+                    // message is consumed the queue is empty and win32k's GetMessage would block the whole
+                    // single-threaded executive in co_MsqWaitForNewMessages — that empty-queue wait is
+                    // winlogon's genuine steady state (waiting for the next SAS / user input).
+                    let n = WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        print_str(b"[wl-main] winlogon entered its SAS message loop (UserGetMessage 0x");
+                        print_hex(m0 as u32);
+                        print_str(b") -> dispatching to retrieve the posted WLX_WM_SAS (co_IntGetPeekMessage)\n");
+                    } else {
+                        print_str(b"[wl-main] winlogon GetMessage on EMPTY SAS queue (post-WlxLoggedOutSAS) -> MESSAGE-LOOP MILESTONE PARK (boot quiesces; gate runs)\n");
+                        handled = false;
+                        wl_milestone_park = true;
+                    }
+                }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
                 // services pi 3 / lsass pi 4) so it attaches win32k's client window to this client's frames
                 // (per-client cross-AS client memory — services' OBJECT_ATTRIBUTES / USERCONNECT
@@ -3019,7 +3051,11 @@ pub(crate) unsafe fn service_sec_image(
                 // it can only reach if its user32 process-attach class-registration loop COMPLETES
                 // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
                 let svc_noninteractive = badge == LSASS_BADGE || badge == SERVICES_BADGE;
-                let (st, ok) = if m0 == 0x125c && badge == WINLOGON_BADGE {
+                let (st, ok) = if wl_milestone_park {
+                    // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
+                    // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
+                    (0i32, false)
+                } else if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
                     (0x0409_0409i32, true)
@@ -3274,9 +3310,14 @@ pub(crate) unsafe fn service_sec_image(
                     // quiesces, and the gate runs cleanly. Gated on the SAS HWND milestone so we only park
                     // once winlogon actually created its window (never on the old NULL-HWND failure path).
                     if pi == 2 && m0 == 0x127c && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0 {
-                        print_str(b"[wl-main] winlogon registered logon-notify window (UserSetLogonNotifyWindow 0x127c) = InitializeSAS complete -> MILESTONE PARK (boot quiesces; gate runs)\n");
-                        handled = false;
-                        wl_milestone_park = true;
+                        // UserSetLogonNotifyWindow success = the SAS window + logon-notify registration is
+                        // done. winlogon now runs the InitializeSAS tail (SetDefaultLanguage) + WinMain's
+                        // post-SAS setup (RemoveStatusMessage, GetSetupType, PostMessage(WLX_WM_SAS),
+                        // NtInitializeRegistry) then enters its GetMessage loop. Do NOT park here — let it
+                        // advance; the message-loop milestone park (0x1006/0x1001 above) is its real steady
+                        // state. (Reaching 0x127c-success now requires the PsLookup/gpidLogon fix, else the
+                        // logon-process access check would fail SetLogonNotifyWindow → InitializeSAS FALSE.)
+                        print_str(b"[wl-main] winlogon registered logon-notify window (0x127c) = SAS window ready -> advancing to post-SAS setup\n");
                     }
                 } else {
                     handled = false; // dispatch wall — stop with the SSN recorded
@@ -3345,10 +3386,17 @@ pub(crate) unsafe fn service_sec_image(
                     // loop's next recv would hang forever (winlogon no longer CRASHES to trigger the
                     // old msgina-wall quiesce). QUIESCE to the gate. Gated on the msgina-crossed +
                     // LSA-signalled steady state so it never fires during live bring-up.
+                    // Gate the terminal quiesce on winlogon having reached its SAS MESSAGE-LOOP milestone
+                    // (WINLOGON_MSGLOOP_MILESTONE) in addition to the msgina + LSA steady state. Without
+                    // this, a server listener parking races winlogon's post-InitializeSAS flow: it fires
+                    // right after SetDefaultLanguage (SSN 224) and stops the loop before winlogon issues
+                    // PostMessage(WLX_WM_SAS) / enters GetMessage. Requiring the message-loop milestone makes
+                    // the quiesce deterministic — winlogon is parked at its genuine steady state first.
                     if WINLOGON_KEY_OPENED.load(Ordering::Relaxed) != 0
                         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
+                        && WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed) >= 2
                     {
-                        print_str(b"[quiesce] server listener parked + winlogon crossed msgina GINA init + LSA signalled -> steady state -> run gate\n");
+                        print_str(b"[quiesce] server listener parked + winlogon parked at empty SAS message loop + LSA signalled -> steady state -> run gate\n");
                         stop = m0;
                         break;
                     }

@@ -270,3 +270,18 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
   the two bitmasks, the two helpers, a table of all 8 park kinds, the special break-sites, and WHY not
   further unified) + a `★★ PARK + QUIESCE CONTRACT` anchor comment in the source pointing at it. Purely
   docs/comment — behaviour-preserving. Gate re-verified green.
+
+## Desktop/logon-UI frontier — winlogon crosses the SAS message loop (2026-07-20, gate 184/98)
+- [x] Diagnosed: winlogon was NOT reaching PostMessage/GetMessage — **InitializeSAS FAILED entirely**
+  (`NtUserSetLogonNotifyWindow` returned FALSE → `ExitProcess(2)`). Root cause: `PsLookupProcessByProcessId`
+  was an unbound `s_zero` stub → `co_IntRegisterLogonProcess` set `gpidLogon` from an uninitialized
+  `*Process` → the logon-process access check `gpidLogon == PsGetCurrentProcessId()` failed.
+- [x] FIX chain (executive-only; see `ntdll_plan.md` §B-RESOLVED): bind `PsLookupProcessByProcessId` +
+  seed EPROCESS.UniqueProcessId@0xd0; back `Control\Nls\Language\Default` (real hive) + fix NtQueryValueKey
+  BUFFER_OVERFLOW header fill; register `NtSetDefaultLocale` (224) no-op; seed THREADINFO
+  `PostedMessagesListHead`@0x188 (NtUserPostMessage null-deref at cr2=8).
+- [x] Result: winlogon posts WLX_WM_SAS + GetMessage RETRIEVES it (real win32k `co_IntGetPeekMessage`,
+  status=1) + DispatchMessage + re-polls empty queue = steady state. New MESSAGE-LOOP MILESTONE PARK;
+  counted spec `exec_winlogon_sas_message_pumped`. Gate 184/98, RUNEXIT=3, paint 768/768.
+- [ ] NEXT: `NtUserDispatchMessage` (0x1002) does not yet invoke `SASWindowProc` via the KeUserModeCallback
+  WINDOWPROC bridge → `DispatchSAS → WlxLoggedOutSAS` (msgina logon dialog) body not yet executed.

@@ -1490,6 +1490,23 @@ impl NativeSyscallHandler for ExecNtHandler {
                             return 0; // STATUS_SUCCESS — HKLM predefined root
                         }
                     }
+                    // winlogon InitializeSAS → SetDefaultLanguage(NULL) opens
+                    // `System\CurrentControlSet\Control\Nls\Language` (relative to the HKLM handle, so
+                    // root_dir arrives 0 like the keyboard-layout key) and reads its `Default` value (the
+                    // system default LCID string). This key IS in the real staged SYSTEM hive, so resolve
+                    // it there (prepend the `\Registry\Machine\` mount prefix → `resolve_key` applies the
+                    // CurrentControlSet→ControlSet001 alias + strips the prefix). Backing it makes
+                    // SetDefaultLanguage succeed → InitializeSAS succeeds (was: NOT_FOUND → SetDefaultLanguage
+                    // FALSE → InitializeSAS FALSE → winlogon ExitProcess(2)). EXACT-name scoped so no other
+                    // pi==2 HKLM subkey outcome changes (the desktop paint's client reads stay identical).
+                    if is_nls_language_key(&eff_name) {
+                        let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
+                        if let Some(kr) = self.resolve_key(&full) {
+                            let h = self.intern_key_handle(kr);
+                            self.xas_write_u64(args[0], h);
+                            return 0; // STATUS_SUCCESS — real Nls\Language key
+                        }
+                    }
                 }
                 // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
                 // the real SYSTEM hive (::ROSSYS.HIV). A predefined `\Registry\Machine` open → the
@@ -2233,6 +2250,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                         name_lc.push(c.to_ascii_lowercase());
                     }
                 }
+                // Set for winlogon's real-hive Nls\Language `Default` read: its out-params (a heap/stack
+                // advapi allocation) need the cross-AS writer, whereas msgina's synth reads stay mirror-only
+                // (byte-identical). Local so no other value read's copyout method changes.
+                let mut use_xas_write = false;
                 let val: Option<(u32, alloc::vec::Vec<u8>)> = if key == SYNTH_CPU_KEY {
                     synth_cpu_value(&name_lc).map(|(ty, d16)| (ty, utf16_bytes(&d16)))
                 } else if self.pi == 2
@@ -2258,6 +2279,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                         p.and_then(|p| self.resolve_key(&p))
                             .and_then(|hk| self.hive.as_ref().and_then(|h| h.value(hk, &name_lc)))
                     }
+                } else if self.pi == 2 && name_lc == "default" && !is_synth_key(key) {
+                    // winlogon (pi 2): SetDefaultLanguage(NULL) reads the `Default` value of the real
+                    // SYSTEM-hive key `...\Control\Nls\Language` (opened above via is_nls_language_key,
+                    // so `key` is a genuine hive KeyRef, NOT a synth handle). Read it for real so
+                    // SetDefaultLanguage succeeds (was: pi 0-2 → None → NOT_FOUND → SetDefaultLanguage
+                    // FALSE → InitializeSAS FALSE → ExitProcess(2)). Tightly scoped: pi==2 + value name
+                    // exactly "Default" + a real hive key, so no paint-time msgina value read changes
+                    // (those hit SYNTH_WINLOGON_KEY / synth handles, excluded by is_synth_key). Its
+                    // out-params are advapi heap/stack the plain mirror can't reach → cross-AS write.
+                    use_xas_write = true;
+                    self.hive.as_ref().and_then(|h| h.value(key, &name_lc))
                 } else if self.pi == 3 || self.pi == 4 {
                     // Real SYSTEM hive value-by-name (case-insensitive) — services' SCM reads
                     // SetupType/SystemSetupInProgress + the service DB values off ::ROSSYS.HIV; lsass
@@ -2272,13 +2304,33 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some((ty, data)) => {
                         // KeyValuePartialInformation (class 2) carries no name.
                         let info = build_key_value_info(args[2], "", ty, &data);
-                        smss_copyout(args[5], &(info.len() as u32).to_le_bytes());
+                        // *ResultLength: use the cross-AS writer for pi 3/4 + the winlogon Nls read
+                        // (advapi's out-param may be a heap/stack the plain mirror can't reach — same
+                        // reason as the data write below); everything else stays mirror-only (byte-identical).
+                        if self.pi == 3 || self.pi == 4 || use_xas_write {
+                            self.xas_write_buf(args[5], &(info.len() as u32).to_le_bytes());
+                        } else {
+                            smss_copyout(args[5], &(info.len() as u32).to_le_bytes());
+                        }
                         if info.len() > args[4] as usize {
+                            // BUFFER_OVERFLOW: real NtQueryValueKey still fills as much of the buffer as
+                            // fits (the KEY_VALUE_PARTIAL_INFORMATION header carries Type + DataLength,
+                            // which advapi's RegQueryValueExW reads to size the retry / set dwSize when
+                            // lpData is NULL). Writing NOTHING left advapi with a garbage dwType/dwSize →
+                            // SetDefaultLanguage bailed. Write the truncated prefix so the header lands.
+                            let n = args[4] as usize;
+                            if n > 0 {
+                                if self.pi == 3 || self.pi == 4 || use_xas_write {
+                                    self.xas_write_buf(args[3], &info[..n]);
+                                } else {
+                                    smss_copyout(args[3], &info[..n]);
+                                }
+                            }
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
-                            // services' out-buffer may be an advapi32 heap allocation the mirror can't
-                            // reach → use the cross-AS writer so the DWORD data actually lands.
-                            if self.pi == 3 || self.pi == 4 {
+                            // services'/winlogon's out-buffer may be an advapi32 heap allocation the mirror
+                            // can't reach → use the cross-AS writer so the value data actually lands.
+                            if self.pi == 3 || self.pi == 4 || use_xas_write {
                                 self.xas_write_buf(args[3], &info);
                             } else {
                                 smss_copyout(args[3], &info);
@@ -3301,6 +3353,10 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetSystemInformation
             | NativeService::NtUnmapViewOfSection
             | NativeService::NtSetSecurityObject
+            // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the
+            // Nls\Language\Default LCID. No kernel locale plane to mutate in this single-user host →
+            // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
+            | NativeService::NtSetDefaultLocale
             | NativeService::NtSetInformationObject => 0,
             NativeService::NtFlushInstructionCache => {
                 let base = args.get(1).copied().unwrap_or(0);

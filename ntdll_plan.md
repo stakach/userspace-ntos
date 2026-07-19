@@ -2998,6 +2998,47 @@ blocks the frontier — the ntdll surface winlogon's post-SAS path needs (regist
 frontier is a win32k task (message queue + `WlxLoggedOutSAS`/msgina dialog), tracked separately from
 ntdll completion.**
 
+### B-RESOLVED (2026-07-20, gate 184/98, RUNEXIT=3, sentinel, paint 768/768) — winlogon crosses the SAS message loop
+
+The prior recon (above) was WRONG about the exact wall: winlogon was **not** reaching PostMessage/GetMessage
+— **InitializeSAS was FAILING ENTIRELY** so winlogon did `ExitProcess(2)` (confirmed:
+`NtTerminateProcess`=SSN 266 called twice with ExitStatus=2). Root-cause chain (each fixed source-faithfully,
+executive-only — no rust-micro/src, no ntdll change):
+
+1. **`NtUserSetLogonNotifyWindow` (0x127c) returned FALSE** — its logon-process access check
+   `gpidLogon == PsGetCurrentProcessId()` failed. `gpidLogon` is set by `co_IntRegisterLogonProcess`
+   (`gpidLogon = Process->UniqueProcessId`, EPROCESS+0xd0 — disasm-confirmed at win32k RVA 0xe4cf2), but
+   **`PsLookupProcessByProcessId` was an UNBOUND `s_zero` stub** → returned SUCCESS with `*Process`
+   uninitialized → `gpidLogon` = garbage. FIX: bind `PsLookupProcessByProcessId` → `*Process = PH_EPROCESS_VA`
+   + seed `PH_EPROCESS_VA[0xd0] = PsGetCurrentProcessId()` (`win32k_subsystem.rs`).
+2. **`SetDefaultLanguage(NULL)` (InitializeSAS tail) failed** reading
+   `HKLM\System\CurrentControlSet\Control\Nls\Language\Default`: winlogon (pi 2) NtOpenKey returned NOT_FOUND
+   for MACHINE-relative subkeys. FIX: `is_nls_language_key` resolves it against the REAL ROSSYS.HIV
+   (`exec_handler.rs`) + read its `Default` value (LCID "0409") for pi 2 via the cross-AS writer; also fixed
+   NtQueryValueKey's **BUFFER_OVERFLOW path to still fill the KEY_VALUE_PARTIAL_INFORMATION header** (advapi's
+   size query read a garbage dwType/dwSize otherwise).
+3. **`NtSetDefaultLocale` (SSN 224) was unregistered** → winlogon parked as unrecoverable. FIX: add
+   `NtSetDefaultLocale` to `NativeService` + `build_nt_table` as a no-op SUCCESS.
+4. **`NtUserPostMessage` (0x100e, WLX_WM_SAS) null-derefed at cr2=8** — `MsqPostMessage` does
+   `InsertTailList(&pti->PostedMessagesListHead,…)` and the THREADINFO's `PostedMessagesListHead` (offset
+   **0x188**) was a zeroed (NULL) list head. FIX: seed it as an empty list head in
+   `init_threadinfo_placeholder` (`win32k_subsystem.rs`).
+
+**Result:** winlogon now runs the FULL post-SAS flow (`winlogon.c:589-608`): SetDefaultLanguage →
+RemoveStatusMessage → GetSetupType (`SYSTEM\Setup`) → **`PostMessageW(SASWindow, WLX_WM_SAS)` succeeds** →
+NtInitializeRegistry → **`GetMessageW` RETRIEVES the posted WLX_WM_SAS** (win32k's real `co_IntGetPeekMessage`,
+status=1) → DispatchMessage → loops back to a GetMessage on the now-EMPTY queue = its genuine steady state.
+The **win32k message queue GENUINELY CARRIES the SAS message** (post → retrieve → dispatch proven). New
+deterministic **MESSAGE-LOOP MILESTONE PARK** at the empty-queue GetMessage (gated on
+`WINLOGON_MSGLOOP_MILESTONE >= 2`); the boot quiesces there. Counted gate spec
+**`exec_winlogon_sas_message_pumped`** (GetMessage count ≥ 2) → gate **184/98**.
+
+**NEXT FRONTIER:** `DispatchMessage(WLX_WM_SAS)` (`NtUserDispatchMessage` 0x1002) currently returns without
+invoking `SASWindowProc` via the `KeUserModeCallback` WINDOWPROC bridge — so `DispatchSAS → WlxLoggedOutSAS`
+(the msgina logon dialog, `sas.c:1347`) does not yet execute its substantive body (no msgina SSNs after the
+dispatch). Wiring `NtUserDispatchMessage`'s window-proc callback for the retrieved SAS message is the next
+step toward the actual logon dialog. The message-queue carry (this batch's goal) is DONE.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface

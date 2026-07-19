@@ -159,6 +159,7 @@ pub enum NativeService {
     NtQueryAttributesFile,
     NtQuerySection,
     NtQueryDefaultLocale,
+    NtSetDefaultLocale,
     NtCreateProcess,
 }
 
@@ -251,6 +252,7 @@ impl NativeService {
             NtQueryAttributesFile => "NtQueryAttributesFile",
             NtQuerySection => "NtQuerySection",
             NtQueryDefaultLocale => "NtQueryDefaultLocale",
+            NtSetDefaultLocale => "NtSetDefaultLocale",
             NtCreateProcess => "NtCreateProcess",
         }
     }
@@ -275,8 +277,8 @@ impl NativeService {
             // Group-C ladder migrations: these handlers read their register args via the executive's
             // IPC helpers (get_recv_mr) + stack args off the caller's SP directly, and use the arg
             // vector only for RDX (args[1]); cap at 4 register args (no stack-arg prefill needed).
-            NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtCreateProcess
-            | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
+            NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtSetDefaultLocale
+            | NtCreateProcess | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
             | NtOpenSymbolicLinkObject | NtOpenEvent => (0, 4),
             // NtQueryDirectoryObject(Handle, Buffer, Length, ReturnSingleEntry, RestartScan,
@@ -393,6 +395,7 @@ impl NativeService {
         NativeService::NtQueryAttributesFile,
         NativeService::NtQuerySection,
         NativeService::NtQueryDefaultLocale,
+        NativeService::NtSetDefaultLocale,
         NativeService::NtCreateProcess,
     ];
 }

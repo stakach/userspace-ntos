@@ -663,6 +663,21 @@ extern "win64" fn s_current_process() -> u64 {
 extern "win64" fn s_current_thread() -> u64 {
     PH_ETHREAD
 }
+/// `NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCESS *Process)` — resolve a PID to
+/// its EPROCESS + referenced. In this single-hosted-client model the only EPROCESS is the shared
+/// placeholder ([`PH_EPROCESS_VA`], same one `PsGetCurrentProcess` returns), so hand it back and
+/// return SUCCESS. Previously UNBOUND → fell to the benign `s_zero` stub, which returned
+/// STATUS_SUCCESS but left the caller's `*Process` out-param UNINITIALIZED. That silently broke
+/// `co_IntRegisterLogonProcess` (it reads `Process->UniqueProcessId` off the garbage pointer to set
+/// `gpidLogon`), so winlogon's SAS-window logon-process access check failed and InitializeSAS →
+/// ExitProcess(2). Writing `*Process = PH_EPROCESS_VA` (whose UniqueProcessId@0xd0 is seeded to
+/// PsGetCurrentProcessId()'s value) makes gpidLogon match the current-process id → check passes.
+extern "win64" fn s_ps_lookup_process_by_id(_process_id: u64, process_out: *mut u64) -> i32 {
+    if !process_out.is_null() {
+        unsafe { write_volatile(process_out, PH_EPROCESS_VA) };
+    }
+    0 // STATUS_SUCCESS
+}
 /// `PVOID PsGetProcessWin32Process(PEPROCESS)` / `PsGetCurrentProcessWin32Process()` — the real
 /// per-process win32-slot (set by win32k via PsSetProcessWin32Process during process attach).
 extern "win64" fn s_get_win32process() -> u64 {
@@ -2323,6 +2338,7 @@ fn register_trampolines() {
     reg.bind("IoGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
     reg.bind("PsGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind("PsLookupProcessByProcessId", s_ps_lookup_process_by_id as usize as u64);
     reg.bind("KeGetCurrentThread", s_current_thread as usize as u64);
     reg.bind("PsGetCurrentProcessWin32Process", s_get_win32process as usize as u64);
     reg.bind("PsGetProcessWin32Process", s_get_win32process as usize as u64);
@@ -3078,6 +3094,14 @@ unsafe fn setup_dispatch_context() {
     write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA); // KPCR.Used_Self = self
     write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, PH_EPROCESS_VA); // [Used_Self+0x60] = EPROCESS
     write_volatile((PH_EPROCESS_VA + 0x2c0) as *mut u32, 0); // SessionId = 0
+    // EPROCESS.UniqueProcessId (this ReactOS win32k reads it at offset 0xd0 —
+    // confirmed by disassembling co_IntRegisterLogonProcess: `mov rax,[Process+0xd0]`).
+    // Must equal what PsGetCurrentProcessId() (s_current_process_id) returns, so that
+    // winlogon's RegisterLogonProcess sets gpidLogon = PsGetCurrentProcessId(), and the
+    // NtUserSetLogonNotifyWindow logon-process access-check (`gpidLogon == PsGetCurrentProcessId()`)
+    // passes → SetLogonNotifyWindow succeeds → InitializeSAS succeeds (was: PsLookup's stubbed
+    // s_zero left *Process uninitialized → gpidLogon = garbage → check failed → winlogon ExitProcess(2)).
+    write_volatile((PH_EPROCESS_VA + 0xd0) as *mut u64, (FAKE_PROCESS_HANDLE as u32) as u64);
     write_volatile((PH_EPROCESS_VA + 0x20) as *mut u64, q); // [EPROCESS+0x20] = Q
     write_volatile((q + 0x80) as *mut u64, zstr); // [Q+0x80] = empty wide string ptr
     write_volatile(zstr as *mut u16, 0);
@@ -3157,7 +3181,11 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     //   +0xB0  SentMessagesListHead   (message.c / co_MsqSendMessage)
     //   +0x2d8 WindowListHead         (IntCreateWindow window.c:2142)
     //   +0x2e8 W32CallbackListHead    (IntCbAllocateMemory callback.c)
-    for off in [0xB0u64, 0x2d8, 0x2e8] {
+    //   +0x188 PostedMessagesListHead — `InsertTailList(&pti->PostedMessagesListHead,…)` MsqPostMessage
+    //          (msgqueue.c:1369). NtUserPostMessage(SAS window, WLX_WM_SAS) posts here; a NULL (zeroed)
+    //          list head → InsertTailList derefs head->Blink (offset +8) → null-deref at cr2=0x8.
+    //          Offset computed from the SentMessagesListHead@0xB0 anchor per win32.h THREADINFO layout.
+    for off in [0xB0u64, 0x188, 0x2d8, 0x2e8] {
         let head = w32thread + off;
         write_volatile(head as *mut u64, head); // Flink = &head
         write_volatile((head + 8) as *mut u64, head); // Blink = &head

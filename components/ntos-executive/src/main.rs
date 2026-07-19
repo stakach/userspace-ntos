@@ -450,6 +450,9 @@ pub const SSN_NT_FS_CONTROL_FILE: u64 = 88;
 pub const SSN_NT_PROTECT_VM: u64 = 143;
 /// ntdll's NtQueryDefaultLocale SSN (LdrpInitialize caches the default LCID in an ntdll global).
 pub const SSN_NT_QUERY_DEFAULT_LOCALE: u64 = 149;
+/// ntdll's NtSetDefaultLocale SSN. winlogon's InitializeSAS → SetDefaultLanguage(NULL) sets the
+/// system default UI locale after reading Nls\Language\Default. No-op SUCCESS (see exec_handler).
+pub const SSN_NT_SET_DEFAULT_LOCALE: u64 = 224;
 /// ntdll's NtQueryDebugFilterState SSN. DbgPrintEx(component,...) suppresses its message unless
 /// this returns (NTSTATUS)TRUE=1 (rtl/debug.c:66). Returning 1 unmasks the SXS/LDR component
 /// traces so we can see *which* internal loader step fails (otherwise only DPRINT1/-1 shows).
@@ -1168,6 +1171,13 @@ pub(crate) static W32_ASSERT_LOG: AtomicU64 = AtomicU64::new(0);
 /// creates its SAS window (first NtUserCreateWindowEx 0x1077 SUCCESS) — the proven interactive
 /// milestone. Drives the `exec_winlogon_sas_window` gate spec + the milestone park/quiesce.
 pub(crate) static WINLOGON_SAS_MILESTONE: AtomicU64 = AtomicU64::new(0);
+/// Set (=1) when winlogon has crossed the WHOLE of InitializeSAS + WinMain's post-SAS setup and
+/// entered its SAS message loop — the first `UserGetMessage`/`UserPeekMessage` (SSN 0x1006/0x1001)
+/// AFTER the SAS milestone, i.e. `WinMain`'s `while (GetMessageW(&Msg, SASWindow, …))`
+/// (winlogon.c:608). This is winlogon's genuine steady state (it blocks here waiting for a SAS
+/// message / user input). Drives the `exec_winlogon_sas_message_loop` gate spec + the message-loop
+/// milestone park (the boot quiesces here deterministically instead of racing the SCM/LSA backstop).
+pub(crate) static WINLOGON_MSGLOOP_MILESTONE: AtomicU64 = AtomicU64::new(0);
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -3076,6 +3086,12 @@ const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
 /// `SYNTH_CPU_KEY` (0xFFFF_FF00), so it collides with neither.
 const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
 const OVERLAY_KEY_MAX: u32 = 0x1000;
+/// True if a `KeyRef` is a synthetic/overlay handle (SYNTH_CPU_KEY, SYNTH_WINLOGON_KEY, or an overlay
+/// key) rather than a genuine ::ROSSYS.HIV cell offset. Real hive KeyRefs are small hbin-relative cell
+/// offsets (well under the ~204 KiB hive), so any KeyRef at/above OVERLAY_KEY_TAG (0x8000_0000) is synth.
+fn is_synth_key(kr: KeyRef) -> bool {
+    kr >= OVERLAY_KEY_TAG
+}
 /// If a `KeyRef` names an overlay (created) key, return its overlay index.
 fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
     if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
@@ -3115,6 +3131,30 @@ const SYNTH_KBD_HANDLE: u64 = 0x0000_0009_0000_0010;
 fn is_keyboard_layout_key(path: &str) -> bool {
     let lc = path.to_ascii_lowercase();
     lc.contains("keyboard layouts\\")
+}
+/// True if `path` names the NLS default-language key `System\CurrentControlSet\Control\Nls\Language`
+/// (HKLM-relative form, with or without a leading `\` or `\Registry\Machine\` prefix). winlogon's
+/// InitializeSAS → SetDefaultLanguage(NULL) opens it to read the `Default` LCID; it exists in the real
+/// staged SYSTEM hive. Matched EXACTLY (its 6 trailing components, in order) so no other Control subkey
+/// is spuriously satisfied — paint-safety, like the keyboard-layout / Winlogon-key matchers.
+pub(crate) fn is_nls_language_key(path: &str) -> bool {
+    let comps: alloc::vec::Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
+    // Strip an optional leading \Registry\Machine.
+    let tail: &[&str] = if comps.len() >= 2
+        && comps[0].eq_ignore_ascii_case("Registry")
+        && comps[1].eq_ignore_ascii_case("Machine")
+    {
+        &comps[2..]
+    } else {
+        &comps[..]
+    };
+    tail.len() == 5
+        && tail[0].eq_ignore_ascii_case("System")
+        && (tail[1].eq_ignore_ascii_case("CurrentControlSet")
+            || tail[1].eq_ignore_ascii_case("ControlSet001"))
+        && tail[2].eq_ignore_ascii_case("Control")
+        && tail[3].eq_ignore_ascii_case("Nls")
+        && tail[4].eq_ignore_ascii_case("Language")
 }
 /// True if `comps` (backslash-split, no `\Registry\Machine` prefix) name the Winlogon key
 /// `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. Matched EXACTLY (5 components, in order)
@@ -3826,6 +3866,7 @@ fn build_nt_table() -> NativeServiceTable {
             // Workstream A batch 7 (group C): section-image query + locale demand-fill.
             (NativeService::NtQuerySection, SSN_NT_QUERY_SECTION as u32),
             (NativeService::NtQueryDefaultLocale, SSN_NT_QUERY_DEFAULT_LOCALE as u32),
+            (NativeService::NtSetDefaultLocale, SSN_NT_SET_DEFAULT_LOCALE as u32),
             // Workstream A batch 8 (group C): section creation (csrss.exe SEC_IMAGE + DLL + anon).
             (NativeService::NtCreateSection, SSN_NT_CREATE_SECTION as u32),
             // Workstream A batch 9 (group C): view mapping (DLL SEC_IMAGE + anon + NLS).
@@ -8330,6 +8371,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(harness_syscall);
     print_str(b"\n");
     check(b"exec_win32k_on_shared_harness", harness_syscall >= 4, &mut passed);
+
+    // --- PROOF winlogon crossed its SAS message loop: InitializeSAS COMPLETED (was failing entirely —
+    // NtUserSetLogonNotifyWindow's logon-process access check failed because PsLookupProcessByProcessId
+    // was an s_zero stub that left *Process uninitialized → gpidLogon = garbage), SetDefaultLanguage
+    // read the real Nls\Language\Default LCID + NtSetDefaultLocale, then WinMain posted WLX_WM_SAS and
+    // entered `while (GetMessageW(&Msg, SASWindow,…))` (winlogon.c:608). The win32k message queue then
+    // CARRIED the SAS message: UserPostMessage inserted WLX_WM_SAS into the SAS window's
+    // PostedMessagesListHead (a NULL list head there null-derefed at cr2=8 before we seeded it), the
+    // first UserGetMessage RETRIEVED it (co_IntGetPeekMessage, status=1), winlogon DispatchMessage'd it,
+    // then looped back to a GetMessage on the now-EMPTY queue = its steady state (the message-loop park).
+    // WINLOGON_MSGLOOP_MILESTONE counts GetMessage calls after the SAS milestone; >= 2 proves the full
+    // post-SAS setup + the message-pump round-trip (post → retrieve → dispatch → re-poll-empty) ran.
+    print_str(b"[winlogon] SAS message-loop GetMessage count (post-SAS): ");
+    print_u64(WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_winlogon_sas_message_pumped",
+        WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+            && WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed) >= 2,
+        &mut passed,
+    );
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
