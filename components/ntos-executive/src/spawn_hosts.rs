@@ -60,6 +60,81 @@ pub(crate) struct GrantedCaps {
     pub fault_ep: Option<u64>,
 }
 
+// =============================================================================================
+// Component-runtime harness ABI scaffolding (Phase B, Step 0).
+//
+// The two Family-A persistent dispatch servers (the npfs FSD + win32k) run near-identical
+// recv→dispatch→reply loops on the component side and near-identical ep_send+demand-map fault
+// pumps on the executive side. This block introduces the SHARED abstractions the two families
+// converge onto: a KIND-tagged request header, a [`HostCaps`] capability set on
+// [`ComponentDescriptor`] gating win32k's irreducible specifics, and the shared
+// [`component_pump`] (executive-side) + [`component_main`] (component-side) run loops.
+//
+// STEP 0 is PURELY ADDITIVE: these types + fns are defined but WIRED TO NOTHING. Every existing
+// descriptor keeps `caps: HostCaps::default()` (all-false) so the boot is byte-identical. The FSD
+// migrates onto `component_pump`/`component_main` in Steps 1/2; win32k migrates LAST (Step 4).
+// See `docs/component-harness.md` §2.
+// =============================================================================================
+
+/// The KIND a Family-A dispatch server speaks over its shared frame. `Irp` = the FSD IRP protocol
+/// (reads `SH_REQ_MAJOR/MINOR/FSCTL/INLEN/OUTLEN/FILEID`, writes status@0x70 + info@0x78);
+/// `Syscall` = win32k's SSN protocol (reads `SH_REQ_SSN/A0..`, writes status@0x78). Constant per
+/// component (no component serves both today), so it is set once by the descriptor builder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub(crate) enum ReqKind {
+    Irp = 0,
+    Syscall = 1,
+}
+
+impl Default for ReqKind {
+    #[inline]
+    fn default() -> Self {
+        ReqKind::Irp
+    }
+}
+
+/// Shared-frame request-header KIND tag offset. VERIFIED FREE in BOTH Family-A frames:
+///   * FSD frame: between `SH_POOL_USED=0x28` and `SH_REQ_MAJOR=0x40` (`driver_launch.rs`).
+///   * win32k frame: between `SH_POOL_USED=0x30` and `SH_NTUSER_HANDLER=0x40` (`win32k_subsystem.rs`).
+/// A component builder MAY stamp its constant `ReqKind` here at spawn time; the pump can also key
+/// KIND off the descriptor (`caps.kind`) since it is constant per component — the design's fallback.
+pub(crate) const SH_REQ_KIND: u64 = 0x38;
+
+/// Out: NTSTATUS offset — DIFFERS by KIND (FSD writes 0x70, win32k 0x78). The pump reads the offset
+/// appropriate to `caps.kind`; these do NOT unify (design §2.2 status-offset note).
+pub(crate) const SH_REQ_STATUS_IRP: u64 = 0x70;
+pub(crate) const SH_REQ_STATUS_SYSCALL: u64 = 0x78;
+/// Out: monotonic completed-request counter — SHARED (both frames already agree at 0x80).
+pub(crate) const SH_REQ_SEQ: u64 = 0x80;
+
+/// Capability flags on a component descriptor. ALL DEFAULT FALSE → a component with
+/// `HostCaps::default()` is byte-identical to today (Family B + the FSD). The flags are consumed on
+/// the EXECUTIVE side ([`component_pump`]) to gate win32k's irreducible specifics; the win32k
+/// component-side specifics (usermode-callback registration, exact-arity transmute) stay keyed off
+/// the SSN, not a runtime flag. See `docs/component-harness.md` §2.3.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostCaps {
+    /// Component runs a persistent recv→dispatch→reply server loop (Family A).
+    /// false => one-shot run_once (Family B).
+    pub dispatch_server: bool,
+    /// Dispatch KIND the server speaks (only meaningful when `dispatch_server`).
+    pub kind: ReqKind,
+    /// win32k: attach the calling client's user memory (`w32_client_attach`) before each dispatch,
+    /// and share foreign client frames on demand-fault instead of zero-filling.
+    pub client_attach: bool,
+    /// win32k: honour `KeUserModeCallback` / WINDOWPROC bridge (documents the capability; the
+    /// callback is bound component-side in DriverEntry).
+    pub usermode_callback: bool,
+    /// win32k: stage wide (>4) stack args from the caller frame into `SH_REQ_A4..` / `SH_REQ_NARGS`.
+    pub wide_arg_marshal: bool,
+    /// win32k: skip checked-build int-0x2c NT_ASSERTs (resume IP+2) on a label-3 UserException.
+    pub assert_skip: bool,
+    /// win32k: answer nested demand-page faults through a per-caller reply cap (REPLY_W32) rather
+    /// than the fault EP's reply_recv, so an outer caller's reply binding survives.
+    pub nested_reply_cap: bool,
+}
+
 /// Fully declarative description of an isolated component to spawn. DATA only — the POLICY
 /// (which frames/VAs/rights/caps). [`spawn_component`] turns it into the seL4 MECHANISM.
 pub(crate) struct ComponentDescriptor<'a> {
@@ -85,6 +160,9 @@ pub(crate) struct ComponentDescriptor<'a> {
     pub prio: u64,
     /// Optional GS base (win32k's KPCR placeholder). `None` = leave GS unset.
     pub gs_base: Option<u64>,
+    /// Component-runtime capability flags (Phase B harness). `HostCaps::default()` (all-false) is
+    /// byte-identical to a pre-harness component — consumed only by [`component_pump`].
+    pub caps: HostCaps,
 }
 
 /// What a spawned component hands back (the caps the caller may still need).
@@ -217,6 +295,7 @@ pub(crate) unsafe fn spawn_isr(entry: unsafe extern "C" fn() -> !, irq_cap: u64,
         granted: GrantedCaps { irq_ntfn: Some(irq_cap), result_ntfn: Some(result_cap), fault_ep: None },
         prio,
         gs_base: None,
+        caps: HostCaps::default(),
     };
     let _ = spawn_component(&d);
 }
@@ -296,6 +375,273 @@ pub(crate) unsafe fn spawn_storage_host(
         granted: GrantedCaps { irq_ntfn: None, result_ntfn: Some(result_cap), fault_ep: Some(fault_ep) },
         prio,
         gs_base: None,
+        caps: HostCaps::default(),
     };
     let _ = spawn_component(&d);
+}
+
+// =============================================================================================
+// The unified component-runtime harness (Phase B): `component_pump` (executive-side) +
+// `component_main` (component-side). STEP 0 defines them; they are wired to nothing yet. The FSD
+// migrates onto them in Steps 1/2; win32k (which adds the flag-gated branches marked below) LAST.
+// See `docs/component-harness.md` §2.4-2.5.
+// =============================================================================================
+
+/// The executive-side channel to one Family-A dispatch server. Carries the fault/dispatch EP, the
+/// component VSpace (for demand-map), the in-image wall bounds, the shared frame base, the DONE
+/// label, and the per-server demand budget. `reply_cap`/`client_pi`/`caps` gate win32k's specifics
+/// (Step 4); for the FSD they are 0/0/all-false and the pump degenerates to today's
+/// `npfs_dispatch_irp`/`load_driver` inner loop EXACTLY.
+#[derive(Clone, Copy)]
+pub(crate) struct PumpChannel {
+    /// Dispatch + fault channel (the `CT_FAULT` peer cap for this component).
+    pub fault_ep: u64,
+    /// Component VSpace root, for demand-mapping its page faults.
+    pub pml4: u64,
+    /// In-image wall bounds: a fault whose address lands inside `[code_va, code_va+image_frames*0x1000)`
+    /// is a real code-page fault (a wall), not a benign demand page. `image_frames == 0` disables the
+    /// in-image wall (the per-IRP loop shape, which only walls on the low-address guard).
+    pub code_va: u64,
+    pub image_frames: u64,
+    /// The `SH_*` shared-frame base for this component.
+    pub shared_va: u64,
+    /// The DONE / ready label the server Sends when it re-parks (0x771 FSD / 0x770 win32k).
+    pub dispatch_label: u64,
+    /// Max benign demand-pages to satisfy before walling (FSD init-loop = 512, per-IRP loop = 256).
+    pub demand_cap: u64,
+    /// Emit `[svc] fault #N ...` trace lines for the first 40 faults (init-loop observability).
+    pub trace_faults: bool,
+    /// win32k Step-4 fields (0 for the FSD): the per-caller reply cap (REPLY_W32) and the client
+    /// process-index for `client_attach`/foreign-frame sharing.
+    pub reply_cap: u64,
+    pub client_pi: u64,
+    /// The win32k capability gates (all-false for the FSD).
+    pub caps: HostCaps,
+}
+
+/// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
+/// dispatch loop (sent `dispatch_label`); `false` = it hit a wall (fault we won't demand-map).
+#[derive(Clone, Copy)]
+pub(crate) struct PumpResult {
+    pub status: i32,
+    pub completed: bool,
+    /// Wall diagnostics (only meaningful when `!completed`).
+    pub wall_ip: u64,
+    pub wall_addr: u64,
+    pub wall_label: u64,
+    pub faults: u64,
+    pub demand: u64,
+}
+
+/// Drive ONE request to a Family-A dispatch server: wake the parked server with `dispatch_label`,
+/// demand-map its page faults against `pml4`, and return when it re-parks (completed) or walls.
+///
+/// The caller MUST have already filled the shared-frame request fields (the IRP struct build for
+/// the FSD / the SSN+args for win32k) — the pump owns only the IPC + fault engine, not the KIND-
+/// specific marshal. On completion the pump reads `SH_REQ_STATUS` at the offset appropriate to
+/// `caps.kind` (0x70 Irp / 0x78 Syscall). This is the ONE loop `npfs_dispatch_irp` (Step 1) and
+/// `load_driver`'s init loop (Step 1) and `win32k_dispatch_wide` (Step 4) converge onto.
+#[allow(dead_code)]
+pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
+    // (Step 4, win32k) if ch.caps.client_attach { w32_client_attach(ch.client_pi); }
+    // (Step 4, win32k) if ch.caps.wide_arg_marshal { stage SH_REQ_A4../NARGS from the caller SP. }
+
+    // Wake the server, then pump its faults until it re-parks or walls.
+    crate::ep_send(ch.fault_ep, ch.dispatch_label);
+    let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = crate::ep_recv_full(ch.fault_ep);
+    let mut faults = 0u64;
+    let mut demand = 0u64;
+    let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
+    let mut completed = false;
+    loop {
+        let label = mi >> 12;
+        if label == ch.dispatch_label {
+            completed = true;
+            break;
+        } else if label == 6 {
+            let ip = m0;
+            let addr = m1;
+            faults += 1;
+            if ch.trace_faults && faults <= 40 {
+                crate::print_str(b"[svc] fault #");
+                crate::print_u64(faults);
+                crate::print_str(b" ip=0x");
+                crate::print_hex(ip as u32);
+                crate::print_str(b" RVA=0x");
+                crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+                crate::print_str(b" addr=0x");
+                crate::print_hex((addr >> 32) as u32);
+                crate::print_hex(addr as u32);
+                crate::print_str(b"\n");
+            }
+            let in_image =
+                ch.image_frames != 0 && addr >= ch.code_va && addr < ch.code_va + ch.image_frames * 0x1000;
+            if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+                wall_ip = ip;
+                wall_addr = addr;
+                wall_label = label;
+                break;
+            }
+            // (Step 4, win32k) if ch.caps.client_attach { foreign-frame-share / internal-low zero-fill. }
+            let page = addr & !0xFFF;
+            crate::driver_launch::ensure_paging(page, ch.pml4);
+            let f = crate::alloc_frame();
+            let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+            demand += 1;
+            // (Step 4, win32k) nested_reply_cap => send_on_reply(reply_cap,..)+recv_full_r12.
+            let (nmi, nm0, nm1, nm2, nm3) = crate::reply_recv_full(ch.fault_ep, 0, 0, 0, 0, 0);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            _m2 = nm2;
+            _m3 = nm3;
+            continue;
+        } else {
+            // (Step 4, win32k) label==3 UserException + assert_skip => verify CD 2C, resume IP+2.
+            wall_ip = m0;
+            wall_addr = m1;
+            wall_label = label;
+            break;
+        }
+    }
+    let status = if completed {
+        let so = match ch.caps.kind {
+            ReqKind::Irp => SH_REQ_STATUS_IRP,
+            ReqKind::Syscall => SH_REQ_STATUS_SYSCALL,
+        };
+        core::ptr::read_volatile((ch.shared_va + so) as *const i32)
+    } else {
+        0xC000_0001u32 as i32 // STATUS_UNSUCCESSFUL
+    };
+    PumpResult { status, completed, wall_ip, wall_addr, wall_label, faults, demand }
+}
+
+/// The DRIVER_OBJECT byte layout a component's `DriverEntry` expects. FSD = { size:0x150, ext:0x68 };
+/// win32k = { size:0x200, ext:0x30 }. `component_main` builds a zeroed DRIVER_OBJECT of `size` with
+/// Type=4 @0, Size @2, a zeroed DriverExtension pointer @`ext`, and MajorFunction @`mj`.
+#[derive(Clone, Copy)]
+pub(crate) struct DriverObjectSpec {
+    pub size: u64,
+    pub ext: u64,
+    pub ext_size: u64,
+    pub mj: u64,
+}
+
+/// One dispatched request handed to the component-side `dispatch` callback. For the FSD, `sel` is
+/// the IRP major function; the router does `major → MajorFunction[major] → run_irp`.
+#[derive(Clone, Copy)]
+pub(crate) struct DispatchReq {
+    /// The dispatch selector: IRP major (Irp) or SSN (Syscall).
+    pub sel: u64,
+    pub drv: u64,
+}
+
+/// The component-side shared entry (Family A): read the DriverEntry RVA from the shared frame, build
+/// a `DriverObjectSpec`-shaped DRIVER_OBJECT + a zero-length RegistryPath from the pool, mark
+/// `V_ENTERED`, call `DriverEntry`, record the verdict/status, run `post_driver_entry` (win32k:
+/// establish-client; FSD: no-op — MUST run between DriverEntry and the FIRST send_done), then loop
+/// `send_done → recv_req → dispatch(req) → write SH_REQ_STATUS + bump SH_REQ_SEQ`.
+///
+/// `code_va` is the loaded image base (DriverEntry = code_va + entry_rva). `dispatch` is the KIND
+/// router (FSD: major→run_irp; win32k: ssn→dispatch_ssn). This is the shape both
+/// `fsd_component_entry` (Step 2) and `win32k_subsystem_entry` (Step 4) collapse onto.
+#[allow(dead_code)]
+pub(crate) unsafe fn component_main(
+    shared_va: u64,
+    code_va: u64,
+    spec: DriverObjectSpec,
+    status_off: u64,
+    dispatch_label: u64,
+    dispatch: unsafe fn(&DispatchReq) -> (i32, u64),
+    post_driver_entry: unsafe fn(status: i32, drv: u64),
+) -> ! {
+    let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
+
+    // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension@spec.ext, MajorFunction@spec.mj).
+    let drv = crate::driver_launch::pool_alloc(spec.size);
+    let mut i = 0u64;
+    while i < spec.size {
+        core::ptr::write_unaligned((drv + i) as *mut u64, 0);
+        i += 8;
+    }
+    core::ptr::write_unaligned(drv as *mut i16, 4); // Type = IO_TYPE_DRIVER
+    core::ptr::write_unaligned((drv + 2) as *mut u16, spec.size as u16); // Size
+    let ext = crate::driver_launch::pool_alloc(spec.ext_size);
+    let mut j = 0u64;
+    while j < spec.ext_size {
+        core::ptr::write_unaligned((ext + j) as *mut u64, 0);
+        j += 8;
+    }
+    core::ptr::write_unaligned((drv + spec.ext) as *mut u64, ext);
+
+    // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
+    let reg_path = crate::driver_launch::pool_alloc(0x18);
+    let reg_buf = crate::driver_launch::pool_alloc(0x10);
+    core::ptr::write_unaligned(reg_buf as *mut u16, 0);
+    core::ptr::write_unaligned(reg_path as *mut u16, 0);
+    core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
+    core::ptr::write_unaligned((reg_path + 8) as *mut u64, reg_buf);
+
+    core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, crate::driver_launch::V_ENTERED);
+
+    let entry = code_va + entry_rva as u64;
+    let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
+    let status = de(drv, reg_path);
+
+    let mj_base = drv + spec.mj;
+    let mj_create = core::ptr::read_unaligned(mj_base as *const u64);
+    let mut v = core::ptr::read_volatile((shared_va + SH_VERDICT_H) as *const u32);
+    v |= crate::driver_launch::V_RETURNED;
+    if status == 0 {
+        v |= crate::driver_launch::V_SUCCESS;
+    }
+    if mj_create != 0 {
+        v |= crate::driver_launch::V_MJ;
+    }
+    core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, v);
+    core::ptr::write_volatile((shared_va + SH_DE_STATUS_H) as *mut i32, status);
+    core::ptr::write_volatile((shared_va + SH_MJ_TABLE_H) as *mut u64, mj_base);
+
+    post_driver_entry(status, drv);
+
+    // The persistent dispatch loop.
+    let mut seq = 0u64;
+    loop {
+        crate::driver_launch::send_done_on(dispatch_label);
+        crate::driver_launch::recv_req_on();
+        let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
+        let (st, info) = dispatch(&DispatchReq { sel, drv });
+        core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
+        core::ptr::write_volatile((shared_va + SH_REQ_INFO_H) as *mut u64, info);
+        seq += 1;
+        core::ptr::write_volatile((shared_va + SH_REQ_SEQ) as *mut u64, seq);
+    }
+}
+
+// Header-prefix offsets shared by both Family-A frames (design §1.2 "the header prefix (0x00-0x30)
+// is the same shape"). These name the SAME bytes the FSD/win32k modules already use under their own
+// const names; `component_main` uses these generic names.
+const SH_ENTRY_RVA_H: u64 = 0x00;
+const SH_VERDICT_H: u64 = 0x08;
+const SH_DE_STATUS_H: u64 = 0x10;
+const SH_MJ_TABLE_H: u64 = 0x18;
+/// The dispatch selector (IRP major @0x40 for the FSD; the caller writes it before the pump). NOTE:
+/// win32k's SSN lives at 0x50, so Step 4 passes a KIND-appropriate selector offset — for the FSD
+/// (Step 2) the selector is `SH_REQ_MAJOR=0x40`.
+const SH_REQ_SEL_H: u64 = 0x40;
+/// IoStatus.Information out (FSD @0x78). win32k does not use this field.
+const SH_REQ_INFO_H: u64 = 0x78;
+
+/// Family-B one-shot epilogue: run `body` to a verdict, store it at `verdict_va`, signal
+/// `CT_RESULT_NTFN` once, and park. STEP 0 skeleton (Family B folds onto this in the OPTIONAL
+/// Step 3); wired to nothing yet.
+#[allow(dead_code)]
+pub(crate) unsafe fn run_once(body: unsafe fn() -> u32, verdict_va: u64) -> ! {
+    let verdict = body();
+    core::ptr::write_volatile(verdict_va as *mut u32, verdict);
+    // Signal the executive once (the Family-B result notification), exactly as driver_host/kmdf do.
+    let _ = crate::syscall5(crate::SYS_SEND, crate::CT_RESULT_NTFN, 0, 0, 0, 0);
+    loop {
+        crate::yield_now();
+    }
 }

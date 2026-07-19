@@ -6626,6 +6626,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 granted: GrantedCaps { irq_ntfn: Some(dh_irq), result_ntfn: Some(dh_result_badged), fault_ep: Some(dh_fault) },
                 prio: 100,
                 gs_base: None,
+                caps: HostCaps::default(),
             };
             let _ = spawn_component(&d);
         }
@@ -6716,6 +6717,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 granted: GrantedCaps { irq_ntfn: None, result_ntfn: Some(kmdf_result_badged), fault_ep: Some(kmdf_fault) },
                 prio: 100,
                 gs_base: None,
+                caps: HostCaps::default(),
             };
             let _ = spawn_component(&d);
         }
@@ -6882,6 +6884,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // win32k is a kernel driver: it reads the KPCR via gs:[..]. Point GS at a zeroed
                     // KPCR placeholder so those reads resolve (0) instead of faulting.
                     gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
+                    caps: HostCaps::default(),
                 };
                 let sc = spawn_component(&d);
                 // Stash the globals the demand-map fault loop + per-client attach need. The stack frame

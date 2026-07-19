@@ -184,7 +184,7 @@ pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::v
 /// A simple free-list allocator: an FSD alloc/frees file objects; a leak-forever bump would exhaust
 /// under FSCTL churn. Header = 16 B ([+0]=capacity, [+8]=next-free). `pool_free` pushes onto the
 /// single free list (head @ [POOL+8]); `pool_alloc` first-fits it before bumping. Counter @ [POOL+0].
-unsafe fn pool_alloc(size: u64) -> u64 {
+pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
     // first-fit the free list
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
     let mut prev = head_slot;
@@ -866,6 +866,34 @@ unsafe fn send_done() {
     );
 }
 
+/// Generic (label-parameterised) form of [`send_done`] for the shared [`crate::component_main`]
+/// harness: plain `seL4_Send(CT_FAULT, label)`. `send_done` is the FSD-labelled shim over this.
+#[inline(never)]
+pub(crate) unsafe fn send_done_on(label: u64) {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_SEND as u64,
+        in("rdi") crate::CT_FAULT,
+        in("rsi") label << 12,
+        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
+/// Generic form of [`recv_req`] for the shared harness: plain `seL4_Recv(CT_FAULT)`.
+#[inline(never)]
+pub(crate) unsafe fn recv_req_on() {
+    core::arch::asm!(
+        "syscall",
+        in("rdx") crate::SYS_RECV as u64,
+        inout("rdi") crate::CT_FAULT => _,
+        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
+
 /// Block for the next dispatch request: a plain `seL4_Recv` on [`crate::CT_FAULT`].
 #[inline(never)]
 unsafe fn recv_req() {
@@ -1525,6 +1553,7 @@ unsafe fn spawn_fsd_component(
         granted: GrantedCaps { irq_ntfn: None, result_ntfn: None, fault_ep: Some(fault_ep) },
         prio: 100,
         gs_base: Some(FSD_KPCR_VA),
+        caps: HostCaps::default(),
     };
     spawn_component(&d).pml4
 }
@@ -1533,7 +1562,7 @@ unsafe fn spawn_fsd_component(
 /// missing-PT error). Idempotent-ish: builds one PT per 2 MiB region touched (tracked in a small
 /// static bitmap keyed by the 2 MiB index within the pool/demand window). Mirrors the win32k
 /// `ensure_w32_client_paging` mechanism.
-unsafe fn ensure_paging(page: u64, pml4: u64) {
+pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
     let pt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, page & !0x1F_FFFF, pml4);
