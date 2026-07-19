@@ -62,18 +62,38 @@ The launcher (`spawn_component`/`ComponentDescriptor`) is ALREADY shared. This w
       `exec_sys_start_reached_real_nic`, `exec_kmdf_driver_create/_adddevice_queue/_prepare_hw_read_real_nic/`
       `_ioctl/_remove`, `exec_kmdf_read_real_nic`; gate 180/98.
 
-## Step 4 — win32k LAST (capability-gate every specific)
-- [ ] 4a. `win32k_dispatch_wide` (`win32k_glue.rs:388-614`) loop → `component_pump`, `caps = { all win32k
-      flags true }`, `reply_cap = REPLY_W32_SLOT`, `client_pi = W32_CLIENT_PI`. Relocate VERBATIM behind
-      flags: (c) client-attach, (e) wide-arg staging, (f) foreign-frame sharing, (g) int-0x2c skip,
-      (h) REPLY_W32 nesting. Keep the forward arm `service_sec_image.rs:3120-3122`.
-- [ ] 4b. `win32k_subsystem_entry` (`win32k_subsystem.rs:2662-2717`) → `component_main`, SSN dispatch
-      closure (`ssn → dispatch_ssn`, retains exact-arity transmute (e)),
-      `post_driver_entry = establish_client_and_dispatch`, `DriverObjectSpec{size:0x200, ext:0x30}`.
-- [ ] VERIFY (CRITICAL): `exec_win32k_desktop_painted` == 768/768 @ 0x003a6ea5 (`main.rs:8048`);
-      `SSN_TEST_FAULT` nested-reply round-trip; win32k connect specs; gate 180/98. Diff boot serial
-      `[w32disp]`/`[w32attach]` lines vs a pre-migration reference boot (byte-identical dispatch).
-- [ ] Rollback 4a/4b independently if any regression.
+## Step 4 — win32k LAST (capability-gate every specific)  — DONE (gate 183/98, paint 768/768)
+- [x] 4a. `win32k_dispatch_wide` (`win32k_glue.rs`) is now a THIN caller wrapper: it fills the request
+      (client_attach + SSN/args + wide-arg SH_REQ_A4../NARGS staging, exactly as before) then calls
+      `component_pump(&ch)` with `caps = { all win32k flags true }`, `reply_cap = REPLY_W32_SLOT`,
+      `client_pi = W32_CLIENT_PI`, `demand_cap=8192`, `kind=Syscall`. The fault loop's win32k specifics
+      RELOCATED VERBATIM behind flags INSIDE `component_pump`: (f) foreign-frame sharing + internal-low
+      zero-fill (behind `client_attach`), (g) int-0x2c assert-skip (behind `assert_skip`, `W32_ASSERT_LOG`
+      + per-dispatch 4000 bound kept), (h) REPLY_W32 nested reply (behind `nested_reply_cap` — strictly
+      gated, recv_full_r12/send_on_reply, NEVER collapsed into REPLY_MAIN), the WALL diag, backtrace.
+      Forward arm `service_sec_image.rs` UNCHANGED.
+- [x] 4b. `win32k_subsystem_entry` → `component_main(WIN32K_SHARED_VADDR, WIN32K_CODE_VA,
+      DriverObjectSpec{size:0x200, size_field:336, ext:0x30, mj_table_off:MAX, pool:win32k pool},
+      SH_REQ_STATUS(0x78), W32_DISPATCH_LABEL, win32k_dispatch, win32k_post_driver_entry)`. The SSN
+      router + all per-dispatch pre/post (WindowListHead re-empty, BATCH-43 thread↔desktop re-assert,
+      SSN_TEST_FAULT, NtUserInitialize event-register, post-init font/winsta seed, dispatch_ssn w/
+      exact-arity transmute) live in the `win32k_dispatch` closure; `establish_client_and_dispatch` +
+      `setup_dispatch_context` in `win32k_post_driver_entry` (establish→setup ordering preserved).
+      Harness changes needed to fit win32k: `DriverObjectSpec` gained `size_field` (alloc 0x200 but
+      Size=336), `pool` fn-ptr (win32k's OWN bump arena, not FSD's free-list), `mj_table_off` (win32k
+      0x18 is SH_SSDT_BASE — must NOT be clobbered → MAX); `component_main` writes info-then-status so
+      win32k's status@0x78==info@0x78 alias resolves to status. Skeleton's flag-gated branches were
+      COMMENT-ONLY stubs — implemented them to reproduce `win32k_dispatch_wide` exactly.
+- [x] VERIFY: gate 183/98, RUNEXIT=3, ZERO FAILs, `exec_win32k_desktop_painted` 768/768 @ 0x003a6ea5,
+      `win32k_dispatch_fault_via_reply_cap` (SSN_TEST_FAULT nested-reply) PASS,
+      `win32k_dispatch_loop_roundtrip` PASS, all FSD/npfs + `exec_fsd_on_shared_harness` PASS. NEW proof
+      `exec_win32k_on_shared_harness` (HARNESS_SYSCALL_DISPATCHES=140 ≥4) PASS. Boot-serial diff vs
+      `4a157f8` CLEAN: only 3 cosmetic diffs — 1 bring-up demand-fault timing shift (component_main's
+      preamble zeroing pre-touches a page the old entry faulted lazily; same page, identical DriverEntry
+      result) + 2 reported IPs shifted (refactored win32k dispatch code at new addresses). SSDT
+      base/count(740), connect status, TEST_FAULT status all byte-identical.
+- [x] Retired the dead bespoke win32k loop: `dispatch_loop`/`send_done`/`recv_req` deleted (replaced by
+      `component_main` + `send_done_on`/`recv_req_on`); `win32k_dispatch_wide`'s inline fault loop gone.
 
 ## Step 4.5 — REUSABLE substrate for user-specified drivers  — DONE (gate 181/98, clean qemu_exit)
 Requirement: users can specify drivers to run by-path; adding a driver = stage the .sys + declare a

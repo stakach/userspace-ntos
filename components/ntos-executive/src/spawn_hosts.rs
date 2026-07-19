@@ -426,6 +426,35 @@ pub(crate) struct PumpChannel {
     pub caps: HostCaps,
 }
 
+/// win32k demand-fault verbosity budget: print the first 60 demand faults per dispatch (matches the
+/// bespoke `win32k_dispatch_wide` `if demand < 60` gate exactly).
+const W32_FAULT_LOG_LIMIT: u64 = 60;
+/// win32k int-0x2c assert-skip per-dispatch bound (a looping assert still walls after this many).
+const W32_ASSERT_SKIP_BOUND: u64 = 4000;
+
+/// win32k WALL diagnostic (relocated VERBATIM from `win32k_dispatch_wide`'s tail): label + fault
+/// IP/addr, RVA relative to the win32k image + dxg, and the UserException number/flags.
+#[inline(never)]
+unsafe fn win32k_wall_diag(ch: &PumpChannel, label: u64, m0: u64, m1: u64, m2: u64, m3: u64) {
+    crate::print_str(b"[w32disp] WALL label=");
+    crate::print_u64(label);
+    crate::print_str(b" m0=0x");
+    crate::print_hex((m0 >> 32) as u32);
+    crate::print_hex(m0 as u32);
+    crate::print_str(b" RVA=0x");
+    crate::print_hex(m0.wrapping_sub(ch.code_va) as u32);
+    crate::print_str(b" dxgRVA=0x");
+    crate::print_hex(m0.wrapping_sub(crate::win32k_subsystem::DXG_VA) as u32);
+    crate::print_str(b" m1=0x");
+    crate::print_hex((m1 >> 32) as u32);
+    crate::print_hex(m1 as u32);
+    crate::print_str(b" exc#=");
+    crate::print_u64(m3);
+    crate::print_str(b" flags=0x");
+    crate::print_hex(m2 as u32);
+    crate::print_str(b"\n");
+}
+
 /// PROOF-OF-WIRING counters: `component_pump` increments these per SERVICED dispatch, tagged by
 /// `ReqKind`. They are the durable evidence that a component's live traffic actually flows through
 /// the SHARED harness pump (not the retired bespoke inline loop). The `exec_fsd_on_shared_harness`
@@ -470,8 +499,17 @@ pub(crate) struct PumpResult {
 /// On a COMPLETED dispatch (server re-parked) the pump bumps [`HARNESS_IRP_DISPATCHES`] /
 /// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
-    // (Step 4, win32k) if ch.caps.client_attach { w32_client_attach(ch.client_pi); }
-    // (Step 4, win32k) if ch.caps.wide_arg_marshal { stage SH_REQ_A4../NARGS from the caller SP. }
+    // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
+    // wide-arg (SH_REQ_A4../NARGS) staging — is done by the win32k caller wrapper `win32k_dispatch_wide`
+    // BEFORE this pump runs (exactly as the FSD `dispatch_irp` fills the IRP fields before the pump).
+    // `caps.client_attach` here gates only the DEMAND-FAULT foreign-frame sharing (pump step 4); the
+    // initial attach is the caller's, matching the design's caller-owns-fill split.
+
+    // The nested-reply transport (win32k Fix B): when `nested_reply_cap` and a REPLY_W32 cap is bound,
+    // recv/resume through it (recv_full_r12 / send_on_reply) so the outer csrss caller's reply binding
+    // survives across win32k's nested demand-page faults; else use the legacy ep_recv/reply_recv on the
+    // fault EP (the FSD path). This is the LOAD-BEARING nesting fix — kept strictly gated (never merged).
+    let use_reply_cap = ch.caps.nested_reply_cap && ch.reply_cap != 0;
 
     // Wake the server (per-request shape), then pump its faults until it re-parks or walls. The
     // DriverEntry-init shape (`wake_first=false`) starts by RECEIVING — the component is a blocked
@@ -479,9 +517,14 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
     if ch.wake_first {
         crate::ep_send(ch.fault_ep, ch.dispatch_label);
     }
-    let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = crate::ep_recv_full(ch.fault_ep);
+    let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = if use_reply_cap {
+        crate::recv_full_r12(ch.fault_ep, ch.reply_cap)
+    } else {
+        crate::ep_recv_full(ch.fault_ep)
+    };
     let mut faults = 0u64;
     let mut demand = 0u64;
+    let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded → a looping assert walls)
     let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
     let mut completed = false;
     loop {
@@ -493,42 +536,157 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
             let ip = m0;
             let addr = m1;
             faults += 1;
-            if ch.trace_faults && faults <= 40 {
-                crate::print_str(b"[svc] fault #");
-                crate::print_u64(faults);
-                crate::print_str(b" ip=0x");
-                crate::print_hex(ip as u32);
-                crate::print_str(b" RVA=0x");
-                crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
-                crate::print_str(b" addr=0x");
-                crate::print_hex((addr >> 32) as u32);
-                crate::print_hex(addr as u32);
-                crate::print_str(b"\n");
-            }
             let in_image =
                 ch.image_frames != 0 && addr >= ch.code_va && addr < ch.code_va + ch.image_frames * 0x1000;
-            if addr < 0x10000 || in_image || demand >= ch.demand_cap {
-                wall_ip = ip;
-                wall_addr = addr;
-                wall_label = label;
-                break;
+            if ch.caps.client_attach {
+                // ── win32k demand-fault CLIENT-FRAME-SHARING (relocated VERBATIM from
+                // `win32k_dispatch_wide`; foreign-pointer detection + internal-low zero-fill discrimination).
+                let page = addr & !0xFFF;
+                let foreign = addr < 0x0000_0100_0000_0000
+                    || (addr >= 0x10000
+                        && !in_image
+                        && crate::csrss_frame_get(ch.client_pi, page) != 0);
+                if demand < W32_FAULT_LOG_LIMIT {
+                    crate::print_str(b"[w32disp] fault #");
+                    crate::print_u64(demand);
+                    crate::print_str(b" ip=0x");
+                    crate::print_hex((ip >> 32) as u32);
+                    crate::print_hex(ip as u32);
+                    crate::print_str(b" RVA=0x");
+                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+                    crate::print_str(b" addr=0x");
+                    crate::print_hex((addr >> 32) as u32);
+                    crate::print_hex(addr as u32);
+                    if foreign {
+                        crate::print_str(b" (client ptr - sharing csrss frame)");
+                    }
+                    crate::print_str(b"\n");
+                }
+                // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
+                if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+                    crate::win32k_glue::win32k_dispatch_backtrace();
+                    wall_ip = ip;
+                    wall_addr = addr;
+                    wall_label = label;
+                    break;
+                }
+                if foreign {
+                    if !crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4) {
+                        let win32k_internal_low =
+                            page < 0x0000_0100_0000_0000 && page >= 0x10000;
+                        if win32k_internal_low {
+                            if demand < W32_FAULT_LOG_LIMIT {
+                                crate::print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
+                                crate::print_hex((page >> 32) as u32);
+                                crate::print_hex(page as u32);
+                                crate::print_str(b" -> zero-fill (blit source buffer)\n");
+                            }
+                            crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                            let f = crate::alloc_frame();
+                            let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                        } else {
+                            crate::print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
+                            crate::print_hex((page >> 32) as u32);
+                            crate::print_hex(page as u32);
+                            crate::print_str(b" client_pi=");
+                            crate::print_u64(ch.client_pi);
+                            crate::print_str(b"\n");
+                            crate::win32k_glue::win32k_dispatch_backtrace();
+                            wall_ip = ip;
+                            wall_addr = addr;
+                            wall_label = label;
+                            break;
+                        }
+                    }
+                } else {
+                    crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4);
+                    let f = crate::alloc_frame();
+                    let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                }
+                demand += 1;
+            } else {
+                // ── FSD / generic demand-map (byte-identical to the old inline loop).
+                if ch.trace_faults && faults <= 40 {
+                    crate::print_str(b"[svc] fault #");
+                    crate::print_u64(faults);
+                    crate::print_str(b" ip=0x");
+                    crate::print_hex(ip as u32);
+                    crate::print_str(b" RVA=0x");
+                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+                    crate::print_str(b" addr=0x");
+                    crate::print_hex((addr >> 32) as u32);
+                    crate::print_hex(addr as u32);
+                    crate::print_str(b"\n");
+                }
+                if addr < 0x10000 || in_image || demand >= ch.demand_cap {
+                    wall_ip = ip;
+                    wall_addr = addr;
+                    wall_label = label;
+                    break;
+                }
+                let page = addr & !0xFFF;
+                crate::driver_launch::ensure_paging(page, ch.pml4);
+                let f = crate::alloc_frame();
+                let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
+                demand += 1;
             }
-            // (Step 4, win32k) if ch.caps.client_attach { foreign-frame-share / internal-low zero-fill. }
-            let page = addr & !0xFFF;
-            crate::driver_launch::ensure_paging(page, ch.pml4);
-            let f = crate::alloc_frame();
-            let _ = crate::page_map(f, page, crate::RW_NX, ch.pml4);
-            demand += 1;
-            // (Step 4, win32k) nested_reply_cap => send_on_reply(reply_cap,..)+recv_full_r12.
-            let (nmi, nm0, nm1, nm2, nm3) = crate::reply_recv_full(ch.fault_ep, 0, 0, 0, 0, 0);
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            _m2 = nm2;
-            _m3 = nm3;
+            // Resume the server + recv the next fault/DONE. win32k (nested_reply_cap) resumes through
+            // the bound REPLY_W32 cap (send_on_reply + recv_full_r12); the FSD uses reply_recv_full.
+            if use_reply_cap {
+                crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
+                let (_b, nmi, nm0, nm1, nm2, nm3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                _m2 = nm2;
+                _m3 = nm3;
+            } else {
+                let (nmi, nm0, nm1, nm2, nm3) = crate::reply_recv_full(ch.fault_ep, 0, 0, 0, 0, 0);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                _m2 = nm2;
+                _m3 = nm3;
+            }
             continue;
+        } else if label == 3 && ch.caps.assert_skip {
+            // ── win32k checked-build int-0x2c ASSERT-SKIP (relocated VERBATIM). Verify CD 2C via the
+            // executive's RW view of win32k's image at the same VA, then resume at IP+2 (release-build
+            // semantics). Bounded by W32_ASSERT_SKIP_BOUND (a looping assert still walls).
+            let ip = m0;
+            let in_win32k = ip >= ch.code_va && ip < ch.code_va + ch.image_frames * 0x1000;
+            let is_int2c = in_win32k
+                && core::ptr::read_volatile(ip as *const u8) == 0xCD
+                && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
+            if is_int2c && ch.reply_cap != 0 && skips < W32_ASSERT_SKIP_BOUND {
+                if crate::W32_ASSERT_LOG.fetch_add(1, Ordering::Relaxed) < 40 {
+                    crate::print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
+                    crate::print_hex(ip.wrapping_sub(ch.code_va) as u32);
+                    crate::print_str(b"\n");
+                }
+                skips += 1;
+                crate::send_on_reply(ch.reply_cap, 1, ip + 2, 0, 0, 0); // resume FaultIP past CD 2C
+                let (_b, nmi, nm0, nm1, nm2, nm3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                _m2 = nm2;
+                _m3 = nm3;
+                continue;
+            }
+            // Not a skippable int-0x2c — fall through to the wall.
+            if ch.caps.client_attach {
+                win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+            }
+            wall_ip = m0;
+            wall_addr = m1;
+            wall_label = label;
+            break;
         } else {
-            // (Step 4, win32k) label==3 UserException + assert_skip => verify CD 2C, resume IP+2.
+            // Any other fault — a real wall inside the handler.
+            if ch.caps.client_attach {
+                win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+            }
             wall_ip = m0;
             wall_addr = m1;
             wall_label = label;
@@ -557,10 +715,23 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
 /// Type=4 @0, Size @2, a zeroed DriverExtension pointer @`ext`, and MajorFunction @`mj`.
 #[derive(Clone, Copy)]
 pub(crate) struct DriverObjectSpec {
+    /// The DRIVER_OBJECT allocation size (bytes reserved from `pool`).
     pub size: u64,
+    /// The value written into the DRIVER_OBJECT `Size` field @2. USUALLY == `size` (FSD), but win32k
+    /// allocates 0x200 yet stamps Size=336 (0x150) — so this is a distinct field to preserve that.
+    pub size_field: u16,
     pub ext: u64,
     pub ext_size: u64,
     pub mj: u64,
+    /// Shared-frame offset to record `drv + mj` (the MajorFunction[] base) into, for the executive to
+    /// read back. FSD = 0x18 (`SH_MJ_TABLE`). `u64::MAX` = DO NOT record — win32k does not use an
+    /// MJ-table field and 0x18 in ITS frame is `SH_SSDT_BASE` (which DriverEntry populates); writing
+    /// there would clobber the SSDT base → dispatch fails. So win32k passes `u64::MAX`.
+    pub mj_table_off: u64,
+    /// The component's pool allocator (FSD's free-list `driver_launch::pool_alloc`, or win32k's own
+    /// bump allocator over `WIN32K_POOL_VADDR`). `component_main` builds the DRIVER_OBJECT / ext /
+    /// RegistryPath from THIS pool — win32k's DriverEntry + `SH_POOL_USED` readback need its own pool.
+    pub pool: unsafe fn(u64) -> u64,
 }
 
 /// One dispatched request handed to the component-side `dispatch` callback. For the FSD, `sel` is
@@ -593,15 +764,15 @@ pub(crate) unsafe fn component_main(
     let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
 
     // DRIVER_OBJECT (Type@0=4, Size@2, DriverExtension@spec.ext, MajorFunction@spec.mj).
-    let drv = crate::driver_launch::pool_alloc(spec.size);
+    let drv = (spec.pool)(spec.size);
     let mut i = 0u64;
     while i < spec.size {
         core::ptr::write_unaligned((drv + i) as *mut u64, 0);
         i += 8;
     }
     core::ptr::write_unaligned(drv as *mut i16, 4); // Type = IO_TYPE_DRIVER
-    core::ptr::write_unaligned((drv + 2) as *mut u16, spec.size as u16); // Size
-    let ext = crate::driver_launch::pool_alloc(spec.ext_size);
+    core::ptr::write_unaligned((drv + 2) as *mut u16, spec.size_field); // Size (may differ from alloc)
+    let ext = (spec.pool)(spec.ext_size);
     let mut j = 0u64;
     while j < spec.ext_size {
         core::ptr::write_unaligned((ext + j) as *mut u64, 0);
@@ -610,8 +781,8 @@ pub(crate) unsafe fn component_main(
     core::ptr::write_unaligned((drv + spec.ext) as *mut u64, ext);
 
     // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
-    let reg_path = crate::driver_launch::pool_alloc(0x18);
-    let reg_buf = crate::driver_launch::pool_alloc(0x10);
+    let reg_path = (spec.pool)(0x18);
+    let reg_buf = (spec.pool)(0x10);
     core::ptr::write_unaligned(reg_buf as *mut u16, 0);
     core::ptr::write_unaligned(reg_path as *mut u16, 0);
     core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
@@ -635,7 +806,11 @@ pub(crate) unsafe fn component_main(
     }
     core::ptr::write_volatile((shared_va + SH_VERDICT_H) as *mut u32, v);
     core::ptr::write_volatile((shared_va + SH_DE_STATUS_H) as *mut i32, status);
-    core::ptr::write_volatile((shared_va + SH_MJ_TABLE_H) as *mut u64, mj_base);
+    // Record the MajorFunction[] base ONLY when the spec names a field for it (FSD 0x18). win32k
+    // passes u64::MAX (its 0x18 is SH_SSDT_BASE, populated by DriverEntry — must not be clobbered).
+    if spec.mj_table_off != u64::MAX {
+        core::ptr::write_volatile((shared_va + spec.mj_table_off) as *mut u64, mj_base);
+    }
 
     post_driver_entry(status, drv);
 
@@ -646,8 +821,12 @@ pub(crate) unsafe fn component_main(
         crate::driver_launch::recv_req_on();
         let sel = core::ptr::read_volatile((shared_va + SH_REQ_SEL_H) as *const u64);
         let (st, info) = dispatch(&DispatchReq { sel, drv });
-        core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
+        // Write info FIRST, then status LAST: the FSD has distinct offsets (status@0x70, info@0x78) so
+        // order is irrelevant; win32k's status@0x78 ALIASES info@0x78, so writing info(0) first and
+        // status last means the status is what survives at 0x78 (win32k's closure returns info=0). This
+        // ordering is byte-behaviour-identical for the FSD and correct for the win32k status/info alias.
         core::ptr::write_volatile((shared_va + SH_REQ_INFO_H) as *mut u64, info);
+        core::ptr::write_volatile((shared_va + status_off) as *mut i32, st);
         seq += 1;
         core::ptr::write_volatile((shared_va + SH_REQ_SEQ) as *mut u64, seq);
     }
@@ -659,7 +838,8 @@ pub(crate) unsafe fn component_main(
 const SH_ENTRY_RVA_H: u64 = 0x00;
 const SH_VERDICT_H: u64 = 0x08;
 const SH_DE_STATUS_H: u64 = 0x10;
-const SH_MJ_TABLE_H: u64 = 0x18;
+// (SH_MJ_TABLE is now parameterised per-spec via `DriverObjectSpec::mj_table_off` — FSD 0x18, win32k
+//  MAX/none — since 0x18 is SH_SSDT_BASE in win32k's frame and must not be clobbered.)
 /// The dispatch selector (IRP major @0x40 for the FSD; the caller writes it before the pump). NOTE:
 /// win32k's SSN lives at 0x50, so Step 4 passes a KIND-appropriate selector offset — for the FSD
 /// (Step 2) the selector is `SH_REQ_MAJOR=0x40`.

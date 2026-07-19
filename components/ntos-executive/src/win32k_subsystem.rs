@@ -2657,41 +2657,60 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize) -> Option<u32> {
 /// The win32k host component entry. Reads the DriverEntry RVA from the shared page, builds a
 /// minimal DRIVER_OBJECT + RegistryPath from the pool, calls `DriverEntry`, writes the verdict,
 /// then trips the SENTINEL fault so the executive knows init finished.
+/// win32k's pool allocator exposed as a fn pointer for the shared [`crate::spawn_hosts::component_main`]
+/// DriverEntry preamble (which must build the DRIVER_OBJECT / ext / RegistryPath from win32k's OWN
+/// bump arena over `WIN32K_POOL_VADDR`, so the DriverEntry + `SH_POOL_USED` readback see win32k's pool).
+pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
+    pool_alloc(size)
+}
+
 #[no_mangle]
 #[link_section = ".text.win32k_subsystem_entry"]
 pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
+    // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT
+    // + RegistryPath from win32k's OWN pool, mark V_ENTERED, call DriverEntry, record verdict/status),
+    // the `post_driver_entry` hook, and the persistent send_done→recv_req→dispatch→writeback loop are
+    // all delegated to [`crate::spawn_hosts::component_main`]. win32k's irreducible specifics stay
+    // win32k-side: the SSN router + per-dispatch pre/post work is [`win32k_dispatch`] (the `dispatch`
+    // closure); `establish_client_and_dispatch` + `setup_dispatch_context` are [`win32k_post_driver_entry`]
+    // (both MUST run between DriverEntry and the FIRST send_done — preserved by the harness ordering).
     let entry_rva = read_volatile((WIN32K_SHARED_VADDR + SH_ENTRY_RVA) as *const u64) as u32;
     print_str(b"[win32k-host] START DriverEntry rva=0x");
     print_hex(entry_rva);
     print_str(b"\n");
-
-    // DRIVER_OBJECT (Type@0=4, Size@2=336, DriverExtension@48) + RegistryPath UNICODE_STRING.
-    let drv = pool_alloc(0x200);
-    core::ptr::write_unaligned(drv as *mut i16, 4);
-    core::ptr::write_unaligned((drv + 2) as *mut i16, 336);
-    let ext = pool_alloc(0x40);
-    core::ptr::write_unaligned((drv + 48) as *mut u64, ext);
-    let reg_path = pool_alloc(0x20);
-    // UNICODE_STRING { Length=0, MaximumLength=2, Buffer=<a NUL wchar> }.
-    let reg_buf = pool_alloc(0x10);
-    core::ptr::write_unaligned(reg_path as *mut u16, 0);
-    core::ptr::write_unaligned((reg_path + 2) as *mut u16, 2);
-    core::ptr::write_unaligned((reg_path + 8) as *mut u64, reg_buf);
-
-    // Mark "entered" BEFORE the call so a fault mid-init is still attributable.
+    // Mark "entered" BEFORE component_main calls DriverEntry so a fault mid-init is still attributable.
+    // (component_main also sets V_ENTERED, but win32k's DriverEntry may fault before that write; keep
+    // the early mark to match the old entry's ordering exactly.)
     write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, V_ENTERED);
+    crate::spawn_hosts::component_main(
+        WIN32K_SHARED_VADDR,
+        WIN32K_CODE_VA,
+        // Allocate 0x200 but stamp Size=336 (0x150), exactly as the old bespoke entry; ext ptr @48
+        // (0x30), ext block 0x40; win32k has NO MajorFunction table — mj @0x100 (a zeroed drv slot,
+        // so no spurious V_MJ) and mj_table_off=MAX (do NOT record: 0x18 is win32k's SH_SSDT_BASE).
+        crate::spawn_hosts::DriverObjectSpec {
+            size: 0x200,
+            size_field: 336,
+            ext: 0x30,
+            ext_size: 0x40,
+            mj: 0x100,
+            mj_table_off: u64::MAX,
+            pool: pool_alloc_export,
+        },
+        SH_REQ_STATUS,      // win32k status offset (0x78)
+        W32_DISPATCH_LABEL, // 0x770
+        win32k_dispatch,    // ssn → per-dispatch pre/post + dispatch_ssn
+        win32k_post_driver_entry,
+    )
+}
 
-    let entry = WIN32K_CODE_VA + entry_rva as u64;
-    let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
-    let status = de(drv, reg_path);
-
+/// win32k `post_driver_entry` (runs between DriverEntry and the FIRST `send_done`, exactly as the old
+/// inline entry): emit the DriverEntry-returned diagnostic, record the pool high-water, then
+/// establish the client's per-process win32 context (Phase 2c) and enter the per-dispatch process/
+/// thread context ([`setup_dispatch_context`]) — the same establish→setup ordering the old
+/// `win32k_subsystem_entry` → `dispatch_loop` did before its first sentinel.
+unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
     let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
-    let mut v = v | V_RETURNED;
-    if status == 0 {
-        v |= V_SUCCESS;
-    }
-    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
-    write_volatile((WIN32K_SHARED_VADDR + SH_DE_STATUS) as *mut i32, status);
     let pool_used = read_volatile(WIN32K_POOL_VADDR as *const u64);
     write_volatile((WIN32K_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
     print_str(b"[win32k-host] DriverEntry returned status=0x");
@@ -2704,16 +2723,117 @@ pub unsafe extern "C" fn win32k_subsystem_entry() -> ! {
     // win32k's OWN process-create callout (recorded by PsEstablishWin32Callouts during DriverEntry)
     // so win32k allocates + owns the client's W32PROCESS and calls PsSetProcessWin32Process — then
     // dispatch NtUserProcessConnect (SSN 0x10FA) through the SSDT in this component's context. Any
-    // fault is caught + backtraced by the executive's fault loop before the sentinel below.
+    // fault is caught + backtraced by the executive's fault loop before the first sentinel.
     if status == 0 {
         establish_client_and_dispatch();
     }
+    // Enter the per-dispatch process/thread context (the old `dispatch_loop` ran this ONCE before the
+    // loop; the harness's loop calls win32k_dispatch per request, so seed the context here — before the
+    // FIRST send_done — to preserve the exact ordering).
+    setup_dispatch_context();
+}
 
-    // Enter the persistent dispatch loop (Milestone B): the host does NOT park after attach — it
-    // serves win32k SSN requests forever. The first sentinel below IS the "DriverEntry+attach done"
-    // signal the executive's bring-up loop waits for; thereafter each sentinel means "ready / prior
-    // request done", and the executive fills a request + resume-replies to drive the next handler.
-    dispatch_loop()
+/// The win32k `dispatch` closure plugged into [`crate::spawn_hosts::component_main`]. This is the EXACT
+/// per-request body the retired inline `dispatch_loop` ran (minus the send_done/recv_req/status-writeback,
+/// which the harness owns): the per-dispatch WindowListHead re-empty + BATCH-43 thread↔desktop re-assert,
+/// the SSN_TEST_FAULT self-test, NtUserInitialize event registration + the post-init font/winsta seed,
+/// and the SSDT dispatch via `dispatch_ssn` (which retains the exact-arity wide-arg transmute). Returns
+/// `(status, 0)` — win32k has no IoStatus.Information (its status@0x78 aliases the harness's info@0x78,
+/// so info=0 written first then status is byte-behaviour-correct — see `component_main`).
+unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
+    let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
+    let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
+    let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
+    let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+    // Each client dispatch begins with the dispatch thread owning NO windows. The desktop windows
+    // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
+    // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
+    // would wrongly see those desktop windows as ITS windows and fail "thread has windows",
+    // short-circuiting its `SetThreadDesktop(Winlogon) && SwitchDesktop(Winlogon)` (wlx.c:1077) —
+    // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Re-empty the current
+    // thread's WindowListHead (+0x2d8) each dispatch to restore the authentic invariant (in real
+    // Windows the desktop windows belong to a SEPARATE desktop/RIT thread; the desktop window is
+    // still reachable via pdesk->pDeskInfo->spwnd, not the thread list).
+    {
+        let t = read_volatile(SLOT_W32THREAD as *const u64);
+        let t = if t == 0 { PH_W32THREAD_VA } else { t };
+        let head = t + 0x2d8;
+        write_volatile(head as *mut u64, head);
+        write_volatile((head + 8) as *mut u64, head);
+        // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
+        // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
+        // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent dispatch body runs.
+        //
+        // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
+        // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
+        // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
+        // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
+        // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
+        // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
+        // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
+        // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
+        // re-opens exactly this wall — so we restore both here (idempotent).
+        //
+        // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
+        // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
+        // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
+        // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
+        if BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
+            if BOUND_DESK_BODY != 0 {
+                write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
+                // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
+                // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
+                if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
+                    write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
+                }
+            }
+            write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
+            let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+            if pci != 0 {
+                write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
+            }
+        }
+    }
+    if ssn == SSN_NT_USER_INITIALIZE_REAL {
+        // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
+        // real Event handles winsrv created via NtCreateEvent; win32k's IntInitWin32PowerManagement
+        // references the power event by handle+type. MODEL them as real typed Event objects — a
+        // KEVENT body from the win32k pool + a win32k_ob registration keyed by the handle — so the
+        // subsequent ObReferenceObjectByHandle(handle, *ExEventObjectType) resolves + type-checks a
+        // genuine KEVENT (no fake-EPROCESS masking). Synchronization/non-signalled == winsrv's
+        // NtCreateEvent(SynchronizationEvent, FALSE).
+        register_event_object(a1);
+        register_event_object(a2);
+    }
+    let status = if ssn == SSN_TEST_FAULT {
+        // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
+        // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
+        // page (observability into SH_REQ_A0) and report the sentinel status.
+        let probe = read_volatile(TEST_FAULT_VA as *const u64);
+        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
+        TEST_FAULT_STATUS
+    } else {
+        dispatch_ssn(ssn, a0, a1, a2, a3)
+    };
+    // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). The eager
+    // co_IntInitializeDesktopGraphics scaffold is RETIRED — InitVideo/surface + the paint now run
+    // fully lazily from winlogon's own first GUI DC-op (SwitchDesktop → co_IntShowDesktop → erase →
+    // DceAllocDCE → co_IntGraphicsCheck → co_IntInitializeDesktopGraphics). But two host-side
+    // prerequisites that the lazy init depends on cannot be produced by winlogon itself and must be
+    // seeded here, at the earliest valid point (NtUserInitialize → InitializeGreCSRSS → InitFontSupport
+    // has just run, so FreeType/g_FreeTypeLock exist):
+    //   (1) the system font (arial.ttf memory-font) — else the lazy co_IntInitializeDesktopGraphics's
+    //       font realize null-derefs ("no fonts loaded at all");
+    //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
+    //       hWinSta=0x4, and gpdeskInputDesktop is set) — via a bRedraw=FALSE SwitchDesktop that does
+    //       NOT itself trigger the lazy path, leaving NrGuiAppsRunning==0 for winlogon to drive.
+    if ssn == SSN_NT_USER_INITIALIZE_REAL && status == 0 && !DESKTOP_GFX_SEEDED {
+        DESKTOP_GFX_SEEDED = true;
+        load_system_font();
+        create_winsta_and_desktop();
+    }
+    (status, 0)
 }
 
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
@@ -2947,45 +3067,11 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     ret
 }
 
-/// Signal ready/done to the executive: a PLAIN `seL4_Send` on this component's fault-endpoint cap
-/// ([`crate::CT_FAULT`]) carrying [`W32_DISPATCH_LABEL`]. Fix (A) — the dispatch handshake is
-/// Send/Recv, NOT `seL4_Call`: a Call parks win32k needing the executive's *reply*, which flows
-/// through the kernel's single per-TCB `reply_to` slot. When the executive drives a dispatch while
-/// mid-service of a csrss syscall (nested), `reply_to` names csrss, so the Call-reply targeted the
-/// wrong thread and win32k never ran (the root-caused hang). A plain Send doesn't touch `reply_to`,
-/// so csrss's in-flight reply survives. win32k runs on its own bound scheduling context.
-#[inline(never)]
-unsafe fn send_done() {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_SEND as u64,
-        in("rdi") crate::CT_FAULT,
-        in("rsi") W32_DISPATCH_LABEL << 12, // msginfo: label, length 0 (request via shared page)
-        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// Block for the next dispatch request: a plain `seL4_Recv` on [`crate::CT_FAULT`]. The executive
-/// wakes us with a plain Send (the request payload rides the shared page `SH_REQ_*`, so the message
-/// itself is ignored). No reply cap involved.
-#[inline(never)]
-unsafe fn recv_req() {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_RECV as u64,
-        inout("rdi") crate::CT_FAULT => _,
-        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// The persistent win32k dispatch service loop (fix A, Send/Recv handshake). Each iteration: Send a
-/// ready/done signal (the FIRST one is the "DriverEntry+attach done" signal the bring-up loop waits
-/// for), Recv the next request, then resolve the SSN through the registered SSDT and invoke the
-/// handler in this component's context (GS=KPCR / session heap). Never returns.
+/// The retired inline `send_done`/`recv_req`/`dispatch_loop` (win32k's bespoke Send/Recv handshake +
+/// per-request loop) are now the SHARED harness's implementation (`send_done_on`/`recv_req_on` +
+/// `component_main`'s loop, Phase B Step 4b). win32k's per-dispatch body lives in [`win32k_dispatch`]
+/// and its context seed in [`setup_dispatch_context`] (called from `win32k_post_driver_entry`).
+///
 /// Build the "current process/thread" context win32k's INLINED accessors read during a dispatch —
 /// distinct from the bring-up attach phase (which is happy with a zeroed KPCR: its optional
 /// environment getter early-returns STATUS_NOT_FOUND when `gs:[0x30]==0`). During a routed dispatch,
@@ -3341,111 +3427,9 @@ static mut DESKTOP_GFX_SEEDED: bool = false;
 static mut BOUND_DESK_BODY: u64 = 0;
 static mut BOUND_DESK_PDESKINFO: u64 = 0;
 
-unsafe fn dispatch_loop() -> ! {
-    // Enter the per-dispatch process/thread context (see `setup_dispatch_context`). The bring-up
-    // attach already ran with a zeroed KPCR (its happy path); every dispatch below runs as the
-    // current (csrss) process so win32k's inlined IoGetCurrentProcess/SessionId resolve.
-    setup_dispatch_context();
-    loop {
-        send_done();
-        recv_req();
-        let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
-        let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
-        let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
-        let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
-        let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
-        // Each client dispatch begins with the dispatch thread owning NO windows. The desktop windows
-        // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
-        // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
-        // would wrongly see those desktop windows as ITS windows and fail "thread has windows",
-        // short-circuiting its `SetThreadDesktop(Winlogon) && SwitchDesktop(Winlogon)` (wlx.c:1077) —
-        // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Re-empty the current
-        // thread's WindowListHead (+0x2d8) each dispatch to restore the authentic invariant (in real
-        // Windows the desktop windows belong to a SEPARATE desktop/RIT thread; the desktop window is
-        // still reachable via pdesk->pDeskInfo->spwnd, not the thread list).
-        {
-            let t = read_volatile(SLOT_W32THREAD as *const u64);
-            let t = if t == 0 { PH_W32THREAD_VA } else { t };
-            let head = t + 0x2d8;
-            write_volatile(head as *mut u64, head);
-            write_volatile((head + 8) as *mut u64, head);
-            // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
-            // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
-            // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent dispatch body runs.
-            //
-            // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
-            // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
-            // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
-            // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
-            // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
-            // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
-            // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
-            // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
-            // re-opens exactly this wall — so we restore both here (idempotent).
-            //
-            // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
-            // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
-            // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
-            // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
-            if BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
-                if BOUND_DESK_BODY != 0 {
-                    write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
-                    // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
-                    // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
-                    if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-                        write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
-                    }
-                }
-                write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
-                let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-                if pci != 0 {
-                    write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
-                }
-            }
-        }
-        if ssn == SSN_NT_USER_INITIALIZE_REAL {
-            // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
-            // real Event handles winsrv created via NtCreateEvent; win32k's IntInitWin32PowerManagement
-            // references the power event by handle+type. MODEL them as real typed Event objects — a
-            // KEVENT body from the win32k pool + a win32k_ob registration keyed by the handle — so the
-            // subsequent ObReferenceObjectByHandle(handle, *ExEventObjectType) resolves + type-checks a
-            // genuine KEVENT (no fake-EPROCESS masking). Synchronization/non-signalled == winsrv's
-            // NtCreateEvent(SynchronizationEvent, FALSE).
-            register_event_object(a1);
-            register_event_object(a2);
-        }
-        let status = if ssn == SSN_TEST_FAULT {
-            // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
-            // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
-            // page (observability into SH_REQ_A0) and report the sentinel status.
-            let probe = read_volatile(TEST_FAULT_VA as *const u64);
-            write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
-            TEST_FAULT_STATUS
-        } else {
-            dispatch_ssn(ssn, a0, a1, a2, a3)
-        };
-        // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). The eager
-        // co_IntInitializeDesktopGraphics scaffold is RETIRED — InitVideo/surface + the paint now run
-        // fully lazily from winlogon's own first GUI DC-op (SwitchDesktop → co_IntShowDesktop → erase →
-        // DceAllocDCE → co_IntGraphicsCheck → co_IntInitializeDesktopGraphics). But two host-side
-        // prerequisites that the lazy init depends on cannot be produced by winlogon itself and must be
-        // seeded here, at the earliest valid point (NtUserInitialize → InitializeGreCSRSS → InitFontSupport
-        // has just run, so FreeType/g_FreeTypeLock exist):
-        //   (1) the system font (arial.ttf memory-font) — else the lazy co_IntInitializeDesktopGraphics's
-        //       font realize null-derefs ("no fonts loaded at all");
-        //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
-        //       hWinSta=0x4, and gpdeskInputDesktop is set) — via a bRedraw=FALSE SwitchDesktop that does
-        //       NOT itself trigger the lazy path, leaving NrGuiAppsRunning==0 for winlogon to drive.
-        if ssn == SSN_NT_USER_INITIALIZE_REAL && status == 0 && !DESKTOP_GFX_SEEDED {
-            DESKTOP_GFX_SEEDED = true;
-            load_system_font();
-            create_winsta_and_desktop();
-        }
-        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
-        let seq = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *const u64);
-        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq + 1);
-    }
-}
+// The persistent win32k dispatch loop is now `component_main`'s (Phase B Step 4b); its per-request
+// body + context seed moved to [`win32k_dispatch`] / [`setup_dispatch_context`] (above). BOUND_DESK_*
+// (latched by `create_winsta_and_desktop` / `dispatch_ssn`, re-asserted per dispatch in `win32k_dispatch`).
 
 /// Give the EPROCESS placeholder the fields win32k's process callout asserts, invoke win32k's
 /// process-create callout (WIN32_CALLOUTS[0]) to build the W32PROCESS authentically, then dispatch

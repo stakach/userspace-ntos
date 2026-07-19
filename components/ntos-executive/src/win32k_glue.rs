@@ -399,6 +399,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     if w_fault == 0 {
         return (0xC000_0001u32 as i32, false);
     }
+    // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
     // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
@@ -422,195 +423,39 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         i += 1;
     }
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *mut i32, 0);
-    let code_va = win32k_subsystem::WIN32K_CODE_VA;
-    // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
-    // many pages and trips many checked-build asserts; allow generous headroom (still bounded).
-    const DEMAND_CAP: u64 = 8192;
-    let mut demand = 0u64;
-    let mut skips = 0u64; // int-0x2c asserts skipped (bounded, so a looping assert still walls)
-    // Fix (A): WAKE the parked component with a PLAIN Send (it is blocked in `recv_req`, waiting for
-    // a request). A plain Send does NOT touch the executive's single `reply_to` slot, so a csrss
-    // syscall reply in flight on this same executive thread is preserved (the root-caused nesting
-    // bug). The component reads SH_REQ_* + runs the handler on its own scheduling context.
-    //
-    // Fix (B): the component's demand-page FAULTS are delivered as Calls to `w_fault`; recv them
-    // with REPLY_W32 registered (r12) so the kernel binds win32k to REPLY_W32 (finish_call) INSTEAD
-    // of relying on `reply_to`. We then resume win32k via Send-on-REPLY_W32 (decode_reply). This
-    // leaves REPLY_MAIN's binding to the outer csrss caller intact across win32k faults — removing
-    // the (A) caveat where a nested faulting SSN clobbered `reply_to`. The DONE signal is still a
-    // plain Send (no cap), distinguished by its label. cptr 0 (pre-retype) falls back to reply_to.
+
+    // ── FAULT LOOP (shared): drive win32k's dispatch through the unified `component_pump`, all win32k
+    // capability gates TRUE. Fix (A) [DONE via a plain Send, distinguished by label] + Fix (B) [nested
+    // faults answered through the per-caller REPLY_W32 cap so REPLY_MAIN's binding to the outer csrss
+    // caller survives] + (f) demand-fault client-frame sharing + (g) int-0x2c assert-skip + the
+    // 8192-page demand cap all live in the pump behind these flags — no logic deleted, only relocated.
     let rw = REPLY_W32_SLOT.load(Ordering::Relaxed);
-    ep_send(w_fault, win32k_subsystem::W32_DISPATCH_LABEL);
-    let (_b0, mut mi, mut m0, mut m1, mut m2, mut m3) = if rw != 0 {
-        recv_full_r12(w_fault, rw)
-    } else {
-        ep_recv_full(w_fault)
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: w_fault,
+        pml4: host_pml4,
+        code_va: win32k_subsystem::WIN32K_CODE_VA,
+        image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        shared_va: sh,
+        dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+        // The desktop-graphics init (co_IntInitializeDesktopGraphics) is a deep chain that demand-maps
+        // many pages and trips many checked-build asserts; allow generous headroom (still bounded).
+        demand_cap: 8192,
+        trace_faults: false,
+        wake_first: true, // win32k is parked in `recv_req` → wake it with a leading plain Send
+        reply_cap: rw,
+        client_pi,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Syscall,
+            client_attach: true,
+            usermode_callback: true,
+            wide_arg_marshal: true,
+            assert_skip: true,
+            nested_reply_cap: true,
+        },
     };
-    loop {
-        let label = mi >> 12;
-        if label == 6 {
-            let addr = m1;
-            let in_image =
-                addr >= code_va && addr < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
-            // A foreign CLIENT pointer: the handler dereferenced a csrss/user32/gdi32/winlogon USER
-            // pointer directly. Rather than zero-fill (WRONG data), SHARE the current client's OWN
-            // frame for that page into win32k at the same VA — the authentic model where win32k
-            // dereferences the calling process's user address space. Detection: (a) anything below
-            // 0x100_.. is a client DLL/heap/anon pointer (win32k's own regions are all PML4[2] >=
-            // 0x100_0680_0000); (b) a HIGH client pointer — the hosted-process STACK lives at
-            // STACK_BASE=0x100_105C_0000 (PML4[2], ABOVE win32k's own regions), so an address-range
-            // test alone misses a stack-built OBJECT_ATTRIBUTES; identify it by the per-client frame
-            // table (win32k's OWN demand pages — session/pool/past-image — are never recorded there).
-            let page = addr & !0xFFF;
-            let foreign = addr < 0x0000_0100_0000_0000
-                || (addr >= 0x10000 && !in_image && csrss_frame_get(client_pi, page) != 0);
-            if demand < 60 {
-                print_str(b"[w32disp] fault #");
-                print_u64(demand);
-                print_str(b" ip=0x");
-                print_hex((m0 >> 32) as u32);
-                print_hex(m0 as u32);
-                print_str(b" RVA=0x");
-                print_hex(m0.wrapping_sub(code_va) as u32);
-                print_str(b" addr=0x");
-                print_hex((addr >> 32) as u32);
-                print_hex(addr as u32);
-                if foreign {
-                    print_str(b" (client ptr - sharing csrss frame)");
-                }
-                print_str(b"\n");
-            }
-            // Hard walls: a genuine null/low deref, a W^X write into the RX image, or the demand cap.
-            if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
-                win32k_dispatch_backtrace();
-                return (0xC000_0001u32 as i32, false);
-            }
-            if foreign {
-                // Map the CALLER's (csrss's) own frame for this page into win32k at the identical VA.
-                // False = the page isn't backed by a recorded csrss frame.
-                if !map_csrss_page_into_win32k(page, client_pi, host_pml4) {
-                    // ★ DISCRIMINATE a genuine client user pointer from a win32k-INTERNAL working
-                    // buffer. Every hosted-process user region lives in PML4[2] (>= 0x100_0000_0000:
-                    // PE_LOAD_BASE / NTDLL_BASE / STACK_BASE / SMSS_ALLOC_VA / the executive-issued
-                    // allocations). A fault BELOW that range (PML4[0], e.g. 0x0200_0000) with NO
-                    // recorded client frame is NOT a client pointer at all — it is a bits/surface
-                    // buffer win32k itself materialized (a source SURFOBJ.pvScan0 the GDI blit path
-                    // built) whose VA no host allocator backed. Back it as win32k-own zero memory so
-                    // the blit reads a defined (blank) buffer instead of walling — the correct handling
-                    // for a win32k-internal working page (a stock/DDB bitmap-init blit source during
-                    // gdi32 process-attach). Bounded by DEMAND_CAP. A GENUINE unbacked high client
-                    // pointer (>= PML4[2], no frame) still walls — that would be real garbage.
-                    let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
-                    if win32k_internal_low {
-                        if demand < 60 {
-                            print_str(b"[w32disp] win32k-internal unbacked low VA 0x");
-                            print_hex((page >> 32) as u32);
-                            print_hex(page as u32);
-                            print_str(b" -> zero-fill (blit source buffer)\n");
-                        }
-                        ensure_w32_client_paging(page, host_pml4);
-                        let f = alloc_frame();
-                        let _ = page_map(f, page, RW_NX, host_pml4);
-                    } else {
-                        print_str(b"[w32disp] map_csrss_page_into_win32k FALSE page=0x");
-                        print_hex((page >> 32) as u32);
-                        print_hex(page as u32);
-                        print_str(b" client_pi=");
-                        print_u64(client_pi);
-                        print_str(b"\n");
-                        win32k_dispatch_backtrace();
-                        return (0xC000_0001u32 as i32, false);
-                    }
-                }
-            } else {
-                // A win32k-own demand-pageable page (past the image tail / session arena / the
-                // demand-mapped pool): ensure its page table exists (SYS_SEND page_map can't report a
-                // missing-PT error to drive a retry), then zero-fill.
-                ensure_w32_client_paging(page, host_pml4);
-                let f = alloc_frame();
-                let _ = page_map(f, page, RW_NX, host_pml4);
-            }
-            demand += 1;
-            // Fix (B): resume win32k via its bound reply cap (Send-on-REPLY_W32 -> decode_reply ->
-            // apply_fault_reply for the VMFault, length 0) then recv the next fault/DONE re-binding
-            // REPLY_W32. Falls back to the legacy reply_recv on the single `reply_to` if REPLY_W32
-            // wasn't retyped.
-            let (nmi, nm0, nm1) = if rw != 0 {
-                send_on_reply(rw, 0, 0, 0, 0, 0);
-                let (_b, nmi, nm0, nm1, _, _) = recv_full_r12(w_fault, rw);
-                (nmi, nm0, nm1)
-            } else {
-                let (nmi, nm0, nm1, _, _) = reply_recv_full(w_fault, 0, 0, 0, 0, 0);
-                (nmi, nm0, nm1)
-            };
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            continue;
-        }
-        if label == win32k_subsystem::W32_DISPATCH_LABEL {
-            // The component sent its DONE signal (a plain Send) — handler finished. Read back the
-            // status. The component then loops to `recv_req` (blocked), ready for the next dispatch.
-            let _ = m0;
-            let status = core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_STATUS) as *const i32);
-            return (status, true);
-        }
-        if label == 3 {
-            // UserException — almost always a checked-build `int 0x2c` NT_ASSERT
-            // (DbgRaiseAssertionFailure). Verify the faulting instruction (CD 2C) via the executive's
-            // RW view of win32k's image at the SAME VA, then SKIP it (resume at IP+2), treating the
-            // assert as ignored — like a release build. Our single-threaded lock/thread stubs trip
-            // lock-ownership + context asserts that a real multi-threaded kernel wouldn't; the
-            // underlying operation is fine. m0 = FaultIP.
-            let ip = m0;
-            let in_win32k = ip >= code_va && ip < code_va + win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
-            let is_int2c = in_win32k
-                && core::ptr::read_volatile(ip as *const u8) == 0xCD
-                && core::ptr::read_volatile((ip + 1) as *const u8) == 0x2C;
-            if is_int2c && rw != 0 && skips < 4000 {
-                // BATCH 43: gate the assert-skip diagnostic on a GLOBAL counter (was a per-dispatch local
-                // `skips`, so it re-armed 40 lines every dispatch → hundreds of serial lines). Serial
-                // writes dominate the TCG per-round-trip cost and the boot budget is tight now that
-                // winlogon crosses its win32k class wall; print the first 40 assert-skips TOTAL, then
-                // suppress. The 4000 per-dispatch `skips` bound (a looping assert still walls) is unchanged.
-                if crate::W32_ASSERT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
-                    print_str(b"[w32disp] skip int 0x2c assert @ RVA 0x");
-                    print_hex(ip.wrapping_sub(code_va) as u32);
-                    print_str(b"\n");
-                }
-                skips += 1;
-                send_on_reply(rw, 1, ip + 2, 0, 0, 0); // label 0, len 1, MR0 = resume FaultIP (past CD 2C)
-                let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(w_fault, rw);
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
-            }
-        }
-        // Any other fault (a real wall inside the handler) — fail. Diagnose: label + fault IP/addr
-        // (m0=IP, m1=addr for exceptions; for UnknownSyscall m0=SSN). RVA relative to code / dxg.
-        print_str(b"[w32disp] WALL label=");
-        print_u64(label);
-        print_str(b" m0=0x");
-        print_hex((m0 >> 32) as u32);
-        print_hex(m0 as u32);
-        print_str(b" RVA=0x");
-        print_hex(m0.wrapping_sub(code_va) as u32);
-        print_str(b" dxgRVA=0x");
-        print_hex(m0.wrapping_sub(win32k_subsystem::DXG_VA) as u32);
-        print_str(b" m1=0x");
-        print_hex((m1 >> 32) as u32);
-        print_hex(m1 as u32);
-        // For a UserException (label 3): m2=FLAGS, m3=exception Number (#UD=6, #NM=7, #GP=13, #AC=17).
-        print_str(b" exc#=");
-        print_u64(m3);
-        print_str(b" flags=0x");
-        print_hex(m2 as u32);
-        print_str(b"\n");
-        return (0xC000_0001u32 as i32, false);
-    }
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    (pr.status, pr.completed)
 }
 
 /// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's `(rip, rsp, rax)`.

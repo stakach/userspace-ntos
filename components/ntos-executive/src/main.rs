@@ -8314,6 +8314,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"\n");
     check(b"exec_fsd_on_shared_harness", harness_irp >= 8, &mut passed);
 
+    // --- PROOF win32k GENUINELY runs on the SAME SHARED HARNESS (Phase B Step 4b). `component_pump`
+    // increments `HARNESS_SYSCALL_DISPATCHES` per serviced win32k SSN dispatch (kind=Syscall). By this
+    // point win32k's whole live NtUser/NtGdi bring-up has flowed through it: the DriverEntry+attach
+    // connect, the dispatch-loop round-trip self-test, the SSN_TEST_FAULT nested-reply proof, the
+    // NtUserInitialize/SwitchDesktop desktop-paint chain, and every routed GUI syscall. If win32k were
+    // NOT wired through `component_pump` (its retired bespoke `win32k_dispatch_wide` loop), this counter
+    // would be 0 → this spec FAILS. This is the durable proof "one run-loop for all dispatch servers".
+    let harness_syscall = spawn_hosts::harness_dispatches(spawn_hosts::ReqKind::Syscall);
+    print_str(b"[harness] SSN dispatches serviced through component_pump: ");
+    print_u64(harness_syscall);
+    print_str(b"\n");
+    check(b"exec_win32k_on_shared_harness", harness_syscall >= 4, &mut passed);
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
     print_str(b"/98 executive->isolated-service checks passed]\n");

@@ -855,7 +855,15 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
     crate::spawn_hosts::component_main(
         FSD_SHARED_VADDR,
         FSD_CODE_VA,
-        crate::spawn_hosts::DriverObjectSpec { size: 0x150, ext: 0x68, ext_size: 0x50, mj: 0x70 },
+        crate::spawn_hosts::DriverObjectSpec {
+            size: 0x150,
+            size_field: 0x150,
+            ext: 0x68,
+            ext_size: 0x50,
+            mj: 0x70,
+            mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
+            pool: pool_alloc,
+        },
         SH_REQ_STATUS,      // FSD status offset (0x70)
         FSD_DISPATCH_LABEL, // 0x771
         fsd_dispatch,       // major → MajorFunction[major] → run_irp
