@@ -7547,8 +7547,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         WINLOGON_CSR_CONNECTED.load(Ordering::Relaxed) == 1,
                         &mut passed,
                     );
-                    // The DIRECT cross-badge message plane carried live winlogon↔csrss CSR API traffic
-                    // (NtRequestWaitReplyPort → the CsrpClientConnect message, modeled reply=SUCCESS).
+                    // The REAL CSR message plane carried live winlogon↔csrss CSR API traffic: csrss's
+                    // genuine CsrApiRequestThread (driven by csr_rendezvous, mirroring the SM triad) issued
+                    // NtReplyWaitReceivePort and RECEIVED a live LPC_CONNECTION_REQUEST message off
+                    // \Windows\ApiPort (winlogon's kernel32 CSR client connect). CSR_MSGS counts that real
+                    // received-message event in the rendezvous — proving the CSR message plane is live on the
+                    // real path (the old modeled NtRequestWaitReplyPort arm no longer runs; see BATCH 47).
                     check(
                         b"exec_csr_message_plane",
                         CSR_MSGS.load(Ordering::Relaxed) >= 1,

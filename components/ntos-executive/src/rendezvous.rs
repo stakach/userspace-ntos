@@ -828,6 +828,11 @@ pub(crate) unsafe fn csr_rendezvous(
                     let got = lpc_client().and_then(|c| c.reply_wait_receive(port).ok());
                     match got {
                         Some(r) if r.connection_id != 0 => {
+                            // The REAL CsrApiRequestThread received a live CSR API message off
+                            // \Windows\ApiPort (an LPC_CONNECTION_REQUEST from winlogon's kernel32 CSR
+                            // client). This is genuine winlogon↔csrss CSR message-plane traffic on the
+                            // real path (NtReplyWaitReceivePort returning a real connection) — count it.
+                            CSR_MSGS.fetch_add(1, Ordering::Relaxed);
                             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
                             csr_stack_write(recvmsg + 0x08, CSR_STATIC_CID_PROC); // ClientId.UniqueProcess
                             csr_stack_write(recvmsg + 0x10, CSR_STATIC_CID_THREAD); // ClientId.UniqueThread
