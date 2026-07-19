@@ -5,7 +5,7 @@
 //!
 //! Class relationship: like `npfs.sys` is the first client of the FSD class (`driver_launch`'s
 //! `fsd_component_entry` + shared `DriverExportRegistry`), `win32k.sys` is the first client of the
-//! Subsystem class ([`DriverClass::Subsystem`](crate::driver_launch::DriverClass)). The RESOLUTION
+//! GUI syscall server class ([`DriverClass::GuiSyscallServer`](crate::driver_launch::DriverClass)). The RESOLUTION
 //! MECHANISM is converged — win32k binds its `ntoskrnl.exe` imports into the SAME driver-agnostic
 //! [`DriverExportRegistry`] every hosted `.sys` uses, and the pure byte/string primitives are the
 //! SAME [`crate::ntoskrnl_shared`] impls the FSD class calls. What is NOT generic (and by design

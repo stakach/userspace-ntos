@@ -13,7 +13,9 @@
 //!     + IPC-buf + fault EP + a shared handoff page; NO device caps.
 //!   * [`DriverClass::Device`] — hardware drivers (NIC/AHCI/GPU): the device-cap section is populated
 //!     by `nt-pnp` (MMIO BARs / IRQ / DMA). SEAM ONLY here (out of scope for this increment).
-//!   * [`DriverClass::Subsystem`] — win32k/WDF: explicit subsystem contract (kept bespoke for now).
+//!   * [`DriverClass::Filter`]  — FS/bus filter drivers: the SAME IRP substrate + caps as `Fsd`.
+//!   * [`DriverClass::GuiSyscallServer`] — win32k: a unique privileged class (kept bespoke — its
+//!     Syscall substrate + paint-loop protocol are NOT routed through the IRP builder here).
 //!
 //! The existing bespoke spawners are follow-on migrations onto this path (their descriptor-builders
 //! already exist post effort-1); this increment builds the general path + proves it with npfs.
@@ -82,6 +84,58 @@ pub const FSD_SHARED_VADDR: u64 = 0x0000_0100_0F38_0000;
 /// its own context; the executive copies out-params back to the caller on reply. 4 pages = 16 KiB.
 pub const FSD_ARG_VADDR: u64 = 0x0000_0100_0F3A_0000;
 pub const FSD_ARG_FRAMES: u64 = 4;
+
+// --- PER-INSTANCE executive-side load/comm VAs (multi-driver de-singleton) --------------------
+//
+// The COMPONENT-side VAs above (`FSD_CODE_VA`, `FSD_POOL_VADDR`, … `FSD_ARG_VADDR`) are FIXED: every
+// launched FSD component runs in its OWN isolated VSpace and reuses the same VAs there (the component
+// entry / pool / dispatch loop all reference these fixed values). What MUST differ per instance is the
+// EXECUTIVE-side mapping window — the executive maps every live instance's aliased CODE/DATA/SHARED/
+// ARG frames into its OWN VSpace to (a) load+relocate the PE and (b) marshal IRPs — so two instances
+// cannot both map at `FSD_CODE_VA`. Instance 0 (npfs) keeps the fixed VAs EXACTLY (byte-identical);
+// instance N≥1 gets a distinct executive window at `FSD_EXEC_BASE + (N-1)*FSD_EXEC_STRIDE`, well clear
+// of every other executive mapping (past the 48 MiB file pool at 0x100_1500_0000..0x100_1800_0000).
+//
+// The PE is RELOCATED for its EXECUTION VA (`FSD_CODE_VA`, same across instances) via `load_pe_into`'s
+// `run_va` — decoupled from the executive load VA — so instance N runs correctly at `FSD_CODE_VA` in
+// its own VSpace while the executive loaded its bytes at a distinct window.
+pub const FSD_EXEC_BASE: u64 = 0x0000_0100_1A00_0000;
+pub const FSD_EXEC_STRIDE: u64 = 0x0000_0000_0100_0000; // 16 MiB per instance window
+
+/// The executive-side VA window for launching an instance's frames. Instance 0 == the fixed
+/// (npfs) VAs (behavior-preserving); instance N≥1 == a distinct high window.
+#[derive(Clone, Copy)]
+pub(crate) struct ExecVaWindow {
+    pub code_va: u64,
+    pub data_va: u64,
+    pub shared_va: u64,
+    pub arg_va: u64,
+    pub aux_pt_va: u64,
+}
+
+impl ExecVaWindow {
+    pub fn for_instance(instance: usize) -> ExecVaWindow {
+        if instance == 0 {
+            ExecVaWindow {
+                code_va: FSD_CODE_VA,
+                data_va: FSD_DATA_VADDR,
+                shared_va: FSD_SHARED_VADDR,
+                arg_va: FSD_ARG_VADDR,
+                aux_pt_va: FSD_AUX_PT_VADDR,
+            }
+        } else {
+            let base = FSD_EXEC_BASE + (instance as u64 - 1) * FSD_EXEC_STRIDE;
+            // Same RELATIVE offsets as the fixed layout: aux PT (2 MiB) holds DATA/SHARED/ARG.
+            ExecVaWindow {
+                code_va: base,                  // 256 KiB image window (fits in the first 2 MiB PT)
+                data_va: base + 0x0030_0000,    // DATA (4 frames)
+                shared_va: base + 0x0038_0000,  // SHARED (1 frame)
+                arg_va: base + 0x003A_0000,     // ARG (4 frames)
+                aux_pt_va: base + 0x0020_0000,  // aux PT covering the 2 MiB region holding DATA/SHARED/ARG
+            }
+        }
+    }
+}
 
 // --- shared-page offsets ---------------------------------------------------------------------
 
@@ -1127,22 +1181,56 @@ unsafe fn zero(p: u64, n: u64) {
 }
 
 /// The policy class of a dynamically-launched driver — determines the [`ComponentDescriptor`]'s
-/// device-cap section.
+/// [`HostCaps`], granted caps, and regions (the DECLARATIVE surface: a class → caps/layout map, not
+/// a per-driver branch). See [`caps_and_layout_for`] + `docs/component-harness.md` §5.4.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverClass {
-    /// File-system driver (npfs, fastfat, ntfs) — no device caps.
+    /// File-system driver (npfs, fastfat, ntfs) — the DEFAULT persistent-IRP-server path, no device
+    /// caps. `HostCaps { dispatch_server, kind: Irp }`.
     Fsd,
-    /// Hardware device driver — device caps minted by nt-pnp (SEAM; not built here).
+    /// A generic IRP filter/class driver (FS/bus filter). Same IRP substrate + caps as [`Fsd`]; the
+    /// distinction is policy documentation (IRP forwarding is driver logic, not a harness concern).
+    Filter,
+    /// Hardware device driver — same IRP substrate as [`Fsd`], plus a device-cap section (MMIO BAR
+    /// frames / DMA / IRQ) that `nt-pnp` populates. The device caps/regions are a SEAM (not minted
+    /// here yet); routed through the same `load_driver` Family-A path.
     #[allow(dead_code)]
     Device,
-    /// Subsystem/runtime driver (win32k, WDF). The RESOLUTION MECHANISM is converged (the shared
-    /// [`DriverExportRegistry`] + [`crate::ntoskrnl_shared`] primitives), but the class protocol is
-    /// its own: a large inline demand-fault init loop with paint side-effects, not the FSD IRP
-    /// loop. The first client is win32k — see [`crate::win32k_subsystem`] (component entry
-    /// `win32k_subsystem_entry`); it is spawned via the generic `spawn_component`, so `load_driver`
-    /// keeps a documented seam for it rather than folding the paint-loop protocol in here.
+    /// The GUI syscall server (**win32k ONLY** — a unique privileged class). Its caps
+    /// (`client_attach`/`usermode_callback`/`wide_arg_marshal`/`assert_skip`/`nested_reply_cap`) are
+    /// NEVER set for a normal user driver. win32k keeps its own Syscall substrate + paint-loop
+    /// protocol (migrated onto the shared harness LAST — not routed through `load_driver`'s IRP
+    /// builder). See [`crate::win32k_subsystem`] (`win32k_subsystem_entry`).
     #[allow(dead_code)]
-    Subsystem,
+    GuiSyscallServer,
+}
+
+/// The declarative class→policy map (design §5.4): a class selects [`HostCaps`] + whether device
+/// caps are granted. NO per-driver branch — a new FSD/filter/device driver picks an existing class
+/// and gets the descriptor for free. `(caps, wants_device_caps)`.
+pub(crate) fn caps_and_layout_for(class: DriverClass) -> (HostCaps, bool) {
+    match class {
+        // The default user-driver path: a persistent IRP dispatch server, no device caps.
+        DriverClass::Fsd | DriverClass::Filter => {
+            (HostCaps { dispatch_server: true, kind: ReqKind::Irp, ..HostCaps::default() }, false)
+        }
+        // Same IRP substrate; ONLY the granted-cap/region device section differs (nt-pnp populates it).
+        DriverClass::Device => {
+            (HostCaps { dispatch_server: true, kind: ReqKind::Irp, ..HostCaps::default() }, true)
+        }
+        // win32k's unique privileged class — NOT routed through load_driver's IRP builder.
+        DriverClass::GuiSyscallServer => (HostCaps::default(), false),
+    }
+}
+
+/// A user-specifiable driver to launch by-path: the `.sys` path + its policy [`DriverClass`]. The
+/// boot iterates a static [`DRIVERS`] list, calling [`load_driver`] for each — the "user specifies
+/// drivers to run" surface (registry `\Services` / boot-arg population is a later increment; a static
+/// list proves the reuse). Adding a driver = stage the `.sys` by-path + add ONE `DriverSpec`.
+#[derive(Clone, Copy)]
+pub(crate) struct DriverSpec {
+    pub path: &'static [u8],
+    pub class: DriverClass,
 }
 
 /// A launched, isolated driver component — the caps + VAs the executive keeps to route IRPs to it.
@@ -1161,6 +1249,13 @@ pub(crate) struct DriverComponent {
     pub verdict: u32,
     /// Whether DriverEntry ran to its dispatch loop (parked) vs faulted mid-init.
     pub finished: bool,
+    /// The EXECUTIVE-side SHARED-frame VA for THIS instance (where the executive marshals IRP
+    /// request/reply fields). Instance 0 == [`FSD_SHARED_VADDR`]; N≥1 == a per-instance window.
+    pub exec_shared_va: u64,
+    /// The EXECUTIVE-side ARG-frame VA for THIS instance (buffered-I/O in/out data).
+    pub exec_arg_va: u64,
+    /// This driver's instance index in [`DRIVER_INSTANCES`].
+    pub instance: usize,
 }
 
 /// Copy `n` bytes from `src` to `dst` (both mapped in the executive). HEAP-FREE, byte-wise-safe
@@ -1187,6 +1282,7 @@ unsafe fn copy_bytes(dst: u64, src: u64, n: u64) {
 unsafe fn load_pe_into(
     src_va: u64,
     dst_va: u64,
+    run_va: u64,
     max_frames: u64,
     rights_out: &mut [u64],
     resolve: fn(&str) -> u64,
@@ -1232,8 +1328,11 @@ unsafe fn load_pe_into(
         }
     }
 
-    // DIR64 relocs for the load at dst_va.
-    let delta = dst_va.wrapping_sub(image_base);
+    // DIR64 relocs for the EXECUTION load at run_va (the component's VSpace VA). The bytes are
+    // WRITTEN into dst_va (the executive's per-instance load window, aliased to the same frames), but
+    // the relocated absolute values must target where the code RUNS (run_va), which is fixed across
+    // instances (each in its own VSpace). For instance 0, run_va == dst_va == FSD_CODE_VA.
+    let delta = run_va.wrapping_sub(image_base);
     if delta != 0 {
         let reloc_rva = read_unaligned((opt + 112 + 5 * 8) as *const u32) as u64;
         let reloc_size = read_unaligned((opt + 112 + 5 * 8 + 4) as *const u32) as u64;
@@ -1343,15 +1442,26 @@ unsafe fn load_pe_into(
     Some(entry_rva)
 }
 
-/// The FSD image loaded/mapped rights (W^X), filled by [`load_pe_into`].
-static mut FSD_RIGHTS: [u64; FSD_IMAGE_FRAMES as usize] = [RW_NX; FSD_IMAGE_FRAMES as usize];
+/// The FSD image loaded/mapped rights (W^X), filled by [`load_pe_into`]. ONE array per instance
+/// (a live driver's `Region` holds a `'static` slice, so two coexisting drivers need distinct arrays).
+pub(crate) const MAX_DRIVER_INSTANCES: usize = 4;
+static mut FSD_RIGHTS: [[u64; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES] =
+    [[RW_NX; FSD_IMAGE_FRAMES as usize]; MAX_DRIVER_INSTANCES];
+
+/// Next free instance slot (bump — a driver launched via [`load_driver`] never unloads in this host).
+static DRIVER_NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// GENERAL dynamic driver launch: load the `.sys` at `path` by-path from the FS, IAT-patch it, spawn
 /// it as an ISOLATED component (per its `class`), run its real DriverEntry, and return the live
-/// [`DriverComponent`]. Currently the FSD class is fully built here (npfs is the first client); the
-/// Device class is a documented seam (nt-pnp populates the device caps), and the Subsystem class
-/// (win32k, see [`crate::win32k_subsystem`]) has its own paint-loop protocol driven at the call
-/// site via `spawn_component` — [`DriverClass::Subsystem`] documents why it isn't folded in here.
+/// [`DriverComponent`]. The FSD/Filter/Device classes are all routed through this ONE Family-A IRP
+/// path (`caps_and_layout_for(class)` selects the [`HostCaps`] + whether device caps are granted);
+/// the GUI syscall server ([`DriverClass::GuiSyscallServer`], win32k) keeps its own Syscall substrate
+/// and is NOT routed here — see [`crate::win32k_subsystem`].
+///
+/// MULTI-INSTANCE: each call takes a fresh instance slot; instance 0 uses the fixed npfs executive
+/// VAs (byte-identical), instance N≥1 a distinct executive window ([`ExecVaWindow::for_instance`]).
+/// The live driver state is recorded in [`DRIVER_INSTANCES`] so [`dispatch_irp`] can route to any of
+/// N drivers by instance index. Adding a new IRP driver needs ZERO bespoke code — a `DriverSpec`.
 ///
 /// Fault-contained: the component's DriverEntry faults land on ITS fault EP (this loop demand-maps
 /// benign pages + reports a wall) — a driver crash never brings down the executive root.
@@ -1360,10 +1470,19 @@ pub(crate) unsafe fn load_driver(
     path: &[u8],
     class: DriverClass,
 ) -> Option<DriverComponent> {
-    if class != DriverClass::Fsd {
-        // Device/Subsystem seams: not routed through the general path in this increment.
+    let (caps, _wants_device_caps) = caps_and_layout_for(class);
+    if !caps.dispatch_server {
+        // The GUI syscall server (win32k) is NOT routed through the general IRP path.
         return None;
     }
+
+    // Take a fresh instance slot + its executive-side VA window.
+    let instance = DRIVER_NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed) as usize;
+    if instance >= MAX_DRIVER_INSTANCES {
+        print_str(b"[driver-launch] instance table full\n");
+        return None;
+    }
+    let win = ExecVaWindow::for_instance(instance);
 
     // 1. Load the .sys bytes by-path into the executive's pool.
     let (src_va, src_size) = load_file_to_pool(fs, path)?;
@@ -1371,9 +1490,14 @@ pub(crate) unsafe fn load_driver(
     print_str(path);
     print_str(b" size=");
     print_u64(src_size as u64);
+    print_str(b" instance=");
+    print_u64(instance as u64);
     print_str(b"\n");
 
-    let code_va = FSD_CODE_VA;
+    // The image RUNS at the fixed component VA (FSD_CODE_VA) in its own VSpace; the executive loads
+    // its bytes at the per-instance window (win.code_va) so two instances don't collide executive-side.
+    let code_va = win.code_va;
+    let run_va = FSD_CODE_VA;
     let img_frames = FSD_IMAGE_FRAMES;
 
     // 2. Executive-side frames: CODE (mapped RW to load into) in its own 2 MiB PT, DATA + SHARED +
@@ -1405,23 +1529,24 @@ pub(crate) unsafe fn load_driver(
     }
     let apt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
-    let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, FSD_AUX_PT_VADDR, CAP_INIT_THREAD_VSPACE);
+    let _ = paging_struct_map(apt, LBL_X86_PAGE_TABLE_MAP, win.aux_pt_va, CAP_INIT_THREAD_VSPACE);
     for i in 0..FSD_DATA_FRAMES {
-        let _ = page_map(copy_cap(data_base + i), FSD_DATA_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(copy_cap(data_base + i), win.data_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     }
-    let _ = page_map(copy_cap(shared), FSD_SHARED_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let _ = page_map(copy_cap(shared), win.shared_va, RW_NX, CAP_INIT_THREAD_VSPACE);
     for i in 0..FSD_ARG_FRAMES {
-        let _ = page_map(copy_cap(arg_base + i), FSD_ARG_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(copy_cap(arg_base + i), win.arg_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     }
 
-    // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights).
-    let rights = &mut *core::ptr::addr_of_mut!(FSD_RIGHTS);
-    let entry_rva = load_pe_into(src_va, code_va, img_frames, rights, fsd_export_addr)?;
-    print_str(b"[driver-launch] npfs DriverEntry rva=0x");
+    // 3. Parse + copy + relocate + IAT-patch (HEAP-FREE, records W^X rights). Load bytes into the
+    //    per-instance executive window (code_va) but relocate for the component execution VA (run_va).
+    let rights = &mut (*core::ptr::addr_of_mut!(FSD_RIGHTS))[instance];
+    let entry_rva = load_pe_into(src_va, code_va, run_va, img_frames, rights, fsd_export_addr)?;
+    print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
     print_str(b"\n");
-    write_volatile((FSD_SHARED_VADDR + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
-    write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, 0);
+    write_volatile((win.shared_va + SH_ENTRY_RVA) as *mut u64, entry_rva as u64);
+    write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
 
     // 4. Build the FSD-class descriptor + spawn the isolated component.
     let fault_ep = make_object(OBJ_ENDPOINT);
@@ -1446,13 +1571,14 @@ pub(crate) unsafe fn load_driver(
                 print_str(b" ip=0x");
                 print_hex(ip as u32);
                 print_str(b" RVA=0x");
-                print_hex(ip.wrapping_sub(code_va) as u32);
+                print_hex(ip.wrapping_sub(run_va) as u32);
                 print_str(b" addr=0x");
                 print_hex((addr >> 32) as u32);
                 print_hex(addr as u32);
                 print_str(b"\n");
             }
-            let in_image = addr >= code_va && addr < code_va + img_frames * 0x1000;
+            // Faults report addresses in the COMPONENT's VSpace (image runs at run_va).
+            let in_image = addr >= run_va && addr < run_va + img_frames * 0x1000;
             if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
                 wall_ip = ip;
                 wall_addr = addr;
@@ -1482,10 +1608,10 @@ pub(crate) unsafe fn load_driver(
         }
     }
 
-    let verdict = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
-    let de_status = read_volatile((FSD_SHARED_VADDR + SH_DE_STATUS) as *const i32);
-    let mj_table = read_volatile((FSD_SHARED_VADDR + SH_MJ_TABLE) as *const u64);
-    let devobj = read_volatile((FSD_SHARED_VADDR + SH_DEVOBJ) as *const u64);
+    let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
+    let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
+    let mj_table = read_volatile((win.shared_va + SH_MJ_TABLE) as *const u64);
+    let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     print_str(b"[npfs-svc] DriverEntry ");
     if finished {
         print_str(b"RETURNED status=0x");
@@ -1496,7 +1622,7 @@ pub(crate) unsafe fn load_driver(
         print_str(b" ip=0x");
         print_hex(wall_ip as u32);
         print_str(b" RVA=0x");
-        print_hex(wall_ip.wrapping_sub(code_va) as u32);
+        print_hex(wall_ip.wrapping_sub(run_va) as u32);
         print_str(b" addr=0x");
         print_hex((wall_addr >> 32) as u32);
         print_hex(wall_addr as u32);
@@ -1512,7 +1638,21 @@ pub(crate) unsafe fn load_driver(
     print_hex(devobj as u32);
     print_str(b"\n");
 
-    Some(DriverComponent { pml4, fault_ep, code_va, mj_table, devobj, verdict, finished })
+    let dc = DriverComponent {
+        pml4,
+        fault_ep,
+        code_va: run_va,
+        mj_table,
+        devobj,
+        verdict,
+        finished,
+        exec_shared_va: win.shared_va,
+        exec_arg_va: win.arg_va,
+        instance,
+    };
+    // Record the live instance so `dispatch_irp(instance, ...)` can route to it from anywhere.
+    register_instance(&dc);
+    Some(dc)
 }
 
 /// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED/ARG windows, fault
@@ -1569,62 +1709,143 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The live launched npfs component + the IRP dispatch call.
+// The live launched IRP-driver instance table + the generic IRP dispatch call.
+//
+// De-singletoned (multi-driver): the executive keeps a small table of live [`DriverComponent`]s
+// keyed by instance index. [`dispatch_irp(instance, …)`] routes an IRP to ANY launched driver;
+// `npfs_dispatch_irp` is the instance-0 (npfs) convenience wrapper so the many existing npfs call
+// sites are unchanged. Each instance carries its OWN executive-side SHARED/ARG VAs, fault EP, and
+// PML4 — two drivers coexist with fully isolated windows.
 // ---------------------------------------------------------------------------------------------
 
-static NPFS_FAULT_EP: AtomicU64 = AtomicU64::new(0);
-static NPFS_PML4: AtomicU64 = AtomicU64::new(0);
-static NPFS_MJ_TABLE: AtomicU64 = AtomicU64::new(0);
-static NPFS_DEVOBJ: AtomicU64 = AtomicU64::new(0);
-static NPFS_READY: AtomicU64 = AtomicU64::new(0);
-
-/// Record a launched npfs component so [`npfs_dispatch_irp`] can route IRPs to it from anywhere.
-pub(crate) fn register_npfs(dc: &DriverComponent) {
-    NPFS_FAULT_EP.store(dc.fault_ep, Ordering::Relaxed);
-    NPFS_PML4.store(dc.pml4, Ordering::Relaxed);
-    NPFS_MJ_TABLE.store(dc.mj_table, Ordering::Relaxed);
-    NPFS_DEVOBJ.store(dc.devobj, Ordering::Relaxed);
-    NPFS_READY.store(if dc.finished && dc.devobj != 0 { 1 } else { 0 }, Ordering::Relaxed);
+/// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
+#[derive(Clone, Copy)]
+pub(crate) struct DriverInstance {
+    pub fault_ep: u64,
+    pub pml4: u64,
+    pub mj_table: u64,
+    pub devobj: u64,
+    pub exec_shared_va: u64,
+    pub exec_arg_va: u64,
+    pub ready: bool,
+    pub used: bool,
 }
 
-/// Whether npfs is launched + parked at its dispatch loop (ready to serve IRPs).
+const EMPTY_INSTANCE: DriverInstance = DriverInstance {
+    fault_ep: 0,
+    pml4: 0,
+    mj_table: 0,
+    devobj: 0,
+    exec_shared_va: 0,
+    exec_arg_va: 0,
+    ready: false,
+    used: false,
+};
+
+/// The live-driver instance table (indexed by [`DriverComponent::instance`]).
+static mut DRIVER_INSTANCES: [DriverInstance; MAX_DRIVER_INSTANCES] =
+    [EMPTY_INSTANCE; MAX_DRIVER_INSTANCES];
+
+/// Record a launched driver in [`DRIVER_INSTANCES`] (called by [`load_driver`]). "Ready" iff it
+/// parked at its dispatch loop with a control DEVICE_OBJECT (an FSD; a filter/device without an
+/// IoCreateDevice may still be ready — see [`register_instance_ready`]).
+fn register_instance(dc: &DriverComponent) {
+    // SAFETY: single-threaded executive; the table is written here + read in dispatch_irp.
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
+    if dc.instance < t.len() {
+        t[dc.instance] = DriverInstance {
+            fault_ep: dc.fault_ep,
+            pml4: dc.pml4,
+            mj_table: dc.mj_table,
+            devobj: dc.devobj,
+            exec_shared_va: dc.exec_shared_va,
+            exec_arg_va: dc.exec_arg_va,
+            // Default readiness = npfs's historic rule (parked + a control device object). A
+            // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
+            // is marked ready explicitly by the caller via `register_instance_ready`.
+            ready: dc.finished && dc.devobj != 0,
+            used: true,
+        };
+    }
+}
+
+/// Mark instance `i` ready for IRP dispatch (used when readiness ≠ npfs's "has a devobj" rule, e.g.
+/// a minimal driver that fills MajorFunction[] but creates no control DEVICE_OBJECT).
+pub(crate) fn register_instance_ready(i: usize, ready: bool) {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(DRIVER_INSTANCES) };
+    if i < t.len() && t[i].used {
+        t[i].ready = ready;
+    }
+}
+
+/// The PML4 (VSpace) cap of launched instance `i` (0 = not launched) — for the isolation proof.
+pub(crate) fn instance_pml4(i: usize) -> u64 {
+    instance(i).map(|d| d.pml4).unwrap_or(0)
+}
+
+/// Snapshot of a live instance, or None if `i` isn't launched.
+fn instance(i: usize) -> Option<DriverInstance> {
+    let t = unsafe { &*core::ptr::addr_of!(DRIVER_INSTANCES) };
+    if i < t.len() && t[i].used {
+        Some(t[i])
+    } else {
+        None
+    }
+}
+
+/// Record a launched npfs component (instance 0). Kept for source compatibility — `load_driver`
+/// already registered it in [`DRIVER_INSTANCES`]; this only re-asserts the npfs (instance-0) row.
+pub(crate) fn register_npfs(dc: &DriverComponent) {
+    register_instance(dc);
+}
+
+/// Whether npfs (instance 0) is launched + parked at its dispatch loop (ready to serve IRPs).
 pub(crate) fn npfs_ready() -> bool {
-    NPFS_READY.load(Ordering::Relaxed) != 0
+    instance(0).map(|d| d.ready).unwrap_or(false)
 }
 
 /// The recorded \Device\NamedPipe DEVICE_OBJECT (0 = not launched).
 pub(crate) fn npfs_devobj() -> u64 {
-    NPFS_DEVOBJ.load(Ordering::Relaxed)
+    instance(0).map(|d| d.devobj).unwrap_or(0)
 }
 
-/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP — a non-zero value
-/// proves the create/open produced a real CCB-backed FILE_OBJECT (0 = failed / not a pipe).
+/// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP to instance 0.
 pub(crate) unsafe fn npfs_last_file_id() -> u64 {
-    read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64)
+    let sh = instance(0).map(|d| d.exec_shared_va).unwrap_or(FSD_SHARED_VADDR);
+    read_volatile((sh + SH_REQ_FILEID) as *const u64)
 }
 
-/// Route one IRP to the isolated npfs component: fill the shared request fields, drive its dispatch
-/// loop (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP
-/// lands on its fault EP → demand-map + resume), then read back the completion. Returns
-/// `(status, information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the ARG frame (buffered
-/// I/O); `out` receives the driver's output.
+/// The opaque FILE_OBJECT id from the LAST dispatched IRP to `instance`.
+pub(crate) unsafe fn last_file_id(inst: usize) -> u64 {
+    let Some(d) = instance(inst) else { return 0 };
+    read_volatile((d.exec_shared_va + SH_REQ_FILEID) as *const u64)
+}
+
+/// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop
+/// (a plain Send wakes it; it runs `MajorFunction[major]` in its own context; a fault mid-IRP lands
+/// on its fault EP → demand-map + resume), then read back the completion. Returns `(status,
+/// information)`. `major` is an `IRP_MJ_*`; `in_data` is copied into the instance's ARG frame
+/// (buffered I/O); `out` receives the driver's output. Returns `None` if `inst` isn't ready.
 ///
-/// Returns `None` if npfs isn't ready (the caller falls back to the modeled path).
-pub(crate) unsafe fn npfs_dispatch_irp(
+/// This is the SHARED multi-driver dispatch engine — no per-driver code. `npfs_dispatch_irp` is the
+/// instance-0 wrapper.
+pub(crate) unsafe fn dispatch_irp(
+    inst: usize,
     major: u64,
     fsctl: u64,
     file_id: u64,
     in_data: &[u8],
     out: &mut [u8],
 ) -> Option<(i32, u64)> {
-    if !npfs_ready() {
+    let d = instance(inst)?;
+    if !d.ready {
         return None;
     }
-    let ep = NPFS_FAULT_EP.load(Ordering::Relaxed);
-    let pml4 = NPFS_PML4.load(Ordering::Relaxed);
-    let sh = FSD_SHARED_VADDR;
-    // buffered I/O: copy input into the ARG frame (mapped RW in both AS).
-    let arg = FSD_ARG_VADDR;
+    let ep = d.fault_ep;
+    let pml4 = d.pml4;
+    let sh = d.exec_shared_va;
+    // buffered I/O: copy input into the instance's ARG frame (mapped RW in both AS).
+    let arg = d.exec_arg_va;
     let inlen = in_data.len().min((FSD_ARG_FRAMES * 0x1000) as usize);
     for i in 0..inlen {
         write_volatile((arg + i as u64) as *mut u8, in_data[i]);
@@ -1663,7 +1884,9 @@ pub(crate) unsafe fn npfs_dispatch_irp(
                 _m3 = nm3;
                 continue;
             }
-            print_str(b"[npfs-svc] IRP fault wall addr=0x");
+            print_str(b"[fsd-svc] IRP fault wall inst=");
+            print_u64(inst as u64);
+            print_str(b" addr=0x");
             print_hex(addr as u32);
             print_str(b"\n");
             return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
@@ -1680,4 +1903,16 @@ pub(crate) unsafe fn npfs_dispatch_irp(
         out[i] = read_volatile((arg + i as u64) as *const u8);
     }
     Some((st, info))
+}
+
+/// Route one IRP to the isolated npfs component (instance 0). Thin wrapper over [`dispatch_irp`]
+/// so the many existing npfs call sites are unchanged. Returns `None` if npfs isn't ready.
+pub(crate) unsafe fn npfs_dispatch_irp(
+    major: u64,
+    fsctl: u64,
+    file_id: u64,
+    in_data: &[u8],
+    out: &mut [u8],
+) -> Option<(i32, u64)> {
+    dispatch_irp(0, major, fsctl, file_id, in_data, out)
 }

@@ -15,13 +15,13 @@ Four components, but TWO families — not four variants of one:
 
 The launcher (`spawn_component`/`ComponentDescriptor`) is ALREADY shared. This work unifies the RUN loop.
 
-## Step 0 — ABI scaffolding, wired to nothing (pure additive)
-- [ ] Add `HostCaps` + `ReqKind` + `SH_REQ_KIND`(verify 0x38 free in both frames) to a shared const block.
-- [ ] Add `caps: HostCaps` field to `ComponentDescriptor` (`spawn_hosts.rs:88`); `HostCaps::default()` at
+## Step 0 — ABI scaffolding, wired to nothing (pure additive)  — DONE (commit a9b36d3)
+- [x] Add `HostCaps` + `ReqKind` + `SH_REQ_KIND`(verify 0x38 free in both frames) to a shared const block.
+- [x] Add `caps: HostCaps` field to `ComponentDescriptor` (`spawn_hosts.rs:88`); `HostCaps::default()` at
       all 6 descriptor sites (2 in `spawn_hosts.rs`, driver-host + kmdf inlined in `main.rs:6618/6708`,
       fsd `driver_launch.rs`, win32k builder).
-- [ ] Define `component_pump`, `component_main`, `run_once` — CALLED FROM NOWHERE yet.
-- [ ] VERIFY: gate 180/98 (byte-identical; no call sites touched).
+- [x] Define `component_pump`, `component_main`, `run_once` — CALLED FROM NOWHERE yet.
+- [x] VERIFY: gate 180/98 (byte-identical; no call sites touched).
 
 ## Step 1 — FSD executive pump → `component_pump`
 - [ ] Re-express `npfs_dispatch_irp` inner loop (`driver_launch.rs:1584-1654`) as a `component_pump`
@@ -58,32 +58,39 @@ The launcher (`spawn_component`/`ComponentDescriptor`) is ALREADY shared. This w
       `[w32disp]`/`[w32attach]` lines vs a pre-migration reference boot (byte-identical dispatch).
 - [ ] Rollback 4a/4b independently if any regression.
 
-## Step 4.5 — REUSABLE substrate for user-specified drivers (do AFTER Step 2; around/independent of Step 4)
+## Step 4.5 — REUSABLE substrate for user-specified drivers  — DONE (gate 181/98, clean qemu_exit)
 Requirement: users can specify drivers to run by-path; adding a driver = stage the .sys + declare a
 class → runs on the SAME harness with ZERO bespoke code. Design: `docs/component-harness.md` §5.
 Family-A IRP dispatch server is the DEFAULT driver path (Family B = test-lifecycle fixtures only).
-- [ ] G1: make `load_driver(fs,path,class)` (`driver_launch.rs:1330`) route `Fsd` AND `Device`/`Filter`
-      through the SAME `component_main`/`component_pump` (`:1335-1338` currently returns None for
-      non-Fsd). Class only changes caps/regions.
-- [ ] Add `caps_and_layout_for(class) -> (HostCaps, GrantedCapsPolicy, &[Region])` — the ONLY per-class
-      code; no per-driver branch. Rename `DriverClass::Subsystem` → `GuiSyscallServer` (win32k-only,
-      unique privileged class; its caps NEVER set for a normal user driver). Add `Filter`.
-- [ ] G2 (core enabler): de-singleton the FSD path so N IRP drivers coexist. Parameterise per-instance
-      VA windows (currently fixed `FSD_CODE_VA:54`, `FSD_POOL/DATA/SHARED/ARG/STACK_VADDR`), replace the
-      single `FSD_RIGHTS:1319` / `FSD_EXPORTS:668` / `NPFS_PML4/FAULT_EP/MJ_TABLE/DEVOBJ:1546-1550`
-      atomics with a small `[DriverComponent; N]` instance table; `npfs_dispatch_irp` → `dispatch_irp(instance,…)`.
-- [ ] G3: add a declarative `DRIVERS: &[DriverSpec{path,class}]` list the boot iterates (currently ONE
-      hardcoded call site `main.rs:7165`). This is the "user specifies drivers" surface (registry
-      `\Services` / boot-arg population is a later increment; static list proves reuse).
-- [ ] Stage a 2nd synthetic IRP driver by path (add to `rust-micro/scripts/make_image.sh:159` loop like
-      the fixtures) that registers `IRP_MJ_CREATE`/`IRP_MJ_DEVICE_CONTROL`.
-- [ ] PROVE reuse: new spec `exec_second_irp_driver_via_harness` — the 2nd driver loads via
-      `load_driver(path, Fsd)` + a `DriverSpec` ONLY (zero bespoke executive code), enters DriverEntry,
-      builds its MajorFunction table in its OWN isolated VSpace (PML4 != npfs), and round-trips one IRP
-      through `component_pump`. Exercises G1+G2+G3.
-- [ ] G4 (note, not a code change): a new driver importing an unbound ntoskrnl API fails soft + audits
-      (`fsd_export_addr:745-774`) — implement the missing export per the standing backlog; expected, not a hang.
-- [ ] VERIFY: full gate stays 180/98 + the new spec passes; win32k-last order UNCHANGED.
+NOTE: Steps 1/2 landed the `component_main`/`component_pump` scaffolding but left them UNWIRED (the FSD
+still runs its bespoke `fsd_component_entry`/`dispatch_loop` + inline executive pump). Step 4.5 kept that
+proven bespoke path and made it MULTI-INSTANCE — the substrate is now genuinely multi-driver regardless.
+- [x] G1: `load_driver(fs,path,class)` routes `Fsd`/`Filter`/`Device` through the SAME IRP path (was
+      `if class != Fsd { return None }`); gated by `caps_and_layout_for(class).dispatch_server` so only
+      the GUI syscall server (win32k) is rejected. Class selects caps/policy, no per-driver branch.
+- [x] Added `caps_and_layout_for(class) -> (HostCaps, wants_device_caps)` — the ONLY per-class code.
+      Renamed `DriverClass::Subsystem` → `GuiSyscallServer` (win32k-only privileged class). Added `Filter`.
+- [x] G2 (core enabler): de-singletoned the FSD path. Per-instance EXECUTIVE-side VA windows
+      (`ExecVaWindow::for_instance`; instance 0 = fixed npfs VAs byte-identical, N≥1 = distinct high
+      window at `FSD_EXEC_BASE`; PE relocated for the fixed component run VA via `load_pe_into`'s new
+      `run_va`). `FSD_RIGHTS` → per-instance array. Replaced the `NPFS_*` atomics with a
+      `[DriverInstance; MAX_DRIVER_INSTANCES]` table; `npfs_dispatch_irp` → thin wrapper over
+      `dispatch_irp(instance, …)`.
+- [x] G3: declarative `DRIVERS: &[DriverSpec{path,class}]` the boot iterates (npfs's rich data-plane
+      specs stay inline; the list carries the 2nd driver). "User specifies drivers" surface.
+- [x] Staged a 2nd GENUINE IRP driver by path: `IrpFsdTest.sys` (real PE, DriverEntry fills
+      `MajorFunction[CREATE/READ/WRITE/DEVICE_CONTROL]`, handler sets STATUS_SUCCESS + Information=0x5A5A),
+      emitted by `nt-driver-test-fixtures::irp_fsd_pe()`, staged via `make_image.sh` loop like the fixtures.
+- [x] PROVED reuse: `exec_second_irp_driver_via_harness` — loads via `load_driver(path, Fsd)` + a
+      `DriverSpec` ONLY (zero bespoke code): DriverEntry entered, MJ table built, OWN isolated PML4
+      (distinct from npfs's + the executive's), IRP_MJ_CREATE round-trips status=0/info=0x5A5A through the
+      shared `dispatch_irp` pump. Instance=1 confirmed in the boot log.
+- [x] G4: unbound-import audit already in place (`fsd_export_addr` fails soft + logs) — the synthetic
+      driver imports nothing, so no new exports needed.
+- [x] VERIFY: gate 181/98 (180 + the new proof spec), ZERO FAILs, clean qemu_exit (RUNEXIT=3 sentinel).
+      Canaries PASS: `exec_win32k_desktop_painted` 768/768, `npfs_isolated_vspace`,
+      `exec_pipe_syscalls_routed_through_npfs`, `exec_npfs_flush_pending`, `exec_svc_rpc_listener_multiplex`.
+      win32k dispatch path UNTOUCHED (only a 2-char doc-comment rename in win32k_subsystem.rs).
 
 ## Step 5 — retire duplicated bespoke loops
 - [ ] Delete the now-dead inner loops (one commit each, guarded). Tail of Phase B.

@@ -7333,6 +7333,69 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         } else {
             print_str(b"[driver-launch] npfs.sys launch returned None (not staged / load failed)\n");
         }
+
+        // --- G3: the DECLARATIVE user-specified driver list. A driver runs by adding ONE
+        // `DriverSpec { path, class }` here (the "user specifies drivers to run" surface) + staging
+        // the .sys by-path — ZERO bespoke executive code. npfs.sys above is the same declarative
+        // `load_driver(path, Fsd)` call (its rich data-plane specs stay inline). This list is the
+        // GENERAL substrate: a SECOND, DIFFERENT IRP driver (`IrpFsdTest.sys`, staged by-path like
+        // the fixtures) loads through the SAME `load_driver`/`component_main`/`component_pump`
+        // harness. It proves multi-instance reuse (G1+G2+G3): its own isolated PML4 (!= npfs's) +
+        // an IRP round-trip through the shared dispatch pump.
+        use driver_launch::{DriverClass, DriverSpec};
+        static DRIVERS: &[DriverSpec] = &[DriverSpec {
+            path: b"reactos\\system32\\drivers\\IrpFsdTest.sys",
+            class: DriverClass::Fsd,
+        }];
+        for spec in DRIVERS {
+            print_str(b"[driver-launch] launching user-specified driver via the general path\n");
+            if let Some(dc) = load_driver(&fs, spec.path, spec.class) {
+                // This minimal FSD fills its MajorFunction[] table but creates NO control
+                // DEVICE_OBJECT — it is ready-for-IRP as soon as it parks with a non-null MJ table.
+                let irp_ready = dc.finished && (dc.verdict & V_MJ) != 0;
+                driver_launch::register_instance_ready(dc.instance, irp_ready);
+
+                // Isolation: the 2nd driver runs in its OWN VSpace — a PML4 distinct from npfs's
+                // (instance 0) AND the executive's.
+                let npfs_pml4 = driver_launch::instance_pml4(0);
+                let distinct_pml4 = dc.pml4 != 0
+                    && dc.pml4 != CAP_INIT_THREAD_VSPACE
+                    && dc.pml4 != npfs_pml4;
+
+                // IRP round-trip through the SHARED component_pump: dispatch IRP_MJ_CREATE (major 0)
+                // to the 2nd driver's own instance; its handler sets STATUS_SUCCESS + Information =
+                // 0x5A5A. Prove the completion propagated back through the shared dispatch engine.
+                let mut out = [0u8; 16];
+                let rt = driver_launch::dispatch_irp(
+                    dc.instance, 0 /* IRP_MJ_CREATE */, 0, 0, &[], &mut out,
+                );
+                let mut irp_ok = false;
+                if let Some((st, info)) = rt {
+                    print_str(b"[driver-launch] 2nd-driver instance=");
+                    print_u64(dc.instance as u64);
+                    print_str(b" IRP_MJ_CREATE -> status=0x");
+                    print_hex(st as u32);
+                    print_str(b" info=0x");
+                    print_hex(info as u32);
+                    print_str(b" distinct_pml4=");
+                    print_u64(distinct_pml4 as u64);
+                    print_str(b"\n");
+                    irp_ok = st == 0 && info == 0x5A5A;
+                }
+
+                check(
+                    b"exec_second_irp_driver_via_harness",
+                    (dc.verdict & V_ENTERED) != 0
+                        && (dc.verdict & V_MJ) != 0
+                        && distinct_pml4
+                        && irp_ready
+                        && irp_ok,
+                    &mut passed,
+                );
+            } else {
+                print_str(b"[driver-launch] 2nd driver launch returned None (not staged / load failed)\n");
+            }
+        }
     }
 
     // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)

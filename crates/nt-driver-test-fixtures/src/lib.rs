@@ -175,6 +175,61 @@ pub fn pe_importing(dll: &str, funcs: &[&str]) -> Vec<u8> {
     )
 }
 
+/// Build a minimal but GENUINE IRP dispatch-server FSD `.sys` (x86_64 PE32+).
+///
+/// Its real `DriverEntry(DriverObject, RegistryPath)` writes a handler VA into
+/// `DriverObject->MajorFunction[]` for IRP_MJ_CREATE(0) / READ(3) / WRITE(4) /
+/// DEVICE_CONTROL(0xe), then returns `STATUS_SUCCESS`. The handler
+/// `(DeviceObject, Irp)` sets `Irp->IoStatus.Status = STATUS_SUCCESS` and
+/// `Irp->IoStatus.Information = 0x5A5A` (a sentinel the executive asserts on the
+/// IRP round-trip), then returns success. NO ntoskrnl imports — it exercises the
+/// GENERAL harness (by-path load + PE reloc + DriverEntry preamble + MajorFunction
+/// routing + demand-map IRP pump) with ZERO bespoke executive code, proving the
+/// `load_driver` substrate is a genuine multi-driver by-path loader.
+///
+/// The layout matches the executive host's x64 DRIVER_OBJECT (MajorFunction @0x70)
+/// and IRP (IoStatus @0x30) offsets. Entry (`DriverEntry`) is at RVA 0x1000.
+pub fn irp_fsd_pe() -> Vec<u8> {
+    // MajorFunction[] is at DRIVER_OBJECT+0x70; MajorFunction[i] = +0x70 + i*8.
+    const MJ: u32 = 0x70;
+    let mj = |i: u32| MJ + i * 8;
+
+    // Assemble .text: DriverEntry then handler. Compute the RIP-relative disp to `handler`
+    // from the LEA (disp is relative to the byte AFTER the 7-byte LEA).
+    let mut de: Vec<u8> = Vec::new();
+    // lea rax, [rip + disp32]   (48 8D 05 <disp32>) — patch disp32 after we know handler offset.
+    de.extend_from_slice(&[0x48, 0x8D, 0x05, 0, 0, 0, 0]);
+    let lea_end = de.len(); // disp is relative to here
+    // mov [rcx + mj(i)], rax   (48 89 81 <disp32>) for CREATE/READ/WRITE/DEVICE_CONTROL.
+    for &i in &[0u32, 3, 4, 0xe] {
+        de.extend_from_slice(&[0x48, 0x89, 0x81]);
+        de.extend_from_slice(&mj(i).to_le_bytes());
+    }
+    de.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax  (STATUS_SUCCESS)
+    de.extend_from_slice(&[0xC3]); // ret
+
+    let handler_off = de.len();
+    // handler(rcx=DeviceObject, rdx=Irp) -> eax
+    // mov dword [rdx+0x30], 0            (C7 42 30 00 00 00 00)   IoStatus.Status = STATUS_SUCCESS
+    de.extend_from_slice(&[0xC7, 0x42, 0x30, 0x00, 0x00, 0x00, 0x00]);
+    // mov qword [rdx+0x38], 0x5A5A       (48 C7 42 38 5A 5A 00 00) IoStatus.Information = sentinel
+    de.extend_from_slice(&[0x48, 0xC7, 0x42, 0x38, 0x5A, 0x5A, 0x00, 0x00]);
+    de.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    de.extend_from_slice(&[0xC3]); // ret
+
+    // Patch the LEA disp32 = handler_off - lea_end.
+    let disp = (handler_off as i32 - lea_end as i32) as u32;
+    de[3..7].copy_from_slice(&disp.to_le_bytes());
+
+    build_pe(
+        DEFAULT_IMAGE_BASE,
+        0x1000,
+        0x2000,
+        &[text_section(0x1000, de)],
+        &[],
+    )
+}
+
 /// The real MSVC-built `AsyncTest.sys` WDM driver (async DPC/timer/work-item IRP
 /// completion), built by <https://github.com/stakach/ntdriver>. Used by the
 /// `driver-host-async` component + Milestone 10 integration.
