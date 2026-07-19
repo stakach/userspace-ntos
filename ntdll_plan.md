@@ -3039,6 +3039,52 @@ invoking `SASWindowProc` via the `KeUserModeCallback` WINDOWPROC bridge — so `
 dispatch). Wiring `NtUserDispatchMessage`'s window-proc callback for the retrieved SAS message is the next
 step toward the actual logon dialog. The message-queue carry (this batch's goal) is DONE.
 
+### B-FRONTIER RE-DIAGNOSED (2026-07-20) — the SAS dispatch is CLIENT-SIDE, NOT KeUserModeCallback
+
+Investigated the "wire `NtUserDispatchMessage` → `KeUserModeCallback` WINDOWPROC" hypothesis with live
+tracing (executive-only diagnostics, since reverted; tree clean at 36a9371). **The premise was wrong:
+ReactOS's same-thread normal-window `DispatchMessageW` does NOT go through the kernel at all.**
+
+**Live evidence (diagnostic boot, MSG dumps):**
+- `GetMessageW` (SSN 0x1006, pi 2) DID retrieve WLX_WM_SAS correctly: it wrote `MSG{hwnd=0x2002e (the SAS
+  window), message=0x659 (WLX_WM_SAS)}` to winlogon's `&Msg` at VA `0x105c3e50` (win32k's real
+  `co_IntGetPeekMessage` + the cross-AS write-back landed). ret=1.
+- The `NtUserDispatchMessage` (SSN 0x1002) we observed reads a DIFFERENT, **all-zero** MSG at VA
+  `0x077e1bb0` — so it is NOT winlogon's `DispatchMessageW(&Msg=0x105c3e50)`; it is an unrelated/internal
+  dispatch. There is **NO `KeUserModeCallback api=0` for WLX_WM_SAS** after the message loop (the only
+  api=0 callbacks are the WM_NCCREATE/WM_CREATE/… window-creation ones).
+
+**Root cause (source-confirmed, `references/reactos/win32ss/user/user32/windows/message.c:1990`):**
+`DispatchMessageW(&Msg)` for a **normal, same-thread, non-WM_PAINT window** calls
+`IntCallMessageProc(Wnd, …)` → `Wnd->lpfnWndProc` (= `SASWindowProc`) **entirely CLIENT-SIDE in winlogon
+user mode — no syscall, no KeUserModeCallback.** It only falls back to `NtUserDispatchMessage` for
+server-side (`WNDS_SERVERSIDEWINDOWPROC`) windows or WM_PAINT. So the KeUserModeCallback bridge is NOT on
+this path; wiring it would not run `SASWindowProc`.
+
+`IntCallMessageProc` requires the CLIENT-SIDE window object: `Wnd = ValidateHwnd(0x2002e)` →
+`GetUser32Handle` indexes `gHandleEntries[7]` (in win32k's `gHandleTable->handles`, live-shared RO into
+winlogon via `map_win32k_heap_into_csrss`, pi-keyed) then `DesktopPtrToUser(pEntry->ptr)` maps the SAS
+window's **PWND out of win32k's DESKTOP HEAP into winlogon's client desktop-heap view**, and derefs
+`Wnd->head.pti` / `Wnd->pcls` / `Wnd->lpfnWndProc`. **Our host does NOT map the real desktop heap into a
+client** — `img_spawn.rs:434` gives each GUI client only a *placeholder* DESKTOPINFO with a single zeroed
+WND at `SMSS_DESKINFO_VA+0x800` (enough for `GetThreadDesktopWnd`, not for a real window). So
+`ValidateHwnd(0x2002e)`/`DesktopPtrToUser` cannot resolve the SAS PWND client-side → `DispatchMessageW`
+returns 0 at message.c:2005 → `SASWindowProc` (hence `DispatchSAS`) never runs. This is entirely
+client-side (invisible in the syscall trace — matching "no msgina SSNs").
+
+**THE REAL NEXT BATCH (a win32k desktop-heap task, NOT a KeUserModeCallback/ntdll task):** map win32k's
+DESKTOP HEAP (where the SAS `PWND` + its `CLS`/`lpfnWndProc` live) into winlogon's client VSpace at the
+`DesktopPtrToUser` delta (set `CLIENTINFO.ulClientDelta` / DESKTOPINFO base+limit accordingly), and ensure
+`gHandleEntries[7]` (type=TYPE_WINDOW, ptr=PWND, generation=2) + `PWND.head.pti == GetW32ThreadInfo()`
+resolve for winlogon. Then `DispatchMessageW(WLX_WM_SAS)` runs `SASWindowProc → DispatchSAS`. NB:
+`Session->LogonState == STATE_INIT` at first SAS, so `DispatchSAS(CTRL_ALT_DEL)` calls
+**`WlxDisplaySASNotice`** (the "Press Ctrl+Alt+Del" notice), NOT `WlxLoggedOutSAS` (that is the
+STATE_LOGGED_OFF branch, `sas.c:1338-1355`). msgina is already loaded (its `GetRegistrySettings`/
+`WlxInitialize` are serviced). **RISK:** `WlxDisplaySASNotice` creates a dialog (more DLL loads + a nested
+window + a modal pump) → a fresh cascade of walls that will likely NOT quiesce at a clean 185 without
+several more batches; this is a multi-batch subsystem, not a one-shot. Deferred as the next desktop-UI
+batch. Boot left GREEN at the message-loop park (184/98) — the proven, quiescent steady state.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface
