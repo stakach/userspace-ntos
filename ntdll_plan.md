@@ -2903,6 +2903,140 @@ Gate **175/98**, clean qemu_exit (RUNEXIT=3, sentinel matched). 5 processes spaw
 
 ---
 
+## Step 5 — ntdll completion (frontier-prioritized) (recon 2026-07-19)
+
+Recon pass after BATCH 47 (gate 180/98, HEAD 66071f2). This is the **systematic-completion**
+step: the pivot's boot-driving grind is done (5 real processes + live SCM MSRPC + real x64 SEH +
+authentic desktop paint, all on our Rust ntdll). What remains for ntdll parity is measured below.
+
+### A — completeness map (real vs placeholder vs missing)
+
+**Method:** `#[export_name = "…"]` enumeration across `crates/nt-ntdll-dll/src/{exports.rs,
+security_exports.rs,on_target.rs}` (macro-inclusive: `heap_noop_bool!`/`etw_ok!`/`dbgui_noop!`/
+`zw_alias!`) + the `trap_stubs.rs` Nt\* generator, cross-referenced against
+`references/reactos/dll/ntdll/def/ntdll.spec` (716 Rtl names) and the `/tmp/ntdll_required_surface.txt`
+hosted-import surface (Step 1: 545 exports imported by the real ReactOS set, 244 of them Rtl\*).
+
+**Totals (377 classified exports):**
+
+| bucket | count | notes |
+|---|---|---|
+| **Nt\*** trap stubs | **189** | required 188, ALL covered (one extra). Mechanical `mov r10,rcx; mov eax,ssn; syscall; ret` — real semantics live executive-side in `ExecNtHandler`. NOT the completion target. |
+| **Rtl\*** exported | **276** | of the 244 Rtl imported by the hosted set, **243 present, 1 missing** (`RtlDeleteResource`). Of 716 spec-Rtl, 441 long-tail unexported (none imported by the current set). |
+| **Ldr\*** | 21 | loader; mostly real (a few thread-callout/alt-resource no-ops that are legit). |
+| **Csr\*** | 8 | CSR client; 2 NOT_IMPL stubs (`CsrClientCallServer`, `CsrGetProcessId` — the real path is csrss's `CsrApiRequestThread`, not the ntdll client). |
+| **Dbg\*** (+7 DbgUi) | 12 | serial-forward + no-op-legit. |
+| **Etw\*** | 31 | ALL no-op (`etw_ok!` → STATUS_SUCCESS) — legit; nothing consumes trace output. |
+| **Zw\*** | 12 | aliases of the Nt\* stubs (`zw_alias!`). |
+| **CRT / other** | 65 | `mem*/str*/wcs*/sprintf/qsort/math` + 3 data exports — **ALL present** (+ `__chkstk`, `KiUserExceptionDispatcher`, `VerSetConditionMask`). |
+
+**Real / placeholder split of the 377:** ~**330 REAL** (43 forward to a `rtl/*.rs` body + 287 real
+inline) · ~**41 no-op** (mostly legitimate: ETW, activation-context/SxS we don't do, timer/threadpool
+not exercised, heap validate/compact/tag) · **6 explicit NOT_IMPLEMENTED**. So the import surface is
+**~99.6% present** (1 missing) and **~88% real bodies**; completion is about **fidelity**
+(no-op → real where a consumer needs it), NOT breadth.
+
+**The explicit stubs (returns STATUS_NOT_IMPLEMENTED / a fixed error / a no-op body):**
+- *Unconditional:* `RtlGetSetBootStatusData`/`RtlLockBootStatusData`/`RtlUnlockBootStatusData`
+  (boot-status-data — LKG boot; tolerated) · `RtlFindMessage` (→ STATUS_MESSAGE_NOT_FOUND) ·
+  `RtlFindActivationContextSectionString`/`…Guid` (→ STATUS_SXS_KEY_NOT_FOUND — no manifests) ·
+  `RtlDosSearchPath_Ustr` · `RtlVerifyVersionInfo` (→ REVISION_MISMATCH) · `RtlWalkHeap`
+  (→ NO_MORE_ENTRIES) · `RtlCreateTagHeap`/`RtlCompactHeap` (→ 0) · `RtlLockHeap`/`RtlUnlockHeap`
+  (`heap_noop_bool!` → TRUE) · `RtlReleasePrivilege` (empty) · `RtlImpersonateSelf`
+  (→ SUCCESS, exec models the token plane) · `RtlNewSecurityObject`/`RtlSetSecurityObject`/
+  `RtlQuerySecurityObject` (no Se create/apply/query plane) · `CsrClientCallServer`/`CsrGetProcessId`
+  (dead — real CSR path is csrss-side).
+- *Conditional (REAL on x86_64 via `on_target.rs` thunks; STATUS_NOT_IMPLEMENTED only on the host
+  build):* `RtlAdjustPrivilege`, `RtlSetEnvironmentVariable`, `RtlQueryEnvironmentVariable_U`,
+  `RtlExpandEnvironmentStrings_U`, `RtlSet{Process,Thread}IsCritical`, `RtlOpenCurrentUser`,
+  `RtlSetCurrentDirectory_U`, `Rtl{Create,Add,Lookup,Delete}…AtomTable`, `RtlGetNativeSystemInformation`
+  — these run for real on target; the host arm is just the non-x86_64 fallback.
+
+**The 1 truly-missing required import:** `RtlDeleteResource`
+(`references/reactos/sdk/lib/rtl/resource.c:68` — 7-line teardown: `RtlDeleteCriticalSection(&Lock)` +
+2× `NtClose` + zero the fields; we already export the rest of the RTL_RESOURCE family
+Initialize/Acquire/Release). **Trivial.**
+
+**Required-imported Rtl that are inline-NO-OP in our impl (imported but tolerated as no-op)** — the
+fidelity backlog, none currently blocking:
+`RtlCreateTagHeap` · `RtlValidateHeap` · `RtlCompactHeap` · `RtlSetHeapInformation` ·
+`RtlSetUserValueHeap` · `RtlQueryTagHeap` · `RtlActivateActivationContextUnsafeFast` ·
+`RtlDeactivateActivationContext` · `RtlZombifyActivationContext` · `RtlIsThreadWithinLoaderCallout` ·
+`RtlGetThreadErrorMode` · `RtlWow64EnableFsRedirection` · `RtlUnhandledExceptionFilter` ·
+`RtlFlushSecureMemoryCache`.
+
+**The 441 long-tail unexported spec-Rtl** (NONE imported by the hosted set) group as: IPv4/IPv6
+string↔address (`RtlIpv4/6*`, ~16), trace database (`RtlTraceDatabase*`, ~8), memory-block lookaside
+(`Rtl*MemoryBlockLookaside`, ~7), MUI/lang-registry (`RtlpMui*`, ~5), generic-table AVL "Full"
+variants, dynamic-timezone, IDN/normalization, custom-codepage (`RtlCustomCPToUnicodeN` etc.),
+IP/hash/compound-ACE security, `RtlLargeIntegerToChar`/`RtlInt64ToUnicodeString` converters. These are
+**Tier 3** (breadth-to-parity; only implement when a real binary imports one).
+
+### B — the desktop/logon-UI frontier (past the SAS park)
+
+**Diagnostic:** temporarily lifted `WINLOGON_SAS_MILESTONE` park at
+`service_sec_image.rs` 0x127c (reverted; tree clean), booted once (`/tmp/boot_frontier_*.log`).
+
+**Result — winlogon crosses InitializeSAS and immediately blocks in its SAS message loop.** After the
+SAS-window milestone (`NtUserCreateWindowEx 0x1077 → HWND 0x2002e`, `UserSetLogonNotifyWindow 0x127c`),
+winlogon issues exactly one more SSN — `UserUnregisterClass 0x10bf` (the temp-class cleanup tail of
+`InitializeSAS`) — then goes **completely silent** (no further win32k SSNs, no faults). Per
+`references/reactos/base/system/winlogon/winlogon.c:576-612` (`WinMain`), the next steps are
+`RemoveStatusMessage` → `GetSetupType()` (reads `HKLM\SYSTEM\Setup\SetupType`, already backed) →
+**`PostMessageW(SASWindow, WLX_WM_SAS, WLX_SAS_TYPE_CTRL_ALT_DEL, 0)`** (winlogon.c:600) →
+`NtInitializeRegistry` → **`while (GetMessageW(&Msg, SASWindow, …))`** (winlogon.c:608). The posted
+`WLX_WM_SAS` would drive `SASWindowProc → DispatchSAS → WlxLoggedOutSAS` (the msgina logon dialog,
+`sas.c:1347`).
+
+**THE NEXT WALL IS NOT ntdll — it is the win32k message-queue subsystem.** winlogon blocks on its first
+message-loop syscall: **`UserPostMessage` (SSN 0x100e)** / **`UserGetMessage` (SSN 0x1006)**
+(`references/reactos/win32ss/w32ksvc64.h`). Neither has a dispatch handler in
+`components/ntos-executive/src/win32k_subsystem.rs` (only `argc` entries exist for 0x1001/0x10ee); the
+win32k message-queue/`WM_`-dispatch path is unimplemented in the host. No stubbed **ntdll** function
+blocks the frontier — the ntdll surface winlogon's post-SAS path needs (registry via advapi→Nt\*,
+`PostMessageW`/`GetMessageW` are plain syscall thunks) is already real. **The desktop/logon-UI
+frontier is a win32k task (message queue + `WlxLoggedOutSAS`/msgina dialog), tracked separately from
+ntdll completion.**
+
+### C — prioritized, batched completion plan
+
+Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface
+gap + the cheapest fidelity wins that any next binary will hit); the bulk is breadth toward the 716
+spec. All `rtl/*.rs` bodies are **host-testable in `nt-ntdll`** (pure `no_std` core, `cargo test`);
+target-only pieces live in `on_target.rs` and are gate-verified.
+
+**TIER 1 — close the surface + cheap real fidelity (1 batch, host-testable):**
+- `RtlDeleteResource` (resource.c:68) — the 1 missing required import. **[host]**
+- `RtlGetThreadErrorMode`/`RtlSetThreadErrorMode` (error.c:190/217 — TEB `HardErrorMode` bit). **[host/target: TEB]**
+- `RtlValidateHeap`/`RtlCompactHeap` (heap.c:3714/3103 — real walk/return-0). **[host]**
+- `RtlUnhandledExceptionFilter` → forward to our real `RtlDispatchException`/last-chance (exception.c:313). **[host]**
+- `RtlOpenCurrentUser` real (return the `\Registry\User\<sid>` or `.Default` key handle). **[target: Nt\* reg]**
+- Batch = ~6 fns, one green commit + `nt-ntdll` unit tests.
+
+**TIER 2 — commonly-used Rtl breadth (grouped, host-testable, ~5-15/batch):**
+- **B2.1 strings/case:** `RtlDowncaseUnicodeString`/`Char`, `RtlCompareString`/`RtlEqualString`/`RtlPrefixString` (ANSI), `RtlUpperString`/`RtlUpperChar`, `RtlHashUnicodeString`, `RtlAppendAsciizToString`/`RtlAppendStringToString`, `RtlCopyString` (strings via `references/reactos/sdk/lib/rtl/unicode.c`/`nls.c`). **[host]**
+- **B2.2 converters:** `RtlLargeIntegerToChar`, `RtlInt64ToUnicodeString`, `RtlOemToUnicodeN`/`RtlUpcaseUnicodeToOemN`, `RtlUnicodeStringToAnsiSize`/`RtlOemStringToUnicodeSize`/`RtlxAnsiStringToUnicodeSize` (unicode.c/nls.c). **[host]**
+- **B2.3 path:** `RtlGetLengthWithoutTrailingPathSeparators`, `RtlGetLengthWithoutLastFullDosOrNtPathElement`, `RtlAppendPathElement`, `RtlNtPathNameToDosPathName`, `RtlDosPathNameToNtPathName_U_WithStatus` (path.c). **[host]**
+- **B2.4 heap fidelity:** `RtlLockHeap`/`RtlUnlockHeap` real (currently `heap_noop_bool!`), `RtlSetHeapInformation`, `RtlQueryProcessHeapInformation`, `RtlZeroHeap` (heap.c). **[host]**
+- **B2.5 security:** `RtlEqualLuid`, `RtlCopySecurityDescriptor`, `RtlValidRelativeSecurityDescriptor`, `RtlOwnerAcesPresent`, `RtlAddMandatoryAce`, `RtlSidDominates`/`RtlSidEqualLevel` (sd.c/acl.c/sid.c). **[host]**
+- **B2.6 time/registry-helper:** `RtlTimeToSecondsSince1980`/`RtlSecondsSince1980ToTime`, `RtlSystemTimeToLocalTime`/`RtlLocalTimeToSystemTime`, `RtlCheckRegistryKey`/`RtlCreateRegistryKey`/`RtlWriteRegistryValue`/`RtlDeleteRegistryValue` (time.c/registry.c). **[host + target for reg]**
+
+**TIER 3 — long-tail (implement on-demand when a real binary imports one):**
+IPv4/6 string↔address (`RtlIpv4/6*`), `RtlTraceDatabase*`, `Rtl*MemoryBlockLookaside`, `RtlpMui*`,
+generic-table AVL "Full" variants, dynamic-timezone (`Rtl*DynamicTimeZoneInformation`), IDN/normalize
+(`RtlIdnTo*`/`RtlNormalizeString`), custom-codepage (`RtlCustomCPToUnicodeN`), compound/hash ACE
+security. ~441 names; do NOT pre-implement — add as the Win7-pivot / new-binary imports light them up.
+
+**Host-testability note:** every Tier-1/2 Rtl is a pure `rtl/*.rs` core body → `nt-ntdll` `cargo test`
+covers it; the DLL export is a thin forward. Only registry-touching helpers (`RtlWriteRegistryValue`,
+`RtlOpenCurrentUser`) and TEB-reads have a target-only tail in `on_target.rs`, gate-verified on boot.
+
+**Frontier hand-off:** the desktop/logon-UI advance (past the SAS park) is a **win32k** batch —
+implement `UserGetMessage 0x1006` / `UserPostMessage 0x100e` (message-queue) + `WlxLoggedOutSAS`/msgina
+dialog dispatch in `win32k_subsystem.rs` — NOT an ntdll batch. Tracked separately.
+
+---
+
 *Footer (Phase A consolidation complete): this file is a historical batch log. The unified
 component-runtime harness (FSD + win32k on the shared `component_main`/`component_pump`, the
 multi-driver by-path substrate, and what's isolated vs. deliberately in-executive) is documented in
