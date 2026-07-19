@@ -1437,4 +1437,164 @@ mod tests {
         assert!(t.complete_by_name(pipe_name_hash(&unknown)).is_none());
         assert_eq!(t.len(), 2);
     }
+
+    #[test]
+    fn async_listen_complete_by_name_wildcards_on_unset_hash() {
+        // The `name_hash == 0` (unset) contract on BOTH sides: a stored listen with name_hash==0 is
+        // matched by ANY connect (legacy/unnamed arm), and a query name_hash==0 matches the FIRST armed
+        // listen (a connect whose name we couldn't hash). Both are the documented wildcard branches.
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        // Stored unset → matched by a specific query.
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al(0xA, 1)).unwrap(); // al() leaves name_hash == 0
+        let done = t.complete_by_name(pipe_name_hash(&ntsvcs)).unwrap();
+        assert_eq!(done.event_obj_idx, 1, "an unset stored name_hash matches any connect");
+        assert!(t.is_empty());
+        // Query unset (hash 0) → matches the FIRST armed listen regardless of its stored name.
+        let lsarpc: std::vec::Vec<u16> = "\\lsarpc".encode_utf16().collect();
+        let mut t2 = AsyncListenTable::<8>::new();
+        t2.arm(al_named(0xB, 2, &lsarpc)).unwrap();
+        let done2 = t2.complete_by_name(0).unwrap();
+        assert_eq!(done2.event_obj_idx, 2, "a hash-0 query matches the first armed listen");
+        assert!(t2.is_empty());
+    }
+
+    #[test]
+    fn async_listen_complete_by_name_takes_first_of_same_name_then_rearm_is_new() {
+        // Two instances of the SAME named pipe (two server ends listening on \ntsvcs). A connect
+        // completes ONE (the first in slot order); the second stays armed. A re-post is a distinct
+        // record consumed on the NEXT connect (idempotent — the first connect consumed exactly one).
+        let ntsvcs: std::vec::Vec<u16> = "\\ntsvcs".encode_utf16().collect();
+        let h = pipe_name_hash(&ntsvcs);
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al_named(0xA, 1, &ntsvcs)).unwrap();
+        t.arm(al_named(0xB, 2, &ntsvcs)).unwrap();
+        let first = t.complete_by_name(h).unwrap();
+        assert_eq!(first.server_file_id, 0xA, "first slot-order match consumed");
+        assert_eq!(t.len(), 1, "the second same-named instance stays armed");
+        let second = t.complete_by_name(h).unwrap();
+        assert_eq!(second.server_file_id, 0xB);
+        assert!(t.is_empty());
+        // No third connect completes anything — consumption was one-per-connect.
+        assert!(t.complete_by_name(h).is_none());
+    }
+
+    #[test]
+    fn pipe_waiter_cancel_thread_clears_parked_on_and_reopens_slot() {
+        // cancel_thread must clear the parked_on() key AND free the slot for immediate re-park (a
+        // thread torn down mid-read; its reading end can later be re-opened by another thread).
+        let mut t = PipeWaiterTable::<2>::new();
+        t.park(wtr(0xAA, 3, 7)).unwrap();
+        t.park(wtr(0xBB, 3, 7)).unwrap();
+        assert!(t.parked_on(0xAA));
+        assert_eq!(t.cancel_thread(7), 2);
+        assert!(!t.parked_on(0xAA), "cancel clears the parked_on key");
+        assert!(!t.parked_on(0xBB));
+        assert!(t.is_empty());
+        // Both freed slots are immediately re-usable.
+        assert!(t.park(wtr(0xCC, 2, 4)).is_some());
+        assert!(t.park(wtr(0xDD, 2, 4)).is_some());
+        assert!(t.park(wtr(0xEE, 2, 4)).is_none(), "still bounded at N=2");
+    }
+
+    #[test]
+    fn pipe_waiter_cancel_thread_no_match_is_noop() {
+        // cancel_thread for a tid with no parked waiters frees nothing and disturbs nobody.
+        let mut t = PipeWaiterTable::<4>::new();
+        t.park(wtr(0xAA, 3, 7)).unwrap();
+        assert_eq!(t.cancel_thread(999), 0);
+        assert_eq!(t.len(), 1);
+        assert!(t.parked_on(0xAA));
+    }
+
+    #[test]
+    fn half_duplex_outbound_rejects_wrong_direction_read() {
+        // The READ direction check (read.c:70): on an OUTBOUND pipe the server may NOT read (it only
+        // writes); the client may. Only the WRITE direction was covered before — this exercises the
+        // read-side direction_ok_read branch.
+        let mut r = dx();
+        let p = PipeParams {
+            configuration: FILE_PIPE_OUTBOUND as u32,
+            ..PipeParams::default()
+        };
+        let s = r.create_server_pipe("hdo", p).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("hdo").unwrap();
+        // OUTBOUND: server→client allowed, client→server write rejected.
+        assert_eq!(r.pipe_write(s, b"ok").unwrap(), 2);
+        assert_eq!(r.pipe_write(c, b"no").unwrap_err(), NtStatus::INVALID_PARAMETER);
+        // Server READ is the wrong direction on an OUTBOUND pipe → rejected.
+        assert_eq!(r.pipe_read(s, 8).unwrap_err(), NtStatus::INVALID_PARAMETER);
+        // Client read of the server's write is allowed.
+        assert_eq!(r.pipe_read(c, 8).unwrap().0, b"ok");
+    }
+
+    #[test]
+    fn read_zero_max_returns_empty_without_draining() {
+        // A zero-length read must return no bytes and NOT touch the queue (dequeue max==0 early-out).
+        let mut r = dx();
+        let s = r.create_server_pipe("z", PipeParams::default()).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("z").unwrap();
+        r.pipe_write(s, b"keepme").unwrap();
+        let (got, more) = r.pipe_read(c, 0).unwrap();
+        assert!(got.is_empty());
+        assert!(!more);
+        // Nothing was consumed.
+        assert_eq!(r.readable_bytes(c).unwrap(), 6);
+        assert_eq!(r.pipe_read(c, 64).unwrap().0, b"keepme");
+    }
+
+    #[test]
+    fn write_to_full_queue_accepts_zero() {
+        // enqueue on a queue with NO room returns 0 (the room==0 early-out) — a second write once the
+        // quota is exhausted is accepted-what-fits = nothing, not a panic or overwrite.
+        let mut r = dx();
+        let p = PipeParams { outbound_quota: 4, ..PipeParams::default() };
+        let s = r.create_server_pipe("full", p).unwrap();
+        r.listen(s).unwrap();
+        let c = r.connect_client("full").unwrap();
+        assert_eq!(r.pipe_write(s, b"ABCD").unwrap(), 4); // fills the quota exactly
+        assert_eq!(r.pipe_write(s, b"EF").unwrap(), 0, "no room left → 0 accepted");
+        // The queued bytes are intact and untouched by the rejected write.
+        assert_eq!(r.pipe_read(c, 64).unwrap().0, b"ABCD");
+    }
+
+    #[test]
+    fn transceive_propagates_wrong_direction_write_error() {
+        // transceive is write-then-read; a direction-illegal write must surface as the error (and NOT
+        // then attempt the read). On an INBOUND pipe a server transceive write is rejected.
+        let mut r = dx();
+        let p = PipeParams { configuration: FILE_PIPE_INBOUND as u32, ..PipeParams::default() };
+        let s = r.create_server_pipe("inb", p).unwrap();
+        r.listen(s).unwrap();
+        let _c = r.connect_client("inb").unwrap();
+        assert_eq!(r.transceive(s, b"x", 16).unwrap_err(), NtStatus::INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn transceive_on_disconnected_pipe_errors() {
+        // transceive before a client connects → the underlying write hits the not-Connected guard.
+        let mut r = dx();
+        let s = r.create_server_pipe("d", PipeParams::default()).unwrap();
+        assert_eq!(r.transceive(s, b"x", 16).unwrap_err(), STATUS_PIPE_DISCONNECTED);
+    }
+
+    #[test]
+    fn drain_all_order_is_stable_slot_order() {
+        // The executive re-drives parked readers in a DETERMINISTIC order (slot order) so a peer write
+        // re-issues reads reproducibly. Freeing a middle slot and re-parking reuses the low slot.
+        let mut t = PipeWaiterTable::<4>::new();
+        let s0 = t.park(wtr(0xA0, 1, 1)).unwrap();
+        let _s1 = t.park(wtr(0xA1, 1, 2)).unwrap();
+        let _s2 = t.park(wtr(0xA2, 1, 3)).unwrap();
+        let ids: std::vec::Vec<u64> = t.drain_all().map(|(_, w)| w.file_id).collect();
+        assert_eq!(ids, [0xA0, 0xA1, 0xA2]);
+        // Free the FIRST; a re-park fills the now-lowest free slot (slot 0).
+        t.complete(s0).unwrap();
+        let s_new = t.park(wtr(0xB0, 1, 9)).unwrap();
+        assert_eq!(s_new, 0, "the lowest free slot is reused");
+        let ids2: std::vec::Vec<u64> = t.drain_all().map(|(_, w)| w.file_id).collect();
+        assert_eq!(ids2, [0xB0, 0xA1, 0xA2]);
+    }
 }

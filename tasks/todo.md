@@ -208,3 +208,31 @@ Winlogon client connect got fid 0x0e802d50 (pairs by name in npfs prefix table).
   multiplex → it never reads the bind / writes bind_ack. Batch 35 = route that worker (N-threads).
 - Paint still 0/768 (after the SCM round-trip). No regression (same 5 pre-existing FAILs; +3 real
   terminate specs now PASS).
+
+## Phase A — host-test backfill (DONE)
+Backfilled meaningful HOST unit tests for under-covered subsystems from the recent arc. NO boot, NO
+executive/rust-micro change (test-only additions in the crates). All three targeted crates green.
+- **nt-io-manager 73 → 83** (+10): AsyncListenTable name-hash WILDCARD branches (stored `name_hash==0`
+  matches any connect; query hash-0 matches first armed; first-of-same-name consumed once + re-arm is a
+  new record); PipeWaiterTable `cancel_thread` clears `parked_on` + reopens slots (+ no-match no-op) +
+  `drain_all` stable slot-order/lowest-free reuse; half-duplex OUTBOUND READ direction reject (only
+  WRITE dir was covered); `dequeue(max=0)` no-drain; `enqueue` full-queue → 0 accepted; `transceive`
+  propagates wrong-direction + disconnected write errors.
+- **nt-ntdll 192 → 200** (+8): x64 SEH unwind opcodes that lacked coverage — `UWOP_SAVE_NONVOL_FAR`,
+  `UWOP_SAVE_XMM128`, `UWOP_SAVE_XMM128_FAR`, `UWOP_PUSH_MACHFRAME` (terminates unwind, no retaddr pop;
+  + error-code OpInfo=1 RSP adjust), and `UWOP_EPILOG`/`UWOP_SPARE_CODE` no-op slot-consumption; RTL
+  string batch-32 edges — `create_unicode_string_from_asciiz` (no-NUL/leading-NUL/high-bit-widen) +
+  `duplicate_unicode_string(false)` init-vs-create MaximumLength semantics.
+- **nt-driver-test-fixtures 0 → 5** (+5): first host tests — `irp_fsd_pe()` well-formed PE + DriverEntry
+  `lea`/MajorFunction[0,3,4,0xe] store shape + handler IoStatus.Status/Information(0x5A5A); `minimal_pe`
+  headers; `pe_importing` walkable import descriptor/IAT/by-name; section characteristics; `build_pe`
+  data-directory + SizeOfImage/Headers alignment.
+- **NOT host-testable (documented, not gaps):**
+  - `RtlQueryRegistryValues` REG_MULTI_SZ per-substring split + Context forwarding (batches 30/31): lives
+    in `nt-ntdll-dll::on_target::dispatch_value`, `#[cfg(target_arch=x86_64)]`, raw-pointer + gs-relative
+    PEB (inline asm) — target-gated + syscall/PEB-bound; the split is inline in the unsafe FFI fn with no
+    extractable pure helper (refactoring it out is forbidden by the constraints).
+  - Harness pure logic (`caps_and_layout_for`, `pts_for`, `HostCaps`, `DriverObjectSpec`,
+    `HARNESS_*_DISPATCHES` selection): in `ntos-executive`, a `#![no_std] #![no_main]` seL4 binary with a
+    custom target + its own workspace + zero host-test harness. `cargo test` cannot target it, and adding
+    a test module is an executive src change (forbidden). Genuinely not host-testable here.

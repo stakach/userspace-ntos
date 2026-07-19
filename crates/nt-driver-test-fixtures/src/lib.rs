@@ -258,3 +258,146 @@ pub fn pnp_mmio_interrupt_test_sys() -> &'static [u8] {
 pub fn power_pnp_mmio_test_sys() -> &'static [u8] {
     include_bytes!("../fixtures/PowerPnpMmioTest.sys")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rd_u16(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+    fn rd_u32(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+    fn rd_u64(b: &[u8], o: usize) -> u64 {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[o..o + 8]);
+        u64::from_le_bytes(a)
+    }
+
+    /// Given a section table entry, the file-raw offset of an RVA (walks the sections).
+    fn rva_to_off(b: &[u8]) -> impl Fn(u32) -> Option<usize> + '_ {
+        let n = rd_u16(b, NT_OFF + 6) as usize;
+        move |rva: u32| {
+            for i in 0..n {
+                let se = SECTION_TABLE + i * 40;
+                let va = rd_u32(b, se + 12);
+                let vsz = rd_u32(b, se + 8);
+                let praw = rd_u32(b, se + 20);
+                if rva >= va && rva < va + vsz.max(1) {
+                    return Some((praw + (rva - va)) as usize);
+                }
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn minimal_pe_has_well_formed_headers() {
+        let b = minimal_pe();
+        assert_eq!(rd_u16(&b, 0), 0x5A4D, "MZ magic");
+        assert_eq!(rd_u32(&b, 0x3C) as usize, NT_OFF, "e_lfanew points at PE header");
+        assert_eq!(rd_u32(&b, NT_OFF), 0x0000_4550, "PE\\0\\0 signature");
+        assert_eq!(rd_u16(&b, NT_OFF + 4), 0x8664, "machine = AMD64");
+        assert_eq!(rd_u16(&b, OPT_OFF), 0x020b, "PE32+ optional-header magic");
+        assert_eq!(rd_u16(&b, NT_OFF + 4 + 16), 240, "SizeOfOptionalHeader");
+        assert_eq!(rd_u16(&b, NT_OFF + 6), 1, "one section");
+        assert_eq!(rd_u32(&b, OPT_OFF + 16), 0x1000, "AddressOfEntryPoint");
+        assert_eq!(rd_u64(&b, OPT_OFF + 24), DEFAULT_IMAGE_BASE, "ImageBase");
+        assert_eq!(rd_u16(&b, OPT_OFF + 68), 1, "Subsystem = NATIVE");
+        assert_eq!(rd_u32(&b, OPT_OFF + 108), 16, "NumberOfRvaAndSizes");
+        // EXECUTABLE_IMAGE characteristic set.
+        assert_eq!(rd_u16(&b, NT_OFF + 4 + 18) & 0x0002, 0x0002);
+        // The single section is .text with the nop;ret body reachable at the entry RVA.
+        let se = SECTION_TABLE;
+        assert_eq!(&b[se..se + 5], b".text");
+        let off = rva_to_off(&b)(0x1000).unwrap();
+        assert_eq!(&b[off..off + 2], &[0x90, 0xC3], "entry body nop; ret");
+    }
+
+    #[test]
+    fn pe_importing_builds_a_walkable_import_table() {
+        let b = pe_importing("ntoskrnl.exe", &["IoCreateDevice", "IoDeleteDevice"]);
+        // Import directory (index 1) points at the descriptor in .rdata.
+        let imp_rva = rd_u32(&b, OPT_OFF + 112 + 1 * 8);
+        assert_ne!(imp_rva, 0, "import data directory RVA set");
+        let to_off = rva_to_off(&b);
+        let desc = to_off(imp_rva).unwrap();
+        // Descriptor: OriginalFirstThunk@0, Name@0x0c, FirstThunk@0x10.
+        let name_rva = rd_u32(&b, desc + 0x0c);
+        let name_off = to_off(name_rva).unwrap();
+        let name_end = b[name_off..].iter().position(|&c| c == 0).unwrap();
+        assert_eq!(&b[name_off..name_off + name_end], b"ntoskrnl.exe");
+        // The IAT has one thunk per import plus a NULL terminator.
+        let iat_rva = rd_u32(&b, desc + 0x10);
+        let iat0 = to_off(iat_rva).unwrap();
+        // First thunk points at a hint/name entry whose name is the first import.
+        let byname_rva = rd_u64(&b, iat0) as u32;
+        let byname_off = to_off(byname_rva).unwrap();
+        let fn_end = b[byname_off + 2..].iter().position(|&c| c == 0).unwrap();
+        assert_eq!(&b[byname_off + 2..byname_off + 2 + fn_end], b"IoCreateDevice");
+        // The thunk array is NULL-terminated (2 imports → slot 2 is zero).
+        assert_eq!(rd_u64(&b, iat0 + 2 * 8), 0, "IAT null terminator");
+    }
+
+    #[test]
+    fn irp_fsd_pe_emits_driver_entry_and_handler_shape() {
+        let b = irp_fsd_pe();
+        // Valid PE32+ with entry at 0x1000.
+        assert_eq!(rd_u16(&b, 0), 0x5A4D);
+        assert_eq!(rd_u16(&b, OPT_OFF), 0x020b);
+        assert_eq!(rd_u32(&b, OPT_OFF + 16), 0x1000, "DriverEntry at RVA 0x1000");
+        let to_off = rva_to_off(&b);
+        let entry = to_off(0x1000).unwrap();
+        // DriverEntry prologue: `lea rax, [rip+disp32]` (48 8D 05 ..).
+        assert_eq!(&b[entry..entry + 3], &[0x48, 0x8D, 0x05], "lea rax,[rip+disp]");
+        let disp = rd_u32(&b, entry + 3) as i32;
+        let lea_end = entry + 7;
+        let handler = (lea_end as i64 + disp as i64) as usize;
+        // Four MajorFunction stores follow (CREATE=0, READ=3, WRITE=4, DEVICE_CONTROL=0xe), each
+        // `mov [rcx + 0x70 + i*8], rax` = 48 89 81 <disp32>.
+        let mut p = lea_end;
+        for &i in &[0u32, 3, 4, 0xe] {
+            assert_eq!(&b[p..p + 3], &[0x48, 0x89, 0x81], "mov [rcx+mj],rax");
+            assert_eq!(rd_u32(&b, p + 3), 0x70 + i * 8, "MajorFunction[{}] slot offset", i);
+            p += 7;
+        }
+        // Then `xor eax,eax; ret` (STATUS_SUCCESS return).
+        assert_eq!(&b[p..p + 3], &[0x31, 0xC0, 0xC3]);
+        // The handler: sets IoStatus.Status=0 @Irp+0x30 and Information=0x5A5A @Irp+0x38.
+        assert_eq!(&b[handler..handler + 3], &[0xC7, 0x42, 0x30], "mov dword[rdx+0x30],imm");
+        assert_eq!(rd_u32(&b, handler + 3), 0, "IoStatus.Status = STATUS_SUCCESS");
+        assert_eq!(&b[handler + 7..handler + 11], &[0x48, 0xC7, 0x42, 0x38], "mov qword[rdx+0x38],imm");
+        assert_eq!(rd_u32(&b, handler + 11), 0x5A5A, "IoStatus.Information sentinel");
+        // Handler tail: xor eax,eax; ret.
+        assert_eq!(&b[handler + 15..handler + 18], &[0x31, 0xC0, 0xC3]);
+    }
+
+    #[test]
+    fn section_helpers_set_the_right_characteristics() {
+        let t = text_section(0x1000, vec![0xC3]);
+        assert_eq!(&t.name, b".text\0\0\0");
+        assert_eq!(t.characteristics, 0x6000_0020, "CODE|EXECUTE|READ");
+        let r = rdata_section(0x2000, vec![0]);
+        assert_eq!(&r.name, b".rdata\0\0");
+        assert_eq!(r.characteristics, 0x4000_0040, "INITIALIZED_DATA|READ");
+    }
+
+    #[test]
+    fn build_pe_writes_data_directory_entries() {
+        // A directory tuple lands at OPT_OFF+112 + idx*8 (rva) and +4 (size).
+        let b = build_pe(
+            DEFAULT_IMAGE_BASE,
+            0x1000,
+            0x3000,
+            &[text_section(0x1000, vec![0xC3])],
+            &[(5, 0x2000, 0x40)], // base-reloc directory
+        );
+        assert_eq!(rd_u32(&b, OPT_OFF + 112 + 5 * 8), 0x2000, "reloc dir RVA");
+        assert_eq!(rd_u32(&b, OPT_OFF + 112 + 5 * 8 + 4), 0x40, "reloc dir size");
+        // SizeOfImage / SizeOfHeaders are populated and file-aligned.
+        assert_eq!(rd_u32(&b, OPT_OFF + 56), 0x3000);
+        let soh = rd_u32(&b, OPT_OFF + 60) as usize;
+        assert_eq!(soh % FILE_ALIGN, 0, "SizeOfHeaders is file-aligned");
+    }
+}

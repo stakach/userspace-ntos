@@ -1402,4 +1402,120 @@ mod tests {
         let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
         assert!(virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).is_none());
     }
+
+    #[test]
+    fn unwind_save_nonvol_far() {
+        // UWOP_SAVE_NONVOL_FAR OpInfo=RDI(7): value at [RSP + u32] (raw byte offset, 3 slots).
+        // op byte = 5 | (7<<4) = 0x75, code_off = 0x0C, then u32 = 0x0000_1000.
+        let img = img_with_unwind(&[0x0C, 0x75, 0x00, 0x10, 0x00, 0x00], 0x01, 0x10, 3, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x7000 + 0x1000, 0xFEED_FACE); // saved RDI at raw byte offset 0x1000
+        stack.put(0x7000, 0x1400_ABAB); // return address (RSP unchanged; SAVE_* doesn't move RSP)
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x7000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.gpr[REG_RDI], 0xFEED_FACE);
+        assert_eq!(ctx.rip, 0x1400_ABAB);
+        assert_eq!(ctx.rsp(), 0x7008);
+    }
+
+    #[test]
+    fn unwind_save_xmm128() {
+        // UWOP_SAVE_XMM128 OpInfo=XMM6(6): 128-bit value at [RSP + u16*16] (2 slots).
+        // op byte = 8 | (6<<4) = 0x68, code_off = 0x0A, then u16 = 0x0002 => byte offset 0x20.
+        let img = img_with_unwind(&[0x0A, 0x68, 0x02, 0x00], 0x01, 0x10, 2, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x7000 + 0x20, 0x1111_2222_3333_4444); // XMM6 low
+        stack.put(0x7000 + 0x28, 0x5555_6666_7777_8888); // XMM6 high
+        stack.put(0x7000, 0x1400_CDCD); // return address
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x7000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.xmm[6], [0x1111_2222_3333_4444, 0x5555_6666_7777_8888]);
+        assert_eq!(ctx.rip, 0x1400_CDCD);
+        assert_eq!(ctx.rsp(), 0x7008);
+    }
+
+    #[test]
+    fn unwind_save_xmm128_far() {
+        // UWOP_SAVE_XMM128_FAR OpInfo=XMM10(10): 128-bit value at [RSP + u32] raw offset (3 slots).
+        // op byte = 9 | (10<<4) = 0xA9, code_off = 0x10, then u32 = 0x0000_0200.
+        let img = img_with_unwind(&[0x10, 0xA9, 0x00, 0x02, 0x00, 0x00], 0x01, 0x18, 3, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x7000 + 0x200, 0xAAAA_BBBB_CCCC_DDDD); // XMM10 low
+        stack.put(0x7000 + 0x208, 0xEEEE_FFFF_0000_1111); // XMM10 high
+        stack.put(0x7000, 0x1400_EFEF); // return address
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x7000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.xmm[10], [0xAAAA_BBBB_CCCC_DDDD, 0xEEEE_FFFF_0000_1111]);
+        assert_eq!(ctx.rip, 0x1400_EFEF);
+        assert_eq!(ctx.rsp(), 0x7008);
+    }
+
+    #[test]
+    fn unwind_push_machframe_terminates_without_retaddr_pop() {
+        // UWOP_PUSH_MACHFRAME (op 10) OpInfo=0 (no error code): RSP += 0; RIP=[RSP]; RSP=[RSP+0x18].
+        // This op TERMINATES the unwind — no return-address pop happens after it (it IS the trap
+        // frame). op byte = 10 | (0<<4) = 0x0A, code_off = 1.
+        let img = img_with_unwind(&[0x01, 0x0A], 0x01, 0x08, 1, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x6000, 0x1400_1234); // trap-frame RIP at [RSP]
+        stack.put(0x6000 + 0x18, 0x9999_0000); // trap-frame RSP at [RSP+0x18]
+        // A poisoned cell where a spurious return-address pop WOULD read from (must NOT be used).
+        stack.put(0x9999_0000, 0xDEAD_DEAD);
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x6000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.rip, 0x1400_1234, "RIP comes straight from the trap frame, not a ret pop");
+        assert_eq!(ctx.rsp(), 0x9999_0000, "RSP restored from [orig+0x18], not orig+8");
+    }
+
+    #[test]
+    fn unwind_push_machframe_with_error_code_adjusts_rsp() {
+        // UWOP_PUSH_MACHFRAME OpInfo=1 (an error-code was pushed): RSP += 1*8 first, THEN the frame.
+        // op byte = 10 | (1<<4) = 0x1A, code_off = 1.
+        let img = img_with_unwind(&[0x01, 0x1A], 0x01, 0x08, 1, 0);
+        let mut stack = MockStack::new();
+        // RSP starts 0x6000; +8 for error code → machine frame based at 0x6008.
+        stack.put(0x6008, 0x1400_5678); // RIP
+        stack.put(0x6008 + 0x18, 0x8888_0000); // caller RSP
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x6000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.rip, 0x1400_5678);
+        assert_eq!(ctx.rsp(), 0x8888_0000);
+    }
+
+    #[test]
+    fn unwind_epilog_and_spare_codes_are_noops() {
+        // UWOP_EPILOG (op 6, 2 slots) and UWOP_SPARE_CODE (op 7, 3 slots) have NO register effect
+        // during a virtual unwind, but their slots must be consumed so a following real code (a
+        // PUSH_NONVOL RBX here) is decoded at the correct offset. Layout (all past prologue):
+        //   [off=1, EPILOG]     op=6|(0<<4)=0x06  + 1 operand slot (u16)
+        //   [off=1, SPARE]      op=7|(0<<4)=0x07  + 2 operand slots (u32)
+        //   [off=1, PUSH RBX]   op=0|(3<<4)=0x30
+        // count = 2(epilog) + 3(spare) + 1(push) = 6 codes worth of slots.
+        let codes = [
+            0x01, 0x06, 0x00, 0x00, // EPILOG + u16 operand
+            0x01, 0x07, 0x00, 0x00, 0x00, 0x00, // SPARE + u32 operand
+            0x01, 0x30, // PUSH_NONVOL RBX
+        ];
+        let img = img_with_unwind(&codes, 0x01, 0x08, 6, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x8000, 0xC0DE_C0DE); // saved RBX popped by the PUSH_NONVOL
+        stack.put(0x8008, 0x1400_7A7A); // return address after the pop
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x8000);
+        let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
+        virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(ctx.gpr[REG_RBX], 0xC0DE_C0DE, "the PUSH after the no-op codes decoded correctly");
+        assert_eq!(ctx.rip, 0x1400_7A7A);
+        assert_eq!(ctx.rsp(), 0x8010);
+    }
 }

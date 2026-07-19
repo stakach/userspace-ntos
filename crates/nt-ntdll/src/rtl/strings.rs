@@ -278,6 +278,38 @@ mod tests {
     }
 
     #[test]
+    fn create_from_asciiz_edge_cases() {
+        // No embedded NUL → the WHOLE slice is widened (position() → None → src.len()).
+        let all = create_unicode_string_from_asciiz(b"NoNul");
+        assert_eq!(all.as_units(), &u("NoNul")[..]);
+        assert_eq!(all.length, 10); // 5 units * 2
+        assert_eq!(*all.buffer.last().unwrap(), 0); // still NUL-terminated by create()
+        // Leading NUL → empty content, but a valid NUL-terminated empty string.
+        let empty = create_unicode_string_from_asciiz(b"\0rest");
+        assert_eq!(empty.length, 0);
+        assert_eq!(empty.maximum_length, 2); // room for the NUL only
+        assert_eq!(*empty.buffer.last().unwrap(), 0);
+        // High-bit bytes widen 1:1 (b as u16), NOT sign-extended.
+        let hi = create_unicode_string_from_asciiz(&[0xE9, 0x00]); // 'é' in latin1 → U+00E9
+        assert_eq!(hi.as_units(), &[0x00E9u16][..]);
+    }
+
+    #[test]
+    fn duplicate_without_nul_terminate_uses_init_semantics() {
+        // nul_terminate=false → RtlDuplicateUnicodeString via init(): MaximumLength == Length, NO
+        // trailing NUL reserved (the other branch, only the =true path was covered).
+        let src = UnicodeString::create(&u("Path")); // 4 units, NUL-terminated source
+        let dup = duplicate_unicode_string(&src, false);
+        assert_eq!(dup.as_units(), &u("Path")[..]);
+        assert_eq!(dup.length, 8); // 4 units * 2
+        assert_eq!(dup.maximum_length, 8, "init: MaximumLength == Length (no NUL slack)");
+        // A NUL-terminated duplicate of the SAME source reserves the extra unit.
+        let dup_nul = duplicate_unicode_string(&src, true);
+        assert_eq!(dup_nul.maximum_length, 10, "create: MaximumLength includes the NUL");
+        assert_eq!(*dup_nul.buffer.last().unwrap(), 0);
+    }
+
+    #[test]
     fn append_and_copy() {
         let mut dst = UnicodeString {
             buffer: Vec::new(),
