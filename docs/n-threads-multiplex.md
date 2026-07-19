@@ -94,6 +94,113 @@ scheduling.
 
 ---
 
+## 1a. Milestone parks + the quiesce predicate (authoritative catalog)
+
+The boot is SINGLE-THREADED at the executive: ONE `service_sec_image()` loop
+`recv`s on `fault_ep` forever. For the spec **gate** to run + `qemu_exit` to fire,
+the loop must eventually `break` — i.e. the boot must **QUIESCE**. It quiesces when
+no live top-level process can make forward progress (every one is parked and no
+runnable thread remains to wake a waiter). A process/thread is *parked* when the
+loop does a **`recv`-next WITHOUT replying** (its seL4 TCB stays blocked at a
+proven-advanced state; its TEB/stack/ETHREAD stay mapped). This is behaviour-
+preserving: the parked thread was going to block forever anyway (an unserviced
+blocking server syscall, an unsignalled wait, a crash, or a login-wait we don't
+service headless).
+
+**★ These parks + the quiesce logic are LOAD-BEARING. Moving a park's location,
+changing its trigger condition, or altering the quiesce predicate can make the boot
+hang (never quiesce → boot timeout, gate never runs) or quiesce EARLY (miss specs /
+skip the desktop paint). Treat all of this as a behaviour-preserving contract.**
+
+### The two quiesce state bitmasks (`service_sec_image.rs:303,312`)
+
+- **`crash_parked`** — top-level process badges (0/2/4/6/8) that hit an
+  UNRECOVERABLE crash (bad fault / unhandled syscall). A crash-parked process can
+  never run again.
+- **`wait_parked`** — top-level badges cooperatively parked in a WAKEABLE wait
+  (event / array / pipe / delay). A wait-parked process CAN be woken by a running
+  process's `NtSetEvent`/peer pipe write, so it stays "live" — UNLESS every live
+  process is now parked, in which case no signaler remains → deadlock → quiesce.
+  Cleared at loop-top when the owner produces an event (it's running again).
+
+`live_top_badges()` = the set of top-level processes that have been spawned. The
+core quiesce test is `(live_top_badges() & !(crash_parked | wait_parked)) == 0`.
+
+### The two consolidated park helpers (already the ONE mechanism)
+
+- **`park_and_log!(pi, label, ip, cr2)`** (`:320`) — the generalized UNRECOVERABLE-
+  fault park. Logs `[parked] pi=.. fault=..` once per process (the `already`
+  guard), sets its `crash_parked` bit, flushes fault bookkeeping, then quiesces if
+  every live top-level process is crash-parked, else `recv`-next-without-reply +
+  `continue`. **Every** crash park routes here: cpu-exception(3) `:719`,
+  debug-exception(4) `:859`, null-deref `:981`, vmf-out `:1155`, fault-cap `:1164`,
+  unhandled-syscall `:3393`, other-fault `:3646`.
+- **`mark_wait_parked!(pi, ip)`** (`:369`) — records a WAKEABLE cooperative wait in
+  `wait_parked` and breaks to the gate ONLY at true all-parked deadlock. Called by
+  every cooperative-park site (event/array/pipe waits + the server-listener park).
+
+The bespoke `wait_park` / `wait_park_multi` / `pipe_wait_park` / `delay_park`
+functions do the reply-cap-steal + re-drive plumbing; each then calls
+`mark_wait_parked!`. This IS the unified park mechanism the design aimed at.
+
+### Catalog of every park site
+
+| # | Thread (badge)                     | Trigger (SSN / condition)                                        | Kind          | What it stands in for |
+|---|------------------------------------|------------------------------------------------------------------|---------------|-----------------------|
+| 1 | any hosted thread                  | unrecoverable fault / unhandled syscall (`park_and_log!`)         | crash-park    | OS fault isolation: one process crash doesn't halt the kernel |
+| 2 | smss main (0)                      | `NtRaiseHardError(190)` = `SmpTerminate` (`:3363`)               | terminal-park | smss finished spawning csrss+winlogon; real NT then waits on subsystem handles |
+| 3 | svc/lsass/scm/wl listener+worker   | blocking/unserviced server syscall (`:3309`)                    | wait-park     | a server thread reached its RPC/LPC receive loop (blocks forever waiting for a client) |
+| 4 | any top-level (2/4/…)              | `NtWaitForSingleObject` on unsignalled event (`wait_park :3467`) | wait-park     | thread blocked on an event; a peer `NtSetEvent` wakes it |
+| 5 | any top-level                      | `NtWaitForMultipleObjects` unsignalled (`wait_park_multi :3497`) | wait-park     | rpcrt4 two-thread wait-array handshake |
+| 6 | any top-level                      | pipe read/TRANSCEIVE returned STATUS_PENDING (`pipe_wait_park :3533`) | wait-park | npfs pipe read with no data yet; a peer write re-drives it |
+| 7 | any                                | `NtDelayExecution` timed sleep (`delay_park :3400`)             | wait-park     | timer-woken sleep (never deadlocks) |
+| 8 | winlogon main (4)                  | `UserSetLogonNotifyWindow` (0x127c) after SAS HWND (`:3269`)     | milestone-park| InitializeSAS complete; winlogon enters its SAS message loop (infinite `NtUserGetMessage`) |
+
+### The "special" quiesce break-sites (per-process steady-state predicates)
+
+Beyond the generic all-parked test inside the two helpers, a handful of sites
+`break` directly on a **per-process steady-state predicate**. These are NOT
+duplicates of each other — each encodes a different terminal condition with
+ordering constraints, so they are intentionally left as distinct, heavily-
+commented arms:
+
+- **winlogon SAS-window milestone** (`:3289`): park #8 quiesces once
+  `WINLOGON_KEY_OPENED && LSA_RPC_SERVER_ACTIVE_SIGNALLED` (winlogon crossed msgina
+  GINA init AND lsass signalled its RPC-server-active event).
+- **winlogon WinMain event-wait** (`:3458`): winlogon's worker parked + its main
+  parked on an event, **guarded by `LSA_RPC_SERVER_ACTIVE_SIGNALLED != 0`.** ★ This
+  guard is the load-bearing paint-ordering invariant: winlogon `WaitForLsass`
+  BEFORE `InitializeSAS → SwitchDesktop → the desktop paint`. If we quiesced while
+  LSA was unsignalled we'd stop the loop before lsass's `SetEvent` can wake
+  winlogon into `SwitchDesktop` → **the `exec_win32k_desktop_painted` 768/768 spec
+  would never paint.** So while unsignalled we fall through to a WAKEABLE `wait_park`
+  (never quiesce).
+- **winlogon SCM-RPC read-park** (`:3576`): the `scm_server_live` predicate — while
+  the SCM server listener is signalled AND running AND not terminated/parked,
+  winlogon's SCM read-park is re-drivable (don't quiesce); once the listener is
+  gone it's terminal → quiesce.
+- **winlogon post-OpenSCManager crash** (`:972`), **SCM listener exit while
+  winlogon read-parked** (`:1676`), **server-listener steady state** (`:3341`) —
+  each a distinct terminal condition, all gated on the same
+  `LSA_RPC_SERVER_ACTIVE_SIGNALLED` steady-state flag so they never fire during
+  live bring-up.
+- **45s wall-clock progress watchdog** (`:390`): the backstop — if no
+  load/fill/event/paint happens for 45 s of wall-clock (TCG is slow: ~1–2 loop
+  iters/sec), forward progress is impossible → quiesce. Catches any missed edge.
+
+### Why this is documented, not further unified
+
+The two park HELPERS (`park_and_log!`, `mark_wait_parked!`) already ARE the single
+consolidated mechanism; every generic park routes through them. The residual
+direct-`break` sites are heterogeneous per-process steady-state predicates whose
+ordering (especially the `LSA_RPC_SERVER_ACTIVE_SIGNALLED` paint guard) is
+individually load-bearing. Collapsing them behind one predicate would risk the
+exact quiesce-ordering / paint-timing regressions this contract protects, for
+marginal tidiness. This catalog IS the consolidation: the mechanism is now legible
+in one place.
+
+---
+
 ## 2. The evidenced stall (boot log `/tmp/boot_fix2.log`)
 
 Exact timeline (line numbers in that log):

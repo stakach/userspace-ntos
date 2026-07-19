@@ -290,6 +290,13 @@ pub(crate) unsafe fn service_sec_image(
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
     let (mut badge, mut mi, mut m0, mut m1, mut m2, mut m3) =
         recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+    // ★★ PARK + QUIESCE CONTRACT — see docs/n-threads-multiplex.md §1a for the authoritative catalog
+    // of every park site + the quiesce predicate. Load-bearing: moving a park's location/condition or
+    // changing the quiesce logic can hang the boot (never quiesce) or quiesce EARLY (miss specs / skip
+    // the desktop paint). The two helpers below (`park_and_log!` crash parks, `mark_wait_parked!`
+    // wakeable waits) + the `crash_parked`/`wait_parked` bitmasks ARE the unified park mechanism; the
+    // remaining direct-`break` sites are per-process steady-state predicates (notably the
+    // LSA_RPC_SERVER_ACTIVE_SIGNALLED paint-ordering guard) intentionally kept distinct.
     // ★ FAULT ISOLATION (generalized park-and-log). An UNHANDLED / UNRECOVERABLE fault in ONE hosted
     // process must PARK THAT PROCESS (with a clear one-line log) and let the shared loop CONTINUE
     // servicing the others — a process crash does not halt the kernel (fundamental OS fault isolation).

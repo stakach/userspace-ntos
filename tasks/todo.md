@@ -257,3 +257,16 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
 - [x] **4. Docs.** `docs/component-harness.md` header → IMPLEMENTED + a tight §6 consolidated-state note
   (unified harness, multi-driver substrate, isolated-vs-in-executive, diagnostics); `ntdll_plan.md`
   gained a one-line "consolidation complete" footer pointing at §6.
+- [x] **5. Milestone-park consolidation — VERDICT: DOCUMENT, don't refactor.** Inventoried every park
+  site + quiesce break-site in `service_sec_image.rs`. FINDING: the mechanism is ALREADY consolidated
+  behind two helpers (`park_and_log!` crash parks; `mark_wait_parked!` wakeable waits) + two bitmasks
+  (`crash_parked`/`wait_parked`). Every generic park routes through them. The residual ~7 direct-`break`
+  quiesce sites are heterogeneous per-process steady-state predicates whose ordering is individually
+  load-bearing — most critically the `LSA_RPC_SERVER_ACTIVE_SIGNALLED` guard that MUST hold winlogon in
+  a WAKEABLE event-wait so lsass's SetEvent can wake it into `SwitchDesktop` → the
+  `exec_win32k_desktop_painted` 768/768 paint. Collapsing these behind one predicate would risk exactly
+  the quiesce-ordering / paint-timing regression the contract protects, for marginal tidiness. So:
+  documented rather than refactored — added `docs/n-threads-multiplex.md` §1a (authoritative catalog:
+  the two bitmasks, the two helpers, a table of all 8 park kinds, the special break-sites, and WHY not
+  further unified) + a `★★ PARK + QUIESCE CONTRACT` anchor comment in the source pointing at it. Purely
+  docs/comment — behaviour-preserving. Gate re-verified green.
