@@ -755,11 +755,16 @@ pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
 pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 /// A normal RAM frame the executive owns, used as a DMA buffer (TX descriptor ring +
-/// packet buffer) for the e1000e. VT-d translation is off (identity) so the NIC DMAs
-/// straight to this frame's physical address. Kept just past IPCBUF so it stays inside
-/// the same 2 MiB page table as every other runtime mapping (0x40_0000..0x5F_FFFF) — a
-/// vaddr in the next 2 MiB region would need a PT this vspace doesn't have.
-pub const DMA_VADDR: u64 = 0x0000_0100_105F_C000;
+/// packet buffer) for the e1000e. In Phase 1 VT-d translation is off (identity) so the NIC
+/// DMAs straight to this frame's physical address (learned via X86PageGetAddress).
+// DMA_VADDR gets its OWN dedicated page table in a fresh 2 MiB region (0x10C0_0000, in the free
+// gap between the FILEBUF-adjacent buffers 0x10B9… and the process-mirror region 0x1200…). The old
+// placement at 0x105F_C000 sat inside the SHARED WORK_CLUSTER 2 MiB PT and — after the boot's frame
+// footprint grew — its leaf PT slot was already occupied by another runtime mapping, so
+// `page_map(dma_frame, DMA_VADDR)` failed with seL4_DeleteFirst (error 8). The CPU's descriptor
+// writes then landed on the STALE frame while the NIC DMA'd from dma_frame's real (zeroed) paddr,
+// so the DD writeback never appeared in the polled frame. A dedicated PT guarantees a free slot.
+pub const DMA_VADDR: u64 = 0x0000_0100_10C0_0000;
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -6003,7 +6008,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let dma_frame = alloc_slot();
             nic_dma_frame = dma_frame; // hoist for the deferred (post-FS-mount) driver-host hosting
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
-            let _ = page_map(dma_frame, DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            // DMA_VADDR lives in its OWN dedicated 2 MiB region — build its page table so the frame
+            // map lands in a guaranteed-free leaf slot (the old shared-cluster slot was occupied,
+            // making page_map fail with DeleteFirst → CPU wrote a stale frame while the NIC DMA'd a
+            // zeroed one → no DD writeback ever observed).
+            let dma_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, dma_pt);
+            let _ = paging_struct_map(dma_pt, LBL_X86_PAGE_TABLE_MAP, DMA_VADDR, CAP_INIT_THREAD_VSPACE);
+            let _ = page_map_r(dma_frame, DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let dma_paddr = get_frame_paddr(dma_frame);
             print_str(b"[ntos-exec] DMA frame paddr=");
             print_hex((dma_paddr >> 32) as u32);
@@ -6595,7 +6607,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         {
             let regions = [
                 Region { source: FrameSource::Alias(nic_bar_base), base_va: NIC_VADDR, count: 4, rights: Rights::Uniform(RW_NX), pts: 0 },
-                Region { source: FrameSource::Alias(nic_dma_frame), base_va: DMA_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
+                // DMA_VADDR moved to its own dedicated 2 MiB region (0x10C0_0000) to dodge the
+                // shared-cluster slot collision; give this region its own PT here (pts: 1) since the
+                // driver-host's skeleton no longer covers that VA.
+                Region { source: FrameSource::Alias(nic_dma_frame), base_va: DMA_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 1 },
                 Region { source: FrameSource::Alias(reslist_frame), base_va: RESLIST_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 },
                 Region { source: FrameSource::Alias(pe_base), base_va: driver_pe::CODE_VA, count: driver_pe::PE_FRAMES, rights: Rights::Uniform(3 /* RWX */), pts: 0 },
                 Region { source: FrameSource::Alias(arena_base), base_va: driver_pe::ARENA_VADDR, count: driver_pe::ARENA_FRAMES, rights: Rights::Uniform(RW_NX), pts: 0 },
