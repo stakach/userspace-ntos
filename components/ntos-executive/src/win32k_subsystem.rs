@@ -102,9 +102,6 @@ pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
-/// An unmapped VA the host reads once DriverEntry returns / a dispatch completes — the fault-recv
-/// loop recognises the address as the "ready/done" signal (vs. a fault mid-init). Pool PT window.
-pub const WIN32K_SENTINEL_VADDR: u64 = 0x0000_0100_0719_0000;
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
 /// component (within the pool PT window). The executive copies a dispatched syscall's user buffers
 /// here (sized per the win32k SSN signature); win32k's handler reads/writes them in its own context;
@@ -326,7 +323,6 @@ pub fn win32k_ssn_argc(ssn: u64) -> u64 {
 
 // verdict bits
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
-pub const V_RETURNED: u32 = 2; // DriverEntry returned (did not fault)
 pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_SSDT: u32 = 8; // KeAddSystemServiceTable recorded the win32k table
 pub const V_NTUSER_ENTERED: u32 = 0x10; // dispatched SSDT[0xFA] NtUserInitialize into the handler
@@ -362,14 +358,6 @@ pub const SSN_TEST_FAULT: u64 = 0x1FFE;
 pub const TEST_FAULT_VA: u64 = 0x0000_0100_06B0_0000;
 /// The sentinel NTSTATUS the synthetic handler returns after surviving the fault.
 pub const TEST_FAULT_STATUS: i32 = 0x600D_600Du32 as i32;
-
-/// co_IntInitializeDesktopGraphics RVA (identified via its L"DISPLAY" ref + the PDEVOBJ_lChangeDisplay
-/// Settings(&gpmdev)/gbBaseVideo/EngpUpdateGraphicsDeviceList structure). NOTE: this is NO LONGER
-/// invoked directly by the host — the eager SSN_INIT_DESKTOP_GFX scaffold that called it was RETIRED.
-/// InitVideo/surface + the paint now run fully lazily: winlogon's first GUI DC-op drives
-/// `co_IntGraphicsCheck(TRUE)` → `co_AddGuiApp` (win32k RVA 0x7a080, which bumps the `NrGuiAppsRunning`
-/// counter at RVA 0x20be88 on the 0→1 transition) → this function. Kept only as a structural landmark.
-pub const CO_INIT_DESKTOP_GFX_RVA: u64 = 0xfca10;
 
 /// win32k `.data` global `gptiDesktopThread` (desktop.c:54) RVA. `IntGetAndReferenceClass(WC_DESKTOP,
 /// bDesktopThread=TRUE)` (class.c:1457) reads it as the desktop thread's THREADINFO — NULL in our host
@@ -1361,7 +1349,6 @@ extern "win64" fn s_ex_free_pool_with_tag(_p: u64, _tag: u64) {}
 
 // --- ZwAllocateVirtualMemory + RTL_BITMAP (GDI DC_ATTR / RGN_ATTR pool) -----------------------
 
-const MEM_COMMIT: u64 = 0x1000;
 const MEM_RESERVE: u64 = 0x2000;
 
 /// `NTSTATUS ZwAllocateVirtualMemory(HANDLE, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T
@@ -3535,7 +3522,6 @@ pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 /// this VA as FrameBufferBase, so framebuf writes pixels straight to the real framebuffer.
 /// 1024x768x32 scanline 4096 = 0x300000 = 768 pages (2 PTs at 0x0900/0x0920).
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
-pub const WIN32K_FB_FRAMES: u64 = 768;
 pub const WIN32K_FB_SIZE: u64 = 0x30_0000;
 
 // The pre-loaded dxg.sys image info the ZwSetSystemInformation trampoline reports to win32k. Written

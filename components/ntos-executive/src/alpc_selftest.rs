@@ -292,7 +292,7 @@ fn section_view_shared(
     }
 
     // Two views of the SAME section — one per endpoint.
-    let mut mk_view = |chan: &mut RingChannel<'_>, out: &mut [u8]| -> u64 {
+    let mk_view = |chan: &mut RingChannel<'_>, out: &mut [u8]| -> u64 {
         let cv = AlpcCreateSectionViewRequest {
             abi_size: core::mem::size_of::<AlpcCreateSectionViewRequest>() as u16,
             port_handle: listen,

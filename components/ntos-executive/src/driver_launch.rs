@@ -154,7 +154,6 @@ pub const SH_REQ_OUTLEN: u64 = 0x60; // in:  output buffer length (u64)
 pub const SH_REQ_FILEID: u64 = 0x68; // in/out: opaque FILE_OBJECT id (u64)
 pub const SH_REQ_STATUS: u64 = 0x70; // out: IoStatus.Status (i32)
 pub const SH_REQ_INFO: u64 = 0x78; // out: IoStatus.Information (u64)
-pub const SH_REQ_SEQ: u64 = 0x80; // out: completed-request counter (u64) — observability
 
 // --- verdict bits ----------------------------------------------------------------------------
 
@@ -824,12 +823,6 @@ pub fn fsd_export_addr(name: &str) -> u64 {
     s_true as usize as u64 // fail-soft default (auditable — the loader logs unbound names)
 }
 
-/// Whether a name was EXPLICITLY bound (vs the fail-soft default) — the loader uses this to log the
-/// unresolved surface for auditing.
-pub fn fsd_is_bound(name: &str) -> bool {
-    fsd_export_addr(name) != s_true as usize as u64
-}
-
 // --- the FSD component entry -----------------------------------------------------------------
 
 /// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
@@ -1190,10 +1183,6 @@ pub(crate) struct DriverComponent {
     pub pml4: u64,
     /// The component's fault endpoint (also the IRP dispatch channel: plain Send/Recv).
     pub fault_ep: u64,
-    /// The loaded image base VA (= [`FSD_CODE_VA`] for an FSD).
-    pub code_va: u64,
-    /// The recorded `DriverObject->MajorFunction[]` base VA (in the component's VSpace).
-    pub mj_table: u64,
     /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
     pub devobj: u64,
     /// The DriverEntry verdict bitmask ([`V_ENTERED`] etc.).
@@ -1536,7 +1525,6 @@ pub(crate) unsafe fn load_driver(
 
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
-    let mj_table = read_volatile((win.shared_va + SH_MJ_TABLE) as *const u64);
     let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     print_str(b"[npfs-svc] DriverEntry ");
     if finished {
@@ -1567,8 +1555,6 @@ pub(crate) unsafe fn load_driver(
     let dc = DriverComponent {
         pml4,
         fault_ep,
-        code_va: run_va,
-        mj_table,
         devobj,
         verdict,
         finished,
@@ -1649,8 +1635,6 @@ pub(crate) unsafe fn ensure_paging(page: u64, pml4: u64) {
 pub(crate) struct DriverInstance {
     pub fault_ep: u64,
     pub pml4: u64,
-    pub mj_table: u64,
-    pub devobj: u64,
     pub exec_shared_va: u64,
     pub exec_arg_va: u64,
     pub ready: bool,
@@ -1660,8 +1644,6 @@ pub(crate) struct DriverInstance {
 const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     fault_ep: 0,
     pml4: 0,
-    mj_table: 0,
-    devobj: 0,
     exec_shared_va: 0,
     exec_arg_va: 0,
     ready: false,
@@ -1682,8 +1664,6 @@ fn register_instance(dc: &DriverComponent) {
         t[dc.instance] = DriverInstance {
             fault_ep: dc.fault_ep,
             pml4: dc.pml4,
-            mj_table: dc.mj_table,
-            devobj: dc.devobj,
             exec_shared_va: dc.exec_shared_va,
             exec_arg_va: dc.exec_arg_va,
             // Default readiness = npfs's historic rule (parked + a control device object). A
@@ -1730,21 +1710,10 @@ pub(crate) fn npfs_ready() -> bool {
     instance(0).map(|d| d.ready).unwrap_or(false)
 }
 
-/// The recorded \Device\NamedPipe DEVICE_OBJECT (0 = not launched).
-pub(crate) fn npfs_devobj() -> u64 {
-    instance(0).map(|d| d.devobj).unwrap_or(0)
-}
-
 /// The opaque FILE_OBJECT id (npfs's `FsContext`) from the LAST dispatched IRP to instance 0.
 pub(crate) unsafe fn npfs_last_file_id() -> u64 {
     let sh = instance(0).map(|d| d.exec_shared_va).unwrap_or(FSD_SHARED_VADDR);
     read_volatile((sh + SH_REQ_FILEID) as *const u64)
-}
-
-/// The opaque FILE_OBJECT id from the LAST dispatched IRP to `instance`.
-pub(crate) unsafe fn last_file_id(inst: usize) -> u64 {
-    let Some(d) = instance(inst) else { return 0 };
-    read_volatile((d.exec_shared_va + SH_REQ_FILEID) as *const u64)
 }
 
 /// Route one IRP to launched driver `inst`: fill the shared request fields, drive its dispatch loop

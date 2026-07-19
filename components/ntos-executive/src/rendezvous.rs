@@ -202,7 +202,7 @@ pub(crate) unsafe fn sm_rendezvous(
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let rdx = m3;
-            let mut result = 0u64;
+            let result = 0u64;
             let mut stop_rdv = false;
             let mut done = false;
             match ssn {
@@ -817,7 +817,7 @@ pub(crate) unsafe fn csr_rendezvous(
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let rdx = m3;
-            let mut result = 0u64;
+            let result = 0u64;
             let mut done = false;
             match ssn {
                 SSN_SET_EVENT => {} // NtSetEvent(hRequestEvent) — no-op success

@@ -94,13 +94,6 @@ impl Default for ReqKind {
     }
 }
 
-/// Shared-frame request-header KIND tag offset. VERIFIED FREE in BOTH Family-A frames:
-///   * FSD frame: between `SH_POOL_USED=0x28` and `SH_REQ_MAJOR=0x40` (`driver_launch.rs`).
-///   * win32k frame: between `SH_POOL_USED=0x30` and `SH_NTUSER_HANDLER=0x40` (`win32k_subsystem.rs`).
-/// A component builder MAY stamp its constant `ReqKind` here at spawn time; the pump can also key
-/// KIND off the descriptor (`caps.kind`) since it is constant per component — the design's fallback.
-pub(crate) const SH_REQ_KIND: u64 = 0x38;
-
 /// Out: NTSTATUS offset — DIFFERS by KIND (FSD writes 0x70, win32k 0x78). The pump reads the offset
 /// appropriate to `caps.kind`; these do NOT unify (design §2.2 status-offset note).
 pub(crate) const SH_REQ_STATUS_IRP: u64 = 0x70;
