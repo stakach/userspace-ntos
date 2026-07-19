@@ -38,6 +38,9 @@ use nt_compat_exports::ssdt::{
 /// for the record; the isolated win32k-service component maps these into untyped-backed frames.
 pub struct Win32kPe {
     pub size: u64,
+    // Documentation-of-record: the PE's preferred ImageBase, recorded from the offline PE parse. The
+    // component relocates to its own run VA, so nothing reads this back; kept as recorded PE metrics.
+    #[allow(dead_code)]
     pub image_base: u64,
     pub size_of_image: u32,
     pub image_frames: u32,

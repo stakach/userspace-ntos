@@ -1134,6 +1134,9 @@ pub(crate) enum DriverClass {
     Fsd,
     /// A generic IRP filter/class driver (FS/bus filter). Same IRP substrate + caps as [`Fsd`]; the
     /// distinction is policy documentation (IRP forwarding is driver logic, not a harness concern).
+    // Future-wiring: a user-specified filter-driver class seam (design §5.4); no `DriverSpec`
+    // constructs it yet, but `caps_and_layout_for` already routes it. Intentional — matches `Device`.
+    #[allow(dead_code)]
     Filter,
     /// Hardware device driver — same IRP substrate as [`Fsd`], plus a device-cap section (MMIO BAR
     /// frames / DMA / IRQ) that `nt-pnp` populates. The device caps/regions are a SEAM (not minted

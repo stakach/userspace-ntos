@@ -118,8 +118,13 @@ pub(crate) struct HostCaps {
     pub client_attach: bool,
     /// win32k: honour `KeUserModeCallback` / WINDOWPROC bridge (documents the capability; the
     /// callback is bound component-side in DriverEntry).
+    // Capability-surface documentation (§2.3): the win32k callback/wide-arg specifics are keyed off
+    // the SSN component-side, not this runtime flag, so the pump never reads it. Intentional seam.
+    #[allow(dead_code)]
     pub usermode_callback: bool,
     /// win32k: stage wide (>4) stack args from the caller frame into `SH_REQ_A4..` / `SH_REQ_NARGS`.
+    // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
+    #[allow(dead_code)]
     pub wide_arg_marshal: bool,
     /// win32k: skip checked-build int-0x2c NT_ASSERTs (resume IP+2) on a label-3 UserException.
     pub assert_skip: bool,
@@ -155,6 +160,10 @@ pub(crate) struct ComponentDescriptor<'a> {
     pub gs_base: Option<u64>,
     /// Component-runtime capability flags (Phase B harness). `HostCaps::default()` (all-false) is
     /// byte-identical to a pre-harness component — consumed only by [`component_pump`].
+    // Future-wiring seam (Step-0 additive ABI): the pump reads `PumpChannel.caps`, built independently
+    // by the win32k/FSD callers, so `spawn_component` never reads this descriptor field yet. Kept as
+    // the documented descriptor→spawn_component caps path for when that wiring lands.
+    #[allow(dead_code)]
     pub caps: HostCaps,
 }
 
@@ -162,6 +171,9 @@ pub(crate) struct ComponentDescriptor<'a> {
 pub(crate) struct SpawnedComponent {
     pub pml4: u64,
     pub tcb: u64,
+    // Documentation-of-record: the component's CNode cap. Callers use `pml4`/`tcb`/`stack_frame_base`;
+    // the CNode is returned for a future teardown/revoke path (cap reclaim on component exit).
+    #[allow(dead_code)]
     pub cnode: u64,
     /// The cap slot of the first stack frame (win32k stashes this for later remaps). Only
     /// meaningful when the stack uses `FreshZeroed`.

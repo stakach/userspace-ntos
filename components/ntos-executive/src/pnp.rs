@@ -38,6 +38,9 @@ pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevic
 /// The PnP resource assignment + minted caps for one device the broker granted.
 pub(crate) struct GrantedDevice {
     /// The bound device (bus/dev/func + decoded BARs/IRQ from enumeration).
+    // Documentation-of-record: only the resource `assignment` is consumed downstream; the bound
+    // device identity is recorded for a future device-driver granting path (per-device caps).
+    #[allow(dead_code)]
     pub device: PciDevice,
     /// The abstract resource assignment (MMIO phys+len, interrupt vector, DMA len).
     pub assignment: ResourceAssignment,
