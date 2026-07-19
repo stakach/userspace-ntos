@@ -23,20 +23,37 @@ The launcher (`spawn_component`/`ComponentDescriptor`) is ALREADY shared. This w
 - [x] Define `component_pump`, `component_main`, `run_once` — CALLED FROM NOWHERE yet.
 - [x] VERIFY: gate 180/98 (byte-identical; no call sites touched).
 
-## Step 1 — FSD executive pump → `component_pump`
-- [ ] Re-express `npfs_dispatch_irp` inner loop (`driver_launch.rs:1584-1654`) as a `component_pump`
-      call, `caps = { dispatch_server, kind: Irp }`. Request-fill stays in `npfs_dispatch_irp`.
-- [ ] Migrate the FSD init-time fault loop (`load_driver:1402-1455`) too (same shape).
-- [ ] VERIFY specs: `npfs_isolated_vspace`, `npfs_dispatch_roundtrip`, `npfs_create_named_pipe_complete`,
-      `npfs_client_connect_finds_fcb`, `npfs_set_pipe_information`,
-      `exec_pipe_syscalls_routed_through_npfs`, `exec_pipe_data_plane_*`, `exec_npfs_flush_pending`;
-      gate 180/98.
+## Step 1 — FSD executive pump → `component_pump`  — ACTUALLY DONE (gate 182/98)
+> PRIOR STATE: Steps 1/2 had only landed `component_pump`/`component_main` as UNWIRED skeletons
+> (zero call sites, dead code); the FSD still ran its bespoke `npfs_dispatch_irp`/inline loop. Step
+> 4.5 kept that bespoke path and made it multi-instance. THIS batch actually wires the FSD through
+> the shared harness.
+- [x] Re-expressed BOTH executive-side FSD fault loops as `component_pump(&PumpChannel)` calls,
+      `caps = { dispatch_server, kind: Irp }`, all win32k flags false:
+      - `dispatch_irp(inst, …)` (the per-IRP loop; `npfs_dispatch_irp` is its instance-0 wrapper):
+        `wake_first=true`, `image_frames=0`, `demand_cap=256`. Request-fill stays in `dispatch_irp`.
+      - `load_driver`'s DriverEntry init loop: `wake_first=false` (the component is a blocked SENDER
+        mid-init, not parked at a recv — the pump must RECEIVE first), `image_frames=FSD_IMAGE_FRAMES`,
+        `code_va=run_va`, `demand_cap=512`, `trace_faults=true`.
+- [x] Added `wake_first: bool` to `PumpChannel` (skeleton bug surfaced by wiring: the per-request
+      shape wakes with a leading Send; the init shape must Recv first or it DEADLOCKS against the
+      faulting sender — the design's pump always Sent first).
+- [x] VERIFY: gate 182/98, all npfs specs PASS (see the harness proof spec below).
 
-## Step 2 — FSD component entry → `component_main`
-- [ ] `fsd_component_entry` (`driver_launch.rs:785-852`) → `component_main` with IRP dispatch closure
-      (`major → run_irp`), `post_driver_entry = no-op`, `DriverObjectSpec{size:0x150, ext:0x68}`.
-- [ ] Hoist `send_done`/`recv_req` into the harness (parameterised by `dispatch_label`).
-- [ ] VERIFY: same npfs spec set; gate 180/98.
+## Step 2 — FSD component entry → `component_main`  — ACTUALLY DONE
+- [x] `fsd_component_entry` now delegates the whole DriverEntry-preamble + dispatch loop to
+      `component_main(FSD_SHARED_VADDR, FSD_CODE_VA, DriverObjectSpec{size:0x150,ext:0x68,ext_size:0x50,
+      mj:0x70}, SH_REQ_STATUS, FSD_DISPATCH_LABEL, fsd_dispatch, fsd_post_driver_entry)`. The FSD IRP
+      router is `fsd_dispatch` (`major → MajorFunction[major] → run_irp`); `fsd_post_driver_entry`
+      records the pool high-water + the `[fsd-host] DriverEntry returned` diagnostic line. BOTH the
+      npfs instance AND `IrpFsdTest.sys` (they share `fsd_component_entry`) now run on the harness.
+- [x] Retired the bespoke inline `dispatch_loop`/`send_done`/`recv_req` (now genuinely dead). The
+      harness's `send_done_on(label)`/`recv_req_on()` are the shared implementation.
+- [x] PROOF (durable, not green-alone): `component_pump` bumps `HARNESS_IRP_DISPATCHES` per serviced
+      IRP dispatch; the counted gate spec `exec_fsd_on_shared_harness` asserts the live FSD traffic
+      (both DriverEntry inits + npfs create/read/write/flush + the 2nd-driver IRP) flowed through the
+      pump (`>= 8`). If the FSD were unwired the counter would be 0 → spec FAILS.
+- [x] VERIFY: same npfs spec set PASS; gate 182/98; win32k `dispatch_loop` UNTOUCHED (migrates later).
 
 ## Step 3 — Family B fold → `run_once` (optional, do before win32k for confidence)
 - [ ] `driver_host_entry` (`driver_host.rs:19-100`) + `kmdf_host_entry` (`kmdf_host.rs:766-779`) call
@@ -62,8 +79,11 @@ The launcher (`spawn_component`/`ComponentDescriptor`) is ALREADY shared. This w
 Requirement: users can specify drivers to run by-path; adding a driver = stage the .sys + declare a
 class → runs on the SAME harness with ZERO bespoke code. Design: `docs/component-harness.md` §5.
 Family-A IRP dispatch server is the DEFAULT driver path (Family B = test-lifecycle fixtures only).
-NOTE: Steps 1/2 landed the `component_main`/`component_pump` scaffolding but left them UNWIRED (the FSD
-still runs its bespoke `fsd_component_entry`/`dispatch_loop` + inline executive pump). Step 4.5 kept that
+NOTE (now HISTORICAL — superseded above): Steps 1/2 originally landed the `component_main`/`component_pump`
+scaffolding but left them UNWIRED (the FSD still ran its bespoke `fsd_component_entry`/`dispatch_loop` +
+inline executive pump). This has since been FIXED — the FSD (both instances) genuinely runs on the shared
+harness now (gate 182/98; proven by `exec_fsd_on_shared_harness`, 96 IRP dispatches through
+`component_pump`). Step 4.5 kept that
 proven bespoke path and made it MULTI-INSTANCE — the substrate is now genuinely multi-driver regardless.
 - [x] G1: `load_driver(fs,path,class)` routes `Fsd`/`Filter`/`Device` through the SAME IRP path (was
       `if class != Fsd { return None }`); gated by `caps_and_layout_for(class).dispatch_server` so only

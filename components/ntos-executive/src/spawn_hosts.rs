@@ -411,12 +411,37 @@ pub(crate) struct PumpChannel {
     pub demand_cap: u64,
     /// Emit `[svc] fault #N ...` trace lines for the first 40 faults (init-loop observability).
     pub trace_faults: bool,
+    /// Whether to WAKE the server with a leading `ep_send(dispatch_label)` before receiving.
+    /// `true` = the PER-REQUEST shape: the server is parked in `recv_req_on` (a blocked receiver),
+    /// so the executive Sends to hand it the request (the win32k / per-IRP loops). `false` = the
+    /// DRIVER-ENTRY-INIT shape: the component is NOT yet at a recv — it is mid-DriverEntry and will
+    /// fault (a blocked SENDER on the fault EP) or Send its ready signal, so the executive must start
+    /// by RECEIVING (a leading Send would deadlock against the faulting sender). See `load_driver`.
+    pub wake_first: bool,
     /// win32k Step-4 fields (0 for the FSD): the per-caller reply cap (REPLY_W32) and the client
     /// process-index for `client_attach`/foreign-frame sharing.
     pub reply_cap: u64,
     pub client_pi: u64,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
+}
+
+/// PROOF-OF-WIRING counters: `component_pump` increments these per SERVICED dispatch, tagged by
+/// `ReqKind`. They are the durable evidence that a component's live traffic actually flows through
+/// the SHARED harness pump (not the retired bespoke inline loop). The `exec_fsd_on_shared_harness`
+/// gate spec asserts `HARNESS_IRP_DISPATCHES >= N` for the real npfs data-plane + 2nd-driver IRPs —
+/// if the FSD were NOT routed through `component_pump`, this counter would stay 0 and the spec FAILS.
+pub(crate) static HARNESS_IRP_DISPATCHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) static HARNESS_SYSCALL_DISPATCHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Total dispatches serviced by [`component_pump`] for the given `kind`.
+pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
+    match kind {
+        ReqKind::Irp => HARNESS_IRP_DISPATCHES.load(Ordering::Relaxed),
+        ReqKind::Syscall => HARNESS_SYSCALL_DISPATCHES.load(Ordering::Relaxed),
+    }
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its
@@ -441,13 +466,19 @@ pub(crate) struct PumpResult {
 /// specific marshal. On completion the pump reads `SH_REQ_STATUS` at the offset appropriate to
 /// `caps.kind` (0x70 Irp / 0x78 Syscall). This is the ONE loop `npfs_dispatch_irp` (Step 1) and
 /// `load_driver`'s init loop (Step 1) and `win32k_dispatch_wide` (Step 4) converge onto.
-#[allow(dead_code)]
+///
+/// On a COMPLETED dispatch (server re-parked) the pump bumps [`HARNESS_IRP_DISPATCHES`] /
+/// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
     // (Step 4, win32k) if ch.caps.client_attach { w32_client_attach(ch.client_pi); }
     // (Step 4, win32k) if ch.caps.wide_arg_marshal { stage SH_REQ_A4../NARGS from the caller SP. }
 
-    // Wake the server, then pump its faults until it re-parks or walls.
-    crate::ep_send(ch.fault_ep, ch.dispatch_label);
+    // Wake the server (per-request shape), then pump its faults until it re-parks or walls. The
+    // DriverEntry-init shape (`wake_first=false`) starts by RECEIVING — the component is a blocked
+    // sender (mid-init fault / ready-Send), so a leading Send would deadlock against it.
+    if ch.wake_first {
+        crate::ep_send(ch.fault_ep, ch.dispatch_label);
+    }
     let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = crate::ep_recv_full(ch.fault_ep);
     let mut faults = 0u64;
     let mut demand = 0u64;
@@ -505,6 +536,11 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
         }
     }
     let status = if completed {
+        // Proof-of-wiring: count each serviced dispatch by kind.
+        match ch.caps.kind {
+            ReqKind::Irp => HARNESS_IRP_DISPATCHES.fetch_add(1, Ordering::Relaxed),
+            ReqKind::Syscall => HARNESS_SYSCALL_DISPATCHES.fetch_add(1, Ordering::Relaxed),
+        };
         let so = match ch.caps.kind {
             ReqKind::Irp => SH_REQ_STATUS_IRP,
             ReqKind::Syscall => SH_REQ_STATUS_SYSCALL,
@@ -545,7 +581,6 @@ pub(crate) struct DispatchReq {
 /// `code_va` is the loaded image base (DriverEntry = code_va + entry_rva). `dispatch` is the KIND
 /// router (FSD: major→run_irp; win32k: ssn→dispatch_ssn). This is the shape both
 /// `fsd_component_entry` (Step 2) and `win32k_subsystem_entry` (Step 4) collapse onto.
-#[allow(dead_code)]
 pub(crate) unsafe fn component_main(
     shared_va: u64,
     code_va: u64,

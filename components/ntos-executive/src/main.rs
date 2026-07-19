@@ -8302,6 +8302,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         check(b"exec_win32k_load_contract", contract_ok, &mut passed);
     }
 
+    // --- PROOF the FSD (all instances) GENUINELY runs on the SHARED HARNESS. `component_pump`
+    // increments `HARNESS_IRP_DISPATCHES` per serviced IRP dispatch (kind=Irp). By this point the
+    // whole live FSD data-plane has flowed through it: BOTH DriverEntry inits (npfs + IrpFsdTest) +
+    // the 2nd-driver IRP_MJ_CREATE round-trip + every npfs pipe create/read/write/flush IRP. If the
+    // FSD were NOT wired through `component_pump` (the pre-harness bespoke inline loop), this counter
+    // would be 0 and this spec FAILS — that is the durable, non-green-alone proof the wiring is real.
+    let harness_irp = spawn_hosts::harness_dispatches(spawn_hosts::ReqKind::Irp);
+    print_str(b"[harness] IRP dispatches serviced through component_pump: ");
+    print_u64(harness_irp);
+    print_str(b"\n");
+    check(b"exec_fsd_on_shared_harness", harness_irp >= 8, &mut passed);
+
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
     print_str(b"/98 executive->isolated-service checks passed]\n");

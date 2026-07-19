@@ -832,10 +832,15 @@ pub fn fsd_is_bound(name: &str) -> bool {
 
 // --- the FSD component entry -----------------------------------------------------------------
 
-/// The generic FSD host-component entry. Reads the DriverEntry RVA from the shared page, builds a
-/// minimal DRIVER_OBJECT + RegistryPath from the pool, calls the driver's `DriverEntry`, records the
-/// MajorFunction table + verdict, then enters the IRP dispatch loop. Sends its ready/done signal on
-/// the fault EP. Runs in the isolated component's VSpace (executive image mapped RWX-shared).
+/// The generic FSD host-component entry. NOW RUNS ON THE SHARED HARNESS: it delegates the whole
+/// DriverEntry-preamble → dispatch-loop shape to [`crate::spawn_hosts::component_main`], plugging the
+/// FSD's IRP router ([`fsd_dispatch`]) as the per-request callback, a no-op-plus-diagnostics
+/// [`fsd_post_driver_entry`], and the FSD [`DriverObjectSpec`] (size 0x150, ext ptr @0x68, ext size
+/// 0x50, MajorFunction @0x70). The bespoke inline `dispatch_loop`/`send_done`/`recv_req` are retired
+/// in favour of the harness's shared implementation (`send_done_on`/`recv_req_on`). This is the
+/// component-side leg of the FSD's migration onto the unified harness (Phase B, Step 2). Both the
+/// npfs instance and the 2nd `IrpFsdTest.sys` instance share this entry, so BOTH now run on the harness.
+/// Runs in the isolated component's VSpace (executive image mapped RWX-shared).
 #[no_mangle]
 #[link_section = ".text.fsd_component_entry"]
 pub unsafe extern "C" fn fsd_component_entry() -> ! {
@@ -844,53 +849,28 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
     print_hex(entry_rva);
     print_str(b"\n");
 
-    // DRIVER_OBJECT (Type@0=4, Size@2=0x150, MajorFunction[]@0x70..). The x64 DRIVER_OBJECT is
-    // 0x150 bytes with MajorFunction at offset 0x70 (28 entries * 8 = 0xE0 → ends at 0x150).
-    let drv = pool_alloc(0x150);
-    let mut i = 0u64;
-    while i < 0x150 {
-        write_unaligned((drv + i) as *mut u64, 0);
-        i += 8;
-    }
-    write_unaligned(drv as *mut i16, 4); // Type = IO_TYPE_DRIVER
-    write_unaligned((drv + 2) as *mut u16, 0x150); // Size
-    // DriverExtension is at 0x68 (a pointer); MajorFunction is at 0x70.
-    let ext = pool_alloc(0x50);
-    let mut j = 0u64;
-    while j < 0x50 {
-        write_unaligned((ext + j) as *mut u64, 0);
-        j += 8;
-    }
-    write_unaligned((drv + 0x68) as *mut u64, ext);
+    // The x64 DRIVER_OBJECT is 0x150 bytes: Type@0=4, Size@2, DriverExtension ptr @0x68 (ext block
+    // 0x50), MajorFunction[]@0x70 (28 entries * 8 = 0xE0 → ends at 0x150). Hand the whole preamble +
+    // persistent recv→dispatch→reply loop to the SHARED harness.
+    crate::spawn_hosts::component_main(
+        FSD_SHARED_VADDR,
+        FSD_CODE_VA,
+        crate::spawn_hosts::DriverObjectSpec { size: 0x150, ext: 0x68, ext_size: 0x50, mj: 0x70 },
+        SH_REQ_STATUS,      // FSD status offset (0x70)
+        FSD_DISPATCH_LABEL, // 0x771
+        fsd_dispatch,       // major → MajorFunction[major] → run_irp
+        fsd_post_driver_entry,
+    )
+}
 
-    // RegistryPath UNICODE_STRING { Length=0, MaximumLength=2, Buffer=&NUL }.
-    let reg_path = pool_alloc(0x18);
-    let reg_buf = pool_alloc(0x10);
-    write_unaligned(reg_buf as *mut u16, 0);
-    write_unaligned(reg_path as *mut u16, 0);
-    write_unaligned((reg_path + 2) as *mut u16, 2);
-    write_unaligned((reg_path + 8) as *mut u64, reg_buf);
-
-    write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, V_ENTERED);
-
-    let entry = FSD_CODE_VA + entry_rva as u64;
-    let de: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(entry as *const ());
-    let status = de(drv, reg_path);
-
-    // MajorFunction table base = drv + 0x70.
-    let mj_base = drv + 0x70;
-    let mj_create = read_unaligned(mj_base as *const u64);
-    let mut v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
-    v |= V_RETURNED;
-    if status == 0 {
-        v |= V_SUCCESS;
-    }
-    if mj_create != 0 {
-        v |= V_MJ;
-    }
-    write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
-    write_volatile((FSD_SHARED_VADDR + SH_DE_STATUS) as *mut i32, status);
-    write_volatile((FSD_SHARED_VADDR + SH_MJ_TABLE) as *mut u64, mj_base);
+/// FSD `post_driver_entry` (runs between DriverEntry and the FIRST `send_done`, exactly as the old
+/// inline path): record the pool high-water for diagnostics + emit the DriverEntry-returned line. The
+/// verdict/status/MJ-table were already recorded by `component_main`; this only adds the FSD's
+/// diagnostic prints so the boot serial keeps its `[fsd-host] DriverEntry returned ...` line.
+unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
+    let mj_create = read_unaligned((drv + 0x70) as *const u64);
+    let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
+    // Pool high-water (diagnostic; not read by the executive — parity with the old inline entry).
     let pool_used = read_volatile(FSD_POOL_VADDR as *const u64);
     write_volatile((FSD_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
     print_str(b"[fsd-host] DriverEntry returned status=0x");
@@ -901,27 +881,26 @@ pub unsafe extern "C" fn fsd_component_entry() -> ! {
     print_hex((mj_create >> 32) as u32);
     print_hex(mj_create as u32);
     print_str(b"\n");
-
-    dispatch_loop(drv)
 }
 
-/// Signal ready/done to the executive: a plain `seL4_Send` on the fault-endpoint cap ([`crate::CT_FAULT`])
-/// carrying [`FSD_DISPATCH_LABEL`] (Send/Recv, NOT Call — the win32k fix-A rationale).
-#[inline(never)]
-unsafe fn send_done() {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_SEND as u64,
-        in("rdi") crate::CT_FAULT,
-        in("rsi") FSD_DISPATCH_LABEL << 12,
-        in("r10") 0u64, in("r8") 0u64, in("r9") 0u64, in("r15") 0u64,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
+/// The FSD IRP router — the `dispatch` callback plugged into [`crate::spawn_hosts::component_main`].
+/// Reads the request's IRP major from `req.sel`, looks up `DriverObject->MajorFunction[major]`, and
+/// runs the driver's handler via [`run_irp`] in this component's context. Returns `(status, info)`.
+/// This is the EXACT body the retired inline `dispatch_loop` ran per request.
+unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    let major = req.sel;
+    let mj_base = req.drv + 0x70;
+    let handler = read_volatile((mj_base + major * 8) as *const u64);
+    if handler != 0 {
+        run_irp(major, handler)
+    } else {
+        (0xC000_0002u32 as i32, 0) // STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// Generic (label-parameterised) form of [`send_done`] for the shared [`crate::component_main`]
-/// harness: plain `seL4_Send(CT_FAULT, label)`. `send_done` is the FSD-labelled shim over this.
+/// Generic (label-parameterised) ready/done signal for the shared [`crate::spawn_hosts::component_main`]
+/// harness: a plain `seL4_Send(CT_FAULT, label)` (Send/Recv, NOT Call — the win32k fix-A rationale).
+/// The FSD dispatch loop (now the harness's) Sends [`FSD_DISPATCH_LABEL`] through this.
 #[inline(never)]
 pub(crate) unsafe fn send_done_on(label: u64) {
     core::arch::asm!(
@@ -935,7 +914,8 @@ pub(crate) unsafe fn send_done_on(label: u64) {
     );
 }
 
-/// Generic form of [`recv_req`] for the shared harness: plain `seL4_Recv(CT_FAULT)`.
+/// Block for the next dispatch request for the shared [`crate::spawn_hosts::component_main`]
+/// harness: a plain `seL4_Recv(CT_FAULT)`.
 #[inline(never)]
 pub(crate) unsafe fn recv_req_on() {
     core::arch::asm!(
@@ -946,43 +926,6 @@ pub(crate) unsafe fn recv_req_on() {
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-}
-
-/// Block for the next dispatch request: a plain `seL4_Recv` on [`crate::CT_FAULT`].
-#[inline(never)]
-unsafe fn recv_req() {
-    core::arch::asm!(
-        "syscall",
-        in("rdx") crate::SYS_RECV as u64,
-        inout("rdi") crate::CT_FAULT => _,
-        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
-        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-        options(nostack),
-    );
-}
-
-/// The persistent FSD IRP dispatch loop (Send/Recv handshake). Each iteration: Send ready/done, Recv
-/// the next request, build a minimal IRP + IO_STACK_LOCATION for `SH_REQ_MAJOR`, invoke
-/// `DriverObject->MajorFunction[major]` in this component's context, and write the IoStatus back.
-unsafe fn dispatch_loop(drv: u64) -> ! {
-    let mj_base = drv + 0x70;
-    let mut seq = 0u64;
-    loop {
-        send_done();
-        recv_req();
-        let major = read_volatile((FSD_SHARED_VADDR + SH_REQ_MAJOR) as *const u64);
-        let handler = read_volatile((mj_base + major * 8) as *const u64);
-        let (mut st, mut info): (i32, u64) = (0xC000_0002u32 as i32, 0); // STATUS_NOT_IMPLEMENTED
-        if handler != 0 {
-            let (rst, rinfo) = run_irp(major, handler);
-            st = rst;
-            info = rinfo;
-        }
-        write_volatile((FSD_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, st);
-        write_volatile((FSD_SHARED_VADDR + SH_REQ_INFO) as *mut u64, info);
-        seq += 1;
-        write_volatile((FSD_SHARED_VADDR + SH_REQ_SEQ) as *mut u64, seq);
-    }
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke the FSD's
@@ -1552,61 +1495,36 @@ pub(crate) unsafe fn load_driver(
     let fault_ep = make_object(OBJ_ENDPOINT);
     let pml4 = spawn_fsd_component(code_base, pool_base, data_base, shared, arg_base, fault_ep, &rights[..img_frames as usize]);
 
-    // 5. Drive the fault-recv loop: demand-map benign pages, wait for the dispatch-ready signal.
-    const DEMAND_CAP: u64 = 512;
-    let mut faults = 0u64;
-    let mut demand = 0u64;
-    let mut finished = false;
-    let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
-    let (mut _bdg, mut mi, mut m0, mut m1, mut _m2, mut _m3) = ep_recv_full(fault_ep);
-    loop {
-        let label = mi >> 12;
-        if label == 6 {
-            let ip = m0;
-            let addr = m1;
-            faults += 1;
-            if faults <= 40 {
-                print_str(b"[npfs-svc] fault #");
-                print_u64(faults);
-                print_str(b" ip=0x");
-                print_hex(ip as u32);
-                print_str(b" RVA=0x");
-                print_hex(ip.wrapping_sub(run_va) as u32);
-                print_str(b" addr=0x");
-                print_hex((addr >> 32) as u32);
-                print_hex(addr as u32);
-                print_str(b"\n");
-            }
-            // Faults report addresses in the COMPONENT's VSpace (image runs at run_va).
-            let in_image = addr >= run_va && addr < run_va + img_frames * 0x1000;
-            if addr < 0x10000 || in_image || demand >= DEMAND_CAP {
-                wall_ip = ip;
-                wall_addr = addr;
-                wall_label = label;
-                break;
-            }
-            let page = addr & !0xFFF;
-            ensure_paging(page, pml4);
-            let f = alloc_frame();
-            let _ = page_map(f, page, RW_NX, pml4);
-            demand += 1;
-            let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(fault_ep, 0, 0, 0, 0, 0);
-            mi = nmi;
-            m0 = nm0;
-            m1 = nm1;
-            _m2 = nm2;
-            _m3 = nm3;
-            continue;
-        } else if label == FSD_DISPATCH_LABEL {
-            finished = true;
-            break;
-        } else {
-            wall_ip = m0;
-            wall_addr = m1;
-            wall_label = label;
-            break;
-        }
-    }
+    // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
+    //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
+    //    signal (FSD_DISPATCH_LABEL). Faults report addresses in the COMPONENT's VSpace (image runs at
+    //    run_va), so the in-image wall bounds are `[run_va, run_va + img_frames*0x1000)`.
+    // `wake_first=false`: the component is mid-DriverEntry (a blocked SENDER on its fault EP, or about
+    // to Send its ready signal), NOT parked at a recv — so the pump must start by RECEIVING, exactly
+    // as the old inline `ep_recv_full(fault_ep)` did. Trace on for init-time observability.
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep,
+        pml4,
+        code_va: run_va,
+        image_frames: img_frames,
+        shared_va: win.shared_va,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 512,
+        trace_faults: true,
+        wake_first: false,
+        reply_cap: 0,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    let faults = pr.faults;
+    let demand = pr.demand;
+    let finished = pr.completed;
+    let (wall_ip, wall_addr, wall_label) = (pr.wall_ip, pr.wall_addr, pr.wall_label);
 
     let verdict = read_volatile((win.shared_va + SH_VERDICT) as *const u32);
     let de_status = read_volatile((win.shared_va + SH_DE_STATUS) as *const i32);
@@ -1859,43 +1777,40 @@ pub(crate) unsafe fn dispatch_irp(
     write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
-    // Wake the component (plain Send), then drive its fault loop until it re-parks (its next
-    // send_done). Any fault mid-IRP → demand-map + resume.
-    ep_send(ep, FSD_DISPATCH_LABEL);
-    let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = ep_recv_full(ep);
-    let mut guard = 0u64;
-    loop {
-        let label = mi >> 12;
-        if label == FSD_DISPATCH_LABEL {
-            break; // re-parked at its dispatch loop → request complete
-        } else if label == 6 {
-            let addr = m1;
-            let page = addr & !0xFFF;
-            if addr >= 0x10000 && guard < 256 {
-                ensure_paging(page, pml4);
-                let f = alloc_frame();
-                let _ = page_map(f, page, RW_NX, pml4);
-                guard += 1;
-                let (nmi, nm0, nm1, nm2, nm3) = reply_recv_full(ep, 0, 0, 0, 0, 0);
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                _m2 = nm2;
-                _m3 = nm3;
-                continue;
-            }
-            print_str(b"[fsd-svc] IRP fault wall inst=");
-            print_u64(inst as u64);
-            print_str(b" addr=0x");
-            print_hex(addr as u32);
-            print_str(b"\n");
-            return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
-        } else {
-            let _ = (m0,);
-            return Some((0xC000_0001u32 as i32, 0));
-        }
+    // Wake the component (plain Send) + drive its fault loop until it re-parks, THROUGH THE SHARED
+    // HARNESS PUMP. The per-IRP loop only walls on the low-address guard (image_frames=0 → no
+    // in-image wall), demand-caps at 256, all win32k caps false — degenerate to today's inline loop
+    // EXACTLY. `component_pump` bumps `HARNESS_IRP_DISPATCHES` per serviced dispatch (the
+    // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: ep,
+        pml4,
+        code_va: 0,
+        image_frames: 0, // per-IRP loop: no in-image wall (matches the old `addr < 0x10000` guard)
+        shared_va: sh,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        wake_first: true, // per-IRP: the component is parked in recv_req_on → Send wakes it
+        reply_cap: 0,
+        client_pi: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = crate::spawn_hosts::component_pump(&ch);
+    if !pr.completed {
+        print_str(b"[fsd-svc] IRP fault wall inst=");
+        print_u64(inst as u64);
+        print_str(b" addr=0x");
+        print_hex(pr.wall_addr as u32);
+        print_str(b"\n");
+        return Some((0xC000_0001u32 as i32, 0)); // STATUS_UNSUCCESSFUL
     }
-    let st = read_volatile((sh + SH_REQ_STATUS) as *const i32);
+    let st = pr.status;
+    // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
     // copy the driver's output back out (buffered I/O).
     let outlen = (info as usize).min(out.len());
