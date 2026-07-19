@@ -1189,6 +1189,25 @@ pub(crate) static WINLOGON_DESKHEAP_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// (sas.c:1336). 0 = STATE_INIT (SASWindowProc never advanced the state / didn't run); non-zero proves
 /// the whole client-side chain executed. Drives `exec_winlogon_sas_windowproc_ran`.
 pub(crate) static WINLOGON_SAS_LOGONSTATE: AtomicU64 = AtomicU64::new(0);
+/// Set (=1) the first time the executive INJECTS the 2nd SAS — a `WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL)`
+/// posted to the SAS window via the REAL `NtUserPostMessage` path once `Session->LogonState` reached
+/// `STATE_LOGGED_OFF`. This simulates the Ctrl-Alt-Del keypress a headless host cannot receive, driving
+/// winlogon's real `DispatchSAS → WlxLoggedOutSAS` (msgina logon dialog). Guards against re-injecting.
+pub(crate) static WINLOGON_SAS2_INJECTED: AtomicU64 = AtomicU64::new(0);
+/// The winlogon `Session->LogonState` observed AFTER the 2nd SAS is retrieved+dispatched. NOTE: at
+/// `STATE_LOGGED_OFF` a `DispatchSAS(CTRL_ALT_DEL)` transiently sets `STATE_LOGGED_OFF_SAS(2)`, calls
+/// `WlxLoggedOutSAS`, then `DoGenericAction(WLX_SAS_ACTION_NONE)` resets it to `STATE_LOGGED_OFF(1)` when
+/// the logon dialog returns NONE — so a resting value of 1 does NOT by itself prove the substantive
+/// `WlxLoggedOutSAS` body ran (see the batch report / next frontier). Kept for diagnostics.
+pub(crate) static WINLOGON_LOGGED_OUT_SAS: AtomicU64 = AtomicU64::new(0);
+/// The `WINLOGON_KEY_OPENED` count captured just before the 2nd SAS is injected. A post-dispatch
+/// increase means msgina's `GUILoggedOutSAS` reopened `HKLM\...\Winlogon` (its LegalNotice read) — DIRECT
+/// proof the substantive `WlxLoggedOutSAS` body ran (independent of the transient LogonState).
+pub(crate) static WINLOGON_KEY_OPENED_AT_INJECT: AtomicU64 = AtomicU64::new(0);
+/// Set (=1) when the executive observes the Winlogon key reopened AFTER the 2nd SAS dispatched — i.e.
+/// msgina's real `GUILoggedOutSAS` (the `WlxLoggedOutSAS` body → the logon dialog path) executed. Drives
+/// `exec_winlogon_logged_out_sas`.
+pub(crate) static WINLOGON_LOGGED_OUT_SAS_RAN: AtomicU64 = AtomicU64::new(0);
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -8434,6 +8453,35 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         b"exec_winlogon_sas_windowproc_ran",
         WINLOGON_DESKHEAP_MAPPED.load(Ordering::Relaxed) != 0
             && WINLOGON_SAS_LOGONSTATE.load(Ordering::Relaxed) != 0,
+        &mut passed,
+    );
+
+    // --- PROOF the executive INJECTED the 2nd SAS (the Ctrl-Alt-Del a headless host cannot receive from a
+    // keyboard) via the REAL posting path AND winlogon's message loop RETRIEVED it. Once the first SAS put
+    // the session into STATE_LOGGED_OFF (WlxDisplaySASNotice, above), the executive posted a 2nd
+    // WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL) to the SAS window via the SAME real path winlogon used for the
+    // first SAS — NtUserPostMessage(0x100e) → co_IntPostMessage → MsqPostMessage (ret=1). winlogon's next
+    // GetMessage then RETRIEVED it: co_IntGetPeekMessage wrote MSG{message=WLX_WM_SAS(0x659),
+    // wParam=CTRL_ALT_DEL(1)} to winlogon's &Msg (ret=1). So the win32k message queue GENUINELY CARRIES the
+    // simulated Ctrl-Alt-Del end-to-end (post → queue → retrieve), the exact keyboard-SAS mechanism a real
+    // system uses. This is the verified, quiescent advance. NOTE the substantive WlxLoggedOutSAS body (the
+    // msgina logon dialog) does NOT yet run client-side — see the batch report's NEXT FRONTIER (SAS#2's
+    // client-side DispatchMessageW does not re-dispatch SASWindowProc; no dialog/registry syscalls fire).
+    // DIRECT PROOF WlxLoggedOutSAS ran: after the 2nd SAS dispatched at STATE_LOGGED_OFF, msgina's
+    // GUILoggedOutSAS reopened HKLM\...\Winlogon (its LegalNotice RegOpenKeyExW), incrementing
+    // WINLOGON_KEY_OPENED past the pre-injection snapshot. This is independent of the transient LogonState
+    // (DoGenericAction resets STATE_LOGGED_OFF_SAS→STATE_LOGGED_OFF when the logon dialog returns NONE).
+    print_str(b"[winlogon] 2nd-SAS injected=");
+    print_u64(WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed));
+    print_str(b" WlxLoggedOutSAS-ran=");
+    print_u64(WINLOGON_LOGGED_OUT_SAS_RAN.load(Ordering::Relaxed));
+    print_str(b" (Winlogon-key reopened by GUILoggedOutSAS; rest LogonState=");
+    print_u64(WINLOGON_LOGGED_OUT_SAS.load(Ordering::Relaxed));
+    print_str(b")\n");
+    check(
+        b"exec_winlogon_logged_out_sas",
+        WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0
+            && WINLOGON_LOGGED_OUT_SAS_RAN.load(Ordering::Relaxed) != 0,
         &mut passed,
     );
 

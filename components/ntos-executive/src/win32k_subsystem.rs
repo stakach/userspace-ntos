@@ -205,6 +205,12 @@ pub const SH_SAS_AHELIST: u64 = 0x110; // in: gSharedInfo.aheList (USER_HANDLE_T
 // callback bridge; the executive reads winlogon's `Session->LogonState` (Session+0x118) through it to
 // PROVE SASWindowProc → DispatchSAS ran client-side (STATE_INIT→STATE_LOGGED_OFF after the SAS).
 pub const SH_SAS_SESSION: u64 = 0x118; // out: winlogon SAS-window Session VA (u64)
+// The SAS window's HWND (handle value), published by win32k's WM_CREATE callback bridge. The executive
+// uses it to INJECT the 2nd SAS: at STATE_LOGGED_OFF it posts WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL) to
+// this HWND via the REAL NtUserPostMessage(0x100e) path (co_IntPostMessage → MsqPostMessage), simulating
+// the Ctrl-Alt-Del a headless host can't receive from a keyboard, so winlogon's GetMessage retrieves it →
+// client-side SASWindowProc → DispatchSAS → WlxLoggedOutSAS (the msgina logon dialog).
+pub const SH_SAS_HWND: u64 = 0x120; // out: winlogon SAS-window HWND (u64)
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
@@ -2304,6 +2310,9 @@ extern "win64" fn s_ke_user_mode_callback(
                         // Publish the Session VA so the executive can read LogonState (proof of the
                         // client-side SASWindowProc→DispatchSAS run).
                         write_volatile((WIN32K_SHARED_VADDR + SH_SAS_SESSION) as *mut u64, create_params);
+                        // Publish the SAS window HWND so the executive can INJECT the 2nd SAS to it via
+                        // the real NtUserPostMessage path (the keyboard Ctrl-Alt-Del a headless host lacks).
+                        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_HWND) as *mut u64, hwnd);
                         print_str(b"[win32k-host] WM_CREATE stored Session 0x");
                         print_hex((create_params >> 32) as u32);
                         print_hex(create_params as u32);

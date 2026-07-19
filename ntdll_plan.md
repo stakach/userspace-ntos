@@ -3115,6 +3115,64 @@ its `DisplaySASNotice` notice dialog didn't block). The real logon flow needs a 
 `STATE_LOGGED_OFF` → next WLX_WM_SAS → `WlxLoggedOutSAS` (msgina logon dialog + credential UI). Driving a
 synthetic 2nd SAS (or the notice dialog's DialogBox pump) is the next desktop-UI batch.
 
+### B-FRONTIER RESOLVED (2026-07-20, gate 186/98) — 2nd SAS injected via the REAL post path → WlxLoggedOutSAS RUNS
+
+Injected the 2nd SAS (the Ctrl+Alt+Del a headless host cannot receive from a keyboard) via the SAME real
+posting path winlogon used for the first SAS, and **winlogon's genuine `WlxLoggedOutSAS` (msgina's
+`GUILoggedOutSAS`) now RUNS** at `STATE_LOGGED_OFF`. Gate **186/98**, RUNEXIT=3, `microtest sentinel`, paint
+768/768, ZERO FAILs (executive-only; rust-micro submodule clean). Deterministic across two boots.
+
+**How the injection works (REAL path reused, evidence):** winlogon's OWN first SAS was posted by
+`WinMain`'s `PostMessageW(SASWindow, WLX_WM_SAS, WLX_SAS_TYPE_CTRL_ALT_DEL, 0)` (winlogon.c:600) =
+`NtUserPostMessage(0x100e)` → `co_IntPostMessage` → `MsqPostMessage` into the SAS window's
+`PostedMessagesListHead`, and `GetMessageW` retrieved it. **The injection reuses this exact path:** once the
+executive observes `Session->LogonState == STATE_LOGGED_OFF (1)` (after SAS#1 dispatched), it calls
+`win32k_glue::win32k_dispatch(0x100e /*NtUserPostMessage*/, SAS_HWND, 0x659 /*WLX_WM_SAS*/, 1
+/*CTRL_ALT_DEL*/, 0)` on winlogon's behalf (`W32_CLIENT_PI=2`). Evidence: `NtUserPostMessage(WLX_WM_SAS) ->
+ret=1`; winlogon's next `GetMessage` retrieved `MSG{hwnd=0x2002e, message=0x659, wParam=1}` (ret=1) — the
+win32k message queue GENUINELY CARRIES the simulated CAD end-to-end (post→queue→retrieve→winlogon's `&Msg`).
+The SAS window HWND is published by win32k's WM_CREATE callback bridge (new `SH_SAS_HWND` shared field).
+
+**Did DispatchSAS route to WlxLoggedOutSAS at STATE_LOGGED_OFF? YES — proven by a msgina side effect, not
+by the transient LogonState.** The client-side `DispatchMessageW(WLX_WM_SAS)` → `SASWindowProc` →
+`DispatchSAS(CTRL_ALT_DEL)` at `STATE_LOGGED_OFF` (sas.c:1338) → `WlxLoggedOutSAS` runs entirely in winlogon
+user mode (no KeUserModeCallback — same client-side path as the 185 batch). **The definitive proof:**
+msgina's `GUILoggedOutSAS` (gui.c:1482) FIRST does `RegOpenKeyExW(HKLM\SOFTWARE\Microsoft\Windows
+NT\CurrentVersion\Winlogon)` (its LegalNotice read) — a real advapi→`NtOpenKey` syscall the executive
+counts via `WINLOGON_KEY_OPENED`. The executive snapshots that count at injection (=2) and re-reads it after
+SAS#2 dispatched (=3): **the increment is DIRECT proof the substantive `WlxLoggedOutSAS` body executed**
+(`[wl-main] ... Winlogon-key opens: at-inject=2 now=3 -> WlxLoggedOutSAS RAN`). This is robust where
+`LogonState` is NOT: `DispatchSAS` transiently sets `STATE_LOGGED_OFF_SAS(2)` then `DoGenericAction(NONE)`
+resets it to `STATE_LOGGED_OFF(1)` when the logon dialog returns NONE, so the resting LogonState (1) does not
+by itself distinguish "ran" from "never dispatched" — the key-reopen does.
+
+**How far into WlxLoggedOutSAS:** `GUILoggedOutSAS` reached its Winlogon-key/LegalNotice registry read.
+The logon `WlxDialogBoxParam(IDD_LOGON, LogonDialogProc)` (gui.c:1526) did NOT create a visible dialog
+window (no `NtUserCreateWindowEx 0x1077` after the SAS) — msgina's `LogonDialogProc` returns
+`WLX_SAS_ACTION_NONE` here (no interactive credential entry in a headless boot), so `DoGenericAction(NONE)`
+reset the state and re-armed `WlxDisplaySASNotice`. The credential UI (a rendered logon dialog + control
+windows) is the NEXT batch, not this one.
+
+**The REAL fix (executive-only, files):**
+- `win32k_subsystem.rs`: new `SH_SAS_HWND` (0x120) shared field; the WM_CREATE callback bridge now also
+  publishes the SAS window HWND (alongside the existing `SH_SAS_SESSION`).
+- `service_sec_image.rs`: in winlogon's SAS message-loop milestone, when `LogonState==STATE_LOGGED_OFF` and
+  not-yet-injected, snapshot `WINLOGON_KEY_OPENED`, then `win32k_dispatch(NtUserPostMessage, hwnd,
+  WLX_WM_SAS, CTRL_ALT_DEL, 0)` (the injection), and DON'T park that GetMessage (let it retrieve the injected
+  SAS). Park from the NEXT empty-queue GetMessage; there, detect the Winlogon-key reopen → set
+  `WINLOGON_LOGGED_OUT_SAS_RAN`. Added a `[wl-diag]` MSG dump proving retrieval.
+- `main.rs`: new statics `WINLOGON_SAS2_INJECTED`, `WINLOGON_LOGGED_OUT_SAS`,
+  `WINLOGON_KEY_OPENED_AT_INJECT`, `WINLOGON_LOGGED_OUT_SAS_RAN`; new counted gate spec
+  **`exec_winlogon_logged_out_sas`** (injected && WlxLoggedOutSAS-ran) → gate 185→**186**.
+
+**NEXT FRONTIER (the msgina logon DIALOG):** `WlxLoggedOutSAS → GUILoggedOutSAS → WlxDialogBoxParam(IDD_LOGON,
+LogonDialogProc)` does not yet create/render the credential dialog window (no post-SAS `NtUserCreateWindowEx`;
+`LogonDialogProc` returns `WLX_SAS_ACTION_NONE`). Driving a rendered logon dialog = making winlogon's
+`WlxDialogBoxParam` (its nested modal `DialogBox` pump) create the IDD_LOGON dialog + its edit/button control
+windows client-side (more win32k window-create + a nested message pump, and msgina's `LogonDialogProc`
+returning `WLX_SAS_ACTION_LOGON` only with real credentials). This is the multi-batch desktop-UI cascade the
+185 batch flagged; the SAS-carry + WlxLoggedOutSAS-entry (this batch) is the clean, quiescent step toward it.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface

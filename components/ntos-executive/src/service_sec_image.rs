@@ -2885,13 +2885,14 @@ pub(crate) unsafe fn service_sec_image(
                         let session = core::ptr::read_volatile(
                             (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
                         );
+                        let mut logon_state = 0u32;
                         if session != 0 {
                             const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
                             // winlogon's Session is on its early heap (SMSS_ALLOC_VA 2 MiB window), which
                             // the ACTIVE heap mirror maps (pi 2 is active here) → smss_copyin reads it.
                             let mut ls = [0u8; 4];
                             if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut ls) {
-                                let logon_state = u32::from_le_bytes(ls);
+                                logon_state = u32::from_le_bytes(ls);
                                 print_str(b"[wl-main] post-DispatchSAS Session->LogonState=0x");
                                 print_hex(logon_state);
                                 print_str(b" (STATE_INIT=0 -> STATE_LOGGED_OFF=1 proves SASWindowProc->DispatchSAS ran)\n");
@@ -2903,9 +2904,86 @@ pub(crate) unsafe fn service_sec_image(
                                 print_str(b"[wl-main] post-DispatchSAS Session read miss (not in heap mirror)\n");
                             }
                         }
-                        print_str(b"[wl-main] winlogon GetMessage on EMPTY SAS queue (post-WlxLoggedOutSAS) -> MESSAGE-LOOP MILESTONE PARK (boot quiesces; gate runs)\n");
-                        handled = false;
-                        wl_milestone_park = true;
+                        // ★ INJECT THE 2nd SAS (the Ctrl-Alt-Del a headless host can't receive from a
+                        // keyboard). winlogon's message loop is now at STATE_LOGGED_OFF showing the SAS
+                        // notice (WlxDisplaySASNotice). In a real system win32k posts WLX_WM_SAS when the
+                        // user presses CAD; here we simulate it by posting WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL)
+                        // to the SAS window via the SAME real path winlogon used for the first SAS —
+                        // NtUserPostMessage(0x100e) → co_IntPostMessage → MsqPostMessage inserts it into the
+                        // SAS window's PostedMessagesListHead. This GetMessage#2 then retrieves it (queue
+                        // non-empty, won't block) → winlogon DispatchMessageW → client-side SASWindowProc →
+                        // DispatchSAS(CTRL_ALT_DEL) at STATE_LOGGED_OFF → the REAL WlxLoggedOutSAS (msgina
+                        // logon dialog, sas.c:1347). Everything downstream is the genuine winlogon/msgina code.
+                        if logon_state == 1
+                            && WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
+                        {
+                            let hwnd = core::ptr::read_volatile(
+                                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
+                            );
+                            if hwnd != 0 {
+                                // Snapshot the Winlogon-key open count BEFORE injecting. msgina's
+                                // GUILoggedOutSAS (the WlxLoggedOutSAS body) FIRST does
+                                // RegOpenKeyExW(HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon)
+                                // to read LegalNotice — which bumps WINLOGON_KEY_OPENED. A post-dispatch
+                                // increase is DIRECT PROOF the real WlxLoggedOutSAS ran (independent of the
+                                // transient LogonState, which DoGenericAction resets 2→1).
+                                WINLOGON_KEY_OPENED_AT_INJECT
+                                    .store(WINLOGON_KEY_OPENED.load(Ordering::Relaxed), Ordering::Relaxed);
+                                // The injecting dispatch runs on winlogon's behalf (pi 2) so win32k
+                                // attaches winlogon's frames + resolves the SAS window's THREADINFO queue.
+                                W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+                                const WLX_WM_SAS: u64 = 0x659; // WM_USER(0x400) + 0x259
+                                const WLX_SAS_TYPE_CTRL_ALT_DEL: u64 = 1;
+                                const SSN_NT_USER_POST_MESSAGE: u64 = 0x100e;
+                                print_str(b"[wl-main] STATE_LOGGED_OFF -> INJECTING 2nd SAS: NtUserPostMessage(hwnd=0x");
+                                print_hex(hwnd as u32);
+                                print_str(b", WLX_WM_SAS, CTRL_ALT_DEL) [simulated Ctrl-Alt-Del]\n");
+                                let (r, _) = win32k_glue::win32k_dispatch(
+                                    SSN_NT_USER_POST_MESSAGE,
+                                    hwnd,
+                                    WLX_WM_SAS,
+                                    WLX_SAS_TYPE_CTRL_ALT_DEL,
+                                    0,
+                                );
+                                print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
+                                print_hex(r as u32);
+                                print_str(b"\n");
+                                WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
+                                // DON'T park: let THIS GetMessage#2 flow through to win32k's real
+                                // co_IntGetPeekMessage, which retrieves the just-posted WLX_WM_SAS → winlogon
+                                // dispatches it client-side → WlxLoggedOutSAS runs.
+                            } else {
+                                print_str(b"[wl-main] SAS HWND not published - cannot inject 2nd SAS; parking\n");
+                                handled = false;
+                                wl_milestone_park = true;
+                            }
+                        } else {
+                            // GetMessage#3+ : the queue is empty again. This is the furthest proven steady
+                            // state → MESSAGE-LOOP MILESTONE PARK so the boot quiesces. Record the resting
+                            // LogonState for the diagnostic (a resting STATE_LOGGED_OFF(1) is expected even
+                            // when WlxLoggedOutSAS runs, because DoGenericAction(NONE) resets 2→1 — see the
+                            // batch report; the 2nd-SAS proof is the injection+retrieval, not the resting state).
+                            WINLOGON_LOGGED_OUT_SAS.store(logon_state as u64, Ordering::Relaxed);
+                            // DIRECT PROOF of WlxLoggedOutSAS: did GUILoggedOutSAS reopen the Winlogon key
+                            // (RegOpenKeyExW for LegalNotice) after the 2nd SAS dispatched?
+                            let keyed_now = WINLOGON_KEY_OPENED.load(Ordering::Relaxed);
+                            let keyed_at_inject = WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
+                            print_str(b"[wl-main] post-2nd-SAS resting LogonState=0x");
+                            print_hex(logon_state);
+                            print_str(b" Winlogon-key opens: at-inject=");
+                            print_u64(keyed_at_inject);
+                            print_str(b" now=");
+                            print_u64(keyed_now);
+                            if keyed_now > keyed_at_inject {
+                                // GUILoggedOutSAS ran → WlxLoggedOutSAS's substantive body executed.
+                                WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
+                                print_str(b" -> WlxLoggedOutSAS RAN (GUILoggedOutSAS reopened Winlogon key)");
+                            }
+                            print_str(b"\n");
+                            print_str(b"[wl-main] winlogon GetMessage on EMPTY SAS queue -> MESSAGE-LOOP MILESTONE PARK (boot quiesces; gate runs)\n");
+                            handled = false;
+                            wl_milestone_park = true;
+                        }
                     }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
@@ -3194,7 +3272,25 @@ pub(crate) unsafe fn service_sec_image(
                     // common nargs<=4 case it is byte-identical to the old register-only dispatch.
                     let sp = get_recv_mr(16);
                     let nargs = win32k_subsystem::win32k_ssn_argc(m0);
-                    win32k_glue::win32k_dispatch_wide(m0, d_a0, d_a1, a2, a3, sp, nargs)
+                    let r = win32k_glue::win32k_dispatch_wide(m0, d_a0, d_a1, a2, a3, sp, nargs);
+                    // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
+                    // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
+                    // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.
+                    if pi == 2 && (m0 == 0x1006 || m0 == 0x1001) && a0 != 0 {
+                        let hwnd = smss_stack_read(a0);
+                        let message = smss_stack_read(a0 + 8);
+                        let wparam = smss_stack_read(a0 + 0x10);
+                        print_str(b"[wl-diag] GetMessage retrieved MSG hwnd=0x");
+                        print_hex(hwnd as u32);
+                        print_str(b" message=0x");
+                        print_hex(message as u32);
+                        print_str(b" wParam=0x");
+                        print_hex(wparam as u32);
+                        print_str(b" (ret=0x");
+                        print_hex(r.0 as u32);
+                        print_str(b")\n");
+                    }
+                    r
                 };
                 if winlogon_switch {
                     // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow

@@ -314,7 +314,18 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
   and re-parks cleanly. PROOF: the executive reads `Session->LogonState==1` (was 0) via winlogon's own heap
   mirror → new counted spec `exec_winlogon_sas_windowproc_ran`. Gate **185/98**, RUNEXIT=3, sentinel,
   paint 768/768, `exec_winlogon_sas_message_pumped` still PASS. Boot QUIESCES at the message-loop park.
-- [ ] NEXT FRONTIER: `WlxDisplaySASNotice` ran but issued no NEW win32k syscalls (headless host, no CAD input —
-  its `DisplaySASNotice` notice dialog didn't block). The actual logon flow needs a real Ctrl+Alt+Del SAS:
-  `STATE_LOGGED_OFF` → next WLX_WM_SAS → `WlxLoggedOutSAS` (msgina logon dialog + credential UI). Driving a
-  synthetic 2nd SAS (or the notice dialog's DialogBox pump) is the next desktop-UI batch.
+- [x] DONE (gate **186/98**, RUNEXIT=3, sentinel, paint 768/768, executive-only, rust-micro clean, deterministic
+  ×2): INJECTED the 2nd SAS (the CAD a headless host lacks) via the SAME real path winlogon used for SAS#1 —
+  `win32k_dispatch(NtUserPostMessage 0x100e, SAS_HWND, WLX_WM_SAS 0x659, WLX_SAS_TYPE_CTRL_ALT_DEL 1, 0)` when
+  `LogonState==STATE_LOGGED_OFF`. Evidence: PostMessage ret=1; winlogon's GetMessage retrieved
+  `MSG{msg=0x659, wParam=1}` ret=1 (queue carries the SAS end-to-end). **winlogon's REAL `WlxLoggedOutSAS`
+  RUNS at STATE_LOGGED_OFF** — PROVEN by msgina's `GUILoggedOutSAS` reopening `HKLM\...\Winlogon` (LegalNotice
+  read): `WINLOGON_KEY_OPENED` went 2→3 after the SAS. (LogonState is unreliable here: DispatchSAS sets
+  STATE_LOGGED_OFF_SAS=2 then DoGenericAction(NONE) resets to 1.) New counted spec
+  `exec_winlogon_logged_out_sas`. Files: `win32k_subsystem.rs` (SH_SAS_HWND publish), `service_sec_image.rs`
+  (inject + key-reopen detect), `main.rs` (statics + spec). Boot QUIESCES at the message-loop park.
+- [ ] NEXT FRONTIER: the msgina logon DIALOG. `WlxLoggedOutSAS → GUILoggedOutSAS → WlxDialogBoxParam(IDD_LOGON,
+  LogonDialogProc)` did NOT create/render the credential window (no post-SAS `NtUserCreateWindowEx`;
+  `LogonDialogProc` returns `WLX_SAS_ACTION_NONE` headless). Next batch: make winlogon's `WlxDialogBoxParam`
+  nested modal `DialogBox` pump create the IDD_LOGON dialog + control windows client-side (win32k window-create
+  + a nested pump). Multi-batch desktop-UI cascade.
