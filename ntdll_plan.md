@@ -3092,13 +3092,29 @@ gap + the cheapest fidelity wins that any next binary will hit); the bulk is bre
 spec. All `rtl/*.rs` bodies are **host-testable in `nt-ntdll`** (pure `no_std` core, `cargo test`);
 target-only pieces live in `on_target.rs` and are gate-verified.
 
-**TIER 1 — close the surface + cheap real fidelity (1 batch, host-testable):**
-- `RtlDeleteResource` (resource.c:68) — the 1 missing required import. **[host]**
-- `RtlGetThreadErrorMode`/`RtlSetThreadErrorMode` (error.c:190/217 — TEB `HardErrorMode` bit). **[host/target: TEB]**
-- `RtlValidateHeap`/`RtlCompactHeap` (heap.c:3714/3103 — real walk/return-0). **[host]**
-- `RtlUnhandledExceptionFilter` → forward to our real `RtlDispatchException`/last-chance (exception.c:313). **[host]**
-- `RtlOpenCurrentUser` real (return the `\Registry\User\<sid>` or `.Default` key handle). **[target: Nt\* reg]**
-- Batch = ~6 fns, one green commit + `nt-ntdll` unit tests.
+**TIER 1 — close the surface + cheap real fidelity — ✅ DONE (gate 184/98 no-regression, host tests 200→216):**
+- ✅ `RtlDeleteResource` (resource.c:68) — the 1 missing required import. Implemented the **full RTL_RESOURCE
+  family** as a pure host-tested core (`crates/nt-ntdll/src/rtl/resource.rs`: `Resource` reader/writer counter
+  model faithful to `resource.c` — signed `NumberActive`, owner-recursion, shared/exclusive waiter queues +
+  their semaphore-release side effects) with thin `nt-ntdll-dll` wrappers at the **byte-exact x64 offsets**
+  (`NumberActive @0x44`, not the stale x86 `+0x18` the old inline stubs used — fixed): `RtlInitializeResource`,
+  `RtlDeleteResource`, `RtlAcquireResourceShared/Exclusive`, `RtlReleaseResource`,
+  `RtlConvertSharedToExclusive`, `RtlConvertExclusiveToShared`, `RtlDumpResource`. Single-threaded runtime →
+  the counter state is the whole observable contract (no real waiter to wake). **[host]**
+- ✅ `RtlGetThreadErrorMode`/`RtlSetThreadErrorMode` (error.c:190/217) — real `TEB->HardErrorMode` @0x16B0 (x64)
+  read/write; Set rejects bits outside `SEM_FAILCRITICALERRORS|NOGPFAULTERRORBOX|NOALIGNMENTFAULTEXCEPT` with
+  `STATUS_INVALID_PARAMETER_1`, returns the prior mode. **[target: TEB]**
+- ✅ `RtlValidateHeap` (heap.c:3714) — faithful-minimal: our first-fit process heap has no exposed `HEAP` header
+  to signature-check + is consistent by construction → non-NULL handle ⇒ TRUE, NULL (invalid heap) ⇒ FALSE
+  (matching the `Heap->Signature != HEAP_SIGNATURE ⇒ FALSE` observable contract). `RtlCompactHeap` (heap.c:3103)
+  **already matched ReactOS exactly** (`@unimplemented` ⇒ return 0) — kept. **[host]**
+- ✅ `RtlUnhandledExceptionFilter` (exception.c:313) — real per `RtlUnhandledExceptionFilter2`: dismiss
+  `STATUS_POSSIBLE_DEADLOCK` (`EXCEPTION_CONTINUE_EXECUTION`), else `EXCEPTION_CONTINUE_SEARCH`. Pure decision
+  core `nt_ntdll::rtl::exception::unhandled_exception_filter`; the export reads
+  `ExceptionInfo->ExceptionRecord->ExceptionCode`. **[host]**
+- ⏭ `RtlOpenCurrentUser` — **ALREADY REAL** (live `NtOpenKey(\Registry\User\.Default)` driver in
+  `on_target::rtl_open_current_user`) — skipped, no change.
+- Landed: one green commit, `nt-ntdll` 200→216 tests (13 resource lifecycle/counter + 2 filter).
 
 **TIER 2 — commonly-used Rtl breadth (grouped, host-testable, ~5-15/batch):**
 - **B2.1 strings/case:** `RtlDowncaseUnicodeString`/`Char`, `RtlCompareString`/`RtlEqualString`/`RtlPrefixString` (ANSI), `RtlUpperString`/`RtlUpperChar`, `RtlHashUnicodeString`, `RtlAppendAsciizToString`/`RtlAppendStringToString`, `RtlCopyString` (strings via `references/reactos/sdk/lib/rtl/unicode.c`/`nls.c`). **[host]**

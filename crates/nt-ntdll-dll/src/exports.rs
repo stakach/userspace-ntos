@@ -2240,15 +2240,29 @@ pub unsafe extern "system" fn rtl_create_heap(
 }
 
 /// `RtlUnhandledExceptionFilter(PEXCEPTION_POINTERS) -> LONG`. Ref
-/// `references/reactos/sdk/lib/rtl/libsupp.c` — the top-level filter returns
-/// `EXCEPTION_CONTINUE_SEARCH` (0) when no debugger/handler wants it. We return 0 so an unhandled
-/// exception propagates (honest; the real fatal-error path is the executive's, not fabricated here).
+/// `references/reactos/sdk/lib/rtl/exception.c:RtlUnhandledExceptionFilter[2]` — the top-level filter
+/// dismisses a `STATUS_POSSIBLE_DEADLOCK` (`EXCEPTION_CONTINUE_EXECUTION` = -1) and otherwise declines
+/// (`EXCEPTION_CONTINUE_SEARCH` = 0) so an unhandled exception keeps propagating to the real fatal
+/// path. The decision logic is the host-tested pure core; here we read
+/// `ExceptionInfo->ExceptionRecord->ExceptionCode` (EXCEPTION_POINTERS.ExceptionRecord @0x0,
+/// EXCEPTION_RECORD.ExceptionCode @0x0) and forward it.
 ///
 /// # Safety
-/// Called by the SEH machinery with EXCEPTION_POINTERS.
+/// Called by the SEH machinery with a valid EXCEPTION_POINTERS.
 #[export_name = "RtlUnhandledExceptionFilter"]
-pub unsafe extern "system" fn rtl_unhandled_exception_filter(_ptrs: *mut c_void) -> i32 {
-    0 // EXCEPTION_CONTINUE_SEARCH
+pub unsafe extern "system" fn rtl_unhandled_exception_filter(ptrs: *mut c_void) -> i32 {
+    if ptrs.is_null() {
+        return 0; // EXCEPTION_CONTINUE_SEARCH
+    }
+    // SAFETY: EXCEPTION_POINTERS.ExceptionRecord @0x0; EXCEPTION_RECORD.ExceptionCode @0x0.
+    let code = unsafe {
+        let record = *(ptrs as *const *const u32);
+        if record.is_null() {
+            return 0;
+        }
+        *record
+    };
+    nt_ntdll::rtl::exception::unhandled_exception_filter(code)
 }
 
 /// `memmove(void* dst, const void* src, size_t n) -> void*` — overlap-safe copy. csrsrv imports it
@@ -4662,58 +4676,150 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
     }
 }
 
-// ---- resource RW-lock (RTL_RESOURCE) — real inline single-threaded --------------------------------
+// ---- resource RW-lock (RTL_RESOURCE) — real, backed by the host-tested pure core -----------------
+//
+// x64 RTL_RESOURCE layout (`references/reactos/sdk/include/ndk/rtltypes.h`, a 40-byte
+// RTL_CRITICAL_SECTION):
+//   Lock @0x00 (40) | SharedSemaphore @0x28 | SharedWaiters @0x30 | ExclusiveSemaphore @0x38 |
+//   ExclusiveWaiters @0x40 | NumberActive @0x44 | OwningThread @0x48 | TimeoutBoost @0x50 |
+//   DebugInfo @0x58 — total 0x60 bytes.
+//
+// The reader/writer counter arithmetic lives in `nt_ntdll::rtl::resource::Resource` (host-tested).
+// These exports load the raw fields into that model, run the transition, and store them back; on the
+// single-threaded userspace runtime the semaphore-queue side effects never have a real waiter to
+// wake, so the counter state is the whole observable contract. Faithful to
+// `references/reactos/sdk/lib/rtl/resource.c`.
 
-/// `RtlInitializeResource(PRTL_RESOURCE Resource)` — zero the resource (unlocked).
-///
-/// # Safety
-/// `resource` a valid writable RTL_RESOURCE.
-#[export_name = "RtlInitializeResource"]
-pub unsafe extern "system" fn rtl_initialize_resource(resource: *mut c_void) {
-    if !resource.is_null() {
-        // RTL_RESOURCE is ~0x38 bytes; zero it = unlocked, 0 shared/exclusive owners.
-        // SAFETY: resource valid per the contract.
-        unsafe { core::ptr::write_bytes(resource as *mut u8, 0, 0x38) };
+const RES_SHARED_WAITERS: usize = 0x30;
+const RES_EXCLUSIVE_WAITERS: usize = 0x40;
+const RES_NUMBER_ACTIVE: usize = 0x44;
+const RES_OWNING_THREAD: usize = 0x48;
+
+/// The current thread id (`NtCurrentTeb()->ClientId.UniqueThread`, TEB @0x48). On the host this is
+/// a fixed sentinel — the model only compares it for owner-recursion, and host tests exercise that
+/// directly against the pure core.
+#[inline]
+unsafe fn resource_current_thread() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; TEB->ClientId.UniqueThread @ gs:[0x48].
+    unsafe {
+        let tid: u64;
+        core::arch::asm!("mov {}, gs:[0x48]", out(reg) tid, options(nostack, preserves_flags, readonly));
+        tid
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1
     }
 }
 
-/// `RtlAcquireResourceShared(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN` — single-threaded → always
-/// granted (bump the shared count @ +0x18).
+/// Load the pure `Resource` model out of a raw `RTL_RESOURCE`.
+///
+/// # Safety
+/// `resource` a valid readable `RTL_RESOURCE`.
+unsafe fn resource_load(resource: *mut c_void) -> nt_ntdll::rtl::resource::Resource {
+    // SAFETY: fields at their x64 offsets per the contract.
+    unsafe {
+        nt_ntdll::rtl::resource::Resource {
+            number_active: *(resource.byte_add(RES_NUMBER_ACTIVE) as *const i32),
+            shared_waiters: *(resource.byte_add(RES_SHARED_WAITERS) as *const u32),
+            exclusive_waiters: *(resource.byte_add(RES_EXCLUSIVE_WAITERS) as *const u32),
+            owning_thread: *(resource.byte_add(RES_OWNING_THREAD) as *const u64),
+        }
+    }
+}
+
+/// Store the pure `Resource` model back into a raw `RTL_RESOURCE`.
+///
+/// # Safety
+/// `resource` a valid writable `RTL_RESOURCE`.
+unsafe fn resource_store(resource: *mut c_void, r: &nt_ntdll::rtl::resource::Resource) {
+    // SAFETY: fields at their x64 offsets per the contract.
+    unsafe {
+        *(resource.byte_add(RES_NUMBER_ACTIVE) as *mut i32) = r.number_active;
+        *(resource.byte_add(RES_SHARED_WAITERS) as *mut u32) = r.shared_waiters;
+        *(resource.byte_add(RES_EXCLUSIVE_WAITERS) as *mut u32) = r.exclusive_waiters;
+        *(resource.byte_add(RES_OWNING_THREAD) as *mut u64) = r.owning_thread;
+    }
+}
+
+/// `RtlInitializeResource(PRTL_RESOURCE Resource)` — initialise to the fully-unlocked state. The real
+/// body also inits the critical section + creates the two semaphores; on the single-threaded runtime
+/// those transports are never contended, so zeroing the whole 0x60-byte descriptor is the observable
+/// half (0 active, 0 waiters, no owner). Ref `resource.c:RtlInitializeResource`.
+///
+/// # Safety
+/// `resource` a valid writable RTL_RESOURCE (0x60 bytes).
+#[export_name = "RtlInitializeResource"]
+pub unsafe extern "system" fn rtl_initialize_resource(resource: *mut c_void) {
+    if !resource.is_null() {
+        // SAFETY: resource valid for the full x64 RTL_RESOURCE per the contract.
+        unsafe { core::ptr::write_bytes(resource as *mut u8, 0, 0x60) };
+    }
+}
+
+/// `RtlDeleteResource(PRTL_RESOURCE Resource)` — tear the lock down. The real body deletes the
+/// critical section + closes both semaphore handles; we have no live kernel handles in the
+/// single-threaded model, so resetting the counter state (the observable half) is the faithful
+/// equivalent. Ref `resource.c:RtlDeleteResource`.
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlDeleteResource"]
+pub unsafe extern "system" fn rtl_delete_resource(resource: *mut c_void) {
+    if resource.is_null() {
+        return;
+    }
+    let mut r = nt_ntdll::rtl::resource::Resource::default();
+    r.delete();
+    // SAFETY: resource valid per the contract.
+    unsafe { resource_store(resource, &r) };
+}
+
+/// `RtlAcquireResourceShared(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN`. Ref
+/// `resource.c:RtlAcquireResourceShared`. Single-threaded: an uncontended shared acquire is always
+/// granted; the writer-held / no-wait case returns FALSE without blocking.
 ///
 /// # Safety
 /// `resource` from `RtlInitializeResource`.
 #[export_name = "RtlAcquireResourceShared"]
-pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void, _wait: u8) -> u8 {
-    if resource.is_null() {
-        return 0;
-    }
-    // SAFETY: resource valid per the contract; NumberActive @ +0x18 (i32).
-    unsafe {
-        let active = (resource as *mut i32).byte_add(0x18);
-        *active += 1;
-    }
-    1
-}
-
-/// `RtlAcquireResourceExclusive(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN` — single-threaded → granted
-/// (NumberActive = -1 = exclusive).
-///
-/// # Safety
-/// `resource` from `RtlInitializeResource`.
-#[export_name = "RtlAcquireResourceExclusive"]
-pub unsafe extern "system" fn rtl_acquire_resource_exclusive(resource: *mut c_void, _wait: u8) -> u8 {
+pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void, wait: u8) -> u8 {
     if resource.is_null() {
         return 0;
     }
     // SAFETY: resource valid per the contract.
     unsafe {
-        let active = (resource as *mut i32).byte_add(0x18);
-        *active = -1;
+        let tid = resource_current_thread();
+        let mut r = resource_load(resource);
+        let granted = matches!(r.acquire_shared(tid, wait != 0), nt_ntdll::rtl::resource::Acquire::Granted);
+        resource_store(resource, &r);
+        u8::from(granted)
     }
-    1
 }
 
-/// `RtlReleaseResource(PRTL_RESOURCE)` — release (reset the active count).
+/// `RtlAcquireResourceExclusive(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN`. Ref
+/// `resource.c:RtlAcquireResourceExclusive`.
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlAcquireResourceExclusive"]
+pub unsafe extern "system" fn rtl_acquire_resource_exclusive(resource: *mut c_void, wait: u8) -> u8 {
+    if resource.is_null() {
+        return 0;
+    }
+    // SAFETY: resource valid per the contract.
+    unsafe {
+        let tid = resource_current_thread();
+        let mut r = resource_load(resource);
+        let granted =
+            matches!(r.acquire_exclusive(tid, wait != 0), nt_ntdll::rtl::resource::Acquire::Granted);
+        resource_store(resource, &r);
+        u8::from(granted)
+    }
+}
+
+/// `RtlReleaseResource(PRTL_RESOURCE)` — drop one hold + wake any queued waiter. Ref
+/// `resource.c:RtlReleaseResource`.
 ///
 /// # Safety
 /// `resource` from `RtlInitializeResource`.
@@ -4724,13 +4830,73 @@ pub unsafe extern "system" fn rtl_release_resource(resource: *mut c_void) {
     }
     // SAFETY: resource valid per the contract.
     unsafe {
-        let active = (resource as *mut i32).byte_add(0x18);
-        if *active < 0 {
-            *active = 0; // exclusive → free
-        } else if *active > 0 {
-            *active -= 1; // one shared holder leaves
-        }
+        let mut r = resource_load(resource);
+        // The single-threaded runtime never has a real queued waiter to wake; the counter update is
+        // the observable effect.
+        let _wake = r.release();
+        resource_store(resource, &r);
     }
+}
+
+/// `RtlConvertSharedToExclusive(PRTL_RESOURCE)` — upgrade the sole reader to a writer. Ref
+/// `resource.c:RtlConvertSharedToExclusive`. If it is not the sole reader the real body blocks on the
+/// exclusive semaphore; single-threaded, there is no other reader to release it, so we finalise the
+/// upgrade in place (the same end state the real re-entry tail installs).
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`, held shared by the caller.
+#[export_name = "RtlConvertSharedToExclusive"]
+pub unsafe extern "system" fn rtl_convert_shared_to_exclusive(resource: *mut c_void) {
+    if resource.is_null() {
+        return;
+    }
+    // SAFETY: resource valid per the contract.
+    unsafe {
+        let tid = resource_current_thread();
+        let mut r = resource_load(resource);
+        if matches!(
+            r.convert_shared_to_exclusive(tid),
+            nt_ntdll::rtl::resource::Acquire::Blocked
+        ) {
+            // No concurrent reader can wake us on this runtime → finalise the upgrade directly.
+            r.exclusive_waiters = r.exclusive_waiters.saturating_sub(1);
+            r.finish_shared_to_exclusive(tid);
+        }
+        resource_store(resource, &r);
+    }
+}
+
+/// `RtlConvertExclusiveToShared(PRTL_RESOURCE)` — downgrade the writer to a reader, waking queued
+/// readers. Ref `resource.c:RtlConvertExclusiveToShared`.
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`, held exclusive by the caller.
+#[export_name = "RtlConvertExclusiveToShared"]
+pub unsafe extern "system" fn rtl_convert_exclusive_to_shared(resource: *mut c_void) {
+    if resource.is_null() {
+        return;
+    }
+    // SAFETY: resource valid per the contract.
+    unsafe {
+        let mut r = resource_load(resource);
+        let _wake = r.convert_exclusive_to_shared();
+        resource_store(resource, &r);
+    }
+}
+
+/// `RtlDumpResource(PRTL_RESOURCE)` — a debug dump (DbgPrint the active/waiter counts). We have no
+/// debug-print sink wired here; read the fields (side-effect-free) and return. Ref
+/// `resource.c:RtlDumpResource`.
+///
+/// # Safety
+/// `resource` from `RtlInitializeResource`.
+#[export_name = "RtlDumpResource"]
+pub unsafe extern "system" fn rtl_dump_resource(resource: *mut c_void) {
+    if resource.is_null() {
+        return;
+    }
+    // SAFETY: resource valid per the contract; read-only.
+    let _ = unsafe { resource_load(resource) };
 }
 
 // ---- timer-queue / thread-pool / work-item — no scheduler plane (honest seams) --------------------
@@ -5671,24 +5837,58 @@ pub unsafe extern "system" fn rtl_restore_last_win32_error(error: u32) {
     }
 }
 
-/// `RtlGetThreadErrorMode() -> ULONG` — TEB->HardErrorMode. Default 0 (all errors reported).
+/// `RtlGetThreadErrorMode() -> ULONG` — return `TEB->HardErrorMode` (@0x16B0 on x64). Ref
+/// `references/reactos/sdk/lib/rtl/error.c:RtlGetThreadErrorMode`.
 ///
 /// # Safety
-/// Reads no cross-plane state.
+/// Reads gs:[0]-based TEB on target.
 #[export_name = "RtlGetThreadErrorMode"]
 pub unsafe extern "system" fn rtl_get_thread_error_mode() -> u32 {
-    0
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; TEB->HardErrorMode @ gs:[0x16B0].
+    unsafe {
+        let mode: u32;
+        core::arch::asm!("mov {:e}, gs:[0x16B0]", out(reg) mode, options(nostack, preserves_flags, readonly));
+        mode
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
 }
 
-/// `RtlSetThreadErrorMode(ULONG NewMode, PULONG OldMode) -> NTSTATUS`.
+/// `RtlSetThreadErrorMode(ULONG NewMode, PULONG OldMode) -> NTSTATUS` — store the per-thread hard
+/// error mode in `TEB->HardErrorMode` (@0x16B0 on x64), returning the previous mode. Rejects any bit
+/// outside `RTL_SEM_FAILCRITICALERRORS | RTL_SEM_NOGPFAULTERRORBOX | RTL_SEM_NOALIGNMENTFAULTEXCEPT`
+/// (0x1|0x2|0x4) with `STATUS_INVALID_PARAMETER_1`. Ref
+/// `references/reactos/sdk/lib/rtl/error.c:RtlSetThreadErrorMode`.
 ///
 /// # Safety
-/// `old_mode` null or writable.
+/// `old_mode` null or writable; writes gs:[0]-based TEB on target.
 #[export_name = "RtlSetThreadErrorMode"]
-pub unsafe extern "system" fn rtl_set_thread_error_mode(_new_mode: u32, old_mode: *mut u32) -> NtStatus {
-    if !old_mode.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *old_mode = 0 };
+pub unsafe extern "system" fn rtl_set_thread_error_mode(new_mode: u32, old_mode: *mut u32) -> NtStatus {
+    // Valid bits: SEM_FAILCRITICALERRORS(1) | SEM_NOGPFAULTERRORBOX(2) | SEM_NOALIGNMENTFAULTEXCEPT(4).
+    const VALID: u32 = 0x1 | 0x2 | 0x4;
+    if new_mode & !VALID != 0 {
+        return 0xC000_00EF; // STATUS_INVALID_PARAMETER_1
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; TEB->HardErrorMode @ gs:[0x16B0]; old_mode null or writable per the contract.
+    unsafe {
+        if !old_mode.is_null() {
+            let prev: u32;
+            core::arch::asm!("mov {:e}, gs:[0x16B0]", out(reg) prev, options(nostack, preserves_flags, readonly));
+            *old_mode = prev;
+        }
+        core::arch::asm!("mov gs:[0x16B0], {:e}", in(reg) new_mode, options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if !old_mode.is_null() {
+            // SAFETY: writable per the contract.
+            unsafe { *old_mode = 0 };
+        }
+        let _ = new_mode;
     }
     STATUS_SUCCESS
 }
@@ -6290,13 +6490,17 @@ pub unsafe extern "system" fn rtl_size_heap(_heap: *mut c_void, _flags: u32, mem
 }
 
 /// `RtlValidateHeap(PVOID HeapHandle, ULONG Flags, PVOID MemoryPointer) -> BOOLEAN` — validate the
-/// heap (or a block). Our first-fit heap is internally consistent by construction; return TRUE.
+/// heap (or a block). Ref `references/reactos/sdk/lib/rtl/heap.c:RtlValidateHeap`, which returns FALSE
+/// for a handle whose `Heap->Signature != HEAP_SIGNATURE`. Faithful-minimal: our first-fit process
+/// heap has no exposed `HEAP` header to signature-check, and it is internally consistent by
+/// construction — so a well-formed (non-NULL) handle validates TRUE, and a NULL handle (the "invalid
+/// heap" case) validates FALSE, matching the observable contract.
 ///
 /// # Safety
 /// `heap`/`mem` valid or NULL.
 #[export_name = "RtlValidateHeap"]
-pub unsafe extern "system" fn rtl_validate_heap(_heap: *mut c_void, _flags: u32, _mem: *mut c_void) -> u8 {
-    1
+pub unsafe extern "system" fn rtl_validate_heap(heap: *mut c_void, _flags: u32, _mem: *mut c_void) -> u8 {
+    u8::from(!heap.is_null())
 }
 
 /// `RtlDestroyHeap(PVOID HeapHandle) -> PVOID` — destroy a heap (returns NULL on success). We have
@@ -8124,9 +8328,13 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_free_handle as usize,
         rtl_is_valid_handle as usize,
         rtl_initialize_resource as usize,
+        rtl_delete_resource as usize,
         rtl_acquire_resource_shared as usize,
         rtl_acquire_resource_exclusive as usize,
         rtl_release_resource as usize,
+        rtl_convert_shared_to_exclusive as usize,
+        rtl_convert_exclusive_to_shared as usize,
+        rtl_dump_resource as usize,
     ];
     core::hint::black_box(anchors_pathimg);
     let anchors_timer: &[usize] = &[

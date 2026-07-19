@@ -884,6 +884,24 @@ pub fn unwind(frames: &[FrameModel], target_frame: usize) -> Vec<usize> {
     unwound
 }
 
+/// `STATUS_POSSIBLE_DEADLOCK` — the exception the critical-section deadlock detector raises; the
+/// top-level filter special-cases it (resume execution rather than let it terminate).
+pub const STATUS_POSSIBLE_DEADLOCK: u32 = 0xC000_0194;
+
+/// `RtlUnhandledExceptionFilter(ExceptionInfo)` — the top-level exception filter. Faithful to
+/// `references/reactos/sdk/lib/rtl/exception.c:RtlUnhandledExceptionFilter2` (which
+/// `RtlUnhandledExceptionFilter` tail-calls): a `STATUS_POSSIBLE_DEADLOCK` is dismissed
+/// (`EXCEPTION_CONTINUE_EXECUTION`), everything else declines (`EXCEPTION_CONTINUE_SEARCH`) so the
+/// exception keeps propagating to the real fatal-error path. This is the pure decision core; the
+/// export reads `ExceptionInfo->ExceptionRecord->ExceptionCode` and forwards it here.
+pub fn unhandled_exception_filter(exception_code: u32) -> i32 {
+    if exception_code == STATUS_POSSIBLE_DEADLOCK {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 // =================================================================================================
 // Tests
 // =================================================================================================
@@ -1517,5 +1535,22 @@ mod tests {
         assert_eq!(ctx.gpr[REG_RBX], 0xC0DE_C0DE, "the PUSH after the no-op codes decoded correctly");
         assert_eq!(ctx.rip, 0x1400_7A7A);
         assert_eq!(ctx.rsp(), 0x8010);
+    }
+
+    #[test]
+    fn unhandled_filter_dismisses_possible_deadlock() {
+        // The deadlock detector's exception is dismissed → resume execution.
+        assert_eq!(
+            unhandled_exception_filter(STATUS_POSSIBLE_DEADLOCK),
+            EXCEPTION_CONTINUE_EXECUTION
+        );
+    }
+
+    #[test]
+    fn unhandled_filter_declines_ordinary_exceptions() {
+        // STATUS_ACCESS_VIOLATION and friends keep propagating (continue search).
+        assert_eq!(unhandled_exception_filter(0xC000_0005), EXCEPTION_CONTINUE_SEARCH);
+        assert_eq!(unhandled_exception_filter(0x8000_0003), EXCEPTION_CONTINUE_SEARCH); // breakpoint
+        assert_eq!(unhandled_exception_filter(0), EXCEPTION_CONTINUE_SEARCH);
     }
 }

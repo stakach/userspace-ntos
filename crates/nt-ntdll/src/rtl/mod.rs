@@ -23,6 +23,7 @@ pub mod integer;
 pub mod path;
 pub mod process_params;
 pub mod random;
+pub mod resource;
 pub mod security;
 pub mod status;
 pub mod strings;
