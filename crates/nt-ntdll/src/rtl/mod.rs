@@ -21,6 +21,7 @@ pub mod guid;
 pub mod image;
 pub mod integer;
 pub mod path;
+pub mod pe_resource;
 pub mod process_params;
 pub mod random;
 pub mod resource;

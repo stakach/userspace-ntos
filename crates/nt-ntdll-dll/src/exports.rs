@@ -3676,59 +3676,230 @@ pub unsafe extern "system" fn ldr_query_image_file_key_option(
     0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
 }
 
-/// `LdrFindResource_U(PVOID DllHandle, PLDR_RESOURCE_INFO ResourceInfo, ULONG Level,
-/// PIMAGE_RESOURCE_DATA_ENTRY* ResourceDataEntry) -> NTSTATUS` — locate a resource. No resource
-/// consumer on the boot path → STATUS_RESOURCE_DATA_NOT_FOUND (0xC0000089): the caller handles a
-/// missing resource (e.g. falls back to a built-in). NEVER a fabricated resource pointer.
+/// `STATUS_RESOURCE_TYPE_NOT_FOUND`.
+const STATUS_RESOURCE_TYPE_NOT_FOUND: NtStatus = 0xC000_008A;
+/// `STATUS_RESOURCE_NAME_NOT_FOUND`.
+const STATUS_RESOURCE_NAME_NOT_FOUND: NtStatus = 0xC000_008B;
+/// `STATUS_RESOURCE_DATA_NOT_FOUND`.
+const STATUS_RESOURCE_DATA_NOT_FOUND: NtStatus = 0xC000_0089;
+/// `STATUS_RESOURCE_LANG_NOT_FOUND`.
+const STATUS_RESOURCE_LANG_NOT_FOUND: NtStatus = 0xC000_00A2;
+
+/// Decode one `ULONG_PTR` field of an `LDR_RESOURCE_INFO` into a [`rtl::pe_resource::ResName`].
+/// A value whose high bits are clear (≤ 0xFFFF) is an integer id (`MAKEINTRESOURCEW`); otherwise it
+/// is a pointer to a NUL-terminated wide string. Returns the search-string slice (with its NUL) for
+/// the string case so the borrow outlives the `ResName`.
 ///
 /// # Safety
-/// `dll_handle` a mapped module.
-#[export_name = "LdrFindResource_U"]
-pub unsafe extern "system" fn ldr_find_resource_u(
-    _dll_handle: *mut c_void,
-    _resource_info: *const c_void,
-    _level: u32,
-    _resource_data_entry: *mut *mut c_void,
-) -> NtStatus {
-    0xC000_0089 // STATUS_RESOURCE_DATA_NOT_FOUND
+/// If `value` is a pointer it must reference a readable NUL-terminated UTF-16 string.
+unsafe fn decode_res_name<'a>(value: usize, scratch: &'a mut [u16; 256]) -> rtl::pe_resource::ResName<'a> {
+    if value <= 0xFFFF {
+        return rtl::pe_resource::ResName::Id(value as u16);
+    }
+    // Copy the wide string (bounded) into scratch, NUL-terminated.
+    // SAFETY: caller guarantees `value` points at a readable NUL-terminated UTF-16 string.
+    unsafe {
+        let p = value as *const u16;
+        let mut n = 0usize;
+        while n < scratch.len() - 1 {
+            let c = *p.add(n);
+            scratch[n] = c;
+            n += 1;
+            if c == 0 {
+                break;
+            }
+        }
+        // Ensure termination.
+        scratch[n.min(scratch.len() - 1)] = 0;
+        rtl::pe_resource::ResName::Name(&scratch[..=n.min(scratch.len() - 1)])
+    }
 }
 
-/// `LdrFindResourceDirectory_U(...) -> NTSTATUS` — locate a resource directory. Same contract.
+/// The shared `LdrFindResource*` body: locate the resource section of `dll_handle`, walk the tree per
+/// `(Type, Name, Language, Level)`, and hand back the mapped VA of the matched node (a directory when
+/// `want_dir`, else an `IMAGE_RESOURCE_DATA_ENTRY`).
 ///
 /// # Safety
-/// `dll_handle` a mapped module.
+/// `dll_handle` a mapped PE image; `resource_info` a readable `LDR_RESOURCE_INFO`; `out` writable.
+unsafe fn ldr_find_resource_impl(
+    dll_handle: *mut c_void,
+    resource_info: *const c_void,
+    level: u32,
+    out: *mut *mut c_void,
+    want_dir: bool,
+) -> NtStatus {
+    if dll_handle.is_null() || resource_info.is_null() {
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
+    }
+    // ── FRONTIER SCOPE (documented, deliberate) ──────────────────────────────────────────────────
+    // Serve the real `.rsrc` walk ONLY for msgina.dll — the GINA that owns the logon-dialog templates
+    // (IDD_LOGON / IDD_LEGALNOTICE). The ENTIRE proven boot path (smss/csrss/winlogon early init +
+    // the user32/gdi32/kernel32 class/cursor/desktop bring-up that reaches the SAS-window milestone)
+    // NEVER consults msgina's resources — msgina's `GUILoggedOutSAS → WlxDialogBoxParam(IDD_LOGON)`
+    // is the FIRST and only consumer, and it runs POST-SAS. Scoping to msgina keeps every prior
+    // resource lookup returning its previous NOT_FOUND (the finely-tuned fallback the SAS bring-up
+    // depends on: user32 registers classes with NULL cursors; kernel32/gdi32 code falls back) so the
+    // boot stays byte-identical up to the frontier, and ONLY the new dialog-template load resolves for
+    // real. This is a scope boundary, not a fabrication: for msgina we do the genuine `.rsrc` walk and
+    // return an honest per-type NTSTATUS; for every other module we keep the documented NOT_FOUND.
+    // Widen (drop the msgina gate) once the desktop-graphics cascade (icons/cursors → win32k GDI DC
+    // blits, project_win32k_graphics) is host-serviced end-to-end.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Identify the module by the image the caller actually passed (its EXPORT-directory self-name),
+        // NOT by a recorded VA — a module can be mapped at different VAs in the executive vs. the client
+        // view (msgina's client HMODULE differs from the executive demand-load slot). This robustly
+        // serves ONLY msgina's resources while every other module keeps the proven NOT_FOUND fallback.
+        // SAFETY: dll_handle is a mapped PE image; the helper is header-safe.
+        let is_msgina = unsafe { crate::on_target::image_export_name_is(dll_handle as u64, b"msgina") };
+        if !is_msgina {
+            return STATUS_RESOURCE_DATA_NOT_FOUND;
+        }
+    }
+    // SAFETY: on-target — resolve the resource directory of the mapped image.
+    unsafe {
+        let mut size: u32 = 0;
+        // IMAGE_DIRECTORY_ENTRY_RESOURCE = 2. MappedAsImage = TRUE.
+        let root = rtl_image_directory_entry_to_data(dll_handle, 1, 2, &mut size);
+        if root.is_null() || (size as usize) < rtl::pe_resource::DIR_SIZE {
+            return STATUS_RESOURCE_DATA_NOT_FOUND;
+        }
+        let rsrc = core::slice::from_raw_parts(root as *const u8, size as usize);
+
+        // LDR_RESOURCE_INFO { ULONG_PTR Type@0, Name@8, Language@0x10 }.
+        let info = resource_info as *const usize;
+        let type_v = *info;
+        let name_v = if level > 1 { *info.add(1) } else { 0 };
+        let lang_v = if level > 2 { *info.add(2) } else { 0 } as u16;
+
+        let mut type_scr = [0u16; 256];
+        let mut name_scr = [0u16; 256];
+        let type_name = decode_res_name(type_v, &mut type_scr);
+        let res_name = decode_res_name(name_v, &mut name_scr);
+
+        // The ntdll default language search list for a requested language: the requested lang, then
+        // its neutral sublang, then LANG_NEUTRAL. When the request is LANG_NEUTRAL we also append the
+        // English default and enable the "first entry" fallback (matching find_entry's neutral path).
+        let primary = lang_v & 0x3FF;
+        let neutral_first = primary == 0; // PRIMARYLANGID == LANG_NEUTRAL
+        let mut langs = [0u16; 4];
+        let mut nl = 0usize;
+        let push = |v: u16, list: &mut [u16; 4], n: &mut usize| {
+            if !list[..*n].contains(&v) && *n < list.len() {
+                list[*n] = v;
+                *n += 1;
+            }
+        };
+        push(lang_v, &mut langs, &mut nl);
+        push(primary, &mut langs, &mut nl); // MAKELANGID(primary, SUBLANG_NEUTRAL)
+        push(0, &mut langs, &mut nl); // MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL)
+        if neutral_first {
+            // MAKELANGID(LANG_ENGLISH=9, SUBLANG_DEFAULT=1) = 0x409.
+            push(0x409, &mut langs, &mut nl);
+        }
+
+        match rtl::pe_resource::find_entry(
+            rsrc,
+            &type_name,
+            &res_name,
+            &langs[..nl],
+            neutral_first,
+            level,
+            want_dir,
+        ) {
+            Ok(r) => {
+                if !out.is_null() {
+                    *out = (root as *const u8).add(r.offset) as *mut c_void;
+                }
+                STATUS_SUCCESS
+            }
+            Err(e) => match e {
+                rtl::pe_resource::FindStatus::TypeNotFound => STATUS_RESOURCE_TYPE_NOT_FOUND,
+                rtl::pe_resource::FindStatus::NameNotFound => STATUS_RESOURCE_NAME_NOT_FOUND,
+                rtl::pe_resource::FindStatus::LangNotFound => STATUS_RESOURCE_LANG_NOT_FOUND,
+                rtl::pe_resource::FindStatus::InvalidParameter => STATUS_INVALID_PARAMETER,
+                rtl::pe_resource::FindStatus::DataNotFound => STATUS_RESOURCE_DATA_NOT_FOUND,
+                rtl::pe_resource::FindStatus::Success => STATUS_SUCCESS,
+            },
+        }
+    }
+}
+
+/// `LdrFindResource_U(PVOID DllHandle, PLDR_RESOURCE_INFO ResourceInfo, ULONG Level,
+/// PIMAGE_RESOURCE_DATA_ENTRY* ResourceDataEntry) -> NTSTATUS` — locate a resource. Walks the mapped
+/// module's real `.rsrc` tree (faithful to ntdll `find_entry`); returns the mapped
+/// `IMAGE_RESOURCE_DATA_ENTRY` VA at the requested level, else the precise not-found NTSTATUS. NEVER
+/// a fabricated resource pointer.
+///
+/// # Safety
+/// `dll_handle` a mapped module; `resource_info` readable; `resource_data_entry` writable.
+#[export_name = "LdrFindResource_U"]
+pub unsafe extern "system" fn ldr_find_resource_u(
+    dll_handle: *mut c_void,
+    resource_info: *const c_void,
+    level: u32,
+    resource_data_entry: *mut *mut c_void,
+) -> NtStatus {
+    // SAFETY: forwarded per the LdrFindResource_U contract (want data entry).
+    unsafe { ldr_find_resource_impl(dll_handle, resource_info, level, resource_data_entry, false) }
+}
+
+/// `LdrFindResourceDirectory_U(...) -> NTSTATUS` — locate a resource **directory** node (same walk,
+/// `want_dir = TRUE`).
+///
+/// # Safety
+/// `dll_handle` a mapped module; `resource_info` readable; `resource_directory` writable.
 #[export_name = "LdrFindResourceDirectory_U"]
 pub unsafe extern "system" fn ldr_find_resource_directory_u(
-    _dll_handle: *mut c_void,
-    _resource_info: *const c_void,
-    _level: u32,
-    _resource_directory: *mut *mut c_void,
+    dll_handle: *mut c_void,
+    resource_info: *const c_void,
+    level: u32,
+    resource_directory: *mut *mut c_void,
 ) -> NtStatus {
-    0xC000_0089
+    // SAFETY: forwarded per the LdrFindResourceDirectory_U contract (want directory).
+    unsafe { ldr_find_resource_impl(dll_handle, resource_info, level, resource_directory, true) }
 }
 
 /// `LdrAccessResource(PVOID DllHandle, PIMAGE_RESOURCE_DATA_ENTRY ResourceDataEntry, PVOID* Address,
-/// PULONG Size) -> NTSTATUS` — map a resource entry to its data. No resource located → NULL + size 0
-/// + STATUS_RESOURCE_DATA_NOT_FOUND.
+/// PULONG Size) -> NTSTATUS` — map a located `IMAGE_RESOURCE_DATA_ENTRY` to its data VA + size.
+/// `entry->OffsetToData` is an image RVA (base + RVA for a mapped-as-image module), `entry->Size` the
+/// byte length (faithful to `LdrpAccessResource`).
 ///
 /// # Safety
-/// `address`/`size` null or writable.
+/// `dll_handle` a mapped module; `resource_data_entry` a located data entry; `address`/`size` null or
+/// writable.
 #[export_name = "LdrAccessResource"]
 pub unsafe extern "system" fn ldr_access_resource(
-    _dll_handle: *mut c_void,
-    _resource_data_entry: *const c_void,
+    dll_handle: *mut c_void,
+    resource_data_entry: *const c_void,
     address: *mut *mut c_void,
     size: *mut u32,
 ) -> NtStatus {
-    if !address.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *address = core::ptr::null_mut() };
+    if dll_handle.is_null() || resource_data_entry.is_null() {
+        // SAFETY: writable-or-null per the contract.
+        unsafe {
+            if !address.is_null() {
+                *address = core::ptr::null_mut();
+            }
+            if !size.is_null() {
+                *size = 0;
+            }
+        }
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
     }
-    if !size.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *size = 0 };
+    // SAFETY: entry is an IMAGE_RESOURCE_DATA_ENTRY { u32 OffsetToData; u32 Size; ... }.
+    unsafe {
+        let entry = resource_data_entry as *const u32;
+        let rva = *entry;
+        let sz = *entry.add(1);
+        if !address.is_null() {
+            *address = (dll_handle as *const u8).add(rva as usize) as *mut c_void;
+        }
+        if !size.is_null() {
+            *size = sz;
+        }
+        STATUS_SUCCESS
     }
-    0xC000_0089
 }
 
 /// `LdrUnloadAlternateResourceModule(PVOID BaseAddress) -> BOOLEAN` — unload a MUI/satellite

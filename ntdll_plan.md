@@ -3173,6 +3173,49 @@ windows client-side (more win32k window-create + a nested message pump, and msgi
 returning `WLX_SAS_ACTION_LOGON` only with real credentials). This is the multi-batch desktop-UI cascade the
 185 batch flagged; the SAS-carry + WlxLoggedOutSAS-entry (this batch) is the clean, quiescent step toward it.
 
+### DIALOG BATCH (2026-07-20, gate 186 HELD) — real `LdrFindResource_U` `.rsrc` walker landed; the dialog wall RE-DIAGNOSED to a PRE-resource blocker
+
+Built the genuine PE `.rsrc` resource-directory walker behind ntdll's `LdrFindResource_U` /
+`LdrFindResourceDirectory_U` / `LdrAccessResource` (they were STUBS returning
+`STATUS_RESOURCE_DATA_NOT_FOUND`). This is the export `user32`'s `DialogBoxParamW → FindResourceW(msgina,
+IDD_LOGON, RT_DIALOG)` → kernel32 `FindResourceExW` → `LdrFindResource_U` needs to load the dialog template.
+
+**REAL fix (crate-side only; executive + rust-micro/src UNTOUCHED, sel4test unaffected):**
+- `crates/nt-ntdll/src/rtl/pe_resource.rs` — a pure, host-tested (`+10 tests`, nt-ntdll 216→226) faithful
+  port of ntdll `find_entry` / `find_entry_by_id` / `find_entry_by_name` / `find_first_entry` /
+  `CompareResourceString` (`references/reactos/dll/ntdll/rtl/libsupp.c` + `sdk/lib/rtl/res.c`): the 3-level
+  type→name→language tree walk over the `.rsrc` bytes, binary-searched ids + case-insensitive named entries +
+  the LANG_NEUTRAL first-entry fallback + the language search list. Byte-offset based (no allocation).
+- `crates/nt-ntdll-dll/src/exports.rs` — the 3 exports wrap it: resolve the resource section via
+  `RtlImageDirectoryEntryToData(base, RESOURCE)`, decode `LDR_RESOURCE_INFO {Type,Name,Language}` (id vs
+  wide-string), build the ntdll default language list, walk, return the mapped `IMAGE_RESOURCE_DATA_ENTRY` VA;
+  `LdrAccessResource` maps entry→(base+OffsetToData, Size).
+- **SCOPED to msgina** via `on_target::image_export_name_is(dll_handle, b"msgina")` (identifies the module by
+  its EXPORT-directory self-name, robust to the executive-slot-VA vs client-HMODULE-VA split). The ENTIRE
+  proven boot path (which loads NO msgina resources pre-SAS) stays byte-identical — every other module keeps
+  the documented NOT_FOUND fallback (user32 registers classes with NULL cursors, etc.). **Rationale learned the
+  hard way:** enabling the walk GLOBALLY diverts winlogon's early user32/gdi32 class/cursor init into the
+  win32k GDI icon/cursor blit cascade (`NtGdiOpenDCW` → NULL-deref wall) = the desktop-GRAPHICS frontier
+  (project_win32k_graphics), NOT this batch — so the walk MUST be scoped until that cascade is host-serviced.
+
+**RESULT:** gate **186/98 HELD** (RUNEXIT=3, microtest sentinel, paint 768/768, all SAS specs PASS, ZERO
+regression, boot QUIESCES). The dialog is **NOT yet created** — but the wall is now proven to be a **DEEPER,
+PRE-RESOURCE blocker**, not the resource stub:
+
+**★ THE REAL NEXT WALL (diagnosed with on-target `int-0x2d` handle/type diagnostics):** msgina's base
+(executive slot `0x82290000`) is **NEVER queried for a resource** — `FindResourceW(msgina, IDD_LOGON)` never
+fires. The only post-SAS `.rsrc` queries come from **winlogon.exe's OWN image** (`ImageBase=0x10000560000`,
+RT_DIALOG ids `0x44c`/`0x4b0` + RT_STRING) — NOT msgina's IDD_LOGON. Yet `GUILoggedOutSAS`'s reg-read DOES run
+(WINLOGON_KEY_OPENED 2→3). So `GUILoggedOutSAS` reaches its `RegOpenKeyExW(...Winlogon)` LegalNotice read but
+**does NOT reach `WlxDialogBoxParam(pgContext->hDllInstance=msgina, IDD_LOGON, LogonDialogProc)`** (gui.c:1527)
+— it bails / faults between the reg-close (gui.c:1507) and the dialog call, OR `pgContext->hDllInstance` is not
+msgina's base. DIAGNOSE-FIRST NEXT: lldb/on-target-trace winlogon's client-side run between GetMessage#2 and
+GetMessage#3 (after the reg-read) to find where `GUILoggedOutSAS` stops before `WlxDialogBoxParam(IDD_LOGON)`
+— check `pgContext->hDllInstance` (set in msgina `WlxInitialize` = msgina `DllMain`'s `hinstDLL`), the
+`LegalNotice.pszCaption/pszText` HeapFree path (gui.c:1521-1525), and whether the client-side `WlxDialogBoxParam`
+WLX-dispatch fn-pointer resolves. Once `FindResourceW(msgina, IDD_LOGON)` fires, the (now-real) walker returns
+the template → `DialogBoxParamW → DIALOG_CreateIndirect → NtUserCreateWindowEx(#32770)` + control creates.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface

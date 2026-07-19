@@ -324,8 +324,21 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
   STATE_LOGGED_OFF_SAS=2 then DoGenericAction(NONE) resets to 1.) New counted spec
   `exec_winlogon_logged_out_sas`. Files: `win32k_subsystem.rs` (SH_SAS_HWND publish), `service_sec_image.rs`
   (inject + key-reopen detect), `main.rs` (statics + spec). Boot QUIESCES at the message-loop park.
-- [ ] NEXT FRONTIER: the msgina logon DIALOG. `WlxLoggedOutSAS → GUILoggedOutSAS → WlxDialogBoxParam(IDD_LOGON,
-  LogonDialogProc)` did NOT create/render the credential window (no post-SAS `NtUserCreateWindowEx`;
-  `LogonDialogProc` returns `WLX_SAS_ACTION_NONE` headless). Next batch: make winlogon's `WlxDialogBoxParam`
-  nested modal `DialogBox` pump create the IDD_LOGON dialog + control windows client-side (win32k window-create
-  + a nested pump). Multi-batch desktop-UI cascade.
+- [x] DIALOG BATCH (gate **186/98 HELD**, RUNEXIT=3, sentinel, paint 768/768, crate-side only, rust-micro clean):
+  built the REAL PE `.rsrc` resource walker behind ntdll `LdrFindResource_U`/`LdrFindResourceDirectory_U`/
+  `LdrAccessResource` (were stubs → `STATUS_RESOURCE_DATA_NOT_FOUND`). Pure host-tested core
+  `crates/nt-ntdll/src/rtl/pe_resource.rs` (faithful ntdll `find_entry`, +10 tests, nt-ntdll 216→226); DLL
+  wrappers resolve the resource section + walk + return the mapped data entry. SCOPED to msgina via
+  `image_export_name_is(dll_handle, "msgina")` so the proven boot path stays byte-identical (global enablement
+  diverts winlogon's early user32/gdi32 cursor init into the win32k GDI blit cascade `NtGdiOpenDCW` wall =
+  project_win32k_graphics, tracked separately). No regression; boot QUIESCES at the SAS message-loop park.
+- [ ] NEXT FRONTIER (RE-DIAGNOSED — the wall is a PRE-resource blocker, not the stub): msgina's base
+  (`0x82290000`) is NEVER queried for a resource — `FindResourceW(msgina, IDD_LOGON)` never fires (proven by
+  on-target `int-0x2d` handle diagnostics: the only post-SAS `.rsrc` queries are winlogon.exe's OWN image
+  `0x10000560000`). Yet `GUILoggedOutSAS`'s reg-read runs (WINLOGON_KEY_OPENED 2→3). So `GUILoggedOutSAS`
+  reaches its LegalNotice `RegOpenKeyExW` (gui.c:1492) but NOT `WlxDialogBoxParam(hDllInstance=msgina,
+  IDD_LOGON)` (gui.c:1527). DIAGNOSE-FIRST NEXT: trace winlogon's client-side run after the reg-read to find
+  where `GUILoggedOutSAS` stops before the dialog call — check `pgContext->hDllInstance` (msgina `WlxInitialize`
+  = msgina DllMain `hinstDLL`), the `LegalNotice` HeapFree path (gui.c:1521-1525), the client-side
+  `WlxDialogBoxParam` WLX-dispatch fn-pointer. Once `FindResourceW(msgina, IDD_LOGON)` fires, the now-REAL
+  walker returns the template → `DialogBoxParamW → NtUserCreateWindowEx(#32770)` + control creates.
