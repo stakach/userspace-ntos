@@ -116,6 +116,266 @@ pub const STATUS_PENDING: i32 = 0x0000_0103;
 /// ReactOS `USER32_CALLBACK_CLIENTTHREADSTARTUP` / `apfnDispatch[7]`.
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 
+/// Hard bound for the alternating win32k-dispatch / user-callback continuation stack.
+///
+/// ReactOS callbacks are synchronous and may re-enter win32k, but an invalid client must not be
+/// able to grow executive state without limit. Eight alternating frames permit four complete
+/// dispatch/callback levels, which is deliberately more than the create-time SAS paths need.
+pub const MAX_CONTINUATION_DEPTH: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientThreadIdentity {
+    pub client_pi: u32,
+    pub client_tid: u64,
+    pub client_badge: u64,
+}
+
+impl ClientThreadIdentity {
+    pub const fn new(client_pi: u32, client_tid: u64, client_badge: u64) -> Self {
+        Self {
+            client_pi,
+            client_tid,
+            client_badge,
+        }
+    }
+
+    pub const fn matches_correlation(&self, correlation: &CallbackCorrelation) -> bool {
+        self.client_pi == correlation.client_pi
+            && self.client_tid == correlation.client_tid
+            && self.client_badge == correlation.client_badge
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinuationKind {
+    Win32kDispatch,
+    UserCallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinuationState {
+    Running,
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContinuationFrame {
+    pub kind: ContinuationKind,
+    pub state: ContinuationState,
+    pub client: ClientThreadIdentity,
+    pub dispatch_id: u64,
+    pub callback_id: u32,
+}
+
+impl ContinuationFrame {
+    const fn dispatch(client: ClientThreadIdentity, dispatch_id: u64) -> Self {
+        Self {
+            kind: ContinuationKind::Win32kDispatch,
+            state: ContinuationState::Running,
+            client,
+            dispatch_id,
+            callback_id: 0,
+        }
+    }
+
+    const fn callback(correlation: CallbackCorrelation) -> Self {
+        Self {
+            kind: ContinuationKind::UserCallback,
+            state: ContinuationState::Running,
+            client: ClientThreadIdentity::new(
+                correlation.client_pi,
+                correlation.client_tid,
+                correlation.client_badge,
+            ),
+            dispatch_id: correlation.dispatch_id,
+            callback_id: correlation.callback_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinuationError {
+    Overflow,
+    Underflow,
+    Sequence,
+    Kind,
+    State,
+    Client,
+    Correlation,
+}
+
+/// Pointer-free, bounded model of one client thread's alternating continuation chain.
+///
+/// The expected order is `dispatch -> callback -> nested dispatch -> callback ...`. Pushing a child
+/// suspends its parent; completing the child makes that exact parent runnable again. Correlation is
+/// checked before mutation, so stale `NtCallbackReturn`s and cross-thread nested syscalls cannot pop
+/// another client's continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContinuationStack<const DEPTH: usize = MAX_CONTINUATION_DEPTH> {
+    frames: [Option<ContinuationFrame>; DEPTH],
+    len: usize,
+}
+
+impl<const DEPTH: usize> ContinuationStack<DEPTH> {
+    pub const fn new() -> Self {
+        Self {
+            frames: [None; DEPTH],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn top(&self) -> Option<&ContinuationFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            self.frames[self.len - 1].as_ref()
+        }
+    }
+
+    pub fn push_dispatch(
+        &mut self,
+        client: ClientThreadIdentity,
+        dispatch_id: u64,
+    ) -> Result<(), ContinuationError> {
+        if dispatch_id == 0 {
+            return Err(ContinuationError::Sequence);
+        }
+        if self.len == DEPTH {
+            return Err(ContinuationError::Overflow);
+        }
+        if self.len != 0 {
+            let parent = self.frames[self.len - 1]
+                .as_mut()
+                .ok_or(ContinuationError::Underflow)?;
+            if parent.kind != ContinuationKind::UserCallback {
+                return Err(ContinuationError::Kind);
+            }
+            if parent.state != ContinuationState::Running {
+                return Err(ContinuationError::State);
+            }
+            if parent.client != client {
+                return Err(ContinuationError::Client);
+            }
+            parent.state = ContinuationState::Suspended;
+        }
+        self.frames[self.len] = Some(ContinuationFrame::dispatch(client, dispatch_id));
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn push_callback(
+        &mut self,
+        correlation: CallbackCorrelation,
+    ) -> Result<(), ContinuationError> {
+        if correlation.dispatch_id == 0 || correlation.callback_id == 0 {
+            return Err(ContinuationError::Sequence);
+        }
+        if self.len == DEPTH {
+            return Err(ContinuationError::Overflow);
+        }
+        let parent = self
+            .frames
+            .get_mut(
+                self.len
+                    .checked_sub(1)
+                    .ok_or(ContinuationError::Underflow)?,
+            )
+            .and_then(Option::as_mut)
+            .ok_or(ContinuationError::Underflow)?;
+        if parent.kind != ContinuationKind::Win32kDispatch {
+            return Err(ContinuationError::Kind);
+        }
+        if parent.state != ContinuationState::Running {
+            return Err(ContinuationError::State);
+        }
+        if parent.dispatch_id != correlation.dispatch_id
+            || !parent.client.matches_correlation(&correlation)
+        {
+            return Err(ContinuationError::Correlation);
+        }
+        parent.state = ContinuationState::Suspended;
+        self.frames[self.len] = Some(ContinuationFrame::callback(correlation));
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn complete_dispatch(
+        &mut self,
+        client: ClientThreadIdentity,
+        dispatch_id: u64,
+    ) -> Result<(), ContinuationError> {
+        let top = self.top().copied().ok_or(ContinuationError::Underflow)?;
+        if top.kind != ContinuationKind::Win32kDispatch {
+            return Err(ContinuationError::Kind);
+        }
+        if top.state != ContinuationState::Running {
+            return Err(ContinuationError::State);
+        }
+        if top.client != client || top.dispatch_id != dispatch_id {
+            return Err(ContinuationError::Correlation);
+        }
+        self.pop_and_resume_parent(ContinuationKind::UserCallback)
+    }
+
+    pub fn return_callback(
+        &mut self,
+        correlation: CallbackCorrelation,
+    ) -> Result<(), ContinuationError> {
+        let top = self.top().copied().ok_or(ContinuationError::Underflow)?;
+        if top.kind != ContinuationKind::UserCallback {
+            return Err(ContinuationError::Kind);
+        }
+        if top.state != ContinuationState::Running {
+            return Err(ContinuationError::State);
+        }
+        if top.dispatch_id != correlation.dispatch_id
+            || top.callback_id != correlation.callback_id
+            || !top.client.matches_correlation(&correlation)
+        {
+            return Err(ContinuationError::Correlation);
+        }
+        self.pop_and_resume_parent(ContinuationKind::Win32kDispatch)
+    }
+
+    fn pop_and_resume_parent(
+        &mut self,
+        expected_parent: ContinuationKind,
+    ) -> Result<(), ContinuationError> {
+        self.len = self
+            .len
+            .checked_sub(1)
+            .ok_or(ContinuationError::Underflow)?;
+        self.frames[self.len] = None;
+        if self.len != 0 {
+            let parent = self.frames[self.len - 1]
+                .as_mut()
+                .ok_or(ContinuationError::Underflow)?;
+            if parent.kind != expected_parent {
+                return Err(ContinuationError::Kind);
+            }
+            if parent.state != ContinuationState::Suspended {
+                return Err(ContinuationError::State);
+            }
+            parent.state = ContinuationState::Running;
+        }
+        Ok(())
+    }
+}
+
+impl<const DEPTH: usize> Default for ContinuationStack<DEPTH> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ControlledTransitionPhase {
@@ -134,10 +394,7 @@ pub enum ControlledTransitionEvent {
 }
 
 impl ControlledTransitionPhase {
-    pub const fn advance(
-        self,
-        event: ControlledTransitionEvent,
-    ) -> Result<Self, ValidationError> {
+    pub const fn advance(self, event: ControlledTransitionEvent) -> Result<Self, ValidationError> {
         match (self, event) {
             (Self::Idle, ControlledTransitionEvent::SuspendComponent) => {
                 Ok(Self::ComponentSuspended)
@@ -165,8 +422,23 @@ pub const fn outer_syscall_reply(
     resume_flags: u64,
 ) -> [u64; 18] {
     [
-        result, saved[4], saved[5], saved[6], saved[7], saved[8], saved[9], saved[10], saved[11],
-        saved[12], saved[13], saved[14], saved[15], saved[16], saved[17], resume_ip, resume_sp,
+        result,
+        saved[4],
+        saved[5],
+        saved[6],
+        saved[7],
+        saved[8],
+        saved[9],
+        saved[10],
+        saved[11],
+        saved[12],
+        saved[13],
+        saved[14],
+        saved[15],
+        saved[16],
+        saved[17],
+        resume_ip,
+        resume_sp,
         resume_flags,
     ]
 }
@@ -551,6 +823,116 @@ mod tests {
             suspended.advance(ControlledTransitionEvent::SuspendComponent),
             Err(ValidationError::State)
         );
+    }
+
+    #[test]
+    fn continuation_stack_models_two_nested_callback_levels() {
+        let client = ClientThreadIdentity::new(2, 44, 4);
+        let outer = CallbackCorrelation {
+            dispatch_id: 7,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        let inner = CallbackCorrelation {
+            dispatch_id: 8,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        let mut stack = ContinuationStack::<8>::new();
+
+        stack.push_dispatch(client, outer.dispatch_id).unwrap();
+        stack.push_callback(outer).unwrap();
+        stack.push_dispatch(client, inner.dispatch_id).unwrap();
+        stack.push_callback(inner).unwrap();
+        assert_eq!(stack.len(), 4);
+        assert_eq!(stack.top().unwrap().kind, ContinuationKind::UserCallback);
+
+        stack.return_callback(inner).unwrap();
+        assert_eq!(stack.top().unwrap().state, ContinuationState::Running);
+        stack.complete_dispatch(client, inner.dispatch_id).unwrap();
+        assert_eq!(stack.top().unwrap().state, ContinuationState::Running);
+        stack.return_callback(outer).unwrap();
+        stack.complete_dispatch(client, outer.dispatch_id).unwrap();
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn continuation_stack_rejects_stale_or_cross_thread_unwind() {
+        let client = ClientThreadIdentity::new(2, 44, 4);
+        let correlation = CallbackCorrelation {
+            dispatch_id: 7,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        let mut stack = ContinuationStack::<4>::new();
+        stack
+            .push_dispatch(client, correlation.dispatch_id)
+            .unwrap();
+        stack.push_callback(correlation).unwrap();
+
+        let mut stale = correlation;
+        stale.callback_id += 1;
+        assert_eq!(
+            stack.return_callback(stale),
+            Err(ContinuationError::Correlation)
+        );
+        assert_eq!(stack.len(), 2);
+
+        let mut wrong_thread = correlation;
+        wrong_thread.client_tid += 1;
+        assert_eq!(
+            stack.return_callback(wrong_thread),
+            Err(ContinuationError::Correlation)
+        );
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack.return_callback(correlation), Ok(()));
+    }
+
+    #[test]
+    fn continuation_stack_is_bounded_and_alternating() {
+        let client = ClientThreadIdentity::new(2, 44, 4);
+        let callback = CallbackCorrelation {
+            dispatch_id: 7,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        let mut stack = ContinuationStack::<2>::new();
+        stack.push_dispatch(client, callback.dispatch_id).unwrap();
+        assert_eq!(stack.push_dispatch(client, 8), Err(ContinuationError::Kind));
+        stack.push_callback(callback).unwrap();
+        assert_eq!(
+            stack.push_dispatch(client, 8),
+            Err(ContinuationError::Overflow)
+        );
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn continuation_stack_rejects_callback_for_another_dispatch() {
+        let client = ClientThreadIdentity::new(2, 44, 4);
+        let mut stack = ContinuationStack::<4>::new();
+        stack.push_dispatch(client, 7).unwrap();
+        let stale = CallbackCorrelation {
+            dispatch_id: 8,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        assert_eq!(
+            stack.push_callback(stale),
+            Err(ContinuationError::Correlation)
+        );
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.top().unwrap().state, ContinuationState::Running);
     }
 
     #[test]

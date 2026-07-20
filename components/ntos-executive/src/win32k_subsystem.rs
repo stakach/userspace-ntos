@@ -538,6 +538,10 @@ pub const SSN_NT_USER_SET_THREAD_DESKTOP: u64 = 0x1092;
 pub const W32_DISPATCH_LABEL: u64 = 0x770;
 /// A component-side `KeUserModeCallback` request issued while the outer 0x770 dispatch is active.
 pub const W32_USER_CALLBACK_LABEL: u64 = 0x772;
+/// Plain Send/Recv continuation signal for a component callback trampoline. Unlike the former
+/// synchronous callback Call reply, this leaves the sole win32k TCB runnable as a nested-dispatch
+/// receiver while the user callback executes.
+pub const W32_USER_CALLBACK_RESUME_LABEL: u64 = 0x773;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
@@ -2203,10 +2207,11 @@ unsafe fn patch_ke_get_current_irql() {
 //   ApiNumber 11 USER32_CALLBACK_SETWNDICONS        (co_IntSetWndIcons)        → *Out = SETWNDICONS_CALLBACK_ARGUMENTS
 //   ApiNumber 15 USER32_CALLBACK_SETOBM             (co_IntSetupOBM/MenuInit)  → *Out = SETOBM_CALLBACK_ARGUMENTS
 // Phase 2A: because this is a directly-bound component import (not an executive syscall), the stub
-// copies the bounded input into the pointer-free shared ABI and issues W32_USER_CALLBACK_LABEL as a
-// genuine seL4 Call. The executive applies the behavior-preserving synthetic policy and replies;
-// this stub then copies the validated result into component-owned pool memory. Phase 2B will withhold
-// that same reply and redirect the client instead. No direct component pointer crosses the ABI.
+// copies the bounded input into the pointer-free shared ABI and Sends W32_USER_CALLBACK_LABEL. It
+// then receives either W32_USER_CALLBACK_RESUME_LABEL or a nested W32_DISPATCH_LABEL. This explicit
+// receive loop is the Phase-3 re-entrancy seam: the sole component TCB remains able to run a nested
+// USER/GDI dispatch while the outer window-proc callback executes. No direct component pointer
+// crosses the ABI.
 #[cfg(any())]
 const USER32_CB_LOADDEFAULTCURSORS: u32 = 3;
 // USER32_CALLBACK_WINDOWPROC (u32cb.h:9) — the CLIENT window-proc dispatch (WM_NCCREATE / WM_CREATE /
@@ -2274,19 +2279,24 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         write_volatile(core::ptr::addr_of_mut!((*frame).header), header);
         let request = header;
 
-        let mut message_info = W32_USER_CALLBACK_LABEL << 12;
-        core::arch::asm!(
-            "syscall",
-            inout("rdx") crate::SYS_CALL as u64 => _,
-            inout("rdi") crate::CT_FAULT => _,
-            inout("rsi") message_info => message_info,
-            inout("r10") 0u64 => _, inout("r8") 0u64 => _,
-            inout("r9") 0u64 => _, inout("r15") 0u64 => _,
-            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
+        crate::driver_launch::send_done_on(W32_USER_CALLBACK_LABEL);
+        loop {
+            match crate::driver_launch::recv_req_on() {
+                W32_USER_CALLBACK_RESUME_LABEL => break,
+                W32_DISPATCH_LABEL => {
+                    let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
+                        sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
+                        drv: 0,
+                    });
+                    write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
+                    let _ = info;
+                    crate::driver_launch::send_done_on(W32_DISPATCH_LABEL);
+                }
+                _ => return 0xC000_0001u32 as i32,
+            }
+        }
         let reply = read_volatile(core::ptr::addr_of!((*frame).header));
-        if (message_info >> 12) != 0 || nt_user_callback::validate_reply(&request, &reply).is_err() {
+        if nt_user_callback::validate_reply(&request, &reply).is_err() {
             return 0xC000_0001u32 as i32;
         }
 

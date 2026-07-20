@@ -8452,6 +8452,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         callback_table_valid,
         callback_real_redirects,
         callback_real_returns,
+        callback_continuation_pushes,
+        callback_continuation_unwinds,
     ) = win32k_glue::user_callback_proofs();
     print_str(b"[user-callback] rendezvous=");
     print_u64(callback_rendezvous);
@@ -8463,12 +8465,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(callback_real_redirects);
     print_str(b" real-api7-returns=");
     print_u64(callback_real_returns);
+    print_str(b" continuation-pushes=");
+    print_u64(callback_continuation_pushes);
+    print_str(b" continuation-unwinds=");
+    print_u64(callback_continuation_unwinds);
     print_str(b"\n");
     check(
         b"exec_user_callback_real_api7_roundtrip",
         callback_table_valid != 0
             && callback_real_redirects == 1
-            && callback_real_returns == 1,
+            && callback_real_returns == 1
+            && callback_continuation_pushes == 2
+            && callback_continuation_unwinds == 2,
         &mut passed,
     );
 

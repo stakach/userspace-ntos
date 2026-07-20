@@ -1,12 +1,15 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
 Status: **PHASE 2A implemented; PHASE 2B controlled api7 reverse transition implemented and
-gate-verified; Phase 3 nesting remains**. Author target: the
+gate-verified; Phase 3 bounded continuation + re-entrant component transport foundation
+implemented and gate-verified; real api0 marshalling remains**. Author target: the
 executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
 Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
-executive callback rendezvous while preserving the synthetic reply policy. Phase 2B now withholds
-one validated winlogon request, completes a controlled real api7 client roundtrip, then preserves the
-original api0 request's synthetic completion. General api0 callbacks remain Phase 3 work.
+executive callback rendezvous while preserving the synthetic reply policy. Phase 2B completes a
+controlled real api7 client roundtrip, then preserves the original api0 request's synthetic
+completion. The Phase-3 foundation replaces the callback `Call` with a Send + explicit component
+receive loop, so the sole win32k TCB can accept nested dispatches while a callback is parked. General
+api0 callbacks still await client-buffer marshalling and live nested-dispatch correlation.
 The IDD_LOGON logon dialog
 is *created* (17 `#32770` windows) but never *painted* because its `WM_PAINT` is never
 dispatched to the control procs.
@@ -134,9 +137,9 @@ Keyed by the client thread (badge/tid). Mirrors the review's struct, adapted:
 
 ```rust
 struct UserCallbackFrame {
-    /// How to resume win32k's suspended dispatch: the parked reply cap + component identity
-    /// of the win32k Call that issued KeUserModeCallback. (Our "syscall_continuation".)
-    win32k_continuation: SuspendedDispatch,     // reply cap + win32k component/thread id
+    /// How to resume win32k's suspended dispatch: the component callback receive-loop identity
+    /// plus its correlated dispatch frame. (Our "syscall_continuation".)
+    win32k_continuation: SuspendedDispatch,     // resume label + win32k component/thread id
     callback_index:       u32,                  // ApiIndex → PEB->KernelCallbackTable
     user_argument:        ClientAddr,           // marshalled input buffer in the CLIENT VSpace
     argument_length:      usize,
@@ -206,23 +209,24 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
-| Executive: per-thread **callback-continuation stack** (3a) | ☐ build |
-| win32k **nested-dispatch** / re-entrant `component_pump` (3b) | ☐ build |
+| Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ Phase 3 foundation: alternating dispatch/callback frames, correlation-tested and api7-wired |
+| win32k **nested-dispatch** / re-entrant component transport (3b) | △ Phase 3 foundation: callback Send + component receive/recursive-dispatch seam is live; real nested api0 not yet wired |
 | **buffer marshalling** in/out across VSpaces (client-visible only) | ☐ build |
 
 `KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
-Phase 2A creates the interception substrate: copy into the fixed shared frame, `seL4_Call` the
-executive with `W32_USER_CALLBACK_LABEL`, then copy the validated bounded reply into component pool
-memory. The synthetic policy now lives on the executive side. Phase 2B changes the executive's
-response: withhold the component reply, redirect the blocked client, and later complete the same
-rendezvous from `NtCallbackReturn`.
+Phase 2A created the interception substrate with a fixed shared frame and callback rendezvous. The
+Phase-3 transport seam now sends `W32_USER_CALLBACK_LABEL` and explicitly receives either
+`W32_USER_CALLBACK_RESUME_LABEL` or a nested `W32_DISPATCH_LABEL` in the component callback
+trampoline. The synthetic policy remains on the executive side; a real callback is parked by
+withholding the resume label and is completed from `NtCallbackReturn`.
 
 ## 5. Control-transfer mechanics (seL4 level)
 
-- **Suspend win32k (Phase 2B):** Phase 2A first creates the genuine component `Call` rendezvous.
-  Phase 2B stops replying immediately: the executive *withholds* the reply, so win32k stays blocked
-  (its parked reply cap = the `win32k_continuation`). This is exactly the cooperative
-  reply-cap park already used for events/pipes, applied to the win32k dispatch.
+- **Suspend win32k:** the component Sends the callback rendezvous and enters its explicit callback
+  receive loop. The executive *withholds* `W32_USER_CALLBACK_RESUME_LABEL`, so the outer win32k
+  dispatch remains on the component's native stack while the same TCB is available to receive a
+  nested `W32_DISPATCH_LABEL`. `REPLY_W32` remains responsible for demand-fault replies inside each
+  dispatch; it is no longer the callback-continuation token.
 - **Redirect winlogon → `KiUserCallbackDispatcher`:** winlogon is blocked awaiting the reply to
   its (possibly nested) native `Call`. The executive marshals the callback input buffer into a
   client-side callback-args region, then **replies to winlogon's Call with a redirected resume
@@ -277,8 +281,9 @@ rendezvous from `NtCallbackReturn`.
   All three acceptance checks pass on the Phase-1 checkpoint.
 - **Phase 2A — component rendezvous, synthetic executive reply (implemented).** A fixed shared ABI
   carries bounded copied bytes plus explicit dispatch/client correlation. The directly-bound stub
-  issues a genuine seL4 `Call`; `component_pump` services its label while the outer dispatch is
-  active, performs the previous zero-init / input-preserving WINDOWPROC policy, and replies. The
+  originally issued a genuine seL4 `Call`; the Phase-3A transport now Sends the same label and waits
+  in its explicit receive loop. `component_pump` services the rendezvous while the outer dispatch is
+  active, performs the previous zero-init / input-preserving WINDOWPROC policy, and resumes it. The
   WINDOWPROC marshaller represents ReactOS's appended `Arguments+0x40` lParam copy as a validated
   payload offset, never as a component-local pointer. The
   first live winlogon api=0 request logs the real `PEB+0x58` pointer and loaded Rust ntdll
@@ -300,9 +305,9 @@ rendezvous from `NtCallbackReturn`.
   remain green and desktop paint stays 768/768. This phase is implemented and has an explicit
   `exec_user_callback_real_api7_roundtrip` gate spec.
 
-  The executive retains `REPLY_W32` while the component is suspended, saves winlogon's full outer
-  syscall context, writes the exact callback frame and redirected context, and consumes the outer
-  fault reply without replacing the saved continuation. SSN 22 is correlated by dispatch, callback,
+  The executive saves winlogon's full outer syscall context, writes the exact callback frame and
+  redirected context, and consumes the outer fault reply without replacing the saved continuation.
+  SSN 22 is correlated by dispatch, callback,
   process, badge, and current thread identity. The handler resumes the parked component without a
   second dispatch wake, waits for the original win32k dispatch to complete, rewrites winlogon's TCB
   with the saved outer context plus the real win32k result, then uses the SSN-22 fault reply only to
@@ -321,12 +326,36 @@ rendezvous from `NtCallbackReturn`.
   through its remaining `WM_NCCALCSIZE`/`WM_CREATE`/`WM_SIZE`/`WM_MOVE` callbacks, serviced 119
   callback rendezvous (117 winlogon api0), kept the login-dialog creation frontier, painted 768/768,
   passed 187 pre-existing checks plus the new Phase-2B check, and reached `[microtest done]`.
-- **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
+- **Phase 3A — bounded continuation + re-entrant component transport (implemented).**
+  `nt-user-callback::ContinuationStack` holds at most eight pointer-free alternating
+  `Win32kDispatch`/`UserCallback` frames. Push/pop operations require the exact process, badge,
+  thread, dispatch, and callback identity; a child suspends its parent and only an exact correlated
+  unwind makes that parent runnable. Host tests cover two callback levels, overflow, illegal
+  alternation, stale callback IDs, cross-thread returns, and wrong-dispatch requests. The controlled
+  api7 path is wired through this stack and its gate requires exactly two pushes and two unwinds.
+
+  The architecture audit confirmed why the former callback `seL4_Call` could never support Phase 3:
+  the project has one win32k component TCB, and that TCB was blocked in the Call while user32 needed
+  it to service a nested syscall. The callback trampoline now Sends its request, then explicitly
+  receives. A resume label completes the callback; a dispatch label invokes the win32k dispatch
+  body on top of the parked outer native stack, Sends DONE, and returns to the callback receive loop.
+  This transport change is behavior-preserving for the existing synthetic callbacks and controlled
+  api7 transition. The serialized acceptance run recorded 119 rendezvous / 117 winlogon api0,
+  one real api7 redirect/return, continuation pushes=2/unwinds=2, 768/768 paint, 188/99 checks, and
+  `[microtest done]` with no FAIL lines.
+
+- **Phase 3B — nesting + real WINDOWPROC callbacks.** Finish per-thread callback storage +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and
   `NtUserSetWindowLongPtr`, respectively. Prove with a real `WndProc` callback that its nested
   syscall re-enters win32k while the outer dispatch is suspended, returns, and unwinds correctly.
-  Host-test the continuation-stack push/pop/nesting logic (pure). Gate green.
+  The first controlled candidate is **SAS `WM_CREATE`**, not `WM_NCCREATE`: its application proc does
+  a client-side `GetWindowLongPtr`, then exactly one nested `NtUserSetWindowLongPtr` (SSN `0x1298`)
+  for `GWLP_USERDATA`; that kernel branch directly updates `WND.dwUserData` and does not callback.
+  `WM_NCCREATE` enters `DefWindowProc -> NtUserDefSetText` (SSN `0x1080`) and is the broader path.
+  Before enabling the candidate, marshal the complete api0 payload into winlogon's VSpace, copy the
+  SSN-22 output back into the shared reply, and preserve the parked callback frame while the nested
+  dispatch temporarily uses the shared request fields.
 - **Phase 4 — `WM_PAINT` → the login box renders.** With the machinery real, drive the dialog's
   `WM_PAINT`/`WM_ERASEBKGND`/`WM_INITDIALOG` to the control procs via the callback; the procs'
   `BeginPaint → GetDC/GetStockObject/GetSysColorBrush/FillRect/DrawTextW` first exercise the
@@ -359,9 +388,11 @@ rendezvous from `NtCallbackReturn`.
 - Builds on `crates/nt-ntdll/src/ki.rs` (`callback_dispatcher`, host-tested) and mirrors the SEH
   `KiUserExceptionDispatcher` target seam (batch 42) for the client entry.
 - Phase 2A replaces the component-local synthetic shortcut with the real component→executive
-  rendezvous. Phase 2B turns that suspension point into the user redirect; Phase 3 extends
-  `component_pump` for re-entrant/nested win32k dispatch.
-- Reuses the cooperative reply-cap park (events/pipes) for "suspend win32k", and the
-  client-memory mapping patterns (desktop-heap window mapping, GDI handle table) for Phase 4.
+  rendezvous. Phase 2B turns that suspension point into the user redirect; Phase 3A replaces the
+  blocking callback Call with the re-entrant component Send/Recv loop and adds the bounded correlated
+  continuation stack. Phase 3B adds client-buffer marshalling and proves the first nested api0.
+- Reuses the cooperative withhold/resume pattern from event/pipe parks, but represents the component
+  continuation with an explicit resume label so its TCB remains able to receive nested dispatches.
+  Client-memory mapping follows the desktop-heap window and GDI handle-table patterns for Phase 4.
 - Tracked in `ntdll_plan.md` (the desktop/logon-UI frontier) as the machinery behind the
   rendered login box.

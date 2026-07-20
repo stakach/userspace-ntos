@@ -549,7 +549,10 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 demand: 0,
             };
         }
-        crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
+        crate::ep_send(
+            ch.fault_ep,
+            crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
+        );
     } else if ch.wake_first {
         crate::ep_send(ch.fault_ep, ch.dispatch_label);
     }
@@ -586,7 +589,10 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
                 callback_suspended = true;
                 break;
             }
-            crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
+            crate::ep_send(
+                ch.fault_ep,
+                crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
+            );
             let (_b, nmi, nm0, nm1, nm2, nm3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
             mi = nmi;
             m0 = nm0;

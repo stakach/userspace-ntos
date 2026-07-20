@@ -916,17 +916,20 @@ pub(crate) unsafe fn send_done_on(label: u64) {
 }
 
 /// Block for the next dispatch request for the shared [`crate::spawn_hosts::component_main`]
-/// harness: a plain `seL4_Recv(CT_FAULT)`.
+/// harness: a plain `seL4_Recv(CT_FAULT)`. Returns the received message label so the win32k
+/// callback trampoline can distinguish a nested dispatch from its callback-resume signal.
 #[inline(never)]
-pub(crate) unsafe fn recv_req_on() {
+pub(crate) unsafe fn recv_req_on() -> u64 {
+    let message_info: u64;
     core::arch::asm!(
         "syscall",
         in("rdx") crate::SYS_RECV as u64,
         inout("rdi") crate::CT_FAULT => _,
-        lateout("rsi") _, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
+        lateout("rsi") message_info, lateout("r10") _, lateout("r8") _, lateout("r9") _, lateout("r15") _,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    message_info >> 12
 }
 
 /// Build a real IRP + IO_STACK_LOCATION + FILE_OBJECT (buffered I/O) and invoke the FSD's

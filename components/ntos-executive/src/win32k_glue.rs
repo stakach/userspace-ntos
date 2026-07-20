@@ -11,6 +11,8 @@ static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_PHASE: AtomicU64 =
     AtomicU64::new(nt_user_callback::ControlledTransitionPhase::Idle as u64);
@@ -23,6 +25,8 @@ static USER_CALLBACK_OUTER_RESUME_IP: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_REQUEST: nt_user_callback::CallbackHeader =
     nt_user_callback::CallbackHeader::idle(0, 0, 0, 0);
 static mut USER_CALLBACK_SAVED_REGS: [u64; 20] = [0; 20];
+static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
+    nt_user_callback::ContinuationStack::new();
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum UserCallbackDisposition {
@@ -38,14 +42,59 @@ pub(crate) struct Win32kClientContext {
     pub peb_mirror: u64,
 }
 
-pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64) {
+pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         USER_CALLBACK_RENDEZVOUS.load(Ordering::Relaxed),
         USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed),
         USER_CALLBACK_TABLE_VALID.load(Ordering::Relaxed),
         USER_CALLBACK_REAL_REDIRECTS.load(Ordering::Relaxed),
         USER_CALLBACK_REAL_RETURNS.load(Ordering::Relaxed),
+        USER_CALLBACK_CONTINUATION_PUSHES.load(Ordering::Relaxed),
+        USER_CALLBACK_CONTINUATION_UNWINDS.load(Ordering::Relaxed),
     )
+}
+
+unsafe fn begin_controlled_continuation(request: nt_user_callback::CallbackHeader) -> bool {
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+    let client = nt_user_callback::ClientThreadIdentity::new(
+        request.client_pi,
+        request.client_tid,
+        request.client_badge,
+    );
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    if !stack.is_empty()
+        || stack.push_dispatch(client, request.dispatch_id).is_err()
+        || stack.push_callback(correlation).is_err()
+    {
+        *stack = nt_user_callback::ContinuationStack::new();
+        return false;
+    }
+    USER_CALLBACK_CONTINUATION_PUSHES.fetch_add(2, Ordering::Relaxed);
+    true
+}
+
+unsafe fn unwind_controlled_callback(request: nt_user_callback::CallbackHeader) -> bool {
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    if stack.return_callback(correlation).is_err() {
+        return false;
+    }
+    USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn unwind_controlled_dispatch(request: nt_user_callback::CallbackHeader) -> bool {
+    let client = nt_user_callback::ClientThreadIdentity::new(
+        request.client_pi,
+        request.client_tid,
+        request.client_badge,
+    );
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    if stack.complete_dispatch(client, request.dispatch_id).is_err() || !stack.is_empty() {
+        return false;
+    }
+    USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 pub(crate) fn take_user_callback_pump_suspended() -> bool {
@@ -193,6 +242,7 @@ pub(crate) unsafe fn service_user_callback(
             && dispatcher != 0
             && USER_CALLBACK_PHASE.load(Ordering::Acquire)
                 == nt_user_callback::ControlledTransitionPhase::Idle as u64
+            && begin_controlled_continuation(request)
         {
             USER_CALLBACK_CLIENT_PI.store(client.pi as u64, Ordering::Relaxed);
             USER_CALLBACK_CLIENT_BADGE.store(client.badge, Ordering::Relaxed);
@@ -346,12 +396,21 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     {
         return (0xC000_0001u32 as i32, false);
     }
+    let request = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_REQUEST));
+    if !unwind_controlled_callback(request) {
+        *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
+            nt_user_callback::ContinuationStack::new();
+        return (0xC000_0001u32 as i32, false);
+    }
     let result = resume_suspended_user_callback_component();
+    let stack_ok = result.completed
+        && !result.callback_suspended
+        && unwind_controlled_dispatch(request);
     USER_CALLBACK_PHASE.store(
         nt_user_callback::ControlledTransitionPhase::Idle as u64,
         Ordering::Release,
     );
-    (result.status, result.completed)
+    (result.status, stack_ok)
 }
 
 pub(crate) unsafe fn complete_controlled_user_callback(
@@ -380,6 +439,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     if nt_user_callback::validate_reply(&request, &reply).is_err() {
         return false;
     }
+    if !unwind_controlled_callback(request) {
+        print_str(b"[user-callback] continuation correlation rejected SSN 22\n");
+        return false;
+    }
 
     USER_CALLBACK_PHASE.store(
         nt_user_callback::ControlledTransitionPhase::CallbackReturned as u64,
@@ -388,7 +451,15 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     print_str(b"[user-callback] A apfnDispatch[7] returned; resuming B component\n");
     let component = resume_suspended_user_callback_component();
     if !component.completed || component.callback_suspended {
+        *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
+            nt_user_callback::ContinuationStack::new();
         print_str(b"[user-callback] B component continuation failed to complete\n");
+        return false;
+    }
+    if !unwind_controlled_dispatch(request) {
+        *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
+            nt_user_callback::ContinuationStack::new();
+        print_str(b"[user-callback] dispatch continuation failed to unwind\n");
         return false;
     }
     let Some(tcb) = PM_MAIN_TCBS
