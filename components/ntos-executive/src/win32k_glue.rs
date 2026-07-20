@@ -9,6 +9,26 @@ static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_PHASE: AtomicU64 =
+    AtomicU64::new(nt_user_callback::ControlledTransitionPhase::Idle as u64);
+static USER_CALLBACK_CLIENT_PI: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_BADGE: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_TID: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_PEB: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_OUTER_RESUME_IP: AtomicU64 = AtomicU64::new(0);
+static mut USER_CALLBACK_REQUEST: nt_user_callback::CallbackHeader =
+    nt_user_callback::CallbackHeader::idle(0, 0, 0, 0);
+static mut USER_CALLBACK_SAVED_REGS: [u64; 20] = [0; 20];
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum UserCallbackDisposition {
+    ReplyImmediately,
+    SuspendComponent,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Win32kClientContext {
@@ -18,12 +38,18 @@ pub(crate) struct Win32kClientContext {
     pub peb_mirror: u64,
 }
 
-pub(crate) fn user_callback_proofs() -> (u64, u64, u64) {
+pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64) {
     (
         USER_CALLBACK_RENDEZVOUS.load(Ordering::Relaxed),
         USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed),
         USER_CALLBACK_TABLE_VALID.load(Ordering::Relaxed),
+        USER_CALLBACK_REAL_REDIRECTS.load(Ordering::Relaxed),
+        USER_CALLBACK_REAL_RETURNS.load(Ordering::Relaxed),
     )
+}
+
+pub(crate) fn take_user_callback_pump_suspended() -> bool {
+    USER_CALLBACK_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) != 0
 }
 
 unsafe fn callback_payload_u64(frame: *mut nt_user_callback::CallbackFrame, offset: usize) -> u64 {
@@ -44,7 +70,9 @@ unsafe fn callback_payload_write_u64(frame: *mut nt_user_callback::CallbackFrame
     }
 }
 
-pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+pub(crate) unsafe fn service_user_callback(
+    client: crate::spawn_hosts::UserCallbackClient,
+) -> Option<UserCallbackDisposition> {
     const WPCA_WND: usize = 0x10;
     const WPCA_MSG: usize = 0x18;
     const WPCA_LPARAM: usize = 0x28;
@@ -60,7 +88,7 @@ pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallb
         || request.client_badge != client.badge
     {
         print_str(b"[user-callback] invalid or stale component request\n");
-        return false;
+        return None;
     }
     USER_CALLBACK_RENDEZVOUS.fetch_add(1, Ordering::Relaxed);
 
@@ -133,6 +161,7 @@ pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallb
         }
     }
 
+    let mut suspend_component = false;
     if client.pi == 2
         && request.api_index == 0
         && USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed) == 1
@@ -160,6 +189,19 @@ pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallb
         print_str(b" RVA=0x");
         print_hex(dispatcher_rva as u32);
         print_str(b"\n");
+        if valid
+            && dispatcher != 0
+            && USER_CALLBACK_PHASE.load(Ordering::Acquire)
+                == nt_user_callback::ControlledTransitionPhase::Idle as u64
+        {
+            USER_CALLBACK_CLIENT_PI.store(client.pi as u64, Ordering::Relaxed);
+            USER_CALLBACK_CLIENT_BADGE.store(client.badge, Ordering::Relaxed);
+            USER_CALLBACK_CLIENT_TID.store(client.tid, Ordering::Relaxed);
+            USER_CALLBACK_CLIENT_PEB.store(client.peb_mirror, Ordering::Relaxed);
+            USER_CALLBACK_DISPATCHER.store(dispatcher, Ordering::Relaxed);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(USER_CALLBACK_REQUEST), request);
+            suspend_component = true;
+        }
     }
 
     let mut reply = request;
@@ -167,6 +209,210 @@ pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallb
     reply.output_length = request.output_capacity;
     reply.status = 0;
     core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
+    if suspend_component {
+        USER_CALLBACK_PHASE.store(
+            nt_user_callback::ControlledTransitionPhase::ComponentSuspended as u64,
+            Ordering::Release,
+        );
+        print_str(b"[user-callback] B component continuation parked on REPLY_W32\n");
+        Some(UserCallbackDisposition::SuspendComponent)
+    } else {
+        Some(UserCallbackDisposition::ReplyImmediately)
+    }
+}
+
+unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: bool) -> u64 {
+    for (index, register) in registers.iter().enumerate().skip(2) {
+        set_reply_mr(index + 2, *register);
+    }
+    let reply_info: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") tcb => _,
+        inout("rsi") (LBL_TCB_WRITE_REGISTERS << 12) | 22 => reply_info,
+        inout("r10") resume as u64 => _,
+        inout("r8") 20u64 => _,
+        inout("r9") registers[0] => _,
+        inout("r15") registers[1] => _,
+        lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply_info >> 12
+}
+
+pub(crate) unsafe fn begin_controlled_user_callback_redirect(
+    client: Win32kClientContext,
+    outer_resume_ip: u64,
+    outer_rsp: u64,
+    outer_flags: u64,
+) -> bool {
+    if USER_CALLBACK_PHASE.load(Ordering::Acquire)
+        != nt_user_callback::ControlledTransitionPhase::ComponentSuspended as u64
+        || USER_CALLBACK_CLIENT_PI.load(Ordering::Relaxed) != client.pi as u64
+        || USER_CALLBACK_CLIENT_BADGE.load(Ordering::Relaxed) != client.badge
+        || USER_CALLBACK_CLIENT_TID.load(Ordering::Relaxed) != client.tid
+    {
+        return false;
+    }
+    let Some(tcb) = PM_MAIN_TCBS
+        .get(client.pi as usize)
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .filter(|tcb| *tcb != 0)
+    else {
+        return false;
+    };
+    let dispatcher = USER_CALLBACK_DISPATCHER.load(Ordering::Relaxed);
+    if dispatcher == 0 {
+        return false;
+    }
+
+    let mut saved = [0u64; 20];
+    tcb_read_regs20(tcb, &mut saved);
+    let Some(callback_sp) = saved[nt_user_callback::USER_CONTEXT_RSP]
+        .checked_sub(core::mem::size_of::<nt_user_callback::UserCalloutFrame>() as u64)
+        .map(|sp| sp & !0xf)
+    else {
+        return false;
+    };
+    let frame = nt_user_callback::UserCalloutFrame::client_thread_startup(
+        outer_resume_ip,
+        outer_rsp,
+        outer_flags as u32,
+    );
+    let frame_bytes = core::slice::from_raw_parts(
+        core::ptr::addr_of!(frame) as *const u8,
+        core::mem::size_of::<nt_user_callback::UserCalloutFrame>(),
+    );
+    if !crate::img_spawn::smss_copyout(callback_sp, frame_bytes) {
+        return false;
+    }
+
+    core::ptr::write_volatile(core::ptr::addr_of_mut!(USER_CALLBACK_SAVED_REGS), saved);
+    USER_CALLBACK_OUTER_RESUME_IP.store(outer_resume_ip, Ordering::Relaxed);
+    let redirected = nt_user_callback::callback_redirect_context(&saved, dispatcher, callback_sp);
+    let error = tcb_write_regs20(tcb, &redirected, false);
+    if error != 0 {
+        print_str(b"[user-callback] client redirect TCB_WriteRegisters failed error=");
+        print_u64(error);
+        print_str(b"\n");
+        return false;
+    }
+    USER_CALLBACK_PHASE.store(
+        nt_user_callback::ControlledTransitionPhase::ClientRedirected as u64,
+        Ordering::Release,
+    );
+    USER_CALLBACK_REAL_REDIRECTS.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[user-callback] A client redirected to real apfnDispatch[7]\n");
+    true
+}
+
+unsafe fn resume_suspended_user_callback_component() -> crate::spawn_hosts::PumpResult {
+    let client = crate::spawn_hosts::UserCallbackClient {
+        pi: USER_CALLBACK_CLIENT_PI.load(Ordering::Relaxed) as u32,
+        badge: USER_CALLBACK_CLIENT_BADGE.load(Ordering::Relaxed),
+        tid: USER_CALLBACK_CLIENT_TID.load(Ordering::Relaxed),
+        peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
+    };
+    let channel = crate::spawn_hosts::PumpChannel {
+        fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
+        pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
+        code_va: win32k_subsystem::WIN32K_CODE_VA,
+        image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
+        dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+        demand_cap: 8192,
+        trace_faults: false,
+        wake_first: false,
+        reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
+        client_pi: client.pi as u64,
+        callback_client: Some(client),
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Syscall,
+            client_attach: true,
+            usermode_callback: true,
+            wide_arg_marshal: true,
+            assert_skip: true,
+            nested_reply_cap: true,
+        },
+    };
+    crate::spawn_hosts::component_pump_resume_user_callback(&channel)
+}
+
+pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
+    if USER_CALLBACK_PHASE.load(Ordering::Acquire)
+        != nt_user_callback::ControlledTransitionPhase::ComponentSuspended as u64
+    {
+        return (0xC000_0001u32 as i32, false);
+    }
+    let result = resume_suspended_user_callback_component();
+    USER_CALLBACK_PHASE.store(
+        nt_user_callback::ControlledTransitionPhase::Idle as u64,
+        Ordering::Release,
+    );
+    (result.status, result.completed)
+}
+
+pub(crate) unsafe fn complete_controlled_user_callback(
+    client_pi: u32,
+    client_badge: u64,
+    client_tid: u64,
+    result_pointer: u64,
+    result_length: u64,
+    callback_status: u64,
+) -> bool {
+    if USER_CALLBACK_PHASE.load(Ordering::Acquire)
+        != nt_user_callback::ControlledTransitionPhase::ClientRedirected as u64
+        || USER_CALLBACK_CLIENT_PI.load(Ordering::Relaxed) != client_pi as u64
+        || USER_CALLBACK_CLIENT_BADGE.load(Ordering::Relaxed) != client_badge
+        || USER_CALLBACK_CLIENT_TID.load(Ordering::Relaxed) != client_tid
+        || result_pointer != 0
+        || result_length != 0
+        || callback_status as u32 != 0
+    {
+        return false;
+    }
+    let request = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_REQUEST));
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    let reply = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    if nt_user_callback::validate_reply(&request, &reply).is_err() {
+        return false;
+    }
+
+    USER_CALLBACK_PHASE.store(
+        nt_user_callback::ControlledTransitionPhase::CallbackReturned as u64,
+        Ordering::Release,
+    );
+    print_str(b"[user-callback] A apfnDispatch[7] returned; resuming B component\n");
+    let component = resume_suspended_user_callback_component();
+    if !component.completed || component.callback_suspended {
+        print_str(b"[user-callback] B component continuation failed to complete\n");
+        return false;
+    }
+    let Some(tcb) = PM_MAIN_TCBS
+        .get(client_pi as usize)
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .filter(|tcb| *tcb != 0)
+    else {
+        return false;
+    };
+    let saved = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_SAVED_REGS));
+    let completed = nt_user_callback::completed_outer_context(
+        &saved,
+        component.status as u32 as u64,
+        USER_CALLBACK_OUTER_RESUME_IP.load(Ordering::Relaxed),
+    );
+    if tcb_write_regs20(tcb, &completed, false) != 0 {
+        return false;
+    }
+    USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
+    USER_CALLBACK_PHASE.store(
+        nt_user_callback::ControlledTransitionPhase::Idle as u64,
+        Ordering::Release,
+    );
+    print_str(b"[user-callback] B completed; restored A with outer result in RAX\n");
     true
 }
 
@@ -748,6 +994,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         },
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
+    USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
     (pr.status, pr.completed)
 }
 

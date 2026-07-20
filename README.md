@@ -115,8 +115,8 @@ self-contained launcher that:
    `REACTOS_7Z_URL=…`. ReactOS is GPL, so its binaries are freely
    redistributable — the executive loads them via `SEC_IMAGE` and runs their
    real user-mode binaries through this project's Rust `ntdll.dll` implementation.
-4. **Builds** the `ntos-executive` (the NT executive that hosts the ReactOS
-   processes) + the kernel, and packs the FAT32/UEFI disk image.
+4. **Builds** the Rust `ntdll.dll`, `ntos-executive` (the NT executive that
+   hosts the ReactOS processes), and the kernel, then packs the FAT32/UEFI disk image.
 5. **Boots QEMU.**
 
 ### What you should see
@@ -127,8 +127,9 @@ executive's success sentinel; `run.sh` then prints a clear verdict:
 ```
   PASS exec_win32k_desktop_painted
 [ntos-exec] desktop-bg match 768/768 px, px0=0x003a6ea5 (expected 0x003a6ea5)
-[user-callback] rendezvous=114 winlogon-api0=112 table-nonzero-aligned=1
-[ntos-exec summary: 187/98 executive->isolated-service checks passed]
+[user-callback] rendezvous=119 winlogon-api0=117 table-nonzero-aligned=1 real-api7-redirects=1 real-api7-returns=1
+  PASS exec_user_callback_real_api7_roundtrip
+[ntos-exec summary: 188/99 executive->isolated-service checks passed]
 [microtest done]
 SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5).
 ```

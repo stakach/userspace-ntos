@@ -8446,14 +8446,31 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(harness_syscall);
     print_str(b"\n");
     check(b"exec_win32k_on_shared_harness", harness_syscall >= 4, &mut passed);
-    let (callback_rendezvous, callback_winlogon_api0, callback_table_valid) = win32k_glue::user_callback_proofs();
+    let (
+        callback_rendezvous,
+        callback_winlogon_api0,
+        callback_table_valid,
+        callback_real_redirects,
+        callback_real_returns,
+    ) = win32k_glue::user_callback_proofs();
     print_str(b"[user-callback] rendezvous=");
     print_u64(callback_rendezvous);
     print_str(b" winlogon-api0=");
     print_u64(callback_winlogon_api0);
     print_str(b" table-nonzero-aligned=");
     print_u64(callback_table_valid);
-    print_str(b" (Phase 2A synthetic reply; no user redirect)\n");
+    print_str(b" real-api7-redirects=");
+    print_u64(callback_real_redirects);
+    print_str(b" real-api7-returns=");
+    print_u64(callback_real_returns);
+    print_str(b"\n");
+    check(
+        b"exec_user_callback_real_api7_roundtrip",
+        callback_table_valid != 0
+            && callback_real_redirects == 1
+            && callback_real_returns == 1,
+        &mut passed,
+    );
 
     // --- PROOF winlogon crossed its SAS message loop: InitializeSAS COMPLETED (was failing entirely —
     // NtUserSetLogonNotifyWindow's logon-process access check failed because PsLookupProcessByProcessId
@@ -8559,7 +8576,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
-    print_str(b"/98 executive->isolated-service checks passed]\n");
+    print_str(b"/99 executive->isolated-service checks passed]\n");
     print_str(b"[microtest done]\n");
     park()
 }

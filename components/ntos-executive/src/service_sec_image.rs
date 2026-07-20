@@ -1462,6 +1462,50 @@ pub(crate) unsafe fn service_sec_image(
             let resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
+            let current_tid = if is_svc_listener {
+                SVC_LISTENER_TID.load(Ordering::Relaxed)
+            } else if is_scm_worker {
+                SCM_WORKER_TID.load(Ordering::Relaxed)
+            } else if is_lsass_listener {
+                LSASS_LISTENER_TID.load(Ordering::Relaxed)
+            } else if is_lsass_listener2 {
+                LSASS_LISTENER2_TID.load(Ordering::Relaxed)
+            } else if is_lsass_listener3 {
+                LSASS_LISTENER3_TID.load(Ordering::Relaxed)
+            } else if is_wl_worker {
+                match badge {
+                    WINLOGON_WORKER2_BADGE => WL_WORKER2_TID.load(Ordering::Relaxed),
+                    WINLOGON_WORKER3_BADGE => WL_WORKER3_TID.load(Ordering::Relaxed),
+                    _ => PM_LISTENER_TID.load(Ordering::Relaxed),
+                }
+            } else {
+                PM_TIDS[pi].load(Ordering::Relaxed)
+            };
+            if m0 == 22
+                && win32k_glue::complete_controlled_user_callback(
+                    pi as u32,
+                    badge,
+                    current_tid,
+                    get_recv_mr(9),
+                    m3,
+                    get_recv_mr(7),
+                )
+            {
+                procs[pi].faults = faults;
+                procs[pi].first = first;
+                procs[pi].ntfaults = ntfaults;
+                pfilled[pi] = *filled_pages;
+                let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                send_on_reply(reply_main, 0, 0, 0, 0, 0);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
             let mut handled = true;
             // BATCH 43: set when winlogon reaches its win32k SAS-window creation milestone (0x1077 OK) →
@@ -1478,6 +1522,7 @@ pub(crate) unsafe fn service_sec_image(
             // Set when winlogon's NtSecureConnectPort was completed via the nested CSR rendezvous
             // (like routed_lpc, the CSR thread's faults clobbered reply_to → reply via REPLY_MAIN).
             let mut routed_csr = false;
+            let mut redirected_user_callback = false;
             // Broker-only terminal waits (currently smss waiting forever for csrss/winlogon) park
             // by withholding a reply. Self-termination does not use this flag: its explicit post
             // action deletes the bound Reply cap and caller TCB before receiving again.
@@ -1505,25 +1550,7 @@ pub(crate) unsafe fn service_sec_image(
             // the previous registered syscall.
             nt_handler.pi = pi;
             nt_handler.current_badge = badge;
-            nt_handler.current_tid = if is_svc_listener {
-                SVC_LISTENER_TID.load(Ordering::Relaxed)
-            } else if is_scm_worker {
-                SCM_WORKER_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener {
-                LSASS_LISTENER_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener2 {
-                LSASS_LISTENER2_TID.load(Ordering::Relaxed)
-            } else if is_lsass_listener3 {
-                LSASS_LISTENER3_TID.load(Ordering::Relaxed)
-            } else if is_wl_worker {
-                match badge {
-                    WINLOGON_WORKER2_BADGE => WL_WORKER2_TID.load(Ordering::Relaxed),
-                    WINLOGON_WORKER3_BADGE => WL_WORKER3_TID.load(Ordering::Relaxed),
-                    _ => PM_LISTENER_TID.load(Ordering::Relaxed),
-                }
-            } else {
-                PM_TIDS[pi].load(Ordering::Relaxed)
-            };
+            nt_handler.current_tid = current_tid;
             // SEAM: if this SSN is in the real service table, dispatch it through the NT syscall
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
@@ -3161,7 +3188,7 @@ pub(crate) unsafe fn service_sec_image(
                 // it can only reach if its user32 process-attach class-registration loop COMPLETES
                 // (parking on 0x103d left \pipe\ntsvcs unserved → winlogon's OpenSCManager 0xC0000034).
                 let svc_noninteractive = badge == LSASS_BADGE || badge == SERVICES_BADGE;
-                let (st, ok) = if wl_milestone_park {
+                let (mut st, mut ok) = if wl_milestone_park {
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0i32, false)
@@ -3308,7 +3335,34 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     r
                 };
-                if winlogon_switch {
+                let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+                if callback_suspended {
+                    let peb_mirror = match pi {
+                        0 => 0x0000_0100_1074_1000,
+                        1 => 0x0000_0100_1078_1000,
+                        2 => 0x0000_0100_107C_1000,
+                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
+                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        _ => 0,
+                    };
+                    redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
+                        win32k_glue::Win32kClientContext {
+                            pi: pi as u32,
+                            badge,
+                            tid: nt_handler.current_tid,
+                            peb_mirror,
+                        },
+                        resume_ip,
+                        sp,
+                        flags,
+                    );
+                    if !redirected_user_callback {
+                        let resumed = win32k_glue::cancel_suspended_user_callback();
+                        st = resumed.0;
+                        ok = resumed.1;
+                    }
+                }
+                if winlogon_switch && !redirected_user_callback {
                     // Read back the 768-px sampled grid; count how many winlogon's OWN SwitchDesktop flow
                     // painted to the WC_DESKTOP background. This drives the counted paint gate.
                     let fb = FB_VADDR as *const u32;
@@ -3349,12 +3403,12 @@ pub(crate) unsafe fn service_sec_image(
                     // must NOT clear/re-read the fb (it would wipe the paint we just sampled).
                     WINLOGON_PAINT_DONE.store(1, Ordering::Relaxed);
                 }
-                if has_buf && ok && st == 0 {
+                if has_buf && ok && st == 0 && !redirected_user_callback {
                     // NtUserProcessConnect (0x10FA) returned STATUS_SUCCESS for this GUI client —
                     // record the per-pi "win32k client connected" bit (csrss=1, winlogon=2, services=3).
                     W32_CONNECTED_MASK.fetch_or(1u64 << pi, Ordering::Relaxed);
                 }
-                if has_buf && ok {
+                if has_buf && ok && !redirected_user_callback {
                     let arg = win32k_subsystem::WIN32K_ARG_VADDR;
                     // gSharedInfo CLIENT-MAPPING. win32k's NtUserProcessConnect handler filled the
                     // USERCONNECT's siClient with pointers into its OWN session-space USER heap
@@ -3411,7 +3465,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // BATCH 43: throttle the status line for the same hot class-loop SSNs (WALL statuses ALWAYS
                 // print — a wall is never suppressed).
-                if !ok || w32_log {
+                if !redirected_user_callback && (!ok || w32_log) {
                     print_str(b"[win32k-svc] csrss SSN 0x");
                     print_hex(m0 as u32);
                     print_str(if ok { b" -> status=0x" } else { b" -> WALL status=0x" });
@@ -3507,7 +3561,9 @@ pub(crate) unsafe fn service_sec_image(
                 // DceCreateDisplayDC → co_IntGraphicsCheck(TRUE) → co_AddGuiApp →
                 // co_IntInitializeDesktopGraphics (InitVideo/surface :278/:286 + the atomic paint :340).
                 // The counted exec_win32k_desktop_painted spec is fed by the m0==0x1288 arm above.
-                if ok {
+                if redirected_user_callback {
+                    result = nt_user_callback::STATUS_PENDING as u32 as u64;
+                } else if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
                     // ★ BATCH 45 — SAS-window milestone gated on a REAL HWND (st != 0). Root cause found in
                     // BATCH 44/45: the BATCH-43 "0x1077 OK" was a FALSE POSITIVE — the executive forwarded
@@ -3913,6 +3969,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
+                recv_full_r12(fault_ep, reply_main)
+            } else if redirected_user_callback && reply_main != 0 {
+                send_on_reply(reply_main, 0, 0, 0, 0, 0);
                 recv_full_r12(fault_ep, reply_main)
             } else if (routed_win32k || routed_lpc || routed_csr) && reply_main != 0 {
                 // Fix (B): this caller's syscall was serviced by the win32k component, whose faults

@@ -1,11 +1,12 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **PHASE 2A implemented; PHASE 2B frame/correlation foundation implemented, live redirect
-not landed**. Author target: the
+Status: **PHASE 2A implemented; PHASE 2B controlled api7 reverse transition implemented and
+gate-verified; Phase 3 nesting remains**. Author target: the
 executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
 Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
-executive callback rendezvous while preserving the synthetic reply policy. The executive still
-replies immediately; Phase 2B is the first phase that withholds this reply and redirects the client.
+executive callback rendezvous while preserving the synthetic reply policy. Phase 2B now withholds
+one validated winlogon request, completes a controlled real api7 client roundtrip, then preserves the
+original api0 request's synthetic completion. General api0 callbacks remain Phase 3 work.
 The IDD_LOGON logon dialog
 is *created* (17 `#32770` windows) but never *painted* because its `WM_PAINT` is never
 dispatched to the control procs.
@@ -199,12 +200,12 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | `KiUserCallbackDispatcher` target entry | ✅ Phase 1: naked x64 stack-frame entry in `nt-ntdll-dll` |
 | `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ✅ Phase 2A diagnostic (never fabricated) |
 | `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
-| Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2B |
+| Executive-side special `NtCallbackReturn` continuation handler | ✅ Phase 2B controlled api7 path |
 | Exact 0x58 `UCALLOUT_FRAME`, pointer-free correlation, and redirect/outer-resume context transforms | ✅ Phase 2B foundation, host-tested |
 | Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
 | Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
-| Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ☐ build |
+| Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
 | Executive: per-thread **callback-continuation stack** (3a) | ☐ build |
 | win32k **nested-dispatch** / re-entrant `component_pump` (3b) | ☐ build |
 | **buffer marshalling** in/out across VSpaces (client-visible only) | ☐ build |
@@ -296,54 +297,30 @@ rendezvous from `NtCallbackReturn`.
   `apfnDispatch[7]` thunk complete through the special `NtCallbackReturn` handler. Preserve the
   original api0 rendezvous's synthetic completion. Prove the exact frame → real callback table →
   callback-return → resumed continuation round trip, while `CreateWindowEx` and the SAS specs
-  remain green and desktop paint stays 768/768. Gate 187 held or +1 for a "callback ran for real"
-  spec.
-  The behavior-preserving foundation is implemented in `nt-user-callback`: an exact ReactOS AMD64
-  frame builder for callback 7 plus a pointer-free `(dispatch_id, callback_id, pi, tid, badge)`
-  correlation key, with layout and stale-return tests. The discarded live prototype was
-  reconstructed from its retained symbolized binary and split into independently logged
-  client-context (A) and component-continuation (B) phases. This proved the old
-  `WIN32K+0xe7be1` wall was caused by reply-cap reuse, not an unknown win32k context word: the
-  prototype returned from `component_pump` while the callback `Call` was still bound to the
-  reusable `REPLY_W32`. The next pump rebound that reply object and advanced the wrong outer
-  dispatch while overwriting the single shared request frame. An explicit suspended pump outcome
-  plus resume-without-wake eliminated that NULL wall: SSN 22 resumed the original component, which
-  completed its remaining api0 sequence (`WM_NCCALCSIZE`, `WM_CREATE`, `WM_SIZE`, `WM_MOVE`).
+  remain green and desktop paint stays 768/768. This phase is implemented and has an explicit
+  `exec_user_callback_real_api7_roundtrip` gate spec.
 
-  The remaining blocker is narrower: **the outer client fault continuation itself must remain
-  parked, not merely have its register values copied.** Directly restoring a saved TCB context
-  advanced through the former NULL wall to `NtUserUnregisterClass`, but did not reach the baseline
-  gate. Re-expressing the saved context as an exact 18-word `UnknownSyscall` reply caused SSN 22 to
-  repeat, even when MR15/16/17 used the original outer fault's captured `(resume_ip, rsp, flags)`.
-  That reply still completes the *SSN-22 fault continuation*, not the older outer win32k syscall
-  continuation. These runtime experiments remain **unlanded**. The safe foundation now host-tests
-  the A/B phase ordering and exact outer reply-word mapping. The next pass must retain two distinct
-  client-side continuation identities (outer syscall and callback return), just as B retains the
-  component callback reply identity; it must not substitute one fault reply for the other.
+  The executive retains `REPLY_W32` while the component is suspended, saves winlogon's full outer
+  syscall context, writes the exact callback frame and redirected context, and consumes the outer
+  fault reply without replacing the saved continuation. SSN 22 is correlated by dispatch, callback,
+  process, badge, and current thread identity. The handler resumes the parked component without a
+  second dispatch wake, waits for the original win32k dispatch to complete, rewrites winlogon's TCB
+  with the saved outer context plus the real win32k result, then uses the SSN-22 fault reply only to
+  make that rewritten context runnable. The separately captured post-`syscall` IP repairs the
+  kernel's `TCB_ReadRegisters` `resume_ip - 2` reporting convention and rebuilds RIP/RCX plus
+  RFLAGS/R11 while preserving R10.
 
-  A 2026-07-20 retry retained `REPLY_W32`, wrote the callback context with
-  `TCB_WriteRegisters(resume=false)`, and consumed the outer fault with a zero-length reply before
-  waiting for SSN 22. Its immediately preceding clean-HEAD control passed 187/98, painted 768/768,
-  serviced 114 callback rendezvous, and reached `[microtest done]`. The retry painted 768/768 and
-  reached exactly:
+  The redirect-boundary diagnostic proved, in order: `TCB_WriteRegisters(resume=false)` succeeded;
+  the zero-length outer reply resumed winlogon; the real dispatcher and `apfnDispatch[7]` ran; and
+  `ZwCallbackReturn` delivered SSN 22. The apparent missing-SSN wall was an executive ordering bug:
+  callback correlation ran before `nt_handler.current_tid` was refreshed for the newly received
+  caller, so a valid SSN 22 fell through as unhandled. Caller identity is now computed before the
+  special callback-return path and reused by normal dispatch.
 
-  ```text
-  [user-callback] B component continuation parked on REPLY_W32
-  [user-callback] A client redirected to real apfnDispatch[7]
-  ```
-
-  It then produced no serial output and never delivered SSN 22. That runtime path is therefore not
-  landed. This evidence narrows the next diagnostic to the client restart boundary; it does **not**
-  distinguish a failed outer-fault restart from entry/dispatch code spinning before
-  `ZwCallbackReturn`. Before another integrated attempt, add bounded proof for the
-  `TCB_WriteRegisters` error label, the post-reply runnable context, dispatcher entry, and the
-  table[7] call/return boundary (or cover the restart sequence with a kernel microtest).
-
-  Static review also found a definite downstream correction: this kernel's `TCB_ReadRegisters`
-  reports `resume_ip - 2` for a thread blocked on `UnknownSyscall`. A final full-context restore
-  must therefore use the separately captured post-`syscall` return IP, rebuild the RIP/RCX and
-  RFLAGS/R11 sysret aliases, place the outer win32k result in RAX, and preserve R10. The pure
-  `completed_outer_context` helper now host-tests that contract; it is not yet wired into runtime.
+  The acceptance run recorded one real redirect and one real return, resumed the original component
+  through its remaining `WM_NCCALCSIZE`/`WM_CREATE`/`WM_SIZE`/`WM_MOVE` callbacks, serviced 119
+  callback rendezvous (117 winlogon api0), kept the login-dialog creation frontier, painted 768/768,
+  passed 187 pre-existing checks plus the new Phase-2B check, and reached `[microtest done]`.
 - **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and

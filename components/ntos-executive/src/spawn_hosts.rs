@@ -492,6 +492,7 @@ pub(crate) fn harness_dispatches(kind: ReqKind) -> u64 {
 pub(crate) struct PumpResult {
     pub status: i32,
     pub completed: bool,
+    pub callback_suspended: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -512,6 +513,14 @@ pub(crate) struct PumpResult {
 /// On a COMPLETED dispatch (server re-parked) the pump bumps [`HARNESS_IRP_DISPATCHES`] /
 /// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
+    component_pump_inner(ch, false)
+}
+
+pub(crate) unsafe fn component_pump_resume_user_callback(ch: &PumpChannel) -> PumpResult {
+    component_pump_inner(ch, true)
+}
+
+unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> PumpResult {
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
     // wide-arg (SH_REQ_A4../NARGS) staging — is done by the win32k caller wrapper `win32k_dispatch_wide`
     // BEFORE this pump runs (exactly as the FSD `dispatch_irp` fills the IRP fields before the pump).
@@ -527,7 +536,21 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
     // Wake the server (per-request shape), then pump its faults until it re-parks or walls. The
     // DriverEntry-init shape (`wake_first=false`) starts by RECEIVING — the component is a blocked
     // sender (mid-init fault / ready-Send), so a leading Send would deadlock against it.
-    if ch.wake_first {
+    if resume_user_callback {
+        if !use_reply_cap {
+            return PumpResult {
+                status: 0xC000_0001u32 as i32,
+                completed: false,
+                callback_suspended: false,
+                wall_ip: 0,
+                wall_addr: 0,
+                wall_label: crate::win32k_subsystem::W32_USER_CALLBACK_LABEL,
+                faults: 0,
+                demand: 0,
+            };
+        }
+        crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
+    } else if ch.wake_first {
         crate::ep_send(ch.fault_ep, ch.dispatch_label);
     }
     let (mut _b, mut mi, mut m0, mut m1, mut _m2, mut _m3) = if use_reply_cap {
@@ -540,6 +563,7 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
     let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded → a looping assert walls)
     let (mut wall_ip, mut wall_addr, mut wall_label) = (0u64, 0u64, 0u64);
     let mut completed = false;
+    let mut callback_suspended = false;
     loop {
         let label = mi >> 12;
         if label == ch.dispatch_label {
@@ -549,13 +573,17 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
             && ch.caps.usermode_callback
             && use_reply_cap
         {
-            let serviced = ch
+            let disposition = ch
                 .callback_client
-                .is_some_and(|client| crate::win32k_glue::service_user_callback(client));
-            if !serviced {
+                .and_then(|client| crate::win32k_glue::service_user_callback(client));
+            let Some(disposition) = disposition else {
                 wall_ip = m0;
                 wall_addr = m1;
                 wall_label = label;
+                break;
+            };
+            if disposition == crate::win32k_glue::UserCallbackDisposition::SuspendComponent {
+                callback_suspended = true;
                 break;
             }
             crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
@@ -742,10 +770,21 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
             ReqKind::Syscall => SH_REQ_STATUS_SYSCALL,
         };
         core::ptr::read_volatile((ch.shared_va + so) as *const i32)
+    } else if callback_suspended {
+        nt_user_callback::STATUS_PENDING
     } else {
         0xC000_0001u32 as i32 // STATUS_UNSUCCESSFUL
     };
-    PumpResult { status, completed, wall_ip, wall_addr, wall_label, faults, demand }
+    PumpResult {
+        status,
+        completed,
+        callback_suspended,
+        wall_ip,
+        wall_addr,
+        wall_label,
+        faults,
+        demand,
+    }
 }
 
 /// The DRIVER_OBJECT byte layout a component's `DriverEntry` expects. FSD = { size:0x150, ext:0x68 };
