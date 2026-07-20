@@ -135,6 +135,56 @@ pub const IDD_LOGON_CAPTION: [u16; 5] = [
     b'o' as u16,
     b'n' as u16,
 ];
+pub const MAX_DIALOG_CAPTION_CODE_UNITS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LargeUnicodeStringDescriptor {
+    pub length_bytes: u32,
+    pub buffer: u64,
+}
+
+impl LargeUnicodeStringDescriptor {
+    pub fn parse(raw: &[u8; 16]) -> Result<Self, ValidationError> {
+        let length_bytes = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let maximum_and_ansi = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let maximum_length = maximum_and_ansi & 0x7fff_ffff;
+        let buffer = u64::from_le_bytes([
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+        ]);
+        let max_bytes = (MAX_DIALOG_CAPTION_CODE_UNITS * 2) as u32;
+        if maximum_and_ansi & 0x8000_0000 != 0
+            || length_bytes & 1 != 0
+            || length_bytes > max_bytes
+            || maximum_length < length_bytes
+            || (length_bytes != 0 && buffer == 0)
+            || buffer.checked_add(length_bytes as u64).is_none()
+        {
+            return Err(ValidationError::Length);
+        }
+        Ok(Self {
+            length_bytes,
+            buffer,
+        })
+    }
+
+    pub const fn code_units(self) -> usize {
+        self.length_bytes as usize / 2
+    }
+}
+
+pub fn decode_utf16le_bounded(
+    bytes: &[u8],
+    output: &mut [u16; MAX_DIALOG_CAPTION_CODE_UNITS],
+) -> Result<usize, ValidationError> {
+    if bytes.len() & 1 != 0 || bytes.len() / 2 > output.len() {
+        return Err(ValidationError::Length);
+    }
+    let count = bytes.len() / 2;
+    for index in 0..count {
+        output[index] = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+    }
+    Ok(count)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WinlogonDialogCorrelation {
@@ -1192,6 +1242,62 @@ mod tests {
             Err(ValidationError::Sequence)
         );
         assert!(!correlation.modal_ready());
+    }
+
+    #[test]
+    fn large_unicode_string_descriptor_validates_bounded_unicode_input() {
+        let mut raw = [0u8; 16];
+        raw[0..4].copy_from_slice(&10u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&12u32.to_le_bytes());
+        raw[8..16].copy_from_slice(&0x80ff_f000u64.to_le_bytes());
+        let descriptor = LargeUnicodeStringDescriptor::parse(&raw).unwrap();
+        assert_eq!(descriptor.length_bytes, 10);
+        assert_eq!(descriptor.code_units(), 5);
+        assert_eq!(descriptor.buffer, 0x80ff_f000);
+
+        let mut output = [0u16; MAX_DIALOG_CAPTION_CODE_UNITS];
+        let count = decode_utf16le_bounded(b"L\0o\0g\0o\0n\0", &mut output).unwrap();
+        assert_eq!(&output[..count], &IDD_LOGON_CAPTION);
+    }
+
+    #[test]
+    fn large_unicode_string_descriptor_rejects_ansi_odd_overflow_or_unbounded_input() {
+        let mut raw = [0u8; 16];
+        raw[0..4].copy_from_slice(&3u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&4u32.to_le_bytes());
+        raw[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(
+            LargeUnicodeStringDescriptor::parse(&raw),
+            Err(ValidationError::Length)
+        );
+
+        raw[0..4].copy_from_slice(&2u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0x8000_0004u32.to_le_bytes());
+        assert_eq!(
+            LargeUnicodeStringDescriptor::parse(&raw),
+            Err(ValidationError::Length)
+        );
+
+        raw[0..4].copy_from_slice(&((MAX_DIALOG_CAPTION_CODE_UNITS as u32 + 1) * 2).to_le_bytes());
+        raw[4..8].copy_from_slice(&((MAX_DIALOG_CAPTION_CODE_UNITS as u32 + 1) * 2).to_le_bytes());
+        assert_eq!(
+            LargeUnicodeStringDescriptor::parse(&raw),
+            Err(ValidationError::Length)
+        );
+
+        raw[0..4].copy_from_slice(&4u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&4u32.to_le_bytes());
+        raw[8..16].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        assert_eq!(
+            LargeUnicodeStringDescriptor::parse(&raw),
+            Err(ValidationError::Length)
+        );
+
+        let mut output = [0u16; MAX_DIALOG_CAPTION_CODE_UNITS];
+        assert_eq!(
+            decode_utf16le_bounded(&[0; 3], &mut output),
+            Err(ValidationError::Length)
+        );
     }
 
     #[test]

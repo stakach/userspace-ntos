@@ -793,6 +793,42 @@ pub(crate) unsafe fn scratch_for(va: u64, filled_pages: &[u64], nfilled: usize, 
     }
     None
 }
+/// Copy bytes from any already-mapped SEC_IMAGE client page. Prefer the process's persistent
+/// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases used for
+/// DLL pages. The walk is read-only, bounded by `dst`, handles cross-page ranges, and never faults in
+/// a new page: every source page must already be represented by a mirror or `filled_pages` entry.
+pub(crate) unsafe fn client_copyin_mapped(
+    va: u64,
+    dst: &mut [u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if va.checked_add(dst.len() as u64).is_none() {
+        return false;
+    }
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let current = va + copied as u64;
+        let page_remaining = 0x1000usize - (current as usize & 0xfff);
+        let chunk = page_remaining.min(dst.len() - copied);
+        let source = smss_mirror(current, chunk as u64)
+            .or_else(|| scratch_for(current, filled_pages, nfilled, scratch_base));
+        let Some(source) = source else {
+            return false;
+        };
+        core::ptr::copy_nonoverlapping(
+            source as *const u8,
+            dst.as_mut_ptr().add(copied),
+            chunk,
+        );
+        copied += chunk;
+    }
+    true
+}
 /// Write a u64 OUT-param to a csrss VA that may live ANYWHERE in its VSpace — not just the
 /// stack/heap/image mirrors, but also a csrsrv .data global (~0x8001xxxx). Tries the mirrors
 /// (smss_copyout), then an already-faulted page's scratch alias, then — for a not-yet-faulted csrsrv

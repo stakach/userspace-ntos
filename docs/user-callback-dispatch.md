@@ -445,9 +445,13 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   tightened diagnostic gate ended `187/99`. The likely cause is address coverage, not evidence that
   the title differs: the `LARGE_STRING` descriptor is on the client stack, but its UTF-16 buffer can
   live in a demand-filled DLL page outside `smss_copyin`'s stack/early-heap/main-image windows. The
-  next diagnostic should read that buffer through `scratch_for` (or a general client-copyin helper
-  backed by the filled-page table), log its length/code units, and only then bind `0x2003a` if the
-  caption and other correlations match. This experiment is also not landed; the runtime remains at
+  A bounded `client_copyin_mapped` helper and validated `LARGE_STRING`/UTF-16 decoder are now
+  implemented as a behavior-preserving foundation. A serialized diagnostic could read the
+  descriptor for `0x2003a`, but the referenced caption page was still absent from both the mirror
+  and filled-page lookup (`descriptor-read=1`, `caption-read=0`), so the tightened diagnostic gate
+  ended `187/99` and the runtime wiring was reverted. The next pass must identify which VSpace page
+  owns that buffer and make its existing frame visible to the read-only lookup; only then bind
+  `0x2003a` if the caption and other correlations match. The runtime remains at
   the green Phase-3B checkpoint. `WinlogonDialogCorrelation` retains the pure state model for exact
   SAS session/HWND/messages, logged-off state, distinct top-level `#32770`/`Logon` HWND, and key-open
   evidence.
