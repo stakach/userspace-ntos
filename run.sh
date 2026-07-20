@@ -138,6 +138,7 @@ fi
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
 say "[4/5] building ntos-executive + kernel + disk image..."
+"$ROOT/scripts/build_ntdll_dll.sh"
 "$ROOT/components/ntos-executive/build.sh"
 ( cd "$RM" && ./scripts/build_kernel.sh extern-rootserver )
 
