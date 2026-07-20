@@ -401,35 +401,17 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   iteration calls `ShowWindow`, then `GetMessageW`; a retrieved `WM_PAINT` is consumed through
   `NtUserDispatchMessage` (SSNs `0x1001`, `0x1057`, `0x1006`, and `0x1035`). `WM_INITDIALOG` is
   sent synchronously during dialog construction and is therefore not the first missing kernel
-  callback. `nt-user-callback::DialogModalPumpSequence` now models the strict observable kernel
-  prefix `Peek(false) -> Get(WM_PAINT) -> Dispatch(WM_PAINT)` and rejects wrong order, a blocking
-  Peek result, and non-paint messages.
+  callback. `nt-user-callback::DialogModalPumpSequence` models the observable kernel prefix
+  `Peek(false) -> Get(WM_PAINT) -> Dispatch(WM_PAINT)` and rejects wrong order, a blocking
+  Peek result, and non-paint dispatches.
 
-  One serialized diagnostic boot temporarily allowed exactly that prefix. It observed:
-  `PeekMessage` returned zero; `ShowWindow` ran; `GetMessage` returned one with
-  `MSG{hwnd=0x20030, message=WM_PAINT}`; `NtUserDispatchMessage` invoked callback api 0 for
-  `WM_PAINT`; and the next Peek was parked. The existing real api0 nested-callback gate remained
-  green (`redirects/returns=1/1`, pushes/unwinds `7/7`, nested dispatches `5`) and the desktop
-  framebuffer marker remained `0x003a6ea5`.
-
-  That diagnostic runtime is **not landed**. It exposed two proof/scoping problems that must be
-  fixed before the modal pump can stay enabled:
-
-  1. the executive's legacy SAS milestone treats every post-milestone winlogon Peek/Get as the SAS
-     loop and derives three SAS gates from the later modal Peek. Bypassing that inference let the
-     real paint prefix run, but made `exec_winlogon_sas_message_pumped`,
-     `exec_winlogon_sas_windowproc_ran`, and `exec_winlogon_logged_out_sas` fail (`185/99` instead
-     of the green `188/99`), even though the downstream dialog path executed;
-  2. the exact ownership of `hwnd=0x20030` was not proven read-only. A `WM_PAINT` callback is not
-     sufficient evidence that the credential dialog, rather than an earlier SAS/dialog window,
-     painted.
-
-  The next safe increment is therefore to decouple SAS proof from the broad Peek/Get interceptor:
-  record the retrieved `WLX_WM_SAS` by inspecting the returned `MSG`, latch the resulting session
-  transition at its real boundary, and capture the actual top-level IDD_LOGON HWND when it is
-  created. Only then enable the bounded modal sequence when `ShowWindow`/`GetMessage` target that
-  HWND. Keep `WM_PAINT` synthetic until its nested GDI sequence has its own audited bounded policy;
-  add a dialog-rectangle framebuffer gate only after that real callback is enabled.
+  One serialized diagnostic boot temporarily allowed exactly that prefix, but it used stale HWND
+  evidence and broke the legacy SAS proof. It exposed the needed scoping: decouple SAS proof from
+  the broad Peek/Get interceptor, record returned `WLX_WM_SAS` messages by inspecting `MSG`, latch
+  the resulting session transition at its real boundary, and capture the actual top-level IDD_LOGON
+  HWND before enabling any modal-pump path. Keep `WM_PAINT` synthetic until its nested GDI sequence
+  has its own audited bounded policy; add a dialog-rectangle framebuffer gate only after that real
+  callback is enabled.
 
   A second serialized diagnostic validated that decoupling strategy but also found the next exact
   read boundary. Latching `SH_SAS_SESSION`/`SH_SAS_HWND` when the controlled SAS `WM_CREATE`
@@ -461,11 +443,16 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   `[winlogon] IDD_LOGON correlation ready=1 hwnd=0x2003a errors=0`, passes
   `exec_msgina_idd_logon_correlated`, and advances the summary to `189/99`.
 
-  The runtime still does not enable the modal pump from this evidence alone. Next step: use the
-  captured `WINLOGON_IDD_LOGON_HWND`/`WINLOGON_DIALOG_MODAL_READY` gate to enable the bounded modal
-  prefix only when `ShowWindow`/`GetMessage` target that dialog HWND. Keep `WM_PAINT` synthetic until
-  its nested GDI sequence has its own audited bounded policy; only then add the dialog-rectangle
-  framebuffer gate.
+  The modal pump is now enabled from that evidence. The runtime gates on
+  `WINLOGON_IDD_LOGON_HWND` + `WINLOGON_DIALOG_MODAL_READY`, synthesizes exactly the first empty
+  modal `PeekMessage` so `DIALOG_DoDialogBox` runs `ShowWindow`, synthesizes one `GetMessage`
+  result containing `MSG{hwnd=IDD_LOGON,message=WM_PAINT}`, then lets the real
+  `NtUserDispatchMessage(0x1035)` run and observes the api0 `WM_PAINT` callback. The serialized
+  acceptance run reported `[dialog-pump] completed step=3/3 ... modal-prefix-complete=1`,
+  `[winlogon] IDD_LOGON modal pump steps=3/3 completed=1 hwnd=0x2003a message=0x000f errors=0`,
+  passed `exec_msgina_modal_paint_prefix`, and advanced the summary to `190/99`. This is still a
+  prefix proof, not the final login-rendering gate: next audit the nested GDI sequence reached by
+  that callback, then replace the prefix gate with a dialog-rectangle framebuffer readback gate.
 
 ## 8. Risks / notes
 

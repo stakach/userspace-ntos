@@ -2872,6 +2872,27 @@ pub(crate) unsafe fn service_sec_image(
                     || badge == LSASS_BADGE)
             {
                 routed_win32k = true;
+                let dialog_modal_expected_ssn = if pi == 2 {
+                    winlogon_dialog_modal_expected_ssn()
+                } else {
+                    0
+                };
+                let dialog_modal_dispatch =
+                    dialog_modal_expected_ssn != 0 && dialog_modal_expected_ssn == m0;
+                let dialog_modal_synthesize_empty_peek = dialog_modal_dispatch
+                    && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN;
+                let dialog_modal_synthesize_paint_get = dialog_modal_dispatch
+                    && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN;
+                if dialog_modal_dispatch {
+                    print_str(b"[dialog-pump] allowing bounded modal SSN=");
+                    print_hex(m0 as u32);
+                    if dialog_modal_synthesize_empty_peek {
+                        print_str(b" (synthesize empty Peek)");
+                    } else if dialog_modal_synthesize_paint_get {
+                        print_str(b" (synthesize IDD_LOGON WM_PAINT)");
+                    }
+                    print_str(b"\n");
+                }
                 // ★ winlogon SAS MESSAGE-LOOP milestone. After InitializeSAS completes, WinMain posts
                 // WLX_WM_SAS and enters `while (GetMessageW(&Msg, SASWindow, …))` (winlogon.c:608) — its
                 // genuine steady state, where it blocks waiting for a SAS message / user input (Ctrl-Alt-Del).
@@ -2884,6 +2905,7 @@ pub(crate) unsafe fn service_sec_image(
                 if pi == 2
                     && (m0 == 0x1006 || m0 == 0x1001)
                     && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+                    && !dialog_modal_dispatch
                 {
                     // The FIRST GetMessage after the SAS milestone should RETRIEVE the just-posted
                     // WLX_WM_SAS from the SAS window's PostedMessagesListHead and return it → winlogon
@@ -3199,6 +3221,72 @@ pub(crate) unsafe fn service_sec_image(
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0i32, false)
+                } else if dialog_modal_synthesize_empty_peek {
+                    let session = core::ptr::read_volatile(
+                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION)
+                            as *const u64,
+                    );
+                    let mut logon_state = 0u32;
+                    if session != 0 {
+                        const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
+                        let mut ls = [0u8; 4];
+                        if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut ls) {
+                            logon_state = u32::from_le_bytes(ls);
+                            WINLOGON_LOGGED_OUT_SAS.store(logon_state as u64, Ordering::Relaxed);
+                        }
+                    }
+                    let keyed_now = WINLOGON_KEY_OPENED.load(Ordering::Relaxed);
+                    let keyed_at_inject = WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
+                    if keyed_now > keyed_at_inject {
+                        WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
+                    }
+                    print_str(b"[dialog-pump] modal empty Peek: preserving WlxLoggedOutSAS proof LogonState=");
+                    print_hex(logon_state);
+                    print_str(b" key-at-inject=");
+                    print_u64(keyed_at_inject);
+                    print_str(b" key-now=");
+                    print_u64(keyed_now);
+                    print_str(b"\n");
+                    if winlogon_dialog_modal_observe(m0, 0, 0, 0) {
+                        (0i32, true)
+                    } else {
+                        handled = false;
+                        wl_milestone_park = true;
+                        (0i32, false)
+                    }
+                } else if dialog_modal_synthesize_paint_get {
+                    let hwnd = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+                    if a0 != 0 && hwnd != 0 {
+                        smss_stack_write(a0, hwnd);
+                        smss_stack_write(a0 + 8, nt_user_callback::WM_PAINT as u64);
+                        smss_stack_write(a0 + 0x10, 0);
+                        smss_stack_write(a0 + 0x18, 0);
+                        smss_stack_write(a0 + 0x20, 0);
+                        smss_stack_write(a0 + 0x28, 0);
+                        print_str(b"[dialog-pump] synthetic GetMessage MSG hwnd=0x");
+                        print_hex(hwnd as u32);
+                        print_str(b" message=");
+                        print_hex(nt_user_callback::WM_PAINT);
+                        print_str(b"\n");
+                        if winlogon_dialog_modal_observe(
+                            m0,
+                            1,
+                            hwnd,
+                            nt_user_callback::WM_PAINT,
+                        ) {
+                            (1i32, true)
+                        } else {
+                            handled = false;
+                            wl_milestone_park = true;
+                            (0i32, false)
+                        }
+                    } else {
+                        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        print_str(b"[dialog-pump] synthetic GetMessage missing MSG pointer or IDD hwnd\n");
+                        handled = false;
+                        wl_milestone_park = true;
+                        (0i32, false)
+                    }
                 } else if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
@@ -3365,6 +3453,18 @@ pub(crate) unsafe fn service_sec_image(
                                 message as u32,
                                 wparam,
                             );
+                        }
+                    }
+                    if dialog_modal_dispatch {
+                        let hwnd = if a0 != 0 { smss_stack_read(a0) } else { 0 };
+                        let message = if a0 != 0 {
+                            smss_stack_read(a0 + 8) as u32
+                        } else {
+                            0
+                        };
+                        if !winlogon_dialog_modal_observe(m0, r.0, hwnd, message) {
+                            handled = false;
+                            wl_milestone_park = true;
                         }
                     }
                     r

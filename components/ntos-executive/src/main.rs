@@ -1219,6 +1219,13 @@ static mut WINLOGON_DIALOG_CORRELATION: nt_user_callback::WinlogonDialogCorrelat
 pub(crate) static WINLOGON_IDD_LOGON_HWND: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_MODAL_READY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_CORRELATION_ERRORS: AtomicU64 = AtomicU64::new(0);
+static mut WINLOGON_DIALOG_MODAL_PUMP: nt_user_callback::DialogModalPumpSequence =
+    nt_user_callback::DialogModalPumpSequence::new();
+pub(crate) static WINLOGON_DIALOG_MODAL_STEPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_HWND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_MESSAGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn winlogon_dialog_correlation_load() -> nt_user_callback::WinlogonDialogCorrelation {
     core::ptr::read(core::ptr::addr_of!(WINLOGON_DIALOG_CORRELATION))
@@ -1302,6 +1309,77 @@ pub(crate) unsafe fn winlogon_dialog_capture_idd_logon(
         print_str(b" modal-ready=1\n");
     }
     ok
+}
+
+unsafe fn winlogon_dialog_modal_load() -> nt_user_callback::DialogModalPumpSequence {
+    core::ptr::read(core::ptr::addr_of!(WINLOGON_DIALOG_MODAL_PUMP))
+}
+
+unsafe fn winlogon_dialog_modal_store(state: nt_user_callback::DialogModalPumpSequence) {
+    core::ptr::write(core::ptr::addr_of_mut!(WINLOGON_DIALOG_MODAL_PUMP), state);
+    WINLOGON_DIALOG_MODAL_STEPS.store(state.completed_steps() as u64, Ordering::Relaxed);
+    WINLOGON_DIALOG_MODAL_COMPLETED.store(state.is_complete() as u64, Ordering::Relaxed);
+}
+
+pub(crate) unsafe fn winlogon_dialog_modal_expected_ssn() -> u64 {
+    if WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) == 0
+        || WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) == 0
+        || WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
+    {
+        return 0;
+    }
+    winlogon_dialog_modal_load().expected_ssn().unwrap_or(0)
+}
+
+pub(crate) unsafe fn winlogon_dialog_modal_observe(
+    ssn: u64,
+    result: i32,
+    hwnd: u64,
+    message: u32,
+) -> bool {
+    let idd_hwnd = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    if WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) == 0 || idd_hwnd == 0 {
+        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if ssn != nt_user_callback::NTUSER_PEEK_MESSAGE_SSN && hwnd != idd_hwnd {
+        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let mut state = winlogon_dialog_modal_load();
+    let message = if ssn == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN && result == 0 {
+        None
+    } else {
+        Some(message)
+    };
+    if state.complete(ssn, result, message).is_err() {
+        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    winlogon_dialog_modal_store(state);
+    if let Some(message) = message {
+        if hwnd != 0 {
+            WINLOGON_DIALOG_MODAL_HWND.store(hwnd, Ordering::Relaxed);
+        }
+        WINLOGON_DIALOG_MODAL_MESSAGE.store(message as u64, Ordering::Relaxed);
+    }
+    print_str(b"[dialog-pump] completed step=");
+    print_u64(state.completed_steps() as u64);
+    print_str(b"/3 SSN=");
+    print_hex(ssn as u32);
+    print_str(b" ret=");
+    print_hex(result as u32);
+    if let Some(message) = message {
+        print_str(b" hwnd=");
+        print_hex(hwnd as u32);
+        print_str(b" message=");
+        print_hex(message);
+    }
+    if state.is_complete() {
+        print_str(b" modal-prefix-complete=1");
+    }
+    print_str(b"\n");
+    true
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
@@ -8743,6 +8821,27 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
             && WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) != 0
             && WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed) == 0,
+        &mut passed,
+    );
+    print_str(b"[winlogon] IDD_LOGON modal pump steps=");
+    print_u64(WINLOGON_DIALOG_MODAL_STEPS.load(Ordering::Relaxed));
+    print_str(b"/3 completed=");
+    print_u64(WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed));
+    print_str(b" hwnd=");
+    print_hex(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" message=");
+    print_hex(WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed) as u32);
+    print_str(b" errors=");
+    print_u64(WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_msgina_modal_paint_prefix",
+        WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed)
+                == WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed)
+            && WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed)
+                == nt_user_callback::WM_PAINT as u64
+            && WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed) == 0,
         &mut passed,
     );
 
