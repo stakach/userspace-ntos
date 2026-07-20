@@ -198,7 +198,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | `KiUserCallbackDispatcher` target entry | ✅ Phase 1: naked x64 stack-frame entry in `nt-ntdll-dll` |
 | `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ✅ Phase 2A diagnostic (never fabricated) |
 | `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
-| Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2 |
+| Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2B |
 | Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
 | Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
@@ -283,20 +283,25 @@ rendezvous from `NtCallbackReturn`.
   installed. The live acceptance run serviced 114 rendezvous (112 winlogon api=0), observed
   `KernelCallbackTable=0x80214190`, resolved the dispatcher to `NTDLL_BASE+0x1000`, held 187/98,
   painted 768/768 pixels, and quiesced at the same frontier.
-- **Phase 2B — single reverse transition (no nesting).** Change the Phase-2A response for **one**
-  callback (start with the create-time
-  `WM_NCCREATE`, whose synthetic path we can compare against) with the real reverse transition:
-  first read and log winlogon's `PEB+0x58` and reject a null/unobserved table; then suspend win32k,
-  build the exact §3d frame, redirect winlogon to `KiUserCallbackDispatcher`, run its real `WndProc`,
-  `NtCallbackReturn` → resume win32k. Prove the real `WndProc` ran (a counter / the client proc's
-  observable effect) and that `CreateWindowEx` still succeeds + `exec_win32k_desktop_painted`
-  stays 768/768 + the SAS specs hold. Gate 187 held (behavior-equivalent) or +1 for a
-  "callback ran for real" spec.
-- **Phase 3 — nesting + re-entrant win32k dispatch.** Per-thread callback-continuation stack +
-  win32k nested-dispatch stack + re-entrant `component_pump`. Prove with a callback whose
-  `WndProc` issues a nested syscall (e.g. `GetDC`/`BeginPaint`) that re-enters win32k while the
-  outer dispatch is suspended, returns, and unwinds correctly. Host-test the continuation-stack
-  push/pop/nesting logic (pure). Gate green.
+- **Phase 2B — controlled single reverse transition (no nesting).** Do not start with callback
+  index 0 / `WM_NCCREATE`: `User32CallWindowProcFromKernel` can invoke an arbitrary application
+  procedure, and the SAS window's default `WM_NCCREATE` path calls nested `NtUserDefSetText`.
+  Instead, issue a one-shot diagnostic callback index 7
+  (`USER32_CALLBACK_CLIENTTHREADSTARTUP`) after validating winlogon's observed `PEB+0x58` table.
+  In this ReactOS tree `User32CallClientThreadSetupFromKernel` performs no USER/GDI syscall and
+  immediately calls `ZwCallbackReturn(NULL, 0, STATUS_SUCCESS)`. Suspend win32k, build the exact
+  §3d frame, redirect winlogon to `KiUserCallbackDispatcher`, and let the real
+  `apfnDispatch[7]` thunk complete through the special `NtCallbackReturn` handler. Preserve the
+  original api0 rendezvous's synthetic completion. Prove the exact frame → real callback table →
+  callback-return → resumed continuation round trip, while `CreateWindowEx` and the SAS specs
+  remain green and desktop paint stays 768/768. Gate 187 held or +1 for a "callback ran for real"
+  spec.
+- **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
+  win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
+  `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and
+  `NtUserSetWindowLongPtr`, respectively. Prove with a real `WndProc` callback that its nested
+  syscall re-enters win32k while the outer dispatch is suspended, returns, and unwinds correctly.
+  Host-test the continuation-stack push/pop/nesting logic (pure). Gate green.
 - **Phase 4 — `WM_PAINT` → the login box renders.** With the machinery real, drive the dialog's
   `WM_PAINT`/`WM_ERASEBKGND`/`WM_INITDIALOG` to the control procs via the callback; the procs'
   `BeginPaint → GetDC/GetStockObject/GetSysColorBrush/FillRect/DrawTextW` first exercise the

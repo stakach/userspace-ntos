@@ -114,7 +114,7 @@ self-contained launcher that:
    `rust-micro/.tmp/reactos/`, extracted with `bsdtar`). Override the URL with
    `REACTOS_7Z_URL=…`. ReactOS is GPL, so its binaries are freely
    redistributable — the executive loads them via `SEC_IMAGE` and runs their
-   real ntdll loader.
+   real user-mode binaries through this project's Rust `ntdll.dll` implementation.
 4. **Builds** the `ntos-executive` (the NT executive that hosts the ReactOS
    processes) + the kernel, and packs the FAT32/UEFI disk image.
 5. **Boots QEMU.**
@@ -127,7 +127,8 @@ executive's success sentinel; `run.sh` then prints a clear verdict:
 ```
   PASS exec_win32k_desktop_painted
 [ntos-exec] desktop-bg match 768/768 px, px0=0x003a6ea5 (expected 0x003a6ea5)
-[ntos-exec summary: 140/94 executive->isolated-service checks passed]
+[user-callback] rendezvous=114 winlogon-api0=112 table-nonzero-aligned=1
+[ntos-exec summary: 187/98 executive->isolated-service checks passed]
 [microtest done]
 SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5).
 ```
@@ -137,8 +138,10 @@ authentically fills the BOOTBOOT GOP framebuffer with the ReactOS desktop
 background colour `0x003a6ea5` (RGB 58,110,165) via winlogon's natural
 `SwitchDesktop` flow. This is a genuine graphics path (the real ReactOS
 `win32k.sys` + `framebuf.dll` display driver + `ftfd.dll`/Arial font stack), not
-a stub or a mock. The window persists after the run so you can see it — close it
-to quit.
+a stub or a mock. This mode intentionally does not exit at `[microtest done]`; the
+terminal remains attached to QEMU and the window persists so you can inspect it.
+Close the QEMU window to quit. Use the default headless mode for an automated
+pass/fail result.
 
 **Expected run time:** ~1 minute once the toolchain is warm (the QEMU boot +
 gate is ~50 s); the very first run adds the one-time ReactOS download + a full
