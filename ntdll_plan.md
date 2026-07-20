@@ -3293,14 +3293,61 @@ indexes it. It was NULL → NULL-deref on the dialog's DC/font setup. Fix (all i
 - Counted spec `exec_msgina_logon_dialog_created` (main.rs): `WINLOGON_GDI_MAPPED != 0 &&
   WINLOGON_DIALOG_WINDOWS >= 2` (dialog-class #32770 windows after winlogon's own SAS-notify window).
 
-**NEXT FRONTIER:** winlogon parks in the modal pump with the dialog + controls created but likely NOT
-yet PAINTED to the framebuffer (WM_PAINT/WM_INITDIALOG client-side GDI drawing — the zero-init GDI table
-returns `invalid handle` for real DC/brush/font ops, so the dialog's controls create but don't render
-pixels). To actually RENDER the credential box: seed the GDI table with REAL entries for win32k's DC /
-system-font / dialog-brush GDI objects (map win32k's real GDI objects into the client like the window
-mapping), so gdi32's validity checks PASS and the draw calls reach real objects. Also observed:
-win32k `Class 0x%p not found` + `Didn't find a suitable PDEV` debug msgs during the cascade — worth
-checking whether a control class registration or the display PDEV needs wiring for full paint.
+**NEXT FRONTIER:** winlogon parks with the dialog + controls created but NOT painted. **[UPDATED by
+DIALOG BATCH 4 — this earlier note's "zero-init GDI table blocks the paint" framing was a HYPOTHESIS;
+the definitive diagnosis is that the dialog's WM_PAINT is NEVER PUMPED, so no GDI check is even reached.
+See "DIALOG BATCH 4" below for the real next wall = the modal-pump / KeUserModeCallback WM_PAINT dispatch
+cycle. GDI-object seeding is DOWNSTREAM of it.]**
+
+### DIALOG BATCH 4 (2026-07-20, gate 187 HELD — DIAGNOSE-FIRST, no code landed) — the dialog does NOT paint because its **WM_PAINT is never pumped**, NOT because of GDI objects. The real next wall = the modal-pump / `KeUserModeCallback` WM_PAINT dispatch cycle (a win32k message-pump batch); GDI-object seeding is DOWNSTREAM of it.
+
+**★ DEFINITIVE DIAGNOSIS (one foreground boot at HEAD 4b2fc03, gate 187/98 green, RUNEXIT=3, desktop 768/768):**
+The msgina IDD_LOGON dialog cascade (17 `NtUserCreateWindowEx(#32770)`) IS created during `WlxLoggedOutSAS →
+DialogBoxParamW → DIALOG_CreateIndirect` — but after it returns, winlogon goes back to its OUTER SAS
+`GetMessage` loop and PARKS (`user32+0x9f093`, the message-loop milestone park). **The boot log shows ZERO
+paint activity from winlogon**: no `BeginPaint`, no `GetDC`, no `NtGdi*` draw SSN, no `WM_PAINT`. Winlogon's
+issued win32k SSNs are all NtUser (`0x1007/0x101b/0x1029/0x1041/0x1077/0x1096/0x1298/0x10de` — window/class/
+create), never the NtGdi draw range. So the dialog's controls are CREATED but their **`WM_PAINT` / `WM_INITDIALOG`
+/ `WM_ERASEBKGND` are never DISPATCHED** to their window procs → no `BeginPaint` → no GDI validity check is ever
+exercised on the paint path. **The zero-init GDI table is a DOWNSTREAM wall that only becomes reachable once the
+paint is pumped** — it is NOT what blocks the render today; the create cascade completes gracefully against the
+zero table (gdi32 takes its benign `invalid handle` branch on create, no crash).
+
+**★ WHY the pump doesn't run (mechanism):** our single-threaded host services window-proc callbacks via the
+`KeUserModeCallback` bridge (`win32k_subsystem.rs::s_ke_user_mode_callback`), and it currently handles only the
+window-CREATE messages (WM_NCCREATE/WM_CREATE, api=0 → stamp DefWindowProc TRUE) needed to make `CreateWindowEx`
+return a real HWND (BATCH 45). There is NO modal-dialog message pump and NO WM_PAINT/WM_INITDIALOG/WM_ERASEBKGND
+dispatch: `DialogBoxParamW`'s internal `DIALOG_DoDialogBox` GetMessage loop finds an empty queue on our headless
+host and never generates the paint cycle, and the dialog/control procs are never invoked with a paint message.
+
+**★ DISASSEMBLY-VERIFIED GDI VALIDITY CONTRACT (for the eventual paint batch — real staged gdi32,
+`GdiGetHandleUserData` @ RVA 0x5310, from `objdump`):** `func(HANDLE h[rcx], DWORD dwType[edx], PVOID* ppv[r8])`.
+`pEntry = GdiSharedHandleTable[h & 0xffff]` (0x18-byte entries; base = gdi32 RVA 0x4e188 ← `PEB->GdiSharedHandleTable`,
+PEB+0xf8). Passes iff: (1) `(h & 0x7f0000) == dwType`; (2) `(entry[0xc] & 0x7f) == ((h>>16) & 0x7f)` — entry's
+type low-7 bits == handle's type bits; (3) `(entry[0xc] & 0x1f0000) == (dwType & 0x1f0000)`; (4) `(entry[0x8] & ~1)
+== GdiProcessId` (gdi32 RVA 0x4e198 ← **TEB->ClientId.UniqueProcess**, TEB+0x40). On pass: `*ppv = entry[0x10]`
+(the client-side object UserData ptr the caller then dereferences). **KEY:** our winlogon TEB.ClientId (TEB+0x40)
+is currently 0 (never seeded in `img_spawn.rs`), so `GdiProcessId==0` → the **ProcessId check already passes with a
+zero-init entry**; only `entry[0xc]` type bits + a real `entry[0x10]` UserData object would remain to seed per
+GDI handle the paint touches (DC → DC_ATTR, brush → BRUSH_ATTR, font, the display surface/PDEV). `GdiProcessSetup`
+(gdi32 RVA 0x1100) is confirmed to cache PEB+0xf8 → 0x4e188 and TEB+0x40 → 0x4e198 on its single run.
+
+**★ THE REAL NEXT BATCH (win32k message-pump, NOT ntdll, NOT a one-liner):** to RENDER the dialog we must, IN ORDER:
+1. **Pump the dialog's modal message loop** — either run `DialogBoxParamW`'s internal GetMessage/DispatchMessage
+   with a synthesized WM_PAINT/WM_INITDIALOG for the dialog + each control, or invalidate the dialog rect and drive
+   the paint cycle from the executive.
+2. **Dispatch WM_INITDIALOG + WM_PAINT + WM_ERASEBKGND to the dialog/control procs** via `KeUserModeCallback`
+   (api=0 co_IntCallWindowProc) — extend `s_ke_user_mode_callback` past its current create-only handling.
+3. **THEN** the dialog/control procs call `BeginPaint → GetDC/GetDCEx` (a display DC) + `GetStockObject`/
+   `GetSysColorBrush` + the dialog font + `FillRect`/`DrawTextW` → these are the FIRST calls that exercise the GDI
+   validity check → seed the GDI table entries (type bits per §contract; `entry[0x10]` UserData) for exactly those
+   handles + route the `NtGdi*` draw ops to the real framebuffer surface win32k's desktop paint already drives.
+4. The client DC's display **PDEV** = the SAME framebuffer PDEV the desktop paint uses (the `Didn't find a suitable
+   PDEV` msgs are win32k-internal from earlier init, not the dialog paint — re-verify once the paint path runs).
+
+Nothing landed this batch (holding 187 green per "keep the gate HONEST / commit real infra or report the wall").
+The client-GDI handle-table mapping + `PEB->GdiSharedHandleTable` seed from BATCH 3 remain the standing infra; the
+blocking work is the WM_PAINT dispatch cycle above, which is a prerequisite for the GDI-object seeding to matter.
 
 ### C — prioritized, batched completion plan
 

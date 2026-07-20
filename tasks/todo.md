@@ -371,3 +371,25 @@ msgina base=0x82290000, user32=0x80150000.
       REAL entries for win32k's DC / system-font / dialog-brush objects (map win32k's real GDI objects
       into the client like the window mapping). Also investigate win32k `Class not found` / `no suitable
       PDEV` during the cascade.
+
+## DIALOG BATCH 4 (2026-07-20) — DIAGNOSE-FIRST, gate 187 HELD (no code landed; honest infra)
+Ran ONE foreground boot at HEAD 4b2fc03: gate 187/98, RUNEXIT=3, desktop 768/768, `exec_msgina_logon_
+dialog_created` PASS, 0 FAILs, `microtest sentinel`.
+- [x] DIAGNOSED the dialog-paint wall DEFINITIVELY: the dialog cascade (17 #32770 windows) is created,
+      but winlogon returns to its OUTER SAS GetMessage loop and parks (user32+0x9f093). Boot log shows
+      **ZERO paint activity from winlogon** — no BeginPaint / GetDC / NtGdi draw SSN / WM_PAINT. So the
+      dialog's WM_PAINT/WM_INITDIALOG are NEVER DISPATCHED to their procs → no BeginPaint → the GDI
+      validity check is never exercised on the paint path. **The zero-init GDI table is a DOWNSTREAM
+      wall, NOT what blocks the render today** (batch-3's "invalid handle blocks paint" was a hypothesis).
+- [x] Disassembled the REAL staged gdi32 `GdiGetHandleUserData` (RVA 0x5310) + `GdiProcessSetup` (0x1100)
+      → recorded the exact GDI_TABLE_ENTRY validity contract (Type@0xc bits 0-6 & 0x1f0000; ProcessId@0x8
+      &~1 == TEB.ClientId@TEB+0x40; UserData@0x10) in ntdll_plan.md "DIALOG BATCH 4". KEY: winlogon's
+      TEB.ClientId is 0 (unseeded) → GdiProcessId==0 → the ProcessId check already passes on zero entries.
+- [x] Documented the REAL next batch (win32k message-pump, NOT ntdll): (1) pump the dialog's modal loop,
+      (2) dispatch WM_INITDIALOG/WM_PAINT/WM_ERASEBKGND via KeUserModeCallback (extend s_ke_user_mode_
+      callback past its create-only handling), (3) THEN the procs' BeginPaint→GetDC/GetStockObject/
+      GetSysColorBrush/FillRect/DrawTextW first exercise the GDI check → seed the entries + route NtGdi
+      draw to the real framebuffer surface, (4) the client DC's display PDEV = the desktop paint's PDEV.
+- [ ] Nothing landed (holding 187 green per "keep the gate HONEST"). The GDI-object seeding is a
+      prerequisite of the WM_PAINT dispatch cycle, so it can't be verified until the pump exists — the
+      next batch must build the WM_PAINT dispatch cycle FIRST.
