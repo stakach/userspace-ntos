@@ -171,6 +171,49 @@ pub const fn outer_syscall_reply(
     ]
 }
 
+/// seL4 x86-64 `UserContext` register indices used by the controlled callback transition.
+pub const USER_CONTEXT_RIP: usize = 0;
+pub const USER_CONTEXT_RSP: usize = 1;
+pub const USER_CONTEXT_RFLAGS: usize = 2;
+pub const USER_CONTEXT_RAX: usize = 3;
+pub const USER_CONTEXT_RCX: usize = 5;
+pub const USER_CONTEXT_R10: usize = 12;
+pub const USER_CONTEXT_R11: usize = 13;
+
+/// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
+/// path. The original outer syscall context remains untouched in the caller's saved copy.
+pub const fn callback_redirect_context(
+    saved: &[u64; 20],
+    dispatcher: u64,
+    callback_sp: u64,
+) -> [u64; 20] {
+    let mut redirected = *saved;
+    redirected[USER_CONTEXT_RIP] = dispatcher;
+    redirected[USER_CONTEXT_RSP] = callback_sp;
+    redirected[USER_CONTEXT_RAX] = 0;
+    redirected[USER_CONTEXT_RCX] = dispatcher;
+    redirected[USER_CONTEXT_R10] = 0;
+    redirected[USER_CONTEXT_R11] = redirected[USER_CONTEXT_RFLAGS];
+    redirected
+}
+
+/// Complete the suspended outer syscall after `NtCallbackReturn`. `TCB_ReadRegisters` reports the
+/// instruction address for a thread blocked on an `UnknownSyscall`, so the caller supplies the
+/// captured post-`syscall` return address and this helper rebuilds its sysret aliases. RAX receives
+/// the completed win32k result rather than the old SSN; all other general registers are preserved.
+pub const fn completed_outer_context(
+    saved: &[u64; 20],
+    result: u64,
+    outer_resume_ip: u64,
+) -> [u64; 20] {
+    let mut completed = *saved;
+    completed[USER_CONTEXT_RIP] = outer_resume_ip;
+    completed[USER_CONTEXT_RAX] = result;
+    completed[USER_CONTEXT_RCX] = outer_resume_ip;
+    completed[USER_CONTEXT_R11] = completed[USER_CONTEXT_RFLAGS];
+    completed
+}
+
 /// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -528,5 +571,51 @@ mod tests {
         assert_eq!(reply[15], 0xaaaa);
         assert_eq!(reply[16], 0xbbbb);
         assert_eq!(reply[17], 0x246);
+    }
+
+    #[test]
+    fn callback_redirect_context_uses_sysret_register_aliases() {
+        let mut saved = [0u64; 20];
+        let mut index = 0;
+        while index < saved.len() {
+            saved[index] = 0x1000 + index as u64;
+            index += 1;
+        }
+        let redirected = callback_redirect_context(&saved, 0x7000, 0x8000);
+        assert_eq!(redirected[USER_CONTEXT_RIP], 0x7000);
+        assert_eq!(redirected[USER_CONTEXT_RSP], 0x8000);
+        assert_eq!(redirected[USER_CONTEXT_RAX], 0);
+        assert_eq!(redirected[USER_CONTEXT_RCX], 0x7000);
+        assert_eq!(redirected[USER_CONTEXT_R10], 0);
+        assert_eq!(redirected[USER_CONTEXT_R11], saved[USER_CONTEXT_RFLAGS]);
+        assert_eq!(redirected[4], saved[4]);
+        assert_eq!(redirected[17], saved[17]);
+    }
+
+    #[test]
+    fn completed_outer_context_restores_result_and_sysret_resume_aliases() {
+        let mut saved = [0u64; 20];
+        let mut index = 0;
+        while index < saved.len() {
+            saved[index] = 0x2000 + index as u64;
+            index += 1;
+        }
+        let completed = completed_outer_context(&saved, 0xcafe_babe, 0x7fff_1234);
+        assert_eq!(completed[USER_CONTEXT_RIP], 0x7fff_1234);
+        assert_eq!(completed[USER_CONTEXT_RAX], 0xcafe_babe);
+        assert_eq!(completed[USER_CONTEXT_RCX], 0x7fff_1234);
+        assert_eq!(completed[USER_CONTEXT_R11], saved[USER_CONTEXT_RFLAGS]);
+        assert_eq!(completed[USER_CONTEXT_R10], saved[USER_CONTEXT_R10]);
+        let mut index = 0;
+        while index < saved.len() {
+            if index != USER_CONTEXT_RIP
+                && index != USER_CONTEXT_RAX
+                && index != USER_CONTEXT_RCX
+                && index != USER_CONTEXT_R11
+            {
+                assert_eq!(completed[index], saved[index]);
+            }
+            index += 1;
+        }
     }
 }

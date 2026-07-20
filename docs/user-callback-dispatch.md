@@ -200,7 +200,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ✅ Phase 2A diagnostic (never fabricated) |
 | `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
 | Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2B |
-| Exact executive-side 0x58 `UCALLOUT_FRAME` builder + pointer-free continuation correlation | ✅ Phase 2B foundation, host-tested |
+| Exact 0x58 `UCALLOUT_FRAME`, pointer-free correlation, and redirect/outer-resume context transforms | ✅ Phase 2B foundation, host-tested |
 | Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
 | Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
@@ -320,6 +320,30 @@ rendezvous from `NtCallbackReturn`.
   the A/B phase ordering and exact outer reply-word mapping. The next pass must retain two distinct
   client-side continuation identities (outer syscall and callback return), just as B retains the
   component callback reply identity; it must not substitute one fault reply for the other.
+
+  A 2026-07-20 retry retained `REPLY_W32`, wrote the callback context with
+  `TCB_WriteRegisters(resume=false)`, and consumed the outer fault with a zero-length reply before
+  waiting for SSN 22. Its immediately preceding clean-HEAD control passed 187/98, painted 768/768,
+  serviced 114 callback rendezvous, and reached `[microtest done]`. The retry painted 768/768 and
+  reached exactly:
+
+  ```text
+  [user-callback] B component continuation parked on REPLY_W32
+  [user-callback] A client redirected to real apfnDispatch[7]
+  ```
+
+  It then produced no serial output and never delivered SSN 22. That runtime path is therefore not
+  landed. This evidence narrows the next diagnostic to the client restart boundary; it does **not**
+  distinguish a failed outer-fault restart from entry/dispatch code spinning before
+  `ZwCallbackReturn`. Before another integrated attempt, add bounded proof for the
+  `TCB_WriteRegisters` error label, the post-reply runnable context, dispatcher entry, and the
+  table[7] call/return boundary (or cover the restart sequence with a kernel microtest).
+
+  Static review also found a definite downstream correction: this kernel's `TCB_ReadRegisters`
+  reports `resume_ip - 2` for a thread blocked on `UnknownSyscall`. A final full-context restore
+  must therefore use the separately captured post-`syscall` return IP, rebuild the RIP/RCX and
+  RFLAGS/R11 sysret aliases, place the outer win32k result in RAX, and preserve R10. The pure
+  `completed_outer_context` helper now host-tests that contract; it is not yet wired into runtime.
 - **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and

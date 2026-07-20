@@ -143,9 +143,10 @@ terminal remains attached to QEMU and the window persists so you can inspect it.
 Close the QEMU window to quit. Use the default headless mode for an automated
 pass/fail result.
 
-**Expected run time:** ~1 minute once the toolchain is warm (the QEMU boot +
-gate is ~50 s); the very first run adds the one-time ReactOS download + a full
-`cargo` build.
+**Expected run time:** the headless gate can take several minutes under QEMU TCG, especially on
+Apple Silicon, and DLL-loading phases can be quiet for tens of seconds. `--desktop` opens the
+window before win32k paints it; use the serial `desktop-bg match 768/768` line as the ready signal.
+The first run also adds the one-time ReactOS download and a full `cargo` build.
 
 **Gotchas:**
 
