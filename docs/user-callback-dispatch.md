@@ -446,15 +446,26 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   made those DLL pages visible too early to win32k and changed boot behavior, ending in an unrelated
   `0xbe` stall; that path was rejected.
 
-  The current fix is deliberately narrower: `client_copyin_mapped` can read from an explicit
+  The landed fix is deliberately narrower: `client_copyin_mapped` can read from an explicit
   copy-in-only prefetch table populated for validated dialog `LARGE_STRING` buffers, without
-  publishing those pages through the normal win32k client-page lookup. The serialized diagnostic now
-  reports `descriptor-read=1`, `parse=1`, `source=4`, `caption-read=1`, `units=5`, `Logon=1`, and
-  `top-level=1` while preserving the green `188/99` QEMU gate. The runtime still does not enable the
-  modal pump from this evidence. Next step: bind the verified `0x2003a` candidate into
-  `WinlogonDialogCorrelation` using the exact SAS session/HWND/messages, logged-off state, distinct
-  top-level `#32770`/`Logon` HWND, and key-open evidence, then enable the bounded modal sequence only
-  when `ShowWindow`/`GetMessage` target that captured HWND.
+  publishing those pages through the normal win32k client-page lookup. The serialized diagnostic
+  reported `descriptor-read=1`, `parse=1`, `source=4`, `caption-read=1`, `units=5`, `Logon=1`, and
+  `top-level=1` while preserving the green `188/99` QEMU gate.
+
+  `WinlogonDialogCorrelation` is now wired at runtime. The executive latches the exact SAS window
+  from returned queue messages, not from the legacy post-`0x1077` milestone: the real evidence is
+  `MSG{hwnd=0x2002e,message=0x659,wParam=1}` followed by `Session->LogonState == LOGGED_OFF`, a
+  second matching SAS message, and then the distinct top-level `#32770`/`Logon` dialog candidate.
+  This avoids the stale `0x20030` inference from the older milestone. The green serialized run now
+  reports `[dialog-caption] ... correlated=1`, `[dialog-correlation] IDD_LOGON ... modal-ready=1`,
+  `[winlogon] IDD_LOGON correlation ready=1 hwnd=0x2003a errors=0`, passes
+  `exec_msgina_idd_logon_correlated`, and advances the summary to `189/99`.
+
+  The runtime still does not enable the modal pump from this evidence alone. Next step: use the
+  captured `WINLOGON_IDD_LOGON_HWND`/`WINLOGON_DIALOG_MODAL_READY` gate to enable the bounded modal
+  prefix only when `ShowWindow`/`GetMessage` target that dialog HWND. Keep `WM_PAINT` synthetic until
+  its nested GDI sequence has its own audited bounded policy; only then add the dialog-rectangle
+  framebuffer gate.
 
 ## 8. Risks / notes
 

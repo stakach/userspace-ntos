@@ -1214,6 +1214,95 @@ pub(crate) static WINLOGON_LOGGED_OUT_SAS_RAN: AtomicU64 = AtomicU64::new(0);
 /// (the client-GDI handle-table mapping + hDllInstance-seed advance). Drives
 /// `exec_msgina_logon_dialog_created`.
 pub(crate) static WINLOGON_DIALOG_WINDOWS: AtomicU64 = AtomicU64::new(0);
+static mut WINLOGON_DIALOG_CORRELATION: nt_user_callback::WinlogonDialogCorrelation =
+    nt_user_callback::WinlogonDialogCorrelation::new();
+pub(crate) static WINLOGON_IDD_LOGON_HWND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_READY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_CORRELATION_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn winlogon_dialog_correlation_load() -> nt_user_callback::WinlogonDialogCorrelation {
+    core::ptr::read(core::ptr::addr_of!(WINLOGON_DIALOG_CORRELATION))
+}
+
+unsafe fn winlogon_dialog_correlation_store(
+    state: nt_user_callback::WinlogonDialogCorrelation,
+) {
+    core::ptr::write(core::ptr::addr_of_mut!(WINLOGON_DIALOG_CORRELATION), state);
+    WINLOGON_IDD_LOGON_HWND.store(state.idd_logon_hwnd(), Ordering::Relaxed);
+    WINLOGON_DIALOG_MODAL_READY.store(state.modal_ready() as u64, Ordering::Relaxed);
+}
+
+unsafe fn winlogon_dialog_correlation_commit(
+    state: nt_user_callback::WinlogonDialogCorrelation,
+    result: Result<(), nt_user_callback::ValidationError>,
+) -> bool {
+    if result.is_ok() {
+        winlogon_dialog_correlation_store(state);
+        true
+    } else {
+        WINLOGON_DIALOG_CORRELATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+pub(crate) unsafe fn winlogon_dialog_observe_sas_message(
+    session: u64,
+    hwnd: u64,
+    message: u32,
+    wparam: u64,
+) -> bool {
+    if WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let mut state = winlogon_dialog_correlation_load();
+    if state.sas_hwnd() == 0 {
+        if state.latch_sas_window(session, hwnd).is_err() {
+            WINLOGON_DIALOG_CORRELATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+    let result = state.observe_sas_message(session, hwnd, message, wparam);
+    winlogon_dialog_correlation_commit(state, result)
+}
+
+pub(crate) unsafe fn winlogon_dialog_observe_logged_off(session: u64, state_value: u32) -> bool {
+    let mut state = winlogon_dialog_correlation_load();
+    if state.logged_off() {
+        return true;
+    }
+    let result = state.observe_logged_off(session, state_value);
+    winlogon_dialog_correlation_commit(state, result)
+}
+
+pub(crate) unsafe fn winlogon_dialog_capture_idd_logon(
+    session: u64,
+    hwnd: u64,
+    class_atom: u64,
+    caption: &[u16],
+    top_level: bool,
+    winlogon_key_advanced: bool,
+) -> bool {
+    let was_ready = WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0;
+    let mut state = winlogon_dialog_correlation_load();
+    if state.modal_ready() {
+        return state.idd_logon_hwnd() == hwnd;
+    }
+    let result = state.capture_idd_logon(
+        session,
+        hwnd,
+        class_atom,
+        caption,
+        top_level,
+        winlogon_key_advanced,
+    );
+    let ok = winlogon_dialog_correlation_commit(state, result);
+    if ok && !was_ready && state.modal_ready() {
+        print_str(b"[dialog-correlation] IDD_LOGON hwnd=");
+        print_hex(hwnd as u32);
+        print_str(b" modal-ready=1\n");
+    }
+    ok
+}
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -8640,6 +8729,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         b"exec_msgina_logon_dialog_created",
         WINLOGON_GDI_MAPPED.load(Ordering::Relaxed) != 0
             && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) >= 2,
+        &mut passed,
+    );
+    print_str(b"[winlogon] IDD_LOGON correlation ready=");
+    print_u64(WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed));
+    print_str(b" hwnd=");
+    print_hex(WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" errors=");
+    print_u64(WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_msgina_idd_logon_correlated",
+        WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+            && WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed) == 0,
         &mut passed,
     );
 

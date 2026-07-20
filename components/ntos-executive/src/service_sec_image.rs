@@ -2927,6 +2927,12 @@ pub(crate) unsafe fn service_sec_image(
                                 // STATE_INIT is 0; any non-zero == DispatchSAS advanced the state machine.
                                 if logon_state != 0 {
                                     WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
+                                    if logon_state == nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
+                                        let _ = winlogon_dialog_observe_logged_off(
+                                            session,
+                                            logon_state,
+                                        );
+                                    }
                                 }
                             } else {
                                 print_str(b"[wl-main] post-DispatchSAS Session read miss (not in heap mirror)\n");
@@ -3344,6 +3350,22 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" (ret=0x");
                         print_hex(r.0 as u32);
                         print_str(b")\n");
+                        if r.0 == 1
+                            && message as u32 == nt_user_callback::WLX_WM_SAS
+                            && wparam == nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL
+                        {
+                            let session = core::ptr::read_volatile(
+                                (win32k_subsystem::WIN32K_SHARED_VADDR
+                                    + win32k_subsystem::SH_SAS_SESSION)
+                                    as *const u64,
+                            );
+                            let _ = winlogon_dialog_observe_sas_message(
+                                session,
+                                hwnd,
+                                message as u32,
+                                wparam,
+                            );
+                        }
                     }
                     r
                 };
@@ -3662,6 +3684,28 @@ pub(crate) unsafe fn service_sec_image(
                                 }
                             }
                             let style = smss_stack_read(sp + 0x28) as u32;
+                            let top_level = style & 0x8000_0000 != 0 && style & 0x4000_0000 == 0;
+                            let winlogon_key_advanced = WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
+                                > WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
+                            let caption_match =
+                                caption_read && units[..count] == nt_user_callback::IDD_LOGON_CAPTION;
+                            let session = core::ptr::read_volatile(
+                                (win32k_subsystem::WIN32K_SHARED_VADDR
+                                    + win32k_subsystem::SH_SAS_SESSION)
+                                    as *const u64,
+                            );
+                            let correlated = if caption_read {
+                                winlogon_dialog_capture_idd_logon(
+                                    session,
+                                    st as u64,
+                                    a1,
+                                    &units[..count],
+                                    top_level,
+                                    winlogon_key_advanced,
+                                )
+                            } else {
+                                false
+                            };
                             print_str(b"[dialog-caption] hwnd=0x");
                             print_hex(st as u32);
                             print_str(b" descriptor-read=");
@@ -3682,11 +3726,11 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" units=");
                             print_u64(count as u64);
                             print_str(b" Logon=");
-                            print_u64((units[..count] == nt_user_callback::IDD_LOGON_CAPTION) as u64);
+                            print_u64(caption_match as u64);
                             print_str(b" top-level=");
-                            print_u64(
-                                (style & 0x8000_0000 != 0 && style & 0x4000_0000 == 0) as u64,
-                            );
+                            print_u64(top_level as u64);
+                            print_str(b" correlated=");
+                            print_u64(correlated as u64);
                             print_str(b"\n");
                         }
                         // ★ DIALOG BATCH 3 — the FIRST #32770 window is winlogon's SAS-notify window
