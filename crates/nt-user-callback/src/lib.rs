@@ -120,6 +120,66 @@ pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 pub const USER32_CALLBACK_WINDOWPROC: u32 = 0;
 pub const NTUSER_SET_WINDOW_LONG_PTR_SSN: u64 = 0x1298;
 pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
+pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
+pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
+pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
+pub const WM_PAINT: u32 = 0x000f;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DialogModalPumpSequence {
+    completed_steps: u8,
+}
+
+impl DialogModalPumpSequence {
+    pub const fn new() -> Self {
+        Self { completed_steps: 0 }
+    }
+
+    pub const fn expected_ssn(self) -> Option<u64> {
+        match self.completed_steps {
+            0 => Some(NTUSER_PEEK_MESSAGE_SSN),
+            1 => Some(NTUSER_GET_MESSAGE_SSN),
+            2 => Some(NTUSER_DISPATCH_MESSAGE_SSN),
+            _ => None,
+        }
+    }
+
+    pub fn complete(
+        &mut self,
+        ssn: u64,
+        result: i32,
+        message: Option<u32>,
+    ) -> Result<(), ValidationError> {
+        if self.expected_ssn() != Some(ssn) {
+            return Err(ValidationError::Sequence);
+        }
+        let valid = match self.completed_steps {
+            0 => result == 0 && message.is_none(),
+            1 => result == 1 && message == Some(WM_PAINT),
+            2 => message == Some(WM_PAINT),
+            _ => false,
+        };
+        if !valid {
+            return Err(ValidationError::Sequence);
+        }
+        self.completed_steps += 1;
+        Ok(())
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.completed_steps == 3
+    }
+
+    pub const fn completed_steps(self) -> u8 {
+        self.completed_steps
+    }
+}
+
+impl Default for DialogModalPumpSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SasWmCreateNestedSequence {
@@ -873,6 +933,43 @@ mod tests {
             Err(ValidationError::Sequence)
         );
         assert_eq!(sequence.accept(0x1080), Err(ValidationError::Sequence));
+    }
+
+    #[test]
+    fn dialog_modal_pump_sequence_reaches_one_paint_dispatch() {
+        let mut sequence = DialogModalPumpSequence::new();
+        assert_eq!(sequence.expected_ssn(), Some(NTUSER_PEEK_MESSAGE_SSN));
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert_eq!(sequence.expected_ssn(), Some(NTUSER_GET_MESSAGE_SSN));
+        assert_eq!(
+            sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(sequence.expected_ssn(), Some(NTUSER_DISPATCH_MESSAGE_SSN));
+        assert_eq!(
+            sequence.complete(NTUSER_DISPATCH_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert!(sequence.is_complete());
+        assert_eq!(sequence.expected_ssn(), None);
+    }
+
+    #[test]
+    fn dialog_modal_pump_sequence_rejects_blocking_or_nonpaint_path() {
+        let mut sequence = DialogModalPumpSequence::new();
+        assert_eq!(
+            sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 1, None),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert_eq!(
+            sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(0x0110)),
+            Err(ValidationError::Sequence)
+        );
     }
 
     #[test]

@@ -396,6 +396,41 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   `DIALOG_DoDialogBox` pump currently returns instead of pumping (DIALOG BATCH 4); Phase 4 must
   also make that pump run so a `WM_PAINT` is generated to dispatch.
 
+  The Phase-4 source audit narrowed that prerequisite to an exact user32 sequence. ReactOS
+  `DIALOG_DoDialogBox` first calls `PeekMessageW(PM_REMOVE)`. When it returns false, the first
+  iteration calls `ShowWindow`, then `GetMessageW`; a retrieved `WM_PAINT` is consumed through
+  `NtUserDispatchMessage` (SSNs `0x1001`, `0x1057`, `0x1006`, and `0x1035`). `WM_INITDIALOG` is
+  sent synchronously during dialog construction and is therefore not the first missing kernel
+  callback. `nt-user-callback::DialogModalPumpSequence` now models the strict observable kernel
+  prefix `Peek(false) -> Get(WM_PAINT) -> Dispatch(WM_PAINT)` and rejects wrong order, a blocking
+  Peek result, and non-paint messages.
+
+  One serialized diagnostic boot temporarily allowed exactly that prefix. It observed:
+  `PeekMessage` returned zero; `ShowWindow` ran; `GetMessage` returned one with
+  `MSG{hwnd=0x20030, message=WM_PAINT}`; `NtUserDispatchMessage` invoked callback api 0 for
+  `WM_PAINT`; and the next Peek was parked. The existing real api0 nested-callback gate remained
+  green (`redirects/returns=1/1`, pushes/unwinds `7/7`, nested dispatches `5`) and the desktop
+  framebuffer marker remained `0x003a6ea5`.
+
+  That diagnostic runtime is **not landed**. It exposed two proof/scoping problems that must be
+  fixed before the modal pump can stay enabled:
+
+  1. the executive's legacy SAS milestone treats every post-milestone winlogon Peek/Get as the SAS
+     loop and derives three SAS gates from the later modal Peek. Bypassing that inference let the
+     real paint prefix run, but made `exec_winlogon_sas_message_pumped`,
+     `exec_winlogon_sas_windowproc_ran`, and `exec_winlogon_logged_out_sas` fail (`185/99` instead
+     of the green `188/99`), even though the downstream dialog path executed;
+  2. the exact ownership of `hwnd=0x20030` was not proven read-only. A `WM_PAINT` callback is not
+     sufficient evidence that the credential dialog, rather than an earlier SAS/dialog window,
+     painted.
+
+  The next safe increment is therefore to decouple SAS proof from the broad Peek/Get interceptor:
+  record the retrieved `WLX_WM_SAS` by inspecting the returned `MSG`, latch the resulting session
+  transition at its real boundary, and capture the actual top-level IDD_LOGON HWND when it is
+  created. Only then enable the bounded modal sequence when `ShowWindow`/`GetMessage` target that
+  HWND. Keep `WM_PAINT` synthetic until its nested GDI sequence has its own audited bounded policy;
+  add a dialog-rectangle framebuffer gate only after that real callback is enabled.
+
 ## 8. Risks / notes
 
 - **Context save/restore correctness.** A wrong register/RSP on the redirect or restore
