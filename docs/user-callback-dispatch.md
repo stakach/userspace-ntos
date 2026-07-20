@@ -440,21 +440,21 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   gate (`1/1`, `7/7`, nested `5`) and desktop paint (`768/768`).
 
   After the second SAS, the first top-level dialog candidate was `hwnd=0x2003a`, class atom
-  `0x8002`, top-level style true, and Winlogon-key-open advance true. The caption comparison failed,
-  so the runtime deliberately did not identify it as IDD_LOGON or enable the modal pump; the
-  tightened diagnostic gate ended `187/99`. The likely cause is address coverage, not evidence that
-  the title differs: the `LARGE_STRING` descriptor is on the client stack, but its UTF-16 buffer can
-  live in a demand-filled DLL page outside `smss_copyin`'s stack/early-heap/main-image windows. The
-  A bounded `client_copyin_mapped` helper and validated `LARGE_STRING`/UTF-16 decoder are now
-  implemented as a behavior-preserving foundation. A serialized diagnostic could read the
-  descriptor for `0x2003a`, but the referenced caption page was still absent from both the mirror
-  and filled-page lookup (`descriptor-read=1`, `caption-read=0`), so the tightened diagnostic gate
-  ended `187/99` and the runtime wiring was reverted. The next pass must identify which VSpace page
-  owns that buffer and make its existing frame visible to the read-only lookup; only then bind
-  `0x2003a` if the caption and other correlations match. The runtime remains at
-  the green Phase-3B checkpoint. `WinlogonDialogCorrelation` retains the pure state model for exact
-  SAS session/HWND/messages, logged-off state, distinct top-level `#32770`/`Logon` HWND, and key-open
-  evidence.
+  `0x8002`, top-level style true, and Winlogon-key-open advance true. The `LARGE_STRING` descriptor
+  is readable from the client stack, and its UTF-16 buffer was confirmed at `0x82313596` in
+  `msgina.dll` `.rsrc` (`len=10`, caption `Logon`). Broadly enlarging the normal client-frame table
+  made those DLL pages visible too early to win32k and changed boot behavior, ending in an unrelated
+  `0xbe` stall; that path was rejected.
+
+  The current fix is deliberately narrower: `client_copyin_mapped` can read from an explicit
+  copy-in-only prefetch table populated for validated dialog `LARGE_STRING` buffers, without
+  publishing those pages through the normal win32k client-page lookup. The serialized diagnostic now
+  reports `descriptor-read=1`, `parse=1`, `source=4`, `caption-read=1`, `units=5`, `Logon=1`, and
+  `top-level=1` while preserving the green `188/99` QEMU gate. The runtime still does not enable the
+  modal pump from this evidence. Next step: bind the verified `0x2003a` candidate into
+  `WinlogonDialogCorrelation` using the exact SAS session/HWND/messages, logged-off state, distinct
+  top-level `#32770`/`Logon` HWND, and key-open evidence, then enable the bounded modal sequence only
+  when `ShowWindow`/`GetMessage` target that captured HWND.
 
 ## 8. Risks / notes
 

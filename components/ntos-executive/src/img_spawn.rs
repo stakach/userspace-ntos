@@ -794,10 +794,11 @@ pub(crate) unsafe fn scratch_for(va: u64, filled_pages: &[u64], nfilled: usize, 
     None
 }
 /// Copy bytes from any already-mapped SEC_IMAGE client page. Prefer the process's persistent
-/// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases used for
-/// DLL pages. The walk is read-only, bounded by `dst`, handles cross-page ranges, and never faults in
-/// a new page: every source page must already be represented by a mirror or `filled_pages` entry.
+/// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases, the
+/// client-frame table, and explicit copy-in prefetches. The walk is read-only, bounded by `dst`,
+/// handles cross-page ranges, and never faults in a new page.
 pub(crate) unsafe fn client_copyin_mapped(
+    pi: u64,
     va: u64,
     dst: &mut [u8],
     filled_pages: &[u64],
@@ -815,16 +816,45 @@ pub(crate) unsafe fn client_copyin_mapped(
         let current = va + copied as u64;
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
-        let source = smss_mirror(current, chunk as u64)
-            .or_else(|| scratch_for(current, filled_pages, nfilled, scratch_base));
-        let Some(source) = source else {
-            return false;
+        let mut temporary_cap = 0;
+        let source = if let Some(source) = smss_mirror(current, chunk as u64)
+            .or_else(|| scratch_for(current, filled_pages, nfilled, scratch_base))
+        {
+            source
+        } else {
+            let page = current & !0xfff;
+            let frame = {
+                let frame = csrss_frame_get(pi, page);
+                if frame != 0 {
+                    frame
+                } else {
+                    client_copyin_frame_get(pi, page)
+                }
+            };
+            if frame == 0 {
+                return false;
+            }
+            let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
+            temporary_cap = copy_cap(frame);
+            if page_map(
+                temporary_cap,
+                alias,
+                2 | PAGE_EXECUTE_NEVER,
+                CAP_INIT_THREAD_VSPACE,
+            ) != 0
+            {
+                return false;
+            }
+            alias + (current & 0xfff)
         };
         core::ptr::copy_nonoverlapping(
             source as *const u8,
             dst.as_mut_ptr().add(copied),
             chunk,
         );
+        if temporary_cap != 0 {
+            let _ = page_unmap(temporary_cap);
+        }
         copied += chunk;
     }
     true

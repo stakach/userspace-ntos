@@ -1409,6 +1409,51 @@ unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
     }
     dll_cache_get(page)
 }
+
+const CLIENT_COPYIN_FRAME_CAP: usize = 256;
+static mut CLIENT_COPYIN_FRAME_PI: [u8; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
+static mut CLIENT_COPYIN_FRAME_VA: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
+static mut CLIENT_COPYIN_FRAME_FR: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
+static mut CLIENT_COPYIN_FRAME_N: usize = 0;
+
+unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N));
+    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
+    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
+            return;
+        }
+    }
+    if n < CLIENT_COPYIN_FRAME_CAP {
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_PI) as *mut u8).add(n),
+            pi as u8,
+        );
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_VA) as *mut u64).add(n),
+            page,
+        );
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_FR) as *mut u64).add(n),
+            fr,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_N), n + 1);
+    }
+}
+
+unsafe fn client_copyin_frame_get(pi: u64, page: u64) -> u64 {
+    let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N));
+    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
+    let frs = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_FR) as *const u64;
+    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
+            return core::ptr::read(frs.add(i));
+        }
+    }
+    0
+}
 unsafe fn alloc_frame() -> u64 {
     let s = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, s);

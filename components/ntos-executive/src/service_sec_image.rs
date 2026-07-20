@@ -4,6 +4,8 @@
 use crate::*;
 use nt_io_abi::major;
 
+const SEC_IMAGE_FAULT_CAP: u64 = 15000;
+
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
 /// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
 /// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
@@ -33,7 +35,6 @@ pub(crate) unsafe fn service_sec_image(
     // (now 64 MiB = 16384 slots, see map_demand_scratch_pts). (A) EAGER IMAGE-MAP front-loads a
     // process's whole DLL tree, so raised 6000→15000 (headroom under 16384) to let lsass's full
     // LSA-init tree page in eagerly without hitting the cap. Runaway/frame-pool guard only.
-    const FAULT_CAP: u64 = 15000;
     let mut first = 0u64;
     let mut stop = 0u64;
     let mut ntfaults = 0u64;
@@ -1165,7 +1166,7 @@ pub(crate) unsafe fn service_sec_image(
             // scratch bounded to ≤256 slots regardless of this count) this is now purely a
             // frame-budget / runaway guard, not a scratch limit — raised so lsass's full LSA-init DLL
             // tree (lsasrv/samsrv/msv1_0 + deps, thousands of pages) fits.
-            if faults >= FAULT_CAP {
+            if faults >= SEC_IMAGE_FAULT_CAP {
                 // This process exhausted its per-process demand-fault budget (runaway / frame-pool
                 // guard) — treat as unrecoverable for THIS process: park+log, let the others proceed.
                 park_and_log!(pi, b"fault-cap", m0, addr);
@@ -1222,7 +1223,7 @@ pub(crate) unsafe fn service_sec_image(
                 // The single page that actually FAULTED (present in every window). Only this page is
                 // guaranteed unmapped; every other page must be checked before (re)mapping.
                 let is_fault_page = bpage == page;
-                if faults >= FAULT_CAP {
+                if faults >= SEC_IMAGE_FAULT_CAP {
                     break;
                 }
                 let rva = (bpage - base) as u32;
@@ -3307,6 +3308,17 @@ pub(crate) unsafe fn service_sec_image(
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
+                    if pi >= 1 && m0 == 0x1077 && a3 != 0 {
+                        prefill_client_large_string_pages(
+                            pi as u64,
+                            a3,
+                            scratch_base,
+                            &mut faults,
+                            filled_pages,
+                            &reg,
+                            &dll_pes,
+                        );
+                    }
                     let r = win32k_glue::win32k_dispatch_wide(
                         m0, d_a0, d_a1, a2, a3, sp, nargs,
                         win32k_glue::Win32kClientContext {
@@ -3575,6 +3587,108 @@ pub(crate) unsafe fn service_sec_image(
                     // returns a real HWND. Winlogon then runs THROUGH: UserSetLogonNotifyWindow (0x127c) +
                     // UnregisterClass (0x10bf) = InitializeSAS COMPLETE. Record the HWND milestone here.
                     if pi == 2 && m0 == 0x1077 && st != 0 {
+                        if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0
+                            && WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
+                                > WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed)
+                            && a1 == 0x8002
+                            && a3 != 0
+                        {
+                            let mut raw = [0u8; 16];
+                            let descriptor_read = img_spawn::client_copyin_mapped(
+                                pi as u64,
+                                a3,
+                                &mut raw,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                            let descriptor = descriptor_read
+                                .then(|| nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw))
+                                .and_then(Result::ok);
+                            let raw_length = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                            let raw_maximum_and_ansi =
+                                u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+                            let raw_buffer = u64::from_le_bytes([
+                                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
+                                raw[15],
+                            ]);
+                            let source = if descriptor.is_some()
+                                && img_spawn::smss_mirror(raw_buffer, raw_length as u64).is_some()
+                            {
+                                1
+                            } else if descriptor.is_some()
+                                && img_spawn::scratch_for(
+                                    raw_buffer,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                )
+                                .is_some()
+                            {
+                                2
+                            } else if descriptor.is_some()
+                                && csrss_frame_get(pi as u64, raw_buffer & !0xfff) != 0
+                            {
+                                3
+                            } else if descriptor.is_some()
+                                && client_copyin_frame_get(pi as u64, raw_buffer & !0xfff) != 0
+                            {
+                                4
+                            } else {
+                                0
+                            };
+                            let mut bytes =
+                                [0u8; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS * 2];
+                            let mut units =
+                                [0u16; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS];
+                            let mut count = 0usize;
+                            let mut caption_read = false;
+                            if let Some(descriptor) = descriptor {
+                                let length = descriptor.length_bytes as usize;
+                                caption_read = img_spawn::client_copyin_mapped(
+                                    pi as u64,
+                                    descriptor.buffer,
+                                    &mut bytes[..length],
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                );
+                                if caption_read {
+                                    count = nt_user_callback::decode_utf16le_bounded(
+                                        &bytes[..length],
+                                        &mut units,
+                                    )
+                                    .unwrap_or(0);
+                                }
+                            }
+                            let style = smss_stack_read(sp + 0x28) as u32;
+                            print_str(b"[dialog-caption] hwnd=0x");
+                            print_hex(st as u32);
+                            print_str(b" descriptor-read=");
+                            print_u64(descriptor_read as u64);
+                            print_str(b" parse=");
+                            print_u64(descriptor.is_some() as u64);
+                            print_str(b" len=");
+                            print_u64(raw_length as u64);
+                            print_str(b" maxansi=0x");
+                            print_hex(raw_maximum_and_ansi);
+                            print_str(b" buf=0x");
+                            print_hex((raw_buffer >> 32) as u32);
+                            print_hex(raw_buffer as u32);
+                            print_str(b" source=");
+                            print_u64(source);
+                            print_str(b" caption-read=");
+                            print_u64(caption_read as u64);
+                            print_str(b" units=");
+                            print_u64(count as u64);
+                            print_str(b" Logon=");
+                            print_u64((units[..count] == nt_user_callback::IDD_LOGON_CAPTION) as u64);
+                            print_str(b" top-level=");
+                            print_u64(
+                                (style & 0x8000_0000 != 0 && style & 0x4000_0000 == 0) as u64,
+                            );
+                            print_str(b"\n");
+                        }
                         // ★ DIALOG BATCH 3 — the FIRST #32770 window is winlogon's SAS-notify window
                         // (sets the milestone below). EVERY subsequent #32770 (milestone already set) is
                         // part of the msgina IDD_LOGON credential dialog cascade: WlxDialogBoxParam →
@@ -4719,6 +4833,81 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     completed
+}
+
+unsafe fn ensure_client_copyin_dll_page(
+    pi: u64,
+    page: u64,
+    scratch_base: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) -> bool {
+    if csrss_frame_get(pi, page) != 0 || client_copyin_frame_get(pi, page) != 0 {
+        return true;
+    }
+    let Some((i, rva)) = reg.dll_for_page(page) else {
+        return false;
+    };
+    let Some(slot) = dll_pes.get(i) else {
+        return false;
+    };
+    let Some(tpe) = (*slot).as_ref() else {
+        return false;
+    };
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x2000;
+    let (frame, fe) = alloc_frame_r();
+    let se = page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+    if fe != 0 || se != 0 {
+        return false;
+    }
+    let _ = fill_image_page(tpe, rva, alias);
+    let _ = page_unmap(frame);
+    client_copyin_frame_put(pi, page, frame);
+    true
+}
+
+unsafe fn prefill_client_large_string_pages(
+    pi: u64,
+    descriptor_va: u64,
+    scratch_base: u64,
+    faults: &mut u64,
+    filled_pages: &mut [u64; 256],
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) {
+    let mut raw = [0u8; 16];
+    if !img_spawn::client_copyin_mapped(
+        pi,
+        descriptor_va,
+        &mut raw,
+        filled_pages,
+        *faults as usize,
+        scratch_base,
+    ) {
+        return;
+    }
+    let Ok(descriptor) = nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw) else {
+        return;
+    };
+    let mut offset = 0usize;
+    let length = descriptor.length_bytes as usize;
+    let mut last_page = u64::MAX;
+    while offset < length {
+        let current = descriptor.buffer + offset as u64;
+        let page = current & !0xfffu64;
+        if page != last_page {
+            let _ = ensure_client_copyin_dll_page(
+                pi,
+                page,
+                scratch_base,
+                reg,
+                dll_pes,
+            );
+            last_page = page;
+        }
+        let page_remaining = 0x1000usize - (current as usize & 0xfff);
+        offset += page_remaining.min(length - offset);
+    }
 }
 
 /// Map any fault badge to the TOP-LEVEL process badge that owns it (a listener/worker thread's
