@@ -300,14 +300,26 @@ rendezvous from `NtCallbackReturn`.
   spec.
   The behavior-preserving foundation is implemented in `nt-user-callback`: an exact ReactOS AMD64
   frame builder for callback 7 plus a pointer-free `(dispatch_id, callback_id, pi, tid, badge)`
-  correlation key, with layout and stale-return tests. A live prototype also proved the intended
-  first half end to end — it withheld the first winlogon api0 rendezvous, ran the real
-  `apfnDispatch[7]`, received SSN 22, and resumed the component continuation. It was deliberately
-  **not landed** because the immediately following `NtUserCreateWindowEx` hit a new win32k NULL
-  wall (`WIN32K+0xe7be1`, return-chain RVAs `0xc454d` / `0xe4d21`) before the existing frontier.
-  The next implementation pass must first identify which outer-dispatch/client context word the
-  prototype failed to preserve; the saved-register and component-reply paths should be compared
-  independently before re-enabling the redirect.
+  correlation key, with layout and stale-return tests. The discarded live prototype was
+  reconstructed from its retained symbolized binary and split into independently logged
+  client-context (A) and component-continuation (B) phases. This proved the old
+  `WIN32K+0xe7be1` wall was caused by reply-cap reuse, not an unknown win32k context word: the
+  prototype returned from `component_pump` while the callback `Call` was still bound to the
+  reusable `REPLY_W32`. The next pump rebound that reply object and advanced the wrong outer
+  dispatch while overwriting the single shared request frame. An explicit suspended pump outcome
+  plus resume-without-wake eliminated that NULL wall: SSN 22 resumed the original component, which
+  completed its remaining api0 sequence (`WM_NCCALCSIZE`, `WM_CREATE`, `WM_SIZE`, `WM_MOVE`).
+
+  The remaining blocker is narrower: **the outer client fault continuation itself must remain
+  parked, not merely have its register values copied.** Directly restoring a saved TCB context
+  advanced through the former NULL wall to `NtUserUnregisterClass`, but did not reach the baseline
+  gate. Re-expressing the saved context as an exact 18-word `UnknownSyscall` reply caused SSN 22 to
+  repeat, even when MR15/16/17 used the original outer fault's captured `(resume_ip, rsp, flags)`.
+  That reply still completes the *SSN-22 fault continuation*, not the older outer win32k syscall
+  continuation. These runtime experiments remain **unlanded**. The safe foundation now host-tests
+  the A/B phase ordering and exact outer reply-word mapping. The next pass must retain two distinct
+  client-side continuation identities (outer syscall and callback return), just as B retains the
+  component callback reply identity; it must not substitute one fault reply for the other.
 - **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and

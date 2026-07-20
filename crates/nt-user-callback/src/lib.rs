@@ -116,6 +116,61 @@ pub const STATUS_PENDING: i32 = 0x0000_0103;
 /// ReactOS `USER32_CALLBACK_CLIENTTHREADSTARTUP` / `apfnDispatch[7]`.
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ControlledTransitionPhase {
+    Idle = 0,
+    ComponentSuspended = 1,
+    ClientRedirected = 2,
+    CallbackReturned = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlledTransitionEvent {
+    SuspendComponent,
+    RedirectClient,
+    ReturnFromClient,
+    ResumeComponent,
+}
+
+impl ControlledTransitionPhase {
+    pub const fn advance(
+        self,
+        event: ControlledTransitionEvent,
+    ) -> Result<Self, ValidationError> {
+        match (self, event) {
+            (Self::Idle, ControlledTransitionEvent::SuspendComponent) => {
+                Ok(Self::ComponentSuspended)
+            }
+            (Self::ComponentSuspended, ControlledTransitionEvent::RedirectClient) => {
+                Ok(Self::ClientRedirected)
+            }
+            (Self::ClientRedirected, ControlledTransitionEvent::ReturnFromClient) => {
+                Ok(Self::CallbackReturned)
+            }
+            (Self::CallbackReturned, ControlledTransitionEvent::ResumeComponent) => Ok(Self::Idle),
+            _ => Err(ValidationError::State),
+        }
+    }
+}
+
+/// Translate a seL4 x86-64 `UserContext` snapshot into the 18-word reply shape for an
+/// `UnknownSyscall` fault. This completes the suspended outer syscall without copying the
+/// callback's SSN-22 register frame over the original caller context.
+pub const fn outer_syscall_reply(
+    saved: &[u64; 20],
+    result: u64,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+) -> [u64; 18] {
+    [
+        result, saved[4], saved[5], saved[6], saved[7], saved[8], saved[9], saved[10], saved[11],
+        saved[12], saved[13], saved[14], saved[15], saved[16], saved[17], resume_ip, resume_sp,
+        resume_flags,
+    ]
+}
+
 /// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -416,5 +471,62 @@ mod tests {
         header.state = CallbackState::Reply as u32;
         header.begin_request(0, 64, 64).unwrap();
         assert_eq!((header.dispatch_id, header.callback_id), (9, 2));
+    }
+
+    #[test]
+    fn controlled_transition_keeps_client_and_component_phases_distinct() {
+        let phase = ControlledTransitionPhase::Idle
+            .advance(ControlledTransitionEvent::SuspendComponent)
+            .unwrap();
+        assert_eq!(phase, ControlledTransitionPhase::ComponentSuspended);
+        let phase = phase
+            .advance(ControlledTransitionEvent::RedirectClient)
+            .unwrap();
+        assert_eq!(phase, ControlledTransitionPhase::ClientRedirected);
+        let phase = phase
+            .advance(ControlledTransitionEvent::ReturnFromClient)
+            .unwrap();
+        assert_eq!(phase, ControlledTransitionPhase::CallbackReturned);
+        assert_eq!(
+            phase
+                .advance(ControlledTransitionEvent::ResumeComponent)
+                .unwrap(),
+            ControlledTransitionPhase::Idle
+        );
+    }
+
+    #[test]
+    fn controlled_transition_rejects_reply_cap_reuse() {
+        let suspended = ControlledTransitionPhase::Idle
+            .advance(ControlledTransitionEvent::SuspendComponent)
+            .unwrap();
+        assert_eq!(
+            suspended.advance(ControlledTransitionEvent::ResumeComponent),
+            Err(ValidationError::State)
+        );
+        assert_eq!(
+            suspended.advance(ControlledTransitionEvent::SuspendComponent),
+            Err(ValidationError::State)
+        );
+    }
+
+    #[test]
+    fn outer_syscall_reply_preserves_the_saved_context_layout() {
+        let mut saved = [0u64; 20];
+        let mut index = 0;
+        while index < saved.len() {
+            saved[index] = 0x1000 + index as u64;
+            index += 1;
+        }
+        let reply = outer_syscall_reply(&saved, 0xfeed, 0xaaaa, 0xbbbb, 0x246);
+        assert_eq!(reply[0], 0xfeed);
+        assert_eq!(reply[1], saved[4]);
+        assert_eq!(reply[3], saved[6]);
+        assert_eq!(reply[9], saved[12]);
+        assert_eq!(reply[11], saved[14]);
+        assert_eq!(reply[14], saved[17]);
+        assert_eq!(reply[15], 0xaaaa);
+        assert_eq!(reply[16], 0xbbbb);
+        assert_eq!(reply[17], 0x246);
     }
 }
