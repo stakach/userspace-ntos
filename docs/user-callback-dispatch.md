@@ -2,7 +2,9 @@
 
 Status: **PHASE 2A implemented; PHASE 2B controlled api7 reverse transition implemented and
 gate-verified; Phase 3 bounded continuation + re-entrant component transport foundation
-implemented and gate-verified; real api0 marshalling remains**. Author target: the
+implemented and gate-verified; api0 frame/layout/rebase primitives are host-tested, but the first
+live api0 candidate exposed a wider nested-syscall sequence and its runtime experiment was
+reverted**. Author target: the
 executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
 Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
 executive callback rendezvous while preserving the synthetic reply policy. Phase 2B completes a
@@ -211,7 +213,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
 | Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ Phase 3 foundation: alternating dispatch/callback frames, correlation-tested and api7-wired |
 | win32k **nested-dispatch** / re-entrant component transport (3b) | △ Phase 3 foundation: callback Send + component receive/recursive-dispatch seam is live; real nested api0 not yet wired |
-| **buffer marshalling** in/out across VSpaces (client-visible only) | ☐ build |
+| **buffer marshalling** in/out across VSpaces (client-visible only) | △ exact api0 frame, bounded stack layout, and embedded-reference rebase are host-tested; runtime wiring reverted after the first live candidate exceeded its syscall bound |
 
 `KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
 Phase 2A created the interception substrate with a fixed shared frame and callback rendezvous. The
@@ -285,7 +287,9 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   in its explicit receive loop. `component_pump` services the rendezvous while the outer dispatch is
   active, performs the previous zero-init / input-preserving WINDOWPROC policy, and resumes it. The
   WINDOWPROC marshaller represents ReactOS's appended `Arguments+0x40` lParam copy as a validated
-  payload offset, never as a component-local pointer. The
+  payload offset. The synthetic path consumes the offset, but the component-local pointer remains
+  in the copied argument today; a real redirect must scrub it at the transport boundary and rebase
+  the `lParam` field to the client-visible copy before user32 runs. The
   first live winlogon api=0 request logs the real `PEB+0x58` pointer and loaded Rust ntdll
   `KiUserCallbackDispatcher` address/RVA. No client registers are changed and no continuation is
   installed. The live acceptance run serviced 114 rendezvous (112 winlogon api=0), observed
@@ -344,18 +348,34 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   one real api7 redirect/return, continuation pushes=2/unwinds=2, 768/768 paint, 188/99 checks, and
   `[microtest done]` with no FAIL lines.
 
-- **Phase 3B — nesting + real WINDOWPROC callbacks.** Finish per-thread callback storage +
+- **Phase 3B — nesting + real WINDOWPROC callbacks (first live attempt diagnosed and reverted).** Finish per-thread callback storage +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and
   `NtUserSetWindowLongPtr`, respectively. Prove with a real `WndProc` callback that its nested
   syscall re-enters win32k while the outer dispatch is suspended, returns, and unwinds correctly.
-  The first controlled candidate is **SAS `WM_CREATE`**, not `WM_NCCREATE`: its application proc does
-  a client-side `GetWindowLongPtr`, then exactly one nested `NtUserSetWindowLongPtr` (SSN `0x1298`)
+  The first controlled candidate was **SAS `WM_CREATE`**, not `WM_NCCREATE`: its application proc does
+  a client-side `GetWindowLongPtr`, then nested `NtUserSetWindowLongPtr` (SSN `0x1298`)
   for `GWLP_USERDATA`; that kernel branch directly updates `WND.dwUserData` and does not callback.
+  It is **not** a one-syscall callback in the boot configuration actually observed. After setting
+  `GWLP_USERDATA`, `GetSetupType()` returned zero and `SASWindowProc` entered `RegisterHotKeys`,
+  whose source contains up to four `RegisterHotKey` calls (SSN `0x126b`).
   `WM_NCCREATE` enters `DefWindowProc -> NtUserDefSetText` (SSN `0x1080`) and is the broader path.
   Before enabling the candidate, marshal the complete api0 payload into winlogon's VSpace, copy the
   SSN-22 output back into the shared reply, and preserve the parked callback frame while the nested
   dispatch temporarily uses the shared request fields.
+
+  The single serialized Phase-3B experiment proved the following exact prefix before being stopped:
+  the selected `WM_CREATE` payload length was `0xca`; the client entered real `apfnDispatch[0]`;
+  nested `0x1298` completed with result `0x00c15bc0`; then nested `0x126b`
+  (`NtUserRegisterHotKey`) arrived. The experiment deliberately allowed only `0x1298`, so it
+  rejected `0x126b` with `STATUS_INVALID_PARAMETER` and winlogon parked before SSN 22. There was no
+  api0-return gate. All runtime changes were therefore reverted; only the generic exact-frame,
+  bounded stack-placement, and embedded-pointer-rebase helpers/tests remain.
+
+  Before another QEMU run, audit the complete `NtUserRegisterHotKey` kernel path for callbacks and
+  define a bounded expected sequence (`0x1298`, followed by one to four `0x126b` calls) or choose a
+  genuinely syscall-free callback. Add sequence-state validation rather than a broad nested-syscall
+  allowlist, then restore the runtime wiring and require SSN 22 plus exact push/unwind counts.
 - **Phase 4 — `WM_PAINT` → the login box renders.** With the machinery real, drive the dialog's
   `WM_PAINT`/`WM_ERASEBKGND`/`WM_INITDIALOG` to the control procs via the callback; the procs'
   `BeginPaint → GetDC/GetStockObject/GetSysColorBrush/FillRect/DrawTextW` first exercise the

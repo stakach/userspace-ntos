@@ -29,8 +29,9 @@ pub struct CallbackHeader {
     pub status: i32,
     pub client_pi: u32,
     pub callback_id: u32,
-    /// Optional offset of an embedded buffer referenced by callback arguments. Component stubs
-    /// scrub the original component-local pointer and describe the copied bytes by offset instead.
+    /// Optional offset of an embedded buffer referenced by callback arguments. The transport
+    /// boundary must scrub the original component-local pointer and describe the copied bytes by
+    /// offset instead; the executive rebases that offset into the client-visible copy.
     pub payload_reference_offset: u32,
     pub dispatch_id: u64,
     pub client_tid: u64,
@@ -115,6 +116,8 @@ pub const STATUS_PENDING: i32 = 0x0000_0103;
 
 /// ReactOS `USER32_CALLBACK_CLIENTTHREADSTARTUP` / `apfnDispatch[7]`.
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
+/// ReactOS `USER32_CALLBACK_WINDOWPROC` / `apfnDispatch[0]`.
+pub const USER32_CALLBACK_WINDOWPROC: u32 = 0;
 
 /// Hard bound for the alternating win32k-dispatch / user-callback continuation stack.
 ///
@@ -512,13 +515,20 @@ pub struct UserCalloutFrame {
 }
 
 impl UserCalloutFrame {
-    /// Build the no-input Phase-2B callback frame for the real user32 client-thread-startup thunk.
-    pub const fn client_thread_startup(prior_rip: u64, prior_rsp: u64, prior_eflags: u32) -> Self {
+    /// Build the exact AMD64 callout frame for any validated user32 callback payload.
+    pub const fn callback(
+        input: u64,
+        input_length: u32,
+        api_index: u32,
+        prior_rip: u64,
+        prior_rsp: u64,
+        prior_eflags: u32,
+    ) -> Self {
         Self {
             home: [0; 4],
-            input: 0,
-            input_length: 0,
-            api_index: USER32_CALLBACK_CLIENTTHREADSTARTUP,
+            input,
+            input_length,
+            api_index,
             machine_frame: UserCallbackMachineFrame {
                 rip: prior_rip,
                 seg_cs: 0x33,
@@ -530,6 +540,59 @@ impl UserCalloutFrame {
                 fill3: [0; 3],
             },
         }
+    }
+
+    /// Build the no-input Phase-2B callback frame for the real user32 client-thread-startup thunk.
+    pub const fn client_thread_startup(prior_rip: u64, prior_rsp: u64, prior_eflags: u32) -> Self {
+        Self::callback(
+            0,
+            0,
+            USER32_CALLBACK_CLIENTTHREADSTARTUP,
+            prior_rip,
+            prior_rsp,
+            prior_eflags,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserCallbackStackLayout {
+    pub frame_pointer: u64,
+    pub input_pointer: u64,
+}
+
+impl UserCallbackStackLayout {
+    /// Place the fixed callout frame and bounded input copy below the client's saved RSP.
+    pub fn below(prior_rsp: u64, input_length: usize) -> Result<Self, ValidationError> {
+        checked_payload_length(input_length)?;
+        let frame_size = core::mem::size_of::<UserCalloutFrame>() as u64;
+        let total_size = frame_size
+            .checked_add(input_length as u64)
+            .and_then(|size| size.checked_add(15))
+            .ok_or(ValidationError::Length)?
+            & !15;
+        let frame_pointer = prior_rsp
+            .checked_sub(total_size)
+            .ok_or(ValidationError::Length)?
+            & !15;
+        let input_pointer = if input_length == 0 {
+            0
+        } else {
+            frame_pointer
+                .checked_add(frame_size)
+                .ok_or(ValidationError::Length)?
+        };
+        let end = frame_pointer
+            .checked_add(frame_size)
+            .and_then(|address| address.checked_add(input_length as u64))
+            .ok_or(ValidationError::Length)?;
+        if end > prior_rsp {
+            return Err(ValidationError::Length);
+        }
+        Ok(Self {
+            frame_pointer,
+            input_pointer,
+        })
     }
 }
 
@@ -587,6 +650,26 @@ pub fn checked_payload_range(length: usize) -> Result<core::ops::Range<usize>, V
         return Err(ValidationError::Length);
     }
     Ok(start..end)
+}
+
+pub fn client_payload_reference(
+    input_pointer: u64,
+    input_length: usize,
+    reference_offset: u32,
+) -> Result<u64, ValidationError> {
+    checked_payload_length(input_length)?;
+    let offset = reference_offset as usize;
+    if input_pointer == 0
+        || reference_offset == NO_PAYLOAD_REFERENCE
+        || offset
+            .checked_add(core::mem::size_of::<u64>())
+            .is_none_or(|end| end > input_length)
+    {
+        return Err(ValidationError::Length);
+    }
+    input_pointer
+        .checked_add(offset as u64)
+        .ok_or(ValidationError::Length)
 }
 
 pub fn validate_request(header: &CallbackHeader) -> Result<(), ValidationError> {
@@ -693,6 +776,39 @@ mod tests {
     }
 
     #[test]
+    fn windowproc_callout_frame_carries_client_visible_payload() {
+        let frame = UserCalloutFrame::callback(
+            0x7fff_1000,
+            0x90,
+            USER32_CALLBACK_WINDOWPROC,
+            0x1111,
+            0x2222,
+            0x246,
+        );
+        assert_eq!(frame.input, 0x7fff_1000);
+        assert_eq!(frame.input_length, 0x90);
+        assert_eq!(frame.api_index, USER32_CALLBACK_WINDOWPROC);
+        assert_eq!(frame.machine_frame.rip, 0x1111);
+        assert_eq!(frame.machine_frame.rsp, 0x2222);
+    }
+
+    #[test]
+    fn callback_stack_layout_is_aligned_bounded_and_nonoverlapping() {
+        let layout = UserCallbackStackLayout::below(0x8000, 0x90).unwrap();
+        assert_eq!(layout.frame_pointer & 0xf, 0);
+        assert_eq!(layout.input_pointer, layout.frame_pointer + 0x58);
+        assert!(layout.input_pointer + 0x90 <= 0x8000);
+        assert_eq!(
+            UserCallbackStackLayout::below(0x40, 0x90),
+            Err(ValidationError::Length)
+        );
+        assert_eq!(
+            UserCallbackStackLayout::below(0x8000, CALLBACK_PAYLOAD_MAX + 1),
+            Err(ValidationError::Length)
+        );
+    }
+
+    #[test]
     fn callback_correlation_rejects_stale_client_or_sequence() {
         let request = request();
         let correlation = CallbackCorrelation::from_request(&request);
@@ -776,6 +892,22 @@ mod tests {
         assert_eq!(validate_request(&header), Ok(()));
         header.payload_reference_offset = 124;
         assert_eq!(validate_request(&header), Err(ValidationError::Length));
+    }
+
+    #[test]
+    fn embedded_payload_reference_rebases_into_client_copy() {
+        assert_eq!(
+            client_payload_reference(0x7fff_1000, 0x90, 0x40),
+            Ok(0x7fff_1040)
+        );
+        assert_eq!(
+            client_payload_reference(0x7fff_1000, 0x40, 0x40),
+            Err(ValidationError::Length)
+        );
+        assert_eq!(
+            client_payload_reference(0, 0x90, 0x40),
+            Err(ValidationError::Length)
+        );
     }
 
     #[test]
