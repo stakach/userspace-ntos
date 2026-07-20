@@ -1,6 +1,7 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **PHASE 2A implemented; user redirect intentionally not started**. Author target: the
+Status: **PHASE 2A implemented; PHASE 2B frame/correlation foundation implemented, live redirect
+not landed**. Author target: the
 executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
 Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
 executive callback rendezvous while preserving the synthetic reply policy. The executive still
@@ -199,6 +200,7 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ✅ Phase 2A diagnostic (never fabricated) |
 | `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
 | Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2B |
+| Exact executive-side 0x58 `UCALLOUT_FRAME` builder + pointer-free continuation correlation | ✅ Phase 2B foundation, host-tested |
 | Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
 | Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
@@ -296,6 +298,16 @@ rendezvous from `NtCallbackReturn`.
   callback-return → resumed continuation round trip, while `CreateWindowEx` and the SAS specs
   remain green and desktop paint stays 768/768. Gate 187 held or +1 for a "callback ran for real"
   spec.
+  The behavior-preserving foundation is implemented in `nt-user-callback`: an exact ReactOS AMD64
+  frame builder for callback 7 plus a pointer-free `(dispatch_id, callback_id, pi, tid, badge)`
+  correlation key, with layout and stale-return tests. A live prototype also proved the intended
+  first half end to end — it withheld the first winlogon api0 rendezvous, ran the real
+  `apfnDispatch[7]`, received SSN 22, and resumed the component continuation. It was deliberately
+  **not landed** because the immediately following `NtUserCreateWindowEx` hit a new win32k NULL
+  wall (`WIN32K+0xe7be1`, return-chain RVAs `0xc454d` / `0xe4d21`) before the existing frontier.
+  The next implementation pass must first identify which outer-dispatch/client context word the
+  prototype failed to preserve; the saved-register and component-reply paths should be compared
+  independently before re-enabling the redirect.
 - **Phase 3 — nesting + real WINDOWPROC callbacks.** Per-thread callback-continuation stack +
   win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
   `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and

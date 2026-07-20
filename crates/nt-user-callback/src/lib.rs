@@ -113,6 +113,90 @@ impl Default for CallbackFrame {
 
 pub const STATUS_PENDING: i32 = 0x0000_0103;
 
+/// ReactOS `USER32_CALLBACK_CLIENTTHREADSTARTUP` / `apfnDispatch[7]`.
+pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
+
+/// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct UserCallbackMachineFrame {
+    pub rip: u64,
+    pub seg_cs: u16,
+    pub fill1: [u16; 3],
+    pub eflags: u32,
+    pub fill2: u32,
+    pub rsp: u64,
+    pub seg_ss: u16,
+    pub fill3: [u16; 3],
+}
+
+/// Exact ReactOS AMD64 `UCALLOUT_FRAME` consumed by `KiUserCallbackDispatcher`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct UserCalloutFrame {
+    pub home: [u64; 4],
+    pub input: u64,
+    pub input_length: u32,
+    pub api_index: u32,
+    pub machine_frame: UserCallbackMachineFrame,
+}
+
+impl UserCalloutFrame {
+    /// Build the no-input Phase-2B callback frame for the real user32 client-thread-startup thunk.
+    pub const fn client_thread_startup(prior_rip: u64, prior_rsp: u64, prior_eflags: u32) -> Self {
+        Self {
+            home: [0; 4],
+            input: 0,
+            input_length: 0,
+            api_index: USER32_CALLBACK_CLIENTTHREADSTARTUP,
+            machine_frame: UserCallbackMachineFrame {
+                rip: prior_rip,
+                seg_cs: 0x33,
+                fill1: [0; 3],
+                eflags: prior_eflags,
+                fill2: 0,
+                rsp: prior_rsp,
+                seg_ss: 0x2b,
+                fill3: [0; 3],
+            },
+        }
+    }
+}
+
+/// Pointer-free identity which correlates the component request, redirected client, and SSN 22.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallbackCorrelation {
+    pub dispatch_id: u64,
+    pub callback_id: u32,
+    pub client_pi: u32,
+    pub client_tid: u64,
+    pub client_badge: u64,
+}
+
+impl CallbackCorrelation {
+    pub const fn from_request(request: &CallbackHeader) -> Self {
+        Self {
+            dispatch_id: request.dispatch_id,
+            callback_id: request.callback_id,
+            client_pi: request.client_pi,
+            client_tid: request.client_tid,
+            client_badge: request.client_badge,
+        }
+    }
+
+    pub const fn matches_client(&self, client_pi: u32, client_tid: u64, client_badge: u64) -> bool {
+        self.client_pi == client_pi
+            && self.client_tid == client_tid
+            && self.client_badge == client_badge
+    }
+
+    pub const fn matches_request(&self, request: &CallbackHeader) -> bool {
+        self.dispatch_id == request.dispatch_id
+            && self.callback_id == request.callback_id
+            && self.matches_client(request.client_pi, request.client_tid, request.client_badge)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     Magic,
@@ -215,6 +299,39 @@ mod tests {
         let mut header = CallbackHeader::idle(7, 2, 44, 4);
         header.begin_request(0, 64, 80).unwrap();
         header
+    }
+
+    #[test]
+    fn user_callout_frame_matches_reactos_amd64_layout() {
+        assert_eq!(core::mem::size_of::<UserCallbackMachineFrame>(), 0x28);
+        assert_eq!(core::mem::size_of::<UserCalloutFrame>(), 0x58);
+        let frame = UserCalloutFrame::client_thread_startup(0x1111, 0x2222, 0x246);
+        let base = core::ptr::addr_of!(frame) as usize;
+        assert_eq!(core::ptr::addr_of!(frame.input) as usize - base, 0x20);
+        assert_eq!(
+            core::ptr::addr_of!(frame.input_length) as usize - base,
+            0x28
+        );
+        assert_eq!(core::ptr::addr_of!(frame.api_index) as usize - base, 0x2c);
+        assert_eq!(
+            core::ptr::addr_of!(frame.machine_frame) as usize - base,
+            0x30
+        );
+        assert_eq!(frame.api_index, USER32_CALLBACK_CLIENTTHREADSTARTUP);
+        assert_eq!(frame.machine_frame.rip, 0x1111);
+        assert_eq!(frame.machine_frame.rsp, 0x2222);
+    }
+
+    #[test]
+    fn callback_correlation_rejects_stale_client_or_sequence() {
+        let request = request();
+        let correlation = CallbackCorrelation::from_request(&request);
+        assert!(correlation.matches_request(&request));
+        assert!(correlation.matches_client(2, 44, 4));
+        assert!(!correlation.matches_client(2, 45, 4));
+        let mut stale = request;
+        stale.callback_id += 1;
+        assert!(!correlation.matches_request(&stale));
     }
 
     #[test]
