@@ -3216,6 +3216,52 @@ GetMessage#3 (after the reg-read) to find where `GUILoggedOutSAS` stops before `
 WLX-dispatch fn-pointer resolves. Once `FindResourceW(msgina, IDD_LOGON)` fires, the (now-real) walker returns
 the template → `DialogBoxParamW → DIALOG_CreateIndirect → NtUserCreateWindowEx(#32770)` + control creates.
 
+### DIALOG BATCH 2 (2026-07-20, gate 186 HELD, revert-to-clean) — ROOT CAUSE FOUND (hDllInstance NULL) + NEXT wall pinned (client GDI handle table). ntdll changes REVERTED (regress the gate → not landed)
+
+**★ ROOT CAUSE — DEFINITIVE (on-target `[rsrc-diag]` LdrFindResource print, module self-name + base + type + id):**
+`WlxDialogBoxParam(pgContext->hDllInstance, IDD_LOGON)` → `DialogBoxParamW → FindResourceW(hDllInstance, IDD_LOGON, RT_DIALOG)`
+DID fire — but with **`hDllInstance` = winlogon.exe's ImageBase `0x10000560000`, NOT msgina's base `0x82290000`**
+(the `[rsrc-diag]` line: `base=0000010000560000 mod= type=00000005 name=000004b0` — 0x4b0 = 1200 = IDD_LOGON,
+0x44c = 1100 = IDD_WELCOME, both msgina dialog ids; empty `mod=` = winlogon.exe, no export dir). So it was
+`FindResourceW(NULL-ish → the EXE, IDD_LOGON)` → NOT_FOUND → dialog fails. **`pgContext->hDllInstance` is NULL**
+because **msgina's `DllMain(DLL_PROCESS_ATTACH)` NEVER RAN**: msgina is loaded at RUNTIME by winlogon's
+`LoadGina → LoadLibraryW("msgina.dll")` (wlx.c:829), and our ntdll's runtime `LdrLoadDll` driver
+(`crates/nt-ntdll-dll/src/on_target.rs::ldr_load_dll`) maps + snaps + threads PEB->Ldr but **does NOT run
+`DLL_PROCESS_ATTACH`** on the freshly-loaded module (only process-init `run_process_attach` runs DllMains).
+msgina's `DllMain` (`references/reactos/dll/win32/msgina/msgina.c:1094`) sets `hDllInstance = hinstDLL` on
+ATTACH; without it, the global stays NULL → `WlxInitialize` copies NULL into `pgContext->hDllInstance`.
+
+**Fixes attempted (ALL reverted — each regressed the 186 gate; tree clean at f8eaa98):**
+1. **Run DllMain on runtime LdrLoadDll, UNCONDITIONAL** → 71 fresh DllMains across all processes; msgina's
+   logon flow immediately drove a deep **win32k desktop cascade** (`NtUserCreateDesktop`×N →
+   `NtUserSetThreadDesktop` (SSN 0x1092) NULL-deref cr2=0x8) → boot did NOT quiesce (RUNEXIT=124).
+2. **Run DllMain scoped to msgina only** → msgina's ENTRY is a CRT `_DllMainCRTStartup` (entry_rva=0x118f0);
+   its `_CRT_INIT` walks the `.CRT`/TLS init sections + needs loader state our runtime-load path doesn't set
+   up → it **NULL-calls and crashes (rip=0)** before the user DllMain's `hDllInstance` store. Also perturbing
+   `attach_dfs`'s process-init dedup regressed the earlier bring-up.
+3. **Disasm-verified DIRECT hDllInstance patch (the surgical fix that WORKED for the resource lookup):** in
+   `ldr_load_dll`, when the loaded module is msgina, write msgina's base to `[base + 0x193c8]` (msgina's
+   `hDllInstance` .data global — verified from `msgina.dll .text 0x6d30` user-DllMain:
+   `cmp reason,DLL_PROCESS_ATTACH; mov rax,hinstDLL; mov [rip+0x12673 → RVA 0x193c8],rax`). RESULT: **`FindResourceW`
+   now fires with msgina's base** (`[rsrc-diag] base=0000000082290000 mod=msgina.dll type=00000005 name=0000044c`)
+   → the real `.rsrc` walker resolves the template → **dialog creation now PROCEEDS** — but immediately hits
+   the NEXT wall (below). Net gate 183 (winlogon crashes in GDI) → reverted to hold 186.
+
+**★★ THE REAL NEXT WALL (pinned, disasm-verified) — CLIENT-SIDE GDI: `GdiSharedHandleTable` is NULL.**
+Once the template resolves, `DisplaySASNotice`'s `DialogBoxParamW(IDD_WELCOME) → DIALOG_CreateIndirect →
+CreateWindowEx(#32770)` proceeds into the dialog's DC/font setup and **gdi32 NULL-derefs at RVA 0x535a**
+(`mov eax,[rax+0xc]`, cr2≈0x75c): gdi32 computes `pEntry = GdiSharedHandleTable[handle&0xffff]*0x18 + [gdi32
+RVA 0x4e188]`, and **the `GdiSharedHandleTable` global (gdi32 RVA 0x4e188) is NULL in winlogon** — win32k's GDI
+handle table (the section win32k maps into every GUI process at attach, published via `PEB->GdiSharedHandleTable`)
+is **not mapped into the client**. The desktop PAINT works because it runs win32k-side (kernel); CLIENT-side GDI
+(what the dialog's DC/brush/font need) requires the shared GDI handle table + real GDI objects mapped into
+winlogon — the **`project_win32k_graphics` client-GDI mapping** (the GDI analogue of the 185 batch's desktop-heap
+client-WINDOW mapping). That is the next batch: (a) hDllInstance fix (RVA 0x193c8 patch above — trivial, proven),
+(b) map win32k's GDI handle table into the client + seed `PEB->GdiSharedHandleTable`, (c) service the dialog's
+`NtGdiCreateCompatibleDC`/font/brush so `CreateWindowEx(#32770)` + `WM_INITDIALOG` complete. It is a multi-step
+win32k-GDI subsystem, NOT an ntdll gap — so nothing landed this batch (holding 186 green, per "revert if it
+won't quiesce"). **The dialog wall is now fully diagnosed end-to-end; the remaining work is win32k client-GDI.**
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface
