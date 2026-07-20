@@ -97,6 +97,73 @@ pub(crate) unsafe fn map_win32k_pool_into_csrss(pml4: u64, pi: usize) -> u64 {
     delta
 }
 
+/// ★ DIALOG BATCH 3 — RO-map the GDI shared handle table into GUI client `pi`'s VSpace at
+/// [`win32k_subsystem::GDI_SHARED_TABLE_VA`]. Client-side gdi32 validates every GDI handle through
+/// `GdiSharedHandleTable[handle & 0xffff]` (base = `PEB->GdiSharedHandleTable`, PEB+0xf8). In real
+/// Windows win32k allocates this table from a GdiPool section + RO-maps it into every GUI process; our
+/// host allocates the frames ONCE (globally, zero-initialized — a zero `entry.Type@0xc` mismatches
+/// gdi32's type-bits check → gdi32 takes its `invalid handle` path instead of NULL-derefing at RVA
+/// 0x535a), then RO-maps that same table into each client. Per-pi guarded (mirrors
+/// [`map_win32k_pool_into_csrss`]). Returns the client-side base VA (== GDI_SHARED_TABLE_VA).
+pub(crate) unsafe fn map_gdi_shared_handle_table_into_client(pml4: u64, pi: usize) -> u64 {
+    const RW_NX_L: u64 = 3 | PAGE_EXECUTE_NEVER; // read-write, non-executable (executive scratch)
+    let frames = win32k_subsystem::GDI_SHARED_TABLE_FRAMES;
+    // Allocate + zero-init the table frames once (shared into any GUI client thereafter).
+    let mut base = GDI_SHARED_TABLE_FRAME_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        // Allocate `frames` contiguous frame caps, then zero them by mapping the whole run into a
+        // dedicated executive-side 2 MiB scratch window (its own fresh PT — frames < 512 fit one PT)
+        // and memset-ing once. GDI_SHARED_TABLE_VA is a CLIENT VA; the frames are copy_cap'ed RO into
+        // the client afterward, and win32k never writes them, so the zero fill is durable.
+        const GDI_ZERO_SCR: u64 = 0x0000_0100_1400_0000; // dedicated 2 MiB scratch window, own PT
+        debug_assert!(frames <= 512);
+        let scr_pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, scr_pt);
+        let _ = paging_struct_map(scr_pt, LBL_X86_PAGE_TABLE_MAP, GDI_ZERO_SCR, CAP_INIT_THREAD_VSPACE);
+        let first = alloc_frame();
+        base = first;
+        let _ = page_map(first, GDI_ZERO_SCR, RW_NX_L, CAP_INIT_THREAD_VSPACE);
+        for i in 1..frames {
+            // Frame caps are handed out sequentially (alloc_frame bumps a slot), so the run is
+            // contiguous; map each at its own scratch page (no VA reuse → no occupied-slot failure).
+            let f = alloc_frame();
+            let _ = page_map(f, GDI_ZERO_SCR + i * 0x1000, RW_NX_L, CAP_INIT_THREAD_VSPACE);
+        }
+        core::ptr::write_bytes(GDI_ZERO_SCR as *mut u8, 0, (frames * 0x1000) as usize);
+        GDI_SHARED_TABLE_FRAME_BASE.store(base, Ordering::Relaxed);
+        print_str(b"[win32k-svc] allocated GDI shared handle table (0x");
+        print_hex(frames as u32);
+        print_str(b" frames, zero-init)\n");
+    }
+    let bit = 1u64 << pi;
+    if GDI_SHARED_TABLE_MAPPED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return win32k_subsystem::GDI_SHARED_TABLE_VA; // already mapped into this process's VSpace
+    }
+    const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER; // read-only, non-executable
+    // The 1 GiB PD covering 0x8000_0000..0xC000_0000 already exists in the client; the table window is
+    // fresh, so allocate + map one PT per 2 MiB sub-range up front (page_map is fire-and-forget).
+    for p in 0..(frames + 511) / 512 {
+        let pt = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+        let _ = paging_struct_map(
+            pt,
+            LBL_X86_PAGE_TABLE_MAP,
+            win32k_subsystem::GDI_SHARED_TABLE_VA + p * 0x20_0000,
+            pml4,
+        );
+    }
+    for i in 0..frames {
+        let cp = copy_cap(base + i);
+        let _ = page_map(cp, win32k_subsystem::GDI_SHARED_TABLE_VA + i * 0x1000, RO_NX, pml4);
+    }
+    print_str(b"[win32k-svc] RO-mapped GDI shared handle table into pi 0x");
+    print_hex(pi as u32);
+    print_str(b" @0x");
+    print_hex(win32k_subsystem::GDI_SHARED_TABLE_VA as u32);
+    print_str(b"\n");
+    win32k_subsystem::GDI_SHARED_TABLE_VA
+}
+
 // --- win32k cross-AS client-memory sharing (the authentic "win32k shares the caller's user AS") ---
 // win32k-side paging structures provisioned for the shared client window, and pages already mapped,
 // keyed by a level-tagged aligned index (SYS_SEND paging_struct_map is fire-and-forget so we can't

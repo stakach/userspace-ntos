@@ -3262,6 +3262,46 @@ client-WINDOW mapping). That is the next batch: (a) hDllInstance fix (RVA 0x193c
 win32k-GDI subsystem, NOT an ntdll gap — so nothing landed this batch (holding 186 green, per "revert if it
 won't quiesce"). **The dialog wall is now fully diagnosed end-to-end; the remaining work is win32k client-GDI.**
 
+### DIALOG BATCH 3 (2026-07-20, gate 186 → **187**, LANDED green, clean quiesce) — CLIENT-GDI HANDLE-TABLE MAPPING + hDllInstance seed → the msgina IDD_LOGON dialog CASCADE is CREATED
+
+**★ RESULT: both batch-2 walls fell; the msgina logon dialog now creates its window cascade
+(17 post-SAS-notify #32770 windows = the dialog frame + Static/Edit/Button controls) and winlogon
+parks in the nested modal message pump (blocked on credential input a headless host can't supply =
+clean quiesce). Gate 187/98, RUNEXIT=3, desktop paint 768/768 intact, 0 FAILs.**
+
+**Fix #1 — hDllInstance interim (proven, applied):** in `ldr_load_dll`
+(`crates/nt-ntdll-dll/src/on_target.rs`), when the runtime-loaded module is `msgina`, seed
+`[base + 0x193c8] = base` (msgina's user-DllMain hDllInstance store, msgina RVA 0x6d4e — the ONLY write
+to that global, disasm-verified). Stands in for "run DllMains on runtime LdrLoadDll" (tracked follow-up
+that cascades into a win32k desktop issue). Makes `FindResourceW(msgina, IDD_LOGON)` resolve the template.
+
+**Fix #2 — client-side GDI handle table (THE MAIN WORK):** client-side gdi32 validates every GDI handle
+through `GdiSharedHandleTable[handle & 0xffff]` (0x18-byte `GDI_TABLE_ENTRY` each), base =
+`PEB->GdiSharedHandleTable` (PEB+0xf8). gdi32's `GdiProcessSetup` (gdi32 RVA 0x1100, run once from its
+DllMain: `call NtCurrentPeb; mov rax,[rax+0xf8]; mov [RVA 0x4e188],rax`) caches PEB+0xf8 into its global;
+every later validity check (RVA 0x5310, reached from the NULL-deref at RVA 0x535a `mov eax,[rax+0xc]`)
+indexes it. It was NULL → NULL-deref on the dialog's DC/font setup. Fix (all in `ntos-executive`):
+- **Seed `PEB->GdiSharedHandleTable` at spawn** (`img_spawn.rs`, gated pi==2), BEFORE the loader runs any
+  DllMain, so gdi32's `GdiProcessSetup` caches the real table VA on its only run (no need to patch the
+  gdi32 cached global directly — the cleanest seam).
+- **Allocate + RO-map a real GDI handle table** into winlogon (`win32k_glue.rs
+  ::map_gdi_shared_handle_table_into_client`): 0x10000 entries × 0x18 = 1.5 MiB (384 frames),
+  zero-initialized (a zero `entry.Type@0xc` mismatches gdi32's type-bits check → gdi32 takes its
+  `invalid handle` branch instead of NULL-derefing), at `GDI_SHARED_TABLE_VA = 0x9C00_0000` (above the
+  POOL client window, below the NLS section). Mirrors the desktop-heap client-window RO-mapping pattern
+  (per-pi guarded). Called from `service_sec_image.rs`'s pi==2 win32k reassert block.
+- Counted spec `exec_msgina_logon_dialog_created` (main.rs): `WINLOGON_GDI_MAPPED != 0 &&
+  WINLOGON_DIALOG_WINDOWS >= 2` (dialog-class #32770 windows after winlogon's own SAS-notify window).
+
+**NEXT FRONTIER:** winlogon parks in the modal pump with the dialog + controls created but likely NOT
+yet PAINTED to the framebuffer (WM_PAINT/WM_INITDIALOG client-side GDI drawing — the zero-init GDI table
+returns `invalid handle` for real DC/brush/font ops, so the dialog's controls create but don't render
+pixels). To actually RENDER the credential box: seed the GDI table with REAL entries for win32k's DC /
+system-font / dialog-brush GDI objects (map win32k's real GDI objects into the client like the window
+mapping), so gdi32's validity checks PASS and the draw calls reach real objects. Also observed:
+win32k `Class 0x%p not found` + `Didn't find a suitable PDEV` debug msgs during the cascade — worth
+checking whether a control class registration or the display PDEV needs wiring for full paint.
+
 ### C — prioritized, batched completion plan
 
 Because the frontier is win32k (not ntdll), the ntdll TIER-1 is small (close the last import-surface

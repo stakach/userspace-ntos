@@ -133,6 +133,24 @@ pub const CSRSS_W32_POOL_VA: u64 = 0x0000_0000_9900_0000;
 const _: () = assert!(CSRSS_W32_SHARED_VA + WIN32K_HEAP_FRAMES * 0x1000 <= CSRSS_W32_POOL_VA);
 const _: () = assert!(CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
 
+// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE window. gdi32's client-side validity check indexes
+// `GdiSharedHandleTable[handle & 0xffff]` (0x18-byte GDI_TABLE_ENTRY each — KernelData@0, ProcessId@8,
+// Type@0xc, UserData@0x10; ntgdihdl.h). The base pointer is `PEB->GdiSharedHandleTable` (PEB+0xf8);
+// gdi32's `GdiProcessSetup` (RVA 0x1100) copies it into its cached global (gdi32 RVA 0x4e188). We
+// RO-map a full GDI_HANDLE_COUNT (0x10000) entry array so ANY handle&0xffff index is in-bounds (no
+// fault on the read), zero-initialized (a zero entry.Type mismatches the validity check → gdi32 takes
+// its `invalid handle` branch rather than a NULL-deref). Sits ABOVE the POOL client window
+// (0x9900_0000 + 8 MiB = 0x9980_0000) and below the NLS section (0xA000_0000).
+pub const GDI_SHARED_TABLE_VA: u64 = 0x0000_0000_9C00_0000;
+/// GDI handle count (ReactOS GDI_HANDLE_COUNT) — the index space of `handle & 0xffff`.
+pub const GDI_HANDLE_COUNT: u64 = 0x1_0000;
+/// sizeof(GDI_TABLE_ENTRY) on x64 (KernelData 8 + ProcessId/Type union 8 + UserData 8).
+pub const GDI_TABLE_ENTRY_SIZE: u64 = 0x18;
+/// Frames spanning the GDI table (0x10000 * 0x18 = 0x18_0000 = 1.5 MiB = 384 frames).
+pub const GDI_SHARED_TABLE_FRAMES: u64 = (GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE + 0xfff) / 0x1000;
+const _: () = assert!(GDI_SHARED_TABLE_VA + GDI_SHARED_TABLE_FRAMES * 0x1000 <= 0x0000_0000_A000_0000);
+const _: () = assert!(GDI_SHARED_TABLE_VA >= CSRSS_W32_POOL_VA + WIN32K_POOL_FRAMES * 0x1000);
+
 // USERCONNECT / SHAREDINFO x64 field offsets (references/reactos win32ss/include/ntuser.h): a
 // USERCONNECT is { ULONG ulVersion; ULONG ulCurrentVersion; DWORD dwDispatchCount; SHAREDINFO
 // siClient; } with siClient (8-byte aligned) at +0x10, and SHAREDINFO = { PSERVERINFO psi; PVOID

@@ -352,3 +352,22 @@ Four gate-verified tidy items on the executive (no rust-micro/src change; behavi
   client + seed `PEB->GdiSharedHandleTable`, (c) service the dialog's DC/font/brush GDI calls so
   `CreateWindowEx(#32770)` + `WM_INITDIALOG` complete. Multi-step win32k-GDI subsystem (analogue of the 185
   desktop-heap client-WINDOW mapping, for GDI objects).
+
+## DIALOG BATCH 3 (2026-07-20) — CLIENT-GDI HANDLE-TABLE MAPPING (in progress)
+Goal: land the client-side GDI mapping so IDD_LOGON's CreateWindowEx(#32770)+DC/font setup progress.
+Baseline: gate 186/98, RUNEXIT=3, paint 768/768 (HEAD fa293c4, verified). gdi32 base=0x800f0000,
+msgina base=0x82290000, user32=0x80150000.
+- [x] Fix #1 (interim, proven): `ldr_load_dll` (on_target.rs) seeds `[msgina_base+0x193c8]=msgina_base`
+      (hDllInstance) → FindResourceW(IDD_LOGON) resolves the template.
+- [x] Fix #2 (the real work): seed PEB->GdiSharedHandleTable (PEB+0xf8) at spawn (img_spawn.rs, pi==2)
+      BEFORE the loader → gdi32's GdiProcessSetup caches it (no direct gdi32-global patch needed) +
+      RO-map a zero-init 0x10000-entry GDI handle table into winlogon (win32k_glue
+      ::map_gdi_shared_handle_table_into_client @ GDI_SHARED_TABLE_VA=0x9C00_0000) from the pi==2 reassert.
+- [x] Boot: **gate 187/98, RUNEXIT=3, paint 768/768, 0 FAILs.** The msgina logon dialog now creates its
+      CASCADE (17 post-SAS-notify #32770 windows = dialog frame + Static/Edit/Button controls); winlogon
+      parks in the nested modal message pump (clean quiesce). New spec `exec_msgina_logon_dialog_created`.
+- [ ] NEXT (batch 4): the dialog is CREATED but not yet PAINTED — the zero-init GDI table returns
+      `invalid handle` for real DC/brush/font ops. To RENDER the credential box, seed the GDI table with
+      REAL entries for win32k's DC / system-font / dialog-brush objects (map win32k's real GDI objects
+      into the client like the window mapping). Also investigate win32k `Class not found` / `no suitable
+      PDEV` during the cascade.

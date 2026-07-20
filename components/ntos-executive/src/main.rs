@@ -1208,6 +1208,12 @@ pub(crate) static WINLOGON_KEY_OPENED_AT_INJECT: AtomicU64 = AtomicU64::new(0);
 /// msgina's real `GUILoggedOutSAS` (the `WlxLoggedOutSAS` body → the logon dialog path) executed. Drives
 /// `exec_winlogon_logged_out_sas`.
 pub(crate) static WINLOGON_LOGGED_OUT_SAS_RAN: AtomicU64 = AtomicU64::new(0);
+/// ★ DIALOG BATCH 3 — count of `NtUserCreateWindowEx(#32770)` (dialog-class) windows winlogon created
+/// AFTER `WlxLoggedOutSAS` ran (i.e. the msgina IDD_LOGON credential dialog + its child controls —
+/// Static labels, Edit fields, Buttons). Non-zero proves the logon dialog was CREATED client-side
+/// (the client-GDI handle-table mapping + hDllInstance-seed advance). Drives
+/// `exec_msgina_logon_dialog_created`.
+pub(crate) static WINLOGON_DIALOG_WINDOWS: AtomicU64 = AtomicU64::new(0);
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
 /// signalled, or the desktop paint. The service loop snapshots this at each iteration; if it runs a
@@ -4523,6 +4529,17 @@ static WIN32K_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Per-pi bit set once win32k's POOL arena has been RO-mapped into that GUI client's VSpace (the
 /// desktop-heap client-window mapping — makes the bound DESKTOPINFO client-readable).
 static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE TABLE. Frame-cap base of the GDI shared handle table (a
+/// `GDI_TABLE_ENTRY[GDI_HANDLE_COUNT]` array — client-side gdi32 validates every GDI handle through it,
+/// reached via `PEB->GdiSharedHandleTable`). In real Windows win32k allocates this from a GdiPool
+/// section + RO-maps it into every GUI process; our host allocates + zero-inits it once here, then
+/// RO-maps it into the client (`map_gdi_shared_handle_table_into_client`). 0 until allocated.
+static GDI_SHARED_TABLE_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+/// Per-pi bit set once the GDI shared handle table has been RO-mapped into that GUI client's VSpace.
+static GDI_SHARED_TABLE_MAPPED: AtomicU64 = AtomicU64::new(0);
+/// Latched (=1) the first time the executive seeds winlogon's PEB->GdiSharedHandleTable + gdi32's
+/// cached global with the client GDI handle-table VA (client-GDI mapping milestone). Read by the spec.
+pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// The BOOTBOOT framebuffer's frame-cap base + count (set in Phase 0a's `claim_device_pages`), so the
 /// win32k bring-up can copy_cap + map the SAME physical fb frames into win32k's VSpace at WIN32K_FB_VA
 /// (framebuf.dll's IOCTL_VIDEO_MAP_VIDEO_MEMORY reports that VA → framebuf writes pixels to the real fb).
@@ -8482,6 +8499,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         b"exec_winlogon_logged_out_sas",
         WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0
             && WINLOGON_LOGGED_OUT_SAS_RAN.load(Ordering::Relaxed) != 0,
+        &mut passed,
+    );
+
+    // ★ DIALOG BATCH 3 — PROOF the msgina IDD_LOGON credential dialog was CREATED client-side. Two
+    // walls fell this batch: (1) msgina's hDllInstance was NULL (its DllMain doesn't run on runtime
+    // LdrLoadDll) → FindResourceW(IDD_LOGON) missed → the dialog template never resolved. Interim fix:
+    // seed msgina's hDllInstance .data global (msgina RVA 0x193c8) at LdrLoadDll time (on_target.rs).
+    // (2) client-side gdi32 validates every GDI handle through GdiSharedHandleTable[handle&0xffff]
+    // (base = PEB->GdiSharedHandleTable, PEB+0xf8), which was NULL in winlogon → gdi32 NULL-deref at RVA
+    // 0x535a on the dialog's DC/font setup. Fix: seed PEB->GdiSharedHandleTable at spawn (img_spawn.rs)
+    // so gdi32's GdiProcessSetup caches it, + RO-map a real GDI handle table into winlogon
+    // (win32k_glue::map_gdi_shared_handle_table_into_client). With both, msgina's WlxLoggedOutSAS →
+    // WlxDialogBoxParam → DIALOG_CreateIndirect drives a CASCADE of NtUserCreateWindowEx (#32770) — the
+    // dialog frame + its child controls (Static labels, Edit fields, Buttons). WINLOGON_DIALOG_WINDOWS
+    // counts every #32770 window AFTER winlogon's own SAS-notify window (the first #32770) — i.e. the
+    // msgina dialog cascade (SAS notice + the IDD_LOGON credential dialog). Before this batch NO dialog
+    // window could be created (msgina's FindResource missed + gdi32 NULL-derefed); >=2 proves the
+    // client-GDI path now works and msgina's real dialog code creates windows. winlogon then parks in
+    // the nested modal message pump (blocked on credential input a headless host can't supply).
+    print_str(b"[winlogon] msgina dialog windows created (post-SAS-notify #32770): ");
+    print_u64(WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed));
+    print_str(b" (client GDI handle table mapped=");
+    print_u64(WINLOGON_GDI_MAPPED.load(Ordering::Relaxed));
+    print_str(b")\n");
+    check(
+        b"exec_msgina_logon_dialog_created",
+        WINLOGON_GDI_MAPPED.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) >= 2,
         &mut passed,
     );
 

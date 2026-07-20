@@ -1828,6 +1828,19 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 return 0xC000_0135; // STATUS_DLL_NOT_FOUND
             }
             table.insert(dep, loaded);
+            // ★ DIALOG BATCH 3 — INTERIM hDllInstance seed for msgina. msgina is loaded at RUNTIME by
+            // winlogon's LoadGina→LoadLibraryW("msgina.dll"); this LdrLoadDll driver maps+snaps+threads
+            // PEB->Ldr but does NOT run the module's DLL_PROCESS_ATTACH DllMain. msgina's user-DllMain
+            // stores `hDllInstance = hinstDLL` on ATTACH (msgina.dll RVA 0x6d4e:
+            // `mov [rip→RVA 0x193c8], rax`, the ONLY write to that .data global — disasm-verified). Without
+            // it, `pgContext->hDllInstance` stays NULL → WlxDialogBoxParam→FindResourceW(NULL→the EXE,
+            // IDD_LOGON) misses → the logon dialog never resolves its template. Seed it directly here (the
+            // exact value the real DllMain would write = the module's own base). This stands in for
+            // "run DllMains on runtime LdrLoadDll" — a tracked ntdll-loader follow-up that currently
+            // cascades into a win32k desktop issue (batch-2), so this surgical seed is the interim.
+            if dep == b"msgina" {
+                unsafe { core::ptr::write_unaligned((loaded + 0x193c8) as *mut u64, loaded) };
+            }
             // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
             let ntdll_base = table.find(b"ntdll");
             let mut out = SnapResult::default();

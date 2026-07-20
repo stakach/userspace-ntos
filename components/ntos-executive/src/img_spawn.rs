@@ -489,6 +489,21 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0xA0) as *mut u64, NLS_SMSS_ANSI_VA);
         core::ptr::write_volatile((scr + 0x1000 + 0xA8) as *mut u64, NLS_SMSS_OEM_VA);
         core::ptr::write_volatile((scr + 0x1000 + 0xB0) as *mut u64, NLS_SMSS_CASE_VA);
+        // ★ DIALOG BATCH 3 — PEB->GdiSharedHandleTable (x64 PEB+0xf8). Client-side gdi32's
+        // GdiProcessSetup (gdi32 RVA 0x1100, run once from GdiDllInitialize/DllMain at process init)
+        // copies PEB+0xf8 into its cached global (gdi32 RVA 0x4e188); every later GDI-handle validity
+        // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
+        // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
+        // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
+        // table base on its only run. Gated to winlogon (pi 2 — the interactive GUI client); the table
+        // frames are RO-mapped into winlogon lazily in service_sec_image's pi==2 reassert block. Other
+        // processes never touch GDI so seeding is unnecessary (and would map an unused 1.5 MiB table).
+        if pi == 2 {
+            core::ptr::write_volatile(
+                (scr + 0x1000 + 0xf8) as *mut u64,
+                win32k_subsystem::GDI_SHARED_TABLE_VA,
+            );
+        }
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
         // Share the NLS tables (read off disk into the shared buffers at storage bring-up) into
         // smss at their own page table (the 0xE0_0000 2 MiB region covers all three).

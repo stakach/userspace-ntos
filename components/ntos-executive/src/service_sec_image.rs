@@ -3466,6 +3466,20 @@ pub(crate) unsafe fn service_sec_image(
                         core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
                         core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, 0); // ulClientDelta
                     }
+                    // ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE-TABLE MAPPING. The msgina logon dialog's
+                    // CreateWindowEx(#32770) → DC/font setup makes client-side gdi32 validate GDI handles
+                    // through `GdiSharedHandleTable[handle & 0xffff]` (base = PEB->GdiSharedHandleTable,
+                    // seeded at spawn in img_spawn.rs). RO-map the (executive-allocated, zero-init) GDI
+                    // handle table into winlogon so the index read at gdi32 RVA 0x535a lands in mapped
+                    // memory instead of NULL-derefing. One-time (per-pi guarded). PEB+0xf8 was already
+                    // seeded pre-loader so gdi32's GdiProcessSetup cached this same VA. Latch the milestone.
+                    let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
+                    if WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                        print_str(b"[wl-main] winlogon client GDI handle table mapped @0x");
+                        print_hex((gdi_va >> 32) as u32);
+                        print_hex(gdi_va as u32);
+                        print_str(b" (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                    }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
                 // SSN_INIT_DESKTOP_GFX scaffold here: win32k's own NtUserInitialize (0x125a) dispatch
@@ -3489,10 +3503,23 @@ pub(crate) unsafe fn service_sec_image(
                     // returns a real HWND. Winlogon then runs THROUGH: UserSetLogonNotifyWindow (0x127c) +
                     // UnregisterClass (0x10bf) = InitializeSAS COMPLETE. Record the HWND milestone here.
                     if pi == 2 && m0 == 0x1077 && st != 0 {
-                        WINLOGON_SAS_MILESTONE.store(1, Ordering::Relaxed);
-                        print_str(b"[wl-main] winlogon created SAS window (NtUserCreateWindowEx 0x1077 -> HWND 0x");
-                        print_hex(st as u32);
-                        print_str(b")\n");
+                        // ★ DIALOG BATCH 3 — the FIRST #32770 window is winlogon's SAS-notify window
+                        // (sets the milestone below). EVERY subsequent #32770 (milestone already set) is
+                        // part of the msgina IDD_LOGON credential dialog cascade: WlxDialogBoxParam →
+                        // DIALOG_CreateIndirect creates the dialog frame + its child controls (Static
+                        // labels, Edit fields, Buttons). Note the dialog windows are created BEFORE the
+                        // executive detects WlxLoggedOutSAS-ran (that's a later Winlogon-key reopen), so
+                        // gate on the SAS-milestone, not LOGGED_OUT_SAS_RAN. The client-GDI handle-table
+                        // mapping + hDllInstance seed are what let CreateWindowEx get this far.
+                        if WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0 {
+                            WINLOGON_DIALOG_WINDOWS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            // The SAS-notify window milestone (unchanged behavior).
+                            WINLOGON_SAS_MILESTONE.store(1, Ordering::Relaxed);
+                            print_str(b"[wl-main] winlogon created SAS window (NtUserCreateWindowEx 0x1077 -> HWND 0x");
+                            print_hex(st as u32);
+                            print_str(b")\n");
+                        }
                     }
                     // ★ BATCH 45 — QUIESCE at the InitializeSAS-complete milestone. `UserSetLogonNotifyWindow`
                     // (0x127c) is winlogon's DEFINING final interactive step: it registers its logon-notify
