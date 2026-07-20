@@ -2,19 +2,19 @@
 
 Status: **PHASE 2A implemented; PHASE 2B controlled api7 reverse transition implemented and
 gate-verified; Phase 3 bounded continuation + re-entrant component transport foundation
-implemented and gate-verified; api0 frame/layout/rebase primitives are host-tested, but the first
-live api0 candidate exposed a wider nested-syscall sequence and its runtime experiment was
-reverted**. Author target: the
+implemented and gate-verified; Phase 3B real api0 `WM_CREATE` marshalling, bounded nested dispatch,
+and SSN-22 return are implemented and gate-verified**. Author target: the
 executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
 Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
 executive callback rendezvous while preserving the synthetic reply policy. Phase 2B completes a
 controlled real api7 client roundtrip, then preserves the original api0 request's synthetic
 completion. The Phase-3 foundation replaces the callback `Call` with a Send + explicit component
 receive loop, so the sole win32k TCB can accept nested dispatches while a callback is parked. General
-api0 callbacks still await client-buffer marshalling and live nested-dispatch correlation.
+api0 callbacks still need per-callback sequence/marshalling policy, but the first real WINDOWPROC
+roundtrip is live.
 The IDD_LOGON logon dialog
-is *created* (17 `#32770` windows) but never *painted* because its `WM_PAINT` is never
-dispatched to the control procs.
+is *created* (16 `#32770` windows in the current gate) but never *painted* because its `WM_PAINT`
+is never dispatched to the control procs.
 
 ## 0. Why
 
@@ -212,8 +212,8 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
 | Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ Phase 3 foundation: alternating dispatch/callback frames, correlation-tested and api7-wired |
-| win32k **nested-dispatch** / re-entrant component transport (3b) | △ Phase 3 foundation: callback Send + component receive/recursive-dispatch seam is live; real nested api0 not yet wired |
-| **buffer marshalling** in/out across VSpaces (client-visible only) | △ exact api0 frame, bounded stack layout, and embedded-reference rebase are host-tested; runtime wiring reverted after the first live candidate exceeded its syscall bound |
+| win32k **nested-dispatch** / re-entrant component transport (3b) | ✅ Phase 3B: bounded SAS `WM_CREATE` sequence is live and correlation/gate-verified |
+| **buffer marshalling** in/out across VSpaces (client-visible only) | ✅ Phase 3B controlled api0: exact frame, bounded stack copy, embedded-reference scrub/rebase, and output copy-back are live and host/gate-tested |
 
 `KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
 Phase 2A created the interception substrate with a fixed shared frame and callback rendezvous. The
@@ -287,9 +287,9 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   in its explicit receive loop. `component_pump` services the rendezvous while the outer dispatch is
   active, performs the previous zero-init / input-preserving WINDOWPROC policy, and resumes it. The
   WINDOWPROC marshaller represents ReactOS's appended `Arguments+0x40` lParam copy as a validated
-  payload offset. The synthetic path consumes the offset, but the component-local pointer remains
-  in the copied argument today; a real redirect must scrub it at the transport boundary and rebase
-  the `lParam` field to the client-visible copy before user32 runs. The
+  payload offset. Phase 3B scrubs the component-local pointer at the transport boundary, rebases the
+  `lParam` field to the client-visible stack copy before user32 runs, and scrubs it again on the
+  copied reply. The
   first live winlogon api=0 request logs the real `PEB+0x58` pointer and loaded Rust ntdll
   `KiUserCallbackDispatcher` address/RVA. No client registers are changed and no continuation is
   installed. The live acceptance run serviced 114 rendezvous (112 winlogon api=0), observed
@@ -348,34 +348,43 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   one real api7 redirect/return, continuation pushes=2/unwinds=2, 768/768 paint, 188/99 checks, and
   `[microtest done]` with no FAIL lines.
 
-- **Phase 3B — nesting + real WINDOWPROC callbacks (first live attempt diagnosed and reverted).** Finish per-thread callback storage +
-  win32k nested-dispatch stack + re-entrant `component_pump`. Move callback index 0 here, including
-  `WM_NCCREATE` and `WM_CREATE`: the SAS paths issue nested `NtUserDefSetText` and
-  `NtUserSetWindowLongPtr`, respectively. Prove with a real `WndProc` callback that its nested
-  syscall re-enters win32k while the outer dispatch is suspended, returns, and unwinds correctly.
-  The first controlled candidate was **SAS `WM_CREATE`**, not `WM_NCCREATE`: its application proc does
+- **Phase 3B — nesting + real WINDOWPROC callbacks (implemented).** The per-thread continuation
+  stack and re-entrant `component_pump` now run callback index 0 for one bounded SAS `WM_CREATE`.
+  Broader expansion still includes `WM_NCCREATE` and other WINDOWPROC callbacks: the SAS
+  `WM_NCCREATE` and `WM_CREATE` paths issue nested `NtUserDefSetText` and
+  `NtUserSetWindowLongPtr`, respectively. The live `WM_CREATE` proves that a real `WndProc`
+  callback can re-enter win32k while the outer dispatch is suspended, return, and unwind correctly.
+  The first controlled candidate is **SAS `WM_CREATE`**, not `WM_NCCREATE`: its application proc does
   a client-side `GetWindowLongPtr`, then nested `NtUserSetWindowLongPtr` (SSN `0x1298`)
   for `GWLP_USERDATA`; that kernel branch directly updates `WND.dwUserData` and does not callback.
   It is **not** a one-syscall callback in the boot configuration actually observed. After setting
   `GWLP_USERDATA`, `GetSetupType()` returned zero and `SASWindowProc` entered `RegisterHotKeys`,
   whose source contains up to four `RegisterHotKey` calls (SSN `0x126b`).
   `WM_NCCREATE` enters `DefWindowProc -> NtUserDefSetText` (SSN `0x1080`) and is the broader path.
-  Before enabling the candidate, marshal the complete api0 payload into winlogon's VSpace, copy the
-  SSN-22 output back into the shared reply, and preserve the parked callback frame while the nested
+  The implementation marshals the complete api0 payload into winlogon's VSpace, copies the
+  SSN-22 output back into the shared reply, and preserves the parked callback frame while the nested
   dispatch temporarily uses the shared request fields.
 
-  The single serialized Phase-3B experiment proved the following exact prefix before being stopped:
+  The first serialized experiment proved the following exact prefix before being stopped:
   the selected `WM_CREATE` payload length was `0xca`; the client entered real `apfnDispatch[0]`;
   nested `0x1298` completed with result `0x00c15bc0`; then nested `0x126b`
   (`NtUserRegisterHotKey`) arrived. The experiment deliberately allowed only `0x1298`, so it
   rejected `0x126b` with `STATUS_INVALID_PARAMETER` and winlogon parked before SSN 22. There was no
-  api0-return gate. All runtime changes were therefore reverted; only the generic exact-frame,
-  bounded stack-placement, and embedded-pointer-rebase helpers/tests remain.
+  api0-return gate. That runtime experiment was reverted before the sequence was expanded.
 
-  Before another QEMU run, audit the complete `NtUserRegisterHotKey` kernel path for callbacks and
-  define a bounded expected sequence (`0x1298`, followed by one to four `0x126b` calls) or choose a
-  genuinely syscall-free callback. Add sequence-state validation rather than a broad nested-syscall
-  allowlist, then restore the runtime wiring and require SSN 22 plus exact push/unwind counts.
+  The follow-up source audit found `NtUserRegisterHotKey` is bounded and non-callbacking: it validates
+  flags/window ownership, scans the hotkey list, allocates one `HOT_KEY`, links it, and returns while
+  holding/releasing the USER lock entirely inside the nested syscall. `RegisterHotKeys` makes one
+  mandatory registration followed by three optional registrations. The executive therefore uses
+  an exact sequence state, not a broad allowlist: one `0x1298`, then one through four `0x126b`, with
+  every other SSN, wrong order, fifth hotkey, or premature SSN 22 rejected.
+
+  The green serialized acceptance run observed the full four-hotkey path: payload `0xca`, one real
+  api0 redirect/return, nested `0x1298` once, nested `0x126b` four times, sequence completion once,
+  and continuation pushes/unwinds `7/7`. The component then completed the remaining callbacks and
+  restored the original client context. `exec_user_callback_real_api0_nested_roundtrip` passed,
+  desktop paint remained `768/768`, the summary remained `188/99`, and `[microtest done]` completed
+  with no FAIL lines.
 - **Phase 4 — `WM_PAINT` → the login box renders.** With the machinery real, drive the dialog's
   `WM_PAINT`/`WM_ERASEBKGND`/`WM_INITDIALOG` to the control procs via the callback; the procs'
   `BeginPaint → GetDC/GetStockObject/GetSysColorBrush/FillRect/DrawTextW` first exercise the

@@ -8454,6 +8454,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         callback_real_returns,
         callback_continuation_pushes,
         callback_continuation_unwinds,
+        callback_nested_dispatches,
+        callback_nested_ssn_1298,
+        callback_nested_ssn_126b,
+        callback_sequence_completions,
     ) = win32k_glue::user_callback_proofs();
     print_str(b"[user-callback] rendezvous=");
     print_u64(callback_rendezvous);
@@ -8461,22 +8465,34 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(callback_winlogon_api0);
     print_str(b" table-nonzero-aligned=");
     print_u64(callback_table_valid);
-    print_str(b" real-api7-redirects=");
+    print_str(b" real-api0-redirects=");
     print_u64(callback_real_redirects);
-    print_str(b" real-api7-returns=");
+    print_str(b" real-api0-returns=");
     print_u64(callback_real_returns);
     print_str(b" continuation-pushes=");
     print_u64(callback_continuation_pushes);
     print_str(b" continuation-unwinds=");
     print_u64(callback_continuation_unwinds);
+    print_str(b" nested-dispatches=");
+    print_u64(callback_nested_dispatches);
+    print_str(b" nested-ssn-1298=");
+    print_u64(callback_nested_ssn_1298);
+    print_str(b" nested-ssn-126b=");
+    print_u64(callback_nested_ssn_126b);
+    print_str(b" sequence-completions=");
+    print_u64(callback_sequence_completions);
     print_str(b"\n");
     check(
-        b"exec_user_callback_real_api7_roundtrip",
+        b"exec_user_callback_real_api0_nested_roundtrip",
         callback_table_valid != 0
             && callback_real_redirects == 1
             && callback_real_returns == 1
-            && callback_continuation_pushes == 2
-            && callback_continuation_unwinds == 2,
+            && callback_nested_ssn_1298 == 1
+            && (1..=4).contains(&callback_nested_ssn_126b)
+            && callback_nested_dispatches == 1 + callback_nested_ssn_126b
+            && callback_continuation_pushes == callback_nested_dispatches + 2
+            && callback_continuation_unwinds == callback_nested_dispatches + 2
+            && callback_sequence_completions == 1,
         &mut passed,
     );
 

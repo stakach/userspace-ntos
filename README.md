@@ -127,8 +127,8 @@ executive's success sentinel; `run.sh` then prints a clear verdict:
 ```
   PASS exec_win32k_desktop_painted
 [ntos-exec] desktop-bg match 768/768 px, px0=0x003a6ea5 (expected 0x003a6ea5)
-[user-callback] rendezvous=119 winlogon-api0=117 table-nonzero-aligned=1 real-api7-redirects=1 real-api7-returns=1
-  PASS exec_user_callback_real_api7_roundtrip
+[user-callback] rendezvous=119 winlogon-api0=117 table-nonzero-aligned=1 real-api0-redirects=1 real-api0-returns=1 continuation-pushes=7 continuation-unwinds=7 nested-dispatches=5 nested-ssn-1298=1 nested-ssn-126b=4 sequence-completions=1
+  PASS exec_user_callback_real_api0_nested_roundtrip
 [ntos-exec summary: 188/99 executive->isolated-service checks passed]
 [microtest done]
 SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5).

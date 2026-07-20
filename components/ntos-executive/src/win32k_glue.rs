@@ -5,6 +5,9 @@
 #![allow(clippy::all)]
 use crate::*;
 
+const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
+const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
+
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
@@ -13,6 +16,10 @@ static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_NESTED_SSN_126B: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_SEQUENCE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_PHASE: AtomicU64 =
     AtomicU64::new(nt_user_callback::ControlledTransitionPhase::Idle as u64);
@@ -27,6 +34,8 @@ static mut USER_CALLBACK_REQUEST: nt_user_callback::CallbackHeader =
 static mut USER_CALLBACK_SAVED_REGS: [u64; 20] = [0; 20];
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
+static mut USER_CALLBACK_SAS_SEQUENCE: nt_user_callback::SasWmCreateNestedSequence =
+    nt_user_callback::SasWmCreateNestedSequence::new();
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum UserCallbackDisposition {
@@ -42,7 +51,7 @@ pub(crate) struct Win32kClientContext {
     pub peb_mirror: u64,
 }
 
-pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64) {
+pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         USER_CALLBACK_RENDEZVOUS.load(Ordering::Relaxed),
         USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed),
@@ -51,7 +60,79 @@ pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64) {
         USER_CALLBACK_REAL_RETURNS.load(Ordering::Relaxed),
         USER_CALLBACK_CONTINUATION_PUSHES.load(Ordering::Relaxed),
         USER_CALLBACK_CONTINUATION_UNWINDS.load(Ordering::Relaxed),
+        USER_CALLBACK_NESTED_DISPATCHES.load(Ordering::Relaxed),
+        USER_CALLBACK_NESTED_SSN_1298.load(Ordering::Relaxed),
+        USER_CALLBACK_NESTED_SSN_126B.load(Ordering::Relaxed),
+        USER_CALLBACK_SEQUENCE_COMPLETIONS.load(Ordering::Relaxed),
     )
+}
+
+pub(crate) unsafe fn begin_nested_user_callback_dispatch(
+    client: Win32kClientContext,
+    dispatch_id: u64,
+    ssn: u64,
+) -> Option<bool> {
+    if USER_CALLBACK_PHASE.load(Ordering::Acquire)
+        != nt_user_callback::ControlledTransitionPhase::ClientRedirected as u64
+    {
+        return Some(false);
+    }
+    if USER_CALLBACK_CLIENT_PI.load(Ordering::Relaxed) != client.pi as u64
+        || USER_CALLBACK_CLIENT_BADGE.load(Ordering::Relaxed) != client.badge
+        || USER_CALLBACK_CLIENT_TID.load(Ordering::Relaxed) != client.tid
+    {
+        return None;
+    }
+    let mut sequence = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_SAS_SEQUENCE));
+    if sequence.accept(ssn).is_err() {
+        print_str(b"[user-callback] rejected nested api0 sequence ssn=0x");
+        print_hex(ssn as u32);
+        print_str(b"\n");
+        return None;
+    }
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    if stack.push_dispatch(identity, dispatch_id).is_err() {
+        return None;
+    }
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_SAS_SEQUENCE), sequence);
+    USER_CALLBACK_CONTINUATION_PUSHES.fetch_add(1, Ordering::Relaxed);
+    USER_CALLBACK_NESTED_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    USER_CALLBACK_NESTED_SSN_1298.fetch_add(
+        (ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN) as u64,
+        Ordering::Relaxed,
+    );
+    USER_CALLBACK_NESTED_SSN_126B.fetch_add(
+        (ssn == nt_user_callback::NTUSER_REGISTER_HOT_KEY_SSN) as u64,
+        Ordering::Relaxed,
+    );
+    print_str(b"[user-callback] nested win32k dispatch ssn=0x");
+    print_hex(ssn as u32);
+    print_str(b" pushed above api0 callback\n");
+    Some(true)
+}
+
+pub(crate) unsafe fn complete_nested_user_callback_dispatch(
+    client: Win32kClientContext,
+    dispatch_id: u64,
+) -> bool {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    if stack.complete_dispatch(identity, dispatch_id).is_err() {
+        return false;
+    }
+    USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn write_synthetic_callback_reply(request: nt_user_callback::CallbackHeader) {
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *mut nt_user_callback::CallbackFrame;
+    let mut reply = request;
+    reply.state = nt_user_callback::CallbackState::Reply as u32;
+    reply.output_length = request.output_capacity;
+    reply.status = 0;
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
 }
 
 unsafe fn begin_controlled_continuation(request: nt_user_callback::CallbackHeader) -> bool {
@@ -142,13 +223,26 @@ pub(crate) unsafe fn service_user_callback(
     USER_CALLBACK_RENDEZVOUS.fetch_add(1, Ordering::Relaxed);
 
     let output_capacity = request.output_capacity as usize;
+    let winlogon_api0_ordinal = if request.api_index == 0 && client.pi == 2 {
+        USER_CALLBACK_WINLOGON_API0.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        0
+    };
+    let window_message =
+        if request.api_index == 0 && request.input_length as usize >= WPCA_RESULT + 8 {
+            callback_payload_u32(frame, WPCA_MSG)
+        } else {
+            u32::MAX
+        };
+    let sas_session_before = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+    );
     if request.api_index == 0 {
-        USER_CALLBACK_WINLOGON_API0.fetch_add((client.pi == 2) as u64, Ordering::Relaxed);
         for offset in request.input_length as usize..output_capacity {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
         }
         if request.input_length as usize >= WPCA_RESULT + 8 {
-            let msg = callback_payload_u32(frame, WPCA_MSG);
+            let msg = window_message;
             let result = if msg == 0x0083 { 0 } else { 1 };
             callback_payload_write_u64(frame, WPCA_RESULT, result);
 
@@ -200,7 +294,7 @@ pub(crate) unsafe fn service_user_callback(
             }
             print_str(b"[user-callback] WINDOWPROC api=0 msg=0x");
             print_hex(msg);
-            print_str(b" -> synthetic Result=");
+            print_str(b" -> fallback Result=");
             print_u64(result);
             print_str(b" via rendezvous\n");
         }
@@ -211,10 +305,7 @@ pub(crate) unsafe fn service_user_callback(
     }
 
     let mut suspend_component = false;
-    if client.pi == 2
-        && request.api_index == 0
-        && USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed) == 1
-    {
+    if client.pi == 2 && request.api_index == 0 {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -223,22 +314,29 @@ pub(crate) unsafe fn service_user_callback(
         let dispatcher_rva = crate::img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.load(Ordering::Relaxed);
         let dispatcher = if dispatcher_rva == 0 { 0 } else { crate::NTDLL_BASE + dispatcher_rva };
         let valid = callback_table != 0 && callback_table & 7 == 0;
-        USER_CALLBACK_TABLE_VALID.fetch_add(valid as u64, Ordering::Relaxed);
-        print_str(b"[user-callback] first winlogon api=0 pi=2 badge=");
-        print_u64(client.badge);
-        print_str(b" tid=");
-        print_u64(client.tid);
-        print_str(b" PEB+0x58 table=0x");
-        print_hex((callback_table >> 32) as u32);
-        print_hex(callback_table as u32);
-        print_str(if valid { b" (nonzero, aligned)" } else { b" (INVALID)" });
-        print_str(b" Rust-ntdll!KiUserCallbackDispatcher=0x");
-        print_hex((dispatcher >> 32) as u32);
-        print_hex(dispatcher as u32);
-        print_str(b" RVA=0x");
-        print_hex(dispatcher_rva as u32);
-        print_str(b"\n");
-        if valid
+        if winlogon_api0_ordinal == 1 {
+            USER_CALLBACK_TABLE_VALID.fetch_add(valid as u64, Ordering::Relaxed);
+            print_str(b"[user-callback] first winlogon api=0 pi=2 badge=");
+            print_u64(client.badge);
+            print_str(b" tid=");
+            print_u64(client.tid);
+            print_str(b" PEB+0x58 table=0x");
+            print_hex((callback_table >> 32) as u32);
+            print_hex(callback_table as u32);
+            print_str(if valid { b" (nonzero, aligned)" } else { b" (INVALID)" });
+            print_str(b" Rust-ntdll!KiUserCallbackDispatcher=0x");
+            print_hex((dispatcher >> 32) as u32);
+            print_hex(dispatcher as u32);
+            print_str(b" RVA=0x");
+            print_hex(dispatcher_rva as u32);
+            print_str(b"\n");
+        }
+        if window_message == 0x0001
+            && sas_session_before == 0
+            && request.payload_reference_offset == WINDOWPROC_PAYLOAD_OFFSET
+            && request.input_length >= 0x40 + 0x50
+            && USER_CALLBACK_REAL_REDIRECTS.load(Ordering::Relaxed) == 0
+            && valid
             && dispatcher != 0
             && USER_CALLBACK_PHASE.load(Ordering::Acquire)
                 == nt_user_callback::ControlledTransitionPhase::Idle as u64
@@ -250,23 +348,24 @@ pub(crate) unsafe fn service_user_callback(
             USER_CALLBACK_CLIENT_PEB.store(client.peb_mirror, Ordering::Relaxed);
             USER_CALLBACK_DISPATCHER.store(dispatcher, Ordering::Relaxed);
             core::ptr::write_volatile(core::ptr::addr_of_mut!(USER_CALLBACK_REQUEST), request);
+            core::ptr::write(
+                core::ptr::addr_of_mut!(USER_CALLBACK_SAS_SEQUENCE),
+                nt_user_callback::SasWmCreateNestedSequence::new(),
+            );
             suspend_component = true;
+            print_str(b"[user-callback] selected first SAS WM_CREATE for real api0 dispatch\n");
         }
     }
 
-    let mut reply = request;
-    reply.state = nt_user_callback::CallbackState::Reply as u32;
-    reply.output_length = request.output_capacity;
-    reply.status = 0;
-    core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
     if suspend_component {
         USER_CALLBACK_PHASE.store(
             nt_user_callback::ControlledTransitionPhase::ComponentSuspended as u64,
             Ordering::Release,
         );
-        print_str(b"[user-callback] B component continuation parked on REPLY_W32\n");
+        print_str(b"[user-callback] B component continuation parked in callback receive loop\n");
         Some(UserCallbackDisposition::SuspendComponent)
     } else {
+        write_synthetic_callback_reply(request);
         Some(UserCallbackDisposition::ReplyImmediately)
     }
 }
@@ -319,13 +418,42 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
 
     let mut saved = [0u64; 20];
     tcb_read_regs20(tcb, &mut saved);
-    let Some(callback_sp) = saved[nt_user_callback::USER_CONTEXT_RSP]
-        .checked_sub(core::mem::size_of::<nt_user_callback::UserCalloutFrame>() as u64)
-        .map(|sp| sp & !0xf)
-    else {
+    let request = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_REQUEST));
+    let Ok(layout) = nt_user_callback::UserCallbackStackLayout::below(
+        saved[nt_user_callback::USER_CONTEXT_RSP],
+        request.input_length as usize,
+    ) else {
         return false;
     };
-    let frame = nt_user_callback::UserCalloutFrame::client_thread_startup(
+    if request.input_length != 0 {
+        let shared = (win32k_subsystem::WIN32K_SHARED_VADDR
+            + win32k_subsystem::SH_USER_CALLBACK
+            + core::mem::size_of::<nt_user_callback::CallbackHeader>() as u64)
+            as *const u8;
+        let input = core::slice::from_raw_parts(shared, request.input_length as usize);
+        if !crate::img_spawn::smss_copyout(layout.input_pointer, input) {
+            return false;
+        }
+    }
+    if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+        let Ok(reference) = nt_user_callback::client_payload_reference(
+            layout.input_pointer,
+            request.input_length as usize,
+            request.payload_reference_offset,
+        ) else {
+            return false;
+        };
+        if !crate::img_spawn::smss_copyout(
+            layout.input_pointer + WINDOWPROC_LPARAM_OFFSET,
+            &reference.to_le_bytes(),
+        ) {
+            return false;
+        }
+    }
+    let frame = nt_user_callback::UserCalloutFrame::callback(
+        layout.input_pointer,
+        request.input_length,
+        request.api_index,
         outer_resume_ip,
         outer_rsp,
         outer_flags as u32,
@@ -334,13 +462,14 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
         core::ptr::addr_of!(frame) as *const u8,
         core::mem::size_of::<nt_user_callback::UserCalloutFrame>(),
     );
-    if !crate::img_spawn::smss_copyout(callback_sp, frame_bytes) {
+    if !crate::img_spawn::smss_copyout(layout.frame_pointer, frame_bytes) {
         return false;
     }
 
     core::ptr::write_volatile(core::ptr::addr_of_mut!(USER_CALLBACK_SAVED_REGS), saved);
     USER_CALLBACK_OUTER_RESUME_IP.store(outer_resume_ip, Ordering::Relaxed);
-    let redirected = nt_user_callback::callback_redirect_context(&saved, dispatcher, callback_sp);
+    let redirected =
+        nt_user_callback::callback_redirect_context(&saved, dispatcher, layout.frame_pointer);
     let error = tcb_write_regs20(tcb, &redirected, false);
     if error != 0 {
         print_str(b"[user-callback] client redirect TCB_WriteRegisters failed error=");
@@ -353,7 +482,9 @@ pub(crate) unsafe fn begin_controlled_user_callback_redirect(
         Ordering::Release,
     );
     USER_CALLBACK_REAL_REDIRECTS.fetch_add(1, Ordering::Relaxed);
-    print_str(b"[user-callback] A client redirected to real apfnDispatch[7]\n");
+    print_str(b"[user-callback] A client redirected to real apfnDispatch[0] payload=0x");
+    print_hex(request.input_length);
+    print_str(b" bytes\n");
     true
 }
 
@@ -397,6 +528,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
         return (0xC000_0001u32 as i32, false);
     }
     let request = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_REQUEST));
+    write_synthetic_callback_reply(request);
     if !unwind_controlled_callback(request) {
         *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
             nt_user_callback::ContinuationStack::new();
@@ -426,13 +558,42 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         || USER_CALLBACK_CLIENT_PI.load(Ordering::Relaxed) != client_pi as u64
         || USER_CALLBACK_CLIENT_BADGE.load(Ordering::Relaxed) != client_badge
         || USER_CALLBACK_CLIENT_TID.load(Ordering::Relaxed) != client_tid
-        || result_pointer != 0
-        || result_length != 0
         || callback_status as u32 != 0
     {
         return false;
     }
     let request = core::ptr::read_volatile(core::ptr::addr_of!(USER_CALLBACK_REQUEST));
+    if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+        let sequence = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_SAS_SEQUENCE));
+        if !sequence.can_complete() {
+            print_str(b"[user-callback] rejected SSN 22 before SAS nested sequence completed\n");
+            return false;
+        }
+        if result_pointer == 0
+            || result_length != request.input_length as u64
+            || result_length > request.output_capacity as u64
+        {
+            return false;
+        }
+        let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+            as *mut nt_user_callback::CallbackFrame;
+        let output = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!((*frame).payload) as *mut u8,
+            result_length as usize,
+        );
+        if !crate::img_spawn::smss_copyin(result_pointer, output) {
+            return false;
+        }
+        callback_payload_write_u64(frame, WINDOWPROC_LPARAM_OFFSET as usize, 0);
+        let mut reply = request;
+        reply.state = nt_user_callback::CallbackState::Reply as u32;
+        reply.output_length = result_length as u32;
+        reply.status = callback_status as i32;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
+        USER_CALLBACK_SEQUENCE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+    } else if result_pointer != 0 || result_length != 0 {
+        return false;
+    }
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *const nt_user_callback::CallbackFrame;
     let reply = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
@@ -448,7 +609,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         nt_user_callback::ControlledTransitionPhase::CallbackReturned as u64,
         Ordering::Release,
     );
-    print_str(b"[user-callback] A apfnDispatch[7] returned; resuming B component\n");
+    print_str(
+        b"[user-callback] A real api0 returned payload through SSN 22; resuming B component\n",
+    );
     let component = resume_suspended_user_callback_component();
     if !component.completed || component.callback_suspended {
         *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
@@ -1005,11 +1168,20 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     w32_client_attach(client_pi);
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
+        Some(nested) => nested,
+        None => {
+            print_str(b"[user-callback] rejected uncorrelated nested win32k dispatch\n");
+            return (0xC000_000Du32 as i32, false);
+        }
+    };
     let callback_frame = (sh + win32k_subsystem::SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
-    core::ptr::write_volatile(
-        core::ptr::addr_of_mut!((*callback_frame).header),
-        nt_user_callback::CallbackHeader::idle(dispatch_id, client.pi, client.tid, client.badge),
-    );
+    if !nested_user_callback {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*callback_frame).header),
+            nt_user_callback::CallbackHeader::idle(dispatch_id, client.pi, client.tid, client.badge),
+        );
+    }
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *mut u64, ssn);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
@@ -1066,6 +1238,14 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
+    if nested_user_callback
+        && (!pr.completed
+            || pr.callback_suspended
+            || !complete_nested_user_callback_dispatch(client, dispatch_id))
+    {
+        print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
+        return (pr.status, false);
+    }
     (pr.status, pr.completed)
 }
 

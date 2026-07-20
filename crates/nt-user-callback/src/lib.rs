@@ -118,6 +118,52 @@ pub const STATUS_PENDING: i32 = 0x0000_0103;
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 /// ReactOS `USER32_CALLBACK_WINDOWPROC` / `apfnDispatch[0]`.
 pub const USER32_CALLBACK_WINDOWPROC: u32 = 0;
+pub const NTUSER_SET_WINDOW_LONG_PTR_SSN: u64 = 0x1298;
+pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SasWmCreateNestedSequence {
+    set_window_long_ptr_seen: bool,
+    register_hot_key_count: u8,
+}
+
+impl SasWmCreateNestedSequence {
+    pub const fn new() -> Self {
+        Self {
+            set_window_long_ptr_seen: false,
+            register_hot_key_count: 0,
+        }
+    }
+
+    pub fn accept(&mut self, ssn: u64) -> Result<(), ValidationError> {
+        if !self.set_window_long_ptr_seen {
+            if ssn != NTUSER_SET_WINDOW_LONG_PTR_SSN {
+                return Err(ValidationError::Sequence);
+            }
+            self.set_window_long_ptr_seen = true;
+            return Ok(());
+        }
+        if ssn != NTUSER_REGISTER_HOT_KEY_SSN || self.register_hot_key_count == 4 {
+            return Err(ValidationError::Sequence);
+        }
+        self.register_hot_key_count += 1;
+        Ok(())
+    }
+
+    pub const fn can_complete(self) -> bool {
+        self.set_window_long_ptr_seen && self.register_hot_key_count >= 1
+    }
+
+    pub const fn register_hot_key_count(self) -> u8 {
+        self.register_hot_key_count
+    }
+}
+
+impl Default for SasWmCreateNestedSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Hard bound for the alternating win32k-dispatch / user-callback continuation stack.
 ///
@@ -790,6 +836,43 @@ mod tests {
         assert_eq!(frame.api_index, USER32_CALLBACK_WINDOWPROC);
         assert_eq!(frame.machine_frame.rip, 0x1111);
         assert_eq!(frame.machine_frame.rsp, 0x2222);
+    }
+
+    #[test]
+    fn sas_wm_create_nested_sequence_accepts_one_to_four_hotkeys() {
+        for hot_key_count in 1..=4 {
+            let mut sequence = SasWmCreateNestedSequence::new();
+            assert!(!sequence.can_complete());
+            assert_eq!(sequence.accept(NTUSER_SET_WINDOW_LONG_PTR_SSN), Ok(()));
+            assert!(!sequence.can_complete());
+            for _ in 0..hot_key_count {
+                assert_eq!(sequence.accept(NTUSER_REGISTER_HOT_KEY_SSN), Ok(()));
+            }
+            assert!(sequence.can_complete());
+            assert_eq!(sequence.register_hot_key_count(), hot_key_count);
+        }
+    }
+
+    #[test]
+    fn sas_wm_create_nested_sequence_rejects_wrong_order_and_overflow() {
+        let mut sequence = SasWmCreateNestedSequence::new();
+        assert_eq!(
+            sequence.accept(NTUSER_REGISTER_HOT_KEY_SSN),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(sequence.accept(NTUSER_SET_WINDOW_LONG_PTR_SSN), Ok(()));
+        assert_eq!(
+            sequence.accept(NTUSER_SET_WINDOW_LONG_PTR_SSN),
+            Err(ValidationError::Sequence)
+        );
+        for _ in 0..4 {
+            assert_eq!(sequence.accept(NTUSER_REGISTER_HOT_KEY_SSN), Ok(()));
+        }
+        assert_eq!(
+            sequence.accept(NTUSER_REGISTER_HOT_KEY_SSN),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(sequence.accept(0x1080), Err(ValidationError::Sequence));
     }
 
     #[test]

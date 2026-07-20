@@ -2271,6 +2271,9 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
                     .is_some_and(|end| end <= input_len as usize)
             {
                 header.payload_reference_offset = 0x40;
+                for offset in 0x28..0x30 {
+                    write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
+                }
             }
         }
         for offset in input_len as usize..output_capacity {
