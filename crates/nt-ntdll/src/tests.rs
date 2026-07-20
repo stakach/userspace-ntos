@@ -11,7 +11,7 @@ use nt_syscall_abi::NT_SYSCALLS;
 fn stub_table_covers_all_required_nt_services() {
     let t = StubTable::new();
     assert_eq!(t.len(), NT_SYSCALLS.len());
-    assert_eq!(t.len(), 189);
+    assert_eq!(t.len(), 190);
     // Every shared-ABI entry has a stub resolving to the right SSN.
     for e in NT_SYSCALLS {
         let s = t.get(e.name).unwrap_or_else(|| panic!("missing stub {}", e.name));

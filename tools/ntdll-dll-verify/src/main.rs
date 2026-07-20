@@ -78,7 +78,7 @@ fn main() -> ExitCode {
         println!("       LdrpInitialize RVA = {:#x}", l.rva);
     }
 
-    // All 188 Nt* from the shared ABI must be exported.
+    // Every Nt* from the shared ABI must be exported.
     let mut missing = Vec::new();
     for e in NT_SYSCALLS {
         if !names.contains(e.name) {
@@ -95,14 +95,36 @@ fn main() -> ExitCode {
 
     // Spot-check the canonical few.
     for spot in [
+        "KiUserCallbackDispatcher",
+        "NtCallbackReturn",
         "NtClose",
         "NtCreateFile",
         "NtOpenFile",
         "NtDelayExecution",
         "NtWaitForSingleObject",
         "NtProtectVirtualMemory",
+        "ZwCallbackReturn",
     ] {
         check(names.contains(spot), &format!("export {spot}"));
+    }
+
+    let nt_callback_return = exports.iter().find(|e| e.name == "NtCallbackReturn");
+    let zw_callback_return = exports.iter().find(|e| e.name == "ZwCallbackReturn");
+    if let (Some(nt), Some(zw)) = (nt_callback_return, zw_callback_return) {
+        let image = pe.map(pe.image_base()).expect("map emitted ntdll");
+        let nt_stub = &image.bytes[nt.rva as usize..nt.rva as usize + 96];
+        let moves_rcx_to_r10 = nt_stub.starts_with(&[0x4c, 0x8b, 0xd1])
+            || nt_stub.starts_with(&[0x49, 0x89, 0xca]);
+        let trap_ssn = moves_rcx_to_r10
+            && nt_stub.get(3..8).is_some_and(|bytes| bytes == [0xb8, 22, 0, 0, 0])
+            && nt_stub.get(8..10).is_some_and(|bytes| bytes == [0x0f, 0x05]);
+        let native_ssn = nt_stub.windows(6).any(|window| window == [0x41, 0xba, 22, 0, 0, 0]);
+        check(
+            trap_ssn || native_ssn,
+            "NtCallbackReturn encodes SSN 22",
+        );
+        let zw_stub = &image.bytes[zw.rva as usize..zw.rva as usize + 5];
+        check(zw_stub.first() == Some(&0xe9), "ZwCallbackReturn is a tail-jump alias");
     }
 
     // Base relocations parse cleanly (the .reloc directory the loader will apply).
@@ -161,7 +183,7 @@ fn main() -> ExitCode {
     }
 
     if ok {
-        println!("==> OK: nt-pe-loader can load our ntdll.dll (PE32+/DLL, 188 Nt* + LdrpInitialize, .reloc)");
+        println!("==> OK: nt-pe-loader can load our ntdll.dll (PE32+/DLL, complete Nt* ABI + LdrpInitialize, .reloc)");
         ExitCode::SUCCESS
     } else {
         eprintln!("!! verification FAILED");

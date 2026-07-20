@@ -2,7 +2,7 @@
 #
 # build_ntdll_dll.sh — emit our Rust ntdll as a loadable PE32+ DLL (ntdll_plan.md Step 4.0).
 #
-# Produces `.tmp/nt-ntdll.dll`: a PE32+ DLL whose export directory lists all 188 `Nt*` trap stubs
+# Produces `.tmp/nt-ntdll.dll`: a PE32+ DLL whose export directory lists the complete `Nt*` ABI
 # (under their real Windows names) + `LdrpInitialize`, with a `.reloc` directory, no CRT startup,
 # no_std. Built from the host-tested `nt-ntdll` rlib via the thin `nt-ntdll-dll` cdylib wrapper.
 #
@@ -71,10 +71,10 @@ if [ -n "$OBJDUMP" ]; then
 fi
 
 # ---- Compatibility proof (THE HARD GATE): parse it with the EXECUTIVE'S OWN loader --------------
-# ntdll-dll-verify asserts PE32+/IMAGE_FILE_DLL, all 188 Nt* + LdrpInitialize exported (reporting the
-# RVA), and a non-empty base-relocation directory. If our own nt-pe-loader can read it, the
-# executive can load it (Step 4.B). Non-zero exit fails the build.
+# ntdll-dll-verify asserts PE32+/IMAGE_FILE_DLL, the complete Nt* ABI + LdrpInitialize exported
+# (reporting the RVA), and a non-empty base-relocation directory. If our own nt-pe-loader can read
+# it, the executive can load it (Step 4.B). Non-zero exit fails the build.
 echo "==> compatibility check (hard gate): parsing with the executive's own nt-pe-loader"
 cargo run -q -p ntdll-dll-verify -- "$OUT_DLL"
 
-echo "==> OK: PE32+ ntdll.dll (188 Nt* + LdrpInitialize + .reloc), nt-pe-loader-parsed, staged at $OUT_DLL"
+echo "==> OK: PE32+ ntdll.dll (complete Nt* ABI + LdrpInitialize + .reloc), nt-pe-loader-parsed, staged at $OUT_DLL"

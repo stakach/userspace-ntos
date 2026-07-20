@@ -69,10 +69,11 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 
-/// The complete `Nt*` SSN table: the **188** distinct `Nt*` exports imported across the current
+/// The complete required `Nt*` SSN table: the 188 distinct imports across the current
 /// hosted ReactOS x64 set (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
 /// rpcrt4/csrsrv/basesrv/winsrv/… — measured 2026-07-16, see `ntdll_plan.md` Step 1 Results),
-/// each paired with its `sysfuncs.lst`-derived SSN. Sorted by SSN.
+/// set, plus ntdll-internal `NtSecureConnectPort` and `NtCallbackReturn`, each paired with its
+/// `sysfuncs.lst`-derived SSN. Sorted by SSN.
 pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtAcceptConnectPort", 0),
     n("NtAccessCheck", 1),
@@ -87,6 +88,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtAllocateVirtualMemory", 18),
     n("NtApphelpCacheControl", 19),
     n("NtAssignProcessToJobObject", 21),
+    n("NtCallbackReturn", 22),
     n("NtCancelDeviceWakeupRequest", 23),
     n("NtCancelIoFile", 24),
     n("NtCancelTimer", 25),
@@ -302,6 +304,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtAllocateVirtualMemory", 6),
     ("NtApphelpCacheControl", 2),
     ("NtAssignProcessToJobObject", 2),
+    ("NtCallbackReturn", 3),
     ("NtCancelDeviceWakeupRequest", 1),
     ("NtCancelIoFile", 2),
     ("NtCancelTimer", 2),

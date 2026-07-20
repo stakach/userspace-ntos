@@ -3,7 +3,7 @@
 //! Every `Nt*` export our ntdll ships resolves — by NAME — to an SSN (from the shared
 //! [`nt_syscall_abi`](nt_syscall_abi) table, the single source of truth) and a transport backend
 //! (from [`transport::Backend::for_ssn`]). A stub is then just: look up the SSN, marshal the args,
-//! call [`transport::syscall`]. This module builds that table over the whole required 188-entry
+//! call [`transport::syscall`]. This module builds that table over the whole required
 //! surface and provides the generic invoke path; [`crate::rtl`] + a few wired stubs prove the
 //! pattern end-to-end.
 

@@ -1,5 +1,5 @@
-//! The full 188 `Nt*` **trap-stub bodies** — the classic x86 form, macro-generated over the shared
-//! SSN table.
+//! The full required `Nt*` **trap-stub bodies** — the classic x86 form, macro-generated over the
+//! shared SSN table.
 //!
 //! Each exported `Nt*` stub is the canonical native-syscall thunk:
 //!
@@ -17,15 +17,15 @@
 //! IPC message, use [`crate::marshal`] instead — that's where ">4 args" needs explicit work.)
 //!
 //! The bodies are `#[cfg(target_arch = "x86_64")]` naked functions (no host equivalent — a host
-//! can't issue the trap). What IS host-tested is that the generator covers **all 188** required
-//! services with the correct SSN + arity: see [`TRAP_STUBS`] and the tests. This keeps the
+//! can't issue the trap). What IS host-tested is that the generator covers every required service
+//! with the correct SSN + arity: see [`TRAP_STUBS`] and the tests. This keeps the
 //! generation itself under test even though the asm is target-only.
 
 use nt_syscall_abi::argc_of;
 
 /// A generated trap stub's metadata: export name, SSN, and parameter count. On the x86_64 target the
 /// matching naked function exists (see [`generate_trap_stubs!`]); this table exists on every target
-/// so the *coverage* (all 188, right SSN/arity) is host-testable.
+/// so the complete coverage (right SSN/arity) is host-testable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TrapStubMeta {
     /// The `Nt*` export name.
@@ -118,7 +118,7 @@ macro_rules! generate_trap_stubs {
     };
 }
 
-// The 188 required Nt* services, sysfuncs.lst-derived SSN. Sorted by SSN (matches the shared table).
+// Required Nt* services, sysfuncs.lst-derived SSNs. Sorted by SSN (matches the shared table).
 generate_trap_stubs! {
     (nt_accept_connect_port, "NtAcceptConnectPort", 0),
     (nt_access_check, "NtAccessCheck", 1),
@@ -133,6 +133,7 @@ generate_trap_stubs! {
     (nt_allocate_virtual_memory, "NtAllocateVirtualMemory", 18),
     (nt_apphelp_cache_control, "NtApphelpCacheControl", 19),
     (nt_assign_process_to_job_object, "NtAssignProcessToJobObject", 21),
+    (nt_callback_return, "NtCallbackReturn", 22),
     (nt_cancel_device_wakeup_request, "NtCancelDeviceWakeupRequest", 23),
     (nt_cancel_io_file, "NtCancelIoFile", 24),
     (nt_cancel_timer, "NtCancelTimer", 25),
@@ -330,8 +331,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn generates_all_188_required_stubs() {
-        assert_eq!(TRAP_STUBS.len(), 189);
+    fn generates_all_required_stubs() {
+        assert_eq!(TRAP_STUBS.len(), 190);
         assert_eq!(TRAP_STUBS.len(), NT_SYSCALLS.len());
     }
 

@@ -25,7 +25,7 @@
 
 use crate::rtl::exception::{dispatch_exception, DispatchResult, ExceptionRecord, FrameModel};
 use crate::NtStatus;
-use crate::{STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
+use crate::{STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
 
 /// A pending APC as unpacked from the `KiUserApcDispatcher` stack frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -91,35 +91,123 @@ pub fn exception_dispatcher(
     }
 }
 
-/// A win32k `KeUserModeCallback` request as unpacked from the `KiUserCallbackDispatcher` frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallbackMachineFrame {
+    pub rip: u64,
+    pub seg_cs: u16,
+    pub fill1: [u16; 3],
+    pub eflags: u32,
+    pub fill2: u32,
+    pub rsp: u64,
+    pub seg_ss: u16,
+    pub fill3: [u16; 3],
+}
+
+/// The exact x64 user callback stack frame consumed by `KiUserCallbackDispatcher`.
+///
+/// This mirrors ReactOS `UCALLOUT_FRAME`: the four ABI home slots are followed by `Buffer` at
+/// `+0x20`, `Length` at `+0x28`, `ApiNumber` at `+0x2c`, then a `MACHINE_FRAME`. The callback input
+/// remains in the caller-provided user buffer; the frame never allocates or copies it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallbackFrame {
-    /// The `ApiIndex` into `PEB->KernelCallbackTable`.
+    pub home: [u64; 4],
+    pub input: u64,
+    pub input_length: u32,
     pub api_index: u32,
-    /// The input buffer (copied out to user mode by the kernel).
-    pub input: alloc::vec::Vec<u8>,
+    pub machine_frame: CallbackMachineFrame,
 }
 
-/// The verdict of `KiUserCallbackDispatcher`: the resolved callback routine address (from the
-/// callback table) + the input to pass. The routine is invoked target-side, then
-/// `NtCallbackReturn(result)` returns into the kernel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CallbackDispatch {
-    /// The resolved callback routine (0 = the api index was out of range → return an error status).
-    pub routine: u64,
-    /// The input buffer to pass to the routine.
-    pub input: alloc::vec::Vec<u8>,
+/// A validated, allocation-free callback request unpacked from [`CallbackFrame`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CallbackRequest {
+    pub api_index: u32,
+    pub input: u64,
+    pub input_length: u32,
 }
 
-/// `KiUserCallbackDispatcher` dispatch logic: resolve `api_index` against the callback table (the
-/// `PEB->KernelCallbackTable`, modelled here as a slice of routine addresses). Out-of-range →
-/// `routine == 0` (the dispatcher returns `STATUS_INVALID_PARAMETER` via `NtCallbackReturn`).
-pub fn callback_dispatcher(frame: &CallbackFrame, callback_table: &[u64]) -> CallbackDispatch {
-    let routine = callback_table.get(frame.api_index as usize).copied().unwrap_or(0);
-    CallbackDispatch {
-        routine,
-        input: frame.input.clone(),
+/// Why a user callback frame or table could not be dispatched.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CallbackError {
+    NullInput,
+    InputRangeOverflow,
+    NullTable,
+    UnalignedTable,
+    IndexOutOfRange,
+    TableRangeOverflow,
+    NullRoutine,
+}
+
+impl CallbackError {
+    pub const fn status(self) -> NtStatus {
+        STATUS_INVALID_PARAMETER
     }
+}
+
+/// The validated callback routine and borrowed input range to pass to it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CallbackDispatch {
+    pub routine: u64,
+    pub input: u64,
+    pub input_length: u32,
+}
+
+/// Validate the buffer range in a raw x64 callback frame and unpack its request.
+pub fn callback_request(frame: &CallbackFrame) -> Result<CallbackRequest, CallbackError> {
+    if frame.input_length != 0 {
+        if frame.input == 0 {
+            return Err(CallbackError::NullInput);
+        }
+        if frame.input.checked_add(u64::from(frame.input_length) - 1).is_none() {
+            return Err(CallbackError::InputRangeOverflow);
+        }
+    }
+    Ok(CallbackRequest {
+        api_index: frame.api_index,
+        input: frame.input,
+        input_length: frame.input_length,
+    })
+}
+
+/// Resolve the address of an indexed callback-table slot without dereferencing it.
+pub fn callback_table_slot(
+    table_base: u64,
+    table_entries: u32,
+    api_index: u32,
+) -> Result<u64, CallbackError> {
+    if table_base == 0 {
+        return Err(CallbackError::NullTable);
+    }
+    if table_base & 7 != 0 {
+        return Err(CallbackError::UnalignedTable);
+    }
+    if api_index >= table_entries {
+        return Err(CallbackError::IndexOutOfRange);
+    }
+    table_base
+        .checked_add(u64::from(api_index) * 8)
+        .ok_or(CallbackError::TableRangeOverflow)
+}
+
+/// Host-testable callback resolution against a bounded table.
+pub fn callback_dispatcher(
+    request: CallbackRequest,
+    callback_table: &[u64],
+) -> Result<CallbackDispatch, CallbackError> {
+    let routine = callback_table
+        .get(request.api_index as usize)
+        .copied()
+        .ok_or(CallbackError::IndexOutOfRange)?;
+    if routine == 0 {
+        return Err(CallbackError::NullRoutine);
+    }
+    Ok(CallbackDispatch {
+        routine,
+        input: request.input,
+        input_length: request.input_length,
+    })
 }
 
 /// `KiRaiseUserExceptionDispatcher` dispatch logic: a kernel-detected user error is re-raised as a
@@ -213,18 +301,73 @@ mod tests {
     #[test]
     fn callback_resolves_from_table() {
         let table = [0xAAAA, 0xBBBB, 0xCCCC];
-        let f = CallbackFrame { api_index: 1, input: vec![1, 2, 3] };
-        let d = callback_dispatcher(&f, &table);
+        let f = CallbackFrame {
+            input: 0x1000,
+            input_length: 3,
+            api_index: 1,
+            ..Default::default()
+        };
+        let request = callback_request(&f).unwrap();
+        let d = callback_dispatcher(request, &table).unwrap();
         assert_eq!(d.routine, 0xBBBB);
-        assert_eq!(d.input, vec![1, 2, 3]);
+        assert_eq!(d.input, 0x1000);
+        assert_eq!(d.input_length, 3);
     }
 
     #[test]
-    fn callback_out_of_range_is_null_routine() {
+    fn callback_out_of_range_is_rejected() {
         let table = [0xAAAA];
-        let f = CallbackFrame { api_index: 5, input: vec![] };
-        let d = callback_dispatcher(&f, &table);
-        assert_eq!(d.routine, 0); // → dispatcher returns an error via NtCallbackReturn
+        let request = CallbackRequest { api_index: 5, input: 0, input_length: 0 };
+        assert_eq!(
+            callback_dispatcher(request, &table),
+            Err(CallbackError::IndexOutOfRange)
+        );
+    }
+
+    #[test]
+    fn callback_frame_matches_reactos_amd64_layout() {
+        assert_eq!(core::mem::size_of::<CallbackMachineFrame>(), 0x28);
+        assert_eq!(core::mem::size_of::<CallbackFrame>(), 0x58);
+        let frame = CallbackFrame::default();
+        let base = core::ptr::addr_of!(frame) as usize;
+        assert_eq!(core::ptr::addr_of!(frame.input) as usize - base, 0x20);
+        assert_eq!(core::ptr::addr_of!(frame.input_length) as usize - base, 0x28);
+        assert_eq!(core::ptr::addr_of!(frame.api_index) as usize - base, 0x2c);
+        assert_eq!(core::ptr::addr_of!(frame.machine_frame) as usize - base, 0x30);
+        let machine = core::ptr::addr_of!(frame.machine_frame) as usize;
+        assert_eq!(core::ptr::addr_of!(frame.machine_frame.rip) as usize - machine, 0x00);
+        assert_eq!(core::ptr::addr_of!(frame.machine_frame.eflags) as usize - machine, 0x10);
+        assert_eq!(core::ptr::addr_of!(frame.machine_frame.rsp) as usize - machine, 0x18);
+    }
+
+    #[test]
+    fn callback_request_validates_null_and_overflowing_input() {
+        let null = CallbackFrame { input_length: 1, ..Default::default() };
+        assert_eq!(callback_request(&null), Err(CallbackError::NullInput));
+        let overflow = CallbackFrame {
+            input: u64::MAX,
+            input_length: 2,
+            ..Default::default()
+        };
+        assert_eq!(callback_request(&overflow), Err(CallbackError::InputRangeOverflow));
+        let empty = CallbackFrame::default();
+        assert_eq!(callback_request(&empty).unwrap().input, 0);
+    }
+
+    #[test]
+    fn callback_table_slot_validates_base_index_and_overflow() {
+        assert_eq!(callback_table_slot(0, 20, 0), Err(CallbackError::NullTable));
+        assert_eq!(callback_table_slot(0x1004, 20, 0), Err(CallbackError::UnalignedTable));
+        assert_eq!(callback_table_slot(0x1000, 20, 20), Err(CallbackError::IndexOutOfRange));
+        assert_eq!(callback_table_slot(u64::MAX - 7, 20, 1), Err(CallbackError::TableRangeOverflow));
+        assert_eq!(callback_table_slot(0x1000, 20, 3), Ok(0x1018));
+    }
+
+    #[test]
+    fn callback_rejects_null_routine() {
+        let request = CallbackRequest { api_index: 0, input: 0, input_length: 0 };
+        assert_eq!(callback_dispatcher(request, &[0]), Err(CallbackError::NullRoutine));
+        assert_eq!(CallbackError::NullRoutine.status(), STATUS_INVALID_PARAMETER);
     }
 
     #[test]

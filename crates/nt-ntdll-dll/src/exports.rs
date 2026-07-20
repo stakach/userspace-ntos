@@ -6505,6 +6505,83 @@ pub unsafe extern "system" fn ki_user_exception_dispatcher(record: *mut c_void, 
     }
 }
 
+/// `KiUserCallbackDispatcher` — the x64 user-mode entry for a kernel `KeUserModeCallback`.
+///
+/// ReactOS enters this symbol with `RSP` pointing at a 16-byte-aligned `UCALLOUT_FRAME`, not with
+/// normal register arguments. Its AMD64 dispatcher reads `Buffer`/`Length`/`ApiNumber` at
+/// `RSP+0x20/+0x28/+0x2c`, resolves `PEB->KernelCallbackTable[ApiNumber]`, calls the user32 thunk as
+/// `NTSTATUS NTAPI thunk(PVOID, ULONG)`, then terminates the callback through SSN 22. The first four
+/// qwords of the frame are the callback thunk's Windows-x64 home space.
+///
+/// This project hosts ReactOS user32, whose `USER32_CALLBACK_COUNT` is 20. Rejecting larger indices
+/// before touching the table makes the Phase-1 entry bounded; a null/misaligned table, null routine,
+/// null non-empty input, or overflowing input range is returned as `STATUS_INVALID_PARAMETER` via
+/// `NtCallbackReturn`. Phase 1 deliberately does not fabricate or seed a callback table: user32's
+/// `Init` must first publish its real `apfnDispatch` pointer at `PEB+0x58`.
+///
+/// # Safety
+/// Entered only by the executive with a valid writable ReactOS AMD64 `UCALLOUT_FRAME` at `RSP`.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "KiUserCallbackDispatcher"]
+pub unsafe extern "C" fn ki_user_callback_dispatcher() -> ! {
+    core::arch::naked_asm!(
+        // ReactOS amd64 dispatch.S requires an aligned, fully materialized UCALLOUT_FRAME.
+        "test rsp, 15",
+        "jnz 3f",
+        // Validate Buffer/Length without copying or allocating.
+        "mov r11, [rsp + 0x20]",
+        "mov edx, [rsp + 0x28]",
+        "test edx, edx",
+        "jz 1f",
+        "test r11, r11",
+        "jz 3f",
+        "mov eax, edx",
+        "dec rax",
+        "add rax, r11",
+        "jc 3f",
+        "1:",
+        // ReactOS USER32_CALLBACK_COUNT = 20 (win32ss/include/u32cb.h).
+        "mov r8d, [rsp + 0x2c]",
+        "cmp r8d, 20",
+        "jae 3f",
+        // NtCurrentPeb() = gs:[0x60], PEB.KernelCallbackTable = +0x58 on amd64.
+        "mov rax, gs:[0x60]",
+        "test rax, rax",
+        "jz 3f",
+        "mov r9, [rax + 0x58]",
+        "test r9, r9",
+        "jz 3f",
+        "test r9, 7",
+        "jnz 3f",
+        "mov rax, [r9 + r8 * 8]",
+        "test rax, rax",
+        "jz 3f",
+        // USER_CALL(PVOID Argument, ULONG ArgumentLength). The frame's first 0x20 bytes are home.
+        "mov rcx, r11",
+        "call rax",
+        // ZwCallbackReturn(NULL, 0, callback_status). On success this syscall never returns here.
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "mov r8d, eax",
+        "call {callback_return}",
+        "jmp 4f",
+        // Invalid frame/table/index/routine: complete the callback with STATUS_INVALID_PARAMETER.
+        "3:",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "mov r8d, 0xC000000D",
+        "call {callback_return}",
+        // A successful NtCallbackReturn is non-returning. Raise any unexpected failure status.
+        "4:",
+        "mov ecx, eax",
+        "call {raise_status}",
+        "int3",
+        callback_return = sym nt_ntdll::trap_stubs::nt_callback_return,
+        raise_status = sym rtl_raise_status,
+    );
+}
+
 /// `RtlRestoreContext(PCONTEXT ContextRecord, PEXCEPTION_RECORD)` — resume at a captured context.
 /// BATCH 42: real — resumes the context via `NtContinue` (does not return). The unwind path also
 /// resumes internally; this export is the standalone entry.
@@ -6922,43 +6999,16 @@ pub unsafe extern "C" fn zw_yield_execution() {
     core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::nt_yield_execution);
 }
 
-/// `ZwCallbackReturn` — alias of `NtCallbackReturn` (SSN 22). `NtCallbackReturn` is not in the 188
-/// trap-stub set (it's a Ki-adjacent stub); emit a direct native/trap stub here under BOTH names is
-/// unnecessary — the Win32 boot path calls `ZwCallbackReturn` only from `KiUserCallbackDispatcher`,
-/// which we service via the callback seam. Provide the export as a trap stub (SSN 22).
+/// `ZwCallbackReturn` — the name twin of `NtCallbackReturn` (SSN 22).
 ///
 /// # Safety
-/// Issues the NtCallbackReturn syscall (SSN 22, trap ABI).
-#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
+/// Tail-calls the single generated `NtCallbackReturn` stub, preserving whichever trap/native
+/// transport variant the build selected. Keeping one body prevents the two exported names drifting.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[export_name = "ZwCallbackReturn"]
 pub unsafe extern "C" fn zw_callback_return() {
-    core::arch::naked_asm!("mov r10, rcx", "mov eax, 22", "syscall", "ret");
-}
-
-/// `ZwCallbackReturn` (native seL4-Call transport variant) — SSN 22.
-///
-/// # Safety
-/// Issues the NtCallbackReturn native seL4 Call (SSN 22).
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-#[unsafe(naked)]
-#[export_name = "ZwCallbackReturn"]
-pub unsafe extern "C" fn zw_callback_return() {
-    core::arch::naked_asm!(
-        "movabs rax, 0x00000100105FB000",
-        "mov qword ptr [rax + 0x28], r8",
-        "mov qword ptr [rax + 0x30], r9",
-        "mov r8, rsp",
-        "mov r9, rcx",
-        "mov r15, rdx",
-        "mov r10d, 22",
-        "mov edi, 6",
-        "mov esi, 0x04E54006",
-        "mov rdx, -1",
-        "syscall",
-        "mov rax, r10",
-        "ret",
-    );
+    core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::nt_callback_return);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -8340,6 +8390,7 @@ pub unsafe extern "C" fn export_anchor() {
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors3: &[usize] = &[
+        ki_user_callback_dispatcher as *const () as usize,
         zw_yield_execution as *const () as usize,
         zw_callback_return as *const () as usize,
     ];

@@ -4,8 +4,9 @@ use super::*;
 
 /// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement = 188)
 /// plus `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally (it
-/// isn't an *import* of any hosted binary, but IS an ntdll-internal syscall → it must be in the table).
-const REQUIRED_NT_COUNT: usize = 189;
+/// isn't an *import* of any hosted binary, but IS an ntdll-internal syscall), and
+/// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
+const REQUIRED_NT_COUNT: usize = 190;
 const REQUIRED_ZW_COUNT: usize = 7;
 
 #[test]
@@ -81,6 +82,7 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtAddAtom", 8),                  // SSN_NT_ADD_ATOM = 8
         ("NtAdjustPrivilegesToken", 12),   // SSN_NT_ADJUST_PRIV_TOKEN = 12
         ("NtAllocateVirtualMemory", 18),   // SSN_NT_ALLOCATE_VM = 0x12
+        ("NtCallbackReturn", 22),          // SSN_NT_CALLBACK_RETURN = 22
         ("NtClose", 27),                   // SSN_NT_CLOSE = 27
         ("NtCreateFile", 39),              // SSN_NT_CREATE_FILE = 39
         ("NtCreatePort", 48),              // SSN_NT_CREATE_PORT = 48
@@ -122,6 +124,7 @@ fn every_service_has_an_exact_arity() {
 #[test]
 fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtClose"), 1);
+    assert_eq!(argc_of("NtCallbackReturn"), 3);
     assert_eq!(argc_of("NtCreateFile"), 11);
     assert_eq!(argc_of("NtWaitForSingleObject"), 3);
     assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest

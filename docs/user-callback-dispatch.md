@@ -1,7 +1,10 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **PLAN for review** (no code yet). Author target: the executive + `nt-ntdll`.
-Gate baseline: 187/98 (HEAD `ee3a804`); desktop paints 768/768; the IDD_LOGON logon dialog
+Status: **PHASE 1 implemented; executive reverse transition not started**. Author target: the
+executive + `nt-ntdll`. Implementation base: HEAD `e992af2`.
+Phase-1 gate: **187/98 held**; desktop paints 768/768 and the boot quiesces at the existing
+winlogon message-loop frontier. The baseline is `ee3a804` (`e992af2` is documentation-only).
+The IDD_LOGON logon dialog
 is *created* (17 `#32770` windows) but never *painted* because its `WM_PAINT` is never
 dispatched to the control procs.
 
@@ -146,20 +149,52 @@ frame when it forwards a (possibly nested) `NtUser*/NtGdi*` to win32k and pops o
 back to the executive to run the callback.
 
 ### 3c. Client-side callback table + entry
-`PEB->KernelCallbackTable` (PEB **+0x58**, x64) must point at winlogon's `KernelCallbackTable` —
-the array of user32 client thunks (`__fnDWORD`, `__fnINLPCREATESTRUCT`, the `WINDOWPROC`
-dispatcher, …). user32 builds this during its client-pfn init (`NtUserInitializeClientPfnArrays`
-/ `apfnClientA/W`); we must ensure it is populated (either user32 populates it and we seed the
-PEB pointer, or we seed the table). `ntdll!KiUserCallbackDispatcher` reads `[PEB+0x58][index]`.
+`PEB->KernelCallbackTable` (PEB **+0x58**, x64) must point at winlogon's real user32 callback table.
+In this ReactOS tree, `user32!Init` assigns `NtCurrentPeb()->KernelCallbackTable = apfnDispatch`;
+`apfnDispatch` has 20 entries defined by `win32ss/include/u32cb.h`, index 0 being
+`User32CallWindowProcFromKernel`. This is not `NtUserInitializeClientPfnArrays`/`apfnClientA/W`.
+
+Phase 1 must **not seed a fabricated table or pointer**. The actual pointer can only be trusted after
+user32's `Init` has run and must be observed in winlogon's PEB before Phase 2 redirects execution.
+`ntdll!KiUserCallbackDispatcher` reads `[PEB+0x58][index]`; a null table or invalid index completes
+the callback with `STATUS_INVALID_PARAMETER` rather than calling an invented thunk.
+
+### 3d. Proven ReactOS AMD64 client-entry ABI
+
+ReactOS does not enter `KiUserCallbackDispatcher` with `(ApiIndex, Buffer, Length)` in normal x64
+argument registers. `KiUserCallbackExit` sets `RIP = KeUserCallbackDispatcher` and restores the
+user `RSP` prepared by `KiSetupUserCalloutFrame`. At entry, `RSP` points at a 16-byte-aligned,
+0x58-byte `UCALLOUT_FRAME`:
+
+```text
++0x00  P1Home..P4Home (0x20 bytes; callback thunk home space)
++0x20  Buffer         (PVOID)
++0x28  Length         (ULONG)
++0x2c  ApiNumber      (ULONG)
++0x30  MACHINE_FRAME  (0x28 bytes: prior RIP/RSP and selectors/flags)
+```
+
+The dispatcher loads `RCX=Buffer`, `EDX=Length`, obtains the PEB from `gs:[0x60]`, loads the table
+from `PEB+0x58`, and calls `table[ApiNumber]` with the Windows x64 ABI. The thunk type is
+`NTSTATUS NTAPI USER_CALL(PVOID Argument, ULONG ArgumentLength)`. If that thunk returns, the
+dispatcher calls `ZwCallbackReturn(NULL, 0, returned_status)`; many ReactOS user32 thunks instead
+call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
+
+- `references/reactos/dll/ntdll/dispatch/amd64/dispatch.S`
+- `references/reactos/ntoskrnl/ke/amd64/usercall.c` and `usercall_asm.S`
+- `references/reactos/sdk/include/ndk/amd64/ketypes.h`
+- `references/reactos/win32ss/user/user32/misc/dllmain.c`
+- `references/reactos/win32ss/include/u32cb.h`
 
 ## 4. Pieces: exist vs to build
 
 | Piece | State |
 |---|---|
-| `KiUserCallbackDispatcher` **dispatch logic** (`ki.rs::callback_dispatcher`, `UserCallback`) | ✅ exists, host-tested |
-| `KiUserCallbackDispatcher` **target entry** (naked thunk: read frame → call logic → `NtCallbackReturn`) | ☐ build (in `nt-ntdll-dll`, mirror the SEH `KiUserExceptionDispatcher` seam) |
-| `PEB->KernelCallbackTable` populated + PEB+0x58 seeded for winlogon | ☐ build (verify user32's client-pfn init runs; seed the pointer at spawn) |
-| `NtCallbackReturn` (`ZwCallbackReturn`) target syscall | ☐ build (ntdll stub + the executive-side special handler) |
+| `KiUserCallbackDispatcher` fixed-layout dispatch logic (`ki.rs`) | ✅ Phase 1: exact 0x58 frame + bounded validation, host-tested |
+| `KiUserCallbackDispatcher` target entry | ✅ Phase 1: naked x64 stack-frame entry in `nt-ntdll-dll` |
+| `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ☐ Phase 2 diagnostic before redirect (never fabricate it) |
+| `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
+| Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2 |
 | Executive: intercept win32k's real `KeUserModeCallback` → issue a **callback request** | ☐ build (replace the `s_ke_user_mode_callback` shortcut) |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ☐ build |
 | Executive: per-thread **callback-continuation stack** (3a) | ☐ build |
@@ -179,8 +214,9 @@ of a synthetic return.
 - **Redirect winlogon → `KiUserCallbackDispatcher`:** winlogon is blocked awaiting the reply to
   its (possibly nested) native `Call`. The executive marshals the callback input buffer into a
   client-side callback-args region, then **replies to winlogon's Call with a redirected resume
-  point**: set `RIP = KiUserCallbackDispatcher`, `RSP =` a fresh callback stack, and the
-  argument registers per the `KiUserCallbackDispatcher` ABI (ApiIndex, input ptr, input length).
+  point**: set `RIP = KiUserCallbackDispatcher`, `RSP =` the 16-byte-aligned `UCALLOUT_FRAME`
+  described in §3d. Do not pass a fabricated register-argument ABI: the entry reads the callback
+  request from that frame.
   Save winlogon's *pre-redirect* context (its real post-syscall RIP/RSP/regs) into the
   `UserCallbackFrame.saved_user_context`. Use `seL4_TCB_WriteRegisters` (or the reply-with-context
   path) — the register ABI must be exact.
@@ -216,16 +252,22 @@ of a synthetic return.
 
 ## 7. Phased implementation (each phase gate-verified, boot must QUIESCE, paint stays 768/768)
 
-- **Phase 1 — client dispatcher (mostly host-testable).** Real `KiUserCallbackDispatcher`
-  target entry in `nt-ntdll-dll` (naked: read the frame, call the existing `ki::callback_dispatcher`
-  logic, invoke the resolved thunk, `NtCallbackReturn` with the LRESULT). Seed
-  `PEB->KernelCallbackTable` (verify user32's client-pfn table is built; seed PEB+0x58). ntdll
-  stub for `NtCallbackReturn`/`ZwCallbackReturn`. Host-test the dispatch logic (exists) + the
-  frame unpack. No behavior change yet (nothing calls it) → gate 187 held, byte-identical.
+- **Phase 1 — client dispatcher (implemented, behavior-preserving).** Exact fixed-layout
+  `UCALLOUT_FRAME` representation and allocation-free request/table validation in `nt-ntdll`; real
+  naked `KiUserCallbackDispatcher` target entry in `nt-ntdll-dll`; exported `NtCallbackReturn` and
+  `ZwCallbackReturn` share one SSN-22 trap/native transport body. No callback table is seeded and no
+  executive reverse-transition behavior changes. Acceptance checks:
+  1. host tests prove frame size/offsets, null/overflow/index/table/routine rejection, callback ABI
+     metadata, and SSN 22 with arity 3;
+  2. the PE gate proves all three exports exist, `NtCallbackReturn` encodes SSN 22, and
+     `ZwCallbackReturn` is a tail alias;
+  3. QEMU remains 187/98, desktop paint remains 768/768, and boot quiesces at the same frontier.
+  All three acceptance checks pass on the Phase-1 checkpoint.
 - **Phase 2 — single reverse transition (no nesting).** Executive: replace the
   `s_ke_user_mode_callback` shortcut for **one** callback (start with the create-time
   `WM_NCCREATE`, whose synthetic path we can compare against) with the real reverse transition:
-  suspend win32k, redirect winlogon to `KiUserCallbackDispatcher`, run its real `WndProc`,
+  first read and log winlogon's `PEB+0x58` and reject a null/unobserved table; then suspend win32k,
+  build the exact §3d frame, redirect winlogon to `KiUserCallbackDispatcher`, run its real `WndProc`,
   `NtCallbackReturn` → resume win32k. Prove the real `WndProc` ran (a counter / the client proc's
   observable effect) and that `CreateWindowEx` still succeeds + `exec_win32k_desktop_painted`
   stays 768/768 + the SAS specs hold. Gate 187 held (behavior-equivalent) or +1 for a

@@ -76,6 +76,8 @@ pub type NtStatus = u32;
 
 /// `STATUS_SUCCESS`.
 pub const STATUS_SUCCESS: NtStatus = 0x0000_0000;
+/// `STATUS_INVALID_PARAMETER`.
+pub const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 /// `STATUS_NOT_IMPLEMENTED` — returned by a stub whose transport backend is a declared-but-
 /// unimplemented seam (seL4-Call / SURT-ring, until Step 6).
 pub const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
