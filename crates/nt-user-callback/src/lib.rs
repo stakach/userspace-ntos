@@ -124,6 +124,137 @@ pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
 pub const NTUSER_GET_MESSAGE_SSN: u64 = 0x1006;
 pub const NTUSER_DISPATCH_MESSAGE_SSN: u64 = 0x1035;
 pub const WM_PAINT: u32 = 0x000f;
+pub const WLX_WM_SAS: u32 = 0x0659;
+pub const WLX_SAS_TYPE_CTRL_ALT_DEL: u64 = 1;
+pub const WC_DIALOG_ATOM: u64 = 0x8002;
+pub const WINLOGON_STATE_LOGGED_OFF: u32 = 1;
+pub const IDD_LOGON_CAPTION: [u16; 5] = [
+    b'L' as u16,
+    b'o' as u16,
+    b'g' as u16,
+    b'o' as u16,
+    b'n' as u16,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WinlogonDialogCorrelation {
+    sas_session: u64,
+    sas_hwnd: u64,
+    sas_messages: u8,
+    logged_off: bool,
+    idd_logon_hwnd: u64,
+}
+
+impl WinlogonDialogCorrelation {
+    pub const fn new() -> Self {
+        Self {
+            sas_session: 0,
+            sas_hwnd: 0,
+            sas_messages: 0,
+            logged_off: false,
+            idd_logon_hwnd: 0,
+        }
+    }
+
+    pub fn latch_sas_window(&mut self, session: u64, hwnd: u64) -> Result<(), ValidationError> {
+        if session == 0 || hwnd == 0 {
+            return Err(ValidationError::Sequence);
+        }
+        if self.sas_session != 0 && (self.sas_session != session || self.sas_hwnd != hwnd) {
+            return Err(ValidationError::Sequence);
+        }
+        self.sas_session = session;
+        self.sas_hwnd = hwnd;
+        Ok(())
+    }
+
+    pub fn observe_sas_message(
+        &mut self,
+        session: u64,
+        hwnd: u64,
+        message: u32,
+        wparam: u64,
+    ) -> Result<(), ValidationError> {
+        if session != self.sas_session
+            || hwnd != self.sas_hwnd
+            || message != WLX_WM_SAS
+            || wparam != WLX_SAS_TYPE_CTRL_ALT_DEL
+            || self.sas_messages >= 2
+            || (self.sas_messages == 1 && !self.logged_off)
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.sas_messages += 1;
+        Ok(())
+    }
+
+    pub fn observe_logged_off(&mut self, session: u64, state: u32) -> Result<(), ValidationError> {
+        if session != self.sas_session
+            || self.sas_messages != 1
+            || state != WINLOGON_STATE_LOGGED_OFF
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.logged_off = true;
+        Ok(())
+    }
+
+    pub fn capture_idd_logon(
+        &mut self,
+        session: u64,
+        hwnd: u64,
+        class_atom: u64,
+        caption: &[u16],
+        top_level: bool,
+        winlogon_key_advanced: bool,
+    ) -> Result<(), ValidationError> {
+        if session != self.sas_session
+            || self.sas_messages != 2
+            || !self.logged_off
+            || hwnd == 0
+            || hwnd == self.sas_hwnd
+            || class_atom != WC_DIALOG_ATOM
+            || caption != IDD_LOGON_CAPTION
+            || !top_level
+            || !winlogon_key_advanced
+            || (self.idd_logon_hwnd != 0 && self.idd_logon_hwnd != hwnd)
+        {
+            return Err(ValidationError::Sequence);
+        }
+        self.idd_logon_hwnd = hwnd;
+        Ok(())
+    }
+
+    pub const fn sas_session(self) -> u64 {
+        self.sas_session
+    }
+
+    pub const fn sas_hwnd(self) -> u64 {
+        self.sas_hwnd
+    }
+
+    pub const fn sas_messages(self) -> u8 {
+        self.sas_messages
+    }
+
+    pub const fn logged_off(self) -> bool {
+        self.logged_off
+    }
+
+    pub const fn idd_logon_hwnd(self) -> u64 {
+        self.idd_logon_hwnd
+    }
+
+    pub const fn modal_ready(self) -> bool {
+        self.logged_off && self.sas_messages == 2 && self.idd_logon_hwnd != 0
+    }
+}
+
+impl Default for WinlogonDialogCorrelation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DialogModalPumpSequence {
@@ -970,6 +1101,97 @@ mod tests {
             sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(0x0110)),
             Err(ValidationError::Sequence)
         );
+    }
+
+    #[test]
+    fn winlogon_dialog_correlation_binds_sas_session_messages_and_logon_hwnd() {
+        let mut correlation = WinlogonDialogCorrelation::new();
+        assert_eq!(correlation.latch_sas_window(0xc15bc0, 0x2002e), Ok(()));
+        assert_eq!(
+            correlation.observe_sas_message(0xc15bc0, 0x2002e, WLX_WM_SAS, 1),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.observe_logged_off(0xc15bc0, WINLOGON_STATE_LOGGED_OFF),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.observe_sas_message(0xc15bc0, 0x2002e, WLX_WM_SAS, 1),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.capture_idd_logon(
+                0xc15bc0,
+                0x20040,
+                WC_DIALOG_ATOM,
+                &IDD_LOGON_CAPTION,
+                true,
+                true,
+            ),
+            Ok(())
+        );
+        assert!(correlation.modal_ready());
+        assert_eq!(correlation.sas_hwnd(), 0x2002e);
+        assert_eq!(correlation.idd_logon_hwnd(), 0x20040);
+    }
+
+    #[test]
+    fn winlogon_dialog_correlation_rejects_stale_session_or_wrong_hwnd() {
+        let mut correlation = WinlogonDialogCorrelation::new();
+        assert_eq!(correlation.latch_sas_window(0xc15bc0, 0x2002e), Ok(()));
+        assert_eq!(
+            correlation.observe_sas_message(0xdead, 0x2002e, WLX_WM_SAS, 1),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(
+            correlation.observe_sas_message(0xc15bc0, 0x20030, WLX_WM_SAS, 1),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(
+            correlation.observe_sas_message(0xc15bc0, 0x2002e, WLX_WM_SAS, 1),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.observe_logged_off(0xdead, WINLOGON_STATE_LOGGED_OFF),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(
+            correlation.observe_logged_off(0xc15bc0, WINLOGON_STATE_LOGGED_OFF),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.observe_sas_message(0xc15bc0, 0x2002e, WLX_WM_SAS, 1),
+            Ok(())
+        );
+        assert_eq!(
+            correlation.capture_idd_logon(
+                0xc15bc0,
+                0x2002e,
+                WC_DIALOG_ATOM,
+                &IDD_LOGON_CAPTION,
+                true,
+                true,
+            ),
+            Err(ValidationError::Sequence)
+        );
+        assert_eq!(
+            correlation.capture_idd_logon(
+                0xc15bc0,
+                0x20040,
+                WC_DIALOG_ATOM,
+                &[
+                    b'L' as u16,
+                    b'o' as u16,
+                    b'g' as u16,
+                    b'o' as u16,
+                    b'f' as u16
+                ],
+                true,
+                true,
+            ),
+            Err(ValidationError::Sequence)
+        );
+        assert!(!correlation.modal_ready());
     }
 
     #[test]

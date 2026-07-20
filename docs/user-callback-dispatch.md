@@ -431,6 +431,27 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   HWND. Keep `WM_PAINT` synthetic until its nested GDI sequence has its own audited bounded policy;
   add a dialog-rectangle framebuffer gate only after that real callback is enabled.
 
+  A second serialized diagnostic validated that decoupling strategy but also found the next exact
+  read boundary. Latching `SH_SAS_SESSION`/`SH_SAS_HWND` when the controlled SAS `WM_CREATE`
+  continuation completed identified the real SAS window as `0x2002e`; the previous generic
+  post-`0x1077` latch had missed that return path and mislabeled the next dialog. Inspecting returned
+  messages then correlated two real queue deliveries
+  `MSG{hwnd=0x2002e,message=0x659,wParam=1}`. All three legacy SAS gates passed, as did the callback
+  gate (`1/1`, `7/7`, nested `5`) and desktop paint (`768/768`).
+
+  After the second SAS, the first top-level dialog candidate was `hwnd=0x2003a`, class atom
+  `0x8002`, top-level style true, and Winlogon-key-open advance true. The caption comparison failed,
+  so the runtime deliberately did not identify it as IDD_LOGON or enable the modal pump; the
+  tightened diagnostic gate ended `187/99`. The likely cause is address coverage, not evidence that
+  the title differs: the `LARGE_STRING` descriptor is on the client stack, but its UTF-16 buffer can
+  live in a demand-filled DLL page outside `smss_copyin`'s stack/early-heap/main-image windows. The
+  next diagnostic should read that buffer through `scratch_for` (or a general client-copyin helper
+  backed by the filled-page table), log its length/code units, and only then bind `0x2003a` if the
+  caption and other correlations match. This experiment is also not landed; the runtime remains at
+  the green Phase-3B checkpoint. `WinlogonDialogCorrelation` retains the pure state model for exact
+  SAS session/HWND/messages, logged-off state, distinct top-level `#32770`/`Logon` HWND, and key-open
+  evidence.
+
 ## 8. Risks / notes
 
 - **Context save/restore correctness.** A wrong register/RSP on the redirect or restore
