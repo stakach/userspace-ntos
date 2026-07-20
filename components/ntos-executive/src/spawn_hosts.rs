@@ -116,11 +116,7 @@ pub(crate) struct HostCaps {
     /// win32k: attach the calling client's user memory (`w32_client_attach`) before each dispatch,
     /// and share foreign client frames on demand-fault instead of zero-filling.
     pub client_attach: bool,
-    /// win32k: honour `KeUserModeCallback` / WINDOWPROC bridge (documents the capability; the
-    /// callback is bound component-side in DriverEntry).
-    // Capability-surface documentation (§2.3): the win32k callback/wide-arg specifics are keyed off
-    // the SSN component-side, not this runtime flag, so the pump never reads it. Intentional seam.
-    #[allow(dead_code)]
+    /// win32k: service the nested callback rendezvous label while an outer dispatch is active.
     pub usermode_callback: bool,
     /// win32k: stage wide (>4) stack args from the caller frame into `SH_REQ_A4..` / `SH_REQ_NARGS`.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
@@ -427,8 +423,20 @@ pub(crate) struct PumpChannel {
     /// process-index for `client_attach`/foreign-frame sharing.
     pub reply_cap: u64,
     pub client_pi: u64,
+    /// Explicit identity of the user thread whose win32k syscall is currently forwarded. This is
+    /// carried with the pump invocation so callback diagnostics never consult stale global identity.
+    pub callback_client: Option<UserCallbackClient>,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UserCallbackClient {
+    pub pi: u32,
+    pub badge: u64,
+    pub tid: u64,
+    /// Executive alias of this process's PEB page, or zero when the dispatch has no user client.
+    pub peb_mirror: u64,
 }
 
 /// win32k demand-fault verbosity budget: print the first 60 demand faults per dispatch (matches the
@@ -537,6 +545,27 @@ pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
         if label == ch.dispatch_label {
             completed = true;
             break;
+        } else if label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL
+            && ch.caps.usermode_callback
+            && use_reply_cap
+        {
+            let serviced = ch
+                .callback_client
+                .is_some_and(|client| crate::win32k_glue::service_user_callback(client));
+            if !serviced {
+                wall_ip = m0;
+                wall_addr = m1;
+                wall_label = label;
+                break;
+            }
+            crate::send_on_reply(ch.reply_cap, 0, 0, 0, 0, 0);
+            let (_b, nmi, nm0, nm1, nm2, nm3) = crate::recv_full_r12(ch.fault_ep, ch.reply_cap);
+            mi = nmi;
+            m0 = nm0;
+            m1 = nm1;
+            _m2 = nm2;
+            _m3 = nm3;
+            continue;
         } else if label == 6 {
             let ip = m0;
             let addr = m1;

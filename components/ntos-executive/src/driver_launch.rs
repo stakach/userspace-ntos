@@ -1514,6 +1514,7 @@ pub(crate) unsafe fn load_driver(
         wake_first: false,
         reply_cap: 0,
         client_pi: 0,
+        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -1774,6 +1775,7 @@ pub(crate) unsafe fn dispatch_irp(
         wake_first: true, // per-IRP: the component is parked in recv_req_on → Send wakes it
         reply_cap: 0,
         client_pi: 0,
+        callback_client: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,

@@ -67,6 +67,7 @@ nt-dll-registry = { path = "../../crates/nt-dll-registry" }
 nt-loader-trace = { path = "../../crates/nt-loader-trace" }
 nt-delay-execution = { path = "../../crates/nt-delay-execution" }
 nt-thread-start = { path = "../../crates/nt-thread-start" }
+nt-user-callback = { path = "../../crates/nt-user-callback" }
 # The driver-visible ntoskrnl/hal export table + win32k import surface + SSDT recorder — the
 # load-time contract the win32k.sys prototype resolves its imports against.
 nt-compat-exports = { path = "../../crates/nt-compat-exports" }

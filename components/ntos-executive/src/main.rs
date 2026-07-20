@@ -6887,12 +6887,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES { let _ = alloc_frame(); }
-            // The win32k session-heap arena (host-only; the executive doesn't map it). Retain the
-            // frame-cap base so the connect marshaling can RO-map the global USER heap into a GUI
-            // client's VSpace (the gSharedInfo client-mapping).
+            // The win32k session-heap arena. Retain the frame-cap base so the connect marshaling can
+            // RO-map it into GUI clients. Phase 2A also maps the same frames RW into the executive at
+            // their server VAs: callback policy must resolve HWND through gSharedInfo's handle table
+            // without dereferencing an unmapped raw component address.
             let heap_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_HEAP_FRAMES { let _ = alloc_frame(); }
             WIN32K_HEAP_FRAME_BASE.store(heap_base, Ordering::Relaxed);
+            for page_table in 0..win32k_subsystem::WIN32K_HEAP_FRAMES / 512 {
+                let pt = alloc_slot();
+                let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, win32k_subsystem::WIN32K_HEAP_VADDR + page_table * 0x20_0000, CAP_INIT_THREAD_VSPACE);
+            }
+            for frame in 0..win32k_subsystem::WIN32K_HEAP_FRAMES {
+                let _ = page_map(heap_base + frame, win32k_subsystem::WIN32K_HEAP_VADDR + frame * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            }
             // The aux-window PT in the executive VSpace (covers DATA @0x0710 + SHARED @0x0718 + ARG
             // @0x071A; the pool is host-only, in its own window, so not mapped in the executive).
             let ppt = alloc_slot();
@@ -7616,10 +7625,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let callback_dispatcher_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "KiUserCallbackDispatcher")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
                     img_spawn::OUR_LDRP_RVA.store(smss_ldrp_rva, Ordering::Relaxed);
+                    img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.store(callback_dispatcher_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
                     print_str(b"\n");
@@ -8427,6 +8446,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(harness_syscall);
     print_str(b"\n");
     check(b"exec_win32k_on_shared_harness", harness_syscall >= 4, &mut passed);
+    let (callback_rendezvous, callback_winlogon_api0, callback_table_valid) = win32k_glue::user_callback_proofs();
+    print_str(b"[user-callback] rendezvous=");
+    print_u64(callback_rendezvous);
+    print_str(b" winlogon-api0=");
+    print_u64(callback_winlogon_api0);
+    print_str(b" table-nonzero-aligned=");
+    print_u64(callback_table_valid);
+    print_str(b" (Phase 2A synthetic reply; no user redirect)\n");
 
     // --- PROOF winlogon crossed its SAS message loop: InitializeSAS COMPLETED (was failing entirely —
     // NtUserSetLogonNotifyWindow's logon-process access check failed because PsLookupProcessByProcessId

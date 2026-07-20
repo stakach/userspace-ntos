@@ -5,6 +5,171 @@
 #![allow(clippy::all)]
 use crate::*;
 
+static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Win32kClientContext {
+    pub pi: u32,
+    pub badge: u64,
+    pub tid: u64,
+    pub peb_mirror: u64,
+}
+
+pub(crate) fn user_callback_proofs() -> (u64, u64, u64) {
+    (
+        USER_CALLBACK_RENDEZVOUS.load(Ordering::Relaxed),
+        USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed),
+        USER_CALLBACK_TABLE_VALID.load(Ordering::Relaxed),
+    )
+}
+
+unsafe fn callback_payload_u64(frame: *mut nt_user_callback::CallbackFrame, offset: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile(core::ptr::addr_of!((*frame).payload[offset + index]));
+    }
+    u64::from_le_bytes(bytes)
+}
+
+unsafe fn callback_payload_u32(frame: *mut nt_user_callback::CallbackFrame, offset: usize) -> u32 {
+    callback_payload_u64(frame, offset) as u32
+}
+
+unsafe fn callback_payload_write_u64(frame: *mut nt_user_callback::CallbackFrame, offset: usize, value: u64) {
+    for (index, byte) in value.to_le_bytes().iter().enumerate() {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset + index]), *byte);
+    }
+}
+
+pub(crate) unsafe fn service_user_callback(client: crate::spawn_hosts::UserCallbackClient) -> bool {
+    const WPCA_WND: usize = 0x10;
+    const WPCA_MSG: usize = 0x18;
+    const WPCA_LPARAM: usize = 0x28;
+    const WPCA_RESULT: usize = 0x38;
+    const WND_DWUSERDATA_OFF: u64 = 0x110;
+
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *mut nt_user_callback::CallbackFrame;
+    let request = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    if nt_user_callback::validate_request(&request).is_err()
+        || request.client_pi != client.pi
+        || request.client_tid != client.tid
+        || request.client_badge != client.badge
+    {
+        print_str(b"[user-callback] invalid or stale component request\n");
+        return false;
+    }
+    USER_CALLBACK_RENDEZVOUS.fetch_add(1, Ordering::Relaxed);
+
+    let output_capacity = request.output_capacity as usize;
+    if request.api_index == 0 {
+        USER_CALLBACK_WINLOGON_API0.fetch_add((client.pi == 2) as u64, Ordering::Relaxed);
+        for offset in request.input_length as usize..output_capacity {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
+        }
+        if request.input_length as usize >= WPCA_RESULT + 8 {
+            let msg = callback_payload_u32(frame, WPCA_MSG);
+            let result = if msg == 0x0083 { 0 } else { 1 };
+            callback_payload_write_u64(frame, WPCA_RESULT, result);
+
+            if msg == 0x0001 {
+                let hwnd = callback_payload_u64(frame, WPCA_WND);
+                let lparam = callback_payload_u64(frame, WPCA_LPARAM);
+                let ahelist = core::ptr::read_volatile(
+                    (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_AHELIST)
+                        as *const u64,
+                );
+                let mut pwnd = 0u64;
+                if ahelist != 0 && (hwnd & 0xffff) >= 0x20 {
+                    let handles = core::ptr::read_volatile(ahelist as *const u64);
+                    let count = core::ptr::read_volatile((ahelist + 0x10) as *const u32) as u64;
+                    let index = ((hwnd & 0xffff) - 0x20) >> 1;
+                    if handles != 0 && index < count {
+                        let entry = handles + index * 0x18;
+                        if core::ptr::read_volatile((entry + 0x10) as *const u8) == 1 {
+                            pwnd = core::ptr::read_volatile(entry as *const u64);
+                        }
+                    }
+                }
+                let mut create_params_bytes = [0u8; 8];
+                let copied = if request.payload_reference_offset != nt_user_callback::NO_PAYLOAD_REFERENCE {
+                    let offset = request.payload_reference_offset as usize;
+                    for (index, byte) in create_params_bytes.iter_mut().enumerate() {
+                        *byte = core::ptr::read_volatile(core::ptr::addr_of!((*frame).payload[offset + index]));
+                    }
+                    true
+                } else {
+                    lparam != 0 && crate::img_spawn::smss_copyin(lparam, &mut create_params_bytes)
+                };
+                if pwnd != 0 && copied {
+                    let create_params = u64::from_le_bytes(create_params_bytes);
+                    if create_params != 0 {
+                        core::ptr::write_volatile((pwnd + WND_DWUSERDATA_OFF) as *mut u64, create_params);
+                        core::ptr::write_volatile(
+                            (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION)
+                                as *mut u64,
+                            create_params,
+                        );
+                        core::ptr::write_volatile(
+                            (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND)
+                                as *mut u64,
+                            hwnd,
+                        );
+                    }
+                }
+            }
+            print_str(b"[user-callback] WINDOWPROC api=0 msg=0x");
+            print_hex(msg);
+            print_str(b" -> synthetic Result=");
+            print_u64(result);
+            print_str(b" via rendezvous\n");
+        }
+    } else {
+        for offset in 0..output_capacity {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
+        }
+    }
+
+    if client.pi == 2
+        && request.api_index == 0
+        && USER_CALLBACK_WINLOGON_API0.load(Ordering::Relaxed) == 1
+    {
+        let callback_table = if client.peb_mirror == 0 {
+            0
+        } else {
+            core::ptr::read_volatile((client.peb_mirror + 0x58) as *const u64)
+        };
+        let dispatcher_rva = crate::img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.load(Ordering::Relaxed);
+        let dispatcher = if dispatcher_rva == 0 { 0 } else { crate::NTDLL_BASE + dispatcher_rva };
+        let valid = callback_table != 0 && callback_table & 7 == 0;
+        USER_CALLBACK_TABLE_VALID.fetch_add(valid as u64, Ordering::Relaxed);
+        print_str(b"[user-callback] first winlogon api=0 pi=2 badge=");
+        print_u64(client.badge);
+        print_str(b" tid=");
+        print_u64(client.tid);
+        print_str(b" PEB+0x58 table=0x");
+        print_hex((callback_table >> 32) as u32);
+        print_hex(callback_table as u32);
+        print_str(if valid { b" (nonzero, aligned)" } else { b" (INVALID)" });
+        print_str(b" Rust-ntdll!KiUserCallbackDispatcher=0x");
+        print_hex((dispatcher >> 32) as u32);
+        print_hex(dispatcher as u32);
+        print_str(b" RVA=0x");
+        print_hex(dispatcher_rva as u32);
+        print_str(b"\n");
+    }
+
+    let mut reply = request;
+    reply.state = nt_user_callback::CallbackState::Reply as u32;
+    reply.output_length = request.output_capacity;
+    reply.status = 0;
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
+    true
+}
+
 /// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi /
 /// gHandleTable / the USER handle-entry array live) into the caller's (csrss's) VSpace at
 /// [`win32k_subsystem::CSRSS_W32_SHARED_VA`], so the Win32 client can dereference the SHAREDINFO the
@@ -485,7 +650,11 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
 /// then demand-page the handler's faults until the component issues its NEXT dispatch Call = "done".
 /// Returns `(status, ok)`; `ok=false` on a wall (null deref / W^X / demand cap / unexpected fault).
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32, bool) {
-    win32k_dispatch_wide(ssn, a0, a1, a2, a3, 0, 0)
+    let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
+    win32k_dispatch_wide(
+        ssn, a0, a1, a2, a3, 0, 0,
+        Win32kClientContext { pi, badge: 0, tid: 0, peb_mirror: 0 },
+    )
 }
 
 /// Like [`win32k_dispatch`] but marshals the win64 STACK-ARG TAIL for WIDE SSNs (args 5+). The x64
@@ -504,6 +673,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     a3: u64,
     caller_sp: u64,
     nargs: u64,
+    client: Win32kClientContext,
 ) -> (i32, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
@@ -514,9 +684,15 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
     // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
-    let client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
+    let client_pi = client.pi as u64;
     w32_client_attach(client_pi);
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let callback_frame = (sh + win32k_subsystem::SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*callback_frame).header),
+        nt_user_callback::CallbackHeader::idle(dispatch_id, client.pi, client.tid, client.badge),
+    );
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *mut u64, ssn);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
@@ -555,6 +731,12 @@ pub(crate) unsafe fn win32k_dispatch_wide(
         wake_first: true, // win32k is parked in `recv_req` → wake it with a leading plain Send
         reply_cap: rw,
         client_pi,
+        callback_client: Some(crate::spawn_hosts::UserCallbackClient {
+            pi: client.pi,
+            badge: client.badge,
+            tid: client.tid,
+            peb_mirror: client.peb_mirror,
+        }),
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,

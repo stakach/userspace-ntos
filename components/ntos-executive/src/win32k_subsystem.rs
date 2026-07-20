@@ -230,6 +230,10 @@ pub const SH_SAS_SESSION: u64 = 0x118; // out: winlogon SAS-window Session VA (u
 // client-side SASWindowProc → DispatchSAS → WlxLoggedOutSAS (the msgina logon dialog).
 pub const SH_SAS_HWND: u64 = 0x120; // out: winlogon SAS-window HWND (u64)
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
+/// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
+/// tail of the existing shared page; both the component stub and executive pump access it here.
+pub const SH_USER_CALLBACK: u64 = 0x200;
+const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
 /// + user32/gdi32 actually issue; verified: 0x1077=CreateWindowEx, 0x10bd=GetClassInfo,
@@ -532,6 +536,8 @@ pub const SSN_NT_USER_SET_THREAD_DESKTOP: u64 = 0x1092;
 /// AND these Calls on the same endpoint and tells them apart by the message label: fault labels are
 /// small (VMFault=6, UnknownSyscall=2, …), so this distinctive value never collides.
 pub const W32_DISPATCH_LABEL: u64 = 0x770;
+/// A component-side `KeUserModeCallback` request issued while the outer 0x770 dispatch is active.
+pub const W32_USER_CALLBACK_LABEL: u64 = 0x772;
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
@@ -2196,15 +2202,12 @@ unsafe fn patch_ke_get_current_irql() {
 //   ApiNumber 3  USER32_CALLBACK_LOADDEFAULTCURSORS (co_IntLoadDefaultCursors) → *Out = &HCURSOR
 //   ApiNumber 11 USER32_CALLBACK_SETWNDICONS        (co_IntSetWndIcons)        → *Out = SETWNDICONS_CALLBACK_ARGUMENTS
 //   ApiNumber 15 USER32_CALLBACK_SETOBM             (co_IntSetupOBM/MenuInit)  → *Out = SETOBM_CALLBACK_ARGUMENTS
-// In real Windows the callback runs user32's KiUserCallbackDispatcher on the CLIENT stack; our win32k
-// is a separate component. Each of these init callbacks returns a structure of HANDLES that win32k
-// tolerates all-NULL (IntLoadSystenIcons(NULL)/RtlCopyMemory of zeros are safe no-ops), so we
-// SYNTHESIZE structurally-valid, zeroed output here (a real IAT CALL/return — no RIP redirect
-// needed). This is the callback EFFECT faithfully: a client that found no custom resources.
-//
-// Contract: allocate a zeroed output buffer sized to max(caller's *OutputLength, InputLength, 8),
-// point *OutputBuffer at it, set *OutputLength, return STATUS_SUCCESS. (The caller pre-seeds
-// *OutputLength with the exact struct size it will RtlMoveMemory back, so honour it.)
+// Phase 2A: because this is a directly-bound component import (not an executive syscall), the stub
+// copies the bounded input into the pointer-free shared ABI and issues W32_USER_CALLBACK_LABEL as a
+// genuine seL4 Call. The executive applies the behavior-preserving synthetic policy and replies;
+// this stub then copies the validated result into component-owned pool memory. Phase 2B will withhold
+// that same reply and redirect the client instead. No direct component pointer crosses the ABI.
+#[cfg(any())]
 const USER32_CB_LOADDEFAULTCURSORS: u32 = 3;
 // USER32_CALLBACK_WINDOWPROC (u32cb.h:9) — the CLIENT window-proc dispatch (WM_NCCREATE / WM_CREATE /
 // WM_NCCALCSIZE etc.). co_IntCallWindowProc (callback.c:351,373) RtlMoveMemory's the OUTPUT buffer back
@@ -2215,12 +2218,102 @@ const USER32_CB_LOADDEFAULTCURSORS: u32 = 3;
 // LRESULT at Result (offset 0x38). See WINDOWPROC_CALLBACK_ARGUMENTS (callback.h:21): x64 layout is
 // Proc@0 IsAnsiProc@8 Wnd@0x10 Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38.
 const USER32_CB_WINDOWPROC: u32 = 0;
+#[cfg(any())]
 const WPCA_MSG: u64 = 0x18; // UINT Msg
 const WPCA_RESULT: u64 = 0x38; // LRESULT Result
 // WINDOWPROC_CALLBACK_ARGUMENTS x64 layout invariant (callback.h:21): Proc@0 IsAnsiProc@8 Wnd@0x10
 // Msg@0x18 wParam@0x20 lParam@0x28 lParamBufferSize@0x30 Result@0x38. Result is the 8th 8-byte slot.
-const _: () = assert!(WPCA_RESULT == 7 * 8 && WPCA_MSG == 3 * 8);
-extern "win64" fn s_ke_user_mode_callback(
+const _: () = assert!(WPCA_RESULT == 7 * 8);
+extern "win64" fn s_ke_user_mode_callback_rendezvous(
+    api: u32,
+    input: u64,
+    input_len: u32,
+    out_buf: *mut u64,
+    out_len: *mut u32,
+) -> i32 {
+    unsafe {
+        let requested_output = if out_len.is_null() { 0 } else { read_volatile(out_len) };
+        let mut output_capacity = requested_output.max(input_len).max(8) as usize;
+        output_capacity = match output_capacity.checked_add(15) {
+            Some(value) => value & !15,
+            None => return 0xC000_000Du32 as i32,
+        };
+        if input_len != 0 && input == 0 {
+            return 0xC000_000Du32 as i32;
+        }
+        if input_len as usize > nt_user_callback::CALLBACK_PAYLOAD_MAX
+            || output_capacity > nt_user_callback::CALLBACK_PAYLOAD_MAX
+        {
+            return 0xC000_0023u32 as i32;
+        }
+
+        let frame = (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
+        let mut header = read_volatile(core::ptr::addr_of!((*frame).header));
+        if header.begin_request(api, input_len as usize, output_capacity).is_err() {
+            return 0xC000_000Du32 as i32;
+        }
+        for offset in 0..input_len as usize {
+            write_volatile(
+                core::ptr::addr_of_mut!((*frame).payload[offset]),
+                read_volatile((input + offset as u64) as *const u8),
+            );
+        }
+        if api == USER32_CB_WINDOWPROC && input_len as usize >= 0x40 {
+            let lparam_size = read_volatile((input + 0x30) as *const i32);
+            if lparam_size >= 0
+                && 0x40usize
+                    .checked_add(lparam_size as usize)
+                    .is_some_and(|end| end <= input_len as usize)
+            {
+                header.payload_reference_offset = 0x40;
+            }
+        }
+        for offset in input_len as usize..output_capacity {
+            write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
+        }
+        write_volatile(core::ptr::addr_of_mut!((*frame).header), header);
+        let request = header;
+
+        let mut message_info = W32_USER_CALLBACK_LABEL << 12;
+        core::arch::asm!(
+            "syscall",
+            inout("rdx") crate::SYS_CALL as u64 => _,
+            inout("rdi") crate::CT_FAULT => _,
+            inout("rsi") message_info => message_info,
+            inout("r10") 0u64 => _, inout("r8") 0u64 => _,
+            inout("r9") 0u64 => _, inout("r15") 0u64 => _,
+            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        let reply = read_volatile(core::ptr::addr_of!((*frame).header));
+        if (message_info >> 12) != 0 || nt_user_callback::validate_reply(&request, &reply).is_err() {
+            return 0xC000_0001u32 as i32;
+        }
+
+        let size = reply.output_length as u64;
+        let buf = pool_alloc(size.max(8));
+        if buf == 0 {
+            return 0xC000_009Au32 as i32;
+        }
+        for offset in 0..size as usize {
+            write_volatile(
+                (buf + offset as u64) as *mut u8,
+                read_volatile(core::ptr::addr_of!((*frame).payload[offset])),
+            );
+        }
+        if !out_buf.is_null() {
+            write_volatile(out_buf, buf);
+        }
+        if !out_len.is_null() {
+            write_volatile(out_len, reply.output_length);
+        }
+        reply.status
+    }
+}
+
+// Historical pre-Phase-2A shortcut retained outside every build only as nearby bring-up context.
+#[cfg(any())]
+extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
     api: u32,
     _input: u64,
     input_len: u32,
@@ -2471,7 +2564,7 @@ fn register_trampolines() {
     reg.bind("PsEstablishWin32Callouts", s_establish_win32_callouts as usize as u64);
     // --- batch 4: misc scalars ---
     reg.bind("IoGetDeviceObjectPointer", s_io_get_device_object_pointer as usize as u64);
-    reg.bind("KeUserModeCallback", s_ke_user_mode_callback as usize as u64);
+    reg.bind("KeUserModeCallback", s_ke_user_mode_callback_rendezvous as usize as u64);
     reg.bind("KeAddSystemServiceTable", s_ke_add_system_service_table as usize as u64);
     reg.bind("DbgPrint", s_dbg_print as usize as u64);
     // --- batch 4: resource / lock acquire → BOOLEAN TRUE (single-threaded host: always acquired) ---

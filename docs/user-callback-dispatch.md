@@ -1,9 +1,10 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **PHASE 1 implemented; executive reverse transition not started**. Author target: the
-executive + `nt-ntdll`. Implementation base: HEAD `e992af2`.
-Phase-1 gate: **187/98 held**; desktop paints 768/768 and the boot quiesces at the existing
-winlogon message-loop frontier. The baseline is `ee3a804` (`e992af2` is documentation-only).
+Status: **PHASE 2A implemented; user redirect intentionally not started**. Author target: the
+executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
+Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
+executive callback rendezvous while preserving the synthetic reply policy. The executive still
+replies immediately; Phase 2B is the first phase that withholds this reply and redirects the client.
 The IDD_LOGON logon dialog
 is *created* (17 `#32770` windows) but never *painted* because its `WM_PAINT` is never
 dispatched to the control procs.
@@ -12,8 +13,9 @@ dispatched to the control procs.
 
 Every interactive window message that win32k must run in the *client's* window procedure —
 `WM_PAINT`, `WM_ERASEBKGND`, `WM_INITDIALOG` to a server-side/queued window, hooks,
-cross-thread `SendMessage` — flows through **`KeUserModeCallback`**. Today the executive's
-`s_ke_user_mode_callback` (`win32k_subsystem.rs:2223`) is a *synthetic shortcut*: for the
+cross-thread `SendMessage` — flows through **`KeUserModeCallback`**. Before Phase 2A the isolated
+win32k component's directly-bound `s_ke_user_mode_callback` import stub was a *synthetic shortcut*;
+it was not an already executive-intercepted `Call`. For the
 window-creation callbacks (`WM_NCCREATE`/`WM_CREATE`) it stamps a canned `LRESULT` (Result=1)
 into the output buffer and returns, **without ever running the client's `WndProc`**. That was
 enough to make `CreateWindowEx` succeed, but it cannot render anything: the login dialog's
@@ -80,7 +82,9 @@ this is the whole design problem:**
   as a **native seL4 `Call`** to the executive, which routes it to win32k.
 - **win32k.sys** runs as an **isolated seL4 component** (own VSpace/TCB/dispatch loop —
   `component_main`/`component_pump`), reached over an endpoint. It is NOT in winlogon's address
-  space and cannot itself run code in winlogon's VSpace.
+  space and cannot itself run code in winlogon's VSpace. Its ntoskrnl imports are patched directly
+  to shared executable stubs, so the `KeUserModeCallback` stub must issue the distinct seL4
+  rendezvous `Call` itself while the outer win32k dispatch remains active.
 - The **executive** is the mediator between them.
 
 So the reverse transition is a **three-party dance mediated by the executive**, and "the
@@ -192,23 +196,28 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 |---|---|
 | `KiUserCallbackDispatcher` fixed-layout dispatch logic (`ki.rs`) | ✅ Phase 1: exact 0x58 frame + bounded validation, host-tested |
 | `KiUserCallbackDispatcher` target entry | ✅ Phase 1: naked x64 stack-frame entry in `nt-ntdll-dll` |
-| `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ☐ Phase 2 diagnostic before redirect (never fabricate it) |
+| `PEB->KernelCallbackTable` actual user32 pointer observed in winlogon | ✅ Phase 2A diagnostic (never fabricated) |
 | `NtCallbackReturn` + `ZwCallbackReturn` target exports | ✅ Phase 1: one SSN-22 transport body, Zw tail alias |
 | Executive-side special `NtCallbackReturn` continuation handler | ☐ Phase 2 |
-| Executive: intercept win32k's real `KeUserModeCallback` → issue a **callback request** | ☐ build (replace the `s_ke_user_mode_callback` shortcut) |
+| Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
+| Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
+| Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ☐ build |
 | Executive: per-thread **callback-continuation stack** (3a) | ☐ build |
 | win32k **nested-dispatch** / re-entrant `component_pump` (3b) | ☐ build |
 | **buffer marshalling** in/out across VSpaces (client-visible only) | ☐ build |
 
-`s_ke_user_mode_callback` today intercepts win32k's `KeUserModeCallback` ntoskrnl import and
-short-circuits it. The real version turns that interception into the reverse transition instead
-of a synthetic return.
+`KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
+Phase 2A creates the interception substrate: copy into the fixed shared frame, `seL4_Call` the
+executive with `W32_USER_CALLBACK_LABEL`, then copy the validated bounded reply into component pool
+memory. The synthetic policy now lives on the executive side. Phase 2B changes the executive's
+response: withhold the component reply, redirect the blocked client, and later complete the same
+rendezvous from `NtCallbackReturn`.
 
 ## 5. Control-transfer mechanics (seL4 level)
 
-- **Suspend win32k:** win32k's `KeUserModeCallback` is (already) an executive-intercepted call.
-  Instead of replying, the executive *withholds* the reply — win32k stays blocked in that call
+- **Suspend win32k (Phase 2B):** Phase 2A first creates the genuine component `Call` rendezvous.
+  Phase 2B stops replying immediately: the executive *withholds* the reply, so win32k stays blocked
   (its parked reply cap = the `win32k_continuation`). This is exactly the cooperative
   reply-cap park already used for events/pipes, applied to the win32k dispatch.
 - **Redirect winlogon → `KiUserCallbackDispatcher`:** winlogon is blocked awaiting the reply to
@@ -263,8 +272,19 @@ of a synthetic return.
      `ZwCallbackReturn` is a tail alias;
   3. QEMU remains 187/98, desktop paint remains 768/768, and boot quiesces at the same frontier.
   All three acceptance checks pass on the Phase-1 checkpoint.
-- **Phase 2 — single reverse transition (no nesting).** Executive: replace the
-  `s_ke_user_mode_callback` shortcut for **one** callback (start with the create-time
+- **Phase 2A — component rendezvous, synthetic executive reply (implemented).** A fixed shared ABI
+  carries bounded copied bytes plus explicit dispatch/client correlation. The directly-bound stub
+  issues a genuine seL4 `Call`; `component_pump` services its label while the outer dispatch is
+  active, performs the previous zero-init / input-preserving WINDOWPROC policy, and replies. The
+  WINDOWPROC marshaller represents ReactOS's appended `Arguments+0x40` lParam copy as a validated
+  payload offset, never as a component-local pointer. The
+  first live winlogon api=0 request logs the real `PEB+0x58` pointer and loaded Rust ntdll
+  `KiUserCallbackDispatcher` address/RVA. No client registers are changed and no continuation is
+  installed. The live acceptance run serviced 114 rendezvous (112 winlogon api=0), observed
+  `KernelCallbackTable=0x80214190`, resolved the dispatcher to `NTDLL_BASE+0x1000`, held 187/98,
+  painted 768/768 pixels, and quiesced at the same frontier.
+- **Phase 2B — single reverse transition (no nesting).** Change the Phase-2A response for **one**
+  callback (start with the create-time
   `WM_NCCREATE`, whose synthetic path we can compare against) with the real reverse transition:
   first read and log winlogon's `PEB+0x58` and reject a null/unobserved table; then suspend win32k,
   build the exact §3d frame, redirect winlogon to `KiUserCallbackDispatcher`, run its real `WndProc`,
@@ -308,8 +328,9 @@ of a synthetic return.
 
 - Builds on `crates/nt-ntdll/src/ki.rs` (`callback_dispatcher`, host-tested) and mirrors the SEH
   `KiUserExceptionDispatcher` target seam (batch 42) for the client entry.
-- Replaces the `win32k_subsystem.rs::s_ke_user_mode_callback` synthetic shortcut with the real
-  reverse transition; extends `component_pump` for re-entrant/nested win32k dispatch.
+- Phase 2A replaces the component-local synthetic shortcut with the real component→executive
+  rendezvous. Phase 2B turns that suspension point into the user redirect; Phase 3 extends
+  `component_pump` for re-entrant/nested win32k dispatch.
 - Reuses the cooperative reply-cap park (events/pipes) for "suspend win32k", and the
   client-memory mapping patterns (desktop-heap window mapping, GDI handle table) for Phase 4.
 - Tracked in `ntdll_plan.md` (the desktop/logon-UI frontier) as the machinery behind the

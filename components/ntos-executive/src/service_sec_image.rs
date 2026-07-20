@@ -3272,7 +3272,23 @@ pub(crate) unsafe fn service_sec_image(
                     // common nargs<=4 case it is byte-identical to the old register-only dispatch.
                     let sp = get_recv_mr(16);
                     let nargs = win32k_subsystem::win32k_ssn_argc(m0);
-                    let r = win32k_glue::win32k_dispatch_wide(m0, d_a0, d_a1, a2, a3, sp, nargs);
+                    let peb_mirror = match pi {
+                        0 => 0x0000_0100_1074_1000,
+                        1 => 0x0000_0100_1078_1000,
+                        2 => 0x0000_0100_107C_1000,
+                        3 => SERVICES_ENV_SCRATCH_VA + 0x1000,
+                        4 => LSASS_ENV_SCRATCH_VA + 0x1000,
+                        _ => 0,
+                    };
+                    let r = win32k_glue::win32k_dispatch_wide(
+                        m0, d_a0, d_a1, a2, a3, sp, nargs,
+                        win32k_glue::Win32kClientContext {
+                            pi: pi as u32,
+                            badge,
+                            tid: nt_handler.current_tid,
+                            peb_mirror,
+                        },
+                    );
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
                     // {hwnd@0, message@8, wParam@0x10, lParam@0x18}. Confirms whether the injected
                     // WLX_WM_SAS (0x659) reaches winlogon so DispatchMessageW runs SASWindowProc.

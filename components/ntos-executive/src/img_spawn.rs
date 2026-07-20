@@ -10,6 +10,8 @@ use crate::*;
 /// call this RVA (never the retired real-ntdll fixed 0x8e70). 0 until set. Since it is non-zero for
 /// all hosted spawns, it also selects the NATIVE seL4-Call transport uniformly (see `spawn_sec_image`).
 pub(crate) static OUR_LDRP_RVA: AtomicU64 = AtomicU64::new(0);
+/// RVA of the callback entry in the same loaded Rust ntdll, resolved from its export table at boot.
+pub(crate) static OUR_KI_USER_CALLBACK_DISPATCHER_RVA: AtomicU64 = AtomicU64::new(0);
 
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE

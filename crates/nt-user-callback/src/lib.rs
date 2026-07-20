@@ -1,0 +1,303 @@
+#![no_std]
+
+pub const CALLBACK_MAGIC: u32 = u32::from_le_bytes(*b"UCBK");
+pub const CALLBACK_VERSION: u16 = 1;
+pub const CALLBACK_KIND_USER_MODE: u16 = 1;
+pub const CALLBACK_PAYLOAD_MAX: usize = 0xD80;
+pub const CALLBACK_FRAME_SIZE: usize = core::mem::size_of::<CallbackFrame>();
+pub const NO_PAYLOAD_REFERENCE: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CallbackState {
+    Idle = 0,
+    Request = 1,
+    Reply = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct CallbackHeader {
+    pub magic: u32,
+    pub version: u16,
+    pub kind: u16,
+    pub state: u32,
+    pub api_index: u32,
+    pub input_length: u32,
+    pub output_capacity: u32,
+    pub output_length: u32,
+    pub status: i32,
+    pub client_pi: u32,
+    pub callback_id: u32,
+    /// Optional offset of an embedded buffer referenced by callback arguments. Component stubs
+    /// scrub the original component-local pointer and describe the copied bytes by offset instead.
+    pub payload_reference_offset: u32,
+    pub dispatch_id: u64,
+    pub client_tid: u64,
+    pub client_badge: u64,
+}
+
+impl CallbackHeader {
+    pub const fn idle(
+        dispatch_id: u64,
+        client_pi: u32,
+        client_tid: u64,
+        client_badge: u64,
+    ) -> Self {
+        Self {
+            magic: CALLBACK_MAGIC,
+            version: CALLBACK_VERSION,
+            kind: CALLBACK_KIND_USER_MODE,
+            state: CallbackState::Idle as u32,
+            api_index: 0,
+            input_length: 0,
+            output_capacity: 0,
+            output_length: 0,
+            status: 0,
+            client_pi,
+            callback_id: 0,
+            payload_reference_offset: NO_PAYLOAD_REFERENCE,
+            dispatch_id,
+            client_tid,
+            client_badge,
+        }
+    }
+
+    pub fn begin_request(
+        &mut self,
+        api_index: u32,
+        input_length: usize,
+        output_capacity: usize,
+    ) -> Result<(), ValidationError> {
+        validate_common(self)?;
+        if self.state != CallbackState::Idle as u32 && self.state != CallbackState::Reply as u32 {
+            return Err(ValidationError::State);
+        }
+        checked_payload_length(input_length)?;
+        checked_payload_length(output_capacity)?;
+        self.callback_id = self
+            .callback_id
+            .checked_add(1)
+            .ok_or(ValidationError::Sequence)?;
+        self.api_index = api_index;
+        self.input_length = input_length as u32;
+        self.output_capacity = output_capacity as u32;
+        self.output_length = 0;
+        self.payload_reference_offset = NO_PAYLOAD_REFERENCE;
+        self.status = STATUS_PENDING;
+        self.state = CallbackState::Request as u32;
+        Ok(())
+    }
+}
+
+#[repr(C, align(8))]
+pub struct CallbackFrame {
+    pub header: CallbackHeader,
+    pub payload: [u8; CALLBACK_PAYLOAD_MAX],
+}
+
+impl CallbackFrame {
+    pub const fn new() -> Self {
+        Self {
+            header: CallbackHeader::idle(0, 0, 0, 0),
+            payload: [0; CALLBACK_PAYLOAD_MAX],
+        }
+    }
+}
+
+impl Default for CallbackFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub const STATUS_PENDING: i32 = 0x0000_0103;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationError {
+    Magic,
+    Version,
+    Kind,
+    State,
+    Length,
+    OutputLength,
+    Sequence,
+    Correlation,
+}
+
+pub fn checked_payload_range(length: usize) -> Result<core::ops::Range<usize>, ValidationError> {
+    checked_payload_length(length)?;
+    let start = core::mem::size_of::<CallbackHeader>();
+    let end = start.checked_add(length).ok_or(ValidationError::Length)?;
+    if end > CALLBACK_FRAME_SIZE {
+        return Err(ValidationError::Length);
+    }
+    Ok(start..end)
+}
+
+pub fn validate_request(header: &CallbackHeader) -> Result<(), ValidationError> {
+    validate_common(header)?;
+    if header.state != CallbackState::Request as u32 {
+        return Err(ValidationError::State);
+    }
+    if header.dispatch_id == 0 || header.callback_id == 0 {
+        return Err(ValidationError::Sequence);
+    }
+    checked_payload_length(header.input_length as usize)?;
+    checked_payload_length(header.output_capacity as usize)?;
+    if header.payload_reference_offset != NO_PAYLOAD_REFERENCE {
+        let offset = header.payload_reference_offset as usize;
+        let end = offset.checked_add(8).ok_or(ValidationError::Length)?;
+        if end > header.input_length as usize {
+            return Err(ValidationError::Length);
+        }
+    }
+    if header.output_length != 0 {
+        return Err(ValidationError::OutputLength);
+    }
+    Ok(())
+}
+
+pub fn validate_reply(
+    request: &CallbackHeader,
+    reply: &CallbackHeader,
+) -> Result<(), ValidationError> {
+    validate_request(request)?;
+    validate_common(reply)?;
+    if reply.state != CallbackState::Reply as u32 {
+        return Err(ValidationError::State);
+    }
+    if reply.dispatch_id != request.dispatch_id
+        || reply.callback_id != request.callback_id
+        || reply.client_pi != request.client_pi
+        || reply.client_tid != request.client_tid
+        || reply.client_badge != request.client_badge
+        || reply.api_index != request.api_index
+        || reply.input_length != request.input_length
+        || reply.output_capacity != request.output_capacity
+        || reply.payload_reference_offset != request.payload_reference_offset
+    {
+        return Err(ValidationError::Correlation);
+    }
+    checked_payload_length(reply.output_length as usize)?;
+    if reply.output_length > reply.output_capacity {
+        return Err(ValidationError::OutputLength);
+    }
+    Ok(())
+}
+
+fn validate_common(header: &CallbackHeader) -> Result<(), ValidationError> {
+    if header.magic != CALLBACK_MAGIC {
+        return Err(ValidationError::Magic);
+    }
+    if header.version != CALLBACK_VERSION {
+        return Err(ValidationError::Version);
+    }
+    if header.kind != CALLBACK_KIND_USER_MODE {
+        return Err(ValidationError::Kind);
+    }
+    Ok(())
+}
+
+fn checked_payload_length(length: usize) -> Result<(), ValidationError> {
+    if length > CALLBACK_PAYLOAD_MAX {
+        Err(ValidationError::Length)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> CallbackHeader {
+        let mut header = CallbackHeader::idle(7, 2, 44, 4);
+        header.begin_request(0, 64, 80).unwrap();
+        header
+    }
+
+    #[test]
+    fn layout_fits_reserved_shared_page_tail() {
+        assert_eq!(core::mem::size_of::<CallbackHeader>(), 72);
+        assert_eq!(CALLBACK_FRAME_SIZE, 0xDC8);
+        assert!(0x200usize.checked_add(CALLBACK_FRAME_SIZE).unwrap() <= 0x1000);
+    }
+
+    #[test]
+    fn request_validates_lengths_state_and_sequence() {
+        let header = request();
+        assert_eq!(validate_request(&header), Ok(()));
+
+        let mut bad = header;
+        bad.state = CallbackState::Idle as u32;
+        assert_eq!(validate_request(&bad), Err(ValidationError::State));
+        bad = header;
+        bad.input_length = CALLBACK_PAYLOAD_MAX as u32 + 1;
+        assert_eq!(validate_request(&bad), Err(ValidationError::Length));
+        bad = header;
+        bad.callback_id = 0;
+        assert_eq!(validate_request(&bad), Err(ValidationError::Sequence));
+        bad = header;
+        bad.payload_reference_offset = 60;
+        assert_eq!(validate_request(&bad), Err(ValidationError::Length));
+    }
+
+    #[test]
+    fn reply_is_bounded_and_correlated() {
+        let request = request();
+        let mut reply = request;
+        reply.state = CallbackState::Reply as u32;
+        reply.output_length = 80;
+        reply.status = 0;
+        assert_eq!(validate_reply(&request, &reply), Ok(()));
+
+        reply.output_length = 81;
+        assert_eq!(
+            validate_reply(&request, &reply),
+            Err(ValidationError::OutputLength)
+        );
+        reply.output_length = 80;
+        reply.client_tid += 1;
+        assert_eq!(
+            validate_reply(&request, &reply),
+            Err(ValidationError::Correlation)
+        );
+    }
+
+    #[test]
+    fn payload_range_rejects_large_and_overflowing_lengths() {
+        assert_eq!(
+            checked_payload_range(CALLBACK_PAYLOAD_MAX).unwrap().end,
+            CALLBACK_FRAME_SIZE
+        );
+        assert_eq!(
+            checked_payload_range(CALLBACK_PAYLOAD_MAX + 1),
+            Err(ValidationError::Length)
+        );
+        assert_eq!(
+            checked_payload_range(usize::MAX),
+            Err(ValidationError::Length)
+        );
+    }
+
+    #[test]
+    fn embedded_payload_reference_must_stay_inside_copied_input() {
+        let mut header = CallbackHeader::idle(3, 2, 6, 4);
+        header.begin_request(0, 128, 128).unwrap();
+        header.payload_reference_offset = 0x40;
+        assert_eq!(validate_request(&header), Ok(()));
+        header.payload_reference_offset = 124;
+        assert_eq!(validate_request(&header), Err(ValidationError::Length));
+    }
+
+    #[test]
+    fn request_ids_advance_without_losing_dispatch_identity() {
+        let mut header = CallbackHeader::idle(9, 2, 100, 4);
+        header.begin_request(3, 8, 16).unwrap();
+        assert_eq!((header.dispatch_id, header.callback_id), (9, 1));
+        header.state = CallbackState::Reply as u32;
+        header.begin_request(0, 64, 64).unwrap();
+        assert_eq!((header.dispatch_id, header.callback_id), (9, 2));
+    }
+}
