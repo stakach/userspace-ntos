@@ -3654,14 +3654,7 @@ pub unsafe extern "C" fn local_unwind(_frame: *mut c_void, _target: *mut c_void)
 /// the type's field-index into the 64-bit mask (7 fields × 8 bits). Ref MS `VerSetConditionMask`.
 #[export_name = "VerSetConditionMask"]
 pub extern "C" fn ver_set_condition_mask(mask: u64, type_bit_mask: u32, condition: u8) -> u64 {
-    if type_bit_mask == 0 {
-        return mask;
-    }
-    // find the single set bit's index (VER_MINORVERSION=1, MAJORVERSION=2, BUILDNUMBER=4, ...).
-    let index = type_bit_mask.trailing_zeros() as u64;
-    let cond = (condition & 0x07) as u64;
-    let shift = 3 * index;
-    (mask & !(0x07u64 << shift)) | (cond << shift)
+    rtl::status::version_condition_set(mask, type_bit_mask, condition)
 }
 
 // ---- math helpers for sin/cos (no libm) ----------------------------------------------------------
@@ -6972,37 +6965,61 @@ pub unsafe extern "system" fn rtl_get_version(vi: *mut c_void) -> NtStatus {
         *p.add(4) = 2; // VER_PLATFORM_WIN32_NT
                        // szCSDVersion @ 0x14: zero the first wchar (empty).
         *((vi as *mut u16).add(0x14 / 2)) = 0;
+        if *p >= 0x11C {
+            core::ptr::write_unaligned((vi as *mut u8).add(0x114) as *mut u16, 0); // SP major
+            core::ptr::write_unaligned((vi as *mut u8).add(0x116) as *mut u16, 0); // SP minor
+            core::ptr::write_unaligned((vi as *mut u8).add(0x118) as *mut u16, 0); // suite mask
+            *((vi as *mut u8).add(0x11A)) = 1; // VER_NT_WORKSTATION
+            *((vi as *mut u8).add(0x11B)) = 0; // reserved
+        }
     }
     STATUS_SUCCESS
 }
 
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
-/// -> NTSTATUS`. Compare against our reported 5.2.3790. For the common `>=` boot checks we return
-/// STATUS_SUCCESS (the running version satisfies a `<=` requirement); a strictly-greater requirement
-/// returns STATUS_REVISION_MISMATCH (0xC0000059).
+/// -> NTSTATUS`. Compare against the version reported by `RtlGetVersion`, honoring ReactOS'
+/// `TypeMask`/`ConditionMask` semantics.
 ///
 /// # Safety
 /// `vi` a valid RTL_OSVERSIONINFOEXW.
 #[export_name = "RtlVerifyVersionInfo"]
 pub unsafe extern "system" fn rtl_verify_version_info(
     vi: *const c_void,
-    _type_mask: u32,
-    _condition_mask: u64,
+    type_mask: u32,
+    condition_mask: u64,
 ) -> NtStatus {
     if vi.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: vi valid per the contract.
-    let (major, minor) = unsafe {
+    let want = unsafe {
         let p = vi as *const u32;
-        (*p.add(1), *p.add(2))
+        rtl::status::OsVersionInfoEx {
+            major: core::ptr::read_unaligned(p.add(1)),
+            minor: core::ptr::read_unaligned(p.add(2)),
+            build: core::ptr::read_unaligned(p.add(3)),
+            platform_id: core::ptr::read_unaligned(p.add(4)),
+            service_pack_major: core::ptr::read_unaligned(
+                (vi as *const u8).add(0x114) as *const u16
+            ),
+            service_pack_minor: core::ptr::read_unaligned(
+                (vi as *const u8).add(0x116) as *const u16
+            ),
+            suite_mask: core::ptr::read_unaligned((vi as *const u8).add(0x118) as *const u16),
+            product_type: *((vi as *const u8).add(0x11A)),
+        }
     };
-    // Our OS = 5.2. Satisfy any requirement <= 5.2 (the boot path checks "at least NT4/2000").
-    if major < 5 || (major == 5 && minor <= 2) {
-        STATUS_SUCCESS
-    } else {
-        0xC000_0059 // STATUS_REVISION_MISMATCH
-    }
+    let have = rtl::status::OsVersionInfoEx {
+        major: 5,
+        minor: 2,
+        build: 3790,
+        platform_id: 2,
+        service_pack_major: 0,
+        service_pack_minor: 0,
+        suite_mask: 0,
+        product_type: 1,
+    };
+    rtl::status::verify_version_info(&have, &want, type_mask, condition_mask)
 }
 
 /// `RtlGetCurrentProcessorNumber() -> ULONG` — always CPU 0 (single-CPU boot).
