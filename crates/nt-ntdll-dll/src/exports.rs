@@ -10707,6 +10707,38 @@ pub unsafe extern "system" fn rtl_compare_unicode_strings(
     string1_length as i32 - string2_length as i32
 }
 
+/// `RtlHashUnicodeString(PCUNICODE_STRING, BOOLEAN, ULONG, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is a valid counted UTF-16 string and `hash_value` is writable.
+#[export_name = "RtlHashUnicodeString"]
+pub unsafe extern "system" fn rtl_hash_unicode_string(
+    string: PCUnicodeString,
+    case_insensitive: u8,
+    hash_algorithm: u32,
+    hash_value: *mut u32,
+) -> NtStatus {
+    if string.is_null() || hash_value.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (buffer, units) =
+        unsafe { ((*string).buffer as *const u16, (*string).length as usize / 2) };
+    let src = if units == 0 {
+        &[][..]
+    } else if buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    } else {
+        unsafe { core::slice::from_raw_parts(buffer, units) }
+    };
+    match rtl::strings::hash_unicode_string(src, case_insensitive != 0, hash_algorithm) {
+        Some(hash) => unsafe {
+            *hash_value = hash;
+            STATUS_SUCCESS
+        },
+        None => STATUS_INVALID_PARAMETER,
+    }
+}
+
 /// `RtlUpcaseUnicodeString(PUNICODE_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` — uppercase.
 ///
 /// # Safety
@@ -13222,6 +13254,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_upper_string as usize,
         rtl_copy_unicode_string as usize,
         rtl_compare_unicode_strings as usize,
+        rtl_hash_unicode_string as usize,
         rtl_upcase_unicode_string as usize,
         rtl_downcase_unicode_string as usize,
         rtl_duplicate_unicode_string as usize,

@@ -200,6 +200,25 @@ pub fn prefix_unicode_string(prefix: &[u16], s: &[u16], case_insensitive: bool) 
     equal_unicode_string(prefix, &s[..prefix.len()], case_insensitive)
 }
 
+/// `RtlHashUnicodeString`: X65599 hash over the counted UTF-16 units.
+pub fn hash_unicode_string(src: &[u16], case_insensitive: bool, algorithm: u32) -> Option<u32> {
+    if !matches!(algorithm, 0 | 1) {
+        return None;
+    }
+    let mut hash = 0u32;
+    for &unit in src {
+        let folded = if case_insensitive {
+            upcase_char(unit)
+        } else {
+            unit
+        };
+        hash = hash
+            .wrapping_mul(65_599)
+            .wrapping_add(folded as u32);
+    }
+    Some(hash)
+}
+
 // --- case folding over whole strings -----------------------------------------------------------
 
 /// `RtlUpcaseUnicodeString` (the pure part): upper-case every code unit into a fresh buffer.
@@ -408,6 +427,45 @@ mod tests {
         assert!(prefix_string(b"\\Device", b"\\DEVICE\\Harddisk0", true));
         assert_eq!(upper_string(b"aBz9!"), b"ABZ9!");
         assert_eq!(upcase_ansi_byte(0xE9), 0xC9);
+    }
+
+    #[test]
+    fn hash_unicode_string_matches_x65599_vectors() {
+        assert_eq!(hash_unicode_string(&u("T"), false, 1), Some(0x0000_0054));
+        assert_eq!(hash_unicode_string(&u("Test"), false, 1), Some(0x766b_b952));
+        assert_eq!(hash_unicode_string(&u("TeSt"), false, 1), Some(0x764b_b172));
+        assert_eq!(hash_unicode_string(&u("test"), false, 1), Some(0x4745_d132));
+        assert_eq!(hash_unicode_string(&u("test"), true, 1), Some(0x6689_c132));
+        assert_eq!(hash_unicode_string(&u("TEST"), true, 1), Some(0x6689_c132));
+        assert_eq!(hash_unicode_string(&u("TEST"), false, 1), Some(0x6689_c132));
+        assert_eq!(
+            hash_unicode_string(&u("t\u{e9}st"), false, 1),
+            Some(0x8845_cfb6)
+        );
+        assert_eq!(
+            hash_unicode_string(&u("t\u{e9}st"), true, 1),
+            Some(0xa789_bfb6)
+        );
+        assert_eq!(
+            hash_unicode_string(&u("T\u{c9}ST"), true, 1),
+            Some(0xa789_bfb6)
+        );
+        assert_eq!(
+            hash_unicode_string(&u("T\u{c9}ST"), false, 1),
+            Some(0xa789_bfb6)
+        );
+        assert_eq!(
+            hash_unicode_string(
+                &[
+                    'T' as u16, 'e' as u16, 's' as u16, 't' as u16, 0, '1' as u16,
+                ],
+                false,
+                1,
+            ),
+            Some(0x3280_3083)
+        );
+        assert_eq!(hash_unicode_string(&u("abcdef"), false, 0), Some(0x9713_18c3));
+        assert_eq!(hash_unicode_string(&u("Test"), false, 0xffff_ffff), None);
     }
 
     #[test]
