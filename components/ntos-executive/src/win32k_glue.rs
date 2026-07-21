@@ -105,23 +105,23 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
     client: Win32kClientContext,
     dispatch_id: u64,
     ssn: u64,
-) -> Option<bool> {
+) -> Result<bool, nt_user_callback::ContinuationError> {
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
     let Some(parent) = active.top() else {
-        return Some(false);
+        return Ok(false);
     };
-    if !parent.is_redirected()
-        || parent.request().client_pi != client.pi
+    if !parent.is_redirected() {
+        return Err(nt_user_callback::ContinuationError::State);
+    }
+    if parent.request().client_pi != client.pi
         || parent.request().client_badge != client.badge
         || parent.request().client_tid != client.tid
     {
-        return None;
+        return Err(nt_user_callback::ContinuationError::Client);
     }
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
-    if stack.push_dispatch(identity, dispatch_id).is_err() {
-        return None;
-    }
+    stack.push_dispatch(identity, dispatch_id)?;
     if USER_CALLBACK_SAS_SEQUENCE_ACTIVE.load(Ordering::Relaxed) != 0 {
         let mut sequence = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_SAS_SEQUENCE));
         if sequence.accept(ssn).is_ok() {
@@ -141,7 +141,7 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
     print_str(b"[user-callback] nested win32k dispatch ssn=0x");
     print_hex(ssn as u32);
     print_str(b" pushed above api0 callback\n");
-    Some(true)
+    Ok(true)
 }
 
 pub(crate) unsafe fn complete_nested_user_callback_dispatch(
@@ -1602,9 +1602,18 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
-        Some(nested) => nested,
-        None => {
-            print_str(b"[user-callback] rejected uncorrelated nested win32k dispatch\n");
+        Ok(nested) => nested,
+        Err(error) => {
+            print_str(b"[user-callback] rejected nested win32k dispatch: ");
+            print_str(match error {
+                nt_user_callback::ContinuationError::Overflow => b"continuation stack overflow\n",
+                nt_user_callback::ContinuationError::Underflow => b"continuation stack underflow\n",
+                nt_user_callback::ContinuationError::Sequence => b"invalid sequence\n",
+                nt_user_callback::ContinuationError::Kind => b"invalid continuation kind\n",
+                nt_user_callback::ContinuationError::State => b"invalid continuation state\n",
+                nt_user_callback::ContinuationError::Client => b"client identity mismatch\n",
+                nt_user_callback::ContinuationError::Correlation => b"dispatch correlation mismatch\n",
+            });
             return (0xC000_000Du32 as i32, false);
         }
     };
