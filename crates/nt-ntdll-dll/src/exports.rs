@@ -5831,6 +5831,54 @@ pub unsafe extern "system" fn rtl_guid_from_string(
     }
 }
 
+/// `RtlStringFromGUID(REFGUID Guid, PUNICODE_STRING GuidString) -> NTSTATUS`.
+///
+/// # Safety
+/// `guid` points to a 16-byte GUID; `guid_string` is writable and later freed with
+/// `RtlFreeUnicodeString`.
+#[export_name = "RtlStringFromGUID"]
+pub unsafe extern "system" fn rtl_string_from_guid(
+    guid: *const c_void,
+    guid_string: PUnicodeString,
+) -> NtStatus {
+    if guid.is_null() || guid_string.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let guid = unsafe {
+        let bytes = guid as *const u8;
+        let mut data4 = [0u8; 8];
+        core::ptr::copy_nonoverlapping(bytes.add(8), data4.as_mut_ptr(), 8);
+        rtl::guid::Guid {
+            data1: core::ptr::read_unaligned(bytes as *const u32),
+            data2: core::ptr::read_unaligned(bytes.add(4) as *const u16),
+            data3: core::ptr::read_unaligned(bytes.add(6) as *const u16),
+            data4,
+        }
+    };
+    let formatted = rtl::guid::guid_to_string(&guid);
+    let bytes = (formatted.len() + 1) * 2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let buffer = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
+        if buffer.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(formatted.as_ptr(), buffer, formatted.len());
+            *buffer.add(formatted.len()) = 0;
+            (*guid_string).length = (formatted.len() * 2) as u16;
+            (*guid_string).maximum_length = bytes as u16;
+            (*guid_string).buffer = buffer as u64;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = bytes;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 // ---- image (host-tested nt_ntdll::rtl::image over a mapped image byte slice) ----------------------
 
 /// `RtlImageNtHeader(PVOID BaseAddress) -> PIMAGE_NT_HEADERS` — the NT headers of a mapped image.
@@ -13358,6 +13406,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
         rtl_guid_from_string as usize,
+        rtl_string_from_guid as usize,
         rtl_image_nt_header as usize,
         rtl_image_directory_entry_to_data as usize,
         rtl_image_rva_to_va as usize,
