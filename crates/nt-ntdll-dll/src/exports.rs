@@ -75,6 +75,7 @@ static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
 static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
 const SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET: usize = 16;
@@ -4810,6 +4811,58 @@ pub unsafe extern "system" fn rtl_open_current_user(
     }
 }
 
+/// `RtlFormatCurrentUserKeyPath(PUNICODE_STRING KeyPath) -> NTSTATUS`.
+///
+/// Current-user registry opens are currently backed by `\Registry\User\.Default`; return the same
+/// heap-allocated path here so apphelp and the registry helpers agree on the active user hive.
+///
+/// # Safety
+/// `key_path` writable for a `UNICODE_STRING`.
+#[export_name = "RtlFormatCurrentUserKeyPath"]
+pub unsafe extern "system" fn rtl_format_current_user_key_path(
+    key_path: PUnicodeString,
+) -> NtStatus {
+    if key_path.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const PATH: &[u8] = b"\\Registry\\User\\.Default";
+    let bytes = PATH.len() * 2;
+    let total = bytes + 2;
+    if total > u16::MAX as usize {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: process heap is available on target after loader initialization.
+        let buffer = unsafe { crate::process_heap_alloc(total) } as *mut u16;
+        if buffer.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        // SAFETY: `buffer` is writable for `total` bytes and `key_path` is caller-writable.
+        unsafe {
+            for (i, &byte) in PATH.iter().enumerate() {
+                core::ptr::write_unaligned(buffer.add(i), byte as u16);
+            }
+            core::ptr::write_unaligned(buffer.add(PATH.len()), 0);
+            (*key_path).length = bytes as u16;
+            (*key_path).maximum_length = total as u16;
+            (*key_path).buffer = buffer as u64;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        unsafe {
+            (*key_path).length = 0;
+            (*key_path).maximum_length = 0;
+            (*key_path).buffer = 0;
+        }
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `_snwprintf(wchar_t* buf, size_t count, const wchar_t* fmt, ...) -> int` — variadic wide; the 4.0b
 /// seam (writes an empty string; real formatting is the CRT plane). Declares only the fixed args (the
 /// Win64 ABI leaves the variadic tail in caller regs/stack, which we never read).
@@ -6237,6 +6290,31 @@ pub unsafe extern "system" fn ldr_lock_loader_lock(
 #[export_name = "LdrUnlockLoaderLock"]
 pub unsafe extern "system" fn ldr_unlock_loader_lock(_flags: u32, _cookie: usize) -> NtStatus {
     STATUS_SUCCESS
+}
+
+/// `LdrInitShimEngineDynamic(PVOID BaseAddress) -> BOOLEAN`.
+///
+/// ReactOS apphelp calls this after loading dynamically. Record the shim module base once under the
+/// loader lock; the actual shim callback interface is not invoked until the loader has full shim
+/// policy support.
+#[export_name = "LdrInitShimEngineDynamic"]
+pub unsafe extern "system" fn ldr_init_shim_engine_dynamic(base_address: *mut c_void) -> u8 {
+    let mut cookie = 0usize;
+    // SAFETY: local loader-lock export accepts null state and writable cookie.
+    let status =
+        unsafe { ldr_lock_loader_lock(0, core::ptr::null_mut(), &mut cookie as *mut usize) };
+    if status != STATUS_SUCCESS {
+        return 0;
+    }
+    let _ = LDR_SHIM_ENGINE_MODULE.compare_exchange(
+        0,
+        base_address as u64,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    // SAFETY: release the cookie from the matching lock call.
+    let _ = unsafe { ldr_unlock_loader_lock(0, cookie) };
+    1
 }
 
 /// `LdrDisableThreadCalloutsForDll(PVOID DllHandle) -> NTSTATUS` — suppress DLL_THREAD_ATTACH/DETACH
@@ -14444,6 +14522,78 @@ pub unsafe extern "system" fn rtl_validate_unicode_string(
     }
 }
 
+const RTL_BUFFER_BUFFER: usize = 0x00;
+const RTL_BUFFER_STATIC_BUFFER: usize = 0x08;
+const RTL_BUFFER_SIZE: usize = 0x10;
+const RTL_BUFFER_STATIC_SIZE: usize = 0x18;
+const RTL_BUFFER_RESERVED_ALLOCATED_SIZE: usize = 0x20;
+const RTL_SKIP_BUFFER_COPY: u32 = 0x0000_0001;
+
+/// `RtlpEnsureBufferSize(ULONG Flags, PRTL_BUFFER Buffer, SIZE_T RequiredSize) -> NTSTATUS`.
+///
+/// # Safety
+/// `buffer` points to an x64 `RTL_BUFFER` descriptor.
+#[export_name = "RtlpEnsureBufferSize"]
+pub unsafe extern "system" fn rtlp_ensure_buffer_size(
+    flags: u32,
+    buffer: *mut c_void,
+    required_size: usize,
+) -> NtStatus {
+    if flags & !RTL_SKIP_BUFFER_COPY != 0 || buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let base = buffer as *mut u8;
+    // SAFETY: `buffer` is a valid RTL_BUFFER per the contract.
+    let (current, static_buffer, size, static_size) = unsafe {
+        (
+            core::ptr::read_unaligned(base.add(RTL_BUFFER_BUFFER) as *const *mut u8),
+            core::ptr::read_unaligned(base.add(RTL_BUFFER_STATIC_BUFFER) as *const *mut u8),
+            core::ptr::read_unaligned(base.add(RTL_BUFFER_SIZE) as *const usize),
+            core::ptr::read_unaligned(base.add(RTL_BUFFER_STATIC_SIZE) as *const usize),
+        )
+    };
+
+    if size >= required_size {
+        return STATUS_SUCCESS;
+    }
+    if current == static_buffer && static_size >= required_size {
+        // SAFETY: descriptor writable per the contract.
+        unsafe { core::ptr::write_unaligned(base.add(RTL_BUFFER_SIZE) as *mut usize, required_size) };
+        return STATUS_SUCCESS;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: process heap is available on target after loader initialization.
+        let new_buffer = unsafe { crate::process_heap_alloc(required_size.max(1)) };
+        if new_buffer.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        // SAFETY: old/new buffers follow the descriptor contract.
+        unsafe {
+            if flags & RTL_SKIP_BUFFER_COPY == 0 && !current.is_null() && size != 0 {
+                core::ptr::copy_nonoverlapping(current, new_buffer, size);
+            }
+            if current != static_buffer && !current.is_null() {
+                crate::process_heap_free(current);
+            }
+            core::ptr::write_unaligned(base.add(RTL_BUFFER_BUFFER) as *mut *mut u8, new_buffer);
+            core::ptr::write_unaligned(base.add(RTL_BUFFER_SIZE) as *mut usize, required_size);
+            core::ptr::write_unaligned(
+                base.add(RTL_BUFFER_RESERVED_ALLOCATED_SIZE) as *mut usize,
+                required_size,
+            );
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (current, static_buffer);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `RtlSecondsSince1970ToTime(ULONG SecondsSince1970, PLARGE_INTEGER Time)` — convert to NT time
 /// (`sdk/lib/rtl/time.c:406`): `Time = Seconds * TICKSPERSEC + TICKSTO1970`.
 ///
@@ -17427,6 +17577,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_reallocate_heap as usize,
         rtl_expand_environment_strings_u as usize,
         rtl_open_current_user as usize,
+        rtl_format_current_user_key_path as usize,
         snwprintf as usize,
         wcsncpy as usize,
         wcscat as usize,
@@ -17582,6 +17733,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_console_multi_byte_to_unicode_n as usize,
         rtl_multi_byte_to_unicode_size as usize,
         rtl_unicode_to_multi_byte_size as usize,
+        rtlp_ensure_buffer_size as usize,
         rtl_oem_string_to_unicode_string as usize,
         rtl_unicode_string_to_oem_string as usize,
         rtl_unicode_string_to_counted_oem_string as usize,
@@ -17975,6 +18127,7 @@ pub unsafe extern "C" fn export_anchor() {
     let anchors_ldr: &[usize] = &[
         ldr_lock_loader_lock as usize,
         ldr_unlock_loader_lock as usize,
+        ldr_init_shim_engine_dynamic as usize,
         ldr_disable_thread_callouts_for_dll as usize,
         ldr_add_ref_dll as usize,
         ldr_register_dll_notification as usize,
