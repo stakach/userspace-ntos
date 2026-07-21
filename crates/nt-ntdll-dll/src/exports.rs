@@ -13172,6 +13172,109 @@ pub unsafe extern "system" fn rtl_get_product_info(
     1
 }
 
+unsafe fn rtl_copy_preferred_ui_languages(
+    kind: rtl::locale::PreferredUiLanguageKind,
+    flags: u32,
+    count: *mut u32,
+    buffer: *mut u16,
+    size: *mut u32,
+) -> NtStatus {
+    if count.is_null() || size.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // SAFETY: `size` is a required in/out pointer per the ABI contract.
+    let capacity = unsafe { *size };
+    let query = rtl::locale::query_preferred_ui_languages(kind, flags, !buffer.is_null(), capacity);
+
+    // SAFETY: required writable pointers were validated above.
+    unsafe {
+        *count = query.count;
+        *size = query.required;
+    }
+
+    if query.status == STATUS_SUCCESS && !query.units.is_empty() {
+        // SAFETY: query_preferred_ui_languages only returns payload when the supplied capacity is
+        // large enough for the whole multi-string.
+        unsafe {
+            core::ptr::copy_nonoverlapping(query.units.as_ptr(), buffer, query.units.len());
+        }
+    }
+
+    query.status
+}
+
+/// `RtlGetSystemPreferredUILanguages(ULONG Flags, ULONG Reserved, PULONG Count, PWSTR Buffer,
+/// PULONG Size) -> NTSTATUS` — return the system UI language list. Until registry-backed MUI
+/// policy exists, the real process default is the built-in en-US / 0409 list.
+///
+/// # Safety
+/// `count` and `size` must be writable. `buffer`, when non-null, must hold `*size` WCHARs.
+#[export_name = "RtlGetSystemPreferredUILanguages"]
+pub unsafe extern "system" fn rtl_get_system_preferred_ui_languages(
+    flags: u32,
+    _reserved: u32,
+    count: *mut u32,
+    buffer: *mut u16,
+    size: *mut u32,
+) -> NtStatus {
+    unsafe {
+        rtl_copy_preferred_ui_languages(
+            rtl::locale::PreferredUiLanguageKind::System,
+            flags,
+            count,
+            buffer,
+            size,
+        )
+    }
+}
+
+/// `RtlGetThreadPreferredUILanguages(ULONG Flags, PULONG Count, PWSTR Buffer, PULONG Size)`.
+///
+/// # Safety
+/// `count` and `size` must be writable. `buffer`, when non-null, must hold `*size` WCHARs.
+#[export_name = "RtlGetThreadPreferredUILanguages"]
+pub unsafe extern "system" fn rtl_get_thread_preferred_ui_languages(
+    flags: u32,
+    count: *mut u32,
+    buffer: *mut u16,
+    size: *mut u32,
+) -> NtStatus {
+    unsafe {
+        rtl_copy_preferred_ui_languages(
+            rtl::locale::PreferredUiLanguageKind::Thread,
+            flags,
+            count,
+            buffer,
+            size,
+        )
+    }
+}
+
+/// `RtlGetUserPreferredUILanguages(ULONG Flags, ULONG Reserved, PULONG Count, PWSTR Buffer,
+/// PULONG Size)`.
+///
+/// # Safety
+/// `count` and `size` must be writable. `buffer`, when non-null, must hold `*size` WCHARs.
+#[export_name = "RtlGetUserPreferredUILanguages"]
+pub unsafe extern "system" fn rtl_get_user_preferred_ui_languages(
+    flags: u32,
+    _reserved: u32,
+    count: *mut u32,
+    buffer: *mut u16,
+    size: *mut u32,
+) -> NtStatus {
+    unsafe {
+        rtl_copy_preferred_ui_languages(
+            rtl::locale::PreferredUiLanguageKind::User,
+            flags,
+            count,
+            buffer,
+            size,
+        )
+    }
+}
+
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
 /// -> NTSTATUS`. Compare against the version reported by `RtlGetVersion`, honoring ReactOS'
 /// `TypeMask`/`ConditionMask` semantics.
@@ -18307,6 +18410,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_get_version as usize,
         rtl_get_nt_version_numbers as usize,
         rtl_get_product_info as usize,
+        rtl_get_system_preferred_ui_languages as usize,
+        rtl_get_thread_preferred_ui_languages as usize,
+        rtl_get_user_preferred_ui_languages as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
         rtl_get_current_processor_number_ex as usize,

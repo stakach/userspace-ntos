@@ -23,6 +23,7 @@ pub mod generic_table;
 pub mod guid;
 pub mod image;
 pub mod integer;
+pub mod locale;
 pub mod memory;
 pub mod memstream;
 pub mod message;
