@@ -180,6 +180,32 @@ impl OwnedAtomTable {
         unsafe { delete(self.as_mut_ptr(), atom) }
     }
 
+    pub fn pin(&mut self, atom: u16) -> u32 {
+        // SAFETY: the pointer is the live allocation initialized by `with_capacity`.
+        unsafe { pin(self.as_mut_ptr(), atom) }
+    }
+
+    pub fn empty(&mut self, delete_pinned: bool) -> u32 {
+        // SAFETY: the pointer is the live allocation initialized by `with_capacity`.
+        unsafe { empty(self.as_mut_ptr(), delete_pinned) }
+    }
+
+    /// Raw `RtlQueryAtomInAtomTable` form for ABI wrappers that need null out-params.
+    ///
+    /// # Safety
+    /// Any non-null out-param must be writable. If `name` is non-null, `name_len` must point to the
+    /// caller-provided byte capacity.
+    pub unsafe fn query_raw(
+        &self,
+        atom: u16,
+        ref_count: *mut u32,
+        pin_count: *mut u32,
+        name: *mut u16,
+        name_len: *mut u32,
+    ) -> u32 {
+        unsafe { query(self.as_ptr(), atom, ref_count, pin_count, name, name_len) }
+    }
+
     /// Query an atom into `name`. `name_capacity_bytes` preserves the native byte-sized contract,
     /// including odd/truncated capacities; callers must provide a 256-unit scratch buffer.
     pub fn query(
@@ -548,6 +574,36 @@ pub unsafe fn pin(table: *mut u8, atom: u16) -> u32 {
     }
 }
 
+/// `RtlEmptyAtomTable(table, delete_pinned)`. Clears string atoms in-place, preserving pinned atoms
+/// when requested. Integer atoms are synthesized and therefore never table entries.
+///
+/// # Safety
+/// `table` must be a table from [`create`] (or null -> `INVALID_HANDLE`).
+pub unsafe fn empty(table: *mut u8, delete_pinned: bool) -> u32 {
+    if table.is_null() {
+        return status::INVALID_HANDLE;
+    }
+    let cap = rd_u32(table, hdr::CAPACITY);
+    let mut kept = 0u32;
+    for i in 0..cap {
+        let e = entry_mut(table, i);
+        if rd_u16(e, ent::ATOM) == 0 {
+            continue;
+        }
+        if !delete_pinned && (rd_u16(e, ent::FLAGS) & FLAG_PINNED) != 0 {
+            kept += 1;
+            continue;
+        }
+        wr_u16(e, ent::ATOM, 0);
+        wr_u16(e, ent::REF, 0);
+        wr_u16(e, ent::FLAGS, 0);
+        wr_u16(e, ent::NAME_LEN, 0);
+        wr_u16(e, ent::NAME, 0);
+    }
+    wr_u32(table, hdr::COUNT, kept);
+    status::SUCCESS
+}
+
 /// `RtlQueryAtomInAtomTable(table, atom, ref_count, pin_count, name, name_len)`. Fills whichever of
 /// the out-params are non-null. `name_len` is IN/OUT in BYTES (the odd Windows contract): on entry
 /// the `name` buffer capacity, on exit the copied length excluding the null terminator. Returns
@@ -835,6 +891,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_preserves_pinned_unless_requested() {
+        let mut a = arena(65536);
+        let pinned_name = w("Pinned");
+        let transient_name = w("Transient");
+        unsafe {
+            let t = create(a.as_mut_ptr(), a.len());
+            let mut pinned = 0u16;
+            let mut transient = 0u16;
+            assert_eq!(add(t, pinned_name.as_ptr(), &mut pinned), status::SUCCESS);
+            assert_eq!(
+                add(t, transient_name.as_ptr(), &mut transient),
+                status::SUCCESS
+            );
+            assert_eq!(pin(t, pinned), status::SUCCESS);
+
+            assert_eq!(empty(t, false), status::SUCCESS);
+            assert_eq!(
+                lookup(t, pinned_name.as_ptr(), core::ptr::null_mut()),
+                status::SUCCESS
+            );
+            assert_eq!(
+                lookup(t, transient_name.as_ptr(), core::ptr::null_mut()),
+                status::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(rd_u32(t, hdr::COUNT), 1);
+
+            assert_eq!(empty(t, true), status::SUCCESS);
+            assert_eq!(
+                lookup(t, pinned_name.as_ptr(), core::ptr::null_mut()),
+                status::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(rd_u32(t, hdr::COUNT), 0);
+        }
+    }
+
+    #[test]
     fn query_returns_name_and_refs() {
         let mut a = arena(65536);
         let name = w("ScrollBar");
@@ -973,5 +1065,47 @@ mod tests {
         assert_eq!(name[0], b'L' as u16);
         assert_eq!(name[1], 0);
         assert_eq!(name[2], 0xCCCC);
+    }
+
+    #[test]
+    fn owned_pin_empty_and_raw_query_support_export_contracts() {
+        let mut table = OwnedAtomTable::with_capacity(2).unwrap();
+        let pinned_name: std::vec::Vec<u16> = "Pinned".encode_utf16().collect();
+        let transient_name: std::vec::Vec<u16> = "Transient".encode_utf16().collect();
+        let pinned = table.add_name(&pinned_name).unwrap();
+        let transient = table.add_name(&transient_name).unwrap();
+
+        assert_eq!(table.pin(pinned), status::SUCCESS);
+        let mut refs = 0u32;
+        let mut pins = 0u32;
+        unsafe {
+            assert_eq!(
+                table.query_raw(
+                    pinned,
+                    &mut refs,
+                    &mut pins,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ),
+                status::SUCCESS
+            );
+        }
+        assert_eq!(refs, 1);
+        assert_eq!(pins, 1);
+
+        assert_eq!(table.empty(false), status::SUCCESS);
+        assert_eq!(table.find_name(&pinned_name), Ok(pinned));
+        assert_eq!(
+            table.find_name(&transient_name),
+            Err(status::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(table.delete(pinned), status::WAS_LOCKED);
+        assert_eq!(table.delete(transient), status::INVALID_HANDLE);
+
+        assert_eq!(table.empty(true), status::SUCCESS);
+        assert_eq!(
+            table.find_name(&pinned_name),
+            Err(status::OBJECT_NAME_NOT_FOUND)
+        );
     }
 }

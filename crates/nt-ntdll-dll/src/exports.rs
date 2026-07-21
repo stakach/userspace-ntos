@@ -6189,22 +6189,45 @@ pub unsafe extern "system" fn rtl_find_clear_bits_and_set(
 // returns a HANDLE; we back it with a heap-boxed OwnedAtomTable and pass the box pointer as the
 // handle. Full add/lookup/delete/query route through the boxed table.
 
+const FIRST_DYNAMIC_ATOM: u16 = 0xC000;
+
+#[inline]
+unsafe fn rtl_handle_integer_atom_name(atom_name: *const u16, atom: *mut u16) -> Option<NtStatus> {
+    let integer = unsafe { nt_ntdll::rtl::atom::check_integer_atom(atom_name) }?;
+    if integer >= FIRST_DYNAMIC_ATOM {
+        return Some(STATUS_INVALID_PARAMETER);
+    }
+    if !atom.is_null() {
+        // SAFETY: caller supplied a writable atom out-param.
+        unsafe { *atom = integer };
+    }
+    Some(STATUS_SUCCESS)
+}
+
 /// `RtlCreateAtomTable(ULONG NumberOfBuckets, PVOID* AtomTable) -> NTSTATUS`.
 ///
 /// # Safety
 /// `atom_table` writable.
 #[export_name = "RtlCreateAtomTable"]
 pub unsafe extern "system" fn rtl_create_atom_table(
-    _number_of_buckets: u32,
+    number_of_buckets: u32,
     atom_table: *mut *mut c_void,
 ) -> NtStatus {
     if atom_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    if unsafe { !(*atom_table).is_null() } {
+        return STATUS_SUCCESS;
+    }
     // SAFETY: on-target box lives on the process heap; the handle is the box pointer.
     #[cfg(target_arch = "x86_64")]
     {
-        let table = match nt_ntdll::rtl::atom::OwnedAtomTable::with_capacity(37) {
+        let capacity = if number_of_buckets <= 1 {
+            37
+        } else {
+            number_of_buckets as usize
+        };
+        let table = match nt_ntdll::rtl::atom::OwnedAtomTable::with_capacity(capacity) {
             Some(t) => t,
             None => return STATUS_NO_MEMORY,
         };
@@ -6229,6 +6252,9 @@ pub unsafe extern "system" fn rtl_add_atom_to_atom_table(
     atom_name: *const u16,
     atom: *mut u16,
 ) -> NtStatus {
+    if let Some(status) = unsafe { rtl_handle_integer_atom_name(atom_name, atom) } {
+        return status;
+    }
     if atom_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -6265,6 +6291,9 @@ pub unsafe extern "system" fn rtl_lookup_atom_in_atom_table(
     atom_name: *const u16,
     atom: *mut u16,
 ) -> NtStatus {
+    if let Some(status) = unsafe { rtl_handle_integer_atom_name(atom_name, atom) } {
+        return status;
+    }
     if atom_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -6300,6 +6329,9 @@ pub unsafe extern "system" fn rtl_delete_atom_from_atom_table(
     atom_table: *mut c_void,
     atom: u16,
 ) -> NtStatus {
+    if atom < FIRST_DYNAMIC_ATOM {
+        return STATUS_SUCCESS;
+    }
     if atom_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -6312,6 +6344,77 @@ pub unsafe extern "system" fn rtl_delete_atom_from_atom_table(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = atom;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlPinAtomInAtomTable(PVOID AtomTable, USHORT Atom) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` from `RtlCreateAtomTable`.
+#[export_name = "RtlPinAtomInAtomTable"]
+pub unsafe extern "system" fn rtl_pin_atom_in_atom_table(
+    atom_table: *mut c_void,
+    atom: u16,
+) -> NtStatus {
+    if atom < FIRST_DYNAMIC_ATOM {
+        return STATUS_SUCCESS;
+    }
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &mut *(atom_table as *mut nt_ntdll::rtl::atom::OwnedAtomTable);
+        nt_ntdll::rtl::atom::pin_atom(table, atom)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlEmptyAtomTable(PVOID AtomTable, BOOLEAN DeletePinned) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` from `RtlCreateAtomTable`.
+#[export_name = "RtlEmptyAtomTable"]
+pub unsafe extern "system" fn rtl_empty_atom_table(
+    atom_table: *mut c_void,
+    delete_pinned: u8,
+) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = &mut *(atom_table as *mut nt_ntdll::rtl::atom::OwnedAtomTable);
+        nt_ntdll::rtl::atom::empty_atom_table(table, delete_pinned != 0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlDestroyAtomTable(PVOID AtomTable) -> NTSTATUS`.
+///
+/// # Safety
+/// `atom_table` is a handle returned by `RtlCreateAtomTable` and is not used again after destroy.
+#[export_name = "RtlDestroyAtomTable"]
+pub unsafe extern "system" fn rtl_destroy_atom_table(atom_table: *mut c_void) -> NtStatus {
+    if atom_table.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        drop(alloc::boxed::Box::from_raw(
+            atom_table as *mut nt_ntdll::rtl::atom::OwnedAtomTable,
+        ));
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -6332,6 +6435,17 @@ pub unsafe extern "system" fn rtl_query_atom_in_atom_table(
     atom_name: *mut u16,
     atom_name_length: *mut u32,
 ) -> NtStatus {
+    if atom < FIRST_DYNAMIC_ATOM {
+        return unsafe {
+            nt_ntdll::rtl::atom::query_integer_atom(
+                atom,
+                ref_count,
+                pin_count,
+                atom_name,
+                atom_name_length,
+            )
+        };
+    }
     if atom_table.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -6339,33 +6453,7 @@ pub unsafe extern "system" fn rtl_query_atom_in_atom_table(
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let table = &*(atom_table as *const nt_ntdll::rtl::atom::OwnedAtomTable);
-        // The query helper writes the name into a caller-owned 256+1 scratch (its NAME_CAP contract).
-        let mut scratch = [0u16; 255 + 1];
-        let cap_bytes = if atom_name_length.is_null() {
-            0
-        } else {
-            *atom_name_length
-        };
-        let res = table.query(atom, &mut scratch, cap_bytes);
-        if res.status != STATUS_SUCCESS {
-            return res.status;
-        }
-        if !ref_count.is_null() {
-            *ref_count = res.reference_count;
-        }
-        if !pin_count.is_null() {
-            *pin_count = res.pin_count;
-        }
-        if !atom_name.is_null() {
-            let units = (res.name_length as usize) / 2;
-            for i in 0..units {
-                *atom_name.add(i) = scratch[i];
-            }
-        }
-        if !atom_name_length.is_null() {
-            *atom_name_length = res.name_length;
-        }
-        STATUS_SUCCESS
+        table.query_raw(atom, ref_count, pin_count, atom_name, atom_name_length)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -9361,6 +9449,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_add_atom_to_atom_table as usize,
         rtl_lookup_atom_in_atom_table as usize,
         rtl_delete_atom_from_atom_table as usize,
+        rtl_pin_atom_in_atom_table as usize,
+        rtl_empty_atom_table as usize,
+        rtl_destroy_atom_table as usize,
         rtl_query_atom_in_atom_table as usize,
         rtl_encode_pointer as usize,
         rtl_decode_pointer as usize,
