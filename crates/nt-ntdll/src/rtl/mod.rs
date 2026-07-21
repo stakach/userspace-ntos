@@ -14,6 +14,7 @@
 pub mod atom;
 pub mod avl_table;
 pub mod bitmap;
+pub mod compression;
 pub mod convert;
 pub mod encode;
 pub mod environment;
@@ -28,8 +29,8 @@ pub mod message;
 pub mod network;
 pub mod path;
 pub mod pe_resource;
-pub mod process_params;
 pub mod prefix;
+pub mod process_params;
 pub mod propvariant;
 pub mod random;
 pub mod resource;

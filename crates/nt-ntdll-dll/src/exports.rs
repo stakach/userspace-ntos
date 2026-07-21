@@ -6392,6 +6392,155 @@ pub unsafe extern "system" fn rtl_nt_path_name_to_dos_path_name(
     }
 }
 
+unsafe fn raw_input_bytes<'a>(ptr: *const u8, len: u32) -> Result<&'a [u8], NtStatus> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len as usize) })
+}
+
+unsafe fn raw_output_bytes<'a>(ptr: *mut u8, len: u32) -> Result<&'a mut [u8], NtStatus> {
+    if len == 0 {
+        let dangling = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        return Ok(unsafe { core::slice::from_raw_parts_mut(dangling, 0) });
+    }
+    if ptr.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len as usize) })
+}
+
+/// `RtlGetCompressionWorkSpaceSize(USHORT, PULONG, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `compress_workspace` and `fragment_workspace` are writable.
+#[export_name = "RtlGetCompressionWorkSpaceSize"]
+pub unsafe extern "system" fn rtl_get_compression_work_space_size(
+    format_and_engine: u16,
+    compress_workspace: *mut u32,
+    fragment_workspace: *mut u32,
+) -> NtStatus {
+    if compress_workspace.is_null() || fragment_workspace.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match rtl::compression::compression_workspace_size(format_and_engine) {
+        Ok((compress, fragment)) => unsafe {
+            core::ptr::write_unaligned(compress_workspace, compress);
+            core::ptr::write_unaligned(fragment_workspace, fragment);
+            STATUS_SUCCESS
+        },
+        Err(status) => status,
+    }
+}
+
+/// `RtlCompressBuffer(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID) -> NTSTATUS`.
+///
+/// # Safety
+/// Buffer pointers follow the Windows compression API contract.
+#[export_name = "RtlCompressBuffer"]
+pub unsafe extern "system" fn rtl_compress_buffer(
+    format_and_engine: u16,
+    uncompressed_buffer: *const u8,
+    uncompressed_size: u32,
+    compressed_buffer: *mut u8,
+    compressed_size: u32,
+    uncompressed_chunk_size: u32,
+    final_compressed_size: *mut u32,
+    _workspace: *mut c_void,
+) -> NtStatus {
+    let input = match unsafe { raw_input_bytes(uncompressed_buffer, uncompressed_size) } {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let output = match unsafe { raw_output_bytes(compressed_buffer, compressed_size) } {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    match rtl::compression::compress_buffer(
+        format_and_engine,
+        input,
+        output,
+        uncompressed_chunk_size,
+    ) {
+        Ok(written) => {
+            if !final_compressed_size.is_null() {
+                unsafe { core::ptr::write_unaligned(final_compressed_size, written as u32) };
+            }
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// `RtlDecompressFragment(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID) -> NTSTATUS`.
+///
+/// # Safety
+/// Buffer pointers follow the Windows compression API contract.
+#[export_name = "RtlDecompressFragment"]
+pub unsafe extern "system" fn rtl_decompress_fragment(
+    format: u16,
+    uncompressed_buffer: *mut u8,
+    uncompressed_size: u32,
+    compressed_buffer: *const u8,
+    compressed_size: u32,
+    offset: u32,
+    final_uncompressed_size: *mut u32,
+    workspace: *mut c_void,
+) -> NtStatus {
+    let input = match unsafe { raw_input_bytes(compressed_buffer, compressed_size) } {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let output = match unsafe { raw_output_bytes(uncompressed_buffer, uncompressed_size) } {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let workspace = if workspace.is_null() {
+        None
+    } else {
+        Some(unsafe { core::slice::from_raw_parts_mut(workspace as *mut u8, 0x1000) })
+    };
+    match rtl::compression::decompress_fragment(format, output, input, offset, workspace) {
+        Ok(written) => {
+            if !final_uncompressed_size.is_null() {
+                unsafe { core::ptr::write_unaligned(final_uncompressed_size, written as u32) };
+            }
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// `RtlDecompressBuffer(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// Buffer pointers follow the Windows compression API contract.
+#[export_name = "RtlDecompressBuffer"]
+pub unsafe extern "system" fn rtl_decompress_buffer(
+    format: u16,
+    uncompressed_buffer: *mut u8,
+    uncompressed_size: u32,
+    compressed_buffer: *const u8,
+    compressed_size: u32,
+    final_uncompressed_size: *mut u32,
+) -> NtStatus {
+    unsafe {
+        rtl_decompress_fragment(
+            format,
+            uncompressed_buffer,
+            uncompressed_size,
+            compressed_buffer,
+            compressed_size,
+            0,
+            final_uncompressed_size,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
 /// `RtlGetLengthWithoutTrailingPathSeperators(ULONG, PCUNICODE_STRING, PULONG) -> NTSTATUS`.
 ///
 /// # Safety
@@ -16405,6 +16554,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_determine_dos_path_name_type_ustr as usize,
         rtl_get_longest_nt_path_length as usize,
         rtl_nt_path_name_to_dos_path_name as usize,
+        rtl_get_compression_work_space_size as usize,
+        rtl_compress_buffer as usize,
+        rtl_decompress_fragment as usize,
+        rtl_decompress_buffer as usize,
         rtl_get_length_without_trailing_path_seperators as usize,
         rtl_get_length_without_last_full_dos_or_nt_path_element as usize,
         rtlp_apply_length_function as usize,
