@@ -97,9 +97,17 @@ static mut NLS_ANSI_TO_UNICODE_TABLE: *const u16 = core::ptr::null();
 #[cfg(target_arch = "x86_64")]
 static mut NLS_UNICODE_TO_ANSI_TABLE: *const u8 = core::ptr::null();
 #[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_TO_MB_ANSI_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_ANSI_LEAD_BYTE_INFO: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
 static mut NLS_OEM_TO_UNICODE_TABLE: *const u16 = core::ptr::null();
 #[cfg(target_arch = "x86_64")]
 static mut NLS_UNICODE_TO_OEM_TABLE: *const u8 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_TO_MB_OEM_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_OEM_LEAD_BYTE_INFO: *const u16 = core::ptr::null();
 #[cfg(target_arch = "x86_64")]
 static mut NLS_UNICODE_UPCASE_TABLE: *const u16 = core::ptr::null();
 #[cfg(target_arch = "x86_64")]
@@ -296,6 +304,208 @@ fn nls_unicode_default_char() -> u16 {
     #[cfg(not(target_arch = "x86_64"))]
     {
         b'?' as u16
+    }
+}
+
+unsafe fn rtl_mb_to_unicode_n_dbcs(
+    unicode_str: *mut u16,
+    unicode_size: u32,
+    bytes_out: *mut u32,
+    mb_str: *const u8,
+    bytes_in_mb: u32,
+    oem: bool,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lead_info = if oem {
+            NLS_OEM_LEAD_BYTE_INFO
+        } else {
+            NLS_ANSI_LEAD_BYTE_INFO
+        };
+        let to_unicode = if oem {
+            NLS_OEM_TO_UNICODE_TABLE
+        } else {
+            NLS_ANSI_TO_UNICODE_TABLE
+        };
+        if lead_info.is_null() || to_unicode.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let mut src = 0usize;
+        let mut written = 0usize;
+        let max_units = unicode_size as usize / 2;
+        let src_len = bytes_in_mb as usize;
+        while written < max_units && src < src_len {
+            let byte = core::ptr::read(mb_str.add(src));
+            src += 1;
+            let unit = if byte < 0x80 {
+                byte as u16
+            } else {
+                let lead = core::ptr::read_unaligned(lead_info.add(byte as usize));
+                if lead == 0 {
+                    core::ptr::read_unaligned(to_unicode.add(byte as usize))
+                } else if src < src_len {
+                    let trail = core::ptr::read(mb_str.add(src));
+                    src += 1;
+                    core::ptr::read_unaligned(lead_info.add(lead as usize + trail as usize))
+                } else {
+                    break;
+                }
+            };
+            core::ptr::write(unicode_str.add(written), unit);
+            written += 1;
+        }
+        if !bytes_out.is_null() {
+            core::ptr::write(bytes_out, (written * 2) as u32);
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (unicode_str, unicode_size, bytes_out, mb_str, bytes_in_mb, oem);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+unsafe fn rtl_unicode_to_mb_n_dbcs(
+    mb_str: *mut u8,
+    mb_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+    oem: bool,
+    upcase: bool,
+) -> (NtStatus, usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let to_mb = if oem {
+            NLS_UNICODE_TO_MB_OEM_TABLE
+        } else {
+            NLS_UNICODE_TO_MB_ANSI_TABLE
+        };
+        if to_mb.is_null() {
+            return (STATUS_INVALID_PARAMETER, 0);
+        }
+        let mut written = 0usize;
+        let mut consumed = 0usize;
+        let units = bytes_in_unicode as usize / 2;
+        let capacity = mb_size as usize;
+        while consumed < units && written < capacity {
+            let mut unit = core::ptr::read(unicode_str.add(consumed));
+            if upcase {
+                unit = nls_upcase_unit(unit);
+            }
+            let mb = if unit < 0x80 {
+                unit
+            } else {
+                core::ptr::read_unaligned(to_mb.add(unit as usize))
+            };
+            let high = (mb >> 8) as u8;
+            let low = (mb & 0xFF) as u8;
+            if high != 0 {
+                if capacity - written < 2 {
+                    break;
+                }
+                core::ptr::write(mb_str.add(written), high);
+                core::ptr::write(mb_str.add(written + 1), low);
+                written += 2;
+            } else {
+                core::ptr::write(mb_str.add(written), low);
+                written += 1;
+            }
+            consumed += 1;
+        }
+        if !bytes_out.is_null() {
+            core::ptr::write(bytes_out, written as u32);
+        }
+        (STATUS_SUCCESS, consumed)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            mb_str,
+            mb_size,
+            bytes_out,
+            unicode_str,
+            bytes_in_unicode,
+            oem,
+            upcase,
+        );
+        (STATUS_NOT_IMPLEMENTED, 0)
+    }
+}
+
+unsafe fn rtl_multibyte_to_unicode_size_dbcs(
+    bytes: *const u8,
+    byte_len: u32,
+    oem: bool,
+) -> Result<u32, NtStatus> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lead_info = if oem {
+            NLS_OEM_LEAD_BYTE_INFO
+        } else {
+            NLS_ANSI_LEAD_BYTE_INFO
+        };
+        if lead_info.is_null() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut src = 0usize;
+        let mut units = 0usize;
+        let len = byte_len as usize;
+        while src < len {
+            let byte = core::ptr::read(bytes.add(src));
+            src += 1;
+            if byte >= 0x80 && core::ptr::read_unaligned(lead_info.add(byte as usize)) != 0 {
+                if src < len {
+                    src += 1;
+                }
+            }
+            units += 1;
+        }
+        Ok((units * 2) as u32)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bytes, byte_len, oem);
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+}
+
+unsafe fn rtl_unicode_to_multibyte_size_dbcs(
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+    oem: bool,
+    upcase: bool,
+) -> Result<u32, NtStatus> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let to_mb = if oem {
+            NLS_UNICODE_TO_MB_OEM_TABLE
+        } else {
+            NLS_UNICODE_TO_MB_ANSI_TABLE
+        };
+        if to_mb.is_null() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut bytes = 0u32;
+        for i in 0..(bytes_in_unicode as usize / 2) {
+            let mut unit = core::ptr::read(unicode_str.add(i));
+            if upcase {
+                unit = nls_upcase_unit(unit);
+            }
+            let mb = if unit < 0x80 {
+                unit
+            } else {
+                core::ptr::read_unaligned(to_mb.add(unit as usize))
+            };
+            bytes = bytes.saturating_add(if (mb >> 8) != 0 { 2 } else { 1 });
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (unicode_str, bytes_in_unicode, oem, upcase);
+        Err(STATUS_NOT_IMPLEMENTED)
     }
 }
 
@@ -13841,7 +14051,19 @@ unsafe fn rtl_upcase_unicode_to_single_byte_n(
     oem: bool,
 ) -> NtStatus {
     if (oem && nls_is_oem_dbcs()) || (!oem && nls_is_ansi_dbcs()) {
-        return STATUS_NOT_IMPLEMENTED;
+        // SAFETY: caller supplies the Windows conversion buffers.
+        return unsafe {
+            rtl_unicode_to_mb_n_dbcs(
+                dst,
+                dst_size,
+                bytes_out,
+                unicode_str,
+                bytes_in_unicode,
+                oem,
+                true,
+            )
+            .0
+        };
     }
     let units = bytes_in_unicode as usize / 2;
     let n = core::cmp::min(units, dst_size as usize);
@@ -14046,7 +14268,19 @@ pub unsafe extern "system" fn rtl_unicode_to_multi_byte_n(
     bytes_in_unicode: u32,
 ) -> NtStatus {
     if nls_is_ansi_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
+        // SAFETY: caller supplies the Windows conversion buffers.
+        return unsafe {
+            rtl_unicode_to_mb_n_dbcs(
+                mb_str,
+                mb_size,
+                bytes_out,
+                unicode_str,
+                bytes_in_unicode,
+                false,
+                false,
+            )
+            .0
+        };
     }
     let units = bytes_in_unicode as usize / 2;
     let n = core::cmp::min(units, mb_size as usize);
@@ -14076,7 +14310,25 @@ pub unsafe extern "system" fn rtl_unicode_to_oem_n(
     bytes_in_unicode: u32,
 ) -> NtStatus {
     if nls_is_oem_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
+        // SAFETY: caller supplies the Windows conversion buffers.
+        let (status, consumed) = unsafe {
+            rtl_unicode_to_mb_n_dbcs(
+                oem_str,
+                oem_size,
+                bytes_out,
+                unicode_str,
+                bytes_in_unicode,
+                true,
+                false,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        if consumed < bytes_in_unicode as usize / 2 {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        return STATUS_SUCCESS;
     }
     let units = bytes_in_unicode as usize / 2;
     let n = core::cmp::min(units, oem_size as usize);
@@ -14240,7 +14492,17 @@ pub unsafe extern "system" fn rtl_multi_byte_to_unicode_n(
     bytes_in_mb: u32,
 ) -> NtStatus {
     if nls_is_ansi_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
+        // SAFETY: caller supplies the Windows conversion buffers.
+        return unsafe {
+            rtl_mb_to_unicode_n_dbcs(
+                unicode_str,
+                unicode_size,
+                bytes_out,
+                mb_str,
+                bytes_in_mb,
+                false,
+            )
+        };
     }
     let max_units = unicode_size as usize / 2;
     let n = core::cmp::min(bytes_in_mb as usize, max_units);
@@ -14270,7 +14532,17 @@ pub unsafe extern "system" fn rtl_oem_to_unicode_n(
     bytes_in_oem: u32,
 ) -> NtStatus {
     if nls_is_oem_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
+        // SAFETY: caller supplies the Windows conversion buffers.
+        return unsafe {
+            rtl_mb_to_unicode_n_dbcs(
+                unicode_str,
+                unicode_size,
+                bytes_out,
+                oem_str,
+                bytes_in_oem,
+                true,
+            )
+        };
     }
     let max_units = unicode_size as usize / 2;
     let n = core::cmp::min(bytes_in_oem as usize, max_units);
@@ -14317,11 +14589,23 @@ pub unsafe extern "system" fn rtl_console_multi_byte_to_unicode_n(
 #[export_name = "RtlMultiByteToUnicodeSize"]
 pub unsafe extern "system" fn rtl_multi_byte_to_unicode_size(
     unicode_size: *mut u32,
-    _mb_str: *const u8,
+    mb_str: *const u8,
     mb_size: u32,
 ) -> NtStatus {
     if unicode_size.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_ansi_dbcs() {
+        if mb_size != 0 && mb_str.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let size = match unsafe { rtl_multibyte_to_unicode_size_dbcs(mb_str, mb_size, false) } {
+            Ok(size) => size,
+            Err(status) => return status,
+        };
+        // SAFETY: unicode_size writable per the contract.
+        unsafe { *unicode_size = size };
+        return STATUS_SUCCESS;
     }
     // SAFETY: unicode_size writable per the contract.
     unsafe { *unicode_size = mb_size.saturating_mul(2) };
@@ -14335,11 +14619,25 @@ pub unsafe extern "system" fn rtl_multi_byte_to_unicode_size(
 #[export_name = "RtlUnicodeToMultiByteSize"]
 pub unsafe extern "system" fn rtl_unicode_to_multi_byte_size(
     bytes_out: *mut u32,
-    _unicode_str: *const u16,
+    unicode_str: *const u16,
     bytes_in_unicode: u32,
 ) -> NtStatus {
     if bytes_out.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_ansi_dbcs() {
+        if bytes_in_unicode != 0 && unicode_str.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let size = match unsafe {
+            rtl_unicode_to_multibyte_size_dbcs(unicode_str, bytes_in_unicode, false, false)
+        } {
+            Ok(size) => size,
+            Err(status) => return status,
+        };
+        // SAFETY: bytes_out writable.
+        unsafe { *bytes_out = size };
+        return STATUS_SUCCESS;
     }
     // Single-byte: 1 output byte per UTF-16 unit.
     // SAFETY: bytes_out writable.
@@ -14842,6 +15140,10 @@ pub unsafe extern "system" fn rtl_reset_rtl_translations(nls_table: *const c_voi
             core::ptr::read_unaligned(ansi.add(NLS_CP_MULTI_BYTE_TABLE) as *const *const u16);
         NLS_UNICODE_TO_ANSI_TABLE =
             core::ptr::read_unaligned(ansi.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u8);
+        NLS_UNICODE_TO_MB_ANSI_TABLE =
+            core::ptr::read_unaligned(ansi.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u16);
+        NLS_ANSI_LEAD_BYTE_INFO =
+            core::ptr::read_unaligned(ansi.add(NLS_CP_DBCS_OFFSETS) as *const *const u16);
         NLS_ANSI_DEFAULT_CHAR =
             core::ptr::read_unaligned(ansi.add(NLS_CP_DEFAULT_CHAR) as *const u16) as u8;
 
@@ -14849,6 +15151,10 @@ pub unsafe extern "system" fn rtl_reset_rtl_translations(nls_table: *const c_voi
             core::ptr::read_unaligned(oem.add(NLS_CP_MULTI_BYTE_TABLE) as *const *const u16);
         NLS_UNICODE_TO_OEM_TABLE =
             core::ptr::read_unaligned(oem.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u8);
+        NLS_UNICODE_TO_MB_OEM_TABLE =
+            core::ptr::read_unaligned(oem.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u16);
+        NLS_OEM_LEAD_BYTE_INFO =
+            core::ptr::read_unaligned(oem.add(NLS_CP_DBCS_OFFSETS) as *const *const u16);
         NLS_OEM_DEFAULT_CHAR =
             core::ptr::read_unaligned(oem.add(NLS_CP_DEFAULT_CHAR) as *const u16) as u8;
         NLS_UNICODE_DEFAULT_CHAR =
