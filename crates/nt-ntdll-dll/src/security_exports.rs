@@ -72,6 +72,25 @@ const SE_SACL_DEFAULTED: u16 = 0x0020;
 const SE_RM_CONTROL_VALID: u16 = 0x4000;
 const SE_SELF_RELATIVE: u16 = 0x8000;
 
+// SECURITY_INFORMATION bits.
+const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+
+// Well-known access/privilege constants.
+const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+const SE_SECURITY_PRIVILEGE: u32 = 8;
+const SE_PRIVILEGE_USED_FOR_ACCESS: u32 = 0x8000_0000;
+const ACL_REVISION2: u32 = 2;
+const SECURITY_LOCAL_SYSTEM_RID: u32 = 18;
+const SECURITY_BUILTIN_DOMAIN_RID: u32 = 32;
+const DOMAIN_ALIAS_RID_ADMINS: u32 = 544;
+const SECURITY_ANONYMOUS_LOGON_RID: u32 = 7;
+const SECURITY_WORLD_RID: u32 = 0;
+const GENERIC_READ_MASK: u32 = 0x8000_0000;
+const GENERIC_ALL_MASK: u32 = 0x1000_0000;
+
 // ACE types.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
@@ -169,6 +188,31 @@ unsafe fn sd_dacl(sd: *const u8) -> *mut u8 {
 #[inline]
 fn round_up4(n: usize) -> usize {
     (n + 3) & !3
+}
+
+fn stack_sid(buf: &mut [u8; 16], authority: [u8; 6], sub_authorities: &[u32]) -> *mut c_void {
+    buf.fill(0);
+    buf[0] = SID_REVISION;
+    buf[1] = sub_authorities.len() as u8;
+    buf[2..8].copy_from_slice(&authority);
+    for (i, sub_authority) in sub_authorities.iter().enumerate() {
+        let start = 8 + i * 4;
+        buf[start..start + 4].copy_from_slice(&sub_authority.to_le_bytes());
+    }
+    buf.as_mut_ptr() as *mut c_void
+}
+
+fn valid_sd_offset_and_size(offset: u32, length: u32, min_length: usize) -> Option<usize> {
+    let offset = offset as usize;
+    let length = length as usize;
+    if offset < SD_REL_HEADER || offset >= length || offset & 3 != 0 {
+        return None;
+    }
+    let available = length - offset;
+    if available < min_length {
+        return None;
+    }
+    Some(available)
 }
 
 /// Build an absolute, empty SECURITY_DESCRIPTOR in caller-provided storage.
@@ -368,11 +412,6 @@ unsafe fn select_security_parts(
     modification_descriptor: *const c_void,
     object_descriptor: *const c_void,
 ) -> Result<SdParts, NtStatus> {
-    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
-    const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
-
     if object_descriptor.is_null() {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -1946,6 +1985,267 @@ pub unsafe extern "system" fn rtl_set_security_descriptor_rm_control(
     STATUS_SUCCESS
 }
 
+/// `RtlSetAttributesSecurityDescriptor(PSD, SECURITY_DESCRIPTOR_CONTROL, PULONG) -> NTSTATUS`.
+/// Ported from `sd.c:550`: always reports the descriptor revision, masks the requested bits down to
+/// the settable attribute/control range, then delegates to `RtlSetControlSecurityDescriptor`.
+///
+/// # Safety
+/// `sd` is a valid SD and `revision` is writable.
+#[export_name = "RtlSetAttributesSecurityDescriptor"]
+pub unsafe extern "system" fn rtl_set_attributes_security_descriptor(
+    sd: *mut c_void,
+    control: u16,
+    revision: *mut u32,
+) -> NtStatus {
+    if sd.is_null() || revision.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: sd/revision are valid per the contract.
+    unsafe {
+        let p = sd as *mut u8;
+        *revision = *p as u32;
+        if *p != SECURITY_DESCRIPTOR_REVISION {
+            return STATUS_UNKNOWN_REVISION;
+        }
+    }
+    const ATTRIBUTES: u16 = 0x0040 // SE_DACL_UNTRUSTED
+        | 0x0080 // SE_SERVER_SECURITY
+        | 0x0100 // SE_DACL_AUTO_INHERIT_REQ
+        | 0x0200 // SE_SACL_AUTO_INHERIT_REQ
+        | 0x0400 // SE_DACL_AUTO_INHERITED
+        | 0x0800 // SE_SACL_AUTO_INHERITED
+        | 0x1000 // SE_DACL_PROTECTED
+        | 0x2000; // SE_SACL_PROTECTED
+    let masked = control & ATTRIBUTES;
+    // SAFETY: same SD contract as this wrapper.
+    unsafe { rtl_set_control_security_descriptor(sd, masked, masked) }
+}
+
+/// `RtlCopySecurityDescriptor(PSD Source, PSD* Destination) -> NTSTATUS`.
+/// Allocates a process-heap self-relative copy of either an absolute or self-relative descriptor.
+///
+/// # Safety
+/// `source` is a valid security descriptor and `destination` is writable.
+#[export_name = "RtlCopySecurityDescriptor"]
+pub unsafe extern "system" fn rtl_copy_security_descriptor(
+    source: *const c_void,
+    destination: *mut *mut c_void,
+) -> NtStatus {
+    if source.is_null() || destination.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: source/destination satisfy the exported API contract.
+        unsafe {
+            match clone_security_descriptor_to_heap(source) {
+                Ok(copy) => {
+                    *destination = copy;
+                    STATUS_SUCCESS
+                }
+                Err(status) => status,
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = source;
+        // SAFETY: destination is writable per the contract.
+        unsafe { *destination = core::ptr::null_mut() };
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlValidRelativeSecurityDescriptor(PSD, ULONG Length, SECURITY_INFORMATION Required) -> BOOLEAN`.
+/// Ported from `sd.c:1098`: the descriptor must be self-relative and every present component must
+/// fit inside the caller-supplied byte span.
+///
+/// # Safety
+/// `sd` points at a readable `length`-byte security descriptor buffer.
+#[export_name = "RtlValidRelativeSecurityDescriptor"]
+pub unsafe extern "system" fn rtl_valid_relative_security_descriptor(
+    sd: *const c_void,
+    length: u32,
+    required_information: u32,
+) -> u8 {
+    if sd.is_null() || (length as usize) < SD_REL_HEADER {
+        return 0;
+    }
+    // SAFETY: the caller provided a readable SD buffer of `length` bytes.
+    unsafe {
+        let p = sd as *const u8;
+        if *p != SECURITY_DESCRIPTOR_REVISION || sd_control(p) & SE_SELF_RELATIVE == 0 {
+            return 0;
+        }
+
+        let owner_off = core::ptr::read_unaligned(p.add(0x04) as *const u32);
+        if owner_off != 0 {
+            let Some(available) = valid_sd_offset_and_size(owner_off, length, 8) else {
+                return 0;
+            };
+            let owner = p.add(owner_off as usize);
+            if rtl_valid_sid(owner as *const c_void) == 0 || available < sid_len(owner) {
+                return 0;
+            }
+        } else if required_information & OWNER_SECURITY_INFORMATION != 0 {
+            return 0;
+        }
+
+        let group_off = core::ptr::read_unaligned(p.add(0x08) as *const u32);
+        if group_off != 0 {
+            let Some(available) = valid_sd_offset_and_size(group_off, length, 8) else {
+                return 0;
+            };
+            let group = p.add(group_off as usize);
+            if rtl_valid_sid(group as *const c_void) == 0 || available < sid_len(group) {
+                return 0;
+            }
+        } else if required_information & GROUP_SECURITY_INFORMATION != 0 {
+            return 0;
+        }
+
+        if sd_control(p) & SE_DACL_PRESENT != 0 {
+            let dacl_off = core::ptr::read_unaligned(p.add(0x10) as *const u32);
+            let Some(available) = valid_sd_offset_and_size(dacl_off, length, ACL_HEADER) else {
+                return 0;
+            };
+            let dacl = p.add(dacl_off as usize);
+            let acl_len = core::ptr::read_unaligned(dacl.add(2) as *const u16) as usize;
+            if rtl_valid_acl(dacl as *const c_void) == 0 || available < acl_len {
+                return 0;
+            }
+        }
+
+        if sd_control(p) & SE_SACL_PRESENT != 0 {
+            let sacl_off = core::ptr::read_unaligned(p.add(0x0C) as *const u32);
+            let Some(available) = valid_sd_offset_and_size(sacl_off, length, ACL_HEADER) else {
+                return 0;
+            };
+            let sacl = p.add(sacl_off as usize);
+            let acl_len = core::ptr::read_unaligned(sacl.add(2) as *const u16) as usize;
+            if rtl_valid_acl(sacl as *const c_void) == 0 || available < acl_len {
+                return 0;
+            }
+        }
+    }
+    1
+}
+
+/// `RtlDefaultNpAcl(PACL*) -> NTSTATUS`.
+/// Builds the default named-pipe ACL ReactOS creates from the process token. Our executive currently
+/// models hosted processes as LocalSystem, so the owner ACE uses S-1-5-18.
+///
+/// # Safety
+/// `acl` is a writable out-pointer; the returned ACL is process-heap allocated.
+#[export_name = "RtlDefaultNpAcl"]
+pub unsafe extern "system" fn rtl_default_np_acl(acl: *mut *mut c_void) -> NtStatus {
+    if acl.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: acl is writable per the contract.
+    unsafe { *acl = core::ptr::null_mut() };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        const ACL_BYTES: usize = ACL_HEADER
+            + 5 * (ACE_HEADER + 4)
+            + (8 + 4)
+            + (8 + 8)
+            + (8 + 4)
+            + (8 + 4)
+            + (8 + 4);
+        const NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
+        const WORLD_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 1];
+
+        // SAFETY: process heap allocation in the hosted process.
+        let p = unsafe { crate::process_heap_alloc(ACL_BYTES) };
+        if p.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        // SAFETY: p is a writable ACL buffer of ACL_BYTES.
+        let mut status =
+            unsafe { crate::exports::rtl_create_acl(p as *mut c_void, ACL_BYTES as u32, ACL_REVISION2) };
+        let mut sid = [0u8; 16];
+        if status == STATUS_SUCCESS {
+            let local_system = stack_sid(&mut sid, NT_AUTHORITY, &[SECURITY_LOCAL_SYSTEM_RID]);
+            status = unsafe {
+                rtl_add_access_allowed_ace_ex(
+                    p as *mut c_void,
+                    ACL_REVISION2,
+                    0,
+                    GENERIC_ALL_MASK,
+                    local_system,
+                )
+            };
+        }
+        if status == STATUS_SUCCESS {
+            let administrators = stack_sid(
+                &mut sid,
+                NT_AUTHORITY,
+                &[SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS],
+            );
+            status = unsafe {
+                rtl_add_access_allowed_ace_ex(
+                    p as *mut c_void,
+                    ACL_REVISION2,
+                    0,
+                    GENERIC_ALL_MASK,
+                    administrators,
+                )
+            };
+        }
+        if status == STATUS_SUCCESS {
+            let owner = stack_sid(&mut sid, NT_AUTHORITY, &[SECURITY_LOCAL_SYSTEM_RID]);
+            status = unsafe {
+                rtl_add_access_allowed_ace_ex(
+                    p as *mut c_void,
+                    ACL_REVISION2,
+                    0,
+                    GENERIC_ALL_MASK,
+                    owner,
+                )
+            };
+        }
+        if status == STATUS_SUCCESS {
+            let anonymous = stack_sid(&mut sid, NT_AUTHORITY, &[SECURITY_ANONYMOUS_LOGON_RID]);
+            status = unsafe {
+                rtl_add_access_allowed_ace_ex(
+                    p as *mut c_void,
+                    ACL_REVISION2,
+                    0,
+                    GENERIC_READ_MASK,
+                    anonymous,
+                )
+            };
+        }
+        if status == STATUS_SUCCESS {
+            let world = stack_sid(&mut sid, WORLD_AUTHORITY, &[SECURITY_WORLD_RID]);
+            status = unsafe {
+                rtl_add_access_allowed_ace_ex(
+                    p as *mut c_void,
+                    ACL_REVISION2,
+                    0,
+                    GENERIC_READ_MASK,
+                    world,
+                )
+            };
+        }
+
+        if status == STATUS_SUCCESS {
+            // SAFETY: acl is writable per the contract.
+            unsafe { *acl = p as *mut c_void };
+        } else {
+            // SAFETY: p came from process_heap_alloc above.
+            unsafe { crate::process_heap_free(p) };
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 // ---- Absolute <-> self-relative conversions ------------------------------------------------------
 
 /// Shared body of RtlMakeSelfRelativeSD / RtlAbsoluteToSelfRelativeSD: pack an ABSOLUTE SD into a
@@ -2437,6 +2737,155 @@ pub unsafe extern "system" fn rtl_new_security_object(
     }
 }
 
+/// `RtlNewSecurityObjectEx(...) -> NTSTATUS`.
+/// The object-type and auto-inherit refinements share the same materialization subset as
+/// `RtlNewSecurityObject` until the full token/inheritance plane exists.
+///
+/// # Safety
+/// Same descriptor pointer contract as `RtlNewSecurityObject`.
+#[allow(clippy::too_many_arguments)]
+#[export_name = "RtlNewSecurityObjectEx"]
+pub unsafe extern "system" fn rtl_new_security_object_ex(
+    parent_descriptor: *const c_void,
+    creator_descriptor: *const c_void,
+    new_descriptor: *mut *mut c_void,
+    object_type: *mut c_void,
+    is_directory_object: u8,
+    auto_inherit_flags: u32,
+    token: *mut c_void,
+    generic_mapping: *const c_void,
+) -> NtStatus {
+    let _ = (object_type, auto_inherit_flags);
+    // SAFETY: forwards the same descriptor/out-parameter contract.
+    unsafe {
+        rtl_new_security_object(
+            parent_descriptor,
+            creator_descriptor,
+            new_descriptor,
+            is_directory_object,
+            token,
+            generic_mapping,
+        )
+    }
+}
+
+/// `RtlNewSecurityObjectWithMultipleInheritance(...) -> NTSTATUS`.
+/// Multiple object GUID inheritance is not yet modelled; descriptor selection/materialization matches
+/// the base helper.
+///
+/// # Safety
+/// Same descriptor pointer contract as `RtlNewSecurityObject`.
+#[allow(clippy::too_many_arguments)]
+#[export_name = "RtlNewSecurityObjectWithMultipleInheritance"]
+pub unsafe extern "system" fn rtl_new_security_object_with_multiple_inheritance(
+    parent_descriptor: *const c_void,
+    creator_descriptor: *const c_void,
+    new_descriptor: *mut *mut c_void,
+    object_types: *mut *mut c_void,
+    guid_count: u32,
+    is_directory_object: u8,
+    auto_inherit_flags: u32,
+    token: *mut c_void,
+    generic_mapping: *const c_void,
+) -> NtStatus {
+    let _ = (object_types, guid_count, auto_inherit_flags);
+    // SAFETY: forwards the same descriptor/out-parameter contract.
+    unsafe {
+        rtl_new_security_object(
+            parent_descriptor,
+            creator_descriptor,
+            new_descriptor,
+            is_directory_object,
+            token,
+            generic_mapping,
+        )
+    }
+}
+
+/// `RtlConvertToAutoInheritSecurityObject(...) -> NTSTATUS`.
+/// Auto-inheritance metadata is deferred to the object/security plane; the exported ntdll contract
+/// still returns a heap-owned descriptor built from creator/parent inputs.
+///
+/// # Safety
+/// Same descriptor pointer contract as `RtlNewSecurityObject`.
+#[export_name = "RtlConvertToAutoInheritSecurityObject"]
+pub unsafe extern "system" fn rtl_convert_to_auto_inherit_security_object(
+    parent_descriptor: *const c_void,
+    creator_descriptor: *const c_void,
+    new_descriptor: *mut *mut c_void,
+    object_type: *mut c_void,
+    is_directory_object: u8,
+    generic_mapping: *const c_void,
+) -> NtStatus {
+    let _ = object_type;
+    // SAFETY: forwards the same descriptor/out-parameter contract.
+    unsafe {
+        rtl_new_security_object(
+            parent_descriptor,
+            creator_descriptor,
+            new_descriptor,
+            is_directory_object,
+            core::ptr::null_mut(),
+            generic_mapping,
+        )
+    }
+}
+
+/// `RtlNewInstanceSecurityObject(...) -> NTSTATUS`.
+/// The executive currently exposes stable LocalSystem token identity. If neither parent nor creator
+/// changed and the caller's token LUID is unchanged, this mirrors ReactOS by returning no new
+/// descriptor; otherwise it materializes through `RtlNewSecurityObject`.
+///
+/// # Safety
+/// Output pointers are writable when non-null; descriptor pointers are valid when non-null.
+#[allow(clippy::too_many_arguments)]
+#[export_name = "RtlNewInstanceSecurityObject"]
+pub unsafe extern "system" fn rtl_new_instance_security_object(
+    parent_descriptor_changed: u8,
+    creator_descriptor_changed: u8,
+    old_client_token_modified_id: *const u8,
+    new_client_token_modified_id: *mut u8,
+    parent_descriptor: *const c_void,
+    creator_descriptor: *const c_void,
+    new_descriptor: *mut *mut c_void,
+    is_directory_object: u8,
+    token: *mut c_void,
+    generic_mapping: *const c_void,
+) -> NtStatus {
+    if new_descriptor.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: LUID pointers are optional 8-byte records per the contract.
+    unsafe {
+        if !new_client_token_modified_id.is_null() {
+            if !old_client_token_modified_id.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    old_client_token_modified_id,
+                    new_client_token_modified_id,
+                    8,
+                );
+            } else {
+                core::ptr::write_bytes(new_client_token_modified_id, 0, 8);
+            }
+        }
+        if parent_descriptor_changed == 0 && creator_descriptor_changed == 0 {
+            *new_descriptor = core::ptr::null_mut();
+            return STATUS_SUCCESS;
+        }
+    }
+    // SAFETY: forwards the same descriptor/out-parameter contract.
+    unsafe {
+        rtl_new_security_object(
+            parent_descriptor,
+            creator_descriptor,
+            new_descriptor,
+            is_directory_object,
+            token,
+            generic_mapping,
+        )
+    }
+}
+
 /// `RtlDeleteSecurityObject(PSECURITY_DESCRIPTOR* ObjectDescriptor) -> NTSTATUS`. Frees the SD
 /// allocated by RtlNewSecurityObject and NULLs the slot. On x86_64 we free to the process heap;
 /// off-target it is a no-op success (nothing was allocated).
@@ -2547,6 +2996,85 @@ pub unsafe extern "system" fn rtl_set_security_object(
     }
 }
 
+/// `RtlSetSecurityObjectEx(...) -> NTSTATUS`.
+/// Auto-inherit flags are not yet represented in the local descriptor materializer, so this shares
+/// the base `RtlSetSecurityObject` behavior.
+///
+/// # Safety
+/// Same descriptor pointer contract as `RtlSetSecurityObject`.
+#[export_name = "RtlSetSecurityObjectEx"]
+pub unsafe extern "system" fn rtl_set_security_object_ex(
+    security_information: u32,
+    modification_descriptor: *const c_void,
+    object_descriptor: *mut *mut c_void,
+    auto_inherit_flags: u32,
+    generic_mapping: *const c_void,
+    token: *mut c_void,
+) -> NtStatus {
+    let _ = auto_inherit_flags;
+    // SAFETY: forwards the same descriptor/update contract.
+    unsafe {
+        rtl_set_security_object(
+            security_information,
+            modification_descriptor,
+            object_descriptor,
+            generic_mapping,
+            token,
+        )
+    }
+}
+
+/// `RtlNewSecurityGrantedAccess(...) -> NTSTATUS`.
+/// Maps generic bits, grants `ACCESS_SYSTEM_SECURITY` using the standard SeSecurityPrivilege record,
+/// and returns the remaining desired access mask.
+///
+/// # Safety
+/// `length` and `remaining_desired_access` are writable; `privileges` is writable when `*length`
+/// is large enough.
+#[export_name = "RtlNewSecurityGrantedAccess"]
+pub unsafe extern "system" fn rtl_new_security_granted_access(
+    desired_access: u32,
+    privileges: *mut c_void,
+    length: *mut u32,
+    token: *mut c_void,
+    generic_mapping: *const c_void,
+    remaining_desired_access: *mut u32,
+) -> NtStatus {
+    let _ = token;
+    if length.is_null() || remaining_desired_access.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const PRIVILEGE_SET_SIZE: u32 = 20;
+    let mut mapped_access = desired_access;
+    // SAFETY: rtl_map_generic_mask accepts a null mapping as a no-op; mapped_access is writable.
+    unsafe { rtl_map_generic_mask(&mut mapped_access, generic_mapping) };
+    let granted = mapped_access & ACCESS_SYSTEM_SECURITY != 0;
+    if granted {
+        mapped_access &= !ACCESS_SYSTEM_SECURITY;
+    }
+    // SAFETY: length/remaining_desired_access are writable per the contract.
+    unsafe {
+        *remaining_desired_access = mapped_access;
+        if *length < PRIVILEGE_SET_SIZE {
+            *length = PRIVILEGE_SET_SIZE;
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        *length = PRIVILEGE_SET_SIZE;
+        if privileges.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let p = privileges as *mut u8;
+        core::ptr::write_bytes(p, 0, PRIVILEGE_SET_SIZE as usize);
+        core::ptr::write_unaligned(p as *mut u32, u32::from(granted));
+        if granted {
+            core::ptr::write_unaligned(p.add(0x08) as *mut u32, SE_SECURITY_PRIVILEGE);
+            core::ptr::write_unaligned(p.add(0x0C) as *mut u32, 0);
+            core::ptr::write_unaligned(p.add(0x10) as *mut u32, SE_PRIVILEGE_USED_FOR_ACCESS);
+        }
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlQuerySecurityObject(...)` — extract SECURITY_INFORMATION from an object's SD into a caller
 /// self-relative descriptor. Ported from ReactOS `sdk/lib/rtl/security.c:RtlQuerySecurityObject`.
 ///
@@ -2564,11 +3092,6 @@ pub unsafe extern "system" fn rtl_query_security_object(
     if object_descriptor.is_null() || return_length.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
-    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
-    const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
 
     let mut abs = [0u8; SD_ABS_HEADER];
 
@@ -2729,6 +3252,10 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_set_sacl_security_descriptor as usize,
         rtl_get_security_descriptor_rm_control as usize,
         rtl_set_security_descriptor_rm_control as usize,
+        rtl_set_attributes_security_descriptor as usize,
+        rtl_copy_security_descriptor as usize,
+        rtl_valid_relative_security_descriptor as usize,
+        rtl_default_np_acl as usize,
         rtl_absolute_to_self_relative_sd as usize,
         rtl_make_self_relative_sd as usize,
         rtl_self_relative_to_absolute_sd as usize,
@@ -2740,8 +3267,14 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_release_privilege as usize,
         rtl_impersonate_self as usize,
         rtl_new_security_object as usize,
+        rtl_new_security_object_ex as usize,
+        rtl_new_security_object_with_multiple_inheritance as usize,
+        rtl_convert_to_auto_inherit_security_object as usize,
+        rtl_new_instance_security_object as usize,
         rtl_delete_security_object as usize,
         rtl_set_security_object as usize,
+        rtl_set_security_object_ex as usize,
+        rtl_new_security_granted_access as usize,
         rtl_query_security_object as usize,
         rtl_capture_stack_back_trace as usize,
     ];
