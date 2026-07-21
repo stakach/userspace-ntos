@@ -5459,7 +5459,139 @@ pub unsafe extern "system" fn rtl_is_thread_within_loader_callout() -> u8 {
     0
 }
 
-// ---- path / guid (host-tested bodies) ------------------------------------------------------------
+// ---- network / path / guid (host-tested bodies) --------------------------------------------------
+
+/// `RtlIpv4AddressToStringA(const IN_ADDR*, PSTR) -> PSTR`.
+///
+/// # Safety
+/// `address` points to four IPv4 address bytes; `string` is writable for
+/// `IPV4_ADDR_STRING_MAX_LEN` bytes.
+#[export_name = "RtlIpv4AddressToStringA"]
+pub unsafe extern "system" fn rtl_ipv4_address_to_string_a(
+    address: *const u8,
+    string: *mut u8,
+) -> *mut u8 {
+    if address.is_null() || string.is_null() {
+        return usize::MAX as *mut u8;
+    }
+    let octets = unsafe {
+        [
+            *address,
+            *address.add(1),
+            *address.add(2),
+            *address.add(3),
+        ]
+    };
+    let formatted = rtl::network::ipv4_address_to_string(octets);
+    unsafe {
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        string.add(formatted.len())
+    }
+}
+
+/// `RtlIpv4AddressToStringW(const IN_ADDR*, PWSTR) -> PWSTR`.
+///
+/// # Safety
+/// `address` points to four IPv4 address bytes; `string` is writable for
+/// `IPV4_ADDR_STRING_MAX_LEN` UTF-16 units.
+#[export_name = "RtlIpv4AddressToStringW"]
+pub unsafe extern "system" fn rtl_ipv4_address_to_string_w(
+    address: *const u8,
+    string: *mut u16,
+) -> *mut u16 {
+    if address.is_null() || string.is_null() {
+        return usize::MAX as *mut u16;
+    }
+    let octets = unsafe {
+        [
+            *address,
+            *address.add(1),
+            *address.add(2),
+            *address.add(3),
+        ]
+    };
+    let formatted = rtl::network::ipv4_address_to_string_w(octets);
+    unsafe {
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        string.add(formatted.len())
+    }
+}
+
+/// `RtlIpv4AddressToStringExA(const IN_ADDR*, USHORT, PSTR, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `address` points to four IPv4 address bytes; `string` is writable for the character count in
+/// `string_length`; `string_length` is readable and writable.
+#[export_name = "RtlIpv4AddressToStringExA"]
+pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_a(
+    address: *const u8,
+    port: u16,
+    string: *mut u8,
+    string_length: *mut u32,
+) -> NtStatus {
+    if address.is_null() || string.is_null() || string_length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let octets = unsafe {
+        [
+            *address,
+            *address.add(1),
+            *address.add(2),
+            *address.add(3),
+        ]
+    };
+    let formatted = rtl::network::ipv4_address_to_string_ex(octets, port);
+    let required = (formatted.len() + 1) as u32;
+    unsafe {
+        if *string_length <= formatted.len() as u32 {
+            *string_length = required;
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        *string_length = required;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlIpv4AddressToStringExW(const IN_ADDR*, USHORT, PWSTR, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `address` points to four IPv4 address bytes; `string` is writable for the UTF-16 unit count in
+/// `string_length`; `string_length` is readable and writable.
+#[export_name = "RtlIpv4AddressToStringExW"]
+pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_w(
+    address: *const u8,
+    port: u16,
+    string: *mut u16,
+    string_length: *mut u32,
+) -> NtStatus {
+    if address.is_null() || string.is_null() || string_length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let octets = unsafe {
+        [
+            *address,
+            *address.add(1),
+            *address.add(2),
+            *address.add(3),
+        ]
+    };
+    let formatted = rtl::network::ipv4_address_to_string_ex_w(octets, port);
+    let required = (formatted.len() + 1) as u32;
+    unsafe {
+        if *string_length <= formatted.len() as u32 {
+            *string_length = required;
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        *string_length = required;
+    }
+    STATUS_SUCCESS
+}
 
 /// `RtlDetermineDosPathNameType_U(PCWSTR Path) -> RTL_PATH_TYPE`.
 ///
@@ -13034,6 +13166,10 @@ pub unsafe extern "C" fn export_anchor() {
     ];
     core::hint::black_box(anchors_sxs);
     let anchors_pathimg: &[usize] = &[
+        rtl_ipv4_address_to_string_a as usize,
+        rtl_ipv4_address_to_string_w as usize,
+        rtl_ipv4_address_to_string_ex_a as usize,
+        rtl_ipv4_address_to_string_ex_w as usize,
         rtl_determine_dos_path_name_type_u as usize,
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,

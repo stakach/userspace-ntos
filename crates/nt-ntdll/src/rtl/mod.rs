@@ -25,6 +25,7 @@ pub mod integer;
 pub mod memory;
 pub mod memstream;
 pub mod message;
+pub mod network;
 pub mod path;
 pub mod pe_resource;
 pub mod process_params;
