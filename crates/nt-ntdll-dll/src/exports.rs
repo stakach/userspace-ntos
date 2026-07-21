@@ -6090,22 +6090,28 @@ pub unsafe extern "system" fn rtl_get_full_path_name_u(
     }
     // SAFETY: file_name NUL-terminated per the contract.
     let n = unsafe { wcslen_raw(file_name) };
-    // Determine if absolute (has a ':' at [1] or a leading '\\'): copy through; else copy through
-    // too (a full CWD-prefix canonicalizer is the deferred part — but for the boot path the callers
-    // pass absolute/near-absolute paths). We copy the input verbatim + a NUL, which is correct for
-    // an already-normalized absolute path and a safe conservative result otherwise.
-    let out_bytes = n * 2;
+    // SAFETY: file_name is valid for n UTF-16 units by the NUL-terminated contract above.
+    let name_units = unsafe { core::slice::from_raw_parts(file_name, n) };
+    #[cfg(target_arch = "x86_64")]
+    let full = {
+        let cwd = peb_current_directory();
+        nt_ntdll::rtl::environment::full_path_units(name_units, &cwd)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let full = name_units.to_vec();
+
+    let out_bytes = full.len() * 2;
     if (buffer_length as usize) < out_bytes + 2 || buffer.is_null() {
         return (out_bytes + 2) as u32;
     }
-    // SAFETY: buffer valid for n+1 units per the check; file_name valid for n units.
+    // SAFETY: buffer valid for full.len()+1 units per the check.
     unsafe {
-        core::ptr::copy_nonoverlapping(file_name, buffer, n);
-        *buffer.add(n) = 0;
+        core::ptr::copy_nonoverlapping(full.as_ptr(), buffer, full.len());
+        *buffer.add(full.len()) = 0;
         if !file_part.is_null() {
             // FilePart = the char after the last backslash (or NULL if none).
             let mut fp = core::ptr::null_mut();
-            for i in (0..n).rev() {
+            for i in (0..full.len()).rev() {
                 if *buffer.add(i) == b'\\' as u16 {
                     fp = buffer.add(i + 1);
                     break;
