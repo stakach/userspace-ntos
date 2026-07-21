@@ -3017,7 +3017,6 @@ fn keyed_release_take_pending(key: u64) -> bool {
         } else {
             KEYED_RELEASE_COUNT[slot].store(count - 1, Ordering::Relaxed);
         }
-        KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         return true;
     }
     false
