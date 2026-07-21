@@ -26,9 +26,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
-#[cfg(not(target_arch = "x86_64"))]
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
 use nt_ntdll_layout::UnicodeString;
@@ -38,6 +36,7 @@ const STATUS_SUCCESS: NtStatus = 0x0000_0000;
 const STATUS_PENDING: NtStatus = 0x0000_0103;
 const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
+#[cfg(not(target_arch = "x86_64"))]
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
@@ -16160,16 +16159,78 @@ pub unsafe extern "system" fn csr_set_priority_class(
 
 // ---- Alpc* user-mode helpers ---------------------------------------------------------------------
 
+const ALPC_COMPLETION_LIST_SLOTS: usize = 16;
+
+static ALPC_COMPLETION_LISTS: [AtomicUsize; ALPC_COMPLETION_LIST_SLOTS] =
+    [const { AtomicUsize::new(0) }; ALPC_COMPLETION_LIST_SLOTS];
+static ALPC_COMPLETION_LIST_CONCURRENCY: [AtomicU32; ALPC_COMPLETION_LIST_SLOTS] =
+    [const { AtomicU32::new(0) }; ALPC_COMPLETION_LIST_SLOTS];
+
+fn alpc_completion_list_slot(completion_list: *mut c_void) -> Option<usize> {
+    let ptr = completion_list as usize;
+    if ptr == 0 {
+        return None;
+    }
+    for (i, slot) in ALPC_COMPLETION_LISTS.iter().enumerate() {
+        if slot.load(Ordering::Relaxed) == ptr {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn alpc_register_completion_list_ptr(
+    completion_list: *mut c_void,
+    completion_list_size: u32,
+    concurrency_count: u32,
+    attribute_flags: u32,
+) -> NtStatus {
+    let ptr = completion_list as usize;
+    if ptr == 0
+        || completion_list_size == 0
+        || !nt_ntdll::alpc::valid_attribute_flags(attribute_flags)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if let Some(i) = alpc_completion_list_slot(completion_list) {
+        ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
+        return STATUS_SUCCESS;
+    }
+
+    for (i, slot) in ALPC_COMPLETION_LISTS.iter().enumerate() {
+        if slot
+            .compare_exchange(0, ptr, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
+            return STATUS_SUCCESS;
+        }
+    }
+    STATUS_NO_MEMORY
+}
+
+fn alpc_unregister_completion_list_ptr(completion_list: *mut c_void) {
+    if let Some(i) = alpc_completion_list_slot(completion_list) {
+        ALPC_COMPLETION_LIST_CONCURRENCY[i].store(0, Ordering::Relaxed);
+        ALPC_COMPLETION_LISTS[i].store(0, Ordering::Relaxed);
+    }
+}
+
 /// `AlpcAdjustCompletionListConcurrencyCount(PVOID CompletionList, ULONG ConcurrencyCount)`.
 ///
-/// Completion-list delivery is not wired yet. Return an honest unsupported status instead of
-/// accepting a registration we cannot service.
+/// Updates ntdll's bounded local registration state. Message delivery still flows through the
+/// regular ALPC receive path, so completion-list reads below observe an empty queue.
 #[export_name = "AlpcAdjustCompletionListConcurrencyCount"]
 pub unsafe extern "system" fn alpc_adjust_completion_list_concurrency_count(
-    _completion_list: *mut c_void,
-    _concurrency_count: u32,
+    completion_list: *mut c_void,
+    concurrency_count: u32,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    let Some(i) = alpc_completion_list_slot(completion_list) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    ALPC_COMPLETION_LIST_CONCURRENCY[i].store(concurrency_count, Ordering::Relaxed);
+    STATUS_SUCCESS
 }
 
 /// `AlpcFreeCompletionListMessage(PVOID CompletionList, PVOID Message)`.
@@ -16307,25 +16368,36 @@ pub extern "system" fn alpc_max_allowed_message_length() -> u32 {
 #[export_name = "AlpcRegisterCompletionList"]
 pub unsafe extern "system" fn alpc_register_completion_list(
     _port_handle: *mut c_void,
-    _completion_list: *mut c_void,
-    _completion_list_size: u32,
-    _concurrency_count: u32,
-    _attribute_flags: u32,
+    completion_list: *mut c_void,
+    completion_list_size: u32,
+    concurrency_count: u32,
+    attribute_flags: u32,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    alpc_register_completion_list_ptr(
+        completion_list,
+        completion_list_size,
+        concurrency_count,
+        attribute_flags,
+    )
 }
 
 /// `AlpcRegisterCompletionListWorkerThread(PVOID CompletionList) -> NTSTATUS`.
 #[export_name = "AlpcRegisterCompletionListWorkerThread"]
 pub unsafe extern "system" fn alpc_register_completion_list_worker_thread(
-    _completion_list: *mut c_void,
+    completion_list: *mut c_void,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    if alpc_completion_list_slot(completion_list).is_some() {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_PARAMETER
+    }
 }
 
 /// `AlpcUnregisterCompletionList(PVOID CompletionList)`.
 #[export_name = "AlpcUnregisterCompletionList"]
-pub unsafe extern "system" fn alpc_unregister_completion_list(_completion_list: *mut c_void) {}
+pub unsafe extern "system" fn alpc_unregister_completion_list(completion_list: *mut c_void) {
+    alpc_unregister_completion_list_ptr(completion_list);
+}
 
 /// `AlpcUnregisterCompletionListWorkerThread(PVOID CompletionList)`.
 #[export_name = "AlpcUnregisterCompletionListWorkerThread"]
