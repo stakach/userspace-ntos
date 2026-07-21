@@ -22,6 +22,7 @@ default = ["native_transport"]
 native_transport = ["nt-ntdll/native_transport"]
 
 [dependencies]
+nt-alpc-abi = { path = "../nt-alpc-abi" }
 nt-ntdll = { path = "../nt-ntdll", default-features = false }
 nt-ntdll-layout = { path = "../nt-ntdll-layout" }
 

@@ -13,6 +13,7 @@ authors.workspace = true
 native_transport = []
 
 [dependencies]
+nt-alpc-abi = { workspace = true }
 nt-syscall-abi = { path = "../nt-syscall-abi" }
 nt-ntdll-layout = { workspace = true }
 nt-compat-exports = { workspace = true }

@@ -11282,12 +11282,193 @@ pub unsafe extern "system" fn csr_set_priority_class(
     STATUS_INVALID_PARAMETER
 }
 
+// ---- Alpc* user-mode helpers ---------------------------------------------------------------------
+
+/// `AlpcAdjustCompletionListConcurrencyCount(PVOID CompletionList, ULONG ConcurrencyCount)`.
+///
+/// Completion-list delivery is not wired yet. Return an honest unsupported status instead of
+/// accepting a registration we cannot service.
+#[export_name = "AlpcAdjustCompletionListConcurrencyCount"]
+pub unsafe extern "system" fn alpc_adjust_completion_list_concurrency_count(
+    _completion_list: *mut c_void,
+    _concurrency_count: u32,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `AlpcFreeCompletionListMessage(PVOID CompletionList, PVOID Message)`.
+///
+/// # Safety
+/// ABI-only no-op for an unsupported completion-list queue.
+#[export_name = "AlpcFreeCompletionListMessage"]
+pub unsafe extern "system" fn alpc_free_completion_list_message(
+    _completion_list: *mut c_void,
+    _message: *mut c_void,
+) {
+}
+
+/// `AlpcGetCompletionListLastMessageInformation(...) -> BOOLEAN`.
+///
+/// # Safety
+/// Optional out-params are null or writable.
+#[export_name = "AlpcGetCompletionListLastMessageInformation"]
+pub unsafe extern "system" fn alpc_get_completion_list_last_message_information(
+    _completion_list: *mut c_void,
+    last_message_id: *mut u32,
+    last_callback_id: *mut u32,
+) -> u8 {
+    unsafe {
+        if !last_message_id.is_null() {
+            *last_message_id = 0;
+        }
+        if !last_callback_id.is_null() {
+            *last_callback_id = 0;
+        }
+    }
+    0
+}
+
+/// `AlpcGetCompletionListMessageAttributes(PVOID CompletionList, PVOID Message) -> PVOID`.
+#[export_name = "AlpcGetCompletionListMessageAttributes"]
+pub unsafe extern "system" fn alpc_get_completion_list_message_attributes(
+    _completion_list: *mut c_void,
+    _message: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `AlpcGetHeaderSize(ULONG AttributeFlags) -> ULONG`.
+#[export_name = "AlpcGetHeaderSize"]
+pub extern "system" fn alpc_get_header_size(attribute_flags: u32) -> u32 {
+    nt_ntdll::alpc::message_attribute_buffer_size(attribute_flags).unwrap_or(0) as u32
+}
+
+/// `AlpcGetMessageAttribute(PALPC_MESSAGE_ATTRIBUTES Attributes, ULONG AttributeFlag) -> PVOID`.
+///
+/// # Safety
+/// `attributes` points to a packed `ALPC_MESSAGE_ATTRIBUTES` buffer.
+#[export_name = "AlpcGetMessageAttribute"]
+pub unsafe extern "system" fn alpc_get_message_attribute(
+    attributes: *mut c_void,
+    attribute_flag: u32,
+) -> *mut c_void {
+    if attributes.is_null() {
+        return core::ptr::null_mut();
+    }
+    let allocated = unsafe {
+        core::ptr::read_unaligned(attributes as *const nt_alpc_abi::AlpcMessageAttributes)
+            .allocated_attributes
+    };
+    let Some(offset) = nt_ntdll::alpc::message_attribute_offset(allocated, attribute_flag) else {
+        return core::ptr::null_mut();
+    };
+    unsafe { (attributes as *mut u8).add(offset) as *mut c_void }
+}
+
+/// `AlpcGetMessageFromCompletionList(PVOID CompletionList, PALPC_MESSAGE_ATTRIBUTES *Attributes)`.
+///
+/// # Safety
+/// `message_attributes` is null or writable.
+#[export_name = "AlpcGetMessageFromCompletionList"]
+pub unsafe extern "system" fn alpc_get_message_from_completion_list(
+    _completion_list: *mut c_void,
+    message_attributes: *mut *mut c_void,
+) -> *mut c_void {
+    if !message_attributes.is_null() {
+        unsafe { *message_attributes = core::ptr::null_mut() };
+    }
+    core::ptr::null_mut()
+}
+
+/// `AlpcGetOutstandingCompletionListMessageCount(PVOID CompletionList) -> ULONG`.
+#[export_name = "AlpcGetOutstandingCompletionListMessageCount"]
+pub unsafe extern "system" fn alpc_get_outstanding_completion_list_message_count(
+    _completion_list: *mut c_void,
+) -> u32 {
+    0
+}
+
+/// `AlpcInitializeMessageAttribute(ULONG Flags, PVOID Buffer, ULONG BufferSize, PULONG Required)`.
+///
+/// # Safety
+/// `buffer` writable for `buffer_size` bytes when non-null; `required_buffer_size` null or writable.
+#[export_name = "AlpcInitializeMessageAttribute"]
+pub unsafe extern "system" fn alpc_initialize_message_attribute(
+    attribute_flags: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    required_buffer_size: *mut u32,
+) -> NtStatus {
+    let Some(required) = nt_ntdll::alpc::message_attribute_buffer_size(attribute_flags) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if !required_buffer_size.is_null() {
+        unsafe { *required_buffer_size = required as u32 };
+    }
+    if buffer.is_null() || (buffer_size as usize) < required {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        core::ptr::write_bytes(buffer as *mut u8, 0, required);
+        core::ptr::write_unaligned(
+            buffer as *mut nt_alpc_abi::AlpcMessageAttributes,
+            nt_alpc_abi::AlpcMessageAttributes {
+                allocated_attributes: attribute_flags,
+                valid_attributes: 0,
+            },
+        );
+    }
+    STATUS_SUCCESS
+}
+
+/// `AlpcMaxAllowedMessageLength() -> ULONG`.
+#[export_name = "AlpcMaxAllowedMessageLength"]
+pub extern "system" fn alpc_max_allowed_message_length() -> u32 {
+    nt_ntdll::alpc::MAX_ALLOWED_MESSAGE_LENGTH
+}
+
+/// `AlpcRegisterCompletionList(...) -> NTSTATUS`.
+#[export_name = "AlpcRegisterCompletionList"]
+pub unsafe extern "system" fn alpc_register_completion_list(
+    _port_handle: *mut c_void,
+    _completion_list: *mut c_void,
+    _completion_list_size: u32,
+    _concurrency_count: u32,
+    _attribute_flags: u32,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `AlpcRegisterCompletionListWorkerThread(PVOID CompletionList) -> NTSTATUS`.
+#[export_name = "AlpcRegisterCompletionListWorkerThread"]
+pub unsafe extern "system" fn alpc_register_completion_list_worker_thread(
+    _completion_list: *mut c_void,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `AlpcUnregisterCompletionList(PVOID CompletionList)`.
+#[export_name = "AlpcUnregisterCompletionList"]
+pub unsafe extern "system" fn alpc_unregister_completion_list(_completion_list: *mut c_void) {}
+
+/// `AlpcUnregisterCompletionListWorkerThread(PVOID CompletionList)`.
+#[export_name = "AlpcUnregisterCompletionListWorkerThread"]
+pub unsafe extern "system" fn alpc_unregister_completion_list_worker_thread(
+    _completion_list: *mut c_void,
+) {
+}
+
 // ---- Data exports — the NLS multi-byte code-page tags hosted binaries read. -----------------------
 //
 // `NlsMbCodePageTag` / `NlsMbOemCodePageTag` are BOOLEANs: TRUE iff the ANSI / OEM code page is a
 // MULTI-byte (DBCS) code page. Our defaults (1252 ANSI / 437 OEM) are BOTH single-byte, so both are
 // FALSE — matching `nt_ntdll::crt`'s single-byte-default tags. Exported as data (a `#[used]`
 // `#[no_mangle]` static under the real name).
+
+/// `USHORT NlsAnsiCodePage` — ANSI code page used by the fallback NLS conversion path.
+#[used]
+#[export_name = "NlsAnsiCodePage"]
+pub static NLS_ANSI_CODE_PAGE: u16 = nt_ntdll::nls::ANSI_CODE_PAGE;
 
 /// `BOOLEAN NlsMbCodePageTag` — FALSE (the 1252 ANSI default is single-byte).
 #[used]
@@ -11544,6 +11725,21 @@ pub unsafe extern "C" fn export_anchor() {
         csr_new_thread as usize,
         csr_identify_alertable_thread as usize,
         csr_set_priority_class as usize,
+        alpc_adjust_completion_list_concurrency_count as usize,
+        alpc_free_completion_list_message as usize,
+        alpc_get_completion_list_last_message_information as usize,
+        alpc_get_completion_list_message_attributes as usize,
+        alpc_get_header_size as usize,
+        alpc_get_message_attribute as usize,
+        alpc_get_message_from_completion_list as usize,
+        alpc_get_outstanding_completion_list_message_count as usize,
+        alpc_initialize_message_attribute as usize,
+        alpc_max_allowed_message_length as usize,
+        alpc_register_completion_list as usize,
+        alpc_register_completion_list_worker_thread as usize,
+        alpc_unregister_completion_list as usize,
+        alpc_unregister_completion_list_worker_thread as usize,
+        &NLS_ANSI_CODE_PAGE as *const u16 as usize,
         &NLS_MB_CODE_PAGE_TAG as *const u8 as usize,
         &NLS_MB_OEM_CODE_PAGE_TAG as *const u8 as usize,
         // BATCH 4 — Rtl* string / convert family.

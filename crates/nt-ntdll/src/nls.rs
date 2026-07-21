@@ -17,6 +17,9 @@
 //!
 //! Category A. Host-tested.
 
+/// Default ANSI code page used by the current NLS fallback path.
+pub const ANSI_CODE_PAGE: u16 = 1252;
+
 /// `MAXIMUM_LEADBYTES` — the DBCS lead-byte range table length (bytes) in the NLS header.
 pub const MAXIMUM_LEADBYTES: usize = 12;
 
