@@ -34,6 +34,7 @@ use nt_ntdll_layout::UnicodeString;
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
 const STATUS_PENDING: NtStatus = 0x0000_0103;
+const STATUS_SOME_NOT_MAPPED: NtStatus = 0x0000_0107;
 const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
 #[cfg(not(target_arch = "x86_64"))]
@@ -54,6 +55,8 @@ const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
 const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
 const STATUS_SHARING_VIOLATION: NtStatus = 0xC000_0043;
 const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
+const STATUS_INVALID_PARAMETER_4: NtStatus = 0xC000_00F2;
+const STATUS_INVALID_PARAMETER_5: NtStatus = 0xC000_00F3;
 const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
@@ -5914,6 +5917,49 @@ pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *const u8 {
     }
 }
 
+/// `_memccpy(void*, const void*, int, size_t) -> void*` — copy through the first matching byte.
+///
+/// # Safety
+/// `dst`/`src` valid for `n` bytes, non-overlapping.
+#[export_name = "_memccpy"]
+pub unsafe extern "C" fn memccpy(
+    dst: *mut c_void,
+    src: *const c_void,
+    c: i32,
+    n: usize,
+) -> *mut c_void {
+    let dst = dst as *mut u8;
+    let src = src as *const u8;
+    let needle = c as u8;
+    for i in 0..n {
+        // SAFETY: caller contract; i < n.
+        let byte = unsafe { *src.add(i) };
+        // SAFETY: caller contract; i < n.
+        unsafe { *dst.add(i) = byte };
+        if byte == needle {
+            // SAFETY: one-past the byte just copied.
+            return unsafe { dst.add(i + 1) } as *mut c_void;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// `_memicmp(const void*, const void*, size_t) -> int`.
+///
+/// # Safety
+/// Both inputs valid for `n` bytes.
+#[export_name = "_memicmp"]
+pub unsafe extern "C" fn memicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    // SAFETY: caller contract.
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, n),
+            core::slice::from_raw_parts(b, n),
+        )
+    };
+    ordering_to_int(nt_ntdll::crt::memicmp(sa, sb, n))
+}
+
 /// `strlen(const char*) -> size_t`. Weak (compiler-builtins-mem also provides it).
 ///
 /// # Safety
@@ -6021,6 +6067,30 @@ pub unsafe extern "C" fn strcat(dst: *mut u8, src: *const u8) -> *mut u8 {
     dst
 }
 
+/// `strncat(char* dst, const char* src, size_t n) -> char*`.
+///
+/// # Safety
+/// `dst` NUL-terminated + large enough for at most `n` source bytes plus NUL; `src` valid.
+#[export_name = "strncat"]
+pub unsafe extern "C" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract.
+    let dlen = unsafe { strlen_raw(dst) };
+    let mut copied = 0usize;
+    while copied < n {
+        // SAFETY: caller contract; copied < n.
+        let byte = unsafe { *src.add(copied) };
+        if byte == 0 {
+            break;
+        }
+        // SAFETY: destination is large enough per the contract.
+        unsafe { *dst.add(dlen + copied) = byte };
+        copied += 1;
+    }
+    // SAFETY: destination has room for the terminator.
+    unsafe { *dst.add(dlen + copied) = 0 };
+    dst
+}
+
 /// `strchr(const char*, int) -> char*` — already exported above; not duplicated.
 /// `strrchr(const char*, int) -> char*`.
 ///
@@ -6081,6 +6151,23 @@ pub unsafe extern "C" fn strcspn(s: *const u8, reject: *const u8) -> usize {
     ss.iter().take_while(|b| !rs.contains(b)).count()
 }
 
+/// `strspn(const char* s, const char* accept) -> size_t`.
+///
+/// # Safety
+/// Both NUL-terminated byte strings.
+#[export_name = "strspn"]
+pub unsafe extern "C" fn strspn(s: *const u8, accept: *const u8) -> usize {
+    // SAFETY: caller contract.
+    let (sl, al) = unsafe { (strlen_raw(s), strlen_raw(accept)) };
+    let (ss, ac) = unsafe {
+        (
+            core::slice::from_raw_parts(s, sl),
+            core::slice::from_raw_parts(accept, al),
+        )
+    };
+    nt_ntdll::crt::strspn(ss, ac)
+}
+
 /// `strpbrk(const char* s, const char* accept) -> char*` — first char of `s` in `accept`.
 ///
 /// # Safety
@@ -6100,6 +6187,59 @@ pub unsafe extern "C" fn strpbrk(s: *const u8, accept: *const u8) -> *const u8 {
         Some(i) => unsafe { s.add(i) },
         None => core::ptr::null(),
     }
+}
+
+/// `_strnicmp(const char*, const char*, size_t) -> int`.
+///
+/// # Safety
+/// Both valid up to a NUL or `n` bytes.
+#[export_name = "_strnicmp"]
+pub unsafe extern "C" fn strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    // SAFETY: caller contract — walk at most n, stopping at a NUL in either.
+    let (la, lb) = unsafe { (strnlen_raw(a, n), strnlen_raw(b, n)) };
+    let (sa, sb) = unsafe {
+        (
+            core::slice::from_raw_parts(a, la),
+            core::slice::from_raw_parts(b, lb),
+        )
+    };
+    ordering_to_int(nt_ntdll::crt::strnicmp(sa, sb, n))
+}
+
+/// `_strlwr(char*) -> char*` — lowercase an ASCII string in place.
+///
+/// # Safety
+/// `s` a NUL-terminated, writable byte string.
+#[export_name = "_strlwr"]
+pub unsafe extern "C" fn strlwr(s: *mut u8) -> *mut u8 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    for i in 0..n {
+        // SAFETY: i < n, within the writable buffer.
+        unsafe {
+            let c = *s.add(i) as i32;
+            *s.add(i) = nt_ntdll::crt::ascii_tolower(c) as u8;
+        }
+    }
+    s
+}
+
+/// `_strupr(char*) -> char*` — uppercase an ASCII string in place.
+///
+/// # Safety
+/// `s` a NUL-terminated, writable byte string.
+#[export_name = "_strupr"]
+pub unsafe extern "C" fn strupr(s: *mut u8) -> *mut u8 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    for i in 0..n {
+        // SAFETY: i < n, within the writable buffer.
+        unsafe {
+            let c = *s.add(i) as i32;
+            *s.add(i) = nt_ntdll::crt::ascii_toupper(c) as u8;
+        }
+    }
+    s
 }
 
 /// `_wcslwr(wchar_t*) -> wchar_t*` — lowercase an ASCII/Latin-1 wide string in place.
@@ -6214,6 +6354,30 @@ pub unsafe extern "C" fn wcsncmp(a: *const u16, b: *const u16, n: usize) -> i32 
         }
     }
     0
+}
+
+/// `wcsncat(wchar_t* dst, const wchar_t* src, size_t n) -> wchar_t*`.
+///
+/// # Safety
+/// `dst` NUL-terminated + large enough for at most `n` source code units plus NUL; `src` valid.
+#[export_name = "wcsncat"]
+pub unsafe extern "C" fn wcsncat(dst: *mut u16, src: *const u16, n: usize) -> *mut u16 {
+    // SAFETY: caller contract.
+    let dlen = unsafe { wcslen_raw(dst) };
+    let mut copied = 0usize;
+    while copied < n {
+        // SAFETY: caller contract; copied < n.
+        let ch = unsafe { *src.add(copied) };
+        if ch == 0 {
+            break;
+        }
+        // SAFETY: destination is large enough per the contract.
+        unsafe { *dst.add(dlen + copied) = ch };
+        copied += 1;
+    }
+    // SAFETY: destination has room for the terminator.
+    unsafe { *dst.add(dlen + copied) = 0 };
+    dst
 }
 
 /// `wcscspn(const wchar_t* s, const wchar_t* reject) -> size_t`.
@@ -17194,6 +17358,216 @@ unsafe fn rtl_unicode_string_to_counted_oem_string_impl(
     unsafe { rtl_unicode_string_to_multibyte_string_impl(dst, src, allocate, true, upcase, false) }
 }
 
+/// `RtlUnicodeToUTF8N(PCHAR Dest, ULONG DestBytes, PULONG BytesWritten, PCWCH Src,
+/// ULONG SrcBytes) -> NTSTATUS`.
+///
+/// Port of ReactOS' Vista UTF-16 to UTF-8 conversion, including replacement of malformed surrogate
+/// sequences with U+FFFD and partial-write `STATUS_BUFFER_TOO_SMALL` behavior.
+///
+/// # Safety
+/// `uni_src` is readable for `uni_bytes`; `utf8_dest`, when non-null, is writable for
+/// `utf8_bytes_max`; `utf8_bytes_written` is writable.
+#[export_name = "RtlUnicodeToUTF8N"]
+pub unsafe extern "system" fn rtl_unicode_to_utf8_n(
+    utf8_dest: *mut u8,
+    mut utf8_bytes_max: u32,
+    utf8_bytes_written: *mut u32,
+    uni_src: *const u16,
+    uni_bytes: u32,
+) -> NtStatus {
+    if uni_src.is_null() {
+        return STATUS_INVALID_PARAMETER_4;
+    }
+    if utf8_bytes_written.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !utf8_dest.is_null() && uni_bytes % 2 != 0 {
+        return STATUS_INVALID_PARAMETER_5;
+    }
+
+    let mut written = 0u32;
+    let mut status = STATUS_SUCCESS;
+    let units = uni_bytes / 2;
+    let mut i = 0u32;
+    while i < units {
+        let mut ch = unsafe { core::ptr::read(uni_src.add(i as usize)) as u32 };
+        i += 1;
+
+        if (0xdc00..=0xdfff).contains(&ch) {
+            ch = 0xfffd;
+            status = STATUS_SOME_NOT_MAPPED;
+        } else if (0xd800..=0xdbff).contains(&ch) {
+            if i < units {
+                let next = unsafe { core::ptr::read(uni_src.add(i as usize)) as u32 };
+                if (0xdc00..=0xdfff).contains(&next) {
+                    ch = ((ch - 0xd800) << 10) | (next - 0xdc00);
+                    ch += 0x010000;
+                    i += 1;
+                } else {
+                    ch = 0xfffd;
+                    status = STATUS_SOME_NOT_MAPPED;
+                }
+            } else {
+                ch = 0xfffd;
+                status = STATUS_SOME_NOT_MAPPED;
+            }
+        }
+
+        let mut encoded = [0u8; 4];
+        let encoded_len = if ch < 0x80 {
+            encoded[0] = (ch & 0x7f) as u8;
+            1u32
+        } else if ch < 0x800 {
+            encoded[0] = (0xc0 | ((ch >> 6) & 0x1f)) as u8;
+            encoded[1] = (0x80 | (ch & 0x3f)) as u8;
+            2
+        } else if ch < 0x10000 {
+            encoded[0] = (0xe0 | ((ch >> 12) & 0x0f)) as u8;
+            encoded[1] = (0x80 | ((ch >> 6) & 0x3f)) as u8;
+            encoded[2] = (0x80 | (ch & 0x3f)) as u8;
+            3
+        } else {
+            encoded[0] = (0xf0 | ((ch >> 18) & 0x07)) as u8;
+            encoded[1] = (0x80 | ((ch >> 12) & 0x3f)) as u8;
+            encoded[2] = (0x80 | ((ch >> 6) & 0x3f)) as u8;
+            encoded[3] = (0x80 | (ch & 0x3f)) as u8;
+            4
+        };
+
+        if utf8_dest.is_null() {
+            written = written.wrapping_add(encoded_len);
+            continue;
+        }
+        if utf8_bytes_max >= encoded_len {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    encoded.as_ptr(),
+                    utf8_dest.add(written as usize),
+                    encoded_len as usize,
+                );
+            }
+            utf8_bytes_max -= encoded_len;
+            written = written.wrapping_add(encoded_len);
+        } else {
+            utf8_bytes_max = 0;
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+    }
+
+    unsafe { *utf8_bytes_written = written };
+    status
+}
+
+/// `RtlUTF8ToUnicodeN(PWCH Dest, ULONG DestBytes, PULONG BytesWritten, PCCH Src,
+/// ULONG SrcBytes) -> NTSTATUS`.
+///
+/// Port of ReactOS' Vista UTF-8 to UTF-16 conversion. Invalid byte sequences are mapped to U+FFFD
+/// and report `STATUS_SOME_NOT_MAPPED`; too-small destination buffers preserve partial output.
+///
+/// # Safety
+/// `utf8_src` is readable for `utf8_bytes`; `uni_dest`, when non-null, is writable for
+/// `uni_bytes_max`; `uni_bytes_written` is writable.
+#[export_name = "RtlUTF8ToUnicodeN"]
+pub unsafe extern "system" fn rtl_utf8_to_unicode_n(
+    uni_dest: *mut u16,
+    mut uni_bytes_max: u32,
+    uni_bytes_written: *mut u32,
+    utf8_src: *const u8,
+    utf8_bytes: u32,
+) -> NtStatus {
+    if utf8_src.is_null() {
+        return STATUS_INVALID_PARAMETER_4;
+    }
+    if uni_bytes_written.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let mut written_units = 0u32;
+    let mut status = STATUS_SUCCESS;
+    let mut i = 0u32;
+    while i < utf8_bytes {
+        let mut ch = unsafe { core::ptr::read(utf8_src.add(i as usize)) as u32 };
+        i += 1;
+
+        let mut trail_bytes = 0u32;
+        if ch >= 0xf5 {
+            ch = 0xfffd;
+            status = STATUS_SOME_NOT_MAPPED;
+        } else if ch >= 0xf0 {
+            ch &= 0x07;
+            trail_bytes = 3;
+        } else if ch >= 0xe0 {
+            ch &= 0x0f;
+            trail_bytes = 2;
+        } else if ch >= 0xc2 {
+            ch &= 0x1f;
+            trail_bytes = 1;
+        } else if ch >= 0x80 {
+            ch = 0xfffd;
+            status = STATUS_SOME_NOT_MAPPED;
+        }
+
+        if i + trail_bytes <= utf8_bytes {
+            for _ in 0..trail_bytes {
+                let next = unsafe { core::ptr::read(utf8_src.add(i as usize)) };
+                if next & 0xc0 == 0x80 {
+                    ch = (ch << 6) | (next & 0x3f) as u32;
+                    i += 1;
+                } else {
+                    ch = 0xfffd;
+                    trail_bytes = 0;
+                    status = STATUS_SOME_NOT_MAPPED;
+                    break;
+                }
+            }
+        } else {
+            ch = 0xfffd;
+            trail_bytes = 0;
+            status = STATUS_SOME_NOT_MAPPED;
+            i = utf8_bytes;
+        }
+
+        let mut utf16 = [0u16; 3];
+        let utf16_len = if ch > 0x10ffff
+            || (0xd800..=0xdfff).contains(&ch)
+            || (trail_bytes == 2 && ch < 0x0800)
+            || (trail_bytes == 3 && ch < 0x10000)
+        {
+            utf16 = [0xfffd; 3];
+            status = STATUS_SOME_NOT_MAPPED;
+            trail_bytes
+        } else if ch >= 0x10000 {
+            let scalar = ch - 0x010000;
+            utf16[0] = (0xd800 + ((scalar >> 10) & 0x3ff)) as u16;
+            utf16[1] = (0xdc00 + (scalar & 0x3ff)) as u16;
+            2
+        } else {
+            utf16[0] = ch as u16;
+            1
+        };
+
+        if uni_dest.is_null() {
+            written_units = written_units.wrapping_add(utf16_len);
+            continue;
+        }
+        for j in 0..utf16_len {
+            if uni_bytes_max >= 2 {
+                unsafe {
+                    core::ptr::write(uni_dest.add(written_units as usize), utf16[j as usize]);
+                }
+                uni_bytes_max -= 2;
+                written_units = written_units.wrapping_add(1);
+            } else {
+                uni_bytes_max = 0;
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+        }
+    }
+
+    unsafe { *uni_bytes_written = written_units.wrapping_mul(2) };
+    status
+}
+
 /// `RtlUnicodeToMultiByteN(PCHAR MbStr, ULONG MbSize, PULONG BytesInMbStr, PCWCH UnicodeStr,
 /// ULONG BytesInUnicodeStr) -> NTSTATUS` — UTF-16 → single-byte code page.
 ///
@@ -19666,6 +20040,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ansi_char_to_unicode_char as usize,
         rtl_integer_to_unicode_string as usize,
         rtl_int64_to_unicode_string as usize,
+        rtl_unicode_to_utf8_n as usize,
+        rtl_utf8_to_unicode_n as usize,
         rtl_unicode_to_multi_byte_n as usize,
         rtl_unicode_to_oem_n as usize,
         rtl_upcase_unicode_to_multi_byte_n as usize,
