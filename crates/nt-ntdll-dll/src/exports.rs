@@ -2061,6 +2061,59 @@ pub unsafe extern "system" fn rtl_create_process_parameters(
     }
 }
 
+/// `RtlCreateProcessParametersEx(...) -> NTSTATUS`.
+///
+/// The existing non-Ex builder returns ReactOS-style de-normalized parameters. The Ex variant adds a
+/// flags word; `RTL_USER_PROCESS_PARAMETERS_NORMALIZED` requests live pointer fields in the returned
+/// block, which is what newer process-creation callers use before `NtCreateUserProcess`.
+///
+/// # Safety
+/// Same pointer contract as [`rtl_create_process_parameters`].
+#[export_name = "RtlCreateProcessParametersEx"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_create_process_parameters_ex(
+    params: *mut *mut c_void,
+    image_path: PCUnicodeString,
+    dll_path: PCUnicodeString,
+    current_directory: PCUnicodeString,
+    command_line: PCUnicodeString,
+    environment: *mut c_void,
+    window_title: PCUnicodeString,
+    desktop_info: PCUnicodeString,
+    shell_info: PCUnicodeString,
+    runtime_data: PCUnicodeString,
+    flags: u32,
+) -> NtStatus {
+    const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 0x1;
+    if flags & !RTL_USER_PROCESS_PARAMETERS_NORMALIZED != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let status = unsafe {
+        rtl_create_process_parameters(
+            params,
+            image_path,
+            dll_path,
+            current_directory,
+            command_line,
+            environment,
+            window_title,
+            desktop_info,
+            shell_info,
+            runtime_data,
+        )
+    };
+    if status == STATUS_SUCCESS
+        && flags & RTL_USER_PROCESS_PARAMETERS_NORMALIZED != 0
+        && !params.is_null()
+    {
+        let block = unsafe { *params };
+        if !block.is_null() {
+            let _ = unsafe { rtl_normalize_process_params(block) };
+        }
+    }
+    status
+}
+
 /// `RtlDestroyProcessParameters(PRTL_USER_PROCESS_PARAMETERS) -> NTSTATUS` (ppb.c:242 =
 /// `RtlFreeHeap(RtlGetProcessHeap(), 0, ProcessParameters)`). BATCH 1: real — frees the block
 /// [`rtl_create_process_parameters`] allocated back to the process heap.
@@ -6089,6 +6142,122 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_w(
         *string_length = required;
     }
     STATUS_SUCCESS
+}
+
+/// `RtlIpv6AddressToStringA(const IN6_ADDR*, PSTR) -> PSTR`.
+///
+/// # Safety
+/// `address` points to sixteen IPv6 address bytes; `string` is writable for
+/// `IPV6_ADDR_STRING_MAX_LEN` bytes.
+#[export_name = "RtlIpv6AddressToStringA"]
+pub unsafe extern "system" fn rtl_ipv6_address_to_string_a(
+    address: *const u8,
+    string: *mut u8,
+) -> *mut u8 {
+    if address.is_null() || string.is_null() {
+        return usize::MAX as *mut u8;
+    }
+    let octets = unsafe { read_ipv6_address(address) };
+    let formatted = rtl::network::ipv6_address_to_string(octets);
+    unsafe {
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        string.add(formatted.len())
+    }
+}
+
+/// `RtlIpv6AddressToStringW(const IN6_ADDR*, PWSTR) -> PWSTR`.
+///
+/// # Safety
+/// `address` points to sixteen IPv6 address bytes; `string` is writable for
+/// `IPV6_ADDR_STRING_MAX_LEN` UTF-16 units.
+#[export_name = "RtlIpv6AddressToStringW"]
+pub unsafe extern "system" fn rtl_ipv6_address_to_string_w(
+    address: *const u8,
+    string: *mut u16,
+) -> *mut u16 {
+    if address.is_null() || string.is_null() {
+        return usize::MAX as *mut u16;
+    }
+    let octets = unsafe { read_ipv6_address(address) };
+    let formatted = rtl::network::ipv6_address_to_string_w(octets);
+    unsafe {
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        string.add(formatted.len())
+    }
+}
+
+/// `RtlIpv6AddressToStringExA(const IN6_ADDR*, ULONG, USHORT, PSTR, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `address` points to sixteen IPv6 address bytes; `string` is writable for the character count in
+/// `string_length`; `string_length` is readable and writable.
+#[export_name = "RtlIpv6AddressToStringExA"]
+pub unsafe extern "system" fn rtl_ipv6_address_to_string_ex_a(
+    address: *const u8,
+    scope_id: u32,
+    port: u16,
+    string: *mut u8,
+    string_length: *mut u32,
+) -> NtStatus {
+    if address.is_null() || string.is_null() || string_length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let octets = unsafe { read_ipv6_address(address) };
+    let formatted = rtl::network::ipv6_address_to_string_ex(octets, scope_id, port);
+    let required = (formatted.len() + 1) as u32;
+    unsafe {
+        if *string_length <= formatted.len() as u32 {
+            *string_length = required;
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        *string_length = required;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlIpv6AddressToStringExW(const IN6_ADDR*, ULONG, USHORT, PWSTR, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `address` points to sixteen IPv6 address bytes; `string` is writable for the UTF-16 unit count in
+/// `string_length`; `string_length` is readable and writable.
+#[export_name = "RtlIpv6AddressToStringExW"]
+pub unsafe extern "system" fn rtl_ipv6_address_to_string_ex_w(
+    address: *const u8,
+    scope_id: u32,
+    port: u16,
+    string: *mut u16,
+    string_length: *mut u32,
+) -> NtStatus {
+    if address.is_null() || string.is_null() || string_length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let octets = unsafe { read_ipv6_address(address) };
+    let formatted = rtl::network::ipv6_address_to_string_ex_w(octets, scope_id, port);
+    let required = (formatted.len() + 1) as u32;
+    unsafe {
+        if *string_length <= formatted.len() as u32 {
+            *string_length = required;
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
+        *string.add(formatted.len()) = 0;
+        *string_length = required;
+    }
+    STATUS_SUCCESS
+}
+
+/// Copy an ABI `IN6_ADDR` into an owned byte array.
+///
+/// # Safety
+/// `address` is readable for 16 bytes.
+unsafe fn read_ipv6_address(address: *const u8) -> [u8; 16] {
+    let mut octets = [0u8; 16];
+    unsafe { core::ptr::copy_nonoverlapping(address, octets.as_mut_ptr(), octets.len()) };
+    octets
 }
 
 /// `RtlIpv4StringToAddressA(PCSTR, BOOLEAN, PCSTR*, IN_ADDR*) -> NTSTATUS`.
@@ -13725,6 +13894,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_normalize_process_params as usize,
         rtl_denormalize_process_params as usize,
         rtl_create_process_parameters as usize,
+        rtl_create_process_parameters_ex as usize,
         rtl_destroy_process_parameters as usize,
         rtl_create_environment as usize,
         rtl_set_environment_variable as usize,
@@ -14195,6 +14365,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ipv4_address_to_string_w as usize,
         rtl_ipv4_address_to_string_ex_a as usize,
         rtl_ipv4_address_to_string_ex_w as usize,
+        rtl_ipv6_address_to_string_a as usize,
+        rtl_ipv6_address_to_string_w as usize,
+        rtl_ipv6_address_to_string_ex_a as usize,
+        rtl_ipv6_address_to_string_ex_w as usize,
         rtl_ipv4_string_to_address_a as usize,
         rtl_ipv4_string_to_address_w as usize,
         rtl_ipv4_string_to_address_ex_a as usize,
