@@ -245,6 +245,110 @@ pub unsafe fn find_set_bits_and_clear(bm: *mut u8, count: u32, hint: u32) -> u32
     position
 }
 
+unsafe fn find_next_forward_run(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+    want_set: bool,
+) -> u32 {
+    if bm.is_null() || starting_run_index.is_null() {
+        return 0;
+    }
+
+    let size = unsafe { hdr_size(bm) };
+    if from >= size {
+        unsafe { core::ptr::write_unaligned(starting_run_index, from) };
+        return 0;
+    }
+
+    let buf = unsafe { hdr_buffer(bm) };
+    let mut start = from;
+    while start < size && unsafe { get_bit(buf, start) } != want_set {
+        start += 1;
+    }
+    unsafe { core::ptr::write_unaligned(starting_run_index, start) };
+
+    let mut end = start;
+    while end < size && unsafe { get_bit(buf, end) } == want_set {
+        end += 1;
+    }
+    end - start
+}
+
+/// `RtlFindNextForwardRunClear(RTL_BITMAP*, ULONG from, PULONG start)` — find the next clear run at
+/// or after `from`.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable.
+pub unsafe fn find_next_forward_run_clear(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    unsafe { find_next_forward_run(bm, from, starting_run_index, false) }
+}
+
+/// `RtlFindNextForwardRunSet(RTL_BITMAP*, ULONG from, PULONG start)` — find the next set run at or
+/// after `from`.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable.
+pub unsafe fn find_next_forward_run_set(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    unsafe { find_next_forward_run(bm, from, starting_run_index, true) }
+}
+
+/// `RtlFindFirstRunClear(RTL_BITMAP*, PULONG start)`.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable.
+pub unsafe fn find_first_run_clear(bm: *const u8, starting_run_index: *mut u32) -> u32 {
+    unsafe { find_next_forward_run_clear(bm, 0, starting_run_index) }
+}
+
+/// `RtlFindLastBackwardRunClear(RTL_BITMAP*, ULONG from, PULONG start)` — find the clear run
+/// preceding or containing `from`.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap; `starting_run_index` must be writable when a run exists.
+pub unsafe fn find_last_backward_run_clear(
+    bm: *const u8,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    if bm.is_null() || starting_run_index.is_null() {
+        return 0;
+    }
+
+    let size = unsafe { hdr_size(bm) };
+    if size == 0 {
+        unsafe { core::ptr::write_unaligned(starting_run_index, 0) };
+        return 0;
+    }
+
+    let buf = unsafe { hdr_buffer(bm) };
+    let mut bit = from.min(size - 1);
+    loop {
+        if !unsafe { get_bit(buf, bit) } {
+            break;
+        }
+        if bit == 0 {
+            return 0;
+        }
+        bit -= 1;
+    }
+
+    let last_clear = bit;
+    while bit > 0 && !unsafe { get_bit(buf, bit - 1) } {
+        bit -= 1;
+    }
+    unsafe { core::ptr::write_unaligned(starting_run_index, bit) };
+    last_clear - bit + 1
+}
+
 /// `RtlClearBits(RTL_BITMAP*, ULONG start, ULONG count)`.
 ///
 /// # Safety
@@ -412,6 +516,54 @@ mod tests {
             assert_eq!(find_clear_bits(b.c(), 3, 14), 2);
             assert_eq!(find_set_bits(b.c(), 0, 13), 8);
             assert_eq!(find_clear_bits(b.c(), 0, 99), 0);
+        }
+    }
+
+    #[test]
+    fn forward_run_search_reports_start_and_length() {
+        let mut b = Bm::new(8);
+        unsafe {
+            clear_all(b.p());
+            set_bits(b.p(), 1, 1);
+            set_bits(b.p(), 4, 2);
+            set_bit(b.p(), 7);
+
+            let mut index = u32::MAX;
+            assert_eq!(find_next_forward_run_clear(b.c(), 0, &mut index), 1);
+            assert_eq!(index, 0);
+            assert_eq!(find_next_forward_run_clear(b.c(), 1, &mut index), 2);
+            assert_eq!(index, 2);
+            assert_eq!(find_next_forward_run_clear(b.c(), 7, &mut index), 0);
+            assert_eq!(index, 8);
+            assert_eq!(find_next_forward_run_clear(b.c(), 17, &mut index), 0);
+            assert_eq!(index, 17);
+
+            assert_eq!(find_first_run_clear(b.c(), &mut index), 1);
+            assert_eq!(index, 0);
+            assert_eq!(find_next_forward_run_set(b.c(), 0, &mut index), 1);
+            assert_eq!(index, 1);
+            assert_eq!(find_next_forward_run_set(b.c(), 2, &mut index), 2);
+            assert_eq!(index, 4);
+        }
+    }
+
+    #[test]
+    fn backward_run_search_reports_scanned_clear_run_length() {
+        let mut b = Bm::new(16);
+        unsafe {
+            set_all(b.p());
+            clear_bits(b.p(), 4, 3);
+            clear_bits(b.p(), 10, 2);
+
+            let mut index = u32::MAX;
+            assert_eq!(find_last_backward_run_clear(b.c(), 15, &mut index), 2);
+            assert_eq!(index, 10);
+            assert_eq!(find_last_backward_run_clear(b.c(), 8, &mut index), 3);
+            assert_eq!(index, 4);
+            assert_eq!(find_last_backward_run_clear(b.c(), 5, &mut index), 2);
+            assert_eq!(index, 4);
+            assert_eq!(find_last_backward_run_clear(b.c(), 3, &mut index), 0);
+            assert_eq!(index, 4);
         }
     }
 }

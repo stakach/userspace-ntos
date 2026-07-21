@@ -8,8 +8,9 @@
 
 pub use nt_kernel_exec::rtl_bitmap::{
     are_bits_clear, clear_all, clear_bit, clear_bits, find_clear_bits, find_clear_bits_and_set,
-    find_set_bits, find_set_bits_and_clear, initialize, number_of_clear_bits, number_of_set_bits,
-    set_all, set_bit, set_bits, test_bit, BITMAP_NONE,
+    find_first_run_clear, find_last_backward_run_clear, find_next_forward_run_clear,
+    find_next_forward_run_set, find_set_bits, find_set_bits_and_clear, initialize,
+    number_of_clear_bits, number_of_set_bits, set_all, set_bit, set_bits, test_bit, BITMAP_NONE,
 };
 
 use alloc::vec;
@@ -104,6 +105,30 @@ impl BitMap {
         unsafe { find_set_bits_and_clear(self.hdr.as_mut_ptr(), count, hint) }
     }
 
+    /// `RtlFindNextForwardRunClear`.
+    pub fn find_next_forward_clear(&self, from: u32, start: &mut u32) -> u32 {
+        // SAFETY: initialised header; `start` is writable.
+        unsafe { find_next_forward_run_clear(self.hdr.as_ptr(), from, start) }
+    }
+
+    /// `RtlFindNextForwardRunSet`.
+    pub fn find_next_forward_set(&self, from: u32, start: &mut u32) -> u32 {
+        // SAFETY: initialised header; `start` is writable.
+        unsafe { find_next_forward_run_set(self.hdr.as_ptr(), from, start) }
+    }
+
+    /// `RtlFindFirstRunClear`.
+    pub fn find_first_clear_run(&self, start: &mut u32) -> u32 {
+        // SAFETY: initialised header; `start` is writable.
+        unsafe { find_first_run_clear(self.hdr.as_ptr(), start) }
+    }
+
+    /// `RtlFindLastBackwardRunClear`.
+    pub fn find_last_backward_clear(&self, from: u32, start: &mut u32) -> u32 {
+        // SAFETY: initialised header; `start` is writable.
+        unsafe { find_last_backward_run_clear(self.hdr.as_ptr(), from, start) }
+    }
+
     /// `RtlNumberOfSetBits`.
     pub fn count_set(&self) -> u32 {
         // SAFETY: initialised header.
@@ -159,5 +184,25 @@ mod tests {
         assert_eq!(b.find_clear(8, 16), 23);
         assert_eq!(b.find_set_and_clear(3, 16), 20);
         assert!(b.are_bits_clear(20, 3));
+    }
+
+    #[test]
+    fn forward_and_backward_clear_runs() {
+        let mut b = BitMap::new(32);
+        b.set_range(0, 32);
+        b.clear_range(3, 4);
+        b.clear_range(12, 2);
+
+        let mut start = u32::MAX;
+        assert_eq!(b.find_first_clear_run(&mut start), 4);
+        assert_eq!(start, 3);
+        assert_eq!(b.find_next_forward_clear(7, &mut start), 2);
+        assert_eq!(start, 12);
+        assert_eq!(b.find_next_forward_set(7, &mut start), 5);
+        assert_eq!(start, 7);
+        assert_eq!(b.find_last_backward_clear(31, &mut start), 2);
+        assert_eq!(start, 12);
+        assert_eq!(b.find_last_backward_clear(11, &mut start), 4);
+        assert_eq!(start, 3);
     }
 }

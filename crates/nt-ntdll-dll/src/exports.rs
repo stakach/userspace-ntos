@@ -11319,6 +11319,79 @@ pub unsafe extern "system" fn rtl_find_set_bits_and_clear(
     unsafe { nt_ntdll::rtl::bitmap::find_set_bits_and_clear(header as *mut u8, count, hint) }
 }
 
+/// `RtlFindNextForwardRunClear(PRTL_BITMAP, ULONG FromIndex, PULONG StartingRunIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; `starting_run_index` writable.
+#[export_name = "RtlFindNextForwardRunClear"]
+pub unsafe extern "system" fn rtl_find_next_forward_run_clear(
+    header: *const c_void,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract; out pointer supplied by caller.
+    unsafe {
+        nt_ntdll::rtl::bitmap::find_next_forward_run_clear(
+            header as *const u8,
+            from,
+            starting_run_index,
+        )
+    }
+}
+
+/// `RtlFindNextForwardRunSet(PRTL_BITMAP, ULONG FromIndex, PULONG StartingRunIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; `starting_run_index` writable.
+#[export_name = "RtlFindNextForwardRunSet"]
+pub unsafe extern "system" fn rtl_find_next_forward_run_set(
+    header: *const c_void,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract; out pointer supplied by caller.
+    unsafe {
+        nt_ntdll::rtl::bitmap::find_next_forward_run_set(
+            header as *const u8,
+            from,
+            starting_run_index,
+        )
+    }
+}
+
+/// `RtlFindFirstRunClear(PRTL_BITMAP, PULONG StartingIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; `starting_run_index` writable.
+#[export_name = "RtlFindFirstRunClear"]
+pub unsafe extern "system" fn rtl_find_first_run_clear(
+    header: *const c_void,
+    starting_run_index: *mut u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract; out pointer supplied by caller.
+    unsafe { nt_ntdll::rtl::bitmap::find_first_run_clear(header as *const u8, starting_run_index) }
+}
+
+/// `RtlFindLastBackwardRunClear(PRTL_BITMAP, ULONG FromIndex, PULONG StartingRunIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP; `starting_run_index` writable.
+#[export_name = "RtlFindLastBackwardRunClear"]
+pub unsafe extern "system" fn rtl_find_last_backward_run_clear(
+    header: *const c_void,
+    from: u32,
+    starting_run_index: *mut u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract; out pointer supplied by caller.
+    unsafe {
+        nt_ntdll::rtl::bitmap::find_last_backward_run_clear(
+            header as *const u8,
+            from,
+            starting_run_index,
+        )
+    }
+}
+
 /// `RtlFindMostSignificantBit(ULONGLONG) -> CCHAR`.
 #[export_name = "RtlFindMostSignificantBit"]
 pub extern "system" fn rtl_find_most_significant_bit(value: u64) -> i8 {
@@ -17604,6 +17677,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_find_set_bits as usize,
         rtl_find_clear_bits_and_set as usize,
         rtl_find_set_bits_and_clear as usize,
+        rtl_find_next_forward_run_clear as usize,
+        rtl_find_next_forward_run_set as usize,
+        rtl_find_first_run_clear as usize,
+        rtl_find_last_backward_run_clear as usize,
         rtl_find_most_significant_bit as usize,
         rtl_find_least_significant_bit as usize,
         rtl_create_atom_table as usize,
