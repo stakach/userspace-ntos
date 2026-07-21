@@ -2555,6 +2555,90 @@ pub unsafe extern "system" fn a_sha_final(
     unsafe { nt_ntdll::crypto::a_sha_final(&mut *context, out) };
 }
 
+/// `MD4Init(PMD4_CTX Context)`.
+///
+/// # Safety
+/// `context` must point at a writable ReactOS `MD4_CTX`.
+#[export_name = "MD4Init"]
+pub unsafe extern "system" fn md4_init(context: *mut nt_ntdll::crypto::Md4Context) {
+    // SAFETY: caller supplies a writable MD4_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md4_init(&mut *context) };
+}
+
+/// `MD4Update(PMD4_CTX Context, const unsigned char *Buffer, ULONG BufferSize)`.
+///
+/// # Safety
+/// `context` writable; `buffer` readable for `buffer_size` bytes.
+#[export_name = "MD4Update"]
+pub unsafe extern "system" fn md4_update(
+    context: *mut nt_ntdll::crypto::Md4Context,
+    buffer: *const u8,
+    buffer_size: u32,
+) {
+    let input = if buffer_size == 0 {
+        &[]
+    } else if buffer.is_null() {
+        return;
+    } else {
+        // SAFETY: caller supplies a valid input range per the ABI contract.
+        unsafe { core::slice::from_raw_parts(buffer, buffer_size as usize) }
+    };
+    // SAFETY: caller supplies a writable MD4_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md4_update(&mut *context, input) };
+}
+
+/// `MD4Final(PMD4_CTX Context)`.
+///
+/// # Safety
+/// `context` must point at a writable ReactOS `MD4_CTX`.
+#[export_name = "MD4Final"]
+pub unsafe extern "system" fn md4_final(context: *mut nt_ntdll::crypto::Md4Context) {
+    // SAFETY: caller supplies a writable MD4_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md4_final(&mut *context) };
+}
+
+/// `MD5Init(PMD5_CTX Context)`.
+///
+/// # Safety
+/// `context` must point at a writable ReactOS `MD5_CTX`.
+#[export_name = "MD5Init"]
+pub unsafe extern "system" fn md5_init(context: *mut nt_ntdll::crypto::Md5Context) {
+    // SAFETY: caller supplies a writable MD5_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md5_init(&mut *context) };
+}
+
+/// `MD5Update(PMD5_CTX Context, const unsigned char *Buffer, ULONG BufferSize)`.
+///
+/// # Safety
+/// `context` writable; `buffer` readable for `buffer_size` bytes.
+#[export_name = "MD5Update"]
+pub unsafe extern "system" fn md5_update(
+    context: *mut nt_ntdll::crypto::Md5Context,
+    buffer: *const u8,
+    buffer_size: u32,
+) {
+    let input = if buffer_size == 0 {
+        &[]
+    } else if buffer.is_null() {
+        return;
+    } else {
+        // SAFETY: caller supplies a valid input range per the ABI contract.
+        unsafe { core::slice::from_raw_parts(buffer, buffer_size as usize) }
+    };
+    // SAFETY: caller supplies a writable MD5_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md5_update(&mut *context, input) };
+}
+
+/// `MD5Final(PMD5_CTX Context)`.
+///
+/// # Safety
+/// `context` must point at a writable ReactOS `MD5_CTX`.
+#[export_name = "MD5Final"]
+pub unsafe extern "system" fn md5_final(context: *mut nt_ntdll::crypto::Md5Context) {
+    // SAFETY: caller supplies a writable MD5_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::md5_final(&mut *context) };
+}
+
 // =================================================================================================
 // CRT re-exports — mem/str/wcs + printf-family. Self-contained; correct on a live path.
 // =================================================================================================
@@ -7598,6 +7682,33 @@ pub unsafe extern "system" fn rtl_integer_to_char(
     STATUS_SUCCESS
 }
 
+/// `RtlUshortByteSwap(USHORT Source) -> USHORT`.
+///
+/// # Safety
+/// Pure scalar ABI.
+#[export_name = "RtlUshortByteSwap"]
+pub unsafe extern "system" fn rtl_ushort_byte_swap(source: u16) -> u16 {
+    rtl::integer::ushort_byte_swap(source)
+}
+
+/// `RtlUlongByteSwap(ULONG Source) -> ULONG`.
+///
+/// # Safety
+/// Pure scalar ABI.
+#[export_name = "RtlUlongByteSwap"]
+pub unsafe extern "system" fn rtl_ulong_byte_swap(source: u32) -> u32 {
+    rtl::integer::ulong_byte_swap(source)
+}
+
+/// `RtlUlonglongByteSwap(ULONGLONG Source) -> ULONGLONG`.
+///
+/// # Safety
+/// Pure scalar ABI.
+#[export_name = "RtlUlonglongByteSwap"]
+pub unsafe extern "system" fn rtl_ulonglong_byte_swap(source: u64) -> u64 {
+    rtl::integer::ulonglong_byte_swap(source)
+}
+
 // ---- interlocked SList (single-linked list, x64 SLIST_HEADER is 16 bytes) -------------------------
 // We model the SLIST_HEADER's first 8 bytes as the head pointer + next 8 as {Depth:u16, Sequence}.
 // Single-threaded, so the "interlocked" ops are plain pointer swaps.
@@ -7640,6 +7751,51 @@ pub unsafe extern "system" fn rtl_interlocked_push_entry_slist(
         *depth = depth.read().wrapping_add(1);
         prev as *mut c_void
     }
+}
+
+/// `RtlInterlockedPushListSList(PSLIST_HEADER, PSLIST_ENTRY List, PSLIST_ENTRY ListEnd, ULONG Count)
+/// -> PSLIST_ENTRY` — prepend a caller-built chain and return the previous head.
+///
+/// # Safety
+/// `head` valid SLIST_HEADER; `list`/`list_end` describe a valid singly-linked chain when
+/// `count != 0`.
+#[export_name = "RtlInterlockedPushListSList"]
+pub unsafe extern "system" fn rtl_interlocked_push_list_slist(
+    head: *mut c_void,
+    list: *mut c_void,
+    list_end: *mut c_void,
+    count: u32,
+) -> *mut c_void {
+    if head.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: head valid per the contract.
+    unsafe {
+        let prev = *(head as *mut u64);
+        if count == 0 || list.is_null() || list_end.is_null() {
+            return prev as *mut c_void;
+        }
+        *(list_end as *mut u64) = prev; // ListEnd->Next = old head
+        *(head as *mut u64) = list as u64;
+        let depth = (head as *mut u16).add(4);
+        *depth = depth.read().wrapping_add(count as u16);
+        prev as *mut c_void
+    }
+}
+
+/// `RtlInterlockedPushListSListEx` — Windows 8+ alias of `RtlInterlockedPushListSList` on x64.
+///
+/// # Safety
+/// Same contract as `RtlInterlockedPushListSList`.
+#[export_name = "RtlInterlockedPushListSListEx"]
+pub unsafe extern "system" fn rtl_interlocked_push_list_slist_ex(
+    head: *mut c_void,
+    list: *mut c_void,
+    list_end: *mut c_void,
+    count: u32,
+) -> *mut c_void {
+    // SAFETY: same caller contract as the base export.
+    unsafe { rtl_interlocked_push_list_slist(head, list, list_end, count) }
 }
 
 /// `RtlInterlockedPopEntrySList(PSLIST_HEADER) -> PSLIST_ENTRY` — pop the head (NULL if empty).
@@ -10555,6 +10711,12 @@ pub unsafe extern "C" fn export_anchor() {
         a_sha_init as usize,
         a_sha_update as usize,
         a_sha_final as usize,
+        md4_init as usize,
+        md4_update as usize,
+        md4_final as usize,
+        md5_init as usize,
+        md5_update as usize,
+        md5_final as usize,
         memcpy as usize,
         memset as usize,
         wcslen as usize,
@@ -10807,11 +10969,16 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_uniform as usize,
         rtl_random as usize,
         rtl_integer_to_char as usize,
+        rtl_ushort_byte_swap as usize,
+        rtl_ulong_byte_swap as usize,
+        rtl_ulonglong_byte_swap as usize,
     ];
     core::hint::black_box(anchors_misc1);
     let anchors_misc2: &[usize] = &[
         rtl_initialize_slist_head as usize,
         rtl_interlocked_push_entry_slist as usize,
+        rtl_interlocked_push_list_slist as usize,
+        rtl_interlocked_push_list_slist_ex as usize,
         rtl_interlocked_pop_entry_slist as usize,
         rtl_interlocked_flush_slist as usize,
         rtl_query_depth_slist as usize,

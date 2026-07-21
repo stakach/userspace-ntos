@@ -43,6 +43,21 @@ pub fn int64_to_unicode(value: u64, base: u32) -> Option<Vec<u16>> {
     Some(digits)
 }
 
+/// `RtlUshortByteSwap`.
+pub const fn ushort_byte_swap(value: u16) -> u16 {
+    value.swap_bytes()
+}
+
+/// `RtlUlongByteSwap`.
+pub const fn ulong_byte_swap(value: u32) -> u32 {
+    value.swap_bytes()
+}
+
+/// `RtlUlonglongByteSwap`.
+pub const fn ulonglong_byte_swap(value: u64) -> u64 {
+    value.swap_bytes()
+}
+
 // --- LARGE_INTEGER helpers (x64: plain i64/u64 arithmetic, but ntdll exports them) -------------
 
 /// `RtlLargeIntegerAdd`.
@@ -106,5 +121,12 @@ mod tests {
         assert_eq!(enlarged_unsigned_multiply(0xFFFF_FFFF, 2), 0x1_FFFF_FFFE);
         assert_eq!(enlarged_unsigned_divide(100, 7), Some((14, 2)));
         assert_eq!(enlarged_unsigned_divide(1, 0), None);
+    }
+
+    #[test]
+    fn byte_swaps_match_rtl_exports() {
+        assert_eq!(ushort_byte_swap(0x1234), 0x3412);
+        assert_eq!(ulong_byte_swap(0x1234_5678), 0x7856_3412);
+        assert_eq!(ulonglong_byte_swap(0x0123_4567_89AB_CDEF), 0xEFCD_AB89_6745_2301);
     }
 }
