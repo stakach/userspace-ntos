@@ -35,6 +35,8 @@ const TICKS_PER_MS: i64 = 10_000;
 const SECS_PER_DAY: i64 = 86_400;
 /// Days from 1601-01-01 to 1970-01-01 (the Unix epoch), proleptic Gregorian.
 const DAYS_1601_TO_1970: i64 = 134_774;
+/// NT ticks from 1601-01-01 to 1980-01-01 (the DOS epoch).
+const TICKS_TO_1980: i64 = 0x01A8_E79F_E1D5_8000;
 
 #[inline]
 fn is_leap(year: i64) -> bool {
@@ -155,6 +157,21 @@ pub fn seconds_since_1970_to_time(seconds: u32) -> i64 {
     (seconds as i64 + DAYS_1601_TO_1970 * SECS_PER_DAY) * TICKS_PER_SEC
 }
 
+/// `RtlTimeToSecondsSince1980`: convert an NT tick count to DOS epoch seconds. Returns `None` if the
+/// time overflows the `ULONG` seconds output.
+pub fn time_to_seconds_since_1980(nt_time: i64) -> Option<u32> {
+    let secs = (nt_time as i128 - TICKS_TO_1980 as i128) / TICKS_PER_SEC as i128;
+    if secs < 0 || secs > u32::MAX as i128 {
+        return None;
+    }
+    Some(secs as u32)
+}
+
+/// `RtlSecondsSince1980ToTime`: DOS epoch seconds → NT tick count.
+pub fn seconds_since_1980_to_time(seconds: u32) -> i64 {
+    seconds as i64 * TICKS_PER_SEC + TICKS_TO_1980
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +237,18 @@ mod tests {
     #[test]
     fn pre_1970_rejected_for_unix() {
         assert_eq!(time_to_seconds_since_1970(0), None); // 1601 predates 1970
+    }
+
+    #[test]
+    fn dos_epoch_roundtrip() {
+        let nt = seconds_since_1980_to_time(0);
+        let tf = time_to_time_fields(nt);
+        assert_eq!((tf.year, tf.month, tf.day), (1980, 1, 1));
+        assert_eq!(tf.weekday, 2); // 1980-01-01 was a Tuesday
+        assert_eq!(time_to_seconds_since_1980(nt), Some(0));
+
+        let max = seconds_since_1980_to_time(u32::MAX);
+        assert_eq!(time_to_seconds_since_1980(max), Some(u32::MAX));
+        assert_eq!(time_to_seconds_since_1980(max + TICKS_PER_SEC), None);
     }
 }

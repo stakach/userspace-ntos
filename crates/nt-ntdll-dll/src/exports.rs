@@ -8618,6 +8618,28 @@ pub unsafe extern "system" fn rtl_time_to_seconds_since_1970(
     }
 }
 
+/// `RtlTimeToSecondsSince1980(PLARGE_INTEGER Time, PULONG Seconds) -> BOOLEAN`.
+///
+/// # Safety
+/// `time`/`seconds` valid pointers.
+#[export_name = "RtlTimeToSecondsSince1980"]
+pub unsafe extern "system" fn rtl_time_to_seconds_since_1980(
+    time: *const i64,
+    seconds: *mut u32,
+) -> u8 {
+    if time.is_null() || seconds.is_null() {
+        return 0;
+    }
+    let t = unsafe { *time };
+    match nt_ntdll::rtl::time::time_to_seconds_since_1980(t) {
+        Some(s) => {
+            unsafe { *seconds = s };
+            1
+        }
+        None => 0,
+    }
+}
+
 /// `RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS TimeFields)`. TIME_FIELDS = 7 shorts
 /// {Year,Month,Day,Hour,Minute,Second,Milliseconds,Weekday}.
 ///
@@ -10751,14 +10773,37 @@ pub unsafe extern "system" fn rtl_seconds_since_1970_to_time(
     seconds_since_1970: u32,
     time: *mut i64,
 ) {
-    const TICKSPERSEC: i64 = 10_000_000;
-    const TICKSTO1970: i64 = 0x019D_B1DE_D53E_8000;
     if time.is_null() {
         return;
     }
     // SAFETY: time writable per the contract.
     unsafe {
-        core::ptr::write_unaligned(time, seconds_since_1970 as i64 * TICKSPERSEC + TICKSTO1970)
+        core::ptr::write_unaligned(
+            time,
+            nt_ntdll::rtl::time::seconds_since_1970_to_time(seconds_since_1970),
+        )
+    };
+}
+
+/// `RtlSecondsSince1980ToTime(ULONG SecondsSince1980, PLARGE_INTEGER Time)` — convert to NT time
+/// (`sdk/lib/rtl/time.c:417`): `Time = Seconds * TICKSPERSEC + TICKSTO1980`.
+///
+/// # Safety
+/// `time` a valid writable LARGE_INTEGER (i64).
+#[export_name = "RtlSecondsSince1980ToTime"]
+pub unsafe extern "system" fn rtl_seconds_since_1980_to_time(
+    seconds_since_1980: u32,
+    time: *mut i64,
+) {
+    if time.is_null() {
+        return;
+    }
+    // SAFETY: time writable per the contract.
+    unsafe {
+        core::ptr::write_unaligned(
+            time,
+            nt_ntdll::rtl::time::seconds_since_1980_to_time(seconds_since_1980),
+        )
     };
 }
 
@@ -13221,6 +13266,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_encode_system_pointer as usize,
         rtl_decode_system_pointer as usize,
         rtl_time_to_seconds_since_1970 as usize,
+        rtl_time_to_seconds_since_1980 as usize,
+        rtl_seconds_since_1970_to_time as usize,
+        rtl_seconds_since_1980_to_time as usize,
         rtl_time_to_time_fields as usize,
         rtl_time_fields_to_time as usize,
         rtl_uniform as usize,
