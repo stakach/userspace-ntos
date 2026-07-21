@@ -292,7 +292,7 @@ impl NativeService {
             // Group-A services the executive handles by reading registers directly (out-handle in
             // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
             // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
-            NtCreatePort | NtCreateThread | NtCreateEvent | NtCreateSemaphore
+            NtCreatePort | NtCreateThread | NtCreateEvent
             | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
             | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
             | NtFlushInstructionCache | NtCreateKeyedEvent | NtAdjustPrivilegesToken
@@ -304,6 +304,9 @@ impl NativeService {
             // Named-pipe / device I/O: the handler writes out-params (FileHandle in R10,
             // IoStatusBlock in R9) via the executive's register/stack helpers; register-only cap.
             | NtCreateNamedPipeFile => (0, 4),
+            // NtCreateSemaphore is a real 5-arg ntdll call. The executive currently mints an opaque
+            // closable handle, but ntdll must be allowed to pass the InitialCount stack arg.
+            NtCreateSemaphore => (5, 5),
             // The filesystem-control handler forwards all native buffer arguments to the FSD.
             NtFsControlFile => (10, 10),
             _ => (0, 16), // permissive for the rest in v0.1

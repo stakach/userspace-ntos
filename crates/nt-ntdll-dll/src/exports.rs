@@ -34,6 +34,7 @@ type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
+const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009A;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
@@ -955,7 +956,7 @@ pub unsafe extern "system" fn rtl_add_access_allowed_ace(
         *(cur.add(2) as *mut u16) = ace_size as u16; // AceSize
         *(cur.add(4) as *mut u32) = access_mask; // Mask
         core::ptr::copy_nonoverlapping(sid as *const u8, cur.add(8), sid_len); // SidStart
-        // Bump AceCount.
+                                                                               // Bump AceCount.
         *(p.add(4) as *mut u16) = ace_count + 1;
     }
     STATUS_SUCCESS
@@ -999,8 +1000,14 @@ pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
             return STATUS_NO_MEMORY;
         }
         let subs = [
-            sub_authority0, sub_authority1, sub_authority2, sub_authority3, sub_authority4,
-            sub_authority5, sub_authority6, sub_authority7,
+            sub_authority0,
+            sub_authority1,
+            sub_authority2,
+            sub_authority3,
+            sub_authority4,
+            sub_authority5,
+            sub_authority6,
+            sub_authority7,
         ];
         // SID: Revision(1)=1, SubAuthorityCount(1)=count, IdentifierAuthority(6), SubAuthority[count].
         // SAFETY: p is a fresh `size`-byte allocation; identifier_authority is a valid 6-byte auth.
@@ -1019,8 +1026,14 @@ pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (
-            sub_authority0, sub_authority1, sub_authority2, sub_authority3, sub_authority4,
-            sub_authority5, sub_authority6, sub_authority7,
+            sub_authority0,
+            sub_authority1,
+            sub_authority2,
+            sub_authority3,
+            sub_authority4,
+            sub_authority5,
+            sub_authority6,
+            sub_authority7,
         );
         STATUS_NO_MEMORY
     }
@@ -1045,7 +1058,8 @@ pub unsafe extern "system" fn rtl_adjust_privilege(
     {
         // SAFETY: on-target hosted-process; routes through the live token syscalls.
         unsafe {
-            crate::on_target::rtl_adjust_privilege(privilege, enable, client, was_enabled) as NtStatus
+            crate::on_target::rtl_adjust_privilege(privilege, enable, client, was_enabled)
+                as NtStatus
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -1076,7 +1090,8 @@ pub unsafe extern "system" fn rtl_normalize_process_params(params: *mut c_void) 
     let len = unsafe { core::ptr::read((params as *const u8).add(0x04) as *const u32) } as usize;
     // Normalize over the header extent (the pure step only touches the UNICODE_STRING fields, all
     // within the fixed header — a header-sized view suffices).
-    let hdr = nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE.min(len.max(nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE));
+    let hdr = nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE
+        .min(len.max(nt_ntdll::rtl::process_params::PARAMS_HEADER_SIZE));
     // SAFETY: [params, params+hdr) covers the header UNICODE_STRING fields.
     let block = unsafe { core::slice::from_raw_parts_mut(params as *mut u8, hdr) };
     nt_ntdll::rtl::process_params::normalize(block, params as u64);
@@ -1150,8 +1165,15 @@ pub unsafe extern "system" fn rtl_create_process_parameters(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (
-            image_path, dll_path, current_directory, command_line, environment, window_title,
-            desktop_info, shell_info, runtime_data,
+            image_path,
+            dll_path,
+            current_directory,
+            command_line,
+            environment,
+            window_title,
+            desktop_info,
+            shell_info,
+            runtime_data,
         );
         STATUS_NO_MEMORY
     }
@@ -1408,8 +1430,14 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
         core::ptr::copy_nonoverlapping(nt.as_ptr(), buf, n_units);
         core::ptr::write(buf.add(n_units), 0);
         // Fill the UNICODE_STRING: Length excludes the NUL, MaximumLength includes it.
-        core::ptr::write(core::ptr::addr_of_mut!((*nt_name).length), (n_units * 2) as u16);
-        core::ptr::write(core::ptr::addr_of_mut!((*nt_name).maximum_length), (bytes) as u16);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*nt_name).length),
+            (n_units * 2) as u16,
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*nt_name).maximum_length),
+            (bytes) as u16,
+        );
         core::ptr::write(core::ptr::addr_of_mut!((*nt_name).buffer), buf as u64);
     }
     if !part_name.is_null() {
@@ -1417,7 +1445,9 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
         // a separator. Compute over the DOS input tail.
         // SAFETY: part_name is a valid writable pointer per the contract.
         unsafe {
-            let last_sep = input.iter().rposition(|&c| c == b'\\' as u16 || c == b'/' as u16);
+            let last_sep = input
+                .iter()
+                .rposition(|&c| c == b'\\' as u16 || c == b'/' as u16);
             match last_sep {
                 Some(i) if i + 1 < len => core::ptr::write(part_name, dos_name.add(i + 1)),
                 _ => core::ptr::write(part_name, core::ptr::null()),
@@ -1475,10 +1505,10 @@ pub unsafe extern "system" fn rtl_dos_search_path_u(
 /// The `RTL_QUERY_REGISTRY_ROUTINE` callback ABI (x64 system): `(ValueName, ValueType, ValueData,
 /// ValueLength, Context, EntryContext) -> NTSTATUS`.
 type QueryRoutine = unsafe extern "system" fn(
-    *mut u16,   // ValueName
-    u32,        // ValueType
+    *mut u16,    // ValueName
+    u32,         // ValueType
     *mut c_void, // ValueData
-    u32,        // ValueLength
+    u32,         // ValueLength
     *mut c_void, // Context
     *mut c_void, // EntryContext
 ) -> NtStatus;
@@ -1534,51 +1564,52 @@ pub unsafe extern "system" fn rtl_query_registry_values(
     }
     #[allow(unreachable_code)]
     {
-    const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
-    const ENTRY_SIZE: usize = 0x38;
-    // SAFETY: query_table is a valid RTL_QUERY_REGISTRY_TABLE array per the contract.
-    unsafe {
-        let mut e = query_table as *const u8;
-        loop {
-            let query_routine = core::ptr::read_unaligned(e as *const u64);
-            let flags = core::ptr::read_unaligned(e.add(0x08) as *const u32);
-            let name = core::ptr::read_unaligned(e.add(0x10) as *const u64);
-            let entry_context = core::ptr::read_unaligned(e.add(0x18) as *const u64);
-            let default_type = core::ptr::read_unaligned(e.add(0x20) as *const u32);
-            let default_data = core::ptr::read_unaligned(e.add(0x28) as *const u64);
-            let default_length = core::ptr::read_unaligned(e.add(0x30) as *const u32);
-            // Terminator: QueryRoutine == NULL && Name == NULL.
-            if query_routine == 0 && name == 0 {
-                break;
-            }
-            if (flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
-                // DIRECT: copy DefaultData (DefaultLength bytes) straight into EntryContext.
-                if entry_context != 0 && default_data != 0 && default_length != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        default_data as *const u8,
-                        entry_context as *mut u8,
-                        default_length as usize,
+        const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
+        const ENTRY_SIZE: usize = 0x38;
+        // SAFETY: query_table is a valid RTL_QUERY_REGISTRY_TABLE array per the contract.
+        unsafe {
+            let mut e = query_table as *const u8;
+            loop {
+                let query_routine = core::ptr::read_unaligned(e as *const u64);
+                let flags = core::ptr::read_unaligned(e.add(0x08) as *const u32);
+                let name = core::ptr::read_unaligned(e.add(0x10) as *const u64);
+                let entry_context = core::ptr::read_unaligned(e.add(0x18) as *const u64);
+                let default_type = core::ptr::read_unaligned(e.add(0x20) as *const u32);
+                let default_data = core::ptr::read_unaligned(e.add(0x28) as *const u64);
+                let default_length = core::ptr::read_unaligned(e.add(0x30) as *const u32);
+                // Terminator: QueryRoutine == NULL && Name == NULL.
+                if query_routine == 0 && name == 0 {
+                    break;
+                }
+                if (flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
+                    // DIRECT: copy DefaultData (DefaultLength bytes) straight into EntryContext.
+                    if entry_context != 0 && default_data != 0 && default_length != 0 {
+                        core::ptr::copy_nonoverlapping(
+                            default_data as *const u8,
+                            entry_context as *mut u8,
+                            default_length as usize,
+                        );
+                    }
+                } else if query_routine != 0 && default_type != 0 {
+                    // Callback with the default value (REG_NONE=0 default type → skip, per the contract).
+                    let routine: QueryRoutine =
+                        core::mem::transmute::<u64, QueryRoutine>(query_routine);
+                    let st = routine(
+                        name as *mut u16,
+                        default_type,
+                        default_data as *mut c_void,
+                        default_length,
+                        context,
+                        entry_context as *mut c_void,
                     );
+                    if st != STATUS_SUCCESS {
+                        return st;
+                    }
                 }
-            } else if query_routine != 0 && default_type != 0 {
-                // Callback with the default value (REG_NONE=0 default type → skip, per the contract).
-                let routine: QueryRoutine = core::mem::transmute::<u64, QueryRoutine>(query_routine);
-                let st = routine(
-                    name as *mut u16,
-                    default_type,
-                    default_data as *mut c_void,
-                    default_length,
-                    context,
-                    entry_context as *mut c_void,
-                );
-                if st != STATUS_SUCCESS {
-                    return st;
-                }
+                e = e.add(ENTRY_SIZE);
             }
-            e = e.add(ENTRY_SIZE);
         }
-    }
-    STATUS_SUCCESS
+        STATUS_SUCCESS
     }
 }
 
@@ -1721,8 +1752,14 @@ pub unsafe extern "system" fn rtl_create_user_process(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (
-            attributes, process_parameters, process_sd, thread_sd, parent_process, inherit_handles,
-            debug_port, exception_port,
+            attributes,
+            process_parameters,
+            process_sd,
+            thread_sd,
+            parent_process,
+            inherit_handles,
+            debug_port,
+            exception_port,
         );
         STATUS_NOT_IMPLEMENTED
     }
@@ -1772,8 +1809,16 @@ pub unsafe extern "system" fn rtl_create_user_thread(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (
-            process, thread_sd, create_suspended, stack_zero_bits, stack_reserve, stack_commit,
-            start_address, parameter, thread_handle, client_id,
+            process,
+            thread_sd,
+            create_suspended,
+            stack_zero_bits,
+            stack_reserve,
+            stack_commit,
+            start_address,
+            parameter,
+            thread_handle,
+            client_id,
         );
         STATUS_NOT_IMPLEMENTED
     }
@@ -2107,7 +2152,12 @@ pub unsafe extern "C" fn c_specific_handler(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (exception_record, establisher_frame, context_record, dispatcher_context);
+        let _ = (
+            exception_record,
+            establisher_frame,
+            context_record,
+            dispatcher_context,
+        );
         1 // ExceptionContinueSearch (no live plane off target)
     }
 }
@@ -2373,7 +2423,8 @@ pub unsafe extern "system" fn rtl_init_string(dst: *mut c_void, src: *const u8) 
     unsafe {
         core::ptr::write_unaligned(dst as *mut u16, len as u16); // Length
         core::ptr::write_unaligned((dst as *mut u8).add(2) as *mut u16, (len + 1) as u16); // MaxLength
-        core::ptr::write_unaligned((dst as *mut u8).add(8) as *mut u64, src as u64); // Buffer
+        core::ptr::write_unaligned((dst as *mut u8).add(8) as *mut u64, src as u64);
+        // Buffer
     }
 }
 
@@ -2423,7 +2474,7 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_and_spin_count(
         core::ptr::write_bytes(cs as *mut u8, 0, 40);
         *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
         *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF; // SpinCount (bit31 masked)
-        // DebugInfo @ offset 0 — allocate + populate (msvcrt & others deref it).
+                                                                             // DebugInfo @ offset 0 — allocate + populate (msvcrt & others deref it).
         install_cs_debug_info(cs);
     }
     STATUS_SUCCESS
@@ -2696,9 +2747,7 @@ pub unsafe extern "system" fn ldr_get_procedure_address(
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: on-target; base a mapped module, name an ANSI_STRING*/NULL, address writable.
-        unsafe {
-            crate::on_target::ldr_get_procedure_address(base_address, name, ordinal, address)
-        }
+        unsafe { crate::on_target::ldr_get_procedure_address(base_address, name, ordinal, address) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -3532,7 +3581,9 @@ pub unsafe extern "system" fn ldr_unlock_loader_lock(_flags: u32, _cookie: usize
 /// # Safety
 /// `dll_handle` a loaded module base.
 #[export_name = "LdrDisableThreadCalloutsForDll"]
-pub unsafe extern "system" fn ldr_disable_thread_callouts_for_dll(_dll_handle: *mut c_void) -> NtStatus {
+pub unsafe extern "system" fn ldr_disable_thread_callouts_for_dll(
+    _dll_handle: *mut c_void,
+) -> NtStatus {
     STATUS_SUCCESS
 }
 
@@ -3692,7 +3743,10 @@ const STATUS_RESOURCE_LANG_NOT_FOUND: NtStatus = 0xC000_00A2;
 ///
 /// # Safety
 /// If `value` is a pointer it must reference a readable NUL-terminated UTF-16 string.
-unsafe fn decode_res_name<'a>(value: usize, scratch: &'a mut [u16; 256]) -> rtl::pe_resource::ResName<'a> {
+unsafe fn decode_res_name<'a>(
+    value: usize,
+    scratch: &'a mut [u16; 256],
+) -> rtl::pe_resource::ResName<'a> {
     if value <= 0xFFFF {
         return rtl::pe_resource::ResName::Id(value as u16);
     }
@@ -3900,7 +3954,9 @@ pub unsafe extern "system" fn ldr_access_resource(
 /// # Safety
 /// `base_address` a module base or NULL.
 #[export_name = "LdrUnloadAlternateResourceModule"]
-pub unsafe extern "system" fn ldr_unload_alternate_resource_module(_base_address: *mut c_void) -> u8 {
+pub unsafe extern "system" fn ldr_unload_alternate_resource_module(
+    _base_address: *mut c_void,
+) -> u8 {
     1
 }
 
@@ -3932,7 +3988,10 @@ pub unsafe extern "system" fn rtl_destroy_environment(environment: *mut u16) -> 
 /// # Safety
 /// `buffer` writable for `buffer_length` bytes.
 #[export_name = "RtlGetCurrentDirectory_U"]
-pub unsafe extern "system" fn rtl_get_current_directory_u(buffer_length: u32, buffer: *mut u16) -> u32 {
+pub unsafe extern "system" fn rtl_get_current_directory_u(
+    buffer_length: u32,
+    buffer: *mut u16,
+) -> u32 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: on-target; PEB @ gs:[0x60], ProcessParameters @ PEB+0x20, CurrentDirectory @ +0x38.
     unsafe {
@@ -4362,7 +4421,10 @@ pub unsafe extern "system" fn rtl_activate_activation_context_unsafe_fast(
 /// # Safety
 /// `cookie` from a matching Activate.
 #[export_name = "RtlDeactivateActivationContext"]
-pub unsafe extern "system" fn rtl_deactivate_activation_context(_flags: u32, _cookie: usize) -> NtStatus {
+pub unsafe extern "system" fn rtl_deactivate_activation_context(
+    _flags: u32,
+    _cookie: usize,
+) -> NtStatus {
     STATUS_SUCCESS
 }
 
@@ -4427,7 +4489,9 @@ pub unsafe extern "system" fn rtl_zombify_activation_context(_act_ctx: *mut c_vo
 /// # Safety
 /// `act_ctx` writable.
 #[export_name = "RtlGetActiveActivationContext"]
-pub unsafe extern "system" fn rtl_get_active_activation_context(act_ctx: *mut *mut c_void) -> NtStatus {
+pub unsafe extern "system" fn rtl_get_active_activation_context(
+    act_ctx: *mut *mut c_void,
+) -> NtStatus {
     if !act_ctx.is_null() {
         // SAFETY: act_ctx writable per the contract.
         unsafe { *act_ctx = core::ptr::null_mut() };
@@ -4501,7 +4565,9 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
 /// # Safety
 /// `stack` writable.
 #[export_name = "RtlAllocateActivationContextStack"]
-pub unsafe extern "system" fn rtl_allocate_activation_context_stack(stack: *mut *mut c_void) -> NtStatus {
+pub unsafe extern "system" fn rtl_allocate_activation_context_stack(
+    stack: *mut *mut c_void,
+) -> NtStatus {
     if !stack.is_null() {
         // SAFETY: stack writable per the contract.
         unsafe { *stack = core::ptr::null_mut() };
@@ -4613,7 +4679,10 @@ pub unsafe extern "system" fn rtl_guid_from_string(
     }
     // SAFETY: guid_string valid per the contract.
     let (buf, units) = unsafe {
-        ((*guid_string).buffer as *const u16, (*guid_string).length as usize / 2)
+        (
+            (*guid_string).buffer as *const u16,
+            (*guid_string).length as usize / 2,
+        )
     };
     let s = unsafe { core::slice::from_raw_parts(buf, units) };
     match nt_ntdll::rtl::guid::guid_from_string(s) {
@@ -4681,7 +4750,11 @@ pub unsafe extern "system" fn rtl_image_directory_entry_to_data(
     unsafe {
         let opt = (nt as *const u8).add(0x18);
         let magic = *(opt as *const u16);
-        let dir_base = if magic == 0x20B { opt.add(0x70) } else { opt.add(0x60) };
+        let dir_base = if magic == 0x20B {
+            opt.add(0x70)
+        } else {
+            opt.add(0x60)
+        };
         let entry = dir_base.add(directory_entry as usize * 8);
         let rva = *(entry as *const u32);
         let sz = *((entry as *const u32).add(1));
@@ -4794,7 +4867,10 @@ pub unsafe extern "system" fn rtl_initialize_handle_table(
 /// # Safety
 /// `table` from `RtlInitializeHandleTable`; `index` null or writable.
 #[export_name = "RtlAllocateHandle"]
-pub unsafe extern "system" fn rtl_allocate_handle(table: *mut c_void, index: *mut u32) -> *mut c_void {
+pub unsafe extern "system" fn rtl_allocate_handle(
+    table: *mut c_void,
+    index: *mut u32,
+) -> *mut c_void {
     if table.is_null() {
         return core::ptr::null_mut();
     }
@@ -4827,15 +4903,11 @@ pub unsafe extern "system" fn rtl_allocate_handle(table: *mut c_void, index: *mu
         let free = rtl_handle_read_ptr(table, RTL_HANDLE_FREE);
         if free != 0 {
             let end = rtl_handle_read_ptr(table, RTL_HANDLE_MAX_RESERVED);
-            let free_index = match nt_ntdll::handle_table::entry_index(
-                committed,
-                end,
-                free,
-                entry_size_u32,
-            ) {
-                Some(free_index) if free_index < max => free_index,
-                _ => return core::ptr::null_mut(),
-            };
+            let free_index =
+                match nt_ntdll::handle_table::entry_index(committed, end, free, entry_size_u32) {
+                    Some(free_index) if free_index < max => free_index,
+                    _ => return core::ptr::null_mut(),
+                };
             let next = core::ptr::read_unaligned(free as *const usize);
             rtl_handle_write_ptr(table, RTL_HANDLE_FREE, next);
             core::ptr::write_bytes(free as *mut u8, 0, entry_size);
@@ -4924,10 +4996,60 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
 // wake, so the counter state is the whole observable contract. Faithful to
 // `references/reactos/sdk/lib/rtl/resource.c`.
 
+const RES_SHARED_SEMAPHORE: usize = 0x28;
 const RES_SHARED_WAITERS: usize = 0x30;
+const RES_EXCLUSIVE_SEMAPHORE: usize = 0x38;
 const RES_EXCLUSIVE_WAITERS: usize = 0x40;
 const RES_NUMBER_ACTIVE: usize = 0x44;
 const RES_OWNING_THREAD: usize = 0x48;
+const RES_TIMEOUT_BOOST: usize = 0x50;
+const SEMAPHORE_ALL_ACCESS: u32 = 0x001F_0003;
+
+/// Create one RTL_RESOURCE semaphore through the real NtCreateSemaphore stub.
+///
+/// # Safety
+/// On-target only. Issues a native syscall and writes to a stack out-param.
+#[cfg(target_arch = "x86_64")]
+unsafe fn resource_create_semaphore() -> Result<u64, NtStatus> {
+    let mut handle = 0u64;
+    // SAFETY: forwards to the generated NtCreateSemaphore stub with the real x64 ABI. `&mut handle`
+    // is a stack out-param the executive can write through its mirrored stack.
+    let status = unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut u64, u32, *mut c_void, i32, i32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_create_semaphore)(
+            &mut handle as *mut u64,
+            SEMAPHORE_ALL_ACCESS,
+            core::ptr::null_mut(),
+            0,
+            65_535,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        Ok(handle)
+    } else {
+        Err(status)
+    }
+}
+
+/// Close a non-null resource semaphore handle through NtClose.
+///
+/// # Safety
+/// `handle` is either 0 or a handle returned by NtCreateSemaphore in this process.
+#[cfg(target_arch = "x86_64")]
+unsafe fn resource_close_handle(handle: u64) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: forwards to the generated NtClose stub. Close failures are ignored, matching
+    // RtlDeleteResource's VOID contract.
+    let _ = unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
+            nt_ntdll::trap_stubs::nt_close,
+        )(handle)
+    };
+}
 
 /// The current thread id (`NtCurrentTeb()->ClientId.UniqueThread`, TEB @0x48). On the host this is
 /// a fixed sentinel — the model only compares it for owner-recursion, and host tests exercise that
@@ -4978,24 +5100,53 @@ unsafe fn resource_store(resource: *mut c_void, r: &nt_ntdll::rtl::resource::Res
 }
 
 /// `RtlInitializeResource(PRTL_RESOURCE Resource)` — initialise to the fully-unlocked state. The real
-/// body also inits the critical section + creates the two semaphores; on the single-threaded runtime
-/// those transports are never contended, so zeroing the whole 0x60-byte descriptor is the observable
-/// half (0 active, 0 waiters, no owner). Ref `resource.c:RtlInitializeResource`.
+/// body inits the critical section + creates the two semaphores. Ref `resource.c:RtlInitializeResource`.
 ///
 /// # Safety
 /// `resource` a valid writable RTL_RESOURCE (0x60 bytes).
 #[export_name = "RtlInitializeResource"]
 pub unsafe extern "system" fn rtl_initialize_resource(resource: *mut c_void) {
-    if !resource.is_null() {
-        // SAFETY: resource valid for the full x64 RTL_RESOURCE per the contract.
-        unsafe { core::ptr::write_bytes(resource as *mut u8, 0, 0x60) };
+    if resource.is_null() {
+        return;
+    }
+    // SAFETY: resource valid for the full x64 RTL_RESOURCE per the contract.
+    unsafe { core::ptr::write_bytes(resource as *mut u8, 0, 0x60) };
+    // SAFETY: the embedded RTL_CRITICAL_SECTION starts at offset 0.
+    let lock_status = unsafe { rtl_initialize_critical_section(resource) };
+    if lock_status != STATUS_SUCCESS {
+        // SAFETY: same behavior as ReactOS: initialization failures are raised, not silently ignored.
+        unsafe { rtl_raise_status(lock_status) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: real NtCreateSemaphore syscalls; handles are written only after success.
+        let shared = match unsafe { resource_create_semaphore() } {
+            Ok(h) => h,
+            Err(status) => {
+                unsafe { rtl_raise_status(status) };
+                return;
+            }
+        };
+        let exclusive = match unsafe { resource_create_semaphore() } {
+            Ok(h) => h,
+            Err(status) => {
+                unsafe { resource_close_handle(shared) };
+                unsafe { rtl_raise_status(status) };
+                return;
+            }
+        };
+        // SAFETY: fields at their x64 offsets per the contract.
+        unsafe {
+            *(resource.byte_add(RES_SHARED_SEMAPHORE) as *mut u64) = shared;
+            *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *mut u64) = exclusive;
+        }
     }
 }
 
 /// `RtlDeleteResource(PRTL_RESOURCE Resource)` — tear the lock down. The real body deletes the
-/// critical section + closes both semaphore handles; we have no live kernel handles in the
-/// single-threaded model, so resetting the counter state (the observable half) is the faithful
-/// equivalent. Ref `resource.c:RtlDeleteResource`.
+/// critical section + closes both semaphore handles, then resets the resource counters. Ref
+/// `resource.c:RtlDeleteResource`.
 ///
 /// # Safety
 /// `resource` from `RtlInitializeResource`.
@@ -5004,10 +5155,30 @@ pub unsafe extern "system" fn rtl_delete_resource(resource: *mut c_void) {
     if resource.is_null() {
         return;
     }
+    // SAFETY: resource valid per the contract; read handles before zeroing their fields.
+    #[cfg(target_arch = "x86_64")]
+    let (shared, exclusive) = unsafe {
+        (
+            *(resource.byte_add(RES_SHARED_SEMAPHORE) as *const u64),
+            *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *const u64),
+        )
+    };
+    // SAFETY: delete the embedded RTL_CRITICAL_SECTION at offset 0.
+    let _ = unsafe { rtl_delete_critical_section(resource) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        resource_close_handle(exclusive);
+        resource_close_handle(shared);
+    }
     let mut r = nt_ntdll::rtl::resource::Resource::default();
     r.delete();
     // SAFETY: resource valid per the contract.
-    unsafe { resource_store(resource, &r) };
+    unsafe {
+        resource_store(resource, &r);
+        *(resource.byte_add(RES_SHARED_SEMAPHORE) as *mut u64) = 0;
+        *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *mut u64) = 0;
+        *(resource.byte_add(RES_TIMEOUT_BOOST) as *mut u32) = 0;
+    }
 }
 
 /// `RtlAcquireResourceShared(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN`. Ref
@@ -5025,7 +5196,10 @@ pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void,
     unsafe {
         let tid = resource_current_thread();
         let mut r = resource_load(resource);
-        let granted = matches!(r.acquire_shared(tid, wait != 0), nt_ntdll::rtl::resource::Acquire::Granted);
+        let granted = matches!(
+            r.acquire_shared(tid, wait != 0),
+            nt_ntdll::rtl::resource::Acquire::Granted
+        );
         resource_store(resource, &r);
         u8::from(granted)
     }
@@ -5037,7 +5211,10 @@ pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void,
 /// # Safety
 /// `resource` from `RtlInitializeResource`.
 #[export_name = "RtlAcquireResourceExclusive"]
-pub unsafe extern "system" fn rtl_acquire_resource_exclusive(resource: *mut c_void, wait: u8) -> u8 {
+pub unsafe extern "system" fn rtl_acquire_resource_exclusive(
+    resource: *mut c_void,
+    wait: u8,
+) -> u8 {
     if resource.is_null() {
         return 0;
     }
@@ -5045,8 +5222,10 @@ pub unsafe extern "system" fn rtl_acquire_resource_exclusive(resource: *mut c_vo
     unsafe {
         let tid = resource_current_thread();
         let mut r = resource_load(resource);
-        let granted =
-            matches!(r.acquire_exclusive(tid, wait != 0), nt_ntdll::rtl::resource::Acquire::Granted);
+        let granted = matches!(
+            r.acquire_exclusive(tid, wait != 0),
+            nt_ntdll::rtl::resource::Acquire::Granted
+        );
         resource_store(resource, &r);
         u8::from(granted)
     }
@@ -5313,7 +5492,10 @@ pub unsafe extern "system" fn rtl_set_time_zone_information(_tz: *const c_void) 
 /// # Safety
 /// Reads no memory.
 #[export_name = "RtlCreateQueryDebugBuffer"]
-pub unsafe extern "system" fn rtl_create_query_debug_buffer(size: u32, _event_pair: u8) -> *mut c_void {
+pub unsafe extern "system" fn rtl_create_query_debug_buffer(
+    size: u32,
+    _event_pair: u8,
+) -> *mut c_void {
     #[cfg(target_arch = "x86_64")]
     {
         let n = (size as usize).max(0x1000);
@@ -5488,7 +5670,11 @@ pub unsafe extern "system" fn rtl_clear_bits(header: *mut c_void, start: u32, co
 /// # Safety
 /// `header` a valid initialized RTL_BITMAP.
 #[export_name = "RtlAreBitsSet"]
-pub unsafe extern "system" fn rtl_are_bits_set(header: *const c_void, start: u32, length: u32) -> u8 {
+pub unsafe extern "system" fn rtl_are_bits_set(
+    header: *const c_void,
+    start: u32,
+    length: u32,
+) -> u8 {
     if length == 0 {
         return 0;
     }
@@ -5778,7 +5964,10 @@ fn process_cookie() -> u64 {
 /// # Safety
 /// `time`/`seconds` valid pointers.
 #[export_name = "RtlTimeToSecondsSince1970"]
-pub unsafe extern "system" fn rtl_time_to_seconds_since_1970(time: *const i64, seconds: *mut u32) -> u8 {
+pub unsafe extern "system" fn rtl_time_to_seconds_since_1970(
+    time: *const i64,
+    seconds: *mut u32,
+) -> u8 {
     if time.is_null() || seconds.is_null() {
         return 0;
     }
@@ -5824,7 +6013,10 @@ pub unsafe extern "system" fn rtl_time_to_time_fields(time: *const i64, time_fie
 /// # Safety
 /// `time_fields`/`time` valid.
 #[export_name = "RtlTimeFieldsToTime"]
-pub unsafe extern "system" fn rtl_time_fields_to_time(time_fields: *const i16, time: *mut i64) -> u8 {
+pub unsafe extern "system" fn rtl_time_fields_to_time(
+    time_fields: *const i16,
+    time: *mut i64,
+) -> u8 {
     if time_fields.is_null() || time.is_null() {
         return 0;
     }
@@ -6100,7 +6292,10 @@ pub unsafe extern "system" fn rtl_get_thread_error_mode() -> u32 {
 /// # Safety
 /// `old_mode` null or writable; writes gs:[0]-based TEB on target.
 #[export_name = "RtlSetThreadErrorMode"]
-pub unsafe extern "system" fn rtl_set_thread_error_mode(new_mode: u32, old_mode: *mut u32) -> NtStatus {
+pub unsafe extern "system" fn rtl_set_thread_error_mode(
+    new_mode: u32,
+    old_mode: *mut u32,
+) -> NtStatus {
     // Valid bits: SEM_FAILCRITICALERRORS(1) | SEM_NOGPFAULTERRORBOX(2) | SEM_NOALIGNMENTFAULTEXCEPT(4).
     const VALID: u32 = 0x1 | 0x2 | 0x4;
     if new_mode & !VALID != 0 {
@@ -6159,7 +6354,7 @@ pub unsafe extern "system" fn rtl_get_version(vi: *mut c_void) -> NtStatus {
         *p.add(2) = 2; // minor
         *p.add(3) = 3790; // build
         *p.add(4) = 2; // VER_PLATFORM_WIN32_NT
-        // szCSDVersion @ 0x14: zero the first wchar (empty).
+                       // szCSDVersion @ 0x14: zero the first wchar (empty).
         *((vi as *mut u16).add(0x14 / 2)) = 0;
     }
     STATUS_SUCCESS
@@ -6222,7 +6417,7 @@ pub unsafe extern "system" fn rtl_get_native_system_information(
             unsafe extern "C" fn(),
             unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> NtStatus,
         >(nt_ntdll::trap_stubs::nt_query_system_information)(
-            info_class, info, info_len, ret_len,
+            info_class, info, info_len, ret_len
         )
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -6419,7 +6614,10 @@ pub unsafe extern "system" fn rtl_raise_exception(exception_record: *mut c_void)
 /// # Safety
 /// `record`/`context` valid.
 #[export_name = "RtlDispatchException"]
-pub unsafe extern "system" fn rtl_dispatch_exception(record: *mut c_void, context: *mut c_void) -> u8 {
+pub unsafe extern "system" fn rtl_dispatch_exception(
+    record: *mut c_void,
+    context: *mut c_void,
+) -> u8 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: valid records; dispatches over the live stack.
     unsafe {
@@ -6502,7 +6700,14 @@ pub unsafe extern "system" fn rtl_unwind_ex(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (target_frame, target_ip, exception_record, return_value, context, history_table);
+        let _ = (
+            target_frame,
+            target_ip,
+            exception_record,
+            return_value,
+            context,
+            history_table,
+        );
     }
 }
 
@@ -6541,8 +6746,16 @@ pub unsafe extern "system" fn rtl_virtual_unwind(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (handler_type, image_base, control_pc, function_entry, context, handler_data,
-            establisher_frame, context_pointers);
+        let _ = (
+            handler_type,
+            image_base,
+            control_pc,
+            function_entry,
+            context,
+            handler_data,
+            establisher_frame,
+            context_pointers,
+        );
         core::ptr::null_mut()
     }
 }
@@ -6556,7 +6769,10 @@ pub unsafe extern "system" fn rtl_virtual_unwind(
 /// # Safety
 /// `record`/`context` valid (a stacked EXCEPTION_RECORD + CONTEXT).
 #[export_name = "KiUserExceptionDispatcher"]
-pub unsafe extern "system" fn ki_user_exception_dispatcher(record: *mut c_void, context: *mut c_void) {
+pub unsafe extern "system" fn ki_user_exception_dispatcher(
+    record: *mut c_void,
+    context: *mut c_void,
+) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: valid delivered records.
     unsafe {
@@ -6728,7 +6944,10 @@ pub unsafe extern "system" fn rtl_flush_secure_memory_cache(
 /// # Safety
 /// `cs` a valid RTL_CRITICAL_SECTION (SpinCount @ 0x20 on x64).
 #[export_name = "RtlSetCriticalSectionSpinCount"]
-pub unsafe extern "system" fn rtl_set_critical_section_spin_count(cs: *mut c_void, spin: u32) -> u32 {
+pub unsafe extern "system" fn rtl_set_critical_section_spin_count(
+    cs: *mut c_void,
+    spin: u32,
+) -> u32 {
     if cs.is_null() {
         return 0;
     }
@@ -6782,7 +7001,11 @@ pub unsafe extern "system" fn rtl_try_enter_critical_section(cs: *mut c_void) ->
 /// # Safety
 /// `mem` a live block from the process heap (or NULL).
 #[export_name = "RtlSizeHeap"]
-pub unsafe extern "system" fn rtl_size_heap(_heap: *mut c_void, _flags: u32, mem: *mut c_void) -> usize {
+pub unsafe extern "system" fn rtl_size_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    mem: *mut c_void,
+) -> usize {
     if mem.is_null() {
         return usize::MAX; // (SIZE_T)-1 = failure, matching RtlSizeHeap.
     }
@@ -6810,7 +7033,11 @@ pub unsafe extern "system" fn rtl_size_heap(_heap: *mut c_void, _flags: u32, mem
 /// # Safety
 /// `heap`/`mem` valid or NULL.
 #[export_name = "RtlValidateHeap"]
-pub unsafe extern "system" fn rtl_validate_heap(heap: *mut c_void, _flags: u32, _mem: *mut c_void) -> u8 {
+pub unsafe extern "system" fn rtl_validate_heap(
+    heap: *mut c_void,
+    _flags: u32,
+    _mem: *mut c_void,
+) -> u8 {
     u8::from(!heap.is_null())
 }
 
@@ -7002,12 +7229,7 @@ macro_rules! etw_ok {
         /// # Safety
         /// Called with the corresponding Etw* ABI; ignores its args (no trace session).
         #[export_name = $export]
-        pub unsafe extern "system" fn $fn(
-            _a: u64,
-            _b: u64,
-            _c: u64,
-            _d: u64,
-        ) -> u32 {
+        pub unsafe extern "system" fn $fn(_a: u64, _b: u64, _c: u64, _d: u64) -> u32 {
             0
         }
     };
@@ -7022,8 +7244,14 @@ etw_ok!("EtwFlushTraceW", etw_flush_trace_w);
 etw_ok!("EtwGetTraceEnableFlags", etw_get_trace_enable_flags);
 etw_ok!("EtwGetTraceEnableLevel", etw_get_trace_enable_level);
 etw_ok!("EtwGetTraceLoggerHandle", etw_get_trace_logger_handle);
-etw_ok!("EtwNotificationRegistrationA", etw_notification_registration_a);
-etw_ok!("EtwNotificationRegistrationW", etw_notification_registration_w);
+etw_ok!(
+    "EtwNotificationRegistrationA",
+    etw_notification_registration_a
+);
+etw_ok!(
+    "EtwNotificationRegistrationW",
+    etw_notification_registration_w
+);
 etw_ok!("EtwQueryAllTracesA", etw_query_all_traces_a);
 etw_ok!("EtwQueryAllTracesW", etw_query_all_traces_w);
 etw_ok!("EtwQueryTraceA", etw_query_trace_a);
@@ -7101,13 +7329,29 @@ zw_alias!(zw_connect_port, "ZwConnectPort", nt_connect_port);
 zw_alias!(zw_create_event, "ZwCreateEvent", nt_create_event);
 zw_alias!(zw_create_key, "ZwCreateKey", nt_create_key);
 zw_alias!(zw_enumerate_key, "ZwEnumerateKey", nt_enumerate_key);
-zw_alias!(zw_enumerate_value_key, "ZwEnumerateValueKey", nt_enumerate_value_key);
-zw_alias!(zw_free_virtual_memory, "ZwFreeVirtualMemory", nt_free_virtual_memory);
+zw_alias!(
+    zw_enumerate_value_key,
+    "ZwEnumerateValueKey",
+    nt_enumerate_value_key
+);
+zw_alias!(
+    zw_free_virtual_memory,
+    "ZwFreeVirtualMemory",
+    nt_free_virtual_memory
+);
 zw_alias!(zw_open_event, "ZwOpenEvent", nt_open_event);
 zw_alias!(zw_query_value_key, "ZwQueryValueKey", nt_query_value_key);
-zw_alias!(zw_request_wait_reply_port, "ZwRequestWaitReplyPort", nt_request_wait_reply_port);
+zw_alias!(
+    zw_request_wait_reply_port,
+    "ZwRequestWaitReplyPort",
+    nt_request_wait_reply_port
+);
 zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
-zw_alias!(zw_wait_for_single_object, "ZwWaitForSingleObject", nt_wait_for_single_object);
+zw_alias!(
+    zw_wait_for_single_object,
+    "ZwWaitForSingleObject",
+    nt_wait_for_single_object
+);
 
 // =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
@@ -7255,8 +7499,7 @@ pub unsafe extern "system" fn rtl_validate_unicode_string(
         return STATUS_SUCCESS;
     }
     // SAFETY: string valid per the contract.
-    let (buf, len, max) =
-        unsafe { ((*string).buffer, (*string).length, (*string).maximum_length) };
+    let (buf, len, max) = unsafe { ((*string).buffer, (*string).length, (*string).maximum_length) };
     let empty_but_nonzero = buf == 0 && (len != 0 || max != 0);
     if !empty_but_nonzero && (len % 2 == 0) && (max % 2 == 0) && (len <= max) {
         STATUS_SUCCESS
@@ -7281,7 +7524,9 @@ pub unsafe extern "system" fn rtl_seconds_since_1970_to_time(
         return;
     }
     // SAFETY: time writable per the contract.
-    unsafe { core::ptr::write_unaligned(time, seconds_since_1970 as i64 * TICKSPERSEC + TICKSTO1970) };
+    unsafe {
+        core::ptr::write_unaligned(time, seconds_since_1970 as i64 * TICKSPERSEC + TICKSTO1970)
+    };
 }
 
 /// `RtlCopyLuidAndAttributesArray(ULONG Count, PLUID_AND_ATTRIBUTES Src, PLUID_AND_ATTRIBUTES Dest)`
@@ -7355,8 +7600,12 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: uni_source valid per the contract.
-    let (sbuf, sunits) =
-        unsafe { ((*uni_source).buffer as *const u16, (*uni_source).length as usize / 2) };
+    let (sbuf, sunits) = unsafe {
+        (
+            (*uni_source).buffer as *const u16,
+            (*uni_source).length as usize / 2,
+        )
+    };
     let src = if sbuf.is_null() {
         &[][..]
     } else {
@@ -7539,7 +7788,10 @@ pub unsafe extern "system" fn rtl_free_ansi_string(s: PUnicodeString) {
 /// # Safety
 /// `dst` writable; `src` null or NUL-terminated.
 #[export_name = "RtlInitAnsiStringEx"]
-pub unsafe extern "system" fn rtl_init_ansi_string_ex(dst: PUnicodeString, src: *const u8) -> NtStatus {
+pub unsafe extern "system" fn rtl_init_ansi_string_ex(
+    dst: PUnicodeString,
+    src: *const u8,
+) -> NtStatus {
     if dst.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -7906,10 +8158,7 @@ pub unsafe extern "system" fn rtlx_oem_string_to_unicode_size(src: PCUnicodeStri
 /// `table` a valid NLS table base (a mapped `.nls` view); `cp_table` a writable CPTABLEINFO
 /// (>= 0x40 bytes).
 #[export_name = "RtlInitCodePageTable"]
-pub unsafe extern "system" fn rtl_init_code_page_table(
-    table: *const u16,
-    cp_table: *mut c_void,
-) {
+pub unsafe extern "system" fn rtl_init_code_page_table(table: *const u16, cp_table: *mut c_void) {
     if cp_table.is_null() || table.is_null() {
         return;
     }
@@ -7934,7 +8183,7 @@ pub unsafe extern "system" fn rtl_init_code_page_table(
         *(cp.add(0x06) as *mut u16) = *hdr.add(4); // UniDefaultChar
         *(cp.add(0x08) as *mut u16) = *hdr.add(5); // TransDefaultChar
         *(cp.add(0x0A) as *mut u16) = *hdr.add(6); // TransUniDefaultChar
-        // LeadByte[MAXIMUM_LEADBYTES=12] — the 12 bytes at header USHORT index 7 (byte 0x0E).
+                                                   // LeadByte[MAXIMUM_LEADBYTES=12] — the 12 bytes at header USHORT index 7 (byte 0x0E).
         core::ptr::copy_nonoverlapping(
             (hdr as *const u8).add(0x0E),
             cp.add(0x0E),
@@ -7946,7 +8195,7 @@ pub unsafe extern "system" fn rtl_init_code_page_table(
         let widechar = hdr.add(header_size + 1 + (*hdr.add(header_size) as usize)) as *const c_void;
         *(cp.add(0x20) as *mut *const u16) = multibyte; // MultiByteTable
         *(cp.add(0x28) as *mut *const c_void) = widechar; // WideCharTable
-        // Glyph table (256 wchars) present? If MultiByteTable[256] == 0, no glyph table.
+                                                          // Glyph table (256 wchars) present? If MultiByteTable[256] == 0, no glyph table.
         let dbcs_ranges = if *multibyte.add(256) == 0 {
             multibyte.add(256 + 1)
         } else {
@@ -7979,7 +8228,11 @@ pub unsafe extern "system" fn rtl_init_code_page_table(
 /// # Safety
 /// Called with the C DbgPrintEx ABI; ignores the variadic tail.
 #[export_name = "DbgPrintEx"]
-pub unsafe extern "C" fn dbg_print_ex(_component: u32, _level: u32, _format: *const u8) -> NtStatus {
+pub unsafe extern "C" fn dbg_print_ex(
+    _component: u32,
+    _level: u32,
+    _format: *const u8,
+) -> NtStatus {
     STATUS_SUCCESS
 }
 
@@ -8035,7 +8288,10 @@ macro_rules! dbgui_noop {
 }
 dbgui_noop!("DbgUiConnectToDbg", dbg_ui_connect_to_dbg);
 dbgui_noop!("DbgUiContinue", dbg_ui_continue);
-dbgui_noop!("DbgUiConvertStateChangeStructure", dbg_ui_convert_state_change_structure);
+dbgui_noop!(
+    "DbgUiConvertStateChangeStructure",
+    dbg_ui_convert_state_change_structure
+);
 dbgui_noop!("DbgUiDebugActiveProcess", dbg_ui_debug_active_process);
 dbgui_noop!("DbgUiStopDebugging", dbg_ui_stop_debugging);
 dbgui_noop!("DbgUiIssueRemoteBreakin", dbg_ui_issue_remote_breakin);
@@ -8050,16 +8306,23 @@ pub unsafe extern "system" fn dbg_ui_get_thread_debug_object() -> *mut c_void {
     core::ptr::null_mut()
 }
 
-// ---- Csr* — the CSR client. The real port send is the LPC transport seam. -------------------------
+// ---- Csr* — the CSR client. ----------------------------------------------------------------------
 
-/// `CsrGetProcessId() -> HANDLE` — the CSR (csrss) process id. Not yet published to the client PEB;
-/// returns 0 (unresolved) — never a fabricated pid. The export exists so the IAT resolves.
+/// `CsrGetProcessId() -> HANDLE` — the CSR (csrss) process id assigned by `CsrpConnectToServer`.
 ///
 /// # Safety
 /// Reads no memory.
 #[export_name = "CsrGetProcessId"]
 pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
-    core::ptr::null_mut()
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: scalar read of the CSR global populated during connect.
+        unsafe { crate::on_target::csr_process_id() as *mut c_void }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
 }
 
 /// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
@@ -8107,76 +8370,185 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
 }
 
 /// `CsrClientCallServer(PCSR_API_MESSAGE Request, PCSR_CAPTURE_BUFFER Capture, CSR_API_NUMBER
-/// ApiNumber, ULONG RequestLength) -> NTSTATUS`. The port round-trip is the LPC transport seam;
-/// returns STATUS_NOT_IMPLEMENTED — never a fabricated reply.
+/// ApiNumber, ULONG RequestLength) -> NTSTATUS`.
+///
+/// This is the real ntdll client-side half: fill the PORT_MESSAGE/CSR headers, translate an optional
+/// capture buffer to the CSR server view, issue `NtRequestWaitReplyPort(CsrApiPort, &Header,
+/// &Header)`, then translate captured pointers back and return `ApiMessage->Status`.
 ///
 /// # Safety
 /// `request` a valid `CSR_API_MESSAGE*`; `capture` null or a valid capture buffer.
 #[export_name = "CsrClientCallServer"]
 pub unsafe extern "system" fn csr_client_call_server(
-    _request: *mut c_void,
-    _capture: *mut c_void,
-    _api_number: u32,
-    _request_length: u32,
+    request: *mut c_void,
+    capture: *mut c_void,
+    api_number: u32,
+    request_length: u32,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED
+    if request.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: request points to a writable CSR_API_MESSAGE.
+    if let Err(status) = unsafe {
+        nt_ntdll::csr::init_raw_api_message(request as *mut u8, api_number, request_length)
+    } {
+        return status;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let delta = unsafe { crate::on_target::csr_port_memory_delta() };
+        if !capture.is_null() {
+            // SAFETY: request/capture are raw CSR objects from the caller.
+            if let Err(status) = unsafe {
+                nt_ntdll::csr::prepare_raw_capture_for_call(
+                    request as *mut u8,
+                    capture as *mut u8,
+                    delta,
+                )
+            } {
+                return status;
+            }
+        }
+
+        // SAFETY: request is both the LPC request and reply buffer.
+        let transport_status = unsafe { crate::on_target::csr_request_wait_reply(request as u64) };
+
+        if !capture.is_null() {
+            // SAFETY: restores the same raw capture buffer converted above.
+            if let Err(status) = unsafe {
+                nt_ntdll::csr::restore_raw_capture_after_call(
+                    request as *mut u8,
+                    capture as *mut u8,
+                    delta,
+                )
+            } {
+                return status;
+            }
+        }
+
+        let msg = request as *mut u8;
+        if (transport_status as i32) < 0 {
+            // SAFETY: request is a writable CSR_API_MESSAGE; Status is at the byte-exact x64 offset.
+            unsafe {
+                core::ptr::write_unaligned(
+                    msg.add(nt_ntdll::csr::CSR_API_MESSAGE_STATUS_OFFSET) as *mut u32,
+                    transport_status,
+                );
+            }
+        }
+        // SAFETY: request is a writable CSR_API_MESSAGE; Status is at the byte-exact x64 offset.
+        unsafe {
+            core::ptr::read_unaligned(
+                msg.add(nt_ntdll::csr::CSR_API_MESSAGE_STATUS_OFFSET) as *const u32
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = capture;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `CsrAllocateCaptureBuffer(ULONG ArgumentCount, ULONG BufferSize) -> PCSR_CAPTURE_BUFFER`.
-/// Allocates a capture buffer on the process heap (the marshalling plane `nt_ntdll::csr` models).
-/// Until the CSR heap plane is wired we return NULL (allocation unavailable) — never a dangling
-/// buffer.
+/// Allocates the real ReactOS CSR_CAPTURE_BUFFER layout from the process heap.
 ///
 /// # Safety
 /// Reads no memory.
 #[export_name = "CsrAllocateCaptureBuffer"]
 pub unsafe extern "system" fn csr_allocate_capture_buffer(
-    _argument_count: u32,
-    _buffer_size: u32,
+    argument_count: u32,
+    buffer_size: u32,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    let size = match nt_ntdll::csr::raw_capture_buffer_size(argument_count, buffer_size) {
+        Some(n) => n,
+        None => return core::ptr::null_mut(),
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: process heap allocation; zero-initialize the public buffer layout.
+        let p = unsafe { crate::process_heap_alloc(size) };
+        if p.is_null() {
+            return core::ptr::null_mut();
+        }
+        unsafe {
+            core::ptr::write_bytes(p, 0, size);
+            nt_ntdll::csr::init_raw_capture_buffer(p, size, argument_count);
+        }
+        p as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
 }
 
-/// `CsrFreeCaptureBuffer(PCSR_CAPTURE_BUFFER CaptureBuffer)`. Frees a buffer from
-/// `CsrAllocateCaptureBuffer` (none allocated yet → no-op).
+/// `CsrFreeCaptureBuffer(PCSR_CAPTURE_BUFFER CaptureBuffer)`.
 ///
 /// # Safety
 /// `capture_buffer` null or a buffer from `CsrAllocateCaptureBuffer`.
 #[export_name = "CsrFreeCaptureBuffer"]
-pub unsafe extern "system" fn csr_free_capture_buffer(_capture_buffer: *mut c_void) {}
+pub unsafe extern "system" fn csr_free_capture_buffer(capture_buffer: *mut c_void) {
+    if capture_buffer.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: buffer was allocated from the process heap by CsrAllocateCaptureBuffer.
+    unsafe {
+        crate::process_heap_free(capture_buffer as *mut u8);
+    }
+}
 
 /// `CsrCaptureMessageBuffer(PCSR_CAPTURE_BUFFER CaptureBuffer, PVOID MessageBuffer, ULONG Length,
-/// PVOID* CapturedBuffer) -> PCSR_CAPTURE_BUFFER`. Captures a pointer arg into the buffer. Seam:
-/// returns NULL (no capture buffer plane) — never a fabricated captured pointer.
+/// PVOID* CapturedBuffer)`. Captures a pointer arg into the CSR capture buffer.
 ///
 /// # Safety
-/// `captured_buffer` null or writable.
+/// `capture_buffer` valid; `message_buffer` readable for `length` bytes unless null;
+/// `captured_buffer` writable.
 #[export_name = "CsrCaptureMessageBuffer"]
 pub unsafe extern "system" fn csr_capture_message_buffer(
-    _capture_buffer: *mut c_void,
-    _message_buffer: *mut c_void,
-    _length: u32,
-    _captured_buffer: *mut *mut c_void,
-) -> *mut c_void {
-    core::ptr::null_mut()
+    capture_buffer: *mut c_void,
+    message_buffer: *mut c_void,
+    length: u32,
+    captured_buffer: *mut *mut c_void,
+) {
+    if captured_buffer.is_null() {
+        return;
+    }
+    // SAFETY: raw CSR capture-buffer contract; the output slot is a PVOID*.
+    unsafe {
+        nt_ntdll::csr::raw_capture_message_buffer(
+            capture_buffer as *mut u8,
+            message_buffer as *const u8,
+            length,
+            captured_buffer as *mut u64,
+        );
+    }
 }
 
 /// `CsrAllocateMessagePointer(PCSR_CAPTURE_BUFFER CaptureBuffer, ULONG Length, PVOID* Pointer)
-/// -> ULONG`. Reserves `Length` bytes in the capture buffer. Seam: returns 0 bytes.
+/// -> ULONG`. Reserves `Length` bytes in the capture buffer and records the message pointer slot.
 ///
 /// # Safety
-/// `pointer` null or writable.
+/// `capture_buffer` valid; `pointer` writable.
 #[export_name = "CsrAllocateMessagePointer"]
 pub unsafe extern "system" fn csr_allocate_message_pointer(
-    _capture_buffer: *mut c_void,
-    _length: u32,
+    capture_buffer: *mut c_void,
+    length: u32,
     pointer: *mut *mut c_void,
 ) -> u32 {
-    if !pointer.is_null() {
-        // SAFETY: pointer writable per the contract.
-        unsafe { *pointer = core::ptr::null_mut() };
+    if pointer.is_null() {
+        return 0;
     }
-    0
+    // SAFETY: raw CSR capture-buffer contract; the output slot is a PVOID*.
+    unsafe {
+        nt_ntdll::csr::raw_allocate_message_pointer(
+            capture_buffer as *mut u8,
+            length,
+            pointer as *mut u64,
+        )
+    }
 }
 
 /// `CsrNewThread() -> NTSTATUS` — register a new thread with the CSR client runtime (marks the TEB

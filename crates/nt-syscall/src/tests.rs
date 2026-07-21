@@ -316,7 +316,6 @@ fn group_a_services_register_with_register_only_bounds() {
         (NativeService::NtCreatePort, 48u32),
         (NativeService::NtCreateThread, 55),
         (NativeService::NtCreateEvent, 37),
-        (NativeService::NtCreateSemaphore, 53),
         (NativeService::NtOpenProcessToken, 129),
         (NativeService::NtMakeTemporaryObject, 110),
         (NativeService::NtFreeVirtualMemory, 87),
@@ -336,6 +335,13 @@ fn group_a_services_register_with_register_only_bounds() {
             svc.name()
         );
     }
+    let sem = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtCreateSemaphore, 53)],
+    );
+    let e = sem.lookup(53).unwrap();
+    assert_eq!(e.service, NativeService::NtCreateSemaphore);
+    assert_eq!((e.min_args, e.max_args), (5, 5));
 }
 
 #[test]

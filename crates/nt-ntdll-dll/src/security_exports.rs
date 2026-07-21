@@ -45,6 +45,8 @@ const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_SID: NtStatus = 0xC000_0078;
 const STATUS_INVALID_ACL: NtStatus = 0xC000_0077;
+const STATUS_INVALID_OWNER: NtStatus = 0xC000_005A;
+const STATUS_INVALID_PRIMARY_GROUP: NtStatus = 0xC000_005B;
 const STATUS_UNKNOWN_REVISION: NtStatus = 0xC000_0058;
 const STATUS_INVALID_INFO_CLASS: NtStatus = 0xC000_0003;
 const STATUS_INVALID_SECURITY_DESCR: NtStatus = 0xC000_0079;
@@ -62,6 +64,8 @@ const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
 // SECURITY_DESCRIPTOR_CONTROL bits.
 const SE_OWNER_DEFAULTED: u16 = 0x0001;
 const SE_GROUP_DEFAULTED: u16 = 0x0002;
+const SE_DACL_PRESENT: u16 = 0x0004;
+const SE_DACL_DEFAULTED: u16 = 0x0008;
 const SE_SACL_PRESENT: u16 = 0x0010;
 const SE_SACL_DEFAULTED: u16 = 0x0020;
 const SE_RM_CONTROL_VALID: u16 = 0x4000;
@@ -164,6 +168,219 @@ unsafe fn sd_dacl(sd: *const u8) -> *mut u8 {
 #[inline]
 fn round_up4(n: usize) -> usize {
     (n + 3) & !3
+}
+
+/// Build an absolute, empty SECURITY_DESCRIPTOR in caller-provided storage.
+///
+/// # Safety
+/// `sd` is writable for an x64 absolute SECURITY_DESCRIPTOR (0x28 bytes).
+unsafe fn init_absolute_sd(sd: *mut u8) {
+    // SAFETY: caller provided a valid writable SD buffer.
+    unsafe {
+        core::ptr::write_bytes(sd, 0, SD_ABS_HEADER);
+        *sd = SECURITY_DESCRIPTOR_REVISION;
+    }
+}
+
+/// Set an absolute SD's DACL fields.
+///
+/// # Safety
+/// `sd` is a writable absolute SD; `dacl` is either null or a valid ACL.
+unsafe fn set_abs_dacl(sd: *mut u8, present: bool, dacl: *mut c_void, defaulted: bool) {
+    // SAFETY: caller provided a valid writable absolute SD.
+    unsafe {
+        let ctrl = sd.add(0x02) as *mut u16;
+        if present {
+            *(sd.add(0x20) as *mut *mut c_void) = dacl;
+            *ctrl |= SE_DACL_PRESENT;
+            *ctrl &= !SE_DACL_DEFAULTED;
+            if defaulted {
+                *ctrl |= SE_DACL_DEFAULTED;
+            }
+        } else {
+            *(sd.add(0x20) as *mut *mut c_void) = core::ptr::null_mut();
+            *ctrl &= !(SE_DACL_PRESENT | SE_DACL_DEFAULTED);
+        }
+    }
+}
+
+/// Read an SD's DACL presence/defaulted bits and component pointer.
+///
+/// # Safety
+/// `sd` is a valid absolute or self-relative SECURITY_DESCRIPTOR.
+unsafe fn get_dacl(sd: *const u8) -> Result<(bool, *mut c_void, bool), NtStatus> {
+    // SAFETY: caller provided a valid readable SD header.
+    unsafe {
+        if *sd != SECURITY_DESCRIPTOR_REVISION {
+            return Err(STATUS_UNKNOWN_REVISION);
+        }
+        let control = sd_control(sd);
+        let present = (control & SE_DACL_PRESENT) != 0;
+        let dacl = if present {
+            sd_dacl(sd) as *mut c_void
+        } else {
+            core::ptr::null_mut()
+        };
+        let defaulted = (control & SE_DACL_DEFAULTED) != 0;
+        Ok((present, dacl, defaulted))
+    }
+}
+
+/// Copy one SID/ACL blob, rounded to the next component boundary.
+///
+/// # Safety
+/// `src`/`dst` point to readable/writable buffers of `len` bytes.
+unsafe fn copy_component(dst: *mut u8, src: *const u8, len: usize) {
+    // SAFETY: caller validated the source and destination spans.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, len);
+        let pad = round_up4(len) - len;
+        if pad != 0 {
+            core::ptr::write_bytes(dst.add(len), 0, pad);
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct SdParts {
+    owner: *mut u8,
+    group: *mut u8,
+    dacl: *mut u8,
+    sacl: *mut u8,
+    owner_len: usize,
+    group_len: usize,
+    dacl_len: usize,
+    sacl_len: usize,
+    control: u16,
+}
+
+/// Gather the selected/inherited components for RtlSetSecurityObject.
+///
+/// # Safety
+/// The object and modification descriptors are valid SDs for the components read.
+unsafe fn select_security_parts(
+    security_information: u32,
+    modification_descriptor: *const c_void,
+    object_descriptor: *const c_void,
+) -> Result<SdParts, NtStatus> {
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+
+    if object_descriptor.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if security_information
+        & (OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | SACL_SECURITY_INFORMATION)
+        != 0
+        && modification_descriptor.is_null()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    // SAFETY: descriptors are valid for the selected reads.
+    unsafe {
+        let source_owner = if security_information & OWNER_SECURITY_INFORMATION != 0 {
+            modification_descriptor
+        } else {
+            object_descriptor
+        } as *const u8;
+        let source_group = if security_information & GROUP_SECURITY_INFORMATION != 0 {
+            modification_descriptor
+        } else {
+            object_descriptor
+        } as *const u8;
+        let source_dacl = if security_information & DACL_SECURITY_INFORMATION != 0 {
+            modification_descriptor
+        } else {
+            object_descriptor
+        } as *const u8;
+        let source_sacl = if security_information & SACL_SECURITY_INFORMATION != 0 {
+            modification_descriptor
+        } else {
+            object_descriptor
+        } as *const u8;
+
+        if *source_owner != SECURITY_DESCRIPTOR_REVISION
+            || *source_group != SECURITY_DESCRIPTOR_REVISION
+            || *source_dacl != SECURITY_DESCRIPTOR_REVISION
+            || *source_sacl != SECURITY_DESCRIPTOR_REVISION
+        {
+            return Err(STATUS_UNKNOWN_REVISION);
+        }
+
+        let owner = sd_owner(source_owner);
+        if owner.is_null() || rtl_valid_sid(owner as *const c_void) == 0 {
+            return Err(STATUS_INVALID_OWNER);
+        }
+        let group = sd_group(source_group);
+        if group.is_null() || rtl_valid_sid(group as *const c_void) == 0 {
+            return Err(STATUS_INVALID_PRIMARY_GROUP);
+        }
+
+        let (dacl_present, dacl, dacl_defaulted) = get_dacl(source_dacl)?;
+        let mut control = SE_SELF_RELATIVE;
+        if sd_control(source_owner) & SE_OWNER_DEFAULTED != 0 {
+            control |= SE_OWNER_DEFAULTED;
+        }
+        if sd_control(source_group) & SE_GROUP_DEFAULTED != 0 {
+            control |= SE_GROUP_DEFAULTED;
+        }
+        if dacl_present {
+            control |= SE_DACL_PRESENT;
+        }
+        if dacl_defaulted {
+            control |= SE_DACL_DEFAULTED;
+        }
+
+        let mut sacl: *mut c_void = core::ptr::null_mut();
+        let mut sacl_present = 0u8;
+        let mut sacl_defaulted = 0u8;
+        let status = rtl_get_sacl_security_descriptor(
+            source_sacl as *const c_void,
+            &mut sacl_present,
+            &mut sacl,
+            &mut sacl_defaulted,
+        );
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        if sacl_present != 0 {
+            control |= SE_SACL_PRESENT;
+        }
+        if sacl_defaulted != 0 {
+            control |= SE_SACL_DEFAULTED;
+        }
+
+        let owner_len = sid_len(owner);
+        let group_len = sid_len(group);
+        let dacl_len = if dacl.is_null() {
+            0
+        } else {
+            *(dacl.cast::<u8>().add(2) as *const u16) as usize
+        };
+        let sacl_len = if sacl.is_null() {
+            0
+        } else {
+            *(sacl.cast::<u8>().add(2) as *const u16) as usize
+        };
+
+        Ok(SdParts {
+            owner,
+            group,
+            dacl: dacl.cast::<u8>(),
+            sacl: sacl.cast::<u8>(),
+            owner_len,
+            group_len,
+            dacl_len,
+            sacl_len,
+            control,
+        })
+    }
 }
 
 // =================================================================================================
@@ -574,7 +791,11 @@ unsafe fn first_free_ace(acl: *const u8) -> Option<usize> {
             }
             off += *(acl.add(off + 2) as *const u16) as usize;
         }
-        if off <= acl_size { Some(off) } else { None }
+        if off <= acl_size {
+            Some(off)
+        } else {
+            None
+        }
     }
 }
 
@@ -887,7 +1108,16 @@ pub unsafe extern "system" fn rtl_add_access_allowed_ace_ex(
     sid: *const c_void,
 ) -> NtStatus {
     // SAFETY: forwarded to add_known_ace under the same contract.
-    unsafe { add_known_ace(acl, revision, flags as u8, mask, sid, ACCESS_ALLOWED_ACE_TYPE) }
+    unsafe {
+        add_known_ace(
+            acl,
+            revision,
+            flags as u8,
+            mask,
+            sid,
+            ACCESS_ALLOWED_ACE_TYPE,
+        )
+    }
 }
 
 /// `RtlAddAccessDeniedAce(PACL, ULONG Rev, ACCESS_MASK, PSID) -> NTSTATUS`.
@@ -918,7 +1148,16 @@ pub unsafe extern "system" fn rtl_add_access_denied_ace_ex(
     sid: *const c_void,
 ) -> NtStatus {
     // SAFETY: forwarded to add_known_ace under the same contract.
-    unsafe { add_known_ace(acl, revision, flags as u8, mask, sid, ACCESS_DENIED_ACE_TYPE) }
+    unsafe {
+        add_known_ace(
+            acl,
+            revision,
+            flags as u8,
+            mask,
+            sid,
+            ACCESS_DENIED_ACE_TYPE,
+        )
+    }
 }
 
 /// `RtlAddAuditAccessAce(PACL, ULONG Rev, ACCESS_MASK, PSID, BOOLEAN Success, BOOLEAN Failure)`.
@@ -955,9 +1194,8 @@ pub unsafe extern "system" fn rtl_add_audit_access_ace_ex(
     success: u8,
     failure: u8,
 ) -> NtStatus {
-    let f = flags as u8
-        | (if success != 0 { 0x40 } else { 0 })
-        | (if failure != 0 { 0x80 } else { 0 });
+    let f =
+        flags as u8 | (if success != 0 { 0x40 } else { 0 }) | (if failure != 0 { 0x80 } else { 0 });
     // SAFETY: forwarded to add_known_ace under the same contract.
     unsafe { add_known_ace(acl, revision, f, mask, sid, SYSTEM_AUDIT_ACE_TYPE) }
 }
@@ -1118,9 +1356,8 @@ pub unsafe extern "system" fn rtl_add_audit_access_object_ace(
     success: u8,
     failure: u8,
 ) -> NtStatus {
-    let f = flags as u8
-        | (if success != 0 { 0x40 } else { 0 })
-        | (if failure != 0 { 0x80 } else { 0 });
+    let f =
+        flags as u8 | (if success != 0 { 0x40 } else { 0 }) | (if failure != 0 { 0x80 } else { 0 });
     // SAFETY: forwarded to add_known_object_ace under the same contract.
     unsafe {
         add_known_object_ace(
@@ -1695,8 +1932,16 @@ pub unsafe extern "system" fn rtl_self_relative_to_absolute_sd(
         let p_group = sd_group(r);
         let p_sacl = sd_sacl(r);
         let p_dacl = sd_dacl(r);
-        let owner_len = if p_owner.is_null() { 0 } else { sid_len(p_owner) };
-        let group_len = if p_group.is_null() { 0 } else { sid_len(p_group) };
+        let owner_len = if p_owner.is_null() {
+            0
+        } else {
+            sid_len(p_owner)
+        };
+        let group_len = if p_group.is_null() {
+            0
+        } else {
+            sid_len(p_group)
+        };
         let sacl_len = if p_sacl.is_null() {
             0
         } else {
@@ -1788,8 +2033,16 @@ pub unsafe extern "system" fn rtl_self_relative_to_absolute_sd2(
         let p_group = sd_group(r);
         let p_sacl = sd_sacl(r);
         let p_dacl = sd_dacl(r);
-        let owner_len = if p_owner.is_null() { 0 } else { sid_len(p_owner) };
-        let group_len = if p_group.is_null() { 0 } else { sid_len(p_group) };
+        let owner_len = if p_owner.is_null() {
+            0
+        } else {
+            sid_len(p_owner)
+        };
+        let group_len = if p_group.is_null() {
+            0
+        } else {
+            sid_len(p_group)
+        };
         let sacl_len = if p_sacl.is_null() {
             0
         } else {
@@ -2023,11 +2276,14 @@ pub unsafe extern "system" fn rtl_delete_security_object(
     STATUS_SUCCESS
 }
 
-/// `RtlSetSecurityObject(...)` — apply a SECURITY_INFORMATION update to an object's SD. Needs the
-/// full Se apply plane. Honest seam: STATUS_NOT_IMPLEMENTED.
+/// `RtlSetSecurityObject(...)` — apply a SECURITY_INFORMATION update to an object's self-relative SD.
+/// Ported from ReactOS `sdk/lib/rtl/security.c:RtlpSetSecurityObject`: select updated components from
+/// `ModificationDescriptor`, keep the rest from the existing object SD, pack a new self-relative SD on
+/// the process heap, then free the old descriptor.
 ///
 /// # Safety
-/// All pointers unused at this seam.
+/// `object_descriptor` points at a process-heap SECURITY_DESCRIPTOR pointer; descriptor pointers are
+/// valid for the selected components.
 #[export_name = "RtlSetSecurityObject"]
 pub unsafe extern "system" fn rtl_set_security_object(
     security_information: u32,
@@ -2036,21 +2292,72 @@ pub unsafe extern "system" fn rtl_set_security_object(
     generic_mapping: *const c_void,
     token: *mut c_void,
 ) -> NtStatus {
-    let _ = (
-        security_information,
-        modification_descriptor,
-        object_descriptor,
-        generic_mapping,
-        token,
-    );
-    STATUS_NOT_IMPLEMENTED
+    let _ = (generic_mapping, token);
+    if object_descriptor.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // SAFETY: object_descriptor is a writable slot and descriptors satisfy the API contract.
+    unsafe {
+        let current = *object_descriptor;
+        let parts =
+            match select_security_parts(security_information, modification_descriptor, current) {
+                Ok(parts) => parts,
+                Err(status) => return status,
+            };
+        let total = SD_REL_HEADER
+            + round_up4(parts.sacl_len)
+            + round_up4(parts.dacl_len)
+            + round_up4(parts.owner_len)
+            + round_up4(parts.group_len);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let new_sd = crate::process_heap_alloc(total);
+            if new_sd.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            core::ptr::write_bytes(new_sd, 0, total);
+            *new_sd = SECURITY_DESCRIPTOR_REVISION;
+            *(new_sd.add(0x02) as *mut u16) = parts.control;
+
+            let mut cur = SD_REL_HEADER;
+            if parts.sacl_len != 0 {
+                copy_component(new_sd.add(cur), parts.sacl, parts.sacl_len);
+                *(new_sd.add(0x0C) as *mut u32) = cur as u32;
+                cur += round_up4(parts.sacl_len);
+            }
+            if parts.dacl_len != 0 {
+                copy_component(new_sd.add(cur), parts.dacl, parts.dacl_len);
+                *(new_sd.add(0x10) as *mut u32) = cur as u32;
+                cur += round_up4(parts.dacl_len);
+            }
+            copy_component(new_sd.add(cur), parts.owner, parts.owner_len);
+            *(new_sd.add(0x04) as *mut u32) = cur as u32;
+            cur += round_up4(parts.owner_len);
+            copy_component(new_sd.add(cur), parts.group, parts.group_len);
+            *(new_sd.add(0x08) as *mut u32) = cur as u32;
+
+            if !current.is_null() {
+                crate::process_heap_free(current as *mut u8);
+            }
+            *object_descriptor = new_sd as *mut c_void;
+            STATUS_SUCCESS
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = parts;
+            STATUS_NOT_IMPLEMENTED
+        }
+    }
 }
 
 /// `RtlQuerySecurityObject(...)` — extract SECURITY_INFORMATION from an object's SD into a caller
-/// buffer. Needs the Se query plane. Honest seam: STATUS_NOT_IMPLEMENTED.
+/// self-relative descriptor. Ported from ReactOS `sdk/lib/rtl/security.c:RtlQuerySecurityObject`.
 ///
 /// # Safety
-/// All pointers unused at this seam.
+/// `object_descriptor` is a valid SD; `resultant_descriptor` is a caller buffer of
+/// `descriptor_length` bytes; `return_length` is writable.
 #[export_name = "RtlQuerySecurityObject"]
 pub unsafe extern "system" fn rtl_query_security_object(
     object_descriptor: *const c_void,
@@ -2059,14 +2366,96 @@ pub unsafe extern "system" fn rtl_query_security_object(
     descriptor_length: u32,
     return_length: *mut u32,
 ) -> NtStatus {
-    let _ = (
-        object_descriptor,
-        security_information,
-        resultant_descriptor,
-        descriptor_length,
-        return_length,
-    );
-    STATUS_NOT_IMPLEMENTED
+    if object_descriptor.is_null() || return_length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+
+    let mut abs = [0u8; SD_ABS_HEADER];
+
+    // SAFETY: descriptors and out-pointers satisfy the exported function contract.
+    unsafe {
+        init_absolute_sd(abs.as_mut_ptr());
+
+        if security_information & OWNER_SECURITY_INFORMATION != 0 {
+            let mut owner: *mut c_void = core::ptr::null_mut();
+            let mut defaulted = 0u8;
+            let status =
+                rtl_get_owner_security_descriptor(object_descriptor, &mut owner, &mut defaulted);
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+            let status = rtl_set_owner_security_descriptor(
+                abs.as_mut_ptr() as *mut c_void,
+                owner,
+                defaulted,
+            );
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+        }
+
+        if security_information & GROUP_SECURITY_INFORMATION != 0 {
+            let mut group: *mut c_void = core::ptr::null_mut();
+            let mut defaulted = 0u8;
+            let status =
+                rtl_get_group_security_descriptor(object_descriptor, &mut group, &mut defaulted);
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+            let status = rtl_set_group_security_descriptor(
+                abs.as_mut_ptr() as *mut c_void,
+                group,
+                defaulted,
+            );
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+        }
+
+        if security_information & DACL_SECURITY_INFORMATION != 0 {
+            let (present, dacl, defaulted) = match get_dacl(object_descriptor as *const u8) {
+                Ok(parts) => parts,
+                Err(status) => return status,
+            };
+            set_abs_dacl(abs.as_mut_ptr(), present, dacl, defaulted);
+        }
+
+        if security_information & SACL_SECURITY_INFORMATION != 0 {
+            let mut present = 0u8;
+            let mut sacl: *mut c_void = core::ptr::null_mut();
+            let mut defaulted = 0u8;
+            let status = rtl_get_sacl_security_descriptor(
+                object_descriptor,
+                &mut present,
+                &mut sacl,
+                &mut defaulted,
+            );
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+            let status = rtl_set_sacl_security_descriptor(
+                abs.as_mut_ptr() as *mut c_void,
+                present,
+                sacl,
+                defaulted,
+            );
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+        }
+
+        *return_length = descriptor_length;
+        rtl_absolute_to_self_relative_sd(
+            abs.as_ptr() as *const c_void,
+            resultant_descriptor,
+            return_length,
+        )
+    }
 }
 
 /// `RtlCaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture, PVOID* BackTrace,

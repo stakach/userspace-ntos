@@ -18,16 +18,404 @@ use alloc::vec::Vec;
 use nt_port_core::PortApi;
 
 use crate::NtStatus;
+use crate::STATUS_INVALID_PARAMETER;
 use crate::STATUS_NOT_IMPLEMENTED;
 
-/// `STATUS_INVALID_PARAMETER`.
-pub const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 /// `STATUS_BUFFER_TOO_SMALL`.
 pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
+
+/// x64 `CSR_CAPTURE_BUFFER` header bytes before `PointerOffsetsArray`.
+pub const CSR_CAPTURE_BUFFER_HEADER_LEN: usize = 0x20;
+/// `CSR_CAPTURE_BUFFER.Size`.
+pub const CSR_CAPTURE_BUFFER_SIZE_OFFSET: usize = 0x00;
+/// `CSR_CAPTURE_BUFFER.PreviousCaptureBuffer`.
+pub const CSR_CAPTURE_BUFFER_PREVIOUS_OFFSET: usize = 0x08;
+/// `CSR_CAPTURE_BUFFER.PointerCount`.
+pub const CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET: usize = 0x10;
+/// Private client-side copy of the original pointer-slot capacity. This lives in structure padding on
+/// x64 and is ignored by ReactOS csrsrv; it prevents client-side overrun before the message is sent.
+pub const CSR_CAPTURE_BUFFER_MAX_POINTERS_OFFSET: usize = 0x14;
+/// `CSR_CAPTURE_BUFFER.BufferEnd`.
+pub const CSR_CAPTURE_BUFFER_END_OFFSET: usize = 0x18;
+/// `CSR_CAPTURE_BUFFER.PointerOffsetsArray`.
+pub const CSR_CAPTURE_BUFFER_POINTERS_OFFSET: usize = 0x20;
+
+/// x64 `CSR_API_MESSAGE` byte layout used by `CsrClientCallServer`.
+pub const CSR_API_MESSAGE_HEADER_LEN: usize = PORT_MESSAGE_HEADER_LEN;
+pub const CSR_API_MESSAGE_DATA_OFFSET: usize = 0x28;
+pub const CSR_API_MESSAGE_CAPTURE_DATA_OFFSET: usize = 0x28;
+pub const CSR_API_MESSAGE_API_NUMBER_OFFSET: usize = 0x30;
+pub const CSR_API_MESSAGE_STATUS_OFFSET: usize = 0x34;
+pub const CSR_API_MESSAGE_RESERVED_OFFSET: usize = 0x38;
+pub const CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET: usize = 0x40;
+pub const CSR_API_MESSAGE_SIZE: usize = 0x178;
+
+const MAXLONG: usize = 0x7fff_ffff;
+const MAXSHORT: usize = 0x7fff;
 
 /// The x64 `PORT_MESSAGE` header size (bytes) — the frame every LPC/CSR message carries. Shared by
 /// LPC and ALPC (`nt-port-core` docs).
 pub const PORT_MESSAGE_HEADER_LEN: usize = 0x28;
+
+#[inline]
+fn align_up4(n: usize) -> Option<usize> {
+    n.checked_add(3).map(|v| v & !3)
+}
+
+#[inline]
+fn add_signed_delta(value: u64, delta: isize) -> u64 {
+    if delta >= 0 {
+        value.wrapping_add(delta as u64)
+    } else {
+        value.wrapping_sub(delta.wrapping_neg() as u64)
+    }
+}
+
+#[inline]
+fn capture_offsets_span(pointer_count: usize) -> Option<usize> {
+    pointer_count
+        .checked_mul(core::mem::size_of::<u64>())?
+        .checked_add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET)
+}
+
+/// Calculate the heap allocation size for ReactOS' x64 `CSR_CAPTURE_BUFFER`.
+pub fn raw_capture_buffer_size(argument_count: u32, buffer_size: u32) -> Option<usize> {
+    let argument_count = argument_count as usize;
+    let buffer_size = buffer_size as usize;
+    if argument_count > MAXLONG / core::mem::size_of::<u64>() {
+        return None;
+    }
+    let offsets_array_size = argument_count.checked_mul(core::mem::size_of::<u64>())?;
+    let mut maximum_size = (MAXLONG & !3usize).checked_sub(CSR_CAPTURE_BUFFER_POINTERS_OFFSET)?;
+    if offsets_array_size >= maximum_size {
+        return None;
+    }
+    maximum_size -= offsets_array_size;
+    if buffer_size >= maximum_size {
+        return None;
+    }
+    maximum_size -= buffer_size;
+    let padding = argument_count.checked_mul(3)?.checked_add(3)?;
+    if padding >= maximum_size {
+        return None;
+    }
+
+    let total = buffer_size
+        .checked_add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET)?
+        .checked_add(offsets_array_size)?
+        .checked_add(argument_count.checked_mul(3)?)?;
+    align_up4(total)
+}
+
+/// Initialize an already-zeroed raw x64 `CSR_CAPTURE_BUFFER`.
+///
+/// # Safety
+/// `buffer` must point to `total_size` writable bytes.
+pub unsafe fn init_raw_capture_buffer(buffer: *mut u8, total_size: usize, argument_count: u32) {
+    let pointer_array_bytes = argument_count as usize * core::mem::size_of::<u64>();
+    let data_start = buffer as usize + CSR_CAPTURE_BUFFER_POINTERS_OFFSET + pointer_array_bytes;
+    // SAFETY: caller supplied a writable allocation of `total_size` bytes.
+    unsafe {
+        core::ptr::write_unaligned(
+            buffer.add(CSR_CAPTURE_BUFFER_SIZE_OFFSET) as *mut u32,
+            total_size as u32,
+        );
+        core::ptr::write_unaligned(
+            buffer.add(CSR_CAPTURE_BUFFER_PREVIOUS_OFFSET) as *mut u64,
+            0,
+        );
+        core::ptr::write_unaligned(
+            buffer.add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *mut u32,
+            0,
+        );
+        core::ptr::write_unaligned(
+            buffer.add(CSR_CAPTURE_BUFFER_MAX_POINTERS_OFFSET) as *mut u32,
+            argument_count,
+        );
+        core::ptr::write_unaligned(
+            buffer.add(CSR_CAPTURE_BUFFER_END_OFFSET) as *mut u64,
+            data_start as u64,
+        );
+    }
+}
+
+/// Reserve `message_length` bytes in a raw `CSR_CAPTURE_BUFFER` and write the captured data pointer.
+///
+/// Returns the aligned byte count recorded in the captured string/buffer descriptor. A zero return is
+/// both the Windows zero-length result and our failure result for invalid/exhausted buffers.
+///
+/// # Safety
+/// `capture_buffer` must be a live buffer initialized by [`init_raw_capture_buffer`]; `captured_data`
+/// is the caller's writable `PVOID*` slot.
+pub unsafe fn raw_allocate_message_pointer(
+    capture_buffer: *mut u8,
+    message_length: u32,
+    captured_data: *mut u64,
+) -> u32 {
+    if captured_data.is_null() {
+        return 0;
+    }
+    if capture_buffer.is_null() {
+        // SAFETY: captured_data was checked non-null.
+        unsafe { core::ptr::write_unaligned(captured_data, 0) };
+        return 0;
+    }
+
+    // SAFETY: raw capture buffer contract.
+    unsafe {
+        let size = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_SIZE_OFFSET) as *const u32
+        ) as usize;
+        let count = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *const u32,
+        );
+        let max_pointers = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_MAX_POINTERS_OFFSET) as *const u32,
+        );
+        if size < CSR_CAPTURE_BUFFER_POINTERS_OFFSET || count >= max_pointers {
+            core::ptr::write_unaligned(captured_data, 0);
+            return 0;
+        }
+
+        let base = capture_buffer as usize;
+        let buffer_end = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_END_OFFSET) as *const u64,
+        ) as usize;
+        let buffer_limit = match base.checked_add(size) {
+            Some(v) => v,
+            None => {
+                core::ptr::write_unaligned(captured_data, 0);
+                return 0;
+            }
+        };
+        if buffer_end < base + CSR_CAPTURE_BUFFER_POINTERS_OFFSET || buffer_end > buffer_limit {
+            core::ptr::write_unaligned(captured_data, 0);
+            return 0;
+        }
+
+        let (slot_value, aligned_len) = if message_length == 0 {
+            core::ptr::write_unaligned(captured_data, 0);
+            (0u64, 0usize)
+        } else {
+            let requested = message_length as usize;
+            if requested >= MAXLONG {
+                core::ptr::write_unaligned(captured_data, 0);
+                return 0;
+            }
+            let aligned = match align_up4(requested) {
+                Some(v) => v,
+                None => {
+                    core::ptr::write_unaligned(captured_data, 0);
+                    return 0;
+                }
+            };
+            let next_end = match buffer_end.checked_add(aligned) {
+                Some(v) => v,
+                None => {
+                    core::ptr::write_unaligned(captured_data, 0);
+                    return 0;
+                }
+            };
+            if next_end > buffer_limit {
+                core::ptr::write_unaligned(captured_data, 0);
+                return 0;
+            }
+            core::ptr::write_unaligned(captured_data, buffer_end as u64);
+            core::ptr::write_unaligned(
+                capture_buffer.add(CSR_CAPTURE_BUFFER_END_OFFSET) as *mut u64,
+                next_end as u64,
+            );
+            (captured_data as u64, aligned)
+        };
+
+        let slot = capture_buffer
+            .add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET)
+            .add(count as usize * core::mem::size_of::<u64>()) as *mut u64;
+        core::ptr::write_unaligned(slot, slot_value);
+        core::ptr::write_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *mut u32,
+            count + 1,
+        );
+        aligned_len as u32
+    }
+}
+
+/// Capture a raw message buffer into a `CSR_CAPTURE_BUFFER`.
+///
+/// # Safety
+/// Same requirements as [`raw_allocate_message_pointer`]; `message_buffer` must be readable for
+/// `message_length` bytes when non-null.
+pub unsafe fn raw_capture_message_buffer(
+    capture_buffer: *mut u8,
+    message_buffer: *const u8,
+    message_length: u32,
+    captured_data: *mut u64,
+) {
+    // SAFETY: forwarded raw capture-buffer contract.
+    unsafe {
+        let allocated = raw_allocate_message_pointer(capture_buffer, message_length, captured_data);
+        if allocated == 0 || message_buffer.is_null() || message_length == 0 {
+            return;
+        }
+        let dst = core::ptr::read_unaligned(captured_data) as *mut u8;
+        if dst.is_null() {
+            return;
+        }
+        core::ptr::copy_nonoverlapping(message_buffer, dst, message_length as usize);
+    }
+}
+
+/// Return `(PORT_MESSAGE.DataLength, PORT_MESSAGE.TotalLength)` for `CsrClientCallServer`.
+pub fn csr_client_call_lengths(data_length: u32) -> Option<(u16, u16)> {
+    let data_length = data_length as usize;
+    if data_length > MAXSHORT.checked_sub(CSR_API_MESSAGE_SIZE)? {
+        return None;
+    }
+    let total_length = data_length.checked_add(CSR_API_MESSAGE_HEADER_LEN)?;
+    Some((data_length as u16, total_length as u16))
+}
+
+/// Fill the fixed CSR/PORT headers before sending a `CSR_API_MESSAGE`.
+///
+/// # Safety
+/// `api_message` must be a writable x64 `CSR_API_MESSAGE`.
+pub unsafe fn init_raw_api_message(
+    api_message: *mut u8,
+    api_number: u32,
+    data_length: u32,
+) -> Result<(), NtStatus> {
+    let (port_data_len, port_total_len) =
+        csr_client_call_lengths(data_length).ok_or(STATUS_INVALID_PARAMETER)?;
+    // SAFETY: caller supplied a writable CSR_API_MESSAGE.
+    unsafe {
+        core::ptr::write_unaligned(api_message as *mut u16, port_data_len);
+        core::ptr::write_unaligned(api_message.add(0x02) as *mut u16, port_total_len);
+        core::ptr::write_unaligned(api_message.add(0x04) as *mut u32, 0);
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *mut u64,
+            0,
+        );
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_API_NUMBER_OFFSET) as *mut u32,
+            api_number,
+        );
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_STATUS_OFFSET) as *mut u32,
+            0,
+        );
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_RESERVED_OFFSET) as *mut u32,
+            0,
+        );
+    }
+    Ok(())
+}
+
+/// Convert a client capture buffer into the server view before `NtRequestWaitReplyPort`.
+///
+/// # Safety
+/// `api_message` and `capture_buffer` must point at writable raw CSR objects in the current process.
+pub unsafe fn prepare_raw_capture_for_call(
+    api_message: *mut u8,
+    capture_buffer: *mut u8,
+    port_memory_delta: isize,
+) -> Result<(), NtStatus> {
+    if api_message.is_null() || capture_buffer.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: raw CSR objects per the function contract.
+    unsafe {
+        let remote_capture = add_signed_delta(capture_buffer as u64, port_memory_delta);
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *mut u64,
+            remote_capture,
+        );
+        core::ptr::write_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_END_OFFSET) as *mut u64,
+            0,
+        );
+
+        let pointer_count = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *const u32,
+        ) as usize;
+        let size = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_SIZE_OFFSET) as *const u32
+        ) as usize;
+        if match capture_offsets_span(pointer_count) {
+            Some(span) => span > size,
+            None => true,
+        } {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        for i in 0..pointer_count {
+            let slot = capture_buffer
+                .add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET + i * core::mem::size_of::<u64>())
+                as *mut u64;
+            let pointer_slot = core::ptr::read_unaligned(slot);
+            if pointer_slot != 0 {
+                let value_slot = pointer_slot as *mut u64;
+                let value = core::ptr::read_unaligned(value_slot);
+                core::ptr::write_unaligned(value_slot, add_signed_delta(value, port_memory_delta));
+                core::ptr::write_unaligned(slot, pointer_slot.wrapping_sub(api_message as u64));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undo [`prepare_raw_capture_for_call`] after the CSR reply returns.
+///
+/// # Safety
+/// `api_message` and `capture_buffer` must be the same raw objects passed to preparation.
+pub unsafe fn restore_raw_capture_after_call(
+    api_message: *mut u8,
+    capture_buffer: *mut u8,
+    port_memory_delta: isize,
+) -> Result<(), NtStatus> {
+    if api_message.is_null() || capture_buffer.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: raw CSR objects per the function contract.
+    unsafe {
+        let remote_capture = core::ptr::read_unaligned(
+            api_message.add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *const u64,
+        );
+        core::ptr::write_unaligned(
+            api_message.add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *mut u64,
+            add_signed_delta(remote_capture, port_memory_delta.wrapping_neg()),
+        );
+
+        let pointer_count = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *const u32,
+        ) as usize;
+        let size = core::ptr::read_unaligned(
+            capture_buffer.add(CSR_CAPTURE_BUFFER_SIZE_OFFSET) as *const u32
+        ) as usize;
+        if match capture_offsets_span(pointer_count) {
+            Some(span) => span > size,
+            None => true,
+        } {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        for i in 0..pointer_count {
+            let slot = capture_buffer
+                .add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET + i * core::mem::size_of::<u64>())
+                as *mut u64;
+            let offset = core::ptr::read_unaligned(slot);
+            if offset != 0 {
+                let pointer_slot = (api_message as u64).wrapping_add(offset);
+                core::ptr::write_unaligned(slot, pointer_slot);
+                let value_slot = pointer_slot as *mut u64;
+                let value = core::ptr::read_unaligned(value_slot);
+                core::ptr::write_unaligned(
+                    value_slot,
+                    add_signed_delta(value, port_memory_delta.wrapping_neg()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A CSR API number: `(ServerDllIndex << 16) | ApiIndex` (the `CSR_MAKE_API_NUMBER` encoding). The
 /// server-dll index selects basesrv/winsrv/…; the api index selects the routine within it.
@@ -108,7 +496,10 @@ impl CaptureBuffer {
             return Err(STATUS_BUFFER_TOO_SMALL);
         }
         self.data.extend_from_slice(bytes);
-        let p = CapturedPointer { offset, length: bytes.len() };
+        let p = CapturedPointer {
+            offset,
+            length: bytes.len(),
+        };
         self.pointers.push(p);
         Ok(p)
     }
@@ -136,7 +527,11 @@ pub struct CsrApiMessage {
 impl CsrApiMessage {
     /// Build a `CSR_API_MESSAGE` for `api` with the given fixed args + optional capture buffer.
     pub fn new(api: CsrApiNumber, args: Vec<u64>, capture: Option<CaptureBuffer>) -> Self {
-        CsrApiMessage { api_number: api, args, capture }
+        CsrApiMessage {
+            api_number: api,
+            args,
+            capture,
+        }
     }
 
     /// The total data length (`PORT_MESSAGE` `u1.s1.DataLength`) of this message: the CSR body plus
@@ -254,7 +649,10 @@ mod tests {
     #[test]
     fn capture_buffer_rejects_capacity_overflow() {
         let mut cb = CaptureBuffer::allocate(4, 8);
-        assert_eq!(cb.capture(b"0123456789ABCDEF"), Err(STATUS_BUFFER_TOO_SMALL));
+        assert_eq!(
+            cb.capture(b"0123456789ABCDEF"),
+            Err(STATUS_BUFFER_TOO_SMALL)
+        );
     }
 
     #[test]
@@ -283,5 +681,164 @@ mod tests {
         connected.handle = 0x1234;
         let (_built2, status2) = connected.call_server(&msg);
         assert_eq!(status2, STATUS_NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn raw_capture_buffer_size_matches_reactos_layout() {
+        assert_eq!(
+            raw_capture_buffer_size(0, 0),
+            Some(CSR_CAPTURE_BUFFER_HEADER_LEN)
+        );
+        assert_eq!(raw_capture_buffer_size(1, 10), Some(0x38));
+        assert_eq!(raw_capture_buffer_size(2, 17), Some(0x48));
+        assert_eq!(raw_capture_buffer_size(u32::MAX, 0), None);
+    }
+
+    #[test]
+    fn raw_capture_buffer_packs_message_pointers() {
+        let size = raw_capture_buffer_size(2, 32).unwrap();
+        let mut raw = vec![0u8; size];
+        let mut pointer_a = 0u64;
+        let mut pointer_b = 0u64;
+
+        unsafe {
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 2);
+            let first = raw_allocate_message_pointer(raw.as_mut_ptr(), 5, &mut pointer_a);
+            assert_eq!(first, 8);
+            assert_eq!(
+                pointer_a,
+                raw.as_ptr() as u64 + CSR_CAPTURE_BUFFER_POINTERS_OFFSET as u64 + 16
+            );
+            let second = raw_allocate_message_pointer(raw.as_mut_ptr(), 7, &mut pointer_b);
+            assert_eq!(second, 8);
+            assert_eq!(pointer_b, pointer_a + 8);
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    raw.as_ptr().add(CSR_CAPTURE_BUFFER_POINTER_COUNT_OFFSET) as *const u32
+                ),
+                2
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    raw.as_ptr().add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET) as *const u64
+                ),
+                &mut pointer_a as *mut u64 as u64
+            );
+        }
+    }
+
+    #[test]
+    fn raw_capture_message_buffer_copies_bytes() {
+        let size = raw_capture_buffer_size(1, 16).unwrap();
+        let mut raw = vec![0u8; size];
+        let mut captured = 0u64;
+        unsafe {
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 1);
+            raw_capture_message_buffer(raw.as_mut_ptr(), b"hello".as_ptr(), 5, &mut captured);
+            assert_ne!(captured, 0);
+            let copied = core::slice::from_raw_parts(captured as *const u8, 5);
+            assert_eq!(copied, b"hello");
+        }
+    }
+
+    #[test]
+    fn raw_capture_buffer_rejects_exhausted_pointer_slots() {
+        let size = raw_capture_buffer_size(1, 8).unwrap();
+        let mut raw = vec![0u8; size];
+        let mut first = 0u64;
+        let mut second = 0xccccu64;
+        unsafe {
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 1);
+            assert_eq!(
+                raw_allocate_message_pointer(raw.as_mut_ptr(), 4, &mut first),
+                4
+            );
+            assert_eq!(
+                raw_allocate_message_pointer(raw.as_mut_ptr(), 4, &mut second),
+                0
+            );
+            assert_eq!(second, 0);
+        }
+    }
+
+    #[test]
+    fn csr_client_call_header_lengths_match_x64_layout() {
+        assert_eq!(
+            csr_client_call_lengths(0),
+            Some((0, CSR_API_MESSAGE_HEADER_LEN as u16))
+        );
+        assert_eq!(csr_client_call_lengths(0x10), Some((0x10, 0x38)));
+        assert_eq!(
+            csr_client_call_lengths((MAXSHORT - CSR_API_MESSAGE_SIZE) as u32),
+            Some((
+                (MAXSHORT - CSR_API_MESSAGE_SIZE) as u16,
+                (MAXSHORT - CSR_API_MESSAGE_SIZE + CSR_API_MESSAGE_HEADER_LEN) as u16
+            ))
+        );
+        assert_eq!(
+            csr_client_call_lengths((MAXSHORT - CSR_API_MESSAGE_SIZE + 1) as u32),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_capture_prepare_and_restore_relocate_message_fields() {
+        let cap_size = raw_capture_buffer_size(1, 16).unwrap();
+        let mut capture = vec![0u8; cap_size];
+        let mut api = vec![0u8; CSR_API_MESSAGE_SIZE];
+        let api_base = api.as_mut_ptr() as u64;
+        let message_pointer_slot = unsafe {
+            api.as_mut_ptr()
+                .add(CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET) as *mut u64
+        };
+        let delta = 0x1000isize;
+
+        unsafe {
+            init_raw_capture_buffer(capture.as_mut_ptr(), cap_size, 1);
+            raw_capture_message_buffer(
+                capture.as_mut_ptr(),
+                b"abc".as_ptr(),
+                3,
+                message_pointer_slot,
+            );
+            let local_data = core::ptr::read_unaligned(message_pointer_slot);
+
+            prepare_raw_capture_for_call(api.as_mut_ptr(), capture.as_mut_ptr(), delta).unwrap();
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    api.as_ptr().add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *const u64
+                ),
+                capture.as_ptr() as u64 + delta as u64
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(message_pointer_slot),
+                local_data + delta as u64
+            );
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    capture.as_ptr().add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET) as *const u64
+                ),
+                CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET as u64
+            );
+
+            restore_raw_capture_after_call(api.as_mut_ptr(), capture.as_mut_ptr(), delta).unwrap();
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    api.as_ptr().add(CSR_API_MESSAGE_CAPTURE_DATA_OFFSET) as *const u64
+                ),
+                capture.as_ptr() as u64
+            );
+            assert_eq!(core::ptr::read_unaligned(message_pointer_slot), local_data);
+            assert_eq!(
+                core::ptr::read_unaligned(
+                    capture.as_ptr().add(CSR_CAPTURE_BUFFER_POINTERS_OFFSET) as *const u64
+                ),
+                message_pointer_slot as u64
+            );
+            assert_eq!(
+                api_base + CSR_API_MESSAGE_API_MESSAGE_DATA_OFFSET as u64,
+                message_pointer_slot as u64
+            );
+        }
     }
 }
