@@ -13,7 +13,31 @@ pub use nt_compat_exports::rtl::{integer_to_unicode, unicode_string_to_integer};
 /// `RtlIntegerToChar`: format `value` in `base` (2/8/10/16) into ASCII bytes. Returns `None` for an
 /// unsupported base.
 pub fn integer_to_char(value: u32, base: u32) -> Option<Vec<u8>> {
-    Some(integer_to_unicode(value, base)?.iter().map(|&c| c as u8).collect())
+    unsigned_to_char(value as u64, base)
+}
+
+/// `RtlLargeIntegerToChar`: format a 64-bit value in `base` (2/8/10/16) into ASCII bytes.
+pub fn large_integer_to_char(value: u64, base: u32) -> Option<Vec<u8>> {
+    unsigned_to_char(value, base)
+}
+
+fn unsigned_to_char(value: u64, base: u32) -> Option<Vec<u8>> {
+    if !matches!(base, 2 | 8 | 10 | 16) {
+        return None;
+    }
+    if value == 0 {
+        return Some(alloc::vec![b'0']);
+    }
+    let mut digits = Vec::new();
+    let mut v = value;
+    let b = base as u64;
+    while v > 0 {
+        let d = (v % b) as u8;
+        digits.push(if d < 10 { b'0' + d } else { b'A' + d - 10 });
+        v /= b;
+    }
+    digits.reverse();
+    Some(digits)
 }
 
 /// `RtlCharToInteger`: parse an ASCII unsigned integer in `base` (`0` auto-detects `0x`).
@@ -100,17 +124,29 @@ mod tests {
 
     #[test]
     fn char_roundtrip() {
-        assert_eq!(integer_to_char(255, 16).unwrap(), b"ff");
+        assert_eq!(integer_to_char(255, 16).unwrap(), b"FF");
+        assert_eq!(
+            large_integer_to_char(0x1234_5678_9ABC_DEF0, 16).unwrap(),
+            b"123456789ABCDEF0"
+        );
         assert_eq!(char_to_integer(b"255", 10), Some(255));
         assert_eq!(char_to_integer(b"0xFF", 0), Some(255));
         assert!(integer_to_char(1, 7).is_none());
+        assert!(integer_to_char(1, 3).is_none());
+        assert!(large_integer_to_char(1, 12).is_none());
     }
 
     #[test]
     fn int64_format() {
         assert_eq!(int64_to_unicode(0, 10).unwrap(), u("0"));
-        assert_eq!(int64_to_unicode(0xDEAD_BEEF_CAFE, 16).unwrap(), u("deadbeefcafe"));
-        assert_eq!(int64_to_unicode(1_000_000_000_000, 10).unwrap(), u("1000000000000"));
+        assert_eq!(
+            int64_to_unicode(0xDEAD_BEEF_CAFE, 16).unwrap(),
+            u("deadbeefcafe")
+        );
+        assert_eq!(
+            int64_to_unicode(1_000_000_000_000, 10).unwrap(),
+            u("1000000000000")
+        );
         assert!(int64_to_unicode(5, 3).is_none());
     }
 
@@ -127,6 +163,9 @@ mod tests {
     fn byte_swaps_match_rtl_exports() {
         assert_eq!(ushort_byte_swap(0x1234), 0x3412);
         assert_eq!(ulong_byte_swap(0x1234_5678), 0x7856_3412);
-        assert_eq!(ulonglong_byte_swap(0x0123_4567_89AB_CDEF), 0xEFCD_AB89_6745_2301);
+        assert_eq!(
+            ulonglong_byte_swap(0x0123_4567_89AB_CDEF),
+            0xEFCD_AB89_6745_2301
+        );
     }
 }

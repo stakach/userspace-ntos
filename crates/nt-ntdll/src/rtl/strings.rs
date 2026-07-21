@@ -70,6 +70,16 @@ pub fn downcase_char(c: u16) -> u16 {
     }
 }
 
+/// `RtlUpperChar`: upper-case one ANSI/OEM byte for the single-byte boot code-page path.
+pub fn upcase_ansi_byte(b: u8) -> u8 {
+    let up = upcase_char(b as u16);
+    if up <= u8::MAX as u16 {
+        up as u8
+    } else {
+        b
+    }
+}
+
 // --- RtlInit* ----------------------------------------------------------------------------------
 
 /// `RtlInitUnicodeString`: a read-only counted view (`Length == MaximumLength == byte length`).
@@ -147,6 +157,41 @@ pub fn equal_unicode_string(a: &[u16], b: &[u16], case_insensitive: bool) -> boo
     nt_compat_exports::rtl::equal_unicode(a, b, case_insensitive)
 }
 
+/// `RtlCompareString`: lexical comparison of counted 8-bit strings.
+pub fn compare_string(a: &[u8], b: &[u8], case_insensitive: bool) -> i32 {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        let lhs = if case_insensitive {
+            upcase_ansi_byte(a[i])
+        } else {
+            a[i]
+        };
+        let rhs = if case_insensitive {
+            upcase_ansi_byte(b[i])
+        } else {
+            b[i]
+        };
+        let diff = lhs as i32 - rhs as i32;
+        if diff != 0 {
+            return diff;
+        }
+    }
+    a.len() as i32 - b.len() as i32
+}
+
+/// `RtlEqualString`: equality wrapper over [`compare_string`].
+pub fn equal_string(a: &[u8], b: &[u8], case_insensitive: bool) -> bool {
+    a.len() == b.len() && compare_string(a, b, case_insensitive) == 0
+}
+
+/// `RtlPrefixString`: `true` if `prefix` is a leading prefix of `s`.
+pub fn prefix_string(prefix: &[u8], s: &[u8], case_insensitive: bool) -> bool {
+    if prefix.len() > s.len() {
+        return false;
+    }
+    equal_string(prefix, &s[..prefix.len()], case_insensitive)
+}
+
 /// `RtlPrefixUnicodeString`: `true` if `prefix` is a leading prefix of `s`.
 pub fn prefix_unicode_string(prefix: &[u16], s: &[u16], case_insensitive: bool) -> bool {
     if prefix.len() > s.len() {
@@ -165,6 +210,11 @@ pub fn upcase_unicode_string(src: &[u16]) -> Vec<u16> {
 /// `RtlDowncaseUnicodeString` (the pure part): lower-case every code unit into a fresh buffer.
 pub fn downcase_unicode_string(src: &[u16]) -> Vec<u16> {
     src.iter().copied().map(downcase_char).collect()
+}
+
+/// `RtlUpperString`: upper-case a counted 8-bit string into a fresh buffer.
+pub fn upper_string(src: &[u8]) -> Vec<u8> {
+    src.iter().copied().map(upcase_ansi_byte).collect()
 }
 
 // --- validation --------------------------------------------------------------------------------
@@ -284,7 +334,7 @@ mod tests {
         assert_eq!(all.as_units(), &u("NoNul")[..]);
         assert_eq!(all.length, 10); // 5 units * 2
         assert_eq!(*all.buffer.last().unwrap(), 0); // still NUL-terminated by create()
-        // Leading NUL → empty content, but a valid NUL-terminated empty string.
+                                                    // Leading NUL → empty content, but a valid NUL-terminated empty string.
         let empty = create_unicode_string_from_asciiz(b"\0rest");
         assert_eq!(empty.length, 0);
         assert_eq!(empty.maximum_length, 2); // room for the NUL only
@@ -302,10 +352,16 @@ mod tests {
         let dup = duplicate_unicode_string(&src, false);
         assert_eq!(dup.as_units(), &u("Path")[..]);
         assert_eq!(dup.length, 8); // 4 units * 2
-        assert_eq!(dup.maximum_length, 8, "init: MaximumLength == Length (no NUL slack)");
+        assert_eq!(
+            dup.maximum_length, 8,
+            "init: MaximumLength == Length (no NUL slack)"
+        );
         // A NUL-terminated duplicate of the SAME source reserves the extra unit.
         let dup_nul = duplicate_unicode_string(&src, true);
-        assert_eq!(dup_nul.maximum_length, 10, "create: MaximumLength includes the NUL");
+        assert_eq!(
+            dup_nul.maximum_length, 10,
+            "create: MaximumLength includes the NUL"
+        );
         assert_eq!(*dup_nul.buffer.last().unwrap(), 0);
     }
 
@@ -330,9 +386,28 @@ mod tests {
 
     #[test]
     fn prefix_and_equal() {
-        assert!(prefix_unicode_string(&u("\\Device"), &u("\\Device\\Foo"), false));
-        assert!(!prefix_unicode_string(&u("\\Devicez"), &u("\\Device"), false));
+        assert!(prefix_unicode_string(
+            &u("\\Device"),
+            &u("\\Device\\Foo"),
+            false
+        ));
+        assert!(!prefix_unicode_string(
+            &u("\\Devicez"),
+            &u("\\Device"),
+            false
+        ));
         assert!(equal_unicode_string(&u("Foo"), &u("FOO"), true));
+    }
+
+    #[test]
+    fn counted_ansi_compare_prefix_and_uppercase() {
+        assert_eq!(compare_string(b"abc", b"ABC", true), 0);
+        assert!(compare_string(b"abc", b"abd", false) < 0);
+        assert_eq!(compare_string(b"abc", b"abcd", false), -1);
+        assert!(equal_string(b"Service", b"SERVICE", true));
+        assert!(prefix_string(b"\\Device", b"\\DEVICE\\Harddisk0", true));
+        assert_eq!(upper_string(b"aBz9!"), b"ABZ9!");
+        assert_eq!(upcase_ansi_byte(0xE9), 0xC9);
     }
 
     #[test]
