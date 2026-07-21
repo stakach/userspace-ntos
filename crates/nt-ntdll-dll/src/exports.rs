@@ -7029,6 +7029,36 @@ pub unsafe extern "system" fn rtl_copy_memory_non_temporal(
     unsafe { core::ptr::copy(src, dst, n) };
 }
 
+/// `RtlCopyMappedMemory(PVOID Destination, const VOID* Source, SIZE_T Size) -> NTSTATUS`.
+///
+/// # Safety
+/// `destination` writable for `size` bytes; `source` readable for `size` bytes.
+#[export_name = "RtlCopyMappedMemory"]
+pub unsafe extern "system" fn rtl_copy_mapped_memory(
+    destination: *mut u8,
+    source: *const u8,
+    size: usize,
+) -> NtStatus {
+    if size == 0 {
+        return STATUS_SUCCESS;
+    }
+    if destination.is_null() || source.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: caller supplies valid mapped regions per the ABI contract.
+    let (dst, src) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(destination, size),
+            core::slice::from_raw_parts(source, size),
+        )
+    };
+    if nt_ntdll::rtl::memory::copy_mapped_memory(dst, src) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_BUFFER_TOO_SMALL
+    }
+}
+
 // ---- RTL_MEMORY_STREAM family -------------------------------------------------------------------
 
 const S_OK: u32 = nt_ntdll::rtl::memstream::S_OK;
@@ -11640,6 +11670,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_compare_memory as usize,
         rtl_compare_memory_ulong as usize,
         rtl_copy_memory_non_temporal as usize,
+        rtl_copy_mapped_memory as usize,
         rtl_init_memory_stream as usize,
         rtl_init_out_of_process_memory_stream as usize,
         rtl_final_release_out_of_process_memory_stream as usize,
