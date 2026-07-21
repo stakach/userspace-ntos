@@ -4413,6 +4413,34 @@ pub unsafe extern "C" fn wcstombs(mbstr: *mut u8, wcstr: *const u16, count: usiz
     }
 }
 
+/// `mbstowcs(wchar_t* dst, const char* src, size_t count) -> size_t`.
+///
+/// # Safety
+/// `src` is NUL-terminated; `dst` is null or writable for `count` UTF-16 code units.
+#[export_name = "mbstowcs"]
+pub unsafe extern "C" fn mbstowcs(dst: *mut u16, src: *const u8, count: usize) -> usize {
+    if src.is_null() {
+        return usize::MAX;
+    }
+    // SAFETY: caller contract.
+    let src_len = unsafe { strlen_raw(src) };
+    if dst.is_null() {
+        return src_len;
+    }
+    let mut i = 0usize;
+    while i < count {
+        // SAFETY: caller contract; source is NUL-terminated.
+        let byte = unsafe { *src.add(i) };
+        // SAFETY: destination is writable for count code units.
+        unsafe { *dst.add(i) = nls_ansi_widen_byte(byte) };
+        if byte == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    count
+}
+
 /// `wcscpy(wchar_t* dst, const wchar_t* src) -> wchar_t*`.
 ///
 /// # Safety
@@ -6441,6 +6469,54 @@ pub unsafe extern "C" fn wtoi(s: *const u16) -> i32 {
     nt_ntdll::crt::atoi(&bytes)
 }
 
+/// `atol(const char*) -> long`.
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[export_name = "atol"]
+pub unsafe extern "C" fn atol(s: *const u8) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    let bytes = unsafe { core::slice::from_raw_parts(s, n) };
+    nt_ntdll::crt::atol(bytes)
+}
+
+/// `_atoi64(const char*) -> i64`.
+///
+/// # Safety
+/// `s` a NUL-terminated byte string.
+#[export_name = "_atoi64"]
+pub unsafe extern "C" fn atoi64(s: *const u8) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(s) };
+    let bytes = unsafe { core::slice::from_raw_parts(s, n) };
+    nt_ntdll::crt::atoi64(bytes)
+}
+
+/// `_wtoi64(const wchar_t*) -> i64`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "_wtoi64"]
+pub unsafe extern "C" fn wtoi64(s: *const u16) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    nt_ntdll::crt::wtoi64(ws)
+}
+
+/// `_wtol(const wchar_t*) -> long`.
+///
+/// # Safety
+/// `s` a NUL-terminated UTF-16 string.
+#[export_name = "_wtol"]
+pub unsafe extern "C" fn wtol(s: *const u16) -> i64 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    nt_ntdll::crt::wtol(ws)
+}
+
 /// `strtol(const char* s, char** endptr, int base) -> long`.
 ///
 /// # Safety
@@ -6509,6 +6585,142 @@ pub unsafe extern "C" fn wcstoul(s: *const u16, endptr: *mut *mut u16, base: i32
         unsafe { *endptr = s.add(n) as *mut u16 };
     }
     v
+}
+
+/// `_wcstoui64(const wchar_t* s, wchar_t** endptr, int base) -> u64`.
+///
+/// # Safety
+/// `s` NUL-terminated; `endptr` null or writable.
+#[export_name = "_wcstoui64"]
+pub unsafe extern "C" fn wcstoui64(s: *const u16, endptr: *mut *mut u16, base: i32) -> u64 {
+    // SAFETY: caller contract.
+    let n = unsafe { wcslen_raw(s) };
+    let ws = unsafe { core::slice::from_raw_parts(s, n) };
+    let (value, consumed) = nt_ntdll::crt::wcstoui64(ws, base as u32);
+    if !endptr.is_null() {
+        // SAFETY: endptr writable per the contract.
+        unsafe { *endptr = s.add(consumed) as *mut u16 };
+    }
+    value
+}
+
+unsafe fn write_narrow_ascii(buf: *mut u8, bytes: &[u8]) -> *mut u8 {
+    for (i, b) in bytes.iter().copied().enumerate() {
+        // SAFETY: caller supplies a large enough destination buffer.
+        unsafe { *buf.add(i) = b };
+    }
+    // SAFETY: caller supplies room for the terminator.
+    unsafe { *buf.add(bytes.len()) = 0 };
+    buf
+}
+
+unsafe fn write_wide_ascii(buf: *mut u16, bytes: &[u8]) -> *mut u16 {
+    for (i, b) in bytes.iter().copied().enumerate() {
+        // SAFETY: caller supplies a large enough destination buffer.
+        unsafe { *buf.add(i) = b as u16 };
+    }
+    // SAFETY: caller supplies room for the terminator.
+    unsafe { *buf.add(bytes.len()) = 0 };
+    buf
+}
+
+/// `_itoa(int value, char* buf, int radix) -> char*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_itoa"]
+pub unsafe extern "C" fn itoa(value: i32, buf: *mut u8, radix: i32) -> *mut u8 {
+    let rendered = nt_ntdll::crt::i32_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_narrow_ascii(buf, &rendered) }
+}
+
+/// `_ltoa(long value, char* buf, int radix) -> char*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_ltoa"]
+pub unsafe extern "C" fn ltoa(value: i32, buf: *mut u8, radix: i32) -> *mut u8 {
+    let rendered = nt_ntdll::crt::i32_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_narrow_ascii(buf, &rendered) }
+}
+
+/// `_ultoa(unsigned long value, char* buf, int radix) -> char*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_ultoa"]
+pub unsafe extern "C" fn ultoa(value: u32, buf: *mut u8, radix: i32) -> *mut u8 {
+    let rendered = nt_ntdll::crt::u32_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_narrow_ascii(buf, &rendered) }
+}
+
+/// `_i64toa(i64 value, char* buf, int radix) -> char*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_i64toa"]
+pub unsafe extern "C" fn i64toa(value: i64, buf: *mut u8, radix: i32) -> *mut u8 {
+    let rendered = nt_ntdll::crt::i64_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_narrow_ascii(buf, &rendered) }
+}
+
+/// `_ui64toa(u64 value, char* buf, int radix) -> char*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_ui64toa"]
+pub unsafe extern "C" fn ui64toa(value: u64, buf: *mut u8, radix: i32) -> *mut u8 {
+    let rendered = nt_ntdll::crt::u64_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_narrow_ascii(buf, &rendered) }
+}
+
+/// `_itow(int value, wchar_t* buf, int radix) -> wchar_t*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_itow"]
+pub unsafe extern "C" fn itow(value: i32, buf: *mut u16, radix: i32) -> *mut u16 {
+    let rendered = nt_ntdll::crt::i32_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_wide_ascii(buf, &rendered) }
+}
+
+/// `_ltow(long value, wchar_t* buf, int radix) -> wchar_t*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_ltow"]
+pub unsafe extern "C" fn ltow(value: i32, buf: *mut u16, radix: i32) -> *mut u16 {
+    let rendered = nt_ntdll::crt::i32_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_wide_ascii(buf, &rendered) }
+}
+
+/// `_i64tow(i64 value, wchar_t* buf, int radix) -> wchar_t*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_i64tow"]
+pub unsafe extern "C" fn i64tow(value: i64, buf: *mut u16, radix: i32) -> *mut u16 {
+    let rendered = nt_ntdll::crt::i64_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_wide_ascii(buf, &rendered) }
+}
+
+/// `_ui64tow(u64 value, wchar_t* buf, int radix) -> wchar_t*`.
+///
+/// # Safety
+/// `buf` large enough for the rendered value plus NUL.
+#[export_name = "_ui64tow"]
+pub unsafe extern "C" fn ui64tow(value: u64, buf: *mut u16, radix: i32) -> *mut u16 {
+    let rendered = nt_ntdll::crt::u64_to_string(value, radix);
+    // SAFETY: caller contract.
+    unsafe { write_wide_ascii(buf, &rendered) }
 }
 
 /// `_ultow(unsigned long value, wchar_t* buf, int radix) -> wchar_t*` — unsigned-to-wide-string.
@@ -6788,6 +7000,45 @@ pub extern "C" fn floor(x: f64) -> f64 {
     } else {
         t
     }
+}
+
+/// `ceil(double) -> double`.
+#[export_name = "ceil"]
+pub extern "C" fn ceil(x: f64) -> f64 {
+    let t = x as i64 as f64;
+    if t < x {
+        t + 1.0
+    } else {
+        t
+    }
+}
+
+/// `_lfind(const void* key, const void* base, unsigned int* num, unsigned int width, cmp) -> void*`.
+///
+/// # Safety
+/// `base` valid for `*num * width` bytes; `num` readable; `compar` a valid C comparator.
+#[export_name = "_lfind"]
+pub unsafe extern "C" fn lfind(
+    key: *const c_void,
+    base: *const c_void,
+    num: *const u32,
+    width: u32,
+    compar: extern "C" fn(*const c_void, *const c_void) -> i32,
+) -> *mut c_void {
+    if base.is_null() || num.is_null() || width == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: caller contract.
+    let count = unsafe { *num } as usize;
+    let width = width as usize;
+    for i in 0..count {
+        // SAFETY: i < count and base covers count*width bytes.
+        let elem = unsafe { (base as *const u8).add(i * width) } as *const c_void;
+        if compar(key, elem) == 0 {
+            return elem as *mut c_void;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 /// `bsearch(const void* key, const void* base, size_t num, size_t size, cmp) -> void*`. Generic
@@ -20116,6 +20367,7 @@ pub unsafe extern "C" fn export_anchor() {
         memset as usize,
         wcslen as usize,
         wcstombs as usize,
+        mbstowcs as usize,
         wcscpy as usize,
         wcsstr as usize,
         wcsicmp as usize,
@@ -20205,10 +20457,24 @@ pub unsafe extern "C" fn export_anchor() {
         wcsspn as usize,
         atoi as usize,
         wtoi as usize,
+        atol as usize,
+        atoi64 as usize,
+        wtoi64 as usize,
+        wtol as usize,
         strtol as usize,
         strtoul as usize,
         wcstol as usize,
         wcstoul as usize,
+        wcstoui64 as usize,
+        itoa as usize,
+        ltoa as usize,
+        ultoa as usize,
+        i64toa as usize,
+        ui64toa as usize,
+        itow as usize,
+        ltow as usize,
+        i64tow as usize,
+        ui64tow as usize,
         ultow as usize,
         abs as usize,
         labs as usize,
@@ -20243,6 +20509,8 @@ pub unsafe extern "C" fn export_anchor() {
         cos as usize,
         fabs as usize,
         floor as usize,
+        ceil as usize,
+        lfind as usize,
         bsearch as usize,
         qsort as usize,
         local_unwind as usize,

@@ -267,7 +267,7 @@ pub fn wcsstr(hay: &[u16], needle: &[u16]) -> Option<usize> {
 pub fn atoi(s: &[u8]) -> i32 {
     let n = strlen(s);
     let mut i = 0;
-    while i < n && (s[i] == b' ' || s[i] == b'\t') {
+    while i < n && ascii_is_space(s[i] as i32) {
         i += 1;
     }
     let (neg, start) = match s.get(i) {
@@ -285,9 +285,200 @@ pub fn atoi(s: &[u8]) -> i32 {
     v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// `atol`: parse a leading signed decimal long. Windows `long` is 32-bit; return widened to i64.
+pub fn atol(s: &[u8]) -> i64 {
+    atoi64(s).clamp(i32::MIN as i64, i32::MAX as i64)
+}
+
+/// `_atoi64`: parse a leading signed decimal i64.
+pub fn atoi64(s: &[u8]) -> i64 {
+    let n = strlen(s);
+    let mut i = 0;
+    while i < n && ascii_is_space(s[i] as i32) {
+        i += 1;
+    }
+    let (neg, start) = match s.get(i) {
+        Some(b'-') => (true, i + 1),
+        Some(b'+') => (false, i + 1),
+        _ => (false, i),
+    };
+    let limit = if neg {
+        (i64::MAX as u64) + 1
+    } else {
+        i64::MAX as u64
+    };
+    let mut acc = 0u64;
+    let mut j = start;
+    while j < n && ascii_is_digit(s[j] as i32) {
+        acc = acc
+            .saturating_mul(10)
+            .saturating_add((s[j] - b'0') as u64)
+            .min(limit);
+        j += 1;
+    }
+    if neg {
+        if acc == (i64::MAX as u64) + 1 {
+            i64::MIN
+        } else {
+            -(acc as i64)
+        }
+    } else {
+        acc as i64
+    }
+}
+
+/// `_wtoi64`: parse a leading signed decimal i64 from UTF-16 ASCII digits.
+pub fn wtoi64(s: &[u16]) -> i64 {
+    let bytes: Vec<u8> = s[..wcslen(s)].iter().map(|&w| (w & 0xFF) as u8).collect();
+    atoi64(&bytes)
+}
+
+/// `_wtol`: parse a leading signed decimal long from UTF-16 ASCII digits.
+pub fn wtol(s: &[u16]) -> i64 {
+    wtoi64(s).clamp(i32::MIN as i64, i32::MAX as i64)
+}
+
 /// `strtoul` (the pure core): parse an unsigned integer in `base` (0 auto-detects `0x`/`0`).
 pub fn strtoul(s: &[u8], base: u32) -> u32 {
     crate::rtl::integer::char_to_integer(&s[..strlen(s)], base).unwrap_or(0)
+}
+
+/// `_wcstoui64`: parse an unsigned i64-sized integer from UTF-16 ASCII digits.
+///
+/// Returns the value and the consumed UTF-16 code-unit count for `endptr`.
+pub fn wcstoui64(s: &[u16], base: u32) -> (u64, usize) {
+    let n = wcslen(s);
+    let mut i = 0usize;
+    while i < n && ascii_is_space(s[i] as i32) {
+        i += 1;
+    }
+    let original = 0usize;
+    let neg = match s.get(i).copied() {
+        Some(c) if c == b'-' as u16 => {
+            i += 1;
+            true
+        }
+        Some(c) if c == b'+' as u16 => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+
+    let mut radix = if (2..=36).contains(&base) { base } else { 0 };
+    if radix == 0 {
+        if i + 1 < n
+            && s[i] == b'0' as u16
+            && matches!(s[i + 1], c if c == b'x' as u16 || c == b'X' as u16)
+        {
+            radix = 16;
+            i += 2;
+        } else if i < n && s[i] == b'0' as u16 {
+            radix = 8;
+        } else {
+            radix = 10;
+        }
+    } else if radix == 16
+        && i + 1 < n
+        && s[i] == b'0' as u16
+        && matches!(s[i + 1], c if c == b'x' as u16 || c == b'X' as u16)
+    {
+        i += 2;
+    }
+
+    let digits_start = i;
+    let mut value = 0u64;
+    while i < n {
+        let Some(digit) = ascii_digit_value(s[i] as i32) else {
+            break;
+        };
+        if digit >= radix {
+            break;
+        }
+        value = value
+            .saturating_mul(radix as u64)
+            .saturating_add(digit as u64);
+        i += 1;
+    }
+    if i == digits_start {
+        return (0, original);
+    }
+    if neg {
+        (0u64.wrapping_sub(value), i)
+    } else {
+        (value, i)
+    }
+}
+
+fn ascii_digit_value(c: i32) -> Option<u32> {
+    match c {
+        c if (b'0' as i32..=b'9' as i32).contains(&c) => Some((c - b'0' as i32) as u32),
+        c if (b'a' as i32..=b'z' as i32).contains(&c) => Some((c - b'a' as i32) as u32 + 10),
+        c if (b'A' as i32..=b'Z' as i32).contains(&c) => Some((c - b'A' as i32) as u32 + 10),
+        _ => None,
+    }
+}
+
+fn normalize_radix(radix: i32) -> u32 {
+    if (2..=36).contains(&radix) {
+        radix as u32
+    } else {
+        10
+    }
+}
+
+/// Render an unsigned 32-bit value using `_ultoa` semantics.
+pub fn u32_to_string(value: u32, radix: i32) -> Vec<u8> {
+    u64_to_string(value as u64, radix)
+}
+
+/// Render an unsigned 64-bit value using `_ui64toa` semantics.
+pub fn u64_to_string(mut value: u64, radix: i32) -> Vec<u8> {
+    let radix = normalize_radix(radix) as u64;
+    if value == 0 {
+        return alloc::vec![b'0'];
+    }
+    let mut tmp = [0u8; 64];
+    let mut n = 0usize;
+    while value != 0 {
+        let d = (value % radix) as u8;
+        tmp[n] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        n += 1;
+        value /= radix;
+    }
+    tmp[..n].iter().rev().copied().collect()
+}
+
+/// Render a signed 32-bit value using `_itoa` / `_ltoa` semantics.
+pub fn i32_to_string(value: i32, radix: i32) -> Vec<u8> {
+    let radix = normalize_radix(radix);
+    if value < 0 && radix == 10 {
+        let mut out = alloc::vec![b'-'];
+        out.extend(u64_to_string((value as i64).unsigned_abs(), radix as i32));
+        out
+    } else {
+        u64_to_string(value as u32 as u64, radix as i32)
+    }
+}
+
+/// Render a signed 64-bit value using `_i64toa` semantics.
+pub fn i64_to_string(value: i64, radix: i32) -> Vec<u8> {
+    let radix = normalize_radix(radix);
+    if value < 0 && radix == 10 {
+        let mut out = alloc::vec![b'-'];
+        out.extend(u64_to_string(
+            (value as i128).unsigned_abs() as u64,
+            radix as i32,
+        ));
+        out
+    } else {
+        u64_to_string(value as u64, radix as i32)
+    }
+}
+
+/// Convert an ASCII byte string to a UTF-16 byte-for-code-unit vector for `_itow`-family exports.
+pub fn ascii_bytes_to_wide(bytes: &[u8]) -> Vec<u16> {
+    bytes.iter().copied().map(u16::from).collect()
 }
 
 // --- formatting (_snprintf core, decimal/hex only) --------------------------------------------
@@ -445,6 +636,12 @@ mod tests {
     use core::cmp::Ordering;
     use std::vec;
 
+    fn w(s: &str) -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    }
+
     #[test]
     fn narrow_str_ops() {
         assert_eq!(strlen(b"hello\0world"), 5);
@@ -488,11 +685,6 @@ mod tests {
 
     #[test]
     fn wide_str_ops() {
-        let w = |s: &str| -> Vec<u16> {
-            let mut v: Vec<u16> = s.encode_utf16().collect();
-            v.push(0);
-            v
-        };
         assert_eq!(wcslen(&w("system32")), 8);
         assert_eq!(wcscmp(&w("aaa"), &w("aab")), Ordering::Less);
         assert_eq!(wcsicmp(&w("Ntdll"), &w("NTDLL")), Ordering::Equal);
@@ -506,8 +698,25 @@ mod tests {
     fn parse() {
         assert_eq!(atoi(b"  -42abc\0"), -42);
         assert_eq!(atoi(b"2147483648\0"), i32::MAX); // saturates
+        assert_eq!(atol(b"2147483648\0"), i32::MAX as i64);
+        assert_eq!(atoi64(b" -9223372036854775809\0"), i64::MIN);
+        assert_eq!(atoi64(b"9223372036854775808\0"), i64::MAX);
         assert_eq!(strtoul(b"0xFF\0", 0), 255);
         assert_eq!(strtoul(b"777\0", 8), 0o777);
+        let wide_hex = w("  -0x2a tail");
+        assert_eq!(wcstoui64(&wide_hex, 0), (0u64.wrapping_sub(0x2A), 7));
+        assert_eq!(wtoi64(&w("-42")), -42);
+        assert_eq!(wtol(&w("2147483648")), i32::MAX as i64);
+    }
+
+    #[test]
+    fn integer_to_string() {
+        assert_eq!(i32_to_string(-42, 10), b"-42");
+        assert_eq!(i32_to_string(-1, 16), b"ffffffff");
+        assert_eq!(u32_to_string(35, 36), b"z");
+        assert_eq!(i64_to_string(i64::MIN, 10), b"-9223372036854775808");
+        assert_eq!(u64_to_string(u64::MAX, 16), b"ffffffffffffffff");
+        assert_eq!(ascii_bytes_to_wide(b"-42"), vec![45, 52, 50]);
     }
 
     #[test]
