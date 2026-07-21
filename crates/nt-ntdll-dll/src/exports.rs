@@ -7914,22 +7914,36 @@ pub unsafe extern "system" fn rtl_image_rva_to_va(
     }
 }
 
-/// `RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage) -> PVOID` — find the image base containing
-/// PC. No dynamic module map here; return NULL (unknown), with `*BaseOfImage=NULL`. The boot path
-/// only calls this from the SEH unwinder (which doesn't run on the normal path).
+/// `RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage) -> PVOID` — find the loader module whose
+/// image range contains `PcValue` and return that module's base.
 ///
 /// # Safety
 /// `base_of_image` null or writable.
 #[export_name = "RtlPcToFileHeader"]
 pub unsafe extern "system" fn rtl_pc_to_file_header(
-    _pc_value: *mut c_void,
+    pc_value: *mut c_void,
     base_of_image: *mut *mut c_void,
 ) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    let image_base = unsafe {
+        let entry = find_ldr_entry_for_address(pc_value as u64);
+        if entry == 0 {
+            core::ptr::null_mut()
+        } else {
+            core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) as *mut c_void
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let image_base = {
+        let _ = pc_value;
+        core::ptr::null_mut()
+    };
+
     if !base_of_image.is_null() {
         // SAFETY: writable per the contract.
-        unsafe { *base_of_image = core::ptr::null_mut() };
+        unsafe { *base_of_image = image_base };
     }
-    core::ptr::null_mut()
+    image_base
 }
 
 // ---- handle tables (RTL_HANDLE_TABLE) — real inline single-threaded --------------------------------
