@@ -486,6 +486,12 @@ pub const PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA: u64 = 0x2e100;
 pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
 /// SSN NtUserRedrawWindow — SSDT idx 0x012 (w32ksvc64.h: `SVC_(UserRedrawWindow, 4) // 0x1012`).
 pub const SSN_NT_USER_REDRAW_WINDOW: u64 = 0x1012;
+/// SSN NtUserSetProcessWindowStation — win32k's real PROCESSINFO/EPROCESS station association.
+pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
+/// Class registration and window creation SSNs used by the bounded status-dialog diagnostic.
+const SSN_NT_USER_REGISTER_CLASS_EX_WOW: u64 = 0x10b4;
+const SSN_NT_USER_CREATE_WINDOW_EX: u64 = 0x1077;
+const FNID_STATIC: u64 = 0x2a8;
 
 /// `co_IntGraphicsCheck(BOOL Create)` RVA (guicheck.c) — win32k's AUTHENTIC lazy-graphics entry.
 /// Disasm-confirmed for THIS build (0.4.17): prologue at 0x7a100 does
@@ -1010,15 +1016,27 @@ extern "win64" fn s_ob_reference_object_by_handle(
     obj_type: u64,
     _mode: u64,
     object_out: *mut u64,
+    handle_info: *mut u8,
 ) -> i32 {
+    if !object_out.is_null() {
+        unsafe { write_unaligned(object_out, 0) };
+    }
     let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
-    let obj = match table.lookup(handle) {
+    let (obj, granted_access) = match table.lookup(handle) {
         Some((kind, body)) => {
             if !nt_object_manager::win32k_ob::object_type_matches(kind, obj_type) {
                 ob_type_mismatch_trace(handle, obj_type, b"win32k-obj");
                 return STATUS_OBJECT_TYPE_MISMATCH;
             }
-            body
+            let access = match kind {
+                // winuser.h: WINSTA_ALL_ACCESS / DESKTOP_ALL_ACCESS. The modeled objects are
+                // created with MAXIMUM_ALLOWED, and duplicate aliases preserve the same grant.
+                ObKind::WindowStation => 0x000f_037f,
+                ObKind::Desktop => 0x000f_01ff,
+                ObKind::Event => 0x001f_0003,
+                ObKind::Other => u32::MAX,
+            };
+            (body, access)
         }
         None => {
             let process_ty = nt_object_manager::object_type::process_object_type_addr();
@@ -1029,11 +1047,11 @@ extern "win64" fn s_ob_reference_object_by_handle(
                     ob_type_mismatch_trace(handle, obj_type, b"process-connect");
                     return STATUS_OBJECT_TYPE_MISMATCH;
                 }
-                PH_EPROCESS_VA
+                (PH_EPROCESS_VA, u32::MAX)
             } else if obj_type == 0 || obj_type == process_ty {
                 // A polymorphic (NULL) or process-typed reference to some other unregistered handle →
                 // the EPROCESS fallback (unchanged; no modeled object to verify against).
-                PH_EPROCESS_VA
+                (PH_EPROCESS_VA, u32::MAX)
             } else {
                 // A SPECIFIC non-process ExpectedType against an unregistered handle. Every modeled
                 // typed object resolves above; reaching here is a real type requirement we don't model
@@ -1047,7 +1065,71 @@ extern "win64" fn s_ob_reference_object_by_handle(
     if !object_out.is_null() {
         unsafe { write_unaligned(object_out, obj) };
     }
+    if !handle_info.is_null() {
+        unsafe {
+            // OBJECT_HANDLE_INFORMATION { ULONG HandleAttributes; ACCESS_MASK GrantedAccess; }
+            write_unaligned(handle_info as *mut u32, 0);
+            write_unaligned(handle_info.add(4) as *mut u32, granted_access);
+        }
+    }
     0
+}
+
+/// `EPROCESS.Win32WindowStation` in the staged ReactOS kernel ABI. Keeping the cache in the actual
+/// process body also serves win32k call sites that read `PsGetCurrentProcess()->Win32WindowStation`
+/// directly instead of using the Ps getter import.
+const EPROCESS_WIN32_WINDOW_STATION_OFF: u64 = 0x208;
+
+extern "win64" fn s_ps_get_process_winsta(process: u64) -> u64 {
+    if process == 0 {
+        0
+    } else {
+        unsafe { read_volatile((process + EPROCESS_WIN32_WINDOW_STATION_OFF) as *const u64) }
+    }
+}
+
+extern "win64" fn s_ps_set_process_winsta(process: u64, handle: u64) {
+    if process != 0 {
+        unsafe {
+            write_volatile((process + EPROCESS_WIN32_WINDOW_STATION_OFF) as *mut u64, handle);
+        }
+    }
+}
+
+/// `ZwDuplicateObject`: duplicate a modeled USER handle into an independently closeable alias.
+extern "win64" fn s_zw_duplicate_object(
+    _source_process: u64,
+    source_handle: u64,
+    _target_process: u64,
+    target_handle: *mut u64,
+    _desired_access: u64,
+    _handle_attributes: u64,
+    _options: u64,
+) -> i32 {
+    if target_handle.is_null() {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    unsafe { write_unaligned(target_handle, 0) };
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
+    match table.duplicate(source_handle) {
+        Some(alias) => {
+            unsafe { write_unaligned(target_handle, alias) };
+            0
+        }
+        None if table.lookup(source_handle).is_none() => 0xC000_0008u32 as i32,
+        None => 0xC000_009Au32 as i32,
+    }
+}
+
+/// `ObCloseHandle`: duplicated aliases have handle lifetime; canonical pool-backed objects have
+/// session lifetime in this host and remain registered after a successful close.
+extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
+    if table.close(handle) || table.lookup(handle).is_some() {
+        0
+    } else {
+        0xC000_0008u32 as i32 // STATUS_INVALID_HANDLE
+    }
 }
 
 /// Diagnostic for an `ObReferenceObjectByHandle` ExpectedType mismatch — prints the handle, the
@@ -2557,6 +2639,8 @@ fn register_trampolines() {
     reg.bind("ObOpenObjectByName", s_ob_open_object_by_name as usize as u64);
     reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
+    reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
+    reg.bind("ZwDuplicateObject", s_zw_duplicate_object as usize as u64);
     // --- batch 2: RTL heap (win32k session heap) ---
     reg.bind("RtlCreateHeap", s_rtl_create_heap as usize as u64);
     reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as usize as u64);
@@ -2630,6 +2714,8 @@ fn register_trampolines() {
     reg.bind("PsGetThreadWin32Thread", s_get_win32thread as usize as u64);
     reg.bind("PsSetProcessWin32Process", s_set_win32process as usize as u64);
     reg.bind("PsSetThreadWin32Thread", s_set_win32thread as usize as u64);
+    reg.bind("PsGetProcessWin32WindowStation", s_ps_get_process_winsta as usize as u64);
+    reg.bind("PsSetProcessWindowStation", s_ps_set_process_winsta as usize as u64);
     reg.bind("PsEstablishWin32Callouts", s_establish_win32_callouts as usize as u64);
     // --- batch 4: misc scalars ---
     reg.bind("IoGetDeviceObjectPointer", s_io_get_device_object_pointer as usize as u64);
@@ -3172,6 +3258,125 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     (status, 0)
 }
 
+/// Print the string payload of a user `UNICODE_STRING`/`LARGE_STRING` descriptor. Both x64 layouts
+/// place the byte length at +0 (USHORT vs ULONG) and Buffer at +8; the low 16-bit length is enough
+/// for class names. A direct low-valued pointer is an atom, as accepted by CreateWindowEx.
+unsafe fn print_counted_utf16(descriptor: u64) {
+    if descriptor <= 0xffff {
+        print_str(b"<atom ");
+        print_hex(descriptor as u32);
+        print_str(b">");
+        return;
+    }
+    let len = read_unaligned(descriptor as *const u16) as usize / 2;
+    let buffer = read_unaligned((descriptor + 8) as *const u64);
+    if buffer == 0 {
+        print_str(b"<null>");
+        return;
+    }
+    let mut ascii = [0u8; 32];
+    let count = len.min(ascii.len());
+    for (i, byte) in ascii.iter_mut().take(count).enumerate() {
+        let ch = read_unaligned((buffer + (i * 2) as u64) as *const u16);
+        *byte = if (0x20..=0x7e).contains(&ch) { ch as u8 } else { b'?' };
+    }
+    print_str(&ascii[..count]);
+}
+
+unsafe fn counted_utf16_eq_ascii(descriptor: u64, expected: &[u8]) -> bool {
+    if descriptor <= 0xffff {
+        return false;
+    }
+    let len = read_unaligned(descriptor as *const u16) as usize / 2;
+    let buffer = read_unaligned((descriptor + 8) as *const u64);
+    if buffer == 0 || len != expected.len() {
+        return false;
+    }
+    expected.iter().enumerate().all(|(i, expected_byte)| {
+        read_unaligned((buffer + (i * 2) as u64) as *const u16) == *expected_byte as u16
+    })
+}
+
+unsafe fn trace_class_process_state() {
+    const PROCESSINFO_FLAGS_OFF: u64 = 0x0c;
+    const PROCESSINFO_PRIVATE_CLASSES_OFF: u64 = 0xf0;
+    const PROCESSINFO_PUBLIC_CLASSES_OFF: u64 = 0xf8;
+    let pti = read_volatile(SLOT_W32THREAD as *const u64);
+    let slot_ppi = read_volatile(SLOT_W32PROCESS as *const u64);
+    let pti_ppi = if pti != 0 {
+        read_volatile((pti + THREADINFO_PPI_OFF) as *const u64)
+    } else {
+        0
+    };
+    let ppi = if pti_ppi != 0 { pti_ppi } else { slot_ppi };
+    print_str(b"[class-diag] pti=");
+    print_hex((pti >> 32) as u32);
+    print_hex(pti as u32);
+    print_str(b" pti.ppi=");
+    print_hex((pti_ppi >> 32) as u32);
+    print_hex(pti_ppi as u32);
+    print_str(b" slot.ppi=");
+    print_hex((slot_ppi >> 32) as u32);
+    print_hex(slot_ppi as u32);
+    if ppi != 0 {
+        print_str(b" flags=");
+        print_hex(read_volatile((ppi + PROCESSINFO_FLAGS_OFF) as *const u32));
+        print_str(b" private=");
+        let private = read_volatile((ppi + PROCESSINFO_PRIVATE_CLASSES_OFF) as *const u64);
+        print_hex((private >> 32) as u32);
+        print_hex(private as u32);
+        print_str(b" public=");
+        let public = read_volatile((ppi + PROCESSINFO_PUBLIC_CLASSES_OFF) as *const u64);
+        print_hex((public >> 32) as u32);
+        print_hex(public as u32);
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_public_classes(reason: &[u8]) {
+    const PROCESSINFO_PUBLIC_CLASSES_OFF: u64 = 0xf8;
+    let pti = read_volatile(SLOT_W32THREAD as *const u64);
+    let slot_ppi = read_volatile(SLOT_W32PROCESS as *const u64);
+    let pti_ppi = if pti != 0 {
+        read_volatile((pti + THREADINFO_PPI_OFF) as *const u64)
+    } else {
+        0
+    };
+    let ppi = if pti_ppi != 0 { pti_ppi } else { slot_ppi };
+    print_str(b"[class-diag] public classes ");
+    print_str(reason);
+    print_str(b"\n");
+    if ppi == 0 {
+        return;
+    }
+    let mut cls = read_volatile((ppi + PROCESSINFO_PUBLIC_CLASSES_OFF) as *const u64);
+    for index in 0..24u32 {
+        if cls == 0 {
+            break;
+        }
+        let next = read_volatile(cls as *const u64);
+        let atom = read_volatile((cls + 8) as *const u16);
+        let atom_nv = read_volatile((cls + 10) as *const u16);
+        let fnid = read_volatile((cls + 12) as *const u32);
+        print_str(b"[class-diag] node=");
+        print_hex(index);
+        print_str(b" cls=");
+        print_hex((cls >> 32) as u32);
+        print_hex(cls as u32);
+        print_str(b" atom=");
+        print_hex(atom as u32);
+        print_str(b" nv=");
+        print_hex(atom_nv as u32);
+        print_str(b" fnid=");
+        print_hex(fnid);
+        print_str(b" next=");
+        print_hex((next >> 32) as u32);
+        print_hex(next as u32);
+        print_str(b"\n");
+        cls = next;
+    }
+}
+
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
 /// invoke its handler with up to four win64 register args. Returns the handler NTSTATUS (or
 /// `STATUS_INVALID_SYSTEM_SERVICE` if the SSN is out of range / unregistered).
@@ -3196,8 +3401,20 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     // NtUserCreateWindowEx = 15 args) we transmute to the exact-arity fn type so Rust/LLVM places
     // args 5..N on the stack per win64 — delivering hMenu et al. correctly instead of garbage.
     let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
+    let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let sh = WIN32K_SHARED_VADDR;
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
+    let register_fnid = if client_pi == 2 && ssn == SSN_NT_USER_REGISTER_CLASS_EX_WOW {
+        s(4)
+    } else {
+        0
+    };
+    let trace_static_create = client_pi == 2
+        && ssn == SSN_NT_USER_CREATE_WINDOW_EX
+        && counted_utf16_eq_ascii(a1, b"Static");
+    if trace_static_create {
+        trace_public_classes(b"before Static CreateWindowEx");
+    }
     // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
     // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
     // returns TRUE with ZERO paint work — desktop.c:2996); (2) NrGuiAppsRunning (if != 0, co_AddGuiApp's
@@ -3240,6 +3457,23 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             s(15),
         )
     };
+
+    if client_pi == 2 && ssn == SSN_NT_USER_REGISTER_CLASS_EX_WOW {
+        print_str(b"[class-diag] RegisterClass name=");
+        print_counted_utf16(a1);
+        print_str(b" fnid=0x");
+        print_hex(register_fnid as u32);
+        print_str(b" atom=0x");
+        print_hex(ret as u32);
+        print_str(b"\n");
+        trace_class_process_state();
+        if register_fnid == FNID_STATIC {
+            trace_public_classes(b"after Static RegisterClass");
+        }
+    }
+    if trace_static_create && ret == 0 {
+        trace_public_classes(b"after failed Static CreateWindowEx");
+    }
 
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
     //
@@ -3650,14 +3884,44 @@ unsafe fn create_winsta_and_desktop() {
     let winsta_name = [0x57u16, 0x69, 0x6e, 0x53, 0x74, 0x61, 0x30];
     let oa_ws = build_object_attributes(&winsta_name);
     print_str(b"[win32k-host] NtUserCreateWindowStation(WinSta0)...\n");
-    let cws: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> i32 =
+    let cws: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
         core::mem::transmute((WIN32K_CODE_VA + NT_USER_CREATE_WINDOW_STATION_RVA) as *const ());
     let hws = cws(oa_ws, MAXIMUM_ALLOWED, 0, 0, 0, 0, 0);
     print_str(b"[win32k-host] NtUserCreateWindowStation -> hWinSta=0x");
+    print_hex((hws >> 32) as u32);
     print_hex(hws as u32);
     print_str(b" (winsta body=0x");
     print_hex((*core::ptr::addr_of!(OBJ_TABLE)).cached_winsta_body() as u32);
     print_str(b")\n");
+
+    // Follow winlogon's real ordering: CreateWindowStation -> SetProcessWindowStation ->
+    // CreateDesktop. The setter validates the real object handle, duplicates its EPROCESS cache
+    // handle, and fills PROCESSINFO::{prpwinsta,hwinsta,amwinsta,W32PF_flags} inside win32k.
+    let ssdt = read_volatile((WIN32K_SHARED_VADDR + SH_SSDT_BASE) as *const u64);
+    if ssdt == 0 || hws == 0 {
+        print_str(b"[win32k-host] ERROR: cannot associate WinSta0 with current process\n");
+        return;
+    }
+    let set_winsta_handler = read_volatile(
+        (ssdt + (SSN_NT_USER_SET_PROCESS_WINDOW_STATION - WIN32K_SERVICE_BASE) * 8) as *const u64,
+    );
+    if set_winsta_handler == 0 {
+        print_str(b"[win32k-host] ERROR: cannot associate WinSta0 with current process\n");
+        return;
+    }
+    let set_winsta: extern "win64" fn(u64) -> i32 =
+        core::mem::transmute(set_winsta_handler as *const ());
+    let set_winsta_ret = set_winsta(hws);
+    print_str(b"[win32k-host] NtUserSetProcessWindowStation -> ret=0x");
+    print_hex(set_winsta_ret as u32);
+    print_str(b" cache=0x");
+    let cached_winsta = s_ps_get_process_winsta(PH_EPROCESS_VA);
+    print_hex(cached_winsta as u32);
+    print_str(b"\n");
+    if set_winsta_ret == 0 || cached_winsta == 0 {
+        print_str(b"[win32k-host] ERROR: NtUserSetProcessWindowStation failed\n");
+        return;
+    }
 
     // "Default"
     let desk_name = [0x44u16, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74];
