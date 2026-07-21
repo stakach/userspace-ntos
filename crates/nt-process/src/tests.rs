@@ -94,6 +94,12 @@ fn handle_table_operations() {
     // Duplicate into p2's table.
     let h2 = pm.duplicate_handle(p1, h, p2).unwrap();
     assert_eq!(pm.lookup_handle(p2, h2), Some(HandleObject::Process(p2)));
+    assert_eq!(pm.handle_access(p2, h2), Some(0x1F_0000));
+    let h3 = pm
+        .duplicate_handle_with_access(p1, h, p2, Some(0x100000))
+        .unwrap();
+    assert_eq!(pm.lookup_handle(p2, h3), Some(HandleObject::Process(p2)));
+    assert_eq!(pm.handle_access(p2, h3), Some(0x100000));
     // Close.
     pm.close_handle(p1, h).unwrap();
     assert_eq!(pm.lookup_handle(p1, h), None);

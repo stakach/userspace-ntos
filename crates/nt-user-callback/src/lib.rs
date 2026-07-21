@@ -309,15 +309,26 @@ impl Default for WinlogonDialogCorrelation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DialogModalPumpSequence {
     completed_steps: u8,
+    paint_dispatches: u16,
+    phase: u8,
+    drained: bool,
 }
 
 impl DialogModalPumpSequence {
     pub const fn new() -> Self {
-        Self { completed_steps: 0 }
+        Self {
+            completed_steps: 0,
+            paint_dispatches: 0,
+            phase: 0,
+            drained: false,
+        }
     }
 
     pub const fn expected_ssn(self) -> Option<u64> {
-        match self.completed_steps {
+        if self.drained {
+            return None;
+        }
+        match self.phase {
             0 => Some(NTUSER_PEEK_MESSAGE_SSN),
             1 => Some(NTUSER_GET_MESSAGE_SSN),
             2 => Some(NTUSER_DISPATCH_MESSAGE_SSN),
@@ -334,25 +345,48 @@ impl DialogModalPumpSequence {
         if self.expected_ssn() != Some(ssn) {
             return Err(ValidationError::Sequence);
         }
-        let valid = match self.completed_steps {
-            0 => result == 0 && message.is_none(),
-            1 => result == 1 && message == Some(WM_PAINT),
-            2 => message == Some(WM_PAINT),
-            _ => false,
-        };
-        if !valid {
-            return Err(ValidationError::Sequence);
+        match self.phase {
+            0 if result == 0 && message.is_none() => {
+                if self.paint_dispatches != 0 {
+                    self.drained = true;
+                } else {
+                    self.phase = 1;
+                }
+            }
+            0 | 1 if result == 1 && message == Some(WM_PAINT) => self.phase = 2,
+            0 | 1 if result == 1 && message.is_some() => self.phase = 0,
+            2 if message == Some(WM_PAINT) => {
+                self.paint_dispatches = self
+                    .paint_dispatches
+                    .checked_add(1)
+                    .ok_or(ValidationError::Sequence)?;
+                self.phase = 0;
+            }
+            _ => return Err(ValidationError::Sequence),
         }
-        self.completed_steps += 1;
+        self.completed_steps = match (self.paint_dispatches, self.phase) {
+            (0, 0) => 0,
+            (0, 1) => 1,
+            (0, 2) => 2,
+            _ => 3,
+        };
         Ok(())
     }
 
     pub const fn is_complete(self) -> bool {
-        self.completed_steps == 3
+        self.paint_dispatches != 0
     }
 
     pub const fn completed_steps(self) -> u8 {
         self.completed_steps
+    }
+
+    pub const fn paint_dispatches(self) -> u16 {
+        self.paint_dispatches
+    }
+
+    pub const fn is_drained(self) -> bool {
+        self.drained
     }
 }
 
@@ -412,6 +446,7 @@ impl Default for SasWmCreateNestedSequence {
 /// able to grow executive state without limit. Eight alternating frames permit four complete
 /// dispatch/callback levels, which is deliberately more than the create-time SAS paths need.
 pub const MAX_CONTINUATION_DEPTH: usize = 8;
+pub const MAX_ACTIVE_CALLBACK_DEPTH: usize = MAX_CONTINUATION_DEPTH / 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientThreadIdentity {
@@ -661,6 +696,150 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
 }
 
 impl<const DEPTH: usize> Default for ContinuationStack<DEPTH> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveCallbackFrame {
+    request: CallbackHeader,
+    saved_user_context: [u64; 20],
+    outer_resume_ip: u64,
+    redirected: bool,
+}
+
+impl ActiveCallbackFrame {
+    const fn empty() -> Self {
+        Self {
+            request: CallbackHeader::idle(0, 0, 0, 0),
+            saved_user_context: [0; 20],
+            outer_resume_ip: 0,
+            redirected: false,
+        }
+    }
+
+    pub const fn request(&self) -> &CallbackHeader {
+        &self.request
+    }
+
+    pub const fn saved_user_context(&self) -> &[u64; 20] {
+        &self.saved_user_context
+    }
+
+    pub const fn outer_resume_ip(&self) -> u64 {
+        self.outer_resume_ip
+    }
+
+    pub const fn is_redirected(&self) -> bool {
+        self.redirected
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveCallbackStack<const DEPTH: usize = MAX_ACTIVE_CALLBACK_DEPTH> {
+    frames: [ActiveCallbackFrame; DEPTH],
+    len: usize,
+}
+
+impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
+    pub const fn new() -> Self {
+        Self {
+            frames: [ActiveCallbackFrame::empty(); DEPTH],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn top(&self) -> Option<&ActiveCallbackFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(&self.frames[self.len - 1])
+        }
+    }
+
+    pub fn push(&mut self, request: CallbackHeader) -> Result<(), ValidationError> {
+        validate_request(&request)?;
+        if self.len == DEPTH {
+            return Err(ValidationError::Length);
+        }
+        self.frames[self.len] = ActiveCallbackFrame {
+            request,
+            saved_user_context: [0; 20],
+            outer_resume_ip: 0,
+            redirected: false,
+        };
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn record_redirect(
+        &mut self,
+        correlation: CallbackCorrelation,
+        saved_user_context: [u64; 20],
+        outer_resume_ip: u64,
+    ) -> Result<(), ValidationError> {
+        let frame = self
+            .len
+            .checked_sub(1)
+            .map(|index| &mut self.frames[index])
+            .ok_or(ValidationError::State)?;
+        if !correlation.matches_request(&frame.request) {
+            return Err(ValidationError::Correlation);
+        }
+        if frame.redirected || outer_resume_ip == 0 {
+            return Err(ValidationError::State);
+        }
+        frame.saved_user_context = saved_user_context;
+        frame.outer_resume_ip = outer_resume_ip;
+        frame.redirected = true;
+        Ok(())
+    }
+
+    pub fn pop(
+        &mut self,
+        correlation: CallbackCorrelation,
+    ) -> Result<ActiveCallbackFrame, ValidationError> {
+        let index = self.len.checked_sub(1).ok_or(ValidationError::State)?;
+        let frame = self.frames[index];
+        if !frame.redirected {
+            return Err(ValidationError::State);
+        }
+        if !correlation.matches_request(&frame.request) {
+            return Err(ValidationError::Correlation);
+        }
+        self.frames[index] = ActiveCallbackFrame::empty();
+        self.len = index;
+        Ok(frame)
+    }
+
+    pub fn cancel_pending(
+        &mut self,
+        correlation: CallbackCorrelation,
+    ) -> Result<ActiveCallbackFrame, ValidationError> {
+        let index = self.len.checked_sub(1).ok_or(ValidationError::State)?;
+        let frame = self.frames[index];
+        if frame.redirected {
+            return Err(ValidationError::State);
+        }
+        if !correlation.matches_request(&frame.request) {
+            return Err(ValidationError::Correlation);
+        }
+        self.frames[index] = ActiveCallbackFrame::empty();
+        self.len = index;
+        Ok(frame)
+    }
+}
+
+impl<const DEPTH: usize> Default for ActiveCallbackStack<DEPTH> {
     fn default() -> Self {
         Self::new()
     }
@@ -1132,11 +1311,18 @@ mod tests {
             Ok(())
         );
         assert!(sequence.is_complete());
+        assert_eq!(sequence.paint_dispatches(), 1);
+        assert_eq!(sequence.expected_ssn(), Some(NTUSER_PEEK_MESSAGE_SSN));
+        assert_eq!(
+            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None),
+            Ok(())
+        );
+        assert!(sequence.is_drained());
         assert_eq!(sequence.expected_ssn(), None);
     }
 
     #[test]
-    fn dialog_modal_pump_sequence_rejects_blocking_or_nonpaint_path() {
+    fn dialog_modal_pump_sequence_rejects_invalid_or_mismatched_dispatch() {
         let mut sequence = DialogModalPumpSequence::new();
         assert_eq!(
             sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(WM_PAINT)),
@@ -1149,8 +1335,70 @@ mod tests {
         assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
         assert_eq!(
             sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(0x0110)),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_DISPATCH_MESSAGE_SSN, 1, Some(WM_PAINT)),
             Err(ValidationError::Sequence)
         );
+    }
+
+    #[test]
+    fn dialog_modal_pump_allows_unrelated_messages_before_real_paint() {
+        let mut sequence = DialogModalPumpSequence::new();
+        assert_eq!(
+            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 1, Some(WLX_WM_SAS)),
+            Ok(())
+        );
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert_eq!(
+            sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_DISPATCH_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert_eq!(sequence.paint_dispatches(), 1);
+        assert!(sequence.is_drained());
+    }
+
+    #[test]
+    fn dialog_modal_pump_ignores_normalized_unrelated_paint() {
+        let mut sequence = DialogModalPumpSequence::new();
+        assert_eq!(
+            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 1, Some(u32::MAX)),
+            Ok(())
+        );
+        assert_eq!(sequence.paint_dispatches(), 0);
+        assert_eq!(sequence.expected_ssn(), Some(NTUSER_PEEK_MESSAGE_SSN));
+        assert!(!sequence.is_complete());
+    }
+
+    #[test]
+    fn dialog_modal_pump_drains_multiple_real_paints() {
+        let mut sequence = DialogModalPumpSequence::new();
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert_eq!(
+            sequence.complete(NTUSER_GET_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_DISPATCH_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(
+            sequence.complete(NTUSER_DISPATCH_MESSAGE_SSN, 1, Some(WM_PAINT)),
+            Ok(())
+        );
+        assert_eq!(sequence.paint_dispatches(), 2);
+        assert_eq!(sequence.complete(NTUSER_PEEK_MESSAGE_SSN, 0, None), Ok(()));
+        assert!(sequence.is_drained());
     }
 
     #[test]
@@ -1501,6 +1749,32 @@ mod tests {
     }
 
     #[test]
+    fn continuation_stack_accepts_sequential_callbacks_in_one_dispatch() {
+        let client = ClientThreadIdentity::new(2, 44, 4);
+        let first = CallbackCorrelation {
+            dispatch_id: 7,
+            callback_id: 1,
+            client_pi: 2,
+            client_tid: 44,
+            client_badge: 4,
+        };
+        let mut second = first;
+        second.callback_id = 2;
+        let mut stack = ContinuationStack::<4>::new();
+
+        stack.push_dispatch(client, first.dispatch_id).unwrap();
+        stack.push_callback(first).unwrap();
+        stack.return_callback(first).unwrap();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.top().unwrap().state, ContinuationState::Running);
+
+        stack.push_callback(second).unwrap();
+        stack.return_callback(second).unwrap();
+        stack.complete_dispatch(client, second.dispatch_id).unwrap();
+        assert!(stack.is_empty());
+    }
+
+    #[test]
     fn continuation_stack_rejects_stale_or_cross_thread_unwind() {
         let client = ClientThreadIdentity::new(2, 44, 4);
         let correlation = CallbackCorrelation {
@@ -1573,6 +1847,57 @@ mod tests {
         );
         assert_eq!(stack.len(), 1);
         assert_eq!(stack.top().unwrap().state, ContinuationState::Running);
+    }
+
+    #[test]
+    fn active_callback_stack_restores_nested_user_contexts_lifo() {
+        let mut outer = CallbackHeader::idle(7, 2, 44, 4);
+        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let mut inner = CallbackHeader::idle(8, 2, 44, 4);
+        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let outer_correlation = CallbackCorrelation::from_request(&outer);
+        let inner_correlation = CallbackCorrelation::from_request(&inner);
+        let mut stack = ActiveCallbackStack::<2>::new();
+
+        stack.push(outer).unwrap();
+        stack
+            .record_redirect(outer_correlation, [0x11; 20], 0x1111)
+            .unwrap();
+        stack.push(inner).unwrap();
+        stack
+            .record_redirect(inner_correlation, [0x22; 20], 0x2222)
+            .unwrap();
+
+        let completed_inner = stack.pop(inner_correlation).unwrap();
+        assert_eq!(completed_inner.saved_user_context(), &[0x22; 20]);
+        assert_eq!(completed_inner.outer_resume_ip(), 0x2222);
+        assert_eq!(stack.top().unwrap().request(), &outer);
+        let completed_outer = stack.pop(outer_correlation).unwrap();
+        assert_eq!(completed_outer.saved_user_context(), &[0x11; 20]);
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn active_callback_stack_rejects_stale_return_and_overflow() {
+        let mut request = CallbackHeader::idle(7, 2, 44, 4);
+        request
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
+        let correlation = CallbackCorrelation::from_request(&request);
+        let mut stack = ActiveCallbackStack::<1>::new();
+        stack.push(request).unwrap();
+        assert_eq!(stack.push(request), Err(ValidationError::Length));
+        let mut stale = correlation;
+        stale.callback_id += 1;
+        assert_eq!(
+            stack.record_redirect(stale, [0; 20], 0x1000),
+            Err(ValidationError::Correlation)
+        );
+        stack
+            .record_redirect(correlation, [0; 20], 0x1000)
+            .unwrap();
+        assert_eq!(stack.pop(stale), Err(ValidationError::Correlation));
+        assert_eq!(stack.len(), 1);
     }
 
     #[test]

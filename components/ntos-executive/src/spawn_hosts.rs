@@ -267,6 +267,7 @@ unsafe fn map_region(pml4: u64, r: &Region) {
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
         let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, r.base_va + p * 0x20_0000, pml4);
     }
+    let mut first = 0;
     for i in 0..r.count {
         let cap = match r.source {
             FrameSource::FreshZeroed => {
@@ -276,7 +277,16 @@ unsafe fn map_region(pml4: u64, r: &Region) {
             }
             FrameSource::Alias(base) => copy_cap(base + i),
         };
+        if i == 0 {
+            first = match r.source {
+                FrameSource::FreshZeroed => cap,
+                FrameSource::Alias(base) => base,
+            };
+        }
         let _ = page_map(cap, r.base_va + i * 0x1000, rights_at(r.rights, i), pml4);
+    }
+    if r.base_va == crate::win32k_subsystem::WIN32K_USERVM_VADDR && first != 0 {
+        crate::WIN32K_USERVM_FRAME_BASE.store(first, Ordering::Relaxed);
     }
 }
 
@@ -749,6 +759,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             // Not a skippable int-0x2c — fall through to the wall.
             if ch.caps.client_attach {
                 win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+                crate::win32k_glue::win32k_dispatch_backtrace();
             }
             wall_ip = m0;
             wall_addr = m1;
@@ -758,6 +769,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
             // Any other fault — a real wall inside the handler.
             if ch.caps.client_attach {
                 win32k_wall_diag(ch, label, m0, m1, _m2, _m3);
+                crate::win32k_glue::win32k_dispatch_backtrace();
             }
             wall_ip = m0;
             wall_addr = m1;

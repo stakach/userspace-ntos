@@ -229,10 +229,15 @@ pub const SH_SAS_SESSION: u64 = 0x118; // out: winlogon SAS-window Session VA (u
 // the Ctrl-Alt-Del a headless host can't receive from a keyboard, so winlogon's GetMessage retrieves it →
 // client-side SASWindowProc → DispatchSAS → WlxLoggedOutSAS (the msgina logon dialog).
 pub const SH_SAS_HWND: u64 = 0x120; // out: winlogon SAS-window HWND (u64)
+pub const SH_GDI_TABLE_BASE: u64 = 0x128; // out: coherent hosted GDI handle-table backing (u64)
+pub const SH_GDI_TABLE_SIZE: u64 = 0x130; // out: full hosted GDI handle-table byte size (u64)
+pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Manager pid (u64)
+pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
+const _: () = assert!(SH_REQ_PROCESS_ID < SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
@@ -471,6 +476,10 @@ pub const GPDESK_INPUT_DESKTOP_RVA: u64 = 0x20b528;
 /// `co_AddGuiApp` triggers `co_IntInitializeDesktopGraphics` only on the 0→1 transition. We READ it to
 /// diagnose whether winlogon's SwitchGDI DC-op fires the lazy InitVideo (paint) or is short-circuited.
 pub const NR_GUI_APPS_RUNNING_RVA: u64 = 0x20be88;
+/// `gpmdev`, the active MDEV pointer populated by `PDEVOBJ_lChangeDisplaySettings`.
+pub const GPMDEV_RVA: u64 = 0x20b490;
+/// `PDEVOBJ_lChangeDisplaySettings` — creates the real display PDEV and its initial driver surface.
+pub const PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA: u64 = 0x2e100;
 
 /// SSN NtUserSwitchDesktop — SSDT idx 0x288 (== `WIN32K_SERVICE_BASE + 0x288`).
 pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
@@ -803,6 +812,19 @@ use nt_object_manager::win32k_ob::{
 
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
+
+/// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
+/// after the caller's EPROCESS table reports `STATUS_INVALID_HANDLE`, because desktop/window-
+/// station handles are minted by win32k's Ob layer rather than the executive's native table.
+pub(crate) unsafe fn duplicate_user_object_handle(handle: u64) -> Option<u64> {
+    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).duplicate(handle)
+}
+
+/// Close one handle alias in win32k's USER object table. The session-pool object body remains live
+/// while any other handle aliases it.
+pub(crate) unsafe fn close_user_object_handle(handle: u64) -> bool {
+    (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).close(handle)
+}
 
 /// Classify the `OBJECT_TYPE` pointer win32k passed into an [`ObKind`] (`None` = an unrecognized
 /// type). The pointer is the value held in win32k's imported `ExDesktopObjectType` /
@@ -1216,6 +1238,10 @@ extern "win64" fn s_mm_map_view(section: u64, base_out: *mut u64, size_io: *mut 
         }
         if !size_io.is_null() {
             write_volatile(size_io, size);
+        }
+        if size >= GDI_HANDLE_COUNT * GDI_TABLE_ENTRY_SIZE && size < 0x0020_0000 {
+            write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_BASE) as *mut u64, base);
+            write_volatile((WIN32K_SHARED_VADDR + SH_GDI_TABLE_SIZE) as *mut u64, size);
         }
     }
     0
@@ -1634,9 +1660,12 @@ extern "win64" fn s_rtl_destroy_atom_table(_table: u64) -> i32 {
     rtl_atom::status::SUCCESS as i32
 }
 
-/// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` — a fixed nonzero PID.
+static WIN32K_CURRENT_PROCESS_ID: AtomicU64 = AtomicU64::new(FAKE_PROCESS_HANDLE);
+
+/// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` for the routed client. The
+/// bootstrap identity remains in place until the first client request reaches the component.
 extern "win64" fn s_current_process_id() -> u64 {
-    (FAKE_PROCESS_HANDLE as u32) as u64
+    WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed)
 }
 
 /// `NTSTATUS ZwOpenFile(...)` — win32k's font init (IntLoadSystemFonts) opens `\SystemRoot\Fonts\`
@@ -1679,6 +1708,38 @@ extern "win64" fn s_rtl_copy_unicode_string(dest: *mut u8, src: *const u8) {
         }
         write_unaligned(dest as *mut u16, n); // Length
     }
+}
+
+/// Borrow the used UTF-16 units from a native `UNICODE_STRING` descriptor.
+///
+/// The descriptor is laid out as `{ USHORT Length, USHORT MaximumLength, padding, PWSTR Buffer }`
+/// on x64. `Length` is a byte count and the string need not be NUL terminated.
+unsafe fn rtl_unicode_slice<'a>(string: *const u8) -> &'a [u16] {
+    if string.is_null() {
+        return &[];
+    }
+    let length = read_unaligned(string as *const u16) as usize;
+    let buffer = read_unaligned(string.add(8) as *const u64) as *const u16;
+    if buffer.is_null() || length < 2 {
+        return &[];
+    }
+    core::slice::from_raw_parts(buffer, length / 2)
+}
+
+/// `LONG RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_compare_unicode_string(a: *const u8, b: *const u8, case_insensitive: u8) -> i32 {
+    let (a, b) = unsafe { (rtl_unicode_slice(a), rtl_unicode_slice(b)) };
+    match nt_compat_exports::rtl::compare_unicode(a, b, case_insensitive != 0) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN)`.
+extern "win64" fn s_rtl_equal_unicode_string(a: *const u8, b: *const u8, case_insensitive: u8) -> u8 {
+    let (a, b) = unsafe { (rtl_unicode_slice(a), rtl_unicode_slice(b)) };
+    nt_compat_exports::rtl::equal_unicode(a, b, case_insensitive != 0) as u8
 }
 
 // wcslen is a pure primitive — shared in [`crate::ntoskrnl_shared`] (bound by name below).
@@ -2304,16 +2365,7 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         }
 
         let size = reply.output_length as u64;
-        let buf = pool_alloc(size.max(8));
-        if buf == 0 {
-            return 0xC000_009Au32 as i32;
-        }
-        for offset in 0..size as usize {
-            write_volatile(
-                (buf + offset as u64) as *mut u8,
-                read_volatile(core::ptr::addr_of!((*frame).payload[offset])),
-            );
-        }
+        let buf = core::ptr::addr_of!((*frame).payload) as u64;
         if !out_buf.is_null() {
             write_volatile(out_buf, buf);
         }
@@ -2524,6 +2576,8 @@ fn register_trampolines() {
     reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
     reg.bind("RtlInitEmptyUnicodeString", s_rtl_init_empty_unicode_string as usize as u64);
     reg.bind("RtlCopyUnicodeString", s_rtl_copy_unicode_string as usize as u64);
+    reg.bind("RtlCompareUnicodeString", s_rtl_compare_unicode_string as usize as u64);
+    reg.bind("RtlEqualUnicodeString", s_rtl_equal_unicode_string as usize as u64);
     reg.bind("RtlAppendUnicodeToString", s_rtl_append_unicode_to_string as usize as u64);
     reg.bind("RtlCreateUnicodeString", s_rtl_create_unicode_string as usize as u64);
     reg.bind("RtlMultiByteToUnicodeN", s_rtl_multibyte_to_unicode_n as usize as u64);
@@ -2700,7 +2754,7 @@ fn object_type_cell_value(name: &str) -> Option<u64> {
 // walks the import table in place — no `PeFile`/`Vec` anywhere.
 
 /// Per-frame W^X rights for the loaded image (2 = RX code / RW_NX = RW data). A `static` (not a
-/// stack array or heap Vec): the rootserver stack is only 16 KiB and the heap is spent.
+/// stack array or heap Vec): the rootserver stack is bounded and the heap is spent.
 static mut CODE_RIGHTS: [u64; WIN32K_IMAGE_FRAMES as usize] = [RW_NX; WIN32K_IMAGE_FRAMES as usize];
 
 /// The per-frame rights `load_into` computed (for `spawn_win32k_host`'s W^X mapping).
@@ -2977,15 +3031,22 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
-    // Each client dispatch begins with the dispatch thread owning NO windows. The desktop windows
+    let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
+    if process_id != 0 {
+        WIN32K_CURRENT_PROCESS_ID.store(process_id, Ordering::Relaxed);
+        write_volatile((PH_EPROCESS_VA + 0xd0) as *mut u64, process_id);
+    }
+    // Early top-level client dispatches begin with the dispatch thread owning no windows. The desktop windows
     // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
     // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
     // would wrongly see those desktop windows as ITS windows and fail "thread has windows",
     // short-circuiting its `SetThreadDesktop(Winlogon) && SwitchDesktop(Winlogon)` (wlx.c:1077) —
-    // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Re-empty the current
-    // thread's WindowListHead (+0x2d8) each dispatch to restore the authentic invariant (in real
-    // Windows the desktop windows belong to a SEPARATE desktop/RIT thread; the desktop window is
-    // still reachable via pdesk->pDeskInfo->spwnd, not the thread list).
+    // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Before the SAS window
+    // exists, re-empty the current thread's WindowListHead (+0x2d8) on top-level dispatches to
+    // restore the authentic invariant. Nested dispatches and all post-SAS calls must preserve the
+    // live window list.
+    if read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0
+        && read_volatile((WIN32K_SHARED_VADDR + SH_SAS_HWND) as *const u64) == 0
     {
         let t = read_volatile(SLOT_W32THREAD as *const u64);
         let t = if t == 0 { PH_W32THREAD_VA } else { t };
@@ -3068,22 +3129,35 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
-    // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). The eager
-    // co_IntInitializeDesktopGraphics scaffold is RETIRED — InitVideo/surface + the paint now run
-    // fully lazily from winlogon's own first GUI DC-op (SwitchDesktop → co_IntShowDesktop → erase →
-    // DceAllocDCE → co_IntGraphicsCheck → co_IntInitializeDesktopGraphics). But two host-side
-    // prerequisites that the lazy init depends on cannot be produced by winlogon itself and must be
-    // seeded here, at the earliest valid point (NtUserInitialize → InitializeGreCSRSS → InitFontSupport
-    // has just run, so FreeType/g_FreeTypeLock exist):
+    // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). InitializeGreCSRSS and
+    // InitFontSupport have completed, so this is the earliest valid point to create the system font,
+    // interactive object graph and PDEV. The PDEV must exist before user32's real
+    // resource-backed system-cursor/class initialization starts issuing NtGdiOpenDCW; deferring it
+    // until the later winlogon SwitchDesktop leaves every cursor display-DC open without a device.
+    // Two prerequisites cannot be produced by winlogon itself and are seeded here:
     //   (1) the system font (arial.ttf memory-font) — else the lazy co_IntInitializeDesktopGraphics's
     //       font realize null-derefs ("no fonts loaded at all");
     //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
-    //       hWinSta=0x4, and gpdeskInputDesktop is set) — via a bRedraw=FALSE SwitchDesktop that does
-    //       NOT itself trigger the lazy path, leaving NrGuiAppsRunning==0 for winlogon to drive.
+    //       hWinSta=0x4, and gpdeskInputDesktop is set). A bRedraw=FALSE SwitchDesktop establishes the
+    //       active desktop before co_IntGraphicsCheck creates the real device and surface.
     if ssn == SSN_NT_USER_INITIALIZE_REAL && status == 0 && !DESKTOP_GFX_SEEDED {
         DESKTOP_GFX_SEEDED = true;
         load_system_font();
         create_winsta_and_desktop();
+        print_str(b"[win32k-gfx] creating display PDEV before user32 resources...\n");
+        let change_display: extern "win64" fn(u64, u64, u64, *mut u64, u64) -> i32 =
+            core::mem::transmute(
+                (WIN32K_CODE_VA + PDEVOBJ_L_CHANGE_DISPLAY_SETTINGS_RVA) as *const (),
+            );
+        let gpmdev = (WIN32K_CODE_VA + GPMDEV_RVA) as *mut u64;
+        let display_status = change_display(0, 0, 0, gpmdev, 1);
+        print_str(b"[win32k-gfx] PDEVOBJ_lChangeDisplaySettings status=0x");
+        print_hex(display_status as u32);
+        print_str(b" gpmdev=0x");
+        let mdev = read_volatile(gpmdev);
+        print_hex((mdev >> 32) as u32);
+        print_hex(mdev as u32);
+        print_str(b"\n");
     }
     (status, 0)
 }
@@ -3204,7 +3278,9 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             print_str(b" NrGuiAppsRunning=0x");
             print_hex(ngui2);
             print_str(b"\n");
+        }
 
+        if gpdesk != 0 {
             // FULL-DESKTOP REPAINT. InitVideo's own `co_IntShowDesktop(pdesk, 1024, 768, TRUE)` GREW the
             // desktop window from the default 640×480 (winlogon's FIRST bRedraw=FALSE switch pre-showed it at
             // the boot-default SM_CX/CYSCREEN) to full 1024×768. co_WinPosSetWindowPos preserves the old

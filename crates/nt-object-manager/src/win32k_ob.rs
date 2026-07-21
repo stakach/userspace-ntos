@@ -114,6 +114,11 @@ pub const OB_TABLE_LEN: usize = 16;
 /// (evicting the oldest on overflow — the referenced events are always the most-recent) suffices.
 pub const OB_EVENTS_LEN: usize = 4;
 
+/// Number of externally visible aliases created by `NtDuplicateObject` for USER objects.
+pub const OB_ALIASES_LEN: usize = 8;
+/// Keep duplicate aliases disjoint from both native EPROCESS handles and win32k's dense Ob handles.
+pub const OB_ALIAS_HANDLE_BASE: u64 = 0x7FF0_0000;
+
 /// A fixed-size handle → (type, body) registry for win32k's DESKTOP / WINDOWSTATION objects.
 ///
 /// Handles are minted densely from 1; the client-visible `HANDLE` is `idx << 2` (a real Ob handle
@@ -136,6 +141,8 @@ pub struct ObHandleTable {
     /// overflow.
     events: [Option<(u64, u64)>; OB_EVENTS_LEN],
     events_next: usize,
+    /// USER-object aliases minted for `NtDuplicateObject`, indexed by a high-range external handle.
+    aliases: [Option<(ObKind, u64)>; OB_ALIASES_LEN],
 }
 
 impl Default for ObHandleTable {
@@ -155,6 +162,7 @@ impl ObHandleTable {
             winsta_body: 0,
             events: [None; OB_EVENTS_LEN],
             events_next: 0,
+            aliases: [None; OB_ALIASES_LEN],
         }
     }
 
@@ -201,11 +209,15 @@ impl ObHandleTable {
     /// (`idx << 2`), or 0 if the table is full. A `WindowStation` registration is also cached as
     /// the single input window station.
     pub fn register(&mut self, kind: ObKind, body: u64) -> u64 {
-        let idx = self.next;
+        let idx = (1..self.next)
+            .find(|&idx| self.slots[idx].is_none())
+            .unwrap_or(self.next);
         if idx >= OB_TABLE_LEN {
             return 0;
         }
-        self.next = idx + 1;
+        if idx == self.next {
+            self.next = idx + 1;
+        }
         self.slots[idx] = Some((kind, body));
         let handle = (idx as u64) << 2;
         if kind == ObKind::WindowStation {
@@ -215,11 +227,42 @@ impl ObHandleTable {
         handle
     }
 
+    /// Create a distinct high-range handle alias for an existing win32k object. Keeping aliases out
+    /// of the dense range prevents a USER handle from colliding with an EPROCESS-native handle.
+    pub fn duplicate(&mut self, handle: u64) -> Option<u64> {
+        let (kind, body) = self.lookup(handle)?;
+        let index = self.aliases.iter().position(Option::is_none)?;
+        self.aliases[index] = Some((kind, body));
+        Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
+    }
+
+    /// Close an alias created by [`duplicate`](Self::duplicate). Object bodies come from win32k's
+    /// session-lifetime pool, so closing removes only this alias; the original remains valid.
+    pub fn close(&mut self, handle: u64) -> bool {
+        if handle < OB_ALIAS_HANDLE_BASE || handle & 0b11 != 0 {
+            return false;
+        }
+        let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
+        match self.aliases.get_mut(index) {
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve a handle to its `(kind, body)`, or `None` if it is not a registered win32k object
     /// handle. Checks the dense `idx << 2` object slots (Desktop/WindowStation/Other), then the
     /// external-handle `Event` registry. (The two spaces never collide: `Event` handles are the large
     /// values `NtCreateEvent` mints, whose `>> 2` index is far above `OB_TABLE_LEN`.)
     pub fn lookup(&self, handle: u64) -> Option<(ObKind, u64)> {
+        if handle >= OB_ALIAS_HANDLE_BASE && handle & 0b11 == 0 {
+            let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
+            if let Some(entry) = self.aliases.get(index).copied().flatten() {
+                return Some(entry);
+            }
+        }
         let idx = (handle >> 2) as usize;
         if idx != 0 && idx < self.next {
             if let Some(entry) = self.slots.get(idx).copied().flatten() {
@@ -418,6 +461,20 @@ mod tests {
             assert_eq!(h & 0b11, 0, "low tag bits must be clear");
         }
         assert_eq!(t.lookup_body(b), 0x2000);
+    }
+
+    #[test]
+    fn duplicate_aliases_the_typed_object_and_closes_independently() {
+        let mut t = ObHandleTable::new();
+        let original = t.register(ObKind::Desktop, 0xD00D_0000);
+        let duplicate = t.duplicate(original).unwrap();
+        assert_ne!(duplicate, original);
+        assert_eq!(t.lookup(duplicate), t.lookup(original));
+        assert!(t.close(duplicate));
+        assert_eq!(t.lookup(duplicate), None);
+        assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
+        assert!(!t.close(duplicate));
+        assert_eq!(t.duplicate(original), Some(duplicate));
     }
 
     #[test]

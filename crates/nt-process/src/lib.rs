@@ -808,6 +808,17 @@ impl ProcessManager {
         handle: Handle,
         dst_pid: ProcessId,
     ) -> Result<Handle, u32> {
+        self.duplicate_handle_with_access(src_pid, handle, dst_pid, None)
+    }
+    /// Duplicate a handle while optionally replacing its granted access mask. `None` implements
+    /// `DUPLICATE_SAME_ACCESS`; `Some(mask)` implements the ordinary `DesiredAccess` path.
+    pub fn duplicate_handle_with_access(
+        &mut self,
+        src_pid: ProcessId,
+        handle: Handle,
+        dst_pid: ProcessId,
+        desired_access: Option<u32>,
+    ) -> Result<Handle, u32> {
         let (object, access) = {
             let e = self
                 .processes
@@ -817,7 +828,7 @@ impl ProcessManager {
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (e.object, e.granted_access)
         };
-        self.insert_handle(dst_pid, object, access)
+        self.insert_handle(dst_pid, object, desired_access.unwrap_or(access))
     }
     pub fn handle_count(&self, pid: ProcessId) -> usize {
         self.processes

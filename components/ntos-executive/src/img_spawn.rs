@@ -359,7 +359,7 @@ pub(crate) unsafe fn spawn_sec_image(
         // win32k can share them per-client. Unlike demand-grown stack pages (fault site), these are
         // mapped at spawn, so they'd otherwise be absent from the client-frame table — and a client's
         // stack-built OBJECT_ATTRIBUTES (e.g. winlogon's NtUserCreateWindowStation) lives here.
-        if pi >= 1 {
+        if pi == 1 || pi == 2 {
             csrss_frame_put(pi, STACK_BASE + i * 0x1000, f);
         }
     }
@@ -389,6 +389,16 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((scr + 0x30) as *mut u64, SMSS_TEB_VA); // NtTib.Self
         core::ptr::write_volatile((scr + 0x60) as *mut u64, SMSS_PEB_VA); // ProcessEnvironmentBlock
+        let process_id = PM_PIDS
+            .get(pi as usize)
+            .map(|pid| pid.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let thread_id = PM_TIDS
+            .get(pi as usize)
+            .map(|tid| tid.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        core::ptr::write_volatile((scr + 0x40) as *mut u64, process_id); // ClientId.UniqueProcess
+        core::ptr::write_volatile((scr + 0x48) as *mut u64, thread_id); // ClientId.UniqueThread
         // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
         // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
         core::ptr::write_volatile((scr + 0x08) as *mut u64, STACK_BASE + STACK_FRAMES * 0x1000);
@@ -501,9 +511,13 @@ pub(crate) unsafe fn spawn_sec_image(
         // frames are RO-mapped into winlogon lazily in service_sec_image's pi==2 reassert block. Other
         // processes never touch GDI so seeding is unnecessary (and would map an unused 1.5 MiB table).
         if pi == 2 {
+            let gdi_server_base = core::ptr::read_volatile(
+                (win32k_subsystem::WIN32K_SHARED_VADDR
+                    + win32k_subsystem::SH_GDI_TABLE_BASE) as *const u64,
+            );
             core::ptr::write_volatile(
                 (scr + 0x1000 + 0xf8) as *mut u64,
-                win32k_subsystem::GDI_SHARED_TABLE_VA,
+                win32k_subsystem::GDI_SHARED_TABLE_VA + (gdi_server_base & 0xfff),
             );
         }
         let _ = page_map(copy_cap(peb), SMSS_PEB_VA, RW_NX, pml4);
@@ -817,35 +831,50 @@ pub(crate) unsafe fn client_copyin_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
         let mut temporary_cap = 0;
-        let source = if let Some(source) = smss_mirror(current, chunk as u64)
-            .or_else(|| scratch_for(current, filled_pages, nfilled, scratch_base))
-        {
+        let source = if let Some(source) = smss_mirror(current, chunk as u64) {
             source
         } else {
             let page = current & !0xfff;
-            let frame = {
-                let frame = csrss_frame_get(pi, page);
-                if frame != 0 {
-                    frame
+            let persistent_alias = {
+                let alias = csrss_frame_alias_get(pi, page);
+                if alias != 0 {
+                    alias
                 } else {
-                    client_copyin_frame_get(pi, page)
+                    client_copyin_frame_alias_get(pi, page)
                 }
             };
-            if frame == 0 {
-                return false;
+            if persistent_alias != 0 {
+                persistent_alias + (current & 0xfff)
+            } else {
+                let frame = {
+                    let frame = csrss_frame_get(pi, page);
+                    if frame != 0 {
+                        frame
+                    } else {
+                        client_copyin_frame_get(pi, page)
+                    }
+                };
+                if frame == 0 {
+                    if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base) {
+                        source
+                    } else {
+                        return false;
+                    }
+                } else {
+                    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
+                    let (cap, copy_error) = copy_cap_r(frame);
+                    temporary_cap = cap;
+                    let map_error = if copy_error == 0 {
+                        page_map_r(cap, alias, 2 | PAGE_EXECUTE_NEVER, CAP_INIT_THREAD_VSPACE)
+                    } else {
+                        copy_error
+                    };
+                    if map_error != 0 {
+                        return false;
+                    }
+                    alias + (current & 0xfff)
+                }
             }
-            let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
-            temporary_cap = copy_cap(frame);
-            if page_map(
-                temporary_cap,
-                alias,
-                2 | PAGE_EXECUTE_NEVER,
-                CAP_INIT_THREAD_VSPACE,
-            ) != 0
-            {
-                return false;
-            }
-            alias + (current & 0xfff)
         };
         core::ptr::copy_nonoverlapping(
             source as *const u8,

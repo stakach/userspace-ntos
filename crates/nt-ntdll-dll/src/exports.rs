@@ -3731,31 +3731,6 @@ unsafe fn ldr_find_resource_impl(
     if dll_handle.is_null() || resource_info.is_null() {
         return STATUS_RESOURCE_DATA_NOT_FOUND;
     }
-    // ── FRONTIER SCOPE (documented, deliberate) ──────────────────────────────────────────────────
-    // Serve the real `.rsrc` walk ONLY for msgina.dll — the GINA that owns the logon-dialog templates
-    // (IDD_LOGON / IDD_LEGALNOTICE). The ENTIRE proven boot path (smss/csrss/winlogon early init +
-    // the user32/gdi32/kernel32 class/cursor/desktop bring-up that reaches the SAS-window milestone)
-    // NEVER consults msgina's resources — msgina's `GUILoggedOutSAS → WlxDialogBoxParam(IDD_LOGON)`
-    // is the FIRST and only consumer, and it runs POST-SAS. Scoping to msgina keeps every prior
-    // resource lookup returning its previous NOT_FOUND (the finely-tuned fallback the SAS bring-up
-    // depends on: user32 registers classes with NULL cursors; kernel32/gdi32 code falls back) so the
-    // boot stays byte-identical up to the frontier, and ONLY the new dialog-template load resolves for
-    // real. This is a scope boundary, not a fabrication: for msgina we do the genuine `.rsrc` walk and
-    // return an honest per-type NTSTATUS; for every other module we keep the documented NOT_FOUND.
-    // Widen (drop the msgina gate) once the desktop-graphics cascade (icons/cursors → win32k GDI DC
-    // blits, project_win32k_graphics) is host-serviced end-to-end.
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Identify the module by the image the caller actually passed (its EXPORT-directory self-name),
-        // NOT by a recorded VA — a module can be mapped at different VAs in the executive vs. the client
-        // view (msgina's client HMODULE differs from the executive demand-load slot). This robustly
-        // serves ONLY msgina's resources while every other module keeps the proven NOT_FOUND fallback.
-        // SAFETY: dll_handle is a mapped PE image; the helper is header-safe.
-        let is_msgina = unsafe { crate::on_target::image_export_name_is(dll_handle as u64, b"msgina") };
-        if !is_msgina {
-            return STATUS_RESOURCE_DATA_NOT_FOUND;
-        }
-    }
     // SAFETY: on-target — resolve the resource directory of the mapped image.
     unsafe {
         let mut size: u32 = 0;
@@ -3798,7 +3773,7 @@ unsafe fn ldr_find_resource_impl(
             push(0x409, &mut langs, &mut nl);
         }
 
-        match rtl::pe_resource::find_entry(
+        let status = match rtl::pe_resource::find_entry(
             rsrc,
             &type_name,
             &res_name,
@@ -3821,7 +3796,24 @@ unsafe fn ldr_find_resource_impl(
                 rtl::pe_resource::FindStatus::DataNotFound => STATUS_RESOURCE_DATA_NOT_FOUND,
                 rtl::pe_resource::FindStatus::Success => STATUS_SUCCESS,
             },
+        };
+        #[cfg(target_arch = "x86_64")]
+        if type_v == 2 && name_v == 0x7FE2 {
+            let mut message = [0u8; 64];
+            let mut length = 0usize;
+            for &byte in b"resource OBM_COMBO base=" {
+                message[length] = byte;
+                length += 1;
+            }
+            length = crate::write_u64_hex(&mut message, length, dll_handle as u64);
+            for &byte in b" status=" {
+                message[length] = byte;
+                length += 1;
+            }
+            length = crate::write_u64_hex(&mut message, length, status as u64);
+            crate::dbg_print_bytes(message.as_ptr(), length);
         }
+        status
     }
 }
 
@@ -4742,14 +4734,32 @@ pub unsafe extern "system" fn rtl_pc_to_file_header(
 
 // ---- handle tables (RTL_HANDLE_TABLE) — real inline single-threaded --------------------------------
 // RTL_HANDLE_TABLE (x64): MaximumNumberOfHandles:u32@0, SizeOfHandleTableEntry:u32@4,
-// Reserved[2]@8, FreeHandles:ptr@0x18, CommittedHandles:ptr@0x20, UnCommittedHandles:ptr@0x28,
-// MaxReservedHandles:ptr@0x30, Handles:ptr@0x38. We model a simple bump-array of entries.
+// Reserved[2]@8, FreeHandles:ptr@0x10, CommittedHandles:ptr@0x18, UnCommittedHandles:ptr@0x20,
+// MaxReservedHandles:ptr@0x28. The first allocation obtains a separate, stable VM reservation;
+// Reserved[0] is the bump cursor for entries not yet placed on the free list.
+
+const RTL_HANDLE_FREE: usize = 0x10;
+const RTL_HANDLE_COMMITTED: usize = 0x18;
+const RTL_HANDLE_UNCOMMITTED: usize = 0x20;
+const RTL_HANDLE_MAX_RESERVED: usize = 0x28;
+
+#[inline]
+unsafe fn rtl_handle_read_ptr(table: *const c_void, offset: usize) -> usize {
+    // SAFETY: caller supplies a valid RTL_HANDLE_TABLE and one of its pointer-field offsets.
+    unsafe { core::ptr::read_unaligned((table as *const u8).add(offset) as *const usize) }
+}
+
+#[inline]
+unsafe fn rtl_handle_write_ptr(table: *mut c_void, offset: usize, value: usize) {
+    // SAFETY: caller supplies a writable RTL_HANDLE_TABLE and one of its pointer-field offsets.
+    unsafe { core::ptr::write_unaligned((table as *mut u8).add(offset) as *mut usize, value) };
+}
 
 /// `RtlInitializeHandleTable(ULONG MaximumNumberOfHandles, ULONG SizeOfHandleTableEntry,
-/// PRTL_HANDLE_TABLE HandleTable)` — allocate a fixed handle array.
+/// PRTL_HANDLE_TABLE HandleTable)` — initialize an empty, lazily allocated handle table.
 ///
 /// # Safety
-/// `table` a valid writable RTL_HANDLE_TABLE (>= 0x40 bytes).
+/// `table` a valid writable RTL_HANDLE_TABLE (>= 0x30 bytes).
 #[export_name = "RtlInitializeHandleTable"]
 pub unsafe extern "system" fn rtl_initialize_handle_table(
     max_handles: u32,
@@ -4761,15 +4771,15 @@ pub unsafe extern "system" fn rtl_initialize_handle_table(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let bytes = (max_handles as usize) * (entry_size as usize);
-        // SAFETY: on-target heap.
-        let arr = unsafe { crate::process_heap_alloc(bytes.max(1)) };
         // SAFETY: table valid for the RTL_HANDLE_TABLE fields per the contract.
         unsafe {
-            core::ptr::write_bytes(table as *mut u8, 0, 0x40);
+            core::ptr::write_bytes(
+                table as *mut u8,
+                0,
+                nt_ntdll::handle_table::RTL_HANDLE_TABLE_SIZE,
+            );
             *(table as *mut u32) = max_handles;
             *((table as *mut u32).add(1)) = entry_size;
-            *((table as *mut u64).byte_add(0x38)) = arr as u64; // Handles
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -4779,7 +4789,7 @@ pub unsafe extern "system" fn rtl_initialize_handle_table(
 }
 
 /// `RtlAllocateHandle(PRTL_HANDLE_TABLE HandleTable, PULONG HandleIndex) -> PRTL_HANDLE_TABLE_ENTRY`
-/// — allocate the next free entry (bump allocator over the fixed array).
+/// — reuse a freed entry or allocate the next entry from a stable VM-backed array.
 ///
 /// # Safety
 /// `table` from `RtlInitializeHandleTable`; `index` null or writable.
@@ -4788,42 +4798,88 @@ pub unsafe extern "system" fn rtl_allocate_handle(table: *mut c_void, index: *mu
     if table.is_null() {
         return core::ptr::null_mut();
     }
-    // Track the next-free index in Reserved[0] @ +8 (a bump cursor).
     // SAFETY: table valid per the contract.
     unsafe {
         let max = *(table as *const u32);
-        let entry_size = *((table as *const u32).add(1)) as usize;
+        let entry_size_u32 = *((table as *const u32).add(1));
+        let entry_size = entry_size_u32 as usize;
+        let bytes = match nt_ntdll::handle_table::reservation_size(max, entry_size_u32) {
+            Some(bytes) => bytes,
+            None => return core::ptr::null_mut(),
+        };
+
+        let mut committed = rtl_handle_read_ptr(table, RTL_HANDLE_COMMITTED);
+        if committed == 0 {
+            committed = crate::on_target::nt_allocate_virtual_memory(bytes) as usize;
+            if committed == 0 {
+                return core::ptr::null_mut();
+            }
+            let end = match committed.checked_add(bytes) {
+                Some(end) => end,
+                None => return core::ptr::null_mut(),
+            };
+            rtl_handle_write_ptr(table, RTL_HANDLE_COMMITTED, committed);
+            // The userspace executive currently commits the complete reservation in one call.
+            rtl_handle_write_ptr(table, RTL_HANDLE_UNCOMMITTED, end);
+            rtl_handle_write_ptr(table, RTL_HANDLE_MAX_RESERVED, end);
+        }
+
+        let free = rtl_handle_read_ptr(table, RTL_HANDLE_FREE);
+        if free != 0 {
+            let end = rtl_handle_read_ptr(table, RTL_HANDLE_MAX_RESERVED);
+            let free_index = match nt_ntdll::handle_table::entry_index(
+                committed,
+                end,
+                free,
+                entry_size_u32,
+            ) {
+                Some(free_index) if free_index < max => free_index,
+                _ => return core::ptr::null_mut(),
+            };
+            let next = core::ptr::read_unaligned(free as *const usize);
+            rtl_handle_write_ptr(table, RTL_HANDLE_FREE, next);
+            core::ptr::write_bytes(free as *mut u8, 0, entry_size);
+            if !index.is_null() {
+                *index = free_index;
+            }
+            return free as *mut c_void;
+        }
+
+        // Track the next never-used entry in Reserved[0] at +8.
         let cursor = (table as *mut u32).byte_add(8);
         let i = *cursor;
-        if i >= max {
-            return core::ptr::null_mut();
-        }
+        let offset = match nt_ntdll::handle_table::entry_offset(i, max, entry_size_u32) {
+            Some(offset) => offset,
+            None => return core::ptr::null_mut(),
+        };
         *cursor = i + 1;
-        let handles = *((table as *const u64).byte_add(0x38)) as *mut u8;
-        if handles.is_null() {
-            return core::ptr::null_mut();
-        }
+        let entry = committed + offset;
+        core::ptr::write_bytes(entry as *mut u8, 0, entry_size);
         if !index.is_null() {
             *index = i;
         }
-        handles.add(i as usize * entry_size) as *mut c_void
+        entry as *mut c_void
     }
 }
 
 /// `RtlFreeHandle(PRTL_HANDLE_TABLE, PRTL_HANDLE_TABLE_ENTRY) -> BOOLEAN` — mark an entry free. Our
-/// bump allocator doesn't reclaim mid-array (the handle-table users on the boot path allocate
-/// monotonically); mark the entry's flags-word (last u32) as free + return TRUE.
+/// freed entries are cleared and pushed onto the table's free list.
 ///
 /// # Safety
 /// `entry` from `RtlAllocateHandle`.
 #[export_name = "RtlFreeHandle"]
-pub unsafe extern "system" fn rtl_free_handle(_table: *mut c_void, entry: *mut c_void) -> u8 {
-    if entry.is_null() {
+pub unsafe extern "system" fn rtl_free_handle(table: *mut c_void, entry: *mut c_void) -> u8 {
+    if unsafe { rtl_is_valid_handle(table, entry) } == 0 {
         return 0;
     }
-    // Clear the entry's first word (a common "in use" flag lives there).
-    // SAFETY: entry valid per the contract.
-    unsafe { *(entry as *mut u32) = 0 };
+    // SAFETY: validity above proves entry is within the committed table reservation.
+    unsafe {
+        let entry_size = *((table as *const u32).add(1)) as usize;
+        let free = rtl_handle_read_ptr(table, RTL_HANDLE_FREE);
+        core::ptr::write_bytes(entry as *mut u8, 0, entry_size);
+        core::ptr::write_unaligned(entry as *mut usize, free);
+        rtl_handle_write_ptr(table, RTL_HANDLE_FREE, entry as usize);
+    }
     1
 }
 
@@ -4836,14 +4892,21 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
     if table.is_null() || entry.is_null() {
         return 0;
     }
-    // Valid if entry is within the Handles array bounds.
     // SAFETY: table valid per the contract.
     unsafe {
-        let max = *(table as *const u32) as usize;
-        let entry_size = *((table as *const u32).add(1)) as usize;
-        let handles = *((table as *const u64).byte_add(0x38)) as usize;
-        let e = entry as usize;
-        u8::from(handles != 0 && e >= handles && e < handles + max * entry_size)
+        let max = *(table as *const u32);
+        let entry_size = *((table as *const u32).add(1));
+        let committed = rtl_handle_read_ptr(table, RTL_HANDLE_COMMITTED);
+        let end = rtl_handle_read_ptr(table, RTL_HANDLE_MAX_RESERVED);
+        let in_range = committed != 0
+            && nt_ntdll::handle_table::entry_index(committed, end, entry as usize, entry_size)
+                .is_some_and(|entry_index| entry_index < max);
+        let flags = if in_range {
+            core::ptr::read_unaligned(entry as *const u32)
+        } else {
+            0
+        };
+        u8::from(in_range && flags & 1 != 0)
     }
 }
 

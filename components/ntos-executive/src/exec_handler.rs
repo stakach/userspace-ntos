@@ -7,6 +7,8 @@
 use crate::*;
 use nt_io_abi::major;
 
+static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
 impl ExecNtHandler {
     pub(crate) fn new() -> Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
@@ -1262,9 +1264,10 @@ impl NativeSyscallHandler for ExecNtHandler {
             // slot is NOT recycled, so a later open never reuses a closed value (keeping external
             // bindings — the per-pi DLL registry — consistent). We still return SUCCESS
             // unconditionally (matching the prior no-op) so a close of a handle the executive
-            // doesn't own — a win32k/Ob handle, a pseudo-handle, or a fallback global value — stays
-            // benign. Purely additive: the returned status is unchanged.
+            // doesn't own stays benign. A win32k USER-object handle is closed through that owning
+            // table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
+                let mut closed = false;
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
                     let completion_id = match self
                         .pm
@@ -1274,13 +1277,122 @@ impl NativeSyscallHandler for ExecNtHandler {
                         _ => None,
                     };
                     if self.pm.close_handle(pid, args[0] as nt_process::Handle).is_ok() {
+                        closed = true;
                         PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
                         if let Some(id) = completion_id {
                             let _ = self.io_completion_ports.release(id);
                         }
                     }
                 }
+                if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
+                {
+                    PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                }
                 0 // STATUS_SUCCESS
+            }
+            // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, *TargetHandle,
+            // DesiredAccess, HandleAttributes, Options). Resolve both process handles in the
+            // caller's table, then duplicate the typed object into the target EPROCESS table. This
+            // preserves shared identities such as msgina's worker-completion event instead of
+            // copying an unowned scalar handle value.
+            NativeService::NtDuplicateObject => {
+                const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+                const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
+                const DUPLICATE_SAME_ACCESS: u32 = 0x2;
+
+                let Some(source_pid) = self.resolve_process_handle(args[0]) else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                let options = args[6] as u32;
+                let mut target_pid_for_peak = None;
+                let mut native_duplicate = false;
+                let result = if args[2] == 0 {
+                    if args[3] == 0 && options & DUPLICATE_CLOSE_SOURCE != 0 {
+                        Ok(None)
+                    } else {
+                        Err(STATUS_INVALID_HANDLE)
+                    }
+                } else {
+                    let Some(target_pid) = self.resolve_process_handle(args[2]) else {
+                        return STATUS_INVALID_HANDLE;
+                    };
+                    target_pid_for_peak = Some(target_pid);
+                    let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
+                        .then_some(args[4] as u32);
+                    match self.pm.duplicate_handle_with_access(
+                            source_pid,
+                            args[1] as nt_process::Handle,
+                            target_pid,
+                            desired_access,
+                        ) {
+                        Ok(handle) => {
+                            native_duplicate = true;
+                            Ok(Some(handle as u64))
+                        }
+                        Err(status)
+                            if status == STATUS_INVALID_HANDLE
+                                && source_pid == target_pid
+                                && options & DUPLICATE_SAME_ACCESS != 0 =>
+                        {
+                            unsafe {
+                                crate::win32k_subsystem::duplicate_user_object_handle(args[1])
+                            }
+                            .map(Some)
+                            .ok_or(STATUS_INVALID_HANDLE)
+                        }
+                        Err(status) => Err(status),
+                    }
+                };
+
+                if options & DUPLICATE_CLOSE_SOURCE != 0 {
+                    let closed_native = self
+                        .pm
+                        .close_handle(source_pid, args[1] as nt_process::Handle)
+                        .is_ok();
+                    if closed_native
+                        || unsafe {
+                            crate::win32k_subsystem::close_user_object_handle(args[1])
+                        }
+                    {
+                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if self.current_badge == 12 {
+                    print_str(b"[duplicate-object] source=0x");
+                    print_hex_u64(args[1]);
+                    print_str(b" target-out=0x");
+                    print_hex_u64(args[3]);
+                    print_str(b" options=0x");
+                    print_hex(options);
+                    match result {
+                        Ok(Some(handle)) => {
+                            print_str(if native_duplicate { b" native=0x" } else { b" win32k=0x" });
+                            print_hex_u64(handle);
+                            print_str(b"\n");
+                        }
+                        Ok(None) => print_str(b" close-only\n"),
+                        Err(status) => {
+                            print_str(b" status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                        }
+                    }
+                }
+                match result {
+                    Ok(Some(handle)) => {
+                        self.queue_write(args[3], handle);
+                        if native_duplicate {
+                            let count = self.pm.handle_count(target_pid_for_peak.unwrap()) as u64;
+                            if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+                                PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+                            }
+                            PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        0
+                    }
+                    Ok(None) => 0,
+                    Err(status) => status,
+                }
             }
             // One executive-lifetime table is shared across every hosted process. Add increments a
             // duplicate's reference count, Find does not, and Delete decrements/frees at zero.
@@ -3880,8 +3992,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let base_ptr = args[1]; // RDX
                 let size_ptr = args[3]; // R9
                 let alloc_type = args[4]; // arg5 = Type
-                let base_in = smss_stack_read(base_ptr);
-                let want = smss_stack_read(size_ptr);
+                let mut word = [0u8; 8];
+                let base_in = if self.xas_read(base_ptr, &mut word) {
+                    u64::from_le_bytes(word)
+                } else {
+                    0
+                };
+                word = [0; 8];
+                let want = if self.xas_read(size_ptr, &mut word) {
+                    u64::from_le_bytes(word)
+                } else {
+                    0
+                };
                 let rounded = ((want + 0xFFF) & !0xFFFu64).max(0x1000);
                 let base = if base_in != 0 {
                     base_in
@@ -3896,6 +4018,28 @@ impl NativeSyscallHandler for ExecNtHandler {
                 } else {
                     NEXT_SMSS_ALLOC.fetch_add(rounded, Ordering::Relaxed)
                 };
+                if self.pi == 2
+                    && WINLOGON_VM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 48
+                {
+                    print_str(b"[winlogon-vm] base_ptr=0x");
+                    print_hex((base_ptr >> 32) as u32);
+                    print_hex(base_ptr as u32);
+                    print_str(b" size_ptr=0x");
+                    print_hex((size_ptr >> 32) as u32);
+                    print_hex(size_ptr as u32);
+                    print_str(b" base_in=0x");
+                    print_hex((base_in >> 32) as u32);
+                    print_hex(base_in as u32);
+                    print_str(b" want=0x");
+                    print_hex((want >> 32) as u32);
+                    print_hex(want as u32);
+                    print_str(b" type=0x");
+                    print_hex(alloc_type as u32);
+                    print_str(b" selected=0x");
+                    print_hex((base >> 32) as u32);
+                    print_hex(base as u32);
+                    print_str(b"\n");
+                }
                 if alloc_type & 0x1000 != 0 {
                     // MEM_COMMIT — back it with real frames.
                     let mut p = 0u64;
@@ -3905,6 +4049,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                         // Mirror the first heap window into the executive so smss_copyin can read
                         // heap-resident pointer args, into the ACTIVE process's heap mirror.
                         let va = base + p;
+                        if self.pi == 1 || self.pi == 2 {
+                            // win32k runs attached to the calling GUI process and dereferences
+                            // user heap pointers directly. Register the committed frame so a
+                            // win32k-side fault maps this same live page, not a fresh zero page.
+                            csrss_frame_put(self.pi as u64, va, f);
+                        }
                         if va >= SMSS_ALLOC_VA && va < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
                             let mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
                             let _ = page_map(copy_cap(f),
@@ -3913,8 +4063,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                         p += 0x1000;
                     }
                 }
-                smss_stack_write(base_ptr, base);
-                smss_stack_write(size_ptr, rounded);
+                self.xas_write_buf(base_ptr, &base.to_le_bytes());
+                self.xas_write_buf(size_ptr, &rounded.to_le_bytes());
                 NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
                 0
             },

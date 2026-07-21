@@ -61,7 +61,7 @@ const NT_CURRENT_PROCESS: u64 = u64::MAX; // (HANDLE)-1
 /// # Safety
 /// Issues a real syscall serviced by the executive; only valid on-target in a hosted process.
 #[cfg(target_arch = "x86_64")]
-unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
+pub(crate) unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
     let mut base: u64 = 0; // 0 = let the executive pick the per-process bump base
     let mut region: u64 = size_in as u64;
     // arg1=ProcessHandle, arg2=&BaseAddress, arg3=ZeroBits, arg4=&RegionSize, arg5=AllocationType,
@@ -725,64 +725,6 @@ pub unsafe fn seh_containing_image(pc: u64) -> u64 {
         }
     }
     0
-}
-
-/// Return the mapped base of the loaded module whose lowercased base name (no `.dll` suffix) equals
-/// `name`, or 0 if not loaded. Used to SCOPE the resource walker (`LdrFindResource_U`) to a specific
-/// module so the proven early boot path — which never consults that module's resources — stays
-/// byte-identical.
-///
-/// # Safety
-/// Single-threaded loader context; reads `MODULE_TABLE`.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn module_base_by_name(name: &[u8]) -> u64 {
-    // SAFETY: single-threaded loader; MODULE_TABLE is process-wide, touched only on the main thread.
-    unsafe {
-        let table = &*core::ptr::addr_of!(MODULE_TABLE);
-        table.find(name)
-    }
-}
-
-/// Case-insensitively test whether the mapped PE image at `base` names itself `want` in its EXPORT
-/// directory (the `IMAGE_EXPORT_DIRECTORY.Name` string — e.g. `"MSGINA.dll"`). `want` is the ASCII
-/// prefix to match (e.g. `b"msgina"`); the comparison is case-insensitive and prefix-only, so
-/// `"MSGINA.dll"` / `"msgina.dll"` both match `b"msgina"`.
-///
-/// This is a ROBUST module-identity discriminator for `LdrFindResource_U` scoping: it inspects the
-/// image the caller actually passed (`dll_handle`), independent of which VA the executive/loader
-/// recorded it at (a module can be mapped at different VAs in the executive vs. the client view).
-///
-/// # Safety
-/// `base` must be a mapped PE image (or the function safely returns false on a bad header).
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn image_export_name_is(base: u64, want: &[u8]) -> bool {
-    // SAFETY: reading the mapped export directory; bad/absent dirs return false.
-    unsafe {
-        // Validate the DOS/PE signatures cheaply before dereferencing the data directory.
-        if base < 0x1_0000 || core::ptr::read_unaligned(base as *const u16) != 0x5A4D {
-            return false;
-        }
-        let (edir_rva, edir_sz) = data_directory(base, 0); // EXPORT
-        if edir_rva == 0 || edir_sz < 0x10 {
-            return false;
-        }
-        touch_range(base + edir_rva as u64, edir_sz as u64);
-        let ed = base + edir_rva as u64;
-        let name_rva = rd32(ed, 0x0C); // IMAGE_EXPORT_DIRECTORY.Name
-        if name_rva == 0 {
-            return false;
-        }
-        let p = (base + name_rva as u64) as *const u8;
-        for (i, &w) in want.iter().enumerate() {
-            let c = core::ptr::read(p.add(i));
-            let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
-            let lw = if w.is_ascii_uppercase() { w + 32 } else { w };
-            if lc != lw {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 /// `RtlLookupFunctionEntry`'s core: given an absolute control PC, find `(image_base,

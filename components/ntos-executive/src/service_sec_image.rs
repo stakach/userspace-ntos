@@ -6,6 +6,181 @@ use nt_io_abi::major;
 
 const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 
+/// Populate one winlogon thread's client-side win32 state from the desktop facts published by the
+/// live win32k dispatch thread. `Win32ThreadInfo` is an opaque server THREADINFO identity; the
+/// inline CLIENTINFO stores the client mapping of DESKTOPINFO and the USER-heap pointer delta.
+unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<(u64, u64, u64)> {
+    let server_deskinfo = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_DESKINFO) as *const u64,
+    );
+    let pti = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_PTI) as *const u64,
+    );
+    if server_deskinfo == 0 || pti == 0 {
+        return None;
+    }
+
+    let pool_delta = win32k_glue::map_win32k_pool_into_csrss(pml4, 2);
+    let user_delta = win32k_subsystem::WIN32K_HEAP_VADDR
+        - win32k_subsystem::CSRSS_W32_SHARED_VA;
+    let client_deskinfo = server_deskinfo.checked_sub(pool_delta)?;
+    core::ptr::write_volatile((teb_alias + 0x78) as *mut u64, pti);
+    core::ptr::write_volatile((teb_alias + 0x820) as *mut u64, client_deskinfo);
+    core::ptr::write_volatile((teb_alias + 0x828) as *mut u64, user_delta);
+    Some((client_deskinfo, pti, user_delta))
+}
+
+unsafe fn observe_winlogon_completed_dispatch(
+    dispatch: win32k_glue::CompletedWin32kDispatch,
+    filled_pages: &mut [u64; 256],
+    faults: usize,
+    scratch_base: u64,
+) {
+    if dispatch.ssn != 0x1077 || dispatch.status == 0 {
+        return;
+    }
+    let hwnd = dispatch.status as u32 as u64;
+    let class = dispatch.args[1];
+    let name = dispatch.args[3];
+    let sas_hwnd = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
+    );
+    if sas_hwnd != 0 && hwnd == sas_hwnd {
+        if WINLOGON_SAS_MILESTONE.swap(1, Ordering::Relaxed) == 0 {
+            print_str(b"[wl-main] winlogon created SAS window (completed NtUserCreateWindowEx -> HWND 0x");
+            print_hex(hwnd as u32);
+            print_str(b")\n");
+        }
+        return;
+    }
+    if WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+
+    if class != nt_user_callback::WC_DIALOG_ATOM {
+        return;
+    }
+    WINLOGON_DIALOG_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
+        || WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
+            <= WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed)
+        || name == 0
+    {
+        return;
+    }
+
+    let mut raw = [0u8; 16];
+    let descriptor_read = img_spawn::client_copyin_mapped(
+        2,
+        name,
+        &mut raw,
+        filled_pages,
+        faults,
+        scratch_base,
+    );
+    let descriptor = descriptor_read
+        .then(|| nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw))
+        .and_then(Result::ok);
+    let raw_length = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let raw_maximum_and_ansi = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let raw_buffer = u64::from_le_bytes([
+        raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+    ]);
+    let source = if descriptor.is_some()
+        && img_spawn::smss_mirror(raw_buffer, raw_length as u64).is_some()
+    {
+        1
+    } else if descriptor.is_some()
+        && img_spawn::scratch_for(raw_buffer, filled_pages, faults, scratch_base).is_some()
+    {
+        2
+    } else if descriptor.is_some() && csrss_frame_get(2, raw_buffer & !0xfff) != 0 {
+        3
+    } else if descriptor.is_some() && client_copyin_frame_get(2, raw_buffer & !0xfff) != 0 {
+        4
+    } else {
+        0
+    };
+    let mut bytes = [0u8; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS * 2];
+    let mut units = [0u16; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS];
+    let mut count = 0usize;
+    let mut caption_read = false;
+    if let Some(descriptor) = descriptor {
+        let length = descriptor.length_bytes as usize;
+        caption_read = img_spawn::client_copyin_mapped(
+            2,
+            descriptor.buffer,
+            &mut bytes[..length],
+            filled_pages,
+            faults,
+            scratch_base,
+        );
+        if caption_read {
+            count = nt_user_callback::decode_utf16le_bounded(&bytes[..length], &mut units)
+                .unwrap_or(0);
+        }
+    }
+    let style = smss_stack_read(dispatch.caller_sp + 0x28) as u32;
+    let top_level = style & 0x8000_0000 != 0 && style & 0x4000_0000 == 0;
+    let caption_match = caption_read && units[..count] == nt_user_callback::IDD_LOGON_CAPTION;
+    let session = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+    );
+    let correlated = if caption_read {
+        winlogon_dialog_capture_idd_logon(
+            session,
+            hwnd,
+            class,
+            &units[..count],
+            top_level,
+            true,
+        )
+    } else {
+        false
+    };
+    print_str(b"[dialog-caption] hwnd=0x");
+    print_hex(hwnd as u32);
+    print_str(b" descriptor-read=");
+    print_u64(descriptor_read as u64);
+    print_str(b" parse=");
+    print_u64(descriptor.is_some() as u64);
+    print_str(b" len=");
+    print_u64(raw_length as u64);
+    print_str(b" maxansi=0x");
+    print_hex(raw_maximum_and_ansi);
+    print_str(b" buf=0x");
+    print_hex((raw_buffer >> 32) as u32);
+    print_hex(raw_buffer as u32);
+    print_str(b" source=");
+    print_u64(source);
+    print_str(b" caption-read=");
+    print_u64(caption_read as u64);
+    print_str(b" units=");
+    print_u64(count as u64);
+    print_str(b" Logon=");
+    print_u64(caption_match as u64);
+    print_str(b" top-level=");
+    print_u64(top_level as u64);
+    print_str(b" correlated=");
+    print_u64(correlated as u64);
+    print_str(b"\n");
+}
+
+unsafe fn observe_completed_dialog_modal_dispatch(
+    dispatch: win32k_glue::CompletedWin32kDispatch,
+    badge: u64,
+    tid: u64,
+) {
+    if winlogon_dialog_modal_expected_ssn() != dispatch.ssn
+        || !winlogon_dialog_modal_thread_matches(badge, tid, dispatch.args[0])
+    {
+        return;
+    }
+    let hwnd = smss_stack_read(dispatch.args[0]);
+    let message = smss_stack_read(dispatch.args[0] + 8) as u32;
+    let _ = winlogon_dialog_modal_observe(dispatch.ssn, dispatch.status, hwnd, message);
+}
+
 /// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
 /// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
 /// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
@@ -45,7 +220,7 @@ pub(crate) unsafe fn service_sec_image(
     // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
     // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
     // Working buffer for the current pi's demand-filled page VAs — a STATIC (not a 2 KiB stack local)
-    // so the 5th hosted process doesn't overflow the 16 KiB rootserver stack on the deep FS-walk call
+    // so the 5th hosted process doesn't pressure the rootserver stack on the deep FS-walk call
     // chain (see FILLED_WORK). Loaded from / saved to `pfilled[pi]` around each dispatch below.
     let filled_pages: &mut [u64; 256] = &mut *core::ptr::addr_of_mut!(FILLED_WORK);
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
@@ -278,7 +453,7 @@ pub(crate) unsafe fn service_sec_image(
     procs[0].scratch_base = scratch_base;
     procs[0].img_end = img_end;
     // Per-process demand-fill bookkeeping — kept in a `static mut` (3×2 KiB) rather than on the
-    // 16 KiB rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
+    // bounded rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
     // run; zero it at entry so the demo call (ntdll=None) starts clean too.
     let pfilled: &mut [[u64; 256]; MAX_PI] = &mut *core::ptr::addr_of_mut!(PFILLED);
@@ -695,6 +870,35 @@ pub(crate) unsafe fn service_sec_image(
         first = procs[pi].first;
         ntfaults = procs[pi].ntfaults;
         *filled_pages = pfilled[pi];
+        if pi == 2 {
+            let watch = KERNEL32_TABLE_WATCH_SCRATCH.load(Ordering::Relaxed);
+            if watch != 0 {
+                // BaseHeapHandleTable+8 is zero after the kernel32 BSS page is materialized. The
+                // value below is the first eight bytes of the msgina dialog-resource signature
+                // observed in the corrupt page. Catch the first client event after it changes.
+                let value = core::ptr::read_volatile((watch + 0x648) as *const u64);
+                if value == 0x0039_003c_5081_0080
+                    && KERNEL32_TABLE_WATCH_CORRUPT.swap(1, Ordering::Relaxed) == 0
+                {
+                    print_str(b"[alias-corrupt] badge=");
+                    print_u64(badge);
+                    print_str(b" label=0x");
+                    print_hex((mi >> 12) as u32);
+                    print_str(b" m0=0x");
+                    print_hex((m0 >> 32) as u32);
+                    print_hex(m0 as u32);
+                    print_str(b" m1=0x");
+                    print_hex((m1 >> 32) as u32);
+                    print_hex(m1 as u32);
+                    print_str(b" faults=");
+                    print_u64(faults);
+                    print_str(b" scratch=0x");
+                    print_hex((watch >> 32) as u32);
+                    print_hex(watch as u32);
+                    print_str(b"\n");
+                }
+            }
+        }
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
         // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
@@ -872,6 +1076,161 @@ pub(crate) unsafe fn service_sec_image(
                 first = addr;
             }
             let page = addr & !0xFFFu64;
+            if pi == 2
+                && (m3 & 0x7) == 0x7
+                && WINLOGON_HANDLE_FAULT_DIAG_N.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                const KERNEL32_BASE_HEAP_HANDLE_TABLE: u64 = 0x8045_1640;
+                let mut table = [0u8; 0x30];
+                let table_ok = img_spawn::client_copyin_mapped(
+                    pi as u64,
+                    KERNEL32_BASE_HEAP_HANDLE_TABLE,
+                    &mut table,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                );
+                print_str(b"[handle-fault] table-ok=");
+                print_u64(table_ok as u64);
+                if table_ok {
+                    for off in (0..table.len()).step_by(8) {
+                        let value = u64::from_le_bytes(
+                            table[off..off + 8].try_into().unwrap(),
+                        );
+                        print_str(b" +");
+                        print_hex(off as u32);
+                        print_str(b"=0x");
+                        print_hex((value >> 32) as u32);
+                        print_hex(value as u32);
+                    }
+                }
+                const KERNEL32_RTL_ALLOCATE_HANDLE_IAT: u64 = 0x8041_74a8;
+                let mut iat = [0u8; 8];
+                let iat_ok = img_spawn::client_copyin_mapped(
+                    pi as u64,
+                    KERNEL32_RTL_ALLOCATE_HANDLE_IAT,
+                    &mut iat,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                );
+                print_str(b" iat-ok=");
+                print_u64(iat_ok as u64);
+                if iat_ok {
+                    let target = u64::from_le_bytes(iat);
+                    print_str(b" iat=0x");
+                    print_hex((target >> 32) as u32);
+                    print_hex(target as u32);
+                }
+                for (name, (frame, index)) in [
+                    (b" table".as_slice(), csrss_frame_get_exact(2, 0x8045_1000)),
+                    (b" msgina".as_slice(), csrss_frame_get_exact(2, 0x8230_e000)),
+                    (b" entry".as_slice(), csrss_frame_get_exact(2, 0x0000_0100_0057_9000)),
+                ] {
+                    print_str(name);
+                    print_str(b"-cap=0x");
+                    print_hex(frame as u32);
+                    print_str(b"-pa=0x");
+                    let paddr = if frame != 0 { get_frame_paddr(frame) } else { 0 };
+                    print_hex((paddr >> 32) as u32);
+                    print_hex(paddr as u32);
+                    print_str(b"-idx=");
+                    print_u64(if index == usize::MAX { u64::MAX } else { index as u64 });
+                }
+                print_str(b" frame-n=");
+                print_u64(core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)) as u64);
+                let (heap_frame, heap_index) =
+                    csrss_frame_get_exact(2, NTDLL_BASE + 0x99_000);
+                print_str(b" heap-cap=0x");
+                print_hex(heap_frame as u32);
+                print_str(b"-pa=0x");
+                let heap_pa = if heap_frame != 0 { get_frame_paddr(heap_frame) } else { 0 };
+                print_hex((heap_pa >> 32) as u32);
+                print_hex(heap_pa as u32);
+                print_str(b"-idx=");
+                print_u64(if heap_index == usize::MAX { u64::MAX } else { heap_index as u64 });
+                let mut heap_state = [0u8; 0x30];
+                let heap_ok = img_spawn::client_copyin_mapped(
+                    2,
+                    NTDLL_BASE + 0x99_000,
+                    &mut heap_state,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                );
+                print_str(b" heap-ok=");
+                print_u64(heap_ok as u64);
+                if heap_ok {
+                    for off in (0..heap_state.len()).step_by(8) {
+                        let value = u64::from_le_bytes(
+                            heap_state[off..off + 8].try_into().unwrap(),
+                        );
+                        print_str(b" +");
+                        print_hex(off as u32);
+                        print_str(b"=0x");
+                        print_hex((value >> 32) as u32);
+                        print_hex(value as u32);
+                    }
+                }
+                let callback_frame = (win32k_subsystem::WIN32K_SHARED_VADDR
+                    + win32k_subsystem::SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+                let callback_proc = core::ptr::read_volatile(
+                    core::ptr::addr_of!((*callback_frame).payload[0]) as *const u64,
+                );
+                print_str(b" callback-proc=0x");
+                print_hex((callback_proc >> 32) as u32);
+                print_hex(callback_proc as u32);
+                let entry_va = addr.saturating_sub(8);
+                let mut entry = [0u8; 0x20];
+                let entry_ok = img_spawn::client_copyin_mapped(
+                    pi as u64,
+                    entry_va,
+                    &mut entry,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                );
+                print_str(b" entry=0x");
+                print_hex((entry_va >> 32) as u32);
+                print_hex(entry_va as u32);
+                print_str(b" entry-ok=");
+                print_u64(entry_ok as u64);
+                if entry_ok {
+                    for off in (0..entry.len()).step_by(8) {
+                        let value = u64::from_le_bytes(
+                            entry[off..off + 8].try_into().unwrap(),
+                        );
+                        print_str(b" +");
+                        print_hex(off as u32);
+                        print_str(b"=0x");
+                        print_hex((value >> 32) as u32);
+                        print_hex(value as u32);
+                    }
+                }
+                let tcb = PM_MAIN_TCBS[pi].load(Ordering::Relaxed);
+                if tcb != 0 {
+                    let mut regs = [0u64; 20];
+                    win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                    print_str(b" rip=0x");
+                    print_hex((regs[0] >> 32) as u32);
+                    print_hex(regs[0] as u32);
+                    print_str(b" rsp=0x");
+                    print_hex((regs[1] >> 32) as u32);
+                    print_hex(regs[1] as u32);
+                    print_str(b" rcx=0x");
+                    print_hex((regs[5] >> 32) as u32);
+                    print_hex(regs[5] as u32);
+                    for off in (0..=0x80u64).step_by(8) {
+                        let value = smss_stack_read(regs[1] + off);
+                        print_str(b" sp+");
+                        print_hex(off as u32);
+                        print_str(b"=0x");
+                        print_hex((value >> 32) as u32);
+                        print_hex(value as u32);
+                    }
+                }
+                print_str(b"\n");
+            }
             // ROBUSTNESS (gate-safety): a genuine NULL/low deref (addr < 64 KiB) is never a
             // demand-fillable region (image/DLL/scratch/stack/anon all live far above) — it's an
             // unrecoverable client fault (e.g. user32's UserClientDllInitialize deref of a still-null
@@ -879,6 +1238,50 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
+                // user32 GetThreadDesktopWnd (RVA 0x50009) dereferences
+                // `GetThreadDesktopInfo()->spwnd`. IntSetThreadDesktop can clear the client fields
+                // while the hosted per-thread desktop-heap view is being established. Repair the
+                // exact fault in the TEB that owns it (main or one of winlogon's worker TEBs), then
+                // retry the instruction. This must precede the generic worker-wall park below.
+                if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
+                    let teb_alias = if is_wl_worker {
+                        match badge {
+                            WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
+                            WINLOGON_WORKER3_BADGE => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
+                            _ => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+                        }
+                    } else {
+                        0x0000_0100_107C_0000
+                    };
+                    let tcb = match badge {
+                        WINLOGON_WORKER_BADGE => WL_LISTENER_TCB.load(Ordering::Relaxed),
+                        WINLOGON_WORKER2_BADGE => WL_WORKER2_TCB.load(Ordering::Relaxed),
+                        WINLOGON_WORKER3_BADGE => WL_WORKER3_TCB.load(Ordering::Relaxed),
+                        _ => PM_MAIN_TCBS[2].load(Ordering::Relaxed),
+                    };
+                    if let Some((client_deskinfo, pti, _)) =
+                        seed_winlogon_thread_client_info(teb_alias, pml4)
+                    {
+                        // The faulting instruction already has RAX=NULL. Re-run the helper call at
+                        // 0x801a0004 so it reloads the repaired TEB fields before dereferencing.
+                        if tcb != 0 && win32k_glue::rewind_fault_ip(tcb, 0x801a_0004) {
+                            print_str(b"[wl-deskinfo-fixup] badge=");
+                            print_u64(badge);
+                            print_str(b" real pti=0x");
+                            print_hex((pti >> 32) as u32);
+                            print_hex(pti as u32);
+                            print_str(b" pDeskInfo=0x");
+                            print_hex((client_deskinfo >> 32) as u32);
+                            print_hex(client_deskinfo as u32);
+                            print_str(b" -> rewind helper call; RESUME\n");
+                            procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                            badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                            continue;
+                        }
+                    }
+                    print_str(b"[wl-deskinfo-fixup] real client state unavailable; PARK worker\n");
+                }
                 // N-threads multiplex: the services RPC listener (badge 7) walls on its OWN
                 // unrecoverable fault (rpcrt4 io_thread derefs a connection field that needs a real
                 // client connect — the listener's next frontier). PARK it (don't reply → it stays
@@ -895,37 +1298,6 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                    badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
-                    continue;
-                }
-                // BATCH 39 — winlogon's user32 GetThreadDesktopWnd (user32 RVA 0x50009 = base
-                // 0x80150000 -> 0x801a0009) derefs `pci->pDeskInfo->spwnd` (`mov rax,[rax+0x10]`, cr2=0x10)
-                // and NULL-derefs because win32k's IntSetThreadDesktop ELSE branch (desktop.c:3456) cleared
-                // the client `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) during winlogon's NtUserProcessConnect
-                // (our host doesn't wire the per-thread desktop-heap view). Lazily REPAIR the missing client
-                // DESKTOPINFO pointer at the exact fault (via the executive's persistent alias of winlogon's
-                // TEB frame) and RESUME — the retry reads `[SMSS_DESKINFO_VA+0x10]` = the seeded spwnd and
-                // GetThreadDesktopWnd returns a valid (zeroed) desktop window, so winlogon advances into its
-                // GUI/login init instead of crash-parking. Idempotent + scoped to this exact fault site.
-                if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
-                    const WLSCR: u64 = 0x0000_0100_107C_0000;
-                    // The NULL is `GetThreadDesktopInfo()` returning NULL because `GetW32ThreadInfo()`
-                    // (`[TEB+0x78]` = TEB.Win32ThreadInfo) is NULL (its guard short-circuits BEFORE it
-                    // reads pDeskInfo) — so `GetThreadDesktopWnd` faults at `[NULL+0x10]`, cr2=0x10. Seed
-                    // BOTH: TEB.Win32ThreadInfo (TEB+0x78) non-NULL so GetW32ThreadInfo returns non-NULL,
-                    // AND TEB.Win32ClientInfo.pDeskInfo (TEB+0x820) -> the client DESKTOPINFO (+ulClientDelta
-                    // 0). Point Win32ThreadInfo at the readable DESKTOPINFO page (non-NULL, mapped).
-                    let cur = core::ptr::read_volatile((WLSCR + 0x78) as *const u64);
-                    core::ptr::write_volatile((WLSCR + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
-                    core::ptr::write_volatile((WLSCR + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
-                    core::ptr::write_volatile((WLSCR + 0x828) as *mut u64, 0); // ulClientDelta
-                    print_str(b"[wl-deskinfo-fixup] GetThreadDesktopWnd Win32ThreadInfo was 0x");
-                    print_hex(cur as u32);
-                    print_str(b" -> reseeded Win32ThreadInfo+pDeskInfo=0x");
-                    print_hex(SMSS_DESKINFO_VA as u32);
-                    print_str(b"; RESUME winlogon\n");
-                    procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
-                    let (nb, nmi, nm0, nm1, nm2, nm3) = reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 }
@@ -995,7 +1367,7 @@ pub(crate) unsafe fn service_sec_image(
             if page >= STACK_GROWTH_FLOOR && page < STACK_BASE {
                 let f = alloc_frame();
                 let _ = page_map(f, page, RW_NX, pml4);
-                if pi >= 1 {
+                if pi == 1 || pi == 2 {
                     // A GUI client (csrss pi 1 / winlogon pi 2) stack pointer — shareable into win32k
                     // at the same VA when this client dispatches an NtUser/NtGdi call (per-client).
                     csrss_frame_put(pi as u64, page, f);
@@ -1309,6 +1681,33 @@ pub(crate) unsafe fn service_sec_image(
                     let scratch = scratch_base + faults * 0x1000;
                     let (f, fe) = alloc_frame_r();
                     let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    if pi == 2 && bpage == 0x8230_e000 {
+                        let (old, old_index) = csrss_frame_get_exact(2, 0x8045_1000);
+                        print_str(b"[alias-diag] msgina-before faults=");
+                        print_u64(faults);
+                        print_str(b" scratch=0x");
+                        print_hex((scratch >> 32) as u32);
+                        print_hex(scratch as u32);
+                        print_str(b" new-cap=0x");
+                        print_hex(f as u32);
+                        print_str(b" new-pa=0x");
+                        let new_pa = if fe == 0 { get_frame_paddr(f) } else { 0 };
+                        print_hex((new_pa >> 32) as u32);
+                        print_hex(new_pa as u32);
+                        print_str(b" old-cap=0x");
+                        print_hex(old as u32);
+                        print_str(b" old-pa=0x");
+                        let old_pa = if old != 0 { get_frame_paddr(old) } else { 0 };
+                        print_hex((old_pa >> 32) as u32);
+                        print_hex(old_pa as u32);
+                        print_str(b" old-idx=");
+                        print_u64(if old_index == usize::MAX { u64::MAX } else { old_index as u64 });
+                        print_str(b" retype=");
+                        print_u64(fe);
+                        print_str(b" smap=");
+                        print_u64(se);
+                        print_str(b"\n");
+                    }
                     // ★ ROBUSTNESS (must precede the fill): fill_image_page WRITES the PE bytes THROUGH
                     // the scratch alias. If alloc_frame_r / page_map_r failed (untyped pool or CNode
                     // slots exhausted — the frame pressure eager-map front-loads), the scratch VA is
@@ -1329,6 +1728,21 @@ pub(crate) unsafe fn service_sec_image(
                         break;
                     }
                     let r = fill_image_page(tpe, rva, scratch);
+                    if pi == 2 && bpage == 0x8045_1000 {
+                        KERNEL32_TABLE_WATCH_SCRATCH.store(scratch, Ordering::Relaxed);
+                        print_str(b"[alias-watch] kernel32 table faults=");
+                        print_u64(faults);
+                        print_str(b" scratch=0x");
+                        print_hex((scratch >> 32) as u32);
+                        print_hex(scratch as u32);
+                        print_str(b" cap=0x");
+                        print_hex(f as u32);
+                        print_str(b" pa=0x");
+                        let pa = get_frame_paddr(f);
+                        print_hex((pa >> 32) as u32);
+                        print_hex(pa as u32);
+                        print_str(b"\n");
+                    }
                     if shareable {
                         dll_cache_put(bpage, f); // this frame becomes the shared copy for all processes
                     } else {
@@ -1338,13 +1752,13 @@ pub(crate) unsafe fn service_sec_image(
                         if (faults as usize) < filled_pages.len() {
                             filled_pages[faults as usize] = bpage;
                         }
-                        if pi >= 1 {
+                        if pi == 1 || pi == 2 {
                             // Record this GUI client's (csrss pi 1 / winlogon pi 2) frame so win32k can
                             // identity-map + read/write it per-client (a client pointer into user32/gdi32
                             // .data — e.g. the PFNCLIENT arrays — the client's stack-built OBJECT_ATTRIBUTES,
                             // or its own image). The frame is shared with the executive's scratch, so it
                             // holds the client's LIVE runtime data, not the (zeroed) PE static content.
-                            csrss_frame_put(pi as u64, bpage, f);
+                            csrss_frame_put_at(pi as u64, bpage, f, scratch);
                         }
                         if base == PE_LOAD_BASE {
                             let off = bpage - PE_LOAD_BASE;
@@ -1482,30 +1896,45 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 PM_TIDS[pi].load(Ordering::Relaxed)
             };
-            if m0 == 22
-                && win32k_glue::complete_controlled_user_callback(
+            if m0 == 22 {
+                if let Some(completion) = win32k_glue::complete_controlled_user_callback(
                     pi as u32,
                     badge,
                     current_tid,
                     get_recv_mr(9),
                     m3,
                     get_recv_mr(7),
-                )
-            {
-                procs[pi].faults = faults;
-                procs[pi].first = first;
-                procs[pi].ntfaults = ntfaults;
-                pfilled[pi] = *filled_pages;
-                let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                send_on_reply(reply_main, 0, 0, 0, 0, 0);
-                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
-                badge = nb;
-                mi = nmi;
-                m0 = nm0;
-                m1 = nm1;
-                m2 = nm2;
-                m3 = nm3;
-                continue;
+                ) {
+                    if pi == 2 {
+                        if let Some(dispatch) = completion.outer_dispatch {
+                            observe_winlogon_completed_dispatch(
+                                dispatch,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            );
+                            observe_completed_dialog_modal_dispatch(
+                                dispatch,
+                                badge,
+                                current_tid,
+                            );
+                        }
+                    }
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    send_on_reply(reply_main, 0, 0, 0, 0, 0);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                }
             }
             let mut result = 0u64; // STATUS_SUCCESS unless a handler overrides
             let mut handled = true;
@@ -2195,6 +2624,15 @@ pub(crate) unsafe fn service_sec_image(
                         fault_ep,
                         !suspended,
                     );
+                    let teb_alias = match slot {
+                        0 => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+                        1 => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
+                        2 => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
+                        _ => 0,
+                    };
+                    if seed_winlogon_thread_client_info(teb_alias, procs[2].pml4).is_none() {
+                        print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
+                    }
                     tcb_cell.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
@@ -2818,22 +3256,6 @@ pub(crate) unsafe fn service_sec_image(
                 // host → accept it (STATUS_SUCCESS) so winlogon's kernel32 DllMain completes + the
                 // loader runs the remaining DllMains toward winlogon's entry.
                 result = 0;
-            } else if m0 == 71 && badge == 0 {
-                // NtDuplicateObject — smss's SmpExecuteInitialCommand duplicates winlogon's process
-                // handle (SourceHandle=RDX) into InitialCommandProcess (*TargetHandle=R9) so it can
-                // later wait on it (smss.c:344). If this FAILS smss KILLS winlogon (smss.c:355), so it
-                // MUST succeed. Model the dup: write the source handle value to *TargetHandle and
-                // return STATUS_SUCCESS (no real cross-process handle table needed — smss only uses the
-                // dup'd handle in the NtWaitForMultipleObjects below, which we park). This is the smss
-                // step that, when serviced, lets the loop keep multiplexing so winlogon (prio 102) runs
-                // FORWARD past the desktop paint toward StartServicesManager -> services.exe.
-                // ABI: SourceProcess=R10, SourceHandle=RDX(m3), TargetProcess=R8, TargetHandle=R9(PHANDLE).
-                let src_handle = m3;
-                let target = get_recv_mr(8); // R9 = *TargetHandle
-                if target != 0 {
-                    smss_stack_write(target, src_handle);
-                }
-                result = 0; // STATUS_SUCCESS
             } else if m0 == 280 && badge == 0 {
                 // NtWaitForMultipleObjects — smss's main thread waits (WaitAny) on {csrss, winlogon}
                 // to die (smss.c:518). In our boot NEITHER dies, so smss's correct terminal state is to
@@ -2868,6 +3290,7 @@ pub(crate) unsafe fn service_sec_image(
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE
                     || badge == WINLOGON_BADGE
+                    || is_wl_worker
                     || badge == SERVICES_BADGE
                     || badge == LSASS_BADGE)
             {
@@ -2877,169 +3300,71 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     0
                 };
-                let dialog_modal_dispatch =
-                    dialog_modal_expected_ssn != 0 && dialog_modal_expected_ssn == m0;
-                let dialog_modal_synthesize_empty_peek = dialog_modal_dispatch
-                    && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN;
-                let dialog_modal_synthesize_paint_get = dialog_modal_dispatch
-                    && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN;
+                let modal_message_buffer = get_recv_mr(9);
+                let dialog_modal_dispatch = dialog_modal_expected_ssn != 0
+                    && dialog_modal_expected_ssn == m0
+                    && winlogon_dialog_modal_thread_matches(
+                        badge,
+                        current_tid,
+                        modal_message_buffer,
+                    );
                 if dialog_modal_dispatch {
-                    print_str(b"[dialog-pump] allowing bounded modal SSN=");
+                    print_str(b"[dialog-pump] routing real modal SSN=");
                     print_hex(m0 as u32);
-                    if dialog_modal_synthesize_empty_peek {
-                        print_str(b" (synthesize empty Peek)");
-                    } else if dialog_modal_synthesize_paint_get {
-                        print_str(b" (synthesize IDD_LOGON WM_PAINT)");
-                    }
                     print_str(b"\n");
+                    if WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
+                        > WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed)
+                    {
+                        WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
+                    }
                 }
-                // ★ winlogon SAS MESSAGE-LOOP milestone. After InitializeSAS completes, WinMain posts
-                // WLX_WM_SAS and enters `while (GetMessageW(&Msg, SASWindow, …))` (winlogon.c:608) — its
-                // genuine steady state, where it blocks waiting for a SAS message / user input (Ctrl-Alt-Del).
-                // The first UserGetMessage (0x1006) / UserPeekMessage (0x1001) AFTER the SAS milestone marks
-                // reaching this loop. Real win32k's GetMessage would BLOCK winlogon's thread in
-                // co_MsqWaitForNewMessages (no message pending, no input source in this headless host) — which
-                // in our single-threaded model would block the WHOLE executive service loop. So PARK winlogon
-                // here (recv-next-without-reply, like the SAS-window milestone park): its TCB stays blocked at
-                // this proven-advanced steady state, the boot quiesces deterministically, and the gate runs.
+                let sas_hwnd = if pi == 2 {
+                    core::ptr::read_volatile(
+                        (win32k_subsystem::WIN32K_SHARED_VADDR
+                            + win32k_subsystem::SH_SAS_HWND) as *const u64,
+                    )
+                } else {
+                    0
+                };
                 if pi == 2
-                    && (m0 == 0x1006 || m0 == 0x1001)
-                    && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
-                    && !dialog_modal_dispatch
+                    && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                    && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+                    && !winlogon_dialog_modal_target_alive()
+                    && winlogon_dialog_modal_thread_matches(
+                        badge,
+                        current_tid,
+                        modal_message_buffer,
+                    )
                 {
-                    // The FIRST GetMessage after the SAS milestone should RETRIEVE the just-posted
-                    // WLX_WM_SAS from the SAS window's PostedMessagesListHead and return it → winlogon
-                    // TranslateMessage/DispatchMessageW → SASWindowProc → DispatchSAS → WlxLoggedOutSAS.
-                    // So DISPATCH the first GetMessage to win32k's real co_IntGetPeekMessage (the queue is
-                    // non-empty, so it won't block). PARK from the SECOND GetMessage onward: once the SAS
-                    // message is consumed the queue is empty and win32k's GetMessage would block the whole
-                    // single-threaded executive in co_MsqWaitForNewMessages — that empty-queue wait is
-                    // winlogon's genuine steady state (waiting for the next SAS / user input).
+                    WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[dialog-pump] correlated IDD_LOGON was destroyed; parking modal GetMessage\n");
+                    handled = false;
+                    wl_milestone_park = true;
+                } else if pi == 2
+                    && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                    && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
+                    && winlogon_dialog_modal_thread_matches(
+                        badge,
+                        current_tid,
+                        modal_message_buffer,
+                    )
+                {
+                    print_str(b"[dialog-pump] real IDD_LOGON queue drained; parking its blocking GetMessage\n");
+                    handled = false;
+                    wl_milestone_park = true;
+                } else if pi == 2
+                    && m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
+                    && sas_hwnd != 0
+                    && m3 == sas_hwnd
+                    && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0
+                {
                     let n = WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
                     if n == 0 {
-                        print_str(b"[wl-main] winlogon entered its SAS message loop (UserGetMessage 0x");
-                        print_hex(m0 as u32);
-                        print_str(b") -> dispatching to retrieve the posted WLX_WM_SAS (co_IntGetPeekMessage)\n");
+                        print_str(b"[wl-main] winlogon entered its SAS message loop; routing real GetMessage for posted WLX_WM_SAS\n");
                     } else {
-                        // ★ PROOF the client-side SASWindowProc → DispatchSAS RAN. Between GetMessage#1
-                        // (which returned WLX_WM_SAS) and this GetMessage#2, winlogon ran
-                        // DispatchMessageW(&Msg) CLIENT-SIDE (message.c:1990, no syscall): ValidateHwnd
-                        // (0x2002e) resolved the SAS PWND out of the RO-mapped heap, IntCallMessageProc
-                        // called the real SASWindowProc, which dispatched WLX_WM_SAS → DispatchSAS
-                        // (sas.c:1333). At STATE_INIT (0), DispatchSAS sets Session->LogonState =
-                        // STATE_LOGGED_OFF (1) then calls WlxDisplaySASNotice (sas.c:1336-1337). Read
-                        // winlogon's Session->LogonState (Session+0x118, published by the WM_CREATE bridge)
-                        // through its already-faulted heap page: != STATE_INIT proves the whole client-side
-                        // chain executed (before the desktop-heap client-window mapping it was invisible —
-                        // ValidateHwnd returned NULL → DispatchMessageW returned 0 → SASWindowProc never ran).
-                        let session = core::ptr::read_volatile(
-                            (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
-                        );
-                        let mut logon_state = 0u32;
-                        if session != 0 {
-                            const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
-                            // winlogon's Session is on its early heap (SMSS_ALLOC_VA 2 MiB window), which
-                            // the ACTIVE heap mirror maps (pi 2 is active here) → smss_copyin reads it.
-                            let mut ls = [0u8; 4];
-                            if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut ls) {
-                                logon_state = u32::from_le_bytes(ls);
-                                print_str(b"[wl-main] post-DispatchSAS Session->LogonState=0x");
-                                print_hex(logon_state);
-                                print_str(b" (STATE_INIT=0 -> STATE_LOGGED_OFF=1 proves SASWindowProc->DispatchSAS ran)\n");
-                                // STATE_INIT is 0; any non-zero == DispatchSAS advanced the state machine.
-                                if logon_state != 0 {
-                                    WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
-                                    if logon_state == nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
-                                        let _ = winlogon_dialog_observe_logged_off(
-                                            session,
-                                            logon_state,
-                                        );
-                                    }
-                                }
-                            } else {
-                                print_str(b"[wl-main] post-DispatchSAS Session read miss (not in heap mirror)\n");
-                            }
-                        }
-                        // ★ INJECT THE 2nd SAS (the Ctrl-Alt-Del a headless host can't receive from a
-                        // keyboard). winlogon's message loop is now at STATE_LOGGED_OFF showing the SAS
-                        // notice (WlxDisplaySASNotice). In a real system win32k posts WLX_WM_SAS when the
-                        // user presses CAD; here we simulate it by posting WLX_WM_SAS(WLX_SAS_TYPE_CTRL_ALT_DEL)
-                        // to the SAS window via the SAME real path winlogon used for the first SAS —
-                        // NtUserPostMessage(0x100e) → co_IntPostMessage → MsqPostMessage inserts it into the
-                        // SAS window's PostedMessagesListHead. This GetMessage#2 then retrieves it (queue
-                        // non-empty, won't block) → winlogon DispatchMessageW → client-side SASWindowProc →
-                        // DispatchSAS(CTRL_ALT_DEL) at STATE_LOGGED_OFF → the REAL WlxLoggedOutSAS (msgina
-                        // logon dialog, sas.c:1347). Everything downstream is the genuine winlogon/msgina code.
-                        if logon_state == 1
-                            && WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
-                        {
-                            let hwnd = core::ptr::read_volatile(
-                                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_HWND) as *const u64,
-                            );
-                            if hwnd != 0 {
-                                // Snapshot the Winlogon-key open count BEFORE injecting. msgina's
-                                // GUILoggedOutSAS (the WlxLoggedOutSAS body) FIRST does
-                                // RegOpenKeyExW(HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon)
-                                // to read LegalNotice — which bumps WINLOGON_KEY_OPENED. A post-dispatch
-                                // increase is DIRECT PROOF the real WlxLoggedOutSAS ran (independent of the
-                                // transient LogonState, which DoGenericAction resets 2→1).
-                                WINLOGON_KEY_OPENED_AT_INJECT
-                                    .store(WINLOGON_KEY_OPENED.load(Ordering::Relaxed), Ordering::Relaxed);
-                                // The injecting dispatch runs on winlogon's behalf (pi 2) so win32k
-                                // attaches winlogon's frames + resolves the SAS window's THREADINFO queue.
-                                W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-                                const WLX_WM_SAS: u64 = 0x659; // WM_USER(0x400) + 0x259
-                                const WLX_SAS_TYPE_CTRL_ALT_DEL: u64 = 1;
-                                const SSN_NT_USER_POST_MESSAGE: u64 = 0x100e;
-                                print_str(b"[wl-main] STATE_LOGGED_OFF -> INJECTING 2nd SAS: NtUserPostMessage(hwnd=0x");
-                                print_hex(hwnd as u32);
-                                print_str(b", WLX_WM_SAS, CTRL_ALT_DEL) [simulated Ctrl-Alt-Del]\n");
-                                let (r, _) = win32k_glue::win32k_dispatch(
-                                    SSN_NT_USER_POST_MESSAGE,
-                                    hwnd,
-                                    WLX_WM_SAS,
-                                    WLX_SAS_TYPE_CTRL_ALT_DEL,
-                                    0,
-                                );
-                                print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
-                                print_hex(r as u32);
-                                print_str(b"\n");
-                                WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
-                                // DON'T park: let THIS GetMessage#2 flow through to win32k's real
-                                // co_IntGetPeekMessage, which retrieves the just-posted WLX_WM_SAS → winlogon
-                                // dispatches it client-side → WlxLoggedOutSAS runs.
-                            } else {
-                                print_str(b"[wl-main] SAS HWND not published - cannot inject 2nd SAS; parking\n");
-                                handled = false;
-                                wl_milestone_park = true;
-                            }
-                        } else {
-                            // GetMessage#3+ : the queue is empty again. This is the furthest proven steady
-                            // state → MESSAGE-LOOP MILESTONE PARK so the boot quiesces. Record the resting
-                            // LogonState for the diagnostic (a resting STATE_LOGGED_OFF(1) is expected even
-                            // when WlxLoggedOutSAS runs, because DoGenericAction(NONE) resets 2→1 — see the
-                            // batch report; the 2nd-SAS proof is the injection+retrieval, not the resting state).
-                            WINLOGON_LOGGED_OUT_SAS.store(logon_state as u64, Ordering::Relaxed);
-                            // DIRECT PROOF of WlxLoggedOutSAS: did GUILoggedOutSAS reopen the Winlogon key
-                            // (RegOpenKeyExW for LegalNotice) after the 2nd SAS dispatched?
-                            let keyed_now = WINLOGON_KEY_OPENED.load(Ordering::Relaxed);
-                            let keyed_at_inject = WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
-                            print_str(b"[wl-main] post-2nd-SAS resting LogonState=0x");
-                            print_hex(logon_state);
-                            print_str(b" Winlogon-key opens: at-inject=");
-                            print_u64(keyed_at_inject);
-                            print_str(b" now=");
-                            print_u64(keyed_now);
-                            if keyed_now > keyed_at_inject {
-                                // GUILoggedOutSAS ran → WlxLoggedOutSAS's substantive body executed.
-                                WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
-                                print_str(b" -> WlxLoggedOutSAS RAN (GUILoggedOutSAS reopened Winlogon key)");
-                            }
-                            print_str(b"\n");
-                            print_str(b"[wl-main] winlogon GetMessage on EMPTY SAS queue -> MESSAGE-LOOP MILESTONE PARK (boot quiesces; gate runs)\n");
-                            handled = false;
-                            wl_milestone_park = true;
-                        }
+                        print_str(b"[wl-main] SAS queue empty at main-loop GetMessage -> parking\n");
+                        handled = false;
+                        wl_milestone_park = true;
                     }
                 }
                 // Tell win32k_dispatch WHICH client this call belongs to (csrss pi 1 / winlogon pi 2 /
@@ -3064,14 +3389,20 @@ pub(crate) unsafe fn service_sec_image(
                 // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
                 // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
                 {
-                    // Live-lock backstop (kept at 500). BATCH 43 note: winlogon now CROSSES the
-                    // NtUserGetClassInfo class-call-proc wall and would keep dispatching heavy SAS-window
-                    // work past the 620s TCG budget — but the SAS-window MILESTONE PARK (0x1077 OK, see the
-                    // `wl_milestone_park` arm below) parks it first, so this generic cap no longer gates
-                    // winlogon; it remains the catch-all for any client whose win32k flow truly live-locks.
+                    // Creating IDD_LOGON's real child controls legitimately crosses the historical
+                    // 500-dispatch initialization ceiling. Once the dialog is correlated, allow that
+                    // bounded construction/paint burst to reach the modal-pump completion gate.
                     const W32_TOTAL_LIMIT: u64 = 500;
+                    const W32_IDD_LOGON_LIMIT: u64 = 4096;
+                    let limit = if pi == 2
+                        && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+                    {
+                        W32_IDD_LOGON_LIMIT
+                    } else {
+                        W32_TOTAL_LIMIT
+                    };
                     let total = W32_TOTAL_DISPATCH[pi].fetch_add(1, Ordering::Relaxed) + 1;
-                    if total >= W32_TOTAL_LIMIT {
+                    if total >= limit {
                         print_str(b"[w32-spin] pi=");
                         print_u64(pi as u64);
                         print_str(b" badge=");
@@ -3221,72 +3552,6 @@ pub(crate) unsafe fn service_sec_image(
                     // winlogon reached its SAS message-loop milestone (0x1006/0x1001) — do NOT dispatch to
                     // win32k (its GetMessage would block the executive); the !handled block parks winlogon.
                     (0i32, false)
-                } else if dialog_modal_synthesize_empty_peek {
-                    let session = core::ptr::read_volatile(
-                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION)
-                            as *const u64,
-                    );
-                    let mut logon_state = 0u32;
-                    if session != 0 {
-                        const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
-                        let mut ls = [0u8; 4];
-                        if img_spawn::smss_copyin(session + WLSESSION_LOGONSTATE_OFF, &mut ls) {
-                            logon_state = u32::from_le_bytes(ls);
-                            WINLOGON_LOGGED_OUT_SAS.store(logon_state as u64, Ordering::Relaxed);
-                        }
-                    }
-                    let keyed_now = WINLOGON_KEY_OPENED.load(Ordering::Relaxed);
-                    let keyed_at_inject = WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
-                    if keyed_now > keyed_at_inject {
-                        WINLOGON_LOGGED_OUT_SAS_RAN.store(1, Ordering::Relaxed);
-                    }
-                    print_str(b"[dialog-pump] modal empty Peek: preserving WlxLoggedOutSAS proof LogonState=");
-                    print_hex(logon_state);
-                    print_str(b" key-at-inject=");
-                    print_u64(keyed_at_inject);
-                    print_str(b" key-now=");
-                    print_u64(keyed_now);
-                    print_str(b"\n");
-                    if winlogon_dialog_modal_observe(m0, 0, 0, 0) {
-                        (0i32, true)
-                    } else {
-                        handled = false;
-                        wl_milestone_park = true;
-                        (0i32, false)
-                    }
-                } else if dialog_modal_synthesize_paint_get {
-                    let hwnd = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
-                    if a0 != 0 && hwnd != 0 {
-                        smss_stack_write(a0, hwnd);
-                        smss_stack_write(a0 + 8, nt_user_callback::WM_PAINT as u64);
-                        smss_stack_write(a0 + 0x10, 0);
-                        smss_stack_write(a0 + 0x18, 0);
-                        smss_stack_write(a0 + 0x20, 0);
-                        smss_stack_write(a0 + 0x28, 0);
-                        print_str(b"[dialog-pump] synthetic GetMessage MSG hwnd=0x");
-                        print_hex(hwnd as u32);
-                        print_str(b" message=");
-                        print_hex(nt_user_callback::WM_PAINT);
-                        print_str(b"\n");
-                        if winlogon_dialog_modal_observe(
-                            m0,
-                            1,
-                            hwnd,
-                            nt_user_callback::WM_PAINT,
-                        ) {
-                            (1i32, true)
-                        } else {
-                            handled = false;
-                            wl_milestone_park = true;
-                            (0i32, false)
-                        }
-                    } else {
-                        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
-                        print_str(b"[dialog-pump] synthetic GetMessage missing MSG pointer or IDD hwnd\n");
-                        handled = false;
-                        wl_milestone_park = true;
-                        (0i32, false)
-                    }
                 } else if m0 == 0x125c && badge == WINLOGON_BADGE {
                     KBD_LAYOUT_LOADED.fetch_add(1, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserLoadKeyboardLayoutEx(0x125c) FAKED -> HKL=0x04090409\n");
@@ -3417,6 +3682,7 @@ pub(crate) unsafe fn service_sec_image(
                         m0, d_a0, d_a1, a2, a3, sp, nargs,
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
+                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
                             peb_mirror,
@@ -3442,6 +3708,16 @@ pub(crate) unsafe fn service_sec_image(
                             && message as u32 == nt_user_callback::WLX_WM_SAS
                             && wparam == nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL
                         {
+                            if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
+                                && WINLOGON_SAS1_RETRIEVED.swap(1, Ordering::Relaxed) == 0
+                            {
+                                WINLOGON_PAINT_RETURNS_AT_SAS1.store(
+                                    win32k_glue::real_wm_paint_callback_returns(),
+                                    Ordering::Relaxed,
+                                );
+                            } else if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0 {
+                                WINLOGON_MSGLOOP_MILESTONE.fetch_add(1, Ordering::Relaxed);
+                            }
                             let session = core::ptr::read_volatile(
                                 (win32k_subsystem::WIN32K_SHARED_VADDR
                                     + win32k_subsystem::SH_SAS_SESSION)
@@ -3455,21 +3731,93 @@ pub(crate) unsafe fn service_sec_image(
                             );
                         }
                     }
-                    if dialog_modal_dispatch {
-                        let hwnd = if a0 != 0 { smss_stack_read(a0) } else { 0 };
-                        let message = if a0 != 0 {
-                            smss_stack_read(a0 + 8) as u32
-                        } else {
-                            0
-                        };
-                        if !winlogon_dialog_modal_observe(m0, r.0, hwnd, message) {
-                            handled = false;
-                            wl_milestone_park = true;
+                    if pi == 2
+                        && m0 == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+                        && r.0 == 0
+                        && badge == WINLOGON_BADGE
+                        && current_tid == PM_TIDS[pi].load(Ordering::Relaxed)
+                        && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
+                        && WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) == 0
+                        && win32k_glue::real_wm_paint_callback_returns()
+                            > WINLOGON_PAINT_RETURNS_AT_SAS1.load(Ordering::Relaxed)
+                        && winlogon_pwnd_for_hwnd(win32k_glue::last_real_wm_paint_hwnd()) != 0
+                    {
+                        let session = core::ptr::read_volatile(
+                            (win32k_subsystem::WIN32K_SHARED_VADDR
+                                + win32k_subsystem::SH_SAS_SESSION) as *const u64,
+                        );
+                        let mut logon_state = 0u32;
+                        if session != 0 {
+                            const WLSESSION_LOGONSTATE_OFF: u64 = 0x118;
+                            let mut bytes = [0u8; 4];
+                            if img_spawn::smss_copyin(
+                                session + WLSESSION_LOGONSTATE_OFF,
+                                &mut bytes,
+                            ) {
+                                logon_state = u32::from_le_bytes(bytes);
+                            }
+                        }
+                        print_str(b"[wl-main] welcome queue drained after real paint; Session->LogonState=0x");
+                        print_hex(logon_state);
+                        print_str(b"\n");
+                        if logon_state == nt_user_callback::WINLOGON_STATE_LOGGED_OFF {
+                            WINLOGON_SAS_LOGONSTATE.store(logon_state as u64, Ordering::Relaxed);
+                            let _ = winlogon_dialog_observe_logged_off(session, logon_state);
+                            let hwnd = core::ptr::read_volatile(
+                                (win32k_subsystem::WIN32K_SHARED_VADDR
+                                    + win32k_subsystem::SH_SAS_HWND) as *const u64,
+                            );
+                            if hwnd != 0 {
+                                WINLOGON_KEY_OPENED_AT_INJECT.store(
+                                    WINLOGON_KEY_OPENED.load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                                print_str(b"[wl-main] posting simulated Ctrl-Alt-Del through real NtUserPostMessage hwnd=0x");
+                                print_hex(hwnd as u32);
+                                print_str(b"\n");
+                                let post = win32k_glue::win32k_dispatch_wide(
+                                    0x100e,
+                                    hwnd,
+                                    nt_user_callback::WLX_WM_SAS as u64,
+                                    nt_user_callback::WLX_SAS_TYPE_CTRL_ALT_DEL,
+                                    0,
+                                    0,
+                                    4,
+                                    win32k_glue::Win32kClientContext {
+                                        pi: pi as u32,
+                                        pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
+                                        badge,
+                                        tid: nt_handler.current_tid,
+                                        peb_mirror,
+                                    },
+                                );
+                                print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
+                                print_hex(post.0 as u32);
+                                print_str(b"\n");
+                                if post.1 && post.0 != 0 {
+                                    WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
+                                } else {
+                                    handled = false;
+                                    wl_milestone_park = true;
+                                }
+                            }
                         }
                     }
                     r
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+                if dialog_modal_dispatch && !callback_suspended {
+                    let hwnd = if a0 != 0 { smss_stack_read(a0) } else { 0 };
+                    let message = if a0 != 0 {
+                        smss_stack_read(a0 + 8) as u32
+                    } else {
+                        0
+                    };
+                    if !winlogon_dialog_modal_observe(m0, st, hwnd, message) {
+                        handled = false;
+                        wl_milestone_park = true;
+                    }
+                }
                 if callback_suspended {
                     let peb_mirror = match pi {
                         0 => 0x0000_0100_1074_1000,
@@ -3482,6 +3830,7 @@ pub(crate) unsafe fn service_sec_image(
                     redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
+                            pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
                             peb_mirror,
@@ -3613,13 +3962,20 @@ pub(crate) unsafe fn service_sec_image(
                 // (desktop.c:3456), run KeStackAttachProcess'd to winlogon during NtUserProcessConnect,
                 // takes its ELSE branch (winlogon's pti->rpdesk is NULL in our host — the per-thread
                 // desktop-heap view isn't wired) and CLEARS `pci->pDeskInfo = NULL`, re-introducing the
-                // crash. The executive still holds winlogon's TEB frame mapped at its env-scratch base
-                // (WINLOGON_SCR_BASE+0x820, never unmapped after spawn), so re-write it here after every
-                // winlogon (pi 2) win32k dispatch — cheap, idempotent, keeps pDeskInfo valid by the time
-                // winlogon returns to user mode. (Only pi 2 is interactive + hits GetThreadDesktopWnd;
+                // crash. The executive still holds each winlogon TEB frame mapped at its env-scratch
+                // base, so re-write the faulting thread's client fields after every pi-2 win32k
+                // dispatch. (Only pi 2 is interactive + hits GetThreadDesktopWnd;
                 // the non-interactive services/lsass short-circuit before their user32 desktop path.)
                 if pi == 2 {
-                    const WINLOGON_SCR_BASE: u64 = 0x0000_0100_107C_0000;
+                    let winlogon_teb_alias = if is_wl_worker {
+                        match badge {
+                            WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
+                            WINLOGON_WORKER3_BADGE => WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000,
+                            _ => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
+                        }
+                    } else {
+                        0x0000_0100_107C_0000
+                    };
                     // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING. Once win32k has bound the Default desktop it
                     // publishes (per dispatch, via the coherent shared page) the DESKTOPINFO server VA
                     // (SH_SAS_DESKINFO) + the dispatch THREADINFO server VA (SH_SAS_PTI == every window's
@@ -3633,56 +3989,42 @@ pub(crate) unsafe fn service_sec_image(
                     //     RO-mapped heap window at CSRSS_W32_SHARED_VA).
                     //   - CLIENTINFO.ulClientDelta (TEB+0x828) = delta, so DesktopPtrToUser maps every
                     //     heap-resident server pointer (PWND/pcls/spwnd) → its client VA (server−delta).
-                    // The DESKTOPINFO's pvDesktopBase/pvDesktopLimit (win32k-side, RO-shared) bracket the
-                    // whole heap so the range check accepts any heap pointer. Falls back to the
-                    // placeholder DESKTOPINFO until the desktop is bound (SH_SAS_DESKINFO still 0).
-                    let sas_deskinfo = core::ptr::read_volatile(
-                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_DESKINFO) as *const u64,
-                    );
-                    let sas_pti = core::ptr::read_volatile(
-                        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_PTI) as *const u64,
-                    );
-                    // ulClientDelta = the USER-heap delta: DesktopPtrToUser applies it to the PWND/pcls/
-                    // spwnd pointers, which are DesktopHeapAlloc'ed = in the RO-mapped USER heap window.
-                    let delta = win32k_subsystem::WIN32K_HEAP_VADDR - win32k_subsystem::CSRSS_W32_SHARED_VA;
-                    // The DESKTOPINFO itself is `pool_alloc`ed = in the POOL, mapped at its own delta.
-                    let pool_delta = win32k_subsystem::WIN32K_POOL_VADDR - win32k_subsystem::CSRSS_W32_POOL_VA;
-                    if sas_deskinfo != 0 && sas_pti != 0 {
-                        // Ensure the POOL is RO-mapped into winlogon so pci->pDeskInfo is readable client-side.
-                        let _ = win32k_glue::map_win32k_pool_into_csrss(pml4, pi);
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, sas_pti); // Win32ThreadInfo == head.pti
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, sas_deskinfo - pool_delta); // pDeskInfo (POOL client VA)
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, delta); // ulClientDelta (USER-heap delta)
+                    // The DESKTOPINFO's pvDesktopBase/pvDesktopLimit (win32k-side, RO-shared) bracket
+                    // the whole heap so the range check accepts any heap pointer. Do not manufacture a
+                    // placeholder THREADINFO: without published server state this thread is not ready
+                    // for client-side USER dispatch.
+                    if let Some((client_deskinfo, pti, delta)) =
+                        seed_winlogon_thread_client_info(winlogon_teb_alias, pml4)
+                    {
                         if WINLOGON_DESKHEAP_MAPPED.swap(1, Ordering::Relaxed) == 0 {
                             print_str(b"[wl-main] winlogon CLIENTINFO seeded for client-side ValidateHwnd: pDeskInfo=0x");
-                            print_hex(((sas_deskinfo - pool_delta) >> 32) as u32);
-                            print_hex((sas_deskinfo - pool_delta) as u32);
+                            print_hex((client_deskinfo >> 32) as u32);
+                            print_hex(client_deskinfo as u32);
                             print_str(b" pti=0x");
-                            print_hex((sas_pti >> 32) as u32);
-                            print_hex(sas_pti as u32);
+                            print_hex((pti >> 32) as u32);
+                            print_hex(pti as u32);
                             print_str(b" ulClientDelta=0x");
                             print_hex((delta >> 32) as u32);
                             print_hex(delta as u32);
                             print_str(b"\n");
                         }
-                    } else {
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x78) as *mut u64, SMSS_DESKINFO_VA); // Win32ThreadInfo
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x820) as *mut u64, SMSS_DESKINFO_VA); // pDeskInfo
-                        core::ptr::write_volatile((WINLOGON_SCR_BASE + 0x828) as *mut u64, 0); // ulClientDelta
                     }
                     // ★ DIALOG BATCH 3 — CLIENT-GDI HANDLE-TABLE MAPPING. The msgina logon dialog's
                     // CreateWindowEx(#32770) → DC/font setup makes client-side gdi32 validate GDI handles
                     // through `GdiSharedHandleTable[handle & 0xffff]` (base = PEB->GdiSharedHandleTable,
-                    // seeded at spawn in img_spawn.rs). RO-map the (executive-allocated, zero-init) GDI
-                    // handle table into winlogon so the index read at gdi32 RVA 0x535a lands in mapped
-                    // memory instead of NULL-derefing. One-time (per-pi guarded). PEB+0xf8 was already
-                    // seeded pre-loader so gdi32's GdiProcessSetup cached this same VA. Latch the milestone.
+                    // seeded at spawn in img_spawn.rs). Project win32k's coherent live handle-table
+                    // section and client-writable GDI attribute pool into winlogon. PEB+0xf8 was already
+                    // seeded pre-loader so gdi32's GdiProcessSetup cached this same VA.
                     let gdi_va = win32k_glue::map_gdi_shared_handle_table_into_client(pml4, pi);
-                    if WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0 {
+                    let gdi_attributes = win32k_glue::map_gdi_user_attributes_into_client(pml4, pi);
+                    if gdi_va != 0
+                        && gdi_attributes
+                        && WINLOGON_GDI_MAPPED.swap(1, Ordering::Relaxed) == 0
+                    {
                         print_str(b"[wl-main] winlogon client GDI handle table mapped @0x");
                         print_hex((gdi_va >> 32) as u32);
                         print_hex(gdi_va as u32);
-                        print_str(b" (PEB->GdiSharedHandleTable seeded pre-loader)\n");
+                        print_str(b" with live user attributes (PEB->GdiSharedHandleTable seeded pre-loader)\n");
                     }
                 }
                 // ★ EAGER DESKTOP-GFX HOOK FULLY RETIRED. There is no longer any m0==0x125a
@@ -3699,157 +4041,18 @@ pub(crate) unsafe fn service_sec_image(
                     result = nt_user_callback::STATUS_PENDING as u32 as u64;
                 } else if ok {
                     result = st as u32 as u64; // NTSTATUS (EAX) back to csrss
-                    // ★ BATCH 45 — SAS-window milestone gated on a REAL HWND (st != 0). Root cause found in
-                    // BATCH 44/45: the BATCH-43 "0x1077 OK" was a FALSE POSITIVE — the executive forwarded
-                    // only the 4 register args to `NtUserCreateWindowEx` (15 args), so win32k read hMenu
-                    // (11th arg, on the stack) as GARBAGE → `ERROR_INVALID_MENU_HANDLE` → NULL HWND. `ok`
-                    // only meant "the handler ran to DONE", not "valid window". FIX: the win64 STACK-ARG
-                    // TAIL is now marshaled (win32k_dispatch_wide + win32k_ssn_argc) AND the WM_NCCREATE
-                    // WINDOWPROC callback returns Result=TRUE (s_ke_user_mode_callback api=0), so 0x1077
-                    // returns a real HWND. Winlogon then runs THROUGH: UserSetLogonNotifyWindow (0x127c) +
-                    // UnregisterClass (0x10bf) = InitializeSAS COMPLETE. Record the HWND milestone here.
                     if pi == 2 && m0 == 0x1077 && st != 0 {
-                        if WINLOGON_SAS2_INJECTED.load(Ordering::Relaxed) != 0
-                            && WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
-                                > WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed)
-                            && a1 == 0x8002
-                            && a3 != 0
-                        {
-                            let mut raw = [0u8; 16];
-                            let descriptor_read = img_spawn::client_copyin_mapped(
-                                pi as u64,
-                                a3,
-                                &mut raw,
-                                filled_pages,
-                                faults as usize,
-                                scratch_base,
-                            );
-                            let descriptor = descriptor_read
-                                .then(|| nt_user_callback::LargeUnicodeStringDescriptor::parse(&raw))
-                                .and_then(Result::ok);
-                            let raw_length = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                            let raw_maximum_and_ansi =
-                                u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-                            let raw_buffer = u64::from_le_bytes([
-                                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14],
-                                raw[15],
-                            ]);
-                            let source = if descriptor.is_some()
-                                && img_spawn::smss_mirror(raw_buffer, raw_length as u64).is_some()
-                            {
-                                1
-                            } else if descriptor.is_some()
-                                && img_spawn::scratch_for(
-                                    raw_buffer,
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                )
-                                .is_some()
-                            {
-                                2
-                            } else if descriptor.is_some()
-                                && csrss_frame_get(pi as u64, raw_buffer & !0xfff) != 0
-                            {
-                                3
-                            } else if descriptor.is_some()
-                                && client_copyin_frame_get(pi as u64, raw_buffer & !0xfff) != 0
-                            {
-                                4
-                            } else {
-                                0
-                            };
-                            let mut bytes =
-                                [0u8; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS * 2];
-                            let mut units =
-                                [0u16; nt_user_callback::MAX_DIALOG_CAPTION_CODE_UNITS];
-                            let mut count = 0usize;
-                            let mut caption_read = false;
-                            if let Some(descriptor) = descriptor {
-                                let length = descriptor.length_bytes as usize;
-                                caption_read = img_spawn::client_copyin_mapped(
-                                    pi as u64,
-                                    descriptor.buffer,
-                                    &mut bytes[..length],
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                );
-                                if caption_read {
-                                    count = nt_user_callback::decode_utf16le_bounded(
-                                        &bytes[..length],
-                                        &mut units,
-                                    )
-                                    .unwrap_or(0);
-                                }
-                            }
-                            let style = smss_stack_read(sp + 0x28) as u32;
-                            let top_level = style & 0x8000_0000 != 0 && style & 0x4000_0000 == 0;
-                            let winlogon_key_advanced = WINLOGON_KEY_OPENED.load(Ordering::Relaxed)
-                                > WINLOGON_KEY_OPENED_AT_INJECT.load(Ordering::Relaxed);
-                            let caption_match =
-                                caption_read && units[..count] == nt_user_callback::IDD_LOGON_CAPTION;
-                            let session = core::ptr::read_volatile(
-                                (win32k_subsystem::WIN32K_SHARED_VADDR
-                                    + win32k_subsystem::SH_SAS_SESSION)
-                                    as *const u64,
-                            );
-                            let correlated = if caption_read {
-                                winlogon_dialog_capture_idd_logon(
-                                    session,
-                                    st as u64,
-                                    a1,
-                                    &units[..count],
-                                    top_level,
-                                    winlogon_key_advanced,
-                                )
-                            } else {
-                                false
-                            };
-                            print_str(b"[dialog-caption] hwnd=0x");
-                            print_hex(st as u32);
-                            print_str(b" descriptor-read=");
-                            print_u64(descriptor_read as u64);
-                            print_str(b" parse=");
-                            print_u64(descriptor.is_some() as u64);
-                            print_str(b" len=");
-                            print_u64(raw_length as u64);
-                            print_str(b" maxansi=0x");
-                            print_hex(raw_maximum_and_ansi);
-                            print_str(b" buf=0x");
-                            print_hex((raw_buffer >> 32) as u32);
-                            print_hex(raw_buffer as u32);
-                            print_str(b" source=");
-                            print_u64(source);
-                            print_str(b" caption-read=");
-                            print_u64(caption_read as u64);
-                            print_str(b" units=");
-                            print_u64(count as u64);
-                            print_str(b" Logon=");
-                            print_u64(caption_match as u64);
-                            print_str(b" top-level=");
-                            print_u64(top_level as u64);
-                            print_str(b" correlated=");
-                            print_u64(correlated as u64);
-                            print_str(b"\n");
-                        }
-                        // ★ DIALOG BATCH 3 — the FIRST #32770 window is winlogon's SAS-notify window
-                        // (sets the milestone below). EVERY subsequent #32770 (milestone already set) is
-                        // part of the msgina IDD_LOGON credential dialog cascade: WlxDialogBoxParam →
-                        // DIALOG_CreateIndirect creates the dialog frame + its child controls (Static
-                        // labels, Edit fields, Buttons). Note the dialog windows are created BEFORE the
-                        // executive detects WlxLoggedOutSAS-ran (that's a later Winlogon-key reopen), so
-                        // gate on the SAS-milestone, not LOGGED_OUT_SAS_RAN. The client-GDI handle-table
-                        // mapping + hDllInstance seed are what let CreateWindowEx get this far.
-                        if WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) != 0 {
-                            WINLOGON_DIALOG_WINDOWS.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            // The SAS-notify window milestone (unchanged behavior).
-                            WINLOGON_SAS_MILESTONE.store(1, Ordering::Relaxed);
-                            print_str(b"[wl-main] winlogon created SAS window (NtUserCreateWindowEx 0x1077 -> HWND 0x");
-                            print_hex(st as u32);
-                            print_str(b")\n");
-                        }
+                        observe_winlogon_completed_dispatch(
+                            win32k_glue::CompletedWin32kDispatch {
+                                ssn: m0,
+                                args: [a0, a1, a2, a3],
+                                caller_sp: sp,
+                                status: st,
+                            },
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
                     }
                     // ★ BATCH 45 — QUIESCE at the InitializeSAS-complete milestone. `UserSetLogonNotifyWindow`
                     // (0x127c) is winlogon's DEFINING final interactive step: it registers its logon-notify
@@ -4208,10 +4411,11 @@ pub(crate) unsafe fn service_sec_image(
                             // branch clears TEB.Win32ThreadInfo(+0x78)/pDeskInfo(+0x820); re-seed via the
                             // executive's persistent alias of winlogon's TEB frame. (The primary guarantee
                             // is the spawn seed + the fault-time repair; this keeps the window minimal.)
-                            const WLSCR: u64 = 0x0000_0100_107C_0000;
-                            core::ptr::write_volatile((WLSCR + 0x78) as *mut u64, SMSS_DESKINFO_VA);
-                            core::ptr::write_volatile((WLSCR + 0x820) as *mut u64, SMSS_DESKINFO_VA);
-                            core::ptr::write_volatile((WLSCR + 0x828) as *mut u64, 0);
+                            const WINLOGON_MAIN_TEB_ALIAS: u64 = 0x0000_0100_107C_0000;
+                            let _ = seed_winlogon_thread_client_info(
+                                WINLOGON_MAIN_TEB_ALIAS,
+                                procs[2].pml4,
+                            );
                             if first {
                                 print_str(b"[wl-main] winlogon SCM-RPC read parked; SCM server LIVE (listener signalled + running) -> continue recv (server may write bind_ack)\n");
                             }
@@ -4998,15 +5202,21 @@ unsafe fn ensure_client_copyin_dll_page(
     let Some(tpe) = (*slot).as_ref() else {
         return false;
     };
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x2000;
+    let prefetch_index = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N))
+        .min(CLIENT_COPYIN_FRAME_CAP);
+    if prefetch_index == CLIENT_COPYIN_FRAME_CAP {
+        return false;
+    }
+    // Reserve the high end of each process scratch window for bounded copy-in prefetches. Demand
+    // fills are capped below this range, so every prefetched page keeps a distinct live alias.
+    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - (prefetch_index as u64 + 3) * 0x1000;
     let (frame, fe) = alloc_frame_r();
     let se = page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
     if fe != 0 || se != 0 {
         return false;
     }
     let _ = fill_image_page(tpe, rva, alias);
-    let _ = page_unmap(frame);
-    client_copyin_frame_put(pi, page, frame);
+    client_copyin_frame_put(pi, page, frame, alias);
     true
 }
 

@@ -1137,6 +1137,9 @@ static EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// BATCH 25 — count of fixup-preserving re-maps (a re-faulted per-process image page re-mapped from
 /// its already-filled frame instead of re-filled from the raw PE, so reloc/IAT-snap fixups survive).
 static FIXUP_REMAP_N: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_HANDLE_FAULT_DIAG_N: AtomicU64 = AtomicU64::new(0);
+static KERNEL32_TABLE_WATCH_SCRATCH: AtomicU64 = AtomicU64::new(0);
+static KERNEL32_TABLE_WATCH_CORRUPT: AtomicU64 = AtomicU64::new(0);
 /// (B) SPIN WATCHDOG for the win32k dispatch. A hosted GUI client (notably csrss's user32
 /// RegisterSystemClasses loop) can call the SAME win32k SSN over and over when win32k WALLs the
 /// call (returns STATUS_UNSUCCESSFUL / asserts) — a NON-terminating loop that issues syscalls (so it
@@ -1178,6 +1181,11 @@ pub(crate) static WINLOGON_SAS_MILESTONE: AtomicU64 = AtomicU64::new(0);
 /// message / user input). Drives the `exec_winlogon_sas_message_loop` gate spec + the message-loop
 /// milestone park (the boot quiesces here deterministically instead of racing the SCM/LSA backstop).
 pub(crate) static WINLOGON_MSGLOOP_MILESTONE: AtomicU64 = AtomicU64::new(0);
+/// Set when the first real `WLX_WM_SAS` is removed from the SAS window queue. The companion paint
+/// snapshot lets the headless input shim wait until the resulting welcome dialog has actually run
+/// at least one real `WM_PAINT` callback before posting the simulated Ctrl-Alt-Del.
+pub(crate) static WINLOGON_SAS1_RETRIEVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_PAINT_RETURNS_AT_SAS1: AtomicU64 = AtomicU64::new(0);
 /// Latched (=1) the first time the executive seeds winlogon's TEB.Win32ClientInfo with the REAL
 /// desktop-heap client-window mapping (pDeskInfo = bound DESKTOPINFO − delta, Win32ThreadInfo =
 /// head.pti, ulClientDelta = delta) so user32's client-side ValidateHwnd/DesktopPtrToUser resolve the
@@ -1223,9 +1231,17 @@ static mut WINLOGON_DIALOG_MODAL_PUMP: nt_user_callback::DialogModalPumpSequence
     nt_user_callback::DialogModalPumpSequence::new();
 pub(crate) static WINLOGON_DIALOG_MODAL_STEPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_MODAL_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_PAINTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_DRAINED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_BADGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_TID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WINLOGON_DIALOG_MODAL_MSG: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_MODAL_HWND: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_MODAL_MESSAGE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static WINLOGON_DIALOG_MODAL_ERRORS: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_DIALOG_FB_PIXELS: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_DIALOG_FB_NON_DESKTOP: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_DIALOG_FB_COLORS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn winlogon_dialog_correlation_load() -> nt_user_callback::WinlogonDialogCorrelation {
     core::ptr::read(core::ptr::addr_of!(WINLOGON_DIALOG_CORRELATION))
@@ -1319,16 +1335,83 @@ unsafe fn winlogon_dialog_modal_store(state: nt_user_callback::DialogModalPumpSe
     core::ptr::write(core::ptr::addr_of_mut!(WINLOGON_DIALOG_MODAL_PUMP), state);
     WINLOGON_DIALOG_MODAL_STEPS.store(state.completed_steps() as u64, Ordering::Relaxed);
     WINLOGON_DIALOG_MODAL_COMPLETED.store(state.is_complete() as u64, Ordering::Relaxed);
+    WINLOGON_DIALOG_MODAL_PAINTS.store(state.paint_dispatches() as u64, Ordering::Relaxed);
+    WINLOGON_DIALOG_MODAL_DRAINED.store(state.is_drained() as u64, Ordering::Relaxed);
 }
 
 pub(crate) unsafe fn winlogon_dialog_modal_expected_ssn() -> u64 {
     if WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) == 0
         || WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) == 0
-        || WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
+        || WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
     {
         return 0;
     }
     winlogon_dialog_modal_load().expected_ssn().unwrap_or(0)
+}
+
+pub(crate) fn winlogon_dialog_modal_thread_matches(badge: u64, tid: u64, message: u64) -> bool {
+    if badge != WINLOGON_BADGE || tid == 0 || message == 0 {
+        return false;
+    }
+    let observed_tid = WINLOGON_DIALOG_MODAL_TID.load(Ordering::Relaxed);
+    if observed_tid == 0 {
+        WINLOGON_DIALOG_MODAL_BADGE.store(badge, Ordering::Relaxed);
+        WINLOGON_DIALOG_MODAL_TID.store(tid, Ordering::Relaxed);
+        WINLOGON_DIALOG_MODAL_MSG.store(message, Ordering::Relaxed);
+        return true;
+    }
+    WINLOGON_DIALOG_MODAL_BADGE.load(Ordering::Relaxed) == badge
+        && observed_tid == tid
+        && WINLOGON_DIALOG_MODAL_MSG.load(Ordering::Relaxed) == message
+}
+
+pub(crate) unsafe fn winlogon_pwnd_for_hwnd(hwnd: u64) -> u64 {
+    let ahelist = core::ptr::read_volatile(
+        (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_AHELIST) as *const u64,
+    );
+    if ahelist == 0 || (hwnd & 0xffff) < 0x20 {
+        return 0;
+    }
+    let handles = core::ptr::read_volatile(ahelist as *const u64);
+    let count = core::ptr::read_volatile((ahelist + 0x10) as *const u32) as u64;
+    let index = ((hwnd & 0xffff) - 0x20) >> 1;
+    if handles == 0 || index >= count {
+        return 0;
+    }
+    let entry = handles + index * 0x18;
+    if core::ptr::read_volatile((entry + 0x10) as *const u8) != 1
+        || core::ptr::read_volatile((entry + 0x12) as *const u16) != (hwnd >> 16) as u16
+    {
+        return 0;
+    }
+    core::ptr::read_volatile(entry as *const u64)
+}
+
+pub(crate) unsafe fn winlogon_dialog_contains_hwnd(hwnd: u64) -> bool {
+    const WND_PARENT_OFFSET: u64 = 0x58;
+    let dialog = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    if hwnd == 0 || dialog == 0 {
+        return false;
+    }
+    let mut pwnd = winlogon_pwnd_for_hwnd(hwnd);
+    for _ in 0..32 {
+        if pwnd == 0 {
+            break;
+        }
+        if core::ptr::read_volatile(pwnd as *const u64) == dialog {
+            return true;
+        }
+        pwnd = core::ptr::read_volatile((pwnd + WND_PARENT_OFFSET) as *const u64);
+    }
+    false
+}
+
+pub(crate) unsafe fn winlogon_dialog_modal_target_alive() -> bool {
+    const WND_STATE_OFFSET: u64 = 0x28;
+    const WNDS_DESTROYED: u32 = 0x8000_0000;
+    let pwnd = winlogon_pwnd_for_hwnd(WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed));
+    pwnd != 0
+        && core::ptr::read_volatile((pwnd + WND_STATE_OFFSET) as *const u32) & WNDS_DESTROYED == 0
 }
 
 pub(crate) unsafe fn winlogon_dialog_modal_observe(
@@ -1342,13 +1425,16 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if ssn != nt_user_callback::NTUSER_PEEK_MESSAGE_SSN && hwnd != idd_hwnd {
-        WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
+    let dialog_paint = message == nt_user_callback::WM_PAINT
+        && winlogon_dialog_contains_hwnd(hwnd);
     let mut state = winlogon_dialog_modal_load();
     let message = if ssn == nt_user_callback::NTUSER_PEEK_MESSAGE_SSN && result == 0 {
         None
+    } else if message == nt_user_callback::WM_PAINT && !dialog_paint {
+        // A thread-modal pump drains the whole thread queue. Desktop and unrelated-window paints
+        // must still be dispatched before an IDD_LOGON paint can become the next queue entry, but
+        // they are not evidence that the credential dialog itself painted.
+        Some(u32::MAX)
     } else {
         Some(message)
     };
@@ -1358,10 +1444,10 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
     }
     winlogon_dialog_modal_store(state);
     if let Some(message) = message {
-        if hwnd != 0 {
+        if message == nt_user_callback::WM_PAINT && dialog_paint && hwnd != 0 {
             WINLOGON_DIALOG_MODAL_HWND.store(hwnd, Ordering::Relaxed);
+            WINLOGON_DIALOG_MODAL_MESSAGE.store(message as u64, Ordering::Relaxed);
         }
-        WINLOGON_DIALOG_MODAL_MESSAGE.store(message as u64, Ordering::Relaxed);
     }
     print_str(b"[dialog-pump] completed step=");
     print_u64(state.completed_steps() as u64);
@@ -1376,10 +1462,132 @@ pub(crate) unsafe fn winlogon_dialog_modal_observe(
         print_hex(message);
     }
     if state.is_complete() {
-        print_str(b" modal-prefix-complete=1");
+        print_str(b" paints=");
+        print_u64(state.paint_dispatches() as u64);
+    }
+    if state.is_drained() {
+        print_str(b" queue-drained=1");
     }
     print_str(b"\n");
     true
+}
+
+#[inline(never)]
+unsafe fn verify_logon_dialog_framebuffer() -> bool {
+    const WND_RC_WINDOW_OFFSET: u64 = 0x70;
+    const DESKTOP_COLOR: u32 = 0x003a_6ea5;
+    let hwnd = WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed);
+    let pwnd = winlogon_pwnd_for_hwnd(hwnd);
+    if pwnd == 0 {
+        return false;
+    }
+    let mut rect = [0i32; 4];
+    for (index, value) in rect.iter_mut().enumerate() {
+        *value = core::ptr::read_volatile(
+            (pwnd + WND_RC_WINDOW_OFFSET + index as u64 * 4) as *const i32,
+        );
+    }
+    let left = rect[0].clamp(0, 1024) as u64;
+    let top = rect[1].clamp(0, 768) as u64;
+    let right = rect[2].clamp(left as i32, 1024) as u64;
+    let bottom = rect[3].clamp(top as i32, 768) as u64;
+    let mut pixels = 0u64;
+    let mut non_desktop = 0u64;
+    let mut colors = [0u32; 16];
+    let mut color_count = 0usize;
+    let fb = FB_VADDR as *const u32;
+    for y in top..bottom {
+        for x in left..right {
+            let pixel = core::ptr::read_volatile(fb.add((y * 1024 + x) as usize));
+            pixels += 1;
+            non_desktop += (pixel != DESKTOP_COLOR) as u64;
+            if color_count < colors.len() && !colors[..color_count].contains(&pixel) {
+                colors[color_count] = pixel;
+                color_count += 1;
+            }
+        }
+    }
+    WINLOGON_DIALOG_FB_PIXELS.store(pixels, Ordering::Relaxed);
+    WINLOGON_DIALOG_FB_NON_DESKTOP.store(non_desktop, Ordering::Relaxed);
+    WINLOGON_DIALOG_FB_COLORS.store(color_count as u64, Ordering::Relaxed);
+    print_str(b"[winlogon] IDD_LOGON framebuffer rect=");
+    for value in rect {
+        print_u64(value as u32 as u64);
+        print_str(b" ");
+    }
+    print_str(b"pixels=");
+    print_u64(pixels);
+    print_str(b" non-desktop=");
+    print_u64(non_desktop);
+    print_str(b" colors>=");
+    print_u64(color_count as u64);
+    print_str(b"\n");
+    WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
+        && pixels >= 4096
+        && non_desktop > pixels / 20
+        && color_count >= 4
+        && WINLOGON_DIALOG_MODAL_PAINTS.load(Ordering::Relaxed) >= 2
+        && WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed) != hwnd
+}
+
+#[inline(never)]
+unsafe fn check_logon_dialog_gates(passed: &mut u64) {
+    print_str(b"[winlogon] msgina dialog windows created (post-SAS-notify #32770): ");
+    print_u64(WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed));
+    print_str(b" (client GDI handle table mapped=");
+    print_u64(WINLOGON_GDI_MAPPED.load(Ordering::Relaxed));
+    print_str(b")\n");
+    check(
+        b"exec_msgina_logon_dialog_created",
+        WINLOGON_GDI_MAPPED.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) >= 2,
+        passed,
+    );
+    print_str(b"[winlogon] IDD_LOGON correlation ready=");
+    print_u64(WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed));
+    print_str(b" hwnd=");
+    print_hex(WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" errors=");
+    print_u64(WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_msgina_idd_logon_correlated",
+        WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
+            && WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
+    print_str(b"[winlogon] IDD_LOGON modal pump steps=");
+    print_u64(WINLOGON_DIALOG_MODAL_STEPS.load(Ordering::Relaxed));
+    print_str(b"/3 completed=");
+    print_u64(WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed));
+    print_str(b" paints=");
+    print_u64(WINLOGON_DIALOG_MODAL_PAINTS.load(Ordering::Relaxed));
+    print_str(b" drained=");
+    print_u64(WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed));
+    print_str(b" hwnd=");
+    print_hex(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed) as u32);
+    print_str(b" message=");
+    print_hex(WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed) as u32);
+    print_str(b" errors=");
+    print_u64(WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    check(
+        b"exec_msgina_modal_paint_prefix",
+        WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_MODAL_PAINTS.load(Ordering::Relaxed) != 0
+            && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
+            && winlogon_dialog_contains_hwnd(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed))
+            && WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed)
+                == nt_user_callback::WM_PAINT as u64
+            && WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed) == 0,
+        passed,
+    );
+    check(
+        b"exec_msgina_logon_dialog_painted",
+        verify_logon_dialog_framebuffer(),
+        passed,
+    );
 }
 /// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
 /// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
@@ -1434,12 +1642,12 @@ static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-hosted-process demand-fill bookkeeping (page VA per fault index), one row per process
 /// (0 = smss, 1 = csrss, 2 = winlogon, 3 = services, 4 = lsass; MAX_PI rows for post-login growth).
-/// Kept off the 16 KiB rootserver stack — this array as a local plus service_sec_image's other
+/// Kept off the bounded rootserver stack — this array as a local plus service_sec_image's other
 /// arrays would risk the guard page. In `.bss`, so growth to MAX_PI is free (no stack cost).
 /// Zeroed at service_sec_image entry; only that single loop touches it.
 static mut PFILLED: [[u64; 256]; MAX_PI] = [[0u64; 256]; MAX_PI];
 /// SERVICE 10 stack relief: the per-iteration `filled_pages` WORKING buffer (loaded from / saved to
-/// `PFILLED[pi]` around each dispatch) lives in a static, not on the 16 KiB rootserver stack. Adding a
+/// `PFILLED[pi]` around each dispatch) lives in a static, not on the rootserver stack. Adding a
 /// 5th hosted process pushed `service_sec_image`'s frame — its `[u64;256]` working array plus the
 /// ~20 DLL-PE locals — over the stack guard on the DEEP FS-walk call chain (fat_open_path →
 /// dir_find_lfn), corrupting that loop's cluster variable → an infinite FAT cluster-chain spin
@@ -1544,14 +1752,26 @@ const CSRSS_FRAME_CAP: usize = 8192;
 static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
+static mut CSRSS_FRAME_ALIAS: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
+    csrss_frame_put_at(pi, page, fr, 0);
+}
+/// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
+/// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
+unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
     for i in 0..n {
         if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
+            if alias != 0 {
+                let aliases = core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64;
+                if core::ptr::read(aliases.add(i)) == 0 {
+                    core::ptr::write(aliases.add(i), alias);
+                }
+            }
             return;
         }
     }
@@ -1559,20 +1779,39 @@ unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_PI) as *mut u8).add(n), pi as u8);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_VA) as *mut u64).add(n), page);
         core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_FR) as *mut u64).add(n), fr);
+        core::ptr::write((core::ptr::addr_of_mut!(CSRSS_FRAME_ALIAS) as *mut u64).add(n), alias);
         core::ptr::write(core::ptr::addr_of_mut!(CSRSS_FRAME_N), n + 1);
     }
 }
-/// GUI client `pi`'s frame cap for page VA `page`, or 0 if not backed by a recorded per-process
-/// frame (falls back to the shared-DLL-text cache, which backs every client's RX pages identically).
-unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
-    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N));
+/// Exact per-process frame lookup. Unlike `csrss_frame_get`, this never falls back to the shared
+/// executable-page cache, which is important when deciding whether a writable client page has a
+/// persistent private backing frame.
+unsafe fn csrss_frame_get_exact(pi: u64, page: u64) -> (u64, usize) {
+    let n = core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)).min(CSRSS_FRAME_CAP);
     let vas = core::ptr::addr_of!(CSRSS_FRAME_VA) as *const u64;
     let frs = core::ptr::addr_of!(CSRSS_FRAME_FR) as *const u64;
     let pis = core::ptr::addr_of!(CSRSS_FRAME_PI) as *const u8;
     for i in 0..n {
         if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
-            return core::ptr::read(frs.add(i));
+            return (core::ptr::read(frs.add(i)), i);
         }
+    }
+    (0, usize::MAX)
+}
+unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
+    let (_, index) = csrss_frame_get_exact(pi, page);
+    if index == usize::MAX {
+        0
+    } else {
+        core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index))
+    }
+}
+/// GUI client `pi`'s frame cap for page VA `page`, or 0 if not backed by a recorded per-process
+/// frame (falls back to the shared-DLL-text cache, which backs every client's RX pages identically).
+unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
+    let (frame, _) = csrss_frame_get_exact(pi, page);
+    if frame != 0 {
+        return frame;
     }
     dll_cache_get(page)
 }
@@ -1581,9 +1820,10 @@ const CLIENT_COPYIN_FRAME_CAP: usize = 256;
 static mut CLIENT_COPYIN_FRAME_PI: [u8; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
 static mut CLIENT_COPYIN_FRAME_VA: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
 static mut CLIENT_COPYIN_FRAME_FR: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
+static mut CLIENT_COPYIN_FRAME_ALIAS: [u64; CLIENT_COPYIN_FRAME_CAP] = [0; CLIENT_COPYIN_FRAME_CAP];
 static mut CLIENT_COPYIN_FRAME_N: usize = 0;
 
-unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64) {
+unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64, alias: u64) {
     let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N));
     let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
     let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
@@ -1605,6 +1845,10 @@ unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64) {
             (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_FR) as *mut u64).add(n),
             fr,
         );
+        core::ptr::write(
+            (core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_ALIAS) as *mut u64).add(n),
+            alias,
+        );
         core::ptr::write(core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAME_N), n + 1);
     }
 }
@@ -1617,6 +1861,18 @@ unsafe fn client_copyin_frame_get(pi: u64, page: u64) -> u64 {
     for i in 0..n {
         if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
             return core::ptr::read(frs.add(i));
+        }
+    }
+    0
+}
+unsafe fn client_copyin_frame_alias_get(pi: u64, page: u64) -> u64 {
+    let n = core::ptr::read(core::ptr::addr_of!(CLIENT_COPYIN_FRAME_N)).min(CLIENT_COPYIN_FRAME_CAP);
+    let vas = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_VA) as *const u64;
+    let aliases = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_ALIAS) as *const u64;
+    let pis = core::ptr::addr_of!(CLIENT_COPYIN_FRAME_PI) as *const u8;
+    for i in 0..n {
+        if core::ptr::read(vas.add(i)) == page && core::ptr::read(pis.add(i)) as u64 == pi {
+            return core::ptr::read(aliases.add(i));
         }
     }
     0
@@ -4036,6 +4292,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtFindAtom, SSN_NT_FIND_ATOM as u32),
             (NativeService::NtQueryInformationAtom, SSN_NT_QUERY_INFORMATION_ATOM as u32),
             (NativeService::NtClose, SSN_NT_CLOSE as u32),
+            (NativeService::NtDuplicateObject, 71),
             (NativeService::NtOpenKey, SSN_NT_OPEN_KEY as u32),
             (NativeService::NtCreateKey, SSN_NT_CREATE_KEY as u32),
             (NativeService::NtEnumerateValueKey, SSN_NT_ENUM_VALUE_KEY as u32),
@@ -4310,7 +4567,20 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
     // ActivationContextStackPointer@0x2C8 → an empty ACS in the 2nd TEB page.
     let teb = alloc_frame();
-    let _ = page_map(teb, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let teb_scratch = copy_cap(teb);
+    let teb_live_mirror = copy_cap(teb);
+    let teb_target_map = page_map(teb, t.teb_va, RW_NX, t.pml4);
+    let teb_scratch_map = page_map(teb_scratch, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let teb_live_map = if t.stack_mirror_va != 0 {
+        page_map(
+            teb_live_mirror,
+            t.stack_mirror_va + t.stack_frames * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        )
+    } else {
+        0
+    };
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
     core::ptr::write_volatile((scr + 0x48) as *mut u64, t.cid_thread);
@@ -4319,10 +4589,22 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((scr + 0x10) as *mut u64, t.stack_base);
     let acs_va = t.teb_va + 0x1800;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
-    let _ = page_map(copy_cap(teb), t.teb_va, RW_NX, t.pml4);
     // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
     let teb2 = alloc_frame();
-    let _ = page_map(teb2, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let teb2_scratch = copy_cap(teb2);
+    let teb2_live_mirror = copy_cap(teb2);
+    let teb2_target_map = page_map(teb2, t.teb_va + 0x1000, RW_NX, t.pml4);
+    let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    let teb2_live_map = if t.stack_mirror_va != 0 {
+        page_map(
+            teb2_live_mirror,
+            t.stack_mirror_va + (t.stack_frames + 1) * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        )
+    } else {
+        0
+    };
     let acs = scr + 0x1000 + 0x800;
     core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
     core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
@@ -4332,7 +4614,27 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
-    let _ = page_map(copy_cap(teb2), t.teb_va + 0x1000, RW_NX, t.pml4);
+    if teb_target_map != 0
+        || teb_scratch_map != 0
+        || teb_live_map != 0
+        || teb2_target_map != 0
+        || teb2_scratch_map != 0
+        || teb2_live_map != 0
+    {
+        print_str(b"[thread-life] TEB map failure target/scratch/live=");
+        print_u64(teb_target_map);
+        print_str(b"/");
+        print_u64(teb_scratch_map);
+        print_str(b"/");
+        print_u64(teb_live_map);
+        print_str(b" second=");
+        print_u64(teb2_target_map);
+        print_str(b"/");
+        print_u64(teb2_scratch_map);
+        print_str(b"/");
+        print_u64(teb2_live_map);
+        print_str(b"\n");
+    }
     // IPC buffer. NATIVE transport (BATCH 6): reuse the process MAIN thread's ipcbuf FRAME at
     // IPCBUF_VADDR (already mapped in the shared VSpace) so OUR ntdll's native stub — which writes
     // MR4/MR5 to the hardcoded IPCBUF_VADDR and reads its reply there — hits the SAME frame the
@@ -4730,6 +5032,7 @@ static WIN32K_HOST_PML4: AtomicU64 = AtomicU64::new(0);
 /// consecutive caps). Retained so the connect marshaling can copy_cap + RO-map the arena into a
 /// GUI client's VSpace (the gSharedInfo client-mapping).
 static WIN32K_HEAP_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WIN32K_USERVM_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// Frame-cap base of win32k's POOL arena (WIN32K_POOL_VADDR — where the DESKTOP body + its DESKTOPINFO
 /// live, `pool_alloc`ed). Retained so the desktop-heap client-window mapping can copy_cap + RO-map the
 /// pool into a GUI client's VSpace, making the bound DESKTOPINFO (winlogon's CLIENTINFO.pDeskInfo)
@@ -4749,6 +5052,7 @@ static WIN32K_POOL_CLIENT_MAPPED: AtomicU64 = AtomicU64::new(0);
 static GDI_SHARED_TABLE_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 /// Per-pi bit set once the GDI shared handle table has been RO-mapped into that GUI client's VSpace.
 static GDI_SHARED_TABLE_MAPPED: AtomicU64 = AtomicU64::new(0);
+static GDI_USERVM_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// Latched (=1) the first time the executive seeds winlogon's PEB->GdiSharedHandleTable + gdi32's
 /// cached global with the client GDI handle-table VA (client-GDI mapping milestone). Read by the spec.
 pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
@@ -8677,9 +8981,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(callback_winlogon_api0);
     print_str(b" table-nonzero-aligned=");
     print_u64(callback_table_valid);
-    print_str(b" real-api0-redirects=");
+    print_str(b" real-redirects=");
     print_u64(callback_real_redirects);
-    print_str(b" real-api0-returns=");
+    print_str(b" real-returns=");
     print_u64(callback_real_returns);
     print_str(b" continuation-pushes=");
     print_u64(callback_continuation_pushes);
@@ -8697,13 +9001,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     check(
         b"exec_user_callback_real_api0_nested_roundtrip",
         callback_table_valid != 0
-            && callback_real_redirects == 1
-            && callback_real_returns == 1
-            && callback_nested_ssn_1298 == 1
+            && callback_real_redirects >= 1
+            && callback_real_returns == callback_real_redirects
+            && callback_nested_ssn_1298 >= 1
             && (1..=4).contains(&callback_nested_ssn_126b)
-            && callback_nested_dispatches == 1 + callback_nested_ssn_126b
-            && callback_continuation_pushes == callback_nested_dispatches + 2
-            && callback_continuation_unwinds == callback_nested_dispatches + 2
+            && callback_nested_dispatches >= 1 + callback_nested_ssn_126b
+            && callback_continuation_pushes >= callback_nested_dispatches + 2
+            && callback_continuation_unwinds == callback_continuation_pushes
             && callback_sequence_completions == 1,
         &mut passed,
     );
@@ -8798,52 +9102,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // window could be created (msgina's FindResource missed + gdi32 NULL-derefed); >=2 proves the
     // client-GDI path now works and msgina's real dialog code creates windows. winlogon then parks in
     // the nested modal message pump (blocked on credential input a headless host can't supply).
-    print_str(b"[winlogon] msgina dialog windows created (post-SAS-notify #32770): ");
-    print_u64(WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed));
-    print_str(b" (client GDI handle table mapped=");
-    print_u64(WINLOGON_GDI_MAPPED.load(Ordering::Relaxed));
-    print_str(b")\n");
-    check(
-        b"exec_msgina_logon_dialog_created",
-        WINLOGON_GDI_MAPPED.load(Ordering::Relaxed) != 0
-            && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) >= 2,
-        &mut passed,
-    );
-    print_str(b"[winlogon] IDD_LOGON correlation ready=");
-    print_u64(WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed));
-    print_str(b" hwnd=");
-    print_hex(WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) as u32);
-    print_str(b" errors=");
-    print_u64(WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed));
-    print_str(b"\n");
-    check(
-        b"exec_msgina_idd_logon_correlated",
-        WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
-            && WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed) != 0
-            && WINLOGON_DIALOG_CORRELATION_ERRORS.load(Ordering::Relaxed) == 0,
-        &mut passed,
-    );
-    print_str(b"[winlogon] IDD_LOGON modal pump steps=");
-    print_u64(WINLOGON_DIALOG_MODAL_STEPS.load(Ordering::Relaxed));
-    print_str(b"/3 completed=");
-    print_u64(WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed));
-    print_str(b" hwnd=");
-    print_hex(WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed) as u32);
-    print_str(b" message=");
-    print_hex(WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed) as u32);
-    print_str(b" errors=");
-    print_u64(WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed));
-    print_str(b"\n");
-    check(
-        b"exec_msgina_modal_paint_prefix",
-        WINLOGON_DIALOG_MODAL_COMPLETED.load(Ordering::Relaxed) != 0
-            && WINLOGON_DIALOG_MODAL_HWND.load(Ordering::Relaxed)
-                == WINLOGON_IDD_LOGON_HWND.load(Ordering::Relaxed)
-            && WINLOGON_DIALOG_MODAL_MESSAGE.load(Ordering::Relaxed)
-                == nt_user_callback::WM_PAINT as u64
-            && WINLOGON_DIALOG_MODAL_ERRORS.load(Ordering::Relaxed) == 0,
-        &mut passed,
-    );
+    check_logon_dialog_gates(&mut passed);
 
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);

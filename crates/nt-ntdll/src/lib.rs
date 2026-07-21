@@ -60,6 +60,7 @@ pub mod crt;
 pub mod csr;
 pub mod dbg;
 pub mod heap;
+pub mod handle_table;
 pub mod ki;
 pub mod loader;
 pub mod marshal;
