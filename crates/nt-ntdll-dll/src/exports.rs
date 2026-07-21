@@ -437,6 +437,61 @@ pub unsafe extern "system" fn rtl_free_heap(
     }
 }
 
+/// `RtlMultipleAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size, ULONG Count, PVOID* Array)
+/// -> ULONG`.
+///
+/// # Safety
+/// `array` is writable for `count` pointer slots.
+#[export_name = "RtlMultipleAllocateHeap"]
+pub unsafe extern "system" fn rtl_multiple_allocate_heap(
+    heap: *mut c_void,
+    flags: u32,
+    size: usize,
+    count: u32,
+    array: *mut *mut c_void,
+) -> u32 {
+    if array.is_null() {
+        return 0;
+    }
+    let mut index = 0u32;
+    while index < count {
+        // SAFETY: caller owns the output array; RtlAllocateHeap handles the process heap backing.
+        let ptr = unsafe { rtl_allocate_heap(heap, flags, size) };
+        unsafe { *array.add(index as usize) = ptr };
+        if ptr.is_null() {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+/// `RtlMultipleFreeHeap(PVOID HeapHandle, ULONG Flags, ULONG Count, PVOID* Array) -> ULONG`.
+///
+/// # Safety
+/// `array` is readable for `count` pointer slots.
+#[export_name = "RtlMultipleFreeHeap"]
+pub unsafe extern "system" fn rtl_multiple_free_heap(
+    heap: *mut c_void,
+    flags: u32,
+    count: u32,
+    array: *mut *mut c_void,
+) -> u32 {
+    if array.is_null() {
+        return 0;
+    }
+    let mut index = 0u32;
+    while index < count {
+        // SAFETY: caller owns the input array; RtlFreeHeap validates/free through the process heap.
+        let ptr = unsafe { *array.add(index as usize) };
+        if !ptr.is_null() && unsafe { rtl_free_heap(heap, flags, ptr) } == 0 {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
 /// `RtlCreateTagHeap(...)` — heap tagging helper. Honest seam.
 ///
 /// # Safety
@@ -1716,6 +1771,17 @@ pub unsafe extern "system" fn rtl_set_thread_is_critical(
         let _ = (new, old, check_flag);
         STATUS_NOT_IMPLEMENTED
     }
+}
+
+/// `RtlCreateBootStatusDataFile() -> NTSTATUS`.
+/// ReactOS creates and initializes `\SystemRoot\bootstat.dat`; our current boot-status backing is
+/// the process-local `RTL_BSD_DATA` model shared by `RtlLockBootStatusData` /
+/// `RtlGetSetBootStatusData`, so creation initializes that model.
+#[export_name = "RtlCreateBootStatusDataFile"]
+pub unsafe extern "system" fn rtl_create_boot_status_data_file() -> NtStatus {
+    // SAFETY: initializes the in-ntdll boot-status model.
+    unsafe { ensure_boot_status_data() };
+    STATUS_SUCCESS
 }
 
 /// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`.
@@ -9227,6 +9293,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_query_registry_values as usize,
         rtl_set_process_is_critical as usize,
         rtl_set_thread_is_critical as usize,
+        rtl_create_boot_status_data_file as usize,
         rtl_get_set_boot_status_data as usize,
         rtl_lock_boot_status_data as usize,
         rtl_unlock_boot_status_data as usize,
@@ -9386,6 +9453,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_size_heap as usize,
         rtl_validate_heap as usize,
         rtl_destroy_heap as usize,
+        rtl_multiple_allocate_heap as usize,
+        rtl_multiple_free_heap as usize,
         rtl_get_process_heaps as usize,
         rtl_lock_heap as usize,
         rtl_unlock_heap as usize,
