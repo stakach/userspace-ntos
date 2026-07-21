@@ -702,11 +702,32 @@ impl<const DEPTH: usize> Default for ContinuationStack<DEPTH> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientCallbackWindowState {
+    teb_alias: u64,
+    saved: [u64; 3],
+}
+
+impl ClientCallbackWindowState {
+    pub const fn new(teb_alias: u64, saved: [u64; 3]) -> Self {
+        Self { teb_alias, saved }
+    }
+
+    pub const fn teb_alias(&self) -> u64 {
+        self.teb_alias
+    }
+
+    pub const fn saved(&self) -> &[u64; 3] {
+        &self.saved
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
     saved_user_context: [u64; 20],
     outer_resume_ip: u64,
     redirected: bool,
+    callback_window: Option<ClientCallbackWindowState>,
 }
 
 impl ActiveCallbackFrame {
@@ -716,6 +737,7 @@ impl ActiveCallbackFrame {
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
+            callback_window: None,
         }
     }
 
@@ -733,6 +755,10 @@ impl ActiveCallbackFrame {
 
     pub const fn is_redirected(&self) -> bool {
         self.redirected
+    }
+
+    pub const fn callback_window(&self) -> Option<&ClientCallbackWindowState> {
+        self.callback_window.as_ref()
     }
 }
 
@@ -776,6 +802,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             saved_user_context: [0; 20],
             outer_resume_ip: 0,
             redirected: false,
+            callback_window: None,
         };
         self.len += 1;
         Ok(())
@@ -801,6 +828,26 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         frame.saved_user_context = saved_user_context;
         frame.outer_resume_ip = outer_resume_ip;
         frame.redirected = true;
+        Ok(())
+    }
+
+    pub fn record_callback_window(
+        &mut self,
+        correlation: CallbackCorrelation,
+        state: ClientCallbackWindowState,
+    ) -> Result<(), ValidationError> {
+        let frame = self
+            .len
+            .checked_sub(1)
+            .map(|index| &mut self.frames[index])
+            .ok_or(ValidationError::State)?;
+        if !correlation.matches_request(&frame.request) {
+            return Err(ValidationError::Correlation);
+        }
+        if frame.redirected || frame.callback_window.is_some() || state.teb_alias == 0 {
+            return Err(ValidationError::State);
+        }
+        frame.callback_window = Some(state);
         Ok(())
     }
 
@@ -836,6 +883,14 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         self.frames[index] = ActiveCallbackFrame::empty();
         self.len = index;
         Ok(frame)
+    }
+
+    pub fn discard_top(&mut self) -> Option<ActiveCallbackFrame> {
+        let index = self.len.checked_sub(1)?;
+        let frame = self.frames[index];
+        self.frames[index] = ActiveCallbackFrame::empty();
+        self.len = index;
+        Some(frame)
     }
 }
 
@@ -1861,9 +1916,21 @@ mod tests {
 
         stack.push(outer).unwrap();
         stack
+            .record_callback_window(
+                outer_correlation,
+                ClientCallbackWindowState::new(0xaaaa, [0x11, 0x12, 0x13]),
+            )
+            .unwrap();
+        stack
             .record_redirect(outer_correlation, [0x11; 20], 0x1111)
             .unwrap();
         stack.push(inner).unwrap();
+        stack
+            .record_callback_window(
+                inner_correlation,
+                ClientCallbackWindowState::new(0xbbbb, [0x21, 0x22, 0x23]),
+            )
+            .unwrap();
         stack
             .record_redirect(inner_correlation, [0x22; 20], 0x2222)
             .unwrap();
@@ -1871,9 +1938,17 @@ mod tests {
         let completed_inner = stack.pop(inner_correlation).unwrap();
         assert_eq!(completed_inner.saved_user_context(), &[0x22; 20]);
         assert_eq!(completed_inner.outer_resume_ip(), 0x2222);
+        assert_eq!(
+            completed_inner.callback_window(),
+            Some(&ClientCallbackWindowState::new(0xbbbb, [0x21, 0x22, 0x23]))
+        );
         assert_eq!(stack.top().unwrap().request(), &outer);
         let completed_outer = stack.pop(outer_correlation).unwrap();
         assert_eq!(completed_outer.saved_user_context(), &[0x11; 20]);
+        assert_eq!(
+            completed_outer.callback_window(),
+            Some(&ClientCallbackWindowState::new(0xaaaa, [0x11, 0x12, 0x13]))
+        );
         assert!(stack.is_empty());
     }
 
@@ -1889,6 +1964,15 @@ mod tests {
         assert_eq!(stack.push(request), Err(ValidationError::Length));
         let mut stale = correlation;
         stale.callback_id += 1;
+        let callback_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
+        assert_eq!(
+            stack.record_callback_window(stale, callback_window),
+            Err(ValidationError::Correlation)
+        );
+        assert_eq!(stack.top().unwrap().callback_window(), None);
+        stack
+            .record_callback_window(correlation, callback_window)
+            .unwrap();
         assert_eq!(
             stack.record_redirect(stale, [0; 20], 0x1000),
             Err(ValidationError::Correlation)
@@ -1898,6 +1982,57 @@ mod tests {
             .unwrap();
         assert_eq!(stack.pop(stale), Err(ValidationError::Correlation));
         assert_eq!(stack.len(), 1);
+        assert_eq!(stack.top().unwrap().callback_window(), Some(&callback_window));
+    }
+
+    #[test]
+    fn active_callback_cancel_returns_callback_window_state() {
+        let mut request = CallbackHeader::idle(7, 2, 44, 4);
+        request
+            .begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40)
+            .unwrap();
+        let correlation = CallbackCorrelation::from_request(&request);
+        let callback_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
+        let mut stack = ActiveCallbackStack::<1>::new();
+        stack.push(request).unwrap();
+        stack
+            .record_callback_window(correlation, callback_window)
+            .unwrap();
+
+        let cancelled = stack.cancel_pending(correlation).unwrap();
+        assert_eq!(cancelled.callback_window(), Some(&callback_window));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn active_callback_abort_discards_window_state_lifo() {
+        let mut outer = CallbackHeader::idle(7, 2, 44, 4);
+        outer.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let mut inner = CallbackHeader::idle(8, 2, 44, 4);
+        inner.begin_request(USER32_CALLBACK_WINDOWPROC, 0x40, 0x40).unwrap();
+        let outer_correlation = CallbackCorrelation::from_request(&outer);
+        let inner_correlation = CallbackCorrelation::from_request(&inner);
+        let outer_window = ClientCallbackWindowState::new(0xaaaa, [1, 2, 3]);
+        let inner_window = ClientCallbackWindowState::new(0xbbbb, [4, 5, 6]);
+        let mut stack = ActiveCallbackStack::<2>::new();
+        stack.push(outer).unwrap();
+        stack
+            .record_callback_window(outer_correlation, outer_window)
+            .unwrap();
+        stack.push(inner).unwrap();
+        stack
+            .record_callback_window(inner_correlation, inner_window)
+            .unwrap();
+
+        assert_eq!(
+            stack.discard_top().unwrap().callback_window(),
+            Some(&inner_window)
+        );
+        assert_eq!(
+            stack.discard_top().unwrap().callback_window(),
+            Some(&outer_window)
+        );
+        assert_eq!(stack.discard_top(), None);
     }
 
     #[test]

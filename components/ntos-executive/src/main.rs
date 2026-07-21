@@ -208,6 +208,8 @@ pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
 /// mirrors get their OWN page tables (created in spawn_sec_image, past CSRSS_HEAP_MIRROR 0x1200) so
 /// they can't collide with smss's/csrss's mirrors. ACTIVE_*_MIRROR selects them for pi==2.
 pub const WINLOGON_STACK_MIRROR_VA: u64 = 0x0000_0100_106B_0000; // FILEBUF PT, present
+/// Persistent executive alias of winlogon's main-thread TEB frame.
+pub const WINLOGON_MAIN_TEB_MIRROR_VA: u64 = 0x0000_0100_107C_0000;
 pub const WINLOGON_HEAP_MIRROR_VA: u64 = 0x0000_0100_1220_0000; // own PT (spawn_sec_image creates it)
 pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spawn_sec_image creates it)
 /// winlogon's CSR client-connect regions (mapped into winlogon's OWN VSpace by the NtSecureConnectPort

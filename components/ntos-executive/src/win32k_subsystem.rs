@@ -233,11 +233,12 @@ pub const SH_GDI_TABLE_BASE: u64 = 0x128; // out: coherent hosted GDI handle-tab
 pub const SH_GDI_TABLE_SIZE: u64 = 0x130; // out: full hosted GDI handle-table byte size (u64)
 pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Manager pid (u64)
 pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
+pub const SH_REQ_CLIENT_PI: u64 = 0x148; // in: executive hosted-process index for this dispatch
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
-const _: () = assert!(SH_REQ_PROCESS_ID < SH_USER_CALLBACK);
+const _: () = assert!(SH_REQ_CLIENT_PI < SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
@@ -1661,6 +1662,7 @@ extern "win64" fn s_rtl_destroy_atom_table(_table: u64) -> i32 {
 }
 
 static WIN32K_CURRENT_PROCESS_ID: AtomicU64 = AtomicU64::new(FAKE_PROCESS_HANDLE);
+static WINLOGON_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// `HANDLE PsGetCurrentProcessId()` / `PsGetCurrentThreadProcessId()` for the routed client. The
 /// bootstrap identity remains in place until the first client request reaches the component.
@@ -3020,7 +3022,8 @@ unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
 
 /// The win32k `dispatch` closure plugged into [`crate::spawn_hosts::component_main`]. This is the EXACT
 /// per-request body the retired inline `dispatch_loop` ran (minus the send_done/recv_req/status-writeback,
-/// which the harness owns): the per-dispatch WindowListHead re-empty + BATCH-43 thread↔desktop re-assert,
+/// which the harness owns): the SetThreadDesktop WindowListHead compatibility reset + BATCH-43
+/// thread↔desktop re-assert,
 /// the SSN_TEST_FAULT self-test, NtUserInitialize event registration + the post-init font/winsta seed,
 /// and the SSDT dispatch via `dispatch_ssn` (which retains the exact-arity wide-arg transmute). Returns
 /// `(status, 0)` — win32k has no IoStatus.Information (its status@0x78 aliases the harness's info@0x78,
@@ -3032,81 +3035,88 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
     let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
+    let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
+    let top_level = read_volatile(
+        (WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64,
+    ) == 0;
     if process_id != 0 {
         WIN32K_CURRENT_PROCESS_ID.store(process_id, Ordering::Relaxed);
         write_volatile((PH_EPROCESS_VA + 0xd0) as *mut u64, process_id);
     }
-    // Early top-level client dispatches begin with the dispatch thread owning no windows. The desktop windows
+    // The top-level SetThreadDesktop call begins with the client thread owning no windows. The desktop windows
     // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
     // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
     // would wrongly see those desktop windows as ITS windows and fail "thread has windows",
     // short-circuiting its `SetThreadDesktop(Winlogon) && SwitchDesktop(Winlogon)` (wlx.c:1077) —
     // the natural co_IntShowDesktop / co_IntInitializeDesktopGraphics trigger. Before the SAS window
-    // exists, re-empty the current thread's WindowListHead (+0x2d8) on top-level dispatches to
-    // restore the authentic invariant. Nested dispatches and all post-SAS calls must preserve the
-    // live window list.
-    if read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64) == 0
-        && read_volatile((WIN32K_SHARED_VADDR + SH_SAS_HWND) as *const u64) == 0
+    // exists, re-empty the current thread's WindowListHead (+0x2d8) once for that operation to
+    // restore the authentic invariant. Never repeat this on unrelated dispatches: once IntCreateWindow has
+    // inserted a WND.ThreadListEntry, rewriting only the head corrupts the checked RemoveEntryList
+    // performed by co_UserFreeWindow.
+    let t = read_volatile(SLOT_W32THREAD as *const u64);
+    let t = if t == 0 { PH_W32THREAD_VA } else { t };
+    if top_level
+        && client_pi == 2
+        && ssn == SSN_NT_USER_SET_THREAD_DESKTOP
+        && WINLOGON_WINDOW_LIST_RESET_DONE.swap(1, Ordering::Relaxed) == 0
     {
-        let t = read_volatile(SLOT_W32THREAD as *const u64);
-        let t = if t == 0 { PH_W32THREAD_VA } else { t };
         let head = t + 0x2d8;
         write_volatile(head as *mut u64, head);
         write_volatile((head + 8) as *mut u64, head);
-        // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
-        // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
-        // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent dispatch body runs.
-        //
-        // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
-        // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
-        // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
-        // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
-        // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
-        // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
-        // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
-        // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
-        // re-opens exactly this wall — so we restore both here (idempotent).
-        //
-        // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
-        // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
-        // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
-        // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
-        if BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
-            if BOUND_DESK_BODY != 0 {
-                write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
-                // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
-                // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
-                if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
-                    write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
-                }
+    }
+    // RE-ASSERT the thread↔desktop binding (BATCH 43). Once winlogon's own NtUserSetThreadDesktop
+    // has bound the Default desktop (BOUND_DESK_* latched, see dispatch_ssn), keep BOTH
+    // `pti->rpdesk` AND `pti->pDeskInfo` pointing at it before every subsequent top-level dispatch.
+    //
+    // WHY rpdesk too (corrected root cause, subagent + disasm confirmed): win32k's class call-proc
+    // path `NtUserGetClassInfo → UserGetClassInfo → IntGetClassWndProc → UserGetCPD` (callproc.c:
+    // 136-143) does `pDesk = pCls->rpdeskParent ? pCls->rpdeskParent : pti->rpdesk;
+    // CreateCallProc(pDesk) → DesktopHeapAlloc(pDesk->pheapDesktop,…)`. The SAS class was
+    // registered with `rpdeskParent==NULL` (created on the shared heap), so the fallback uses
+    // `pti->rpdesk` — and if that is NULL the real deref `mov rcx,[pDesk+0x80]` (pheapDesktop)
+    // faults at cr2=0x80 (RVA 0x4f5e3). A LATER `NtUserProcessConnect` (0x10FA) whose inner
+    // IntSetThreadDesktop ELSE branch (desktop.c:3451-3453) NULLs `pti->rpdesk`+`pti->pDeskInfo`
+    // re-opens exactly this wall — so we restore both here (idempotent).
+    //
+    // GUARD: skip when the INCOMING dispatch IS `NtUserSetThreadDesktop` (0x1092), so win32k's own
+    // IntSetThreadDesktop still sees the rpdesk state it expects and takes its correct
+    // `if(pdesk!=NULL)`/ELSE branch (a pre-set rpdesk would wrongly flip it into the unmapped
+    // desktop-heap class-migration path, desktop.c:3404 → fault). We re-latch after it (dispatch_ssn).
+    if top_level && BOUND_DESK_PDESKINFO != 0 && ssn != SSN_NT_USER_SET_THREAD_DESKTOP {
+        if BOUND_DESK_BODY != 0 {
+            write_volatile((t + THREADINFO_RPDESK_OFF) as *mut u64, BOUND_DESK_BODY);
+            // Keep the bound desktop's pheapDesktop non-NULL (DesktopHeapAlloc needs it; our
+            // RtlAllocateHeap import ignores the handle value and bumps the shared arena).
+            if read_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *const u64) == 0 {
+                write_volatile((BOUND_DESK_BODY + DESKTOP_PHEAP_OFF) as *mut u64, WIN32K_HEAP_HANDLE);
             }
-            write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
-            let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
-            if pci != 0 {
-                write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
-            }
-            // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING — bracket the bound DESKTOPINFO's window range over
-            // the WHOLE unified USER/desktop heap. In real win32k IntCreateDesktop sets
-            // pvDesktopBase/pvDesktopLimit to the per-desktop heap's [base,limit); our host allocates
-            // every window/class/handle-entry out of the single shared arena at WIN32K_HEAP_VADDR
-            // (s_rtl_allocate_heap ignores the desktop-heap handle). So the client-side
-            // DesktopPtrToUser range check (Ptr in [base,limit) → Ptr-ulClientDelta) must accept any
-            // heap-resident PWND/CLS: set base=heap start, limit=heap end. Idempotent (only sets when
-            // still zero). DESKTOPINFO: pvDesktopBase@0x00, pvDesktopLimit@0x08 (ntuser.h).
-            if read_volatile(BOUND_DESK_PDESKINFO as *const u64) == 0 {
-                write_volatile(BOUND_DESK_PDESKINFO as *mut u64, WIN32K_HEAP_VADDR);
-                write_volatile(
-                    (BOUND_DESK_PDESKINFO + 0x08) as *mut u64,
-                    WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
-                );
-            }
-            // Publish the two server-VA facts the executive needs to seed the GUI client's
-            // TEB.Win32ClientInfo (pDeskInfo = DESKTOPINFO−delta; Win32ThreadInfo = pti == head.pti),
-            // so user32's client-side ValidateHwnd/IntCallMessageProc resolve the SAS window and run
-            // its real SASWindowProc without a syscall. Written every dispatch (cheap, coherent frame).
-            write_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64, BOUND_DESK_PDESKINFO);
-            write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, t);
         }
+        write_volatile((t + THREADINFO_PDESKINFO_OFF) as *mut u64, BOUND_DESK_PDESKINFO);
+        let pci = read_volatile((t + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+        if pci != 0 {
+            write_volatile((pci + 0x20) as *mut u64, BOUND_DESK_PDESKINFO);
+        }
+        // ★ DESKTOP-HEAP CLIENT-WINDOW MAPPING — bracket the bound DESKTOPINFO's window range over
+        // the WHOLE unified USER/desktop heap. In real win32k IntCreateDesktop sets
+        // pvDesktopBase/pvDesktopLimit to the per-desktop heap's [base,limit); our host allocates
+        // every window/class/handle-entry out of the single shared arena at WIN32K_HEAP_VADDR
+        // (s_rtl_allocate_heap ignores the desktop-heap handle). So the client-side
+        // DesktopPtrToUser range check (Ptr in [base,limit) → Ptr-ulClientDelta) must accept any
+        // heap-resident PWND/CLS: set base=heap start, limit=heap end. Idempotent (only sets when
+        // still zero). DESKTOPINFO: pvDesktopBase@0x00, pvDesktopLimit@0x08 (ntuser.h).
+        if read_volatile(BOUND_DESK_PDESKINFO as *const u64) == 0 {
+            write_volatile(BOUND_DESK_PDESKINFO as *mut u64, WIN32K_HEAP_VADDR);
+            write_volatile(
+                (BOUND_DESK_PDESKINFO + 0x08) as *mut u64,
+                WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000,
+            );
+        }
+        // Publish the two server-VA facts the executive needs to seed the GUI client's
+        // TEB.Win32ClientInfo (pDeskInfo = DESKTOPINFO−delta; Win32ThreadInfo = pti == head.pti),
+        // so user32's client-side ValidateHwnd/IntCallMessageProc resolve the SAS window and run
+        // its real SASWindowProc without a syscall. Written every dispatch (cheap, coherent frame).
+        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_DESKINFO) as *mut u64, BOUND_DESK_PDESKINFO);
+        write_volatile((WIN32K_SHARED_VADDR + SH_SAS_PTI) as *mut u64, t);
     }
     if ssn == SSN_NT_USER_INITIALIZE_REAL {
         // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are

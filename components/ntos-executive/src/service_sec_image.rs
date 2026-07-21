@@ -4411,9 +4411,8 @@ pub(crate) unsafe fn service_sec_image(
                             // branch clears TEB.Win32ThreadInfo(+0x78)/pDeskInfo(+0x820); re-seed via the
                             // executive's persistent alias of winlogon's TEB frame. (The primary guarantee
                             // is the spawn seed + the fault-time repair; this keeps the window minimal.)
-                            const WINLOGON_MAIN_TEB_ALIAS: u64 = 0x0000_0100_107C_0000;
                             let _ = seed_winlogon_thread_client_info(
-                                WINLOGON_MAIN_TEB_ALIAS,
+                                WINLOGON_MAIN_TEB_MIRROR_VA,
                                 procs[2].pml4,
                             );
                             if first {
