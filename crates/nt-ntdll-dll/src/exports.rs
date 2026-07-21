@@ -26,9 +26,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
 use nt_ntdll_layout::UnicodeString;
@@ -46,6 +46,7 @@ const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
+const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 #[cfg(not(target_arch = "x86_64"))]
@@ -1508,8 +1509,7 @@ pub unsafe extern "system" fn rtl_run_once_complete(
     }
 }
 
-type RtlRunOnceInitFn =
-    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> u8;
+type RtlRunOnceInitFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> u8;
 
 /// `RtlRunOnceExecuteOnce(PRTL_RUN_ONCE, PRTL_RUN_ONCE_INIT_FN, PVOID, PVOID*) -> NTSTATUS`.
 ///
@@ -5501,9 +5501,7 @@ fn rtl_determine_dos_path_name_type_u_slice(s: &[u16]) -> u32 {
 /// # Safety
 /// `path` points to a valid counted UTF-16 string.
 #[export_name = "RtlDetermineDosPathNameType_Ustr"]
-pub unsafe extern "system" fn rtl_determine_dos_path_name_type_ustr(
-    path: PCUnicodeString,
-) -> u32 {
+pub unsafe extern "system" fn rtl_determine_dos_path_name_type_ustr(path: PCUnicodeString) -> u32 {
     let s = unsafe { us_slice(path) };
     rtl_determine_dos_path_name_type_u_slice(s)
 }
@@ -5537,8 +5535,7 @@ pub unsafe extern "system" fn rtl_get_length_without_trailing_path_seperators(
     STATUS_SUCCESS
 }
 
-type RtlLengthFunction =
-    unsafe extern "system" fn(u32, PUnicodeString, *mut u32) -> NtStatus;
+type RtlLengthFunction = unsafe extern "system" fn(u32, PUnicodeString, *mut u32) -> NtStatus;
 
 /// `RtlpApplyLengthFunction(ULONG, ULONG, PVOID, PRTL_PATH_LENGTH_FUNCTION) -> NTSTATUS`.
 ///
@@ -6025,14 +6022,7 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_a(
     if address.is_null() || string.is_null() {
         return usize::MAX as *mut u8;
     }
-    let octets = unsafe {
-        [
-            *address,
-            *address.add(1),
-            *address.add(2),
-            *address.add(3),
-        ]
-    };
+    let octets = unsafe { [*address, *address.add(1), *address.add(2), *address.add(3)] };
     let formatted = rtl::network::ipv4_address_to_string(octets);
     unsafe {
         core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
@@ -6054,14 +6044,7 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_w(
     if address.is_null() || string.is_null() {
         return usize::MAX as *mut u16;
     }
-    let octets = unsafe {
-        [
-            *address,
-            *address.add(1),
-            *address.add(2),
-            *address.add(3),
-        ]
-    };
+    let octets = unsafe { [*address, *address.add(1), *address.add(2), *address.add(3)] };
     let formatted = rtl::network::ipv4_address_to_string_w(octets);
     unsafe {
         core::ptr::copy_nonoverlapping(formatted.as_ptr(), string, formatted.len());
@@ -6085,14 +6068,7 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_a(
     if address.is_null() || string.is_null() || string_length.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let octets = unsafe {
-        [
-            *address,
-            *address.add(1),
-            *address.add(2),
-            *address.add(3),
-        ]
-    };
+    let octets = unsafe { [*address, *address.add(1), *address.add(2), *address.add(3)] };
     let formatted = rtl::network::ipv4_address_to_string_ex(octets, port);
     let required = (formatted.len() + 1) as u32;
     unsafe {
@@ -6122,14 +6098,7 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_w(
     if address.is_null() || string.is_null() || string_length.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let octets = unsafe {
-        [
-            *address,
-            *address.add(1),
-            *address.add(2),
-            *address.add(3),
-        ]
-    };
+    let octets = unsafe { [*address, *address.add(1), *address.add(2), *address.add(3)] };
     let formatted = rtl::network::ipv4_address_to_string_ex_w(octets, port);
     let required = (formatted.len() + 1) as u32;
     unsafe {
@@ -8263,11 +8232,7 @@ pub unsafe extern "system" fn rtl_compare_memory_ulong(
 /// # Safety
 /// `dst`/`src` valid for `n` bytes.
 #[export_name = "RtlCopyMemoryNonTemporal"]
-pub unsafe extern "system" fn rtl_copy_memory_non_temporal(
-    dst: *mut u8,
-    src: *const u8,
-    n: usize,
-) {
+pub unsafe extern "system" fn rtl_copy_memory_non_temporal(dst: *mut u8, src: *const u8, n: usize) {
     // SAFETY: same observable contract as RtlCopyMemory; non-temporal stores are an optimization.
     unsafe { core::ptr::copy(src, dst, n) };
 }
@@ -11621,8 +11586,12 @@ pub unsafe extern "system" fn rtl_hash_unicode_string(
     if string.is_null() || hash_value.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let (buffer, units) =
-        unsafe { ((*string).buffer as *const u16, (*string).length as usize / 2) };
+    let (buffer, units) = unsafe {
+        (
+            (*string).buffer as *const u16,
+            (*string).length as usize / 2,
+        )
+    };
     let src = if units == 0 {
         &[][..]
     } else if buffer.is_null() {
@@ -12542,6 +12511,103 @@ pub unsafe extern "system" fn rtl_unicode_string_to_oem_string(
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (allocate, out_bytes, sbuf);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlEqualComputerName(PUNICODE_STRING, PUNICODE_STRING) -> BOOLEAN` — case-insensitive
+/// comparison through the uppercased OEM computer-name path (`sdk/lib/rtl/unicode.c:1542`).
+///
+/// # Safety
+/// `computer_name1`/`computer_name2` are valid counted UNICODE_STRING descriptors.
+#[export_name = "RtlEqualComputerName"]
+pub unsafe extern "system" fn rtl_equal_computer_name(
+    computer_name1: PCUnicodeString,
+    computer_name2: PCUnicodeString,
+) -> u8 {
+    if computer_name1.is_null() || computer_name2.is_null() {
+        return 0;
+    }
+    // SAFETY: both descriptors are valid per the contract.
+    let (name1, name2) = unsafe { (us_slice(computer_name1), us_slice(computer_name2)) };
+    u8::from(rtl::strings::equal_computer_name(name1, name2))
+}
+
+/// `RtlEqualDomainName(PUNICODE_STRING, PUNICODE_STRING) -> BOOLEAN` — same comparison as
+/// `RtlEqualComputerName` (`sdk/lib/rtl/unicode.c:1579`).
+///
+/// # Safety
+/// `domain_name1`/`domain_name2` are valid counted UNICODE_STRING descriptors.
+#[export_name = "RtlEqualDomainName"]
+pub unsafe extern "system" fn rtl_equal_domain_name(
+    domain_name1: PCUnicodeString,
+    domain_name2: PCUnicodeString,
+) -> u8 {
+    // SAFETY: same descriptor contract.
+    unsafe { rtl_equal_computer_name(domain_name1, domain_name2) }
+}
+
+/// `RtlDnsHostNameToComputerName(PUNICODE_STRING ComputerName, PUNICODE_STRING DnsHostName,
+/// BOOLEAN AllocateComputerNameString) -> NTSTATUS` — convert the first DNS label to an uppercase
+/// NetBIOS computer name, capped to `MAX_COMPUTERNAME_LENGTH` (`sdk/lib/rtl/unicode.c:2744`).
+///
+/// # Safety
+/// `computer_name` is writable; `dns_host_name` is a valid counted UNICODE_STRING descriptor.
+#[export_name = "RtlDnsHostNameToComputerName"]
+pub unsafe extern "system" fn rtl_dns_host_name_to_computer_name(
+    computer_name: PUnicodeString,
+    dns_host_name: PCUnicodeString,
+    allocate_computer_name_string: u8,
+) -> NtStatus {
+    if computer_name.is_null() || dns_host_name.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dns_host_name is valid per the contract.
+    let dns = unsafe { us_slice(dns_host_name) };
+    let computer = match rtl::strings::dns_host_name_to_computer_name(dns) {
+        Some(computer) => computer,
+        None => return STATUS_INVALID_COMPUTER_NAME,
+    };
+    let out_bytes = computer.len() * 2;
+    let with_nul = out_bytes + 2;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: computer_name is writable per the contract.
+        let dbuf = if allocate_computer_name_string != 0 {
+            // SAFETY: on-target process heap.
+            let p = unsafe { crate::process_heap_alloc(with_nul) } as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            unsafe {
+                (*computer_name).buffer = p as u64;
+                (*computer_name).maximum_length = with_nul as u16;
+            }
+            p
+        } else {
+            unsafe {
+                if (*computer_name).maximum_length < with_nul as u16 {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                let p = (*computer_name).buffer as *mut u16;
+                if p.is_null() {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                p
+            }
+        };
+        // SAFETY: dbuf has enough room for the converted name and trailing NUL.
+        unsafe {
+            core::ptr::copy_nonoverlapping(computer.as_ptr(), dbuf, computer.len());
+            core::ptr::write(dbuf.add(computer.len()), 0);
+            (*computer_name).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (computer, with_nul, allocate_computer_name_string);
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -14222,6 +14288,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_unicode_to_multi_byte_size as usize,
         rtl_oem_string_to_unicode_string as usize,
         rtl_unicode_string_to_oem_string as usize,
+        rtl_equal_computer_name as usize,
+        rtl_equal_domain_name as usize,
+        rtl_dns_host_name_to_computer_name as usize,
         rtl_is_text_unicode as usize,
         rtlx_unicode_string_to_ansi_size as usize,
         rtlx_unicode_string_to_oem_size as usize,

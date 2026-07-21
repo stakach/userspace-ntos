@@ -200,6 +200,57 @@ pub fn prefix_unicode_string(prefix: &[u16], s: &[u16], case_insensitive: bool) 
     equal_unicode_string(prefix, &s[..prefix.len()], case_insensitive)
 }
 
+/// The NetBIOS computer-name cap used by `RtlDnsHostNameToComputerName`.
+pub const MAX_COMPUTER_NAME_LENGTH: usize = 15;
+
+fn narrow_oem_unit(unit: u16) -> u8 {
+    if unit <= u8::MAX as u16 {
+        unit as u8
+    } else {
+        b'?'
+    }
+}
+
+/// `RtlEqualComputerName`: compare two computer names after uppercasing and narrowing through the
+/// single-byte OEM code-page path.
+pub fn equal_computer_name(a: &[u16], b: &[u16]) -> bool {
+    a.len() == b.len()
+        && a.iter().copied().zip(b.iter().copied()).all(|(lhs, rhs)| {
+            narrow_oem_unit(upcase_char(lhs)) == narrow_oem_unit(upcase_char(rhs))
+        })
+}
+
+/// `RtlEqualDomainName`: same comparison rules as `RtlEqualComputerName`.
+pub fn equal_domain_name(a: &[u16], b: &[u16]) -> bool {
+    equal_computer_name(a, b)
+}
+
+/// `RtlDnsHostNameToComputerName`: take the first DNS label, uppercase it, truncate it to the
+/// NetBIOS computer-name limit, and reject unmappable characters. The returned UTF-16 buffer is the
+/// content only; callers add the NUL terminator as needed.
+pub fn dns_host_name_to_computer_name(dns_host_name: &[u16]) -> Option<Vec<u16>> {
+    let label_len = dns_host_name
+        .iter()
+        .position(|&unit| unit == b'.' as u16)
+        .unwrap_or(dns_host_name.len());
+    if label_len == 0 {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    for &unit in dns_host_name[..label_len]
+        .iter()
+        .take(MAX_COMPUTER_NAME_LENGTH)
+    {
+        let narrowed = narrow_oem_unit(upcase_char(unit));
+        if narrowed == b'?' && unit != b'?' as u16 {
+            return None;
+        }
+        out.push(narrowed as u16);
+    }
+    Some(out)
+}
+
 /// `RtlHashUnicodeString`: X65599 hash over the counted UTF-16 units.
 pub fn hash_unicode_string(src: &[u16], case_insensitive: bool, algorithm: u32) -> Option<u32> {
     if !matches!(algorithm, 0 | 1) {
@@ -212,9 +263,7 @@ pub fn hash_unicode_string(src: &[u16], case_insensitive: bool, algorithm: u32) 
         } else {
             unit
         };
-        hash = hash
-            .wrapping_mul(65_599)
-            .wrapping_add(folded as u32);
+        hash = hash.wrapping_mul(65_599).wrapping_add(folded as u32);
     }
     Some(hash)
 }
@@ -492,6 +541,37 @@ mod tests {
     }
 
     #[test]
+    fn computer_and_domain_names_use_uppercase_oem_comparison() {
+        assert!(equal_computer_name(&u("winlogon"), &u("WINLOGON")));
+        assert!(equal_domain_name(&u("domain"), &u("DOMAIN")));
+        assert!(!equal_computer_name(&u("host1"), &u("host2")));
+        assert!(!equal_computer_name(&u("host"), &u("hostx")));
+
+        // The local boot OEM path maps unmappable UTF-16 units to '?' just like the existing
+        // Unicode-to-OEM exports, so equality follows that narrowed representation.
+        assert!(equal_computer_name(&[0x0100], &[0x0102]));
+    }
+
+    #[test]
+    fn dns_host_name_to_computer_name_matches_reactos_shape() {
+        assert_eq!(
+            dns_host_name_to_computer_name(&u("workstation.example.test")),
+            Some(u("WORKSTATION"))
+        );
+        assert_eq!(
+            dns_host_name_to_computer_name(&u("abcdefghijklmnop.example")),
+            Some(u("ABCDEFGHIJKLMNO"))
+        );
+        assert_eq!(dns_host_name_to_computer_name(&u(".example")), None);
+        assert_eq!(dns_host_name_to_computer_name(&[]), None);
+        assert_eq!(dns_host_name_to_computer_name(&[0x0100]), None);
+        assert_eq!(
+            dns_host_name_to_computer_name(&u("?host")),
+            Some(u("?HOST"))
+        );
+    }
+
+    #[test]
     fn hash_unicode_string_matches_x65599_vectors() {
         assert_eq!(hash_unicode_string(&u("T"), false, 1), Some(0x0000_0054));
         assert_eq!(hash_unicode_string(&u("Test"), false, 1), Some(0x766b_b952));
@@ -518,15 +598,16 @@ mod tests {
         );
         assert_eq!(
             hash_unicode_string(
-                &[
-                    'T' as u16, 'e' as u16, 's' as u16, 't' as u16, 0, '1' as u16,
-                ],
+                &['T' as u16, 'e' as u16, 's' as u16, 't' as u16, 0, '1' as u16,],
                 false,
                 1,
             ),
             Some(0x3280_3083)
         );
-        assert_eq!(hash_unicode_string(&u("abcdef"), false, 0), Some(0x9713_18c3));
+        assert_eq!(
+            hash_unicode_string(&u("abcdef"), false, 0),
+            Some(0x9713_18c3)
+        );
         assert_eq!(hash_unicode_string(&u("Test"), false, 0xffff_ffff), None);
     }
 
@@ -535,38 +616,14 @@ mod tests {
         use FindCharInUnicodeString::{Found, InvalidFlags, NotFound};
 
         let string = u("I am a string");
-        assert_eq!(
-            find_char_in_unicode_string(0, &string, &u("a")),
-            Found(6)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(1, &string, &u("a")),
-            Found(10)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(2, &string, &u("a")),
-            Found(2)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(3, &string, &u("G")),
-            Found(24)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(0, &string, &u("A")),
-            NotFound
-        );
-        assert_eq!(
-            find_char_in_unicode_string(4, &string, &u("A")),
-            Found(6)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(6, &string, &u("i")),
-            Found(4)
-        );
-        assert_eq!(
-            find_char_in_unicode_string(7, &string, &u("G")),
-            Found(22)
-        );
+        assert_eq!(find_char_in_unicode_string(0, &string, &u("a")), Found(6));
+        assert_eq!(find_char_in_unicode_string(1, &string, &u("a")), Found(10));
+        assert_eq!(find_char_in_unicode_string(2, &string, &u("a")), Found(2));
+        assert_eq!(find_char_in_unicode_string(3, &string, &u("G")), Found(24));
+        assert_eq!(find_char_in_unicode_string(0, &string, &u("A")), NotFound);
+        assert_eq!(find_char_in_unicode_string(4, &string, &u("A")), Found(6));
+        assert_eq!(find_char_in_unicode_string(6, &string, &u("i")), Found(4));
+        assert_eq!(find_char_in_unicode_string(7, &string, &u("G")), Found(22));
         assert_eq!(
             find_char_in_unicode_string(8, &string, &string),
             InvalidFlags
