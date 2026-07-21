@@ -1009,6 +1009,15 @@ static KEYED_WAITER_RESUME_SP: [AtomicU64; KEYED_WAITER_N] =
     [const { AtomicU64::new(0) }; KEYED_WAITER_N];
 static KEYED_WAITER_RESUME_FLAGS: [AtomicU64; KEYED_WAITER_N] =
     [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+/// Release-before-wait rendezvous slots for `NtReleaseKeyedEvent(..., Timeout = NULL)`. ReactOS
+/// `RtlRunOnceComplete` releases stack wait keys after publishing the waiter list; a waiter can be
+/// preempted between linking that key and entering `NtWaitForKeyedEvent`. A real keyed event pairs
+/// those two sides instead of dropping the release.
+const KEYED_RELEASE_N: usize = 16;
+static KEYED_RELEASE_KEY: [AtomicU64; KEYED_RELEASE_N] =
+    [const { AtomicU64::new(u64::MAX) }; KEYED_RELEASE_N];
+static KEYED_RELEASE_COUNT: [AtomicU64; KEYED_RELEASE_N] =
+    [const { AtomicU64::new(0) }; KEYED_RELEASE_N];
 static KEYED_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -2976,6 +2985,44 @@ unsafe fn keyed_wait_wake_one(key: u64, status: u64) -> bool {
         keyed_wait_clear_slot(slot);
         KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         return true;
+    }
+    false
+}
+
+fn keyed_release_take_pending(key: u64) -> bool {
+    for slot in 0..KEYED_RELEASE_N {
+        if KEYED_RELEASE_KEY[slot].load(Ordering::Relaxed) != key {
+            continue;
+        }
+        let count = KEYED_RELEASE_COUNT[slot].load(Ordering::Relaxed);
+        if count <= 1 {
+            KEYED_RELEASE_COUNT[slot].store(0, Ordering::Relaxed);
+            KEYED_RELEASE_KEY[slot].store(u64::MAX, Ordering::Relaxed);
+        } else {
+            KEYED_RELEASE_COUNT[slot].store(count - 1, Ordering::Relaxed);
+        }
+        KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+fn keyed_release_remember_pending(key: u64) -> bool {
+    if key == u64::MAX {
+        return false;
+    }
+    for slot in 0..KEYED_RELEASE_N {
+        if KEYED_RELEASE_KEY[slot].load(Ordering::Relaxed) == key {
+            KEYED_RELEASE_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    for slot in 0..KEYED_RELEASE_N {
+        if KEYED_RELEASE_KEY[slot].load(Ordering::Relaxed) == u64::MAX {
+            KEYED_RELEASE_COUNT[slot].store(1, Ordering::Relaxed);
+            KEYED_RELEASE_KEY[slot].store(key, Ordering::Relaxed);
+            return true;
+        }
     }
     false
 }

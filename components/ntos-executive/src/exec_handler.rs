@@ -3640,8 +3640,10 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtMakeTemporaryObject => 0,
             // NtReleaseKeyedEvent(Handle, Key, Alertable, Timeout) — wake one waiter parked by
             // NtWaitForKeyedEvent on the same raw key. ReactOS condition variables call this with a
-            // zero timeout and retry/skip on STATUS_TIMEOUT; blocking release-without-waiter is not
-            // modeled yet, so do not fabricate success when no waiter is present.
+            // zero timeout and retry/skip on STATUS_TIMEOUT. A NULL timeout is the keyed-event
+            // rendezvous path used by RtlRunOnce: if the waiter has published its key but has not yet
+            // entered the syscall, remember one release for that key so the later wait returns
+            // immediately instead of losing the wake.
             NativeService::NtReleaseKeyedEvent => unsafe {
                 let _handle = args[0];
                 let key = args[1];
@@ -3659,8 +3661,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     } else {
                         0xC000_0002
                     }
+                } else if keyed_release_remember_pending(key) {
+                    print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
+                    print_hex_u64(key);
+                    print_str(b" -> PENDING release\n");
+                    0
                 } else {
-                    0xC000_0002
+                    0xC000_009A
                 }
             },
             // NtWaitForKeyedEvent(Handle, Key, Alertable, Timeout) — park this syscall's reply cap
@@ -3671,6 +3678,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let key = args[1];
                 let _alertable = args[2];
                 let timeout_ptr = args[3];
+                if keyed_release_take_pending(key) {
+                    print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
+                    print_hex_u64(key);
+                    print_str(b" -> CONSUME pending release\n");
+                    return 0;
+                }
                 if timeout_ptr != 0 {
                     let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
                     match nt_delay_execution::due_time(
