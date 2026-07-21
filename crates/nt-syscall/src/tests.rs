@@ -225,6 +225,7 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtProtectVirtualMemory, 143),
         (NativeService::NtDisplayString, 70),
         (NativeService::NtQueryDebugFilterState, 148),
+        (NativeService::NtSetDebugFilterState, 222),
         (NativeService::NtOpenThreadToken, 135),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
@@ -242,6 +243,7 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtQueryInformationProcess.arg_count(), (5, 5));
     assert_eq!(NativeService::NtOpenThreadToken.arg_count(), (4, 4));
     assert_eq!(NativeService::NtQueryDebugFilterState.arg_count(), (2, 2));
+    assert_eq!(NativeService::NtSetDebugFilterState.arg_count(), (3, 3));
 }
 
 #[test]

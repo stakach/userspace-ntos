@@ -69,10 +69,10 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 
-/// The complete required `Nt*` SSN table: the 188 distinct imports across the current
+/// The complete required `Nt*` SSN table: the 190 distinct imports across the current
 /// hosted ReactOS x64 set (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
 /// rpcrt4/csrsrv/basesrv/winsrv/… — measured 2026-07-16, see `ntdll_plan.md` Step 1 Results),
-/// set, plus ntdll-internal `NtSecureConnectPort` and `NtCallbackReturn`, each paired with its
+/// plus ntdll-internal `NtSecureConnectPort` and `NtCallbackReturn`, each paired with its
 /// `sysfuncs.lst`-derived SSN. Sorted by SSN.
 pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtAcceptConnectPort", 0),
@@ -179,6 +179,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtProtectVirtualMemory", 143),
     n("NtPulseEvent", 144),
     n("NtQueryAttributesFile", 145),
+    n("NtQueryDebugFilterState", 148),
     n("NtQueryDefaultLocale", 149),
     n("NtQueryDefaultUILanguage", 150),
     n("NtQueryDirectoryFile", 151),
@@ -226,6 +227,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtSaveKey", 215),
     n("NtSecureConnectPort", 218),
     n("NtSetContextThread", 221),
+    n("NtSetDebugFilterState", 222),
     n("NtSetDefaultHardErrorPort", 223),
     n("NtSetDefaultLocale", 224),
     n("NtSetEvent", 228),
@@ -274,7 +276,9 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
     z("ZwCreateKey", "NtCreateKey", 43),
     z("ZwEnumerateKey", "NtEnumerateKey", 75),
     z("ZwEnumerateValueKey", "NtEnumerateValueKey", 77),
+    z("ZwQueryDebugFilterState", "NtQueryDebugFilterState", 148),
     z("ZwQueryValueKey", "NtQueryValueKey", 185),
+    z("ZwSetDebugFilterState", "NtSetDebugFilterState", 222),
     z("ZwSetValueKey", "NtSetValueKey", 256),
     z("ZwYieldExecution", "NtYieldExecution", 288),
 ];
@@ -396,6 +400,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtProtectVirtualMemory", 5),
     ("NtPulseEvent", 2),
     ("NtQueryAttributesFile", 2),
+    ("NtQueryDebugFilterState", 2),
     ("NtQueryDefaultLocale", 2),
     ("NtQueryDefaultUILanguage", 1),
     ("NtQueryDirectoryFile", 11),
@@ -444,6 +449,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtSaveKey", 2),
     ("NtSecureConnectPort", 9),
     ("NtSetContextThread", 2),
+    ("NtSetDebugFilterState", 3),
     ("NtSetDefaultHardErrorPort", 1),
     ("NtSetDefaultLocale", 2),
     ("NtSetEvent", 2),
@@ -523,10 +529,7 @@ pub fn ssn_of(name: &str) -> Option<u32> {
     if let Some(e) = NT_SYSCALLS.iter().find(|e| e.name == name) {
         return Some(e.ssn);
     }
-    ZW_ALIASES
-        .iter()
-        .find(|z| z.zw_name == name)
-        .map(|z| z.ssn)
+    ZW_ALIASES.iter().find(|z| z.zw_name == name).map(|z| z.ssn)
 }
 
 /// Reverse lookup: the canonical `Nt*` name for an SSN (first `Nt*` match). Returns `None` if no

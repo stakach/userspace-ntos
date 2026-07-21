@@ -69,6 +69,19 @@ impl ComponentFilter {
     }
 }
 
+/// Convert an `NtQueryDebugFilterState`/`NtSetDebugFilterState` level to the stored mask bitfield.
+pub fn debug_filter_level_mask(level: u32) -> u32 {
+    let mask = if level < 32 { 1u32 << level } else { level };
+    mask & !self::level::MASK
+}
+
+/// Query a debug-filter mask pair using the ReactOS kernel contract: a message is enabled if either
+/// the system-wide mask or the component mask contains the converted level bit.
+pub fn debug_filter_state(system_mask: u32, component_mask: u32, level: u32) -> bool {
+    let mask = debug_filter_level_mask(level);
+    mask != 0 && ((system_mask | component_mask) & mask) != 0
+}
+
 /// Render a `DbgPrint`-style message: `format` + `args` → the bytes that would be emitted to the
 /// debug service. Pure; the target-side `emit` hands these to `int 0x2d`.
 pub fn render(fmt: &[u8], args: &[FmtArg]) -> Vec<u8> {
@@ -192,6 +205,15 @@ mod tests {
         let f = ComponentFilter { mask: 0b0100 };
         assert!(f.should_print(level::MASK | 0b0100));
         assert!(!f.should_print(level::MASK | 0b0010));
+    }
+
+    #[test]
+    fn debug_filter_query_uses_system_or_component_mask() {
+        assert_eq!(debug_filter_level_mask(level::ERROR), 1);
+        assert_eq!(debug_filter_level_mask(level::MASK | 0b0100), 0b0100);
+        assert!(debug_filter_state(1, 0, level::ERROR));
+        assert!(debug_filter_state(0, 1 << level::WARNING, level::WARNING));
+        assert!(!debug_filter_state(0, 0, level::TRACE));
     }
 
     #[test]

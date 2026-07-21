@@ -103,6 +103,7 @@ pub enum NativeService {
     NtProtectVirtualMemory,
     NtDisplayString,
     NtQueryDebugFilterState,
+    NtSetDebugFilterState,
     NtOpenThreadToken,
     // Object-creation services the executive hands a fake handle for (SmpInit's \SmApiPort, the
     // SM/CSR worker threads, events/semaphores) — real LPC/thread objects are later work.
@@ -215,6 +216,7 @@ impl NativeService {
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
+            NtSetDebugFilterState => "NtSetDebugFilterState",
             NtOpenThreadToken => "NtOpenThreadToken",
             NtCreatePort => "NtCreatePort",
             NtCreateThread => "NtCreateThread",
@@ -264,7 +266,8 @@ impl NativeService {
             NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom => (1, 1),
             NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
             | NtQueryDebugFilterState => (2, 2),
-            NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion => (3, 3),
+            NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
+            | NtSetDebugFilterState => (3, 3),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtCreateIoCompletion => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
@@ -361,6 +364,7 @@ impl NativeService {
         NativeService::NtProtectVirtualMemory,
         NativeService::NtDisplayString,
         NativeService::NtQueryDebugFilterState,
+        NativeService::NtSetDebugFilterState,
         NativeService::NtOpenThreadToken,
         NativeService::NtCreatePort,
         NativeService::NtCreateThread,

@@ -459,6 +459,9 @@ pub const SSN_NT_SET_DEFAULT_LOCALE: u64 = 224;
 /// this returns (NTSTATUS)TRUE=1 (rtl/debug.c:66). Returning 1 unmasks the SXS/LDR component
 /// traces so we can see *which* internal loader step fails (otherwise only DPRINT1/-1 shows).
 pub const SSN_NT_QUERY_DEBUG_FILTER_STATE: u64 = 148;
+/// ntdll's NtSetDebugFilterState SSN. The executive has no SeDebugPrivilege plane yet, so the
+/// handler returns STATUS_ACCESS_DENIED just like a real kernel would for an unprivileged caller.
+pub const SSN_NT_SET_DEBUG_FILTER_STATE: u64 = 222;
 /// No-op-success syscalls: NtFreeVirtualMemory (bump allocator never frees),
 /// NtSetInformationThread/Process (attributes we don't model).
 pub const SSN_NT_FREE_VM: u64 = 87;
@@ -4325,6 +4328,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtProtectVirtualMemory, SSN_NT_PROTECT_VM as u32),
             (NativeService::NtDisplayString, SSN_NT_DISPLAY_STRING as u32),
             (NativeService::NtQueryDebugFilterState, SSN_NT_QUERY_DEBUG_FILTER_STATE as u32),
+            (NativeService::NtSetDebugFilterState, SSN_NT_SET_DEBUG_FILTER_STATE as u32),
             (NativeService::NtOpenThreadToken, SSN_NT_OPEN_THREAD_TOKEN as u32),
             // Workstream A batch 2 (group A): create-handle + no-op services.
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),

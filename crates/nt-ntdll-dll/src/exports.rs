@@ -26,6 +26,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
+#[cfg(not(target_arch = "x86_64"))]
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use nt_ntdll::rtl;
 use nt_ntdll_layout::UnicodeString;
@@ -39,6 +41,40 @@ const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
+#[cfg(not(target_arch = "x86_64"))]
+const DBG_TRUE: NtStatus = 1;
+#[cfg(not(target_arch = "x86_64"))]
+const DEBUG_FILTER_COMPONENTS: usize = 256;
+const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
+
+#[cfg(not(target_arch = "x86_64"))]
+static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
+    [const { AtomicU32::new(0) }; DEBUG_FILTER_COMPONENTS];
+#[cfg(not(target_arch = "x86_64"))]
+static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
+    if component == u32::MAX {
+        &DEBUG_FILTER_WIN2000_MASK
+    } else if (component as usize) < DEBUG_FILTER_COMPONENTS {
+        &DEBUG_FILTERS[component as usize]
+    } else {
+        &DEBUG_FILTER_DEFAULT_MASK
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_teb() -> u64 {
+    let teb: u64;
+    // SAFETY: target TEB self-pointer lives at GS:[0x30].
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags, readonly))
+    };
+    teb
+}
 
 // The raw C `UNICODE_STRING` / `STRING` (ANSI) layout — identical 16-byte shape on x64. We use the
 // byte-exact `nt_ntdll_layout::UnicodeString` for reads/writes through the exported pointers.
@@ -2453,6 +2489,70 @@ pub unsafe extern "system" fn dbg_break_point() {
     unsafe {
         core::arch::asm!("int3");
     }
+}
+
+/// `DbgUserBreakPoint()` — same breakpoint instruction as `DbgBreakPoint`.
+///
+/// # Safety
+/// Issues a debug breakpoint (`int3`).
+#[export_name = "DbgUserBreakPoint"]
+pub unsafe extern "system" fn dbg_user_break_point() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: same target-only breakpoint primitive as DbgBreakPoint.
+    unsafe {
+        core::arch::asm!("int3");
+    }
+}
+
+// =================================================================================================
+// A_SHA* — legacy SHA-1 compatibility exports.
+// =================================================================================================
+
+/// `A_SHAInit(PSHA_CTX Context)`.
+///
+/// # Safety
+/// `context` must point at a writable ReactOS/Windows `SHA_CTX`.
+#[export_name = "A_SHAInit"]
+pub unsafe extern "system" fn a_sha_init(context: *mut nt_ntdll::crypto::ShaContext) {
+    // SAFETY: caller supplies a writable SHA_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::a_sha_init(&mut *context) };
+}
+
+/// `A_SHAUpdate(PSHA_CTX Context, const unsigned char *Buffer, ULONG BufferSize)`.
+///
+/// # Safety
+/// `context` writable; `buffer` readable for `buffer_size` bytes.
+#[export_name = "A_SHAUpdate"]
+pub unsafe extern "system" fn a_sha_update(
+    context: *mut nt_ntdll::crypto::ShaContext,
+    buffer: *const u8,
+    buffer_size: u32,
+) {
+    let input = if buffer_size == 0 {
+        &[]
+    } else if buffer.is_null() {
+        return;
+    } else {
+        // SAFETY: caller supplies a valid input range per the ABI contract.
+        unsafe { core::slice::from_raw_parts(buffer, buffer_size as usize) }
+    };
+    // SAFETY: caller supplies a writable SHA_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::a_sha_update(&mut *context, input) };
+}
+
+/// `A_SHAFinal(PSHA_CTX Context, PULONG Result)`.
+///
+/// # Safety
+/// `context` writable; `result` writable for five `ULONG`s.
+#[export_name = "A_SHAFinal"]
+pub unsafe extern "system" fn a_sha_final(
+    context: *mut nt_ntdll::crypto::ShaContext,
+    result: *mut u32,
+) {
+    // SAFETY: PULONG Result has exactly five ULONGs for SHA-1.
+    let out = unsafe { &mut *(result as *mut [u32; 5]) };
+    // SAFETY: caller supplies a writable SHA_CTX per the ABI contract.
+    unsafe { nt_ntdll::crypto::a_sha_final(&mut *context, out) };
 }
 
 // =================================================================================================
@@ -8736,11 +8836,21 @@ zw_alias!(
     nt_free_virtual_memory
 );
 zw_alias!(zw_open_event, "ZwOpenEvent", nt_open_event);
+zw_alias!(
+    zw_query_debug_filter_state,
+    "ZwQueryDebugFilterState",
+    nt_query_debug_filter_state
+);
 zw_alias!(zw_query_value_key, "ZwQueryValueKey", nt_query_value_key);
 zw_alias!(
     zw_request_wait_reply_port,
     "ZwRequestWaitReplyPort",
     nt_request_wait_reply_port
+);
+zw_alias!(
+    zw_set_debug_filter_state,
+    "ZwSetDebugFilterState",
+    nt_set_debug_filter_state
 );
 zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
 zw_alias!(
@@ -9615,6 +9725,13 @@ pub unsafe extern "system" fn rtl_init_code_page_table(table: *const u16, cp_tab
 // resolves + the call is ABI-safe. Data exports are the NLS/prefix globals hosted binaries read.
 // =================================================================================================
 
+#[cfg(not(target_arch = "x86_64"))]
+fn debug_filter_enabled(component: u32, level: u32) -> bool {
+    let win2000 = DEBUG_FILTER_WIN2000_MASK.load(Ordering::Relaxed);
+    let component_mask = debug_filter_mask(component).load(Ordering::Relaxed);
+    nt_ntdll::dbg::debug_filter_state(win2000, component_mask, level)
+}
+
 /// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Variadic; we declare
 /// only the fixed args (the Win64 variadic tail is left in the caller's registers/stack, unread).
 /// ABI-safe no-op returning STATUS_SUCCESS — the export exists so the Win32 stack's IAT resolves
@@ -9628,6 +9745,94 @@ pub unsafe extern "C" fn dbg_print_ex(
     _component: u32,
     _level: u32,
     _format: *const u8,
+) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `DbgPrintReturnControlC(PCSTR Format, ...) -> ULONG`. Variadic checked-build print helper; same
+/// ABI-safe print seam as `DbgPrint`, returning STATUS_SUCCESS without reading the variadic tail.
+///
+/// # Safety
+/// Called with the C DbgPrint ABI; ignores the variadic tail.
+#[export_name = "DbgPrintReturnControlC"]
+pub unsafe extern "C" fn dbg_print_return_control_c(_format: *const u8) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `DbgQueryDebugFilterState(ULONG ComponentId, ULONG Level) -> NTSTATUS/BOOLEAN`.
+///
+/// ReactOS forwards this to `NtQueryDebugFilterState`, whose successful query returns
+/// `(NTSTATUS)TRUE` or `(NTSTATUS)FALSE`. On target this calls the generated Nt stub and lets the
+/// executive's debug-filter service decide.
+///
+/// # Safety
+/// Pure scalar ABI.
+#[export_name = "DbgQueryDebugFilterState"]
+pub unsafe extern "system" fn dbg_query_debug_filter_state(component: u32, level: u32) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwards to the generated NtQueryDebugFilterState native stub.
+        return unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u32, u32) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_query_debug_filter_state)(component, level)
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    if debug_filter_enabled(component, level) {
+        DBG_TRUE
+    } else {
+        STATUS_SUCCESS
+    }
+}
+
+/// `DbgSetDebugFilterState(ULONG ComponentId, ULONG Level, BOOLEAN State) -> NTSTATUS`.
+///
+/// # Safety
+/// Pure scalar ABI.
+#[export_name = "DbgSetDebugFilterState"]
+pub unsafe extern "system" fn dbg_set_debug_filter_state(
+    component: u32,
+    level: u32,
+    state: u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwards to the generated NtSetDebugFilterState native stub.
+        return unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u32, u32, u32) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_set_debug_filter_state)(component, level, state)
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mask = nt_ntdll::dbg::debug_filter_level_mask(level);
+        let cell = debug_filter_mask(component);
+        if state != 0 {
+            cell.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            cell.fetch_and(!mask, Ordering::Relaxed);
+        }
+        STATUS_SUCCESS
+    }
+}
+
+/// `vDbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, va_list) -> ULONG`.
+///
+/// ABI-safe no-op returning STATUS_SUCCESS; the rendered serial path remains the debug transport
+/// seam shared with `DbgPrintEx`.
+///
+/// # Safety
+/// Called with the ntdll `vDbgPrintEx` ABI; ignores the `va_list`.
+#[export_name = "vDbgPrintEx"]
+pub unsafe extern "C" fn vdbg_print_ex(
+    _component: u32,
+    _level: u32,
+    _format: *const u8,
+    _args: *mut c_void,
 ) -> NtStatus {
     STATUS_SUCCESS
 }
@@ -9693,13 +9898,68 @@ dbgui_noop!("DbgUiStopDebugging", dbg_ui_stop_debugging);
 dbgui_noop!("DbgUiIssueRemoteBreakin", dbg_ui_issue_remote_breakin);
 dbgui_noop!("DbgUiWaitStateChange", dbg_ui_wait_state_change);
 
+/// `DbgUiRemoteBreakin()` — debugger break-in thread entry. If the PEB says the process is being
+/// debugged, raise `DbgBreakPoint`, then terminate the current thread with STATUS_SUCCESS.
+///
+/// # Safety
+/// Called as a thread start routine; does not return on target.
+#[export_name = "DbgUiRemoteBreakin"]
+pub unsafe extern "system" fn dbg_ui_remote_breakin() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PEB is mapped at spawn; BeingDebugged is the byte at PEB+2.
+    unsafe {
+        let peb = current_peb();
+        if peb != 0 && core::ptr::read_volatile((peb + 2) as *const u8) != 0 {
+            dbg_break_point();
+        }
+        rtl_exit_user_thread(STATUS_SUCCESS);
+    }
+}
+
 /// `DbgUiGetThreadDebugObject() -> HANDLE` — returns the current thread's debug object (none) = NULL.
 ///
 /// # Safety
-/// Reads no memory; returns a NULL handle (no debug object bound).
+/// Reads the x64 TEB `DbgSsReserved[1]` slot on target.
 #[export_name = "DbgUiGetThreadDebugObject"]
 pub unsafe extern "system" fn dbg_ui_get_thread_debug_object() -> *mut c_void {
-    core::ptr::null_mut()
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: TEB self pointer is gs:[0x30]; DbgSsReserved[1] is at TEB+0x16A8.
+    unsafe {
+        let teb = current_teb();
+        if teb == 0 {
+            core::ptr::null_mut()
+        } else {
+            core::ptr::read_volatile((teb + TEB_DBGSS_RESERVED1_OFFSET) as *const *mut c_void)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// `DbgUiSetThreadDebugObject(HANDLE DebugObject)` — store the current thread's debugger object in
+/// `NtCurrentTeb()->DbgSsReserved[1]`.
+///
+/// # Safety
+/// Writes the x64 TEB `DbgSsReserved[1]` slot on target.
+#[export_name = "DbgUiSetThreadDebugObject"]
+pub unsafe extern "system" fn dbg_ui_set_thread_debug_object(debug_object: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: TEB self pointer is gs:[0x30]; DbgSsReserved[1] is at TEB+0x16A8.
+    unsafe {
+        let teb = current_teb();
+        if teb != 0 {
+            core::ptr::write_volatile(
+                (teb + TEB_DBGSS_RESERVED1_OFFSET) as *mut *mut c_void,
+                debug_object,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = debug_object;
+    }
 }
 
 // ---- Csr* — the CSR client. ----------------------------------------------------------------------
@@ -10110,6 +10370,31 @@ pub unsafe extern "system" fn csr_probe_for_write(
     }
 }
 
+/// `CsrVerifyRegion(PVOID Address, ULONG Length) -> NTSTATUS`.
+///
+/// ReactOS only marks this Vista+ CSR helper as a spec stub. For our ntdll, make it a real bounded
+/// user-memory verification helper: zero-length regions succeed, null non-empty regions fail, and
+/// non-empty regions are volatile-probed at both ends.
+///
+/// # Safety
+/// `address` must be readable for `length` bytes unless `length == 0`.
+#[export_name = "CsrVerifyRegion"]
+pub unsafe extern "system" fn csr_verify_region(address: *const c_void, length: u32) -> NtStatus {
+    if length == 0 {
+        return STATUS_SUCCESS;
+    }
+    if address.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: caller contract; volatile probes mirror the CSR probe helpers.
+    unsafe {
+        let pointer = address as *const u8;
+        core::ptr::read_volatile(pointer);
+        core::ptr::read_volatile(pointer.add(length as usize - 1));
+    }
+    STATUS_SUCCESS
+}
+
 /// `CsrNewThread() -> NTSTATUS` — register a new thread with the CSR client runtime (marks the TEB
 /// CSR fields). No CSR client runtime state to update yet → STATUS_SUCCESS (the observable no-op:
 /// the thread simply isn't CSR-registered, which the boot path tolerates).
@@ -10266,6 +10551,10 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_verify_image_matches_checksum as usize,
         dbg_print as usize,
         dbg_break_point as usize,
+        dbg_user_break_point as usize,
+        a_sha_init as usize,
+        a_sha_update as usize,
+        a_sha_final as usize,
         memcpy as usize,
         memset as usize,
         wcslen as usize,
@@ -10359,6 +10648,10 @@ pub unsafe extern "C" fn export_anchor() {
         ver_set_condition_mask as usize,
         // BATCH 4 — Dbg* / Csr* surface.
         dbg_print_ex as usize,
+        dbg_print_return_control_c as usize,
+        dbg_query_debug_filter_state as usize,
+        dbg_set_debug_filter_state as usize,
+        vdbg_print_ex as usize,
         vdbg_print_ex_with_prefix as usize,
         dbg_prompt as usize,
         dbg_ui_connect_to_dbg as usize,
@@ -10368,7 +10661,9 @@ pub unsafe extern "C" fn export_anchor() {
         dbg_ui_stop_debugging as usize,
         dbg_ui_issue_remote_breakin as usize,
         dbg_ui_wait_state_change as usize,
+        dbg_ui_remote_breakin as usize,
         dbg_ui_get_thread_debug_object as usize,
+        dbg_ui_set_thread_debug_object as usize,
         csr_get_process_id as usize,
         csr_client_connect_to_server as usize,
         csr_client_call_server as usize,
@@ -10381,6 +10676,7 @@ pub unsafe extern "C" fn export_anchor() {
         csr_capture_timeout as usize,
         csr_probe_for_read as usize,
         csr_probe_for_write as usize,
+        csr_verify_region as usize,
         csr_new_thread as usize,
         csr_identify_alertable_thread as usize,
         csr_set_priority_class as usize,

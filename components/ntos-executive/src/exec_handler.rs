@@ -2744,6 +2744,9 @@ impl NativeSyscallHandler for ExecNtHandler {
             // no kernel debugger attached, so DbgPrintEx suppresses the message (see the ladder note
             // this replaces: a TRUE here makes ntdll format a null-relative string → VMFault).
             NativeService::NtQueryDebugFilterState => 0,
+            // NtSetDebugFilterState requires SeDebugPrivilege in ReactOS/NT. We do not model that
+            // privilege plane yet, so deny the mutation instead of fabricating a changed mask.
+            NativeService::NtSetDebugFilterState => 0xC0000022,
             // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
             // the process token.
             NativeService::NtOpenThreadToken => 0xC000007C,

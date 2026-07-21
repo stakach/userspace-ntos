@@ -2,12 +2,12 @@
 
 use super::*;
 
-/// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement = 188)
+/// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement = 190)
 /// plus `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally (it
 /// isn't an *import* of any hosted binary, but IS an ntdll-internal syscall), and
 /// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
-const REQUIRED_NT_COUNT: usize = 190;
-const REQUIRED_ZW_COUNT: usize = 7;
+const REQUIRED_NT_COUNT: usize = 192;
+const REQUIRED_ZW_COUNT: usize = 9;
 
 #[test]
 fn required_counts() {
@@ -20,7 +20,11 @@ fn no_duplicate_ssns() {
     // No two Nt* services may share an SSN (a shared SSN would misdispatch).
     for (i, a) in NT_SYSCALLS.iter().enumerate() {
         for b in &NT_SYSCALLS[i + 1..] {
-            assert_ne!(a.ssn, b.ssn, "duplicate SSN {}: {} / {}", a.ssn, a.name, b.name);
+            assert_ne!(
+                a.ssn, b.ssn,
+                "duplicate SSN {}: {} / {}",
+                a.ssn, a.name, b.name
+            );
         }
     }
 }
@@ -38,7 +42,12 @@ fn no_duplicate_names() {
 fn sorted_by_ssn() {
     // The table is maintained sorted by SSN (matches sysfuncs.lst order — easy diffing).
     for w in NT_SYSCALLS.windows(2) {
-        assert!(w[0].ssn < w[1].ssn, "not sorted at {} / {}", w[0].name, w[1].name);
+        assert!(
+            w[0].ssn < w[1].ssn,
+            "not sorted at {} / {}",
+            w[0].name,
+            w[1].name
+        );
     }
 }
 
@@ -92,9 +101,11 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtOpenFile", 122),               // (loader hot path)
         ("NtOpenKey", 125),                // SSN_NT_OPEN_KEY = 125
         ("NtProtectVirtualMemory", 143),   // SSN_NT_PROTECT_VM = 143
+        ("NtQueryDebugFilterState", 148),  // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
         ("NtQuerySystemInformation", 181), // SSN_NT_QUERY_SYSTEM_INFO = 0xb5
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
+        ("NtSetDebugFilterState", 222),    // SSN_NT_SET_DEBUG_FILTER_STATE = 222
         ("NtSetValueKey", 256),            // SSN_NT_SET_VALUE_KEY = 256
         ("NtTerminateProcess", 266),       // SSN_NT_TERMINATE_PROCESS = 266
         ("NtWaitForSingleObject", 281),    // (core sync)
@@ -116,7 +127,11 @@ fn every_service_has_an_exact_arity() {
             e.name
         );
         let c = argc_of(e.name);
-        assert!(c <= MAX_STUB_ARGS, "arity of {} exceeds MAX_STUB_ARGS", e.name);
+        assert!(
+            c <= MAX_STUB_ARGS,
+            "arity of {} exceeds MAX_STUB_ARGS",
+            e.name
+        );
     }
     assert_eq!(NT_ARGC.len(), NT_SYSCALLS.len());
 }
@@ -128,7 +143,7 @@ fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtCreateFile"), 11);
     assert_eq!(argc_of("NtWaitForSingleObject"), 3);
     assert_eq!(argc_of("NtCreateNamedPipeFile"), 14); // the widest
-    // Zw* inherits its underlying Nt*'s arity.
+                                                      // Zw* inherits its underlying Nt*'s arity.
     assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));
     // Unknown falls back conservatively to MAX_STUB_ARGS (never 0 → never silently drops args).
     assert_eq!(argc_of("NtNotARealService"), MAX_STUB_ARGS);
@@ -147,7 +162,10 @@ fn no_duplicate_argc_names() {
 fn alpc_seam_is_reserved_above_the_reactos_range() {
     // ALPC is documented-but-unassigned; its reserved base is well clear of every real SSN.
     let max = NT_SYSCALLS.iter().map(|e| e.ssn).max().unwrap();
-    assert!(ALPC_SSN_BASE > max, "ALPC base must not collide with real SSNs");
+    assert!(
+        ALPC_SSN_BASE > max,
+        "ALPC base must not collide with real SSNs"
+    );
     // Nothing in the current table sits in the ALPC reserved space.
     assert!(NT_SYSCALLS.iter().all(|e| e.ssn < ALPC_SSN_BASE));
 }

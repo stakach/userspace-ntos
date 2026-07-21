@@ -224,6 +224,7 @@ generate_trap_stubs! {
     (nt_protect_virtual_memory, "NtProtectVirtualMemory", 143),
     (nt_pulse_event, "NtPulseEvent", 144),
     (nt_query_attributes_file, "NtQueryAttributesFile", 145),
+    (nt_query_debug_filter_state, "NtQueryDebugFilterState", 148),
     (nt_query_default_locale, "NtQueryDefaultLocale", 149),
     (nt_query_default_ui_language, "NtQueryDefaultUILanguage", 150),
     (nt_query_directory_file, "NtQueryDirectoryFile", 151),
@@ -272,6 +273,7 @@ generate_trap_stubs! {
     (nt_save_key, "NtSaveKey", 215),
     (nt_secure_connect_port, "NtSecureConnectPort", 218),
     (nt_set_context_thread, "NtSetContextThread", 221),
+    (nt_set_debug_filter_state, "NtSetDebugFilterState", 222),
     (nt_set_default_hard_error_port, "NtSetDefaultHardErrorPort", 223),
     (nt_set_default_locale, "NtSetDefaultLocale", 224),
     (nt_set_event, "NtSetEvent", 228),
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     fn generates_all_required_stubs() {
-        assert_eq!(TRAP_STUBS.len(), 190);
+        assert_eq!(TRAP_STUBS.len(), 192);
         assert_eq!(TRAP_STUBS.len(), NT_SYSCALLS.len());
     }
 

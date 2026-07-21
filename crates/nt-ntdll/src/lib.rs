@@ -57,6 +57,7 @@ extern crate alloc;
 pub use nt_syscall_abi as abi;
 
 pub mod crt;
+pub mod crypto;
 pub mod csr;
 pub mod dbg;
 pub mod heap;
