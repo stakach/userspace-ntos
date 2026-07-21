@@ -15,12 +15,12 @@
 //! ## Honesty discipline (project-wide rule)
 //! Symbols that are **self-contained** (string init/compare, integer parse, CRT mem/str/wcs) are
 //! fully implemented here — correct on a live path. Symbols that require the **live process plane**
-//! not yet wired at 4.0b (the process heap for `RtlAllocateHeap`/`RtlFreeHeap`, the live PEB for
-//! env/CWD, the boot-status device, `RtlCreateUserProcess/Thread`, the SEH `__C_specific_handler`)
-//! export at the correct ABI but return an **honest failure** (a real `NTSTATUS` error / null /
-//! FALSE) — they NEVER fabricate success. Step 4.A/4.B wires the live plane (the process heap +
-//! PEB), at which point these bodies light up. The 4.0b bar is **export-table completeness** (smss
-//! resolves against us, 0 missing), host-proven by `tools/ntdll-dll-verify`.
+//! not yet wired at 4.0b (some live kernel object semantics, `RtlCreateUserProcess/Thread`, parts
+//! of SEH, timer queues/thread pools) export at the correct ABI but return an **honest failure**
+//! (a real `NTSTATUS` error / null / FALSE) — they NEVER fabricate success. Step 4.A/4.B wires the
+//! live process plane; later slices continue replacing these boundaries with real bodies. The 4.0b
+//! bar was **export-table completeness** (smss resolves against us, 0 missing), host-proven by
+//! `tools/ntdll-dll-verify`.
 
 extern crate alloc;
 
@@ -34,9 +34,9 @@ type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
-const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009A;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 
 // The raw C `UNICODE_STRING` / `STRING` (ANSI) layout — identical 16-byte shape on x64. We use the
@@ -169,6 +169,62 @@ unsafe fn us_slice<'a>(p: PCUnicodeString) -> &'a [u16] {
     }
     // SAFETY: buffer+length describe a valid UTF-16 region per the contract.
     unsafe { core::slice::from_raw_parts(buf, len) }
+}
+
+// ---- boot-status data ---------------------------------------------------------------------------
+
+// ReactOS `RTL_BSD_DATA` x64 layout from `sdk/include/ndk/rtltypes.h`.
+const BOOT_STATUS_HANDLE: usize = 0xB007_57A7;
+const BSD_DATA_SIZE: usize = 0x88;
+const BSD_ITEM_MAX: usize = 16;
+const BSD_ITEMS: [(usize, usize); BSD_ITEM_MAX] = [
+    (0x00, 4),  // RtlBsdItemVersionNumber
+    (0x04, 4),  // RtlBsdItemProductType
+    (0x08, 1),  // RtlBsdItemAabEnabled
+    (0x09, 1),  // RtlBsdItemAabTimeout
+    (0x0A, 1),  // RtlBsdItemBootGood
+    (0x0B, 1),  // RtlBsdItemBootShutdown
+    (0x0C, 1),  // RtlBsdSleepInProgress
+    (0x10, 32), // RtlBsdPowerTransition
+    (0x30, 1),  // RtlBsdItemBootAttemptCount
+    (0x31, 1),  // RtlBsdItemBootCheckpoint
+    (0x34, 4),  // RtlBsdItemBootId
+    (0x38, 4),  // RtlBsdItemShutdownBootId
+    (0x3C, 4),  // RtlBsdItemReportedAbnormalShutdownBootId
+    (0x40, 20), // RtlBsdItemErrorInfo
+    (0x58, 48), // RtlBsdItemPowerButtonPressInfo
+    (0x32, 1),  // RtlBsdItemChecksum
+];
+
+static BOOT_STATUS_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static mut BOOT_STATUS_DATA: [u8; BSD_DATA_SIZE] = [0; BSD_DATA_SIZE];
+
+#[inline]
+fn boot_status_data_ptr() -> *mut u8 {
+    core::ptr::addr_of_mut!(BOOT_STATUS_DATA) as *mut u8
+}
+
+unsafe fn boot_status_write_u32(offset: usize, value: u32) {
+    // SAFETY: caller passes offsets inside BOOT_STATUS_DATA.
+    unsafe { core::ptr::write_unaligned(boot_status_data_ptr().add(offset) as *mut u32, value) };
+}
+
+unsafe fn ensure_boot_status_data() {
+    if BOOT_STATUS_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: single-process boot-status model; repeated initialization before the store is benign.
+    unsafe {
+        let data = boot_status_data_ptr();
+        core::ptr::write_bytes(data, 0, BSD_DATA_SIZE);
+        boot_status_write_u32(0x00, BSD_DATA_SIZE as u32); // Version
+        boot_status_write_u32(0x04, 1); // NtProductWinNt
+        *data.add(0x08) = 1; // AabEnabled
+        *data.add(0x09) = 30; // AabTimeout
+        *data.add(0x0A) = 1; // LastBootSucceeded
+    }
+    BOOT_STATUS_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// `RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN) -> LONG`.
@@ -1662,40 +1718,83 @@ pub unsafe extern "system" fn rtl_set_thread_is_critical(
     }
 }
 
-/// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`. Honest
-/// seam (needs the boot-status device file).
+/// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`.
+/// ReactOS ntdll implements this as byte-range reads/writes against `\SystemRoot\bootstat.dat`; this
+/// runtime has no arbitrary file-backed bootstat device yet, so we model the same `RTL_BSD_DATA`
+/// item table in ntdll. This is enough for smss' save/clear/restore boot bookkeeping and keeps the
+/// field sizes/offsets byte-identical to ReactOS.
 ///
 /// # Safety
-/// Standard contract.
+/// `buffer` is readable/writable for `buffer_size` bytes; `return_length` is null or writable.
 #[export_name = "RtlGetSetBootStatusData"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_get_set_boot_status_data(
-    _handle: *mut c_void,
-    _read: u8,
-    _data_class: u32,
-    _buffer: *mut c_void,
-    _buffer_size: u32,
-    _return_length: *mut u32,
+    handle: *mut c_void,
+    read: u8,
+    data_class: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    return_length: *mut u32,
 ) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+    if handle as usize != BOOT_STATUS_HANDLE {
+        return STATUS_INVALID_HANDLE;
+    }
+    if data_class as usize >= BSD_ITEM_MAX {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (offset, item_size) = BSD_ITEMS[data_class as usize];
+    if buffer_size as usize > item_size {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if buffer_size != 0 && buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: boot-status model is initialized and buffer spans were validated.
+    unsafe {
+        ensure_boot_status_data();
+        let data = boot_status_data_ptr().add(offset);
+        if buffer_size != 0 {
+            if read != 0 {
+                core::ptr::copy_nonoverlapping(data, buffer as *mut u8, buffer_size as usize);
+            } else {
+                core::ptr::copy_nonoverlapping(buffer as *const u8, data, buffer_size as usize);
+            }
+        }
+        if !return_length.is_null() {
+            *return_length = item_size as u32;
+        }
+    }
+    STATUS_SUCCESS
 }
 
-/// `RtlLockBootStatusData(PHANDLE) -> NTSTATUS`. Honest seam.
+/// `RtlLockBootStatusData(PHANDLE) -> NTSTATUS`. Return the in-ntdll boot-status handle.
 ///
 /// # Safety
-/// Standard contract.
+/// `handle` is writable.
 #[export_name = "RtlLockBootStatusData"]
-pub unsafe extern "system" fn rtl_lock_boot_status_data(_handle: *mut *mut c_void) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+pub unsafe extern "system" fn rtl_lock_boot_status_data(handle: *mut *mut c_void) -> NtStatus {
+    if handle.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: handle is a writable out-param.
+    unsafe {
+        ensure_boot_status_data();
+        *handle = BOOT_STATUS_HANDLE as *mut c_void;
+    }
+    STATUS_SUCCESS
 }
 
-/// `RtlUnlockBootStatusData(HANDLE) -> NTSTATUS`. Honest seam.
+/// `RtlUnlockBootStatusData(HANDLE) -> NTSTATUS`. Flush/close is a no-op for the in-ntdll model.
 ///
 /// # Safety
-/// Standard contract.
+/// `handle` is the value returned by `RtlLockBootStatusData`.
 #[export_name = "RtlUnlockBootStatusData"]
-pub unsafe extern "system" fn rtl_unlock_boot_status_data(_handle: *mut c_void) -> NtStatus {
-    STATUS_NOT_IMPLEMENTED // needs \BootStatusData device (Step 4.B)
+pub unsafe extern "system" fn rtl_unlock_boot_status_data(handle: *mut c_void) -> NtStatus {
+    if handle as usize == BOOT_STATUS_HANDLE {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_HANDLE
+    }
 }
 
 /// `RtlCreateUserProcess(...)` — the classic user-mode process create (BATCH 1: real, ported from
@@ -4332,24 +4431,79 @@ pub unsafe extern "system" fn rtl_dos_search_path_ustr(
 
 /// `RtlFindMessage(PVOID DllHandle, ULONG MessageTableId, ULONG MessageLanguageId, ULONG MessageId,
 /// PMESSAGE_RESOURCE_ENTRY* MessageEntry) -> NTSTATUS` — look up a message-table string in a
-/// module's `.rsrc`. No message-table consumer on the boot path → STATUS_MESSAGE_NOT_FOUND
-/// (0xC0000109): the caller falls back to a default string. NEVER a fabricated message pointer.
+/// module's `.rsrc`. Mirrors ReactOS `sdk/lib/rtl/message.c`: find the `RT_MESSAGETABLE` resource
+/// with name `1`, access the resource data, and walk its `MESSAGE_RESOURCE_DATA` blocks.
 ///
 /// # Safety
 /// `dll_handle` a mapped module; `message_entry` writable.
 #[export_name = "RtlFindMessage"]
 pub unsafe extern "system" fn rtl_find_message(
-    _dll_handle: *mut c_void,
-    _message_table_id: u32,
-    _message_language_id: u32,
-    _message_id: u32,
+    dll_handle: *mut c_void,
+    message_table_id: u32,
+    message_language_id: u32,
+    message_id: u32,
     message_entry: *mut *mut c_void,
 ) -> NtStatus {
     if !message_entry.is_null() {
         // SAFETY: writable per the contract.
         unsafe { *message_entry = core::ptr::null_mut() };
     }
-    0xC000_0109 // STATUS_MESSAGE_NOT_FOUND
+    if dll_handle.is_null() {
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
+    }
+
+    // LDR_RESOURCE_INFO { ULONG_PTR Type; ULONG_PTR Name; ULONG_PTR Language; }.
+    let resource_info = [
+        message_table_id as usize,
+        1usize,
+        message_language_id as usize,
+    ];
+    let mut data_entry: *mut c_void = core::ptr::null_mut();
+    // SAFETY: dll_handle is a mapped module; resource_info is a valid stack LDR_RESOURCE_INFO.
+    let status = unsafe {
+        ldr_find_resource_u(
+            dll_handle,
+            resource_info.as_ptr() as *const c_void,
+            3,
+            &mut data_entry,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let mut message_table: *mut c_void = core::ptr::null_mut();
+    let mut message_table_size = 0u32;
+    // SAFETY: data_entry was produced by LdrFindResource_U.
+    let status = unsafe {
+        ldr_access_resource(
+            dll_handle,
+            data_entry,
+            &mut message_table,
+            &mut message_table_size,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+    if message_table.is_null() || message_table_size == 0 {
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
+    }
+
+    // SAFETY: LdrAccessResource returned a mapped resource pointer and its byte size.
+    let table = unsafe {
+        core::slice::from_raw_parts(message_table as *const u8, message_table_size as usize)
+    };
+    match rtl::message::find_message_entry(table, message_id) {
+        Ok(offset) => {
+            if !message_entry.is_null() {
+                // SAFETY: offset was validated against `table`.
+                unsafe { *message_entry = (message_table as *mut u8).add(offset) as *mut c_void };
+            }
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
 }
 
 // =================================================================================================
@@ -4979,6 +5133,314 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
             0
         };
         u8::from(in_range && flags & 1 != 0)
+    }
+}
+
+// ---- splay trees + RTL_GENERIC_TABLE ----------------------------------------------------------------
+
+type RtlGenericTable = nt_ntdll::rtl::generic_table::RtlGenericTable;
+type RtlSplayLinks = nt_ntdll::rtl::splay::SplayLinks;
+type RtlGenericCompareRoutine = nt_ntdll::rtl::generic_table::CompareRoutine;
+type RtlGenericAllocateRoutine = nt_ntdll::rtl::generic_table::AllocateRoutine;
+type RtlGenericFreeRoutine = nt_ntdll::rtl::generic_table::FreeRoutine;
+
+#[inline]
+fn rtl_table_search_result(value: u32) -> nt_ntdll::rtl::generic_table::TableSearchResult {
+    match value {
+        1 => nt_ntdll::rtl::generic_table::TableSearchResult::TableFoundNode,
+        2 => nt_ntdll::rtl::generic_table::TableSearchResult::TableInsertAsLeft,
+        3 => nt_ntdll::rtl::generic_table::TableSearchResult::TableInsertAsRight,
+        _ => nt_ntdll::rtl::generic_table::TableSearchResult::TableEmptyTree,
+    }
+}
+
+/// `RtlSplay(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` belongs to a well-formed `RTL_SPLAY_LINKS` tree.
+#[export_name = "RtlSplay"]
+pub unsafe extern "system" fn rtl_splay(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::splay(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlDelete(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` belongs to a well-formed `RTL_SPLAY_LINKS` tree.
+#[export_name = "RtlDelete"]
+pub unsafe extern "system" fn rtl_delete(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::delete(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlDeleteNoSplay(PRTL_SPLAY_LINKS Links, PRTL_SPLAY_LINKS* Root)`.
+///
+/// # Safety
+/// `links` belongs to the tree rooted at `*root`.
+#[export_name = "RtlDeleteNoSplay"]
+pub unsafe extern "system" fn rtl_delete_no_splay(links: *mut c_void, root: *mut *mut c_void) {
+    // SAFETY: pointer-to-pointer has the same representation; the core updates it in place.
+    unsafe {
+        nt_ntdll::rtl::splay::delete_no_splay(
+            links as *mut RtlSplayLinks,
+            root as *mut *mut RtlSplayLinks,
+        )
+    };
+}
+
+/// `RtlRealPredecessor(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` is a valid `RTL_SPLAY_LINKS` node.
+#[export_name = "RtlRealPredecessor"]
+pub unsafe extern "system" fn rtl_real_predecessor(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::real_predecessor(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlRealSuccessor(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` is a valid `RTL_SPLAY_LINKS` node.
+#[export_name = "RtlRealSuccessor"]
+pub unsafe extern "system" fn rtl_real_successor(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::real_successor(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlSubtreePredecessor(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` is a valid `RTL_SPLAY_LINKS` node.
+#[export_name = "RtlSubtreePredecessor"]
+pub unsafe extern "system" fn rtl_subtree_predecessor(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::subtree_predecessor(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlSubtreeSuccessor(PRTL_SPLAY_LINKS Links) -> PRTL_SPLAY_LINKS`.
+///
+/// # Safety
+/// `links` is a valid `RTL_SPLAY_LINKS` node.
+#[export_name = "RtlSubtreeSuccessor"]
+pub unsafe extern "system" fn rtl_subtree_successor(links: *mut c_void) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
+    unsafe { nt_ntdll::rtl::splay::subtree_successor(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `RtlInitializeGenericTable(PRTL_GENERIC_TABLE, Compare, Allocate, Free, Context)`.
+///
+/// # Safety
+/// `table` is writable for an `RTL_GENERIC_TABLE`; callbacks follow the native RTL contracts.
+#[export_name = "RtlInitializeGenericTable"]
+pub unsafe extern "system" fn rtl_initialize_generic_table(
+    table: *mut c_void,
+    compare: Option<RtlGenericCompareRoutine>,
+    allocate: Option<RtlGenericAllocateRoutine>,
+    free: Option<RtlGenericFreeRoutine>,
+    context: *mut c_void,
+) {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::initialize_generic_table(
+            table as *mut RtlGenericTable,
+            compare,
+            allocate,
+            free,
+            context,
+        )
+    };
+}
+
+/// `RtlInsertElementGenericTable(PRTL_GENERIC_TABLE, PVOID, ULONG, PBOOLEAN) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlInsertElementGenericTable"]
+pub unsafe extern "system" fn rtl_insert_element_generic_table(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    new_element: *mut u8,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::insert_element_generic_table(
+            table as *mut RtlGenericTable,
+            buffer,
+            buffer_size,
+            new_element,
+        )
+    }
+}
+
+/// `RtlInsertElementGenericTableFull(...) -> PVOID`.
+///
+/// # Safety
+/// `node_or_parent`/`search_result` are returned by `RtlLookupElementGenericTableFull` or the
+/// equivalent private lookup for the same table and buffer.
+#[export_name = "RtlInsertElementGenericTableFull"]
+pub unsafe extern "system" fn rtl_insert_element_generic_table_full(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    new_element: *mut u8,
+    node_or_parent: *mut c_void,
+    search_result: u32,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::insert_element_generic_table_full(
+            table as *mut RtlGenericTable,
+            buffer,
+            buffer_size,
+            new_element,
+            node_or_parent as *mut RtlSplayLinks,
+            rtl_table_search_result(search_result),
+        )
+    }
+}
+
+/// `RtlIsGenericTableEmpty(PRTL_GENERIC_TABLE) -> BOOLEAN`.
+///
+/// # Safety
+/// `table` is a valid `RTL_GENERIC_TABLE`.
+#[export_name = "RtlIsGenericTableEmpty"]
+pub unsafe extern "system" fn rtl_is_generic_table_empty(table: *mut c_void) -> u8 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    u8::from(unsafe {
+        nt_ntdll::rtl::generic_table::is_generic_table_empty(table as *mut RtlGenericTable)
+    })
+}
+
+/// `RtlNumberGenericTableElements(PRTL_GENERIC_TABLE) -> ULONG`.
+///
+/// # Safety
+/// `table` is a valid `RTL_GENERIC_TABLE`.
+#[export_name = "RtlNumberGenericTableElements"]
+pub unsafe extern "system" fn rtl_number_generic_table_elements(table: *mut c_void) -> u32 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::number_generic_table_elements(table as *mut RtlGenericTable)
+    }
+}
+
+/// `RtlLookupElementGenericTable(PRTL_GENERIC_TABLE, PVOID) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlLookupElementGenericTable"]
+pub unsafe extern "system" fn rtl_lookup_element_generic_table(
+    table: *mut c_void,
+    buffer: *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::lookup_element_generic_table(
+            table as *mut RtlGenericTable,
+            buffer,
+        )
+    }
+}
+
+/// `RtlLookupElementGenericTableFull(PRTL_GENERIC_TABLE, PVOID, PVOID*, TABLE_SEARCH_RESULT*)`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlLookupElementGenericTableFull"]
+pub unsafe extern "system" fn rtl_lookup_element_generic_table_full(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    node_or_parent: *mut *mut c_void,
+    search_result: *mut u32,
+) -> *mut c_void {
+    let mut typed_search_result = nt_ntdll::rtl::generic_table::TableSearchResult::TableEmptyTree;
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    let found = unsafe {
+        nt_ntdll::rtl::generic_table::lookup_element_generic_table_full(
+            table as *mut RtlGenericTable,
+            buffer,
+            node_or_parent as *mut *mut RtlSplayLinks,
+            &mut typed_search_result,
+        )
+    };
+    if !search_result.is_null() {
+        // SAFETY: caller supplied a writable TABLE_SEARCH_RESULT out-param.
+        unsafe { *search_result = typed_search_result as u32 };
+    }
+    found
+}
+
+/// `RtlDeleteElementGenericTable(PRTL_GENERIC_TABLE, PVOID) -> BOOLEAN`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlDeleteElementGenericTable"]
+pub unsafe extern "system" fn rtl_delete_element_generic_table(
+    table: *mut c_void,
+    buffer: *mut c_void,
+) -> u8 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    u8::from(unsafe {
+        nt_ntdll::rtl::generic_table::delete_element_generic_table(
+            table as *mut RtlGenericTable,
+            buffer,
+        )
+    })
+}
+
+/// `RtlEnumerateGenericTable(PRTL_GENERIC_TABLE, BOOLEAN Restart) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlEnumerateGenericTable"]
+pub unsafe extern "system" fn rtl_enumerate_generic_table(
+    table: *mut c_void,
+    restart: u8,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::enumerate_generic_table(
+            table as *mut RtlGenericTable,
+            restart != 0,
+        )
+    }
+}
+
+/// `RtlEnumerateGenericTableWithoutSplaying(PRTL_GENERIC_TABLE, PVOID*) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlEnumerateGenericTableWithoutSplaying"]
+pub unsafe extern "system" fn rtl_enumerate_generic_table_without_splaying(
+    table: *mut c_void,
+    restart_key: *mut *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::enumerate_generic_table_without_splaying(
+            table as *mut RtlGenericTable,
+            restart_key,
+        )
+    }
+}
+
+/// `RtlGetElementGenericTable(PRTL_GENERIC_TABLE, ULONG I) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_GENERIC_TABLE` contract.
+#[export_name = "RtlGetElementGenericTable"]
+pub unsafe extern "system" fn rtl_get_element_generic_table(
+    table: *mut c_void,
+    index: u32,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::generic_table::get_element_generic_table(
+            table as *mut RtlGenericTable,
+            index,
+        )
     }
 }
 
@@ -8984,6 +9446,24 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_allocate_handle as usize,
         rtl_free_handle as usize,
         rtl_is_valid_handle as usize,
+        rtl_splay as usize,
+        rtl_delete as usize,
+        rtl_delete_no_splay as usize,
+        rtl_real_predecessor as usize,
+        rtl_real_successor as usize,
+        rtl_subtree_predecessor as usize,
+        rtl_subtree_successor as usize,
+        rtl_initialize_generic_table as usize,
+        rtl_insert_element_generic_table as usize,
+        rtl_insert_element_generic_table_full as usize,
+        rtl_is_generic_table_empty as usize,
+        rtl_number_generic_table_elements as usize,
+        rtl_lookup_element_generic_table as usize,
+        rtl_lookup_element_generic_table_full as usize,
+        rtl_delete_element_generic_table as usize,
+        rtl_enumerate_generic_table as usize,
+        rtl_enumerate_generic_table_without_splaying as usize,
+        rtl_get_element_generic_table as usize,
         rtl_initialize_resource as usize,
         rtl_delete_resource as usize,
         rtl_acquire_resource_shared as usize,

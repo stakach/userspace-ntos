@@ -2272,9 +2272,10 @@ pub unsafe extern "system" fn rtl_map_generic_mask(
 // These need the live token / Se plane (NtOpenProcessToken, NtAdjustPrivilegesToken,
 // NtDuplicateToken, ...). At this bring-up stage that plane is modeled as no-ops by the executive,
 // so the privilege/impersonation wrappers report SUCCESS (with an empty state) — matching what the
-// executive currently services — and the security-object builders return an HONEST
-// STATUS_NOT_IMPLEMENTED (they need the full RtlpQuerySecurityDescriptor + Se self-relative build,
-// which nothing here consumes yet).
+// executive currently services. The x64 security-object helpers materialize heap-owned
+// self-relative security descriptors for callers that expect `RtlNewSecurityObject` /
+// `RtlDeleteSecurityObject` to manage object descriptors before the executive grows full object SD
+// storage.
 // =================================================================================================
 
 /// `RtlAcquirePrivilege(PULONG Privilege, ULONG NumPriv, ULONG Flags, PVOID* ReturnedState)`.
