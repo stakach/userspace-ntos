@@ -17,6 +17,8 @@
 //!
 //! Category A. Host-tested.
 
+use alloc::vec::Vec;
+
 /// Default ANSI code page used by the current NLS fallback path.
 pub const ANSI_CODE_PAGE: u16 = 1252;
 
@@ -101,11 +103,50 @@ pub fn init_code_page_table(table: &[u16]) -> Option<CodePageTableLayout> {
     })
 }
 
+/// `RtlCustomCPToUnicodeN`, SBCS core: widen at most `unicode_size` bytes of destination capacity
+/// using `CPTABLEINFO.MultiByteTable`.
+pub fn custom_cp_to_unicode_n(
+    multi_byte_table: &[u16],
+    unicode_size: usize,
+    custom: &[u8],
+) -> Option<Vec<u16>> {
+    if multi_byte_table.len() < 256 {
+        return None;
+    }
+    let count = custom.len().min(unicode_size / 2);
+    Some(
+        custom[..count]
+            .iter()
+            .map(|&byte| multi_byte_table[byte as usize])
+            .collect(),
+    )
+}
+
+/// `RtlUnicodeToCustomCPN` / `RtlUpcaseUnicodeToCustomCPN`, SBCS core: narrow at most
+/// `custom_size` bytes using `CPTABLEINFO.WideCharTable`.
+pub fn unicode_to_custom_cp_n(
+    wide_char_table: &[u8],
+    custom_size: usize,
+    unicode: &[u16],
+    upcase: bool,
+) -> Option<Vec<u8>> {
+    let count = unicode.len().min(custom_size);
+    let mut out = Vec::with_capacity(count);
+    for &unit in &unicode[..count] {
+        let unit = if upcase {
+            crate::rtl::strings::upcase_char(unit)
+        } else {
+            unit
+        };
+        out.push(*wide_char_table.get(unit as usize)?);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
-    use alloc::vec::Vec;
 
     /// Build a minimal single-byte (SBCS) `.nls` image shaped like a real code page (e.g. c_20127):
     /// HeaderSize=13, an identity MultiByteTable, no glyph table, no DBCS ranges.
@@ -117,15 +158,15 @@ mod tests {
         t[2] = 1; // MaximumCharacterSize = SBCS
         t[3] = b'?' as u16; // DefaultChar
         t[4] = 0xFFFD; // UniDefaultChar
-        // base[HeaderSize] = size word preceding MultiByteTable (WideCharTable offset delta).
+                       // base[HeaderSize] = size word preceding MultiByteTable (WideCharTable offset delta).
         t[header_size] = 257; // (256 entries + 1 size word), matches real .nls layout
-        // MultiByteTable identity for ASCII.
+                              // MultiByteTable identity for ASCII.
         let mb = header_size + 1;
         for c in 0..256 {
             t[mb + c] = c as u16;
         }
-        t[mb + 256] = 0; // no glyph table
-        // DBCSRanges first word == 0 → SBCS.
+        // No glyph table, then DBCSRanges first word == 0 → SBCS.
+        t[mb + 256] = 0;
         t
     }
 
@@ -172,5 +213,37 @@ mod tests {
         // A table too short to hold MultiByteTable[256] must not panic — return None.
         let t = vec![13u16, 20127, 1, b'?' as u16];
         assert!(init_code_page_table(&t).is_none());
+    }
+
+    #[test]
+    fn custom_cp_to_unicode_uses_multibyte_table_and_capacity() {
+        let mut mb = vec![0u16; 256];
+        for byte in 0..=255 {
+            mb[byte] = byte as u16;
+        }
+        mb[0x80] = 0x20AC;
+        assert_eq!(
+            custom_cp_to_unicode_n(&mb, 4, &[b'A', 0x80, b'Z']).unwrap(),
+            vec![b'A' as u16, 0x20AC]
+        );
+        assert!(custom_cp_to_unicode_n(&mb[..128], 4, b"AB").is_none());
+    }
+
+    #[test]
+    fn unicode_to_custom_cp_uses_wide_table_and_optional_upcase() {
+        let mut wide = vec![b'?'; 0x10000];
+        for byte in 0..=255 {
+            wide[byte] = byte as u8;
+        }
+        wide[0x20AC] = 0x80;
+        assert_eq!(
+            unicode_to_custom_cp_n(&wide, 8, &[b'a' as u16, 0x20AC], false).unwrap(),
+            vec![b'a', 0x80]
+        );
+        assert_eq!(
+            unicode_to_custom_cp_n(&wide, 1, &[b'a' as u16, b'b' as u16], true).unwrap(),
+            vec![b'A']
+        );
+        assert!(unicode_to_custom_cp_n(&wide[..128], 8, &[0x20AC], false).is_none());
     }
 }

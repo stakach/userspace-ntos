@@ -47,6 +47,8 @@ const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
+const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
+const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 #[cfg(not(target_arch = "x86_64"))]
@@ -11958,7 +11960,7 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
     // needs Length + 1 for the terminator.
     let oem_len = src.len(); // 1 OEM byte per unit (single-byte cp)
     if oem_len + 1 > 0xFFFF {
-        return 0xC000_0011; // STATUS_INVALID_PARAMETER_2 domain (Length > MAXUSHORT)
+        return STATUS_INVALID_PARAMETER_2;
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -11995,6 +11997,36 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
         let _ = allocate;
         STATUS_NOT_IMPLEMENTED
     }
+}
+
+/// `RtlUpcaseUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN) -> NTSTATUS`.
+/// Same single-byte path as the OEM fallback, including a trailing NUL.
+///
+/// # Safety
+/// `ansi_dest` writable ANSI_STRING; `uni_source` valid UNICODE_STRING.
+#[export_name = "RtlUpcaseUnicodeStringToAnsiString"]
+pub unsafe extern "system" fn rtl_upcase_unicode_string_to_ansi_string(
+    ansi_dest: PUnicodeString,
+    uni_source: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    // SAFETY: same 16-byte STRING shape and single-byte fallback code page.
+    unsafe { rtl_upcase_unicode_string_to_oem_string(ansi_dest, uni_source, allocate) }
+}
+
+/// `RtlUpcaseUnicodeStringToCountedOemString(POEM_STRING, PCUNICODE_STRING, BOOLEAN)`.
+/// Counted variant: no trailing NUL is written.
+///
+/// # Safety
+/// `oem_dest` writable OEM_STRING; `uni_source` valid UNICODE_STRING.
+#[export_name = "RtlUpcaseUnicodeStringToCountedOemString"]
+pub unsafe extern "system" fn rtl_upcase_unicode_string_to_counted_oem_string(
+    oem_dest: PUnicodeString,
+    uni_source: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    // SAFETY: forwards descriptor contract.
+    unsafe { rtl_unicode_string_to_counted_oem_string_impl(oem_dest, uni_source, allocate, true) }
 }
 
 /// `RtlDuplicateUnicodeString(ULONG Flags, PCUNICODE_STRING src, PUNICODE_STRING dst)` — allocate a
@@ -12287,6 +12319,194 @@ pub unsafe extern "system" fn rtl_int64_to_unicode_string(
     STATUS_SUCCESS
 }
 
+unsafe fn rtl_upcase_unicode_to_single_byte_n(
+    dst: *mut u8,
+    dst_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    let units = bytes_in_unicode as usize / 2;
+    let n = core::cmp::min(units, dst_size as usize);
+    if n != 0 && (dst.is_null() || unicode_str.is_null()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: buffers valid for `n` units/bytes by caller contract and checks above.
+    unsafe {
+        for i in 0..n {
+            let up = rtl::strings::upcase_char(*unicode_str.add(i));
+            *dst.add(i) = rtl::convert::CodePage::LATIN1.narrow_unit(up);
+        }
+        if !bytes_out.is_null() {
+            *bytes_out = n as u32;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_custom_cp_to_unicode_n_impl(
+    custom_cp: *const c_void,
+    unicode_string: *mut u16,
+    unicode_size: u32,
+    result_size: *mut u32,
+    custom_string: *const u8,
+    custom_size: u32,
+) -> NtStatus {
+    if custom_cp.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let count = core::cmp::min(custom_size as usize, unicode_size as usize / 2);
+    if count != 0 && (unicode_string.is_null() || custom_string.is_null()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let cp = custom_cp as *const u8;
+    // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
+    let dbcs = unsafe { core::ptr::read_unaligned(cp.add(0x0C) as *const u16) };
+    if dbcs != 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
+    let multibyte = unsafe { core::ptr::read_unaligned(cp.add(0x20) as *const *const u16) };
+    if count != 0 && multibyte.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: the table and caller buffers are valid per the contract.
+    unsafe {
+        for i in 0..count {
+            let byte = *custom_string.add(i);
+            *unicode_string.add(i) = *multibyte.add(byte as usize);
+        }
+        if !result_size.is_null() {
+            *result_size = (count * 2) as u32;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_unicode_to_custom_cp_n_impl(
+    custom_cp: *const c_void,
+    custom_string: *mut u8,
+    custom_size: u32,
+    result_size: *mut u32,
+    unicode_string: *const u16,
+    unicode_size: u32,
+    upcase: bool,
+) -> NtStatus {
+    if custom_cp.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let count = core::cmp::min(custom_size as usize, unicode_size as usize / 2);
+    if count != 0 && (custom_string.is_null() || unicode_string.is_null()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let cp = custom_cp as *const u8;
+    // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
+    let dbcs = unsafe { core::ptr::read_unaligned(cp.add(0x0C) as *const u16) };
+    if dbcs != 0 {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
+    let widechar = unsafe { core::ptr::read_unaligned(cp.add(0x28) as *const *const u8) };
+    if count != 0 && widechar.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: the table and caller buffers are valid per the contract.
+    unsafe {
+        for i in 0..count {
+            let mut unit = *unicode_string.add(i);
+            if upcase {
+                unit = rtl::strings::upcase_char(unit);
+            }
+            *custom_string.add(i) = *widechar.add(unit as usize);
+        }
+        if !result_size.is_null() {
+            *result_size = count as u32;
+        }
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_unicode_string_to_counted_oem_string_impl(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+    upcase: bool,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src valid per the contract.
+    let sunits = unsafe { us_slice(src) };
+    let out_bytes = sunits.len();
+    if out_bytes > u16::MAX as usize {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    if out_bytes == 0 {
+        // SAFETY: dst writable per the contract.
+        unsafe {
+            (*dst).length = 0;
+            (*dst).maximum_length = 0;
+            (*dst).buffer = 0;
+        }
+        return STATUS_SUCCESS;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst writable per the contract.
+        let dbuf = unsafe {
+            if allocate != 0 {
+                let p = crate::process_heap_alloc(out_bytes);
+                if p.is_null() {
+                    return STATUS_NO_MEMORY;
+                }
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = out_bytes as u16;
+                p
+            } else {
+                if out_bytes > (*dst).maximum_length as usize {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                let p = (*dst).buffer as *mut u8;
+                if p.is_null() {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                p
+            }
+        };
+        let mut status = STATUS_SUCCESS;
+        // SAFETY: dbuf has room for out_bytes bytes.
+        unsafe {
+            for (i, &original) in sunits.iter().enumerate() {
+                let unit = if upcase {
+                    rtl::strings::upcase_char(original)
+                } else {
+                    original
+                };
+                let byte = rtl::convert::CodePage::LATIN1.narrow_unit(unit);
+                if byte == b'?' && original != b'?' as u16 {
+                    status = STATUS_UNMAPPABLE_CHARACTER;
+                }
+                core::ptr::write(dbuf.add(i), byte);
+            }
+            (*dst).length = out_bytes as u16;
+        }
+        if status != STATUS_SUCCESS && allocate != 0 {
+            // SAFETY: buffer came from process_heap_alloc above.
+            unsafe {
+                crate::process_heap_free(dbuf);
+                (*dst).buffer = 0;
+            }
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, upcase, out_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `RtlUnicodeToMultiByteN(PCHAR MbStr, ULONG MbSize, PULONG BytesInMbStr, PCWCH UnicodeStr,
 /// ULONG BytesInUnicodeStr) -> NTSTATUS` — UTF-16 → single-byte code page.
 ///
@@ -12331,6 +12551,137 @@ pub unsafe extern "system" fn rtl_unicode_to_oem_n(
     // SAFETY: same contract.
     unsafe {
         rtl_unicode_to_multi_byte_n(oem_str, oem_size, bytes_out, unicode_str, bytes_in_unicode)
+    }
+}
+
+/// `RtlUpcaseUnicodeToMultiByteN(PCHAR, ULONG, PULONG, PCWCH, ULONG) -> NTSTATUS` — uppercase
+/// UTF-16 units, then narrow them through the default single-byte ANSI table.
+///
+/// # Safety
+/// `mb_str` writable for `mb_size` bytes; `unicode_str` valid for `bytes_in_unicode` bytes;
+/// `bytes_out` null or writable.
+#[export_name = "RtlUpcaseUnicodeToMultiByteN"]
+pub unsafe extern "system" fn rtl_upcase_unicode_to_multi_byte_n(
+    mb_str: *mut u8,
+    mb_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    // SAFETY: same contract.
+    unsafe {
+        rtl_upcase_unicode_to_single_byte_n(
+            mb_str,
+            mb_size,
+            bytes_out,
+            unicode_str,
+            bytes_in_unicode,
+        )
+    }
+}
+
+/// `RtlUpcaseUnicodeToOemN(PCHAR, ULONG, PULONG, PCWCH, ULONG) -> NTSTATUS` — OEM variant of
+/// `RtlUpcaseUnicodeToMultiByteN` for the current single-byte fallback code page.
+///
+/// # Safety
+/// As `RtlUpcaseUnicodeToMultiByteN`.
+#[export_name = "RtlUpcaseUnicodeToOemN"]
+pub unsafe extern "system" fn rtl_upcase_unicode_to_oem_n(
+    oem_str: *mut u8,
+    oem_size: u32,
+    bytes_out: *mut u32,
+    unicode_str: *const u16,
+    bytes_in_unicode: u32,
+) -> NtStatus {
+    // SAFETY: same contract.
+    unsafe {
+        rtl_upcase_unicode_to_single_byte_n(
+            oem_str,
+            oem_size,
+            bytes_out,
+            unicode_str,
+            bytes_in_unicode,
+        )
+    }
+}
+
+/// `RtlCustomCPToUnicodeN(PCPTABLEINFO, PWCHAR, ULONG, PULONG, PCHAR, ULONG)`.
+///
+/// # Safety
+/// `custom_cp` is a valid CPTABLEINFO; buffers follow the Windows contract.
+#[export_name = "RtlCustomCPToUnicodeN"]
+pub unsafe extern "system" fn rtl_custom_cp_to_unicode_n(
+    custom_cp: *const c_void,
+    unicode_string: *mut u16,
+    unicode_size: u32,
+    result_size: *mut u32,
+    custom_string: *const u8,
+    custom_size: u32,
+) -> NtStatus {
+    // SAFETY: forwards the raw CPTABLEINFO/buffer contract.
+    unsafe {
+        rtl_custom_cp_to_unicode_n_impl(
+            custom_cp,
+            unicode_string,
+            unicode_size,
+            result_size,
+            custom_string,
+            custom_size,
+        )
+    }
+}
+
+/// `RtlUnicodeToCustomCPN(PCPTABLEINFO, PCHAR, ULONG, PULONG, PWCHAR, ULONG)`.
+///
+/// # Safety
+/// `custom_cp` is a valid CPTABLEINFO; buffers follow the Windows contract.
+#[export_name = "RtlUnicodeToCustomCPN"]
+pub unsafe extern "system" fn rtl_unicode_to_custom_cp_n(
+    custom_cp: *const c_void,
+    custom_string: *mut u8,
+    custom_size: u32,
+    result_size: *mut u32,
+    unicode_string: *const u16,
+    unicode_size: u32,
+) -> NtStatus {
+    // SAFETY: forwards the raw CPTABLEINFO/buffer contract.
+    unsafe {
+        rtl_unicode_to_custom_cp_n_impl(
+            custom_cp,
+            custom_string,
+            custom_size,
+            result_size,
+            unicode_string,
+            unicode_size,
+            false,
+        )
+    }
+}
+
+/// `RtlUpcaseUnicodeToCustomCPN(PCPTABLEINFO, PCHAR, ULONG, PULONG, PWCHAR, ULONG)`.
+///
+/// # Safety
+/// `custom_cp` is a valid CPTABLEINFO; buffers follow the Windows contract.
+#[export_name = "RtlUpcaseUnicodeToCustomCPN"]
+pub unsafe extern "system" fn rtl_upcase_unicode_to_custom_cp_n(
+    custom_cp: *const c_void,
+    custom_string: *mut u8,
+    custom_size: u32,
+    result_size: *mut u32,
+    unicode_string: *const u16,
+    unicode_size: u32,
+) -> NtStatus {
+    // SAFETY: forwards the raw CPTABLEINFO/buffer contract.
+    unsafe {
+        rtl_unicode_to_custom_cp_n_impl(
+            custom_cp,
+            custom_string,
+            custom_size,
+            result_size,
+            unicode_string,
+            unicode_size,
+            true,
+        )
     }
 }
 
@@ -12515,6 +12866,21 @@ pub unsafe extern "system" fn rtl_unicode_string_to_oem_string(
     }
 }
 
+/// `RtlUnicodeStringToCountedOemString(POEM_STRING, PCUNICODE_STRING, BOOLEAN) -> NTSTATUS`.
+/// Counted variant: no trailing NUL is written.
+///
+/// # Safety
+/// `dst` writable OEM_STRING; `src` valid UNICODE_STRING.
+#[export_name = "RtlUnicodeStringToCountedOemString"]
+pub unsafe extern "system" fn rtl_unicode_string_to_counted_oem_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    // SAFETY: forwards descriptor contract.
+    unsafe { rtl_unicode_string_to_counted_oem_string_impl(dst, src, allocate, false) }
+}
+
 /// `RtlEqualComputerName(PUNICODE_STRING, PUNICODE_STRING) -> BOOLEAN` — case-insensitive
 /// comparison through the uppercased OEM computer-name path (`sdk/lib/rtl/unicode.c:1542`).
 ///
@@ -12665,6 +13031,16 @@ pub unsafe extern "system" fn rtlx_unicode_string_to_ansi_size(src: PCUnicodeStr
     (units + 1) as u32
 }
 
+/// `RtlUnicodeStringToAnsiSize(PCUNICODE_STRING src) -> ULONG`.
+///
+/// # Safety
+/// As `RtlxUnicodeStringToAnsiSize`.
+#[export_name = "RtlUnicodeStringToAnsiSize"]
+pub unsafe extern "system" fn rtl_unicode_string_to_ansi_size(src: PCUnicodeString) -> u32 {
+    // SAFETY: same contract.
+    unsafe { rtlx_unicode_string_to_ansi_size(src) }
+}
+
 /// `RtlxUnicodeStringToOemSize(PCUNICODE_STRING src) -> ULONG`.
 ///
 /// # Safety
@@ -12673,6 +13049,16 @@ pub unsafe extern "system" fn rtlx_unicode_string_to_ansi_size(src: PCUnicodeStr
 pub unsafe extern "system" fn rtlx_unicode_string_to_oem_size(src: PCUnicodeString) -> u32 {
     // SAFETY: same contract.
     unsafe { rtlx_unicode_string_to_ansi_size(src) }
+}
+
+/// `RtlUnicodeStringToOemSize(PCUNICODE_STRING src) -> ULONG`.
+///
+/// # Safety
+/// As `RtlxUnicodeStringToOemSize`.
+#[export_name = "RtlUnicodeStringToOemSize"]
+pub unsafe extern "system" fn rtl_unicode_string_to_oem_size(src: PCUnicodeString) -> u32 {
+    // SAFETY: same contract.
+    unsafe { rtlx_unicode_string_to_oem_size(src) }
 }
 
 /// `RtlxAnsiStringToUnicodeSize(PCANSI_STRING src) -> ULONG` — UTF-16 byte length incl. NUL.
@@ -14270,6 +14656,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_find_char_in_unicode_string as usize,
         rtl_upcase_unicode_string as usize,
         rtl_downcase_unicode_string as usize,
+        rtl_upcase_unicode_string_to_oem_string as usize,
+        rtl_upcase_unicode_string_to_ansi_string as usize,
+        rtl_upcase_unicode_string_to_counted_oem_string as usize,
         rtl_duplicate_unicode_string as usize,
         rtl_create_unicode_string_from_asciiz as usize,
         rtl_free_ansi_string as usize,
@@ -14281,6 +14670,11 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_int64_to_unicode_string as usize,
         rtl_unicode_to_multi_byte_n as usize,
         rtl_unicode_to_oem_n as usize,
+        rtl_upcase_unicode_to_multi_byte_n as usize,
+        rtl_upcase_unicode_to_oem_n as usize,
+        rtl_custom_cp_to_unicode_n as usize,
+        rtl_unicode_to_custom_cp_n as usize,
+        rtl_upcase_unicode_to_custom_cp_n as usize,
         rtl_multi_byte_to_unicode_n as usize,
         rtl_oem_to_unicode_n as usize,
         rtl_console_multi_byte_to_unicode_n as usize,
@@ -14288,12 +14682,15 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_unicode_to_multi_byte_size as usize,
         rtl_oem_string_to_unicode_string as usize,
         rtl_unicode_string_to_oem_string as usize,
+        rtl_unicode_string_to_counted_oem_string as usize,
         rtl_equal_computer_name as usize,
         rtl_equal_domain_name as usize,
         rtl_dns_host_name_to_computer_name as usize,
         rtl_is_text_unicode as usize,
         rtlx_unicode_string_to_ansi_size as usize,
+        rtl_unicode_string_to_ansi_size as usize,
         rtlx_unicode_string_to_oem_size as usize,
+        rtl_unicode_string_to_oem_size as usize,
         rtlx_ansi_string_to_unicode_size as usize,
         rtl_ansi_string_to_unicode_size as usize,
         rtlx_oem_string_to_unicode_size as usize,
