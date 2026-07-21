@@ -5593,6 +5593,138 @@ pub unsafe extern "system" fn rtl_ipv4_address_to_string_ex_w(
     STATUS_SUCCESS
 }
 
+/// `RtlIpv4StringToAddressA(PCSTR, BOOLEAN, PCSTR*, IN_ADDR*) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `terminator` and `address` are writable.
+#[export_name = "RtlIpv4StringToAddressA"]
+pub unsafe extern "system" fn rtl_ipv4_string_to_address_a(
+    string: *const u8,
+    strict: u8,
+    terminator: *mut *const u8,
+    address: *mut u8,
+) -> NtStatus {
+    if string.is_null() || terminator.is_null() || address.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { strlen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    match rtl::network::ipv4_string_to_address_a(input, strict != 0) {
+        Ok(parsed) => unsafe {
+            *terminator = string.add(parsed.terminator);
+            core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 4);
+            STATUS_SUCCESS
+        },
+        Err(term) => unsafe {
+            *terminator = string.add(term);
+            STATUS_INVALID_PARAMETER
+        },
+    }
+}
+
+/// `RtlIpv4StringToAddressW(PCWSTR, BOOLEAN, PCWSTR*, IN_ADDR*) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `terminator` and `address` are writable.
+#[export_name = "RtlIpv4StringToAddressW"]
+pub unsafe extern "system" fn rtl_ipv4_string_to_address_w(
+    string: *const u16,
+    strict: u8,
+    terminator: *mut *const u16,
+    address: *mut u8,
+) -> NtStatus {
+    if string.is_null() || terminator.is_null() || address.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { wcslen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    match rtl::network::ipv4_string_to_address_w(input, strict != 0) {
+        Ok(parsed) => unsafe {
+            *terminator = string.add(parsed.terminator);
+            core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 4);
+            STATUS_SUCCESS
+        },
+        Err(term) => unsafe {
+            *terminator = string.add(term);
+            STATUS_INVALID_PARAMETER
+        },
+    }
+}
+
+/// `RtlIpv4StringToAddressExA(PCSTR, BOOLEAN, IN_ADDR*, PUSHORT) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `address` and `port` are writable.
+#[export_name = "RtlIpv4StringToAddressExA"]
+pub unsafe extern "system" fn rtl_ipv4_string_to_address_ex_a(
+    string: *const u8,
+    strict: u8,
+    address: *mut u8,
+    port: *mut u16,
+) -> NtStatus {
+    if string.is_null() || address.is_null() || port.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { strlen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    let parsed = match rtl::network::ipv4_string_to_address_a(input, strict != 0) {
+        Ok(parsed) => parsed,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe { core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 4) };
+    if parsed.terminator == len {
+        unsafe { *port = 0 };
+        return STATUS_SUCCESS;
+    }
+    if input.get(parsed.terminator).copied() != Some(b':') {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match rtl::network::ipv4_parse_port_a(&input[parsed.terminator + 1..]) {
+        Ok(parsed_port) => unsafe {
+            *port = parsed_port;
+            STATUS_SUCCESS
+        },
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `RtlIpv4StringToAddressExW(PCWSTR, BOOLEAN, IN_ADDR*, PUSHORT) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `address` and `port` are writable.
+#[export_name = "RtlIpv4StringToAddressExW"]
+pub unsafe extern "system" fn rtl_ipv4_string_to_address_ex_w(
+    string: *const u16,
+    strict: u8,
+    address: *mut u8,
+    port: *mut u16,
+) -> NtStatus {
+    if string.is_null() || address.is_null() || port.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { wcslen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    let parsed = match rtl::network::ipv4_string_to_address_w(input, strict != 0) {
+        Ok(parsed) => parsed,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe { core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 4) };
+    if parsed.terminator == len {
+        unsafe { *port = 0 };
+        return STATUS_SUCCESS;
+    }
+    if input.get(parsed.terminator).copied() != Some(b':' as u16) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match rtl::network::ipv4_parse_port_w(&input[parsed.terminator + 1..]) {
+        Ok(parsed_port) => unsafe {
+            *port = parsed_port;
+            STATUS_SUCCESS
+        },
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
 /// `RtlDetermineDosPathNameType_U(PCWSTR Path) -> RTL_PATH_TYPE`.
 ///
 /// # Safety
@@ -13170,6 +13302,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ipv4_address_to_string_w as usize,
         rtl_ipv4_address_to_string_ex_a as usize,
         rtl_ipv4_address_to_string_ex_w as usize,
+        rtl_ipv4_string_to_address_a as usize,
+        rtl_ipv4_string_to_address_w as usize,
+        rtl_ipv4_string_to_address_ex_a as usize,
+        rtl_ipv4_string_to_address_ex_w as usize,
         rtl_determine_dos_path_name_type_u as usize,
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
