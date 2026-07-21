@@ -265,6 +265,176 @@ pub unsafe fn raw_capture_message_buffer(
     }
 }
 
+const STRING_LENGTH_OFFSET: usize = 0x00;
+const STRING_MAXIMUM_LENGTH_OFFSET: usize = 0x02;
+const STRING_BUFFER_OFFSET: usize = 0x08;
+
+#[inline]
+unsafe fn string_length(string: *const u8) -> u16 {
+    unsafe { core::ptr::read_unaligned(string.add(STRING_LENGTH_OFFSET) as *const u16) }
+}
+
+#[inline]
+unsafe fn string_maximum_length(string: *const u8) -> u16 {
+    unsafe { core::ptr::read_unaligned(string.add(STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) }
+}
+
+#[inline]
+unsafe fn string_buffer(string: *const u8) -> u64 {
+    unsafe { core::ptr::read_unaligned(string.add(STRING_BUFFER_OFFSET) as *const u64) }
+}
+
+#[inline]
+unsafe fn set_string_length(string: *mut u8, value: u16) {
+    unsafe { core::ptr::write_unaligned(string.add(STRING_LENGTH_OFFSET) as *mut u16, value) };
+}
+
+#[inline]
+unsafe fn set_string_maximum_length(string: *mut u8, value: u16) {
+    unsafe {
+        core::ptr::write_unaligned(string.add(STRING_MAXIMUM_LENGTH_OFFSET) as *mut u16, value)
+    };
+}
+
+#[inline]
+unsafe fn set_string_buffer(string: *mut u8, value: u64) {
+    unsafe { core::ptr::write_unaligned(string.add(STRING_BUFFER_OFFSET) as *mut u64, value) };
+}
+
+/// Capture an ANSI/byte string into a raw `CSR_CAPTURE_BUFFER`, filling a raw x64 `STRING`.
+///
+/// # Safety
+/// `capture_buffer` is a live CSR capture buffer, `captured_string` is a writable x64 `STRING`,
+/// and `string` is readable for `string_length` bytes when non-null.
+pub unsafe fn raw_capture_message_string(
+    capture_buffer: *mut u8,
+    string: *const u8,
+    string_len: u32,
+    maximum_length: u32,
+    captured_string: *mut u8,
+) {
+    if captured_string.is_null() {
+        return;
+    }
+
+    let capped_maximum = maximum_length.min(u16::MAX as u32);
+    unsafe {
+        if string.is_null() {
+            set_string_length(captured_string, 0);
+            set_string_maximum_length(captured_string, capped_maximum as u16);
+            let mut buffer = 0u64;
+            raw_allocate_message_pointer(capture_buffer, capped_maximum, &mut buffer);
+            set_string_buffer(captured_string, buffer);
+        } else {
+            let copy_len = string_len.min(capped_maximum);
+            set_string_length(captured_string, copy_len as u16);
+            let mut buffer = 0u64;
+            let allocated =
+                raw_allocate_message_pointer(capture_buffer, capped_maximum, &mut buffer);
+            set_string_maximum_length(captured_string, allocated.min(u16::MAX as u32) as u16);
+            set_string_buffer(captured_string, buffer);
+            if copy_len != 0 && buffer != 0 {
+                core::ptr::copy_nonoverlapping(string, buffer as *mut u8, copy_len as usize);
+            }
+        }
+
+        let length = string_length(captured_string) as usize;
+        let maximum = string_maximum_length(captured_string) as usize;
+        let buffer = string_buffer(captured_string) as *mut u8;
+        if !buffer.is_null() && length < maximum {
+            core::ptr::write(buffer.add(length), 0);
+        }
+    }
+}
+
+/// Capture a raw x64 `UNICODE_STRING` in place into a CSR capture buffer.
+///
+/// # Safety
+/// `capture_buffer` is a live CSR capture buffer and `unicode_string` is a writable x64
+/// `UNICODE_STRING`.
+pub unsafe fn raw_capture_message_unicode_string_in_place(
+    capture_buffer: *mut u8,
+    unicode_string: *mut u8,
+) {
+    if unicode_string.is_null() {
+        return;
+    }
+    unsafe {
+        let buffer = string_buffer(unicode_string) as *const u8;
+        let length = string_length(unicode_string) as u32;
+        let maximum = string_maximum_length(unicode_string) as u32;
+        raw_capture_message_string(
+            capture_buffer,
+            buffer,
+            length,
+            maximum,
+            unicode_string,
+        );
+
+        let captured_length = string_length(unicode_string) as usize;
+        let captured_maximum = string_maximum_length(unicode_string) as usize;
+        let captured_buffer = string_buffer(unicode_string) as *mut u16;
+        if !captured_buffer.is_null() && captured_length + 2 <= captured_maximum {
+            core::ptr::write(captured_buffer.add(captured_length / 2), 0);
+        }
+    }
+}
+
+/// Return the data byte count needed to capture non-null `UNICODE_STRING`s from an array.
+///
+/// # Safety
+/// `strings` points to `count` raw x64 `UNICODE_STRING*` entries when `count != 0`.
+pub unsafe fn raw_multi_unicode_capture_data_size(
+    count: u32,
+    strings: *const *mut u8,
+) -> Option<u32> {
+    if count != 0 && strings.is_null() {
+        return None;
+    }
+    let mut total = 0u32;
+    unsafe {
+        for i in 0..count as usize {
+            let string = core::ptr::read_unaligned(strings.add(i));
+            if !string.is_null() {
+                total = total.checked_add(string_maximum_length(string) as u32)?;
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Capture each non-null raw x64 `UNICODE_STRING*` from an array in place.
+///
+/// # Safety
+/// `capture_buffer` is a live CSR capture buffer and `strings` points to `count` raw
+/// `UNICODE_STRING*` entries.
+pub unsafe fn raw_capture_multi_unicode_strings_in_place(
+    capture_buffer: *mut u8,
+    count: u32,
+    strings: *mut *mut u8,
+) {
+    if capture_buffer.is_null() || (count != 0 && strings.is_null()) {
+        return;
+    }
+    unsafe {
+        for i in 0..count as usize {
+            let string = core::ptr::read_unaligned(strings.add(i));
+            if !string.is_null() {
+                raw_capture_message_unicode_string_in_place(capture_buffer, string);
+            }
+        }
+    }
+}
+
+/// Convert a CSR millisecond timeout to NT relative 100ns ticks.
+pub fn capture_timeout_ticks(milliseconds: u32) -> Option<i64> {
+    if milliseconds == u32::MAX {
+        None
+    } else {
+        Some((milliseconds as i64) * -10_000)
+    }
+}
+
 /// Return `(PORT_MESSAGE.DataLength, PORT_MESSAGE.TotalLength)` for `CsrClientCallServer`.
 pub fn csr_client_call_lengths(data_length: u32) -> Option<(u16, u16)> {
     let data_length = data_length as usize;
@@ -739,6 +909,107 @@ mod tests {
             let copied = core::slice::from_raw_parts(captured as *const u8, 5);
             assert_eq!(copied, b"hello");
         }
+    }
+
+    unsafe fn write_raw_string(desc: &mut [u8; 16], length: u16, maximum: u16, buffer: *mut u8) {
+        unsafe {
+            core::ptr::write_unaligned(desc.as_mut_ptr() as *mut u16, length);
+            core::ptr::write_unaligned(desc.as_mut_ptr().add(2) as *mut u16, maximum);
+            core::ptr::write_unaligned(desc.as_mut_ptr().add(8) as *mut u64, buffer as u64);
+        }
+    }
+
+    unsafe fn read_raw_string(desc: &[u8; 16]) -> (u16, u16, *mut u8) {
+        unsafe {
+            (
+                core::ptr::read_unaligned(desc.as_ptr() as *const u16),
+                core::ptr::read_unaligned(desc.as_ptr().add(2) as *const u16),
+                core::ptr::read_unaligned(desc.as_ptr().add(8) as *const u64) as *mut u8,
+            )
+        }
+    }
+
+    #[test]
+    fn raw_capture_message_string_truncates_and_terminates() {
+        let size = raw_capture_buffer_size(1, 8).unwrap();
+        let mut raw = vec![0u8; size];
+        let mut captured = [0u8; 16];
+        unsafe {
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 1);
+            raw_capture_message_string(
+                raw.as_mut_ptr(),
+                b"abcdef".as_ptr(),
+                6,
+                5,
+                captured.as_mut_ptr(),
+            );
+            let (length, maximum, buffer) = read_raw_string(&captured);
+            assert_eq!(length, 5);
+            assert_eq!(maximum, 8);
+            assert_eq!(core::slice::from_raw_parts(buffer, 6), b"abcde\0");
+        }
+    }
+
+    #[test]
+    fn raw_capture_unicode_string_in_place_copies_wide_bytes() {
+        let size = raw_capture_buffer_size(1, 8).unwrap();
+        let mut raw = vec![0u8; size];
+        let mut wide = [b'A' as u16, b'B' as u16, 0];
+        let mut desc = [0u8; 16];
+        unsafe {
+            write_raw_string(
+                &mut desc,
+                4,
+                6,
+                wide.as_mut_ptr() as *mut u8,
+            );
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 1);
+            raw_capture_message_unicode_string_in_place(raw.as_mut_ptr(), desc.as_mut_ptr());
+            let (length, maximum, buffer) = read_raw_string(&desc);
+            assert_eq!(length, 4);
+            assert_eq!(maximum, 8);
+            assert_eq!(*(buffer as *const u16), b'A' as u16);
+            assert_eq!(*((buffer as *const u16).add(1)), b'B' as u16);
+            assert_eq!(*((buffer as *const u16).add(2)), 0);
+        }
+    }
+
+    #[test]
+    fn raw_multi_unicode_capture_sums_and_captures_non_null_strings() {
+        let mut first_buf = [b'a' as u16, 0];
+        let mut second_buf = [b'b' as u16, b'c' as u16, 0];
+        let mut first = [0u8; 16];
+        let mut second = [0u8; 16];
+        unsafe {
+            write_raw_string(&mut first, 2, 4, first_buf.as_mut_ptr() as *mut u8);
+            write_raw_string(&mut second, 4, 6, second_buf.as_mut_ptr() as *mut u8);
+            let mut strings = [
+                first.as_mut_ptr(),
+                core::ptr::null_mut(),
+                second.as_mut_ptr(),
+            ];
+            assert_eq!(
+                raw_multi_unicode_capture_data_size(3, strings.as_ptr()),
+                Some(10)
+            );
+            let size = raw_capture_buffer_size(3, 10).unwrap();
+            let mut raw = vec![0u8; size];
+            init_raw_capture_buffer(raw.as_mut_ptr(), size, 3);
+            raw_capture_multi_unicode_strings_in_place(raw.as_mut_ptr(), 3, strings.as_mut_ptr());
+
+            let (_, _, first_captured) = read_raw_string(&first);
+            let (_, _, second_captured) = read_raw_string(&second);
+            assert_eq!(*(first_captured as *const u16), b'a' as u16);
+            assert_eq!(*(second_captured as *const u16), b'b' as u16);
+            assert_eq!(*((second_captured as *const u16).add(1)), b'c' as u16);
+        }
+    }
+
+    #[test]
+    fn capture_timeout_ticks_matches_csr_contract() {
+        assert_eq!(capture_timeout_ticks(0), Some(0));
+        assert_eq!(capture_timeout_ticks(42), Some(-420_000));
+        assert_eq!(capture_timeout_ticks(u32::MAX), None);
     }
 
     #[test]

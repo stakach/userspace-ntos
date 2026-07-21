@@ -38,6 +38,7 @@ const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
+const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 
 // The raw C `UNICODE_STRING` / `STRING` (ANSI) layout — identical 16-byte shape on x64. We use the
 // byte-exact `nt_ntdll_layout::UnicodeString` for reads/writes through the exported pointers.
@@ -9922,6 +9923,93 @@ pub unsafe extern "system" fn csr_capture_message_buffer(
     }
 }
 
+/// `CsrCaptureMessageString(PCSR_CAPTURE_BUFFER, PCSTR, ULONG, ULONG, PSTRING)`.
+///
+/// # Safety
+/// `capture_buffer` valid; `string` readable for `string_length` bytes unless null;
+/// `captured_string` writable.
+#[export_name = "CsrCaptureMessageString"]
+pub unsafe extern "system" fn csr_capture_message_string(
+    capture_buffer: *mut c_void,
+    string: *const u8,
+    string_length: u32,
+    maximum_length: u32,
+    captured_string: *mut c_void,
+) {
+    // SAFETY: raw CSR capture-buffer and STRING contracts.
+    unsafe {
+        nt_ntdll::csr::raw_capture_message_string(
+            capture_buffer as *mut u8,
+            string,
+            string_length,
+            maximum_length,
+            captured_string as *mut u8,
+        );
+    }
+}
+
+/// `CsrCaptureMessageMultiUnicodeStringsInPlace(PCSR_CAPTURE_BUFFER*, ULONG, PUNICODE_STRING*)`.
+///
+/// # Safety
+/// `capture_buffer` writable; `message_strings` points to `strings_count` UNICODE_STRING pointers.
+#[export_name = "CsrCaptureMessageMultiUnicodeStringsInPlace"]
+pub unsafe extern "system" fn csr_capture_message_multi_unicode_strings_in_place(
+    capture_buffer: *mut *mut c_void,
+    strings_count: u32,
+    message_strings: *mut *mut c_void,
+) -> NtStatus {
+    if capture_buffer.is_null() || (strings_count != 0 && message_strings.is_null()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // SAFETY: capture_buffer checked writable; message_strings checked for count.
+    let mut capture = unsafe { *capture_buffer as *mut u8 };
+    if capture.is_null() {
+        let data_size = match unsafe {
+            nt_ntdll::csr::raw_multi_unicode_capture_data_size(
+                strings_count,
+                message_strings as *const *mut u8,
+            )
+        } {
+            Some(size) => size,
+            None => return STATUS_INVALID_PARAMETER,
+        };
+        let total_size = match nt_ntdll::csr::raw_capture_buffer_size(strings_count, data_size) {
+            Some(size) => size,
+            None => return STATUS_NO_MEMORY,
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: process heap allocation; zero-initialize before CSR header setup.
+            let allocated = unsafe { crate::process_heap_alloc(total_size) };
+            if allocated.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            unsafe {
+                core::ptr::write_bytes(allocated, 0, total_size);
+                nt_ntdll::csr::init_raw_capture_buffer(allocated, total_size, strings_count);
+                *capture_buffer = allocated as *mut c_void;
+            }
+            capture = allocated;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = total_size;
+            return STATUS_NO_MEMORY;
+        }
+    }
+
+    // SAFETY: capture is initialized and message_strings points to strings_count entries.
+    unsafe {
+        nt_ntdll::csr::raw_capture_multi_unicode_strings_in_place(
+            capture,
+            strings_count,
+            message_strings as *mut *mut u8,
+        );
+    }
+    STATUS_SUCCESS
+}
+
 /// `CsrAllocateMessagePointer(PCSR_CAPTURE_BUFFER CaptureBuffer, ULONG Length, PVOID* Pointer)
 /// -> ULONG`. Reserves `Length` bytes in the capture buffer and records the message pointer slot.
 ///
@@ -9946,6 +10034,82 @@ pub unsafe extern "system" fn csr_allocate_message_pointer(
     }
 }
 
+/// `CsrCaptureTimeout(ULONG Milliseconds, PLARGE_INTEGER Timeout) -> PLARGE_INTEGER`.
+///
+/// # Safety
+/// `timeout` writable unless `milliseconds == INFINITE`.
+#[export_name = "CsrCaptureTimeout"]
+pub unsafe extern "system" fn csr_capture_timeout(
+    milliseconds: u32,
+    timeout: *mut i64,
+) -> *mut i64 {
+    let ticks = match nt_ntdll::csr::capture_timeout_ticks(milliseconds) {
+        Some(ticks) => ticks,
+        None => return core::ptr::null_mut(),
+    };
+    if timeout.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: timeout writable per the contract.
+    unsafe { core::ptr::write_unaligned(timeout, ticks) };
+    timeout
+}
+
+/// `CsrProbeForRead(PVOID, ULONG, ULONG)`.
+///
+/// # Safety
+/// `address` readable for `length` bytes.
+#[export_name = "CsrProbeForRead"]
+pub unsafe extern "system" fn csr_probe_for_read(
+    address: *const c_void,
+    length: u32,
+    alignment: u32,
+) {
+    if length == 0 {
+        return;
+    }
+    let mask = alignment.wrapping_sub(1) as usize;
+    if (address as usize) & mask != 0 {
+        // SAFETY: RtlRaiseStatus does not return on target.
+        unsafe { rtl_raise_status(STATUS_DATATYPE_MISALIGNMENT) };
+    }
+    // SAFETY: caller contract; volatile probes mirror ReactOS.
+    unsafe {
+        let pointer = address as *const u8;
+        core::ptr::read_volatile(pointer);
+        core::ptr::read_volatile(pointer.add(length as usize - 1));
+    }
+}
+
+/// `CsrProbeForWrite(PVOID, ULONG, ULONG)`.
+///
+/// # Safety
+/// `address` writable for `length` bytes.
+#[export_name = "CsrProbeForWrite"]
+pub unsafe extern "system" fn csr_probe_for_write(
+    address: *mut c_void,
+    length: u32,
+    alignment: u32,
+) {
+    if length == 0 {
+        return;
+    }
+    let mask = alignment.wrapping_sub(1) as usize;
+    if (address as usize) & mask != 0 {
+        // SAFETY: RtlRaiseStatus does not return on target.
+        unsafe { rtl_raise_status(STATUS_DATATYPE_MISALIGNMENT) };
+    }
+    // SAFETY: caller contract; volatile probes mirror ReactOS.
+    unsafe {
+        let pointer = address as *mut u8;
+        let first = core::ptr::read_volatile(pointer);
+        core::ptr::write_volatile(pointer, first);
+        let last_pointer = pointer.add(length as usize - 1);
+        let last = core::ptr::read_volatile(last_pointer);
+        core::ptr::write_volatile(last_pointer, last);
+    }
+}
+
 /// `CsrNewThread() -> NTSTATUS` — register a new thread with the CSR client runtime (marks the TEB
 /// CSR fields). No CSR client runtime state to update yet → STATUS_SUCCESS (the observable no-op:
 /// the thread simply isn't CSR-registered, which the boot path tolerates).
@@ -9955,6 +10119,25 @@ pub unsafe extern "system" fn csr_allocate_message_pointer(
 #[export_name = "CsrNewThread"]
 pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
     STATUS_SUCCESS
+}
+
+/// `CsrIdentifyAlertableThread() -> NTSTATUS`.
+///
+/// Deprecated on the NT 5.2+ ReactOS target; returns success.
+#[export_name = "CsrIdentifyAlertableThread"]
+pub unsafe extern "system" fn csr_identify_alertable_thread() -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `CsrSetPriorityClass(HANDLE Process, PULONG PriorityClass) -> NTSTATUS`.
+///
+/// Deprecated on the NT 5.2+ ReactOS target; ReactOS returns STATUS_INVALID_PARAMETER.
+#[export_name = "CsrSetPriorityClass"]
+pub unsafe extern "system" fn csr_set_priority_class(
+    _process: *mut c_void,
+    _priority_class: *mut u32,
+) -> NtStatus {
+    STATUS_INVALID_PARAMETER
 }
 
 // ---- Data exports — the NLS multi-byte code-page tags hosted binaries read. -----------------------
@@ -10192,8 +10375,15 @@ pub unsafe extern "C" fn export_anchor() {
         csr_allocate_capture_buffer as usize,
         csr_free_capture_buffer as usize,
         csr_capture_message_buffer as usize,
+        csr_capture_message_string as usize,
+        csr_capture_message_multi_unicode_strings_in_place as usize,
         csr_allocate_message_pointer as usize,
+        csr_capture_timeout as usize,
+        csr_probe_for_read as usize,
+        csr_probe_for_write as usize,
         csr_new_thread as usize,
+        csr_identify_alertable_thread as usize,
+        csr_set_priority_class as usize,
         &NLS_MB_CODE_PAGE_TAG as *const u8 as usize,
         &NLS_MB_OEM_CODE_PAGE_TAG as *const u8 as usize,
         // BATCH 4 — Rtl* string / convert family.
