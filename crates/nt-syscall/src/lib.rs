@@ -128,12 +128,14 @@ pub enum NativeService {
     NtRequestWaitReplyPort,
     NtMakeTemporaryObject,
     // No-op-success services (the executive doesn't model these yet: bump allocator never frees,
-    // no per-thread/process attribute sets, no per-object security, no keyed events).
+    // no per-thread/process attribute sets, no per-object security).
     NtSetInformationThread,
     NtSetInformationProcess,
     NtTestAlert,
     NtFlushInstructionCache,
     NtCreateKeyedEvent,
+    NtReleaseKeyedEvent,
+    NtWaitForKeyedEvent,
     NtAdjustPrivilegesToken,
     NtDeleteValueKey,
     NtInitializeRegistry,
@@ -234,6 +236,8 @@ impl NativeService {
             NtTestAlert => "NtTestAlert",
             NtFlushInstructionCache => "NtFlushInstructionCache",
             NtCreateKeyedEvent => "NtCreateKeyedEvent",
+            NtReleaseKeyedEvent => "NtReleaseKeyedEvent",
+            NtWaitForKeyedEvent => "NtWaitForKeyedEvent",
             NtAdjustPrivilegesToken => "NtAdjustPrivilegesToken",
             NtDeleteValueKey => "NtDeleteValueKey",
             NtInitializeRegistry => "NtInitializeRegistry",
@@ -274,6 +278,7 @@ impl NativeService {
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
             | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion => (5, 5),
             NtWaitForSingleObject => (3, 3),
+            NtCreateKeyedEvent | NtReleaseKeyedEvent | NtWaitForKeyedEvent => (4, 4),
             NtQueryPerformanceCounter => (2, 2),
             NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
             NtOpenSection => (0, 4),
@@ -298,7 +303,7 @@ impl NativeService {
             NtCreatePort | NtCreateThread | NtCreateEvent
             | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
             | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
-            | NtFlushInstructionCache | NtCreateKeyedEvent | NtAdjustPrivilegesToken
+            | NtFlushInstructionCache | NtAdjustPrivilegesToken
             | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
             | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
             // CSR message plane: the handler reads Request/Reply message ptrs via the register
@@ -382,6 +387,8 @@ impl NativeService {
         NativeService::NtTestAlert,
         NativeService::NtFlushInstructionCache,
         NativeService::NtCreateKeyedEvent,
+        NativeService::NtReleaseKeyedEvent,
+        NativeService::NtWaitForKeyedEvent,
         NativeService::NtAdjustPrivilegesToken,
         NativeService::NtDeleteValueKey,
         NativeService::NtInitializeRegistry,

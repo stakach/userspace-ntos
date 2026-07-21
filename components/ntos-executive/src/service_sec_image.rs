@@ -1976,6 +1976,8 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_wait_set_n: usize = 0;
             let mut park_wait_set_all = false;
             let mut park_wait_deadline: Option<u64> = None;
+            let mut park_keyed_wait_key: u64 = u64::MAX;
+            let mut park_keyed_wait_deadline: Option<u64> = None;
             let mut park_delay_deadline: Option<u64> = None;
             // BATCH 33 — pipe-pending park request latched from the handler (0 = none). Consumed at the
             // reply site (the reply-cap steal needs resume_ip/sp/flags, known there).
@@ -2029,6 +2031,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.lsass_listener3_spawn = false;
                 nt_handler.wait_park_event = -1;
                 nt_handler.wait_deadline_100ns = u64::MAX;
+                nt_handler.keyed_wait_key = u64::MAX;
+                nt_handler.keyed_wait_deadline_100ns = u64::MAX;
                 nt_handler.delay_requested = false;
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
@@ -2204,6 +2208,12 @@ pub(crate) unsafe fn service_sec_image(
                     park_wait_event = nt_handler.wait_park_event;
                     if nt_handler.wait_deadline_100ns != u64::MAX {
                         park_wait_deadline = Some(nt_handler.wait_deadline_100ns);
+                    }
+                }
+                if nt_handler.keyed_wait_key != u64::MAX {
+                    park_keyed_wait_key = nt_handler.keyed_wait_key;
+                    if nt_handler.keyed_wait_deadline_100ns != u64::MAX {
+                        park_keyed_wait_deadline = Some(nt_handler.keyed_wait_deadline_100ns);
                     }
                 }
                 if nt_handler.delay_requested {
@@ -4284,6 +4294,37 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                 result = 0xC000_009A;
+            }
+            // Keyed-event wait park (`NtWaitForKeyedEvent`): used by ReactOS condition variables and
+            // run-once state. The matching `NtReleaseKeyedEvent` wakes via keyed_wait_wake_one.
+            if park_keyed_wait_key != u64::MAX && reply_main != 0 {
+                if park_keyed_wait_deadline.is_some() && !delay_timer_init() {
+                    result = 0xC000_009A;
+                } else if keyed_wait_park(
+                    park_keyed_wait_key,
+                    resume_ip,
+                    sp,
+                    flags,
+                    nt_handler.current_tid,
+                    park_keyed_wait_deadline,
+                ) {
+                    delay_timer_rearm(&delay_queue);
+                    print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
+                    print_hex_u64(park_keyed_wait_key);
+                    print_str(b" -> PARK caller\n");
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let received = recv_full_r12(fault_ep, new_reply);
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                } else {
+                    print_str(b"[keyed] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                    result = 0xC000_009A;
+                }
             }
             // Checkpoint B: PARK this caller on an unsignaled event (steal its reply cap into the waiter
             // queue keyed by the event, rotate REPLY_MAIN to a fresh pool object, recv the next event

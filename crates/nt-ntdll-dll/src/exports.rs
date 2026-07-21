@@ -35,7 +35,6 @@ use nt_ntdll_layout::UnicodeString;
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
-const STATUS_TIMEOUT: NtStatus = 0x0000_0102;
 const STATUS_PENDING: NtStatus = 0x0000_0103;
 const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
@@ -1744,19 +1743,264 @@ pub unsafe extern "system" fn rtl_initialize_condition_variable(condition_variab
     }
 }
 
+const COND_VAR_LOCKED_FLAG: usize = 0x2;
+const COND_VAR_FLAGS_MASK: usize = 0x3;
+const COND_VAR_ADDRESS_MASK: usize = !COND_VAR_FLAGS_MASK;
+
+#[repr(C)]
+struct CondVarWaitEntry {
+    flink: *mut CondVarWaitEntry,
+    blink: *mut CondVarWaitEntry,
+    wait_key: *mut c_void,
+    list_removal_handled: u8,
+}
+
+#[inline]
+unsafe fn condvar_wait_key(entry: *mut CondVarWaitEntry) -> *mut c_void {
+    unsafe { core::ptr::addr_of_mut!((*entry).wait_key) as *mut c_void }
+}
+
+#[inline]
+unsafe fn condvar_remove_entry(entry: *mut CondVarWaitEntry) {
+    unsafe {
+        let flink = (*entry).flink;
+        let blink = (*entry).blink;
+        (*flink).blink = blink;
+        (*blink).flink = flink;
+    }
+}
+
+unsafe fn condvar_lock(
+    condition_variable: *mut c_void,
+    insert_entry: *mut CondVarWaitEntry,
+    abort_if_locked: *const u8,
+) -> *mut CondVarWaitEntry {
+    let Some(word) = (unsafe { atomic_word(condition_variable) }) else {
+        return core::ptr::null_mut();
+    };
+    let mut old = word.load(Ordering::Acquire);
+    loop {
+        if old & COND_VAR_LOCKED_FLAG != 0 {
+            spin_pause(old);
+            if !abort_if_locked.is_null() && unsafe { core::ptr::read_volatile(abort_if_locked) } != 0 {
+                return core::ptr::null_mut();
+            }
+            old = word.load(Ordering::Acquire);
+            continue;
+        }
+
+        let old_head = (old & COND_VAR_ADDRESS_MASK) as *mut CondVarWaitEntry;
+        let mut new_value = if insert_entry.is_null() {
+            if old_head.is_null() {
+                return core::ptr::null_mut();
+            }
+            old
+        } else {
+            (old & COND_VAR_FLAGS_MASK) | insert_entry as usize
+        };
+        new_value |= COND_VAR_LOCKED_FLAG;
+
+        match word.compare_exchange(old, new_value, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => {
+                if insert_entry.is_null() {
+                    return old_head;
+                }
+                unsafe {
+                    if old_head.is_null() {
+                        (*insert_entry).flink = insert_entry;
+                        (*insert_entry).blink = insert_entry;
+                    } else {
+                        let tail = (*old_head).blink;
+                        (*insert_entry).flink = old_head;
+                        (*insert_entry).blink = tail;
+                        (*tail).flink = insert_entry;
+                        (*old_head).blink = insert_entry;
+                    }
+                }
+                return insert_entry;
+            }
+            Err(actual) => old = actual,
+        }
+    }
+}
+
+unsafe fn condvar_unlock(condition_variable: *mut c_void, remove_entry: *mut CondVarWaitEntry) {
+    let Some(word) = (unsafe { atomic_word(condition_variable) }) else {
+        return;
+    };
+    let old = word.load(Ordering::Acquire);
+    let mut new_head = (old & COND_VAR_ADDRESS_MASK) as *mut CondVarWaitEntry;
+    if !remove_entry.is_null() {
+        unsafe {
+            if remove_entry == new_head {
+                if (*new_head).flink == new_head {
+                    new_head = core::ptr::null_mut();
+                } else {
+                    new_head = (*new_head).flink;
+                    condvar_remove_entry(remove_entry);
+                }
+            } else {
+                condvar_remove_entry(remove_entry);
+            }
+            core::ptr::write_volatile(&mut (*remove_entry).list_removal_handled, 1);
+        }
+    }
+    let new_value = (old & (COND_VAR_FLAGS_MASK & !COND_VAR_LOCKED_FLAG)) | new_head as usize;
+    word.store(new_value, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_wait_for_keyed_event_raw(key: *mut c_void, timeout: *const i64) -> NtStatus {
+    type NtWaitForKeyedEvent =
+        unsafe extern "system" fn(u64, *mut c_void, u8, *const i64) -> NtStatus;
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtWaitForKeyedEvent>(
+            nt_ntdll::trap_stubs::nt_wait_for_keyed_event,
+        )(0, key, 0, timeout)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_release_keyed_event_raw(key: *mut c_void, timeout: *const i64) -> NtStatus {
+    type NtReleaseKeyedEvent =
+        unsafe extern "system" fn(u64, *mut c_void, u8, *const i64) -> NtStatus;
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtReleaseKeyedEvent>(
+            nt_ntdll::trap_stubs::nt_release_keyed_event,
+        )(0, key, 0, timeout)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn nt_wait_for_keyed_event_raw(_key: *mut c_void, _timeout: *const i64) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn nt_release_keyed_event_raw(_key: *mut c_void, _timeout: *const i64) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+unsafe fn condvar_wake(condition_variable: *mut c_void, release_all: bool) {
+    let head = unsafe {
+        condvar_lock(
+            condition_variable,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        )
+    };
+    if head.is_null() {
+        return;
+    }
+
+    let timeout: i64 = 0;
+    let mut remove_on_unlock = core::ptr::null_mut();
+    let mut entry = unsafe { (*head).blink };
+    while !entry.is_null() {
+        let next = if entry == head {
+            core::ptr::null_mut()
+        } else {
+            unsafe { (*entry).blink }
+        };
+        let status = unsafe { nt_release_keyed_event_raw(condvar_wait_key(entry), &timeout) };
+        if status == STATUS_SUCCESS {
+            if entry == head {
+                remove_on_unlock = head;
+            } else {
+                unsafe {
+                    condvar_remove_entry(entry);
+                    core::ptr::write_volatile(&mut (*entry).list_removal_handled, 1);
+                }
+            }
+            if !release_all {
+                break;
+            }
+        }
+        entry = next;
+    }
+
+    unsafe { condvar_unlock(condition_variable, remove_on_unlock) };
+}
+
+unsafe fn condvar_sleep(
+    condition_variable: *mut c_void,
+    critical_section: *mut c_void,
+    srw_lock: *mut c_void,
+    srw_flags: u32,
+    timeout: *const i64,
+) -> NtStatus {
+    let mut entry = CondVarWaitEntry {
+        flink: core::ptr::null_mut(),
+        blink: core::ptr::null_mut(),
+        wait_key: core::ptr::null_mut(),
+        list_removal_handled: 0,
+    };
+
+    unsafe {
+        condvar_lock(condition_variable, &mut entry, core::ptr::null());
+        condvar_unlock(condition_variable, core::ptr::null_mut());
+
+        if critical_section.is_null() {
+            if srw_flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED == 0 {
+                rtl_release_srw_lock_exclusive(srw_lock);
+            } else {
+                rtl_release_srw_lock_shared(srw_lock);
+            }
+        } else {
+            let _ = rtl_leave_critical_section(critical_section);
+        }
+    }
+
+    let status = unsafe { nt_wait_for_keyed_event_raw(condvar_wait_key(&mut entry), timeout) };
+
+    unsafe {
+        if core::ptr::read_volatile(&entry.list_removal_handled) == 0 {
+            let abort_flag = &entry.list_removal_handled as *const u8;
+            if !condvar_lock(condition_variable, core::ptr::null_mut(), abort_flag).is_null() {
+                let remove = if entry.list_removal_handled == 0 {
+                    &mut entry as *mut CondVarWaitEntry
+                } else {
+                    core::ptr::null_mut()
+                };
+                condvar_unlock(condition_variable, remove);
+            }
+        }
+
+        if critical_section.is_null() {
+            if srw_flags & RTL_CONDITION_VARIABLE_LOCKMODE_SHARED == 0 {
+                rtl_acquire_srw_lock_exclusive(srw_lock);
+            } else {
+                rtl_acquire_srw_lock_shared(srw_lock);
+            }
+        } else {
+            let _ = rtl_enter_critical_section(critical_section);
+        }
+    }
+
+    status
+}
+
 /// `RtlWakeConditionVariable(PRTL_CONDITION_VARIABLE)`.
 ///
 /// # Safety
 /// `condition_variable` is a valid `RTL_CONDITION_VARIABLE`.
 #[export_name = "RtlWakeConditionVariable"]
-pub unsafe extern "system" fn rtl_wake_condition_variable(_condition_variable: *mut c_void) {}
+pub unsafe extern "system" fn rtl_wake_condition_variable(condition_variable: *mut c_void) {
+    if !condition_variable.is_null() {
+        unsafe { condvar_wake(condition_variable, false) };
+    }
+}
 
 /// `RtlWakeAllConditionVariable(PRTL_CONDITION_VARIABLE)`.
 ///
 /// # Safety
 /// `condition_variable` is a valid `RTL_CONDITION_VARIABLE`.
 #[export_name = "RtlWakeAllConditionVariable"]
-pub unsafe extern "system" fn rtl_wake_all_condition_variable(_condition_variable: *mut c_void) {}
+pub unsafe extern "system" fn rtl_wake_all_condition_variable(condition_variable: *mut c_void) {
+    if !condition_variable.is_null() {
+        unsafe { condvar_wake(condition_variable, true) };
+    }
+}
 
 /// `RtlSleepConditionVariableCS(PRTL_CONDITION_VARIABLE, PRTL_CRITICAL_SECTION, PLARGE_INTEGER)`.
 ///
@@ -1771,10 +2015,15 @@ pub unsafe extern "system" fn rtl_sleep_condition_variable_cs(
     if condition_variable.is_null() || critical_section.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    if !timeout.is_null() && unsafe { *timeout == 0 } {
-        return STATUS_TIMEOUT;
+    unsafe {
+        condvar_sleep(
+            condition_variable,
+            critical_section,
+            core::ptr::null_mut(),
+            0,
+            timeout,
+        )
     }
-    STATUS_NOT_IMPLEMENTED
 }
 
 /// `RtlSleepConditionVariableSRW(PRTL_CONDITION_VARIABLE, PRTL_SRWLOCK, PLARGE_INTEGER, ULONG)`.
@@ -1794,10 +2043,7 @@ pub unsafe extern "system" fn rtl_sleep_condition_variable_srw(
     if flags & !RTL_CONDITION_VARIABLE_LOCKMODE_SHARED != 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    if !timeout.is_null() && unsafe { *timeout == 0 } {
-        return STATUS_TIMEOUT;
-    }
-    STATUS_NOT_IMPLEMENTED
+    unsafe { condvar_sleep(condition_variable, core::ptr::null_mut(), srw_lock, flags, timeout) }
 }
 
 /// `RtlRunOnceInitialize(PRTL_RUN_ONCE)`.
@@ -1838,7 +2084,6 @@ pub unsafe extern "system" fn rtl_run_once_begin_initialize(
         return STATUS_SUCCESS;
     }
     let async_mode = flags & RTL_RUN_ONCE_ASYNC != 0;
-    let mut spins = 0usize;
     loop {
         let value = word.load(Ordering::Acquire);
         match value & 0x3 {
@@ -1855,8 +2100,19 @@ pub unsafe extern "system" fn rtl_run_once_begin_initialize(
                 if async_mode {
                     return STATUS_INVALID_PARAMETER;
                 }
-                spin_pause(spins);
-                spins = spins.wrapping_add(1);
+                let next = value & !0x3;
+                let wait_key = &next as *const usize as *mut c_void;
+                if word
+                    .compare_exchange(
+                        value,
+                        (wait_key as usize) | 0x1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    let _ = unsafe { nt_wait_for_keyed_event_raw(wait_key, core::ptr::null()) };
+                }
             }
             2 => {
                 if !context.is_null() {
@@ -1907,6 +2163,14 @@ pub unsafe extern "system" fn rtl_run_once_complete(
                     .compare_exchange(value, final_value, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
                 {
+                    let mut waiter = value & !0x3;
+                    while waiter != 0 {
+                        let next = unsafe { core::ptr::read(waiter as *const usize) };
+                        let _ = unsafe {
+                            nt_release_keyed_event_raw(waiter as *mut c_void, core::ptr::null())
+                        };
+                        waiter = next;
+                    }
                     return STATUS_SUCCESS;
                 }
             }

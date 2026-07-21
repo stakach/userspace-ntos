@@ -485,6 +485,10 @@ pub const SSN_NT_FLUSH_INSTRUCTION_CACHE: u64 = 82;
 /// NULL GlobalKeyedEventHandle makes ntdll use the non-keyed critical-section wait path. This is
 /// the last loader syscall before LdrpInitialize returns and the trampoline enters smss's entry.
 pub const SSN_NT_CREATE_KEYED_EVENT: u64 = 289;
+/// Keyed-event wait/release used by ReactOS condition variables, run-once, and the critical-section
+/// fallback path. These are real blocking syscalls over the executive's reply-cap parking model.
+pub const SSN_NT_RELEASE_KEYED_EVENT: u64 = 291;
+pub const SSN_NT_WAIT_FOR_KEYED_EVENT: u64 = 292;
 /// SmpInit object-creation SSNs (all take the out handle in RCX): NtCreatePort creates \SmApiPort,
 /// NtCreateThread the SM API-loop thread, plus events + sections. Faked with distinct handles.
 pub const SSN_NT_CREATE_PORT: u64 = 48;
@@ -985,6 +989,28 @@ static WAITER_RESUME_FLAGS: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }
 /// Diagnostics/proof counters for the specs: how many waiters have been parked and woken.
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Keyed-event waiters (`NtWaitForKeyedEvent`) use the same reply-cap parking model as object-event
+/// waits, but are keyed by an arbitrary user pointer instead of an object-namespace event index.
+/// ReactOS condition variables pass the address of each stack wait-entry's `WaitKey` field and wake
+/// with `NtReleaseKeyedEvent(..., &Entry->WaitKey, ...)`.
+const KEYED_WAITER_N: usize = 16;
+static KEYED_WAITER_KEY: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(u64::MAX) }; KEYED_WAITER_N];
+static KEYED_WAITER_REPLY_CAP: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+static KEYED_WAITER_TID: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+static KEYED_WAITER_DEADLINE: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(u64::MAX) }; KEYED_WAITER_N];
+static KEYED_WAITER_RESUME_IP: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+static KEYED_WAITER_RESUME_SP: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+static KEYED_WAITER_RESUME_FLAGS: [AtomicU64; KEYED_WAITER_N] =
+    [const { AtomicU64::new(0) }; KEYED_WAITER_N];
+static KEYED_WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
+static KEYED_WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ─── BATCH 33: pipe-pending completion (park a pending pipe read, re-drive on peer write) ─────────
 /// The parked-pipe-read table (host-tested `nt_io_manager::PipeWaiterTable`). A caller whose npfs
@@ -2663,12 +2689,17 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue<DELAY_WAITER_N>) {
         .map(|slot| WAITER_DEADLINE[slot].load(Ordering::Relaxed))
         .filter(|deadline| *deadline != u64::MAX)
         .min();
-    let deadline = match (queue.next_deadline(), event_deadline) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let keyed_deadline = (0..KEYED_WAITER_N)
+        .filter(|slot| KEYED_WAITER_KEY[*slot].load(Ordering::Relaxed) != u64::MAX)
+        .map(|slot| KEYED_WAITER_DEADLINE[slot].load(Ordering::Relaxed))
+        .filter(|deadline| *deadline != u64::MAX)
+        .min();
+    let deadline = queue
+        .next_deadline()
+        .into_iter()
+        .chain(event_deadline)
+        .chain(keyed_deadline)
+        .min();
     if let Some(deadline) = deadline {
         let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
         let target = nt_delay_execution::hundred_ns_to_ticks_ceil(deadline, period);
@@ -2757,6 +2788,7 @@ unsafe fn delay_timer_interrupt(queue: &mut nt_delay_execution::Queue<DELAY_WAIT
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = delay_wake_due(queue);
     let _ = wait_wake_due();
+    let _ = keyed_wait_wake_due();
     delay_timer_rearm(queue);
     // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
     // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
@@ -2859,6 +2891,141 @@ unsafe fn wait_cancel_thread(tid: u64) {
     }
 }
 
+fn keyed_wait_clear_slot(slot: usize) {
+    KEYED_WAITER_KEY[slot].store(u64::MAX, Ordering::Relaxed);
+    KEYED_WAITER_REPLY_CAP[slot].store(0, Ordering::Relaxed);
+    KEYED_WAITER_TID[slot].store(0, Ordering::Relaxed);
+    KEYED_WAITER_DEADLINE[slot].store(u64::MAX, Ordering::Relaxed);
+    KEYED_WAITER_RESUME_IP[slot].store(0, Ordering::Relaxed);
+    KEYED_WAITER_RESUME_SP[slot].store(0, Ordering::Relaxed);
+    KEYED_WAITER_RESUME_FLAGS[slot].store(0, Ordering::Relaxed);
+}
+
+/// PARK the current caller on a keyed-event key (`NtWaitForKeyedEvent`). This is the same
+/// reply-cap steal/rotate operation as `wait_park_multi`, with the wait condition keyed by a raw
+/// user pointer instead of an executive event index.
+unsafe fn keyed_wait_park(
+    key: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    tid: u64,
+    deadline: Option<u64>,
+) -> bool {
+    let mut slot = usize::MAX;
+    for index in 0..KEYED_WAITER_N {
+        if KEYED_WAITER_KEY[index].load(Ordering::Relaxed) == u64::MAX {
+            slot = index;
+            break;
+        }
+    }
+    if slot == usize::MAX {
+        return false;
+    }
+
+    let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if stolen == 0 {
+        return false;
+    }
+    let used = WAIT_REPLY_POOL_USED.load(Ordering::Relaxed);
+    let mut fresh = 0u64;
+    let mut fresh_bit = 0usize;
+    for index in 0..WAIT_REPLY_POOL_N {
+        if used & (1u64 << index) == 0 {
+            let cap = WAIT_REPLY_POOL[index].load(Ordering::Relaxed);
+            if cap != 0 {
+                fresh = cap;
+                fresh_bit = index;
+                break;
+            }
+        }
+    }
+    if fresh == 0 {
+        return false;
+    }
+
+    KEYED_WAITER_REPLY_CAP[slot].store(stolen, Ordering::Relaxed);
+    KEYED_WAITER_TID[slot].store(tid, Ordering::Relaxed);
+    KEYED_WAITER_DEADLINE[slot].store(deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
+    KEYED_WAITER_RESUME_IP[slot].store(resume_ip, Ordering::Relaxed);
+    KEYED_WAITER_RESUME_SP[slot].store(sp, Ordering::Relaxed);
+    KEYED_WAITER_RESUME_FLAGS[slot].store(flags, Ordering::Relaxed);
+    KEYED_WAITER_KEY[slot].store(key, Ordering::Relaxed);
+    WAIT_REPLY_POOL_USED.fetch_or(1u64 << fresh_bit, Ordering::Relaxed);
+    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
+    KEYED_WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Wake one caller parked on `key`, returning `true` when a matching waiter was resumed.
+unsafe fn keyed_wait_wake_one(key: u64, status: u64) -> bool {
+    for slot in 0..KEYED_WAITER_N {
+        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) != key {
+            continue;
+        }
+        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        if cap == 0 {
+            keyed_wait_clear_slot(slot);
+            return false;
+        }
+        set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
+        set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
+        set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
+        send_on_reply(cap, 18, status, 0, 0, 0);
+        release_reply_pool_cap(cap);
+        keyed_wait_clear_slot(slot);
+        KEYED_WAIT_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+unsafe fn keyed_wait_wake_due() -> u64 {
+    let now = monotonic_time_100ns();
+    let mut woken = 0;
+    for slot in 0..KEYED_WAITER_N {
+        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
+            || KEYED_WAITER_DEADLINE[slot].load(Ordering::Relaxed) > now
+        {
+            continue;
+        }
+        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        if cap != 0 {
+            set_reply_mr(15, KEYED_WAITER_RESUME_IP[slot].load(Ordering::Relaxed));
+            set_reply_mr(16, KEYED_WAITER_RESUME_SP[slot].load(Ordering::Relaxed));
+            set_reply_mr(17, KEYED_WAITER_RESUME_FLAGS[slot].load(Ordering::Relaxed));
+            send_on_reply(cap, 18, 0x102, 0, 0, 0);
+            release_reply_pool_cap(cap);
+            woken += 1;
+        }
+        keyed_wait_clear_slot(slot);
+    }
+    woken
+}
+
+unsafe fn keyed_wait_cancel_thread(tid: u64) {
+    for slot in 0..KEYED_WAITER_N {
+        if KEYED_WAITER_KEY[slot].load(Ordering::Relaxed) == u64::MAX
+            || KEYED_WAITER_TID[slot].load(Ordering::Relaxed) != tid
+        {
+            continue;
+        }
+        let cap = KEYED_WAITER_REPLY_CAP[slot].load(Ordering::Relaxed);
+        if cap != 0 {
+            let deleted = cnode_delete_r(cap);
+            let retyped = if deleted == 0 {
+                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+            } else {
+                u64::MAX
+            };
+            if deleted == 0 && retyped == 0 {
+                release_reply_pool_cap(cap);
+            }
+        }
+        keyed_wait_clear_slot(slot);
+    }
+}
+
 /// Consume the Reply object bound to the current native-syscall fault without sending on it, then
 /// rotate a fresh pool object into `REPLY_MAIN_SLOT`. Deleting the bound object clears the only
 /// capability that can resume this Call; the caller remains blocked until its TCB is destroyed.
@@ -2954,6 +3121,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     }
     delay_cancel_thread(delay_queue, tid);
     wait_cancel_thread(tid);
+    keyed_wait_cancel_thread(tid);
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_r(tcb)
@@ -4100,6 +4268,10 @@ struct ExecNtHandler {
     wait_park_event: i64,
     /// Monotonic 100ns deadline for the pending single-event park (`u64::MAX` = infinite).
     wait_deadline_100ns: u64,
+    /// `NtWaitForKeyedEvent` asks the loop to park this syscall on an arbitrary user-mode key.
+    /// `u64::MAX` means no keyed-event park request; finite waits reuse the shared delay timer.
+    keyed_wait_key: u64,
+    keyed_wait_deadline_100ns: u64,
     /// NtDelayExecution asks the service loop to park this syscall's reply until this signed
     /// 100ns interval becomes due. The handler validates/copies the user pointer; the loop owns
     /// deadline conversion and the HPET-backed reply-cap park.
@@ -4350,6 +4522,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtTestAlert, SSN_NT_TEST_ALERT as u32),
             (NativeService::NtFlushInstructionCache, SSN_NT_FLUSH_INSTRUCTION_CACHE as u32),
             (NativeService::NtCreateKeyedEvent, SSN_NT_CREATE_KEYED_EVENT as u32),
+            (NativeService::NtReleaseKeyedEvent, SSN_NT_RELEASE_KEYED_EVENT as u32),
+            (NativeService::NtWaitForKeyedEvent, SSN_NT_WAIT_FOR_KEYED_EVENT as u32),
             (NativeService::NtAdjustPrivilegesToken, SSN_NT_ADJUST_PRIV_TOKEN as u32),
             (NativeService::NtDeleteValueKey, SSN_NT_DELETE_VALUE_KEY as u32),
             (NativeService::NtInitializeRegistry, SSN_NT_INITIALIZE_REGISTRY as u32),

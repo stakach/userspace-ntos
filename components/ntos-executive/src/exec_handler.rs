@@ -123,6 +123,8 @@ impl ExecNtHandler {
             lsass_listener3_spawn: false,
             wait_park_event: -1,
             wait_deadline_100ns: u64::MAX,
+            keyed_wait_key: u64::MAX,
+            keyed_wait_deadline_100ns: u64::MAX,
             delay_requested: false,
             delay_interval_100ns: 0,
             delay_alertable: false,
@@ -3636,8 +3638,57 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtMakeTemporaryObject — clears OBJ_PERMANENT on a link SmpInit re-creates; we don't
             // track permanence. Success no-op.
             NativeService::NtMakeTemporaryObject => 0,
+            // NtReleaseKeyedEvent(Handle, Key, Alertable, Timeout) — wake one waiter parked by
+            // NtWaitForKeyedEvent on the same raw key. ReactOS condition variables call this with a
+            // zero timeout and retry/skip on STATUS_TIMEOUT; blocking release-without-waiter is not
+            // modeled yet, so do not fabricate success when no waiter is present.
+            NativeService::NtReleaseKeyedEvent => unsafe {
+                let _handle = args[0];
+                let key = args[1];
+                let _alertable = args[2];
+                let timeout_ptr = args[3];
+                if keyed_wait_wake_one(key, 0) {
+                    print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
+                    print_hex_u64(key);
+                    print_str(b" -> WAKE one\n");
+                    0
+                } else if timeout_ptr != 0 {
+                    let interval = smss_stack_read(timeout_ptr) as i64;
+                    if interval == 0 {
+                        0x102
+                    } else {
+                        0xC000_0002
+                    }
+                } else {
+                    0xC000_0002
+                }
+            },
+            // NtWaitForKeyedEvent(Handle, Key, Alertable, Timeout) — park this syscall's reply cap
+            // on the key. The service loop performs the actual steal once resume_ip/rsp/rflags are
+            // available at the reply site.
+            NativeService::NtWaitForKeyedEvent => {
+                let _handle = args[0];
+                let key = args[1];
+                let _alertable = args[2];
+                let timeout_ptr = args[3];
+                if timeout_ptr != 0 {
+                    let interval = unsafe { smss_stack_read(timeout_ptr) as i64 };
+                    match nt_delay_execution::due_time(
+                        interval,
+                        monotonic_time_100ns(),
+                        nt_system_time_100ns(),
+                    ) {
+                        nt_delay_execution::Due::Immediate => return 0x102,
+                        nt_delay_execution::Due::Monotonic100ns(deadline) => {
+                            self.keyed_wait_deadline_100ns = deadline;
+                        }
+                    }
+                }
+                self.keyed_wait_key = key;
+                0x102
+            }
             // No-op → STATUS_SUCCESS: the bump allocator never frees, we don't model thread/process
-            // attribute sets, per-object security, keyed events, or a real handle table. (277
+            // attribute sets, per-object security, or a real handle table. (277
             // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
             // 236 NtSetInformationObject.)
             NativeService::NtFreeVirtualMemory
