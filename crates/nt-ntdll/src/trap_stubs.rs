@@ -205,6 +205,7 @@ generate_trap_stubs! {
     (nt_open_directory_object, "NtOpenDirectoryObject", 119),
     (nt_open_event, "NtOpenEvent", 120),
     (nt_open_file, "NtOpenFile", 122),
+    (nt_open_io_completion, "NtOpenIoCompletion", 123),
     (nt_open_job_object, "NtOpenJobObject", 124),
     (nt_open_key, "NtOpenKey", 125),
     (nt_open_mutant, "NtOpenMutant", 126),
@@ -239,6 +240,7 @@ generate_trap_stubs! {
     (nt_query_information_thread, "NtQueryInformationThread", 162),
     (nt_query_information_token, "NtQueryInformationToken", 163),
     (nt_query_install_ui_language, "NtQueryInstallUILanguage", 164),
+    (nt_query_io_completion, "NtQueryIoCompletion", 166),
     (nt_query_key, "NtQueryKey", 167),
     (nt_query_object, "NtQueryObject", 170),
     (nt_query_performance_counter, "NtQueryPerformanceCounter", 173),
@@ -334,7 +336,7 @@ mod tests {
 
     #[test]
     fn generates_all_required_stubs() {
-        assert_eq!(TRAP_STUBS.len(), 192);
+        assert_eq!(TRAP_STUBS.len(), 194);
         assert_eq!(TRAP_STUBS.len(), NT_SYSCALLS.len());
     }
 

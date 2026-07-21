@@ -2,11 +2,10 @@
 
 use super::*;
 
-/// The exact count of `Nt*` exports the current hosted ReactOS set imports (Step 1 measurement = 190)
-/// plus `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally (it
-/// isn't an *import* of any hosted binary, but IS an ntdll-internal syscall), and
+/// The exact count of `Nt*` exports the current hosted ReactOS set imports plus
+/// `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally, and
 /// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
-const REQUIRED_NT_COUNT: usize = 192;
+const REQUIRED_NT_COUNT: usize = 194;
 const REQUIRED_ZW_COUNT: usize = 9;
 
 #[test]
@@ -99,9 +98,11 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtDelayExecution", 61),          // SSN_NT_DELAY_EXECUTION = 61
         ("NtFsControlFile", 88),           // SSN_NT_FS_CONTROL_FILE = 88
         ("NtOpenFile", 122),               // (loader hot path)
+        ("NtOpenIoCompletion", 123),       // SSN_NT_OPEN_IO_COMPLETION = 123
         ("NtOpenKey", 125),                // SSN_NT_OPEN_KEY = 125
         ("NtProtectVirtualMemory", 143),   // SSN_NT_PROTECT_VM = 143
         ("NtQueryDebugFilterState", 148),  // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
+        ("NtQueryIoCompletion", 166),      // SSN_NT_QUERY_IO_COMPLETION = 166
         ("NtQuerySystemInformation", 181), // SSN_NT_QUERY_SYSTEM_INFO = 0xb5
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185

@@ -69,8 +69,8 @@ pub const ALPC_SSN_BASE: u32 = 0x1000;
 /// wire layout (MR0=SSN, MR1=rsp, MR2..5=args; reply MR0=NTSTATUS).
 pub const NT_NATIVE_SYSCALL_LABEL: u64 = 0x4E54;
 
-/// The complete required `Nt*` SSN table: the 190 distinct imports across the current
-/// hosted ReactOS x64 set (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
+/// The complete required `Nt*` SSN table: the hosted ReactOS x64 import set
+/// (smss/csrss/winlogon/services/lsass + kernel32/user32/gdi32/advapi32/
 /// rpcrt4/csrsrv/basesrv/winsrv/… — measured 2026-07-16, see `ntdll_plan.md` Step 1 Results),
 /// plus ntdll-internal `NtSecureConnectPort` and `NtCallbackReturn`, each paired with its
 /// `sysfuncs.lst`-derived SSN. Sorted by SSN.
@@ -160,6 +160,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtOpenDirectoryObject", 119),
     n("NtOpenEvent", 120),
     n("NtOpenFile", 122),
+    n("NtOpenIoCompletion", 123),
     n("NtOpenJobObject", 124),
     n("NtOpenKey", 125),
     n("NtOpenMutant", 126),
@@ -194,6 +195,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtQueryInformationThread", 162),
     n("NtQueryInformationToken", 163),
     n("NtQueryInstallUILanguage", 164),
+    n("NtQueryIoCompletion", 166),
     n("NtQueryKey", 167),
     n("NtQueryObject", 170),
     n("NtQueryPerformanceCounter", 173),
@@ -381,6 +383,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtOpenDirectoryObject", 3),
     ("NtOpenEvent", 3),
     ("NtOpenFile", 6),
+    ("NtOpenIoCompletion", 3),
     ("NtOpenJobObject", 3),
     ("NtOpenKey", 3),
     ("NtOpenMutant", 3),
@@ -415,6 +418,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtQueryInformationThread", 5),
     ("NtQueryInformationToken", 5),
     ("NtQueryInstallUILanguage", 1),
+    ("NtQueryIoCompletion", 5),
     ("NtQueryKey", 5),
     ("NtQueryObject", 5),
     ("NtQueryPerformanceCounter", 2),
