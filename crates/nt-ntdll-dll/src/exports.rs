@@ -6271,6 +6271,57 @@ pub unsafe extern "C" fn strupr(s: *mut u8) -> *mut u8 {
     s
 }
 
+/// `_splitpath(const char* path, char* drive, char* dir, char* fname, char* ext)`.
+///
+/// # Safety
+/// `path` is null or NUL-terminated. Output buffers are null or large enough for CRT component
+/// limits (`_MAX_DRIVE`, `_MAX_DIR`, `_MAX_FNAME`, `_MAX_EXT`).
+#[export_name = "_splitpath"]
+pub unsafe extern "C" fn splitpath(
+    path: *const u8,
+    drive: *mut u8,
+    dir: *mut u8,
+    fname: *mut u8,
+    ext: *mut u8,
+) {
+    unsafe {
+        if !drive.is_null() {
+            *drive = 0;
+        }
+        if !dir.is_null() {
+            *dir = 0;
+        }
+        if !fname.is_null() {
+            *fname = 0;
+        }
+        if !ext.is_null() {
+            *ext = 0;
+        }
+    }
+    if path.is_null() {
+        return;
+    }
+    // SAFETY: caller contract.
+    let n = unsafe { strlen_raw(path) };
+    let bytes = unsafe { core::slice::from_raw_parts(path, n) };
+    if let Some(parts) = nt_ntdll::crt::splitpath(bytes) {
+        unsafe {
+            if !drive.is_null() {
+                write_narrow_ascii(drive, &parts.drive);
+            }
+            if !dir.is_null() {
+                write_narrow_ascii(dir, &parts.dir);
+            }
+            if !fname.is_null() {
+                write_narrow_ascii(fname, &parts.fname);
+            }
+            if !ext.is_null() {
+                write_narrow_ascii(ext, &parts.ext);
+            }
+        }
+    }
+}
+
 /// `_wcslwr(wchar_t*) -> wchar_t*` — lowercase an ASCII/Latin-1 wide string in place.
 ///
 /// # Safety
@@ -20566,6 +20617,7 @@ pub unsafe extern "C" fn export_anchor() {
         strnicmp as usize,
         strlwr as usize,
         strupr as usize,
+        splitpath as usize,
         wcslwr as usize,
         wcschr as usize,
         wcsrchr as usize,

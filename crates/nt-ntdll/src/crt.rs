@@ -214,6 +214,50 @@ pub fn strspn(s: &[u8], accept: &[u8]) -> usize {
     hay.iter().take_while(|b| set.contains(b)).count()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitPath {
+    pub drive: Vec<u8>,
+    pub dir: Vec<u8>,
+    pub fname: Vec<u8>,
+    pub ext: Vec<u8>,
+}
+
+/// `_splitpath`: split a narrow path into drive, directory, filename and extension components.
+pub fn splitpath(path: &[u8]) -> Option<SplitPath> {
+    let mut p = &path[..strlen(path)];
+    if p.starts_with(b"\\\\?\\") {
+        p = &p[4..];
+    }
+    if p.is_empty() {
+        return None;
+    }
+
+    let mut drive = Vec::new();
+    if p.len() >= 2 && p[1] == b':' {
+        drive.extend_from_slice(&p[..2]);
+        p = &p[2..];
+    }
+
+    let mut file_start = 0usize;
+    let mut ext_start = None;
+    for (i, &c) in p.iter().enumerate() {
+        if c == b'\\' || c == b'/' {
+            file_start = i + 1;
+        }
+        if c == b'.' {
+            ext_start = Some(i);
+        }
+    }
+    let ext_start = ext_start.filter(|&i| i >= file_start).unwrap_or(p.len());
+
+    Some(SplitPath {
+        drive,
+        dir: p[..file_start].to_vec(),
+        fname: p[file_start..ext_start].to_vec(),
+        ext: p[ext_start..].to_vec(),
+    })
+}
+
 // --- wide strings (wcs*) ----------------------------------------------------------------------
 
 /// `wcslen`.
@@ -656,6 +700,34 @@ mod tests {
         assert_eq!(strstr(b"hello world\0", b"world\0"), Some(6));
         assert_eq!(strstr(b"hello\0", b"xyz\0"), None);
         assert_eq!(strspn(b"abc123\0", b"cba\0"), 3);
+    }
+
+    #[test]
+    fn splitpath_ops() {
+        assert_eq!(
+            splitpath(b"C:\\Windows\\system32\\ntdll.dll\0"),
+            Some(SplitPath {
+                drive: b"C:".to_vec(),
+                dir: b"\\Windows\\system32\\".to_vec(),
+                fname: b"ntdll".to_vec(),
+                ext: b".dll".to_vec(),
+            })
+        );
+        assert_eq!(
+            splitpath(b"/usr/bin/tool\0"),
+            Some(SplitPath {
+                drive: Vec::new(),
+                dir: b"/usr/bin/".to_vec(),
+                fname: b"tool".to_vec(),
+                ext: Vec::new(),
+            })
+        );
+        assert_eq!(splitpath(b"a.b\\c\0").unwrap().fname, b"c".to_vec(),);
+        assert_eq!(
+            splitpath(b"\\\\?\\C:\\foo.txt\0").unwrap().drive,
+            b"C:".to_vec(),
+        );
+        assert_eq!(splitpath(b"\0"), None);
     }
 
     #[test]
