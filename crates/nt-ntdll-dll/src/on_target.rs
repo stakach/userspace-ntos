@@ -2274,6 +2274,63 @@ unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [
     status
 }
 
+/// `NtSecureConnectPort` over the TRAP transport. This is the same Windows x64 ABI shape as
+/// [`syscall8`], extended with the fifth stack argument at `[rsp+0x48]`.
+///
+/// # Safety
+/// On-target hosted-process syscall; pointer arguments must satisfy the target syscall contract.
+#[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
+    let status: u64;
+    // SAFETY: a hosted-process syscall trap serviced by the executive. The stack slots match the
+    // Windows x64 ABI positions the executive mirror reads for NtSecureConnectPort args 5..9.
+    unsafe {
+        core::arch::asm!(
+            "sub rsp, 0x58",
+            "mov qword ptr [rsp+0x28], {a5}",
+            "mov qword ptr [rsp+0x30], {a6}",
+            "mov qword ptr [rsp+0x38], {a7}",
+            "mov qword ptr [rsp+0x40], {a8}",
+            "mov qword ptr [rsp+0x48], {a9}",
+            "mov r10, {a1}",
+            "mov rdx, {a2}",
+            "mov r8,  {a3}",
+            "mov r9,  {a4}",
+            "mov eax, {ssn:e}",
+            "syscall",
+            "add rsp, 0x58",
+            ssn = in(reg) SSN_NT_SECURE_CONNECT_PORT,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
+            a3 = in(reg) a3,
+            a4 = in(reg) a4,
+            a5 = in(reg) tail[0],
+            a6 = in(reg) tail[1],
+            a7 = in(reg) tail[2],
+            a8 = in(reg) tail[3],
+            a9 = in(reg) tail[4],
+            out("rax") status,
+            out("rcx") _, out("r11") _, out("r10") _, out("r8") _, out("r9") _,
+            clobber_abi("system"),
+        );
+    }
+    status
+}
+
+/// `NtSecureConnectPort` over the native seL4-call transport.
+///
+/// # Safety
+/// On-target hosted-process syscall; pointer arguments must satisfy the target syscall contract.
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
+    // SAFETY: forwarding the already-validated NtSecureConnectPort ABI frame.
+    unsafe { native_secure_connect_port(a1, a2, a3, a4, tail) }
+}
+
 /// `NtSecureConnectPort` SSN (shared `nt-syscall-abi` table; sysfuncs.lst line 219 = index 218).
 #[cfg(target_arch = "x86_64")]
 const SSN_NT_SECURE_CONNECT_PORT: u32 = 218;
@@ -2299,7 +2356,7 @@ const SSN_NT_SECURE_CONNECT_PORT: u32 = 218;
 /// On-target hosted process; issues a real syscall. `object_directory` is a NUL-terminated UTF-16
 /// string (or NULL → default `\Windows`). The out-params (`connection_info_size`,
 /// `server_to_server`) are NULL or writable.
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn csr_client_connect_to_server(
     object_directory: *const u16,
     _server_id: u32,
@@ -2490,7 +2547,7 @@ pub unsafe fn csr_client_connect_to_server(
     //                     MaxMessageLength=NULL, &ConnectionInfo, &ConnectionInfoLength).
     // SAFETY: all pointer args are valid stack locals; the executive services SSN 218.
     let status = unsafe {
-        native_secure_connect_port(
+        secure_connect_port(
             &mut csr_api_port as *mut u64 as u64,      // a1 = *PortHandle
             &port_name as *const UnicodeString as u64, // a2 = PortName
             &qos as *const SecurityQos as u64,         // a3 = SecurityQos

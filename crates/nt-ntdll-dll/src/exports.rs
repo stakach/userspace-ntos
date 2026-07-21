@@ -15732,7 +15732,7 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
     connection_info_size: *mut u32,
     server_to_server: *mut u8,
 ) -> NtStatus {
-    #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+    #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: on-target hosted-process; issues NtSecureConnectPort + fills the PEB CSR fields.
         unsafe {
@@ -15745,7 +15745,7 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
             ) as NtStatus
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "native_transport")))]
+    #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (
             object_directory,
