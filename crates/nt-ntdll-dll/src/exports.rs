@@ -7029,6 +7029,587 @@ pub unsafe extern "system" fn rtl_copy_memory_non_temporal(
     unsafe { core::ptr::copy(src, dst, n) };
 }
 
+// ---- RTL_MEMORY_STREAM family -------------------------------------------------------------------
+
+const S_OK: u32 = nt_ntdll::rtl::memstream::S_OK;
+const E_NOTIMPL: u32 = 0x8000_4001;
+const E_NOINTERFACE: u32 = 0x8000_4002;
+const E_INVALIDARG_HR: u32 = nt_ntdll::rtl::memstream::E_INVALIDARG;
+const STG_E_INVALIDPOINTER: u32 = nt_ntdll::rtl::memstream::STG_E_INVALIDPOINTER;
+const STGTY_STREAM: u32 = 2;
+const STATSTG_SIZE: usize = core::mem::size_of::<StatStg>();
+
+type QueryInterfaceFn =
+    unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> u32;
+type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type ReadFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> u32;
+type WriteFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32) -> u32;
+type SeekFn = unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> u32;
+type SetSizeFn = unsafe extern "system" fn(*mut c_void, u64) -> u32;
+type CopyToFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut u64, *mut u64) -> u32;
+type CommitFn = unsafe extern "system" fn(*mut c_void, u32) -> u32;
+type RevertFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type LockRegionFn = unsafe extern "system" fn(*mut c_void, u64, u64, u32) -> u32;
+type UnlockRegionFn = unsafe extern "system" fn(*mut c_void, u64, u64, u32) -> u32;
+type StatFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> u32;
+type CloneFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> u32;
+
+#[repr(C)]
+struct IStreamVtbl {
+    query_interface: QueryInterfaceFn,
+    add_ref: AddRefFn,
+    release: ReleaseFn,
+    read: ReadFn,
+    write: WriteFn,
+    seek: SeekFn,
+    set_size: SetSizeFn,
+    copy_to: CopyToFn,
+    commit: CommitFn,
+    revert: RevertFn,
+    lock_region: LockRegionFn,
+    unlock_region: UnlockRegionFn,
+    stat: StatFn,
+    clone: CloneFn,
+}
+
+#[repr(C)]
+pub struct RtlMemoryStream {
+    vtbl: *const IStreamVtbl,
+    ref_count: i32,
+    unk1: u32,
+    current: *mut u8,
+    start: *mut u8,
+    end: *mut u8,
+    final_release: Option<unsafe extern "system" fn(*mut RtlMemoryStream)>,
+    process_handle: *mut c_void,
+}
+
+#[repr(C)]
+struct StatStg {
+    pwcs_name: *mut u16,
+    type_: u32,
+    cb_size: u64,
+    mtime: u64,
+    ctime: u64,
+    atime: u64,
+    grf_mode: u32,
+    grf_locks_supported: u32,
+    clsid: [u8; 16],
+    grf_state_bits: u32,
+    reserved: u32,
+}
+
+static RTL_MEMORY_STREAM_VTBL: IStreamVtbl = IStreamVtbl {
+    query_interface: rtl_query_interface_memory_stream,
+    add_ref: rtl_add_ref_memory_stream,
+    release: rtl_release_memory_stream,
+    read: rtl_read_memory_stream,
+    write: rtl_write_memory_stream,
+    seek: rtl_seek_memory_stream,
+    set_size: rtl_set_memory_stream_size,
+    copy_to: rtl_copy_memory_stream_to,
+    commit: rtl_commit_memory_stream,
+    revert: rtl_revert_memory_stream,
+    lock_region: rtl_lock_memory_stream_region,
+    unlock_region: rtl_unlock_memory_stream_region,
+    stat: rtl_stat_memory_stream,
+    clone: rtl_clone_memory_stream,
+};
+
+static RTL_OUT_OF_PROCESS_MEMORY_STREAM_VTBL: IStreamVtbl = IStreamVtbl {
+    query_interface: rtl_query_interface_memory_stream,
+    add_ref: rtl_add_ref_memory_stream,
+    release: rtl_release_memory_stream,
+    read: rtl_read_out_of_process_memory_stream,
+    write: rtl_write_memory_stream,
+    seek: rtl_seek_memory_stream,
+    set_size: rtl_set_memory_stream_size,
+    copy_to: rtl_copy_memory_stream_to,
+    commit: rtl_commit_memory_stream,
+    revert: rtl_revert_memory_stream,
+    lock_region: rtl_lock_memory_stream_region,
+    unlock_region: rtl_unlock_memory_stream_region,
+    stat: rtl_stat_memory_stream,
+    clone: rtl_clone_memory_stream,
+};
+
+const IID_IUNKNOWN_BYTES: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const IID_ISEQUENTIAL_STREAM_BYTES: [u8; 16] = [
+    0x30, 0x3A, 0x73, 0x0C, 0x1C, 0x2A, 0xCE, 0x11, 0xAD, 0xE5, 0x00, 0xAA, 0x00, 0x44, 0x77, 0x3D,
+];
+const IID_ISTREAM_BYTES: [u8; 16] = [
+    0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+
+#[inline]
+fn hresult_from_win32(error: u32) -> u32 {
+    if error == 0 {
+        S_OK
+    } else {
+        0x8007_0000 | (error & 0xFFFF)
+    }
+}
+
+#[inline]
+unsafe fn memory_stream(this: *mut c_void) -> Option<*mut RtlMemoryStream> {
+    if this.is_null() {
+        None
+    } else {
+        Some(this as *mut RtlMemoryStream)
+    }
+}
+
+#[inline]
+unsafe fn stream_vtbl(stream: *mut c_void) -> Option<*const IStreamVtbl> {
+    if stream.is_null() {
+        return None;
+    }
+    // SAFETY: an IStream begins with an IStreamVtbl pointer.
+    let vtbl = unsafe { *(stream as *const *const IStreamVtbl) };
+    if vtbl.is_null() {
+        None
+    } else {
+        Some(vtbl)
+    }
+}
+
+/// `RtlInitMemoryStream(PRTL_MEMORY_STREAM Stream)`.
+///
+/// # Safety
+/// `stream` writable for an `RTL_MEMORY_STREAM`.
+#[export_name = "RtlInitMemoryStream"]
+pub unsafe extern "system" fn rtl_init_memory_stream(stream: *mut RtlMemoryStream) {
+    if stream.is_null() {
+        return;
+    }
+    // SAFETY: stream writable per the contract.
+    unsafe {
+        core::ptr::write_bytes(stream as *mut u8, 0, core::mem::size_of::<RtlMemoryStream>());
+        (*stream).vtbl = &RTL_MEMORY_STREAM_VTBL;
+    }
+}
+
+/// `RtlInitOutOfProcessMemoryStream(PRTL_MEMORY_STREAM Stream)`.
+///
+/// # Safety
+/// `stream` writable for an `RTL_MEMORY_STREAM`.
+#[export_name = "RtlInitOutOfProcessMemoryStream"]
+pub unsafe extern "system" fn rtl_init_out_of_process_memory_stream(stream: *mut RtlMemoryStream) {
+    if stream.is_null() {
+        return;
+    }
+    // SAFETY: stream writable per the contract.
+    unsafe {
+        core::ptr::write_bytes(stream as *mut u8, 0, core::mem::size_of::<RtlMemoryStream>());
+        (*stream).vtbl = &RTL_OUT_OF_PROCESS_MEMORY_STREAM_VTBL;
+        (*stream).final_release = Some(rtl_final_release_out_of_process_memory_stream);
+    }
+}
+
+/// `RtlFinalReleaseOutOfProcessMemoryStream(PRTL_MEMORY_STREAM Stream)`.
+///
+/// # Safety
+/// Final-release callback; reads no memory.
+#[export_name = "RtlFinalReleaseOutOfProcessMemoryStream"]
+pub unsafe extern "system" fn rtl_final_release_out_of_process_memory_stream(
+    _stream: *mut RtlMemoryStream,
+) {
+}
+
+/// `RtlQueryInterfaceMemoryStream(IStream*, REFIID, PVOID*) -> HRESULT`.
+///
+/// # Safety
+/// `requested_iid` points to a GUID; `result_object` writable.
+#[export_name = "RtlQueryInterfaceMemoryStream"]
+pub unsafe extern "system" fn rtl_query_interface_memory_stream(
+    this: *mut c_void,
+    requested_iid: *const u8,
+    result_object: *mut *mut c_void,
+) -> u32 {
+    if this.is_null() || requested_iid.is_null() || result_object.is_null() {
+        return E_INVALIDARG_HR;
+    }
+    // SAFETY: requested_iid/result_object valid per the contract.
+    unsafe {
+        let iid = core::slice::from_raw_parts(requested_iid, 16);
+        if iid == IID_IUNKNOWN_BYTES
+            || iid == IID_ISEQUENTIAL_STREAM_BYTES
+            || iid == IID_ISTREAM_BYTES
+        {
+            rtl_add_ref_memory_stream(this);
+            *result_object = this;
+            return S_OK;
+        }
+        *result_object = core::ptr::null_mut();
+    }
+    E_NOINTERFACE
+}
+
+/// `RtlAddRefMemoryStream(IStream*) -> ULONG`.
+///
+/// # Safety
+/// `this` is an `RTL_MEMORY_STREAM`'s IStream interface.
+#[export_name = "RtlAddRefMemoryStream"]
+pub unsafe extern "system" fn rtl_add_ref_memory_stream(this: *mut c_void) -> u32 {
+    // SAFETY: this is a valid memory stream per the contract.
+    let Some(stream) = (unsafe { memory_stream(this) }) else {
+        return 0;
+    };
+    unsafe {
+        let next = (*stream).ref_count.wrapping_add(1);
+        (*stream).ref_count = next;
+        next as u32
+    }
+}
+
+/// `RtlReleaseMemoryStream(IStream*) -> ULONG`.
+///
+/// # Safety
+/// `this` is an `RTL_MEMORY_STREAM`'s IStream interface.
+#[export_name = "RtlReleaseMemoryStream"]
+pub unsafe extern "system" fn rtl_release_memory_stream(this: *mut c_void) -> u32 {
+    // SAFETY: this is a valid memory stream per the contract.
+    let Some(stream) = (unsafe { memory_stream(this) }) else {
+        return 0;
+    };
+    unsafe {
+        let next = (*stream).ref_count.wrapping_sub(1);
+        (*stream).ref_count = next;
+        if next == 0 {
+            if let Some(final_release) = (*stream).final_release {
+                final_release(stream);
+            }
+        }
+        next as u32
+    }
+}
+
+/// `RtlReadMemoryStream(IStream*, PVOID Buffer, ULONG Length, PULONG BytesRead) -> HRESULT`.
+///
+/// # Safety
+/// `this` is a memory stream; `buffer` writable for `length` bytes.
+#[export_name = "RtlReadMemoryStream"]
+pub unsafe extern "system" fn rtl_read_memory_stream(
+    this: *mut c_void,
+    buffer: *mut c_void,
+    length: u32,
+    bytes_read: *mut u32,
+) -> u32 {
+    if !bytes_read.is_null() {
+        // SAFETY: optional out-param.
+        unsafe { *bytes_read = 0 };
+    }
+    if length == 0 {
+        return S_OK;
+    }
+    if this.is_null() || buffer.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    // SAFETY: this points to an RTL_MEMORY_STREAM.
+    let stream = this as *mut RtlMemoryStream;
+    unsafe {
+        let copy_len = nt_ntdll::rtl::memstream::read_length(
+            (*stream).current as usize,
+            (*stream).end as usize,
+            length,
+        );
+        if copy_len != 0 {
+            core::ptr::copy((*stream).current, buffer as *mut u8, copy_len);
+            (*stream).current = (*stream).current.add(copy_len);
+        }
+        if !bytes_read.is_null() {
+            *bytes_read = copy_len as u32;
+        }
+    }
+    S_OK
+}
+
+/// `RtlReadOutOfProcessMemoryStream(IStream*, PVOID, ULONG, PULONG) -> HRESULT`.
+///
+/// # Safety
+/// `this` is an out-of-process memory stream; `buffer` writable for `length` bytes.
+#[export_name = "RtlReadOutOfProcessMemoryStream"]
+pub unsafe extern "system" fn rtl_read_out_of_process_memory_stream(
+    this: *mut c_void,
+    buffer: *mut c_void,
+    length: u32,
+    bytes_read: *mut u32,
+) -> u32 {
+    if this.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    let stream = this as *mut RtlMemoryStream;
+    // SAFETY: stream points to RTL_MEMORY_STREAM.
+    let process = unsafe { (*stream).process_handle };
+    if process.is_null() {
+        // SAFETY: no process handle means the stream points at local memory.
+        return unsafe { rtl_read_memory_stream(this, buffer, length, bytes_read) };
+    }
+    if !bytes_read.is_null() {
+        // SAFETY: optional out-param.
+        unsafe { *bytes_read = 0 };
+    }
+    if length == 0 {
+        return S_OK;
+    }
+    if buffer.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    // SAFETY: stream valid; NtReadVirtualMemory copies from the remote process into caller buffer.
+    unsafe {
+        let copy_len = nt_ntdll::rtl::memstream::read_length(
+            (*stream).current as usize,
+            (*stream).end as usize,
+            length,
+        );
+        if copy_len == 0 {
+            return S_OK;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut local_read = 0usize;
+            let status = core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                    usize,
+                    *mut usize,
+                ) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_read_virtual_memory)(
+                process,
+                (*stream).current as *const c_void,
+                buffer,
+                copy_len,
+                &mut local_read,
+            );
+            if status == STATUS_SUCCESS {
+                (*stream).current = (*stream).current.add(local_read);
+                if !bytes_read.is_null() {
+                    *bytes_read = local_read as u32;
+                }
+            }
+            hresult_from_win32(rtl::status::nt_status_to_dos_error(status))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            core::ptr::copy((*stream).current, buffer as *mut u8, copy_len);
+            (*stream).current = (*stream).current.add(copy_len);
+            if !bytes_read.is_null() {
+                *bytes_read = copy_len as u32;
+            }
+            S_OK
+        }
+    }
+}
+
+/// `RtlSeekMemoryStream(IStream*, LARGE_INTEGER, ULONG, PULARGE_INTEGER) -> HRESULT`.
+///
+/// # Safety
+/// `this` is a memory stream; `result_offset` null or writable.
+#[export_name = "RtlSeekMemoryStream"]
+pub unsafe extern "system" fn rtl_seek_memory_stream(
+    this: *mut c_void,
+    relative_offset: i64,
+    origin: u32,
+    result_offset: *mut u64,
+) -> u32 {
+    let Some(stream) = (unsafe { memory_stream(this) }) else {
+        return STG_E_INVALIDPOINTER;
+    };
+    // SAFETY: stream points to RTL_MEMORY_STREAM.
+    unsafe {
+        let new_pos = match nt_ntdll::rtl::memstream::seek_position(
+            (*stream).start as usize,
+            (*stream).current as usize,
+            (*stream).end as usize,
+            relative_offset,
+            origin,
+        ) {
+            Ok(pos) => pos,
+            Err(hr) => return hr,
+        };
+        (*stream).current = new_pos as *mut u8;
+        if !result_offset.is_null() {
+            *result_offset = new_pos.saturating_sub((*stream).start as usize) as u64;
+        }
+    }
+    S_OK
+}
+
+/// `RtlCopyMemoryStreamTo(IStream*, IStream*, ULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER)`.
+///
+/// # Safety
+/// `this`/`target` are valid IStream pointers; counters null or writable.
+#[export_name = "RtlCopyMemoryStreamTo"]
+pub unsafe extern "system" fn rtl_copy_memory_stream_to(
+    this: *mut c_void,
+    target: *mut c_void,
+    length: u64,
+    bytes_read: *mut u64,
+    bytes_written: *mut u64,
+) -> u32 {
+    if !bytes_read.is_null() {
+        unsafe { *bytes_read = 0 };
+    }
+    if !bytes_written.is_null() {
+        unsafe { *bytes_written = 0 };
+    }
+    if target.is_null() || length == 0 {
+        return S_OK;
+    }
+    let Some(this_vtbl) = (unsafe { stream_vtbl(this) }) else {
+        return STG_E_INVALIDPOINTER;
+    };
+    let Some(target_vtbl) = (unsafe { stream_vtbl(target) }) else {
+        return STG_E_INVALIDPOINTER;
+    };
+    let mut total = length;
+    let mut buffer = [0u8; 1024];
+    let mut result = S_OK;
+    while total != 0 {
+        let left = total.min(buffer.len() as u64) as u32;
+        let mut amount = 0u32;
+        // SAFETY: vtable methods follow the IStream ABI.
+        result = unsafe { ((*this_vtbl).read)(this, buffer.as_mut_ptr() as *mut c_void, left, &mut amount) };
+        if !bytes_read.is_null() {
+            unsafe { *bytes_read = (*bytes_read).wrapping_add(amount as u64) };
+        }
+        if (result as i32) < 0 || amount == 0 {
+            break;
+        }
+        let mut written = 0u32;
+        result = unsafe {
+            ((*target_vtbl).write)(
+                target,
+                buffer.as_ptr() as *const c_void,
+                amount,
+                &mut written,
+            )
+        };
+        if !bytes_written.is_null() {
+            unsafe { *bytes_written = (*bytes_written).wrapping_add(written as u64) };
+        }
+        if (result as i32) < 0 || written != amount {
+            break;
+        }
+        total -= amount as u64;
+    }
+    result
+}
+
+/// `RtlCopyOutOfProcessMemoryStreamTo` — alias of `RtlCopyMemoryStreamTo`.
+///
+/// # Safety
+/// Same as `RtlCopyMemoryStreamTo`.
+#[export_name = "RtlCopyOutOfProcessMemoryStreamTo"]
+pub unsafe extern "system" fn rtl_copy_out_of_process_memory_stream_to(
+    this: *mut c_void,
+    target: *mut c_void,
+    length: u64,
+    bytes_read: *mut u64,
+    bytes_written: *mut u64,
+) -> u32 {
+    // SAFETY: same ABI and contract.
+    unsafe { rtl_copy_memory_stream_to(this, target, length, bytes_read, bytes_written) }
+}
+
+/// `RtlStatMemoryStream(IStream*, STATSTG*, ULONG) -> HRESULT`.
+///
+/// # Safety
+/// `stats` writable for a STATSTG.
+#[export_name = "RtlStatMemoryStream"]
+pub unsafe extern "system" fn rtl_stat_memory_stream(
+    this: *mut c_void,
+    stats: *mut c_void,
+    _flags: u32,
+) -> u32 {
+    let Some(stream) = (unsafe { memory_stream(this) }) else {
+        return STG_E_INVALIDPOINTER;
+    };
+    if stats.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    // SAFETY: stats writable for STATSTG, stream valid.
+    unsafe {
+        core::ptr::write_bytes(stats as *mut u8, 0, STATSTG_SIZE);
+        let stat = stats as *mut StatStg;
+        (*stat).type_ = STGTY_STREAM;
+        (*stat).cb_size = ((*stream).end as usize).saturating_sub((*stream).start as usize) as u64;
+    }
+    S_OK
+}
+
+/// `RtlWriteMemoryStream(...) -> HRESULT`.
+#[export_name = "RtlWriteMemoryStream"]
+pub unsafe extern "system" fn rtl_write_memory_stream(
+    _this: *mut c_void,
+    _buffer: *const c_void,
+    _length: u32,
+    bytes_written: *mut u32,
+) -> u32 {
+    if !bytes_written.is_null() {
+        unsafe { *bytes_written = 0 };
+    }
+    E_NOTIMPL
+}
+
+/// `RtlSetMemoryStreamSize(...) -> HRESULT`.
+#[export_name = "RtlSetMemoryStreamSize"]
+pub unsafe extern "system" fn rtl_set_memory_stream_size(_this: *mut c_void, _new_size: u64) -> u32 {
+    E_NOTIMPL
+}
+
+/// `RtlCommitMemoryStream(...) -> HRESULT`.
+#[export_name = "RtlCommitMemoryStream"]
+pub unsafe extern "system" fn rtl_commit_memory_stream(_this: *mut c_void, _flags: u32) -> u32 {
+    E_NOTIMPL
+}
+
+/// `RtlRevertMemoryStream(...) -> HRESULT`.
+#[export_name = "RtlRevertMemoryStream"]
+pub unsafe extern "system" fn rtl_revert_memory_stream(_this: *mut c_void) -> u32 {
+    E_NOTIMPL
+}
+
+/// `RtlLockMemoryStreamRegion(...) -> HRESULT`.
+#[export_name = "RtlLockMemoryStreamRegion"]
+pub unsafe extern "system" fn rtl_lock_memory_stream_region(
+    _this: *mut c_void,
+    _offset: u64,
+    _length: u64,
+    _lock_type: u32,
+) -> u32 {
+    E_NOTIMPL
+}
+
+/// `RtlUnlockMemoryStreamRegion(...) -> HRESULT`.
+#[export_name = "RtlUnlockMemoryStreamRegion"]
+pub unsafe extern "system" fn rtl_unlock_memory_stream_region(
+    _this: *mut c_void,
+    _offset: u64,
+    _length: u64,
+    _lock_type: u32,
+) -> u32 {
+    E_NOTIMPL
+}
+
+/// `RtlCloneMemoryStream(...) -> HRESULT`.
+#[export_name = "RtlCloneMemoryStream"]
+pub unsafe extern "system" fn rtl_clone_memory_stream(
+    _this: *mut c_void,
+    result_stream: *mut *mut c_void,
+) -> u32 {
+    if !result_stream.is_null() {
+        unsafe { *result_stream = core::ptr::null_mut() };
+    }
+    E_NOTIMPL
+}
+
 // ---- RTL_BITMAP family (raw RTL_BITMAP*: {SizeOfBitMap:u32@0, _pad, Buffer:*u32@8}) --------------
 
 /// `RtlInitializeBitMap(PRTL_BITMAP BitMapHeader, PULONG BitMapBuffer, ULONG SizeOfBitMap)`.
@@ -11059,6 +11640,25 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_compare_memory as usize,
         rtl_compare_memory_ulong as usize,
         rtl_copy_memory_non_temporal as usize,
+        rtl_init_memory_stream as usize,
+        rtl_init_out_of_process_memory_stream as usize,
+        rtl_final_release_out_of_process_memory_stream as usize,
+        rtl_query_interface_memory_stream as usize,
+        rtl_add_ref_memory_stream as usize,
+        rtl_release_memory_stream as usize,
+        rtl_read_memory_stream as usize,
+        rtl_read_out_of_process_memory_stream as usize,
+        rtl_seek_memory_stream as usize,
+        rtl_copy_memory_stream_to as usize,
+        rtl_copy_out_of_process_memory_stream_to as usize,
+        rtl_stat_memory_stream as usize,
+        rtl_write_memory_stream as usize,
+        rtl_set_memory_stream_size as usize,
+        rtl_commit_memory_stream as usize,
+        rtl_revert_memory_stream as usize,
+        rtl_lock_memory_stream_region as usize,
+        rtl_unlock_memory_stream_region as usize,
+        rtl_clone_memory_stream as usize,
         rtl_initialize_bit_map as usize,
         rtl_clear_all_bits as usize,
         rtl_set_all_bits as usize,

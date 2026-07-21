@@ -23,6 +23,7 @@ pub mod guid;
 pub mod image;
 pub mod integer;
 pub mod memory;
+pub mod memstream;
 pub mod message;
 pub mod path;
 pub mod pe_resource;
