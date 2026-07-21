@@ -37,18 +37,23 @@ type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
 const STATUS_TIMEOUT: NtStatus = 0x0000_0102;
 const STATUS_PENDING: NtStatus = 0x0000_0103;
+const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
+const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
+const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022;
 const STATUS_OBJECT_NAME_INVALID: NtStatus = 0xC000_0033;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
+const STATUS_DLL_NOT_FOUND: NtStatus = 0xC000_0135;
 const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
 const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
+const STATUS_SHARING_VIOLATION: NtStatus = 0xC000_0043;
 const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
 const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
@@ -481,6 +486,21 @@ unsafe fn boot_nt_open_file(
             0,
             open_options,
         )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_query_attributes_file(
+    object_attributes: *const BootObjectAttributes,
+    file_information: *mut c_void,
+) -> NtStatus {
+    type NtQueryAttributesFile =
+        unsafe extern "system" fn(*const BootObjectAttributes, *mut c_void) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtQueryAttributesFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtQueryAttributesFile>(
+            nt_ntdll::trap_stubs::nt_query_attributes_file,
+        )(object_attributes, file_information)
     }
 }
 
@@ -2439,6 +2459,60 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u_with_status(
     }
 }
 
+/// `RtlDoesFileExists_U(PCWSTR FileName) -> BOOLEAN`.
+///
+/// ReactOS converts the DOS path to an NT path, calls `ZwQueryAttributesFile`, and treats
+/// sharing/access-denied as existence when `SucceedIfBusy` is true. This exported `U` variant uses
+/// that `TRUE` policy.
+///
+/// # Safety
+/// `file_name` is a NUL-terminated UTF-16 DOS path.
+#[export_name = "RtlDoesFileExists_U"]
+pub unsafe extern "system" fn rtl_does_file_exists_u(file_name: *const u16) -> u8 {
+    if file_name.is_null() {
+        return 0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut nt_name = UnicodeString::default();
+        // SAFETY: file_name is a NUL-terminated path; nt_name is a writable descriptor.
+        let convert_status = unsafe {
+            rtl_dos_path_name_to_nt_path_name_u_impl(
+                file_name,
+                &mut nt_name,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                false,
+            )
+        };
+        if convert_status != STATUS_SUCCESS {
+            return 0;
+        }
+
+        let oa = boot_status_object_attributes(&nt_name);
+        let mut file_basic_information = [0u8; 40];
+        // SAFETY: oa names the converted NT path; file_basic_information is writable for the
+        // FILE_BASIC_INFORMATION payload the executive fills.
+        let status = unsafe {
+            boot_nt_query_attributes_file(&oa, file_basic_information.as_mut_ptr() as *mut c_void)
+        };
+        if nt_name.buffer != 0 {
+            // SAFETY: the conversion buffer was allocated from the process heap.
+            let _ =
+                unsafe { rtl_free_heap(core::ptr::null_mut(), 0, nt_name.buffer as *mut c_void) };
+        }
+        u8::from(
+            status == STATUS_SUCCESS
+                || status == STATUS_SHARING_VIOLATION
+                || status == STATUS_ACCESS_DENIED,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
 /// `RtlDosSearchPath_U(PCWSTR Path, PCWSTR FileName, PCWSTR Extension, ULONG BufferLength, PWSTR
 /// Buffer, PWSTR *PartName) -> ULONG`. Step 4.C: real over the live FS. Searches each `;`-separated
 /// directory in `Path` for `FileName` (appending `Extension` when `FileName` has no `.`), probing
@@ -4002,6 +4076,425 @@ pub unsafe extern "C" fn wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32
 // resolve their entry points. Wired to the on-target recursive loader (on_target.rs).
 // -------------------------------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
+const LDR_IN_LOAD_ORDER_LINKS: u64 = 0x00;
+#[cfg(target_arch = "x86_64")]
+const LDR_IN_MEMORY_ORDER_LINKS: u64 = 0x10;
+#[cfg(target_arch = "x86_64")]
+const LDR_IN_INITIALIZATION_ORDER_LINKS: u64 = 0x20;
+#[cfg(target_arch = "x86_64")]
+const LDR_DLL_BASE: u64 = 0x30;
+#[cfg(target_arch = "x86_64")]
+const LDR_SIZE_OF_IMAGE: u64 = 0x40;
+#[cfg(target_arch = "x86_64")]
+const LDR_FULL_DLL_NAME: u64 = 0x48;
+#[cfg(target_arch = "x86_64")]
+const LDR_BASE_DLL_NAME: u64 = 0x58;
+#[cfg(target_arch = "x86_64")]
+const LDR_FLAGS: u64 = 0x68;
+#[cfg(target_arch = "x86_64")]
+const LDR_LOAD_COUNT: u64 = 0x6C;
+#[cfg(target_arch = "x86_64")]
+const RTL_PROCESS_MODULES_HEADER_SIZE: u32 = 8;
+#[cfg(target_arch = "x86_64")]
+const RTL_PROCESS_MODULE_INFORMATION_SIZE: u32 = 0x128;
+
+#[cfg(target_arch = "x86_64")]
+static mut LDR_DLL_NOTIFICATION_LIST: [u64; 2] = [0, 0];
+
+#[cfg(target_arch = "x86_64")]
+type LdrDllNotificationFunction = unsafe extern "system" fn(u32, *const c_void, *mut c_void);
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_peb_ldr() -> u64 {
+    let peb: u64;
+    // SAFETY: x64 TEB has PEB at gs:[0x60].
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags))
+    };
+    if peb == 0 {
+        return 0;
+    }
+    // SAFETY: PEB+0x18 is the Ldr pointer in our byte-exact layout.
+    unsafe { core::ptr::read_unaligned((peb + 0x18) as *const u64) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_entry_contains_address(entry: u64, address: u64) -> bool {
+    if entry == 0 {
+        return false;
+    }
+    // SAFETY: entry is an LDR_DATA_TABLE_ENTRY from PEB->Ldr.
+    let base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+    let size = unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+    base != 0 && address >= base && address < base.saturating_add(size as u64)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_ldr_entry_for_address(address: u64) -> u64 {
+    let ldr = unsafe { current_peb_ldr() };
+    if ldr == 0 {
+        return 0;
+    }
+    // EntryInProgress is at PEB_LDR_DATA+0x40.
+    let in_progress = unsafe { core::ptr::read_unaligned((ldr + 0x40) as *const u64) };
+    if unsafe { ldr_entry_contains_address(in_progress, address) } {
+        return in_progress;
+    }
+
+    let head = ldr + 0x20; // PEB_LDR_DATA.InMemoryOrderModuleList
+    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    let mut guard = 0usize;
+    while cur != 0 && cur != head && guard < 4096 {
+        let entry = cur.saturating_sub(LDR_IN_MEMORY_ORDER_LINKS);
+        if unsafe { ldr_entry_contains_address(entry, address) } {
+            return entry;
+        }
+        cur = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+        guard += 1;
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_ldr_entry_for_base(base: u64) -> u64 {
+    let ldr = unsafe { current_peb_ldr() };
+    if ldr == 0 {
+        return 0;
+    }
+    let head = ldr + 0x10; // PEB_LDR_DATA.InLoadOrderModuleList
+    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    let mut guard = 0usize;
+    while cur != 0 && cur != head && guard < 4096 {
+        let entry = cur.saturating_sub(LDR_IN_LOAD_ORDER_LINKS);
+        let dll_base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+        if dll_base == base {
+            return entry;
+        }
+        cur = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+        guard += 1;
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_init_order_index(ldr: u64, target_entry: u64) -> u16 {
+    let head = ldr + 0x30; // PEB_LDR_DATA.InInitializationOrderModuleList
+    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    let mut index = 0u16;
+    let mut guard = 0usize;
+    while cur != 0 && cur != head && guard < 4096 {
+        index = index.wrapping_add(1);
+        let entry = cur.saturating_sub(LDR_IN_INITIALIZATION_ORDER_LINKS);
+        if entry == target_entry {
+            break;
+        }
+        cur = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+        guard += 1;
+    }
+    index
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_ldr_unicode_to_ansi_path(us_addr: u64, dst: *mut u8) -> u16 {
+    // SAFETY: dst points at RTL_PROCESS_MODULE_INFORMATION.FullPathName[256].
+    unsafe { core::ptr::write_bytes(dst, 0, 256) };
+    let length = unsafe { core::ptr::read_unaligned(us_addr as *const u16) } as usize;
+    let buffer = unsafe { core::ptr::read_unaligned((us_addr + 8) as *const u64) };
+    if buffer == 0 || length == 0 {
+        return 0;
+    }
+    let units = (length / 2).min(255);
+    let mut offset_to_file = 0u16;
+    for i in 0..units {
+        let wc = unsafe { core::ptr::read_unaligned((buffer as *const u16).add(i)) };
+        let ch = if wc <= 0x7f { wc as u8 } else { b'?' };
+        if ch == b'\\' || ch == b'/' {
+            offset_to_file = (i + 1) as u16;
+        }
+        unsafe { core::ptr::write_unaligned(dst.add(i), ch) };
+    }
+    offset_to_file
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_process_module_info(module_ptr: u64, entry: u64, ldr: u64, load_index: u16) {
+    // SAFETY: module_ptr points at one writable RTL_PROCESS_MODULE_INFORMATION.
+    unsafe {
+        core::ptr::write_bytes(
+            module_ptr as *mut u8,
+            0,
+            RTL_PROCESS_MODULE_INFORMATION_SIZE as usize,
+        )
+    };
+    let image_base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+    let image_size =
+        unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+    let flags = unsafe { core::ptr::read_unaligned((entry + LDR_FLAGS) as *const u32) };
+    let load_count = unsafe { core::ptr::read_unaligned((entry + LDR_LOAD_COUNT) as *const u16) };
+    let init_index = unsafe { ldr_init_order_index(ldr, entry) };
+
+    unsafe {
+        core::ptr::write_unaligned((module_ptr + 0x00) as *mut u64, 0); // Section
+        core::ptr::write_unaligned((module_ptr + 0x08) as *mut u64, 0); // MappedBase
+        core::ptr::write_unaligned((module_ptr + 0x10) as *mut u64, image_base);
+        core::ptr::write_unaligned((module_ptr + 0x18) as *mut u32, image_size);
+        core::ptr::write_unaligned((module_ptr + 0x1C) as *mut u32, flags);
+        core::ptr::write_unaligned((module_ptr + 0x20) as *mut u16, load_index);
+        core::ptr::write_unaligned((module_ptr + 0x22) as *mut u16, init_index);
+        core::ptr::write_unaligned((module_ptr + 0x24) as *mut u16, load_count);
+        let name_offset = copy_ldr_unicode_to_ansi_path(
+            LDR_FULL_DLL_NAME + entry,
+            (module_ptr + 0x28) as *mut u8,
+        );
+        core::ptr::write_unaligned((module_ptr + 0x26) as *mut u16, name_offset);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_notification_head() -> u64 {
+    let head = core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_LIST) as *mut u64 as u64;
+    // SAFETY: single-process notification list. Initialize the circular head lazily.
+    unsafe {
+        if core::ptr::read_unaligned(head as *const u64) == 0 {
+            core::ptr::write_unaligned(head as *mut u64, head);
+            core::ptr::write_unaligned((head + 8) as *mut u64, head);
+        }
+    }
+    head
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_insert_notification_entry(entry: u64) {
+    let head = unsafe { ldr_notification_head() };
+    let tail = unsafe { core::ptr::read_unaligned((head + 8) as *const u64) };
+    unsafe {
+        core::ptr::write_unaligned(entry as *mut u64, head);
+        core::ptr::write_unaligned((entry + 8) as *mut u64, tail);
+        core::ptr::write_unaligned(tail as *mut u64, entry);
+        core::ptr::write_unaligned((head + 8) as *mut u64, entry);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_remove_notification_entry(entry: u64) {
+    let flink = unsafe { core::ptr::read_unaligned(entry as *const u64) };
+    let blink = unsafe { core::ptr::read_unaligned((entry + 8) as *const u64) };
+    if flink != 0 && blink != 0 {
+        unsafe {
+            core::ptr::write_unaligned((blink) as *mut u64, flink);
+            core::ptr::write_unaligned((flink + 8) as *mut u64, blink);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_send_dll_notifications_for_entry(entry: u64, reason: u32) {
+    let head = unsafe { ldr_notification_head() };
+    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    if cur == head {
+        return;
+    }
+
+    let dll_base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+    let image_size =
+        unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+    let mut data = [0u8; 40];
+    unsafe {
+        core::ptr::write_unaligned(data.as_mut_ptr() as *mut u32, 0);
+        core::ptr::write_unaligned(
+            data.as_mut_ptr().add(8) as *mut u64,
+            entry + LDR_FULL_DLL_NAME,
+        );
+        core::ptr::write_unaligned(
+            data.as_mut_ptr().add(16) as *mut u64,
+            entry + LDR_BASE_DLL_NAME,
+        );
+        core::ptr::write_unaligned(data.as_mut_ptr().add(24) as *mut u64, dll_base);
+        core::ptr::write_unaligned(data.as_mut_ptr().add(32) as *mut u32, image_size);
+    }
+
+    let mut guard = 0usize;
+    while cur != 0 && cur != head && guard < 4096 {
+        let next = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+        let callback = unsafe { core::ptr::read_unaligned((cur + 16) as *const u64) };
+        let context = unsafe { core::ptr::read_unaligned((cur + 24) as *const u64) };
+        if callback != 0 {
+            let f: LdrDllNotificationFunction = unsafe { core::mem::transmute(callback as usize) };
+            unsafe {
+                f(
+                    reason,
+                    data.as_ptr() as *const c_void,
+                    context as *mut c_void,
+                )
+            };
+        }
+        cur = next;
+        guard += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_send_dll_notifications_for_base(base: u64, reason: u32) {
+    let entry = unsafe { find_ldr_entry_for_base(base) };
+    if entry != 0 {
+        unsafe { ldr_send_dll_notifications_for_entry(entry, reason) };
+    }
+}
+
+/// `LdrFindEntryForAddress(PVOID Address, PLDR_DATA_TABLE_ENTRY *Module) -> NTSTATUS`.
+///
+/// # Safety
+/// `module` is writable.
+#[export_name = "LdrFindEntryForAddress"]
+pub unsafe extern "system" fn ldr_find_entry_for_address(
+    address: *mut c_void,
+    module: *mut *mut c_void,
+) -> NtStatus {
+    if module.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let entry = unsafe { find_ldr_entry_for_address(address as u64) };
+        if entry == 0 {
+            return STATUS_NO_MORE_ENTRIES;
+        }
+        unsafe { core::ptr::write_unaligned(module, entry as *mut c_void) };
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = address;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrQueryProcessModuleInformation(PRTL_PROCESS_MODULES, ULONG, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `module_information`/`returned_size` follow the RTL_PROCESS_MODULES ABI.
+#[export_name = "LdrQueryProcessModuleInformation"]
+pub unsafe extern "system" fn ldr_query_process_module_information(
+    module_information: *mut c_void,
+    size: u32,
+    returned_size: *mut u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let ldr = current_peb_ldr();
+        let mut status = STATUS_SUCCESS;
+        let mut used = RTL_PROCESS_MODULES_HEADER_SIZE;
+        let can_write_header =
+            !module_information.is_null() && size >= RTL_PROCESS_MODULES_HEADER_SIZE;
+        if size < RTL_PROCESS_MODULES_HEADER_SIZE {
+            status = STATUS_INFO_LENGTH_MISMATCH;
+        } else if can_write_header {
+            core::ptr::write_unaligned(module_information as *mut u32, 0);
+        }
+
+        if ldr != 0 {
+            let head = ldr + 0x10; // PEB_LDR_DATA.InLoadOrderModuleList
+            let mut cur = core::ptr::read_unaligned(head as *const u64);
+            let mut load_index = 0u16;
+            let mut written = 0u32;
+            let mut guard = 0usize;
+            while cur != 0 && cur != head && guard < 4096 {
+                let entry = cur.saturating_sub(LDR_IN_LOAD_ORDER_LINKS);
+                used = used.saturating_add(RTL_PROCESS_MODULE_INFORMATION_SIZE);
+                if used > size {
+                    status = STATUS_INFO_LENGTH_MISMATCH;
+                } else if can_write_header {
+                    let module_ptr = module_information as u64
+                        + RTL_PROCESS_MODULES_HEADER_SIZE as u64
+                        + written as u64 * RTL_PROCESS_MODULE_INFORMATION_SIZE as u64;
+                    write_process_module_info(module_ptr, entry, ldr, load_index);
+                    written = written.saturating_add(1);
+                    core::ptr::write_unaligned(module_information as *mut u32, written);
+                }
+                load_index = load_index.wrapping_add(1);
+                cur = core::ptr::read_unaligned(cur as *const u64);
+                guard += 1;
+            }
+        }
+
+        if !returned_size.is_null() {
+            core::ptr::write_unaligned(returned_size, used);
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (module_information, size, returned_size);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrRegisterDllNotification(ULONG, PLDR_DLL_NOTIFICATION_FUNCTION, PVOID, PVOID*) -> NTSTATUS`.
+///
+/// # Safety
+/// `notification_function` is a valid callback and `cookie` is writable.
+#[export_name = "LdrRegisterDllNotification"]
+pub unsafe extern "system" fn ldr_register_dll_notification(
+    flags: u32,
+    notification_function: *mut c_void,
+    context: *mut c_void,
+    cookie: *mut *mut c_void,
+) -> NtStatus {
+    if flags != 0 || notification_function.is_null() || cookie.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let entry = crate::process_heap_alloc(32) as u64;
+        if entry == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        core::ptr::write_bytes(entry as *mut u8, 0, 32);
+        core::ptr::write_unaligned((entry + 16) as *mut u64, notification_function as u64);
+        core::ptr::write_unaligned((entry + 24) as *mut u64, context as u64);
+        ldr_insert_notification_entry(entry);
+        core::ptr::write_unaligned(cookie, entry as *mut c_void);
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = context;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `LdrUnregisterDllNotification(PVOID Cookie) -> NTSTATUS`.
+///
+/// # Safety
+/// `cookie` is a value returned by `LdrRegisterDllNotification`.
+#[export_name = "LdrUnregisterDllNotification"]
+pub unsafe extern "system" fn ldr_unregister_dll_notification(cookie: *mut c_void) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let head = ldr_notification_head();
+        let mut cur = core::ptr::read_unaligned(head as *const u64);
+        let wanted = cookie as u64;
+        let mut guard = 0usize;
+        while cur != 0 && cur != head && guard < 4096 {
+            let next = core::ptr::read_unaligned(cur as *const u64);
+            if cur == wanted {
+                ldr_remove_notification_entry(cur);
+                crate::process_heap_free(cur as *mut u8);
+                return STATUS_SUCCESS;
+            }
+            cur = next;
+            guard += 1;
+        }
+        STATUS_DLL_NOT_FOUND
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = cookie;
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `LdrLoadDll(PWSTR SearchPath, PULONG DllCharacteristics, PUNICODE_STRING DllName, PVOID* BaseAddr)
 /// -> NTSTATUS`. Ref `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrLoadDll` → LdrpLoadDll. Loads the
 /// named DLL (map + snap its imports recursively) and returns its base. Driven by the on-target
@@ -4077,6 +4570,22 @@ pub unsafe extern "system" fn ldr_get_procedure_address(
         let _ = (base_address, name, ordinal, address);
         STATUS_NOT_IMPLEMENTED
     }
+}
+
+/// `LdrGetProcedureAddressEx(PVOID, PANSI_STRING, ULONG, PVOID*, ULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// Same pointer contract as `LdrGetProcedureAddress`.
+#[export_name = "LdrGetProcedureAddressEx"]
+pub unsafe extern "system" fn ldr_get_procedure_address_ex(
+    base_address: *mut c_void,
+    name: *const c_void,
+    ordinal: u32,
+    address: *mut *mut c_void,
+    _flags: u32,
+) -> NtStatus {
+    // SAFETY: forwards the same mapped-module/name/address contract.
+    unsafe { ldr_get_procedure_address(base_address, name, ordinal, address) }
 }
 
 /// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Ref
@@ -14802,6 +15311,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_query_environment_variable_u as usize,
         rtl_dos_path_name_to_nt_path_name_u as usize,
         rtl_dos_path_name_to_nt_path_name_u_with_status as usize,
+        rtl_does_file_exists_u as usize,
         rtl_dos_search_path_u as usize,
         rtl_query_registry_values as usize,
         rtl_set_process_is_critical as usize,
@@ -14851,9 +15361,12 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_copy_memory as usize,
         strchr as usize,
         strncpy as usize,
+        ldr_find_entry_for_address as usize,
+        ldr_query_process_module_information as usize,
         ldr_load_dll as usize,
         ldr_get_dll_handle as usize,
         ldr_get_procedure_address as usize,
+        ldr_get_procedure_address_ex as usize,
         ldr_unload_dll as usize,
         // BATCH 2 ckpt 2 — basesrv's 11 ntdll imports.
         rtl_copy_luid as usize,
@@ -15400,6 +15913,8 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_unlock_loader_lock as usize,
         ldr_disable_thread_callouts_for_dll as usize,
         ldr_add_ref_dll as usize,
+        ldr_register_dll_notification as usize,
+        ldr_unregister_dll_notification as usize,
         ldr_get_dll_handle_ex as usize,
         ldr_enumerate_loaded_modules as usize,
         ldr_shutdown_process as usize,

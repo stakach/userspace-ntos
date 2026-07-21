@@ -1857,6 +1857,7 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 }
                 thread_ldr_lists();
             }
+            crate::exports::ldr_send_dll_notifications_for_base(loaded, 1);
             loaded
         };
         if !base_addr.is_null() {
