@@ -17,6 +17,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use nt_kernel_exec::rtl_bitmap::bitmap;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitmapRun {
+    pub starting_index: u32,
+    pub number_of_bits: u32,
+}
+
 /// An owned `RTL_BITMAP` — the 16-byte header plus its backing word array, kept together so the
 /// pointers the raw API needs stay valid. Mirrors how a caller would allocate + `RtlInitializeBitMap`
 /// in one shot.
@@ -129,6 +136,25 @@ impl BitMap {
         unsafe { find_last_backward_run_clear(self.hdr.as_ptr(), from, start) }
     }
 
+    /// `RtlFindClearRuns`.
+    pub fn find_clear_runs(&self, runs: &mut [BitmapRun], locate_longest: bool) -> u32 {
+        // SAFETY: initialised header; `runs` is a valid output slice.
+        unsafe {
+            find_clear_runs(
+                self.hdr.as_ptr(),
+                runs.as_mut_ptr(),
+                runs.len() as u32,
+                locate_longest,
+            )
+        }
+    }
+
+    /// `RtlFindLongestRunClear`.
+    pub fn find_longest_clear_run(&self, start: &mut u32) -> u32 {
+        // SAFETY: initialised header; `start` is writable.
+        unsafe { find_longest_run_clear(self.hdr.as_ptr(), start) }
+    }
+
     /// `RtlNumberOfSetBits`.
     pub fn count_set(&self) -> u32 {
         // SAFETY: initialised header.
@@ -147,9 +173,137 @@ impl BitMap {
     }
 }
 
+#[inline]
+unsafe fn run_bits(run_array: *const BitmapRun, index: u32) -> u32 {
+    unsafe { core::ptr::read_unaligned(run_array.add(index as usize)).number_of_bits }
+}
+
+#[inline]
+unsafe fn write_run(
+    run_array: *mut BitmapRun,
+    index: u32,
+    starting_index: u32,
+    number_of_bits: u32,
+) {
+    unsafe {
+        core::ptr::write_unaligned(
+            run_array.add(index as usize),
+            BitmapRun {
+                starting_index,
+                number_of_bits,
+            },
+        );
+    }
+}
+
+unsafe fn smallest_run_index(run_array: *const BitmapRun, count: u32) -> u32 {
+    let mut smallest = 0;
+    let mut smallest_bits = unsafe { run_bits(run_array, 0) };
+    let mut i = 1;
+    while i < count {
+        let bits = unsafe { run_bits(run_array, i) };
+        if bits < smallest_bits {
+            smallest = i;
+            smallest_bits = bits;
+        }
+        i += 1;
+    }
+    smallest
+}
+
+/// `RtlFindClearRuns(PRTL_BITMAP, PRTL_BITMAP_RUN, ULONG, BOOLEAN) -> ULONG`.
+///
+/// Returns the number of clear runs written to `run_array`. With `locate_longest` false, the first
+/// `size_of_run_array` runs are returned in forward order. With it true, the largest runs are kept
+/// once the output array fills.
+///
+/// # Safety
+/// `header` is an initialized `RTL_BITMAP`; `run_array` points to `size_of_run_array` writable
+/// `RTL_BITMAP_RUN` entries.
+pub unsafe fn find_clear_runs(
+    header: *const u8,
+    run_array: *mut BitmapRun,
+    size_of_run_array: u32,
+    locate_longest: bool,
+) -> u32 {
+    if header.is_null() || run_array.is_null() || size_of_run_array == 0 {
+        return 0;
+    }
+
+    let mut run = 0;
+    let mut from = 0;
+    while run < size_of_run_array {
+        let mut start = 0;
+        let bits = unsafe { find_next_forward_run_clear(header, from, &mut start) };
+        if bits == 0 {
+            return run;
+        }
+        unsafe { write_run(run_array, run, start, bits) };
+        from = start.saturating_add(bits);
+        run += 1;
+    }
+
+    if !locate_longest {
+        return run;
+    }
+
+    let mut smallest = unsafe { smallest_run_index(run_array, size_of_run_array) };
+    loop {
+        let mut start = 0;
+        let bits = unsafe { find_next_forward_run_clear(header, from, &mut start) };
+        if bits == 0 {
+            break;
+        }
+        if bits > unsafe { run_bits(run_array, smallest) } {
+            unsafe { write_run(run_array, smallest, start, bits) };
+            smallest = unsafe { smallest_run_index(run_array, size_of_run_array) };
+        }
+        from = start.saturating_add(bits);
+    }
+
+    run
+}
+
+/// `RtlFindLongestRunClear(PRTL_BITMAP, PULONG StartingIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` is an initialized `RTL_BITMAP`; `starting_index` is writable.
+pub unsafe fn find_longest_run_clear(header: *const u8, starting_index: *mut u32) -> u32 {
+    if header.is_null() || starting_index.is_null() {
+        return 0;
+    }
+
+    let mut from = 0;
+    let mut best_start = 0;
+    let mut best_bits = 0;
+    loop {
+        let mut start = 0;
+        let bits = unsafe { find_next_forward_run_clear(header, from, &mut start) };
+        if bits == 0 {
+            break;
+        }
+        if bits > best_bits {
+            best_start = start;
+            best_bits = bits;
+        }
+        from = start.saturating_add(bits);
+    }
+
+    if best_bits != 0 {
+        unsafe { core::ptr::write_unaligned(starting_index, best_start) };
+    }
+    best_bits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains_run(runs: &[BitmapRun], starting_index: u32, number_of_bits: u32) -> bool {
+        runs.iter().any(|run| {
+            run.starting_index == starting_index && run.number_of_bits == number_of_bits
+        })
+    }
 
     #[test]
     fn owned_bitmap_alloc_free() {
@@ -204,5 +358,45 @@ mod tests {
         assert_eq!(start, 12);
         assert_eq!(b.find_last_backward_clear(11, &mut start), 4);
         assert_eq!(start, 3);
+    }
+
+    #[test]
+    fn clear_run_collection_matches_winetest_shape() {
+        let mut b = BitMap::new(2048);
+        b.set_range(0, 2048);
+        b.clear_range(7, 19);
+        b.clear_range(101, 3);
+        b.clear_range(1877, 33);
+
+        let mut runs = [BitmapRun::default(); 4];
+        let count = b.find_clear_runs(&mut runs[..2], false);
+        assert_eq!(count, 2);
+        assert!(contains_run(&runs[..2], 7, 19));
+        assert!(contains_run(&runs[..2], 101, 3));
+        assert_eq!(runs[2], BitmapRun::default());
+
+        runs = [BitmapRun::default(); 4];
+        let count = b.find_clear_runs(&mut runs[..2], true);
+        assert_eq!(count, 2);
+        assert!(contains_run(&runs[..2], 7, 19));
+        assert!(contains_run(&runs[..2], 1877, 33));
+        assert_eq!(runs[2], BitmapRun::default());
+
+        runs = [BitmapRun::default(); 4];
+        let count = b.find_clear_runs(&mut runs[..3], true);
+        assert_eq!(count, 3);
+        assert_eq!(
+            runs[..3].iter().map(|r| r.number_of_bits).sum::<u32>(),
+            19 + 3 + 33
+        );
+        assert_eq!(runs[3], BitmapRun::default());
+
+        let mut start = 0;
+        assert_eq!(b.find_longest_clear_run(&mut start), 33);
+        assert_eq!(start, 1877);
+
+        b.set_range(0, 2048);
+        assert_eq!(b.find_clear_runs(&mut runs, true), 0);
+        assert_eq!(b.find_longest_clear_run(&mut start), 0);
     }
 }
