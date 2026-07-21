@@ -2621,6 +2621,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtQuerySystemInformation => unsafe {
                 let class = args[0];
                 let buf = args[1];
+                let len = args[2];
                 let retlen_ptr = args[3]; // R9 = *ReturnLength (a register)
                 if class == 0 {
                     smss_stack_write(buf + 0x08, 0x1000); // PageSize
@@ -2628,6 +2629,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                     smss_stack_write(buf + 0x20, 0x10000); // MinimumUserModeAddress
                     smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
                     smss_stack_write(retlen_ptr, 0x40);
+                } else if class == 3 {
+                    // SystemTimeOfDayInformation. RtlLocalTimeToSystemTime reads TimeZoneBias at
+                    // offset 0x10. Publish UTC bias for now, but through the real syscall-backed
+                    // class so timezone policy can move here later.
+                    const TOD_LEN: usize = 48;
+                    if retlen_ptr != 0 {
+                        self.xas_write_buf(retlen_ptr, &(TOD_LEN as u32).to_le_bytes());
+                    }
+                    if buf == 0 {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    if len < TOD_LEN as u64 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let mut info = [0u8; TOD_LEN];
+                    info[8..16].copy_from_slice(&nt_system_time_100ns().to_le_bytes());
+                    // TimeZoneBias @ 0x10 remains zero: local time == system time until registry
+                    // timezone policy is wired into this handler.
+                    self.xas_write_buf(buf, &info);
                 }
                 0
             },

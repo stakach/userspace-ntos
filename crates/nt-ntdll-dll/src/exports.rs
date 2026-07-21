@@ -58,6 +58,9 @@ static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
 static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
+const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
+const SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET: usize = 16;
 
 #[cfg(not(target_arch = "x86_64"))]
 fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
@@ -8688,6 +8691,90 @@ pub unsafe extern "system" fn rtl_time_to_seconds_since_1980(
     }
 }
 
+unsafe fn rtl_query_time_zone_bias() -> Result<i64, NtStatus> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut info = [0u8; SYSTEM_TIME_OF_DAY_INFORMATION_SIZE];
+        let mut return_length = 0u32;
+        let status = unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_query_system_information)(
+                SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+                info.as_mut_ptr() as *mut c_void,
+                info.len() as u32,
+                &mut return_length,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(
+            &info[SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET
+                ..SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET + 8],
+        );
+        Ok(i64::from_le_bytes(bytes))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+}
+
+/// `RtlLocalTimeToSystemTime(PLARGE_INTEGER LocalTime, PLARGE_INTEGER SystemTime) -> NTSTATUS`.
+///
+/// # Safety
+/// `local_time` readable and `system_time` writable.
+#[export_name = "RtlLocalTimeToSystemTime"]
+pub unsafe extern "system" fn rtl_local_time_to_system_time(
+    local_time: *const i64,
+    system_time: *mut i64,
+) -> NtStatus {
+    if local_time.is_null() || system_time.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let bias = match unsafe { rtl_query_time_zone_bias() } {
+        Ok(bias) => bias,
+        Err(status) => return status,
+    };
+    let local = unsafe { core::ptr::read_unaligned(local_time) };
+    unsafe {
+        core::ptr::write_unaligned(
+            system_time,
+            nt_ntdll::rtl::time::local_time_to_system_time(local, bias),
+        )
+    };
+    STATUS_SUCCESS
+}
+
+/// `RtlSystemTimeToLocalTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGER LocalTime) -> NTSTATUS`.
+///
+/// # Safety
+/// `system_time` readable and `local_time` writable.
+#[export_name = "RtlSystemTimeToLocalTime"]
+pub unsafe extern "system" fn rtl_system_time_to_local_time(
+    system_time: *const i64,
+    local_time: *mut i64,
+) -> NtStatus {
+    if system_time.is_null() || local_time.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let bias = match unsafe { rtl_query_time_zone_bias() } {
+        Ok(bias) => bias,
+        Err(status) => return status,
+    };
+    let system = unsafe { core::ptr::read_unaligned(system_time) };
+    unsafe {
+        core::ptr::write_unaligned(
+            local_time,
+            nt_ntdll::rtl::time::system_time_to_local_time(system, bias),
+        )
+    };
+    STATUS_SUCCESS
+}
+
 /// `RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS TimeFields)`. TIME_FIELDS = 7 shorts
 /// {Year,Month,Day,Hour,Minute,Second,Milliseconds,Weekday}.
 ///
@@ -13317,6 +13404,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_time_to_seconds_since_1980 as usize,
         rtl_seconds_since_1970_to_time as usize,
         rtl_seconds_since_1980_to_time as usize,
+        rtl_local_time_to_system_time as usize,
+        rtl_system_time_to_local_time as usize,
         rtl_time_to_time_fields as usize,
         rtl_time_fields_to_time as usize,
         rtl_uniform as usize,

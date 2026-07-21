@@ -172,6 +172,16 @@ pub fn seconds_since_1980_to_time(seconds: u32) -> i64 {
     seconds as i64 * TICKS_PER_SEC + TICKS_TO_1980
 }
 
+/// `RtlLocalTimeToSystemTime`: apply the system timezone bias.
+pub fn local_time_to_system_time(local_time: i64, timezone_bias: i64) -> i64 {
+    local_time.wrapping_add(timezone_bias)
+}
+
+/// `RtlSystemTimeToLocalTime`: remove the system timezone bias.
+pub fn system_time_to_local_time(system_time: i64, timezone_bias: i64) -> i64 {
+    system_time.wrapping_sub(timezone_bias)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +260,13 @@ mod tests {
         let max = seconds_since_1980_to_time(u32::MAX);
         assert_eq!(time_to_seconds_since_1980(max), Some(u32::MAX));
         assert_eq!(time_to_seconds_since_1980(max + TICKS_PER_SEC), None);
+    }
+
+    #[test]
+    fn local_system_bias_roundtrip() {
+        let system = seconds_since_1970_to_time(12345);
+        let bias = 10 * 60 * TICKS_PER_SEC;
+        let local = system_time_to_local_time(system, bias);
+        assert_eq!(local_time_to_system_time(local, bias), system);
     }
 }
