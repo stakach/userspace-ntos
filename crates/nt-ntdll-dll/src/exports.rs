@@ -79,6 +79,37 @@ static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
 const SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET: usize = 16;
+const NLS_CPTABLEINFO_SIZE: usize = 0x40;
+const NLS_TABLEINFO_OEM_OFFSET: usize = 0x00;
+const NLS_TABLEINFO_ANSI_OFFSET: usize = 0x40;
+const NLS_TABLEINFO_UPPER_OFFSET: usize = 0x80;
+const NLS_TABLEINFO_LOWER_OFFSET: usize = 0x88;
+const NLS_CP_CODE_PAGE: usize = 0x00;
+const NLS_CP_DEFAULT_CHAR: usize = 0x04;
+const NLS_CP_TRANS_DEFAULT_CHAR: usize = 0x08;
+const NLS_CP_DBCS_CODE_PAGE: usize = 0x0C;
+const NLS_CP_MULTI_BYTE_TABLE: usize = 0x20;
+const NLS_CP_WIDE_CHAR_TABLE: usize = 0x28;
+const NLS_CP_DBCS_OFFSETS: usize = 0x38;
+
+#[cfg(target_arch = "x86_64")]
+static mut NLS_ANSI_TO_UNICODE_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_TO_ANSI_TABLE: *const u8 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_OEM_TO_UNICODE_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_TO_OEM_TABLE: *const u8 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_UPCASE_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_LOWERCASE_TABLE: *const u16 = core::ptr::null();
+#[cfg(target_arch = "x86_64")]
+static mut NLS_ANSI_DEFAULT_CHAR: u8 = b'?';
+#[cfg(target_arch = "x86_64")]
+static mut NLS_OEM_DEFAULT_CHAR: u8 = b'?';
+#[cfg(target_arch = "x86_64")]
+static mut NLS_UNICODE_DEFAULT_CHAR: u16 = b'?' as u16;
 
 #[cfg(not(target_arch = "x86_64"))]
 fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
@@ -120,6 +151,152 @@ unsafe fn wcslen_raw(p: *const u16) -> usize {
         n += 1;
     }
     n
+}
+
+unsafe fn nls_ansi_widen_byte(byte: u8) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the pointer is published by RtlResetRtlTranslations and names a 256-entry table.
+        let table = unsafe { NLS_ANSI_TO_UNICODE_TABLE };
+        if !table.is_null() {
+            return unsafe { core::ptr::read_unaligned(table.add(byte as usize)) };
+        }
+    }
+    rtl::convert::ansi_char_to_unicode_char(byte)
+}
+
+unsafe fn nls_oem_widen_byte(byte: u8) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the pointer is published by RtlResetRtlTranslations and names a 256-entry table.
+        let table = unsafe { NLS_OEM_TO_UNICODE_TABLE };
+        if !table.is_null() {
+            return unsafe { core::ptr::read_unaligned(table.add(byte as usize)) };
+        }
+    }
+    rtl::convert::ansi_char_to_unicode_char(byte)
+}
+
+unsafe fn nls_ansi_narrow_unit(unit: u16) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the pointer is published by RtlResetRtlTranslations and names the NLS wide table.
+        let table = unsafe { NLS_UNICODE_TO_ANSI_TABLE };
+        if !table.is_null() {
+            return unsafe { core::ptr::read_unaligned(table.add(unit as usize)) };
+        }
+        let default = unsafe { NLS_ANSI_DEFAULT_CHAR };
+        return if unit < 0x100 { unit as u8 } else { default };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        rtl::convert::CodePage::LATIN1.narrow_unit(unit)
+    }
+}
+
+unsafe fn nls_oem_narrow_unit(unit: u16) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the pointer is published by RtlResetRtlTranslations and names the NLS wide table.
+        let table = unsafe { NLS_UNICODE_TO_OEM_TABLE };
+        if !table.is_null() {
+            return unsafe { core::ptr::read_unaligned(table.add(unit as usize)) };
+        }
+        let default = unsafe { NLS_OEM_DEFAULT_CHAR };
+        return if unit < 0x100 { unit as u8 } else { default };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        rtl::convert::CodePage::LATIN1.narrow_unit(unit)
+    }
+}
+
+fn nls_is_ansi_dbcs() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return core::ptr::read_volatile(core::ptr::addr_of!(NLS_MB_CODE_PAGE_TAG)) != 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+fn nls_is_oem_dbcs() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return core::ptr::read_volatile(core::ptr::addr_of!(NLS_MB_OEM_CODE_PAGE_TAG)) != 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+fn nls_upcase_unit(unit: u16) -> u16 {
+    if unit < b'a' as u16 {
+        return unit;
+    }
+    if unit <= b'z' as u16 {
+        return unit - (b'a' - b'A') as u16;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = NLS_UNICODE_UPCASE_TABLE;
+        if !table.is_null() {
+            let mut offset = core::ptr::read_unaligned(table.add(((unit >> 8) & 0xFF) as usize));
+            offset = core::ptr::read_unaligned(
+                table.add(offset as usize + ((unit >> 4) & 0xF) as usize),
+            );
+            offset = core::ptr::read_unaligned(table.add(offset as usize + (unit & 0xF) as usize));
+            return (unit as i32 + offset as i16 as i32) as u16;
+        }
+    }
+    rtl::strings::upcase_char(unit)
+}
+
+fn nls_downcase_unit(unit: u16) -> u16 {
+    if unit < b'A' as u16 {
+        return unit;
+    }
+    if unit <= b'Z' as u16 {
+        return unit + (b'a' - b'A') as u16;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = NLS_UNICODE_LOWERCASE_TABLE;
+        if !table.is_null() {
+            let mut offset = core::ptr::read_unaligned(table.add(((unit >> 8) & 0xFF) as usize));
+            offset = core::ptr::read_unaligned(
+                table.add(offset as usize + ((unit >> 4) & 0xF) as usize),
+            );
+            offset = core::ptr::read_unaligned(table.add(offset as usize + (unit & 0xF) as usize));
+            return (unit as i32 + offset as i16 as i32) as u16;
+        }
+    }
+    rtl::strings::downcase_char(unit)
+}
+
+fn nls_oem_default_char() -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return core::ptr::read_volatile(core::ptr::addr_of!(NLS_OEM_DEFAULT_CHAR));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        b'?'
+    }
+}
+
+fn nls_unicode_default_char() -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return core::ptr::read_volatile(core::ptr::addr_of!(NLS_UNICODE_DEFAULT_CHAR));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        b'?' as u16
+    }
 }
 
 /// Read `PEB->ProcessParameters->CurrentDirectory.DosPath` (the process CWD, e.g. `C:\Windows`) as a
@@ -247,13 +424,13 @@ pub unsafe extern "system" fn rtl_init_ansi_string(dst: PUnicodeString, src: *co
 /// `RtlUpcaseUnicodeChar(WCHAR) -> WCHAR`.
 #[export_name = "RtlUpcaseUnicodeChar"]
 pub extern "system" fn rtl_upcase_unicode_char(c: u16) -> u16 {
-    rtl::strings::upcase_char(c)
+    nls_upcase_unit(c)
 }
 
 /// `RtlDowncaseUnicodeChar(WCHAR) -> WCHAR`.
 #[export_name = "RtlDowncaseUnicodeChar"]
 pub extern "system" fn rtl_downcase_unicode_char(c: u16) -> u16 {
-    rtl::strings::downcase_char(c)
+    nls_downcase_unit(c)
 }
 
 /// Read a `UNICODE_STRING`'s buffer as a `&[u16]` slice (Length is in bytes).
@@ -989,6 +1166,9 @@ pub unsafe extern "system" fn rtl_ansi_string_to_unicode_string(
     if dst.is_null() || src.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    if nls_is_ansi_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
     // SAFETY: src is a valid ANSI_STRING (same 16-byte shape) per the contract.
     let (sbuf, slen) = unsafe { ((*src).buffer as *const u8, (*src).length as usize) };
     // Widened UTF-16 byte length + a NUL terminator (2 bytes). Reject a >0xFFFF result (the
@@ -1027,7 +1207,7 @@ pub unsafe extern "system" fn rtl_ansi_string_to_unicode_string(
         unsafe {
             for i in 0..out_units {
                 let b = core::ptr::read(sbuf.add(i));
-                core::ptr::write(dbuf.add(i), rtl::convert::ansi_char_to_unicode_char(b));
+                core::ptr::write(dbuf.add(i), nls_ansi_widen_byte(b));
             }
             core::ptr::write(dbuf.add(out_units), 0); // NUL
             (*dst).length = out_bytes as u16;
@@ -1058,6 +1238,9 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 ) -> NtStatus {
     if dst.is_null() || src.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_ansi_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
     }
     // SAFETY: src is a valid UNICODE_STRING per the contract.
     let sunits = unsafe { us_slice(src) };
@@ -1092,7 +1275,7 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
         // SAFETY: dbuf..dbuf+out_bytes+1 is valid per the checks above.
         unsafe {
             for (i, &c) in sunits.iter().enumerate() {
-                core::ptr::write(dbuf.add(i), rtl::convert::CodePage::LATIN1.narrow_unit(c));
+                core::ptr::write(dbuf.add(i), nls_ansi_narrow_unit(c));
             }
             core::ptr::write(dbuf.add(out_bytes), 0); // NUL
             (*dst).length = out_bytes as u16;
@@ -3402,7 +3585,7 @@ pub unsafe extern "C" fn wcsupr(s: *mut u16) -> *mut u16 {
         // SAFETY: i < n, within the writable buffer.
         unsafe {
             let c = *s.add(i);
-            *s.add(i) = rtl::strings::upcase_char(c);
+            *s.add(i) = nls_upcase_unit(c);
         }
     }
     s
@@ -4058,8 +4241,8 @@ pub unsafe extern "C" fn wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32
     // SAFETY: caller contract; NUL short-circuits before `n`.
     unsafe {
         for i in 0..n {
-            let ca = rtl::strings::upcase_char(*a.add(i));
-            let cb = rtl::strings::upcase_char(*b.add(i));
+            let ca = nls_upcase_unit(*a.add(i));
+            let cb = nls_upcase_unit(*b.add(i));
             if ca != cb {
                 return if ca < cb { -1 } else { 1 };
             }
@@ -6066,6 +6249,147 @@ pub unsafe extern "system" fn rtl_determine_dos_path_name_type_ustr(path: PCUnic
 #[export_name = "RtlGetLongestNtPathLength"]
 pub extern "system" fn rtl_get_longest_nt_path_length() -> u32 {
     269
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_unicode_string_buffer_ensure_bytes(
+    path: *mut c_void,
+    required: usize,
+) -> Result<(*mut u8, usize), NtStatus> {
+    let byte_buffer = (path as *mut u8).add(16);
+    let current = core::ptr::read_unaligned(byte_buffer as *const u64) as *mut u8;
+    let size = core::ptr::read_unaligned(byte_buffer.add(16) as *const usize);
+    if !current.is_null() && size >= required {
+        return Ok((current, size));
+    }
+
+    let static_buffer = core::ptr::read_unaligned(byte_buffer.add(8) as *const u64) as *mut u8;
+    let static_size = core::ptr::read_unaligned(byte_buffer.add(24) as *const usize);
+    if !static_buffer.is_null() && static_size >= required {
+        core::ptr::write_unaligned(byte_buffer as *mut u64, static_buffer as u64);
+        core::ptr::write_unaligned(byte_buffer.add(16) as *mut usize, static_size);
+        return Ok((static_buffer, static_size));
+    }
+
+    let allocated = crate::process_heap_alloc(required.max(2));
+    if allocated.is_null() {
+        return Err(STATUS_NO_MEMORY);
+    }
+    core::ptr::write_unaligned(byte_buffer as *mut u64, allocated as u64);
+    core::ptr::write_unaligned(byte_buffer.add(16) as *mut usize, required.max(2));
+    Ok((allocated, required.max(2)))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn unicode_prefix(path: &[u16], prefix: &[u16], case_insensitive: bool) -> bool {
+    if path.len() < prefix.len() {
+        return false;
+    }
+    path.iter().zip(prefix).all(|(&a, &b)| {
+        if case_insensitive {
+            nls_upcase_unit(a) == nls_upcase_unit(b)
+        } else {
+            a == b
+        }
+    })
+}
+
+/// `RtlNtPathNameToDosPathName(ULONG, PRTL_UNICODE_STRING_BUFFER, PULONG, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `path` points to an `RTL_UNICODE_STRING_BUFFER`; `path_type` is null or writable.
+#[export_name = "RtlNtPathNameToDosPathName"]
+pub unsafe extern "system" fn rtl_nt_path_name_to_dos_path_name(
+    flags: u32,
+    path: *mut c_void,
+    path_type: *mut u32,
+    _unknown: *mut u32,
+) -> NtStatus {
+    if !path_type.is_null() {
+        unsafe { *path_type = 0 };
+    }
+    if flags != 0 || path.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let string = path as PUnicodeString;
+        let length_bytes = (*string).length as usize;
+        let buffer = (*string).buffer as *mut u16;
+        if buffer.is_null() && length_bytes != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let input = if length_bytes == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(buffer, length_bytes / 2)
+        };
+        let dos_devices_unc: [u16; 8] = [
+            b'\\' as u16,
+            b'?' as u16,
+            b'?' as u16,
+            b'\\' as u16,
+            b'U' as u16,
+            b'N' as u16,
+            b'C' as u16,
+            b'\\' as u16,
+        ];
+        let dos_devices: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+
+        let (prefix_units, alternate_unc, converted_type) =
+            if unicode_prefix(input, &dos_devices_unc, true) {
+                (dos_devices_unc.len(), true, 2u32) // RTL_CONVERTED_UNC_PATH
+            } else if unicode_prefix(input, &dos_devices, false) {
+                (dos_devices.len(), false, 3u32) // RTL_CONVERTED_NT_PATH
+            } else {
+                if !path_type.is_null() {
+                    let path_type_value = match rtl_determine_dos_path_name_type_u_slice(input) {
+                        1 | 2 | 6 | 7 => 4, // RTL_UNCHANGED_DOS_PATH
+                        _ => 1,             // RTL_UNCHANGED_UNK_PATH
+                    };
+                    *path_type = path_type_value;
+                }
+                return STATUS_SUCCESS;
+            };
+
+        if !path_type.is_null() {
+            *path_type = converted_type;
+        }
+
+        let output_units = input
+            .len()
+            .saturating_sub(prefix_units)
+            .saturating_add(if alternate_unc { 2 } else { 0 });
+        let output_bytes = output_units * 2;
+        let (dst_bytes, capacity) =
+            match rtl_unicode_string_buffer_ensure_bytes(path, output_bytes + 2) {
+                Ok(v) => v,
+                Err(status) => return status,
+            };
+        let dst = dst_bytes as *mut u16;
+
+        if alternate_unc {
+            core::ptr::write_unaligned(dst, b'\\' as u16);
+            core::ptr::write_unaligned(dst.add(1), b'\\' as u16);
+            core::ptr::copy(
+                buffer.add(prefix_units),
+                dst.add(2),
+                input.len() - prefix_units,
+            );
+        } else {
+            core::ptr::copy(buffer.add(prefix_units), dst, input.len() - prefix_units);
+        }
+        core::ptr::write_unaligned(dst.add(output_units), 0);
+        (*string).buffer = dst as u64;
+        (*string).length = output_bytes as u16;
+        (*string).maximum_length = capacity.min(u16::MAX as usize) as u16;
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlGetLengthWithoutTrailingPathSeperators(ULONG, PCUNICODE_STRING, PULONG) -> NTSTATUS`.
@@ -12389,8 +12713,8 @@ pub unsafe extern "system" fn rtl_compare_unicode_strings(
     for i in 0..min_len {
         let (mut c1, mut c2) = unsafe { (*string1.add(i), *string2.add(i)) };
         if case_insensitive != 0 {
-            c1 = rtl::strings::upcase_char(c1);
-            c2 = rtl::strings::upcase_char(c2);
+            c1 = nls_upcase_unit(c1);
+            c2 = nls_upcase_unit(c2);
         }
         let diff = c1 as i32 - c2 as i32;
         if diff != 0 {
@@ -12485,8 +12809,7 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string(
         // SAFETY: valid region of slen units.
         unsafe { core::slice::from_raw_parts(sbuf, slen) }
     };
-    let up = rtl::strings::upcase_unicode_string(src_slice);
-    let out_bytes = up.len() * 2;
+    let out_bytes = src_slice.len() * 2;
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: dst valid per the contract.
@@ -12511,9 +12834,11 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string(
                 (*dst).buffer as *mut u16
             }
         };
-        // SAFETY: dbuf valid for up.len() units.
+        // SAFETY: dbuf valid for src_slice.len() units.
         unsafe {
-            core::ptr::copy_nonoverlapping(up.as_ptr(), dbuf, up.len());
+            for (i, &unit) in src_slice.iter().enumerate() {
+                core::ptr::write(dbuf.add(i), nls_upcase_unit(unit));
+            }
             (*dst).length = out_bytes as u16;
         }
         STATUS_SUCCESS
@@ -12549,8 +12874,7 @@ pub unsafe extern "system" fn rtl_downcase_unicode_string(
         // SAFETY: valid region of slen units.
         unsafe { core::slice::from_raw_parts(sbuf, slen) }
     };
-    let down = rtl::strings::downcase_unicode_string(src_slice);
-    let out_bytes = down.len() * 2;
+    let out_bytes = src_slice.len() * 2;
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: dst valid per the contract.
@@ -12587,9 +12911,11 @@ pub unsafe extern "system" fn rtl_downcase_unicode_string(
         if out_bytes != 0 && dbuf.is_null() {
             return STATUS_INVALID_PARAMETER;
         }
-        // SAFETY: dbuf valid for down.len() units.
+        // SAFETY: dbuf valid for src_slice.len() units.
         unsafe {
-            core::ptr::copy_nonoverlapping(down.as_ptr(), dbuf, down.len());
+            for (i, &unit) in src_slice.iter().enumerate() {
+                core::ptr::write(dbuf.add(i), nls_downcase_unit(unit));
+            }
             (*dst).length = out_bytes as u16;
         }
         STATUS_SUCCESS
@@ -12789,6 +13115,9 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
     if oem_dest.is_null() || uni_source.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    if nls_is_oem_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
     // SAFETY: uni_source valid per the contract.
     let (sbuf, sunits) = unsafe {
         (
@@ -12830,8 +13159,8 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
         // SAFETY: dbuf valid for oem_len + 1 bytes per the alloc/overflow checks.
         unsafe {
             for (i, &u) in src.iter().enumerate() {
-                let up = rtl::strings::upcase_char(u);
-                core::ptr::write(dbuf.add(i), rtl::convert::CodePage::LATIN1.narrow_unit(up));
+                let up = nls_upcase_unit(u);
+                core::ptr::write(dbuf.add(i), nls_oem_narrow_unit(up));
             }
             core::ptr::write(dbuf.add(oem_len), 0);
             (*oem_dest).length = oem_len as u16;
@@ -12856,8 +13185,64 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_ansi_string(
     uni_source: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    // SAFETY: same 16-byte STRING shape and single-byte fallback code page.
-    unsafe { rtl_upcase_unicode_string_to_oem_string(ansi_dest, uni_source, allocate) }
+    if ansi_dest.is_null() || uni_source.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_ansi_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // SAFETY: uni_source valid per the contract.
+    let (sbuf, sunits) = unsafe {
+        (
+            (*uni_source).buffer as *const u16,
+            (*uni_source).length as usize / 2,
+        )
+    };
+    let src = if sbuf.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: valid region of sunits units per the contract.
+        unsafe { core::slice::from_raw_parts(sbuf, sunits) }
+    };
+    let ansi_len = src.len();
+    if ansi_len + 1 > 0xFFFF {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: ansi_dest writable per the contract.
+        let dbuf = unsafe {
+            if allocate != 0 {
+                let p = crate::process_heap_alloc(ansi_len + 1) as *mut u8;
+                if p.is_null() {
+                    return STATUS_NO_MEMORY;
+                }
+                (*ansi_dest).buffer = p as u64;
+                (*ansi_dest).maximum_length = (ansi_len + 1) as u16;
+                p
+            } else {
+                if ansi_len >= (*ansi_dest).maximum_length as usize {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                (*ansi_dest).buffer as *mut u8
+            }
+        };
+        // SAFETY: dbuf valid for ansi_len + 1 bytes per the alloc/overflow checks.
+        unsafe {
+            for (i, &u) in src.iter().enumerate() {
+                let up = nls_upcase_unit(u);
+                core::ptr::write(dbuf.add(i), nls_ansi_narrow_unit(up));
+            }
+            core::ptr::write(dbuf.add(ansi_len), 0);
+            (*ansi_dest).length = ansi_len as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = allocate;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlUpcaseUnicodeStringToCountedOemString(POEM_STRING, PCUNICODE_STRING, BOOLEAN)`.
@@ -12960,7 +13345,7 @@ pub unsafe extern "system" fn rtl_create_unicode_string_from_asciiz(
         // SAFETY: widen each byte; buffers valid.
         unsafe {
             for i in 0..n {
-                *p.add(i) = rtl::convert::ansi_char_to_unicode_char(*src.add(i));
+                *p.add(i) = nls_ansi_widen_byte(*src.add(i));
             }
             *p.add(n) = 0;
             (*dst).length = out_bytes as u16;
@@ -13091,7 +13476,7 @@ pub unsafe extern "system" fn rtl_ansi_char_to_unicode_char(src: *mut *const u8)
         let p = *src;
         let b = *p;
         *src = p.add(1);
-        rtl::convert::ansi_char_to_unicode_char(b)
+        nls_ansi_widen_byte(b)
     }
 }
 
@@ -13171,7 +13556,11 @@ unsafe fn rtl_upcase_unicode_to_single_byte_n(
     bytes_out: *mut u32,
     unicode_str: *const u16,
     bytes_in_unicode: u32,
+    oem: bool,
 ) -> NtStatus {
+    if (oem && nls_is_oem_dbcs()) || (!oem && nls_is_ansi_dbcs()) {
+        return STATUS_NOT_IMPLEMENTED;
+    }
     let units = bytes_in_unicode as usize / 2;
     let n = core::cmp::min(units, dst_size as usize);
     if n != 0 && (dst.is_null() || unicode_str.is_null()) {
@@ -13180,8 +13569,12 @@ unsafe fn rtl_upcase_unicode_to_single_byte_n(
     // SAFETY: buffers valid for `n` units/bytes by caller contract and checks above.
     unsafe {
         for i in 0..n {
-            let up = rtl::strings::upcase_char(*unicode_str.add(i));
-            *dst.add(i) = rtl::convert::CodePage::LATIN1.narrow_unit(up);
+            let up = nls_upcase_unit(*unicode_str.add(i));
+            *dst.add(i) = if oem {
+                nls_oem_narrow_unit(up)
+            } else {
+                nls_ansi_narrow_unit(up)
+            };
         }
         if !bytes_out.is_null() {
             *bytes_out = n as u32;
@@ -13261,7 +13654,7 @@ unsafe fn rtl_unicode_to_custom_cp_n_impl(
         for i in 0..count {
             let mut unit = *unicode_string.add(i);
             if upcase {
-                unit = rtl::strings::upcase_char(unit);
+                unit = nls_upcase_unit(unit);
             }
             *custom_string.add(i) = *widechar.add(unit as usize);
         }
@@ -13280,6 +13673,9 @@ unsafe fn rtl_unicode_string_to_counted_oem_string_impl(
 ) -> NtStatus {
     if dst.is_null() || src.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_oem_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
     }
     // SAFETY: src valid per the contract.
     let sunits = unsafe { us_slice(src) };
@@ -13325,12 +13721,12 @@ unsafe fn rtl_unicode_string_to_counted_oem_string_impl(
         unsafe {
             for (i, &original) in sunits.iter().enumerate() {
                 let unit = if upcase {
-                    rtl::strings::upcase_char(original)
+                    nls_upcase_unit(original)
                 } else {
                     original
                 };
-                let byte = rtl::convert::CodePage::LATIN1.narrow_unit(unit);
-                if byte == b'?' && original != b'?' as u16 {
+                let byte = nls_oem_narrow_unit(unit);
+                if byte == nls_oem_default_char() && original != nls_unicode_default_char() {
                     status = STATUS_UNMAPPABLE_CHARACTER;
                 }
                 core::ptr::write(dbuf.add(i), byte);
@@ -13367,13 +13763,16 @@ pub unsafe extern "system" fn rtl_unicode_to_multi_byte_n(
     unicode_str: *const u16,
     bytes_in_unicode: u32,
 ) -> NtStatus {
+    if nls_is_ansi_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
     let units = bytes_in_unicode as usize / 2;
     let n = core::cmp::min(units, mb_size as usize);
     // SAFETY: unicode_str valid for `units`; mb_str writable for `mb_size`.
     unsafe {
         for i in 0..n {
             let c = *unicode_str.add(i);
-            *mb_str.add(i) = if c < 0x100 { c as u8 } else { b'?' };
+            *mb_str.add(i) = nls_ansi_narrow_unit(c);
         }
         if !bytes_out.is_null() {
             *bytes_out = n as u32;
@@ -13394,10 +13793,22 @@ pub unsafe extern "system" fn rtl_unicode_to_oem_n(
     unicode_str: *const u16,
     bytes_in_unicode: u32,
 ) -> NtStatus {
-    // SAFETY: same contract.
-    unsafe {
-        rtl_unicode_to_multi_byte_n(oem_str, oem_size, bytes_out, unicode_str, bytes_in_unicode)
+    if nls_is_oem_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
     }
+    let units = bytes_in_unicode as usize / 2;
+    let n = core::cmp::min(units, oem_size as usize);
+    // SAFETY: buffers valid per the contract.
+    unsafe {
+        for i in 0..n {
+            let c = *unicode_str.add(i);
+            *oem_str.add(i) = nls_oem_narrow_unit(c);
+        }
+        if !bytes_out.is_null() {
+            *bytes_out = n as u32;
+        }
+    }
+    STATUS_SUCCESS
 }
 
 /// `RtlUpcaseUnicodeToMultiByteN(PCHAR, ULONG, PULONG, PCWCH, ULONG) -> NTSTATUS` — uppercase
@@ -13422,6 +13833,7 @@ pub unsafe extern "system" fn rtl_upcase_unicode_to_multi_byte_n(
             bytes_out,
             unicode_str,
             bytes_in_unicode,
+            false,
         )
     }
 }
@@ -13447,6 +13859,7 @@ pub unsafe extern "system" fn rtl_upcase_unicode_to_oem_n(
             bytes_out,
             unicode_str,
             bytes_in_unicode,
+            true,
         )
     }
 }
@@ -13544,12 +13957,15 @@ pub unsafe extern "system" fn rtl_multi_byte_to_unicode_n(
     mb_str: *const u8,
     bytes_in_mb: u32,
 ) -> NtStatus {
+    if nls_is_ansi_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
     let max_units = unicode_size as usize / 2;
     let n = core::cmp::min(bytes_in_mb as usize, max_units);
     // SAFETY: buffers valid per the contract.
     unsafe {
         for i in 0..n {
-            *unicode_str.add(i) = rtl::convert::ansi_char_to_unicode_char(*mb_str.add(i));
+            *unicode_str.add(i) = nls_ansi_widen_byte(*mb_str.add(i));
         }
         if !bytes_out.is_null() {
             *bytes_out = (n * 2) as u32;
@@ -13571,10 +13987,21 @@ pub unsafe extern "system" fn rtl_oem_to_unicode_n(
     oem_str: *const u8,
     bytes_in_oem: u32,
 ) -> NtStatus {
-    // SAFETY: same single-byte conversion contract.
-    unsafe {
-        rtl_multi_byte_to_unicode_n(unicode_str, unicode_size, bytes_out, oem_str, bytes_in_oem)
+    if nls_is_oem_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
     }
+    let max_units = unicode_size as usize / 2;
+    let n = core::cmp::min(bytes_in_oem as usize, max_units);
+    // SAFETY: buffers valid per the contract.
+    unsafe {
+        for i in 0..n {
+            *unicode_str.add(i) = nls_oem_widen_byte(*oem_str.add(i));
+        }
+        if !bytes_out.is_null() {
+            *bytes_out = (n * 2) as u32;
+        }
+    }
+    STATUS_SUCCESS
 }
 
 /// `RtlConsoleMultiByteToUnicodeN(PWCH UnicodeStr, ULONG UnicodeSize, PULONG BytesOut,
@@ -13649,8 +14076,58 @@ pub unsafe extern "system" fn rtl_oem_string_to_unicode_string(
     src: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    // SAFETY: same 16-byte STRING shape + single-byte code page.
-    unsafe { rtl_ansi_string_to_unicode_string(dst, src, allocate) }
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if nls_is_oem_dbcs() {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    // SAFETY: src is a valid OEM_STRING (same 16-byte shape) per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u8, (*src).length as usize) };
+    let out_bytes = slen * 2;
+    let with_nul = out_bytes + 2;
+    if with_nul > 0xFFFF {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dbuf = if allocate != 0 {
+            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
+            let p = unsafe { crate::process_heap_alloc(with_nul) } as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = with_nul as u16;
+            }
+            p
+        } else {
+            unsafe {
+                if (*dst).maximum_length < with_nul as u16 {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                (*dst).buffer as *mut u16
+            }
+        };
+        // SAFETY: buffers valid per the checks.
+        unsafe {
+            for i in 0..slen {
+                core::ptr::write(
+                    dbuf.add(i),
+                    nls_oem_widen_byte(core::ptr::read(sbuf.add(i))),
+                );
+            }
+            core::ptr::write(dbuf.add(slen), 0);
+            (*dst).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, sbuf, slen);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlUnicodeStringToOemString(POEM_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` —
@@ -13698,7 +14175,7 @@ pub unsafe extern "system" fn rtl_unicode_string_to_oem_string(
         unsafe {
             for i in 0..sunits {
                 let c = *sbuf.add(i);
-                *dbuf.add(i) = if c < 0x100 { c as u8 } else { b'?' };
+                *dbuf.add(i) = nls_oem_narrow_unit(c);
             }
             *dbuf.add(sunits) = 0;
             (*dst).length = sunits as u16;
@@ -13981,14 +14458,14 @@ pub unsafe extern "system" fn rtl_init_code_page_table(table: *const u16, cp_tab
     unsafe {
         let hdr = table; // PUSHORT view of the NLS_FILE_HEADER
         let header_size = *hdr as usize; // HeaderSize (in USHORTs)
-        core::ptr::write_bytes(cp_table as *mut u8, 0, 0x40);
+        core::ptr::write_bytes(cp_table as *mut u8, 0, NLS_CPTABLEINFO_SIZE);
         let cp = cp_table as *mut u8;
         // Copy the header scalar fields.
-        *(cp.add(0x00) as *mut u16) = *hdr.add(1); // CodePage
+        *(cp.add(NLS_CP_CODE_PAGE) as *mut u16) = *hdr.add(1); // CodePage
         *(cp.add(0x02) as *mut u16) = *hdr.add(2); // MaximumCharacterSize
-        *(cp.add(0x04) as *mut u16) = *hdr.add(3); // DefaultChar
+        *(cp.add(NLS_CP_DEFAULT_CHAR) as *mut u16) = *hdr.add(3); // DefaultChar
         *(cp.add(0x06) as *mut u16) = *hdr.add(4); // UniDefaultChar
-        *(cp.add(0x08) as *mut u16) = *hdr.add(5); // TransDefaultChar
+        *(cp.add(NLS_CP_TRANS_DEFAULT_CHAR) as *mut u16) = *hdr.add(5); // TransDefaultChar
         *(cp.add(0x0A) as *mut u16) = *hdr.add(6); // TransUniDefaultChar
                                                    // LeadByte[MAXIMUM_LEADBYTES=12] — the 12 bytes at header USHORT index 7 (byte 0x0E).
         core::ptr::copy_nonoverlapping(
@@ -14000,9 +14477,9 @@ pub unsafe extern "system" fn rtl_init_code_page_table(table: *const u16, cp_tab
         let multibyte = hdr.add(header_size + 1);
         // WideCharTable = MultiByteTable + TableBase[HeaderSize] (the size word preceding it).
         let widechar = hdr.add(header_size + 1 + (*hdr.add(header_size) as usize)) as *const c_void;
-        *(cp.add(0x20) as *mut *const u16) = multibyte; // MultiByteTable
-        *(cp.add(0x28) as *mut *const c_void) = widechar; // WideCharTable
-                                                          // Glyph table (256 wchars) present? If MultiByteTable[256] == 0, no glyph table.
+        *(cp.add(NLS_CP_MULTI_BYTE_TABLE) as *mut *const u16) = multibyte; // MultiByteTable
+        *(cp.add(NLS_CP_WIDE_CHAR_TABLE) as *mut *const c_void) = widechar; // WideCharTable
+                                                                            // Glyph table (256 wchars) present? If MultiByteTable[256] == 0, no glyph table.
         let dbcs_ranges = if *multibyte.add(256) == 0 {
             multibyte.add(256 + 1)
         } else {
@@ -14010,10 +14487,108 @@ pub unsafe extern "system" fn rtl_init_code_page_table(table: *const u16, cp_tab
         };
         *(cp.add(0x30) as *mut *const u16) = dbcs_ranges; // DBCSRanges
         if *dbcs_ranges != 0 {
-            *(cp.add(0x0C) as *mut u16) = 1; // DBCSCodePage = 1
-            *(cp.add(0x38) as *mut *const u16) = dbcs_ranges.add(1); // DBCSOffsets
+            *(cp.add(NLS_CP_DBCS_CODE_PAGE) as *mut u16) = 1; // DBCSCodePage = 1
+            *(cp.add(NLS_CP_DBCS_OFFSETS) as *mut *const u16) = dbcs_ranges.add(1);
+            // DBCSOffsets
         }
         // else: DBCSCodePage = 0, DBCSOffsets = NULL (already zeroed).
+    }
+}
+
+/// `RtlInitNlsTables(PUSHORT AnsiTableBase, PUSHORT OemTableBase, PUSHORT CaseTableBase,
+/// PNLSTABLEINFO NlsTable)`.
+///
+/// # Safety
+/// Table bases point at mapped NLS tables; `nls_table` is writable for an `NLSTABLEINFO`.
+#[export_name = "RtlInitNlsTables"]
+pub unsafe extern "system" fn rtl_init_nls_tables(
+    ansi_table_base: *const u16,
+    oem_table_base: *const u16,
+    case_table_base: *const u16,
+    nls_table: *mut c_void,
+) {
+    if nls_table.is_null()
+        || ansi_table_base.is_null()
+        || oem_table_base.is_null()
+        || case_table_base.is_null()
+    {
+        return;
+    }
+    // SAFETY: nls_table writable; table bases readable per the contract.
+    unsafe {
+        core::ptr::write_bytes(
+            nls_table as *mut u8,
+            0,
+            NLS_TABLEINFO_LOWER_OFFSET + core::mem::size_of::<*const u16>(),
+        );
+        rtl_init_code_page_table(
+            ansi_table_base,
+            (nls_table as *mut u8).add(NLS_TABLEINFO_ANSI_OFFSET) as *mut c_void,
+        );
+        rtl_init_code_page_table(
+            oem_table_base,
+            (nls_table as *mut u8).add(NLS_TABLEINFO_OEM_OFFSET) as *mut c_void,
+        );
+        let upper = case_table_base.add(2);
+        let lower = case_table_base.add(*case_table_base.add(1) as usize + 2);
+        core::ptr::write_unaligned(
+            (nls_table as *mut u8).add(NLS_TABLEINFO_UPPER_OFFSET) as *mut *const u16,
+            upper,
+        );
+        core::ptr::write_unaligned(
+            (nls_table as *mut u8).add(NLS_TABLEINFO_LOWER_OFFSET) as *mut *const u16,
+            lower,
+        );
+    }
+}
+
+/// `RtlResetRtlTranslations(PNLSTABLEINFO NlsTable)`.
+///
+/// # Safety
+/// `nls_table` points at an initialized `NLSTABLEINFO`.
+#[export_name = "RtlResetRtlTranslations"]
+pub unsafe extern "system" fn rtl_reset_rtl_translations(nls_table: *const c_void) {
+    if nls_table.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let table = nls_table as *const u8;
+        let ansi = table.add(NLS_TABLEINFO_ANSI_OFFSET);
+        let oem = table.add(NLS_TABLEINFO_OEM_OFFSET);
+        NLS_ANSI_TO_UNICODE_TABLE =
+            core::ptr::read_unaligned(ansi.add(NLS_CP_MULTI_BYTE_TABLE) as *const *const u16);
+        NLS_UNICODE_TO_ANSI_TABLE =
+            core::ptr::read_unaligned(ansi.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u8);
+        NLS_ANSI_DEFAULT_CHAR =
+            core::ptr::read_unaligned(ansi.add(NLS_CP_DEFAULT_CHAR) as *const u16) as u8;
+
+        NLS_OEM_TO_UNICODE_TABLE =
+            core::ptr::read_unaligned(oem.add(NLS_CP_MULTI_BYTE_TABLE) as *const *const u16);
+        NLS_UNICODE_TO_OEM_TABLE =
+            core::ptr::read_unaligned(oem.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u8);
+        NLS_OEM_DEFAULT_CHAR =
+            core::ptr::read_unaligned(oem.add(NLS_CP_DEFAULT_CHAR) as *const u16) as u8;
+        NLS_UNICODE_DEFAULT_CHAR =
+            core::ptr::read_unaligned(oem.add(NLS_CP_TRANS_DEFAULT_CHAR) as *const u16);
+
+        NLS_UNICODE_UPCASE_TABLE =
+            core::ptr::read_unaligned(table.add(NLS_TABLEINFO_UPPER_OFFSET) as *const *const u16);
+        NLS_UNICODE_LOWERCASE_TABLE =
+            core::ptr::read_unaligned(table.add(NLS_TABLEINFO_LOWER_OFFSET) as *const *const u16);
+
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(NLS_ANSI_CODE_PAGE),
+            core::ptr::read_unaligned(ansi.add(NLS_CP_CODE_PAGE) as *const u16),
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(NLS_MB_CODE_PAGE_TAG),
+            u8::from(core::ptr::read_unaligned(ansi.add(NLS_CP_DBCS_CODE_PAGE) as *const u16) != 0),
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(NLS_MB_OEM_CODE_PAGE_TAG),
+            u8::from(core::ptr::read_unaligned(oem.add(NLS_CP_DBCS_CODE_PAGE) as *const u16) != 0),
+        );
     }
 }
 
@@ -15183,17 +15758,17 @@ unsafe fn alloc_bstr(wide: &[u16]) -> *mut u16 {
 /// `USHORT NlsAnsiCodePage` — ANSI code page used by the fallback NLS conversion path.
 #[used]
 #[export_name = "NlsAnsiCodePage"]
-pub static NLS_ANSI_CODE_PAGE: u16 = nt_ntdll::nls::ANSI_CODE_PAGE;
+pub static mut NLS_ANSI_CODE_PAGE: u16 = nt_ntdll::nls::ANSI_CODE_PAGE;
 
 /// `BOOLEAN NlsMbCodePageTag` — FALSE (the 1252 ANSI default is single-byte).
 #[used]
 #[export_name = "NlsMbCodePageTag"]
-pub static NLS_MB_CODE_PAGE_TAG: u8 = 0;
+pub static mut NLS_MB_CODE_PAGE_TAG: u8 = 0;
 
 /// `BOOLEAN NlsMbOemCodePageTag` — FALSE (the 437 OEM default is single-byte).
 #[used]
 #[export_name = "NlsMbOemCodePageTag"]
-pub static NLS_MB_OEM_CODE_PAGE_TAG: u8 = 0;
+pub static mut NLS_MB_OEM_CODE_PAGE_TAG: u8 = 0;
 
 // =================================================================================================
 // Retention anchor — mirror the Nt* TRAP_STUB_ADDRS pattern so the linker keeps every export past
@@ -15491,9 +16066,9 @@ pub unsafe extern "C" fn export_anchor() {
         alpc_register_completion_list_worker_thread as usize,
         alpc_unregister_completion_list as usize,
         alpc_unregister_completion_list_worker_thread as usize,
-        &NLS_ANSI_CODE_PAGE as *const u16 as usize,
-        &NLS_MB_CODE_PAGE_TAG as *const u8 as usize,
-        &NLS_MB_OEM_CODE_PAGE_TAG as *const u8 as usize,
+        core::ptr::addr_of!(NLS_ANSI_CODE_PAGE) as usize,
+        core::ptr::addr_of!(NLS_MB_CODE_PAGE_TAG) as usize,
+        core::ptr::addr_of!(NLS_MB_OEM_CODE_PAGE_TAG) as usize,
         // BATCH 4 — Rtl* string / convert family.
         rtl_append_string_to_string as usize,
         rtl_append_asciiz_to_string as usize,
@@ -15549,6 +16124,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtlx_oem_string_to_unicode_size as usize,
         rtl_oem_string_to_unicode_size as usize,
         rtl_init_code_page_table as usize,
+        rtl_init_nls_tables as usize,
+        rtl_reset_rtl_translations as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors3: &[usize] = &[
@@ -15827,6 +16404,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_determine_dos_path_name_type_u as usize,
         rtl_determine_dos_path_name_type_ustr as usize,
         rtl_get_longest_nt_path_length as usize,
+        rtl_nt_path_name_to_dos_path_name as usize,
         rtl_get_length_without_trailing_path_seperators as usize,
         rtl_get_length_without_last_full_dos_or_nt_path_element as usize,
         rtlp_apply_length_function as usize,
