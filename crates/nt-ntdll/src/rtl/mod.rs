@@ -22,6 +22,7 @@ pub mod generic_table;
 pub mod guid;
 pub mod image;
 pub mod integer;
+pub mod memory;
 pub mod message;
 pub mod path;
 pub mod pe_resource;

@@ -3053,6 +3053,18 @@ pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut
     dst
 }
 
+/// `RtlCopyMemory(void* dst, const void* src, size_t n) -> void*` — x64 Vista+ ntdll exports this
+/// as the same body as `memmove`.
+///
+/// # Safety
+/// `dst`/`src` valid for `n` bytes.
+#[export_name = "RtlCopyMemory"]
+pub unsafe extern "C" fn rtl_copy_memory(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract; Windows aliases this export to memmove on x64.
+    unsafe { core::ptr::copy(src, dst, n) };
+    dst
+}
+
 /// `strchr(const char* s, int c) -> char*` — first occurrence of `c` (or NULL). Uses the host-tested
 /// `nt_ntdll::crt::strchr`.
 ///
@@ -6985,6 +6997,38 @@ pub unsafe extern "system" fn rtl_compare_memory(a: *const u8, b: *const u8, len
     sa.iter().zip(sb.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// `RtlCompareMemoryUlong(PVOID Source, SIZE_T Length, ULONG Value) -> SIZE_T`.
+///
+/// # Safety
+/// `source` valid for `length` bytes.
+#[export_name = "RtlCompareMemoryUlong"]
+pub unsafe extern "system" fn rtl_compare_memory_ulong(
+    source: *const u8,
+    length: usize,
+    value: u32,
+) -> usize {
+    if length == 0 {
+        return 0;
+    }
+    // SAFETY: source valid for length per the contract.
+    let bytes = unsafe { core::slice::from_raw_parts(source, length) };
+    nt_ntdll::rtl::memory::compare_memory_ulong(bytes, value)
+}
+
+/// `RtlCopyMemoryNonTemporal(void* dst, const void* src, size_t n)`.
+///
+/// # Safety
+/// `dst`/`src` valid for `n` bytes.
+#[export_name = "RtlCopyMemoryNonTemporal"]
+pub unsafe extern "system" fn rtl_copy_memory_non_temporal(
+    dst: *mut u8,
+    src: *const u8,
+    n: usize,
+) {
+    // SAFETY: same observable contract as RtlCopyMemory; non-temporal stores are an optimization.
+    unsafe { core::ptr::copy(src, dst, n) };
+}
+
 // ---- RTL_BITMAP family (raw RTL_BITMAP*: {SizeOfBitMap:u32@0, _pad, Buffer:*u32@8}) --------------
 
 /// `RtlInitializeBitMap(PRTL_BITMAP BitMapHeader, PULONG BitMapBuffer, ULONG SizeOfBitMap)`.
@@ -8889,13 +8933,38 @@ macro_rules! etw_ok {
 etw_ok!("EtwControlTraceA", etw_control_trace_a);
 etw_ok!("EtwControlTraceW", etw_control_trace_w);
 etw_ok!("EtwCreateTraceInstanceId", etw_create_trace_instance_id);
+etw_ok!("EtwDeliverDataBlock", etw_deliver_data_block);
 etw_ok!("EtwEnableTrace", etw_enable_trace);
+etw_ok!(
+    "EtwEnumerateProcessRegGuids",
+    etw_enumerate_process_reg_guids
+);
 etw_ok!("EtwEnumerateTraceGuids", etw_enumerate_trace_guids);
+etw_ok!(
+    "EtwEventActivityIdControl",
+    etw_event_activity_id_control
+);
+etw_ok!("EtwEventEnabled", etw_event_enabled);
+etw_ok!("EtwEventProviderEnabled", etw_event_provider_enabled);
+etw_ok!("EtwEventRegister", etw_event_register);
+etw_ok!("EtwEventSetInformation", etw_event_set_information);
+etw_ok!("EtwEventUnregister", etw_event_unregister);
+etw_ok!("EtwEventWrite", etw_event_write);
+etw_ok!("EtwEventWriteEndScenario", etw_event_write_end_scenario);
+etw_ok!("EtwEventWriteFull", etw_event_write_full);
+etw_ok!(
+    "EtwEventWriteStartScenario",
+    etw_event_write_start_scenario
+);
+etw_ok!("EtwEventWriteString", etw_event_write_string);
+etw_ok!("EtwEventWriteTransfer", etw_event_write_transfer);
 etw_ok!("EtwFlushTraceA", etw_flush_trace_a);
 etw_ok!("EtwFlushTraceW", etw_flush_trace_w);
 etw_ok!("EtwGetTraceEnableFlags", etw_get_trace_enable_flags);
 etw_ok!("EtwGetTraceEnableLevel", etw_get_trace_enable_level);
 etw_ok!("EtwGetTraceLoggerHandle", etw_get_trace_logger_handle);
+etw_ok!("EtwLogTraceEvent", etw_log_trace_event);
+etw_ok!("EtwNotificationRegister", etw_notification_register);
 etw_ok!(
     "EtwNotificationRegistrationA",
     etw_notification_registration_a
@@ -8904,14 +8973,27 @@ etw_ok!(
     "EtwNotificationRegistrationW",
     etw_notification_registration_w
 );
+etw_ok!(
+    "EtwNotificationUnregister",
+    etw_notification_unregister
+);
+etw_ok!(
+    "EtwProcessPrivateLoggerRequest",
+    etw_process_private_logger_request
+);
 etw_ok!("EtwQueryAllTracesA", etw_query_all_traces_a);
 etw_ok!("EtwQueryAllTracesW", etw_query_all_traces_w);
 etw_ok!("EtwQueryTraceA", etw_query_trace_a);
 etw_ok!("EtwQueryTraceW", etw_query_trace_w);
 etw_ok!("EtwReceiveNotificationsA", etw_receive_notifications_a);
 etw_ok!("EtwReceiveNotificationsW", etw_receive_notifications_w);
+etw_ok!("EtwRegister", etw_register);
+etw_ok!("EtwRegisterSecurityProvider", etw_register_security_provider);
 etw_ok!("EtwRegisterTraceGuidsA", etw_register_trace_guids_a);
 etw_ok!("EtwRegisterTraceGuidsW", etw_register_trace_guids_w);
+etw_ok!("EtwReplyNotification", etw_reply_notification);
+etw_ok!("EtwSendNotification", etw_send_notification);
+etw_ok!("EtwSetMark", etw_set_mark);
 etw_ok!("EtwStartTraceA", etw_start_trace_a);
 etw_ok!("EtwStartTraceW", etw_start_trace_w);
 etw_ok!("EtwStopTraceA", etw_stop_trace_a);
@@ -8920,9 +9002,17 @@ etw_ok!("EtwTraceEvent", etw_trace_event);
 etw_ok!("EtwTraceEventInstance", etw_trace_event_instance);
 etw_ok!("EtwTraceMessage", etw_trace_message);
 etw_ok!("EtwTraceMessageVa", etw_trace_message_va);
+etw_ok!("EtwUnregister", etw_unregister);
 etw_ok!("EtwUnregisterTraceGuids", etw_unregister_trace_guids);
 etw_ok!("EtwUpdateTraceA", etw_update_trace_a);
 etw_ok!("EtwUpdateTraceW", etw_update_trace_w);
+etw_ok!("EtwWrite", etw_write);
+etw_ok!("EtwWriteUMSecurityEvent", etw_write_um_security_event);
+etw_ok!("EtwpCreateEtwThread", etwp_create_etw_thread);
+etw_ok!("EtwpGetCpuSpeed", etwp_get_cpu_speed);
+etw_ok!("EtwpGetTraceBuffer", etwp_get_trace_buffer);
+etw_ok!("EtwpNotificationThread", etwp_notification_thread);
+etw_ok!("EtwpSetHWConfigFunction", etwp_set_hw_config_function);
 
 // =================================================================================================
 // BATCH 4 — Zw* aliases. Zw* and Nt* are identical exports (same SSN, same ABI) — real ntdll
@@ -10737,6 +10827,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_create_heap as usize,
         rtl_unhandled_exception_filter as usize,
         memmove as usize,
+        rtl_copy_memory as usize,
         strchr as usize,
         strncpy as usize,
         ldr_load_dll as usize,
@@ -10899,23 +10990,46 @@ pub unsafe extern "C" fn export_anchor() {
         etw_control_trace_a as usize,
         etw_control_trace_w as usize,
         etw_create_trace_instance_id as usize,
+        etw_deliver_data_block as usize,
         etw_enable_trace as usize,
+        etw_enumerate_process_reg_guids as usize,
         etw_enumerate_trace_guids as usize,
+        etw_event_activity_id_control as usize,
+        etw_event_enabled as usize,
+        etw_event_provider_enabled as usize,
+        etw_event_register as usize,
+        etw_event_set_information as usize,
+        etw_event_unregister as usize,
+        etw_event_write as usize,
+        etw_event_write_end_scenario as usize,
+        etw_event_write_full as usize,
+        etw_event_write_start_scenario as usize,
+        etw_event_write_string as usize,
+        etw_event_write_transfer as usize,
         etw_flush_trace_a as usize,
         etw_flush_trace_w as usize,
         etw_get_trace_enable_flags as usize,
         etw_get_trace_enable_level as usize,
         etw_get_trace_logger_handle as usize,
+        etw_log_trace_event as usize,
+        etw_notification_register as usize,
         etw_notification_registration_a as usize,
         etw_notification_registration_w as usize,
+        etw_notification_unregister as usize,
+        etw_process_private_logger_request as usize,
         etw_query_all_traces_a as usize,
         etw_query_all_traces_w as usize,
         etw_query_trace_a as usize,
         etw_query_trace_w as usize,
         etw_receive_notifications_a as usize,
         etw_receive_notifications_w as usize,
+        etw_register as usize,
+        etw_register_security_provider as usize,
         etw_register_trace_guids_a as usize,
         etw_register_trace_guids_w as usize,
+        etw_reply_notification as usize,
+        etw_send_notification as usize,
+        etw_set_mark as usize,
         etw_start_trace_a as usize,
         etw_start_trace_w as usize,
         etw_stop_trace_a as usize,
@@ -10924,9 +11038,17 @@ pub unsafe extern "C" fn export_anchor() {
         etw_trace_event_instance as usize,
         etw_trace_message as usize,
         etw_trace_message_va as usize,
+        etw_unregister as usize,
         etw_unregister_trace_guids as usize,
         etw_update_trace_a as usize,
         etw_update_trace_w as usize,
+        etw_write as usize,
+        etw_write_um_security_event as usize,
+        etwp_create_etw_thread as usize,
+        etwp_get_cpu_speed as usize,
+        etwp_get_trace_buffer as usize,
+        etwp_notification_thread as usize,
+        etwp_set_hw_config_function as usize,
     ];
     core::hint::black_box(anchors_etw);
     // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc.
@@ -10935,6 +11057,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_zero_memory as usize,
         rtl_move_memory as usize,
         rtl_compare_memory as usize,
+        rtl_compare_memory_ulong as usize,
+        rtl_copy_memory_non_temporal as usize,
         rtl_initialize_bit_map as usize,
         rtl_clear_all_bits as usize,
         rtl_set_all_bits as usize,
