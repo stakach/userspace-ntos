@@ -7663,6 +7663,46 @@ pub unsafe extern "system" fn rtl_string_from_guid(
 
 // ---- image (host-tested nt_ntdll::rtl::image over a mapped image byte slice) ----------------------
 
+const IMAGE_FILE_HEADER_SIZE: usize = 20;
+const IMAGE_SECTION_HEADER_SIZE: usize = 40;
+const IMAGE_OPTIONAL_HEADER32_MAGIC: u16 = 0x010B;
+const IMAGE_OPTIONAL_HEADER64_MAGIC: u16 = 0x020B;
+const IMAGE_FILE_HEADER_NUMBER_OF_SECTIONS_OFFSET: usize = 6;
+const IMAGE_FILE_HEADER_SIZE_OF_OPTIONAL_HEADER_OFFSET: usize = 20;
+const IMAGE_SECTION_VIRTUAL_ADDRESS_OFFSET: usize = 12;
+const IMAGE_SECTION_SIZE_OF_RAW_DATA_OFFSET: usize = 16;
+const IMAGE_SECTION_POINTER_TO_RAW_DATA_OFFSET: usize = 20;
+const IMAGE_OPTIONAL_HEADER_SIZE_OF_HEADERS_OFFSET: usize = 60;
+const IMAGE_OPTIONAL_HEADER32_NUMBER_OF_RVA_AND_SIZES_OFFSET: usize = 92;
+const IMAGE_OPTIONAL_HEADER32_DATA_DIRECTORY_OFFSET: usize = 96;
+const IMAGE_OPTIONAL_HEADER64_NUMBER_OF_RVA_AND_SIZES_OFFSET: usize = 108;
+const IMAGE_OPTIONAL_HEADER64_DATA_DIRECTORY_OFFSET: usize = 112;
+
+unsafe fn image_read_u16(base: *const c_void, offset: usize) -> u16 {
+    unsafe { core::ptr::read_unaligned((base as *const u8).add(offset) as *const u16) }
+}
+
+unsafe fn image_read_u32(base: *const c_void, offset: usize) -> u32 {
+    unsafe { core::ptr::read_unaligned((base as *const u8).add(offset) as *const u32) }
+}
+
+unsafe fn image_first_section(nt_headers: *mut c_void) -> *mut u8 {
+    let optional_size =
+        unsafe { image_read_u16(nt_headers, IMAGE_FILE_HEADER_SIZE_OF_OPTIONAL_HEADER_OFFSET) };
+    unsafe {
+        (nt_headers as *mut u8).add(4 + IMAGE_FILE_HEADER_SIZE + optional_size as usize)
+    }
+}
+
+unsafe fn image_section_contains_rva(section: *mut c_void, rva: u32) -> bool {
+    if section.is_null() {
+        return false;
+    }
+    let va = unsafe { image_read_u32(section, IMAGE_SECTION_VIRTUAL_ADDRESS_OFFSET) };
+    let raw_size = unsafe { image_read_u32(section, IMAGE_SECTION_SIZE_OF_RAW_DATA_OFFSET) };
+    rva >= va && rva < va.saturating_add(raw_size)
+}
+
 /// `RtlImageNtHeaderEx(ULONG Flags, PVOID Base, ULONG64 Size, PIMAGE_NT_HEADERS* OutHeaders)`.
 ///
 /// # Safety
@@ -7743,10 +7783,15 @@ pub unsafe extern "system" fn rtl_image_nt_header(base: *mut c_void) -> *mut c_v
 #[export_name = "RtlImageDirectoryEntryToData"]
 pub unsafe extern "system" fn rtl_image_directory_entry_to_data(
     base: *mut c_void,
-    _mapped_as_image: u8,
+    mut mapped_as_image: u8,
     directory_entry: u16,
     size: *mut u32,
 ) -> *mut c_void {
+    let mut base = base;
+    if (base as usize & 1) != 0 {
+        base = ((base as usize) & !1usize) as *mut c_void;
+        mapped_as_image = 0;
+    }
     // SAFETY: base a mapped image per the contract.
     let nt = unsafe { rtl_image_nt_header(base) };
     if nt.is_null() {
@@ -7758,11 +7803,21 @@ pub unsafe extern "system" fn rtl_image_directory_entry_to_data(
     unsafe {
         let opt = (nt as *const u8).add(0x18);
         let magic = *(opt as *const u16);
-        let dir_base = if magic == 0x20B {
-            opt.add(0x70)
-        } else {
-            opt.add(0x60)
+        let (rva_count_offset, dir_offset) = match magic {
+            IMAGE_OPTIONAL_HEADER64_MAGIC => (
+                IMAGE_OPTIONAL_HEADER64_NUMBER_OF_RVA_AND_SIZES_OFFSET,
+                IMAGE_OPTIONAL_HEADER64_DATA_DIRECTORY_OFFSET,
+            ),
+            IMAGE_OPTIONAL_HEADER32_MAGIC => (
+                IMAGE_OPTIONAL_HEADER32_NUMBER_OF_RVA_AND_SIZES_OFFSET,
+                IMAGE_OPTIONAL_HEADER32_DATA_DIRECTORY_OFFSET,
+            ),
+            _ => return core::ptr::null_mut(),
         };
+        if (directory_entry as u32) >= image_read_u32(opt as *const c_void, rva_count_offset) {
+            return core::ptr::null_mut();
+        }
+        let dir_base = opt.add(dir_offset);
         let entry = dir_base.add(directory_entry as usize * 8);
         let rva = *(entry as *const u32);
         let sz = *((entry as *const u32).add(1));
@@ -7772,27 +7827,85 @@ pub unsafe extern "system" fn rtl_image_directory_entry_to_data(
         if !size.is_null() {
             *size = sz;
         }
-        (base as *const u8).add(rva as usize) as *mut c_void
+        let size_of_headers = image_read_u32(
+            opt as *const c_void,
+            IMAGE_OPTIONAL_HEADER_SIZE_OF_HEADERS_OFFSET,
+        );
+        if mapped_as_image != 0 || rva < size_of_headers {
+            (base as *const u8).add(rva as usize) as *mut c_void
+        } else {
+            rtl_image_rva_to_va(nt, base, rva, core::ptr::null_mut())
+        }
     }
 }
 
-/// `RtlImageRvaToVa(PIMAGE_NT_HEADERS NtHeaders, PVOID Base, ULONG Rva, PIMAGE_SECTION_HEADER* Sec)
-/// -> PVOID`. For a mapped-as-image module the VA is simply base+rva.
+/// `RtlImageRvaToSection(PIMAGE_NT_HEADERS NtHeaders, PVOID Base, ULONG Rva)
+/// -> PIMAGE_SECTION_HEADER`.
 ///
 /// # Safety
-/// `base` a mapped PE image.
-#[export_name = "RtlImageRvaToVa"]
-pub unsafe extern "system" fn rtl_image_rva_to_va(
-    _nt_headers: *mut c_void,
-    base: *mut c_void,
+/// `nt_headers` points at a valid IMAGE_NT_HEADERS structure.
+#[export_name = "RtlImageRvaToSection"]
+pub unsafe extern "system" fn rtl_image_rva_to_section(
+    nt_headers: *mut c_void,
+    _base: *mut c_void,
     rva: u32,
-    _last_section: *mut *mut c_void,
 ) -> *mut c_void {
-    if base.is_null() {
+    if nt_headers.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: base mapped; base+rva is within the image per the contract.
-    unsafe { (base as *mut u8).add(rva as usize) as *mut c_void }
+    // SAFETY: nt_headers is valid per the contract.
+    unsafe {
+        let count = image_read_u16(nt_headers, IMAGE_FILE_HEADER_NUMBER_OF_SECTIONS_OFFSET);
+        let mut section = image_first_section(nt_headers);
+        for _ in 0..count {
+            let section_ptr = section as *mut c_void;
+            if image_section_contains_rva(section_ptr, rva) {
+                return section_ptr;
+            }
+            section = section.add(IMAGE_SECTION_HEADER_SIZE);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// `RtlImageRvaToVa(PIMAGE_NT_HEADERS NtHeaders, PVOID Base, ULONG Rva, PIMAGE_SECTION_HEADER* Sec)
+/// -> PVOID`.
+///
+/// # Safety
+/// `nt_headers` and `base` identify a PE image mapped as an ordinary file.
+#[export_name = "RtlImageRvaToVa"]
+pub unsafe extern "system" fn rtl_image_rva_to_va(
+    nt_headers: *mut c_void,
+    base: *mut c_void,
+    rva: u32,
+    last_section: *mut *mut c_void,
+) -> *mut c_void {
+    if nt_headers.is_null() || base.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: pointers are valid per the contract.
+    unsafe {
+        let mut section = if last_section.is_null() {
+            core::ptr::null_mut()
+        } else {
+            *last_section
+        };
+        if !image_section_contains_rva(section, rva) {
+            section = rtl_image_rva_to_section(nt_headers, base, rva);
+            if section.is_null() {
+                return core::ptr::null_mut();
+            }
+            if !last_section.is_null() {
+                *last_section = section;
+            }
+        }
+        let va = image_read_u32(section, IMAGE_SECTION_VIRTUAL_ADDRESS_OFFSET);
+        let raw = image_read_u32(section, IMAGE_SECTION_POINTER_TO_RAW_DATA_OFFSET);
+        let offset = (rva as usize)
+            .saturating_add(raw as usize)
+            .saturating_sub(va as usize);
+        (base as *mut u8).add(offset) as *mut c_void
+    }
 }
 
 /// `RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage) -> PVOID` — find the image base containing
@@ -16568,6 +16681,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_image_nt_header_ex as usize,
         rtl_image_nt_header as usize,
         rtl_image_directory_entry_to_data as usize,
+        rtl_image_rva_to_section as usize,
         rtl_image_rva_to_va as usize,
         rtl_pc_to_file_header as usize,
         rtl_initialize_handle_table as usize,
