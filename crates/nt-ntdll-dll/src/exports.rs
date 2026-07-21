@@ -508,6 +508,232 @@ unsafe fn rtl_unicode_to_multibyte_size_dbcs(
     }
 }
 
+unsafe fn rtl_multibyte_string_to_unicode_string_impl(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+    oem: bool,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, src, allocate, oem);
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let sbuf = (*src).buffer as *const u8;
+        let slen = (*src).length as usize;
+        if slen != 0 && sbuf.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let dbcs = if oem {
+            nls_is_oem_dbcs()
+        } else {
+            nls_is_ansi_dbcs()
+        };
+        let out_bytes = if dbcs {
+            match rtl_multibyte_to_unicode_size_dbcs(sbuf, slen as u32, oem) {
+                Ok(size) => size as usize,
+                Err(status) => return status,
+            }
+        } else {
+            slen.saturating_mul(2)
+        };
+        let with_nul = out_bytes.saturating_add(2);
+        if with_nul > u16::MAX as usize {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+
+        let dbuf = if allocate != 0 {
+            let p = crate::process_heap_alloc(with_nul) as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            (*dst).buffer = p as u64;
+            (*dst).maximum_length = with_nul as u16;
+            p
+        } else {
+            if out_bytes >= (*dst).maximum_length as usize {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            let p = (*dst).buffer as *mut u16;
+            if p.is_null() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            p
+        };
+
+        let mut written = 0u32;
+        let status = if dbcs {
+            rtl_mb_to_unicode_n_dbcs(
+                dbuf,
+                out_bytes as u32,
+                &mut written,
+                sbuf,
+                slen as u32,
+                oem,
+            )
+        } else {
+            for i in 0..slen {
+                let byte = core::ptr::read(sbuf.add(i));
+                let unit = if oem {
+                    nls_oem_widen_byte(byte)
+                } else {
+                    nls_ansi_widen_byte(byte)
+                };
+                core::ptr::write(dbuf.add(i), unit);
+            }
+            written = out_bytes as u32;
+            STATUS_SUCCESS
+        };
+
+        if status != STATUS_SUCCESS {
+            if allocate != 0 {
+                crate::process_heap_free(dbuf as *mut u8);
+                (*dst).buffer = 0;
+            }
+            return status;
+        }
+
+        core::ptr::write(dbuf.add((written as usize) / 2), 0);
+        (*dst).length = written as u16;
+        STATUS_SUCCESS
+    }
+}
+
+unsafe fn rtl_unicode_string_to_multibyte_string_impl(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+    oem: bool,
+    upcase: bool,
+    nul_terminate: bool,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, src, allocate, oem, upcase, nul_terminate);
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let sbuf = (*src).buffer as *const u16;
+        let source_bytes = (*src).length as usize;
+        if source_bytes != 0 && sbuf.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let dbcs = if oem {
+            nls_is_oem_dbcs()
+        } else {
+            nls_is_ansi_dbcs()
+        };
+        let body_bytes = if dbcs {
+            match rtl_unicode_to_multibyte_size_dbcs(sbuf, source_bytes as u32, oem, upcase) {
+                Ok(size) => size as usize,
+                Err(status) => return status,
+            }
+        } else {
+            source_bytes / 2
+        };
+        let total_bytes = body_bytes.saturating_add(usize::from(nul_terminate));
+        if total_bytes > u16::MAX as usize {
+            return STATUS_INVALID_PARAMETER_2;
+        }
+        if body_bytes == 0 && !nul_terminate {
+            (*dst).length = 0;
+            (*dst).maximum_length = 0;
+            (*dst).buffer = 0;
+            return STATUS_SUCCESS;
+        }
+
+        let dbuf = if allocate != 0 {
+            let p = crate::process_heap_alloc(total_bytes) as *mut u8;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            (*dst).buffer = p as u64;
+            (*dst).maximum_length = total_bytes as u16;
+            p
+        } else {
+            if total_bytes > (*dst).maximum_length as usize {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            let p = (*dst).buffer as *mut u8;
+            if !nul_terminate && total_bytes == 0 {
+                core::ptr::null_mut()
+            } else if p.is_null() {
+                return STATUS_INVALID_PARAMETER;
+            } else {
+                p
+            }
+        };
+
+        let mut written = 0u32;
+        let status = if dbcs {
+            let (status, consumed) = rtl_unicode_to_mb_n_dbcs(
+                dbuf,
+                body_bytes as u32,
+                &mut written,
+                sbuf,
+                source_bytes as u32,
+                oem,
+                upcase,
+            );
+            if status == STATUS_SUCCESS && consumed < source_bytes / 2 {
+                STATUS_BUFFER_OVERFLOW
+            } else {
+                status
+            }
+        } else {
+            let mut single_status = STATUS_SUCCESS;
+            for i in 0..(source_bytes / 2) {
+                let original = core::ptr::read(sbuf.add(i));
+                let unit = if upcase {
+                    nls_upcase_unit(original)
+                } else {
+                    original
+                };
+                let byte = if oem {
+                    nls_oem_narrow_unit(unit)
+                } else {
+                    nls_ansi_narrow_unit(unit)
+                };
+                if oem && byte == nls_oem_default_char() && original != nls_unicode_default_char() {
+                    single_status = STATUS_UNMAPPABLE_CHARACTER;
+                }
+                core::ptr::write(dbuf.add(i), byte);
+            }
+            written = body_bytes as u32;
+            single_status
+        };
+
+        if status != STATUS_SUCCESS {
+            if allocate != 0 {
+                crate::process_heap_free(dbuf);
+                (*dst).buffer = 0;
+            }
+            return status;
+        }
+
+        if nul_terminate {
+            core::ptr::write(dbuf.add(written as usize), 0);
+        }
+        (*dst).length = written as u16;
+        STATUS_SUCCESS
+    }
+}
+
 /// Read `PEB->ProcessParameters->CurrentDirectory.DosPath` (the process CWD, e.g. `C:\Windows`) as a
 /// `Vec<u16>`. Empty when unavailable. Used to anchor a relative image name in the DOS→NT path
 /// conversion (real ntdll canonicalises against this CWD before prefixing `\??\`).
@@ -1372,62 +1598,8 @@ pub unsafe extern "system" fn rtl_ansi_string_to_unicode_string(
     src: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if dst.is_null() || src.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_ansi_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: src is a valid ANSI_STRING (same 16-byte shape) per the contract.
-    let (sbuf, slen) = unsafe { ((*src).buffer as *const u8, (*src).length as usize) };
-    // Widened UTF-16 byte length + a NUL terminator (2 bytes). Reject a >0xFFFF result (the
-    // UNICODE_STRING Length is a u16).
-    let out_units = slen; // ANSI→UTF-16 is 1 unit per byte for a single-byte code page
-    let out_bytes = out_units * 2;
-    let with_nul = out_bytes + 2;
-    if with_nul > 0xFFFF {
-        return STATUS_INVALID_PARAMETER;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: dst is a valid writable UNICODE_STRING per the contract.
-        let dbuf = if allocate != 0 {
-            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
-            let p = unsafe { crate::process_heap_alloc(with_nul) } as *mut u16;
-            if p.is_null() {
-                return STATUS_NO_MEMORY;
-            }
-            unsafe {
-                (*dst).buffer = p as u64;
-                (*dst).maximum_length = with_nul as u16;
-            }
-            p
-        } else {
-            // Caller-provided buffer: needs room for the widened chars + NUL.
-            unsafe {
-                if (*dst).maximum_length < with_nul as u16 {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-                (*dst).buffer as *mut u16
-            }
-        };
-        // Widen each byte and write, then NUL-terminate.
-        // SAFETY: sbuf..sbuf+slen and dbuf..dbuf+out_units+1 are valid per the checks above.
-        unsafe {
-            for i in 0..out_units {
-                let b = core::ptr::read(sbuf.add(i));
-                core::ptr::write(dbuf.add(i), nls_ansi_widen_byte(b));
-            }
-            core::ptr::write(dbuf.add(out_units), 0); // NUL
-            (*dst).length = out_bytes as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (allocate, sbuf, out_units);
-        STATUS_NOT_IMPLEMENTED
-    }
+    // SAFETY: forwards descriptor contract; ANSI selects the current ANSI code page.
+    unsafe { rtl_multibyte_string_to_unicode_string_impl(dst, src, allocate, false) }
 }
 
 /// `RtlUnicodeStringToAnsiString(PANSI_STRING, PCUNICODE_STRING, BOOLEAN AllocateDestinationString)`.
@@ -1445,57 +1617,8 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
     src: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if dst.is_null() || src.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_ansi_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: src is a valid UNICODE_STRING per the contract.
-    let sunits = unsafe { us_slice(src) };
-    let out_bytes = rtl::convert::unicode_to_multi_byte_size(sunits); // 1 byte per unit (single-byte cp)
-    let with_nul = out_bytes + 1;
-    if with_nul > 0xFFFF {
-        return STATUS_INVALID_PARAMETER;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: dst is a valid writable ANSI_STRING per the contract.
-        let dbuf = if allocate != 0 {
-            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
-            let p = unsafe { crate::process_heap_alloc(with_nul) };
-            if p.is_null() {
-                return STATUS_NO_MEMORY;
-            }
-            unsafe {
-                (*dst).buffer = p as u64;
-                (*dst).maximum_length = with_nul as u16;
-            }
-            p
-        } else {
-            unsafe {
-                if (*dst).maximum_length < with_nul as u16 {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-                (*dst).buffer as *mut u8
-            }
-        };
-        // Narrow via the default LATIN1 code page + NUL-terminate.
-        // SAFETY: dbuf..dbuf+out_bytes+1 is valid per the checks above.
-        unsafe {
-            for (i, &c) in sunits.iter().enumerate() {
-                core::ptr::write(dbuf.add(i), nls_ansi_narrow_unit(c));
-            }
-            core::ptr::write(dbuf.add(out_bytes), 0); // NUL
-            (*dst).length = out_bytes as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (allocate, dst, sunits, out_bytes);
-        STATUS_NOT_IMPLEMENTED
-    }
+    // SAFETY: forwards descriptor contract; ANSI selects the current ANSI code page.
+    unsafe { rtl_unicode_string_to_multibyte_string_impl(dst, src, allocate, false, false, true) }
 }
 
 // =================================================================================================
@@ -13868,65 +13991,11 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_oem_string(
     uni_source: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if oem_dest.is_null() || uni_source.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_oem_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: uni_source valid per the contract.
-    let (sbuf, sunits) = unsafe {
-        (
-            (*uni_source).buffer as *const u16,
-            (*uni_source).length as usize / 2,
+    // SAFETY: forwards descriptor contract; OEM selects the current OEM code page.
+    unsafe {
+        rtl_unicode_string_to_multibyte_string_impl(
+            oem_dest, uni_source, allocate, true, true, true,
         )
-    };
-    let src = if sbuf.is_null() {
-        &[][..]
-    } else {
-        // SAFETY: valid region of sunits units per the contract.
-        unsafe { core::slice::from_raw_parts(sbuf, sunits) }
-    };
-    // Upcase then narrow each unit to a single OEM byte (437). Length excludes the NUL; the buffer
-    // needs Length + 1 for the terminator.
-    let oem_len = src.len(); // 1 OEM byte per unit (single-byte cp)
-    if oem_len + 1 > 0xFFFF {
-        return STATUS_INVALID_PARAMETER_2;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: oem_dest writable per the contract.
-        let dbuf = unsafe {
-            if allocate != 0 {
-                let p = crate::process_heap_alloc(oem_len + 1) as *mut u8;
-                if p.is_null() {
-                    return STATUS_NO_MEMORY;
-                }
-                (*oem_dest).buffer = p as u64;
-                (*oem_dest).maximum_length = (oem_len + 1) as u16;
-                p
-            } else {
-                if oem_len >= (*oem_dest).maximum_length as usize {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-                (*oem_dest).buffer as *mut u8
-            }
-        };
-        // SAFETY: dbuf valid for oem_len + 1 bytes per the alloc/overflow checks.
-        unsafe {
-            for (i, &u) in src.iter().enumerate() {
-                let up = nls_upcase_unit(u);
-                core::ptr::write(dbuf.add(i), nls_oem_narrow_unit(up));
-            }
-            core::ptr::write(dbuf.add(oem_len), 0);
-            (*oem_dest).length = oem_len as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = allocate;
-        STATUS_NOT_IMPLEMENTED
     }
 }
 
@@ -13941,63 +14010,11 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string_to_ansi_string(
     uni_source: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if ansi_dest.is_null() || uni_source.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_ansi_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: uni_source valid per the contract.
-    let (sbuf, sunits) = unsafe {
-        (
-            (*uni_source).buffer as *const u16,
-            (*uni_source).length as usize / 2,
+    // SAFETY: forwards descriptor contract; ANSI selects the current ANSI code page.
+    unsafe {
+        rtl_unicode_string_to_multibyte_string_impl(
+            ansi_dest, uni_source, allocate, false, true, true,
         )
-    };
-    let src = if sbuf.is_null() {
-        &[][..]
-    } else {
-        // SAFETY: valid region of sunits units per the contract.
-        unsafe { core::slice::from_raw_parts(sbuf, sunits) }
-    };
-    let ansi_len = src.len();
-    if ansi_len + 1 > 0xFFFF {
-        return STATUS_INVALID_PARAMETER_2;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: ansi_dest writable per the contract.
-        let dbuf = unsafe {
-            if allocate != 0 {
-                let p = crate::process_heap_alloc(ansi_len + 1) as *mut u8;
-                if p.is_null() {
-                    return STATUS_NO_MEMORY;
-                }
-                (*ansi_dest).buffer = p as u64;
-                (*ansi_dest).maximum_length = (ansi_len + 1) as u16;
-                p
-            } else {
-                if ansi_len >= (*ansi_dest).maximum_length as usize {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-                (*ansi_dest).buffer as *mut u8
-            }
-        };
-        // SAFETY: dbuf valid for ansi_len + 1 bytes per the alloc/overflow checks.
-        unsafe {
-            for (i, &u) in src.iter().enumerate() {
-                let up = nls_upcase_unit(u);
-                core::ptr::write(dbuf.add(i), nls_ansi_narrow_unit(up));
-            }
-            core::ptr::write(dbuf.add(ansi_len), 0);
-            (*ansi_dest).length = ansi_len as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = allocate;
-        STATUS_NOT_IMPLEMENTED
     }
 }
 
@@ -14439,82 +14456,8 @@ unsafe fn rtl_unicode_string_to_counted_oem_string_impl(
     allocate: u8,
     upcase: bool,
 ) -> NtStatus {
-    if dst.is_null() || src.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_oem_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: src valid per the contract.
-    let sunits = unsafe { us_slice(src) };
-    let out_bytes = sunits.len();
-    if out_bytes > u16::MAX as usize {
-        return STATUS_INVALID_PARAMETER_2;
-    }
-    if out_bytes == 0 {
-        // SAFETY: dst writable per the contract.
-        unsafe {
-            (*dst).length = 0;
-            (*dst).maximum_length = 0;
-            (*dst).buffer = 0;
-        }
-        return STATUS_SUCCESS;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: dst writable per the contract.
-        let dbuf = unsafe {
-            if allocate != 0 {
-                let p = crate::process_heap_alloc(out_bytes);
-                if p.is_null() {
-                    return STATUS_NO_MEMORY;
-                }
-                (*dst).buffer = p as u64;
-                (*dst).maximum_length = out_bytes as u16;
-                p
-            } else {
-                if out_bytes > (*dst).maximum_length as usize {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-                let p = (*dst).buffer as *mut u8;
-                if p.is_null() {
-                    return STATUS_INVALID_PARAMETER;
-                }
-                p
-            }
-        };
-        let mut status = STATUS_SUCCESS;
-        // SAFETY: dbuf has room for out_bytes bytes.
-        unsafe {
-            for (i, &original) in sunits.iter().enumerate() {
-                let unit = if upcase {
-                    nls_upcase_unit(original)
-                } else {
-                    original
-                };
-                let byte = nls_oem_narrow_unit(unit);
-                if byte == nls_oem_default_char() && original != nls_unicode_default_char() {
-                    status = STATUS_UNMAPPABLE_CHARACTER;
-                }
-                core::ptr::write(dbuf.add(i), byte);
-            }
-            (*dst).length = out_bytes as u16;
-        }
-        if status != STATUS_SUCCESS && allocate != 0 {
-            // SAFETY: buffer came from process_heap_alloc above.
-            unsafe {
-                crate::process_heap_free(dbuf);
-                (*dst).buffer = 0;
-            }
-        }
-        status
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (allocate, upcase, out_bytes);
-        STATUS_NOT_IMPLEMENTED
-    }
+    // SAFETY: forwards descriptor contract; counted OEM does not append a trailing NUL.
+    unsafe { rtl_unicode_string_to_multibyte_string_impl(dst, src, allocate, true, upcase, false) }
 }
 
 /// `RtlUnicodeToMultiByteN(PCHAR MbStr, ULONG MbSize, PULONG BytesInMbStr, PCWCH UnicodeStr,
@@ -14920,58 +14863,8 @@ pub unsafe extern "system" fn rtl_oem_string_to_unicode_string(
     src: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if dst.is_null() || src.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if nls_is_oem_dbcs() {
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    // SAFETY: src is a valid OEM_STRING (same 16-byte shape) per the contract.
-    let (sbuf, slen) = unsafe { ((*src).buffer as *const u8, (*src).length as usize) };
-    let out_bytes = slen * 2;
-    let with_nul = out_bytes + 2;
-    if with_nul > 0xFFFF {
-        return STATUS_INVALID_PARAMETER;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let dbuf = if allocate != 0 {
-            // SAFETY: on-target; the process heap is installed by LdrpInitialize.
-            let p = unsafe { crate::process_heap_alloc(with_nul) } as *mut u16;
-            if p.is_null() {
-                return STATUS_NO_MEMORY;
-            }
-            unsafe {
-                (*dst).buffer = p as u64;
-                (*dst).maximum_length = with_nul as u16;
-            }
-            p
-        } else {
-            unsafe {
-                if (*dst).maximum_length < with_nul as u16 {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-                (*dst).buffer as *mut u16
-            }
-        };
-        // SAFETY: buffers valid per the checks.
-        unsafe {
-            for i in 0..slen {
-                core::ptr::write(
-                    dbuf.add(i),
-                    nls_oem_widen_byte(core::ptr::read(sbuf.add(i))),
-                );
-            }
-            core::ptr::write(dbuf.add(slen), 0);
-            (*dst).length = out_bytes as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (allocate, sbuf, slen);
-        STATUS_NOT_IMPLEMENTED
-    }
+    // SAFETY: forwards descriptor contract; OEM selects the current OEM code page.
+    unsafe { rtl_multibyte_string_to_unicode_string_impl(dst, src, allocate, true) }
 }
 
 /// `RtlUnicodeStringToOemString(POEM_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` —
@@ -14985,52 +14878,8 @@ pub unsafe extern "system" fn rtl_unicode_string_to_oem_string(
     src: PCUnicodeString,
     allocate: u8,
 ) -> NtStatus {
-    if dst.is_null() || src.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    // SAFETY: src valid per the contract.
-    let (sbuf, sunits) = unsafe { ((*src).buffer as *const u16, (*src).length as usize / 2) };
-    let out_bytes = sunits + 1; // + NUL
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: dst valid per the contract.
-        let dbuf = if allocate != 0 {
-            // SAFETY: on-target heap.
-            let p = unsafe { crate::process_heap_alloc(out_bytes) } as *mut u8;
-            if p.is_null() {
-                return STATUS_NO_MEMORY;
-            }
-            // SAFETY: dst valid.
-            unsafe {
-                (*dst).buffer = p as u64;
-                (*dst).maximum_length = out_bytes as u16;
-            }
-            p
-        } else {
-            // SAFETY: dst valid.
-            unsafe {
-                if (*dst).maximum_length < out_bytes as u16 {
-                    return STATUS_BUFFER_OVERFLOW;
-                }
-                (*dst).buffer as *mut u8
-            }
-        };
-        // SAFETY: buffers valid per the checks.
-        unsafe {
-            for i in 0..sunits {
-                let c = *sbuf.add(i);
-                *dbuf.add(i) = nls_oem_narrow_unit(c);
-            }
-            *dbuf.add(sunits) = 0;
-            (*dst).length = sunits as u16;
-        }
-        STATUS_SUCCESS
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (allocate, out_bytes, sbuf);
-        STATUS_NOT_IMPLEMENTED
-    }
+    // SAFETY: forwards descriptor contract; OEM selects the current OEM code page.
+    unsafe { rtl_unicode_string_to_multibyte_string_impl(dst, src, allocate, true, false, true) }
 }
 
 /// `RtlUnicodeStringToCountedOemString(POEM_STRING, PCUNICODE_STRING, BOOLEAN) -> NTSTATUS`.
@@ -15194,8 +15043,18 @@ pub unsafe extern "system" fn rtlx_unicode_string_to_ansi_size(src: PCUnicodeStr
         return 0;
     }
     // SAFETY: src valid.
-    let units = unsafe { (*src).length as usize / 2 };
-    (units + 1) as u32
+    let (buffer, bytes) = unsafe { ((*src).buffer as *const u16, (*src).length as u32) };
+    if nls_is_ansi_dbcs() {
+        if bytes != 0 && buffer.is_null() {
+            return 0;
+        }
+        match unsafe { rtl_unicode_to_multibyte_size_dbcs(buffer, bytes, false, false) } {
+            Ok(size) => size.saturating_add(1),
+            Err(_) => 0,
+        }
+    } else {
+        (bytes / 2).saturating_add(1)
+    }
 }
 
 /// `RtlUnicodeStringToAnsiSize(PCUNICODE_STRING src) -> ULONG`.
@@ -15214,8 +15073,22 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_size(src: PCUnicodeStri
 /// As `RtlxUnicodeStringToAnsiSize`.
 #[export_name = "RtlxUnicodeStringToOemSize"]
 pub unsafe extern "system" fn rtlx_unicode_string_to_oem_size(src: PCUnicodeString) -> u32 {
-    // SAFETY: same contract.
-    unsafe { rtlx_unicode_string_to_ansi_size(src) }
+    if src.is_null() {
+        return 0;
+    }
+    // SAFETY: src valid.
+    let (buffer, bytes) = unsafe { ((*src).buffer as *const u16, (*src).length as u32) };
+    if nls_is_oem_dbcs() {
+        if bytes != 0 && buffer.is_null() {
+            return 0;
+        }
+        match unsafe { rtl_unicode_to_multibyte_size_dbcs(buffer, bytes, true, false) } {
+            Ok(size) => size.saturating_add(1),
+            Err(_) => 0,
+        }
+    } else {
+        (bytes / 2).saturating_add(1)
+    }
 }
 
 /// `RtlUnicodeStringToOemSize(PCUNICODE_STRING src) -> ULONG`.
@@ -15238,8 +15111,18 @@ pub unsafe extern "system" fn rtlx_ansi_string_to_unicode_size(src: PCUnicodeStr
         return 0;
     }
     // SAFETY: src valid.
-    let bytes = unsafe { (*src).length as usize };
-    ((bytes + 1) * 2) as u32
+    let (buffer, bytes) = unsafe { ((*src).buffer as *const u8, (*src).length as u32) };
+    if nls_is_ansi_dbcs() {
+        if bytes != 0 && buffer.is_null() {
+            return 0;
+        }
+        match unsafe { rtl_multibyte_to_unicode_size_dbcs(buffer, bytes, false) } {
+            Ok(size) => size.saturating_add(2),
+            Err(_) => 0,
+        }
+    } else {
+        bytes.saturating_add(1).saturating_mul(2)
+    }
 }
 
 /// `RtlAnsiStringToUnicodeSize(PCANSI_STRING src) -> ULONG`.
@@ -15258,8 +15141,22 @@ pub unsafe extern "system" fn rtl_ansi_string_to_unicode_size(src: PCUnicodeStri
 /// As `RtlxAnsiStringToUnicodeSize`.
 #[export_name = "RtlxOemStringToUnicodeSize"]
 pub unsafe extern "system" fn rtlx_oem_string_to_unicode_size(src: PCUnicodeString) -> u32 {
-    // SAFETY: same contract.
-    unsafe { rtlx_ansi_string_to_unicode_size(src) }
+    if src.is_null() {
+        return 0;
+    }
+    // SAFETY: src valid.
+    let (buffer, bytes) = unsafe { ((*src).buffer as *const u8, (*src).length as u32) };
+    if nls_is_oem_dbcs() {
+        if bytes != 0 && buffer.is_null() {
+            return 0;
+        }
+        match unsafe { rtl_multibyte_to_unicode_size_dbcs(buffer, bytes, true) } {
+            Ok(size) => size.saturating_add(2),
+            Err(_) => 0,
+        }
+    } else {
+        bytes.saturating_add(1).saturating_mul(2)
+    }
 }
 
 /// `RtlOemStringToUnicodeSize(PCOEM_STRING src) -> ULONG`.
