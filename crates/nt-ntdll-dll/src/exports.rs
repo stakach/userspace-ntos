@@ -362,7 +362,14 @@ unsafe fn rtl_mb_to_unicode_n_dbcs(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (unicode_str, unicode_size, bytes_out, mb_str, bytes_in_mb, oem);
+        let _ = (
+            unicode_str,
+            unicode_size,
+            bytes_out,
+            mb_str,
+            bytes_in_mb,
+            oem,
+        );
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -573,14 +580,7 @@ unsafe fn rtl_multibyte_string_to_unicode_string_impl(
 
         let mut written = 0u32;
         let status = if dbcs {
-            rtl_mb_to_unicode_n_dbcs(
-                dbuf,
-                out_bytes as u32,
-                &mut written,
-                sbuf,
-                slen as u32,
-                oem,
-            )
+            rtl_mb_to_unicode_n_dbcs(dbuf, out_bytes as u32, &mut written, sbuf, slen as u32, oem)
         } else {
             for i in 0..slen {
                 let byte = core::ptr::read(sbuf.add(i));
@@ -1907,7 +1907,9 @@ unsafe fn condvar_lock(
     loop {
         if old & COND_VAR_LOCKED_FLAG != 0 {
             spin_pause(old);
-            if !abort_if_locked.is_null() && unsafe { core::ptr::read_volatile(abort_if_locked) } != 0 {
+            if !abort_if_locked.is_null()
+                && unsafe { core::ptr::read_volatile(abort_if_locked) } != 0
+            {
                 return core::ptr::null_mut();
             }
             old = word.load(Ordering::Acquire);
@@ -2007,13 +2009,8 @@ unsafe fn nt_release_keyed_event_raw(_key: *mut c_void, _timeout: *const i64) ->
 }
 
 unsafe fn condvar_wake(condition_variable: *mut c_void, release_all: bool) {
-    let head = unsafe {
-        condvar_lock(
-            condition_variable,
-            core::ptr::null_mut(),
-            core::ptr::null(),
-        )
-    };
+    let head =
+        unsafe { condvar_lock(condition_variable, core::ptr::null_mut(), core::ptr::null()) };
     if head.is_null() {
         return;
     }
@@ -2168,7 +2165,15 @@ pub unsafe extern "system" fn rtl_sleep_condition_variable_srw(
     if flags & !RTL_CONDITION_VARIABLE_LOCKMODE_SHARED != 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    unsafe { condvar_sleep(condition_variable, core::ptr::null_mut(), srw_lock, flags, timeout) }
+    unsafe {
+        condvar_sleep(
+            condition_variable,
+            core::ptr::null_mut(),
+            srw_lock,
+            flags,
+            timeout,
+        )
+    }
 }
 
 /// `RtlRunOnceInitialize(PRTL_RUN_ONCE)`.
@@ -3868,14 +3873,66 @@ pub unsafe extern "system" fn rtl_assert(
 #[export_name = "LdrQueryImageFileExecutionOptions"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn ldr_query_image_file_execution_options(
-    _sub_key: PCUnicodeString,
-    _value_name: *const u16,
-    _value_type: u32,
-    _buffer: *mut c_void,
-    _buffer_size: u32,
-    _returned_length: *mut u32,
+    sub_key: PCUnicodeString,
+    value_name: *const u16,
+    value_type: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    returned_length: *mut u32,
 ) -> NtStatus {
-    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — no IFEO key (default behavior; honest)
+    unsafe {
+        ldr_query_image_file_execution_options_ex(
+            sub_key,
+            value_name,
+            value_type,
+            buffer,
+            buffer_size,
+            returned_length,
+            0,
+        )
+    }
+}
+
+/// `LdrQueryImageFileExecutionOptionsEx(..., BOOLEAN Wow64) -> NTSTATUS`.
+///
+/// Faithful wrapper over the IFEO key-open/key-query helpers. The current registry model has no
+/// per-image IFEO keys, so the helper path normally returns `STATUS_OBJECT_NAME_NOT_FOUND`; keeping
+/// the wrapper real preserves close-on-success behavior when the key plane is later expanded.
+///
+/// # Safety
+/// Standard IFEO pointer contract.
+#[export_name = "LdrQueryImageFileExecutionOptionsEx"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn ldr_query_image_file_execution_options_ex(
+    sub_key: PCUnicodeString,
+    value_name: *const u16,
+    value_type: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    returned_length: *mut u32,
+    wow64: u8,
+) -> NtStatus {
+    let mut key_handle = core::ptr::null_mut();
+    let status = unsafe { ldr_open_image_file_options_key(sub_key as *const c_void, wow64, &mut key_handle) };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let query_status = unsafe {
+        ldr_query_image_file_key_option(
+            key_handle,
+            value_name,
+            value_type,
+            buffer,
+            buffer_size,
+            returned_length,
+        )
+    };
+    #[cfg(target_arch = "x86_64")]
+    if !key_handle.is_null() {
+        let _ = unsafe { boot_nt_close(key_handle as u64) };
+    }
+    query_status
 }
 
 /// `LdrVerifyImageMatchesChecksum(HANDLE ImageFileHandle, ...) -> NTSTATUS`. Honest seam (checksum
@@ -3927,10 +3984,10 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
         unsafe {
             (
                 core::ptr::read_unaligned(
-                    bytes.add(LDR_VERIFY_CALLBACK_ROUTINE_OFFSET) as *const *mut c_void,
+                    bytes.add(LDR_VERIFY_CALLBACK_ROUTINE_OFFSET) as *const *mut c_void
                 ),
                 core::ptr::read_unaligned(
-                    bytes.add(LDR_VERIFY_CALLBACK_PARAMETER_OFFSET) as *const *mut c_void,
+                    bytes.add(LDR_VERIFY_CALLBACK_PARAMETER_OFFSET) as *const *mut c_void
                 ),
             )
         }
@@ -3946,12 +4003,7 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
         unsafe { core::ptr::write_unaligned(characteristics, 0) };
     }
     unsafe {
-        ldr_verify_image_matches_checksum(
-            image_file_handle,
-            callback,
-            parameter,
-            characteristics,
-        )
+        ldr_verify_image_matches_checksum(image_file_handle, callback, parameter, characteristics)
     }
 }
 
@@ -4334,8 +4386,7 @@ pub unsafe extern "C" fn wcstombs(mbstr: *mut u8, wcstr: *const u16, count: usiz
     let mut size = 0u32;
     if mbstr.is_null() {
         // SAFETY: forwards the conversion-size contract.
-        let status =
-            unsafe { rtl_unicode_to_multi_byte_size(&mut size, wcstr, bytes_in_unicode) };
+        let status = unsafe { rtl_unicode_to_multi_byte_size(&mut size, wcstr, bytes_in_unicode) };
         return if status == STATUS_SUCCESS {
             size as usize
         } else {
@@ -5215,17 +5266,17 @@ struct RtlUnloadEventTrace {
 
 #[cfg(target_arch = "x86_64")]
 static mut LDR_DLL_NOTIFICATION_LIST: [u64; 2] = [0, 0];
-static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_NUMBER] =
-    [const {
-        RtlUnloadEventTrace {
-            base_address: core::ptr::null_mut(),
-            size_of_image: 0,
-            sequence: 0,
-            time_date_stamp: 0,
-            check_sum: 0,
-            image_name: [0u16; 32],
-        }
-    }; RTL_UNLOAD_EVENT_TRACE_NUMBER];
+static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_NUMBER] = [const {
+    RtlUnloadEventTrace {
+        base_address: core::ptr::null_mut(),
+        size_of_image: 0,
+        sequence: 0,
+        time_date_stamp: 0,
+        check_sum: 0,
+        image_name: [0u16; 32],
+    }
+};
+    RTL_UNLOAD_EVENT_TRACE_NUMBER];
 static RTL_UNLOAD_EVENT_TRACE_INDEX: AtomicU32 = AtomicU32::new(0);
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_SIZE: u32 = RTL_UNLOAD_EVENT_TRACE_SIZE;
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_COUNT: u32 = RTL_UNLOAD_EVENT_TRACE_NUMBER as u32;
@@ -5506,7 +5557,8 @@ unsafe fn record_unload_event_from_entry(entry: u64, base_address: *mut c_void) 
     }
 
     if entry != 0 {
-        let ldr_size = unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+        let ldr_size =
+            unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
         if ldr_size != 0 {
             unsafe { (*trace).size_of_image = ldr_size };
         }
@@ -6684,6 +6736,65 @@ pub unsafe extern "system" fn ldr_add_ref_dll(_flags: u32, _dll_handle: *mut c_v
     STATUS_SUCCESS
 }
 
+/// `LdrProcessRelocationBlock(ULONG_PTR Address, ULONG Count, PUSHORT TypeOffset, LONG_PTR Delta)`.
+///
+/// Port of ReactOS' `LdrProcessRelocationBlockLongLong`: apply one relocation block in place and
+/// return the first relocation slot after the block, or NULL for an unsupported relocation type.
+///
+/// # Safety
+/// `address + (TypeOffset[i] & 0xfff)` must be writable for each relocation entry.
+#[export_name = "LdrProcessRelocationBlock"]
+pub unsafe extern "system" fn ldr_process_relocation_block(
+    address: usize,
+    count: u32,
+    type_offset: *mut u16,
+    delta: isize,
+) -> *mut c_void {
+    if type_offset.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+    const IMAGE_REL_BASED_HIGH: u16 = 1;
+    const IMAGE_REL_BASED_LOW: u16 = 2;
+    const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+    const IMAGE_REL_BASED_DIR64: u16 = 10;
+
+    for i in 0..count as usize {
+        let slot = unsafe { core::ptr::read_unaligned(type_offset.add(i)) };
+        let offset = (slot & 0x0fff) as usize;
+        let reloc_type = slot >> 12;
+        let fixup = address.wrapping_add(offset) as *mut u8;
+        match reloc_type {
+            IMAGE_REL_BASED_ABSOLUTE => {}
+            IMAGE_REL_BASED_HIGH => unsafe {
+                let target = fixup as *mut u16;
+                let current = core::ptr::read_unaligned(target) as u32;
+                let adjusted = ((current << 16).wrapping_add(delta as u32) >> 16) as u16;
+                core::ptr::write_unaligned(target, adjusted);
+            },
+            IMAGE_REL_BASED_LOW => unsafe {
+                let target = fixup as *mut u16;
+                let current = core::ptr::read_unaligned(target);
+                core::ptr::write_unaligned(target, current.wrapping_add(delta as u16));
+            },
+            IMAGE_REL_BASED_HIGHLOW => unsafe {
+                let target = fixup as *mut u32;
+                let current = core::ptr::read_unaligned(target);
+                core::ptr::write_unaligned(target, current.wrapping_add(delta as u32));
+            },
+            IMAGE_REL_BASED_DIR64 => unsafe {
+                let target = fixup as *mut u64;
+                let current = core::ptr::read_unaligned(target);
+                core::ptr::write_unaligned(target, current.wrapping_add(delta as u64));
+            },
+            _ => return core::ptr::null_mut(),
+        }
+    }
+
+    unsafe { type_offset.add(count as usize) as *mut c_void }
+}
+
 /// `LdrAlternateResourcesEnabled() -> BOOLEAN`.
 ///
 /// ReactOS does not enable MUI alternate-resource modules in this ntdll layer. Returning FALSE makes
@@ -6988,16 +7099,16 @@ struct LdrLoadAsDataTableRecord {
     file_handle: AtomicUsize,
 }
 
-static LDR_LOAD_AS_DATA_TABLE: [LdrLoadAsDataTableRecord; LDR_LOAD_AS_DATA_TABLE_SLOTS] =
-    [const {
-        LdrLoadAsDataTableRecord {
-            live: AtomicUsize::new(0),
-            module: AtomicUsize::new(0),
-            file_name: AtomicUsize::new(0),
-            file_size: AtomicUsize::new(0),
-            file_handle: AtomicUsize::new(0),
-        }
-    }; LDR_LOAD_AS_DATA_TABLE_SLOTS];
+static LDR_LOAD_AS_DATA_TABLE: [LdrLoadAsDataTableRecord; LDR_LOAD_AS_DATA_TABLE_SLOTS] = [const {
+    LdrLoadAsDataTableRecord {
+        live: AtomicUsize::new(0),
+        module: AtomicUsize::new(0),
+        file_name: AtomicUsize::new(0),
+        file_size: AtomicUsize::new(0),
+        file_handle: AtomicUsize::new(0),
+    }
+};
+    LDR_LOAD_AS_DATA_TABLE_SLOTS];
 
 #[inline]
 fn ldr_untag_resource_module(module: *mut c_void) -> *mut c_void {
@@ -7041,14 +7152,15 @@ unsafe fn copy_wide_name_to_heap(name: *const u16) -> *mut u16 {
     }
 }
 
-fn find_load_as_data_table_record(module: *mut c_void) -> Option<&'static LdrLoadAsDataTableRecord> {
+fn find_load_as_data_table_record(
+    module: *mut c_void,
+) -> Option<&'static LdrLoadAsDataTableRecord> {
     let module = ldr_untag_resource_module(module) as usize;
     if module == 0 {
         return None;
     }
     LDR_LOAD_AS_DATA_TABLE.iter().find(|record| {
-        record.live.load(Ordering::Acquire) != 0
-            && record.module.load(Ordering::Acquire) == module
+        record.live.load(Ordering::Acquire) != 0 && record.module.load(Ordering::Acquire) == module
     })
 }
 
@@ -9147,9 +9259,7 @@ unsafe fn image_read_u32(base: *const c_void, offset: usize) -> u32 {
 unsafe fn image_first_section(nt_headers: *mut c_void) -> *mut u8 {
     let optional_size =
         unsafe { image_read_u16(nt_headers, IMAGE_FILE_HEADER_SIZE_OF_OPTIONAL_HEADER_OFFSET) };
-    unsafe {
-        (nt_headers as *mut u8).add(4 + IMAGE_FILE_HEADER_SIZE + optional_size as usize)
-    }
+    unsafe { (nt_headers as *mut u8).add(4 + IMAGE_FILE_HEADER_SIZE + optional_size as usize) }
 }
 
 unsafe fn image_section_contains_rva(section: *mut c_void, rva: u32) -> bool {
@@ -14774,38 +14884,6 @@ etw_ok!("EtwpSetHWConfigFunction", etwp_set_hw_config_function);
 // the Nt* stub uses, the Zw alias inherits it).
 // =================================================================================================
 
-/// `ZwYieldExecution` — alias of `NtYieldExecution` (SSN 288). Naked `jmp NtYieldExecution`.
-///
-/// # Safety
-/// Tail-calls the `NtYieldExecution` stub (same ABI); no local state.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-#[export_name = "ZwYieldExecution"]
-pub unsafe extern "C" fn zw_yield_execution() {
-    core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::nt_yield_execution);
-}
-
-/// `ZwCallbackReturn` — the name twin of `NtCallbackReturn` (SSN 22).
-///
-/// # Safety
-/// Tail-calls the single generated `NtCallbackReturn` stub, preserving whichever trap/native
-/// transport variant the build selected. Keeping one body prevents the two exported names drifting.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-#[export_name = "ZwCallbackReturn"]
-pub unsafe extern "C" fn zw_callback_return() {
-    core::arch::naked_asm!("jmp {}", sym nt_ntdll::trap_stubs::nt_callback_return);
-}
-
-// -------------------------------------------------------------------------------------------------
-// BATCH 27 — the Zw* aliases the lsass authentication tree (lsasrv/samsrv/msv1_0/secur32) imports.
-// Zw* and Nt* are identical exports (same SSN, same ABI) — a naked tail-`jmp` to the Nt* trap/native
-// stub so the Zw name lands in the export directory and inherits whatever transport the Nt* stub
-// uses. WITHOUT these exports the on-target loader leaves the importer's IAT slot at the RAW
-// IMAGE_IMPORT_BY_NAME thunk (a bare `.rdata` RVA), and the first `call *[IAT]` jumps to that bare
-// RVA → an instruction-fetch fault (the `0x3a288` = lsasrv's unresolved `ntdll!RtlpNtOpenKey` wall).
-// =================================================================================================
-
 /// Emit a naked `Zw*` alias that tail-`jmp`s to the matching `Nt*` trap/native stub.
 macro_rules! zw_alias {
     ($fn:ident, $name:literal, $nt:ident) => {
@@ -14819,43 +14897,702 @@ macro_rules! zw_alias {
     };
 }
 
+zw_alias!(
+    zw_accept_connect_port,
+    "ZwAcceptConnectPort",
+    nt_accept_connect_port
+);
+zw_alias!(zw_access_check, "ZwAccessCheck", nt_access_check);
+zw_alias!(
+    zw_access_check_and_audit_alarm,
+    "ZwAccessCheckAndAuditAlarm",
+    nt_access_check_and_audit_alarm
+);
+zw_alias!(
+    zw_access_check_by_type,
+    "ZwAccessCheckByType",
+    nt_access_check_by_type
+);
+zw_alias!(
+    zw_access_check_by_type_result_list,
+    "ZwAccessCheckByTypeResultList",
+    nt_access_check_by_type_result_list
+);
+zw_alias!(zw_add_atom, "ZwAddAtom", nt_add_atom);
+zw_alias!(
+    zw_adjust_groups_token,
+    "ZwAdjustGroupsToken",
+    nt_adjust_groups_token
+);
+zw_alias!(
+    zw_adjust_privileges_token,
+    "ZwAdjustPrivilegesToken",
+    nt_adjust_privileges_token
+);
+zw_alias!(
+    zw_allocate_locally_unique_id,
+    "ZwAllocateLocallyUniqueId",
+    nt_allocate_locally_unique_id
+);
+zw_alias!(
+    zw_allocate_user_physical_pages,
+    "ZwAllocateUserPhysicalPages",
+    nt_allocate_user_physical_pages
+);
+zw_alias!(
+    zw_allocate_virtual_memory,
+    "ZwAllocateVirtualMemory",
+    nt_allocate_virtual_memory
+);
+zw_alias!(
+    zw_apphelp_cache_control,
+    "ZwApphelpCacheControl",
+    nt_apphelp_cache_control
+);
+zw_alias!(
+    zw_assign_process_to_job_object,
+    "ZwAssignProcessToJobObject",
+    nt_assign_process_to_job_object
+);
+zw_alias!(zw_callback_return, "ZwCallbackReturn", nt_callback_return);
+zw_alias!(
+    zw_cancel_device_wakeup_request,
+    "ZwCancelDeviceWakeupRequest",
+    nt_cancel_device_wakeup_request
+);
+zw_alias!(zw_cancel_io_file, "ZwCancelIoFile", nt_cancel_io_file);
+zw_alias!(zw_cancel_timer, "ZwCancelTimer", nt_cancel_timer);
+zw_alias!(zw_clear_event, "ZwClearEvent", nt_clear_event);
 zw_alias!(zw_close, "ZwClose", nt_close);
+zw_alias!(
+    zw_close_object_audit_alarm,
+    "ZwCloseObjectAuditAlarm",
+    nt_close_object_audit_alarm
+);
+zw_alias!(
+    zw_complete_connect_port,
+    "ZwCompleteConnectPort",
+    nt_complete_connect_port
+);
 zw_alias!(zw_connect_port, "ZwConnectPort", nt_connect_port);
+zw_alias!(
+    zw_create_directory_object,
+    "ZwCreateDirectoryObject",
+    nt_create_directory_object
+);
 zw_alias!(zw_create_event, "ZwCreateEvent", nt_create_event);
+zw_alias!(zw_create_file, "ZwCreateFile", nt_create_file);
+zw_alias!(
+    zw_create_io_completion,
+    "ZwCreateIoCompletion",
+    nt_create_io_completion
+);
+zw_alias!(
+    zw_create_job_object,
+    "ZwCreateJobObject",
+    nt_create_job_object
+);
+zw_alias!(zw_create_job_set, "ZwCreateJobSet", nt_create_job_set);
 zw_alias!(zw_create_key, "ZwCreateKey", nt_create_key);
+zw_alias!(
+    zw_create_mailslot_file,
+    "ZwCreateMailslotFile",
+    nt_create_mailslot_file
+);
+zw_alias!(zw_create_mutant, "ZwCreateMutant", nt_create_mutant);
+zw_alias!(
+    zw_create_named_pipe_file,
+    "ZwCreateNamedPipeFile",
+    nt_create_named_pipe_file
+);
+zw_alias!(
+    zw_create_paging_file,
+    "ZwCreatePagingFile",
+    nt_create_paging_file
+);
+zw_alias!(zw_create_port, "ZwCreatePort", nt_create_port);
+zw_alias!(
+    zw_create_process_ex,
+    "ZwCreateProcessEx",
+    nt_create_process_ex
+);
+zw_alias!(zw_create_section, "ZwCreateSection", nt_create_section);
+zw_alias!(
+    zw_create_semaphore,
+    "ZwCreateSemaphore",
+    nt_create_semaphore
+);
+zw_alias!(
+    zw_create_symbolic_link_object,
+    "ZwCreateSymbolicLinkObject",
+    nt_create_symbolic_link_object
+);
+zw_alias!(zw_create_thread, "ZwCreateThread", nt_create_thread);
+zw_alias!(zw_create_timer, "ZwCreateTimer", nt_create_timer);
+zw_alias!(zw_create_token, "ZwCreateToken", nt_create_token);
+zw_alias!(zw_delay_execution, "ZwDelayExecution", nt_delay_execution);
+zw_alias!(zw_delete_atom, "ZwDeleteAtom", nt_delete_atom);
+zw_alias!(zw_delete_key, "ZwDeleteKey", nt_delete_key);
+zw_alias!(
+    zw_delete_object_audit_alarm,
+    "ZwDeleteObjectAuditAlarm",
+    nt_delete_object_audit_alarm
+);
+zw_alias!(zw_delete_value_key, "ZwDeleteValueKey", nt_delete_value_key);
+zw_alias!(
+    zw_device_io_control_file,
+    "ZwDeviceIoControlFile",
+    nt_device_io_control_file
+);
+zw_alias!(zw_display_string, "ZwDisplayString", nt_display_string);
+zw_alias!(
+    zw_duplicate_object,
+    "ZwDuplicateObject",
+    nt_duplicate_object
+);
+zw_alias!(zw_duplicate_token, "ZwDuplicateToken", nt_duplicate_token);
 zw_alias!(zw_enumerate_key, "ZwEnumerateKey", nt_enumerate_key);
 zw_alias!(
     zw_enumerate_value_key,
     "ZwEnumerateValueKey",
     nt_enumerate_value_key
 );
+zw_alias!(zw_filter_token, "ZwFilterToken", nt_filter_token);
+zw_alias!(zw_find_atom, "ZwFindAtom", nt_find_atom);
+zw_alias!(
+    zw_flush_buffers_file,
+    "ZwFlushBuffersFile",
+    nt_flush_buffers_file
+);
+zw_alias!(
+    zw_flush_instruction_cache,
+    "ZwFlushInstructionCache",
+    nt_flush_instruction_cache
+);
+zw_alias!(zw_flush_key, "ZwFlushKey", nt_flush_key);
+zw_alias!(
+    zw_flush_virtual_memory,
+    "ZwFlushVirtualMemory",
+    nt_flush_virtual_memory
+);
+zw_alias!(
+    zw_free_user_physical_pages,
+    "ZwFreeUserPhysicalPages",
+    nt_free_user_physical_pages
+);
 zw_alias!(
     zw_free_virtual_memory,
     "ZwFreeVirtualMemory",
     nt_free_virtual_memory
 );
+zw_alias!(zw_fs_control_file, "ZwFsControlFile", nt_fs_control_file);
+zw_alias!(
+    zw_get_context_thread,
+    "ZwGetContextThread",
+    nt_get_context_thread
+);
+zw_alias!(
+    zw_get_device_power_state,
+    "ZwGetDevicePowerState",
+    nt_get_device_power_state
+);
+zw_alias!(
+    zw_get_plug_play_event,
+    "ZwGetPlugPlayEvent",
+    nt_get_plug_play_event
+);
+zw_alias!(zw_get_write_watch, "ZwGetWriteWatch", nt_get_write_watch);
+zw_alias!(
+    zw_impersonate_anonymous_token,
+    "ZwImpersonateAnonymousToken",
+    nt_impersonate_anonymous_token
+);
+zw_alias!(
+    zw_impersonate_thread,
+    "ZwImpersonateThread",
+    nt_impersonate_thread
+);
+zw_alias!(
+    zw_initialize_registry,
+    "ZwInitializeRegistry",
+    nt_initialize_registry
+);
+zw_alias!(
+    zw_initiate_power_action,
+    "ZwInitiatePowerAction",
+    nt_initiate_power_action
+);
+zw_alias!(
+    zw_is_process_in_job,
+    "ZwIsProcessInJob",
+    nt_is_process_in_job
+);
+zw_alias!(
+    zw_is_system_resume_automatic,
+    "ZwIsSystemResumeAutomatic",
+    nt_is_system_resume_automatic
+);
+zw_alias!(zw_listen_port, "ZwListenPort", nt_listen_port);
+zw_alias!(zw_load_driver, "ZwLoadDriver", nt_load_driver);
+zw_alias!(zw_load_key, "ZwLoadKey", nt_load_key);
+zw_alias!(zw_lock_file, "ZwLockFile", nt_lock_file);
+zw_alias!(
+    zw_lock_virtual_memory,
+    "ZwLockVirtualMemory",
+    nt_lock_virtual_memory
+);
+zw_alias!(
+    zw_make_permanent_object,
+    "ZwMakePermanentObject",
+    nt_make_permanent_object
+);
+zw_alias!(
+    zw_make_temporary_object,
+    "ZwMakeTemporaryObject",
+    nt_make_temporary_object
+);
+zw_alias!(
+    zw_map_user_physical_pages,
+    "ZwMapUserPhysicalPages",
+    nt_map_user_physical_pages
+);
+zw_alias!(
+    zw_map_user_physical_pages_scatter,
+    "ZwMapUserPhysicalPagesScatter",
+    nt_map_user_physical_pages_scatter
+);
+zw_alias!(
+    zw_map_view_of_section,
+    "ZwMapViewOfSection",
+    nt_map_view_of_section
+);
+zw_alias!(
+    zw_notify_change_directory_file,
+    "ZwNotifyChangeDirectoryFile",
+    nt_notify_change_directory_file
+);
+zw_alias!(
+    zw_notify_change_key,
+    "ZwNotifyChangeKey",
+    nt_notify_change_key
+);
+zw_alias!(
+    zw_open_directory_object,
+    "ZwOpenDirectoryObject",
+    nt_open_directory_object
+);
 zw_alias!(zw_open_event, "ZwOpenEvent", nt_open_event);
+zw_alias!(zw_open_event_pair, "ZwOpenEventPair", nt_open_event_pair);
+zw_alias!(zw_open_file, "ZwOpenFile", nt_open_file);
+zw_alias!(
+    zw_open_io_completion,
+    "ZwOpenIoCompletion",
+    nt_open_io_completion
+);
+zw_alias!(zw_open_job_object, "ZwOpenJobObject", nt_open_job_object);
+zw_alias!(zw_open_key, "ZwOpenKey", nt_open_key);
+zw_alias!(zw_open_mutant, "ZwOpenMutant", nt_open_mutant);
+zw_alias!(
+    zw_open_object_audit_alarm,
+    "ZwOpenObjectAuditAlarm",
+    nt_open_object_audit_alarm
+);
+zw_alias!(zw_open_process, "ZwOpenProcess", nt_open_process);
+zw_alias!(
+    zw_open_process_token,
+    "ZwOpenProcessToken",
+    nt_open_process_token
+);
+zw_alias!(zw_open_section, "ZwOpenSection", nt_open_section);
+zw_alias!(zw_open_semaphore, "ZwOpenSemaphore", nt_open_semaphore);
+zw_alias!(
+    zw_open_symbolic_link_object,
+    "ZwOpenSymbolicLinkObject",
+    nt_open_symbolic_link_object
+);
+zw_alias!(zw_open_thread, "ZwOpenThread", nt_open_thread);
+zw_alias!(
+    zw_open_thread_token,
+    "ZwOpenThreadToken",
+    nt_open_thread_token
+);
+zw_alias!(zw_open_timer, "ZwOpenTimer", nt_open_timer);
+zw_alias!(
+    zw_plug_play_control,
+    "ZwPlugPlayControl",
+    nt_plug_play_control
+);
+zw_alias!(
+    zw_power_information,
+    "ZwPowerInformation",
+    nt_power_information
+);
+zw_alias!(zw_privilege_check, "ZwPrivilegeCheck", nt_privilege_check);
+zw_alias!(
+    zw_privilege_object_audit_alarm,
+    "ZwPrivilegeObjectAuditAlarm",
+    nt_privilege_object_audit_alarm
+);
+zw_alias!(
+    zw_privileged_service_audit_alarm,
+    "ZwPrivilegedServiceAuditAlarm",
+    nt_privileged_service_audit_alarm
+);
+zw_alias!(
+    zw_protect_virtual_memory,
+    "ZwProtectVirtualMemory",
+    nt_protect_virtual_memory
+);
+zw_alias!(zw_pulse_event, "ZwPulseEvent", nt_pulse_event);
+zw_alias!(
+    zw_query_attributes_file,
+    "ZwQueryAttributesFile",
+    nt_query_attributes_file
+);
 zw_alias!(
     zw_query_debug_filter_state,
     "ZwQueryDebugFilterState",
     nt_query_debug_filter_state
 );
+zw_alias!(
+    zw_query_default_locale,
+    "ZwQueryDefaultLocale",
+    nt_query_default_locale
+);
+zw_alias!(
+    zw_query_default_ui_language,
+    "ZwQueryDefaultUILanguage",
+    nt_query_default_ui_language
+);
+zw_alias!(
+    zw_query_directory_file,
+    "ZwQueryDirectoryFile",
+    nt_query_directory_file
+);
+zw_alias!(
+    zw_query_directory_object,
+    "ZwQueryDirectoryObject",
+    nt_query_directory_object
+);
+zw_alias!(zw_query_ea_file, "ZwQueryEaFile", nt_query_ea_file);
+zw_alias!(zw_query_event, "ZwQueryEvent", nt_query_event);
+zw_alias!(
+    zw_query_full_attributes_file,
+    "ZwQueryFullAttributesFile",
+    nt_query_full_attributes_file
+);
+zw_alias!(
+    zw_query_information_atom,
+    "ZwQueryInformationAtom",
+    nt_query_information_atom
+);
+zw_alias!(
+    zw_query_information_file,
+    "ZwQueryInformationFile",
+    nt_query_information_file
+);
+zw_alias!(
+    zw_query_information_job_object,
+    "ZwQueryInformationJobObject",
+    nt_query_information_job_object
+);
+zw_alias!(
+    zw_query_information_process,
+    "ZwQueryInformationProcess",
+    nt_query_information_process
+);
+zw_alias!(
+    zw_query_information_thread,
+    "ZwQueryInformationThread",
+    nt_query_information_thread
+);
+zw_alias!(
+    zw_query_information_token,
+    "ZwQueryInformationToken",
+    nt_query_information_token
+);
+zw_alias!(
+    zw_query_install_ui_language,
+    "ZwQueryInstallUILanguage",
+    nt_query_install_ui_language
+);
+zw_alias!(
+    zw_query_io_completion,
+    "ZwQueryIoCompletion",
+    nt_query_io_completion
+);
+zw_alias!(zw_query_key, "ZwQueryKey", nt_query_key);
+zw_alias!(zw_query_object, "ZwQueryObject", nt_query_object);
+zw_alias!(
+    zw_query_performance_counter,
+    "ZwQueryPerformanceCounter",
+    nt_query_performance_counter
+);
+zw_alias!(zw_query_section, "ZwQuerySection", nt_query_section);
+zw_alias!(
+    zw_query_security_object,
+    "ZwQuerySecurityObject",
+    nt_query_security_object
+);
+zw_alias!(
+    zw_query_symbolic_link_object,
+    "ZwQuerySymbolicLinkObject",
+    nt_query_symbolic_link_object
+);
+zw_alias!(
+    zw_query_system_environment_value_ex,
+    "ZwQuerySystemEnvironmentValueEx",
+    nt_query_system_environment_value_ex
+);
+zw_alias!(
+    zw_query_system_information,
+    "ZwQuerySystemInformation",
+    nt_query_system_information
+);
+zw_alias!(
+    zw_query_system_time,
+    "ZwQuerySystemTime",
+    nt_query_system_time
+);
 zw_alias!(zw_query_value_key, "ZwQueryValueKey", nt_query_value_key);
+zw_alias!(
+    zw_query_virtual_memory,
+    "ZwQueryVirtualMemory",
+    nt_query_virtual_memory
+);
+zw_alias!(
+    zw_query_volume_information_file,
+    "ZwQueryVolumeInformationFile",
+    nt_query_volume_information_file
+);
+zw_alias!(zw_queue_apc_thread, "ZwQueueApcThread", nt_queue_apc_thread);
+zw_alias!(zw_raise_hard_error, "ZwRaiseHardError", nt_raise_hard_error);
+zw_alias!(zw_read_file, "ZwReadFile", nt_read_file);
+zw_alias!(
+    zw_read_file_scatter,
+    "ZwReadFileScatter",
+    nt_read_file_scatter
+);
+zw_alias!(
+    zw_read_virtual_memory,
+    "ZwReadVirtualMemory",
+    nt_read_virtual_memory
+);
+zw_alias!(
+    zw_release_keyed_event,
+    "ZwReleaseKeyedEvent",
+    nt_release_keyed_event
+);
+zw_alias!(zw_release_mutant, "ZwReleaseMutant", nt_release_mutant);
+zw_alias!(
+    zw_release_semaphore,
+    "ZwReleaseSemaphore",
+    nt_release_semaphore
+);
+zw_alias!(
+    zw_remove_io_completion,
+    "ZwRemoveIoCompletion",
+    nt_remove_io_completion
+);
+zw_alias!(zw_replace_key, "ZwReplaceKey", nt_replace_key);
+zw_alias!(zw_reply_port, "ZwReplyPort", nt_reply_port);
+zw_alias!(
+    zw_reply_wait_receive_port,
+    "ZwReplyWaitReceivePort",
+    nt_reply_wait_receive_port
+);
+zw_alias!(
+    zw_request_device_wakeup,
+    "ZwRequestDeviceWakeup",
+    nt_request_device_wakeup
+);
 zw_alias!(
     zw_request_wait_reply_port,
     "ZwRequestWaitReplyPort",
     nt_request_wait_reply_port
 );
 zw_alias!(
+    zw_request_wakeup_latency,
+    "ZwRequestWakeupLatency",
+    nt_request_wakeup_latency
+);
+zw_alias!(zw_reset_event, "ZwResetEvent", nt_reset_event);
+zw_alias!(
+    zw_reset_write_watch,
+    "ZwResetWriteWatch",
+    nt_reset_write_watch
+);
+zw_alias!(zw_restore_key, "ZwRestoreKey", nt_restore_key);
+zw_alias!(zw_resume_process, "ZwResumeProcess", nt_resume_process);
+zw_alias!(zw_resume_thread, "ZwResumeThread", nt_resume_thread);
+zw_alias!(zw_save_key, "ZwSaveKey", nt_save_key);
+zw_alias!(
+    zw_secure_connect_port,
+    "ZwSecureConnectPort",
+    nt_secure_connect_port
+);
+zw_alias!(
+    zw_set_context_thread,
+    "ZwSetContextThread",
+    nt_set_context_thread
+);
+zw_alias!(
     zw_set_debug_filter_state,
     "ZwSetDebugFilterState",
     nt_set_debug_filter_state
 );
+zw_alias!(
+    zw_set_default_hard_error_port,
+    "ZwSetDefaultHardErrorPort",
+    nt_set_default_hard_error_port
+);
+zw_alias!(
+    zw_set_default_locale,
+    "ZwSetDefaultLocale",
+    nt_set_default_locale
+);
+zw_alias!(zw_set_event, "ZwSetEvent", nt_set_event);
+zw_alias!(
+    zw_set_information_debug_object,
+    "ZwSetInformationDebugObject",
+    nt_set_information_debug_object
+);
+zw_alias!(
+    zw_set_information_file,
+    "ZwSetInformationFile",
+    nt_set_information_file
+);
+zw_alias!(
+    zw_set_information_job_object,
+    "ZwSetInformationJobObject",
+    nt_set_information_job_object
+);
+zw_alias!(
+    zw_set_information_object,
+    "ZwSetInformationObject",
+    nt_set_information_object
+);
+zw_alias!(
+    zw_set_information_process,
+    "ZwSetInformationProcess",
+    nt_set_information_process
+);
+zw_alias!(
+    zw_set_information_thread,
+    "ZwSetInformationThread",
+    nt_set_information_thread
+);
+zw_alias!(
+    zw_set_information_token,
+    "ZwSetInformationToken",
+    nt_set_information_token
+);
+zw_alias!(
+    zw_set_io_completion,
+    "ZwSetIoCompletion",
+    nt_set_io_completion
+);
+zw_alias!(
+    zw_set_security_object,
+    "ZwSetSecurityObject",
+    nt_set_security_object
+);
+zw_alias!(
+    zw_set_system_environment_value_ex,
+    "ZwSetSystemEnvironmentValueEx",
+    nt_set_system_environment_value_ex
+);
+zw_alias!(
+    zw_set_system_information,
+    "ZwSetSystemInformation",
+    nt_set_system_information
+);
+zw_alias!(
+    zw_set_system_power_state,
+    "ZwSetSystemPowerState",
+    nt_set_system_power_state
+);
+zw_alias!(zw_set_system_time, "ZwSetSystemTime", nt_set_system_time);
+zw_alias!(
+    zw_set_thread_execution_state,
+    "ZwSetThreadExecutionState",
+    nt_set_thread_execution_state
+);
+zw_alias!(zw_set_timer, "ZwSetTimer", nt_set_timer);
+zw_alias!(zw_set_uuid_seed, "ZwSetUuidSeed", nt_set_uuid_seed);
 zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
+zw_alias!(
+    zw_set_volume_information_file,
+    "ZwSetVolumeInformationFile",
+    nt_set_volume_information_file
+);
+zw_alias!(zw_shutdown_system, "ZwShutdownSystem", nt_shutdown_system);
+zw_alias!(
+    zw_signal_and_wait_for_single_object,
+    "ZwSignalAndWaitForSingleObject",
+    nt_signal_and_wait_for_single_object
+);
+zw_alias!(zw_suspend_process, "ZwSuspendProcess", nt_suspend_process);
+zw_alias!(zw_suspend_thread, "ZwSuspendThread", nt_suspend_thread);
+zw_alias!(
+    zw_terminate_job_object,
+    "ZwTerminateJobObject",
+    nt_terminate_job_object
+);
+zw_alias!(
+    zw_terminate_process,
+    "ZwTerminateProcess",
+    nt_terminate_process
+);
+zw_alias!(
+    zw_terminate_thread,
+    "ZwTerminateThread",
+    nt_terminate_thread
+);
+zw_alias!(zw_unload_driver, "ZwUnloadDriver", nt_unload_driver);
+zw_alias!(zw_unload_key, "ZwUnloadKey", nt_unload_key);
+zw_alias!(zw_unlock_file, "ZwUnlockFile", nt_unlock_file);
+zw_alias!(
+    zw_unlock_virtual_memory,
+    "ZwUnlockVirtualMemory",
+    nt_unlock_virtual_memory
+);
+zw_alias!(
+    zw_unmap_view_of_section,
+    "ZwUnmapViewOfSection",
+    nt_unmap_view_of_section
+);
+zw_alias!(
+    zw_wait_for_keyed_event,
+    "ZwWaitForKeyedEvent",
+    nt_wait_for_keyed_event
+);
+zw_alias!(
+    zw_wait_for_multiple_objects,
+    "ZwWaitForMultipleObjects",
+    nt_wait_for_multiple_objects
+);
 zw_alias!(
     zw_wait_for_single_object,
     "ZwWaitForSingleObject",
     nt_wait_for_single_object
+);
+zw_alias!(zw_write_file, "ZwWriteFile", nt_write_file);
+zw_alias!(
+    zw_write_file_gather,
+    "ZwWriteFileGather",
+    nt_write_file_gather
+);
+zw_alias!(
+    zw_write_virtual_memory,
+    "ZwWriteVirtualMemory",
+    nt_write_virtual_memory
+);
+zw_alias!(zw_yield_execution, "ZwYieldExecution", nt_yield_execution);
+zw_alias!(
+    zw_create_keyed_event,
+    "ZwCreateKeyedEvent",
+    nt_create_keyed_event
 );
 
 // =================================================================================================
@@ -15434,7 +16171,9 @@ pub unsafe extern "system" fn rtlp_ensure_buffer_size(
     }
     if current == static_buffer && static_size >= required_size {
         // SAFETY: descriptor writable per the contract.
-        unsafe { core::ptr::write_unaligned(base.add(RTL_BUFFER_SIZE) as *mut usize, required_size) };
+        unsafe {
+            core::ptr::write_unaligned(base.add(RTL_BUFFER_SIZE) as *mut usize, required_size)
+        };
         return STATUS_SUCCESS;
     }
 
@@ -17039,11 +17778,7 @@ fn debug_filter_enabled(component: u32, level: u32) -> bool {
 /// # Safety
 /// Called with the C DbgPrintEx ABI; the anonymous variadic tail is intentionally unread.
 #[export_name = "DbgPrintEx"]
-pub unsafe extern "C" fn dbg_print_ex(
-    component: u32,
-    level: u32,
-    format: *const u8,
-) -> NtStatus {
+pub unsafe extern "C" fn dbg_print_ex(component: u32, level: u32, format: *const u8) -> NtStatus {
     if !dbg_print_filter_allows(component, level) {
         return STATUS_SUCCESS;
     }
@@ -18645,8 +19380,207 @@ pub unsafe extern "C" fn export_anchor() {
     #[cfg(target_arch = "x86_64")]
     let anchors3: &[usize] = &[
         ki_user_callback_dispatcher as *const () as usize,
-        zw_yield_execution as *const () as usize,
+        zw_accept_connect_port as *const () as usize,
+        zw_access_check as *const () as usize,
+        zw_access_check_and_audit_alarm as *const () as usize,
+        zw_access_check_by_type as *const () as usize,
+        zw_access_check_by_type_result_list as *const () as usize,
+        zw_add_atom as *const () as usize,
+        zw_adjust_groups_token as *const () as usize,
+        zw_adjust_privileges_token as *const () as usize,
+        zw_allocate_locally_unique_id as *const () as usize,
+        zw_allocate_user_physical_pages as *const () as usize,
+        zw_allocate_virtual_memory as *const () as usize,
+        zw_apphelp_cache_control as *const () as usize,
+        zw_assign_process_to_job_object as *const () as usize,
         zw_callback_return as *const () as usize,
+        zw_cancel_device_wakeup_request as *const () as usize,
+        zw_cancel_io_file as *const () as usize,
+        zw_cancel_timer as *const () as usize,
+        zw_clear_event as *const () as usize,
+        zw_close as *const () as usize,
+        zw_close_object_audit_alarm as *const () as usize,
+        zw_complete_connect_port as *const () as usize,
+        zw_connect_port as *const () as usize,
+        zw_create_directory_object as *const () as usize,
+        zw_create_event as *const () as usize,
+        zw_create_file as *const () as usize,
+        zw_create_io_completion as *const () as usize,
+        zw_create_job_object as *const () as usize,
+        zw_create_job_set as *const () as usize,
+        zw_create_key as *const () as usize,
+        zw_create_mailslot_file as *const () as usize,
+        zw_create_mutant as *const () as usize,
+        zw_create_named_pipe_file as *const () as usize,
+        zw_create_paging_file as *const () as usize,
+        zw_create_port as *const () as usize,
+        zw_create_process_ex as *const () as usize,
+        zw_create_section as *const () as usize,
+        zw_create_semaphore as *const () as usize,
+        zw_create_symbolic_link_object as *const () as usize,
+        zw_create_thread as *const () as usize,
+        zw_create_timer as *const () as usize,
+        zw_create_token as *const () as usize,
+        zw_delay_execution as *const () as usize,
+        zw_delete_atom as *const () as usize,
+        zw_delete_key as *const () as usize,
+        zw_delete_object_audit_alarm as *const () as usize,
+        zw_delete_value_key as *const () as usize,
+        zw_device_io_control_file as *const () as usize,
+        zw_display_string as *const () as usize,
+        zw_duplicate_object as *const () as usize,
+        zw_duplicate_token as *const () as usize,
+        zw_enumerate_key as *const () as usize,
+        zw_enumerate_value_key as *const () as usize,
+        zw_filter_token as *const () as usize,
+        zw_find_atom as *const () as usize,
+        zw_flush_buffers_file as *const () as usize,
+        zw_flush_instruction_cache as *const () as usize,
+        zw_flush_key as *const () as usize,
+        zw_flush_virtual_memory as *const () as usize,
+        zw_free_user_physical_pages as *const () as usize,
+        zw_free_virtual_memory as *const () as usize,
+        zw_fs_control_file as *const () as usize,
+        zw_get_context_thread as *const () as usize,
+        zw_get_device_power_state as *const () as usize,
+        zw_get_plug_play_event as *const () as usize,
+        zw_get_write_watch as *const () as usize,
+        zw_impersonate_anonymous_token as *const () as usize,
+        zw_impersonate_thread as *const () as usize,
+        zw_initialize_registry as *const () as usize,
+        zw_initiate_power_action as *const () as usize,
+        zw_is_process_in_job as *const () as usize,
+        zw_is_system_resume_automatic as *const () as usize,
+        zw_listen_port as *const () as usize,
+        zw_load_driver as *const () as usize,
+        zw_load_key as *const () as usize,
+        zw_lock_file as *const () as usize,
+        zw_lock_virtual_memory as *const () as usize,
+        zw_make_permanent_object as *const () as usize,
+        zw_make_temporary_object as *const () as usize,
+        zw_map_user_physical_pages as *const () as usize,
+        zw_map_user_physical_pages_scatter as *const () as usize,
+        zw_map_view_of_section as *const () as usize,
+        zw_notify_change_directory_file as *const () as usize,
+        zw_notify_change_key as *const () as usize,
+        zw_open_directory_object as *const () as usize,
+        zw_open_event as *const () as usize,
+        zw_open_event_pair as *const () as usize,
+        zw_open_file as *const () as usize,
+        zw_open_io_completion as *const () as usize,
+        zw_open_job_object as *const () as usize,
+        zw_open_key as *const () as usize,
+        zw_open_mutant as *const () as usize,
+        zw_open_object_audit_alarm as *const () as usize,
+        zw_open_process as *const () as usize,
+        zw_open_process_token as *const () as usize,
+        zw_open_section as *const () as usize,
+        zw_open_semaphore as *const () as usize,
+        zw_open_symbolic_link_object as *const () as usize,
+        zw_open_thread as *const () as usize,
+        zw_open_thread_token as *const () as usize,
+        zw_open_timer as *const () as usize,
+        zw_plug_play_control as *const () as usize,
+        zw_power_information as *const () as usize,
+        zw_privilege_check as *const () as usize,
+        zw_privilege_object_audit_alarm as *const () as usize,
+        zw_privileged_service_audit_alarm as *const () as usize,
+        zw_protect_virtual_memory as *const () as usize,
+        zw_pulse_event as *const () as usize,
+        zw_query_attributes_file as *const () as usize,
+        zw_query_debug_filter_state as *const () as usize,
+        zw_query_default_locale as *const () as usize,
+        zw_query_default_ui_language as *const () as usize,
+        zw_query_directory_file as *const () as usize,
+        zw_query_directory_object as *const () as usize,
+        zw_query_ea_file as *const () as usize,
+        zw_query_event as *const () as usize,
+        zw_query_full_attributes_file as *const () as usize,
+        zw_query_information_atom as *const () as usize,
+        zw_query_information_file as *const () as usize,
+        zw_query_information_job_object as *const () as usize,
+        zw_query_information_process as *const () as usize,
+        zw_query_information_thread as *const () as usize,
+        zw_query_information_token as *const () as usize,
+        zw_query_install_ui_language as *const () as usize,
+        zw_query_io_completion as *const () as usize,
+        zw_query_key as *const () as usize,
+        zw_query_object as *const () as usize,
+        zw_query_performance_counter as *const () as usize,
+        zw_query_section as *const () as usize,
+        zw_query_security_object as *const () as usize,
+        zw_query_symbolic_link_object as *const () as usize,
+        zw_query_system_environment_value_ex as *const () as usize,
+        zw_query_system_information as *const () as usize,
+        zw_query_system_time as *const () as usize,
+        zw_query_value_key as *const () as usize,
+        zw_query_virtual_memory as *const () as usize,
+        zw_query_volume_information_file as *const () as usize,
+        zw_queue_apc_thread as *const () as usize,
+        zw_raise_hard_error as *const () as usize,
+        zw_read_file as *const () as usize,
+        zw_read_file_scatter as *const () as usize,
+        zw_read_virtual_memory as *const () as usize,
+        zw_release_keyed_event as *const () as usize,
+        zw_release_mutant as *const () as usize,
+        zw_release_semaphore as *const () as usize,
+        zw_remove_io_completion as *const () as usize,
+        zw_replace_key as *const () as usize,
+        zw_reply_port as *const () as usize,
+        zw_reply_wait_receive_port as *const () as usize,
+        zw_request_device_wakeup as *const () as usize,
+        zw_request_wait_reply_port as *const () as usize,
+        zw_request_wakeup_latency as *const () as usize,
+        zw_reset_event as *const () as usize,
+        zw_reset_write_watch as *const () as usize,
+        zw_restore_key as *const () as usize,
+        zw_resume_process as *const () as usize,
+        zw_resume_thread as *const () as usize,
+        zw_save_key as *const () as usize,
+        zw_secure_connect_port as *const () as usize,
+        zw_set_context_thread as *const () as usize,
+        zw_set_debug_filter_state as *const () as usize,
+        zw_set_default_hard_error_port as *const () as usize,
+        zw_set_default_locale as *const () as usize,
+        zw_set_event as *const () as usize,
+        zw_set_information_debug_object as *const () as usize,
+        zw_set_information_file as *const () as usize,
+        zw_set_information_job_object as *const () as usize,
+        zw_set_information_object as *const () as usize,
+        zw_set_information_process as *const () as usize,
+        zw_set_information_thread as *const () as usize,
+        zw_set_information_token as *const () as usize,
+        zw_set_io_completion as *const () as usize,
+        zw_set_security_object as *const () as usize,
+        zw_set_system_environment_value_ex as *const () as usize,
+        zw_set_system_information as *const () as usize,
+        zw_set_system_power_state as *const () as usize,
+        zw_set_system_time as *const () as usize,
+        zw_set_thread_execution_state as *const () as usize,
+        zw_set_timer as *const () as usize,
+        zw_set_uuid_seed as *const () as usize,
+        zw_set_value_key as *const () as usize,
+        zw_set_volume_information_file as *const () as usize,
+        zw_shutdown_system as *const () as usize,
+        zw_signal_and_wait_for_single_object as *const () as usize,
+        zw_suspend_process as *const () as usize,
+        zw_suspend_thread as *const () as usize,
+        zw_terminate_job_object as *const () as usize,
+        zw_terminate_process as *const () as usize,
+        zw_terminate_thread as *const () as usize,
+        zw_unload_driver as *const () as usize,
+        zw_unload_key as *const () as usize,
+        zw_unlock_file as *const () as usize,
+        zw_unlock_virtual_memory as *const () as usize,
+        zw_unmap_view_of_section as *const () as usize,
+        zw_wait_for_keyed_event as *const () as usize,
+        zw_wait_for_multiple_objects as *const () as usize,
+        zw_wait_for_single_object as *const () as usize,
+        zw_write_file as *const () as usize,
+        zw_write_file_gather as *const () as usize,
+        zw_write_virtual_memory as *const () as usize,
+        zw_yield_execution as *const () as usize,
+        zw_create_keyed_event as *const () as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors3);

@@ -6,7 +6,7 @@ use super::*;
 /// `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally, and
 /// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
 const REQUIRED_NT_COUNT: usize = 201;
-const REQUIRED_ZW_COUNT: usize = 9;
+const REQUIRED_ZW_COUNT: usize = 201;
 
 #[test]
 fn required_counts() {
@@ -69,6 +69,19 @@ fn zw_aliases_resolve_to_underlying_nt_ssn() {
         if let Some(nt) = NT_SYSCALLS.iter().find(|e| e.name == z.nt_name) {
             assert_eq!(nt.ssn, z.ssn, "Zw {} vs Nt {}", z.zw_name, z.nt_name);
         }
+    }
+}
+
+#[test]
+fn zw_aliases_cover_every_exported_nt_service() {
+    assert_eq!(ZW_ALIASES.len(), NT_SYSCALLS.len());
+    for nt in NT_SYSCALLS {
+        let zw = ZW_ALIASES
+            .iter()
+            .find(|z| z.nt_name == nt.name)
+            .unwrap_or_else(|| panic!("missing Zw alias for {}", nt.name));
+        assert_eq!(zw.ssn, nt.ssn);
+        assert_eq!(&zw.zw_name.as_bytes()[2..], &nt.name.as_bytes()[2..]);
     }
 }
 
