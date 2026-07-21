@@ -44,6 +44,7 @@ const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_PARAMETER_1: NtStatus = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_3: NtStatus = 0xC000_00F1;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022;
@@ -6556,24 +6557,52 @@ pub extern "C" fn labs(v: i64) -> i64 {
     nt_ntdll::crt::labs(v)
 }
 
+/// `__isascii(int) -> int`.
+#[export_name = "__isascii"]
+pub extern "C" fn isascii(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_ascii(c))
+}
+
+/// `__toascii(int) -> int`.
+#[export_name = "__toascii"]
+pub extern "C" fn toascii(c: i32) -> i32 {
+    nt_ntdll::crt::ascii_to_ascii(c)
+}
+
+/// `__iscsym(int) -> int` — C identifier body char (`[A-Za-z0-9_]`).
+#[export_name = "__iscsym"]
+pub extern "C" fn iscsym(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_csym(c))
+}
+
+/// `__iscsymf(int) -> int` — C identifier first char (`[A-Za-z_]`).
+#[export_name = "__iscsymf"]
+pub extern "C" fn iscsymf(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_csymf(c))
+}
+
+/// `_tolower(int) -> int` (ASCII).
+#[export_name = "_tolower"]
+pub extern "C" fn underscore_tolower(c: i32) -> i32 {
+    nt_ntdll::crt::ascii_tolower(c)
+}
+
+/// `_toupper(int) -> int` (ASCII).
+#[export_name = "_toupper"]
+pub extern "C" fn underscore_toupper(c: i32) -> i32 {
+    nt_ntdll::crt::ascii_toupper(c)
+}
+
 /// `tolower(int) -> int` (ASCII).
 #[export_name = "tolower"]
 pub extern "C" fn tolower(c: i32) -> i32 {
-    if (0x41..=0x5A).contains(&c) {
-        c + 0x20
-    } else {
-        c
-    }
+    nt_ntdll::crt::ascii_tolower(c)
 }
 
 /// `toupper(int) -> int` (ASCII).
 #[export_name = "toupper"]
 pub extern "C" fn toupper(c: i32) -> i32 {
-    if (0x61..=0x7A).contains(&c) {
-        c - 0x20
-    } else {
-        c
-    }
+    nt_ntdll::crt::ascii_toupper(c)
 }
 
 /// `towlower(wint_t) -> wint_t` (Latin-1 subset).
@@ -6599,13 +6628,97 @@ pub extern "C" fn towupper(c: u32) -> u32 {
 /// `isalpha(int) -> int` (ASCII).
 #[export_name = "isalpha"]
 pub extern "C" fn isalpha(c: i32) -> i32 {
-    i32::from((0x41..=0x5A).contains(&c) || (0x61..=0x7A).contains(&c))
+    i32::from(nt_ntdll::crt::ascii_is_alpha(c))
+}
+
+/// `isalnum(int) -> int` (ASCII).
+#[export_name = "isalnum"]
+pub extern "C" fn isalnum(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_alnum(c))
+}
+
+/// `isdigit(int) -> int` (ASCII).
+#[export_name = "isdigit"]
+pub extern "C" fn isdigit(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_digit(c))
+}
+
+/// `iscntrl(int) -> int` (ASCII).
+#[export_name = "iscntrl"]
+pub extern "C" fn iscntrl(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_cntrl(c))
+}
+
+/// `isgraph(int) -> int` (ASCII).
+#[export_name = "isgraph"]
+pub extern "C" fn isgraph(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_graph(c))
+}
+
+/// `isprint(int) -> int` (ASCII).
+#[export_name = "isprint"]
+pub extern "C" fn isprint(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_print(c))
+}
+
+/// `ispunct(int) -> int` (ASCII).
+#[export_name = "ispunct"]
+pub extern "C" fn ispunct(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_punct(c))
+}
+
+/// `isspace(int) -> int` (ASCII).
+#[export_name = "isspace"]
+pub extern "C" fn isspace(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_space(c))
+}
+
+/// `isupper(int) -> int` (ASCII).
+#[export_name = "isupper"]
+pub extern "C" fn isupper(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_upper(c))
+}
+
+/// `isxdigit(int) -> int` (ASCII).
+#[export_name = "isxdigit"]
+pub extern "C" fn isxdigit(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::ascii_is_xdigit(c))
 }
 
 /// `islower(int) -> int` (ASCII).
 #[export_name = "islower"]
 pub extern "C" fn islower(c: i32) -> i32 {
-    i32::from((0x61..=0x7A).contains(&c))
+    i32::from(nt_ntdll::crt::ascii_is_lower(c))
+}
+
+/// `iswalpha(wint_t) -> int` (ASCII subset).
+#[export_name = "iswalpha"]
+pub extern "C" fn iswalpha(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::wide_ascii_is_alpha(c))
+}
+
+/// `iswdigit(wint_t) -> int` (ASCII subset).
+#[export_name = "iswdigit"]
+pub extern "C" fn iswdigit(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::wide_ascii_is_digit(c))
+}
+
+/// `iswlower(wint_t) -> int` (ASCII subset).
+#[export_name = "iswlower"]
+pub extern "C" fn iswlower(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::wide_ascii_is_lower(c))
+}
+
+/// `iswspace(wint_t) -> int` (ASCII subset).
+#[export_name = "iswspace"]
+pub extern "C" fn iswspace(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::wide_ascii_is_space(c))
+}
+
+/// `iswxdigit(wint_t) -> int` (ASCII subset).
+#[export_name = "iswxdigit"]
+pub extern "C" fn iswxdigit(c: i32) -> i32 {
+    i32::from(nt_ntdll::crt::wide_ascii_is_xdigit(c))
 }
 
 /// `iswctype(wint_t c, wctype_t type) -> int` — the wide ctype predicate. We serve the classes the
@@ -6618,10 +6731,11 @@ pub extern "C" fn iswctype(c: u32, mask: u16) -> i32 {
     const IS_DIGIT: u16 = 0x0004;
     const IS_SPACE: u16 = 0x0008;
     const IS_ALPHA: u16 = 0x0100;
-    let upper = (0x41..=0x5A).contains(&c);
-    let lower = (0x61..=0x7A).contains(&c);
-    let digit = (0x30..=0x39).contains(&c);
-    let space = matches!(c, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D);
+    let c = c as i32;
+    let upper = nt_ntdll::crt::ascii_is_upper(c);
+    let lower = nt_ntdll::crt::ascii_is_lower(c);
+    let digit = nt_ntdll::crt::ascii_is_digit(c);
+    let space = nt_ntdll::crt::ascii_is_space(c);
     let mut hit = false;
     if mask & IS_UPPER != 0 && upper {
         hit = true;
@@ -14308,6 +14422,153 @@ pub unsafe extern "system" fn rtl_get_user_preferred_ui_languages(
     }
 }
 
+const RTL_LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0000_0002;
+const NLS_VALID_LOCALE_MASK: u32 = 0x000f_ffff;
+const LOCALE_INVARIANT: u32 = 0x0000_007f;
+const LOCALE_USER_DEFAULT: u32 = 0x0000_0400;
+const LOCALE_SYSTEM_DEFAULT: u32 = 0x0000_0800;
+const LOCALE_CUSTOM_DEFAULT: u32 = 0x0000_0c00;
+const LOCALE_CUSTOM_UI_DEFAULT: u32 = 0x0000_1400;
+const LCID_EN_NEUTRAL: u32 = 0x0000_0009;
+const LCID_EN_US: u32 = 0x0000_0409;
+
+fn rtl_locale_is_neutral(lcid: u32) -> bool {
+    const MAX_PRIMARY_LANGUAGE: u32 = 0x3ff;
+    const MAX_BASIC_LCID: u32 = 0x5fff;
+    ((lcid <= MAX_PRIMARY_LANGUAGE) && (lcid != LOCALE_INVARIANT))
+        || lcid == 0x0460
+        || ((lcid & 0xffff) > MAX_BASIC_LCID)
+}
+
+fn rtl_supported_lcid_to_locale(lcid: u32) -> Option<&'static [u8]> {
+    match lcid {
+        LOCALE_INVARIANT => Some(b""),
+        LCID_EN_NEUTRAL => Some(b"en"),
+        LCID_EN_US => Some(b"en-US"),
+        _ => None,
+    }
+}
+
+unsafe fn rtl_copy_ascii_locale(locale_name: PUnicodeString, ascii: &[u8]) -> NtStatus {
+    if locale_name.is_null() || unsafe { (*locale_name).buffer == 0 } {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    let required = (ascii.len() + 1) * 2;
+    if unsafe { (*locale_name).maximum_length as usize } < required {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let buffer = unsafe { (*locale_name).buffer as *mut u16 };
+    for (i, &byte) in ascii.iter().enumerate() {
+        unsafe { core::ptr::write(buffer.add(i), byte as u16) };
+    }
+    unsafe {
+        core::ptr::write(buffer.add(ascii.len()), 0);
+        (*locale_name).length = (ascii.len() * 2) as u16;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_locale_name_matches(locale_name: *const u16, ascii: &[u8]) -> bool {
+    for (i, &byte) in ascii.iter().enumerate() {
+        let unit = unsafe { core::ptr::read(locale_name.add(i)) };
+        let mut got = unit;
+        if (b'A' as u16..=b'Z' as u16).contains(&got) {
+            got += b'a' as u16 - b'A' as u16;
+        }
+        let mut want = byte as u16;
+        if (b'A' as u16..=b'Z' as u16).contains(&want) {
+            want += b'a' as u16 - b'A' as u16;
+        }
+        if got != want {
+            return false;
+        }
+    }
+    unsafe { core::ptr::read(locale_name.add(ascii.len())) == 0 }
+}
+
+unsafe fn rtl_supported_locale_name_to_lcid(locale_name: *const u16) -> Option<u32> {
+    if unsafe { core::ptr::read(locale_name) } == 0 {
+        return Some(LOCALE_INVARIANT);
+    }
+    if unsafe { rtl_locale_name_matches(locale_name, b"en-US") } {
+        return Some(LCID_EN_US);
+    }
+    if unsafe { rtl_locale_name_matches(locale_name, b"en") } {
+        return Some(LCID_EN_NEUTRAL);
+    }
+    None
+}
+
+/// `RtlLcidToLocaleName(LCID Lcid, PUNICODE_STRING LocaleName, ULONG Flags,
+/// BOOLEAN AllocateDestinationString)`.
+///
+/// The current NLS policy plane exposes invariant, neutral English, and en-US. Default LCIDs resolve
+/// to en-US; unsupported valid LCIDs fail with the same parameter class ReactOS uses for table miss.
+///
+/// # Safety
+/// `locale_name` is a writable UNICODE_STRING whose buffer is supplied by the caller.
+#[export_name = "RtlLcidToLocaleName"]
+pub unsafe extern "system" fn rtl_lcid_to_locale_name(
+    mut lcid: u32,
+    locale_name: PUnicodeString,
+    flags: u32,
+    _allocate_destination_string: u8,
+) -> NtStatus {
+    if flags & !RTL_LOCALE_ALLOW_NEUTRAL_NAMES != 0 {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+    if lcid & !NLS_VALID_LOCALE_MASK != 0 {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    if flags & RTL_LOCALE_ALLOW_NEUTRAL_NAMES == 0 && rtl_locale_is_neutral(lcid) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+
+    match lcid {
+        LOCALE_USER_DEFAULT | LOCALE_SYSTEM_DEFAULT | LOCALE_CUSTOM_DEFAULT => lcid = LCID_EN_US,
+        LOCALE_CUSTOM_UI_DEFAULT => return STATUS_UNSUCCESSFUL,
+        _ => {}
+    }
+
+    let Some(locale) = rtl_supported_lcid_to_locale(lcid) else {
+        return STATUS_INVALID_PARAMETER_1;
+    };
+    unsafe { rtl_copy_ascii_locale(locale_name, locale) }
+}
+
+/// `RtlLocaleNameToLcid(PCWSTR LocaleName, PLCID Lcid, ULONG Flags)`.
+///
+/// Case-insensitive mapping for the locale names currently supported by the kernel NLS policy:
+/// `en-US`, neutral `en`, and invariant empty string.
+///
+/// # Safety
+/// `locale_name` is NUL-terminated and `lcid` is writable.
+#[export_name = "RtlLocaleNameToLcid"]
+pub unsafe extern "system" fn rtl_locale_name_to_lcid(
+    locale_name: *const u16,
+    lcid: *mut u32,
+    flags: u32,
+) -> NtStatus {
+    if locale_name.is_null() {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    if lcid.is_null() {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    if flags & !0x3 != 0 {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+
+    let Some(found) = (unsafe { rtl_supported_locale_name_to_lcid(locale_name) }) else {
+        return STATUS_INVALID_PARAMETER_1;
+    };
+    if flags & RTL_LOCALE_ALLOW_NEUTRAL_NAMES == 0 && rtl_locale_is_neutral(found) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    unsafe { *lcid = found };
+    STATUS_SUCCESS
+}
+
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
 /// -> NTSTATUS`. Compare against the version reported by `RtlGetVersion`, honoring ReactOS'
 /// `TypeMask`/`ConditionMask` semantics.
@@ -19916,22 +20177,30 @@ pub unsafe extern "C" fn export_anchor() {
         // BATCH 4 — CRT surface the Win32 stack imports from ntdll.
         memcmp as usize,
         memchr as usize,
+        memccpy as usize,
+        memicmp as usize,
         strlen as usize,
         strcmp as usize,
         strcmpi as usize,
         strncmp as usize,
         strcpy as usize,
         strcat as usize,
+        strncat as usize,
         strrchr as usize,
         strstr as usize,
         strcspn as usize,
+        strspn as usize,
         strpbrk as usize,
+        strnicmp as usize,
+        strlwr as usize,
+        strupr as usize,
         wcslwr as usize,
         wcschr as usize,
         wcsrchr as usize,
         wcspbrk as usize,
         wcscmp as usize,
         wcsncmp as usize,
+        wcsncat as usize,
         wcscspn as usize,
         wcsspn as usize,
         atoi as usize,
@@ -19943,12 +20212,32 @@ pub unsafe extern "C" fn export_anchor() {
         ultow as usize,
         abs as usize,
         labs as usize,
+        isascii as usize,
+        toascii as usize,
+        iscsym as usize,
+        iscsymf as usize,
+        underscore_tolower as usize,
+        underscore_toupper as usize,
         tolower as usize,
         toupper as usize,
         towlower as usize,
         towupper as usize,
         isalpha as usize,
+        isalnum as usize,
+        isdigit as usize,
+        iscntrl as usize,
+        isgraph as usize,
+        isprint as usize,
+        ispunct as usize,
+        isspace as usize,
+        isupper as usize,
+        isxdigit as usize,
         islower as usize,
+        iswalpha as usize,
+        iswdigit as usize,
+        iswlower as usize,
+        iswspace as usize,
+        iswxdigit as usize,
         iswctype as usize,
         sin as usize,
         cos as usize,
@@ -20488,6 +20777,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_get_system_preferred_ui_languages as usize,
         rtl_get_thread_preferred_ui_languages as usize,
         rtl_get_user_preferred_ui_languages as usize,
+        rtl_lcid_to_locale_name as usize,
+        rtl_locale_name_to_lcid as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
         rtl_get_current_processor_number_ex as usize,
