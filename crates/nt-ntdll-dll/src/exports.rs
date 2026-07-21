@@ -4269,6 +4269,21 @@ pub unsafe extern "C" fn sprintf(buf: *mut u8, _fmt: *const u8) -> i32 {
     0
 }
 
+/// `_snprintf(char* buf, size_t count, const char* fmt, ...) -> int`. Variadic on the C side; this
+/// matches the current formatting seam used by `sprintf`/`_vsnprintf`: resolve the import, write an
+/// empty NUL-terminated string when possible, and return 0 until the full CRT formatter is wired.
+///
+/// # Safety
+/// `buf` writable for `count` bytes.
+#[export_name = "_snprintf"]
+pub unsafe extern "C" fn snprintf(buf: *mut u8, count: usize, _fmt: *const u8) -> i32 {
+    if !buf.is_null() && count > 0 {
+        // SAFETY: buf valid for count bytes per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
 /// `swprintf(wchar_t* buf, const wchar_t* fmt, ...) -> int` — variadic wide; same 4.0b seam.
 ///
 /// # Safety
@@ -4277,6 +4292,19 @@ pub unsafe extern "C" fn sprintf(buf: *mut u8, _fmt: *const u8) -> i32 {
 pub unsafe extern "C" fn swprintf(buf: *mut u16, _fmt: *const u16) -> i32 {
     if !buf.is_null() {
         // SAFETY: buf valid for >= 1 wchar per the contract.
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// `vsprintf(char* buf, const char* fmt, va_list) -> int`. Same formatting seam as `sprintf`.
+///
+/// # Safety
+/// `buf` writable for at least 1 byte.
+#[export_name = "vsprintf"]
+pub unsafe extern "C" fn vsprintf(buf: *mut u8, _fmt: *const u8, _args: *mut c_void) -> i32 {
+    if !buf.is_null() {
+        // SAFETY: buf valid for >= 1 byte per the contract.
         unsafe { *buf = 0 };
     }
     0
@@ -17544,7 +17572,9 @@ pub unsafe extern "C" fn export_anchor() {
         wcsupr as usize,
         stricmp as usize,
         sprintf as usize,
+        snprintf as usize,
         swprintf as usize,
+        vsprintf as usize,
         vsnprintf as usize,
         vsnwprintf as usize,
         c_specific_handler as usize,
