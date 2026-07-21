@@ -53,6 +53,9 @@ const DBG_TRUE: NtStatus = 1;
 #[cfg(not(target_arch = "x86_64"))]
 const DEBUG_FILTER_COMPONENTS: usize = 256;
 const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
+const KUSER_SHARED_DATA_VA: usize = 0x7FFE_0000;
+const KUSER_PROCESSOR_FEATURES_OFFSET: usize = 0x274;
+const KUSER_PROCESSOR_FEATURES_LEN: u32 = 64;
 
 #[cfg(not(target_arch = "x86_64"))]
 static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
@@ -1594,6 +1597,28 @@ pub unsafe extern "system" fn rtl_acquire_peb_lock() {
         if !cs.is_null() {
             let _ = rtl_enter_critical_section(cs);
         }
+    }
+}
+
+/// `RtlTryAcquirePebLock() -> BOOLEAN`.
+///
+/// # Safety
+/// On-target x86_64; the PEB + its FastPebLock are mapped.
+#[export_name = "RtlTryAcquirePebLock"]
+pub unsafe extern "system" fn rtl_try_acquire_peb_lock() -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PEB @ gs:[0x60]; FastPebLock ptr @ PEB+0x38.
+    unsafe {
+        let cs = core::ptr::read((current_peb() + 0x38) as *const *mut c_void);
+        if cs.is_null() {
+            0
+        } else {
+            rtl_try_enter_critical_section(cs)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
     }
 }
 
@@ -5428,6 +5453,12 @@ pub unsafe extern "system" fn rtl_determine_dos_path_name_type_ustr(
 ) -> u32 {
     let s = unsafe { us_slice(path) };
     rtl_determine_dos_path_name_type_u_slice(s)
+}
+
+/// `RtlGetLongestNtPathLength() -> ULONG`.
+#[export_name = "RtlGetLongestNtPathLength"]
+pub extern "system" fn rtl_get_longest_nt_path_length() -> u32 {
+    269
 }
 
 /// `RtlGetLengthWithoutTrailingPathSeperators(ULONG, PCUNICODE_STRING, PULONG) -> NTSTATUS`.
@@ -9406,6 +9437,24 @@ pub unsafe extern "system" fn rtl_large_integer_to_char(
     unsafe { copy_ascii_digits_to_buffer(&digits, length, string) }
 }
 
+/// `RtlConvertLongToLargeInteger(LONG) -> LARGE_INTEGER`.
+#[export_name = "RtlConvertLongToLargeInteger"]
+pub extern "system" fn rtl_convert_long_to_large_integer(value: i32) -> i64 {
+    value as i64
+}
+
+/// `RtlConvertUlongToLargeInteger(ULONG) -> LARGE_INTEGER`.
+#[export_name = "RtlConvertUlongToLargeInteger"]
+pub extern "system" fn rtl_convert_ulong_to_large_integer(value: u32) -> i64 {
+    value as i64
+}
+
+/// `RtlLargeIntegerNegate(LARGE_INTEGER) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerNegate"]
+pub extern "system" fn rtl_large_integer_negate(value: i64) -> i64 {
+    value.wrapping_neg()
+}
+
 /// `RtlUshortByteSwap(USHORT Source) -> USHORT`.
 ///
 /// # Safety
@@ -9431,6 +9480,12 @@ pub unsafe extern "system" fn rtl_ulong_byte_swap(source: u32) -> u32 {
 #[export_name = "RtlUlonglongByteSwap"]
 pub unsafe extern "system" fn rtl_ulonglong_byte_swap(source: u64) -> u64 {
     rtl::integer::ulonglong_byte_swap(source)
+}
+
+/// `RtlNumberOfSetBitsUlongPtr(ULONG_PTR) -> ULONG`.
+#[export_name = "RtlNumberOfSetBitsUlongPtr"]
+pub extern "system" fn rtl_number_of_set_bits_ulong_ptr(value: usize) -> u32 {
+    value.count_ones()
 }
 
 // ---- interlocked SList (single-linked list, x64 SLIST_HEADER is 16 bytes) -------------------------
@@ -9627,6 +9682,59 @@ pub unsafe extern "system" fn rtl_restore_last_win32_error(error: u32) {
     }
 }
 
+/// `RtlGetTickCount() -> ULONG`.
+///
+/// Uses the kernel's `NtQuerySystemTime` backing and converts 100ns units to milliseconds. This is a
+/// live monotonic clock in the current executive; the exact Windows uptime shared-data path is still
+/// a future KUSER_SHARED_DATA update.
+#[export_name = "RtlGetTickCount"]
+pub unsafe extern "system" fn rtl_get_tick_count() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let mut time_100ns = 0i64;
+        let status = core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut i64) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_query_system_time)(&mut time_100ns);
+        if status == STATUS_SUCCESS {
+            (time_100ns / 10_000) as u32
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// `NtGetTickCount() -> ULONG` — ReactOS exports this as the alternate name for `RtlGetTickCount`.
+#[export_name = "NtGetTickCount"]
+pub unsafe extern "system" fn nt_get_tick_count() -> u32 {
+    unsafe { rtl_get_tick_count() }
+}
+
+/// `RtlSetLastWin32ErrorAndNtStatusFromNtStatus(NTSTATUS)`.
+///
+/// # Safety
+/// Writes the current thread's TEB last-status and last-error fields on target.
+#[export_name = "RtlSetLastWin32ErrorAndNtStatusFromNtStatus"]
+pub unsafe extern "system" fn rtl_set_last_win32_error_and_nt_status_from_nt_status(
+    status: NtStatus,
+) {
+    let error = rtl::status::nt_status_to_dos_error(status);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: on-target; TEB->LastErrorValue @ 0x68 and LastStatusValue @ 0x1250.
+    unsafe {
+        core::arch::asm!("mov gs:[0x68], {:e}", in(reg) error);
+        core::arch::asm!("mov gs:[0x1250], {:e}", in(reg) status);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (status, error);
+    }
+}
+
 /// `RtlGetThreadErrorMode() -> ULONG` — return `TEB->HardErrorMode` (@0x16B0 on x64). Ref
 /// `references/reactos/sdk/lib/rtl/error.c:RtlGetThreadErrorMode`.
 ///
@@ -9684,6 +9792,12 @@ pub unsafe extern "system" fn rtl_set_thread_error_mode(
         let _ = new_mode;
     }
     STATUS_SUCCESS
+}
+
+/// `RtlValidateProcessHeaps() -> BOOLEAN`.
+#[export_name = "RtlValidateProcessHeaps"]
+pub extern "system" fn rtl_validate_process_heaps() -> u8 {
+    1
 }
 
 /// `RtlGetNtProductType(PNT_PRODUCT_TYPE ProductType) -> BOOLEAN` — 1 = NtProductWinNt.
@@ -9839,6 +9953,43 @@ pub unsafe extern "system" fn rtl_verify_version_info(
 #[export_name = "RtlGetCurrentProcessorNumber"]
 pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
     0
+}
+
+/// `RtlGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)`.
+///
+/// # Safety
+/// `processor_number` may be null or point to a writable 4-byte `PROCESSOR_NUMBER`.
+#[export_name = "RtlGetCurrentProcessorNumberEx"]
+pub unsafe extern "system" fn rtl_get_current_processor_number_ex(processor_number: *mut c_void) {
+    if processor_number.is_null() {
+        return;
+    }
+    // PROCESSOR_NUMBER = { USHORT Group; UCHAR Number; UCHAR Reserved }. Single-CPU boot => 0/0.
+    unsafe { core::ptr::write_unaligned(processor_number as *mut u32, 0) };
+}
+
+/// `RtlIsProcessorFeaturePresent(ULONG) -> BOOLEAN`.
+///
+/// # Safety
+/// Reads the mapped `KUSER_SHARED_DATA.ProcessorFeatures` byte array on target.
+#[export_name = "RtlIsProcessorFeaturePresent"]
+pub unsafe extern "system" fn rtl_is_processor_feature_present(processor_feature: u32) -> u8 {
+    if processor_feature >= KUSER_PROCESSOR_FEATURES_LEN {
+        return 0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let byte = core::ptr::read_volatile(
+            (KUSER_SHARED_DATA_VA + KUSER_PROCESSOR_FEATURES_OFFSET + processor_feature as usize)
+                as *const u8,
+        );
+        u8::from(byte != 0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = processor_feature;
+        0
+    }
 }
 
 /// `RtlGetNativeSystemInformation(...)` — forwards to `NtQuerySystemInformation`. On WOW64 it queries
@@ -13650,6 +13801,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_last_win32_error as usize,
         // BATCH 3 ckpt 2 — kernel32 early-init PEB-lock + global-flags + status-to-dos.
         rtl_acquire_peb_lock as usize,
+        rtl_try_acquire_peb_lock as usize,
         rtl_release_peb_lock as usize,
         rtl_get_current_peb as usize,
         rtl_dll_shutdown_in_progress as usize,
@@ -13954,14 +14106,20 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_system_time_to_local_time as usize,
         rtl_time_to_time_fields as usize,
         rtl_time_fields_to_time as usize,
+        rtl_get_tick_count as usize,
+        nt_get_tick_count as usize,
         rtl_uniform as usize,
         rtl_random as usize,
         rtl_random_ex as usize,
         rtl_integer_to_char as usize,
         rtl_large_integer_to_char as usize,
+        rtl_convert_long_to_large_integer as usize,
+        rtl_convert_ulong_to_large_integer as usize,
+        rtl_large_integer_negate as usize,
         rtl_ushort_byte_swap as usize,
         rtl_ulong_byte_swap as usize,
         rtl_ulonglong_byte_swap as usize,
+        rtl_number_of_set_bits_ulong_ptr as usize,
     ];
     core::hint::black_box(anchors_misc1);
     let anchors_misc2: &[usize] = &[
@@ -13975,14 +14133,18 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_query_depth_slist as usize,
         rtl_get_last_nt_status as usize,
         rtl_restore_last_win32_error as usize,
+        rtl_set_last_win32_error_and_nt_status_from_nt_status as usize,
         rtl_get_thread_error_mode as usize,
         rtl_set_thread_error_mode as usize,
+        rtl_validate_process_heaps as usize,
         rtl_get_nt_product_type as usize,
         rtl_get_version as usize,
         rtl_get_nt_version_numbers as usize,
         rtl_get_product_info as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
+        rtl_get_current_processor_number_ex as usize,
+        rtl_is_processor_feature_present as usize,
         rtl_get_native_system_information as usize,
         rtl_add_vectored_exception_handler as usize,
         rtl_remove_vectored_exception_handler as usize,
@@ -14039,6 +14201,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ipv4_string_to_address_ex_w as usize,
         rtl_determine_dos_path_name_type_u as usize,
         rtl_determine_dos_path_name_type_ustr as usize,
+        rtl_get_longest_nt_path_length as usize,
         rtl_get_length_without_trailing_path_seperators as usize,
         rtlp_apply_length_function as usize,
         rtl_is_dos_device_name_u as usize,
