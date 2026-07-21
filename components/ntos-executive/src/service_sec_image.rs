@@ -3399,13 +3399,15 @@ pub(crate) unsafe fn service_sec_image(
                 // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
                 // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
                 {
-                    // Dispatching the first real SAS starts welcome-dialog construction, whose child
+                    // Real cursor/icon/OBM callbacks run bounded resource-load bursts before SAS;
+                    // dispatching the first real SAS then starts welcome-dialog construction, whose child
                     // creation and layout legitimately cross the historical 500-call ceiling before
                     // IDD_LOGON can be correlated. Grant only a bounded bridge after both the dequeued
                     // SAS and a real post-SAS dialog creation; reserve the larger burst for the exact
                     // correlated credential dialog.
                     const W32_TOTAL_LIMIT: u64 = 500;
-                    const W32_POST_SAS_DIALOG_LIMIT: u64 = 1024;
+                    const W32_RESOURCE_CALLBACK_LIMIT: u64 = 1536;
+                    const W32_POST_SAS_DIALOG_LIMIT: u64 = 2048;
                     const W32_IDD_LOGON_LIMIT: u64 = 4096;
                     let limit = if pi == 2
                         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
@@ -3416,6 +3418,8 @@ pub(crate) unsafe fn service_sec_image(
                         && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) != 0
                     {
                         W32_POST_SAS_DIALOG_LIMIT
+                    } else if pi == 2 && win32k_glue::real_resource_callback_started() {
+                        W32_RESOURCE_CALLBACK_LIMIT
                     } else {
                         W32_TOTAL_LIMIT
                     };
@@ -3894,11 +3898,14 @@ pub(crate) unsafe fn service_sec_image(
                     let fb = FB_VADDR as *const u32;
                     let mut matched = 0u32;
                     let mut changed = 0u32;
+                    let mut non_bg_count = 0u32;
+                    let mut non_bg_index = 0u64;
+                    let mut non_bg_value = 0u32;
                     let mut sample0 = 0u32;
                     for r in 0..24u64 {
                         for c in 0..32u64 {
-                            let idx = (r * 32 * 1024 + c * 32) as usize;
-                            let px = core::ptr::read_volatile(fb.add(idx));
+                            let idx = r * 32 * 1024 + c * 32;
+                            let px = core::ptr::read_volatile(fb.add(idx as usize));
                             if r == 0 && c == 0 {
                                 sample0 = px;
                             }
@@ -3907,6 +3914,10 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             if px == FB_DESKTOP_BG {
                                 matched += 1;
+                            } else {
+                                non_bg_count += 1;
+                                non_bg_index = idx;
+                                non_bg_value = px;
                             }
                         }
                     }
@@ -3915,6 +3926,10 @@ pub(crate) unsafe fn service_sec_image(
                     // (the scaffold no longer paints — the m0==0x125a arm keeps only InitVideo/surface).
                     FB_PIXELS_DREW.store(if changed > 0 { 2 } else { 1 }, Ordering::Relaxed);
                     FB_PIXELS_MATCH.store(matched as u64, Ordering::Relaxed);
+                    FB_PIXELS_CHANGED.store(changed as u64, Ordering::Relaxed);
+                    FB_NON_BG_COUNT.store(non_bg_count as u64, Ordering::Relaxed);
+                    FB_NON_BG_INDEX.store(non_bg_index, Ordering::Relaxed);
+                    FB_NON_BG_VALUE.store(non_bg_value as u64, Ordering::Relaxed);
                     FB_PIXELS_SAMPLE0.store(sample0 as u64, Ordering::Relaxed);
                     print_str(b"[win32k-svc] winlogon NtUserSwitchDesktop ret=0x");
                     print_hex(st as u32);
@@ -3924,6 +3939,12 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(matched as u64);
                     print_str(b"/768 (px0=0x");
                     print_hex(sample0);
+                    print_str(b", non-bg ");
+                    print_u64(non_bg_count as u64);
+                    print_str(b" at 0x");
+                    print_hex(non_bg_index as u32);
+                    print_str(b" value=0x");
+                    print_hex(non_bg_value);
                     print_str(b")\n");
                     // Latch: this painting switch is done. The next winlogon 0x1288 (already-current no-op)
                     // must NOT clear/re-read the fb (it would wipe the paint we just sampled).

@@ -5124,13 +5124,23 @@ static FB_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static FB_PIXELS_DREW: AtomicU64 = AtomicU64::new(0);
 /// Count (of the 768-px sampled grid) whose value == [`FB_DESKTOP_BG`] after the desktop-graphics
 /// init — i.e. how many sampled pixels hold the authentic WC_DESKTOP background win32k painted.
-/// The `exec_win32k_desktop_painted` gate asserts this is the full 768 (see the summary section).
+/// A single non-background sample is permitted only at the real cursor overlay point.
 static FB_PIXELS_MATCH: AtomicU64 = AtomicU64::new(0);
+/// Count (of the 768-px sampled grid) whose value changed from the magenta pre-paint marker.
+static FB_PIXELS_CHANGED: AtomicU64 = AtomicU64::new(0);
+/// Count of samples that are not the desktop background color.
+static FB_NON_BG_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Flat framebuffer index of the sole/latest non-background sample in the grid.
+static FB_NON_BG_INDEX: AtomicU64 = AtomicU64::new(0);
+/// Pixel value of the sole/latest non-background sample in the grid.
+static FB_NON_BG_VALUE: AtomicU64 = AtomicU64::new(0);
 /// The first sampled pixel (grid origin) after the desktop-graphics init — recorded so the gate
 /// report shows the actual painted COLORREF (expected [`FB_DESKTOP_BG`]).
 static FB_PIXELS_SAMPLE0: AtomicU64 = AtomicU64::new(0);
 /// The number of framebuffer pixels sampled on the readback grid (24 rows x 32 cols).
 const FB_SAMPLE_COUNT: u64 = 24 * 32;
+/// The sampled point covered by the real arrow cursor after user32 loads and sets the default cursor.
+const FB_CURSOR_SAMPLE_INDEX: u64 = 12 * 32 * 1024 + 16 * 32;
 /// Proof that winlogon's OWN natural NtUserSwitchDesktop -> co_IntShowDesktop -> IntPaintDesktop
 /// flow paints the framebuffer. Set by the forward arm around winlogon's SwitchDesktop (SSN 0x1288):
 /// the fb is cleared to magenta (0x00FF00FF) BEFORE the switch and the sampled grid is re-read AFTER —
@@ -5148,7 +5158,8 @@ pub(crate) static WINLOGON_PAINT_DONE: AtomicU64 = AtomicU64::new(0);
 /// The authentic desktop background COLORREF that win32k's WC_DESKTOP class `hbrBackground` paints
 /// (co_IntShowDesktop -> IntPaintDesktop -> NtGdiPatBlt -> DrvBitBlt -> the real framebuffer). This
 /// is the value the Phase-0a magenta (0x00FF00FF) test pattern must flip to when the desktop is
-/// painted; the `exec_win32k_desktop_painted` gate spec asserts the WHOLE sampled grid == this.
+/// painted; the `exec_win32k_desktop_painted` gate spec asserts the sampled grid changed from magenta
+/// and is this color except for the exact cursor overlay sample.
 const FB_DESKTOP_BG: u32 = 0x003a_6ea5;
 /// The executive's Phase-0a framebuffer window (also read back after the desktop-graphics init to
 /// confirm GDI/framebuf drew pixels).
@@ -8778,12 +8789,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // (NtUserSwitchDesktop -> co_IntShowDesktop -> WM_ERASEBKGND -> DceAllocDCE -> co_IntGraphicsCheck)
     // lazily drives co_IntInitializeDesktopGraphics (InitVideo/surface) THEN IntPaintDesktop paints the
     // framebuffer (the m0==0x1288 forward arm cleared the fb to magenta first, then re-read the grid,
-    // stashing the result in FB_PIXELS_DREW/MATCH/SAMPLE0). There is no longer any m0==0x125a arm; win32k's
+    // stashing the result in FB_PIXELS_DREW/MATCH/CHANGED/SAMPLE0). There is no longer any m0==0x125a arm; win32k's
     // own NtUserInitialize dispatch only seeds the host prerequisites (system font + WinSta0/Default Ob).
     {
         let d = FB_PIXELS_DREW.load(Ordering::Relaxed);
         let matched = FB_PIXELS_MATCH.load(Ordering::Relaxed);
+        let changed = FB_PIXELS_CHANGED.load(Ordering::Relaxed);
+        let non_bg_count = FB_NON_BG_COUNT.load(Ordering::Relaxed);
+        let non_bg_index = FB_NON_BG_INDEX.load(Ordering::Relaxed);
+        let non_bg_value = FB_NON_BG_VALUE.load(Ordering::Relaxed);
         let sample0 = FB_PIXELS_SAMPLE0.load(Ordering::Relaxed);
+        let cursor_overlay = matched + 1 == FB_SAMPLE_COUNT
+            && non_bg_count == 1
+            && non_bg_index == FB_CURSOR_SAMPLE_INDEX
+            && non_bg_value as u32 != 0x00ff_00ff;
+        let full_desktop = d == 2
+            && changed == FB_SAMPLE_COUNT
+            && sample0 as u32 == FB_DESKTOP_BG
+            && (matched == FB_SAMPLE_COUNT || cursor_overlay);
         print_str(b"[ntos-exec] win32k desktop-graphics framebuffer pixels: ");
         print_str(match d {
             2 => b"DREW (non-magenta)\n".as_slice(),
@@ -8799,17 +8822,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (expected 0x");
         print_hex(FB_DESKTOP_BG);
         print_str(b")\n");
-        // PERMANENT GATE: the whole sampled framebuffer grid must hold the authentic WC_DESKTOP
-        // background painted by winlogon's NATURAL co_IntShowDesktop -> IntPaintDesktop. Because the
-        // fb was cleared to magenta right before winlogon's SwitchDesktop, a full 768/768 match here
-        // PROVES the desktop is painted by the authentic boot flow (BOOTBOOT -> kernel -> smss ->
-        // csrss -> winlogon -> win32k) with no scaffold paint. A regression that stops the paint (or
-        // changes the color) FAILS the gate.
-        check(
-            b"exec_win32k_desktop_painted",
-            d == 2 && matched == FB_SAMPLE_COUNT && sample0 as u32 == FB_DESKTOP_BG,
-            &mut passed,
-        );
+        print_str(b"[ntos-exec] desktop samples changed ");
+        print_u64(changed);
+        print_str(b"/");
+        print_u64(FB_SAMPLE_COUNT);
+        print_str(b", non-bg ");
+        print_u64(non_bg_count);
+        print_str(b" at 0x");
+        print_hex(non_bg_index as u32);
+        print_str(b" value=0x");
+        print_hex(non_bg_value as u32);
+        print_str(if cursor_overlay {
+            b" (cursor overlay)\n".as_slice()
+        } else {
+            b"\n".as_slice()
+        });
+        // PERMANENT GATE: the sampled framebuffer grid must have fully changed from the magenta marker
+        // and hold the authentic WC_DESKTOP background painted by winlogon's natural boot flow. The only
+        // accepted exception is the exact grid sample covered by the real arrow cursor.
+        check(b"exec_win32k_desktop_painted", full_desktop, &mut passed);
         // Echo winlogon's natural-paint count (same source as the counted spec above — the scaffold
         // paint is retired, so these agree by construction).
         let nat = WINLOGON_NATURAL_PAINT.load(Ordering::Relaxed);
@@ -8819,6 +8850,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(FB_SAMPLE_COUNT);
         print_str(if nat == FB_SAMPLE_COUNT {
             b" px re-painted 0x003a6ea5 (natural flow PAINTS)\n".as_slice()
+        } else if cursor_overlay {
+            b" px re-painted 0x003a6ea5 plus cursor overlay (natural flow PAINTS)\n".as_slice()
         } else {
             b" px (natural flow did NOT fully re-paint)\n".as_slice()
         });

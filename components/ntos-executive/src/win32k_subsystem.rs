@@ -2382,8 +2382,13 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
     out_len: *mut u32,
 ) -> i32 {
     unsafe {
-        let requested_output = if out_len.is_null() { 0 } else { read_volatile(out_len) };
-        let mut output_capacity = requested_output.max(input_len).max(8) as usize;
+        let Some(contract) = nt_user_callback::UserCallbackContract::for_api(api) else {
+            return 0xC000_00BBu32 as i32;
+        };
+        let Some(minimum_result_capacity) = contract.minimum_result_capacity(input_len) else {
+            return 0xC000_0004u32 as i32;
+        };
+        let mut output_capacity = input_len.max(minimum_result_capacity).max(8) as usize;
         output_capacity = match output_capacity.checked_add(15) {
             Some(value) => value & !15,
             None => return 0xC000_000Du32 as i32,

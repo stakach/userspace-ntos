@@ -14,6 +14,7 @@ static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -157,13 +158,16 @@ pub(crate) unsafe fn complete_nested_user_callback_dispatch(
     true
 }
 
-unsafe fn write_synthetic_callback_reply(request: nt_user_callback::CallbackHeader) {
+unsafe fn write_callback_failure_reply(
+    request: nt_user_callback::CallbackHeader,
+    status: i32,
+) {
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
     let mut reply = request;
     reply.state = nt_user_callback::CallbackState::Reply as u32;
-    reply.output_length = request.output_capacity;
-    reply.status = 0;
+    reply.output_length = 0;
+    reply.status = status;
     core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), reply);
 }
 
@@ -221,6 +225,10 @@ pub(crate) fn take_user_callback_pump_suspended() -> bool {
 
 pub(crate) fn real_wm_paint_callback_returns() -> u64 {
     USER_CALLBACK_REAL_WM_PAINT_RETURNS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn real_resource_callback_started() -> bool {
+    USER_CALLBACK_REAL_RESOURCE_STARTED.load(Ordering::Relaxed) != 0
 }
 
 pub(crate) fn last_real_wm_paint_hwnd() -> u64 {
@@ -381,6 +389,18 @@ unsafe fn callback_payload_u32(frame: *mut nt_user_callback::CallbackFrame, offs
     callback_payload_u64(frame, offset) as u32
 }
 
+unsafe fn callback_payload_result_u64(
+    frame: *mut nt_user_callback::CallbackFrame,
+    length: u32,
+) -> u64 {
+    let mut bytes = [0u8; 8];
+    let limit = (length as usize).min(bytes.len());
+    for index in 0..limit {
+        bytes[index] = core::ptr::read_volatile(core::ptr::addr_of!((*frame).payload[index]));
+    }
+    u64::from_le_bytes(bytes)
+}
+
 unsafe fn callback_payload_write_u64(frame: *mut nt_user_callback::CallbackFrame, offset: usize, value: u64) {
     for (index, byte) in value.to_le_bytes().iter().enumerate() {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset + index]), *byte);
@@ -406,7 +426,27 @@ pub(crate) unsafe fn service_user_callback(
     }
     USER_CALLBACK_RENDEZVOUS.fetch_add(1, Ordering::Relaxed);
 
-    let output_capacity = request.output_capacity as usize;
+    let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
+    let contract_valid = contract.is_some_and(|contract| {
+        let base_shape_valid = contract.accepts_request(
+            request.input_length,
+            request.output_capacity,
+            request.payload_reference_offset,
+        );
+        if !base_shape_valid {
+            return false;
+        }
+        if matches!(contract, nt_user_callback::UserCallbackContract::Lpk) {
+            contract.accepts_lpk_layout(
+                request.input_length,
+                callback_payload_u64(frame, 0),
+                callback_payload_u32(frame, 0x2c),
+            )
+        } else {
+            true
+        }
+    });
+
     let winlogon_api0_ordinal = if request.api_index == 0 && client.pi == 2 {
         USER_CALLBACK_WINLOGON_API0.fetch_add(1, Ordering::Relaxed) + 1
     } else {
@@ -422,7 +462,7 @@ pub(crate) unsafe fn service_user_callback(
         (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_SAS_SESSION) as *const u64,
     );
     let mut suspend_component = false;
-    if client.pi == 2 {
+    if client.pi == 2 && contract_valid {
         let callback_table = if client.peb_mirror == 0 {
             0
         } else {
@@ -454,10 +494,10 @@ pub(crate) unsafe fn service_user_callback(
             && sas_session_before == 0
             && request.payload_reference_offset == WINDOWPROC_PAYLOAD_OFFSET
             && request.input_length >= 0x40 + 0x50;
-        if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+        let requires_window_binding = contract.unwrap().requires_window_binding();
+        if (!requires_window_binding || callback_teb_alias.is_some())
             && valid
             && dispatcher != 0
-            && callback_teb_alias.is_some()
             && begin_controlled_continuation(request)
         {
             if !remember_active_dispatch(&request) {
@@ -467,12 +507,14 @@ pub(crate) unsafe fn service_user_callback(
             // win32k's IntSetTebWndCallback executes in the isolated driver component. Bridge its
             // per-callback HWND/PWND cache into the client TEB that user32 actually reads, preserving
             // the same nested save/restore semantics as the native kernel path.
-            if !bind_client_callback_window(
-                request,
-                callback_teb_alias.unwrap(),
-                callback_payload_u64(frame, 0x10),
-                window_message,
-            ) {
+            if requires_window_binding
+                && !bind_client_callback_window(
+                    request,
+                    callback_teb_alias.unwrap(),
+                    callback_payload_u64(frame, 0x10),
+                    window_message,
+                )
+            {
                 let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
                 if let Some(index) = active.len().checked_sub(1) {
                     let _ = take_active_dispatch(index);
@@ -489,6 +531,15 @@ pub(crate) unsafe fn service_user_callback(
                 ),
                 Ordering::Relaxed,
             );
+            if matches!(
+                request.api_index,
+                nt_user_callback::USER32_CALLBACK_LOADDEFAULTCURSORS
+                    | nt_user_callback::USER32_CALLBACK_SETWNDICONS
+                    | nt_user_callback::USER32_CALLBACK_SETOBM
+                    | nt_user_callback::USER32_CALLBACK_LPK
+            ) {
+                USER_CALLBACK_REAL_RESOURCE_STARTED.store(1, Ordering::Relaxed);
+            }
             if first_sas_create {
                 let sas_hwnd = callback_payload_u64(frame, 0x10);
                 let sas_session = callback_payload_u64(frame, WINDOWPROC_PAYLOAD_OFFSET as usize);
@@ -533,25 +584,22 @@ pub(crate) unsafe fn service_user_callback(
         print_str(b"[user-callback] B component continuation parked in callback receive loop\n");
         Some(UserCallbackDisposition::SuspendComponent)
     } else {
-        if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
-            for offset in request.input_length as usize..output_capacity {
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
-            }
-            if request.input_length as usize >= WPCA_RESULT + 8 {
-                let result = if window_message == 0x0083 { 0 } else { 1 };
-                callback_payload_write_u64(frame, WPCA_RESULT, result);
-                print_str(b"[user-callback] WINDOWPROC api=0 msg=0x");
-                print_hex(window_message);
-                print_str(b" -> fallback Result=");
-                print_u64(result);
-                print_str(b" via rendezvous\n");
-            }
+        const STATUS_UNSUCCESSFUL: i32 = 0xc000_0001u32 as i32;
+        const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xc000_0004u32 as i32;
+        const STATUS_NOT_SUPPORTED: i32 = 0xc000_00bbu32 as i32;
+        let status = if contract.is_none() || client.pi != 2 {
+            STATUS_NOT_SUPPORTED
+        } else if !contract_valid {
+            STATUS_INFO_LENGTH_MISMATCH
         } else {
-            for offset in 0..output_capacity {
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[offset]), 0);
-            }
-        }
-        write_synthetic_callback_reply(request);
+            STATUS_UNSUCCESSFUL
+        };
+        print_str(b"[user-callback] callback not redirected api=");
+        print_u64(request.api_index as u64);
+        print_str(b" status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        write_callback_failure_reply(request, status);
         Some(UserCallbackDisposition::ReplyImmediately)
     }
 }
@@ -762,7 +810,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
     let active_index = active.len() - 1;
     let dispatch_context = take_active_dispatch(active_index);
-    write_synthetic_callback_reply(request);
+    write_callback_failure_reply(request, 0xc000_0001u32 as i32);
     let unwind_ok = unwind_controlled_callback(request);
     let cancelled = active.cancel_pending(correlation);
     if let Ok(frame) = cancelled {
@@ -828,10 +876,16 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
+    let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
     if result_length > request.output_capacity as u64
         || (result_length != 0 && result_pointer == 0)
-        || (request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
-            && result_length != request.input_length as u64)
+        || !contract.is_some_and(|contract| {
+            contract.accepts_result(
+                request.input_length,
+                result_length as u32,
+                callback_status as u32 as i32,
+            )
+        })
     {
         abort_controlled_user_callbacks();
         return None;
@@ -877,6 +931,19 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         if !crate::img_spawn::smss_copyin(result_pointer, output) {
             abort_controlled_user_callbacks();
             return None;
+        }
+        if request.api_index != nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+            let result0 = callback_payload_result_u64(frame, result_length as u32);
+            print_str(b"[user-callback] real callback returned api=");
+            print_u64(request.api_index as u64);
+            print_str(b" status=0x");
+            print_hex(callback_status as u32);
+            print_str(b" result-length=0x");
+            print_hex(result_length as u32);
+            print_str(b" result0=0x");
+            print_hex((result0 >> 32) as u32);
+            print_hex(result0 as u32);
+            print_str(b"\n");
         }
     }
     if client_pi == 2

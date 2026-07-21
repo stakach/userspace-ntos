@@ -118,6 +118,134 @@ pub const STATUS_PENDING: i32 = 0x0000_0103;
 pub const USER32_CALLBACK_CLIENTTHREADSTARTUP: u32 = 7;
 /// ReactOS `USER32_CALLBACK_WINDOWPROC` / `apfnDispatch[0]`.
 pub const USER32_CALLBACK_WINDOWPROC: u32 = 0;
+/// ReactOS `USER32_CALLBACK_LOADDEFAULTCURSORS` / `apfnDispatch[3]`.
+pub const USER32_CALLBACK_LOADDEFAULTCURSORS: u32 = 3;
+/// ReactOS `USER32_CALLBACK_SETWNDICONS` / `apfnDispatch[11]`.
+pub const USER32_CALLBACK_SETWNDICONS: u32 = 11;
+/// ReactOS `USER32_CALLBACK_SETOBM` / `apfnDispatch[15]`.
+pub const USER32_CALLBACK_SETOBM: u32 = 15;
+/// ReactOS `USER32_CALLBACK_LPK` / `apfnDispatch[16]`.
+pub const USER32_CALLBACK_LPK: u32 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserCallbackContract {
+    WindowProc,
+    Lpk,
+    Fixed {
+        input_length: u32,
+        result_length: u32,
+    },
+}
+
+impl UserCallbackContract {
+    pub const fn for_api(api_index: u32) -> Option<Self> {
+        match api_index {
+            USER32_CALLBACK_WINDOWPROC => Some(Self::WindowProc),
+            USER32_CALLBACK_LOADDEFAULTCURSORS => Some(Self::Fixed {
+                input_length: 4,
+                result_length: 8,
+            }),
+            USER32_CALLBACK_SETWNDICONS => Some(Self::Fixed {
+                input_length: 0x38,
+                result_length: 0x38,
+            }),
+            USER32_CALLBACK_SETOBM => Some(Self::Fixed {
+                input_length: 0x5d0,
+                result_length: 0x5d0,
+            }),
+            USER32_CALLBACK_LPK => Some(Self::Lpk),
+            _ => None,
+        }
+    }
+
+    pub const fn accepts_request(
+        self,
+        input_length: u32,
+        output_capacity: u32,
+        payload_reference_offset: u32,
+    ) -> bool {
+        match self {
+            Self::WindowProc => {
+                input_length >= 0x40
+                    && output_capacity >= input_length
+                    && (payload_reference_offset == NO_PAYLOAD_REFERENCE
+                        || payload_reference_offset == 0x40)
+            }
+            Self::Lpk => {
+                input_length >= 0x3c
+                    && output_capacity >= 4
+                    && payload_reference_offset == NO_PAYLOAD_REFERENCE
+            }
+            Self::Fixed {
+                input_length: expected_input,
+                result_length,
+            } => {
+                input_length == expected_input
+                    && output_capacity >= result_length
+                    && payload_reference_offset == NO_PAYLOAD_REFERENCE
+            }
+        }
+    }
+
+    pub const fn accepts_result(
+        self,
+        input_length: u32,
+        result_length: u32,
+        callback_status: i32,
+    ) -> bool {
+        if callback_status < 0 {
+            return result_length == 0;
+        }
+        match self {
+            Self::WindowProc => result_length == input_length,
+            Self::Lpk => result_length == 4,
+            Self::Fixed {
+                result_length: expected,
+                ..
+            } => result_length == expected,
+        }
+    }
+
+    pub const fn requires_window_binding(self) -> bool {
+        matches!(self, Self::WindowProc)
+    }
+
+    pub const fn minimum_result_capacity(self, input_length: u32) -> Option<u32> {
+        match self {
+            Self::WindowProc if input_length >= 0x40 => Some(input_length),
+            Self::WindowProc => None,
+            Self::Lpk if input_length >= 0x3c => Some(4),
+            Self::Lpk => None,
+            Self::Fixed {
+                input_length: expected_input,
+                result_length,
+            } if input_length == expected_input => Some(result_length),
+            Self::Fixed { .. } => None,
+        }
+    }
+
+    pub const fn accepts_lpk_layout(
+        self,
+        input_length: u32,
+        string_offset: u64,
+        character_count: u32,
+    ) -> bool {
+        if !matches!(self, Self::Lpk) || string_offset != 0x38 {
+            return false;
+        }
+        let Some(chars_with_slack) = character_count.checked_add(2) else {
+            return false;
+        };
+        let Some(string_bytes) = chars_with_slack.checked_mul(2) else {
+            return false;
+        };
+        let Some(total_input_length) = 0x38u32.checked_add(string_bytes) else {
+            return false;
+        };
+        total_input_length == input_length
+    }
+}
+
 pub const NTUSER_SET_WINDOW_LONG_PTR_SSN: u64 = 0x1298;
 pub const NTUSER_REGISTER_HOT_KEY_SSN: u64 = 0x126b;
 pub const NTUSER_PEEK_MESSAGE_SSN: u64 = 0x1001;
@@ -1730,6 +1858,37 @@ mod tests {
         header.state = CallbackState::Reply as u32;
         header.begin_request(0, 64, 64).unwrap();
         assert_eq!((header.dispatch_id, header.callback_id), (9, 2));
+    }
+
+    #[test]
+    fn active_callback_contracts_validate_exact_payload_shapes() {
+        let api0 = UserCallbackContract::for_api(USER32_CALLBACK_WINDOWPROC).unwrap();
+        assert!(api0.accepts_request(0x40, 0x40, NO_PAYLOAD_REFERENCE));
+        assert!(api0.accepts_request(0x90, 0x90, 0x40));
+        assert!(!api0.accepts_request(0x38, 0x40, NO_PAYLOAD_REFERENCE));
+        assert!(api0.accepts_result(0x90, 0x90, 0));
+
+        let api3 = UserCallbackContract::for_api(USER32_CALLBACK_LOADDEFAULTCURSORS).unwrap();
+        assert!(api3.accepts_request(4, 16, NO_PAYLOAD_REFERENCE));
+        assert!(api3.accepts_result(4, 8, 0));
+        assert!(!api3.accepts_result(4, 16, 0));
+
+        let api11 = UserCallbackContract::for_api(USER32_CALLBACK_SETWNDICONS).unwrap();
+        assert!(api11.accepts_request(0x38, 0x40, NO_PAYLOAD_REFERENCE));
+        assert!(api11.accepts_result(0x38, 0x38, 0));
+
+        let api15 = UserCallbackContract::for_api(USER32_CALLBACK_SETOBM).unwrap();
+        assert!(api15.accepts_request(0x5d0, 0x5d0, NO_PAYLOAD_REFERENCE));
+        assert!(api15.accepts_result(0x5d0, 0x5d0, 0));
+        assert!(api15.accepts_result(0x5d0, 0, 0xc000_0001u32 as i32));
+        let api16 = UserCallbackContract::for_api(USER32_CALLBACK_LPK).unwrap();
+        assert!(api16.accepts_request(0x48, 0x50, NO_PAYLOAD_REFERENCE));
+        assert!(api16.accepts_lpk_layout(0x48, 0x38, 6));
+        assert!(!api16.accepts_lpk_layout(0x48, 0x40, 6));
+        assert!(!api16.accepts_lpk_layout(0x48, 0x38, 7));
+        assert_eq!(api16.minimum_result_capacity(0x48), Some(4));
+        assert!(api16.accepts_result(0x48, 4, 0));
+        assert_eq!(UserCallbackContract::for_api(4), None);
     }
 
     #[test]
