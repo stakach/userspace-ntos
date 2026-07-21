@@ -1,20 +1,20 @@
 # Plan: the win32k → client user-mode callback machinery (`KeUserModeCallback`)
 
-Status: **PHASE 2A implemented; PHASE 2B controlled api7 reverse transition implemented and
-gate-verified; Phase 3 bounded continuation + re-entrant component transport foundation
-implemented and gate-verified; Phase 3B real api0 `WM_CREATE` marshalling, bounded nested dispatch,
-and SSN-22 return are implemented and gate-verified**. Author target: the
-executive + isolated win32k component + `nt-ntdll`. Phase 1 supplied the client dispatcher.
-Phase 2A replaces the component-local synthetic shortcut with a real, synchronous component →
-executive callback rendezvous while preserving the synthetic reply policy. Phase 2B completes a
-controlled real api7 client roundtrip, then preserves the original api0 request's synthetic
-completion. The Phase-3 foundation replaces the callback `Call` with a Send + explicit component
-receive loop, so the sole win32k TCB can accept nested dispatches while a callback is parked. General
-api0 callbacks still need per-callback sequence/marshalling policy, but the first real WINDOWPROC
-roundtrip is live.
-The IDD_LOGON logon dialog
-is *created* (16 `#32770` windows in the current gate) but never *painted* because its `WM_PAINT`
-is never dispatched to the control procs.
+Status: **Phase 4 login-dialog paint path is implemented and gate-verified.** The
+executive + isolated win32k component + `nt-ntdll` now run the real reverse-callback transport:
+win32k requests `KeUserModeCallback`, the executive redirects winlogon into
+`KiUserCallbackDispatcher`, and `NtCallbackReturn` resumes the parked win32k continuation. The
+component callback stub uses Send + an explicit receive loop, so the single win32k TCB can service
+nested USER/GDI dispatches while an outer callback is parked. Supported active callbacks are no
+longer completed by synthetic success replies: api0 WINDOWPROC plus api3 default cursors, api11
+window icons, api15 OBM/menu bitmaps, and api16 LPK text output are contract-validated and executed
+in winlogon; unsupported or malformed callbacks fail closed.
+
+The current gate creates and correlates the IDD_LOGON `#32770`/`Logon` dialog, drives the modal
+`WM_PAINT` path through real user32/dialog/control procedures, drains real paint dispatches, and
+proves the credential box with a framebuffer readback over the dialog rectangle. Round57 validated
+269 real callback redirects/returns, balanced continuation pushes/unwinds, no fallback callback
+successes, `exec_msgina_logon_dialog_painted`, and a cursor-aware desktop framebuffer proof.
 
 ## 0. Why
 
@@ -22,14 +22,13 @@ Every interactive window message that win32k must run in the *client's* window p
 `WM_PAINT`, `WM_ERASEBKGND`, `WM_INITDIALOG` to a server-side/queued window, hooks,
 cross-thread `SendMessage` — flows through **`KeUserModeCallback`**. Before Phase 2A the isolated
 win32k component's directly-bound `s_ke_user_mode_callback` import stub was a *synthetic shortcut*;
-it was not an already executive-intercepted `Call`. For the
-window-creation callbacks (`WM_NCCREATE`/`WM_CREATE`) it stamps a canned `LRESULT` (Result=1)
-into the output buffer and returns, **without ever running the client's `WndProc`**. That was
-enough to make `CreateWindowEx` succeed, but it cannot render anything: the login dialog's
-paint requires the *real* control window procedures to run and issue `BeginPaint`/GDI draws.
+it was not an already executive-intercepted `Call`. For window-creation callbacks it stamped canned
+`LRESULT` values without ever running the client's `WndProc`. That was enough to make
+`CreateWindowEx` succeed, but it could not render anything: the login dialog's paint requires the
+real control window procedures to run and issue `BeginPaint`/GDI draws.
 
-This plan builds the real mechanism. It is a prerequisite for the rendered login box and for
-all future interactive UI (menus, hooks, real dialogs).
+This plan built the real mechanism. It is the reusable path for the rendered login box and future
+interactive UI (menus, hooks, real dialogs).
 
 ## 1. The correct model (per review feedback)
 
@@ -208,19 +207,22 @@ call `ZwCallbackReturn` themselves to return an output buffer. Sources of truth:
 | Executive-side special `NtCallbackReturn` continuation handler | ✅ Phase 2B controlled api7 path |
 | Exact 0x58 `UCALLOUT_FRAME`, pointer-free correlation, and redirect/outer-resume context transforms | ✅ Phase 2B foundation, host-tested |
 | Fixed request/reply ABI: state/sequences/api/lengths/status/pi/tid/badge/bounded payload, no transport pointers | ✅ Phase 2A: `nt-user-callback`, host-tested |
-| Directly-bound component stub copies input and issues a distinct synchronous seL4 callback `Call` | ✅ Phase 2A |
-| Executive pump correlates the active client, applies synthetic policy, and replies | ✅ Phase 2A |
+| Directly-bound component stub copies input and enters the callback Send/receive loop | ✅ Phase 3A transport, still used by Phase 4 |
+| Executive pump correlates the active client and either redirects supported callbacks or fails closed | ✅ active api0/3/11/15/16 contracts gate-verified |
 | Executive: **reverse transition** (suspend win32k, redirect winlogon → `KiUserCallbackDispatcher`, restore) | ✅ Phase 2B one-shot api7 |
-| Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ Phase 3 foundation: alternating dispatch/callback frames, correlation-tested and api7-wired |
-| win32k **nested-dispatch** / re-entrant component transport (3b) | ✅ Phase 3B: bounded SAS `WM_CREATE` sequence is live and correlation/gate-verified |
-| **buffer marshalling** in/out across VSpaces (client-visible only) | ✅ Phase 3B controlled api0: exact frame, bounded stack copy, embedded-reference scrub/rebase, and output copy-back are live and host/gate-tested |
+| Executive: bounded active-thread **callback-continuation stack** (3a) | ✅ 16 continuation frames / 8 active callbacks, correlation-tested and gate-wired |
+| win32k **nested-dispatch** / re-entrant component transport (3b) | ✅ parked callbacks accept nested USER/GDI dispatches; round57 recorded 1327 nested dispatches |
+| **buffer marshalling** in/out across VSpaces (client-visible only) | ✅ api0 client stack copy/reference scrub plus fixed/LPK resource contracts are live and tested |
+| Real user32 resource callbacks | ✅ api3/api11/api15/api16 selected, redirected, and returned with exact result lengths |
+| IDD_LOGON modal paint + framebuffer proof | ✅ 12 real paints drained; credential dialog rectangle has non-desktop, multi-color pixels |
 
 `KeUserModeCallback` is a directly-bound component import, not an executive-intercepted syscall.
 Phase 2A created the interception substrate with a fixed shared frame and callback rendezvous. The
 Phase-3 transport seam now sends `W32_USER_CALLBACK_LABEL` and explicitly receives either
 `W32_USER_CALLBACK_RESUME_LABEL` or a nested `W32_DISPATCH_LABEL` in the component callback
-trampoline. The synthetic policy remains on the executive side; a real callback is parked by
-withholding the resume label and is completed from `NtCallbackReturn`.
+trampoline. A real callback is parked by withholding the resume label and is completed from
+`NtCallbackReturn`; unsupported or malformed callback APIs now return failure instead of synthetic
+success.
 
 ## 5. Control-transfer mechanics (seL4 level)
 
@@ -268,7 +270,7 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   executive-side state that assumes win32k is frozen across the callback, keep the handle table
   coherent, and let win32k re-run its own validation on resume. The executive adds no GUI lock.
 
-## 7. Phased implementation (each phase gate-verified, boot must QUIESCE, paint stays 768/768)
+## 7. Phased implementation (each phase gate-verified, boot must QUIESCE, paint stays proved)
 
 - **Phase 1 — client dispatcher (implemented, behavior-preserving).** Exact fixed-layout
   `UCALLOUT_FRAME` representation and allocation-free request/table validation in `nt-ntdll`; real
@@ -331,10 +333,11 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   callback rendezvous (117 winlogon api0), kept the login-dialog creation frontier, painted 768/768,
   passed 187 pre-existing checks plus the new Phase-2B check, and reached `[microtest done]`.
 - **Phase 3A — bounded continuation + re-entrant component transport (implemented).**
-  `nt-user-callback::ContinuationStack` holds at most eight pointer-free alternating
+  `nt-user-callback::ContinuationStack` holds at most sixteen pointer-free alternating
   `Win32kDispatch`/`UserCallback` frames. Push/pop operations require the exact process, badge,
   thread, dispatch, and callback identity; a child suspends its parent and only an exact correlated
-  unwind makes that parent runnable. Host tests cover two callback levels, overflow, illegal
+  unwind makes that parent runnable. Runtime active callbacks are additionally capped at eight
+  simultaneous reverse transitions. Host tests cover multi-level callback nesting, overflow, illegal
   alternation, stale callback IDs, cross-thread returns, and wrong-dispatch requests. The controlled
   api7 path is wired through this stack and its gate requires exactly two pushes and two unwinds.
 
@@ -385,33 +388,29 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   restored the original client context. `exec_user_callback_real_api0_nested_roundtrip` passed,
   desktop paint remained `768/768`, the summary remained `188/99`, and `[microtest done]` completed
   with no FAIL lines.
-- **Phase 4 — `WM_PAINT` → the login box renders.** With the machinery real, drive the dialog's
-  `WM_PAINT`/`WM_ERASEBKGND`/`WM_INITDIALOG` to the control procs via the callback; the procs'
-  `BeginPaint → GetDC/GetStockObject/GetSysColorBrush/FillRect/DrawTextW` first exercise the
-  GDI validity check → seed the client GDI-object entries (per the disassembled contract in
-  DIALOG BATCH 3/4) + route `NtGdi*` draws to the real framebuffer surface. Result: the
-  credential box paints ON TOP of the `0x003a6ea5` desktop. New spec
-  `exec_msgina_logon_dialog_painted` (framebuffer readback of the dialog rect). Gate → 188.
-  NB: an **adjacent prerequisite** (separate from this machinery) — the dialog's modal
-  `DIALOG_DoDialogBox` pump currently returns instead of pumping (DIALOG BATCH 4); Phase 4 must
-  also make that pump run so a `WM_PAINT` is generated to dispatch.
+- **Phase 4 — `WM_PAINT` → the login box renders (implemented).** With the machinery real, the
+  dialog's modal `PeekMessageW`/`GetMessageW`/`DispatchMessageW` path now routes real win32k SSNs
+  and observes real `WM_PAINT` dispatches for the correlated IDD_LOGON HWND. The resulting api0
+  callbacks run through user32's dialog/control procedures, nested USER/GDI calls re-enter win32k,
+  and GDI draws reach the real framebuffer surface. The `exec_msgina_modal_paint_prefix` spec name
+  is historical: the gate now requires completed modal steps, at least one real IDD paint, the modal
+  queue drained, and no modal errors. The final proof is `exec_msgina_logon_dialog_painted`, a
+  framebuffer readback of the credential dialog rectangle.
 
-  The Phase-4 source audit narrowed that prerequisite to an exact user32 sequence. ReactOS
+  The Phase-4 source audit narrowed the prerequisite to an exact user32 sequence. ReactOS
   `DIALOG_DoDialogBox` first calls `PeekMessageW(PM_REMOVE)`. When it returns false, the first
   iteration calls `ShowWindow`, then `GetMessageW`; a retrieved `WM_PAINT` is consumed through
   `NtUserDispatchMessage` (SSNs `0x1001`, `0x1057`, `0x1006`, and `0x1035`). `WM_INITDIALOG` is
   sent synchronously during dialog construction and is therefore not the first missing kernel
-  callback. `nt-user-callback::DialogModalPumpSequence` models the observable kernel prefix
-  `Peek(false) -> Get(WM_PAINT) -> Dispatch(WM_PAINT)` and rejects wrong order, a blocking
-  Peek result, and non-paint dispatches.
+  callback. `nt-user-callback::DialogModalPumpSequence` tracks
+  `Peek(false) -> Get(WM_PAINT) -> Dispatch(WM_PAINT)`, then drains subsequent real paints, and
+  rejects wrong order, a blocking Peek result, and non-paint dispatches.
 
   One serialized diagnostic boot temporarily allowed exactly that prefix, but it used stale HWND
   evidence and broke the legacy SAS proof. It exposed the needed scoping: decouple SAS proof from
   the broad Peek/Get interceptor, record returned `WLX_WM_SAS` messages by inspecting `MSG`, latch
   the resulting session transition at its real boundary, and capture the actual top-level IDD_LOGON
-  HWND before enabling any modal-pump path. Keep `WM_PAINT` synthetic until its nested GDI sequence
-  has its own audited bounded policy; add a dialog-rectangle framebuffer gate only after that real
-  callback is enabled.
+  HWND before enabling any modal-pump path.
 
   A second serialized diagnostic validated that decoupling strategy but also found the next exact
   read boundary. Latching `SH_SAS_SESSION`/`SH_SAS_HWND` when the controlled SAS `WM_CREATE`
@@ -444,15 +443,20 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   `exec_msgina_idd_logon_correlated`, and advances the summary to `189/99`.
 
   The modal pump is now enabled from that evidence. The runtime gates on
-  `WINLOGON_IDD_LOGON_HWND` + `WINLOGON_DIALOG_MODAL_READY`, synthesizes exactly the first empty
-  modal `PeekMessage` so `DIALOG_DoDialogBox` runs `ShowWindow`, synthesizes one `GetMessage`
-  result containing `MSG{hwnd=IDD_LOGON,message=WM_PAINT}`, then lets the real
-  `NtUserDispatchMessage(0x1035)` run and observes the api0 `WM_PAINT` callback. The serialized
-  acceptance run reported `[dialog-pump] completed step=3/3 ... modal-prefix-complete=1`,
-  `[winlogon] IDD_LOGON modal pump steps=3/3 completed=1 hwnd=0x2003a message=0x000f errors=0`,
-  passed `exec_msgina_modal_paint_prefix`, and advanced the summary to `190/99`. This is still a
-  prefix proof, not the final login-rendering gate: next audit the nested GDI sequence reached by
-  that callback, then replace the prefix gate with a dialog-rectangle framebuffer readback gate.
+  `WINLOGON_IDD_LOGON_HWND` + `WINLOGON_DIALOG_MODAL_READY`, routes the real modal SSNs, records
+  `WM_PAINT` retrieval/dispatch for windows in the correlated dialog tree, and parks only after the
+  real IDD queue is drained. Round57 reported:
+  `steps=3/3 completed=1 paints=12 drained=1 hwnd=0x000200a0 message=0x000f errors=0`, passed
+  `exec_msgina_modal_paint_prefix`, and then passed `exec_msgina_logon_dialog_painted` with
+  framebuffer rect `302,260..721,507`, `103493` pixels, `46404` non-desktop pixels, and at least
+  16 colors.
+
+  The same round extended the active callback contract set beyond WINDOWPROC. api3 returned an
+  8-byte cursor handle result, api11 returned its exact `0x38` icon payload, api15 returned its
+  exact `0x5d0` OBM payload, and api16 LPK text callbacks returned 4-byte BOOL results from real
+  user32. The summary recorded `real-redirects=269`, `real-returns=269`,
+  `continuation-pushes=1643`, `continuation-unwinds=1643`, `nested-dispatches=1327`, and zero
+  `callback not redirected` lines.
 
 ## 8. Risks / notes
 
@@ -463,12 +467,15 @@ withholding the resume label and is completed from `NtCallbackReturn`.
   outer dispatch is suspended is the subtlest part; if win32k's component can only hold one
   dispatch context, Phase 3 must give it a nested-dispatch stack. Validate that win32k's own
   object revalidation still works across the boundary.
-- **The paint is the canary.** The win32k-side desktop paint (768/768) MUST stay green through
-  every phase — the callback path must not disturb it.
-- **Modal-pump prerequisite** (Phase 4) is a separate wall from the callback machinery; keep
-  them distinct in implementation + specs.
+- **The paint is the canary.** The win32k-side desktop paint must stay green through every phase.
+  With real cursor loading enabled, the desktop proof accepts either `768/768` background samples or
+  exactly `767/768` background samples with all 768 samples changed from magenta and the sole
+  non-background sample constrained to framebuffer index `0x60200` (the real arrow cursor overlay).
+- **Modal-pump termination.** The headless host cannot supply credentials, so the modal loop is
+  expected to park after the real IDD paint queue drains. A destroyed dialog, wrong modal thread, or
+  wrong message ordering remains a hard gate failure.
 - **Scope:** Phases 1–3 are the reusable machinery (every future interactive message benefits);
-  Phase 4 is its first real consumer (the login box). Land 1–3 behavior-preserving before 4.
+  Phase 4 is its first real consumer and now proves the login box renders.
 
 ## 9. Relationship to existing code / plans
 
@@ -477,7 +484,8 @@ withholding the resume label and is completed from `NtCallbackReturn`.
 - Phase 2A replaces the component-local synthetic shortcut with the real component→executive
   rendezvous. Phase 2B turns that suspension point into the user redirect; Phase 3A replaces the
   blocking callback Call with the re-entrant component Send/Recv loop and adds the bounded correlated
-  continuation stack. Phase 3B adds client-buffer marshalling and proves the first nested api0.
+  continuation stack. Phase 3B adds client-buffer marshalling, and Phase 4 uses the same machinery for
+  the real login-dialog paint path plus resource callbacks.
 - Reuses the cooperative withhold/resume pattern from event/pipe parks, but represents the component
   continuation with an explicit resume label so its TCB remains able to receive nested dispatches.
   Client-memory mapping follows the desktop-heap window and GDI handle-table patterns for Phase 4.

@@ -488,11 +488,6 @@ pub const SSN_NT_USER_SWITCH_DESKTOP: u64 = 0x1288;
 pub const SSN_NT_USER_REDRAW_WINDOW: u64 = 0x1012;
 /// SSN NtUserSetProcessWindowStation — win32k's real PROCESSINFO/EPROCESS station association.
 pub const SSN_NT_USER_SET_PROCESS_WINDOW_STATION: u64 = 0x10ac;
-/// Class registration and window creation SSNs used by the bounded status-dialog diagnostic.
-const SSN_NT_USER_REGISTER_CLASS_EX_WOW: u64 = 0x10b4;
-const SSN_NT_USER_CREATE_WINDOW_EX: u64 = 0x1077;
-const FNID_STATIC: u64 = 0x2a8;
-
 /// `co_IntGraphicsCheck(BOOL Create)` RVA (guicheck.c) — win32k's AUTHENTIC lazy-graphics entry.
 /// Disasm-confirmed for THIS build (0.4.17): prologue at 0x7a100 does
 /// `W32Data = PsGetCurrentProcessWin32Process(); if (Create && !(W32PF_CREATEDWINORDC|W32PF_MANUALGUICHECK))
@@ -3263,186 +3258,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     (status, 0)
 }
 
-/// Print the string payload of a user `UNICODE_STRING`/`LARGE_STRING` descriptor. Both x64 layouts
-/// place the byte length at +0 (USHORT vs ULONG) and Buffer at +8; the low 16-bit length is enough
-/// for class names. A direct low-valued pointer is an atom, as accepted by CreateWindowEx.
-unsafe fn print_counted_utf16(descriptor: u64) {
-    if descriptor <= 0xffff {
-        print_str(b"<atom ");
-        print_hex(descriptor as u32);
-        print_str(b">");
-        return;
-    }
-    let len = read_unaligned(descriptor as *const u16) as usize / 2;
-    let buffer = read_unaligned((descriptor + 8) as *const u64);
-    if buffer == 0 {
-        print_str(b"<null>");
-        return;
-    }
-    let mut ascii = [0u8; 32];
-    let count = len.min(ascii.len());
-    for (i, byte) in ascii.iter_mut().take(count).enumerate() {
-        let ch = read_unaligned((buffer + (i * 2) as u64) as *const u16);
-        *byte = if (0x20..=0x7e).contains(&ch) { ch as u8 } else { b'?' };
-    }
-    print_str(&ascii[..count]);
-}
-
-/// Decode the `LARGE_STRING` form used by CreateWindowEx. Unlike `UNICODE_STRING`, its second word
-/// is a 31-bit maximum length plus a high `bAnsi` bit; built-in classes may also arrive as direct
-/// atoms or as a zero-length descriptor whose Buffer carries the atom.
-unsafe fn create_class_is_static(descriptor: u64) -> bool {
-    if descriptor <= 0xffff {
-        return descriptor == 0xc002;
-    }
-    let len = read_unaligned(descriptor as *const u32) as usize;
-    let max_and_ansi = read_unaligned((descriptor + 4) as *const u32);
-    let buffer = read_unaligned((descriptor + 8) as *const u64);
-    if len == 0 {
-        return buffer == 0xc002;
-    }
-    if buffer == 0 {
-        return false;
-    }
-    // User32 leaves LARGE_STRING.bAnsi uninitialized for the Unicode path. Length + payload are
-    // authoritative: try the expected UTF-16 representation before consulting the flag.
-    if len == 12
-        && b"Static".iter().enumerate().all(|(i, expected)| {
-            read_unaligned((buffer + (i * 2) as u64) as *const u16) == *expected as u16
-        })
-    {
-        return true;
-    }
-    max_and_ansi & 0x8000_0000 != 0
-        && len == 6
-        && b"Static".iter().enumerate().all(|(i, expected)| {
-            read_unaligned((buffer + i as u64) as *const u8) == *expected
-        })
-}
-
-unsafe fn trace_create_class(descriptor: u64) {
-    print_str(b" desc=");
-    print_hex((descriptor >> 32) as u32);
-    print_hex(descriptor as u32);
-    if descriptor <= 0xffff {
-        print_str(b" direct-atom=");
-        print_hex(descriptor as u32);
-        return;
-    }
-    let len = read_unaligned(descriptor as *const u32);
-    let max_and_ansi = read_unaligned((descriptor + 4) as *const u32);
-    let buffer = read_unaligned((descriptor + 8) as *const u64);
-    print_str(b" len=");
-    print_hex(len);
-    print_str(b" maxflags=");
-    print_hex(max_and_ansi);
-    print_str(b" buffer=");
-    print_hex((buffer >> 32) as u32);
-    print_hex(buffer as u32);
-    if len == 0 && buffer <= 0xffff {
-        print_str(b" atom=");
-        print_hex(buffer as u32);
-        return;
-    }
-    if buffer == 0 {
-        print_str(b" name=<null>");
-        return;
-    }
-    print_str(b" name=");
-    let mut ascii = [0u8; 32];
-    let ansi = max_and_ansi & 0x8000_0000 != 0;
-    let count = if ansi { len as usize } else { len as usize / 2 }.min(ascii.len());
-    for (i, byte) in ascii.iter_mut().take(count).enumerate() {
-        let ch = if ansi {
-            read_unaligned((buffer + i as u64) as *const u8) as u16
-        } else {
-            read_unaligned((buffer + (i * 2) as u64) as *const u16)
-        };
-        *byte = if (0x20..=0x7e).contains(&ch) { ch as u8 } else { b'?' };
-    }
-    print_str(&ascii[..count]);
-}
-
-unsafe fn trace_class_process_state() {
-    const PROCESSINFO_FLAGS_OFF: u64 = 0x0c;
-    const PROCESSINFO_PRIVATE_CLASSES_OFF: u64 = 0xf0;
-    const PROCESSINFO_PUBLIC_CLASSES_OFF: u64 = 0xf8;
-    let pti = read_volatile(SLOT_W32THREAD as *const u64);
-    let slot_ppi = read_volatile(SLOT_W32PROCESS as *const u64);
-    let pti_ppi = if pti != 0 {
-        read_volatile((pti + THREADINFO_PPI_OFF) as *const u64)
-    } else {
-        0
-    };
-    let ppi = if pti_ppi != 0 { pti_ppi } else { slot_ppi };
-    print_str(b"[class-diag] pti=");
-    print_hex((pti >> 32) as u32);
-    print_hex(pti as u32);
-    print_str(b" pti.ppi=");
-    print_hex((pti_ppi >> 32) as u32);
-    print_hex(pti_ppi as u32);
-    print_str(b" slot.ppi=");
-    print_hex((slot_ppi >> 32) as u32);
-    print_hex(slot_ppi as u32);
-    if ppi != 0 {
-        print_str(b" flags=");
-        print_hex(read_volatile((ppi + PROCESSINFO_FLAGS_OFF) as *const u32));
-        print_str(b" private=");
-        let private = read_volatile((ppi + PROCESSINFO_PRIVATE_CLASSES_OFF) as *const u64);
-        print_hex((private >> 32) as u32);
-        print_hex(private as u32);
-        print_str(b" public=");
-        let public = read_volatile((ppi + PROCESSINFO_PUBLIC_CLASSES_OFF) as *const u64);
-        print_hex((public >> 32) as u32);
-        print_hex(public as u32);
-    }
-    print_str(b"\n");
-}
-
-unsafe fn trace_public_classes(reason: &[u8]) {
-    const PROCESSINFO_PUBLIC_CLASSES_OFF: u64 = 0xf8;
-    let pti = read_volatile(SLOT_W32THREAD as *const u64);
-    let slot_ppi = read_volatile(SLOT_W32PROCESS as *const u64);
-    let pti_ppi = if pti != 0 {
-        read_volatile((pti + THREADINFO_PPI_OFF) as *const u64)
-    } else {
-        0
-    };
-    let ppi = if pti_ppi != 0 { pti_ppi } else { slot_ppi };
-    print_str(b"[class-diag] public classes ");
-    print_str(reason);
-    print_str(b"\n");
-    if ppi == 0 {
-        return;
-    }
-    let mut cls = read_volatile((ppi + PROCESSINFO_PUBLIC_CLASSES_OFF) as *const u64);
-    for index in 0..24u32 {
-        if cls == 0 {
-            break;
-        }
-        let next = read_volatile(cls as *const u64);
-        let atom = read_volatile((cls + 8) as *const u16);
-        let atom_nv = read_volatile((cls + 10) as *const u16);
-        let fnid = read_volatile((cls + 12) as *const u32);
-        print_str(b"[class-diag] node=");
-        print_hex(index);
-        print_str(b" cls=");
-        print_hex((cls >> 32) as u32);
-        print_hex(cls as u32);
-        print_str(b" atom=");
-        print_hex(atom as u32);
-        print_str(b" nv=");
-        print_hex(atom_nv as u32);
-        print_str(b" fnid=");
-        print_hex(fnid);
-        print_str(b" next=");
-        print_hex((next >> 32) as u32);
-        print_hex(next as u32);
-        print_str(b"\n");
-        cls = next;
-    }
-}
-
 /// Resolve a win32k SSN (>= [`WIN32K_SERVICE_BASE`]) through the registered NtUser/NtGdi SSDT and
 /// invoke its handler with up to four win64 register args. Returns the handler NTSTATUS (or
 /// `STATUS_INVALID_SYSTEM_SERVICE` if the SSN is out of range / unregistered).
@@ -3467,36 +3282,8 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     // NtUserCreateWindowEx = 15 args) we transmute to the exact-arity fn type so Rust/LLVM places
     // args 5..N on the stack per win64 — delivering hMenu et al. correctly instead of garbage.
     let nargs = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_NARGS) as *const u64);
-    let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let sh = WIN32K_SHARED_VADDR;
     let s = |i: u64| read_volatile((sh + SH_REQ_A4 + (i - 4) * 8) as *const u64); // stack arg i (i>=4)
-    let register_fnid = if client_pi == 2 && ssn == SSN_NT_USER_REGISTER_CLASS_EX_WOW {
-        s(4)
-    } else {
-        0
-    };
-    let trace_create = client_pi == 2 && ssn == SSN_NT_USER_CREATE_WINDOW_EX;
-    let create_style = if trace_create { s(4) } else { 0 };
-    let create_parent = if trace_create { s(9) } else { 0 };
-    let create_menu = if trace_create { s(10) } else { 0 };
-    let create_instance = if trace_create { s(11) } else { 0 };
-    let trace_static_create = trace_create && create_class_is_static(a2);
-    if trace_create {
-        print_str(b"[class-diag] PRE CreateWindowEx class(a1)");
-        trace_create_class(a1);
-        print_str(b" version(a2)");
-        trace_create_class(a2);
-        // user32.dll runtime base 0x80150000, ntdll import IAT RVA 0xA4738. This proves the
-        // class-string initializer is bound to our high-address Rust ntdll, not a low DLL image.
-        let rtl_init_iat = read_volatile(0x801f_4738 as *const u64);
-        print_str(b" RtlInitUnicodeString@IAT=");
-        print_hex((rtl_init_iat >> 32) as u32);
-        print_hex(rtl_init_iat as u32);
-        print_str(b"\n");
-    }
-    if trace_static_create {
-        trace_public_classes(b"before Static CreateWindowEx");
-    }
     // ★ BATCH 46 diagnose — winlogon's SwitchDesktop paint short-circuit. Read the two gates BEFORE the
     // handler runs: (1) gpdeskInputDesktop (if it already == the target desktop, win32k's SwitchDesktop
     // returns TRUE with ZERO paint work — desktop.c:2996); (2) NrGuiAppsRunning (if != 0, co_AddGuiApp's
@@ -3539,37 +3326,6 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             s(15),
         )
     };
-
-    if client_pi == 2 && ssn == SSN_NT_USER_REGISTER_CLASS_EX_WOW {
-        print_str(b"[class-diag] RegisterClass name=");
-        print_counted_utf16(a1);
-        print_str(b" fnid=0x");
-        print_hex(register_fnid as u32);
-        print_str(b" atom=0x");
-        print_hex(ret as u32);
-        print_str(b"\n");
-        trace_class_process_state();
-        if register_fnid == FNID_STATIC {
-            trace_public_classes(b"after Static RegisterClass");
-        }
-    }
-    if trace_create && ret == 0 {
-        print_str(b"[class-diag] failed CreateWindowEx style=");
-        print_hex(create_style as u32);
-        print_str(b" parent=");
-        print_hex(create_parent as u32);
-        print_str(b" menu=");
-        print_hex(create_menu as u32);
-        print_str(b" instance=");
-        print_hex(create_instance as u32);
-        print_str(b"\n");
-        trace_class_process_state();
-        trace_public_classes(if trace_static_create {
-            b"after failed Static CreateWindowEx"
-        } else {
-            b"after failed non-Static CreateWindowEx"
-        });
-    }
 
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.
     //

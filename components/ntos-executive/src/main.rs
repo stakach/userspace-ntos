@@ -4573,54 +4573,17 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     for i in 0..t.stack_frames {
         let f = alloc_frame();
         let page = t.stack_base + i * 0x1000;
-        let target_map = if t.client_pi == 2 {
-            page_map_r(copy_cap(f), page, RW_NX, t.pml4)
-        } else {
-            page_map(copy_cap(f), page, RW_NX, t.pml4);
-            0
-        };
-        let mirror_map = if t.stack_mirror_va != 0 {
-            if t.client_pi == 2 {
-                page_map_r(
-                    copy_cap(f),
-                    t.stack_mirror_va + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                )
-            } else {
-                page_map(
-                    copy_cap(f),
-                    t.stack_mirror_va + i * 0x1000,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
-                0
-            }
-        } else {
-            0
-        };
-        if t.client_pi == 2 && (target_map != 0 || mirror_map != 0 || i + 1 == t.stack_frames) {
-            print_str(b"[wl-stack-map] page=");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" target=");
-            print_u64(target_map);
-            print_str(b" mirror=");
-            print_u64(mirror_map);
-            print_str(b"\n");
+        page_map(copy_cap(f), page, RW_NX, t.pml4);
+        if t.stack_mirror_va != 0 {
+            page_map(
+                copy_cap(f),
+                t.stack_mirror_va + i * 0x1000,
+                RW_NX,
+                CAP_INIT_THREAD_VSPACE,
+            );
         }
         if t.client_pi != 0 {
             csrss_frame_put(t.client_pi, page, f);
-        }
-        if t.client_pi == 2 && i + 1 == t.stack_frames {
-            let (published, index) = csrss_frame_get_exact(t.client_pi, page);
-            print_str(b"[wl-stack-map] published=");
-            print_hex(published as u32);
-            print_str(b" index=");
-            print_u64(if index == usize::MAX { u64::MAX } else { index as u64 });
-            print_str(b" entries=");
-            print_u64(core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)) as u64);
-            print_str(b"\n");
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
