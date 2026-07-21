@@ -19,7 +19,113 @@ pub fn memcmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
 
 /// `memchr`: index of the first byte equal to `c` within the first `n` bytes.
 pub fn memchr(haystack: &[u8], c: u8, n: usize) -> Option<usize> {
-    haystack[..n.min(haystack.len())].iter().position(|&b| b == c)
+    haystack[..n.min(haystack.len())]
+        .iter()
+        .position(|&b| b == c)
+}
+
+// --- ASCII ctype ------------------------------------------------------------------------------
+
+pub fn ascii_is_ascii(c: i32) -> bool {
+    (0..=0x7F).contains(&c)
+}
+
+pub fn ascii_to_ascii(c: i32) -> i32 {
+    c & 0x7F
+}
+
+pub fn ascii_tolower(c: i32) -> i32 {
+    if ascii_is_upper(c) {
+        c + 0x20
+    } else {
+        c
+    }
+}
+
+pub fn ascii_toupper(c: i32) -> i32 {
+    if ascii_is_lower(c) {
+        c - 0x20
+    } else {
+        c
+    }
+}
+
+pub fn ascii_is_alpha(c: i32) -> bool {
+    ascii_is_upper(c) || ascii_is_lower(c)
+}
+
+pub fn ascii_is_digit(c: i32) -> bool {
+    (b'0' as i32..=b'9' as i32).contains(&c)
+}
+
+pub fn ascii_is_alnum(c: i32) -> bool {
+    ascii_is_alpha(c) || ascii_is_digit(c)
+}
+
+pub fn ascii_is_cntrl(c: i32) -> bool {
+    (0..=0x1F).contains(&c) || c == 0x7F
+}
+
+pub fn ascii_is_graph(c: i32) -> bool {
+    (0x21..=0x7E).contains(&c)
+}
+
+pub fn ascii_is_print(c: i32) -> bool {
+    (0x20..=0x7E).contains(&c)
+}
+
+pub fn ascii_is_punct(c: i32) -> bool {
+    ascii_is_graph(c) && !ascii_is_alnum(c)
+}
+
+pub fn ascii_is_space(c: i32) -> bool {
+    matches!(c, 0x09..=0x0D | 0x20)
+}
+
+pub fn ascii_is_upper(c: i32) -> bool {
+    (b'A' as i32..=b'Z' as i32).contains(&c)
+}
+
+pub fn ascii_is_lower(c: i32) -> bool {
+    (b'a' as i32..=b'z' as i32).contains(&c)
+}
+
+pub fn ascii_is_xdigit(c: i32) -> bool {
+    ascii_is_digit(c)
+        || (b'A' as i32..=b'F' as i32).contains(&c)
+        || (b'a' as i32..=b'f' as i32).contains(&c)
+}
+
+pub fn ascii_is_csymf(c: i32) -> bool {
+    ascii_is_alpha(c) || c == b'_' as i32
+}
+
+pub fn ascii_is_csym(c: i32) -> bool {
+    ascii_is_csymf(c) || ascii_is_digit(c)
+}
+
+pub fn wide_ascii_is_alpha(c: i32) -> bool {
+    ascii_is_alpha(c)
+}
+
+pub fn wide_ascii_is_digit(c: i32) -> bool {
+    ascii_is_digit(c)
+}
+
+pub fn wide_ascii_is_lower(c: i32) -> bool {
+    ascii_is_lower(c)
+}
+
+pub fn wide_ascii_is_space(c: i32) -> bool {
+    ascii_is_space(c)
+}
+
+pub fn wide_ascii_is_xdigit(c: i32) -> bool {
+    ascii_is_xdigit(c)
+}
+
+fn ascii_fold_byte(c: u8) -> u8 {
+    ascii_tolower(c as i32) as u8
 }
 
 // --- narrow strings (str*) --------------------------------------------------------------------
@@ -36,8 +142,26 @@ pub fn strcmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 
 /// `_stricmp` / `_strcmpi`: case-insensitive ASCII compare.
 pub fn stricmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
-    let fold = |s: &[u8]| -> Vec<u8> { s[..strlen(s)].iter().map(|c| c.to_ascii_lowercase()).collect() };
+    let fold = |s: &[u8]| -> Vec<u8> {
+        s[..strlen(s)]
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
     fold(a).cmp(&fold(b))
+}
+
+/// `_memicmp`: case-insensitive ASCII comparison over exactly `n` bytes.
+pub fn memicmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
+    let n = n.min(a.len()).min(b.len());
+    for i in 0..n {
+        let ca = ascii_fold_byte(a[i]);
+        let cb = ascii_fold_byte(b[i]);
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+    }
+    core::cmp::Ordering::Equal
 }
 
 /// `strncmp`: compare up to `n` bytes.
@@ -45,6 +169,23 @@ pub fn strncmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
     let ea = strlen(a).min(n);
     let eb = strlen(b).min(n);
     a[..ea].cmp(&b[..eb])
+}
+
+/// `_strnicmp`: case-insensitive ASCII string comparison over at most `n` bytes.
+pub fn strnicmp(a: &[u8], b: &[u8], n: usize) -> core::cmp::Ordering {
+    let alen = strlen(a);
+    let blen = strlen(b);
+    for i in 0..n {
+        let ca = if i < alen { ascii_fold_byte(a[i]) } else { 0 };
+        let cb = if i < blen { ascii_fold_byte(b[i]) } else { 0 };
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+        if i >= alen && i >= blen {
+            break;
+        }
+    }
+    core::cmp::Ordering::Equal
 }
 
 /// `strchr`: index of the first `c`.
@@ -66,6 +207,13 @@ pub fn strstr(hay: &[u8], needle: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
 
+/// `strspn`: length of the initial run of `s` whose bytes are all in `accept`.
+pub fn strspn(s: &[u8], accept: &[u8]) -> usize {
+    let hay = &s[..strlen(s)];
+    let set = &accept[..strlen(accept)];
+    hay.iter().take_while(|b| set.contains(b)).count()
+}
+
 // --- wide strings (wcs*) ----------------------------------------------------------------------
 
 /// `wcslen`.
@@ -81,7 +229,10 @@ pub fn wcscmp(a: &[u16], b: &[u16]) -> core::cmp::Ordering {
 /// `_wcsicmp` / `_wcsnicmp` core: case-insensitive wide compare (ASCII + Latin-1 fold).
 pub fn wcsicmp(a: &[u16], b: &[u16]) -> core::cmp::Ordering {
     let fold = |s: &[u16]| -> Vec<u16> {
-        s[..wcslen(s)].iter().map(|&c| crate::rtl::strings::downcase_char(c)).collect()
+        s[..wcslen(s)]
+            .iter()
+            .map(|&c| crate::rtl::strings::downcase_char(c))
+            .collect()
     };
     fold(a).cmp(&fold(b))
 }
@@ -299,11 +450,40 @@ mod tests {
         assert_eq!(strlen(b"hello\0world"), 5);
         assert_eq!(strcmp(b"abc\0", b"abd\0"), Ordering::Less);
         assert_eq!(stricmp(b"Foo\0", b"FOO\0"), Ordering::Equal);
+        assert_eq!(memicmp(b"AbC\0", b"aBcX", 3), Ordering::Equal);
         assert_eq!(strncmp(b"abcXYZ\0", b"abcQRS\0", 3), Ordering::Equal);
+        assert_eq!(strnicmp(b"abcXYZ\0", b"ABCqrs\0", 3), Ordering::Equal);
+        assert_eq!(strnicmp(b"abcXYZ\0", b"ABCqrs\0", 4), Ordering::Greater);
         assert_eq!(strchr(b"a/b/c\0", b'/'), Some(1));
         assert_eq!(strrchr(b"a/b/c\0", b'/'), Some(3));
         assert_eq!(strstr(b"hello world\0", b"world\0"), Some(6));
         assert_eq!(strstr(b"hello\0", b"xyz\0"), None);
+        assert_eq!(strspn(b"abc123\0", b"cba\0"), 3);
+    }
+
+    #[test]
+    fn ascii_ctype_ops() {
+        assert!(ascii_is_ascii(0x7F));
+        assert!(!ascii_is_ascii(0x80));
+        assert_eq!(ascii_to_ascii(-1), 0x7F);
+        assert_eq!(ascii_tolower(b'Q' as i32), b'q' as i32);
+        assert_eq!(ascii_toupper(b'q' as i32), b'Q' as i32);
+        assert!(ascii_is_alnum(b'9' as i32));
+        assert!(ascii_is_cntrl(0x1F));
+        assert!(ascii_is_graph(b'!' as i32));
+        assert!(ascii_is_print(b' ' as i32));
+        assert!(ascii_is_punct(b'!' as i32));
+        assert!(ascii_is_space(b'\n' as i32));
+        assert!(ascii_is_upper(b'Z' as i32));
+        assert!(ascii_is_lower(b'z' as i32));
+        assert!(ascii_is_xdigit(b'f' as i32));
+        assert!(ascii_is_csymf(b'_' as i32));
+        assert!(ascii_is_csym(b'7' as i32));
+        assert!(wide_ascii_is_alpha(b'A' as i32));
+        assert!(wide_ascii_is_digit(b'3' as i32));
+        assert!(wide_ascii_is_lower(b'x' as i32));
+        assert!(wide_ascii_is_space(b'\t' as i32));
+        assert!(wide_ascii_is_xdigit(b'B' as i32));
     }
 
     #[test]
@@ -333,12 +513,18 @@ mod tests {
     #[test]
     fn snprintf_core() {
         assert_eq!(
-            format(b"pid=%d name=%s hex=%X", &[FmtArg::Int(42), FmtArg::Str(b"smss\0"), FmtArg::Hex(0xdead)]),
+            format(
+                b"pid=%d name=%s hex=%X",
+                &[FmtArg::Int(42), FmtArg::Str(b"smss\0"), FmtArg::Hex(0xdead)]
+            ),
             b"pid=42 name=smss hex=DEAD"
         );
         assert_eq!(format(b"%u%%", &[FmtArg::Uint(100)]), b"100%");
         assert_eq!(format(b"neg %d", &[FmtArg::Int(-7)]), b"neg -7");
-        assert_eq!(format(b"%c%c", &[FmtArg::Char(b'O'), FmtArg::Char(b'K')]), b"OK");
+        assert_eq!(
+            format(b"%c%c", &[FmtArg::Char(b'O'), FmtArg::Char(b'K')]),
+            b"OK"
+        );
     }
 
     #[test]
