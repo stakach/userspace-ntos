@@ -28,6 +28,7 @@ pub mod message;
 pub mod path;
 pub mod pe_resource;
 pub mod process_params;
+pub mod prefix;
 pub mod propvariant;
 pub mod random;
 pub mod resource;

@@ -5768,6 +5768,9 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
 // ---- splay trees + RTL_GENERIC_TABLE ----------------------------------------------------------------
 
 type RtlGenericTable = nt_ntdll::rtl::generic_table::RtlGenericTable;
+type RtlPrefixTable = nt_ntdll::rtl::prefix::PrefixTable;
+type RtlPrefixTableEntry = nt_ntdll::rtl::prefix::PrefixTableEntry;
+type RtlString = nt_ntdll::rtl::prefix::RtlString;
 type RtlSplayLinks = nt_ntdll::rtl::splay::SplayLinks;
 type RtlGenericCompareRoutine = nt_ntdll::rtl::generic_table::CompareRoutine;
 type RtlGenericAllocateRoutine = nt_ntdll::rtl::generic_table::AllocateRoutine;
@@ -5872,6 +5875,68 @@ pub unsafe extern "system" fn rtl_subtree_predecessor(links: *mut c_void) -> *mu
 pub unsafe extern "system" fn rtl_subtree_successor(links: *mut c_void) -> *mut c_void {
     // SAFETY: raw ABI wrapper around the host-tested RTL splay core.
     unsafe { nt_ntdll::rtl::splay::subtree_successor(links as *mut RtlSplayLinks) as *mut c_void }
+}
+
+/// `PfxInitialize(PPREFIX_TABLE)`.
+///
+/// # Safety
+/// `prefix_table` is writable for a `PREFIX_TABLE` when non-null.
+#[export_name = "PfxInitialize"]
+pub unsafe extern "system" fn pfx_initialize(prefix_table: *mut c_void) {
+    unsafe { nt_ntdll::rtl::prefix::initialize(prefix_table as *mut RtlPrefixTable) };
+}
+
+/// `PfxInsertPrefix(PPREFIX_TABLE, PSTRING, PPREFIX_TABLE_ENTRY) -> BOOLEAN`.
+///
+/// # Safety
+/// Arguments follow the native Pfx table ownership contract.
+#[export_name = "PfxInsertPrefix"]
+pub unsafe extern "system" fn pfx_insert_prefix(
+    prefix_table: *mut c_void,
+    prefix: *mut c_void,
+    prefix_table_entry: *mut c_void,
+) -> u8 {
+    u8::from(unsafe {
+        nt_ntdll::rtl::prefix::insert(
+            prefix_table as *mut RtlPrefixTable,
+            prefix as *mut RtlString,
+            prefix_table_entry as *mut RtlPrefixTableEntry,
+        )
+    })
+}
+
+/// `PfxRemovePrefix(PPREFIX_TABLE, PPREFIX_TABLE_ENTRY)`.
+///
+/// # Safety
+/// `prefix_table_entry` may be linked into `prefix_table`.
+#[export_name = "PfxRemovePrefix"]
+pub unsafe extern "system" fn pfx_remove_prefix(
+    prefix_table: *mut c_void,
+    prefix_table_entry: *mut c_void,
+) {
+    unsafe {
+        nt_ntdll::rtl::prefix::remove(
+            prefix_table as *mut RtlPrefixTable,
+            prefix_table_entry as *mut RtlPrefixTableEntry,
+        )
+    };
+}
+
+/// `PfxFindPrefix(PPREFIX_TABLE, PSTRING) -> PPREFIX_TABLE_ENTRY`.
+///
+/// # Safety
+/// Arguments are valid native Pfx structures.
+#[export_name = "PfxFindPrefix"]
+pub unsafe extern "system" fn pfx_find_prefix(
+    prefix_table: *mut c_void,
+    full_name: *mut c_void,
+) -> *mut c_void {
+    unsafe {
+        nt_ntdll::rtl::prefix::find_prefix(
+            prefix_table as *mut RtlPrefixTable,
+            full_name as *mut RtlString,
+        ) as *mut c_void
+    }
 }
 
 /// `RtlInitializeGenericTable(PRTL_GENERIC_TABLE, Compare, Allocate, Free, Context)`.
@@ -12287,6 +12352,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_real_successor as usize,
         rtl_subtree_predecessor as usize,
         rtl_subtree_successor as usize,
+        pfx_initialize as usize,
+        pfx_insert_prefix as usize,
+        pfx_remove_prefix as usize,
+        pfx_find_prefix as usize,
         rtl_initialize_generic_table as usize,
         rtl_insert_element_generic_table as usize,
         rtl_insert_element_generic_table_full as usize,
