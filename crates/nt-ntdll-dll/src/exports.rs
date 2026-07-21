@@ -174,6 +174,7 @@ unsafe fn us_slice<'a>(p: PCUnicodeString) -> &'a [u16] {
 // ---- boot-status data ---------------------------------------------------------------------------
 
 // ReactOS `RTL_BSD_DATA` x64 layout from `sdk/include/ndk/rtltypes.h`.
+#[cfg(not(target_arch = "x86_64"))]
 const BOOT_STATUS_HANDLE: usize = 0xB007_57A7;
 const BSD_DATA_SIZE: usize = 0x88;
 const BSD_ITEM_MAX: usize = 16;
@@ -196,35 +197,290 @@ const BSD_ITEMS: [(usize, usize); BSD_ITEM_MAX] = [
     (0x32, 1),  // RtlBsdItemChecksum
 ];
 
+#[cfg(not(target_arch = "x86_64"))]
 static BOOT_STATUS_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+#[cfg(not(target_arch = "x86_64"))]
 static mut BOOT_STATUS_DATA: [u8; BSD_DATA_SIZE] = [0; BSD_DATA_SIZE];
 
+#[cfg(target_arch = "x86_64")]
+const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+#[cfg(target_arch = "x86_64")]
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+#[cfg(target_arch = "x86_64")]
+const FILE_CREATE: u32 = 2;
+#[cfg(target_arch = "x86_64")]
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+#[cfg(target_arch = "x86_64")]
+const FILE_GENERIC_READ: u32 = 0x0012_0089;
+#[cfg(target_arch = "x86_64")]
+const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+#[cfg(target_arch = "x86_64")]
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+#[cfg(target_arch = "x86_64")]
+const BOOT_STATUS_PATH_WIDE: [u16; 25] = [
+    b'\\' as u16,
+    b'S' as u16,
+    b'y' as u16,
+    b's' as u16,
+    b't' as u16,
+    b'e' as u16,
+    b'm' as u16,
+    b'R' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'b' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b't' as u16,
+    b's' as u16,
+    b't' as u16,
+    b'a' as u16,
+    b't' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'a' as u16,
+    b't' as u16,
+    0,
+];
+
+/// Minimal x64 `OBJECT_ATTRIBUTES`.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct BootObjectAttributes {
+    length: u32,
+    _p0: u32,
+    root_directory: u64,
+    object_name: u64,
+    attributes: u32,
+    _p1: u32,
+    security_descriptor: u64,
+    security_qos: u64,
+}
+
 #[inline]
+#[cfg(not(target_arch = "x86_64"))]
 fn boot_status_data_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(BOOT_STATUS_DATA) as *mut u8
 }
 
-unsafe fn boot_status_write_u32(offset: usize, value: u32) {
-    // SAFETY: caller passes offsets inside BOOT_STATUS_DATA.
-    unsafe { core::ptr::write_unaligned(boot_status_data_ptr().add(offset) as *mut u32, value) };
+fn initial_boot_status_data() -> [u8; BSD_DATA_SIZE] {
+    let mut data = [0u8; BSD_DATA_SIZE];
+    data[0x00..0x04].copy_from_slice(&(BSD_DATA_SIZE as u32).to_le_bytes());
+    data[0x04..0x08].copy_from_slice(&1u32.to_le_bytes()); // NtProductWinNt
+    data[0x08] = 1; // AabEnabled
+    data[0x09] = 30; // AabTimeout
+    data[0x0A] = 1; // LastBootSucceeded
+    data
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn ensure_boot_status_data() {
     if BOOT_STATUS_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
-    // SAFETY: single-process boot-status model; repeated initialization before the store is benign.
+    // SAFETY: non-x64 fallback boot-status model; repeated initialization before the store is benign.
     unsafe {
-        let data = boot_status_data_ptr();
-        core::ptr::write_bytes(data, 0, BSD_DATA_SIZE);
-        boot_status_write_u32(0x00, BSD_DATA_SIZE as u32); // Version
-        boot_status_write_u32(0x04, 1); // NtProductWinNt
-        *data.add(0x08) = 1; // AabEnabled
-        *data.add(0x09) = 30; // AabTimeout
-        *data.add(0x0A) = 1; // LastBootSucceeded
+        let initial = initial_boot_status_data();
+        core::ptr::copy_nonoverlapping(initial.as_ptr(), boot_status_data_ptr(), BSD_DATA_SIZE);
     }
     BOOT_STATUS_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boot_status_file_name() -> UnicodeString {
+    let mut name = UnicodeString::default();
+    name.length = ((BOOT_STATUS_PATH_WIDE.len() - 1) * 2) as u16;
+    name.maximum_length = (BOOT_STATUS_PATH_WIDE.len() * 2) as u16;
+    name.buffer = BOOT_STATUS_PATH_WIDE.as_ptr() as u64;
+    name
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boot_status_object_attributes(name: &UnicodeString) -> BootObjectAttributes {
+    BootObjectAttributes {
+        length: core::mem::size_of::<BootObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: name as *const UnicodeString as u64,
+        attributes: OBJ_CASE_INSENSITIVE,
+        _p1: 0,
+        security_descriptor: 0,
+        security_qos: 0,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_create_file(
+    file_handle: *mut u64,
+    desired_access: u32,
+    object_attributes: *const BootObjectAttributes,
+    iosb: *mut [u64; 2],
+    file_attributes: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> NtStatus {
+    type NtCreateFile = unsafe extern "system" fn(
+        *mut u64,
+        u32,
+        *const BootObjectAttributes,
+        *mut [u64; 2],
+        *const i64,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtCreateFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtCreateFile>(
+            nt_ntdll::trap_stubs::nt_create_file,
+        )(
+            file_handle,
+            desired_access,
+            object_attributes,
+            iosb,
+            core::ptr::null(),
+            file_attributes,
+            0,
+            create_disposition,
+            create_options,
+            core::ptr::null_mut(),
+            0,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_open_file(
+    file_handle: *mut u64,
+    desired_access: u32,
+    object_attributes: *const BootObjectAttributes,
+    iosb: *mut [u64; 2],
+    open_options: u32,
+) -> NtStatus {
+    type NtOpenFile = unsafe extern "system" fn(
+        *mut u64,
+        u32,
+        *const BootObjectAttributes,
+        *mut [u64; 2],
+        u32,
+        u32,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtOpenFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtOpenFile>(
+            nt_ntdll::trap_stubs::nt_open_file,
+        )(
+            file_handle,
+            desired_access,
+            object_attributes,
+            iosb,
+            0,
+            open_options,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_read_file(
+    file_handle: u64,
+    iosb: *mut [u64; 2],
+    buffer: *mut c_void,
+    len: u32,
+    byte_offset: *const i64,
+) -> NtStatus {
+    type NtReadFile = unsafe extern "system" fn(
+        u64,
+        u64,
+        *mut c_void,
+        *mut c_void,
+        *mut [u64; 2],
+        *mut c_void,
+        u32,
+        *const i64,
+        *mut u32,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtReadFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtReadFile>(
+            nt_ntdll::trap_stubs::nt_read_file,
+        )(
+            file_handle,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            iosb,
+            buffer,
+            len,
+            byte_offset,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_write_file(
+    file_handle: u64,
+    iosb: *mut [u64; 2],
+    buffer: *const c_void,
+    len: u32,
+    byte_offset: *const i64,
+) -> NtStatus {
+    type NtWriteFile = unsafe extern "system" fn(
+        u64,
+        u64,
+        *mut c_void,
+        *mut c_void,
+        *mut [u64; 2],
+        *const c_void,
+        u32,
+        *const i64,
+        *mut u32,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtWriteFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtWriteFile>(
+            nt_ntdll::trap_stubs::nt_write_file,
+        )(
+            file_handle,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            iosb,
+            buffer,
+            len,
+            byte_offset,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_flush_buffers_file(file_handle: u64, iosb: *mut [u64; 2]) -> NtStatus {
+    type NtFlushBuffersFile = unsafe extern "system" fn(u64, *mut [u64; 2]) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtFlushBuffersFile ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtFlushBuffersFile>(
+            nt_ntdll::trap_stubs::nt_flush_buffers_file,
+        )(file_handle, iosb)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_close(file_handle: u64) -> NtStatus {
+    type NtClose = unsafe extern "system" fn(u64) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtClose ABI to the generated ntdll trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtClose>(nt_ntdll::trap_stubs::nt_close)(
+            file_handle,
+        )
+    }
 }
 
 /// `RtlCompareUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN) -> LONG`.
@@ -1774,21 +2030,61 @@ pub unsafe extern "system" fn rtl_set_thread_is_critical(
 }
 
 /// `RtlCreateBootStatusDataFile() -> NTSTATUS`.
-/// ReactOS creates and initializes `\SystemRoot\bootstat.dat`; our current boot-status backing is
-/// the process-local `RTL_BSD_DATA` model shared by `RtlLockBootStatusData` /
-/// `RtlGetSetBootStatusData`, so creation initializes that model.
+/// ReactOS creates and initializes `\SystemRoot\bootstat.dat`; on target this issues the same Nt*
+/// sequence against the executive's reserved boot-status file.
 #[export_name = "RtlCreateBootStatusDataFile"]
 pub unsafe extern "system" fn rtl_create_boot_status_data_file() -> NtStatus {
-    // SAFETY: initializes the in-ntdll boot-status model.
-    unsafe { ensure_boot_status_data() };
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        let file_name = boot_status_file_name();
+        let oa = boot_status_object_attributes(&file_name);
+        let mut file_handle = 0u64;
+        let mut iosb = [0u64; 2];
+        // SAFETY: stack locals form valid NtCreateFile arguments and the generated stub preserves
+        // the full x64 syscall ABI.
+        let mut status = unsafe {
+            boot_nt_create_file(
+                &mut file_handle,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                &oa,
+                &mut iosb,
+                FILE_ATTRIBUTE_SYSTEM,
+                FILE_CREATE,
+                FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            let initial = initial_boot_status_data();
+            let byte_offset = 0i64;
+            // SAFETY: writes a stack-owned BSD blob to the live boot-status file handle.
+            status = unsafe {
+                boot_nt_write_file(
+                    file_handle,
+                    &mut iosb,
+                    initial.as_ptr() as *const c_void,
+                    BSD_DATA_SIZE as u32,
+                    &byte_offset,
+                )
+            };
+        }
+        if file_handle != 0 {
+            // SAFETY: closes the handle returned by NtCreateFile.
+            let _ = unsafe { boot_nt_close(file_handle) };
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // SAFETY: initializes the non-target fallback boot-status model.
+        unsafe { ensure_boot_status_data() };
+        STATUS_SUCCESS
+    }
 }
 
 /// `RtlGetSetBootStatusData(HANDLE, BOOLEAN Read, RTL_BSD_ITEM_TYPE, PVOID, ULONG, PULONG)`.
-/// ReactOS ntdll implements this as byte-range reads/writes against `\SystemRoot\bootstat.dat`; this
-/// runtime has no arbitrary file-backed bootstat device yet, so we model the same `RTL_BSD_DATA`
-/// item table in ntdll. This is enough for smss' save/clear/restore boot bookkeeping and keeps the
-/// field sizes/offsets byte-identical to ReactOS.
+/// ReactOS ntdll implements this as byte-range reads/writes against `\SystemRoot\bootstat.dat`; on
+/// target this delegates the byte transfer to `NtReadFile` / `NtWriteFile` using the caller's file
+/// handle.
 ///
 /// # Safety
 /// `buffer` is readable/writable for `buffer_size` bytes; `return_length` is null or writable.
@@ -1802,9 +2098,6 @@ pub unsafe extern "system" fn rtl_get_set_boot_status_data(
     buffer_size: u32,
     return_length: *mut u32,
 ) -> NtStatus {
-    if handle as usize != BOOT_STATUS_HANDLE {
-        return STATUS_INVALID_HANDLE;
-    }
     if data_class as usize >= BSD_ITEM_MAX {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1815,25 +2108,65 @@ pub unsafe extern "system" fn rtl_get_set_boot_status_data(
     if buffer_size != 0 && buffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: boot-status model is initialized and buffer spans were validated.
-    unsafe {
-        ensure_boot_status_data();
-        let data = boot_status_data_ptr().add(offset);
-        if buffer_size != 0 {
-            if read != 0 {
-                core::ptr::copy_nonoverlapping(data, buffer as *mut u8, buffer_size as usize);
-            } else {
-                core::ptr::copy_nonoverlapping(buffer as *const u8, data, buffer_size as usize);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let byte_offset = offset as i64;
+        let mut iosb = [0u64; 2];
+        let status = if read != 0 {
+            // SAFETY: forwards the caller buffer and explicit byte offset to NtReadFile.
+            unsafe {
+                boot_nt_read_file(
+                    handle as u64,
+                    &mut iosb,
+                    buffer,
+                    buffer_size,
+                    &byte_offset,
+                )
+            }
+        } else {
+            // SAFETY: forwards the caller buffer and explicit byte offset to NtWriteFile.
+            unsafe {
+                boot_nt_write_file(
+                    handle as u64,
+                    &mut iosb,
+                    buffer as *const c_void,
+                    buffer_size,
+                    &byte_offset,
+                )
+            }
+        };
+        if status == STATUS_SUCCESS && !return_length.is_null() {
+            // SAFETY: return_length is optional and non-null here.
+            unsafe { *return_length = item_size as u32 };
+        }
+        status
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if handle as usize != BOOT_STATUS_HANDLE {
+            return STATUS_INVALID_HANDLE;
+        }
+        // SAFETY: boot-status model is initialized and buffer spans were validated.
+        unsafe {
+            ensure_boot_status_data();
+            let data = boot_status_data_ptr().add(offset);
+            if buffer_size != 0 {
+                if read != 0 {
+                    core::ptr::copy_nonoverlapping(data, buffer as *mut u8, buffer_size as usize);
+                } else {
+                    core::ptr::copy_nonoverlapping(buffer as *const u8, data, buffer_size as usize);
+                }
+            }
+            if !return_length.is_null() {
+                *return_length = item_size as u32;
             }
         }
-        if !return_length.is_null() {
-            *return_length = item_size as u32;
-        }
+        STATUS_SUCCESS
     }
-    STATUS_SUCCESS
 }
 
-/// `RtlLockBootStatusData(PHANDLE) -> NTSTATUS`. Return the in-ntdll boot-status handle.
+/// `RtlLockBootStatusData(PHANDLE) -> NTSTATUS`. Open the live boot-status file.
 ///
 /// # Safety
 /// `handle` is writable.
@@ -1842,24 +2175,70 @@ pub unsafe extern "system" fn rtl_lock_boot_status_data(handle: *mut *mut c_void
     if handle.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: handle is a writable out-param.
-    unsafe {
-        ensure_boot_status_data();
-        *handle = BOOT_STATUS_HANDLE as *mut c_void;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: handle is a writable out-param.
+        unsafe { *handle = core::ptr::null_mut() };
+        let file_name = boot_status_file_name();
+        let oa = boot_status_object_attributes(&file_name);
+        let mut file_handle = 0u64;
+        let mut iosb = [0u64; 2];
+        // SAFETY: stack locals form valid NtOpenFile arguments.
+        let status = unsafe {
+            boot_nt_open_file(
+                &mut file_handle,
+                FILE_ALL_ACCESS,
+                &oa,
+                &mut iosb,
+                FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            // SAFETY: handle is a writable out-param and file_handle is owned by the caller now.
+            unsafe { *handle = file_handle as *mut c_void };
+        }
+        status
     }
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // SAFETY: handle is a writable out-param.
+        unsafe {
+            ensure_boot_status_data();
+            *handle = BOOT_STATUS_HANDLE as *mut c_void;
+        }
+        STATUS_SUCCESS
+    }
 }
 
-/// `RtlUnlockBootStatusData(HANDLE) -> NTSTATUS`. Flush/close is a no-op for the in-ntdll model.
+/// `RtlUnlockBootStatusData(HANDLE) -> NTSTATUS`. Flush and close the live boot-status file.
 ///
 /// # Safety
 /// `handle` is the value returned by `RtlLockBootStatusData`.
 #[export_name = "RtlUnlockBootStatusData"]
 pub unsafe extern "system" fn rtl_unlock_boot_status_data(handle: *mut c_void) -> NtStatus {
-    if handle as usize == BOOT_STATUS_HANDLE {
-        STATUS_SUCCESS
-    } else {
-        STATUS_INVALID_HANDLE
+    #[cfg(target_arch = "x86_64")]
+    {
+        if handle.is_null() {
+            return STATUS_INVALID_HANDLE;
+        }
+        let file_handle = handle as u64;
+        let mut iosb = [0u64; 2];
+        // SAFETY: forwards the supplied file handle to NtFlushBuffersFile and NtClose.
+        let flush_status = unsafe { boot_nt_flush_buffers_file(file_handle, &mut iosb) };
+        let close_status = unsafe { boot_nt_close(file_handle) };
+        if flush_status != STATUS_SUCCESS {
+            flush_status
+        } else {
+            close_status
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if handle as usize == BOOT_STATUS_HANDLE {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_HANDLE
+        }
     }
 }
 

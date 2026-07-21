@@ -461,6 +461,29 @@ fn file_objects_are_typed_and_process_local() {
 }
 
 #[test]
+fn boot_status_file_handle_is_typed_and_process_local() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let first_handle = pm
+        .insert_handle(first, HandleObject::BootStatusFile, 0x3)
+        .unwrap();
+    let second_handle = pm
+        .insert_handle(second, HandleObject::BootStatusFile, 0x1)
+        .unwrap();
+    assert_eq!(first_handle, second_handle);
+    assert_eq!(
+        pm.lookup_handle(first, first_handle),
+        Some(HandleObject::BootStatusFile)
+    );
+    assert_eq!(
+        pm.lookup_handle(second, second_handle),
+        Some(HandleObject::BootStatusFile)
+    );
+    assert_eq!(pm.handle_access(first, first_handle), Some(0x3));
+}
+
+#[test]
 fn io_completion_objects_are_typed_and_process_local() {
     let mut pm = ProcessManager::new();
     let first = pm.create_process("first.exe", None, None);

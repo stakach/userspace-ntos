@@ -146,6 +146,8 @@ pub enum HandleObject {
     Section(SectionId),
     /// An I/O Manager `FILE_OBJECT`. The identifier belongs to the backing filesystem service.
     File(u64),
+    /// The executive-reserved `\SystemRoot\bootstat.dat` file used by RTL boot-status APIs.
+    BootStatusFile,
     /// An executive I/O completion-port object, indexed in the executive's fixed object table.
     IoCompletion(u32),
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the

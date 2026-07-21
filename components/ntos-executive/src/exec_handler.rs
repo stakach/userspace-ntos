@@ -8,6 +8,45 @@ use crate::*;
 use nt_io_abi::major;
 
 static WINLOGON_VM_TRACE_N: AtomicU64 = AtomicU64::new(0);
+const EXEC_BOOT_STATUS_FILE_SIZE: usize = 0x800;
+const EXEC_BSD_DATA_SIZE: usize = 0x88;
+const EXEC_BOOT_STATUS_PATH: &[u8] = b"\\systemroot\\bootstat.dat";
+static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
+    [0; EXEC_BOOT_STATUS_FILE_SIZE];
+
+#[inline]
+fn boot_status_data_ptr() -> *mut u8 {
+    core::ptr::addr_of_mut!(EXEC_BOOT_STATUS_DATA) as *mut u8
+}
+
+fn boot_status_path_matches(name: &[u16]) -> bool {
+    name.len() == EXEC_BOOT_STATUS_PATH.len()
+        && name.iter().zip(EXEC_BOOT_STATUS_PATH.iter()).all(|(&wide, &ascii)| {
+            wide <= 0x7F && (wide as u8).to_ascii_lowercase() == ascii
+        })
+}
+
+unsafe fn reset_boot_status_data() {
+    let data = boot_status_data_ptr();
+    // SAFETY: the boot-status array is executive-lifetime storage.
+    unsafe {
+        core::ptr::write_bytes(data, 0, EXEC_BOOT_STATUS_FILE_SIZE);
+        core::ptr::write_unaligned(data.add(0x00) as *mut u32, EXEC_BSD_DATA_SIZE as u32);
+        core::ptr::write_unaligned(data.add(0x04) as *mut u32, 1); // NtProductWinNt
+        *data.add(0x08) = 1; // AabEnabled
+        *data.add(0x09) = 30; // AabTimeout
+        *data.add(0x0A) = 1; // LastBootSucceeded
+    }
+    EXEC_BOOT_STATUS_INITIALIZED.store(true, Ordering::Release);
+}
+
+unsafe fn ensure_boot_status_data() {
+    if !EXEC_BOOT_STATUS_INITIALIZED.load(Ordering::Acquire) {
+        // SAFETY: repeated reset races are benign in the single-executive boot path.
+        unsafe { reset_boot_status_data() };
+    }
+}
 
 impl ExecNtHandler {
     pub(crate) fn new() -> Self {
@@ -295,6 +334,130 @@ impl ExecNtHandler {
         }
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         Some(handle as u64)
+    }
+
+    /// Mint a process-local handle for the executive-reserved boot-status file.
+    pub(crate) fn mint_boot_status_handle(&mut self, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let handle = self
+            .pm
+            .insert_handle(pid, nt_process::HandleObject::BootStatusFile, access)
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    fn boot_status_handle_access(&self, handle: u64) -> Result<u32, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::BootStatusFile) => self
+                .pm
+                .handle_access(pid, handle as nt_process::Handle)
+                .ok_or(STATUS_INVALID_HANDLE),
+            _ => Err(STATUS_INVALID_HANDLE),
+        }
+    }
+
+    fn boot_status_check_access(&self, handle: u64, wanted: u32, generic: u32) -> Result<(), u32> {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let access = self.boot_status_handle_access(handle)?;
+        if access & (wanted | generic | GENERIC_ALL) == 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(())
+    }
+
+    unsafe fn boot_status_offset(&self, byte_offset: u64) -> Result<usize, u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if byte_offset == 0 {
+            return Ok(0);
+        }
+        let mut raw = [0u8; 8];
+        if !self.xas_read(byte_offset, &mut raw) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let signed = i64::from_le_bytes(raw);
+        if signed < 0 || signed as usize > EXEC_BOOT_STATUS_FILE_SIZE {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(signed as usize)
+    }
+
+    unsafe fn boot_status_read_file(
+        &self,
+        handle: u64,
+        buffer: u64,
+        len: usize,
+        byte_offset: u64,
+    ) -> Result<u64, u32> {
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        self.boot_status_check_access(handle, FILE_READ_DATA, GENERIC_READ)?;
+        if len != 0 && buffer == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        // SAFETY: reads the caller-supplied LARGE_INTEGER, if present.
+        let offset = unsafe { self.boot_status_offset(byte_offset)? };
+        let available = EXEC_BOOT_STATUS_FILE_SIZE.saturating_sub(offset);
+        let copy_len = len.min(available);
+        // SAFETY: initializes and reads from executive-lifetime boot-status storage.
+        unsafe {
+            ensure_boot_status_data();
+            if copy_len != 0 {
+                let src = core::slice::from_raw_parts(boot_status_data_ptr().add(offset), copy_len);
+                self.xas_write_buf(buffer, src);
+            }
+        }
+        Ok(copy_len as u64)
+    }
+
+    unsafe fn boot_status_write_file(
+        &self,
+        handle: u64,
+        buffer: u64,
+        len: usize,
+        byte_offset: u64,
+    ) -> Result<u64, u32> {
+        const FILE_WRITE_DATA: u32 = 0x0000_0002;
+        const FILE_APPEND_DATA: u32 = 0x0000_0004;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        self.boot_status_check_access(
+            handle,
+            FILE_WRITE_DATA | FILE_APPEND_DATA,
+            GENERIC_WRITE,
+        )?;
+        if len != 0 && buffer == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        // SAFETY: reads the caller-supplied LARGE_INTEGER, if present.
+        let offset = unsafe { self.boot_status_offset(byte_offset)? };
+        let available = EXEC_BOOT_STATUS_FILE_SIZE.saturating_sub(offset);
+        let copy_len = len.min(available);
+        let mut payload = alloc::vec![0u8; copy_len];
+        if copy_len != 0 && !self.xas_read(buffer, &mut payload) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        // SAFETY: initializes and writes into executive-lifetime boot-status storage.
+        unsafe {
+            ensure_boot_status_data();
+            if copy_len != 0 {
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    boot_status_data_ptr().add(offset),
+                    copy_len,
+                );
+            }
+        }
+        Ok(copy_len as u64)
     }
 
     /// Mint a process-local event handle that references a shared executive event identity.
@@ -4384,7 +4547,50 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 let mut status;
                 let mut info = 0u64;
-                if nt_fs::is_named_pipe_path(&name16) {
+                if boot_status_path_matches(&name16) {
+                    if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                        status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                    } else if let Some(handle) = self.mint_boot_status_handle(args[1] as u32) {
+                        let disposition = args[7] as u32;
+                        status = nt_fs::STATUS_SUCCESS;
+                        info = match disposition {
+                            nt_fs::FILE_SUPERSEDE => {
+                                reset_boot_status_data();
+                                nt_fs::FILE_SUPERSEDED as u64
+                            }
+                            nt_fs::FILE_OPEN => {
+                                ensure_boot_status_data();
+                                nt_fs::FILE_OPENED as u64
+                            }
+                            nt_fs::FILE_CREATE => {
+                                reset_boot_status_data();
+                                nt_fs::FILE_CREATED as u64
+                            }
+                            nt_fs::FILE_OPEN_IF => {
+                                let existed = EXEC_BOOT_STATUS_INITIALIZED.load(Ordering::Acquire);
+                                ensure_boot_status_data();
+                                if existed {
+                                    nt_fs::FILE_OPENED as u64
+                                } else {
+                                    nt_fs::FILE_CREATED as u64
+                                }
+                            }
+                            nt_fs::FILE_OVERWRITE | nt_fs::FILE_OVERWRITE_IF => {
+                                reset_boot_status_data();
+                                nt_fs::FILE_OVERWRITTEN as u64
+                            }
+                            _ => {
+                                status = nt_fs::STATUS_INVALID_PARAMETER;
+                                0
+                            }
+                        };
+                        if status == nt_fs::STATUS_SUCCESS {
+                            self.queue_write(args[0], handle);
+                        }
+                    } else {
+                        status = 0xC000_009A;
+                    }
+                } else if nt_fs::is_named_pipe_path(&name16) {
                     if args[7] as u32 != nt_fs::FILE_OPEN {
                         status = nt_fs::STATUS_INVALID_PARAMETER;
                     } else if args[8] as u32 & nt_fs::FILE_DIRECTORY_FILE != 0 {
@@ -4479,6 +4685,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC000_00BB // STATUS_NOT_SUPPORTED
                 } else if let Err(event_status) = completion_event {
                     event_status
+                } else if self.boot_status_handle_access(fh).is_ok() {
+                    match self.boot_status_write_file(fh, buffer, len, byte_offset) {
+                        Ok(written) => {
+                            information = written;
+                            nt_fs::STATUS_SUCCESS
+                        }
+                        Err(status) => status,
+                    }
                 } else {
                     match self.npfs_write_file_id_for(fh) {
                         Err(handle_status) => handle_status,
@@ -4571,6 +4785,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let iosb = smss_stack_read(sp + 0x28);
                 let buffer = smss_stack_read(sp + 0x30);
                 let len = smss_stack_read(sp + 0x38) as u32 as usize;
+                let byte_offset = smss_stack_read(sp + 0x40);
                 let fh = args[0];
                 let event = args[1];
                 let apc_routine = args[2];
@@ -4592,6 +4807,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC000_00BB // STATUS_NOT_SUPPORTED
                 } else if let Err(event_status) = completion_event {
                     event_status
+                } else if self.boot_status_handle_access(fh).is_ok() {
+                    match self.boot_status_read_file(fh, buffer, len, byte_offset) {
+                        Ok(read) => {
+                            information = read;
+                            nt_fs::STATUS_SUCCESS
+                        }
+                        Err(status) => status,
+                    }
                 } else {
                     match self.npfs_read_file_id_for(fh) {
                         Err(handle_status) => handle_status,
@@ -4740,6 +4963,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let mut routed = false;
                 let status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
+                } else if self.boot_status_handle_access(handle).is_ok() {
+                    match self.boot_status_check_access(handle, 0x0000_0002, 0x4000_0000) {
+                        Ok(()) => nt_fs::STATUS_SUCCESS,
+                        Err(status) => status,
+                    }
                 } else {
                     match self.npfs_flush_file_id_for(handle) {
                         Err(handle_status) => handle_status,
@@ -4793,6 +5021,51 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let reg = &mut *ctx.reg;
                 const FILE_DIRECTORY_FILE: u64 = 0x01;
                 let sp = get_recv_mr(16);
+                {
+                    let oa_probe = get_recv_mr(7);
+                    let nm = self.read_objattr_name_pe(oa_probe);
+                    if boot_status_path_matches(&nm) {
+                        let options = smss_stack_read(sp + 0x30) as u32;
+                        let mut status = nt_fs::STATUS_SUCCESS;
+                        let mut opened_handle = None;
+                        if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                            status = nt_fs::STATUS_OBJECT_NAME_COLLISION;
+                        } else {
+                            ensure_boot_status_data();
+                            opened_handle = self.mint_boot_status_handle(args[1] as u32);
+                            if opened_handle.is_none() {
+                                status = 0xC000_009A;
+                            }
+                        }
+                        if let Some(handle) = opened_handle {
+                            self.queue_write(get_recv_mr(9), handle);
+                        }
+                        let iosb = get_recv_mr(8);
+                        if iosb != 0 {
+                            self.xas_write_buf(iosb, &status.to_le_bytes());
+                            let info = if status == nt_fs::STATUS_SUCCESS {
+                                nt_fs::FILE_OPENED as u64
+                            } else {
+                                0
+                            };
+                            self.xas_write_buf(iosb + 8, &info.to_le_bytes());
+                        }
+                        let lc: alloc::vec::Vec<u8> = nm
+                            .iter()
+                            .map(|&w| (w as u8).to_ascii_lowercase())
+                            .collect();
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::OpenFile,
+                            status,
+                            None,
+                            0,
+                            opened_handle.unwrap_or(0),
+                            &lc,
+                        );
+                        return status;
+                    }
+                }
                 // pi==3 pipe client-open: a `\??\pipe\NAME` / `\Device\NamedPipe\NAME` open routes to
                 // npfs (IRP_MJ_CREATE = client connect → finds the FCB via the real prefix tree). Placed
                 // before the FS name-scope so a pipe path never falls into the DLL/System32 fakes.
