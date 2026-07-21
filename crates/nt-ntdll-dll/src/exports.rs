@@ -7069,8 +7069,7 @@ const STG_E_INVALIDPOINTER: u32 = nt_ntdll::rtl::memstream::STG_E_INVALIDPOINTER
 const STGTY_STREAM: u32 = 2;
 const STATSTG_SIZE: usize = core::mem::size_of::<StatStg>();
 
-type QueryInterfaceFn =
-    unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> u32;
+type QueryInterfaceFn = unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> u32;
 type AddRefFn = unsafe extern "system" fn(*mut c_void) -> u32;
 type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 type ReadFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> u32;
@@ -7217,7 +7216,11 @@ pub unsafe extern "system" fn rtl_init_memory_stream(stream: *mut RtlMemoryStrea
     }
     // SAFETY: stream writable per the contract.
     unsafe {
-        core::ptr::write_bytes(stream as *mut u8, 0, core::mem::size_of::<RtlMemoryStream>());
+        core::ptr::write_bytes(
+            stream as *mut u8,
+            0,
+            core::mem::size_of::<RtlMemoryStream>(),
+        );
         (*stream).vtbl = &RTL_MEMORY_STREAM_VTBL;
     }
 }
@@ -7233,7 +7236,11 @@ pub unsafe extern "system" fn rtl_init_out_of_process_memory_stream(stream: *mut
     }
     // SAFETY: stream writable per the contract.
     unsafe {
-        core::ptr::write_bytes(stream as *mut u8, 0, core::mem::size_of::<RtlMemoryStream>());
+        core::ptr::write_bytes(
+            stream as *mut u8,
+            0,
+            core::mem::size_of::<RtlMemoryStream>(),
+        );
         (*stream).vtbl = &RTL_OUT_OF_PROCESS_MEMORY_STREAM_VTBL;
         (*stream).final_release = Some(rtl_final_release_out_of_process_memory_stream);
     }
@@ -7505,7 +7512,9 @@ pub unsafe extern "system" fn rtl_copy_memory_stream_to(
         let left = total.min(buffer.len() as u64) as u32;
         let mut amount = 0u32;
         // SAFETY: vtable methods follow the IStream ABI.
-        result = unsafe { ((*this_vtbl).read)(this, buffer.as_mut_ptr() as *mut c_void, left, &mut amount) };
+        result = unsafe {
+            ((*this_vtbl).read)(this, buffer.as_mut_ptr() as *mut c_void, left, &mut amount)
+        };
         if !bytes_read.is_null() {
             unsafe { *bytes_read = (*bytes_read).wrapping_add(amount as u64) };
         }
@@ -7590,7 +7599,10 @@ pub unsafe extern "system" fn rtl_write_memory_stream(
 
 /// `RtlSetMemoryStreamSize(...) -> HRESULT`.
 #[export_name = "RtlSetMemoryStreamSize"]
-pub unsafe extern "system" fn rtl_set_memory_stream_size(_this: *mut c_void, _new_size: u64) -> u32 {
+pub unsafe extern "system" fn rtl_set_memory_stream_size(
+    _this: *mut c_void,
+    _new_size: u64,
+) -> u32 {
     E_NOTIMPL
 }
 
@@ -9551,10 +9563,7 @@ etw_ok!(
     etw_enumerate_process_reg_guids
 );
 etw_ok!("EtwEnumerateTraceGuids", etw_enumerate_trace_guids);
-etw_ok!(
-    "EtwEventActivityIdControl",
-    etw_event_activity_id_control
-);
+etw_ok!("EtwEventActivityIdControl", etw_event_activity_id_control);
 etw_ok!("EtwEventEnabled", etw_event_enabled);
 etw_ok!("EtwEventProviderEnabled", etw_event_provider_enabled);
 etw_ok!("EtwEventRegister", etw_event_register);
@@ -9563,10 +9572,7 @@ etw_ok!("EtwEventUnregister", etw_event_unregister);
 etw_ok!("EtwEventWrite", etw_event_write);
 etw_ok!("EtwEventWriteEndScenario", etw_event_write_end_scenario);
 etw_ok!("EtwEventWriteFull", etw_event_write_full);
-etw_ok!(
-    "EtwEventWriteStartScenario",
-    etw_event_write_start_scenario
-);
+etw_ok!("EtwEventWriteStartScenario", etw_event_write_start_scenario);
 etw_ok!("EtwEventWriteString", etw_event_write_string);
 etw_ok!("EtwEventWriteTransfer", etw_event_write_transfer);
 etw_ok!("EtwFlushTraceA", etw_flush_trace_a);
@@ -9584,10 +9590,7 @@ etw_ok!(
     "EtwNotificationRegistrationW",
     etw_notification_registration_w
 );
-etw_ok!(
-    "EtwNotificationUnregister",
-    etw_notification_unregister
-);
+etw_ok!("EtwNotificationUnregister", etw_notification_unregister);
 etw_ok!(
     "EtwProcessPrivateLoggerRequest",
     etw_process_private_logger_request
@@ -9599,7 +9602,10 @@ etw_ok!("EtwQueryTraceW", etw_query_trace_w);
 etw_ok!("EtwReceiveNotificationsA", etw_receive_notifications_a);
 etw_ok!("EtwReceiveNotificationsW", etw_receive_notifications_w);
 etw_ok!("EtwRegister", etw_register);
-etw_ok!("EtwRegisterSecurityProvider", etw_register_security_provider);
+etw_ok!(
+    "EtwRegisterSecurityProvider",
+    etw_register_security_provider
+);
 etw_ok!("EtwRegisterTraceGuidsA", etw_register_trace_guids_a);
 etw_ok!("EtwRegisterTraceGuidsW", etw_register_trace_guids_w);
 etw_ok!("EtwReplyNotification", etw_reply_notification);
@@ -11458,6 +11464,277 @@ pub unsafe extern "system" fn alpc_unregister_completion_list_worker_thread(
 ) {
 }
 
+// ---- Private property/variant conversion exports -----------------------------------------------
+
+type RawPropVariant = nt_ntdll::rtl::propvariant::PropVariant;
+
+/// `PropertyLengthAsVariant(SERIALIZEDPROPERTYVALUE*, ULONG, USHORT, BYTE) -> ULONG`.
+///
+/// Computes the amount of external allocation `RtlConvertPropertyToVariant` may need. The reference
+/// NT5 implementation deliberately overestimates variable-length strings; the pure helper preserves
+/// that observable behavior.
+///
+/// # Safety
+/// `property` points to `property_size` bytes of serialized property data.
+#[export_name = "PropertyLengthAsVariant"]
+pub unsafe extern "system" fn property_length_as_variant(
+    property: *const c_void,
+    property_size: u32,
+    code_page: u16,
+    flags: u8,
+) -> u32 {
+    let _ = flags;
+    if property.is_null() || property_size < 4 {
+        return 0;
+    }
+    // SAFETY: caller supplied `property_size` bytes.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(property as *const u8, property_size as usize) };
+    nt_ntdll::rtl::propvariant::property_length_as_variant(bytes, code_page).unwrap_or(0)
+}
+
+/// `RtlConvertPropertyToVariant(SERIALIZEDPROPERTYVALUE*, USHORT, PROPVARIANT*, PMemoryAllocator*)`.
+///
+/// Direct properties return `FALSE` after filling `pvar`, matching the NT5/OLE32 private contract.
+/// Failure also returns `FALSE`; the original API signalled detailed errors by raising status.
+///
+/// # Safety
+/// Raw pointers follow the legacy ntdll contract. `pma`, when non-null, points to a PMemoryAllocator
+/// object whose vtable slot 0 is `Allocate(this, ULONG)`.
+#[export_name = "RtlConvertPropertyToVariant"]
+pub unsafe extern "system" fn rtl_convert_property_to_variant(
+    property: *const c_void,
+    code_page: u16,
+    pvar: *mut RawPropVariant,
+    pma: *mut c_void,
+) -> u8 {
+    if property.is_null() || pvar.is_null() {
+        return 0;
+    }
+
+    let len =
+        match unsafe { nt_ntdll::rtl::propvariant::serialized_len_from_ptr(property as *const u8) }
+        {
+            Ok(len) => len,
+            Err(_) => {
+                unsafe { core::ptr::write(pvar, RawPropVariant::zeroed()) };
+                return 0;
+            }
+        };
+    // SAFETY: the serialized property's inline counts described `len` mapped bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(property as *const u8, len) };
+    let parsed = match nt_ntdll::rtl::propvariant::parse_property(bytes, code_page) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            unsafe { core::ptr::write(pvar, RawPropVariant::zeroed()) };
+            return 0;
+        }
+    };
+    if unsafe { write_parsed_propvariant(pvar, parsed, pma) } {
+        0
+    } else {
+        unsafe { core::ptr::write(pvar, RawPropVariant::zeroed()) };
+        0
+    }
+}
+
+/// `RtlConvertVariantToProperty(PROPVARIANT*, USHORT, SERIALIZEDPROPERTYVALUE*, PULONG, PROPID,
+/// BOOLEAN, PULONG) -> SERIALIZEDPROPERTYVALUE*`.
+///
+/// # Safety
+/// `pvar` points to a valid `PROPVARIANT`; `property` is null or writable for `*property_size`
+/// bytes; `property_size` is writable.
+#[export_name = "RtlConvertVariantToProperty"]
+pub unsafe extern "system" fn rtl_convert_variant_to_property(
+    pvar: *const RawPropVariant,
+    code_page: u16,
+    property: *mut c_void,
+    property_size: *mut u32,
+    property_id: u32,
+    reserved: u8,
+    indirect_count: *mut u32,
+) -> *mut c_void {
+    let _ = (property_id, reserved);
+    if pvar.is_null() || property_size.is_null() {
+        return core::ptr::null_mut();
+    }
+    if !indirect_count.is_null() {
+        unsafe { *indirect_count = 0 };
+    }
+
+    let serialized =
+        match unsafe { nt_ntdll::rtl::propvariant::serialize_variant_to_vec(&*pvar, code_page) } {
+            Ok(serialized) => serialized,
+            Err(_) => {
+                unsafe { *property_size = 0 };
+                return core::ptr::null_mut();
+            }
+        };
+    let needed = serialized.len();
+    let available = unsafe { *property_size as usize };
+    unsafe { *property_size = needed as u32 };
+    if property.is_null() || available < needed {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(serialized.as_ptr(), property as *mut u8, needed);
+    }
+    property
+}
+
+/// `RtlSetUnicodeCallouts(UNICODECALLOUTS*)` — legacy compatibility no-op.
+#[export_name = "RtlSetUnicodeCallouts"]
+pub extern "system" fn rtl_set_unicode_callouts(_unicode_callouts: *mut c_void) {}
+
+unsafe fn write_parsed_propvariant(
+    out: *mut RawPropVariant,
+    parsed: nt_ntdll::rtl::propvariant::ParsedVariant,
+    pma: *mut c_void,
+) -> bool {
+    use nt_ntdll::rtl::propvariant::ParsedVariant;
+
+    unsafe { core::ptr::write(out, RawPropVariant::zeroed()) };
+    unsafe { (*out).vt = parsed.vt() };
+
+    match parsed {
+        ParsedVariant::Empty | ParsedVariant::Null => true,
+        ParsedVariant::I1(value) => unsafe { set_prop_data(out, &[value as u8]) },
+        ParsedVariant::Ui1(value) => unsafe { set_prop_data(out, &[value]) },
+        ParsedVariant::I2(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Ui2(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Bool(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::I4(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Ui4(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::R4(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Error(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::I8(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Ui8(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::R8(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Cy(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Date(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::FileTime(value) => unsafe { set_prop_data(out, &value.to_ne_bytes()) },
+        ParsedVariant::Bstr(None) => true,
+        ParsedVariant::Bstr(Some(wide)) => {
+            let ptr = unsafe { alloc_bstr(&wide) };
+            if ptr.is_null() {
+                return false;
+            }
+            unsafe { set_prop_data(out, &(ptr as u64).to_ne_bytes()) }
+        }
+        ParsedVariant::LpStr(None) | ParsedVariant::LpWstr(None) => true,
+        ParsedVariant::LpStr(Some(bytes)) => {
+            let ptr = unsafe { pma_allocate(pma, bytes.len()) };
+            if ptr.is_null() {
+                return false;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                set_prop_data(out, &(ptr as u64).to_ne_bytes())
+            }
+        }
+        ParsedVariant::LpWstr(Some(wide)) => {
+            let units = wide.len().saturating_add(1);
+            let bytes = units.saturating_mul(2);
+            let ptr = unsafe { pma_allocate(pma, bytes) } as *mut u16;
+            if ptr.is_null() {
+                return false;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                *ptr.add(wide.len()) = 0;
+                set_prop_data(out, &((ptr as *mut u8) as u64).to_ne_bytes())
+            }
+        }
+        ParsedVariant::Blob(bytes) => unsafe {
+            (&mut (*out).data)[..4].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+            if bytes.is_empty() {
+                return true;
+            }
+            let ptr = pma_allocate(pma, bytes.len());
+            if ptr.is_null() {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            (&mut (*out).data)[8..16].copy_from_slice(&(ptr as u64).to_ne_bytes());
+            true
+        },
+        ParsedVariant::Clsid(guid) => unsafe {
+            let ptr = pma_allocate(pma, guid.len());
+            if ptr.is_null() {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(guid.as_ptr(), ptr, guid.len());
+            set_prop_data(out, &(ptr as u64).to_ne_bytes())
+        },
+    }
+}
+
+unsafe fn set_prop_data(out: *mut RawPropVariant, bytes: &[u8]) -> bool {
+    unsafe {
+        (*out).data = [0; 16];
+        (&mut (*out).data)[..bytes.len()].copy_from_slice(bytes);
+    }
+    true
+}
+
+unsafe fn pma_allocate(pma: *mut c_void, size: usize) -> *mut u8 {
+    let size = size.max(1);
+    if size > u32::MAX as usize {
+        return core::ptr::null_mut();
+    }
+    if !pma.is_null() {
+        type Allocate = unsafe extern "system" fn(*mut c_void, u32) -> *mut c_void;
+        unsafe {
+            let vtbl = core::ptr::read(pma as *const *const *const c_void);
+            if !vtbl.is_null() {
+                let raw = core::ptr::read(vtbl as *const *const c_void);
+                if !raw.is_null() {
+                    let allocate: Allocate = core::mem::transmute(raw);
+                    return allocate(pma, size as u32) as *mut u8;
+                }
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::process_heap_alloc(size) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+unsafe fn alloc_bstr(wide: &[u16]) -> *mut u16 {
+    let byte_len = match wide.len().checked_mul(2) {
+        Some(n) => n,
+        None => return core::ptr::null_mut(),
+    };
+    let total = match byte_len.checked_add(6) {
+        Some(n) => n,
+        None => return core::ptr::null_mut(),
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let base = unsafe { crate::process_heap_alloc(total) };
+        if base.is_null() {
+            return core::ptr::null_mut();
+        }
+        unsafe {
+            core::ptr::write_unaligned(base as *mut u32, byte_len as u32);
+            let data = base.add(4) as *mut u16;
+            core::ptr::copy_nonoverlapping(wide.as_ptr(), data, wide.len());
+            *data.add(wide.len()) = 0;
+            data
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = total;
+        core::ptr::null_mut()
+    }
+}
+
 // ---- Data exports — the NLS multi-byte code-page tags hosted binaries read. -----------------------
 //
 // `NlsMbCodePageTag` / `NlsMbOemCodePageTag` are BOOLEANs: TRUE iff the ANSI / OEM code page is a
@@ -11725,6 +12002,10 @@ pub unsafe extern "C" fn export_anchor() {
         csr_new_thread as usize,
         csr_identify_alertable_thread as usize,
         csr_set_priority_class as usize,
+        property_length_as_variant as usize,
+        rtl_convert_property_to_variant as usize,
+        rtl_convert_variant_to_property as usize,
+        rtl_set_unicode_callouts as usize,
         alpc_adjust_completion_list_concurrency_count as usize,
         alpc_free_completion_list_message as usize,
         alpc_get_completion_list_last_message_information as usize,
