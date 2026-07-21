@@ -175,7 +175,10 @@ mod tests {
     #[test]
     fn rva_to_va_and_section() {
         let img = minimal_pe();
-        assert_eq!(image_rva_to_va(&img, 0x1_4000_0000, 0x1000), Some(0x1_4000_1000));
+        assert_eq!(
+            image_rva_to_va(&img, 0x1_4000_0000, 0x1000),
+            Some(0x1_4000_1000)
+        );
         // Past the image size → None.
         assert!(image_rva_to_va(&img, 0x1_4000_0000, 0x9000).is_none());
         assert_eq!(image_rva_to_section(&img, 0x1000).as_deref(), Some(".text"));
@@ -185,7 +188,10 @@ mod tests {
     #[test]
     fn pc_to_file_header_range() {
         let img = minimal_pe();
-        assert_eq!(pc_to_file_header(&img, 0x1_4000_0000, 0x1_4000_1500), Some(0x1_4000_0000));
+        assert_eq!(
+            pc_to_file_header(&img, 0x1_4000_0000, 0x1_4000_1500),
+            Some(0x1_4000_0000)
+        );
         assert!(pc_to_file_header(&img, 0x1_4000_0000, 0x1_5000_0000).is_none());
     }
 }

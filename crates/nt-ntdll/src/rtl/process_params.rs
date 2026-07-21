@@ -89,16 +89,28 @@ pub struct ParamString {
 impl ParamString {
     /// A string from a UTF-16 body (MaximumLength = body + NUL).
     pub fn new(body: &[u16]) -> Self {
-        ParamString { body: body.to_vec(), maximum_length: 0, is_null: false }
+        ParamString {
+            body: body.to_vec(),
+            maximum_length: 0,
+            is_null: false,
+        }
     }
     /// The `EmptyString` default (`Length=0, MaximumLength=sizeof(WCHAR)`), which ppb.c substitutes
     /// for NULL DllPath/CurrentDirectory/CommandLine/WindowTitle/DesktopInfo/ShellInfo.
     pub fn empty() -> Self {
-        ParamString { body: Vec::new(), maximum_length: 2, is_null: false }
+        ParamString {
+            body: Vec::new(),
+            maximum_length: 2,
+            is_null: false,
+        }
     }
     /// The `NullString` (`{0, 0, NULL}`), ppb.c's default for a NULL `RuntimeData` — no buffer.
     pub fn null_string() -> Self {
-        ParamString { body: Vec::new(), maximum_length: 0, is_null: true }
+        ParamString {
+            body: Vec::new(),
+            maximum_length: 0,
+            is_null: true,
+        }
     }
 }
 
@@ -298,7 +310,13 @@ pub fn create_process_parameters(input: &ParamsInput) -> BuiltParams {
         (0, 0)
     };
 
-    BuiltParams { block, length, placements, environment_offset, environment_size }
+    BuiltParams {
+        block,
+        length,
+        placements,
+        environment_offset,
+        environment_size,
+    }
 }
 
 /// The effective source `MaximumLength` (bytes): 0 for a NullString, the caller's if set, else
@@ -416,7 +434,12 @@ mod tests {
                 units.push(read_u16(block, buf as usize + i * 2));
             }
         }
-        (len, max, buf, std::string::String::from_utf16(&units).unwrap())
+        (
+            len,
+            max,
+            buf,
+            std::string::String::from_utf16(&units).unwrap(),
+        )
     }
 
     #[test]
@@ -438,11 +461,17 @@ mod tests {
         assert_eq!(read_u32(&built.block, 0x00), built.length);
         assert_eq!(read_u32(&built.block, 0x04), built.length);
         // NORMALIZED flag is clear (de-normalized block).
-        assert_eq!(read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED, 0);
+        assert_eq!(
+            read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED,
+            0
+        );
 
         let (ilen, imax, ibuf, ipath) = read_string(&built.block, OFF_IMAGE_PATH_NAME);
         assert_eq!(ipath, "\\??\\C:\\Windows\\system32\\csrss.exe");
-        assert_eq!(ilen as usize, "\\??\\C:\\Windows\\system32\\csrss.exe".len() * 2);
+        assert_eq!(
+            ilen as usize,
+            "\\??\\C:\\Windows\\system32\\csrss.exe".len() * 2
+        );
         // ImagePathName MaximumLength = Length + WCHAR.
         assert_eq!(imax, ilen + 2);
         // Buffer offset lands inside the block, past the header.
@@ -519,7 +548,10 @@ mod tests {
         // The environment lives at/after Length (past the header+strings).
         assert!(built.environment_offset >= built.length as u64);
         // The Environment pointer field holds the offset.
-        assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), built.environment_offset);
+        assert_eq!(
+            read_u64(&built.block, OFF_ENVIRONMENT),
+            built.environment_offset
+        );
         // Round-trip the first env var from the block.
         let start = built.environment_offset as usize;
         let mut units = Vec::new();
@@ -528,7 +560,10 @@ mod tests {
             units.push(read_u16(&built.block, i));
             i += 2;
         }
-        assert_eq!(std::string::String::from_utf16(&units).unwrap(), "Path=C:\\Windows");
+        assert_eq!(
+            std::string::String::from_utf16(&units).unwrap(),
+            "Path=C:\\Windows"
+        );
     }
 
     #[test]
@@ -551,20 +586,34 @@ mod tests {
 
         const BASE: u64 = 0x0000_0002_0010_0000;
         normalize(&mut built.block, BASE);
-        assert_eq!(read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED,
-                   RTL_USER_PROC_PARAMS_NORMALIZED);
-        assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off + BASE);
+        assert_eq!(
+            read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED,
+            RTL_USER_PROC_PARAMS_NORMALIZED
+        );
+        assert_eq!(
+            read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER),
+            img_off + BASE
+        );
         // ★ ReactOS ppb.c parity: normalize/denormalize NEVER touch `Environment` — it stays exactly
         // as the pure builder left it (an offset here; a live VA once the export fixes it up). This is
         // the root fix for the `#PF cr2=0x668` (a denormalized `Environment` offset deref'd as a VA).
         assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off);
         // Idempotent.
         normalize(&mut built.block, BASE);
-        assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off + BASE);
+        assert_eq!(
+            read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER),
+            img_off + BASE
+        );
 
         denormalize(&mut built.block, BASE);
-        assert_eq!(read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED, 0);
-        assert_eq!(read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER), img_off);
+        assert_eq!(
+            read_u32(&built.block, OFF_FLAGS) & RTL_USER_PROC_PARAMS_NORMALIZED,
+            0
+        );
+        assert_eq!(
+            read_u64(&built.block, OFF_IMAGE_PATH_NAME + US_BUFFER),
+            img_off
+        );
         // Environment untouched across the whole round-trip.
         assert_eq!(read_u64(&built.block, OFF_ENVIRONMENT), env_off);
         // A NULL buffer (RuntimeData) stays NULL through both.
@@ -578,7 +627,10 @@ mod tests {
         use core::mem::offset_of;
         use nt_ntdll_layout::RtlUserProcessParameters as P;
         assert_eq!(OFF_FLAGS, offset_of!(P, flags));
-        assert_eq!(OFF_CURRENT_DIRECTORY, offset_of!(P, current_directory_dospath));
+        assert_eq!(
+            OFF_CURRENT_DIRECTORY,
+            offset_of!(P, current_directory_dospath)
+        );
         assert_eq!(OFF_DLL_PATH, offset_of!(P, dll_path));
         assert_eq!(OFF_IMAGE_PATH_NAME, offset_of!(P, image_path_name));
         assert_eq!(OFF_COMMAND_LINE, offset_of!(P, command_line));
@@ -610,7 +662,11 @@ mod tests {
         for p in &built.placements {
             if p.buffer_offset != 0 {
                 let end = p.buffer_offset as usize + p.maximum_length as usize;
-                assert!(end <= built.block.len(), "buffer for field {:#x} overruns", p.field_offset);
+                assert!(
+                    end <= built.block.len(),
+                    "buffer for field {:#x} overruns",
+                    p.field_offset
+                );
             }
         }
         // The header+string length must be <= the total (env is the tail).

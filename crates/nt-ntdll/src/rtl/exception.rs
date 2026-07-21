@@ -310,7 +310,10 @@ impl FunctionTable {
     /// `RtlAddFunctionTable` — register + sort a function table.
     pub fn add(image_base: u64, mut functions: Vec<RuntimeFunction>) -> Self {
         functions.sort_by_key(|f| f.begin);
-        FunctionTable { image_base, functions }
+        FunctionTable {
+            image_base,
+            functions,
+        }
     }
 
     /// Find the `RUNTIME_FUNCTION` covering an absolute control PC (binary search). Returns `None`
@@ -389,7 +392,11 @@ pub fn virtual_unwind(
         let begin = img.read_u32(image_base, parent_rva)?;
         let end = img.read_u32(image_base, parent_rva + 4)?;
         let uw = img.read_u32(image_base, parent_rva + 8)?;
-        func = RuntimeFunction { begin, end, unwind_info: uw };
+        func = RuntimeFunction {
+            begin,
+            end,
+            unwind_info: uw,
+        };
         guard += 1;
         if guard > 32 {
             return None; // pathological chain
@@ -442,9 +449,8 @@ fn unwind_one(
     // FrameReg - FrameOffset*16. If still inside the prologue, it is that only once the SET_FPREG
     // code (with CodeOffset <= prologue_offset) has executed; else the incoming RSP. Computed BEFORE
     // any register restores so the frame-register value is the live one.
-    let establisher_frame = compute_establisher_frame(
-        &hdr, image_base, unwind_rva, prologue_offset, ctx, img,
-    )?;
+    let establisher_frame =
+        compute_establisher_frame(&hdr, image_base, unwind_rva, prologue_offset, ctx, img)?;
 
     // Walk the unwind codes. Each slot is (CodeOffset, op_byte) little-endian pairs; a code may
     // consume additional slots for its operand. We only APPLY a code if its CodeOffset has already
@@ -463,8 +469,16 @@ fn unwind_one(
 
         if (code_off as u32) <= prologue_offset {
             if apply_code(
-                op, op_info, image_base, unwind_rva, i, hdr.frame_register, hdr.frame_offset, ctx,
-                img, stack,
+                op,
+                op_info,
+                image_base,
+                unwind_rva,
+                i,
+                hdr.frame_register,
+                hdr.frame_offset,
+                ctx,
+                img,
+                stack,
             )? && op == uwop::PUSH_MACHFRAME
             {
                 machframe = true;
@@ -495,7 +509,14 @@ fn unwind_one(
         ctx.set_rsp(ret_addr_slot.wrapping_add(8));
     }
 
-    Some(collect_handler(handler_type, image_base, &hdr, unwind_rva, establisher_frame, img))
+    Some(collect_handler(
+        handler_type,
+        image_base,
+        &hdr,
+        unwind_rva,
+        establisher_frame,
+        img,
+    ))
 }
 
 /// Apply ONLY the unwind codes of a chained `UNWIND_INFO` (no return-address pop, no handler
@@ -526,7 +547,15 @@ fn apply_chained_codes(
         let slots = op_slots(op, op_info)?;
         // Chained prologue: every code has executed → apply unconditionally.
         apply_code(
-            op, op_info, image_base, unwind_rva, i, hdr.frame_register, hdr.frame_offset, ctx, img,
+            op,
+            op_info,
+            image_base,
+            unwind_rva,
+            i,
+            hdr.frame_register,
+            hdr.frame_offset,
+            ctx,
+            img,
             stack,
         )?;
         i += slots;
@@ -551,8 +580,8 @@ fn compute_establisher_frame(
     if hdr.frame_register == 0 {
         return Some(ctx.rsp());
     }
-    let fp_value = ctx.gpr[hdr.frame_register as usize]
-        .wrapping_sub((hdr.frame_offset as u64) * 16);
+    let fp_value =
+        ctx.gpr[hdr.frame_register as usize].wrapping_sub((hdr.frame_offset as u64) * 16);
     // Past the prologue (or a chained level, prologue_offset == u32::MAX) → the FP is established.
     if prologue_offset >= hdr.size_of_prolog as u32 {
         return Some(fp_value);
@@ -618,8 +647,8 @@ fn op_slots(op: u8, op_info: u8) -> Option<usize> {
         uwop::SET_FPREG => 1,
         uwop::SAVE_NONVOL => 2,
         uwop::SAVE_NONVOL_FAR => 3,
-        6 => 2,               // UWOP_EPILOG (v2) — no-op, 2 slots
-        7 => 3,               // UWOP_SPARE_CODE — 3 slots
+        6 => 2, // UWOP_EPILOG (v2) — no-op, 2 slots
+        7 => 3, // UWOP_SPARE_CODE — 3 slots
         uwop::SAVE_XMM128 => 2,
         uwop::SAVE_XMM128_FAR => 3,
         uwop::PUSH_MACHFRAME => 1,
@@ -670,9 +699,7 @@ fn apply_code(
             // Undo the frame-pointer establishment: RSP = FrameReg - FrameOffset*16 (ref:
             // `Rsp = GetReg(FrameRegister) - FrameOffset*16`). The frame register is in the header,
             // NOT this code's OpInfo (which is 0/unused for SET_FPREG).
-            ctx.set_rsp(
-                ctx.gpr[frame_register as usize].wrapping_sub((frame_offset as u64) * 16),
-            );
+            ctx.set_rsp(ctx.gpr[frame_register as usize].wrapping_sub((frame_offset as u64) * 16));
         }
         uwop::SAVE_NONVOL => {
             // reg = *((u64*)Rsp + FrameOffset); the stored u16 is a count of 8-byte slots.
@@ -958,7 +985,9 @@ mod tests {
     }
     impl MockStack {
         fn new() -> Self {
-            MockStack { cells: BTreeMap::new() }
+            MockStack {
+                cells: BTreeMap::new(),
+            }
         }
         fn put(&mut self, addr: u64, v: u64) {
             self.cells.insert(addr, v);
@@ -971,7 +1000,12 @@ mod tests {
     }
 
     fn rec(code: u32, flags: u32) -> ExceptionRecord {
-        ExceptionRecord { code, flags, address: 0x1000, information: Vec::new() }
+        ExceptionRecord {
+            code,
+            flags,
+            address: 0x1000,
+            information: Vec::new(),
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1013,8 +1047,16 @@ mod tests {
         let t = FunctionTable::add(
             0x1_0000,
             vec![
-                RuntimeFunction { begin: 0x100, end: 0x200, unwind_info: 0x900 },
-                RuntimeFunction { begin: 0x200, end: 0x350, unwind_info: 0x910 },
+                RuntimeFunction {
+                    begin: 0x100,
+                    end: 0x200,
+                    unwind_info: 0x900,
+                },
+                RuntimeFunction {
+                    begin: 0x200,
+                    end: 0x350,
+                    unwind_info: 0x910,
+                },
             ],
         );
         let f = t.lookup(0x1_0000 + 0x250).unwrap();
@@ -1028,7 +1070,11 @@ mod tests {
     fn lookup_at_exact_begin_and_end_boundaries() {
         let t = FunctionTable::add(
             0x400000,
-            vec![RuntimeFunction { begin: 0x1000, end: 0x1100, unwind_info: 0x5000 }],
+            vec![RuntimeFunction {
+                begin: 0x1000,
+                end: 0x1100,
+                unwind_info: 0x5000,
+            }],
         );
         assert!(t.lookup(0x400000 + 0x1000).is_some()); // first byte covered
         assert!(t.lookup(0x400000 + 0x10FF).is_some()); // last byte covered
@@ -1041,9 +1087,19 @@ mod tests {
 
     // Build a function at base+0x1000..0x1100 with UNWIND_INFO at 0x2000; return the image + a
     // helper to run virtual_unwind at a given (already-past-prologue) PC.
-    fn img_with_unwind(codes: &[u8], flags_byte: u8, size_of_prolog: u8, count: u8, framereg: u8) -> MockImage {
+    fn img_with_unwind(
+        codes: &[u8],
+        flags_byte: u8,
+        size_of_prolog: u8,
+        count: u8,
+        framereg: u8,
+    ) -> MockImage {
         let mut img = MockImage::new(0x14000000);
-        img.set_pdata(vec![RuntimeFunction { begin: 0x1000, end: 0x1100, unwind_info: 0x2000 }]);
+        img.set_pdata(vec![RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        }]);
         let hdr = [flags_byte, size_of_prolog, count, framereg];
         img.write(0x2000, &hdr);
         img.write(0x2004, codes);
@@ -1166,7 +1222,16 @@ mod tests {
         ctx.set_rsp(0x8000);
         let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
         // Request the EHANDLER (search pass).
-        let r = virtual_unwind(unw_flag::EHANDLER, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
+        let r = virtual_unwind(
+            unw_flag::EHANDLER,
+            base,
+            0x14000000 + 0x1050,
+            f,
+            &mut ctx,
+            &img,
+            &stack,
+        )
+        .unwrap();
         assert_eq!(r.handler_rva, 0xABCD);
         assert_eq!(r.handler_data_rva, 0x2000 + 12); // points at the handler-data (RVA in xdata)
         assert_eq!(ctx.rip, 0x1400_8888);
@@ -1220,24 +1285,45 @@ mod tests {
     #[test]
     fn c_handler_executes_matching_except() {
         // One __try/__except covering [0x100,0x200); filter at 0x900 returns EXECUTE; body at 0x250.
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: 0x900, target: 0x250 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: 0x900,
+            target: 0x250,
+        }];
         let action = c_specific_handler_search(0x150, &scopes, |filt| {
             assert_eq!(filt, 0x900);
             EXCEPTION_EXECUTE_HANDLER
         });
-        assert_eq!(action, CHandlerAction::ExecuteHandler { target_rva: 0x250, scope_index: 0 });
+        assert_eq!(
+            action,
+            CHandlerAction::ExecuteHandler {
+                target_rva: 0x250,
+                scope_index: 0
+            }
+        );
     }
 
     #[test]
     fn c_handler_continue_search_when_filter_declines() {
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: 0x900, target: 0x250 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: 0x900,
+            target: 0x250,
+        }];
         let action = c_specific_handler_search(0x150, &scopes, |_| EXCEPTION_CONTINUE_SEARCH);
         assert_eq!(action, CHandlerAction::ContinueSearch);
     }
 
     #[test]
     fn c_handler_pc_outside_all_scopes() {
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: 0x900, target: 0x250 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: 0x900,
+            target: 0x250,
+        }];
         let action = c_specific_handler_search(0x500, &scopes, |_| EXCEPTION_EXECUTE_HANDLER);
         assert_eq!(action, CHandlerAction::ContinueSearch);
     }
@@ -1245,19 +1331,35 @@ mod tests {
     #[test]
     fn c_handler_execute_sentinel_skips_filter() {
         // HandlerAddress == 1 (EXCEPTION_EXECUTE_HANDLER sentinel) → no filter call, always execute.
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: SCOPE_HANDLER_EXECUTE, target: 0x300 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: SCOPE_HANDLER_EXECUTE,
+            target: 0x300,
+        }];
         let mut called = false;
         let action = c_specific_handler_search(0x150, &scopes, |_| {
             called = true;
             EXCEPTION_CONTINUE_SEARCH
         });
         assert!(!called);
-        assert_eq!(action, CHandlerAction::ExecuteHandler { target_rva: 0x300, scope_index: 0 });
+        assert_eq!(
+            action,
+            CHandlerAction::ExecuteHandler {
+                target_rva: 0x300,
+                scope_index: 0
+            }
+        );
     }
 
     #[test]
     fn c_handler_continue_execution() {
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: 0x900, target: 0x250 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: 0x900,
+            target: 0x250,
+        }];
         let action = c_specific_handler_search(0x150, &scopes, |_| EXCEPTION_CONTINUE_EXECUTION);
         assert_eq!(action, CHandlerAction::ContinueExecution);
     }
@@ -1266,8 +1368,18 @@ mod tests {
     fn c_handler_first_matching_except_wins() {
         // Two nested scopes both cover 0x150; the first (inner) declines, the second executes.
         let scopes = [
-            ScopeRecord { begin: 0x140, end: 0x160, handler: 0x900, target: 0x250 },
-            ScopeRecord { begin: 0x100, end: 0x200, handler: 0x910, target: 0x260 },
+            ScopeRecord {
+                begin: 0x140,
+                end: 0x160,
+                handler: 0x900,
+                target: 0x250,
+            },
+            ScopeRecord {
+                begin: 0x100,
+                end: 0x200,
+                handler: 0x910,
+                target: 0x260,
+            },
         ];
         let action = c_specific_handler_search(0x150, &scopes, |filt| {
             if filt == 0x900 {
@@ -1276,16 +1388,37 @@ mod tests {
                 EXCEPTION_EXECUTE_HANDLER
             }
         });
-        assert_eq!(action, CHandlerAction::ExecuteHandler { target_rva: 0x260, scope_index: 1 });
+        assert_eq!(
+            action,
+            CHandlerAction::ExecuteHandler {
+                target_rva: 0x260,
+                scope_index: 1
+            }
+        );
     }
 
     #[test]
     fn c_handler_unwind_collects_finally() {
         // Two __finally scopes (target==0) covering the PC, plus a __except that should be ignored.
         let scopes = [
-            ScopeRecord { begin: 0x100, end: 0x200, handler: 0xAAA, target: 0 }, // __finally
-            ScopeRecord { begin: 0x140, end: 0x160, handler: 0xBBB, target: 0 }, // __finally
-            ScopeRecord { begin: 0x100, end: 0x200, handler: 0x900, target: 0x250 }, // __except
+            ScopeRecord {
+                begin: 0x100,
+                end: 0x200,
+                handler: 0xAAA,
+                target: 0,
+            }, // __finally
+            ScopeRecord {
+                begin: 0x140,
+                end: 0x160,
+                handler: 0xBBB,
+                target: 0,
+            }, // __finally
+            ScopeRecord {
+                begin: 0x100,
+                end: 0x200,
+                handler: 0x900,
+                target: 0x250,
+            }, // __except
         ];
         let f = c_specific_handler_unwind(0x150, &scopes);
         assert_eq!(f, vec![0xAAA, 0xBBB]);
@@ -1294,7 +1427,12 @@ mod tests {
     #[test]
     fn c_handler_search_skips_finally() {
         // A __finally (target==0) covering the PC must be skipped in the SEARCH pass.
-        let scopes = [ScopeRecord { begin: 0x100, end: 0x200, handler: 0xAAA, target: 0 }];
+        let scopes = [ScopeRecord {
+            begin: 0x100,
+            end: 0x200,
+            handler: 0xAAA,
+            target: 0,
+        }];
         let action = c_specific_handler_search(0x150, &scopes, |_| EXCEPTION_EXECUTE_HANDLER);
         assert_eq!(action, CHandlerAction::ContinueSearch);
     }
@@ -1306,9 +1444,18 @@ mod tests {
     #[test]
     fn dispatch_finds_handler() {
         let frames = [
-            FrameModel { control_pc: 0x100, handler: Some(Disposition::ContinueSearch) },
-            FrameModel { control_pc: 0x200, handler: Some(Disposition::ContinueExecution) },
-            FrameModel { control_pc: 0x300, handler: None },
+            FrameModel {
+                control_pc: 0x100,
+                handler: Some(Disposition::ContinueSearch),
+            },
+            FrameModel {
+                control_pc: 0x200,
+                handler: Some(Disposition::ContinueExecution),
+            },
+            FrameModel {
+                control_pc: 0x300,
+                handler: None,
+            },
         ];
         assert_eq!(
             dispatch_exception(&rec(0xC000_0005, 0), &frames),
@@ -1319,15 +1466,27 @@ mod tests {
     #[test]
     fn dispatch_unhandled_when_all_search() {
         let frames = [
-            FrameModel { control_pc: 0x100, handler: Some(Disposition::ContinueSearch) },
-            FrameModel { control_pc: 0x200, handler: None },
+            FrameModel {
+                control_pc: 0x100,
+                handler: Some(Disposition::ContinueSearch),
+            },
+            FrameModel {
+                control_pc: 0x200,
+                handler: None,
+            },
         ];
-        assert_eq!(dispatch_exception(&rec(0xC000_0005, 0), &frames), DispatchResult::Unhandled);
+        assert_eq!(
+            dispatch_exception(&rec(0xC000_0005, 0), &frames),
+            DispatchResult::Unhandled
+        );
     }
 
     #[test]
     fn noncontinuable_rejected() {
-        let frames = [FrameModel { control_pc: 0x100, handler: Some(Disposition::ContinueExecution) }];
+        let frames = [FrameModel {
+            control_pc: 0x100,
+            handler: Some(Disposition::ContinueExecution),
+        }];
         assert_eq!(
             dispatch_exception(&rec(0xC000_0025, EXCEPTION_NONCONTINUABLE), &frames),
             DispatchResult::Noncontinuable
@@ -1337,10 +1496,22 @@ mod tests {
     #[test]
     fn unwind_runs_intervening_finally_blocks() {
         let frames = [
-            FrameModel { control_pc: 0x100, handler: Some(Disposition::ContinueSearch) },
-            FrameModel { control_pc: 0x200, handler: None },
-            FrameModel { control_pc: 0x300, handler: Some(Disposition::ContinueSearch) },
-            FrameModel { control_pc: 0x400, handler: Some(Disposition::ContinueExecution) },
+            FrameModel {
+                control_pc: 0x100,
+                handler: Some(Disposition::ContinueSearch),
+            },
+            FrameModel {
+                control_pc: 0x200,
+                handler: None,
+            },
+            FrameModel {
+                control_pc: 0x300,
+                handler: Some(Disposition::ContinueSearch),
+            },
+            FrameModel {
+                control_pc: 0x400,
+                handler: Some(Disposition::ContinueExecution),
+            },
         ];
         assert_eq!(unwind(&frames, 3), vec![0, 2]);
     }
@@ -1366,8 +1537,16 @@ mod tests {
         // Frame B (outer): func at 0x1200, `push rbx`.
         let mut img = MockImage::new(0x14000000);
         img.set_pdata(vec![
-            RuntimeFunction { begin: 0x1000, end: 0x1100, unwind_info: 0x2000 },
-            RuntimeFunction { begin: 0x1200, end: 0x1300, unwind_info: 0x2100 },
+            RuntimeFunction {
+                begin: 0x1000,
+                end: 0x1100,
+                unwind_info: 0x2000,
+            },
+            RuntimeFunction {
+                begin: 0x1200,
+                end: 0x1300,
+                unwind_info: 0x2100,
+            },
         ]);
         img.write(0x2000, &[0x01, 0x08, 0x02, 0x00]); // ver1, size 8, 2 codes
         img.write(0x2004, &[0x05, 0x32, 0x01, 0x30]);
@@ -1489,8 +1668,15 @@ mod tests {
         ctx.set_rsp(0x6000);
         let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
         virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
-        assert_eq!(ctx.rip, 0x1400_1234, "RIP comes straight from the trap frame, not a ret pop");
-        assert_eq!(ctx.rsp(), 0x9999_0000, "RSP restored from [orig+0x18], not orig+8");
+        assert_eq!(
+            ctx.rip, 0x1400_1234,
+            "RIP comes straight from the trap frame, not a ret pop"
+        );
+        assert_eq!(
+            ctx.rsp(),
+            0x9999_0000,
+            "RSP restored from [orig+0x18], not orig+8"
+        );
     }
 
     #[test]
@@ -1532,7 +1718,10 @@ mod tests {
         ctx.set_rsp(0x8000);
         let (base, f) = img.lookup_function(0x14000000 + 0x1050).unwrap();
         virtual_unwind(0, base, 0x14000000 + 0x1050, f, &mut ctx, &img, &stack).unwrap();
-        assert_eq!(ctx.gpr[REG_RBX], 0xC0DE_C0DE, "the PUSH after the no-op codes decoded correctly");
+        assert_eq!(
+            ctx.gpr[REG_RBX], 0xC0DE_C0DE,
+            "the PUSH after the no-op codes decoded correctly"
+        );
         assert_eq!(ctx.rip, 0x1400_7A7A);
         assert_eq!(ctx.rsp(), 0x8010);
     }
@@ -1549,8 +1738,14 @@ mod tests {
     #[test]
     fn unhandled_filter_declines_ordinary_exceptions() {
         // STATUS_ACCESS_VIOLATION and friends keep propagating (continue search).
-        assert_eq!(unhandled_exception_filter(0xC000_0005), EXCEPTION_CONTINUE_SEARCH);
-        assert_eq!(unhandled_exception_filter(0x8000_0003), EXCEPTION_CONTINUE_SEARCH); // breakpoint
+        assert_eq!(
+            unhandled_exception_filter(0xC000_0005),
+            EXCEPTION_CONTINUE_SEARCH
+        );
+        assert_eq!(
+            unhandled_exception_filter(0x8000_0003),
+            EXCEPTION_CONTINUE_SEARCH
+        ); // breakpoint
         assert_eq!(unhandled_exception_filter(0), EXCEPTION_CONTINUE_SEARCH);
     }
 }

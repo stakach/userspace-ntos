@@ -220,7 +220,10 @@ mod tests {
             initialize(&mut table);
             assert!(insert(&mut table, &mut win, &mut win_entry));
             assert!(insert(&mut table, &mut system32, &mut sys_entry));
-            assert_eq!(find_prefix(&mut table, &mut query), ptr::addr_of_mut!(sys_entry));
+            assert_eq!(
+                find_prefix(&mut table, &mut query),
+                ptr::addr_of_mut!(sys_entry)
+            );
         }
     }
 
@@ -240,7 +243,10 @@ mod tests {
             initialize(&mut table);
             assert!(insert(&mut table, &mut name, &mut first));
             assert!(!insert(&mut table, &mut name, &mut duplicate));
-            assert_eq!(find_prefix(&mut table, &mut query), ptr::addr_of_mut!(first));
+            assert_eq!(
+                find_prefix(&mut table, &mut query),
+                ptr::addr_of_mut!(first)
+            );
             remove(&mut table, &mut first);
             assert!(find_prefix(&mut table, &mut query).is_null());
             assert!(first.next_prefix_tree.is_null());

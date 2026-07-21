@@ -85,7 +85,8 @@ impl DirEntry {
 
 #[inline]
 fn rd_u16(buf: &[u8], off: usize) -> Option<u16> {
-    buf.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    buf.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 #[inline]
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
@@ -175,7 +176,12 @@ fn find_entry_by_id(rsrc: &[u8], dir_off: usize, id: u16, want_dir: bool) -> Opt
 
 /// `find_entry_by_name` — for an integer name, defer to `find_entry_by_id`; for a string name,
 /// binary-search the named entries (case-insensitive compare).
-fn find_entry_by_name(rsrc: &[u8], dir_off: usize, name: &ResName, want_dir: bool) -> Option<usize> {
+fn find_entry_by_name(
+    rsrc: &[u8],
+    dir_off: usize,
+    name: &ResName,
+    want_dir: bool,
+) -> Option<usize> {
     let search = match name {
         ResName::Id(id) => return find_entry_by_id(rsrc, dir_off, *id, want_dir),
         ResName::Name(s) => *s,
@@ -278,8 +284,8 @@ pub fn find_entry(
 
     // --- Level 1: type ---
     let want_dir_l1 = want_dir || level > 1;
-    let type_off = find_entry_by_name(rsrc, 0, type_name, want_dir_l1)
-        .ok_or(FindStatus::TypeNotFound)?;
+    let type_off =
+        find_entry_by_name(rsrc, 0, type_name, want_dir_l1).ok_or(FindStatus::TypeNotFound)?;
     if level == 1 {
         return Ok(FindResult { offset: type_off });
     }

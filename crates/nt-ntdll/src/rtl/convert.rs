@@ -41,7 +41,10 @@ impl CodePage {
 
     /// Build a code page from an explicit 256-entry widen table.
     pub const fn from_widen(widen: [u16; 256], default_char: u8) -> Self {
-        CodePage { widen, default_char }
+        CodePage {
+            widen,
+            default_char,
+        }
     }
 
     /// Widen one byte to its UTF-16 code unit.

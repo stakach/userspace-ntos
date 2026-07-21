@@ -329,7 +329,10 @@ mod tests {
         let mut r = Resource::new();
         r.acquire_exclusive(T1, true);
         r.acquire_shared(T2, true); // reader queued
-        assert_eq!(r.convert_exclusive_to_shared(), Some(SemaphoreRelease::Shared(1)));
+        assert_eq!(
+            r.convert_exclusive_to_shared(),
+            Some(SemaphoreRelease::Shared(1))
+        );
         // Downgraded writer (1) + the woken reader (1) = 2 active.
         assert_eq!(r.number_active, 2);
         assert_eq!(r.shared_waiters, 0);

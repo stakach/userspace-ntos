@@ -115,9 +115,9 @@ fn find_dialog_by_id_level3() {
     let rsrc = build();
     let r = find_entry(
         &rsrc,
-        &ResName::Id(5),      // RT_DIALOG
-        &ResName::Id(1000),   // IDD
-        &[0x409],             // en-US
+        &ResName::Id(5),    // RT_DIALOG
+        &ResName::Id(1000), // IDD
+        &[0x409],           // en-US
         false,
         3,
         false, // want data entry
@@ -150,16 +150,32 @@ fn find_by_named_entry() {
 #[test]
 fn missing_type_is_type_not_found() {
     let rsrc = build();
-    let e = find_entry(&rsrc, &ResName::Id(99), &ResName::Id(1000), &[0x409], false, 3, false)
-        .unwrap_err();
+    let e = find_entry(
+        &rsrc,
+        &ResName::Id(99),
+        &ResName::Id(1000),
+        &[0x409],
+        false,
+        3,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(e, FindStatus::TypeNotFound);
 }
 
 #[test]
 fn missing_name_is_name_not_found() {
     let rsrc = build();
-    let e = find_entry(&rsrc, &ResName::Id(5), &ResName::Id(4242), &[0x409], false, 3, false)
-        .unwrap_err();
+    let e = find_entry(
+        &rsrc,
+        &ResName::Id(5),
+        &ResName::Id(4242),
+        &[0x409],
+        false,
+        3,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(e, FindStatus::NameNotFound);
 }
 
@@ -167,8 +183,16 @@ fn missing_name_is_name_not_found() {
 fn missing_lang_neutral_fallback_takes_first() {
     let rsrc = build();
     // Ask for a language not present (0x40C) but with the neutral first-entry fallback → data1.
-    let r = find_entry(&rsrc, &ResName::Id(5), &ResName::Id(1000), &[0x40C], true, 3, false)
-        .expect("neutral fallback");
+    let r = find_entry(
+        &rsrc,
+        &ResName::Id(5),
+        &ResName::Id(1000),
+        &[0x40C],
+        true,
+        3,
+        false,
+    )
+    .expect("neutral fallback");
     let (rva, _) = data_entry(&rsrc, r.offset).unwrap();
     assert_eq!(rva, 0xAAAA);
 }
@@ -176,8 +200,16 @@ fn missing_lang_neutral_fallback_takes_first() {
 #[test]
 fn missing_lang_no_fallback_is_lang_not_found() {
     let rsrc = build();
-    let e = find_entry(&rsrc, &ResName::Id(5), &ResName::Id(1000), &[0x40C], false, 3, false)
-        .unwrap_err();
+    let e = find_entry(
+        &rsrc,
+        &ResName::Id(5),
+        &ResName::Id(1000),
+        &[0x40C],
+        false,
+        3,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(e, FindStatus::LangNotFound);
 }
 
@@ -191,7 +223,16 @@ fn level1_returns_type_directory() {
 #[test]
 fn level2_returns_name_directory() {
     let rsrc = build();
-    let r = find_entry(&rsrc, &ResName::Id(5), &ResName::Id(1000), &[], false, 2, true).expect("l2");
+    let r = find_entry(
+        &rsrc,
+        &ResName::Id(5),
+        &ResName::Id(1000),
+        &[],
+        false,
+        2,
+        true,
+    )
+    .expect("l2");
     assert_eq!(r.offset, 56); // LANG_DIR1
 }
 
@@ -199,15 +240,31 @@ fn level2_returns_name_directory() {
 fn named_compare_case_insensitive() {
     let rsrc = build();
     let name: Vec<u16> = "foo\0".encode_utf16().collect(); // lowercase should still match "FOO"
-    let r = find_entry(&rsrc, &ResName::Id(6), &ResName::Name(&name), &[0x409], false, 3, false)
-        .expect("case-insensitive");
+    let r = find_entry(
+        &rsrc,
+        &ResName::Id(6),
+        &ResName::Name(&name),
+        &[0x409],
+        false,
+        3,
+        false,
+    )
+    .expect("case-insensitive");
     let (rva, _) = data_entry(&rsrc, r.offset).unwrap();
     assert_eq!(rva, 0xBBBB);
 }
 
 #[test]
 fn truncated_section_is_data_not_found() {
-    let e = find_entry(&[0u8; 4], &ResName::Id(5), &ResName::Id(1), &[0x409], false, 3, false)
-        .unwrap_err();
+    let e = find_entry(
+        &[0u8; 4],
+        &ResName::Id(5),
+        &ResName::Id(1),
+        &[0x409],
+        false,
+        3,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(e, FindStatus::DataNotFound);
 }

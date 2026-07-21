@@ -87,8 +87,10 @@ pub fn guid_from_string(s: &[u16]) -> Option<Guid> {
         return None;
     }
     let byte = |i: usize| (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
-    let data1 =
-        ((byte(0) as u32) << 24) | ((byte(1) as u32) << 16) | ((byte(2) as u32) << 8) | byte(3) as u32;
+    let data1 = ((byte(0) as u32) << 24)
+        | ((byte(1) as u32) << 16)
+        | ((byte(2) as u32) << 8)
+        | byte(3) as u32;
     let data2 = ((byte(4) as u16) << 8) | byte(5) as u16;
     let data3 = ((byte(6) as u16) << 8) | byte(7) as u16;
     let mut data4 = [0u8; 8];
@@ -129,7 +131,11 @@ mod tests {
 
     #[test]
     fn parse_without_braces() {
-        let g = guid_from_string(&"00000000-0000-0000-0000-000000000000".encode_utf16().collect::<Vec<_>>());
+        let g = guid_from_string(
+            &"00000000-0000-0000-0000-000000000000"
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(g, Some(Guid::default()));
     }
 

@@ -45,7 +45,13 @@ mod tests {
     #[test]
     fn encode_decode_is_identity() {
         let cookie = 0x1234_5678_9ABC_DEF0;
-        for &p in &[0u64, 0x1000, 0x7FFF_FFFF_0000, 0xDEAD_BEEF_CAFE_BABE, u64::MAX] {
+        for &p in &[
+            0u64,
+            0x1000,
+            0x7FFF_FFFF_0000,
+            0xDEAD_BEEF_CAFE_BABE,
+            u64::MAX,
+        ] {
             assert_eq!(decode_pointer(encode_pointer(p, cookie), cookie), p);
         }
     }

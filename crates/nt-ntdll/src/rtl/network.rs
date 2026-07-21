@@ -184,19 +184,13 @@ pub fn ipv6_string_to_address_ex_w(string: &[u16]) -> Result<Ipv6AddressExParse,
 }
 
 /// Parse an ANSI IPv4 string. Non-strict mode accepts the classic ntdll shortened/octal/hex forms.
-pub fn ipv4_string_to_address_a(
-    string: &[u8],
-    strict: bool,
-) -> Result<Ipv4AddressParse, usize> {
+pub fn ipv4_string_to_address_a(string: &[u8], strict: bool) -> Result<Ipv4AddressParse, usize> {
     let wide: Vec<u16> = string.iter().copied().map(u16::from).collect();
     ipv4_string_to_address_w(&wide, strict)
 }
 
 /// Parse a UTF-16 IPv4 string. The returned terminator is a UTF-16 code-unit offset.
-pub fn ipv4_string_to_address_w(
-    string: &[u16],
-    strict: bool,
-) -> Result<Ipv4AddressParse, usize> {
+pub fn ipv4_string_to_address_w(string: &[u16], strict: bool) -> Result<Ipv4AddressParse, usize> {
     let parsed = parse_ipv4_parts(string, strict);
     if !parsed.ok || (strict && parsed.parts < 4) {
         return Err(parsed.terminator);
@@ -526,7 +520,9 @@ fn parse_ipv6_component(string: &[u16], index: &mut usize, base: u32) -> Option<
     let mut value = 0u64;
     let mut success = false;
     while let Some(digit) = digit_value(char_at(string, i), base) {
-        value = value.saturating_mul(base as u64).saturating_add(digit as u64);
+        value = value
+            .saturating_mul(base as u64)
+            .saturating_add(digit as u64);
         success = true;
         i += 1;
     }
@@ -706,7 +702,11 @@ fn digit_value(c: u16, base: u32) -> Option<u32> {
             return None;
         }
     };
-    if digit < base { Some(digit) } else { None }
+    if digit < base {
+        Some(digit)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -734,10 +734,7 @@ mod tests {
             ipv4_address_to_string([255, 255, 255, 255]),
             b"255.255.255.255"
         );
-        assert_eq!(
-            ipv4_address_to_string_w([127, 0, 0, 1]),
-            wide("127.0.0.1")
-        );
+        assert_eq!(ipv4_address_to_string_w([127, 0, 0, 1]), wide("127.0.0.1"));
     }
 
     #[test]
@@ -746,10 +743,7 @@ mod tests {
             ipv4_address_to_string_ex([1, 2, 3, 4], 80u16.to_be()),
             b"1.2.3.4:80"
         );
-        assert_eq!(
-            ipv4_address_to_string_ex([1, 2, 3, 4], 0),
-            b"1.2.3.4"
-        );
+        assert_eq!(ipv4_address_to_string_ex([1, 2, 3, 4], 0), b"1.2.3.4");
         assert_eq!(
             ipv4_address_to_string_ex_w([1, 2, 3, 4], 65535u16.to_be()),
             wide("1.2.3.4:65535")
@@ -783,9 +777,7 @@ mod tests {
             ),
             (
                 "1111:2222:3333:4444:5555:6666:0:8888",
-                [
-                    0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0, 0x8888,
-                ],
+                [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0, 0x8888],
             ),
             (
                 "1111::4444:5555:6666:7777:8888",
@@ -795,7 +787,10 @@ mod tests {
             ("2001::ffd3", [0x120, 0, 0, 0, 0, 0, 0, 0xd3ff]),
         ];
         for (expected, words) in cases {
-            assert_eq!(ipv6_address_to_string(ipv6_from_s6_words(words)), expected.as_bytes());
+            assert_eq!(
+                ipv6_address_to_string(ipv6_from_s6_words(words)),
+                expected.as_bytes()
+            );
         }
     }
 
@@ -803,24 +798,16 @@ mod tests {
     fn formats_ipv6_ipv4_compatible_and_isatap_addresses() {
         let cases = [
             ("::13.1.68.3", [0, 0, 0, 0, 0, 0, 0x010d, 0x0344]),
-            (
-                "::ffff:13.1.68.3",
-                [0, 0, 0, 0, 0, 0xffff, 0x010d, 0x0344],
-            ),
+            ("::ffff:13.1.68.3", [0, 0, 0, 0, 0, 0xffff, 0x010d, 0x0344]),
             (
                 "::ffff:0:13.1.68.3",
                 [0, 0, 0, 0, 0xffff, 0, 0x010d, 0x0344],
             ),
             ("::ffff", [0, 0, 0, 0, 0, 0, 0, 0xffff]),
-            (
-                "::1:d01:4403",
-                [0, 0, 0, 0, 0, 0x100, 0x010d, 0x0344],
-            ),
+            ("::1:d01:4403", [0, 0, 0, 0, 0, 0x100, 0x010d, 0x0344]),
             (
                 "1111:2222:3333:4444:0:5efe:129.144.52.38",
-                [
-                    0x1111, 0x2222, 0x3333, 0x4444, 0, 0xfe5e, 0x9081, 0x2634,
-                ],
+                [0x1111, 0x2222, 0x3333, 0x4444, 0, 0xfe5e, 0x9081, 0x2634],
             ),
             (
                 "1111::5efe:129.144.52.38",
@@ -836,21 +823,18 @@ mod tests {
             ),
         ];
         for (expected, words) in cases {
-            assert_eq!(ipv6_address_to_string(ipv6_from_s6_words(words)), expected.as_bytes());
+            assert_eq!(
+                ipv6_address_to_string(ipv6_from_s6_words(words)),
+                expected.as_bytes()
+            );
         }
     }
 
     #[test]
     fn formats_ipv6_address_with_scope_and_network_order_port() {
         let address = ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0x010d, 0x0344]);
-        assert_eq!(
-            ipv6_address_to_string_ex(address, 0, 0),
-            b"::13.1.68.3"
-        );
-        assert_eq!(
-            ipv6_address_to_string_ex(address, 1, 0),
-            b"::13.1.68.3%1"
-        );
+        assert_eq!(ipv6_address_to_string_ex(address, 0, 0), b"::13.1.68.3");
+        assert_eq!(ipv6_address_to_string_ex(address, 1, 0), b"::13.1.68.3%1");
         assert_eq!(
             ipv6_address_to_string_ex(address, 0xffffbbbb, 0xeeff),
             b"[::13.1.68.3%4294949819]:65518"
@@ -870,16 +854,10 @@ mod tests {
         let cases = [
             ("::", [0, 0, 0, 0, 0, 0, 0, 0], 2),
             ("::1", [0, 0, 0, 0, 0, 0, 0, 0x100], 3),
-            (
-                "::13.1.68.3",
-                [0, 0, 0, 0, 0, 0, 0x010d, 0x0344],
-                11,
-            ),
+            ("::13.1.68.3", [0, 0, 0, 0, 0, 0, 0x010d, 0x0344], 11),
             (
                 "1111:2222:3333:4444:0:5efe:129.144.52.38",
-                [
-                    0x1111, 0x2222, 0x3333, 0x4444, 0, 0xfe5e, 0x9081, 0x2634,
-                ],
+                [0x1111, 0x2222, 0x3333, 0x4444, 0, 0xfe5e, 0x9081, 0x2634],
                 40,
             ),
             (
@@ -895,18 +873,23 @@ mod tests {
         }
 
         let parsed = ipv6_string_to_address_a(b"::1 trailing").unwrap();
-        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100]));
+        assert_eq!(
+            parsed.address,
+            ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100])
+        );
         assert_eq!(parsed.terminator, 3);
 
         let parsed = ipv6_string_to_address_a(b"::0x12345tail").unwrap();
-        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x4523]));
+        assert_eq!(
+            parsed.address,
+            ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x4523])
+        );
         assert_eq!(parsed.terminator, 3);
     }
 
     #[test]
     fn parses_ipv6_ex_scope_and_network_order_port() {
-        let parsed =
-            ipv6_string_to_address_ex_a(b"[::13.1.68.3%4294949819]:65518").unwrap();
+        let parsed = ipv6_string_to_address_ex_a(b"[::13.1.68.3%4294949819]:65518").unwrap();
         assert_eq!(
             parsed.address,
             ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0x010d, 0x0344])
@@ -915,7 +898,10 @@ mod tests {
         assert_eq!(parsed.port, 65518u16.to_be());
 
         let parsed = ipv6_string_to_address_ex_w(&wide("::1%1")).unwrap();
-        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100]));
+        assert_eq!(
+            parsed.address,
+            ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100])
+        );
         assert_eq!(parsed.scope_id, 1);
         assert_eq!(parsed.port, 0);
     }
@@ -983,7 +969,12 @@ mod tests {
         assert_eq!(ipv4_string_to_address_a(b"1.2.", false), Err(4));
         assert_eq!(ipv4_string_to_address_a(b"3.4.5.6.7", false), Err(7));
         assert_eq!(ipv4_string_to_address_a(b"1.1.1.08", false), Err(7));
-        assert_eq!(ipv4_string_to_address_a(b"1.1.1.008", false).unwrap().terminator, 8);
+        assert_eq!(
+            ipv4_string_to_address_a(b"1.1.1.008", false)
+                .unwrap()
+                .terminator,
+            8
+        );
     }
 
     #[test]
