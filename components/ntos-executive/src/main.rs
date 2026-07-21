@@ -1222,11 +1222,10 @@ pub(crate) static WINLOGON_KEY_OPENED_AT_INJECT: AtomicU64 = AtomicU64::new(0);
 /// msgina's real `GUILoggedOutSAS` (the `WlxLoggedOutSAS` body → the logon dialog path) executed. Drives
 /// `exec_winlogon_logged_out_sas`.
 pub(crate) static WINLOGON_LOGGED_OUT_SAS_RAN: AtomicU64 = AtomicU64::new(0);
-/// ★ DIALOG BATCH 3 — count of `NtUserCreateWindowEx(#32770)` (dialog-class) windows winlogon created
-/// AFTER `WlxLoggedOutSAS` ran (i.e. the msgina IDD_LOGON credential dialog + its child controls —
-/// Static labels, Edit fields, Buttons). Non-zero proves the logon dialog was CREATED client-side
-/// (the client-GDI handle-table mapping + hDllInstance-seed advance). Drives
-/// `exec_msgina_logon_dialog_created`.
+/// Count of `NtUserCreateWindowEx(#32770)` dialog-class windows winlogon creates after the SAS window
+/// exists. This includes the welcome dialog and, after `WlxLoggedOutSAS`, the msgina IDD_LOGON
+/// credential dialog. The count therefore provides a real post-SAS construction milestone; the
+/// correlation state below distinguishes the credential dialog itself.
 pub(crate) static WINLOGON_DIALOG_WINDOWS: AtomicU64 = AtomicU64::new(0);
 static mut WINLOGON_DIALOG_CORRELATION: nt_user_callback::WinlogonDialogCorrelation =
     nt_user_callback::WinlogonDialogCorrelation::new();

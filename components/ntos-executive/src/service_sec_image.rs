@@ -3399,15 +3399,23 @@ pub(crate) unsafe fn service_sec_image(
                 // ceiling it is a live-lock → PARK the client (like a crash) so the loop quiesces + the
                 // gate runs. General: applies to any client (winlogon's paint fires well under the cap).
                 {
-                    // Creating IDD_LOGON's real child controls legitimately crosses the historical
-                    // 500-dispatch initialization ceiling. Once the dialog is correlated, allow that
-                    // bounded construction/paint burst to reach the modal-pump completion gate.
+                    // Dispatching the first real SAS starts welcome-dialog construction, whose child
+                    // creation and layout legitimately cross the historical 500-call ceiling before
+                    // IDD_LOGON can be correlated. Grant only a bounded bridge after both the dequeued
+                    // SAS and a real post-SAS dialog creation; reserve the larger burst for the exact
+                    // correlated credential dialog.
                     const W32_TOTAL_LIMIT: u64 = 500;
+                    const W32_POST_SAS_DIALOG_LIMIT: u64 = 1024;
                     const W32_IDD_LOGON_LIMIT: u64 = 4096;
                     let limit = if pi == 2
                         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
                     {
                         W32_IDD_LOGON_LIMIT
+                    } else if pi == 2
+                        && WINLOGON_SAS1_RETRIEVED.load(Ordering::Relaxed) != 0
+                        && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) != 0
+                    {
+                        W32_POST_SAS_DIALOG_LIMIT
                     } else {
                         W32_TOTAL_LIMIT
                     };
