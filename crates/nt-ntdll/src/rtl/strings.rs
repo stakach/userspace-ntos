@@ -219,6 +219,68 @@ pub fn hash_unicode_string(src: &[u16], case_insensitive: bool, algorithm: u32) 
     Some(hash)
 }
 
+/// Outcome for `RtlFindCharInUnicodeString`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FindCharInUnicodeString {
+    /// A match was found; value is the byte offset written to `Position`.
+    Found(u16),
+    /// No matching character was found.
+    NotFound,
+    /// Unsupported flags were supplied.
+    InvalidFlags,
+}
+
+/// `RtlFindCharInUnicodeString`: scan a counted UTF-16 string for characters in, or outside, a
+/// match set. Positions are byte offsets and match the ReactOS/NT contract: forward searches return
+/// the offset just after the character; reverse searches return the character offset.
+pub fn find_char_in_unicode_string(
+    flags: u32,
+    search: &[u16],
+    matches: &[u16],
+) -> FindCharInUnicodeString {
+    const START_AT_END: u32 = 0x1;
+    const COMPLEMENT_CHAR_SET: u32 = 0x2;
+    const CASE_INSENSITIVE: u32 = 0x4;
+
+    if flags & !(START_AT_END | COMPLEMENT_CHAR_SET | CASE_INSENSITIVE) != 0 {
+        return FindCharInUnicodeString::InvalidFlags;
+    }
+
+    let want_to_find = flags & COMPLEMENT_CHAR_SET == 0;
+    let case_insensitive = flags & CASE_INSENSITIVE != 0;
+    let contains = |unit: u16| {
+        let needle = if case_insensitive {
+            upcase_char(unit)
+        } else {
+            unit
+        };
+        matches.iter().copied().any(|candidate| {
+            let candidate = if case_insensitive {
+                upcase_char(candidate)
+            } else {
+                candidate
+            };
+            needle == candidate
+        })
+    };
+
+    if flags & START_AT_END != 0 {
+        for (i, &unit) in search.iter().enumerate().rev() {
+            if contains(unit) == want_to_find {
+                return FindCharInUnicodeString::Found((i * 2) as u16);
+            }
+        }
+    } else {
+        for (i, &unit) in search.iter().enumerate() {
+            if contains(unit) == want_to_find {
+                return FindCharInUnicodeString::Found(((i + 1) * 2) as u16);
+            }
+        }
+    }
+
+    FindCharInUnicodeString::NotFound
+}
+
 // --- case folding over whole strings -----------------------------------------------------------
 
 /// `RtlUpcaseUnicodeString` (the pure part): upper-case every code unit into a fresh buffer.
@@ -466,6 +528,55 @@ mod tests {
         );
         assert_eq!(hash_unicode_string(&u("abcdef"), false, 0), Some(0x9713_18c3));
         assert_eq!(hash_unicode_string(&u("Test"), false, 0xffff_ffff), None);
+    }
+
+    #[test]
+    fn find_char_in_unicode_string_matches_reactos_vectors() {
+        use FindCharInUnicodeString::{Found, InvalidFlags, NotFound};
+
+        let string = u("I am a string");
+        assert_eq!(
+            find_char_in_unicode_string(0, &string, &u("a")),
+            Found(6)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(1, &string, &u("a")),
+            Found(10)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(2, &string, &u("a")),
+            Found(2)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(3, &string, &u("G")),
+            Found(24)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(0, &string, &u("A")),
+            NotFound
+        );
+        assert_eq!(
+            find_char_in_unicode_string(4, &string, &u("A")),
+            Found(6)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(6, &string, &u("i")),
+            Found(4)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(7, &string, &u("G")),
+            Found(22)
+        );
+        assert_eq!(
+            find_char_in_unicode_string(8, &string, &string),
+            InvalidFlags
+        );
+
+        let alpha = u("abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(find_char_in_unicode_string(0, &alpha, &[]), NotFound);
+        assert_eq!(find_char_in_unicode_string(2, &alpha, &[]), Found(2));
+        assert_eq!(find_char_in_unicode_string(1, &alpha, &u("rvz")), Found(50));
+        assert_eq!(find_char_in_unicode_string(3, &alpha, &u("rvz")), Found(48));
     }
 
     #[test]

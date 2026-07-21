@@ -26,7 +26,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU32;
 
@@ -35,12 +35,16 @@ use nt_ntdll_layout::UnicodeString;
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
+const STATUS_TIMEOUT: NtStatus = 0x0000_0102;
+const STATUS_PENDING: NtStatus = 0x0000_0103;
+const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
+const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 #[cfg(not(target_arch = "x86_64"))]
@@ -1160,6 +1164,379 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
         lock_count.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
     STATUS_SUCCESS
+}
+
+const SRW_LOCK_BIT: usize = 0x1;
+const SRW_SHARED_UNIT: usize = 1 << 4;
+const RTL_CONDITION_VARIABLE_LOCKMODE_SHARED: u32 = 0x1;
+const RTL_RUN_ONCE_CHECK_ONLY: u32 = 0x1;
+const RTL_RUN_ONCE_ASYNC: u32 = 0x2;
+const RTL_RUN_ONCE_INIT_FAILED: u32 = 0x4;
+
+#[inline]
+unsafe fn atomic_word(ptr: *mut c_void) -> Option<&'static AtomicUsize> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(ptr as *const AtomicUsize) })
+    }
+}
+
+#[inline]
+fn spin_pause(iteration: usize) {
+    if iteration & 0xff == 0xff {
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+    core::hint::spin_loop();
+}
+
+/// `RtlInitializeSRWLock(PRTL_SRWLOCK)`.
+///
+/// # Safety
+/// `srw_lock` is a valid writable pointer-width `RTL_SRWLOCK`.
+#[export_name = "RtlInitializeSRWLock"]
+pub unsafe extern "system" fn rtl_initialize_srw_lock(srw_lock: *mut c_void) {
+    if let Some(word) = unsafe { atomic_word(srw_lock) } {
+        word.store(0, Ordering::Release);
+    }
+}
+
+/// `RtlTryAcquireSRWLockExclusive(PRTL_SRWLOCK) -> BOOLEAN`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK`.
+#[export_name = "RtlTryAcquireSRWLockExclusive"]
+pub unsafe extern "system" fn rtl_try_acquire_srw_lock_exclusive(srw_lock: *mut c_void) -> u8 {
+    let Some(word) = (unsafe { atomic_word(srw_lock) }) else {
+        return 0;
+    };
+    u8::from(
+        word.compare_exchange(0, SRW_LOCK_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok(),
+    )
+}
+
+/// `RtlTryAcquireSRWLockShared(PRTL_SRWLOCK) -> BOOLEAN`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK`.
+#[export_name = "RtlTryAcquireSRWLockShared"]
+pub unsafe extern "system" fn rtl_try_acquire_srw_lock_shared(srw_lock: *mut c_void) -> u8 {
+    let Some(word) = (unsafe { atomic_word(srw_lock) }) else {
+        return 0;
+    };
+    let mut current = word.load(Ordering::Acquire);
+    loop {
+        if current & SRW_LOCK_BIT != 0 {
+            return 0;
+        }
+        match word.compare_exchange_weak(
+            current,
+            current.wrapping_add(SRW_SHARED_UNIT),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return 1,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// `RtlAcquireSRWLockExclusive(PRTL_SRWLOCK)`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK`.
+#[export_name = "RtlAcquireSRWLockExclusive"]
+pub unsafe extern "system" fn rtl_acquire_srw_lock_exclusive(srw_lock: *mut c_void) {
+    if srw_lock.is_null() {
+        return;
+    }
+    let mut spins = 0usize;
+    while unsafe { rtl_try_acquire_srw_lock_exclusive(srw_lock) } == 0 {
+        spin_pause(spins);
+        spins = spins.wrapping_add(1);
+    }
+}
+
+/// `RtlAcquireSRWLockShared(PRTL_SRWLOCK)`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK`.
+#[export_name = "RtlAcquireSRWLockShared"]
+pub unsafe extern "system" fn rtl_acquire_srw_lock_shared(srw_lock: *mut c_void) {
+    if srw_lock.is_null() {
+        return;
+    }
+    let mut spins = 0usize;
+    while unsafe { rtl_try_acquire_srw_lock_shared(srw_lock) } == 0 {
+        spin_pause(spins);
+        spins = spins.wrapping_add(1);
+    }
+}
+
+/// `RtlReleaseSRWLockExclusive(PRTL_SRWLOCK)`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK` held exclusively by the caller.
+#[export_name = "RtlReleaseSRWLockExclusive"]
+pub unsafe extern "system" fn rtl_release_srw_lock_exclusive(srw_lock: *mut c_void) {
+    if let Some(word) = unsafe { atomic_word(srw_lock) } {
+        let _ = word.compare_exchange(SRW_LOCK_BIT, 0, Ordering::Release, Ordering::Relaxed);
+    }
+}
+
+/// `RtlReleaseSRWLockShared(PRTL_SRWLOCK)`.
+///
+/// # Safety
+/// `srw_lock` is a valid `RTL_SRWLOCK` held shared by the caller.
+#[export_name = "RtlReleaseSRWLockShared"]
+pub unsafe extern "system" fn rtl_release_srw_lock_shared(srw_lock: *mut c_void) {
+    let Some(word) = (unsafe { atomic_word(srw_lock) }) else {
+        return;
+    };
+    let mut current = word.load(Ordering::Acquire);
+    loop {
+        if current < SRW_SHARED_UNIT || current & SRW_LOCK_BIT != 0 {
+            return;
+        }
+        match word.compare_exchange_weak(
+            current,
+            current - SRW_SHARED_UNIT,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// `RtlInitializeConditionVariable(PRTL_CONDITION_VARIABLE)`.
+///
+/// # Safety
+/// `condition_variable` is a valid writable pointer-width `RTL_CONDITION_VARIABLE`.
+#[export_name = "RtlInitializeConditionVariable"]
+pub unsafe extern "system" fn rtl_initialize_condition_variable(condition_variable: *mut c_void) {
+    if let Some(word) = unsafe { atomic_word(condition_variable) } {
+        word.store(0, Ordering::Release);
+    }
+}
+
+/// `RtlWakeConditionVariable(PRTL_CONDITION_VARIABLE)`.
+///
+/// # Safety
+/// `condition_variable` is a valid `RTL_CONDITION_VARIABLE`.
+#[export_name = "RtlWakeConditionVariable"]
+pub unsafe extern "system" fn rtl_wake_condition_variable(_condition_variable: *mut c_void) {}
+
+/// `RtlWakeAllConditionVariable(PRTL_CONDITION_VARIABLE)`.
+///
+/// # Safety
+/// `condition_variable` is a valid `RTL_CONDITION_VARIABLE`.
+#[export_name = "RtlWakeAllConditionVariable"]
+pub unsafe extern "system" fn rtl_wake_all_condition_variable(_condition_variable: *mut c_void) {}
+
+/// `RtlSleepConditionVariableCS(PRTL_CONDITION_VARIABLE, PRTL_CRITICAL_SECTION, PLARGE_INTEGER)`.
+///
+/// # Safety
+/// Standard ntdll contract.
+#[export_name = "RtlSleepConditionVariableCS"]
+pub unsafe extern "system" fn rtl_sleep_condition_variable_cs(
+    condition_variable: *mut c_void,
+    critical_section: *mut c_void,
+    timeout: *const i64,
+) -> NtStatus {
+    if condition_variable.is_null() || critical_section.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !timeout.is_null() && unsafe { *timeout == 0 } {
+        return STATUS_TIMEOUT;
+    }
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `RtlSleepConditionVariableSRW(PRTL_CONDITION_VARIABLE, PRTL_SRWLOCK, PLARGE_INTEGER, ULONG)`.
+///
+/// # Safety
+/// Standard ntdll contract.
+#[export_name = "RtlSleepConditionVariableSRW"]
+pub unsafe extern "system" fn rtl_sleep_condition_variable_srw(
+    condition_variable: *mut c_void,
+    srw_lock: *mut c_void,
+    timeout: *const i64,
+    flags: u32,
+) -> NtStatus {
+    if condition_variable.is_null() || srw_lock.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if flags & !RTL_CONDITION_VARIABLE_LOCKMODE_SHARED != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !timeout.is_null() && unsafe { *timeout == 0 } {
+        return STATUS_TIMEOUT;
+    }
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `RtlRunOnceInitialize(PRTL_RUN_ONCE)`.
+///
+/// # Safety
+/// `run_once` is a valid writable pointer-width `RTL_RUN_ONCE`.
+#[export_name = "RtlRunOnceInitialize"]
+pub unsafe extern "system" fn rtl_run_once_initialize(run_once: *mut c_void) {
+    if let Some(word) = unsafe { atomic_word(run_once) } {
+        word.store(0, Ordering::Release);
+    }
+}
+
+/// `RtlRunOnceBeginInitialize(PRTL_RUN_ONCE, ULONG, PVOID*) -> NTSTATUS`.
+///
+/// # Safety
+/// `run_once` is a valid `RTL_RUN_ONCE`; `context` is null or writable.
+#[export_name = "RtlRunOnceBeginInitialize"]
+pub unsafe extern "system" fn rtl_run_once_begin_initialize(
+    run_once: *mut c_void,
+    flags: u32,
+    context: *mut *mut c_void,
+) -> NtStatus {
+    let Some(word) = (unsafe { atomic_word(run_once) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if flags & RTL_RUN_ONCE_CHECK_ONLY != 0 {
+        if flags & RTL_RUN_ONCE_ASYNC != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let value = word.load(Ordering::Acquire);
+        if value & 0x3 != 0x2 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        if !context.is_null() {
+            unsafe { *context = (value & !0x3) as *mut c_void };
+        }
+        return STATUS_SUCCESS;
+    }
+    let async_mode = flags & RTL_RUN_ONCE_ASYNC != 0;
+    let mut spins = 0usize;
+    loop {
+        let value = word.load(Ordering::Acquire);
+        match value & 0x3 {
+            0 => {
+                let next = if async_mode { 0x3 } else { 0x1 };
+                if word
+                    .compare_exchange(0, next, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return STATUS_PENDING;
+                }
+            }
+            1 => {
+                if async_mode {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                spin_pause(spins);
+                spins = spins.wrapping_add(1);
+            }
+            2 => {
+                if !context.is_null() {
+                    unsafe { *context = (value & !0x3) as *mut c_void };
+                }
+                return STATUS_SUCCESS;
+            }
+            3 => {
+                if !async_mode {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                return STATUS_PENDING;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// `RtlRunOnceComplete(PRTL_RUN_ONCE, ULONG, PVOID) -> NTSTATUS`.
+///
+/// # Safety
+/// `run_once` is a valid `RTL_RUN_ONCE`.
+#[export_name = "RtlRunOnceComplete"]
+pub unsafe extern "system" fn rtl_run_once_complete(
+    run_once: *mut c_void,
+    flags: u32,
+    context: *mut c_void,
+) -> NtStatus {
+    if (context as usize) & 0x3 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(word) = (unsafe { atomic_word(run_once) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let final_value = if flags & RTL_RUN_ONCE_INIT_FAILED != 0 {
+        if !context.is_null() || flags & RTL_RUN_ONCE_ASYNC != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        0
+    } else {
+        (context as usize) | 0x2
+    };
+    loop {
+        let value = word.load(Ordering::Acquire);
+        match value & 0x3 {
+            1 => {
+                if word
+                    .compare_exchange(value, final_value, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return STATUS_SUCCESS;
+                }
+            }
+            3 => {
+                if flags & RTL_RUN_ONCE_ASYNC == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if word
+                    .compare_exchange(value, final_value, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return STATUS_SUCCESS;
+                }
+            }
+            _ => return STATUS_UNSUCCESSFUL,
+        }
+    }
+}
+
+type RtlRunOnceInitFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> u8;
+
+/// `RtlRunOnceExecuteOnce(PRTL_RUN_ONCE, PRTL_RUN_ONCE_INIT_FN, PVOID, PVOID*) -> NTSTATUS`.
+///
+/// # Safety
+/// `run_once` is a valid `RTL_RUN_ONCE`; `init_fn` follows the Windows callback contract.
+#[export_name = "RtlRunOnceExecuteOnce"]
+pub unsafe extern "system" fn rtl_run_once_execute_once(
+    run_once: *mut c_void,
+    init_fn: Option<RtlRunOnceInitFn>,
+    parameter: *mut c_void,
+    context: *mut *mut c_void,
+) -> NtStatus {
+    let Some(init_fn) = init_fn else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let status = unsafe { rtl_run_once_begin_initialize(run_once, 0, context) };
+    if status != STATUS_PENDING {
+        return status;
+    }
+    if unsafe { init_fn(run_once, parameter, context) } == 0 {
+        let _ = unsafe {
+            rtl_run_once_complete(run_once, RTL_RUN_ONCE_INIT_FAILED, core::ptr::null_mut())
+        };
+        return STATUS_UNSUCCESSFUL;
+    }
+    let final_context = if context.is_null() {
+        core::ptr::null_mut()
+    } else {
+        unsafe { *context }
+    };
+    unsafe { rtl_run_once_complete(run_once, 0, final_context) }
 }
 
 /// The current process's PEB (self-pointer @ `gs:[0x60]`).
@@ -10739,6 +11116,34 @@ pub unsafe extern "system" fn rtl_hash_unicode_string(
     }
 }
 
+/// `RtlFindCharInUnicodeString(ULONG, PCUNICODE_STRING, PCUNICODE_STRING, PUSHORT) -> NTSTATUS`.
+///
+/// # Safety
+/// `search_string`/`match_string` describe readable counted UTF-16 strings and `position` is writable.
+#[export_name = "RtlFindCharInUnicodeString"]
+pub unsafe extern "system" fn rtl_find_char_in_unicode_string(
+    flags: u32,
+    search_string: PCUnicodeString,
+    match_string: PCUnicodeString,
+    position: *mut u16,
+) -> NtStatus {
+    if position.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe { *position = 0 };
+
+    let search = unsafe { us_slice(search_string) };
+    let matches = unsafe { us_slice(match_string) };
+    match rtl::strings::find_char_in_unicode_string(flags, search, matches) {
+        rtl::strings::FindCharInUnicodeString::Found(pos) => unsafe {
+            *position = pos;
+            STATUS_SUCCESS
+        },
+        rtl::strings::FindCharInUnicodeString::NotFound => STATUS_NOT_FOUND,
+        rtl::strings::FindCharInUnicodeString::InvalidFlags => STATUS_INVALID_PARAMETER,
+    }
+}
+
 /// `RtlUpcaseUnicodeString(PUNICODE_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)` — uppercase.
 ///
 /// # Safety
@@ -13048,6 +13453,22 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_initialize_critical_section as usize,
         rtl_enter_critical_section as usize,
         rtl_leave_critical_section as usize,
+        rtl_initialize_srw_lock as usize,
+        rtl_acquire_srw_lock_exclusive as usize,
+        rtl_acquire_srw_lock_shared as usize,
+        rtl_release_srw_lock_exclusive as usize,
+        rtl_release_srw_lock_shared as usize,
+        rtl_try_acquire_srw_lock_exclusive as usize,
+        rtl_try_acquire_srw_lock_shared as usize,
+        rtl_initialize_condition_variable as usize,
+        rtl_wake_condition_variable as usize,
+        rtl_wake_all_condition_variable as usize,
+        rtl_sleep_condition_variable_cs as usize,
+        rtl_sleep_condition_variable_srw as usize,
+        rtl_run_once_initialize as usize,
+        rtl_run_once_begin_initialize as usize,
+        rtl_run_once_complete as usize,
+        rtl_run_once_execute_once as usize,
         rtl_get_critical_section_recursion_count as usize,
         rtl_is_critical_section_locked as usize,
         rtl_is_critical_section_locked_by_thread as usize,
@@ -13255,6 +13676,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_copy_unicode_string as usize,
         rtl_compare_unicode_strings as usize,
         rtl_hash_unicode_string as usize,
+        rtl_find_char_in_unicode_string as usize,
         rtl_upcase_unicode_string as usize,
         rtl_downcase_unicode_string as usize,
         rtl_duplicate_unicode_string as usize,
