@@ -5575,6 +5575,12 @@ type RtlSplayLinks = nt_ntdll::rtl::splay::SplayLinks;
 type RtlGenericCompareRoutine = nt_ntdll::rtl::generic_table::CompareRoutine;
 type RtlGenericAllocateRoutine = nt_ntdll::rtl::generic_table::AllocateRoutine;
 type RtlGenericFreeRoutine = nt_ntdll::rtl::generic_table::FreeRoutine;
+type RtlAvlTable = nt_ntdll::rtl::avl_table::RtlAvlTable;
+type RtlBalancedLinks = nt_ntdll::rtl::avl_table::BalancedLinks;
+type RtlAvlCompareRoutine = nt_ntdll::rtl::avl_table::CompareRoutine;
+type RtlAvlAllocateRoutine = nt_ntdll::rtl::avl_table::AllocateRoutine;
+type RtlAvlFreeRoutine = nt_ntdll::rtl::avl_table::FreeRoutine;
+type RtlAvlMatchRoutine = nt_ntdll::rtl::avl_table::MatchRoutine;
 
 #[inline]
 fn rtl_table_search_result(value: u32) -> nt_ntdll::rtl::generic_table::TableSearchResult {
@@ -5583,6 +5589,16 @@ fn rtl_table_search_result(value: u32) -> nt_ntdll::rtl::generic_table::TableSea
         2 => nt_ntdll::rtl::generic_table::TableSearchResult::TableInsertAsLeft,
         3 => nt_ntdll::rtl::generic_table::TableSearchResult::TableInsertAsRight,
         _ => nt_ntdll::rtl::generic_table::TableSearchResult::TableEmptyTree,
+    }
+}
+
+#[inline]
+fn rtl_avl_table_search_result(value: u32) -> nt_ntdll::rtl::avl_table::TableSearchResult {
+    match value {
+        1 => nt_ntdll::rtl::avl_table::TableSearchResult::TableFoundNode,
+        2 => nt_ntdll::rtl::avl_table::TableSearchResult::TableInsertAsLeft,
+        3 => nt_ntdll::rtl::avl_table::TableSearchResult::TableInsertAsRight,
+        _ => nt_ntdll::rtl::avl_table::TableSearchResult::TableEmptyTree,
     }
 }
 
@@ -5872,6 +5888,267 @@ pub unsafe extern "system" fn rtl_get_element_generic_table(
         nt_ntdll::rtl::generic_table::get_element_generic_table(
             table as *mut RtlGenericTable,
             index,
+        )
+    }
+}
+
+/// `RtlInitializeGenericTableAvl(PRTL_AVL_TABLE, Compare, Allocate, Free, Context)`.
+///
+/// # Safety
+/// `table` is writable for an `RTL_AVL_TABLE`; callbacks follow the native RTL contracts.
+#[export_name = "RtlInitializeGenericTableAvl"]
+pub unsafe extern "system" fn rtl_initialize_generic_table_avl(
+    table: *mut c_void,
+    compare: Option<RtlAvlCompareRoutine>,
+    allocate: Option<RtlAvlAllocateRoutine>,
+    free: Option<RtlAvlFreeRoutine>,
+    context: *mut c_void,
+) {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::initialize_generic_table_avl(
+            table as *mut RtlAvlTable,
+            compare,
+            allocate,
+            free,
+            context,
+        )
+    };
+}
+
+/// `RtlInsertElementGenericTableAvl(PRTL_AVL_TABLE, PVOID, ULONG, PBOOLEAN) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlInsertElementGenericTableAvl"]
+pub unsafe extern "system" fn rtl_insert_element_generic_table_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    new_element: *mut u8,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::insert_element_generic_table_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+            buffer_size,
+            new_element,
+        )
+    }
+}
+
+/// `RtlInsertElementGenericTableFullAvl(...) -> PVOID`.
+///
+/// # Safety
+/// `node_or_parent`/`search_result` are returned by `RtlLookupElementGenericTableFullAvl` or the
+/// equivalent private lookup for the same table and buffer.
+#[export_name = "RtlInsertElementGenericTableFullAvl"]
+pub unsafe extern "system" fn rtl_insert_element_generic_table_full_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    new_element: *mut u8,
+    node_or_parent: *mut c_void,
+    search_result: u32,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::insert_element_generic_table_full_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+            buffer_size,
+            new_element,
+            node_or_parent as *mut RtlBalancedLinks,
+            rtl_avl_table_search_result(search_result),
+        )
+    }
+}
+
+/// `RtlIsGenericTableEmptyAvl(PRTL_AVL_TABLE) -> BOOLEAN`.
+///
+/// # Safety
+/// `table` is a valid `RTL_AVL_TABLE`.
+#[export_name = "RtlIsGenericTableEmptyAvl"]
+pub unsafe extern "system" fn rtl_is_generic_table_empty_avl(table: *mut c_void) -> u8 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    u8::from(unsafe {
+        nt_ntdll::rtl::avl_table::is_generic_table_empty_avl(table as *mut RtlAvlTable)
+    })
+}
+
+/// `RtlNumberGenericTableElementsAvl(PRTL_AVL_TABLE) -> ULONG`.
+///
+/// # Safety
+/// `table` is a valid `RTL_AVL_TABLE`.
+#[export_name = "RtlNumberGenericTableElementsAvl"]
+pub unsafe extern "system" fn rtl_number_generic_table_elements_avl(table: *mut c_void) -> u32 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::number_generic_table_elements_avl(table as *mut RtlAvlTable)
+    }
+}
+
+/// `RtlLookupElementGenericTableAvl(PRTL_AVL_TABLE, PVOID) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlLookupElementGenericTableAvl"]
+pub unsafe extern "system" fn rtl_lookup_element_generic_table_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::lookup_element_generic_table_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+        )
+    }
+}
+
+/// `RtlLookupElementGenericTableFullAvl(PRTL_AVL_TABLE, PVOID, PVOID*, TABLE_SEARCH_RESULT*)`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlLookupElementGenericTableFullAvl"]
+pub unsafe extern "system" fn rtl_lookup_element_generic_table_full_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    node_or_parent: *mut *mut c_void,
+    search_result: *mut u32,
+) -> *mut c_void {
+    let mut typed_search_result = nt_ntdll::rtl::avl_table::TableSearchResult::TableEmptyTree;
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    let found = unsafe {
+        nt_ntdll::rtl::avl_table::lookup_element_generic_table_full_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+            node_or_parent as *mut *mut RtlBalancedLinks,
+            &mut typed_search_result,
+        )
+    };
+    if !search_result.is_null() {
+        // SAFETY: caller supplied a writable TABLE_SEARCH_RESULT out-param.
+        unsafe { *search_result = typed_search_result as u32 };
+    }
+    found
+}
+
+/// `RtlDeleteElementGenericTableAvl(PRTL_AVL_TABLE, PVOID) -> BOOLEAN`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlDeleteElementGenericTableAvl"]
+pub unsafe extern "system" fn rtl_delete_element_generic_table_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+) -> u8 {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    u8::from(unsafe {
+        nt_ntdll::rtl::avl_table::delete_element_generic_table_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+        )
+    })
+}
+
+/// `RtlEnumerateGenericTableAvl(PRTL_AVL_TABLE, BOOLEAN Restart) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlEnumerateGenericTableAvl"]
+pub unsafe extern "system" fn rtl_enumerate_generic_table_avl(
+    table: *mut c_void,
+    restart: u8,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::enumerate_generic_table_avl(
+            table as *mut RtlAvlTable,
+            restart != 0,
+        )
+    }
+}
+
+/// `RtlEnumerateGenericTableWithoutSplayingAvl(PRTL_AVL_TABLE, PVOID*) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlEnumerateGenericTableWithoutSplayingAvl"]
+pub unsafe extern "system" fn rtl_enumerate_generic_table_without_splaying_avl(
+    table: *mut c_void,
+    restart_key: *mut *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::enumerate_generic_table_without_splaying_avl(
+            table as *mut RtlAvlTable,
+            restart_key,
+        )
+    }
+}
+
+/// `RtlLookupFirstMatchingElementGenericTableAvl(PRTL_AVL_TABLE, PVOID, PVOID*) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlLookupFirstMatchingElementGenericTableAvl"]
+pub unsafe extern "system" fn rtl_lookup_first_matching_element_generic_table_avl(
+    table: *mut c_void,
+    buffer: *mut c_void,
+    restart_key: *mut *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::lookup_first_matching_element_generic_table_avl(
+            table as *mut RtlAvlTable,
+            buffer,
+            restart_key,
+        )
+    }
+}
+
+/// `RtlGetElementGenericTableAvl(PRTL_AVL_TABLE, ULONG I) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlGetElementGenericTableAvl"]
+pub unsafe extern "system" fn rtl_get_element_generic_table_avl(
+    table: *mut c_void,
+    index: u32,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::get_element_generic_table_avl(table as *mut RtlAvlTable, index)
+    }
+}
+
+/// `RtlEnumerateGenericTableLikeADirectory(...) -> PVOID`.
+///
+/// # Safety
+/// Standard `RTL_AVL_TABLE` contract.
+#[export_name = "RtlEnumerateGenericTableLikeADirectory"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_enumerate_generic_table_like_a_directory(
+    table: *mut c_void,
+    match_function: Option<RtlAvlMatchRoutine>,
+    match_data: *mut c_void,
+    next_flag: u32,
+    restart_key: *mut *mut c_void,
+    delete_count: *mut u32,
+    buffer: *mut c_void,
+) -> *mut c_void {
+    // SAFETY: raw ABI wrapper around the host-tested RTL AVL generic-table core.
+    unsafe {
+        nt_ntdll::rtl::avl_table::enumerate_generic_table_like_a_directory(
+            table as *mut RtlAvlTable,
+            match_function,
+            match_data,
+            next_flag,
+            restart_key,
+            delete_count,
+            buffer,
         )
     }
 }
@@ -10136,6 +10413,19 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_enumerate_generic_table as usize,
         rtl_enumerate_generic_table_without_splaying as usize,
         rtl_get_element_generic_table as usize,
+        rtl_initialize_generic_table_avl as usize,
+        rtl_insert_element_generic_table_avl as usize,
+        rtl_insert_element_generic_table_full_avl as usize,
+        rtl_is_generic_table_empty_avl as usize,
+        rtl_number_generic_table_elements_avl as usize,
+        rtl_lookup_element_generic_table_avl as usize,
+        rtl_lookup_element_generic_table_full_avl as usize,
+        rtl_delete_element_generic_table_avl as usize,
+        rtl_enumerate_generic_table_avl as usize,
+        rtl_enumerate_generic_table_without_splaying_avl as usize,
+        rtl_lookup_first_matching_element_generic_table_avl as usize,
+        rtl_get_element_generic_table_avl as usize,
+        rtl_enumerate_generic_table_like_a_directory as usize,
         rtl_initialize_resource as usize,
         rtl_delete_resource as usize,
         rtl_acquire_resource_shared as usize,
