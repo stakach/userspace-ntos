@@ -42,6 +42,7 @@ const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_1: NtStatus = 0xC000_00EF;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022;
@@ -9741,45 +9742,393 @@ pub unsafe extern "system" fn rtl_dump_resource(resource: *mut c_void) {
     let _ = unsafe { resource_load(resource) };
 }
 
-// ---- timer-queue / thread-pool / work-item — no scheduler plane (honest seams) --------------------
+// ---- timer-queue / thread-pool / work-item — bounded ntdll records (no scheduler plane) -----------
 
-/// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — no thread-pool plane; return a non-null
-/// sentinel handle so the caller proceeds (the queue simply never fires — an honest no-op timer
-/// queue, never a fabricated timer). Timer callbacks aren't on the boot path.
+const INVALID_HANDLE_VALUE_USIZE: usize = usize::MAX;
+const RTL_TIMER_QUEUE_SLOTS: usize = 16;
+const RTL_TIMER_SLOTS: usize = 64;
+const RTL_WAIT_SLOTS: usize = 32;
+
+#[repr(C)]
+struct TimerQueueRecord {
+    live: AtomicU32,
+    deleting: AtomicU32,
+}
+
+impl TimerQueueRecord {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU32::new(0),
+            deleting: AtomicU32::new(0),
+        }
+    }
+}
+
+#[repr(C)]
+struct TimerRecord {
+    live: AtomicU32,
+    queue: AtomicUsize,
+    callback: AtomicUsize,
+    parameter: AtomicUsize,
+    due_time: AtomicU32,
+    period: AtomicU32,
+    flags: AtomicU32,
+}
+
+impl TimerRecord {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU32::new(0),
+            queue: AtomicUsize::new(0),
+            callback: AtomicUsize::new(0),
+            parameter: AtomicUsize::new(0),
+            due_time: AtomicU32::new(0),
+            period: AtomicU32::new(0),
+            flags: AtomicU32::new(0),
+        }
+    }
+}
+
+#[repr(C)]
+struct WaitRecord {
+    live: AtomicU32,
+    object: AtomicUsize,
+    callback: AtomicUsize,
+    context: AtomicUsize,
+    milliseconds: AtomicU32,
+    flags: AtomicU32,
+}
+
+impl WaitRecord {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU32::new(0),
+            object: AtomicUsize::new(0),
+            callback: AtomicUsize::new(0),
+            context: AtomicUsize::new(0),
+            milliseconds: AtomicU32::new(0),
+            flags: AtomicU32::new(0),
+        }
+    }
+}
+
+static RTL_TIMER_QUEUES: [TimerQueueRecord; RTL_TIMER_QUEUE_SLOTS] =
+    [const { TimerQueueRecord::new() }; RTL_TIMER_QUEUE_SLOTS];
+static RTL_TIMERS: [TimerRecord; RTL_TIMER_SLOTS] = [const { TimerRecord::new() }; RTL_TIMER_SLOTS];
+static RTL_WAITS: [WaitRecord; RTL_WAIT_SLOTS] = [const { WaitRecord::new() }; RTL_WAIT_SLOTS];
+static RTL_DEFAULT_TIMER_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn timer_queue_handle(record: &'static TimerQueueRecord) -> *mut c_void {
+    record as *const TimerQueueRecord as *mut c_void
+}
+
+#[inline]
+fn timer_handle(record: &'static TimerRecord) -> *mut c_void {
+    record as *const TimerRecord as *mut c_void
+}
+
+#[inline]
+fn wait_handle(record: &'static WaitRecord) -> *mut c_void {
+    record as *const WaitRecord as *mut c_void
+}
+
+fn find_timer_queue(handle: *mut c_void) -> Option<&'static TimerQueueRecord> {
+    if handle.is_null() {
+        return None;
+    }
+    for record in &RTL_TIMER_QUEUES {
+        if timer_queue_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
+            return Some(record);
+        }
+    }
+    None
+}
+
+fn alloc_timer_queue_record() -> Option<*mut c_void> {
+    for record in &RTL_TIMER_QUEUES {
+        if record
+            .live
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record.deleting.store(0, Ordering::Release);
+            return Some(timer_queue_handle(record));
+        }
+    }
+    None
+}
+
+fn release_timer_queue_record(handle: *mut c_void) -> bool {
+    let mut released = false;
+    for record in &RTL_TIMER_QUEUES {
+        if timer_queue_handle(record) == handle {
+            record.deleting.store(1, Ordering::Release);
+            released = record.live.swap(0, Ordering::AcqRel) != 0;
+            break;
+        }
+    }
+    if released && RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire) == handle as usize {
+        RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
+    }
+    released
+}
+
+fn default_timer_queue() -> Option<*mut c_void> {
+    let existing = RTL_DEFAULT_TIMER_QUEUE.load(Ordering::Acquire);
+    if existing != 0 {
+        let handle = existing as *mut c_void;
+        if find_timer_queue(handle).is_some() {
+            return Some(handle);
+        }
+        RTL_DEFAULT_TIMER_QUEUE.store(0, Ordering::Release);
+    }
+
+    let handle = alloc_timer_queue_record()?;
+    match RTL_DEFAULT_TIMER_QUEUE.compare_exchange(
+        0,
+        handle as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some(handle),
+        Err(winner) => {
+            let _ = release_timer_queue_record(handle);
+            Some(winner as *mut c_void)
+        }
+    }
+}
+
+fn resolve_timer_queue(handle: *mut c_void) -> Option<*mut c_void> {
+    if handle.is_null() {
+        default_timer_queue()
+    } else if find_timer_queue(handle).is_some() {
+        Some(handle)
+    } else {
+        None
+    }
+}
+
+fn find_timer(handle: *mut c_void) -> Option<&'static TimerRecord> {
+    if handle.is_null() {
+        return None;
+    }
+    for record in &RTL_TIMERS {
+        if timer_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
+            return Some(record);
+        }
+    }
+    None
+}
+
+fn alloc_timer_record(
+    queue: *mut c_void,
+    callback: *mut c_void,
+    parameter: *mut c_void,
+    due_time: u32,
+    period: u32,
+    flags: u32,
+) -> Option<*mut c_void> {
+    for record in &RTL_TIMERS {
+        if record
+            .live
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record.queue.store(queue as usize, Ordering::Release);
+            record.callback.store(callback as usize, Ordering::Release);
+            record
+                .parameter
+                .store(parameter as usize, Ordering::Release);
+            record.due_time.store(due_time, Ordering::Release);
+            record.period.store(period, Ordering::Release);
+            record.flags.store(flags, Ordering::Release);
+            return Some(timer_handle(record));
+        }
+    }
+    None
+}
+
+fn release_timers_for_queue(queue: *mut c_void) {
+    for record in &RTL_TIMERS {
+        if record.live.load(Ordering::Acquire) != 0
+            && record.queue.load(Ordering::Acquire) == queue as usize
+        {
+            record.live.store(0, Ordering::Release);
+        }
+    }
+}
+
+fn find_wait(handle: *mut c_void) -> Option<&'static WaitRecord> {
+    if handle.is_null() {
+        return None;
+    }
+    for record in &RTL_WAITS {
+        if wait_handle(record) == handle && record.live.load(Ordering::Acquire) != 0 {
+            return Some(record);
+        }
+    }
+    None
+}
+
+fn alloc_wait_record(
+    object: *mut c_void,
+    callback: *mut c_void,
+    context: *mut c_void,
+    milliseconds: u32,
+    flags: u32,
+) -> Option<*mut c_void> {
+    for record in &RTL_WAITS {
+        if record
+            .live
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record.object.store(object as usize, Ordering::Release);
+            record.callback.store(callback as usize, Ordering::Release);
+            record.context.store(context as usize, Ordering::Release);
+            record.milliseconds.store(milliseconds, Ordering::Release);
+            record.flags.store(flags, Ordering::Release);
+            return Some(wait_handle(record));
+        }
+    }
+    None
+}
+
+unsafe fn signal_completion_event(completion_event: *mut c_void) {
+    if completion_event.is_null() || completion_event as usize == INVALID_HANDLE_VALUE_USIZE {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwards the same ABI as NtSetEvent(EventHandle, PreviousState=NULL).
+        let _ = unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(*mut c_void, *mut i32) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_set_event)(
+                completion_event, core::ptr::null_mut()
+            )
+        };
+    }
+}
+
+/// `RtlCreateTimerQueue(PHANDLE TimerQueue) -> NTSTATUS` — allocate an ntdll-owned timer-queue
+/// record. There is still no callback scheduler, so timers created on the queue do not fire yet, but
+/// handles are now distinct, validated, updateable, and deletable instead of all aliasing one
+/// sentinel.
 ///
 /// # Safety
 /// `timer_queue` writable.
 #[export_name = "RtlCreateTimerQueue"]
 pub unsafe extern "system" fn rtl_create_timer_queue(timer_queue: *mut *mut c_void) -> NtStatus {
-    if !timer_queue.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *timer_queue = 1 as *mut c_void };
+    if timer_queue.is_null() {
+        return STATUS_INVALID_PARAMETER;
     }
+    let Some(handle) = alloc_timer_queue_record() else {
+        return STATUS_NO_MEMORY;
+    };
+    // SAFETY: writable per the contract.
+    unsafe { *timer_queue = handle };
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_create_timer_impl(
+    timer_queue: *mut c_void,
+    timer: *mut *mut c_void,
+    callback: *mut c_void,
+    parameter: *mut c_void,
+    due_time: u32,
+    period: u32,
+    flags: u32,
+) -> NtStatus {
+    if timer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(queue) = resolve_timer_queue(timer_queue) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(handle) = alloc_timer_record(queue, callback, parameter, due_time, period, flags)
+    else {
+        return STATUS_NO_MEMORY;
+    };
+    // SAFETY: writable per the contract.
+    unsafe { *timer = handle };
+    STATUS_SUCCESS
+}
+
+unsafe fn rtl_delete_timer_queue_ex_impl(
+    timer_queue: *mut c_void,
+    completion_event: *mut c_void,
+) -> NtStatus {
+    if find_timer_queue(timer_queue).is_none() {
+        return STATUS_INVALID_HANDLE;
+    }
+    release_timers_for_queue(timer_queue);
+    let _ = release_timer_queue_record(timer_queue);
+    // SAFETY: optional completion event supplied by the caller.
+    unsafe { signal_completion_event(completion_event) };
     STATUS_SUCCESS
 }
 
 /// `RtlCreateTimer(HANDLE TimerQueue, PHANDLE Timer, WAITORTIMERCALLBACKFUNC Callback,
-/// PVOID Parameter, DWORD DueTime, DWORD Period, ULONG Flags) -> NTSTATUS`. No plane; sentinel
-/// handle + STATUS_SUCCESS (the timer never fires).
+/// PVOID Parameter, DWORD DueTime, DWORD Period, ULONG Flags) -> NTSTATUS`. Allocates a bounded
+/// ntdll-owned timer record. Timer callbacks are still not scheduled yet.
 ///
 /// # Safety
 /// `timer` writable.
 #[export_name = "RtlCreateTimer"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_create_timer(
-    _timer_queue: *mut c_void,
+    timer_queue: *mut c_void,
     timer: *mut *mut c_void,
-    _callback: *mut c_void,
-    _parameter: *mut c_void,
-    _due_time: u32,
-    _period: u32,
-    _flags: u32,
+    callback: *mut c_void,
+    parameter: *mut c_void,
+    due_time: u32,
+    period: u32,
+    flags: u32,
 ) -> NtStatus {
-    if !timer.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *timer = 1 as *mut c_void };
+    // SAFETY: forwards the same pointer contract.
+    unsafe {
+        rtl_create_timer_impl(
+            timer_queue,
+            timer,
+            callback,
+            parameter,
+            due_time,
+            period,
+            flags,
+        )
     }
-    STATUS_SUCCESS
+}
+
+/// `RtlSetTimer(...) -> NTSTATUS` — ReactOS-compatible alias of `RtlCreateTimer`.
+///
+/// # Safety
+/// Same contract as `RtlCreateTimer`.
+#[export_name = "RtlSetTimer"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_set_timer(
+    timer_queue: *mut c_void,
+    timer: *mut *mut c_void,
+    callback: *mut c_void,
+    parameter: *mut c_void,
+    due_time: u32,
+    period: u32,
+    flags: u32,
+) -> NtStatus {
+    // SAFETY: alias with the same ABI.
+    unsafe {
+        rtl_create_timer_impl(
+            timer_queue,
+            timer,
+            callback,
+            parameter,
+            due_time,
+            period,
+            flags,
+        )
+    }
 }
 
 /// `RtlUpdateTimer(HANDLE TimerQueue, HANDLE Timer, DWORD DueTime, DWORD Period) -> NTSTATUS`.
@@ -9788,11 +10137,24 @@ pub unsafe extern "system" fn rtl_create_timer(
 /// Handles from Create*.
 #[export_name = "RtlUpdateTimer"]
 pub unsafe extern "system" fn rtl_update_timer(
-    _timer_queue: *mut c_void,
-    _timer: *mut c_void,
-    _due_time: u32,
-    _period: u32,
+    timer_queue: *mut c_void,
+    timer: *mut c_void,
+    due_time: u32,
+    period: u32,
 ) -> NtStatus {
+    let Some(timer_record) = find_timer(timer) else {
+        return if timer.is_null() {
+            STATUS_INVALID_PARAMETER_1
+        } else {
+            STATUS_INVALID_HANDLE
+        };
+    };
+    if !timer_queue.is_null() && timer_record.queue.load(Ordering::Acquire) != timer_queue as usize
+    {
+        return STATUS_INVALID_HANDLE;
+    }
+    timer_record.due_time.store(due_time, Ordering::Release);
+    timer_record.period.store(period, Ordering::Release);
     STATUS_SUCCESS
 }
 
@@ -9802,11 +10164,38 @@ pub unsafe extern "system" fn rtl_update_timer(
 /// Handles from Create*.
 #[export_name = "RtlDeleteTimer"]
 pub unsafe extern "system" fn rtl_delete_timer(
-    _timer_queue: *mut c_void,
-    _timer: *mut c_void,
-    _completion_event: *mut c_void,
+    timer_queue: *mut c_void,
+    timer: *mut c_void,
+    completion_event: *mut c_void,
 ) -> NtStatus {
+    let Some(timer_record) = find_timer(timer) else {
+        return if timer.is_null() {
+            STATUS_INVALID_PARAMETER_1
+        } else {
+            STATUS_INVALID_HANDLE
+        };
+    };
+    if !timer_queue.is_null() && timer_record.queue.load(Ordering::Acquire) != timer_queue as usize
+    {
+        return STATUS_INVALID_HANDLE;
+    }
+    timer_record.live.store(0, Ordering::Release);
+    // SAFETY: optional completion event supplied by the caller.
+    unsafe { signal_completion_event(completion_event) };
     STATUS_SUCCESS
+}
+
+/// `RtlCancelTimer(HANDLE TimerQueue, HANDLE Timer) -> NTSTATUS`.
+///
+/// # Safety
+/// Handles from `RtlCreateTimer`.
+#[export_name = "RtlCancelTimer"]
+pub unsafe extern "system" fn rtl_cancel_timer(
+    timer_queue: *mut c_void,
+    timer: *mut c_void,
+) -> NtStatus {
+    // SAFETY: alias with the same handle contract.
+    unsafe { rtl_delete_timer(timer_queue, timer, core::ptr::null_mut()) }
 }
 
 /// `RtlDeleteTimerQueueEx(HANDLE TimerQueue, HANDLE CompletionEvent) -> NTSTATUS`.
@@ -9815,10 +10204,23 @@ pub unsafe extern "system" fn rtl_delete_timer(
 /// `timer_queue` from `RtlCreateTimerQueue`.
 #[export_name = "RtlDeleteTimerQueueEx"]
 pub unsafe extern "system" fn rtl_delete_timer_queue_ex(
-    _timer_queue: *mut c_void,
-    _completion_event: *mut c_void,
+    timer_queue: *mut c_void,
+    completion_event: *mut c_void,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    // SAFETY: forwards the same pointer contract.
+    unsafe { rtl_delete_timer_queue_ex_impl(timer_queue, completion_event) }
+}
+
+/// `RtlDeleteTimerQueue(HANDLE TimerQueue) -> NTSTATUS`.
+///
+/// # Safety
+/// `timer_queue` from `RtlCreateTimerQueue`.
+#[export_name = "RtlDeleteTimerQueue"]
+pub unsafe extern "system" fn rtl_delete_timer_queue(timer_queue: *mut c_void) -> NtStatus {
+    // SAFETY: synchronous delete alias (`INVALID_HANDLE_VALUE` completion sentinel).
+    unsafe {
+        rtl_delete_timer_queue_ex_impl(timer_queue, INVALID_HANDLE_VALUE_USIZE as *mut c_void)
+    }
 }
 
 /// `RtlQueueWorkItem(WORKERCALLBACKFUNC Function, PVOID Context, ULONG Flags) -> NTSTATUS`. No
@@ -9841,8 +10243,8 @@ pub unsafe extern "system" fn rtl_queue_work_item(
 }
 
 /// `RtlRegisterWait(PHANDLE NewWaitObject, HANDLE Object, WAITORTIMERCALLBACK Callback,
-/// PVOID Context, ULONG Milliseconds, ULONG Flags) -> NTSTATUS`. No wait-thread plane; sentinel
-/// handle + STATUS_SUCCESS (the wait never completes — no waitable events fire on the boot path).
+/// PVOID Context, ULONG Milliseconds, ULONG Flags) -> NTSTATUS`. Allocates a bounded wait record;
+/// the asynchronous wait-dispatch thread is still future work.
 ///
 /// # Safety
 /// `new_wait_object` writable.
@@ -9850,16 +10252,20 @@ pub unsafe extern "system" fn rtl_queue_work_item(
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_register_wait(
     new_wait_object: *mut *mut c_void,
-    _object: *mut c_void,
-    _callback: *mut c_void,
-    _context: *mut c_void,
-    _milliseconds: u32,
-    _flags: u32,
+    object: *mut c_void,
+    callback: *mut c_void,
+    context: *mut c_void,
+    milliseconds: u32,
+    flags: u32,
 ) -> NtStatus {
-    if !new_wait_object.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *new_wait_object = 1 as *mut c_void };
+    if new_wait_object.is_null() {
+        return STATUS_INVALID_PARAMETER;
     }
+    let Some(handle) = alloc_wait_record(object, callback, context, milliseconds, flags) else {
+        return STATUS_NO_MEMORY;
+    };
+    // SAFETY: writable per the contract.
+    unsafe { *new_wait_object = handle };
     STATUS_SUCCESS
 }
 
@@ -9869,9 +10275,15 @@ pub unsafe extern "system" fn rtl_register_wait(
 /// `wait_handle` from `RtlRegisterWait`.
 #[export_name = "RtlDeregisterWaitEx"]
 pub unsafe extern "system" fn rtl_deregister_wait_ex(
-    _wait_handle: *mut c_void,
-    _completion_event: *mut c_void,
+    wait_handle: *mut c_void,
+    completion_event: *mut c_void,
 ) -> NtStatus {
+    let Some(wait_record) = find_wait(wait_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    wait_record.live.store(0, Ordering::Release);
+    // SAFETY: optional completion event supplied by the caller.
+    unsafe { signal_completion_event(completion_event) };
     STATUS_SUCCESS
 }
 
@@ -17403,9 +17815,12 @@ pub unsafe extern "C" fn export_anchor() {
     let anchors_timer: &[usize] = &[
         rtl_create_timer_queue as usize,
         rtl_create_timer as usize,
+        rtl_set_timer as usize,
         rtl_update_timer as usize,
         rtl_delete_timer as usize,
+        rtl_cancel_timer as usize,
         rtl_delete_timer_queue_ex as usize,
+        rtl_delete_timer_queue as usize,
         rtl_queue_work_item as usize,
         rtl_register_wait as usize,
         rtl_deregister_wait_ex as usize,
