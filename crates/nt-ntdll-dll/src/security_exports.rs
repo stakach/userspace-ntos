@@ -39,6 +39,7 @@ type PUnicodeString = *mut UnicodeString;
 
 // NTSTATUS codes used below (values from the NT status space).
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
+#[cfg(not(target_arch = "x86_64"))]
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
@@ -239,6 +240,110 @@ unsafe fn copy_component(dst: *mut u8, src: *const u8, len: usize) {
             core::ptr::write_bytes(dst.add(len), 0, pad);
         }
     }
+}
+
+/// Byte extent of a self-relative SD, including rounded component payloads.
+///
+/// # Safety
+/// `sd` is a valid self-relative SECURITY_DESCRIPTOR.
+unsafe fn self_relative_sd_extent(sd: *const u8) -> Option<usize> {
+    // SAFETY: caller supplied a readable self-relative SD.
+    unsafe {
+        let mut len = SD_REL_HEADER;
+        for &(rel_off, is_acl) in &[
+            (0x04usize, false),
+            (0x08usize, false),
+            (0x0Cusize, true),
+            (0x10usize, true),
+        ] {
+            let off = *(sd.add(rel_off) as *const u32) as usize;
+            if off == 0 {
+                continue;
+            }
+            let component = sd.add(off);
+            let raw_len = if is_acl {
+                *(component.add(2) as *const u16) as usize
+            } else {
+                sid_len(component)
+            };
+            let end = off.checked_add(round_up4(raw_len))?;
+            len = len.max(end);
+        }
+        Some(len)
+    }
+}
+
+/// Clone a valid SECURITY_DESCRIPTOR into a process-heap self-relative descriptor.
+///
+/// # Safety
+/// `source` is a valid absolute or self-relative SECURITY_DESCRIPTOR.
+#[cfg(target_arch = "x86_64")]
+unsafe fn clone_security_descriptor_to_heap(
+    source: *const c_void,
+) -> Result<*mut c_void, NtStatus> {
+    if source.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: source is a readable SECURITY_DESCRIPTOR per the contract.
+    unsafe {
+        let src = source as *const u8;
+        if *src != SECURITY_DESCRIPTOR_REVISION {
+            return Err(STATUS_UNKNOWN_REVISION);
+        }
+        if rtl_valid_security_descriptor(source) == 0 {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+
+        if sd_control(src) & SE_SELF_RELATIVE != 0 {
+            let len = match self_relative_sd_extent(src) {
+                Some(n) => n,
+                None => return Err(STATUS_INVALID_SECURITY_DESCR),
+            };
+            let dst = crate::process_heap_alloc(len);
+            if dst.is_null() {
+                return Err(STATUS_NO_MEMORY);
+            }
+            core::ptr::copy_nonoverlapping(src, dst, len);
+            return Ok(dst as *mut c_void);
+        }
+
+        let mut len = 0u32;
+        let status = rtl_make_self_relative_sd(source, core::ptr::null_mut(), &mut len);
+        if status != STATUS_BUFFER_TOO_SMALL || len == 0 {
+            return Err(status);
+        }
+        let dst = crate::process_heap_alloc(len as usize);
+        if dst.is_null() {
+            return Err(STATUS_NO_MEMORY);
+        }
+        let mut out_len = len;
+        let status = rtl_make_self_relative_sd(source, dst as *mut c_void, &mut out_len);
+        if status != STATUS_SUCCESS {
+            crate::process_heap_free(dst);
+            return Err(status);
+        }
+        Ok(dst as *mut c_void)
+    }
+}
+
+/// Allocate a minimal empty self-relative SECURITY_DESCRIPTOR.
+///
+/// # Safety
+/// On-target process heap is available.
+#[cfg(target_arch = "x86_64")]
+unsafe fn empty_security_descriptor_to_heap() -> Result<*mut c_void, NtStatus> {
+    // SAFETY: process heap allocation in the hosted process.
+    let dst = unsafe { crate::process_heap_alloc(SD_REL_HEADER) };
+    if dst.is_null() {
+        return Err(STATUS_NO_MEMORY);
+    }
+    // SAFETY: `dst` is a fresh SD_REL_HEADER-byte allocation.
+    unsafe {
+        core::ptr::write_bytes(dst, 0, SD_REL_HEADER);
+        *dst = SECURITY_DESCRIPTOR_REVISION;
+        *(dst.add(0x02) as *mut u16) = SE_SELF_RELATIVE;
+    }
+    Ok(dst as *mut c_void)
 }
 
 #[derive(Copy, Clone)]
@@ -2216,11 +2321,15 @@ pub extern "system" fn rtl_impersonate_self(level: u32) -> NtStatus {
     STATUS_SUCCESS
 }
 
-/// `RtlNewSecurityObject(...)` — build a new self-relative SD for a new object. Needs the full Se
-/// creation plane (parent/creator SD merge, default DACL). Honest seam: STATUS_NOT_IMPLEMENTED.
+/// `RtlNewSecurityObject(...)` — build a process-heap self-relative SD for a new object.
+///
+/// The full Windows body merges creator/parent descriptors with inheritance and token default DACL
+/// policy. Until the token-derived default-DACL plane exists, we implement the faithful descriptor
+/// materialization subset: clone the creator descriptor when supplied, otherwise clone the parent
+/// descriptor, otherwise return a minimal valid empty self-relative SD.
 ///
 /// # Safety
-/// All pointers unused at this seam.
+/// `new_descriptor` is writable; descriptor pointers are valid when non-null.
 #[allow(clippy::too_many_arguments)]
 #[export_name = "RtlNewSecurityObject"]
 pub unsafe extern "system" fn rtl_new_security_object(
@@ -2231,15 +2340,40 @@ pub unsafe extern "system" fn rtl_new_security_object(
     token: *mut c_void,
     generic_mapping: *const c_void,
 ) -> NtStatus {
-    let _ = (
-        parent_descriptor,
-        creator_descriptor,
-        new_descriptor,
-        is_directory_object,
-        token,
-        generic_mapping,
-    );
-    STATUS_NOT_IMPLEMENTED
+    let _ = (is_directory_object, token, generic_mapping);
+    if new_descriptor.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: descriptor pointers/out slot satisfy the exported API contract.
+        unsafe {
+            let source = if !creator_descriptor.is_null() {
+                creator_descriptor
+            } else {
+                parent_descriptor
+            };
+            let sd = if source.is_null() {
+                match empty_security_descriptor_to_heap() {
+                    Ok(sd) => sd,
+                    Err(status) => return status,
+                }
+            } else {
+                match clone_security_descriptor_to_heap(source) {
+                    Ok(sd) => sd,
+                    Err(status) => return status,
+                }
+            };
+            *new_descriptor = sd;
+            STATUS_SUCCESS
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (parent_descriptor, creator_descriptor);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlDeleteSecurityObject(PSECURITY_DESCRIPTOR* ObjectDescriptor) -> NTSTATUS`. Frees the SD
