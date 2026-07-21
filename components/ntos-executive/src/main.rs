@@ -1174,6 +1174,10 @@ pub(crate) static W32_ASSERT_LOG: AtomicU64 = AtomicU64::new(0);
 /// creates its SAS window (first NtUserCreateWindowEx 0x1077 SUCCESS) — the proven interactive
 /// milestone. Drives the `exec_winlogon_sas_window` gate spec + the milestone park/quiesce.
 pub(crate) static WINLOGON_SAS_MILESTONE: AtomicU64 = AtomicU64::new(0);
+/// Winlogon's main thread is parked on the anonymous rpcrt4 server-ready event while a hosted
+/// winlogon worker is still able to signal it. This is not process quiescence: the worker owns the
+/// forward-progress edge. Cleared when the main thread is woken and produces its next event.
+pub(crate) static WINLOGON_MAIN_EVENT_WAIT_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Set (=1) when winlogon has crossed the WHOLE of InitializeSAS + WinMain's post-SAS setup and
 /// entered its SAS message loop — the first `UserGetMessage`/`UserPeekMessage` (SSN 0x1006/0x1001)
 /// AFTER the SAS milestone, i.e. `WinMain`'s `while (GetMessageW(&Msg, SASWindow, …))`

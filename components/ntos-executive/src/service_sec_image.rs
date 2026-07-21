@@ -760,6 +760,9 @@ pub(crate) unsafe fn service_sec_image(
         // This process is producing an event → it's running, not wait-parked. Clear its cooperative
         // wait bit so the all-parked quiesce test reflects reality (a woken waiter re-enters here).
         wait_parked &= !(1u64 << owner_top_badge(badge));
+        if badge == WINLOGON_BADGE {
+            WINLOGON_MAIN_EVENT_WAIT_PARKED.store(0, Ordering::Relaxed);
+        }
         if PM_TERMINATE_THREAD_NO_REPLY.load(Ordering::Relaxed) != 0 && badge < 64 {
             PM_POST_TERM_CONTINUED_BADGES.fetch_or(1u64 << badge, Ordering::Relaxed);
         }
@@ -1295,6 +1298,13 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
                     print_str(b" -> PARK thread (its own unrecoverable fault); boot continues\n");
+                    if is_wl_worker
+                        && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[wl-worker] terminal wall while winlogon main waits for this worker -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -4112,6 +4122,13 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(if is_wl_worker { b"[wl-worker] blocking/unserviced server syscall SSN=" } else if is_scm_worker { b"[scm-worker] blocking/unserviced server syscall SSN=" } else if is_lsass_listener || is_lsass_listener2 || is_lsass_listener3 { b"[lsass-listener] blocking server syscall SSN=" } else { b"[svc-listener] blocking server syscall SSN=" });
                     print_u64(m0);
                     print_str(b" -> PARK thread (reached its RPC receive loop / unserviced); boot continues\n");
+                    if is_wl_worker
+                        && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
+                    {
+                        print_str(b"[wl-worker] parked before signalling the waiting winlogon main thread -> run gate\n");
+                        stop = m0;
+                        break;
+                    }
                     procs[pi].faults = faults; procs[pi].first = first; procs[pi].ntfaults = ntfaults; pfilled[pi] = *filled_pages;
                     // BATCH 40: a PURE-SERVER listener (services pi3 / lsass pi4) reaching its RPC
                     // receive loop is a terminal cooperative park (it blocks forever waiting for a
@@ -4243,36 +4260,16 @@ pub(crate) unsafe fn service_sec_image(
             // queue keyed by the event, rotate REPLY_MAIN to a fresh pool object, recv the next event
             // WITHOUT replying). The matching NtSetEvent wakes it. If the pool/queue is exhausted,
             // wait_park returns false → fall through to a normal (immediate WAIT_0) reply, never a hang.
-            // ★ WINLOGON WinMain QUIESCENCE (BATCH 18): once winlogon (pi 2) has completed its full
-            // startup — its rpcrt4 server WORKER thread reached its RPC receive loop (WL_WORKER_FAULTS
-            // > 0, i.e. it parked) — its MAIN thread's park on an UNSIGNALLED event with no live
-            // signaler (the WinMain SAS/logon wait, e.g. event 'a  ') is the terminal steady state:
-            // winlogon has reached WinMain and is now blocked waiting for interactive logon that never
-            // arrives in this headless boot. Every hosted thread is parked, so the service loop's next
-            // `recv` would block FOREVER (→ boot timeout, gate never runs). STOP the loop here so the
-            // spec gate runs + qemu_exit fires — exactly the terminal behavior the pre-fix boot got for
-            // free when winlogon faulted at comdlg32's unsnapped IAT (0x3ad64). Scoped to winlogon's
-            // main thread AT quiescence (worker already parked) so it can't mask a pre-quiescence fault
-            // or any other process's progress. Not a fault — a clean "winlogon reached WinMain" exit.
-            //
-            // ★ BATCH 25 — LSA-NOT-YET-SIGNALLED GUARD. winlogon's WinMain does `WaitForLsass` (parks on
-            // the LSA_RPC_SERVER_ACTIVE event) BEFORE `InitializeSAS → SwitchDesktop → the desktop paint`.
-            // If we QUIESCE while lsass has not yet signalled, we stop the loop before lsass'
-            // `SetEvent(LSA_RPC_SERVER_ACTIVE)` can wake winlogon into SwitchDesktop → the paint never
-            // runs. So: while `LSA_RPC_SERVER_ACTIVE_SIGNALLED == 0`, DON'T quiesce — fall through to the
-            // Checkpoint-B `wait_park` so winlogon parks in a WAKEABLE state (its reply cap held in the
-            // event's waiter queue), and the later NtSetEvent(lsa_rpc_server_active) resumes it into
-            // SwitchDesktop. Only once lsass HAS signalled (winlogon has been woken + driven past
-            // SwitchDesktop to its genuinely-terminal SAS-logon wait) do we quiesce to run the gate.
-            if park_wait_event >= 0
+            // A winlogon worker that has started but has not yet created the SAS/status window is a
+            // live signaler for the main thread's anonymous server-ready event. The historical
+            // `WL_WORKER_FAULTS > 0` shortcut treated any serviced worker syscall as a terminal park
+            // and stopped immediately after RegisterClassExWOW, before the runnable worker's next
+            // timeslice. Park the main thread normally and keep servicing the worker instead.
+            let winlogon_worker_can_signal = park_wait_event >= 0
                 && pi == 2
-                && WL_WORKER_FAULTS.load(Ordering::Relaxed) > 0
-                && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
-            {
-                print_str(b"[wl-main] winlogon reached WinMain steady-state (worker parked + main event-wait, LSA signalled) -> QUIESCE; run gate\n");
-                stop = resume_ip;
-                break;
-            }
+                && badge == WINLOGON_BADGE
+                && WL_WORKER2_TCB.load(Ordering::Relaxed) != 0
+                && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             if park_wait_event >= 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
@@ -4288,7 +4285,10 @@ pub(crate) unsafe fn service_sec_image(
                     // An INDEFINITE (no-deadline) wait by a top-level process is quiesce-relevant: if
                     // every live process is now parked, no signaler remains → run the gate. A
                     // deadline-bounded wait is timer-woken, so it never deadlocks — don't count it.
-                    if park_wait_deadline.is_none() && pi_is_top_level(badge) {
+                    if winlogon_worker_can_signal {
+                        WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
+                        print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
+                    } else if park_wait_deadline.is_none() && pi_is_top_level(badge) {
                         mark_wait_parked!(pi, resume_ip);
                     }
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
