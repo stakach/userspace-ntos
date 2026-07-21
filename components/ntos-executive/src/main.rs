@@ -563,6 +563,22 @@ pub const SSN_NT_OPEN_FILE: u64 = 122;
 pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
+/// PnP manager syscalls imported by umpnpmgr. We export and route them, but the executive has no
+/// PnP device tree/event queue yet, so the handler returns STATUS_NOT_IMPLEMENTED instead of
+/// fabricating hardware/device-manager success.
+pub const SSN_NT_GET_PLUG_PLAY_EVENT: u64 = 91;
+pub const SSN_NT_PLUG_PLAY_CONTROL: u64 = 138;
+/// Obsolete event-pair object type imported by legacy shell extensions. No event-pair object
+/// manager type exists here yet, so opens fail as a missing named object.
+pub const SSN_NT_OPEN_EVENT_PAIR: u64 = 121;
+/// Debugger-facing process suspend/resume imports. The single-threaded hosted scheduler does not
+/// model per-process suspend counts yet; the handler validates process handles, then returns success.
+pub const SSN_NT_RESUME_PROCESS: u64 = 213;
+pub const SSN_NT_SUSPEND_PROCESS: u64 = 262;
+/// Power manager and UUID cache imports. Power transitions require a future policy/hardware plane;
+/// UUID seed probes the caller buffer but no kernel UUID allocator currently reads the cached value.
+pub const SSN_NT_SET_SYSTEM_POWER_STATE: u64 = 250;
+pub const SSN_NT_SET_UUID_SEED: u64 = 255;
 pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 /// The loaded PE's Windows environment: TEB + PEB (in the PE's existing PT) and
 /// KUSER_SHARED_DATA at its fixed low VA (its own PT chain). The thread's GS base is set to
@@ -4595,6 +4611,14 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtDelayExecution, SSN_NT_DELAY_EXECUTION as u32),
             (NativeService::NtQueryPerformanceCounter, SSN_NT_QUERY_PERF_COUNTER as u32),
             (NativeService::NtQueryVolumeInformationFile, SSN_NT_QUERY_VOLUME_INFO_FILE as u32),
+            // ntdll closure batch: remaining direct ReactOS native imports.
+            (NativeService::NtGetPlugPlayEvent, SSN_NT_GET_PLUG_PLAY_EVENT as u32),
+            (NativeService::NtOpenEventPair, SSN_NT_OPEN_EVENT_PAIR as u32),
+            (NativeService::NtPlugPlayControl, SSN_NT_PLUG_PLAY_CONTROL as u32),
+            (NativeService::NtResumeProcess, SSN_NT_RESUME_PROCESS as u32),
+            (NativeService::NtSetSystemPowerState, SSN_NT_SET_SYSTEM_POWER_STATE as u32),
+            (NativeService::NtSetUuidSeed, SSN_NT_SET_UUID_SEED as u32),
+            (NativeService::NtSuspendProcess, SSN_NT_SUSPEND_PROCESS as u32),
             // Workstream A batch 5 (group C, first cut — demand-fill/alloc subset via ExecLoopCtx).
             (NativeService::NtAllocateVirtualMemory, SSN_NT_ALLOCATE_VM as u32),
             (NativeService::NtOpenSection, SSN_NT_OPEN_SECTION as u32),

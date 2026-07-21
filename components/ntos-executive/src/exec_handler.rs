@@ -3720,6 +3720,56 @@ impl NativeSyscallHandler for ExecNtHandler {
             // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
             | NativeService::NtSetDefaultLocale
             | NativeService::NtSetInformationObject => 0,
+            NativeService::NtResumeProcess | NativeService::NtSuspendProcess => {
+                let handle = args.first().copied().unwrap_or(0);
+                if self.resolve_process_handle(handle).is_some() {
+                    0
+                } else {
+                    nt_process::STATUS_INVALID_HANDLE
+                }
+            }
+            NativeService::NtSetUuidSeed => {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                let seed = args.first().copied().unwrap_or(0);
+                let mut probe = [0u8; 6];
+                if seed == 0 || !unsafe { self.xas_read(seed, &mut probe) } {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    0
+                }
+            }
+            // PnP has no executive device tree/event queue yet; fail explicitly rather than
+            // fabricating hardware/device-manager success or blocking on a nonexistent event.
+            NativeService::NtGetPlugPlayEvent | NativeService::NtPlugPlayControl => 0xC000_0002,
+            NativeService::NtSetSystemPowerState => {
+                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+                const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+                const POWER_ACTION_VALID_MASK: u32 =
+                    0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x1000_0000
+                    | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+                let system_action = args.first().copied().unwrap_or(0) as u32;
+                let min_system_state = args.get(1).copied().unwrap_or(0) as u32;
+                let flags = args.get(2).copied().unwrap_or(0) as u32;
+                if !(1..=7).contains(&system_action)
+                    || !(1..7).contains(&min_system_state)
+                    || flags & !POWER_ACTION_VALID_MASK != 0
+                {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    STATUS_PRIVILEGE_NOT_HELD
+                }
+            }
+            NativeService::NtOpenEventPair => {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+                let out_handle = args.first().copied().unwrap_or(0);
+                let mut probe = [0u8; 8];
+                if out_handle == 0 || !unsafe { self.xas_read(out_handle, &mut probe) } {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            }
             NativeService::NtFlushInstructionCache => {
                 let base = args.get(1).copied().unwrap_or(0);
                 let size = args.get(2).copied().unwrap_or(0);

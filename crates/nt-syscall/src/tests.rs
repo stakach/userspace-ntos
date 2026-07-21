@@ -402,6 +402,35 @@ fn delay_execution_registers_with_native_abi() {
 }
 
 #[test]
+fn remaining_direct_ntdll_import_services_register() {
+    // These are the remaining direct native imports in the hosted ReactOS image set after the
+    // non-syscall ntdll exports are resolved. Registering them makes the export stubs route through
+    // the executive with explicit backend policy instead of import-time failure.
+    let pairs = [
+        (NativeService::NtGetPlugPlayEvent, 91u32),
+        (NativeService::NtOpenEventPair, 121),
+        (NativeService::NtPlugPlayControl, 138),
+        (NativeService::NtResumeProcess, 213),
+        (NativeService::NtSetSystemPowerState, 250),
+        (NativeService::NtSetUuidSeed, 255),
+        (NativeService::NtSuspendProcess, 262),
+    ];
+    let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
+    assert_eq!(table.len(), pairs.len());
+    for (service, ssn) in pairs {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+        assert_eq!(table.number_of(service), Some(ssn));
+    }
+    assert_eq!(NativeService::NtGetPlugPlayEvent.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtOpenEventPair.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtPlugPlayControl.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtResumeProcess.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtSetSystemPowerState.arg_count(), (3, 3));
+    assert_eq!(NativeService::NtSetUuidSeed.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtSuspendProcess.arg_count(), (1, 1));
+}
+
+#[test]
 fn group_b_query_and_namespace_services_register() {
     // Group B1: query + object-namespace services register at their real Win7 SSNs with the
     // arg bounds the executive's table dispatch relies on (QueryVirtualMemory reads a stack arg6).

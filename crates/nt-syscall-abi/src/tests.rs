@@ -5,7 +5,7 @@ use super::*;
 /// The exact count of `Nt*` exports the current hosted ReactOS set imports plus
 /// `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally, and
 /// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
-const REQUIRED_NT_COUNT: usize = 194;
+const REQUIRED_NT_COUNT: usize = 201;
 const REQUIRED_ZW_COUNT: usize = 9;
 
 #[test]
@@ -97,17 +97,23 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtCreateSection", 52),           // SSN_NT_CREATE_SECTION = 52
         ("NtDelayExecution", 61),          // SSN_NT_DELAY_EXECUTION = 61
         ("NtFsControlFile", 88),           // SSN_NT_FS_CONTROL_FILE = 88
+        ("NtGetPlugPlayEvent", 91),        // SSN_NT_GET_PLUG_PLAY_EVENT = 91
         ("NtOpenFile", 122),               // (loader hot path)
         ("NtOpenIoCompletion", 123),       // SSN_NT_OPEN_IO_COMPLETION = 123
         ("NtOpenKey", 125),                // SSN_NT_OPEN_KEY = 125
+        ("NtPlugPlayControl", 138),        // SSN_NT_PLUG_PLAY_CONTROL = 138
         ("NtProtectVirtualMemory", 143),   // SSN_NT_PROTECT_VM = 143
         ("NtQueryDebugFilterState", 148),  // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
         ("NtQueryIoCompletion", 166),      // SSN_NT_QUERY_IO_COMPLETION = 166
         ("NtQuerySystemInformation", 181), // SSN_NT_QUERY_SYSTEM_INFO = 0xb5
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
+        ("NtResumeProcess", 213),          // SSN_NT_RESUME_PROCESS = 213
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
         ("NtSetDebugFilterState", 222),    // SSN_NT_SET_DEBUG_FILTER_STATE = 222
+        ("NtSetSystemPowerState", 250),    // SSN_NT_SET_SYSTEM_POWER_STATE = 250
+        ("NtSetUuidSeed", 255),            // SSN_NT_SET_UUID_SEED = 255
         ("NtSetValueKey", 256),            // SSN_NT_SET_VALUE_KEY = 256
+        ("NtSuspendProcess", 262),         // SSN_NT_SUSPEND_PROCESS = 262
         ("NtTerminateProcess", 266),       // SSN_NT_TERMINATE_PROCESS = 266
         ("NtWaitForSingleObject", 281),    // (core sync)
     ];

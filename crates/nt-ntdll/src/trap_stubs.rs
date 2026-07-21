@@ -183,6 +183,7 @@ generate_trap_stubs! {
     (nt_fs_control_file, "NtFsControlFile", 88),
     (nt_get_context_thread, "NtGetContextThread", 89),
     (nt_get_device_power_state, "NtGetDevicePowerState", 90),
+    (nt_get_plug_play_event, "NtGetPlugPlayEvent", 91),
     (nt_get_write_watch, "NtGetWriteWatch", 92),
     (nt_impersonate_anonymous_token, "NtImpersonateAnonymousToken", 93),
     (nt_impersonate_thread, "NtImpersonateThread", 95),
@@ -204,6 +205,7 @@ generate_trap_stubs! {
     (nt_notify_change_key, "NtNotifyChangeKey", 117),
     (nt_open_directory_object, "NtOpenDirectoryObject", 119),
     (nt_open_event, "NtOpenEvent", 120),
+    (nt_open_event_pair, "NtOpenEventPair", 121),
     (nt_open_file, "NtOpenFile", 122),
     (nt_open_io_completion, "NtOpenIoCompletion", 123),
     (nt_open_job_object, "NtOpenJobObject", 124),
@@ -218,6 +220,7 @@ generate_trap_stubs! {
     (nt_open_thread, "NtOpenThread", 134),
     (nt_open_thread_token, "NtOpenThreadToken", 135),
     (nt_open_timer, "NtOpenTimer", 137),
+    (nt_plug_play_control, "NtPlugPlayControl", 138),
     (nt_power_information, "NtPowerInformation", 139),
     (nt_privilege_check, "NtPrivilegeCheck", 140),
     (nt_privilege_object_audit_alarm, "NtPrivilegeObjectAuditAlarm", 141),
@@ -271,6 +274,7 @@ generate_trap_stubs! {
     (nt_reset_event, "NtResetEvent", 210),
     (nt_reset_write_watch, "NtResetWriteWatch", 211),
     (nt_restore_key, "NtRestoreKey", 212),
+    (nt_resume_process, "NtResumeProcess", 213),
     (nt_resume_thread, "NtResumeThread", 214),
     (nt_save_key, "NtSaveKey", 215),
     (nt_secure_connect_port, "NtSecureConnectPort", 218),
@@ -290,13 +294,16 @@ generate_trap_stubs! {
     (nt_set_security_object, "NtSetSecurityObject", 246),
     (nt_set_system_environment_value_ex, "NtSetSystemEnvironmentValueEx", 248),
     (nt_set_system_information, "NtSetSystemInformation", 249),
+    (nt_set_system_power_state, "NtSetSystemPowerState", 250),
     (nt_set_system_time, "NtSetSystemTime", 251),
     (nt_set_thread_execution_state, "NtSetThreadExecutionState", 252),
     (nt_set_timer, "NtSetTimer", 253),
+    (nt_set_uuid_seed, "NtSetUuidSeed", 255),
     (nt_set_value_key, "NtSetValueKey", 256),
     (nt_set_volume_information_file, "NtSetVolumeInformationFile", 257),
     (nt_shutdown_system, "NtShutdownSystem", 258),
     (nt_signal_and_wait_for_single_object, "NtSignalAndWaitForSingleObject", 259),
+    (nt_suspend_process, "NtSuspendProcess", 262),
     (nt_suspend_thread, "NtSuspendThread", 263),
     (nt_terminate_job_object, "NtTerminateJobObject", 265),
     (nt_terminate_process, "NtTerminateProcess", 266),
@@ -336,7 +343,6 @@ mod tests {
 
     #[test]
     fn generates_all_required_stubs() {
-        assert_eq!(TRAP_STUBS.len(), 194);
         assert_eq!(TRAP_STUBS.len(), NT_SYSCALLS.len());
     }
 

@@ -90,6 +90,8 @@ pub enum NativeService {
     NtTerminateProcess,
     NtTerminateThread,
     NtQueryInformationProcess,
+    NtResumeProcess,
+    NtSuspendProcess,
     // Security / token (§16.7)
     NtOpenProcessToken,
     NtAccessCheck,
@@ -97,6 +99,9 @@ pub enum NativeService {
     NtQuerySystemInformation,
     NtQuerySystemTime,
     NtDelayExecution,
+    NtGetPlugPlayEvent,
+    NtPlugPlayControl,
+    NtSetSystemPowerState,
     // Additional services the executive hosts for real binaries (smss/csrss). These are real
     // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
     // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
@@ -113,6 +118,9 @@ pub enum NativeService {
     // NtOpenEvent — open an existing named event in \BaseNamedObjects (CreateEventW's
     // ERROR_ALREADY_EXISTS fallback + OpenEventW). Resolved against the executive object namespace.
     NtOpenEvent,
+    // NtOpenEventPair — obsolete event-pair objects. Exported so legacy shell/debug imports resolve;
+    // the executive currently returns an object-open failure because no event-pair type is modelled.
+    NtOpenEventPair,
     NtCreateSemaphore,
     // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
     // SURT. The message data plane (request/reply/receive) is served directly by the executive
@@ -143,6 +151,7 @@ pub enum NativeService {
     NtSetSecurityObject,
     NtResumeThread,
     NtSetInformationObject,
+    NtSetUuidSeed,
     // Group B: query + object-namespace services (executive out-writes / obj_ns lookups).
     NtQueryVirtualMemory,
     NtQueryInformationToken,
@@ -210,11 +219,16 @@ impl NativeService {
             NtTerminateProcess => "NtTerminateProcess",
             NtTerminateThread => "NtTerminateThread",
             NtQueryInformationProcess => "NtQueryInformationProcess",
+            NtResumeProcess => "NtResumeProcess",
+            NtSuspendProcess => "NtSuspendProcess",
             NtOpenProcessToken => "NtOpenProcessToken",
             NtAccessCheck => "NtAccessCheck",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
             NtDelayExecution => "NtDelayExecution",
+            NtGetPlugPlayEvent => "NtGetPlugPlayEvent",
+            NtPlugPlayControl => "NtPlugPlayControl",
+            NtSetSystemPowerState => "NtSetSystemPowerState",
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
@@ -224,6 +238,7 @@ impl NativeService {
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
             NtOpenEvent => "NtOpenEvent",
+            NtOpenEventPair => "NtOpenEventPair",
             NtCreateSemaphore => "NtCreateSemaphore",
             NtConnectPort => "NtConnectPort",
             NtSecureConnectPort => "NtSecureConnectPort",
@@ -245,6 +260,7 @@ impl NativeService {
             NtSetSecurityObject => "NtSetSecurityObject",
             NtResumeThread => "NtResumeThread",
             NtSetInformationObject => "NtSetInformationObject",
+            NtSetUuidSeed => "NtSetUuidSeed",
             NtQueryVirtualMemory => "NtQueryVirtualMemory",
             NtQueryInformationToken => "NtQueryInformationToken",
             NtOpenDirectoryObject => "NtOpenDirectoryObject",
@@ -268,10 +284,13 @@ impl NativeService {
         use NativeService::*;
         match self {
             NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom => (1, 1),
+            NtResumeProcess | NtSuspendProcess | NtSetUuidSeed => (1, 1),
             NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
             | NtQueryDebugFilterState => (2, 2),
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
-            | NtSetDebugFilterState => (3, 3),
+            | NtSetDebugFilterState | NtOpenEventPair | NtPlugPlayControl
+            | NtSetSystemPowerState => (3, 3),
+            NtGetPlugPlayEvent => (4, 4),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtCreateIoCompletion => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
@@ -361,11 +380,16 @@ impl NativeService {
         NativeService::NtTerminateProcess,
         NativeService::NtTerminateThread,
         NativeService::NtQueryInformationProcess,
+        NativeService::NtResumeProcess,
+        NativeService::NtSuspendProcess,
         NativeService::NtOpenProcessToken,
         NativeService::NtAccessCheck,
         NativeService::NtQuerySystemInformation,
         NativeService::NtQuerySystemTime,
         NativeService::NtDelayExecution,
+        NativeService::NtGetPlugPlayEvent,
+        NativeService::NtPlugPlayControl,
+        NativeService::NtSetSystemPowerState,
         NativeService::NtProtectVirtualMemory,
         NativeService::NtDisplayString,
         NativeService::NtQueryDebugFilterState,
@@ -375,6 +399,7 @@ impl NativeService {
         NativeService::NtCreateThread,
         NativeService::NtCreateEvent,
         NativeService::NtOpenEvent,
+        NativeService::NtOpenEventPair,
         NativeService::NtCreateSemaphore,
         NativeService::NtConnectPort,
         NativeService::NtSecureConnectPort,
@@ -396,6 +421,7 @@ impl NativeService {
         NativeService::NtSetSecurityObject,
         NativeService::NtResumeThread,
         NativeService::NtSetInformationObject,
+        NativeService::NtSetUuidSeed,
         NativeService::NtQueryVirtualMemory,
         NativeService::NtQueryInformationToken,
         NativeService::NtOpenDirectoryObject,
