@@ -3894,6 +3894,113 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum(
     STATUS_SUCCESS // checksum treated as valid (default; the real map/verify is Step 4.B)
 }
 
+/// `LdrVerifyImageMatchesChecksumEx(HANDLE ImageFileHandle, PLDR_VERIFY_IMAGE_INFO VerifyInfo)`.
+///
+/// Extended wrapper around the checksum verifier. The current loader accepts mapped boot images; when
+/// the caller asks for image characteristics, publish zero rather than leaving the field stale.
+///
+/// # Safety
+/// `verify_info` points to an `LDR_VERIFY_IMAGE_INFO`-compatible buffer.
+#[export_name = "LdrVerifyImageMatchesChecksumEx"]
+pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
+    image_file_handle: *mut c_void,
+    verify_info: *mut c_void,
+) -> NtStatus {
+    if verify_info.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const LDR_VERIFY_IMAGE_INFO_MIN_SIZE: u32 = 58;
+    const LDR_VERIFY_IMAGE_FLAG_USE_CALLBACK: u32 = 0x1;
+    const LDR_VERIFY_IMAGE_FLAG_RETURN_IMAGE_CHARACTERISTICS: u32 = 0x4;
+    const LDR_VERIFY_CALLBACK_ROUTINE_OFFSET: usize = 0x08;
+    const LDR_VERIFY_CALLBACK_PARAMETER_OFFSET: usize = 0x10;
+    const LDR_VERIFY_IMAGE_CHARACTERISTICS_OFFSET: usize = 0x38;
+
+    let bytes = verify_info as *mut u8;
+    let info_size = unsafe { core::ptr::read_unaligned(bytes as *const u32) };
+    let flags = unsafe { core::ptr::read_unaligned(bytes.add(4) as *const u32) };
+    if info_size < LDR_VERIFY_IMAGE_INFO_MIN_SIZE {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    let (callback, parameter) = if flags & LDR_VERIFY_IMAGE_FLAG_USE_CALLBACK != 0 {
+        unsafe {
+            (
+                core::ptr::read_unaligned(
+                    bytes.add(LDR_VERIFY_CALLBACK_ROUTINE_OFFSET) as *const *mut c_void,
+                ),
+                core::ptr::read_unaligned(
+                    bytes.add(LDR_VERIFY_CALLBACK_PARAMETER_OFFSET) as *const *mut c_void,
+                ),
+            )
+        }
+    } else {
+        (core::ptr::null_mut(), core::ptr::null_mut())
+    };
+    let characteristics = if flags & LDR_VERIFY_IMAGE_FLAG_RETURN_IMAGE_CHARACTERISTICS != 0 {
+        unsafe { bytes.add(LDR_VERIFY_IMAGE_CHARACTERISTICS_OFFSET) as *mut u16 }
+    } else {
+        core::ptr::null_mut()
+    };
+    if !characteristics.is_null() {
+        unsafe { core::ptr::write_unaligned(characteristics, 0) };
+    }
+    unsafe {
+        ldr_verify_image_matches_checksum(
+            image_file_handle,
+            callback,
+            parameter,
+            characteristics,
+        )
+    }
+}
+
+/// `LdrGetFailureData() -> PLDR_FAILURE_DATA`.
+///
+/// Returns the process-local loader failure record. No loader failure has been recorded yet, so the
+/// status field starts as `STATUS_SUCCESS`.
+#[export_name = "LdrGetFailureData"]
+pub unsafe extern "system" fn ldr_get_failure_data() -> *mut c_void {
+    core::ptr::addr_of_mut!(LDR_FAILURE_DATA) as *mut c_void
+}
+
+/// `LdrProcessInitializationComplete() -> NTSTATUS`.
+///
+/// The on-target loader completes initialization inside `LdrpInitialize`; no deferred per-process
+/// action remains here.
+#[export_name = "LdrProcessInitializationComplete"]
+pub extern "system" fn ldr_process_initialization_complete() -> NtStatus {
+    STATUS_SUCCESS
+}
+
+/// `LdrQueryModuleServiceTags(PVOID DllHandle, PULONG ServiceTagBuffer, PULONG BufferSize)`.
+///
+/// Service-tag DDAG metadata is not modelled yet. Return a real empty result: required count is zero
+/// and no buffer entries are written.
+///
+/// # Safety
+/// `buffer_size` is writable.
+#[export_name = "LdrQueryModuleServiceTags"]
+pub unsafe extern "system" fn ldr_query_module_service_tags(
+    _dll_handle: *mut c_void,
+    _service_tag_buffer: *mut u32,
+    buffer_size: *mut u32,
+) -> NtStatus {
+    if buffer_size.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe { *buffer_size = 0 };
+    STATUS_SUCCESS
+}
+
+/// `LdrSetMUICacheType(ULONG Type) -> NTSTATUS`.
+///
+/// MUI cache selection is accepted but has no effect while alternate resources are disabled.
+#[export_name = "LdrSetMUICacheType"]
+pub extern "system" fn ldr_set_mui_cache_type(_cache_type: u32) -> NtStatus {
+    STATUS_SUCCESS
+}
+
 // =================================================================================================
 // Dbg* — debug print (serial-forward on our kernel; modelled here)
 // =================================================================================================
@@ -6577,6 +6684,145 @@ pub unsafe extern "system" fn ldr_add_ref_dll(_flags: u32, _dll_handle: *mut c_v
     STATUS_SUCCESS
 }
 
+/// `LdrAlternateResourcesEnabled() -> BOOLEAN`.
+///
+/// ReactOS does not enable MUI alternate-resource modules in this ntdll layer. Returning FALSE makes
+/// `LdrLoadAlternateResourceModule` a successful no-op, which is the ReactOS path at
+/// `dll/ntdll/ldr/ldrapi.c:LdrLoadAlternateResourceModule`.
+#[export_name = "LdrAlternateResourcesEnabled"]
+pub extern "system" fn ldr_alternate_resources_enabled() -> u8 {
+    0
+}
+
+/// `LdrAddLoadAsDataTable(PVOID DllHandle, PCWSTR FilePath, SIZE_T FileSize, HANDLE FileHandle)`.
+///
+/// Keep the process-local loader bookkeeping needed by callers that map a module as a data/resource
+/// file and later ask for its file name or remove it from the data table. Resource lookup itself is
+/// served by the regular mapped-image walker below.
+///
+/// # Safety
+/// `dll_handle` is a mapped module/resource handle. `file_path`, when non-null, is NUL-terminated.
+#[export_name = "LdrAddLoadAsDataTable"]
+pub unsafe extern "system" fn ldr_add_load_as_data_table(
+    dll_handle: *mut c_void,
+    file_path: *const u16,
+    file_size: usize,
+    file_handle: *mut c_void,
+) -> NtStatus {
+    let module = ldr_untag_resource_module(dll_handle) as usize;
+    if module == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let copied_name = unsafe { copy_wide_name_to_heap(file_path) } as usize;
+    if !file_path.is_null() && copied_name == 0 {
+        return STATUS_NO_MEMORY;
+    }
+
+    if let Some(record) = find_load_as_data_table_record(dll_handle) {
+        let old = record.file_name.swap(copied_name, Ordering::AcqRel);
+        if old != 0 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                crate::process_heap_free(old as *mut u8);
+            }
+        }
+        record.file_size.store(file_size, Ordering::Release);
+        record
+            .file_handle
+            .store(file_handle as usize, Ordering::Release);
+        return STATUS_SUCCESS;
+    }
+
+    for record in &LDR_LOAD_AS_DATA_TABLE {
+        if record
+            .live
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            record.module.store(module, Ordering::Release);
+            record.file_name.store(copied_name, Ordering::Release);
+            record.file_size.store(file_size, Ordering::Release);
+            record
+                .file_handle
+                .store(file_handle as usize, Ordering::Release);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if copied_name != 0 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            crate::process_heap_free(copied_name as *mut u8);
+        }
+    }
+    STATUS_NO_MEMORY
+}
+
+/// `LdrRemoveLoadAsDataTable(PVOID DllHandle, PVOID *BaseModule, PSIZE_T Size, ULONG Flags)`.
+///
+/// # Safety
+/// Optional out-parameters are writable.
+#[export_name = "LdrRemoveLoadAsDataTable"]
+pub unsafe extern "system" fn ldr_remove_load_as_data_table(
+    dll_handle: *mut c_void,
+    base_module: *mut *mut c_void,
+    size: *mut usize,
+    _flags: u32,
+) -> NtStatus {
+    let Some(record) = find_load_as_data_table_record(dll_handle) else {
+        return STATUS_NOT_FOUND;
+    };
+    let module = record.module.load(Ordering::Acquire) as *mut c_void;
+    let file_size = record.file_size.load(Ordering::Acquire);
+    if !base_module.is_null() {
+        unsafe { *base_module = module };
+    }
+    if !size.is_null() {
+        unsafe { *size = file_size };
+    }
+    let old_name = record.file_name.swap(0, Ordering::AcqRel);
+    record.file_handle.store(0, Ordering::Release);
+    record.file_size.store(0, Ordering::Release);
+    record.module.store(0, Ordering::Release);
+    record.live.store(0, Ordering::Release);
+    if old_name != 0 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            crate::process_heap_free(old_name as *mut u8);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `LdrGetFileNameFromLoadAsDataTable(PVOID DllHandle, PWSTR *FileName)`.
+///
+/// # Safety
+/// `file_name` is a writable `PWSTR*`.
+#[export_name = "LdrGetFileNameFromLoadAsDataTable"]
+pub unsafe extern "system" fn ldr_get_file_name_from_load_as_data_table(
+    dll_handle: *mut c_void,
+    file_name: *mut *mut u16,
+) -> NtStatus {
+    if file_name.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if let Some(record) = find_load_as_data_table_record(dll_handle) {
+        let name = record.file_name.load(Ordering::Acquire) as *mut u16;
+        if !name.is_null() {
+            unsafe { *file_name = name };
+            return STATUS_SUCCESS;
+        }
+    }
+    let name = unsafe { ldr_entry_full_name_buffer(dll_handle) };
+    if name.is_null() {
+        unsafe { *file_name = core::ptr::null_mut() };
+        return STATUS_NOT_FOUND;
+    }
+    unsafe { *file_name = name };
+    STATUS_SUCCESS
+}
+
 /// `LdrGetDllHandleEx(ULONG Flags, PCWSTR DllPath, PULONG DllCharacteristics, PUNICODE_STRING
 /// DllName, PVOID* DllHandle) -> NTSTATUS` — find a loaded module by name. Delegate to the on-target
 /// module table (via `LdrGetDllHandle`), ignoring the path/characteristics refinements.
@@ -6716,6 +6962,113 @@ const STATUS_RESOURCE_NAME_NOT_FOUND: NtStatus = 0xC000_008B;
 const STATUS_RESOURCE_DATA_NOT_FOUND: NtStatus = 0xC000_0089;
 /// `STATUS_RESOURCE_LANG_NOT_FOUND`.
 const STATUS_RESOURCE_LANG_NOT_FOUND: NtStatus = 0xC000_00A2;
+/// `STATUS_MUI_FILE_NOT_FOUND`.
+const STATUS_MUI_FILE_NOT_FOUND: NtStatus = 0xC00B_0001;
+const LDR_LOAD_AS_DATA_TABLE_SLOTS: usize = 16;
+const LDR_FAILURE_DATA_WCHARS: usize = 32;
+
+#[repr(C)]
+struct LdrFailureData {
+    status: NtStatus,
+    dll_name: [u16; LDR_FAILURE_DATA_WCHARS],
+    additional_info: [u16; LDR_FAILURE_DATA_WCHARS],
+}
+
+static mut LDR_FAILURE_DATA: LdrFailureData = LdrFailureData {
+    status: STATUS_SUCCESS,
+    dll_name: [0; LDR_FAILURE_DATA_WCHARS],
+    additional_info: [0; LDR_FAILURE_DATA_WCHARS],
+};
+
+struct LdrLoadAsDataTableRecord {
+    live: AtomicUsize,
+    module: AtomicUsize,
+    file_name: AtomicUsize,
+    file_size: AtomicUsize,
+    file_handle: AtomicUsize,
+}
+
+static LDR_LOAD_AS_DATA_TABLE: [LdrLoadAsDataTableRecord; LDR_LOAD_AS_DATA_TABLE_SLOTS] =
+    [const {
+        LdrLoadAsDataTableRecord {
+            live: AtomicUsize::new(0),
+            module: AtomicUsize::new(0),
+            file_name: AtomicUsize::new(0),
+            file_size: AtomicUsize::new(0),
+            file_handle: AtomicUsize::new(0),
+        }
+    }; LDR_LOAD_AS_DATA_TABLE_SLOTS];
+
+#[inline]
+fn ldr_untag_resource_module(module: *mut c_void) -> *mut c_void {
+    ((module as usize) & !0x3usize) as *mut c_void
+}
+
+unsafe fn copy_wide_name_to_heap(name: *const u16) -> *mut u16 {
+    if name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut len = 0usize;
+    while len < 0x7fff {
+        if unsafe { core::ptr::read(name.add(len)) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0x7fff {
+        return core::ptr::null_mut();
+    }
+    let bytes = match len.checked_add(1).and_then(|n| n.checked_mul(2)) {
+        Some(n) => n,
+        None => return core::ptr::null_mut(),
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let dst = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
+        if dst.is_null() {
+            return core::ptr::null_mut();
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(name, dst, len);
+            core::ptr::write(dst.add(len), 0);
+        }
+        dst
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = bytes;
+        core::ptr::null_mut()
+    }
+}
+
+fn find_load_as_data_table_record(module: *mut c_void) -> Option<&'static LdrLoadAsDataTableRecord> {
+    let module = ldr_untag_resource_module(module) as usize;
+    if module == 0 {
+        return None;
+    }
+    LDR_LOAD_AS_DATA_TABLE.iter().find(|record| {
+        record.live.load(Ordering::Acquire) != 0
+            && record.module.load(Ordering::Acquire) == module
+    })
+}
+
+unsafe fn ldr_entry_full_name_buffer(module: *mut c_void) -> *mut u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let entry = unsafe { find_ldr_entry_for_base(ldr_untag_resource_module(module) as u64) };
+        if entry == 0 {
+            return core::ptr::null_mut();
+        }
+        unsafe {
+            core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 8) as *const u64) as *mut u16
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = module;
+        core::ptr::null_mut()
+    }
+}
 
 /// Decode one `ULONG_PTR` field of an `LDR_RESOURCE_INFO` into a [`rtl::pe_resource::ResName`].
 /// A value whose high bits are clear (≤ 0xFFFF) is an integer id (`MAKEINTRESOURCEW`); otherwise it
@@ -6763,6 +7116,7 @@ unsafe fn ldr_find_resource_impl(
     out: *mut *mut c_void,
     want_dir: bool,
 ) -> NtStatus {
+    let dll_handle = ldr_untag_resource_module(dll_handle);
     if dll_handle.is_null() || resource_info.is_null() {
         return STATUS_RESOURCE_DATA_NOT_FOUND;
     }
@@ -6871,6 +7225,26 @@ pub unsafe extern "system" fn ldr_find_resource_u(
     unsafe { ldr_find_resource_impl(dll_handle, resource_info, level, resource_data_entry, false) }
 }
 
+/// `LdrFindResourceEx_U(ULONG Flags, PVOID DllHandle, PULONG_PTR ResourcePath, ULONG Count,
+/// PIMAGE_RESOURCE_DATA_ENTRY* ResourceDataEntry) -> NTSTATUS`.
+///
+/// Vista+ flag-bearing wrapper over `LdrFindResource_U`. The flag bits drive MUI alternate-resource
+/// search on Windows; with alternate resources disabled we resolve from the supplied module's real
+/// resource tree.
+///
+/// # Safety
+/// Same pointer contract as [`ldr_find_resource_u`].
+#[export_name = "LdrFindResourceEx_U"]
+pub unsafe extern "system" fn ldr_find_resource_ex_u(
+    _flags: u32,
+    dll_handle: *mut c_void,
+    resource_info: *const c_void,
+    level: u32,
+    resource_data_entry: *mut *mut c_void,
+) -> NtStatus {
+    unsafe { ldr_find_resource_u(dll_handle, resource_info, level, resource_data_entry) }
+}
+
 /// `LdrFindResourceDirectory_U(...) -> NTSTATUS` — locate a resource **directory** node (same walk,
 /// `want_dir = TRUE`).
 ///
@@ -6902,6 +7276,7 @@ pub unsafe extern "system" fn ldr_access_resource(
     address: *mut *mut c_void,
     size: *mut u32,
 ) -> NtStatus {
+    let dll_handle = ldr_untag_resource_module(dll_handle);
     if dll_handle.is_null() || resource_data_entry.is_null() {
         // SAFETY: writable-or-null per the contract.
         unsafe {
@@ -6929,6 +7304,50 @@ pub unsafe extern "system" fn ldr_access_resource(
     }
 }
 
+/// `LdrLoadAlternateResourceModule(PVOID Module, PWSTR Buffer) -> NTSTATUS`.
+///
+/// ReactOS has alternate resources disabled, so this is a successful no-op there. Match that path:
+/// no MUI module is loaded and the caller keeps using the base module resources.
+///
+/// # Safety
+/// `module` is a mapped module and `buffer` is optional scratch storage from the caller.
+#[export_name = "LdrLoadAlternateResourceModule"]
+pub unsafe extern "system" fn ldr_load_alternate_resource_module(
+    _module: *mut c_void,
+    _buffer: *mut u16,
+) -> NtStatus {
+    if ldr_alternate_resources_enabled() == 0 {
+        STATUS_SUCCESS
+    } else {
+        STATUS_MUI_FILE_NOT_FOUND
+    }
+}
+
+/// `LdrLoadAlternateResourceModuleEx(...) -> NTSTATUS`.
+///
+/// Extended MUI loader. Alternate resources are disabled, matching ReactOS' non-Ex path; report that
+/// no satellite module was loaded by clearing the optional out handle and returning success.
+///
+/// # Safety
+/// `resource_module` is null or writable.
+#[export_name = "LdrLoadAlternateResourceModuleEx"]
+pub unsafe extern "system" fn ldr_load_alternate_resource_module_ex(
+    _flags: u32,
+    _module: *mut c_void,
+    _buffer: *mut u16,
+    resource_module: *mut *mut c_void,
+    _language_id: u32,
+) -> NtStatus {
+    if !resource_module.is_null() {
+        unsafe { *resource_module = core::ptr::null_mut() };
+    }
+    if ldr_alternate_resources_enabled() == 0 {
+        STATUS_SUCCESS
+    } else {
+        STATUS_MUI_FILE_NOT_FOUND
+    }
+}
+
 /// `LdrUnloadAlternateResourceModule(PVOID BaseAddress) -> BOOLEAN` — unload a MUI/satellite
 /// resource module. None loaded → TRUE (nothing to unload).
 ///
@@ -6939,6 +7358,26 @@ pub unsafe extern "system" fn ldr_unload_alternate_resource_module(
     _base_address: *mut c_void,
 ) -> u8 {
     1
+}
+
+/// `LdrUnloadAlternateResourceModuleEx(ULONG Flags, PVOID BaseAddress) -> BOOLEAN`.
+///
+/// # Safety
+/// `base_address` is a module base or NULL.
+#[export_name = "LdrUnloadAlternateResourceModuleEx"]
+pub unsafe extern "system" fn ldr_unload_alternate_resource_module_ex(
+    _flags: u32,
+    _base_address: *mut c_void,
+) -> u8 {
+    1
+}
+
+/// `LdrFlushAlternateResourceModules() -> BOOLEAN`.
+///
+/// ReactOS returns FALSE because alternate resources are unsupported.
+#[export_name = "LdrFlushAlternateResourceModules"]
+pub extern "system" fn ldr_flush_alternate_resource_modules() -> u8 {
+    0
 }
 
 // =================================================================================================
@@ -17965,6 +18404,11 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_assert as usize,
         ldr_query_image_file_execution_options as usize,
         ldr_verify_image_matches_checksum as usize,
+        ldr_verify_image_matches_checksum_ex as usize,
+        ldr_get_failure_data as usize,
+        ldr_process_initialization_complete as usize,
+        ldr_query_module_service_tags as usize,
+        ldr_set_mui_cache_type as usize,
         dbg_print as usize,
         dbg_break_point as usize,
         dbg_user_break_point as usize,
@@ -18588,6 +19032,10 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_init_shim_engine_dynamic as usize,
         ldr_disable_thread_callouts_for_dll as usize,
         ldr_add_ref_dll as usize,
+        ldr_alternate_resources_enabled as usize,
+        ldr_add_load_as_data_table as usize,
+        ldr_remove_load_as_data_table as usize,
+        ldr_get_file_name_from_load_as_data_table as usize,
         ldr_register_dll_notification as usize,
         ldr_unregister_dll_notification as usize,
         ldr_get_dll_handle_ex as usize,
@@ -18598,9 +19046,14 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_open_image_file_options_key as usize,
         ldr_query_image_file_key_option as usize,
         ldr_find_resource_u as usize,
+        ldr_find_resource_ex_u as usize,
         ldr_find_resource_directory_u as usize,
         ldr_access_resource as usize,
+        ldr_load_alternate_resource_module as usize,
+        ldr_load_alternate_resource_module_ex as usize,
         ldr_unload_alternate_resource_module as usize,
+        ldr_unload_alternate_resource_module_ex as usize,
+        ldr_flush_alternate_resource_modules as usize,
     ];
     core::hint::black_box(anchors_ldr);
     let anchors_pathenv: &[usize] = &[
