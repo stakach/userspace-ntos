@@ -19117,6 +19117,126 @@ pub unsafe extern "C" fn dbg_prompt(prompt: *const u8, response: *mut u8, length
     0
 }
 
+/// `ShipAssert(...)` — checked-build diagnostic hook. Retail-compatible no-op.
+#[export_name = "ShipAssert"]
+pub extern "system" fn ship_assert(_a: usize, _b: usize) -> u32 {
+    0
+}
+
+/// `ShipAssertMsgA(...)` — checked-build diagnostic hook. Retail-compatible no-op.
+#[export_name = "ShipAssertMsgA"]
+pub extern "system" fn ship_assert_msg_a(_a: usize, _b: usize) -> u32 {
+    0
+}
+
+/// `ShipAssertMsgW(...)` — checked-build diagnostic hook. Retail-compatible no-op.
+#[export_name = "ShipAssertMsgW"]
+pub extern "system" fn ship_assert_msg_w(_a: usize, _b: usize) -> u32 {
+    0
+}
+
+/// `ShipAssertGetBufferInfo(PVOID*, PULONG)` — no ship-assert buffer is installed.
+///
+/// # Safety
+/// Output pointers are null or writable.
+#[export_name = "ShipAssertGetBufferInfo"]
+pub unsafe extern "system" fn ship_assert_get_buffer_info(
+    buffer: *mut *mut c_void,
+    size: *mut u32,
+) -> u32 {
+    if !buffer.is_null() {
+        // SAFETY: caller supplied a writable output slot.
+        unsafe { *buffer = core::ptr::null_mut() };
+    }
+    if !size.is_null() {
+        // SAFETY: caller supplied a writable output slot.
+        unsafe { *size = 0 };
+    }
+    0
+}
+
+/// `WerCheckEventEscalation(...)` — WER is disabled; report no escalation.
+///
+/// # Safety
+/// `escalated` is null or writable.
+#[export_name = "WerCheckEventEscalation"]
+pub unsafe extern "system" fn wer_check_event_escalation(_event: u32, escalated: *mut u32) -> u32 {
+    if !escalated.is_null() {
+        // SAFETY: caller supplied a writable output slot.
+        unsafe { *escalated = 0 };
+    }
+    0
+}
+
+/// `WerReportSQMEvent(...)` — telemetry disabled; event accepted and dropped.
+#[export_name = "WerReportSQMEvent"]
+pub extern "system" fn wer_report_sqm_event(_a: usize, _b: usize, _c: usize) -> u32 {
+    0
+}
+
+/// `WerReportWatsonEvent(...)` — telemetry disabled; event accepted and dropped.
+#[export_name = "WerReportWatsonEvent"]
+pub extern "system" fn wer_report_watson_event(_a: usize, _b: usize, _c: usize, _d: usize) -> u32 {
+    0
+}
+
+/// `WinSqmStartSession(...)` — SQM telemetry disabled; no session handle.
+#[export_name = "WinSqmStartSession"]
+pub extern "system" fn win_sqm_start_session(_session_name: *const c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// `WinSqmEndSession(...)` — SQM telemetry disabled; no-op.
+#[export_name = "WinSqmEndSession"]
+pub extern "system" fn win_sqm_end_session(_session: *mut c_void) -> u32 {
+    0
+}
+
+/// `WinSqmIsOptedIn()` — telemetry opt-in is false.
+#[export_name = "WinSqmIsOptedIn"]
+pub extern "system" fn win_sqm_is_opted_in() -> u32 {
+    0
+}
+
+/// `WinSqmEventEnabled(...)` — telemetry disabled; event is not enabled.
+#[export_name = "WinSqmEventEnabled"]
+pub extern "system" fn win_sqm_event_enabled(_event_id: u32, _session: *mut c_void) -> u32 {
+    0
+}
+
+/// `WinSqmEventWrite(...)` — telemetry disabled; event accepted and dropped.
+#[export_name = "WinSqmEventWrite"]
+pub extern "system" fn win_sqm_event_write(_a: usize, _b: usize, _c: usize) -> u32 {
+    0
+}
+
+/// `WinSqmAddToStream(...)` — telemetry disabled; event accepted and dropped.
+#[export_name = "WinSqmAddToStream"]
+pub extern "system" fn win_sqm_add_to_stream(
+    _session: *mut c_void,
+    _stream: u32,
+    _kind: u32,
+    _value: usize,
+) -> u32 {
+    0
+}
+
+/// `WinSqmSetString(...)` — telemetry disabled; string accepted and dropped.
+#[export_name = "WinSqmSetString"]
+pub extern "system" fn win_sqm_set_string(
+    _session: *mut c_void,
+    _id: u32,
+    _value: *const u16,
+) -> u32 {
+    0
+}
+
+/// `__misaligned_access()` — x64 compatibility diagnostic hook; no-op.
+#[export_name = "__misaligned_access"]
+pub extern "C" fn misaligned_access() -> u32 {
+    0
+}
+
 macro_rules! dbgui_noop {
     ($export:literal, $fn:ident) => {
         /// `DbgUi*` debugger-attach surface — no user-mode debugger present; returns
@@ -20523,6 +20643,21 @@ pub unsafe extern "C" fn export_anchor() {
         vdbg_print_ex as usize,
         vdbg_print_ex_with_prefix as usize,
         dbg_prompt as usize,
+        ship_assert as usize,
+        ship_assert_msg_a as usize,
+        ship_assert_msg_w as usize,
+        ship_assert_get_buffer_info as usize,
+        wer_check_event_escalation as usize,
+        wer_report_sqm_event as usize,
+        wer_report_watson_event as usize,
+        win_sqm_start_session as usize,
+        win_sqm_end_session as usize,
+        win_sqm_is_opted_in as usize,
+        win_sqm_event_enabled as usize,
+        win_sqm_event_write as usize,
+        win_sqm_add_to_stream as usize,
+        win_sqm_set_string as usize,
+        misaligned_access as usize,
         dbg_ui_connect_to_dbg as usize,
         dbg_ui_continue as usize,
         dbg_ui_convert_state_change_structure as usize,
