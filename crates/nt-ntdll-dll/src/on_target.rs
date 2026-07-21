@@ -3496,9 +3496,9 @@ pub unsafe fn rtl_set_environment_variable(
     value: *const u8,
 ) -> u32 {
     use alloc::string::String;
-    // Read a UNICODE_STRING (Length@0 u16 bytes, Buffer@8).
+    // Read a required UNICODE_STRING (Length@0 u16 bytes, Buffer@8).
     // SAFETY: p is a valid UNICODE_STRING per the contract.
-    unsafe fn read_ustr(p: *const u8) -> Option<String> {
+    unsafe fn read_required_ustr(p: *const u8) -> Option<String> {
         if p.is_null() {
             return None;
         }
@@ -3516,13 +3516,36 @@ pub unsafe fn rtl_set_environment_variable(
         let units = unsafe { core::slice::from_raw_parts(buf, len_bytes / 2) };
         Some(String::from_utf16_lossy(units))
     }
+
+    // Read an optional value UNICODE_STRING. ReactOS treats `Value == NULL` and
+    // `Value->Buffer == NULL` as delete; an empty non-null buffer is a set-to-empty.
+    // SAFETY: p is NULL or a valid UNICODE_STRING.
+    unsafe fn read_optional_value_ustr(p: *const u8) -> Option<String> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: valid UNICODE_STRING.
+        let (len_bytes, buf) = unsafe {
+            (
+                core::ptr::read_unaligned(p as *const u16) as usize,
+                core::ptr::read_unaligned(p.add(8) as *const u64) as *const u16,
+            )
+        };
+        if buf.is_null() {
+            return None;
+        }
+        // SAFETY: [buf, buf+len_bytes/2) is the string body.
+        let units = unsafe { core::slice::from_raw_parts(buf, len_bytes / 2) };
+        Some(String::from_utf16_lossy(units))
+    }
+
     // SAFETY: reading the caller's UNICODE_STRINGs.
-    let name_s = match unsafe { read_ustr(name) } {
+    let name_s = match unsafe { read_required_ustr(name) } {
         Some(s) if !s.is_empty() => s,
         _ => return 0xC000_000D, // STATUS_INVALID_PARAMETER
     };
     // SAFETY: reading the value (NULL → delete).
-    let val_s = unsafe { read_ustr(value) };
+    let val_s = unsafe { read_optional_value_ustr(value) };
 
     // Locate the target block pointer: *environment if given, else the PEB process-env slot.
     let mut peb_params: u64 = 0;
@@ -3548,9 +3571,11 @@ pub unsafe fn rtl_set_environment_variable(
     // Edit the block.
     // SAFETY: cur_ptr is a valid double-NUL-terminated block (or null → empty).
     let mut env = unsafe { read_env_block(cur_ptr) };
-    env.set(&name_s, val_s.as_deref());
+    if env.set_checked(&name_s, val_s.as_deref()).is_err() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
     let block = env.to_block(); // Vec<u16>, double-NUL-terminated
-    let bytes = block.len() * 2;
+    let bytes = core::cmp::max(block.len(), 2) * 2;
 
     // Allocate + copy the new block.
     // SAFETY: process heap alloc.
@@ -3560,6 +3585,7 @@ pub unsafe fn rtl_set_environment_variable(
     }
     // SAFETY: dst is a fresh bytes-byte region.
     unsafe {
+        core::ptr::write_bytes(dst, 0, bytes / 2);
         core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
     }
 
@@ -3646,6 +3672,9 @@ pub unsafe fn rtl_query_environment_variable_u(
             // BasepComputeProcessPath re-allocates `EnvPath.Length + sizeof(WCHAR)` and re-queries;
             // returning the CHAR count here (half the bytes) under-allocated → the re-query failed
             // BUFFER_TOO_SMALL again → BaseComputeProcessDllPath returned NULL → CreateProcessW bailed.
+            if !out_buf.is_null() && max_bytes >= 2 {
+                core::ptr::write(out_buf, 0);
+            }
             core::ptr::write_unaligned(value as *mut u16, needed_bytes as u16);
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -3716,7 +3745,6 @@ pub unsafe fn rtl_expand_environment_strings_u(
         let max_bytes = core::ptr::read_unaligned(destination.add(2) as *const u16) as usize;
         let out = core::ptr::read_unaligned(destination.add(8) as *const u64) as *mut u16;
         if needed_bytes > max_bytes || out.is_null() {
-            core::ptr::write_unaligned(destination as *mut u16, (body_units * 2) as u16); // Length
             return STATUS_BUFFER_TOO_SMALL;
         }
         core::ptr::copy_nonoverlapping(expanded.as_ptr(), out, expanded.len());

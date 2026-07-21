@@ -11,6 +11,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use nt_ntdll_layout::RTL_USER_PROC_PARAMS_NORMALIZED;
 
@@ -45,11 +46,8 @@ impl Environment {
                 let entry: String = char::decode_utf16(block[start..i].iter().copied())
                     .map(|r| r.unwrap_or('\u{FFFD}'))
                     .collect();
-                if let Some(eq) = entry.find('=') {
-                    // Skip the leading '=' of drive-letter "=C:" cwd markers only if name is empty.
-                    if eq != 0 {
-                        vars.push((entry[..eq].into(), entry[eq + 1..].into()));
-                    }
+                if let Some(eq) = environment_entry_separator(&entry) {
+                    vars.push((entry[..eq].into(), entry[eq + 1..].into()));
                 }
                 start = i + 1;
             }
@@ -65,6 +63,9 @@ impl Environment {
             out.extend(k.encode_utf16());
             out.push(b'=' as u16);
             out.extend(v.encode_utf16());
+            out.push(0);
+        }
+        if out.is_empty() {
             out.push(0);
         }
         out.push(0); // terminating double NUL
@@ -92,15 +93,38 @@ impl Environment {
     /// `RtlSetEnvironmentVariable` — set (or, with `value == None`, delete) a variable
     /// (case-insensitive name match).
     pub fn set(&mut self, name: &str, value: Option<&str>) {
-        let pos = self.vars.iter().position(|(k, _)| k.eq_ignore_ascii_case(name));
+        let _ = self.set_checked(name, value);
+    }
+
+    /// Checked `RtlSetEnvironmentVariable` model. ReactOS rejects an empty name and rejects `=`
+    /// anywhere except the first character (which is reserved for hidden drive-current-directory
+    /// variables such as `=C:`).
+    pub fn set_checked(
+        &mut self,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<(), EnvironmentSetError> {
+        validate_variable_name(name)?;
+        let pos = self
+            .vars
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(name));
         match (pos, value) {
             (Some(i), Some(v)) => self.vars[i].1 = v.into(),
             (Some(i), None) => {
                 self.vars.remove(i);
             }
-            (None, Some(v)) => self.vars.push((name.into(), v.into())),
+            (None, Some(v)) => {
+                let insert_at = self
+                    .vars
+                    .iter()
+                    .position(|(k, _)| compare_variable_names(k, name) == Ordering::Greater)
+                    .unwrap_or(self.vars.len());
+                self.vars.insert(insert_at, (name.into(), v.into()));
+            }
             (None, None) => {}
         }
+        Ok(())
     }
 
     /// `RtlExpandEnvironmentStrings_U` — replace each `%NAME%` with its value (unknown → left as-is,
@@ -130,6 +154,47 @@ impl Environment {
             i += 1;
         }
         out
+    }
+}
+
+/// Error returned by [`Environment::set_checked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentSetError {
+    InvalidName,
+}
+
+/// ReactOS-compatible environment-variable name validation.
+pub fn validate_variable_name(name: &str) -> Result<(), EnvironmentSetError> {
+    if name.is_empty() || name.chars().skip(1).any(|c| c == '=') {
+        return Err(EnvironmentSetError::InvalidName);
+    }
+    Ok(())
+}
+
+fn environment_entry_separator(entry: &str) -> Option<usize> {
+    let start = if entry.starts_with('=') { 1 } else { 0 };
+    entry[start..].find('=').map(|rel| start + rel)
+}
+
+fn compare_variable_names(left: &str, right: &str) -> Ordering {
+    let mut l = left.chars().map(fold_env_char);
+    let mut r = right.chars().map(fold_env_char);
+    loop {
+        match (l.next(), r.next()) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => return a.cmp(&b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+fn fold_env_char(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else {
+        c
     }
 }
 
@@ -199,7 +264,9 @@ pub fn full_path_units(name: &[u16], cwd: &[u16]) -> Vec<u16> {
         cd.set(&cwd_s);
     }
     let full = cd.full_path(&name_s);
-    full.encode_utf16().map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c }).collect()
+    full.encode_utf16()
+        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
+        .collect()
 }
 
 /// Whether a DOS path is absolute (`X:\...` drive-absolute or `\\...` UNC).
@@ -262,6 +329,7 @@ pub fn is_normalized(flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     extern crate std;
+    use alloc::vec;
     use super::*;
 
     #[test]
@@ -274,6 +342,26 @@ mod tests {
         assert_eq!(e.query("Path"), Some("C:\\Windows"));
         e.set("Path", None); // delete
         assert_eq!(e.query("Path"), None);
+    }
+
+    #[test]
+    fn env_set_rejects_invalid_names_and_sorts_insertions() {
+        let mut e = Environment::new();
+        assert_eq!(
+            e.set_checked("", Some("bad")),
+            Err(EnvironmentSetError::InvalidName)
+        );
+        assert_eq!(
+            e.set_checked("A=B", Some("bad")),
+            Err(EnvironmentSetError::InvalidName)
+        );
+        e.set_checked("Path", Some("C:\\bin")).unwrap();
+        e.set_checked("ComSpec", Some("cmd.exe")).unwrap();
+        e.set_checked("windir", Some("C:\\Windows")).unwrap();
+        assert_eq!(
+            e.vars.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["ComSpec", "Path", "windir"]
+        );
     }
 
     #[test]
@@ -290,6 +378,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_block_is_probeable_double_nul() {
+        let e = Environment::new();
+        assert_eq!(e.to_block(), [0, 0]);
+    }
+
+    #[test]
+    fn env_block_parses_hidden_drive_current_directory_entries() {
+        let mut block: Vec<u16> = "=C:=C:\\Windows\0Path=C:\\bin\0\0"
+            .encode_utf16()
+            .collect();
+        let e = Environment::from_block(&block);
+        assert_eq!(e.query("=C:"), Some("C:\\Windows"));
+        assert_eq!(e.query("Path"), Some("C:\\bin"));
+
+        let mut out = Environment::new();
+        out.set_checked("Path", Some("C:\\bin")).unwrap();
+        out.set_checked("=C:", Some("C:\\Windows")).unwrap();
+        block = out.to_block();
+        let e2 = Environment::from_block(&block);
+        assert_eq!(e2.query("=C:"), Some("C:\\Windows"));
+    }
+
+    #[test]
     fn from_block_keeps_last_var_when_slice_includes_terminating_nul() {
         // The on-target `read_env_block` measures to the double-NUL and must INCLUDE the first NUL of
         // the double-NUL so `from_block` emits the LAST variable (it only emits on a NUL). This test
@@ -299,16 +410,18 @@ mod tests {
         e.set("SystemRoot", Some("C:\\Windows"));
         e.set("Path", Some("C:\\WinSys"));
         let block = e.to_block(); // ...Path=C:\WinSys\0\0
-        // Emulate read_env_block's slice: up to AND INCLUDING the first NUL of the double-NUL
-        // (block.len()-1 drops only the final lone NUL, keeping the last var's own NUL).
+                                  // Emulate read_env_block's slice: up to AND INCLUDING the first NUL of the double-NUL
+                                  // (block.len()-1 drops only the final lone NUL, keeping the last var's own NUL).
         let sliced = &block[..block.len() - 1];
         let e2 = Environment::from_block(sliced);
         assert_eq!(e2.vars_len(), 2, "last variable must not be dropped");
         assert_eq!(e2.query("SystemRoot"), Some("C:\\Windows"));
         assert_eq!(e2.query("Path"), Some("C:\\WinSys"));
-        // And the buggy slice (dropping the last var's NUL too) drops Path — the regression guard.
-        let over_trimmed = &block[..block.len() - 2 - "C:\\WinSys".len() - 1];
-        let e3 = Environment::from_block(over_trimmed);
+        // And a buggy slice that drops the last var's NUL too drops Path.
+        let over_trimmed: Vec<u16> = "SystemRoot=C:\\Windows\0Path=C:\\WinSys"
+            .encode_utf16()
+            .collect();
+        let e3 = Environment::from_block(&over_trimmed);
         assert!(e3.query("Path").is_none());
     }
 
@@ -334,7 +447,10 @@ mod tests {
         let mut cd = CurrentDirectory::default();
         cd.set("C:\\Windows\\System32");
         // Relative.
-        assert_eq!(cd.full_path("ntdll.dll"), "C:\\Windows\\System32\\ntdll.dll");
+        assert_eq!(
+            cd.full_path("ntdll.dll"),
+            "C:\\Windows\\System32\\ntdll.dll"
+        );
         // Absolute passes through (canonicalized).
         assert_eq!(cd.full_path("D:\\a\\b"), "D:\\a\\b");
         // Rooted driveless takes the cwd drive.
@@ -348,20 +464,35 @@ mod tests {
         let u = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
         let s = |v: &[u16]| -> String { String::from_utf16(v).unwrap() };
         // winlogon → services.exe: relative name resolved against C:\Windows.
-        assert_eq!(s(&full_path_units(&u("services.exe"), &u("C:\\Windows"))), "C:\\Windows\\services.exe");
+        assert_eq!(
+            s(&full_path_units(&u("services.exe"), &u("C:\\Windows"))),
+            "C:\\Windows\\services.exe"
+        );
         // Absolute passes through.
-        assert_eq!(s(&full_path_units(&u("D:\\x\\y.exe"), &u("C:\\Windows"))), "D:\\x\\y.exe");
+        assert_eq!(
+            s(&full_path_units(&u("D:\\x\\y.exe"), &u("C:\\Windows"))),
+            "D:\\x\\y.exe"
+        );
         // Rooted driveless takes the cwd drive.
-        assert_eq!(s(&full_path_units(&u("\\dir\\f"), &u("C:\\Windows"))), "C:\\dir\\f");
+        assert_eq!(
+            s(&full_path_units(&u("\\dir\\f"), &u("C:\\Windows"))),
+            "C:\\dir\\f"
+        );
         // Forward slashes normalise to backslashes.
-        assert_eq!(s(&full_path_units(&u("sub/f.exe"), &u("C:\\Windows"))), "C:\\Windows\\sub\\f.exe");
+        assert_eq!(
+            s(&full_path_units(&u("sub/f.exe"), &u("C:\\Windows"))),
+            "C:\\Windows\\sub\\f.exe"
+        );
     }
 
     #[test]
     fn canonicalize_paths() {
         assert_eq!(canonicalize("C:\\a\\.\\b\\..\\c"), "C:\\a\\c");
         assert_eq!(canonicalize("C:\\a\\b\\..\\.."), "C:\\");
-        assert_eq!(canonicalize("\\\\server\\share\\a\\..\\b"), "\\\\server\\share\\b");
+        assert_eq!(
+            canonicalize("\\\\server\\share\\a\\..\\b"),
+            "\\\\server\\share\\b"
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@ const NLS_TABLEINFO_UPPER_OFFSET: usize = 0x80;
 const NLS_TABLEINFO_LOWER_OFFSET: usize = 0x88;
 const NLS_CP_CODE_PAGE: usize = 0x00;
 const NLS_CP_DEFAULT_CHAR: usize = 0x04;
+const NLS_CP_UNI_DEFAULT_CHAR: usize = 0x06;
 const NLS_CP_TRANS_DEFAULT_CHAR: usize = 0x08;
 const NLS_CP_DBCS_CODE_PAGE: usize = 0x0C;
 const NLS_CP_MULTI_BYTE_TABLE: usize = 0x20;
@@ -6603,6 +6604,9 @@ pub unsafe extern "system" fn rtl_get_current_directory_u(
     unsafe {
         let peb: *const u8;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        if peb.is_null() {
+            return 0;
+        }
         let params = *(peb.add(0x20) as *const *const u8);
         if params.is_null() {
             return 0;
@@ -6614,14 +6618,34 @@ pub unsafe extern "system" fn rtl_get_current_directory_u(
             return 0;
         }
         let units = len / 2;
-        // Need room for the string + a NUL (+ a trailing backslash if not present — RtlGetCurrentDir
-        // guarantees a trailing '\'; we keep it simple and copy as-is + NUL).
-        if (buffer_length as usize) < len + 2 || buffer.is_null() {
-            return (len + 2) as u32;
+        if units == 0 {
+            return 0;
         }
+        let has_trailing_slash = *src.add(units - 1) == b'\\' as u16;
+        if !has_trailing_slash {
+            let required = len + 2;
+            if buffer.is_null() || (buffer_length as usize) < required {
+                return required as u32;
+            }
+            core::ptr::copy_nonoverlapping(src, buffer, units);
+            *buffer.add(units) = 0;
+            return len as u32;
+        }
+
+        let is_drive_root = units <= 1 || (units >= 2 && *src.add(units - 2) == b':' as u16);
+        let required = if is_drive_root { len + 2 } else { len };
+        if buffer.is_null() || (buffer_length as usize) < required {
+            return required as u32;
+        }
+
         core::ptr::copy_nonoverlapping(src, buffer, units);
-        *buffer.add(units) = 0;
-        len as u32
+        if is_drive_root {
+            *buffer.add(units) = 0;
+            len as u32
+        } else {
+            *buffer.add(units - 1) = 0;
+            (len - 2) as u32
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -6630,10 +6654,10 @@ pub unsafe extern "system" fn rtl_get_current_directory_u(
     }
 }
 
-/// `RtlSetCurrentDirectory_U(PCUNICODE_STRING Path) -> NTSTATUS` — set the CWD. Updates
-/// `PEB->ProcessParameters->CurrentDirectory.DosPath` in place (copies into the existing buffer if
-/// it fits). This is the pure PEB-update part; the real Rtl also opens a handle to the directory —
-/// deferred (no CWD-handle consumer on the boot path), so we do the observable PEB update.
+/// `RtlSetCurrentDirectory_U(PCUNICODE_STRING Path) -> NTSTATUS` — set the CWD. Canonicalizes the
+/// input against the current PEB CWD, stores a trailing-slash DOS path in
+/// `PEB->ProcessParameters->CurrentDirectory.DosPath`, and updates the string length. Opening and
+/// caching the directory handle is deferred until a live CWD-handle consumer exists.
 ///
 /// # Safety
 /// `path` a valid UNICODE_STRING.
@@ -6652,15 +6676,33 @@ pub unsafe extern "system" fn rtl_set_current_directory_u(path: PCUnicodeString)
             return STATUS_INVALID_PARAMETER;
         }
         let cd = params.add(0x38) as *mut u8;
-        let (src, len) = ((*path).buffer as *const u16, (*path).length);
-        let dst = *(cd.add(8) as *const *mut u16); // existing DosPath.Buffer
-        let dst_max = *(cd.add(2) as *const u16); // MaximumLength
-        if dst.is_null() || len + 2 > dst_max || src.is_null() {
-            return STATUS_BUFFER_TOO_SMALL;
+        let (src, len) = ((*path).buffer as *const u16, (*path).length as usize);
+        if src.is_null() || len == 0 {
+            return STATUS_OBJECT_NAME_INVALID;
         }
-        core::ptr::copy_nonoverlapping(src, dst, (len / 2) as usize);
-        *dst.add((len / 2) as usize) = 0;
-        *(cd as *mut u16) = len; // update Length
+        let dst = *(cd.add(8) as *const *mut u16); // existing DosPath.Buffer
+        let dst_max = *(cd.add(2) as *const u16) as usize; // MaximumLength
+        if dst.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let input = core::slice::from_raw_parts(src, len / 2);
+        let cwd = peb_current_directory();
+        let mut full = nt_ntdll::rtl::environment::full_path_units(input, &cwd);
+        if full.is_empty() {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+        if full.last().copied() != Some(b'\\' as u16) {
+            full.push(b'\\' as u16);
+        }
+
+        let needed = (full.len() + 1) * 2;
+        if needed > dst_max || full.len() > (u16::MAX as usize / 2) {
+            return STATUS_NAME_TOO_LONG;
+        }
+        core::ptr::copy_nonoverlapping(full.as_ptr(), dst, full.len());
+        *dst.add(full.len()) = 0;
+        *(cd as *mut u16) = (full.len() * 2) as u16; // update Length
         STATUS_SUCCESS
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -14386,13 +14428,48 @@ unsafe fn rtl_custom_cp_to_unicode_n_impl(
     let cp = custom_cp as *const u8;
     // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
     let dbcs = unsafe { core::ptr::read_unaligned(cp.add(0x0C) as *const u16) };
-    if dbcs != 0 {
-        return STATUS_NOT_IMPLEMENTED;
-    }
     // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
     let multibyte = unsafe { core::ptr::read_unaligned(cp.add(0x20) as *const *const u16) };
-    if count != 0 && multibyte.is_null() {
+    if custom_size != 0 && multibyte.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if dbcs != 0 {
+        // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
+        let dbcs_offsets =
+            unsafe { core::ptr::read_unaligned(cp.add(NLS_CP_DBCS_OFFSETS) as *const *const u16) };
+        if custom_size != 0 && dbcs_offsets.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let max_units = unicode_size as usize / 2;
+        let mut src = 0usize;
+        let mut written = 0usize;
+        let uni_default =
+            unsafe { core::ptr::read_unaligned(cp.add(NLS_CP_UNI_DEFAULT_CHAR) as *const u16) };
+        // SAFETY: tables and buffers are valid per the contract and checks above.
+        unsafe {
+            while src < custom_size as usize && written < max_units {
+                let byte = core::ptr::read(custom_string.add(src));
+                src += 1;
+                let off = core::ptr::read_unaligned(dbcs_offsets.add(byte as usize));
+                let unit = if off != 0 {
+                    if src < custom_size as usize && core::ptr::read(custom_string.add(src)) != 0 {
+                        let trail = core::ptr::read(custom_string.add(src));
+                        src += 1;
+                        core::ptr::read_unaligned(dbcs_offsets.add(off as usize + trail as usize))
+                    } else {
+                        uni_default
+                    }
+                } else {
+                    core::ptr::read_unaligned(multibyte.add(byte as usize))
+                };
+                core::ptr::write(unicode_string.add(written), unit);
+                written += 1;
+            }
+            if !result_size.is_null() {
+                core::ptr::write(result_size, (written * 2) as u32);
+            }
+        }
+        return STATUS_SUCCESS;
     }
     // SAFETY: the table and caller buffers are valid per the contract.
     unsafe {
@@ -14426,13 +14503,44 @@ unsafe fn rtl_unicode_to_custom_cp_n_impl(
     let cp = custom_cp as *const u8;
     // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
     let dbcs = unsafe { core::ptr::read_unaligned(cp.add(0x0C) as *const u16) };
-    if dbcs != 0 {
-        return STATUS_NOT_IMPLEMENTED;
-    }
     // SAFETY: custom_cp is a CPTABLEINFO pointer per the contract.
-    let widechar = unsafe { core::ptr::read_unaligned(cp.add(0x28) as *const *const u8) };
-    if count != 0 && widechar.is_null() {
+    let widechar =
+        unsafe { core::ptr::read_unaligned(cp.add(NLS_CP_WIDE_CHAR_TABLE) as *const *const u8) };
+    if unicode_size != 0 && widechar.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if dbcs != 0 {
+        let table = widechar as *const u16;
+        let units = unicode_size as usize / 2;
+        let capacity = custom_size as usize;
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+        // SAFETY: table and caller buffers are valid per the contract and checks above.
+        unsafe {
+            while consumed < units && written < capacity {
+                let mut unit = core::ptr::read(unicode_string.add(consumed));
+                if upcase {
+                    unit = nls_upcase_unit(unit);
+                }
+                let mb = core::ptr::read_unaligned(table.add(unit as usize));
+                let high = (mb >> 8) as u8;
+                let low = (mb & 0xFF) as u8;
+                if high != 0 {
+                    if capacity - written < 2 {
+                        break;
+                    }
+                    core::ptr::write(custom_string.add(written), high);
+                    written += 1;
+                }
+                core::ptr::write(custom_string.add(written), low);
+                written += 1;
+                consumed += 1;
+            }
+            if !result_size.is_null() {
+                core::ptr::write(result_size, written as u32);
+            }
+        }
+        return STATUS_SUCCESS;
     }
     // SAFETY: the table and caller buffers are valid per the contract.
     unsafe {
