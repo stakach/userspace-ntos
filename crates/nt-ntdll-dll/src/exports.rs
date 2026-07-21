@@ -26,8 +26,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "x86_64"))]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use nt_ntdll::rtl;
 use nt_ntdll_layout::UnicodeString;
@@ -55,6 +56,8 @@ static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
 static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
 #[cfg(not(target_arch = "x86_64"))]
 static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
+static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
+static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
@@ -224,6 +227,12 @@ pub unsafe extern "system" fn rtl_init_ansi_string(dst: PUnicodeString, src: *co
 #[export_name = "RtlUpcaseUnicodeChar"]
 pub extern "system" fn rtl_upcase_unicode_char(c: u16) -> u16 {
     rtl::strings::upcase_char(c)
+}
+
+/// `RtlDowncaseUnicodeChar(WCHAR) -> WCHAR`.
+#[export_name = "RtlDowncaseUnicodeChar"]
+pub extern "system" fn rtl_downcase_unicode_char(c: u16) -> u16 {
+    rtl::strings::downcase_char(c)
 }
 
 /// Read a `UNICODE_STRING`'s buffer as a `&[u16]` slice (Length is in bytes).
@@ -1165,6 +1174,28 @@ unsafe fn current_peb() -> u64 {
     peb
 }
 
+/// `RtlGetCurrentPeb() -> PPEB`.
+///
+/// # Safety
+/// Reads the current TEB's `ProcessEnvironmentBlock` pointer.
+#[export_name = "RtlGetCurrentPeb"]
+pub unsafe extern "system" fn rtl_get_current_peb() -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { current_peb() as *mut c_void }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlDllShutdownInProgress() -> BOOLEAN`.
+#[export_name = "RtlDllShutdownInProgress"]
+pub extern "system" fn rtl_dll_shutdown_in_progress() -> u8 {
+    u8::from(RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0)
+}
+
 /// `RtlAcquirePebLock()` — enter `PEB->FastPebLock` (a `RTL_CRITICAL_SECTION*` @ PEB+0x38).
 ///
 /// kernel32's early init (and many Rtl paths) serialize PEB access through this lock. Single-threaded
@@ -1215,6 +1246,12 @@ pub unsafe extern "system" fn rtl_get_nt_global_flags() -> u32 {
 /// `RtlNtStatusToDosError(NTSTATUS) -> ULONG` — map an NTSTATUS to a Win32 error (`nt-ntdll` logic).
 #[export_name = "RtlNtStatusToDosError"]
 pub extern "system" fn rtl_nt_status_to_dos_error(status: u32) -> u32 {
+    rtl::status::nt_status_to_dos_error(status)
+}
+
+/// `RtlNtStatusToDosErrorNoTeb(NTSTATUS) -> ULONG`.
+#[export_name = "RtlNtStatusToDosErrorNoTeb"]
+pub extern "system" fn rtl_nt_status_to_dos_error_no_teb(status: u32) -> u32 {
     rtl::status::nt_status_to_dos_error(status)
 }
 
@@ -3073,6 +3110,16 @@ pub unsafe extern "system" fn rtl_unhandled_exception_filter(ptrs: *mut c_void) 
     nt_ntdll::rtl::exception::unhandled_exception_filter(code)
 }
 
+/// `RtlSetUnhandledExceptionFilter(PRTLP_UNHANDLED_EXCEPTION_FILTER Filter)`.
+///
+/// # Safety
+/// Stores the caller-supplied function pointer after ntdll pointer encoding.
+#[export_name = "RtlSetUnhandledExceptionFilter"]
+pub unsafe extern "system" fn rtl_set_unhandled_exception_filter(filter: *mut c_void) {
+    let encoded = nt_ntdll::rtl::encode::encode_pointer(filter as u64, process_cookie());
+    RTL_UNHANDLED_EXCEPTION_FILTER.store(encoded, Ordering::Release);
+}
+
 /// `memmove(void* dst, const void* src, size_t n) -> void*` — overlap-safe copy. csrsrv imports it
 /// from ntdll. `core::ptr::copy` is memmove semantics (handles overlap). Weak (like memcpy/memset):
 /// `compiler-builtins-mem` also emits a `memmove`, so ours must be weak to avoid a duplicate-strong
@@ -4432,6 +4479,7 @@ pub unsafe extern "system" fn ldr_enumerate_loaded_modules(
 /// Reads no memory.
 #[export_name = "LdrShutdownProcess"]
 pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
+    RTL_DLL_SHUTDOWN_IN_PROGRESS.store(1, Ordering::Release);
     STATUS_SUCCESS
 }
 
@@ -8404,6 +8452,23 @@ pub unsafe extern "system" fn rtl_random(seed: *mut u32) -> u32 {
     }
 }
 
+/// `RtlRandomEx(PULONG Seed) -> ULONG`.
+///
+/// # Safety
+/// `seed` a valid writable u32.
+#[export_name = "RtlRandomEx"]
+pub unsafe extern "system" fn rtl_random_ex(seed: *mut u32) -> u32 {
+    if seed.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut s = *seed;
+        let r = nt_ntdll::rtl::random::random_ex(&mut s);
+        *seed = s;
+        r
+    }
+}
+
 /// `RtlIntegerToChar(ULONG Value, ULONG Base, LONG Length, PSZ String) -> NTSTATUS` — format an
 /// integer into an ASCII buffer.
 ///
@@ -8497,6 +8562,18 @@ pub unsafe extern "system" fn rtl_initialize_slist_head(head: *mut c_void) {
         *(head as *mut u64) = 0; // Next
         *((head as *mut u64).add(1)) = 0; // Depth/Sequence
     }
+}
+
+/// `RtlFirstEntrySList(PSLIST_HEADER) -> PSLIST_ENTRY`.
+///
+/// # Safety
+/// `head` a valid SLIST_HEADER.
+#[export_name = "RtlFirstEntrySList"]
+pub unsafe extern "system" fn rtl_first_entry_slist(head: *const c_void) -> *mut c_void {
+    if head.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { *(head as *const u64) as *mut c_void }
 }
 
 /// `RtlInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY Entry) -> PSLIST_ENTRY` — push, return
@@ -8763,6 +8840,61 @@ pub unsafe extern "system" fn rtl_get_version(vi: *mut c_void) -> NtStatus {
         }
     }
     STATUS_SUCCESS
+}
+
+/// `RtlGetNtVersionNumbers(PULONG Major, PULONG Minor, PULONG Build)`.
+///
+/// # Safety
+/// Out-params are null or writable.
+#[export_name = "RtlGetNtVersionNumbers"]
+pub unsafe extern "system" fn rtl_get_nt_version_numbers(
+    major: *mut u32,
+    minor: *mut u32,
+    build: *mut u32,
+) {
+    unsafe {
+        if !major.is_null() {
+            *major = 5;
+        }
+        if !minor.is_null() {
+            *minor = 2;
+        }
+        if !build.is_null() {
+            *build = 0xF000_0000 | 3790;
+        }
+    }
+}
+
+/// `RtlGetProductInfo(ULONG OSMajor, ULONG OSMinor, ULONG SpMajor, ULONG SpMinor, PULONG Product)`.
+///
+/// # Safety
+/// `returned_product_type` is writable when non-null.
+#[export_name = "RtlGetProductInfo"]
+pub unsafe extern "system" fn rtl_get_product_info(
+    os_major: u32,
+    os_minor: u32,
+    _sp_major: u32,
+    _sp_minor: u32,
+    returned_product_type: *mut u32,
+) -> u8 {
+    if returned_product_type.is_null() {
+        return 0;
+    }
+    const PRODUCT_UNDEFINED: u32 = 0x0000_0000;
+    const PRODUCT_BUSINESS: u32 = 0x0000_0006;
+    const PRODUCT_PROFESSIONAL: u32 = 0x0000_0030;
+    unsafe {
+        if os_major < 6 {
+            *returned_product_type = PRODUCT_UNDEFINED;
+            return 0;
+        }
+        *returned_product_type = if os_major == 6 && os_minor == 0 {
+            PRODUCT_BUSINESS
+        } else {
+            PRODUCT_PROFESSIONAL
+        };
+    }
+    1
 }
 
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
@@ -9408,6 +9540,53 @@ pub unsafe extern "system" fn rtl_try_enter_critical_section(cs: *mut c_void) ->
             *rec += 1;
             1
         }
+    }
+}
+
+/// `RtlGetCriticalSectionRecursionCount(PRTL_CRITICAL_SECTION) -> LONG`.
+///
+/// # Safety
+/// `cs` is a valid RTL_CRITICAL_SECTION.
+#[export_name = "RtlGetCriticalSectionRecursionCount"]
+pub unsafe extern "system" fn rtl_get_critical_section_recursion_count(cs: *mut c_void) -> i32 {
+    if cs.is_null() {
+        return 0;
+    }
+    unsafe {
+        let owning_thread = core::ptr::read_unaligned((cs as *const u8).add(0x10) as *const u64);
+        if owning_thread == resource_current_thread() {
+            core::ptr::read_unaligned((cs as *const u8).add(0x0C) as *const i32)
+        } else {
+            0
+        }
+    }
+}
+
+/// `RtlIsCriticalSectionLocked(PRTL_CRITICAL_SECTION) -> LOGICAL`.
+///
+/// # Safety
+/// `cs` is a valid RTL_CRITICAL_SECTION.
+#[export_name = "RtlIsCriticalSectionLocked"]
+pub unsafe extern "system" fn rtl_is_critical_section_locked(cs: *mut c_void) -> u8 {
+    if cs.is_null() {
+        return 0;
+    }
+    unsafe { u8::from(core::ptr::read_unaligned((cs as *const u8).add(0x0C) as *const i32) != 0) }
+}
+
+/// `RtlIsCriticalSectionLockedByThread(PRTL_CRITICAL_SECTION) -> LOGICAL`.
+///
+/// # Safety
+/// `cs` is a valid RTL_CRITICAL_SECTION.
+#[export_name = "RtlIsCriticalSectionLockedByThread"]
+pub unsafe extern "system" fn rtl_is_critical_section_locked_by_thread(cs: *mut c_void) -> u8 {
+    if cs.is_null() {
+        return 0;
+    }
+    unsafe {
+        let owning_thread = core::ptr::read_unaligned((cs as *const u8).add(0x10) as *const u64);
+        let recursion = core::ptr::read_unaligned((cs as *const u8).add(0x0C) as *const i32);
+        u8::from(owning_thread == resource_current_thread() && recursion != 0)
     }
 }
 
@@ -10168,6 +10347,82 @@ pub unsafe extern "system" fn rtl_upcase_unicode_string(
     }
 }
 
+/// `RtlDowncaseUnicodeString(PUNICODE_STRING dst, PCUNICODE_STRING src, BOOLEAN Allocate)`.
+///
+/// # Safety
+/// `dst` writable; `src` valid.
+#[export_name = "RtlDowncaseUnicodeString"]
+pub unsafe extern "system" fn rtl_downcase_unicode_string(
+    dst: PUnicodeString,
+    src: PCUnicodeString,
+    allocate: u8,
+) -> NtStatus {
+    if dst.is_null() || src.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: src valid per the contract.
+    let (sbuf, slen) = unsafe { ((*src).buffer as *const u16, (*src).length as usize / 2) };
+    let src_slice = if sbuf.is_null() {
+        if slen != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        &[][..]
+    } else {
+        // SAFETY: valid region of slen units.
+        unsafe { core::slice::from_raw_parts(sbuf, slen) }
+    };
+    let down = rtl::strings::downcase_unicode_string(src_slice);
+    let out_bytes = down.len() * 2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: dst valid per the contract.
+        let dbuf = if allocate != 0 {
+            if out_bytes == 0 {
+                // SAFETY: dst valid.
+                unsafe {
+                    (*dst).buffer = 0;
+                    (*dst).maximum_length = 0;
+                    (*dst).length = 0;
+                }
+                return STATUS_SUCCESS;
+            }
+            // SAFETY: on-target heap.
+            let p = unsafe { crate::process_heap_alloc(out_bytes) } as *mut u16;
+            if p.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            // SAFETY: dst valid.
+            unsafe {
+                (*dst).buffer = p as u64;
+                (*dst).maximum_length = out_bytes as u16;
+            }
+            p
+        } else {
+            // SAFETY: dst valid.
+            unsafe {
+                if (*dst).maximum_length < out_bytes as u16 {
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                (*dst).buffer as *mut u16
+            }
+        };
+        if out_bytes != 0 && dbuf.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        // SAFETY: dbuf valid for down.len() units.
+        unsafe {
+            core::ptr::copy_nonoverlapping(down.as_ptr(), dbuf, down.len());
+            (*dst).length = out_bytes as u16;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (allocate, out_bytes);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 // =================================================================================================
 // BATCH 27 — the six Rtl* stragglers the lsass tree (lsasrv/msv1_0/samlib/netapi32) imports.
 // Faithful ports of the ReactOS sdk/lib/rtl bodies; leaving any unexported would strand the
@@ -10604,6 +10859,41 @@ pub unsafe extern "system" fn rtl_integer_to_unicode_string(
     }
     let base = if base == 0 { 10 } else { base };
     let digits = match rtl::integer::integer_to_unicode(value, base) {
+        Some(d) => d,
+        None => return STATUS_INVALID_PARAMETER,
+    };
+    let out_bytes = digits.len() * 2;
+    // SAFETY: dst valid per the contract.
+    unsafe {
+        if (*dst).maximum_length < (out_bytes + 2) as u16 {
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        let dbuf = (*dst).buffer as *mut u16;
+        if dbuf.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        core::ptr::copy_nonoverlapping(digits.as_ptr(), dbuf, digits.len());
+        *dbuf.add(digits.len()) = 0;
+        (*dst).length = out_bytes as u16;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlInt64ToUnicodeString(ULONGLONG Value, ULONG Base, PUNICODE_STRING dst) -> NTSTATUS`.
+///
+/// # Safety
+/// `dst` a valid writable UNICODE_STRING with a buffer.
+#[export_name = "RtlInt64ToUnicodeString"]
+pub unsafe extern "system" fn rtl_int64_to_unicode_string(
+    value: u64,
+    base: u32,
+    dst: PUnicodeString,
+) -> NtStatus {
+    if dst.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let base = if base == 0 { 10 } else { base };
+    let digits = match rtl::integer::int64_to_unicode(value, base) {
         Some(d) => d,
         None => return STATUS_INVALID_PARAMETER,
     };
@@ -12265,6 +12555,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_init_unicode_string as usize,
         rtl_init_ansi_string as usize,
         rtl_upcase_unicode_char as usize,
+        rtl_downcase_unicode_char as usize,
         rtl_compare_unicode_string as usize,
         rtl_equal_unicode_string as usize,
         rtl_prefix_unicode_string as usize,
@@ -12281,6 +12572,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_initialize_critical_section as usize,
         rtl_enter_critical_section as usize,
         rtl_leave_critical_section as usize,
+        rtl_get_critical_section_recursion_count as usize,
+        rtl_is_critical_section_locked as usize,
+        rtl_is_critical_section_locked_by_thread as usize,
         rtl_length_sid as usize,
         rtl_create_security_descriptor as usize,
         rtl_set_dacl_security_descriptor as usize,
@@ -12341,6 +12635,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_char_to_integer as usize,
         rtl_create_heap as usize,
         rtl_unhandled_exception_filter as usize,
+        rtl_set_unhandled_exception_filter as usize,
         memmove as usize,
         rtl_copy_memory as usize,
         strchr as usize,
@@ -12368,8 +12663,11 @@ pub unsafe extern "C" fn export_anchor() {
         // BATCH 3 ckpt 2 — kernel32 early-init PEB-lock + global-flags + status-to-dos.
         rtl_acquire_peb_lock as usize,
         rtl_release_peb_lock as usize,
+        rtl_get_current_peb as usize,
+        rtl_dll_shutdown_in_progress as usize,
         rtl_get_nt_global_flags as usize,
         rtl_nt_status_to_dos_error as usize,
+        rtl_nt_status_to_dos_error_no_teb as usize,
         // BATCH 4 — CRT surface the Win32 stack imports from ntdll.
         memcmp as usize,
         memchr as usize,
@@ -12481,6 +12779,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_copy_unicode_string as usize,
         rtl_compare_unicode_strings as usize,
         rtl_upcase_unicode_string as usize,
+        rtl_downcase_unicode_string as usize,
         rtl_duplicate_unicode_string as usize,
         rtl_create_unicode_string_from_asciiz as usize,
         rtl_free_ansi_string as usize,
@@ -12489,6 +12788,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_init_unicode_string_ex as usize,
         rtl_ansi_char_to_unicode_char as usize,
         rtl_integer_to_unicode_string as usize,
+        rtl_int64_to_unicode_string as usize,
         rtl_unicode_to_multi_byte_n as usize,
         rtl_unicode_to_oem_n as usize,
         rtl_multi_byte_to_unicode_n as usize,
@@ -12661,6 +12961,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_time_fields_to_time as usize,
         rtl_uniform as usize,
         rtl_random as usize,
+        rtl_random_ex as usize,
         rtl_integer_to_char as usize,
         rtl_large_integer_to_char as usize,
         rtl_ushort_byte_swap as usize,
@@ -12670,6 +12971,7 @@ pub unsafe extern "C" fn export_anchor() {
     core::hint::black_box(anchors_misc1);
     let anchors_misc2: &[usize] = &[
         rtl_initialize_slist_head as usize,
+        rtl_first_entry_slist as usize,
         rtl_interlocked_push_entry_slist as usize,
         rtl_interlocked_push_list_slist as usize,
         rtl_interlocked_push_list_slist_ex as usize,
@@ -12682,6 +12984,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_thread_error_mode as usize,
         rtl_get_nt_product_type as usize,
         rtl_get_version as usize,
+        rtl_get_nt_version_numbers as usize,
+        rtl_get_product_info as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
         rtl_get_native_system_information as usize,

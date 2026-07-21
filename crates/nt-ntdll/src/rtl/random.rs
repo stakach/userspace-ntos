@@ -60,6 +60,16 @@ mod tests {
     }
 
     #[test]
+    fn random_ex_advances_seed() {
+        let mut seed = 0x1234_5678;
+        let first = random_ex(&mut seed);
+        assert_eq!(first, seed);
+        let second = random_ex(&mut seed);
+        assert_ne!(first, second);
+        assert!(second < 0x7fff_ffff);
+    }
+
+    #[test]
     fn crc32_known_vectors() {
         // CRC-32 of "" is 0; of "123456789" is 0xCBF43926 (the canonical check value).
         assert_eq!(compute_crc32(0, b""), 0);

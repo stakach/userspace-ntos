@@ -59,7 +59,7 @@ pub fn int64_to_unicode(value: u64, base: u32) -> Option<Vec<u16>> {
     let b = base as u64;
     while v > 0 {
         let d = (v % b) as u8;
-        let ch = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        let ch = if d < 10 { b'0' + d } else { b'A' + (d - 10) };
         digits.push(ch as u16);
         v /= b;
     }
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(int64_to_unicode(0, 10).unwrap(), u("0"));
         assert_eq!(
             int64_to_unicode(0xDEAD_BEEF_CAFE, 16).unwrap(),
-            u("deadbeefcafe")
+            u("DEADBEEFCAFE")
         );
         assert_eq!(
             int64_to_unicode(1_000_000_000_000, 10).unwrap(),
