@@ -2116,13 +2116,7 @@ pub unsafe extern "system" fn rtl_get_set_boot_status_data(
         let status = if read != 0 {
             // SAFETY: forwards the caller buffer and explicit byte offset to NtReadFile.
             unsafe {
-                boot_nt_read_file(
-                    handle as u64,
-                    &mut iosb,
-                    buffer,
-                    buffer_size,
-                    &byte_offset,
-                )
+                boot_nt_read_file(handle as u64, &mut iosb, buffer, buffer_size, &byte_offset)
             }
         } else {
             // SAFETY: forwards the caller buffer and explicit byte offset to NtWriteFile.
@@ -6545,6 +6539,36 @@ pub unsafe extern "system" fn rtl_initialize_bit_map(
     unsafe { nt_ntdll::rtl::bitmap::initialize(header as *mut u8, buffer as u64, size) };
 }
 
+/// `RtlClearAllBits(PRTL_BITMAP)`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlClearAllBits"]
+pub unsafe extern "system" fn rtl_clear_all_bits(header: *mut c_void) {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::clear_all(header as *mut u8) };
+}
+
+/// `RtlSetAllBits(PRTL_BITMAP)`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlSetAllBits"]
+pub unsafe extern "system" fn rtl_set_all_bits(header: *mut c_void) {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::set_all(header as *mut u8) };
+}
+
+/// `RtlTestBit(PRTL_BITMAP, ULONG BitNumber) -> BOOLEAN`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlTestBit"]
+pub unsafe extern "system" fn rtl_test_bit(header: *const c_void, bit: u32) -> u8 {
+    // SAFETY: header initialized per the contract.
+    u8::from(unsafe { nt_ntdll::rtl::bitmap::test_bit(header as *const u8, bit) })
+}
+
 /// `RtlSetBits(PRTL_BITMAP, ULONG StartingIndex, ULONG NumberToSet)`.
 ///
 /// # Safety
@@ -6607,6 +6631,54 @@ pub unsafe extern "system" fn rtl_are_bits_clear(
     u8::from(unsafe { nt_ntdll::rtl::bitmap::are_bits_clear(header as *const u8, start, length) })
 }
 
+/// `RtlNumberOfSetBits(PRTL_BITMAP) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlNumberOfSetBits"]
+pub unsafe extern "system" fn rtl_number_of_set_bits(header: *const c_void) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::number_of_set_bits(header as *const u8) }
+}
+
+/// `RtlNumberOfClearBits(PRTL_BITMAP) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlNumberOfClearBits"]
+pub unsafe extern "system" fn rtl_number_of_clear_bits(header: *const c_void) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::number_of_clear_bits(header as *const u8) }
+}
+
+/// `RtlFindClearBits(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlFindClearBits"]
+pub unsafe extern "system" fn rtl_find_clear_bits(
+    header: *const c_void,
+    count: u32,
+    hint: u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::find_clear_bits(header as *const u8, count, hint) }
+}
+
+/// `RtlFindSetBits(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlFindSetBits"]
+pub unsafe extern "system" fn rtl_find_set_bits(
+    header: *const c_void,
+    count: u32,
+    hint: u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::find_set_bits(header as *const u8, count, hint) }
+}
+
 /// `RtlFindClearBitsAndSet(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex) -> ULONG` — find a run
 /// of clear bits, set them, return the start index (0xFFFFFFFF if none).
 ///
@@ -6620,6 +6692,40 @@ pub unsafe extern "system" fn rtl_find_clear_bits_and_set(
 ) -> u32 {
     // SAFETY: header initialized per the contract.
     unsafe { nt_ntdll::rtl::bitmap::find_clear_bits_and_set(header as *mut u8, count, hint) }
+}
+
+/// `RtlFindSetBitsAndClear(PRTL_BITMAP, ULONG NumberToFind, ULONG HintIndex) -> ULONG`.
+///
+/// # Safety
+/// `header` a valid initialized RTL_BITMAP.
+#[export_name = "RtlFindSetBitsAndClear"]
+pub unsafe extern "system" fn rtl_find_set_bits_and_clear(
+    header: *mut c_void,
+    count: u32,
+    hint: u32,
+) -> u32 {
+    // SAFETY: header initialized per the contract.
+    unsafe { nt_ntdll::rtl::bitmap::find_set_bits_and_clear(header as *mut u8, count, hint) }
+}
+
+/// `RtlFindMostSignificantBit(ULONGLONG) -> CCHAR`.
+#[export_name = "RtlFindMostSignificantBit"]
+pub extern "system" fn rtl_find_most_significant_bit(value: u64) -> i8 {
+    if value == 0 {
+        -1
+    } else {
+        (63 - value.leading_zeros()) as i8
+    }
+}
+
+/// `RtlFindLeastSignificantBit(ULONGLONG) -> CCHAR`.
+#[export_name = "RtlFindLeastSignificantBit"]
+pub extern "system" fn rtl_find_least_significant_bit(value: u64) -> i8 {
+    if value == 0 {
+        -1
+    } else {
+        value.trailing_zeros() as i8
+    }
 }
 
 // ---- atom tables (reuse nt-kernel-exec via nt_ntdll::rtl::atom) -----------------------------------
@@ -9905,11 +10011,21 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_move_memory as usize,
         rtl_compare_memory as usize,
         rtl_initialize_bit_map as usize,
+        rtl_clear_all_bits as usize,
+        rtl_set_all_bits as usize,
+        rtl_test_bit as usize,
         rtl_set_bits as usize,
         rtl_clear_bits as usize,
         rtl_are_bits_set as usize,
         rtl_are_bits_clear as usize,
+        rtl_number_of_set_bits as usize,
+        rtl_number_of_clear_bits as usize,
+        rtl_find_clear_bits as usize,
+        rtl_find_set_bits as usize,
         rtl_find_clear_bits_and_set as usize,
+        rtl_find_set_bits_and_clear as usize,
+        rtl_find_most_significant_bit as usize,
+        rtl_find_least_significant_bit as usize,
         rtl_create_atom_table as usize,
         rtl_add_atom_to_atom_table as usize,
         rtl_lookup_atom_in_atom_table as usize,

@@ -7,8 +7,9 @@
 //! `RTL_BITMAP` header.
 
 pub use nt_kernel_exec::rtl_bitmap::{
-    are_bits_clear, clear_all, clear_bit, clear_bits, find_clear_bits_and_set, initialize,
-    number_of_set_bits, set_all, set_bit, set_bits, test_bit, BITMAP_NONE,
+    are_bits_clear, clear_all, clear_bit, clear_bits, find_clear_bits, find_clear_bits_and_set,
+    find_set_bits, find_set_bits_and_clear, initialize, number_of_clear_bits, number_of_set_bits,
+    set_all, set_bit, set_bits, test_bit, BITMAP_NONE,
 };
 
 use alloc::vec;
@@ -85,10 +86,34 @@ impl BitMap {
         unsafe { find_clear_bits_and_set(self.hdr.as_mut_ptr(), count, hint) }
     }
 
+    /// `RtlFindClearBits`.
+    pub fn find_clear(&self, count: u32, hint: u32) -> u32 {
+        // SAFETY: initialised header.
+        unsafe { find_clear_bits(self.hdr.as_ptr(), count, hint) }
+    }
+
+    /// `RtlFindSetBits`.
+    pub fn find_set(&self, count: u32, hint: u32) -> u32 {
+        // SAFETY: initialised header.
+        unsafe { find_set_bits(self.hdr.as_ptr(), count, hint) }
+    }
+
+    /// `RtlFindSetBitsAndClear`.
+    pub fn find_set_and_clear(&mut self, count: u32, hint: u32) -> u32 {
+        // SAFETY: initialised header.
+        unsafe { find_set_bits_and_clear(self.hdr.as_mut_ptr(), count, hint) }
+    }
+
     /// `RtlNumberOfSetBits`.
     pub fn count_set(&self) -> u32 {
         // SAFETY: initialised header.
         unsafe { number_of_set_bits(self.hdr.as_ptr()) }
+    }
+
+    /// `RtlNumberOfClearBits`.
+    pub fn count_clear(&self) -> u32 {
+        // SAFETY: initialised header.
+        unsafe { number_of_clear_bits(self.hdr.as_ptr()) }
     }
 
     /// The number of bits covered.
@@ -121,5 +146,18 @@ mod tests {
         assert!(b.are_bits_set(10, 20));
         b.clear_range(10, 5);
         assert_eq!(b.count_set(), 15);
+    }
+
+    #[test]
+    fn find_and_count_clear_set_runs() {
+        let mut b = BitMap::new(32);
+        b.set_range(8, 4);
+        b.set_range(20, 3);
+        assert_eq!(b.count_set(), 7);
+        assert_eq!(b.count_clear(), 25);
+        assert_eq!(b.find_set(4, 0), 8);
+        assert_eq!(b.find_clear(8, 16), 23);
+        assert_eq!(b.find_set_and_clear(3, 16), 20);
+        assert!(b.are_bits_clear(20, 3));
     }
 }

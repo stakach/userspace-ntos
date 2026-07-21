@@ -137,6 +137,14 @@ pub unsafe fn number_of_set_bits(bm: *const u8) -> u32 {
     n
 }
 
+/// `RtlNumberOfClearBits(RTL_BITMAP*)` — count clear bits.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap.
+pub unsafe fn number_of_clear_bits(bm: *const u8) -> u32 {
+    unsafe { hdr_size(bm).saturating_sub(number_of_set_bits(bm)) }
+}
+
 /// `RtlAreBitsClear(RTL_BITMAP*, ULONG start, ULONG count)` — `true` if `[start, start+count)` are
 /// all clear (and in range).
 ///
@@ -156,36 +164,85 @@ pub unsafe fn are_bits_clear(bm: *const u8, start: u32, count: u32) -> bool {
     true
 }
 
-/// `RtlFindClearBitsAndSet(RTL_BITMAP*, ULONG count, ULONG hint)` — find the first run of `count`
-/// contiguous clear bits at or after `hint` (wrapping to the start once), set them, and return the
-/// run's start index. Returns [`BITMAP_NONE`] if no such run exists.
-///
-/// # Safety
-/// `bm` must be an initialized bitmap.
-pub unsafe fn find_clear_bits_and_set(bm: *mut u8, count: u32, hint: u32) -> u32 {
-    let size = hdr_size(bm);
-    if count == 0 || count > size {
+unsafe fn find_bits(bm: *const u8, count: u32, hint: u32, want_set: bool) -> u32 {
+    if bm.is_null() {
+        return BITMAP_NONE;
+    }
+    let size = unsafe { hdr_size(bm) };
+    if count > size {
         return BITMAP_NONE;
     }
     let start_at = if hint >= size { 0 } else { hint };
-    // Search [start_at, size) then [0, start_at) so a hint is honoured but the whole map is scanned.
+    if count == 0 {
+        return start_at & !7;
+    }
+    let buf = unsafe { hdr_buffer(bm) };
     let mut probed = 0u32;
     let mut i = start_at;
-    while probed <= size {
-        if i + count <= size && are_bits_clear(bm, i, count) {
-            let buf = hdr_buffer(bm);
-            for b in i..i + count {
-                set_bit_raw(buf, b);
+    while probed < size {
+        if let Some(end) = i.checked_add(count) {
+            if end <= size {
+                let mut matched = true;
+                for bit in i..end {
+                    if unsafe { get_bit(buf, bit) } != want_set {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return i;
+                }
             }
-            return i;
         }
         i += 1;
-        if i + count > size {
+        if i >= size {
             i = 0;
         }
         probed += 1;
     }
     BITMAP_NONE
+}
+
+/// `RtlFindClearBits(RTL_BITMAP*, ULONG count, ULONG hint)` — find a clear run, wrapping once.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap.
+pub unsafe fn find_clear_bits(bm: *const u8, count: u32, hint: u32) -> u32 {
+    unsafe { find_bits(bm, count, hint, false) }
+}
+
+/// `RtlFindSetBits(RTL_BITMAP*, ULONG count, ULONG hint)` — find a set run, wrapping once.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap.
+pub unsafe fn find_set_bits(bm: *const u8, count: u32, hint: u32) -> u32 {
+    unsafe { find_bits(bm, count, hint, true) }
+}
+
+/// `RtlFindClearBitsAndSet(RTL_BITMAP*, ULONG count, ULONG hint)` — find a clear run, set it, and
+/// return the run's start index. Returns [`BITMAP_NONE`] if no such run exists.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap.
+pub unsafe fn find_clear_bits_and_set(bm: *mut u8, count: u32, hint: u32) -> u32 {
+    let position = unsafe { find_clear_bits(bm, count, hint) };
+    if position != BITMAP_NONE {
+        unsafe { set_bits(bm, position, count) };
+    }
+    position
+}
+
+/// `RtlFindSetBitsAndClear(RTL_BITMAP*, ULONG count, ULONG hint)` — find a set run, clear it, and
+/// return the run's start index.
+///
+/// # Safety
+/// `bm` must be an initialized bitmap.
+pub unsafe fn find_set_bits_and_clear(bm: *mut u8, count: u32, hint: u32) -> u32 {
+    let position = unsafe { find_set_bits(bm, count, hint) };
+    if position != BITMAP_NONE {
+        unsafe { clear_bits(bm, position, count) };
+    }
+    position
 }
 
 /// `RtlClearBits(RTL_BITMAP*, ULONG start, ULONG count)`.
@@ -226,7 +283,10 @@ mod tests {
     impl Bm {
         fn new(size: u32) -> Self {
             let words = std::vec![0u32; ((size + 31) / 32) as usize];
-            let mut b = Bm { hdr: [0xAA; bitmap::SIZE_OF], words };
+            let mut b = Bm {
+                hdr: [0xAA; bitmap::SIZE_OF],
+                words,
+            };
             let buf = b.words.as_mut_ptr() as u64;
             unsafe { initialize(b.hdr.as_mut_ptr(), buf, size) };
             b
@@ -284,9 +344,10 @@ mod tests {
         let mut b = Bm::new(8);
         unsafe {
             clear_all(b.p());
+            assert_eq!(find_clear_bits(b.c(), 3, 0), 0);
             assert_eq!(find_clear_bits_and_set(b.p(), 3, 0), 0); // bits 0,1,2
             assert_eq!(find_clear_bits_and_set(b.p(), 3, 0), 3); // bits 3,4,5
-            // Only bits 6,7 left -> no run of 3.
+                                                                 // Only bits 6,7 left -> no run of 3.
             assert_eq!(find_clear_bits_and_set(b.p(), 3, 0), BITMAP_NONE);
             assert_eq!(find_clear_bits_and_set(b.p(), 2, 0), 6); // bits 6,7
             assert_eq!(find_clear_bits_and_set(b.p(), 1, 0), BITMAP_NONE);
@@ -319,6 +380,38 @@ mod tests {
             assert_eq!(number_of_set_bits(b.c()), 4);
             set_all(b.p());
             assert_eq!(number_of_set_bits(b.c()), 64);
+        }
+    }
+
+    #[test]
+    fn count_clear_find_set_and_clear() {
+        let mut b = Bm::new(16);
+        unsafe {
+            clear_all(b.p());
+            set_bits(b.p(), 4, 4);
+            set_bits(b.p(), 12, 2);
+            assert_eq!(number_of_set_bits(b.c()), 6);
+            assert_eq!(number_of_clear_bits(b.c()), 10);
+            assert_eq!(find_set_bits(b.c(), 4, 0), 4);
+            assert_eq!(find_set_bits(b.c(), 2, 8), 12);
+            assert_eq!(find_set_bits_and_clear(b.p(), 4, 0), 4);
+            assert_eq!(number_of_set_bits(b.c()), 2);
+            assert!(are_bits_clear(b.c(), 4, 4));
+        }
+    }
+
+    #[test]
+    fn find_bits_wraps_and_zero_count_rounds_hint() {
+        let mut b = Bm::new(16);
+        unsafe {
+            clear_all(b.p());
+            set_bits(b.p(), 0, 2);
+            set_bits(b.p(), 10, 2);
+            assert_eq!(find_set_bits(b.c(), 2, 8), 10);
+            assert_eq!(find_set_bits(b.c(), 2, 12), 0);
+            assert_eq!(find_clear_bits(b.c(), 3, 14), 2);
+            assert_eq!(find_set_bits(b.c(), 0, 13), 8);
+            assert_eq!(find_clear_bits(b.c(), 0, 99), 0);
         }
     }
 }
