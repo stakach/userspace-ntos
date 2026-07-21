@@ -3913,7 +3913,9 @@ pub unsafe extern "system" fn ldr_query_image_file_execution_options_ex(
     wow64: u8,
 ) -> NtStatus {
     let mut key_handle = core::ptr::null_mut();
-    let status = unsafe { ldr_open_image_file_options_key(sub_key as *const c_void, wow64, &mut key_handle) };
+    let status = unsafe {
+        ldr_open_image_file_options_key(sub_key as *const c_void, wow64, &mut key_handle)
+    };
     if status != STATUS_SUCCESS {
         return status;
     }
@@ -7182,6 +7184,162 @@ unsafe fn ldr_entry_full_name_buffer(module: *mut c_void) -> *mut u16 {
     }
 }
 
+const RESOURCE_TYPE_LEVEL: u32 = 0;
+const RESOURCE_NAME_LEVEL: u32 = 1;
+const RESOURCE_LANGUAGE_LEVEL: u32 = 2;
+const IMAGE_RESOURCE_NAME_IS_STRING: u32 = 0x8000_0000;
+const IMAGE_RESOURCE_DATA_IS_DIRECTORY: u32 = 0x8000_0000;
+const LDR_ENUM_RESOURCE_INFO_SIZE: usize = 40;
+const LDR_ENUM_RESOURCE_INFO_TYPE: usize = 0;
+const LDR_ENUM_RESOURCE_INFO_NAME: usize = 8;
+const LDR_ENUM_RESOURCE_INFO_LANGUAGE: usize = 16;
+const LDR_ENUM_RESOURCE_INFO_DATA: usize = 24;
+const LDR_ENUM_RESOURCE_INFO_SIZE_OFFSET: usize = 32;
+const LDR_ENUM_RESOURCE_INFO_RESERVED: usize = 36;
+
+#[derive(Copy, Clone)]
+struct ResourceDirectoryEntry {
+    name: u32,
+    offset: u32,
+}
+
+impl ResourceDirectoryEntry {
+    #[inline]
+    fn name_is_string(self) -> bool {
+        self.name & IMAGE_RESOURCE_NAME_IS_STRING != 0
+    }
+
+    #[inline]
+    fn id(self) -> usize {
+        (self.name & 0xffff) as usize
+    }
+
+    #[inline]
+    fn name_offset(self) -> usize {
+        (self.name & !IMAGE_RESOURCE_NAME_IS_STRING) as usize
+    }
+
+    #[inline]
+    fn data_is_directory(self) -> bool {
+        self.offset & IMAGE_RESOURCE_DATA_IS_DIRECTORY != 0
+    }
+
+    #[inline]
+    fn child_offset(self) -> usize {
+        (self.offset & !IMAGE_RESOURCE_DATA_IS_DIRECTORY) as usize
+    }
+}
+
+#[inline]
+fn ldr_resource_read_u16(rsrc: &[u8], offset: usize) -> Option<u16> {
+    rsrc.get(offset..offset + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+#[inline]
+fn ldr_resource_read_u32(rsrc: &[u8], offset: usize) -> Option<u32> {
+    rsrc.get(offset..offset + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn ldr_resource_entry_count(rsrc: &[u8], directory_offset: usize) -> Option<usize> {
+    let named = ldr_resource_read_u16(rsrc, directory_offset + 12)? as usize;
+    let ids = ldr_resource_read_u16(rsrc, directory_offset + 14)? as usize;
+    let total = named.checked_add(ids)?;
+    let entries_end = directory_offset
+        .checked_add(rtl::pe_resource::DIR_SIZE)?
+        .checked_add(total.checked_mul(rtl::pe_resource::ENTRY_SIZE)?)?;
+    if entries_end <= rsrc.len() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn ldr_resource_directory_entry(
+    rsrc: &[u8],
+    directory_offset: usize,
+    index: usize,
+) -> Option<ResourceDirectoryEntry> {
+    let entry_offset = directory_offset
+        .checked_add(rtl::pe_resource::DIR_SIZE)?
+        .checked_add(index.checked_mul(rtl::pe_resource::ENTRY_SIZE)?)?;
+    Some(ResourceDirectoryEntry {
+        name: ldr_resource_read_u32(rsrc, entry_offset)?,
+        offset: ldr_resource_read_u32(rsrc, entry_offset + 4)?,
+    })
+}
+
+fn ldr_resource_entry_name_value(root: *const u8, entry: ResourceDirectoryEntry) -> usize {
+    if entry.name_is_string() {
+        unsafe { root.add(entry.name_offset()) as usize }
+    } else {
+        entry.id()
+    }
+}
+
+unsafe fn ldr_resource_entry_matches(
+    rsrc: &[u8],
+    entry: ResourceDirectoryEntry,
+    compare_name: usize,
+) -> Option<bool> {
+    if compare_name <= 0xffff {
+        return Some(!entry.name_is_string() && entry.id() == compare_name);
+    }
+    if !entry.name_is_string() {
+        return Some(false);
+    }
+
+    let string_offset = entry.name_offset();
+    let string_len = ldr_resource_read_u16(rsrc, string_offset)? as usize;
+    let string_end = string_offset.checked_add(2 + string_len.checked_mul(2)?)?;
+    if string_end > rsrc.len() {
+        return None;
+    }
+
+    let compare = compare_name as *const u16;
+    for i in 0..string_len {
+        let resource_unit = ldr_resource_read_u16(rsrc, string_offset + 2 + i * 2)?;
+        let compare_unit = unsafe { core::ptr::read(compare.add(i)) };
+        if resource_unit != compare_unit || compare_unit == 0 {
+            return Some(false);
+        }
+    }
+    Some(unsafe { core::ptr::read(compare.add(string_len)) } == 0)
+}
+
+unsafe fn ldr_enum_write_resource_info(
+    resources: *mut c_void,
+    index: u32,
+    type_name: usize,
+    name: usize,
+    language: usize,
+    data: *mut c_void,
+    size: u32,
+) {
+    let out = unsafe { (resources as *mut u8).add(index as usize * LDR_ENUM_RESOURCE_INFO_SIZE) };
+    unsafe {
+        core::ptr::write_unaligned(
+            out.add(LDR_ENUM_RESOURCE_INFO_TYPE) as *mut usize,
+            type_name,
+        );
+        core::ptr::write_unaligned(out.add(LDR_ENUM_RESOURCE_INFO_NAME) as *mut usize, name);
+        core::ptr::write_unaligned(
+            out.add(LDR_ENUM_RESOURCE_INFO_LANGUAGE) as *mut usize,
+            language,
+        );
+        core::ptr::write_unaligned(
+            out.add(LDR_ENUM_RESOURCE_INFO_DATA) as *mut *mut c_void,
+            data,
+        );
+        core::ptr::write_unaligned(
+            out.add(LDR_ENUM_RESOURCE_INFO_SIZE_OFFSET) as *mut u32,
+            size,
+        );
+        core::ptr::write_unaligned(out.add(LDR_ENUM_RESOURCE_INFO_RESERVED) as *mut u32, 0);
+    }
+}
+
 /// Decode one `ULONG_PTR` field of an `LDR_RESOURCE_INFO` into a [`rtl::pe_resource::ResName`].
 /// A value whose high bits are clear (≤ 0xFFFF) is an integer id (`MAKEINTRESOURCEW`); otherwise it
 /// is a pointer to a NUL-terminated wide string. Returns the search-string slice (with its NUL) for
@@ -7371,6 +7529,168 @@ pub unsafe extern "system" fn ldr_find_resource_directory_u(
 ) -> NtStatus {
     // SAFETY: forwarded per the LdrFindResourceDirectory_U contract (want directory).
     unsafe { ldr_find_resource_impl(dll_handle, resource_info, level, resource_directory, true) }
+}
+
+/// `LdrEnumResources(PVOID ImageBase, PLDR_RESOURCE_INFO ResourceInfo, ULONG Level,
+/// PULONG ResourceCount, PLDR_ENUM_RESOURCE_INFO Resources) -> NTSTATUS`.
+///
+/// Enumerates the real mapped `.rsrc` tree. `Level` follows ReactOS/NDK enum semantics:
+/// 0 enumerates every resource, 1 filters by type, 2 by type+name, and 3+ by
+/// type+name+language. If `Resources` is NULL or too small, `ResourceCount` still receives the full
+/// matching count and the function returns `STATUS_INFO_LENGTH_MISMATCH` when any entry did not fit.
+///
+/// # Safety
+/// `image_base` is a mapped PE image; `resource_info` is readable when `level > 0`;
+/// `resource_count` is writable; `resources` is NULL or points at `*resource_count`
+/// `LDR_ENUM_RESOURCE_INFO` entries.
+#[export_name = "LdrEnumResources"]
+pub unsafe extern "system" fn ldr_enum_resources(
+    image_base: *mut c_void,
+    resource_info: *const c_void,
+    level: u32,
+    resource_count: *mut u32,
+    resources: *mut c_void,
+) -> NtStatus {
+    if resource_count.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if level > RESOURCE_TYPE_LEVEL && resource_info.is_null() {
+        unsafe { *resource_count = 0 };
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let max_resource_count = if resources.is_null() {
+        0
+    } else {
+        unsafe { *resource_count }
+    };
+    unsafe { *resource_count = 0 };
+
+    let image_base = ldr_untag_resource_module(image_base);
+    if image_base.is_null() {
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
+    }
+
+    unsafe {
+        let mut section_size = 0u32;
+        let root = rtl_image_directory_entry_to_data(image_base, 1, 2, &mut section_size);
+        if root.is_null() || (section_size as usize) < rtl::pe_resource::DIR_SIZE {
+            return STATUS_RESOURCE_DATA_NOT_FOUND;
+        }
+        let rsrc = core::slice::from_raw_parts(root as *const u8, section_size as usize);
+        let type_count = match ldr_resource_entry_count(rsrc, 0) {
+            Some(count) => count,
+            None => return STATUS_RESOURCE_DATA_NOT_FOUND,
+        };
+
+        let info = resource_info as *const usize;
+        let type_filter = if level > RESOURCE_TYPE_LEVEL {
+            Some(core::ptr::read_unaligned(info))
+        } else {
+            None
+        };
+        let name_filter = if level > RESOURCE_NAME_LEVEL {
+            Some(core::ptr::read_unaligned(info.add(1)))
+        } else {
+            None
+        };
+        let language_filter = if level > RESOURCE_LANGUAGE_LEVEL {
+            Some(core::ptr::read_unaligned(info.add(2)))
+        } else {
+            None
+        };
+
+        let mut status = STATUS_SUCCESS;
+        let mut count = 0u32;
+        for type_index in 0..type_count {
+            let type_entry = match ldr_resource_directory_entry(rsrc, 0, type_index) {
+                Some(entry) => entry,
+                None => return STATUS_INVALID_IMAGE_FORMAT,
+            };
+            if let Some(filter) = type_filter {
+                match ldr_resource_entry_matches(rsrc, type_entry, filter) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => return STATUS_INVALID_IMAGE_FORMAT,
+                }
+            }
+            if !type_entry.data_is_directory() {
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
+
+            let name_dir = type_entry.child_offset();
+            let name_count = match ldr_resource_entry_count(rsrc, name_dir) {
+                Some(count) => count,
+                None => return STATUS_INVALID_IMAGE_FORMAT,
+            };
+            for name_index in 0..name_count {
+                let name_entry = match ldr_resource_directory_entry(rsrc, name_dir, name_index) {
+                    Some(entry) => entry,
+                    None => return STATUS_INVALID_IMAGE_FORMAT,
+                };
+                if let Some(filter) = name_filter {
+                    match ldr_resource_entry_matches(rsrc, name_entry, filter) {
+                        Some(true) => {}
+                        Some(false) => continue,
+                        None => return STATUS_INVALID_IMAGE_FORMAT,
+                    }
+                }
+                if !name_entry.data_is_directory() {
+                    return STATUS_INVALID_IMAGE_FORMAT;
+                }
+
+                let language_dir = name_entry.child_offset();
+                let language_count = match ldr_resource_entry_count(rsrc, language_dir) {
+                    Some(count) => count,
+                    None => return STATUS_INVALID_IMAGE_FORMAT,
+                };
+                for language_index in 0..language_count {
+                    let language_entry =
+                        match ldr_resource_directory_entry(rsrc, language_dir, language_index) {
+                            Some(entry) => entry,
+                            None => return STATUS_INVALID_IMAGE_FORMAT,
+                        };
+                    if let Some(filter) = language_filter {
+                        match ldr_resource_entry_matches(rsrc, language_entry, filter) {
+                            Some(true) => {}
+                            Some(false) => continue,
+                            None => return STATUS_INVALID_IMAGE_FORMAT,
+                        }
+                    }
+                    if language_entry.data_is_directory() {
+                        return STATUS_INVALID_IMAGE_FORMAT;
+                    }
+
+                    let data_entry = language_entry.child_offset();
+                    let data_rva = match ldr_resource_read_u32(rsrc, data_entry) {
+                        Some(rva) => rva,
+                        None => return STATUS_INVALID_IMAGE_FORMAT,
+                    };
+                    let data_size = match ldr_resource_read_u32(rsrc, data_entry + 4) {
+                        Some(size) => size,
+                        None => return STATUS_INVALID_IMAGE_FORMAT,
+                    };
+                    if count < max_resource_count {
+                        ldr_enum_write_resource_info(
+                            resources,
+                            count,
+                            ldr_resource_entry_name_value(root as *const u8, type_entry),
+                            ldr_resource_entry_name_value(root as *const u8, name_entry),
+                            ldr_resource_entry_name_value(root as *const u8, language_entry),
+                            (image_base as *mut u8).add(data_rva as usize) as *mut c_void,
+                            data_size,
+                        );
+                    } else {
+                        status = STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+
+        *resource_count = count;
+        status
+    }
 }
 
 /// `LdrAccessResource(PVOID DllHandle, PIMAGE_RESOURCE_DATA_ENTRY ResourceDataEntry, PVOID* Address,
@@ -19138,6 +19458,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_create_user_thread as usize,
         rtl_assert as usize,
         ldr_query_image_file_execution_options as usize,
+        ldr_query_image_file_execution_options_ex as usize,
         ldr_verify_image_matches_checksum as usize,
         ldr_verify_image_matches_checksum_ex as usize,
         ldr_get_failure_data as usize,
@@ -19966,6 +20287,7 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_init_shim_engine_dynamic as usize,
         ldr_disable_thread_callouts_for_dll as usize,
         ldr_add_ref_dll as usize,
+        ldr_process_relocation_block as usize,
         ldr_alternate_resources_enabled as usize,
         ldr_add_load_as_data_table as usize,
         ldr_remove_load_as_data_table as usize,
@@ -19982,6 +20304,7 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_find_resource_u as usize,
         ldr_find_resource_ex_u as usize,
         ldr_find_resource_directory_u as usize,
+        ldr_enum_resources as usize,
         ldr_access_resource as usize,
         ldr_load_alternate_resource_module as usize,
         ldr_load_alternate_resource_module_ex as usize,
