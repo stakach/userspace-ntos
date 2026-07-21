@@ -91,6 +91,16 @@ pub fn wcschr(s: &[u16], c: u16) -> Option<usize> {
     s[..wcslen(s)].iter().position(|&x| x == c)
 }
 
+/// `wcspbrk`.
+pub fn wcspbrk(s: &[u16], accept: &[u16]) -> Option<usize> {
+    let hay = &s[..wcslen(s)];
+    let set = &accept[..wcslen(accept)];
+    if set.is_empty() {
+        return None;
+    }
+    hay.iter().position(|c| set.contains(c))
+}
+
 /// `wcsstr`.
 pub fn wcsstr(hay: &[u16], needle: &[u16]) -> Option<usize> {
     let (h, n) = (&hay[..wcslen(hay)], &needle[..wcslen(needle)]);
@@ -307,6 +317,8 @@ mod tests {
         assert_eq!(wcscmp(&w("aaa"), &w("aab")), Ordering::Less);
         assert_eq!(wcsicmp(&w("Ntdll"), &w("NTDLL")), Ordering::Equal);
         assert_eq!(wcschr(&w("a\\b"), b'\\' as u16), Some(1));
+        assert_eq!(wcspbrk(&w("system32"), &w("39")), Some(6));
+        assert_eq!(wcspbrk(&w("system32"), &w("qz")), None);
         assert_eq!(wcsstr(&w("kernel32.dll"), &w(".dll")), Some(8));
     }
 

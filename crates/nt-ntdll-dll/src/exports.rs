@@ -4115,6 +4115,43 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     unsafe { wcslen_raw(s) }
 }
 
+/// `wcstombs(char* mbstr, const wchar_t* wcstr, size_t count) -> size_t`.
+///
+/// # Safety
+/// `wcstr` a NUL-terminated UTF-16 string; `mbstr` null or writable for `count` bytes.
+#[export_name = "wcstombs"]
+pub unsafe extern "C" fn wcstombs(mbstr: *mut u8, wcstr: *const u16, count: usize) -> usize {
+    // SAFETY: caller contract.
+    let length = unsafe { wcslen_raw(wcstr) };
+    let Some(bytes_in_unicode) = length.checked_mul(2).and_then(|n| u32::try_from(n).ok()) else {
+        return usize::MAX;
+    };
+
+    let mut size = 0u32;
+    if mbstr.is_null() {
+        // SAFETY: forwards the conversion-size contract.
+        let status =
+            unsafe { rtl_unicode_to_multi_byte_size(&mut size, wcstr, bytes_in_unicode) };
+        return if status == STATUS_SUCCESS {
+            size as usize
+        } else {
+            usize::MAX
+        };
+    }
+
+    let Ok(capacity) = u32::try_from(count) else {
+        return usize::MAX;
+    };
+    // SAFETY: forwards the conversion contract.
+    let status =
+        unsafe { rtl_unicode_to_multi_byte_n(mbstr, capacity, &mut size, wcstr, bytes_in_unicode) };
+    if status == STATUS_SUCCESS {
+        size as usize
+    } else {
+        usize::MAX
+    }
+}
+
 /// `wcscpy(wchar_t* dst, const wchar_t* src) -> wchar_t*`.
 ///
 /// # Safety
@@ -5663,6 +5700,27 @@ pub unsafe extern "C" fn wcsrchr(s: *const u16, c: u16) -> *const u16 {
         // SAFETY: i within [0,n).
         Some(i) => unsafe { s.add(i) },
         None if c == 0 => unsafe { s.add(n) },
+        None => core::ptr::null(),
+    }
+}
+
+/// `wcspbrk(const wchar_t* str, const wchar_t* accept) -> wchar_t*`.
+///
+/// # Safety
+/// Both arguments are NUL-terminated UTF-16 strings.
+#[export_name = "wcspbrk"]
+pub unsafe extern "C" fn wcspbrk(s: *const u16, accept: *const u16) -> *const u16 {
+    // SAFETY: caller contract.
+    let (s_len, accept_len) = unsafe { (wcslen_raw(s), wcslen_raw(accept)) };
+    let (hay, set) = unsafe {
+        (
+            core::slice::from_raw_parts(s, s_len),
+            core::slice::from_raw_parts(accept, accept_len),
+        )
+    };
+    match nt_ntdll::crt::wcspbrk(hay, set) {
+        // SAFETY: i within [0,s_len).
+        Some(i) => unsafe { s.add(i) },
         None => core::ptr::null(),
     }
 }
@@ -17329,6 +17387,7 @@ pub unsafe extern "C" fn export_anchor() {
         memcpy as usize,
         memset as usize,
         wcslen as usize,
+        wcstombs as usize,
         wcscpy as usize,
         wcsstr as usize,
         wcsicmp as usize,
@@ -17400,6 +17459,7 @@ pub unsafe extern "C" fn export_anchor() {
         wcslwr as usize,
         wcschr as usize,
         wcsrchr as usize,
+        wcspbrk as usize,
         wcscmp as usize,
         wcsncmp as usize,
         wcscspn as usize,
