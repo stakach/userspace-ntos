@@ -6392,6 +6392,118 @@ pub unsafe extern "system" fn rtl_ipv4_string_to_address_ex_w(
     }
 }
 
+/// `RtlIpv6StringToAddressA(PCSTR, PCSTR*, IN6_ADDR*) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `terminator` and `address` are writable.
+#[export_name = "RtlIpv6StringToAddressA"]
+pub unsafe extern "system" fn rtl_ipv6_string_to_address_a(
+    string: *const u8,
+    terminator: *mut *const u8,
+    address: *mut u8,
+) -> NtStatus {
+    if string.is_null() || terminator.is_null() || address.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { strlen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    match rtl::network::ipv6_string_to_address_a(input) {
+        Ok(parsed) => unsafe {
+            *terminator = string.add(parsed.terminator);
+            core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 16);
+            STATUS_SUCCESS
+        },
+        Err(term) => unsafe {
+            *terminator = string.add(term);
+            STATUS_INVALID_PARAMETER
+        },
+    }
+}
+
+/// `RtlIpv6StringToAddressW(PCWSTR, PCWSTR*, IN6_ADDR*) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; `terminator` and `address` are writable.
+#[export_name = "RtlIpv6StringToAddressW"]
+pub unsafe extern "system" fn rtl_ipv6_string_to_address_w(
+    string: *const u16,
+    terminator: *mut *const u16,
+    address: *mut u8,
+) -> NtStatus {
+    if string.is_null() || terminator.is_null() || address.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { wcslen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    match rtl::network::ipv6_string_to_address_w(input) {
+        Ok(parsed) => unsafe {
+            *terminator = string.add(parsed.terminator);
+            core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 16);
+            STATUS_SUCCESS
+        },
+        Err(term) => unsafe {
+            *terminator = string.add(term);
+            STATUS_INVALID_PARAMETER
+        },
+    }
+}
+
+/// `RtlIpv6StringToAddressExA(PCSTR, IN6_ADDR*, PULONG, PUSHORT) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; out-params are writable.
+#[export_name = "RtlIpv6StringToAddressExA"]
+pub unsafe extern "system" fn rtl_ipv6_string_to_address_ex_a(
+    string: *const u8,
+    address: *mut u8,
+    scope_id: *mut u32,
+    port: *mut u16,
+) -> NtStatus {
+    if string.is_null() || address.is_null() || scope_id.is_null() || port.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { strlen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    let parsed = match rtl::network::ipv6_string_to_address_ex_a(input) {
+        Ok(parsed) => parsed,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 16);
+        *scope_id = parsed.scope_id;
+        *port = parsed.port;
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlIpv6StringToAddressExW(PCWSTR, IN6_ADDR*, PULONG, PUSHORT) -> NTSTATUS`.
+///
+/// # Safety
+/// `string` is NUL-terminated; out-params are writable.
+#[export_name = "RtlIpv6StringToAddressExW"]
+pub unsafe extern "system" fn rtl_ipv6_string_to_address_ex_w(
+    string: *const u16,
+    address: *mut u8,
+    scope_id: *mut u32,
+    port: *mut u16,
+) -> NtStatus {
+    if string.is_null() || address.is_null() || scope_id.is_null() || port.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let len = unsafe { wcslen_raw(string) };
+    let input = unsafe { core::slice::from_raw_parts(string, len) };
+    let parsed = match rtl::network::ipv6_string_to_address_ex_w(input) {
+        Ok(parsed) => parsed,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(parsed.address.as_ptr(), address, 16);
+        *scope_id = parsed.scope_id;
+        *port = parsed.port;
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlDetermineDosPathNameType_U(PCWSTR Path) -> RTL_PATH_TYPE`.
 ///
 /// # Safety
@@ -14373,6 +14485,10 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ipv4_string_to_address_w as usize,
         rtl_ipv4_string_to_address_ex_a as usize,
         rtl_ipv4_string_to_address_ex_w as usize,
+        rtl_ipv6_string_to_address_a as usize,
+        rtl_ipv6_string_to_address_w as usize,
+        rtl_ipv6_string_to_address_ex_a as usize,
+        rtl_ipv6_string_to_address_ex_w as usize,
         rtl_determine_dos_path_name_type_u as usize,
         rtl_determine_dos_path_name_type_ustr as usize,
         rtl_get_longest_nt_path_length as usize,

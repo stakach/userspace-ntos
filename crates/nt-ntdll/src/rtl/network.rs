@@ -16,6 +16,19 @@ pub struct Ipv4AddressParse {
     pub terminator: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv6AddressParse {
+    pub address: [u8; 16],
+    pub terminator: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv6AddressExParse {
+    pub address: [u8; 16],
+    pub scope_id: u32,
+    pub port: u16,
+}
+
 /// Format an IPv4 address as ASCII octets (`a.b.c.d`).
 pub fn ipv4_address_to_string(address: [u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(IPV4_ADDR_STRING_MAX_LEN - 1);
@@ -133,6 +146,41 @@ pub fn ipv6_address_to_string_ex_w(
         .into_iter()
         .map(u16::from)
         .collect()
+}
+
+/// Parse an ANSI IPv6 string. The returned terminator is a byte offset.
+pub fn ipv6_string_to_address_a(string: &[u8]) -> Result<Ipv6AddressParse, usize> {
+    let wide: Vec<u16> = string.iter().copied().map(u16::from).collect();
+    ipv6_string_to_address_w(&wide)
+}
+
+/// Parse a UTF-16 IPv6 string. The returned terminator is a UTF-16 code-unit offset.
+pub fn ipv6_string_to_address_w(string: &[u16]) -> Result<Ipv6AddressParse, usize> {
+    match ipv6_string_to_address_inner(string, false) {
+        Ok(parsed) => Ok(Ipv6AddressParse {
+            address: parsed.address,
+            terminator: parsed.terminator,
+        }),
+        Err(term) => Err(term),
+    }
+}
+
+/// Parse an ANSI IPv6 string with optional scope and port. The whole string must be consumed.
+pub fn ipv6_string_to_address_ex_a(string: &[u8]) -> Result<Ipv6AddressExParse, usize> {
+    let wide: Vec<u16> = string.iter().copied().map(u16::from).collect();
+    ipv6_string_to_address_ex_w(&wide)
+}
+
+/// Parse a UTF-16 IPv6 string with optional scope and port. The whole string must be consumed.
+pub fn ipv6_string_to_address_ex_w(string: &[u16]) -> Result<Ipv6AddressExParse, usize> {
+    match ipv6_string_to_address_inner(string, true) {
+        Ok(parsed) => Ok(Ipv6AddressExParse {
+            address: parsed.address,
+            scope_id: parsed.scope_id,
+            port: parsed.port,
+        }),
+        Err(term) => Err(term),
+    }
 }
 
 /// Parse an ANSI IPv4 string. Non-strict mode accepts the classic ntdll shortened/octal/hex forms.
@@ -275,6 +323,247 @@ fn push_hex_u16(out: &mut Vec<u8>, mut value: u16) {
         len -= 1;
         out.push(buf[len]);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ipv6InnerParse {
+    address: [u8; 16],
+    terminator: usize,
+    scope_id: u32,
+    port: u16,
+}
+
+fn ipv6_string_to_address_inner(string: &[u16], ex: bool) -> Result<Ipv6InnerParse, usize> {
+    let mut address = [0u8; 16];
+    let mut expecting_port = false;
+    let mut has_0x = false;
+    let mut has_0x_terminator = None;
+    let mut too_big = false;
+    let mut n_bytes = 0usize;
+    let mut n_ipv4_bytes = 0usize;
+    let mut gap: Option<usize> = None;
+    let mut scope_id = 0u32;
+    let mut port = 0u16;
+    let mut index = 0usize;
+
+    if char_at(string, 0) == b'[' as u16 {
+        if !ex {
+            return Err(0);
+        }
+        expecting_port = true;
+        index += 1;
+    }
+
+    if char_at(string, index) == b':' as u16 {
+        if char_at(string, index + 1) != b':' as u16 {
+            return Err(index);
+        }
+        index += 1;
+    }
+
+    loop {
+        let prev_index;
+        if n_ipv4_bytes == 0 && char_at(string, index) == b':' as u16 {
+            if gap.is_some() {
+                return Err(index);
+            }
+            index += 1;
+            prev_index = index;
+            gap = Some(n_bytes);
+            let mut probe = index;
+            if n_bytes == 14 || parse_ipv6_component(string, &mut probe, 16).is_none() {
+                break;
+            }
+            index = prev_index;
+        } else {
+            prev_index = index;
+        }
+
+        let ipv4_probe_limit = if gap.is_some() { 10 } else { 12 };
+        if n_ipv4_bytes == 0 && n_bytes <= ipv4_probe_limit {
+            let mut probe = prev_index;
+            if parse_ipv6_component(string, &mut probe, 10).is_some()
+                && char_at(string, probe) == b'.' as u16
+            {
+                n_ipv4_bytes = 1;
+            }
+            index = prev_index;
+        }
+
+        if n_ipv4_bytes != 0 {
+            let mut next = index;
+            let Some(component) = parse_ipv6_component(string, &mut next, 10) else {
+                return Err(index);
+            };
+            index = next;
+            if index - prev_index > 3 || component > 255 {
+                too_big = true;
+            } else {
+                if char_at(string, index) != b'.' as u16
+                    && (n_ipv4_bytes < 4 || (n_bytes < 15 && gap.is_none()))
+                {
+                    return Err(index);
+                }
+                address[n_bytes] = component as u8;
+                n_bytes += 1;
+            }
+            if n_ipv4_bytes == 4 || char_at(string, index) != b'.' as u16 {
+                break;
+            }
+            n_ipv4_bytes += 1;
+        } else {
+            let mut next = index;
+            let Some(component) = parse_ipv6_component(string, &mut next, 16) else {
+                return Err(index);
+            };
+            index = next;
+            if char_at(string, prev_index) == b'0' as u16
+                && matches!(char_at(string, prev_index + 1), c if c == b'x' as u16 || c == b'X' as u16)
+            {
+                if n_bytes < 14 && gap.is_none() {
+                    return Err(prev_index);
+                }
+                write_ipv6_word(&mut address, n_bytes, component as u16);
+                n_bytes += 2;
+                has_0x = true;
+                has_0x_terminator = Some(prev_index + 1);
+                break;
+            }
+            if char_at(string, index) != b':' as u16 && n_bytes < 14 && gap.is_none() {
+                return Err(index);
+            }
+            if index - prev_index > 4 {
+                too_big = true;
+            } else {
+                write_ipv6_word(&mut address, n_bytes, component as u16);
+            }
+            n_bytes += 2;
+            if char_at(string, index) != b':' as u16
+                || (gap.is_some() && char_at(string, index + 1) == b':' as u16)
+            {
+                break;
+            }
+        }
+
+        let byte_limit = if gap.is_some() { 14 } else { 16 };
+        if n_bytes == byte_limit {
+            break;
+        }
+        if too_big {
+            return Err(index);
+        }
+        index += 1;
+    }
+
+    let terminator = has_0x_terminator.unwrap_or(index);
+    if too_big {
+        return Err(index);
+    }
+
+    if let Some(gap_start) = gap {
+        let trailing_len = n_bytes.saturating_sub(gap_start);
+        let trailing_dst = 16 - trailing_len;
+        address.copy_within(gap_start..n_bytes, trailing_dst);
+        for b in &mut address[gap_start..trailing_dst] {
+            *b = 0;
+        }
+    } else if n_bytes < 16 {
+        return Err(index);
+    }
+
+    if ex {
+        if has_0x {
+            return Err(index);
+        }
+        if char_at(string, index) == b'%' as u16 {
+            index += 1;
+            let Some(scope) = parse_ipv4_component(string, &mut index, true) else {
+                return Err(index);
+            };
+            scope_id = scope;
+        }
+        if expecting_port {
+            if char_at(string, index) != b']' as u16 {
+                return Err(index);
+            }
+            index += 1;
+            if char_at(string, index) == b':' as u16 {
+                index += 1;
+                let Some(parsed_port) = parse_ipv4_component(string, &mut index, false) else {
+                    return Err(index);
+                };
+                if parsed_port == 0 || parsed_port > 0xFFFF || char_at(string, index) != 0 {
+                    return Err(index);
+                }
+                port = (parsed_port as u16).to_be();
+            }
+        }
+        if char_at(string, index) != 0 {
+            return Err(index);
+        }
+    }
+
+    Ok(Ipv6InnerParse {
+        address,
+        terminator,
+        scope_id,
+        port,
+    })
+}
+
+fn parse_ipv6_component(string: &[u16], index: &mut usize, base: u32) -> Option<u32> {
+    let start = *index;
+    let mut i = start;
+    hex_value(char_at(string, i))?;
+
+    let has_prefix = base == 16
+        && char_at(string, i) == b'0' as u16
+        && matches!(char_at(string, i + 1), c if c == b'x' as u16 || c == b'X' as u16);
+    if has_prefix {
+        i += 2;
+    }
+
+    let mut value = 0u64;
+    let mut success = false;
+    while let Some(digit) = digit_value(char_at(string, i), base) {
+        value = value.saturating_mul(base as u64).saturating_add(digit as u64);
+        success = true;
+        i += 1;
+    }
+
+    if !success {
+        if has_prefix {
+            *index = start + 1;
+            return Some(0);
+        }
+        return None;
+    }
+
+    *index = i;
+    Some(value.min(0x7FFF_FFFF) as u32)
+}
+
+fn parse_ipv4_component(string: &[u16], index: &mut usize, strict: bool) -> Option<u32> {
+    if char_at(string, *index) == b'.' as u16 {
+        *index += 1;
+        return None;
+    }
+    let parsed = parse_ulong(string, *index, strict);
+    if !parsed.ok {
+        return None;
+    }
+    *index = parsed.terminator;
+    Some(parsed.value)
+}
+
+fn write_ipv6_word(address: &mut [u8; 16], offset: usize, value: u16) {
+    let bytes = value.to_be_bytes();
+    address[offset] = bytes[0];
+    address[offset + 1] = bytes[1];
+}
+
+fn hex_value(c: u16) -> Option<u32> {
+    digit_value(c, 16)
 }
 
 #[derive(Clone, Copy)]
@@ -574,6 +863,69 @@ mod tests {
             ipv6_address_to_string_ex_w(address, 1, 0),
             wide("::13.1.68.3%1")
         );
+    }
+
+    #[test]
+    fn parses_ipv6_addresses_with_terminators() {
+        let cases = [
+            ("::", [0, 0, 0, 0, 0, 0, 0, 0], 2),
+            ("::1", [0, 0, 0, 0, 0, 0, 0, 0x100], 3),
+            (
+                "::13.1.68.3",
+                [0, 0, 0, 0, 0, 0, 0x010d, 0x0344],
+                11,
+            ),
+            (
+                "1111:2222:3333:4444:0:5efe:129.144.52.38",
+                [
+                    0x1111, 0x2222, 0x3333, 0x4444, 0, 0xfe5e, 0x9081, 0x2634,
+                ],
+                40,
+            ),
+            (
+                "2001:db8::1428:57ab",
+                [0x120, 0xb80d, 0, 0, 0, 0, 0x2814, 0xab57],
+                19,
+            ),
+        ];
+        for (input, words, terminator) in cases {
+            let parsed = ipv6_string_to_address_a(input.as_bytes()).unwrap();
+            assert_eq!(parsed.address, ipv6_from_s6_words(words));
+            assert_eq!(parsed.terminator, terminator);
+        }
+
+        let parsed = ipv6_string_to_address_a(b"::1 trailing").unwrap();
+        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100]));
+        assert_eq!(parsed.terminator, 3);
+
+        let parsed = ipv6_string_to_address_a(b"::0x12345tail").unwrap();
+        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x4523]));
+        assert_eq!(parsed.terminator, 3);
+    }
+
+    #[test]
+    fn parses_ipv6_ex_scope_and_network_order_port() {
+        let parsed =
+            ipv6_string_to_address_ex_a(b"[::13.1.68.3%4294949819]:65518").unwrap();
+        assert_eq!(
+            parsed.address,
+            ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0x010d, 0x0344])
+        );
+        assert_eq!(parsed.scope_id, 0xffffbbbb);
+        assert_eq!(parsed.port, 65518u16.to_be());
+
+        let parsed = ipv6_string_to_address_ex_w(&wide("::1%1")).unwrap();
+        assert_eq!(parsed.address, ipv6_from_s6_words([0, 0, 0, 0, 0, 0, 0, 0x100]));
+        assert_eq!(parsed.scope_id, 1);
+        assert_eq!(parsed.port, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_ipv6_inputs() {
+        assert!(ipv6_string_to_address_ex_a(b"::1 trailing").is_err());
+        assert!(ipv6_string_to_address_ex_a(b"[::1").is_err());
+        assert!(ipv6_string_to_address_ex_a(b"[::1]:0").is_err());
+        assert!(ipv6_string_to_address_a(b"1:2").is_err());
     }
 
     #[test]
