@@ -11893,6 +11893,26 @@ pub unsafe extern "system" fn rtl_copy_luid_and_attributes_array(
     unsafe { core::ptr::copy_nonoverlapping(src, dest, bytes) };
 }
 
+/// `RtlEqualLuid(PLUID Luid1, PLUID Luid2) -> BOOLEAN` — compare the 8-byte LUID value
+/// (`sdk/lib/rtl/luid.c:55`).
+///
+/// # Safety
+/// `luid1`/`luid2` are valid readable LUID pointers.
+#[export_name = "RtlEqualLuid"]
+pub unsafe extern "system" fn rtl_equal_luid(luid1: *const u8, luid2: *const u8) -> u8 {
+    if luid1.is_null() || luid2.is_null() {
+        return 0;
+    }
+    // SAFETY: both point at 8-byte LUIDs per the contract.
+    unsafe {
+        let low1 = core::ptr::read_unaligned(luid1 as *const u32);
+        let high1 = core::ptr::read_unaligned(luid1.add(4) as *const i32);
+        let low2 = core::ptr::read_unaligned(luid2 as *const u32);
+        let high2 = core::ptr::read_unaligned(luid2.add(4) as *const i32);
+        u8::from(rtl::security::equal_luid(low1, high1, low2, high2))
+    }
+}
+
 /// `RtlRunDecodeUnicodeString(UCHAR Hash, PUNICODE_STRING String)` — in-place XOR-decode
 /// (`sdk/lib/rtl/encode.c:20`), the inverse of `RtlRunEncodeUnicodeString`. Operates on the raw
 /// BYTES of the buffer (Length is a byte count).
@@ -14519,6 +14539,8 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_unload_dll as usize,
         // BATCH 2 ckpt 2 — basesrv's 11 ntdll imports.
         rtl_copy_luid as usize,
+        rtl_copy_luid_and_attributes_array as usize,
+        rtl_equal_luid as usize,
         rtl_init_string as usize,
         rtl_delete_critical_section as usize,
         rtl_initialize_critical_section_and_spin_count as usize,

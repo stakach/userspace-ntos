@@ -681,6 +681,66 @@ pub unsafe extern "system" fn rtl_copy_sid(
     STATUS_SUCCESS
 }
 
+/// `RtlCopySidAndAttributesArray(ULONG Count, PSID_AND_ATTRIBUTES Src, ULONG SidAreaSize,
+/// PSID_AND_ATTRIBUTES Dest, PSID SidArea, PSID* RemainingSidArea, PULONG RemainingSidAreaSize)`.
+/// Copies the SID_AND_ATTRIBUTES array and packs SID bytes sequentially into `SidArea`.
+/// Ported from `sid.c:249`.
+///
+/// # Safety
+/// `src`/`dest` are arrays of `count` SID_AND_ATTRIBUTES entries (16 bytes each on x64);
+/// `sid_area` is writable for `sid_area_size` bytes; remaining out-pointers are writable.
+#[export_name = "RtlCopySidAndAttributesArray"]
+pub unsafe extern "system" fn rtl_copy_sid_and_attributes_array(
+    count: u32,
+    src: *const c_void,
+    sid_area_size: u32,
+    dest: *mut c_void,
+    sid_area: *mut c_void,
+    remaining_sid_area: *mut *mut c_void,
+    remaining_sid_area_size: *mut u32,
+) -> NtStatus {
+    if remaining_sid_area.is_null() || remaining_sid_area_size.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if count != 0 && (src.is_null() || dest.is_null() || sid_area.is_null()) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const SID_AND_ATTRIBUTES_SIZE: usize = 16;
+    let mut remaining = sid_area_size as usize;
+    let mut sid_cursor = sid_area as *mut u8;
+    let src = src as *const u8;
+    let dest = dest as *mut u8;
+
+    // SAFETY: caller supplied valid arrays and SID storage per the contract.
+    unsafe {
+        for i in 0..count as usize {
+            let src_entry = src.add(i * SID_AND_ATTRIBUTES_SIZE);
+            let dest_entry = dest.add(i * SID_AND_ATTRIBUTES_SIZE);
+            let src_sid = core::ptr::read_unaligned(src_entry as *const *const u8);
+            let attributes = core::ptr::read_unaligned(src_entry.add(8) as *const u32);
+            if src_sid.is_null() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let sid_length = sid_len(src_sid);
+            if sid_length > remaining {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            core::ptr::write_unaligned(dest_entry as *mut *mut c_void, sid_cursor as *mut c_void);
+            core::ptr::write_unaligned(dest_entry.add(8) as *mut u32, attributes);
+            core::ptr::write_unaligned(dest_entry.add(12) as *mut u32, 0);
+            core::ptr::copy_nonoverlapping(src_sid, sid_cursor, sid_length);
+
+            sid_cursor = sid_cursor.add(sid_length);
+            remaining -= sid_length;
+        }
+        *remaining_sid_area = sid_cursor as *mut c_void;
+        *remaining_sid_area_size = remaining as u32;
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlConvertSidToUnicodeString(PUNICODE_STRING, PSID, BOOLEAN AllocateBuffer) -> NTSTATUS`.
 /// Produces the SDDL "S-1-..." string. Ported from `sid.c:342`. When `allocate_buffer` is set we
 /// allocate the buffer from the process heap (x86_64 only); otherwise we write into the caller's
@@ -2641,6 +2701,7 @@ pub unsafe extern "C" fn security_export_anchor() {
         rtl_sub_authority_sid as usize,
         rtl_sub_authority_count_sid as usize,
         rtl_copy_sid as usize,
+        rtl_copy_sid_and_attributes_array as usize,
         rtl_convert_sid_to_unicode_string as usize,
         rtl_valid_acl as usize,
         rtl_query_information_acl as usize,

@@ -80,7 +80,8 @@ pub fn equal_prefix_sid(a: &Sid, b: &Sid) -> bool {
     if a.sub_authorities.is_empty() {
         return true;
     }
-    a.sub_authorities[..a.sub_authorities.len() - 1] == b.sub_authorities[..b.sub_authorities.len() - 1]
+    a.sub_authorities[..a.sub_authorities.len() - 1]
+        == b.sub_authorities[..b.sub_authorities.len() - 1]
 }
 
 /// `RtlValidSid(Sid)` — revision 1 + a sub-authority count within `SID_MAX_SUB_AUTHORITIES` (15).
@@ -207,6 +208,11 @@ pub fn are_any_accesses_granted(granted: u32, desired: u32) -> bool {
     granted & desired != 0
 }
 
+/// `RtlEqualLuid(Luid1, Luid2)`.
+pub fn equal_luid(low1: u32, high1: i32, low2: u32, high2: i32) -> bool {
+    low1 == low2 && high1 == high2
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -238,7 +244,10 @@ mod tests {
         assert!(copy_sid(4, &s).is_none()); // too small
         assert_eq!(copy_sid(64, &s), Some(s.clone()));
         assert_eq!(sid_to_sddl(&s), "S-1-5-18");
-        assert_eq!(convert_sid_to_unicode_string(&s), "S-1-5-18".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(
+            convert_sid_to_unicode_string(&s),
+            "S-1-5-18".encode_utf16().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -275,6 +284,13 @@ mod tests {
         assert!(!are_all_accesses_granted(0x1, 0x3));
         assert!(are_any_accesses_granted(0x1, 0x3));
         assert!(!are_any_accesses_granted(0x8, 0x3));
+    }
+
+    #[test]
+    fn luid_equality_uses_both_parts() {
+        assert!(equal_luid(0x1234, -1, 0x1234, -1));
+        assert!(!equal_luid(0x1234, -1, 0x1235, -1));
+        assert!(!equal_luid(0x1234, -1, 0x1234, 0));
     }
 
     #[test]
