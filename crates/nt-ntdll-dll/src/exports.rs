@@ -3898,17 +3898,113 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum(
 // Dbg* — debug print (serial-forward on our kernel; modelled here)
 // =================================================================================================
 
+const DBG_PRINT_BUFFER_SIZE: usize = 512;
+const DBG_FORMAT_BUFFER_SIZE: usize = 256;
+const DBG_CSTR_ARGUMENT_SIZE: usize = 256;
+
+unsafe fn copy_cstr_bounded(src: *const u8, dst: &mut [u8]) -> usize {
+    if src.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    while n < dst.len() {
+        let c = unsafe { core::ptr::read(src.add(n)) };
+        if c == 0 {
+            break;
+        }
+        dst[n] = c;
+        n += 1;
+    }
+    n
+}
+
+unsafe fn dbg_emit_stack_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::dbg_print_bytes(bytes.as_ptr(), bytes.len());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = bytes;
+    }
+}
+
+unsafe fn dbg_emit_literal(format: *const u8) -> NtStatus {
+    let mut out = [0u8; DBG_PRINT_BUFFER_SIZE];
+    let n = unsafe { copy_cstr_bounded(format, &mut out) };
+    unsafe { dbg_emit_stack_bytes(&out[..n]) };
+    STATUS_SUCCESS
+}
+
+fn dbg_print_filter_allows(component: u32, level: u32) -> bool {
+    if component == u32::MAX || level == nt_ntdll::dbg::level::ERROR {
+        return true;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        dbg_query_debug_filter_state(component, level) == 1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        debug_filter_enabled(component, level)
+    }
+}
+
+unsafe fn dbg_emit_formatted(
+    prefix: *const u8,
+    format: *const u8,
+    va_list: *mut c_void,
+) -> NtStatus {
+    let mut fmt = [0u8; DBG_FORMAT_BUFFER_SIZE];
+    let fmt_len = unsafe { copy_cstr_bounded(format, &mut fmt) };
+
+    let mut out = [0u8; DBG_PRINT_BUFFER_SIZE];
+    let mut out_len = unsafe { copy_cstr_bounded(prefix, &mut out) };
+    let mut arg_index = 0usize;
+    let mut next_arg = || {
+        if va_list.is_null() {
+            return 0;
+        }
+        let arg = unsafe { core::ptr::read((va_list as *const u64).add(arg_index)) };
+        arg_index += 1;
+        arg
+    };
+    let mut read_cstr = |ptr: u64, dst: &mut [u8]| -> usize {
+        let capped = dst.len().min(DBG_CSTR_ARGUMENT_SIZE);
+        unsafe { copy_cstr_bounded(ptr as *const u8, &mut dst[..capped]) }
+    };
+
+    nt_kernel_exec::dbg::format_dbg(
+        &fmt[..fmt_len],
+        &mut next_arg,
+        &mut read_cstr,
+        &mut |byte| {
+            if out_len < out.len() {
+                out[out_len] = byte;
+                out_len += 1;
+            }
+        },
+    );
+
+    unsafe { dbg_emit_stack_bytes(&out[..out_len]) };
+    STATUS_SUCCESS
+}
+
 /// `DbgPrint(PCSTR Format, ...) -> ULONG` — variadic on the C side. We declare only the fixed
-/// `Format` arg (the Win64 ABI leaves the variadic tail in the caller's registers/stack, which we
-/// never read), so this is a no-op returning STATUS_SUCCESS — ABI-safe without `c_variadic`. The
-/// format string is not rendered here (the live serial-forward is the Step-4.B/Dbg transport); the
-/// export exists so smss's IAT resolves.
+/// `Format` arg (the Win64 ABI leaves the variadic tail in the caller's registers/stack, which Rust
+/// cannot safely read without a real `c_variadic` export). The literal format string is still emitted
+/// through our ntdll DebugService path, so diagnostics are no longer dropped; callers that already
+/// pass a `va_list` use `vDbgPrint*`, which renders substitutions below.
 ///
 /// # Safety
-/// Called with the C DbgPrint ABI; a no-op that ignores the variadic tail.
+/// Called with the C DbgPrint ABI; the anonymous variadic tail is intentionally unread.
 #[export_name = "DbgPrint"]
-pub unsafe extern "C" fn dbg_print(_format: *const u8) -> NtStatus {
-    STATUS_SUCCESS
+pub unsafe extern "C" fn dbg_print(format: *const u8) -> NtStatus {
+    unsafe { dbg_emit_literal(format) }
 }
 
 /// `DbgBreakPoint()` — `int 3`. On x86_64 issue the breakpoint; a no-op elsewhere.
@@ -4997,9 +5093,35 @@ const LDR_LOAD_COUNT: u64 = 0x6C;
 const RTL_PROCESS_MODULES_HEADER_SIZE: u32 = 8;
 #[cfg(target_arch = "x86_64")]
 const RTL_PROCESS_MODULE_INFORMATION_SIZE: u32 = 0x128;
+const RTL_UNLOAD_EVENT_TRACE_NUMBER: usize = 16;
+const RTL_UNLOAD_EVENT_TRACE_SIZE: u32 = core::mem::size_of::<RtlUnloadEventTrace>() as u32;
+
+#[repr(C)]
+struct RtlUnloadEventTrace {
+    base_address: *mut c_void,
+    size_of_image: u32,
+    sequence: u32,
+    time_date_stamp: u32,
+    check_sum: u32,
+    image_name: [u16; 32],
+}
 
 #[cfg(target_arch = "x86_64")]
 static mut LDR_DLL_NOTIFICATION_LIST: [u64; 2] = [0, 0];
+static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_NUMBER] =
+    [const {
+        RtlUnloadEventTrace {
+            base_address: core::ptr::null_mut(),
+            size_of_image: 0,
+            sequence: 0,
+            time_date_stamp: 0,
+            check_sum: 0,
+            image_name: [0u16; 32],
+        }
+    }; RTL_UNLOAD_EVENT_TRACE_NUMBER];
+static RTL_UNLOAD_EVENT_TRACE_INDEX: AtomicU32 = AtomicU32::new(0);
+static RTL_UNLOAD_EVENT_TRACE_ELEMENT_SIZE: u32 = RTL_UNLOAD_EVENT_TRACE_SIZE;
+static RTL_UNLOAD_EVENT_TRACE_ELEMENT_COUNT: u32 = RTL_UNLOAD_EVENT_TRACE_NUMBER as u32;
 
 #[cfg(target_arch = "x86_64")]
 type LdrDllNotificationFunction = unsafe extern "system" fn(u32, *const c_void, *mut c_void);
@@ -5238,6 +5360,82 @@ pub(crate) unsafe fn ldr_send_dll_notifications_for_base(base: u64, reason: u32)
     let entry = unsafe { find_ldr_entry_for_base(base) };
     if entry != 0 {
         unsafe { ldr_send_dll_notifications_for_entry(entry, reason) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn record_unload_event_from_entry(entry: u64, base_address: *mut c_void) {
+    let sequence = RTL_UNLOAD_EVENT_TRACE_INDEX
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let slot = (sequence as usize - 1) % RTL_UNLOAD_EVENT_TRACE_NUMBER;
+    let trace = unsafe {
+        (core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut RtlUnloadEventTrace).add(slot)
+    };
+
+    unsafe {
+        (*trace).base_address = base_address;
+        (*trace).size_of_image = 0;
+        (*trace).sequence = sequence;
+        (*trace).time_date_stamp = 0;
+        (*trace).check_sum = 0;
+        (*trace).image_name = [0u16; 32];
+    }
+
+    let base = if entry != 0 {
+        unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) }
+    } else {
+        base_address as u64
+    };
+    if base != 0 {
+        let nt_headers = unsafe { rtl_image_nt_header(base as *mut c_void) };
+        if !nt_headers.is_null() {
+            unsafe {
+                (*trace).time_date_stamp = image_read_u32(nt_headers, 8);
+                (*trace).check_sum = image_read_u32(nt_headers, 24 + 64);
+                (*trace).size_of_image = image_read_u32(nt_headers, 24 + 56);
+            }
+        }
+    }
+
+    if entry != 0 {
+        let ldr_size = unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
+        if ldr_size != 0 {
+            unsafe { (*trace).size_of_image = ldr_size };
+        }
+        let name = entry + LDR_BASE_DLL_NAME;
+        let name_len = unsafe { core::ptr::read_unaligned(name as *const u16) } as usize / 2;
+        let name_buf = unsafe { core::ptr::read_unaligned((name + 8) as *const u64) } as *const u16;
+        if !name_buf.is_null() {
+            let count = name_len.min(32);
+            for i in 0..count {
+                unsafe {
+                    (*trace).image_name[i] = core::ptr::read_unaligned(name_buf.add(i));
+                }
+            }
+            if count < 32 {
+                unsafe { (*trace).image_name[count] = 0 };
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn record_unload_event_from_entry(_entry: u64, base_address: *mut c_void) {
+    let sequence = RTL_UNLOAD_EVENT_TRACE_INDEX
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let slot = (sequence as usize - 1) % RTL_UNLOAD_EVENT_TRACE_NUMBER;
+    let trace = unsafe {
+        (core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut RtlUnloadEventTrace).add(slot)
+    };
+    unsafe {
+        (*trace).base_address = base_address;
+        (*trace).size_of_image = 0;
+        (*trace).sequence = sequence;
+        (*trace).time_date_stamp = 0;
+        (*trace).check_sum = 0;
+        (*trace).image_name = [0u16; 32];
     }
 }
 
@@ -5496,7 +5694,19 @@ pub unsafe extern "system" fn ldr_get_procedure_address_ex(
 /// # Safety
 /// `base_address` a previously-loaded module base.
 #[export_name = "LdrUnloadDll"]
-pub unsafe extern "system" fn ldr_unload_dll(_base_address: *mut c_void) -> NtStatus {
+pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let entry = unsafe { find_ldr_entry_for_base(base_address as u64) };
+        unsafe { record_unload_event_from_entry(entry, base_address) };
+        if entry != 0 {
+            unsafe { ldr_send_dll_notifications_for_entry(entry, 2) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        record_unload_event_from_entry(0, base_address);
+    }
     STATUS_SUCCESS
 }
 
@@ -10548,6 +10758,101 @@ pub unsafe extern "system" fn rtl_query_process_debug_information(
 ) -> NtStatus {
     STATUS_SUCCESS
 }
+
+/// `RtlGetUnloadEventTrace() -> PRTL_UNLOAD_EVENT_TRACE`.
+///
+/// ReactOS exposes the process-local unload ring maintained by `LdrpRecordUnloadEvent`. Our loader
+/// keeps DLLs mapped, but `LdrUnloadDll` still records an unload attempt with the module metadata.
+///
+/// # Safety
+/// Returns a process-static array pointer.
+#[export_name = "RtlGetUnloadEventTrace"]
+pub unsafe extern "system" fn rtl_get_unload_event_trace() -> *mut c_void {
+    core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut c_void
+}
+
+/// `RtlGetUnloadEventTraceEx(PULONG *ElementSize, PULONG *ElementCount, PVOID *EventTrace)`.
+///
+/// Vista+ exposes the same ring together with element metadata. The out-parameters are optional in
+/// practice; fill every non-null one with stable process-static storage.
+///
+/// # Safety
+/// Each non-null out-parameter is writable.
+#[export_name = "RtlGetUnloadEventTraceEx"]
+pub unsafe extern "system" fn rtl_get_unload_event_trace_ex(
+    element_size: *mut *const u32,
+    element_count: *mut *const u32,
+    event_trace: *mut *mut c_void,
+) {
+    unsafe {
+        if !element_size.is_null() {
+            *element_size = &RTL_UNLOAD_EVENT_TRACE_ELEMENT_SIZE;
+        }
+        if !element_count.is_null() {
+            *element_count = &RTL_UNLOAD_EVENT_TRACE_ELEMENT_COUNT;
+        }
+        if !event_trace.is_null() {
+            *event_trace = core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut c_void;
+        }
+    }
+}
+
+/// `RtlTraceDatabaseCreate(...) -> PRTL_TRACE_DATABASE`.
+///
+/// ReactOS marks the trace-database family unimplemented and returns NULL/FALSE. Export the ABI so
+/// callers resolve the symbol, but do not fabricate a trace database.
+#[export_name = "RtlTraceDatabaseCreate"]
+pub unsafe extern "system" fn rtl_trace_database_create(
+    _buckets: u32,
+    _maximum_size: usize,
+    _flags: u32,
+    _tag: u32,
+    _hash_function: *mut c_void,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+macro_rules! rtl_trace_database_false {
+    ($export:literal, $fn:ident, ($($arg:ident : $ty:ty),* $(,)?)) => {
+        #[export_name = $export]
+        pub unsafe extern "system" fn $fn($($arg: $ty),*) -> u8 {
+            let _ = ($($arg,)*);
+            0
+        }
+    };
+}
+
+rtl_trace_database_false!(
+    "RtlTraceDatabaseAdd",
+    rtl_trace_database_add,
+    (database: *mut c_void, count: u32, trace: *mut *mut c_void, trace_block: *mut *mut c_void)
+);
+rtl_trace_database_false!(
+    "RtlTraceDatabaseDestroy",
+    rtl_trace_database_destroy,
+    (database: *mut c_void)
+);
+rtl_trace_database_false!(
+    "RtlTraceDatabaseEnumerate",
+    rtl_trace_database_enumerate,
+    (database: *mut c_void, trace_enumerate: *mut c_void, trace_block: *mut *mut c_void)
+);
+rtl_trace_database_false!(
+    "RtlTraceDatabaseFind",
+    rtl_trace_database_find,
+    (database: *mut c_void, count: u32, trace: *mut *mut c_void, trace_block: *mut *mut c_void)
+);
+rtl_trace_database_false!("RtlTraceDatabaseLock", rtl_trace_database_lock, (database: *mut c_void));
+rtl_trace_database_false!(
+    "RtlTraceDatabaseUnlock",
+    rtl_trace_database_unlock,
+    (database: *mut c_void)
+);
+rtl_trace_database_false!(
+    "RtlTraceDatabaseValidate",
+    rtl_trace_database_validate,
+    (database: *mut c_void)
+);
 
 // `RtlCaptureStackBackTrace` is provided by the security_exports module (part of that family).
 
@@ -16185,31 +16490,32 @@ fn debug_filter_enabled(component: u32, level: u32) -> bool {
     nt_ntdll::dbg::debug_filter_state(win2000, component_mask, level)
 }
 
-/// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Variadic; we declare
-/// only the fixed args (the Win64 variadic tail is left in the caller's registers/stack, unread).
-/// ABI-safe no-op returning STATUS_SUCCESS — the export exists so the Win32 stack's IAT resolves
-/// (kernel32!DbgPrintEx was the immediate frontier). The live render/serial-forward is the Dbg
-/// transport seam (as with `DbgPrint`).
+/// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. The direct variadic
+/// export cannot consume anonymous varargs from Rust, so it emits the literal format string after
+/// applying the debug-filter gate. `vDbgPrintEx*` below handles callers that provide a `va_list`.
 ///
 /// # Safety
-/// Called with the C DbgPrintEx ABI; ignores the variadic tail.
+/// Called with the C DbgPrintEx ABI; the anonymous variadic tail is intentionally unread.
 #[export_name = "DbgPrintEx"]
 pub unsafe extern "C" fn dbg_print_ex(
-    _component: u32,
-    _level: u32,
-    _format: *const u8,
+    component: u32,
+    level: u32,
+    format: *const u8,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if !dbg_print_filter_allows(component, level) {
+        return STATUS_SUCCESS;
+    }
+    unsafe { dbg_emit_literal(format) }
 }
 
-/// `DbgPrintReturnControlC(PCSTR Format, ...) -> ULONG`. Variadic checked-build print helper; same
-/// ABI-safe print seam as `DbgPrint`, returning STATUS_SUCCESS without reading the variadic tail.
+/// `DbgPrintReturnControlC(PCSTR Format, ...) -> ULONG`. Checked-build print helper; direct varargs
+/// are unreadable from this Rust ABI, so emit the literal format through the debug service.
 ///
 /// # Safety
-/// Called with the C DbgPrint ABI; ignores the variadic tail.
+/// Called with the C DbgPrint ABI; the anonymous variadic tail is intentionally unread.
 #[export_name = "DbgPrintReturnControlC"]
-pub unsafe extern "C" fn dbg_print_return_control_c(_format: *const u8) -> NtStatus {
-    STATUS_SUCCESS
+pub unsafe extern "C" fn dbg_print_return_control_c(format: *const u8) -> NtStatus {
+    unsafe { dbg_emit_literal(format) }
 }
 
 /// `DbgQueryDebugFilterState(ULONG ComponentId, ULONG Level) -> NTSTATUS/BOOLEAN`.
@@ -16274,47 +16580,53 @@ pub unsafe extern "system" fn dbg_set_debug_filter_state(
 }
 
 /// `vDbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, va_list) -> ULONG`.
-///
-/// ABI-safe no-op returning STATUS_SUCCESS; the rendered serial path remains the debug transport
-/// seam shared with `DbgPrintEx`.
+/// Renders the bounded printf-lite subset through the shared debug formatter and emits it via
+/// ntdll's DebugService path.
 ///
 /// # Safety
-/// Called with the ntdll `vDbgPrintEx` ABI; ignores the `va_list`.
+/// `args` is the caller's Win64 `va_list` argument cursor.
 #[export_name = "vDbgPrintEx"]
 pub unsafe extern "C" fn vdbg_print_ex(
-    _component: u32,
-    _level: u32,
-    _format: *const u8,
-    _args: *mut c_void,
+    component: u32,
+    level: u32,
+    format: *const u8,
+    args: *mut c_void,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if !dbg_print_filter_allows(component, level) {
+        return STATUS_SUCCESS;
+    }
+    unsafe { dbg_emit_formatted(core::ptr::null(), format, args) }
 }
 
 /// `vDbgPrintExWithPrefix(PCSTR Prefix, ULONG ComponentId, ULONG Level, PCSTR Format, va_list)
-/// -> ULONG`. The `va_list`-taking core of the DbgPrintEx family. `va_list` is opaque in `no_std`;
-/// ABI-safe no-op returning STATUS_SUCCESS (IAT-resolve; live render = the Dbg transport seam).
+/// -> ULONG`. The `va_list`-taking core of the DbgPrintEx family. Prefix and rendered body are copied
+/// to a stack buffer and emitted via the debug-service trap pair the executive recognizes.
 ///
 /// # Safety
-/// Called with the ntdll `vDbgPrintExWithPrefix` ABI; ignores the `va_list`.
+/// `args` is the caller's Win64 `va_list` argument cursor.
 #[export_name = "vDbgPrintExWithPrefix"]
 pub unsafe extern "C" fn vdbg_print_ex_with_prefix(
-    _prefix: *const u8,
-    _component: u32,
-    _level: u32,
-    _format: *const u8,
-    _args: *mut c_void,
+    prefix: *const u8,
+    component: u32,
+    level: u32,
+    format: *const u8,
+    args: *mut c_void,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if !dbg_print_filter_allows(component, level) {
+        return STATUS_SUCCESS;
+    }
+    unsafe { dbg_emit_formatted(prefix, format, args) }
 }
 
 /// `DbgPrompt(PCSTR Prompt, PCH Response, ULONG Length) -> ULONG` — prompt the debugger for input.
-/// No debugger is attached, so we return an empty response (0 bytes read) — the observable
-/// no-debugger contract.
+/// The prompt is emitted through the debug-service print path. No interactive debugger is attached,
+/// so the response is the observable no-debugger empty string.
 ///
 /// # Safety
 /// `response` writable for `length` bytes.
 #[export_name = "DbgPrompt"]
-pub unsafe extern "C" fn dbg_prompt(_prompt: *const u8, response: *mut u8, length: u32) -> u32 {
+pub unsafe extern "C" fn dbg_prompt(prompt: *const u8, response: *mut u8, length: u32) -> u32 {
+    let _ = unsafe { dbg_emit_literal(prompt) };
     if !response.is_null() && length > 0 {
         // SAFETY: response valid for length bytes per the contract.
         unsafe { *response = 0 };
@@ -18149,6 +18461,16 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_create_query_debug_buffer as usize,
         rtl_destroy_query_debug_buffer as usize,
         rtl_query_process_debug_information as usize,
+        rtl_get_unload_event_trace as usize,
+        rtl_get_unload_event_trace_ex as usize,
+        rtl_trace_database_create as usize,
+        rtl_trace_database_add as usize,
+        rtl_trace_database_destroy as usize,
+        rtl_trace_database_enumerate as usize,
+        rtl_trace_database_find as usize,
+        rtl_trace_database_lock as usize,
+        rtl_trace_database_unlock as usize,
+        rtl_trace_database_validate as usize,
         rtl_wow64_enable_fs_redirection as usize,
         rtl_wow64_enable_fs_redirection_ex as usize,
     ];
