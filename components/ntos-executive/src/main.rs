@@ -1754,7 +1754,10 @@ pub(crate) unsafe fn eager_mark(pi: u64, base: u64) {
 // the fault-fill path allocated for each PER-PROCESS client page ((pi,page) -> frame cptr); the
 // shared-DLL-text cache (`dll_cache`) covers RX pages (byte-identical across clients). The
 // executive's scratch alias already shares these frames, so the client's runtime writes are visible.
-const CSRSS_FRAME_CAP: usize = 8192;
+// Two interactive clients retain private writable pages for their full DLL graphs. Winlogon's
+// runtime worker stacks are created late, after the former 8192-entry table could already be full;
+// silently dropping those entries made win32k attach an unrelated page at the same user VA.
+const CSRSS_FRAME_CAP: usize = 16384;
 static mut CSRSS_FRAME_PI: [u8; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
@@ -4492,6 +4495,9 @@ struct HostedThread {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
     pml4: u64,
+    /// Hosted-process index owning this address space. Non-zero GUI clients publish their stack
+    /// frames for win32k's per-client identity attach; zero is smss and has no win32k attachment.
+    client_pi: u64,
     /// The thread's instruction pointer and first two Windows x64 argument registers.
     entry_rip: u64,
     arg0: u64,
@@ -4562,12 +4568,60 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
         }
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
-    // rendezvous's out-param copyout.
+    // rendezvous's out-param copyout. GUI-client stacks must also be discoverable by win32k's
+    // KeStackAttachProcess model. Without this registration, a pointer to a worker's stack local
+    // faults in win32k and is incorrectly backed by a fresh unrelated page.
     for i in 0..t.stack_frames {
         let f = alloc_frame();
-        let _ = page_map(copy_cap(f), t.stack_base + i * 0x1000, RW_NX, t.pml4);
-        if t.stack_mirror_va != 0 {
-            let _ = page_map(copy_cap(f), t.stack_mirror_va + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let page = t.stack_base + i * 0x1000;
+        let target_map = if t.client_pi == 2 {
+            page_map_r(copy_cap(f), page, RW_NX, t.pml4)
+        } else {
+            page_map(copy_cap(f), page, RW_NX, t.pml4);
+            0
+        };
+        let mirror_map = if t.stack_mirror_va != 0 {
+            if t.client_pi == 2 {
+                page_map_r(
+                    copy_cap(f),
+                    t.stack_mirror_va + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                )
+            } else {
+                page_map(
+                    copy_cap(f),
+                    t.stack_mirror_va + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+                0
+            }
+        } else {
+            0
+        };
+        if t.client_pi == 2 && (target_map != 0 || mirror_map != 0 || i + 1 == t.stack_frames) {
+            print_str(b"[wl-stack-map] page=");
+            print_hex((page >> 32) as u32);
+            print_hex(page as u32);
+            print_str(b" target=");
+            print_u64(target_map);
+            print_str(b" mirror=");
+            print_u64(mirror_map);
+            print_str(b"\n");
+        }
+        if t.client_pi != 0 {
+            csrss_frame_put(t.client_pi, page, f);
+        }
+        if t.client_pi == 2 && i + 1 == t.stack_frames {
+            let (published, index) = csrss_frame_get_exact(t.client_pi, page);
+            print_str(b"[wl-stack-map] published=");
+            print_hex(published as u32);
+            print_str(b" index=");
+            print_u64(if index == usize::MAX { u64::MAX } else { index as u64 });
+            print_str(b" entries=");
+            print_u64(core::ptr::read(core::ptr::addr_of!(CSRSS_FRAME_N)) as u64);
+            print_str(b"\n");
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,

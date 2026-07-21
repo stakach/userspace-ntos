@@ -16,6 +16,7 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
     // m0=RAX garbage → `[sm-rdv] WALL: unexpected SSN`.
     spawn_hosted_thread(&HostedThread {
         pml4: smss_pml4,
+        client_pi: 0,
         entry_rip,
         arg0: port_handle,
         arg1: 0,
@@ -299,6 +300,7 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
     // The TEB carries the self-connect ClientId (0x40/0x48) so the thread's own bookkeeping is consistent.
     spawn_hosted_thread(&HostedThread {
         pml4: csrss_pml4,
+        client_pi: 1,
         entry_rip,
         arg0: param,
         arg1: 0,
@@ -380,6 +382,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     let worker_ep = mint_badged(main_fault_ep, badge);
     spawn_hosted_thread(&HostedThread {
         pml4,
+        client_pi: 2,
         entry_rip,
         arg0,
         arg1,
@@ -431,6 +434,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
+        client_pi: 3,
         entry_rip,
         arg0,
         arg1,
@@ -484,6 +488,7 @@ pub(crate) unsafe fn spawn_scm_worker_thread(
     let worker_ep = mint_badged(main_fault_ep, SCM_WORKER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: svc_pml4,
+        client_pi: 3,
         entry_rip,
         arg0,
         arg1,
@@ -525,6 +530,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
+        client_pi: 4,
         entry_rip,
         arg0,
         arg1,
@@ -570,6 +576,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
+        client_pi: 4,
         entry_rip,
         arg0,
         arg1,
@@ -606,6 +613,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     spawn_hosted_thread(&HostedThread {
         pml4: lsass_pml4,
+        client_pi: 4,
         entry_rip,
         arg0,
         arg1,

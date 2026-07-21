@@ -3283,18 +3283,79 @@ unsafe fn print_counted_utf16(descriptor: u64) {
     print_str(&ascii[..count]);
 }
 
-unsafe fn counted_utf16_eq_ascii(descriptor: u64, expected: &[u8]) -> bool {
+/// Decode the `LARGE_STRING` form used by CreateWindowEx. Unlike `UNICODE_STRING`, its second word
+/// is a 31-bit maximum length plus a high `bAnsi` bit; built-in classes may also arrive as direct
+/// atoms or as a zero-length descriptor whose Buffer carries the atom.
+unsafe fn create_class_is_static(descriptor: u64) -> bool {
     if descriptor <= 0xffff {
-        return false;
+        return descriptor == 0xc002;
     }
-    let len = read_unaligned(descriptor as *const u16) as usize / 2;
+    let len = read_unaligned(descriptor as *const u32) as usize;
+    let max_and_ansi = read_unaligned((descriptor + 4) as *const u32);
     let buffer = read_unaligned((descriptor + 8) as *const u64);
-    if buffer == 0 || len != expected.len() {
+    if len == 0 {
+        return buffer == 0xc002;
+    }
+    if buffer == 0 {
         return false;
     }
-    expected.iter().enumerate().all(|(i, expected_byte)| {
-        read_unaligned((buffer + (i * 2) as u64) as *const u16) == *expected_byte as u16
-    })
+    // User32 leaves LARGE_STRING.bAnsi uninitialized for the Unicode path. Length + payload are
+    // authoritative: try the expected UTF-16 representation before consulting the flag.
+    if len == 12
+        && b"Static".iter().enumerate().all(|(i, expected)| {
+            read_unaligned((buffer + (i * 2) as u64) as *const u16) == *expected as u16
+        })
+    {
+        return true;
+    }
+    max_and_ansi & 0x8000_0000 != 0
+        && len == 6
+        && b"Static".iter().enumerate().all(|(i, expected)| {
+            read_unaligned((buffer + i as u64) as *const u8) == *expected
+        })
+}
+
+unsafe fn trace_create_class(descriptor: u64) {
+    print_str(b" desc=");
+    print_hex((descriptor >> 32) as u32);
+    print_hex(descriptor as u32);
+    if descriptor <= 0xffff {
+        print_str(b" direct-atom=");
+        print_hex(descriptor as u32);
+        return;
+    }
+    let len = read_unaligned(descriptor as *const u32);
+    let max_and_ansi = read_unaligned((descriptor + 4) as *const u32);
+    let buffer = read_unaligned((descriptor + 8) as *const u64);
+    print_str(b" len=");
+    print_hex(len);
+    print_str(b" maxflags=");
+    print_hex(max_and_ansi);
+    print_str(b" buffer=");
+    print_hex((buffer >> 32) as u32);
+    print_hex(buffer as u32);
+    if len == 0 && buffer <= 0xffff {
+        print_str(b" atom=");
+        print_hex(buffer as u32);
+        return;
+    }
+    if buffer == 0 {
+        print_str(b" name=<null>");
+        return;
+    }
+    print_str(b" name=");
+    let mut ascii = [0u8; 32];
+    let ansi = max_and_ansi & 0x8000_0000 != 0;
+    let count = if ansi { len as usize } else { len as usize / 2 }.min(ascii.len());
+    for (i, byte) in ascii.iter_mut().take(count).enumerate() {
+        let ch = if ansi {
+            read_unaligned((buffer + i as u64) as *const u8) as u16
+        } else {
+            read_unaligned((buffer + (i * 2) as u64) as *const u16)
+        };
+        *byte = if (0x20..=0x7e).contains(&ch) { ch as u8 } else { b'?' };
+    }
+    print_str(&ascii[..count]);
 }
 
 unsafe fn trace_class_process_state() {
@@ -3409,9 +3470,25 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
     } else {
         0
     };
-    let trace_static_create = client_pi == 2
-        && ssn == SSN_NT_USER_CREATE_WINDOW_EX
-        && counted_utf16_eq_ascii(a1, b"Static");
+    let trace_create = client_pi == 2 && ssn == SSN_NT_USER_CREATE_WINDOW_EX;
+    let create_style = if trace_create { s(4) } else { 0 };
+    let create_parent = if trace_create { s(9) } else { 0 };
+    let create_menu = if trace_create { s(10) } else { 0 };
+    let create_instance = if trace_create { s(11) } else { 0 };
+    let trace_static_create = trace_create && create_class_is_static(a2);
+    if trace_create {
+        print_str(b"[class-diag] PRE CreateWindowEx class(a1)");
+        trace_create_class(a1);
+        print_str(b" version(a2)");
+        trace_create_class(a2);
+        // user32.dll runtime base 0x80150000, ntdll import IAT RVA 0xA4738. This proves the
+        // class-string initializer is bound to our high-address Rust ntdll, not a low DLL image.
+        let rtl_init_iat = read_volatile(0x801f_4738 as *const u64);
+        print_str(b" RtlInitUnicodeString@IAT=");
+        print_hex((rtl_init_iat >> 32) as u32);
+        print_hex(rtl_init_iat as u32);
+        print_str(b"\n");
+    }
     if trace_static_create {
         trace_public_classes(b"before Static CreateWindowEx");
     }
@@ -3471,8 +3548,22 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
             trace_public_classes(b"after Static RegisterClass");
         }
     }
-    if trace_static_create && ret == 0 {
-        trace_public_classes(b"after failed Static CreateWindowEx");
+    if trace_create && ret == 0 {
+        print_str(b"[class-diag] failed CreateWindowEx style=");
+        print_hex(create_style as u32);
+        print_str(b" parent=");
+        print_hex(create_parent as u32);
+        print_str(b" menu=");
+        print_hex(create_menu as u32);
+        print_str(b" instance=");
+        print_hex(create_instance as u32);
+        print_str(b"\n");
+        trace_class_process_state();
+        trace_public_classes(if trace_static_create {
+            b"after failed Static CreateWindowEx"
+        } else {
+            b"after failed non-Static CreateWindowEx"
+        });
     }
 
     // ★ BATCH 46 — restore the desktop-paint TRIGGER on winlogon's real SwitchDesktop.

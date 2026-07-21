@@ -3501,6 +3501,31 @@ pub(crate) unsafe fn service_sec_image(
                     print_u64(pi as u64);
                     print_str(b"\n");
                 }
+                if pi == 2
+                    && m0 == 0x1077 // NtUserCreateWindowEx
+                    && a1 == 0x0000_0100_104c_77a0
+                {
+                    let temp = a1 - 0x28;
+                    let source_slot = a1 + 0xf8;
+                    print_str(b"[class-stack] badge=");
+                    print_u64(badge);
+                    print_str(b" sp=");
+                    print_hex((sp >> 32) as u32);
+                    print_hex(sp as u32);
+                    print_str(b" desc=");
+                    print_hex(smss_stack_read(a1) as u32);
+                    print_str(b"/");
+                    print_hex(smss_stack_read(a1 + 8) as u32);
+                    print_str(b" temp=");
+                    print_hex(smss_stack_read(temp) as u32);
+                    print_str(b"/");
+                    print_hex(smss_stack_read(temp + 8) as u32);
+                    print_str(b" source=");
+                    let source = smss_stack_read(source_slot);
+                    print_hex((source >> 32) as u32);
+                    print_hex(source as u32);
+                    print_str(b"\n");
+                }
                 // ★ THE COUNTED DESKTOP PAINT — winlogon's OWN natural NtUserSwitchDesktop paints the
                 // framebuffer, and THIS is the source of the `exec_win32k_desktop_painted` gate spec
                 // (scaffold RETIRED — see the m0==0x125a arm, which now runs ONLY the InitVideo/surface

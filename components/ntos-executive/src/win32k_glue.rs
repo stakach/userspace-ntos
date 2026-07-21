@@ -1346,7 +1346,19 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) {
 /// backed by a known client frame (win32k would read garbage → the caller stops with a diagnostic).
 /// Idempotent per page for the currently-attached client (see `w32_client_attach`).
 pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64) -> bool {
-    if w32_attach_mapped(page) {
+    let trace_worker_stack = pi == 2 && page == 0x0000_0100_104c_7000;
+    let already_mapped = w32_attach_mapped(page);
+    if trace_worker_stack {
+        let (exact, index) = csrss_frame_get_exact(pi, page);
+        print_str(b"[w32attach-stack] mapped=");
+        print_u64(already_mapped as u64);
+        print_str(b" exact=");
+        print_hex(exact as u32);
+        print_str(b" index=");
+        print_u64(if index == usize::MAX { u64::MAX } else { index as u64 });
+        print_str(b"\n");
+    }
+    if already_mapped {
         return true; // already shared for the currently-attached client
     }
     let fr = csrss_frame_get(pi, page);
@@ -1357,7 +1369,20 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
     // the client so writes propagate back (out-params). Non-executable — client data, not code.
     let cc = copy_cap(fr);
-    let _ = page_map(cc, page, RW_NX, w_pml4);
+    let map_error = if trace_worker_stack {
+        page_map_r(cc, page, RW_NX, w_pml4)
+    } else {
+        page_map(cc, page, RW_NX, w_pml4);
+        0
+    };
+    if trace_worker_stack {
+        print_str(b"[w32attach-stack] PageMap error=");
+        print_u64(map_error);
+        print_str(b"\n");
+    }
+    if map_error != 0 {
+        return false;
+    }
     w32_attach_record(page, cc);
     true
 }
