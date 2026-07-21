@@ -44,9 +44,11 @@ const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
+const STATUS_OBJECT_NAME_INVALID: NtStatus = 0xC000_0033;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
+const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
 const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
 const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
@@ -2324,25 +2326,23 @@ pub unsafe extern "system" fn rtl_query_environment_variable_u(
 /// # Safety
 /// `dos_name` a NUL-terminated UTF-16 string (or NULL → FALSE); `nt_name` a valid writable
 /// `UNICODE_STRING`.
-#[export_name = "RtlDosPathNameToNtPathName_U"]
-pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
+unsafe fn rtl_dos_path_name_to_nt_path_name_u_impl(
     dos_name: *const u16,
     nt_name: PUnicodeString,
-    part_name: *mut *const u16,
-    _relative_name: *mut c_void,
-) -> u8 {
+    part_name: *mut *mut u16,
+    relative_name: *mut c_void,
+    _have_relative: bool,
+) -> NtStatus {
     if dos_name.is_null() || nt_name.is_null() {
-        return 0;
+        return STATUS_OBJECT_NAME_INVALID;
     }
     // SAFETY: dos_name is a NUL-terminated UTF-16 string per the contract.
     let len = unsafe { wcslen_raw(dos_name) };
     if len == 0 {
-        return 0;
+        return STATUS_OBJECT_NAME_INVALID;
     }
     // SAFETY: [dos_name, dos_name+len) is the string body.
     let input = unsafe { core::slice::from_raw_parts(dos_name, len) };
-    // Resolve relative/rooted names against the process CWD (real ntdll canonicalises against
-    // PEB->ProcessParameters->CurrentDirectory.DosPath); absolute paths ignore the CWD.
     #[cfg(target_arch = "x86_64")]
     let nt_opt = {
         let cwd = peb_current_directory();
@@ -2351,47 +2351,92 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
     #[cfg(not(target_arch = "x86_64"))]
     let nt_opt = rtl::path::dos_path_name_to_nt_path_name(input);
     let Some(nt) = nt_opt else {
-        // Drive-relative (needs a per-drive CWD table) / malformed — honest failure.
-        return 0;
+        return STATUS_OBJECT_NAME_INVALID;
     };
-    // Allocate a NUL-terminated UTF-16 buffer from the process heap.
+
     let n_units = nt.len();
     let bytes = (n_units + 1) * 2;
     // SAFETY: process heap alloc (installed at LdrpInitialize). Null on failure.
     let buf = unsafe { crate::process_heap_alloc(bytes) } as *mut u16;
     if buf.is_null() {
-        return 0;
+        return STATUS_NO_MEMORY;
     }
-    // SAFETY: buf is a fresh `bytes`-byte region; copy the units + terminating NUL.
+
+    // SAFETY: buf is a fresh `bytes`-byte region; nt_name/part_name/relative_name are writable per
+    // the caller's ABI contract when non-null.
     unsafe {
         core::ptr::copy_nonoverlapping(nt.as_ptr(), buf, n_units);
         core::ptr::write(buf.add(n_units), 0);
-        // Fill the UNICODE_STRING: Length excludes the NUL, MaximumLength includes it.
         core::ptr::write(
             core::ptr::addr_of_mut!((*nt_name).length),
             (n_units * 2) as u16,
         );
         core::ptr::write(
             core::ptr::addr_of_mut!((*nt_name).maximum_length),
-            (bytes) as u16,
+            bytes as u16,
         );
         core::ptr::write(core::ptr::addr_of_mut!((*nt_name).buffer), buf as u64);
-    }
-    if !part_name.is_null() {
-        // PartName points at the final component (after the last `\`), or NULL if the path ends in
-        // a separator. Compute over the DOS input tail.
-        // SAFETY: part_name is a valid writable pointer per the contract.
-        unsafe {
-            let last_sep = input
+
+        if !part_name.is_null() {
+            let last_sep = nt
                 .iter()
                 .rposition(|&c| c == b'\\' as u16 || c == b'/' as u16);
             match last_sep {
-                Some(i) if i + 1 < len => core::ptr::write(part_name, dos_name.add(i + 1)),
-                _ => core::ptr::write(part_name, core::ptr::null()),
+                Some(i) if i + 1 < n_units => core::ptr::write(part_name, buf.add(i + 1)),
+                _ => core::ptr::write(part_name, core::ptr::null_mut()),
             }
         }
+
+        if !relative_name.is_null() {
+            core::ptr::write_bytes(relative_name as *mut u8, 0, 0x28);
+        }
     }
-    1 // TRUE
+
+    STATUS_SUCCESS
+}
+
+#[export_name = "RtlDosPathNameToNtPathName_U"]
+pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u(
+    dos_name: *const u16,
+    nt_name: PUnicodeString,
+    part_name: *mut *const u16,
+    relative_name: *mut c_void,
+) -> u8 {
+    // SAFETY: forwards the same descriptor/pointer contract.
+    u8::from(
+        unsafe {
+            rtl_dos_path_name_to_nt_path_name_u_impl(
+                dos_name,
+                nt_name,
+                part_name as *mut *mut u16,
+                relative_name,
+                false,
+            )
+        } == STATUS_SUCCESS,
+    )
+}
+
+/// `RtlDosPathNameToNtPathName_U_WithStatus(...) -> NTSTATUS`.
+///
+/// # Safety
+/// Same pointer contract as `RtlDosPathNameToNtPathName_U`.
+#[export_name = "RtlDosPathNameToNtPathName_U_WithStatus"]
+pub unsafe extern "system" fn rtl_dos_path_name_to_nt_path_name_u_with_status(
+    dos_name: *const u16,
+    nt_name: PUnicodeString,
+    part_name: *mut *const u16,
+    relative_name: *mut c_void,
+) -> NtStatus {
+    // SAFETY: forwards the same descriptor/pointer contract.
+    unsafe {
+        rtl_dos_path_name_to_nt_path_name_u_impl(
+            dos_name,
+            nt_name,
+            part_name as *mut *mut u16,
+            relative_name,
+            false,
+        )
+    }
 }
 
 /// `RtlDosSearchPath_U(PCWSTR Path, PCWSTR FileName, PCWSTR Extension, ULONG BufferLength, PWSTR
@@ -5537,6 +5582,32 @@ pub unsafe extern "system" fn rtl_get_length_without_trailing_path_seperators(
     STATUS_SUCCESS
 }
 
+/// `RtlGetLengthWithoutLastFullDosOrNtPathElement(ULONG, PCUNICODE_STRING, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `path` points to a valid counted UTF-16 string and `length` is writable.
+#[export_name = "RtlGetLengthWithoutLastFullDosOrNtPathElement"]
+pub unsafe extern "system" fn rtl_get_length_without_last_full_dos_or_nt_path_element(
+    flags: u32,
+    path: PCUnicodeString,
+    length: *mut u32,
+) -> NtStatus {
+    if !length.is_null() {
+        unsafe { *length = 0 };
+    }
+    if flags != 0 || path.is_null() || length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let s = unsafe { us_slice(path) };
+    match nt_ntdll::rtl::path::length_without_last_full_dos_or_nt_path_element(s) {
+        Ok(chars) => {
+            unsafe { *length = chars };
+            STATUS_SUCCESS
+        }
+        Err(()) => STATUS_INVALID_PARAMETER,
+    }
+}
+
 type RtlLengthFunction = unsafe extern "system" fn(u32, PUnicodeString, *mut u32) -> NtStatus;
 
 /// `RtlpApplyLengthFunction(ULONG, ULONG, PVOID, PRTL_PATH_LENGTH_FUNCTION) -> NTSTATUS`.
@@ -5601,59 +5672,34 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u(
     part_name: *mut *mut u16,
     relative_name: *mut c_void,
 ) -> u8 {
-    if dos_name.is_null() || nt_name.is_null() {
-        return 0;
-    }
-    // SAFETY: dos_name NUL-terminated per the contract.
-    let n = unsafe { wcslen_raw(dos_name) };
-    let s = unsafe { core::slice::from_raw_parts(dos_name, n) };
-    // Resolve a relative/rooted image name against the process CWD (real ntdll canonicalises against
-    // PEB->ProcessParameters->CurrentDirectory.DosPath before prefixing `\??\`). Absolute paths ignore
-    // the CWD. This is winlogon's `CreateProcessW("services.exe")` path — a relative name that must
-    // become `\??\C:\Windows\services.exe`, else CreateProcessInternalW bails with ERROR_PATH_NOT_FOUND.
-    #[cfg(target_arch = "x86_64")]
-    let nt = {
-        let cwd = peb_current_directory();
-        match nt_ntdll::rtl::path::dos_path_name_to_nt_path_name_rel(s, &cwd) {
-            Some(v) => v,
-            None => return 0,
-        }
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let nt = match nt_ntdll::rtl::path::dos_path_name_to_nt_path_name(s) {
-        Some(v) => v,
-        None => return 0,
-    };
-    #[cfg(target_arch = "x86_64")]
-    {
-        let bytes = nt.len() * 2;
-        // SAFETY: on-target heap.
-        let p = unsafe { crate::process_heap_alloc(bytes + 2) } as *mut u16;
-        if p.is_null() {
-            return 0;
-        }
-        // SAFETY: p valid for nt.len()+1 units; nt_name writable.
+    // SAFETY: forwards the same descriptor/pointer contract.
+    u8::from(
         unsafe {
-            core::ptr::copy_nonoverlapping(nt.as_ptr(), p, nt.len());
-            *p.add(nt.len()) = 0;
-            (*nt_name).length = bytes as u16;
-            (*nt_name).maximum_length = (bytes + 2) as u16;
-            (*nt_name).buffer = p as u64;
-            if !part_name.is_null() {
-                *part_name = core::ptr::null_mut();
-            }
-            // RelativeName cleared = "no relative base" (absolute result). RTL_RELATIVE_NAME_U is
-            // ~0x28 bytes: {RelativeName UNICODE_STRING, ContainingDirectory HANDLE, CurDirRef}.
-            if !relative_name.is_null() {
-                core::ptr::write_bytes(relative_name as *mut u8, 0, 0x28);
-            }
-        }
-        1
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (part_name, relative_name, nt);
-        0
+            rtl_dos_path_name_to_nt_path_name_u_impl(
+                dos_name,
+                nt_name,
+                part_name,
+                relative_name,
+                true,
+            )
+        } == STATUS_SUCCESS,
+    )
+}
+
+/// `RtlDosPathNameToRelativeNtPathName_U_WithStatus(...) -> NTSTATUS`.
+///
+/// # Safety
+/// Same pointer contract as `RtlDosPathNameToRelativeNtPathName_U`.
+#[export_name = "RtlDosPathNameToRelativeNtPathName_U_WithStatus"]
+pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u_with_status(
+    dos_name: *const u16,
+    nt_name: PUnicodeString,
+    part_name: *mut *mut u16,
+    relative_name: *mut c_void,
+) -> NtStatus {
+    // SAFETY: forwards the same descriptor/pointer contract.
+    unsafe {
+        rtl_dos_path_name_to_nt_path_name_u_impl(dos_name, nt_name, part_name, relative_name, true)
     }
 }
 
@@ -6635,28 +6681,76 @@ pub unsafe extern "system" fn rtl_string_from_guid(
 
 // ---- image (host-tested nt_ntdll::rtl::image over a mapped image byte slice) ----------------------
 
+/// `RtlImageNtHeaderEx(ULONG Flags, PVOID Base, ULONG64 Size, PIMAGE_NT_HEADERS* OutHeaders)`.
+///
+/// # Safety
+/// `base` is a mapped PE image candidate; `out_headers` is writable.
+#[export_name = "RtlImageNtHeaderEx"]
+pub unsafe extern "system" fn rtl_image_nt_header_ex(
+    flags: u32,
+    base: *mut c_void,
+    size: u64,
+    out_headers: *mut *mut c_void,
+) -> NtStatus {
+    const RTL_IMAGE_NT_HEADER_EX_FLAG_NO_RANGE_CHECK: u32 = 0x1;
+    const IMAGE_DOS_HEADER_SIZE: u64 = 0x40;
+    const IMAGE_NT_HEADERS_THROUGH_FILE_HEADER: u64 = 0x18;
+    const MAX_NT_HEADER_OFFSET: u32 = 256 * 1024 * 1024;
+
+    if out_headers.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: out_headers writable per the contract.
+    unsafe { *out_headers = core::ptr::null_mut() };
+
+    if (flags & !RTL_IMAGE_NT_HEADER_EX_FLAG_NO_RANGE_CHECK) != 0
+        || base.is_null()
+        || base as usize == usize::MAX
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let wants_range_check = (flags & RTL_IMAGE_NT_HEADER_EX_FLAG_NO_RANGE_CHECK) == 0;
+    if wants_range_check && size < IMAGE_DOS_HEADER_SIZE {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    // SAFETY: caller supplied a mapped image candidate; ReactOS wraps this in SEH. Our live callers
+    // pass mapped images, so direct pointer reads are the correct fast path.
+    unsafe {
+        if *(base as *const u16) != 0x5A4D {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        let nt_header_offset = *((base as *const u8).add(0x3C) as *const u32);
+        if nt_header_offset >= MAX_NT_HEADER_OFFSET {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        if wants_range_check
+            && (nt_header_offset as u64).saturating_add(IMAGE_NT_HEADERS_THROUGH_FILE_HEADER)
+                >= size
+        {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        let nt = (base as *mut u8).add(nt_header_offset as usize);
+        if *(nt as *const u32) != 0x0000_4550 {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        *out_headers = nt as *mut c_void;
+    }
+
+    STATUS_SUCCESS
+}
+
 /// `RtlImageNtHeader(PVOID BaseAddress) -> PIMAGE_NT_HEADERS` — the NT headers of a mapped image.
 ///
 /// # Safety
 /// `base` a mapped PE image.
 #[export_name = "RtlImageNtHeader"]
 pub unsafe extern "system" fn rtl_image_nt_header(base: *mut c_void) -> *mut c_void {
-    if base.is_null() {
-        return core::ptr::null_mut();
-    }
-    // e_lfanew @ base+0x3C → the NT headers offset. Validate the MZ + PE signatures.
-    // SAFETY: base is a mapped image with a DOS header per the contract.
-    unsafe {
-        if *(base as *const u16) != 0x5A4D {
-            return core::ptr::null_mut(); // no "MZ"
-        }
-        let e_lfanew = *((base as *const u8).add(0x3C) as *const u32) as usize;
-        let nt = (base as *const u8).add(e_lfanew);
-        if *(nt as *const u32) != 0x0000_4550 {
-            return core::ptr::null_mut(); // no "PE\0\0"
-        }
-        nt as *mut c_void
-    }
+    let mut nt = core::ptr::null_mut();
+    // SAFETY: forwards the mapped-image candidate contract.
+    let _ = unsafe { rtl_image_nt_header_ex(1, base, 0, &mut nt) };
+    nt
 }
 
 /// `RtlImageDirectoryEntryToData(PVOID Base, BOOLEAN MappedAsImage, USHORT DirectoryEntry,
@@ -8174,6 +8268,19 @@ pub unsafe extern "system" fn rtl_fill_memory(dst: *mut u8, len: usize, fill: u8
     unsafe { core::ptr::write_bytes(dst, fill, len) };
 }
 
+/// `RtlFillMemoryUlong(PVOID Destination, SIZE_T Length, ULONG Fill)`.
+///
+/// # Safety
+/// `dst` writable for `len` bytes.
+#[export_name = "RtlFillMemoryUlong"]
+pub unsafe extern "system" fn rtl_fill_memory_ulong(dst: *mut u32, len: usize, fill: u32) {
+    let count = len / core::mem::size_of::<u32>();
+    for i in 0..count {
+        // SAFETY: dst writable for `len` bytes per the contract; only complete ULONGs are written.
+        unsafe { core::ptr::write_unaligned(dst.add(i), fill) };
+    }
+}
+
 /// `RtlZeroMemory(void* dst, SIZE_T len)`.
 ///
 /// # Safety
@@ -9582,6 +9689,75 @@ pub unsafe extern "system" fn rtl_time_fields_to_time(
     }
 }
 
+/// `RtlTimeToElapsedTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS TimeFields)`.
+///
+/// # Safety
+/// `time`/`time_fields` valid.
+#[export_name = "RtlTimeToElapsedTimeFields"]
+pub unsafe extern "system" fn rtl_time_to_elapsed_time_fields(
+    time: *const i64,
+    time_fields: *mut i16,
+) {
+    if time.is_null() || time_fields.is_null() {
+        return;
+    }
+    let tf = nt_ntdll::rtl::time::time_to_elapsed_time_fields(unsafe { *time });
+    // SAFETY: time_fields writable for 8 shorts.
+    unsafe {
+        *time_fields.add(0) = tf.year;
+        *time_fields.add(1) = tf.month;
+        *time_fields.add(2) = tf.day;
+        *time_fields.add(3) = tf.hour;
+        *time_fields.add(4) = tf.minute;
+        *time_fields.add(5) = tf.second;
+        *time_fields.add(6) = tf.milliseconds;
+        *time_fields.add(7) = tf.weekday;
+    }
+}
+
+/// `RtlCutoverTimeToSystemTime(PTIME_FIELDS CutoverTimeFields, PLARGE_INTEGER SystemTime,
+/// PLARGE_INTEGER CurrentTime, BOOLEAN ThisYearsCutoverOnly) -> BOOLEAN`.
+///
+/// # Safety
+/// `cutover_time_fields`/`system_time`/`current_time` valid.
+#[export_name = "RtlCutoverTimeToSystemTime"]
+pub unsafe extern "system" fn rtl_cutover_time_to_system_time(
+    cutover_time_fields: *const i16,
+    system_time: *mut i64,
+    current_time: *const i64,
+    this_years_cutover_only: u8,
+) -> u8 {
+    if cutover_time_fields.is_null() || system_time.is_null() || current_time.is_null() {
+        return 0;
+    }
+    // SAFETY: cutover_time_fields valid for 8 shorts.
+    let cutover = unsafe {
+        nt_ntdll::rtl::time::TimeFields {
+            year: *cutover_time_fields.add(0),
+            month: *cutover_time_fields.add(1),
+            day: *cutover_time_fields.add(2),
+            hour: *cutover_time_fields.add(3),
+            minute: *cutover_time_fields.add(4),
+            second: *cutover_time_fields.add(5),
+            milliseconds: *cutover_time_fields.add(6),
+            weekday: *cutover_time_fields.add(7),
+        }
+    };
+    let current = unsafe { core::ptr::read_unaligned(current_time) };
+    match nt_ntdll::rtl::time::cutover_time_to_system_time(
+        &cutover,
+        current,
+        this_years_cutover_only != 0,
+    ) {
+        Some(t) => {
+            // SAFETY: system_time writable per the contract.
+            unsafe { core::ptr::write_unaligned(system_time, t) };
+            1
+        }
+        None => 0,
+    }
+}
+
 // ---- random (host-tested) ------------------------------------------------------------------------
 
 /// `RtlUniform(PULONG Seed) -> ULONG`.
@@ -9635,6 +9811,23 @@ pub unsafe extern "system" fn rtl_random_ex(seed: *mut u32) -> u32 {
         *seed = s;
         r
     }
+}
+
+/// `RtlComputeCrc32(ULONG Initial, const UCHAR* Data, ULONG Length) -> ULONG`.
+///
+/// # Safety
+/// `data` readable for `length` bytes unless `length == 0`.
+#[export_name = "RtlComputeCrc32"]
+pub unsafe extern "system" fn rtl_compute_crc32(initial: u32, data: *const u8, length: u32) -> u32 {
+    if length == 0 {
+        return nt_ntdll::rtl::random::compute_crc32(initial, &[]);
+    }
+    if data.is_null() {
+        return nt_ntdll::rtl::random::compute_crc32(initial, &[]);
+    }
+    // SAFETY: data readable for length bytes per the contract.
+    let bytes = unsafe { core::slice::from_raw_parts(data, length as usize) };
+    nt_ntdll::rtl::random::compute_crc32(initial, bytes)
 }
 
 /// `RtlIntegerToChar(ULONG Value, ULONG Base, LONG Length, PSZ String) -> NTSTATUS` — format an
@@ -9697,10 +9890,134 @@ pub extern "system" fn rtl_convert_ulong_to_large_integer(value: u32) -> i64 {
     value as i64
 }
 
+/// `RtlLargeIntegerAdd(LARGE_INTEGER, LARGE_INTEGER) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerAdd"]
+pub extern "system" fn rtl_large_integer_add(addend1: i64, addend2: i64) -> i64 {
+    rtl::integer::large_integer_add(addend1, addend2)
+}
+
+/// `RtlLargeIntegerSubtract(LARGE_INTEGER, LARGE_INTEGER) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerSubtract"]
+pub extern "system" fn rtl_large_integer_subtract(minuend: i64, subtrahend: i64) -> i64 {
+    rtl::integer::large_integer_subtract(minuend, subtrahend)
+}
+
+/// `RtlLargeIntegerDivide(LARGE_INTEGER, LARGE_INTEGER, PLARGE_INTEGER) -> LARGE_INTEGER`.
+///
+/// # Safety
+/// `remainder` null or writable.
+#[export_name = "RtlLargeIntegerDivide"]
+pub unsafe extern "system" fn rtl_large_integer_divide(
+    dividend: i64,
+    divisor: i64,
+    remainder: *mut i64,
+) -> i64 {
+    match rtl::integer::large_integer_divide(dividend, divisor) {
+        Some((quotient, rem)) => {
+            if !remainder.is_null() {
+                // SAFETY: writable when non-null per the contract.
+                unsafe { core::ptr::write_unaligned(remainder, rem) };
+            }
+            quotient
+        }
+        None => 0,
+    }
+}
+
 /// `RtlLargeIntegerNegate(LARGE_INTEGER) -> LARGE_INTEGER`.
 #[export_name = "RtlLargeIntegerNegate"]
 pub extern "system" fn rtl_large_integer_negate(value: i64) -> i64 {
     value.wrapping_neg()
+}
+
+/// `RtlLargeIntegerShiftLeft(LARGE_INTEGER, CCHAR) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerShiftLeft"]
+pub extern "system" fn rtl_large_integer_shift_left(value: i64, shift_count: i8) -> i64 {
+    rtl::integer::large_integer_shift_left(value, shift_count)
+}
+
+/// `RtlLargeIntegerShiftRight(LARGE_INTEGER, CCHAR) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerShiftRight"]
+pub extern "system" fn rtl_large_integer_shift_right(value: i64, shift_count: i8) -> i64 {
+    rtl::integer::large_integer_shift_right(value, shift_count)
+}
+
+/// `RtlLargeIntegerArithmeticShift(LARGE_INTEGER, CCHAR) -> LARGE_INTEGER`.
+#[export_name = "RtlLargeIntegerArithmeticShift"]
+pub extern "system" fn rtl_large_integer_arithmetic_shift(value: i64, shift_count: i8) -> i64 {
+    rtl::integer::large_integer_arithmetic_shift(value, shift_count)
+}
+
+/// `RtlEnlargedIntegerMultiply(LONG, LONG) -> LARGE_INTEGER`.
+#[export_name = "RtlEnlargedIntegerMultiply"]
+pub extern "system" fn rtl_enlarged_integer_multiply(a: i32, b: i32) -> i64 {
+    rtl::integer::enlarged_integer_multiply(a, b)
+}
+
+/// `RtlEnlargedUnsignedMultiply(ULONG, ULONG) -> LARGE_INTEGER`.
+#[export_name = "RtlEnlargedUnsignedMultiply"]
+pub extern "system" fn rtl_enlarged_unsigned_multiply(a: u32, b: u32) -> i64 {
+    rtl::integer::enlarged_unsigned_multiply(a, b) as i64
+}
+
+/// `RtlEnlargedUnsignedDivide(ULARGE_INTEGER, ULONG, PULONG) -> ULONG`.
+///
+/// # Safety
+/// `remainder` null or writable.
+#[export_name = "RtlEnlargedUnsignedDivide"]
+pub unsafe extern "system" fn rtl_enlarged_unsigned_divide(
+    dividend: u64,
+    divisor: u32,
+    remainder: *mut u32,
+) -> u32 {
+    match rtl::integer::enlarged_unsigned_divide(dividend, divisor) {
+        Some((quotient, rem)) => {
+            if !remainder.is_null() {
+                // SAFETY: writable when non-null per the contract.
+                unsafe { *remainder = rem };
+            }
+            quotient
+        }
+        None => 0,
+    }
+}
+
+/// `RtlExtendedIntegerMultiply(LARGE_INTEGER, LONG) -> LARGE_INTEGER`.
+#[export_name = "RtlExtendedIntegerMultiply"]
+pub extern "system" fn rtl_extended_integer_multiply(a: i64, b: i32) -> i64 {
+    rtl::integer::extended_integer_multiply(a, b)
+}
+
+/// `RtlExtendedLargeIntegerDivide(LARGE_INTEGER, ULONG, PULONG) -> LARGE_INTEGER`.
+///
+/// # Safety
+/// `remainder` null or writable.
+#[export_name = "RtlExtendedLargeIntegerDivide"]
+pub unsafe extern "system" fn rtl_extended_large_integer_divide(
+    dividend: i64,
+    divisor: u32,
+    remainder: *mut u32,
+) -> i64 {
+    match rtl::integer::extended_large_integer_divide(dividend, divisor) {
+        Some((quotient, rem)) => {
+            if !remainder.is_null() {
+                // SAFETY: writable when non-null per the contract.
+                unsafe { *remainder = rem };
+            }
+            quotient
+        }
+        None => 0,
+    }
+}
+
+/// `RtlExtendedMagicDivide(LARGE_INTEGER, LARGE_INTEGER, CCHAR) -> LARGE_INTEGER`.
+#[export_name = "RtlExtendedMagicDivide"]
+pub extern "system" fn rtl_extended_magic_divide(
+    dividend: i64,
+    magic_divisor: i64,
+    shift_count: i8,
+) -> i64 {
+    rtl::integer::extended_magic_divide(dividend, magic_divisor, shift_count)
 }
 
 /// `RtlUshortByteSwap(USHORT Source) -> USHORT`.
@@ -14484,6 +14801,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_environment_variable as usize,
         rtl_query_environment_variable_u as usize,
         rtl_dos_path_name_to_nt_path_name_u as usize,
+        rtl_dos_path_name_to_nt_path_name_u_with_status as usize,
         rtl_dos_search_path_u as usize,
         rtl_query_registry_values as usize,
         rtl_set_process_is_critical as usize,
@@ -14815,6 +15133,7 @@ pub unsafe extern "C" fn export_anchor() {
     // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc.
     let anchors_misc1: &[usize] = &[
         rtl_fill_memory as usize,
+        rtl_fill_memory_ulong as usize,
         rtl_zero_memory as usize,
         rtl_move_memory as usize,
         rtl_compare_memory as usize,
@@ -14876,16 +15195,31 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_system_time_to_local_time as usize,
         rtl_time_to_time_fields as usize,
         rtl_time_fields_to_time as usize,
+        rtl_time_to_elapsed_time_fields as usize,
+        rtl_cutover_time_to_system_time as usize,
         rtl_get_tick_count as usize,
         nt_get_tick_count as usize,
         rtl_uniform as usize,
         rtl_random as usize,
         rtl_random_ex as usize,
+        rtl_compute_crc32 as usize,
         rtl_integer_to_char as usize,
         rtl_large_integer_to_char as usize,
         rtl_convert_long_to_large_integer as usize,
         rtl_convert_ulong_to_large_integer as usize,
+        rtl_large_integer_add as usize,
+        rtl_large_integer_subtract as usize,
+        rtl_large_integer_divide as usize,
         rtl_large_integer_negate as usize,
+        rtl_large_integer_shift_left as usize,
+        rtl_large_integer_shift_right as usize,
+        rtl_large_integer_arithmetic_shift as usize,
+        rtl_enlarged_integer_multiply as usize,
+        rtl_enlarged_unsigned_multiply as usize,
+        rtl_enlarged_unsigned_divide as usize,
+        rtl_extended_integer_multiply as usize,
+        rtl_extended_large_integer_divide as usize,
+        rtl_extended_magic_divide as usize,
         rtl_ushort_byte_swap as usize,
         rtl_ulong_byte_swap as usize,
         rtl_ulonglong_byte_swap as usize,
@@ -14981,11 +15315,13 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_determine_dos_path_name_type_ustr as usize,
         rtl_get_longest_nt_path_length as usize,
         rtl_get_length_without_trailing_path_seperators as usize,
+        rtl_get_length_without_last_full_dos_or_nt_path_element as usize,
         rtlp_apply_length_function as usize,
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
         rtl_guid_from_string as usize,
         rtl_string_from_guid as usize,
+        rtl_image_nt_header_ex as usize,
         rtl_image_nt_header as usize,
         rtl_image_directory_entry_to_data as usize,
         rtl_image_rva_to_va as usize,
@@ -15084,6 +15420,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_get_full_path_name_u as usize,
         rtl_get_full_path_name_ustr_ex as usize,
         rtl_dos_path_name_to_relative_nt_path_name_u as usize,
+        rtl_dos_path_name_to_relative_nt_path_name_u_with_status as usize,
         rtl_release_relative_name as usize,
         rtl_dos_search_path_ustr as usize,
         rtl_find_message as usize,

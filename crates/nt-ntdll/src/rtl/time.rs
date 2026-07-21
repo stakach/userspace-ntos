@@ -124,22 +124,109 @@ pub fn time_to_time_fields(nt_time: i64) -> TimeFields {
 /// `RtlTimeFieldsToTime`: recompose calendar fields into a 100-ns NT tick count. Returns `None` for
 /// out-of-range fields.
 pub fn time_fields_to_time(tf: &TimeFields) -> Option<i64> {
-    if tf.month < 1 || tf.month > 12 || tf.day < 1 {
+    if tf.year < 1601
+        || tf.month < 1
+        || tf.month > 12
+        || tf.day < 1
+        || tf.milliseconds < 0
+        || tf.milliseconds > 999
+    {
         return None;
     }
     let (year, month, day) = (tf.year as i64, tf.month as i64, tf.day as i64);
     if day > days_in_month(year, month) {
         return None;
     }
-    if tf.hour < 0 || tf.hour > 23 || tf.minute < 0 || tf.minute > 59 || tf.second < 0 || tf.second > 59 {
+    if tf.hour < 0
+        || tf.hour > 23
+        || tf.minute < 0
+        || tf.minute > 59
+        || tf.second < 0
+        || tf.second > 59
+    {
         return None;
     }
     let days = days_since_1601(year, month, day);
-    let secs = days * SECS_PER_DAY
-        + tf.hour as i64 * 3600
-        + tf.minute as i64 * 60
-        + tf.second as i64;
+    let secs =
+        days * SECS_PER_DAY + tf.hour as i64 * 3600 + tf.minute as i64 * 60 + tf.second as i64;
     Some(secs * TICKS_PER_SEC + tf.milliseconds as i64 * TICKS_PER_MS)
+}
+
+/// `RtlTimeToElapsedTimeFields`: decompose an elapsed NT tick count into days and time-of-day.
+pub fn time_to_elapsed_time_fields(nt_time: i64) -> TimeFields {
+    let elapsed_seconds = (nt_time as u64) / TICKS_PER_SEC as u64;
+    let seconds_in_day = elapsed_seconds % SECS_PER_DAY as u64;
+    let seconds_in_minute = seconds_in_day % 3600;
+
+    TimeFields {
+        year: 0,
+        month: 0,
+        day: (elapsed_seconds / SECS_PER_DAY as u64) as i16,
+        hour: (seconds_in_day / 3600) as i16,
+        minute: (seconds_in_minute / 60) as i16,
+        second: (seconds_in_minute % 60) as i16,
+        milliseconds: ((nt_time % TICKS_PER_SEC) / TICKS_PER_MS) as i16,
+        weekday: 0,
+    }
+}
+
+/// `RtlCutoverTimeToSystemTime`: resolve a fixed or recurring cutover time to an absolute NT time.
+pub fn cutover_time_to_system_time(
+    cutover: &TimeFields,
+    current_time: i64,
+    this_years_cutover_only: bool,
+) -> Option<i64> {
+    if cutover.year != 0 {
+        let system_time = time_fields_to_time(cutover)?;
+        return (system_time >= current_time).then_some(system_time);
+    }
+
+    if cutover.day == 0 || cutover.day > 5 {
+        return None;
+    }
+
+    let current = time_to_time_fields(current_time);
+    let mut next_years_cutover = false;
+    loop {
+        let mut adjusted = TimeFields {
+            year: current.year + i16::from(next_years_cutover),
+            month: cutover.month,
+            day: 1,
+            hour: cutover.hour,
+            minute: cutover.minute,
+            second: cutover.second,
+            milliseconds: cutover.milliseconds,
+            weekday: 0,
+        };
+
+        let first_of_month = time_fields_to_time(&adjusted)?;
+        let first_fields = time_to_time_fields(first_of_month);
+
+        if first_fields.weekday != cutover.weekday {
+            let days = if first_fields.weekday < cutover.weekday {
+                cutover.weekday - first_fields.weekday
+            } else {
+                7 - (first_fields.weekday - cutover.weekday)
+            };
+            adjusted.day += days;
+        }
+
+        if cutover.day > 1 {
+            let mut days = 7 * (cutover.day - 1);
+            let month_length = days_in_month(adjusted.year as i64, adjusted.month as i64) as i16;
+            if adjusted.day + days > month_length {
+                days -= 7;
+            }
+            adjusted.day += days;
+        }
+
+        let system_time = time_fields_to_time(&adjusted)?;
+        if this_years_cutover_only || next_years_cutover || system_time >= current_time {
+            return Some(system_time);
+        }
+
+        next_years_cutover = true;
+    }
 }
 
 /// `RtlTimeToSecondsSince1970`: convert an NT tick count to Unix epoch seconds. Returns `None` if
@@ -242,6 +329,78 @@ mod tests {
             ..Default::default()
         };
         assert!(time_fields_to_time(&feb29_2021).is_none());
+    }
+
+    #[test]
+    fn invalid_time_fields_are_rejected() {
+        assert!(time_fields_to_time(&TimeFields {
+            year: 1600,
+            month: 1,
+            day: 1,
+            ..Default::default()
+        })
+        .is_none());
+        assert!(time_fields_to_time(&TimeFields {
+            year: 2020,
+            month: 1,
+            day: 1,
+            milliseconds: 1000,
+            ..Default::default()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn elapsed_time_fields_are_duration_fields() {
+        let elapsed = 2 * SECS_PER_DAY * TICKS_PER_SEC
+            + 3 * 3600 * TICKS_PER_SEC
+            + 4 * 60 * TICKS_PER_SEC
+            + 5 * TICKS_PER_SEC
+            + 6 * TICKS_PER_MS;
+        let tf = time_to_elapsed_time_fields(elapsed);
+        assert_eq!((tf.year, tf.month, tf.day), (0, 0, 2));
+        assert_eq!(
+            (tf.hour, tf.minute, tf.second, tf.milliseconds),
+            (3, 4, 5, 6)
+        );
+    }
+
+    #[test]
+    fn cutover_time_to_system_time_handles_fixed_and_recurring_rules() {
+        let current = time_fields_to_time(&TimeFields {
+            year: 2024,
+            month: 3,
+            day: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let fixed = TimeFields {
+            year: 2024,
+            month: 4,
+            day: 15,
+            hour: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            time_to_time_fields(cutover_time_to_system_time(&fixed, current, false).unwrap()).day,
+            15
+        );
+
+        let second_sunday_in_march = TimeFields {
+            year: 0,
+            month: 3,
+            day: 2,
+            hour: 2,
+            weekday: 0,
+            ..Default::default()
+        };
+        let resolved = time_to_time_fields(
+            cutover_time_to_system_time(&second_sunday_in_march, current, false).unwrap(),
+        );
+        assert_eq!(
+            (resolved.year, resolved.month, resolved.day, resolved.hour),
+            (2024, 3, 10, 2)
+        );
     }
 
     #[test]

@@ -61,7 +61,8 @@ pub fn determine_dos_path_name_type(path: &[u16]) -> DosPathType {
     // Drive-letter forms: `X:`
     if n >= 2 && path[1] == b':' as u16 {
         let d = path[0];
-        let is_letter = (b'A' as u16..=b'Z' as u16).contains(&d) || (b'a' as u16..=b'z' as u16).contains(&d);
+        let is_letter =
+            (b'A' as u16..=b'Z' as u16).contains(&d) || (b'a' as u16..=b'z' as u16).contains(&d);
         if is_letter {
             if n >= 3 && is_sep(path[2]) {
                 return DosPathType::DriveAbsolute;
@@ -80,6 +81,36 @@ pub fn length_without_trailing_path_separators(path: &[u16]) -> u32 {
         n -= 1;
     }
     n as u32
+}
+
+/// `RtlGetLengthWithoutLastFullDosOrNtPathElement`: return the character count through the path
+/// separator before the last full element.
+pub fn length_without_last_full_dos_or_nt_path_element(path: &[u16]) -> Result<u32, ()> {
+    if path.is_empty() {
+        return Ok(0);
+    }
+
+    match determine_dos_path_name_type(path) {
+        DosPathType::LocalDevice => {
+            if path.len() < 7 || path[5] != b':' as u16 || !is_sep(path[6]) {
+                return Err(());
+            }
+        }
+        DosPathType::Rooted | DosPathType::UncAbsolute | DosPathType::DriveAbsolute => {}
+        _ => return Err(()),
+    }
+
+    let mut end = path.len();
+    while end > 0 && is_sep(path[end - 1]) {
+        end -= 1;
+    }
+    let Some(mut position) = path[..end].iter().rposition(|&unit| is_sep(unit)) else {
+        return Ok(0);
+    };
+    while position > 1 && is_sep(path[position - 1]) {
+        position -= 1;
+    }
+    Ok((position + 1) as u32)
 }
 
 /// `RtlDosPathNameToNtPathName_U` (the pure prefix step): prepend the NT object-manager DOS-devices
@@ -172,7 +203,10 @@ pub fn is_dos_device_name(path: &[u16]) -> bool {
         .map(|i| i + 1)
         .unwrap_or(0);
     let comp = &path[start..];
-    let dot = comp.iter().position(|&c| c == b'.' as u16).unwrap_or(comp.len());
+    let dot = comp
+        .iter()
+        .position(|&c| c == b'.' as u16)
+        .unwrap_or(comp.len());
     let stem = &comp[..dot];
     if stem.is_empty() {
         return false;
@@ -209,14 +243,38 @@ mod tests {
 
     #[test]
     fn classify() {
-        assert_eq!(determine_dos_path_name_type(&u("C:\\Windows")), DosPathType::DriveAbsolute);
-        assert_eq!(determine_dos_path_name_type(&u("C:temp")), DosPathType::DriveRelative);
-        assert_eq!(determine_dos_path_name_type(&u("\\Device")), DosPathType::Rooted);
-        assert_eq!(determine_dos_path_name_type(&u("\\\\srv\\share")), DosPathType::UncAbsolute);
-        assert_eq!(determine_dos_path_name_type(&u("\\\\.\\C:")), DosPathType::LocalDevice);
-        assert_eq!(determine_dos_path_name_type(&u("\\\\?\\C:\\x")), DosPathType::LocalDevice);
-        assert_eq!(determine_dos_path_name_type(&u("\\\\.")), DosPathType::RootLocalDevice);
-        assert_eq!(determine_dos_path_name_type(&u("dir\\file")), DosPathType::Relative);
+        assert_eq!(
+            determine_dos_path_name_type(&u("C:\\Windows")),
+            DosPathType::DriveAbsolute
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("C:temp")),
+            DosPathType::DriveRelative
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("\\Device")),
+            DosPathType::Rooted
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("\\\\srv\\share")),
+            DosPathType::UncAbsolute
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("\\\\.\\C:")),
+            DosPathType::LocalDevice
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("\\\\?\\C:\\x")),
+            DosPathType::LocalDevice
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("\\\\.")),
+            DosPathType::RootLocalDevice
+        );
+        assert_eq!(
+            determine_dos_path_name_type(&u("dir\\file")),
+            DosPathType::Relative
+        );
         assert_eq!(determine_dos_path_name_type(&u("")), DosPathType::Relative);
     }
 
@@ -229,17 +287,49 @@ mod tests {
             15
         );
         assert_eq!(length_without_trailing_path_separators(&u("\\")), 0);
-        assert_eq!(length_without_trailing_path_separators(&u("/Test/String/")), 12);
+        assert_eq!(
+            length_without_trailing_path_separators(&u("/Test/String/")),
+            12
+        );
+    }
+
+    #[test]
+    fn trims_last_full_path_element() {
+        assert_eq!(
+            length_without_last_full_dos_or_nt_path_element(&u("C:\\foo\\bar")).unwrap(),
+            7
+        );
+        assert_eq!(
+            length_without_last_full_dos_or_nt_path_element(&u("C:\\foo\\")).unwrap(),
+            3
+        );
+        assert_eq!(
+            length_without_last_full_dos_or_nt_path_element(&u("\\\\server\\share\\dir\\file"))
+                .unwrap(),
+            19
+        );
+        assert_eq!(
+            length_without_last_full_dos_or_nt_path_element(&u("")).unwrap(),
+            0
+        );
+        assert!(length_without_last_full_dos_or_nt_path_element(&u("relative\\file")).is_err());
+        assert!(length_without_last_full_dos_or_nt_path_element(&u("C:relative")).is_err());
     }
 
     #[test]
     fn nt_path_prefix() {
-        assert_eq!(s(&dos_path_name_to_nt_path_name(&u("C:\\Windows\\notepad.exe")).unwrap()),
-                   "\\??\\C:\\Windows\\notepad.exe");
-        assert_eq!(s(&dos_path_name_to_nt_path_name(&u("\\\\srv\\share\\f")).unwrap()),
-                   "\\??\\UNC\\srv\\share\\f");
-        assert_eq!(s(&dos_path_name_to_nt_path_name(&u("\\\\?\\C:\\x")).unwrap()),
-                   "\\??\\C:\\x");
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name(&u("C:\\Windows\\notepad.exe")).unwrap()),
+            "\\??\\C:\\Windows\\notepad.exe"
+        );
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name(&u("\\\\srv\\share\\f")).unwrap()),
+            "\\??\\UNC\\srv\\share\\f"
+        );
+        assert_eq!(
+            s(&dos_path_name_to_nt_path_name(&u("\\\\?\\C:\\x")).unwrap()),
+            "\\??\\C:\\x"
+        );
         // Relative can't be resolved without the CWD → None.
         assert!(dos_path_name_to_nt_path_name(&u("rel\\path")).is_none());
     }
@@ -253,7 +343,10 @@ mod tests {
         );
         // CWD with a trailing separator → no double backslash.
         assert_eq!(
-            s(&dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("C:\\Windows\\")).unwrap()),
+            s(
+                &dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("C:\\Windows\\"))
+                    .unwrap()
+            ),
             "\\??\\C:\\Windows\\services.exe"
         );
         // Nested relative.
@@ -274,7 +367,9 @@ mod tests {
         // A non-absolute CWD can't anchor a relative name.
         assert!(dos_path_name_to_nt_path_name_rel(&u("services.exe"), &u("Windows")).is_none());
         // Drive-relative (per-drive CWD) is unsupported → None.
-        assert!(dos_path_name_to_nt_path_name_rel(&u("C:services.exe"), &u("C:\\Windows")).is_none());
+        assert!(
+            dos_path_name_to_nt_path_name_rel(&u("C:services.exe"), &u("C:\\Windows")).is_none()
+        );
     }
 
     #[test]
