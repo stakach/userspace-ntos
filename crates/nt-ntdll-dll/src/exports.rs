@@ -45,6 +45,7 @@ const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
+const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 #[cfg(not(target_arch = "x86_64"))]
@@ -5417,6 +5418,92 @@ fn rtl_determine_dos_path_name_type_u_slice(s: &[u16]) -> u32 {
     }
 }
 
+/// `RtlDetermineDosPathNameType_Ustr(PCUNICODE_STRING Path) -> RTL_PATH_TYPE`.
+///
+/// # Safety
+/// `path` points to a valid counted UTF-16 string.
+#[export_name = "RtlDetermineDosPathNameType_Ustr"]
+pub unsafe extern "system" fn rtl_determine_dos_path_name_type_ustr(
+    path: PCUnicodeString,
+) -> u32 {
+    let s = unsafe { us_slice(path) };
+    rtl_determine_dos_path_name_type_u_slice(s)
+}
+
+/// `RtlGetLengthWithoutTrailingPathSeperators(ULONG, PCUNICODE_STRING, PULONG) -> NTSTATUS`.
+///
+/// # Safety
+/// `path` points to a valid counted UTF-16 string and `length` is writable.
+#[export_name = "RtlGetLengthWithoutTrailingPathSeperators"]
+pub unsafe extern "system" fn rtl_get_length_without_trailing_path_seperators(
+    flags: u32,
+    path: PCUnicodeString,
+    length: *mut u32,
+) -> NtStatus {
+    if !length.is_null() {
+        unsafe { *length = 0 };
+    }
+    if flags != 0 || path.is_null() || length.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let s = unsafe { us_slice(path) };
+    unsafe {
+        *length = nt_ntdll::rtl::path::length_without_trailing_path_separators(s);
+    }
+    STATUS_SUCCESS
+}
+
+type RtlLengthFunction =
+    unsafe extern "system" fn(u32, PUnicodeString, *mut u32) -> NtStatus;
+
+/// `RtlpApplyLengthFunction(ULONG, ULONG, PVOID, PRTL_PATH_LENGTH_FUNCTION) -> NTSTATUS`.
+///
+/// # Safety
+/// `unicode_string_or_buffer` is a `UNICODE_STRING` or `RTL_UNICODE_STRING_BUFFER` matching `type_`;
+/// `length_function` follows the ReactOS callback contract.
+#[export_name = "RtlpApplyLengthFunction"]
+pub unsafe extern "system" fn rtlp_apply_length_function(
+    flags: u32,
+    type_: u32,
+    unicode_string_or_buffer: *mut c_void,
+    length_function: Option<RtlLengthFunction>,
+) -> NtStatus {
+    const UNICODE_STRING_SIZE: u32 = 16;
+    const RTL_UNICODE_STRING_BUFFER_SIZE: u32 = 72;
+    const UNICODE_STRING_MAX_CHARS: u32 = 32_767;
+
+    let Some(length_function) = length_function else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if flags != 0 || unicode_string_or_buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if type_ != UNICODE_STRING_SIZE && type_ != RTL_UNICODE_STRING_BUFFER_SIZE {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let string = unicode_string_or_buffer as PUnicodeString;
+    let mut chars = 0u32;
+    let status = unsafe { length_function(0, string, &mut chars) };
+    if status & 0x8000_0000 != 0 {
+        return status;
+    }
+    if chars > UNICODE_STRING_MAX_CHARS {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    unsafe {
+        (*string).length = (chars * 2) as u16;
+        if type_ == RTL_UNICODE_STRING_BUFFER_SIZE {
+            let buffer = (*string).buffer as *mut u16;
+            if !buffer.is_null() {
+                *buffer.add(chars as usize) = 0;
+            }
+        }
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlDosPathNameToRelativeNtPathName_U(PCWSTR DosName, PUNICODE_STRING NtName, PWSTR* PartName,
 /// PRTL_RELATIVE_NAME_U RelativeName) -> BOOLEAN` — convert a DOS path to an NT path (relative form).
 /// We build the absolute NT name via the host-tested `dos_path_name_to_nt_path_name` and leave the
@@ -6113,7 +6200,11 @@ pub unsafe extern "system" fn rtl_ipv4_string_to_address_ex_w(
 pub unsafe extern "system" fn rtl_determine_dos_path_name_type_u(path: *const u16) -> u32 {
     // SAFETY: path NUL-terminated per the contract.
     let n = unsafe { wcslen_raw(path) };
-    let s = unsafe { core::slice::from_raw_parts(path, n) };
+    let s = if n == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(path, n) }
+    };
     // Map to the Windows RTL_PATH_TYPE ordinals (0..=7), matched by variant.
     use nt_ntdll::rtl::path::DosPathType as T;
     match nt_ntdll::rtl::path::determine_dos_path_name_type(s) {
@@ -11668,7 +11759,7 @@ pub unsafe extern "system" fn rtl_init_ansi_string_ex(
     // SAFETY: src per the contract.
     let len = unsafe { strlen_raw(src) };
     if len > 0xFFFE {
-        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+        return STATUS_NAME_TOO_LONG;
     }
     // SAFETY: dst valid.
     unsafe {
@@ -11694,7 +11785,7 @@ pub unsafe extern "system" fn rtl_init_unicode_string_ex(
     // SAFETY: src per the contract.
     let units = unsafe { wcslen_raw(src) };
     if units > 0x7FFE {
-        return 0xC000_0106; // STATUS_NAME_TOO_LONG
+        return STATUS_NAME_TOO_LONG;
     }
     let bytes = (units * 2) as u16;
     // SAFETY: dst valid.
@@ -13947,6 +14038,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_ipv4_string_to_address_ex_a as usize,
         rtl_ipv4_string_to_address_ex_w as usize,
         rtl_determine_dos_path_name_type_u as usize,
+        rtl_determine_dos_path_name_type_ustr as usize,
+        rtl_get_length_without_trailing_path_seperators as usize,
+        rtlp_apply_length_function as usize,
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
         rtl_guid_from_string as usize,

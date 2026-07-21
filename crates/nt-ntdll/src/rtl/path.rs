@@ -41,7 +41,7 @@ fn is_sep(c: u16) -> bool {
 pub fn determine_dos_path_name_type(path: &[u16]) -> DosPathType {
     let n = path.len();
     if n == 0 {
-        return DosPathType::Unknown;
+        return DosPathType::Relative;
     }
     if is_sep(path[0]) {
         if n >= 2 && is_sep(path[1]) {
@@ -70,6 +70,16 @@ pub fn determine_dos_path_name_type(path: &[u16]) -> DosPathType {
         }
     }
     DosPathType::Relative
+}
+
+/// `RtlGetLengthWithoutTrailingPathSeperators`: return the character count after trimming trailing
+/// DOS path separators (`\` and `/`).
+pub fn length_without_trailing_path_separators(path: &[u16]) -> u32 {
+    let mut n = path.len();
+    while n > 0 && is_sep(path[n - 1]) {
+        n -= 1;
+    }
+    n as u32
 }
 
 /// `RtlDosPathNameToNtPathName_U` (the pure prefix step): prepend the NT object-manager DOS-devices
@@ -207,7 +217,19 @@ mod tests {
         assert_eq!(determine_dos_path_name_type(&u("\\\\?\\C:\\x")), DosPathType::LocalDevice);
         assert_eq!(determine_dos_path_name_type(&u("\\\\.")), DosPathType::RootLocalDevice);
         assert_eq!(determine_dos_path_name_type(&u("dir\\file")), DosPathType::Relative);
-        assert_eq!(determine_dos_path_name_type(&u("")), DosPathType::Unknown);
+        assert_eq!(determine_dos_path_name_type(&u("")), DosPathType::Relative);
+    }
+
+    #[test]
+    fn trims_trailing_path_separators() {
+        assert_eq!(length_without_trailing_path_separators(&u("")), 0);
+        assert_eq!(length_without_trailing_path_separators(&u("Test")), 4);
+        assert_eq!(
+            length_without_trailing_path_separators(&u("\\??\\Test\\String\\\\\\")),
+            15
+        );
+        assert_eq!(length_without_trailing_path_separators(&u("\\")), 0);
+        assert_eq!(length_without_trailing_path_separators(&u("/Test/String/")), 12);
     }
 
     #[test]
