@@ -35,6 +35,43 @@ fn named_pipe_path_classification_is_exact() {
 }
 
 #[test]
+fn local_nt_paths_resolve_to_the_fat_volume() {
+    let utf16 = |path: &str| path.encode_utf16().collect::<alloc::vec::Vec<_>>();
+    for path in [
+        r"\??\C:\ReactOS\WinSxS\Manifests\x.manifest",
+        r"\DosDevices\C:\ReactOS\WinSxS\Manifests\x.manifest",
+        r"C:/ReactOS/WinSxS/Manifests/x.manifest",
+    ] {
+        assert_eq!(
+            nt_path_to_volume_relative(&utf16(path), b"reactos").unwrap(),
+            b"reactos\\winsxs\\manifests\\x.manifest"
+        );
+    }
+    assert_eq!(
+        nt_path_to_volume_relative(
+            &utf16(r"\SystemRoot\WinSxS\Manifests\x.manifest"),
+            b"reactos"
+        )
+        .unwrap(),
+        b"reactos\\winsxs\\manifests\\x.manifest"
+    );
+}
+
+#[test]
+fn local_nt_path_resolution_rejects_escapes_and_lookalikes() {
+    let utf16 = |path: &str| path.encode_utf16().collect::<alloc::vec::Vec<_>>();
+    for path in [
+        r"\??\D:\ReactOS\x.manifest",
+        r"\SystemRooted\x.manifest",
+        r"\SystemRoot\..\x.manifest",
+        r"\Device\HarddiskVolume1\x.manifest",
+    ] {
+        assert!(nt_path_to_volume_relative(&utf16(path), b"reactos").is_none());
+    }
+    assert!(nt_path_to_volume_relative(&[0x0100], b"reactos").is_none());
+}
+
+#[test]
 fn query_attributes_by_path_no_handle() {
     let fs = FileSystem::new(MemFs::with_fixture());
     // A file resolves and reports non-directory — without allocating a handle.

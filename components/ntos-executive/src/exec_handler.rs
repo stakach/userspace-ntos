@@ -342,6 +342,66 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
+    /// Mint a process-local handle for a read-only file on the mounted FAT volume.
+    pub(crate) fn mint_disk_file_handle(
+        &mut self,
+        first_cluster: u32,
+        size: u32,
+        access: u32,
+    ) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let handle = self
+            .pm
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::DiskFile {
+                    first_cluster,
+                    size,
+                },
+                access,
+            )
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    fn disk_file_for(&self, handle: u64) -> Result<Option<(u32, u32)>, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const FILE_READ_DATA: u32 = 0x0000_0001;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            return Ok(None);
+        };
+        let Some(object) = self
+            .pm
+            .lookup_handle(pid, handle as nt_process::Handle)
+        else {
+            return Ok(None);
+        };
+        match object {
+            nt_process::HandleObject::DiskFile {
+                first_cluster,
+                size,
+            } => {
+                let access = self
+                    .pm
+                    .handle_access(pid, handle as nt_process::Handle)
+                    .ok_or(STATUS_INVALID_HANDLE)?;
+                if access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0 {
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+                Ok(Some((first_cluster, size)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Mint a process-local handle for the executive-reserved boot-status file.
     pub(crate) fn mint_boot_status_handle(&mut self, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
@@ -1032,20 +1092,27 @@ impl ExecNtHandler {
     /// partial word is read-modify-written so trailing bytes past `src` in that word are preserved.
     /// Used for services (pi 3) registry info-structure copyout (KEY_*_INFORMATION into a heap buffer).
     pub(crate) unsafe fn xas_write_buf(&self, va: u64, src: &[u8]) {
+        let _ = self.xas_try_write_buf(va, src);
+    }
+
+    pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
         if smss_copyout(va, src) {
-            return;
+            return true;
         }
         let mut i = 0usize;
         while i < src.len() {
             let n = (src.len() - i).min(8);
             let mut w = [0u8; 8];
-            if n < 8 {
-                let _ = self.xas_read(va + i as u64, &mut w); // preserve bytes n..8
+            if n < 8 && !self.xas_read(va + i as u64, &mut w) {
+                return false;
             }
             w[..n].copy_from_slice(&src[i..i + n]);
-            self.xas_write_u64(va + i as u64, u64::from_le_bytes(w));
+            if !self.xas_write_u64(va + i as u64, u64::from_le_bytes(w)) {
+                return false;
+            }
             i += 8;
         }
+        true
     }
     /// Capture an NtAddAtom/NtFindAtom explicit-length UTF-16 name from the current process. Small
     /// pointer values preserve MAKEINTATOM semantics and are returned directly without a read.
@@ -5804,16 +5871,22 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let event = args[1];
                 let apc_routine = args[2];
                 let completion_event = self.validate_io_event(event);
+                let disk_file = self.disk_file_for(fh);
                 let mut iosb_probe = [0u8; 16];
                 let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let transport_capacity = (driver_launch::FSD_ARG_FRAMES * 0x1000) as usize;
-                let mut output = alloc::vec![0u8; len.min(transport_capacity)];
+                let output_capacity = if matches!(disk_file, Ok(Some(_))) {
+                    len.min(16 * 1024 * 1024)
+                } else {
+                    len.min(transport_capacity)
+                };
+                let mut output = alloc::vec![0u8; output_capacity];
                 let mut information = 0u64;
                 let mut routed = false;
                 let mut pending_read_fid = 0u64; // BATCH 33: npfs fid if the read went PENDING → park
                 let status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if len > transport_capacity {
+                } else if !matches!(disk_file, Ok(Some(_))) && len > transport_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
                 } else if len != 0 && buffer == 0 {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
@@ -5821,6 +5894,54 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC000_00BB // STATUS_NOT_SUPPORTED
                 } else if let Err(event_status) = completion_event {
                     event_status
+                } else if let Err(handle_status) = disk_file {
+                    handle_status
+                } else if let Some((first_cluster, file_size)) = disk_file.unwrap_or(None) {
+                    if len > output.len() {
+                        0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
+                    } else if len == 0 {
+                        nt_fs::STATUS_SUCCESS
+                    } else if byte_offset == 0 {
+                        0xC000_000D // STATUS_INVALID_PARAMETER: implicit positions are not modeled yet
+                    } else {
+                        let mut offset_bytes = [0u8; 8];
+                        if !self.xas_read(byte_offset, &mut offset_bytes) {
+                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                        } else {
+                            let offset = i64::from_le_bytes(offset_bytes);
+                            if offset < 0 || offset > u32::MAX as i64 {
+                                0xC000_000D // STATUS_INVALID_PARAMETER
+                            } else if offset as u32 >= file_size {
+                                0xC000_0011 // STATUS_END_OF_FILE
+                            } else {
+                                match exec_fs() {
+                                    Some(fs) => {
+                                        let expected = output
+                                            .len()
+                                            .min((file_size - offset as u32) as usize);
+                                        let read = fat_read_file_range(
+                                            &fs,
+                                            first_cluster,
+                                            file_size,
+                                            offset as u32,
+                                            &mut output,
+                                        );
+                                        if read != expected {
+                                            0xC000_0185 // STATUS_IO_DEVICE_ERROR
+                                        } else if read != 0
+                                            && !self.xas_try_write_buf(buffer, &output[..read])
+                                        {
+                                            0xC000_0005 // STATUS_ACCESS_VIOLATION
+                                        } else {
+                                            information = read as u64;
+                                            nt_fs::STATUS_SUCCESS
+                                        }
+                                    }
+                                    None => 0xC000_00A3, // STATUS_DEVICE_NOT_READY
+                                }
+                            }
+                        }
+                    }
                 } else if self.boot_status_handle_access(fh).is_ok() {
                     match self.boot_status_read_file(fh, buffer, len, byte_offset) {
                         Ok(read) => {
@@ -6130,12 +6251,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
-                // Succeed ONLY for SmpInit's KnownDLL directory open (…\system32). The loader's
-                // actctx/manifest opens (individual .manifest FILES, and the \??\C:\Windows SxS
-                // search directory) must keep failing so ntdll falls back to its defaults and
-                // proceeds to SmpInit — otherwise we divert the loader down the SxS path. Match the
-                // (folded) object name against "system32".
-                let name16 = smss_read_objattr_name(get_recv_mr(7));
+                // Read through the hosted process address space: activation-context filenames may
+                // live on ntdll's process heap, not in the legacy boot mirror.
+                let name16 = self.read_objattr_name_pe(get_recv_mr(7));
                 let mut nb = [0u8; 96];
                 let nlen = {
                     let mut n = 0;
@@ -6148,15 +6266,57 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     n
                 };
-                // Reject SxS/actctx probes (csrss.exe.local, csrss.exe.manifest, *.config).
+                // Classify SxS/activation-context paths without admitting them to image loading.
                 let is_sxs = nb[..nlen].windows(6).any(|w| w == b".local")
                     || nb[..nlen].windows(9).any(|w| w == b".manifest")
                     || nb[..nlen].windows(7).any(|w| w == b".config");
+                let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
+                let open_options = smss_stack_read(sp + 0x30) as u32;
+                let desired_access = args[1] as u32;
+                let wants_read_data = desired_access & 0x0000_0001 != 0;
+                let wants_execute = desired_access & 0x0000_0020 != 0;
+                let synchronous = open_options & 0x0000_0030 != 0;
+                let disk_entry = if !want_dir && wants_read_data && !wants_execute && synchronous {
+                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos")
+                        .and_then(|path| exec_fs().and_then(|fs| fat_open_path(&fs, &path)))
+                } else {
+                    None
+                };
+                if let Some((first_cluster, file_size)) = disk_entry {
+                    let mut status = nt_fs::STATUS_SUCCESS;
+                    let opened_handle = self.mint_disk_file_handle(
+                        first_cluster,
+                        file_size,
+                        desired_access,
+                    );
+                    if let Some(handle) = opened_handle {
+                        self.queue_write(get_recv_mr(9), handle);
+                    } else {
+                        status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                    }
+                    let iosb = get_recv_mr(8);
+                    if iosb != 0 {
+                        self.xas_write_buf(iosb, &status.to_le_bytes());
+                        self.xas_write_buf(
+                            iosb + 8,
+                            &(if status == nt_fs::STATUS_SUCCESS { 1u64 } else { 0 }).to_le_bytes(),
+                        );
+                    }
+                    loader_trace_record(
+                        self.pi,
+                        LoaderOp::OpenFile,
+                        status,
+                        None,
+                        0,
+                        opened_handle.unwrap_or(0),
+                        &nb[..nlen],
+                    );
+                    return status;
+                }
                 // The System32 DIRECTORY open (SmpCreateInitialSession → KnownDLLs) resolves through
                 // the REAL \reactos FS: the substring classifies the probe, the FS by-path
                 // authoritatively confirms \reactos\system32 exists AND is a directory
                 // (`sys32_dir_exists`). Path-form independent.
-                let want_dir = smss_stack_read(sp + 0x30) & FILE_DIRECTORY_FILE != 0;
                 let is_sys32_dir = want_dir
                     && nb[..nlen].windows(8).any(|w| w == b"system32")
                     && sys32_dir_exists();

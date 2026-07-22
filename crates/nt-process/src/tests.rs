@@ -480,6 +480,19 @@ fn file_objects_are_typed_and_process_local() {
 }
 
 #[test]
+fn disk_file_handles_preserve_backing_extent() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("reader.exe", None, None);
+    let object = HandleObject::DiskFile {
+        first_cluster: 0x1234,
+        size: 0x5678,
+    };
+    let handle = pm.insert_handle(pid, object, 0x0012_0089).unwrap();
+    assert_eq!(pm.lookup_handle(pid, handle), Some(object));
+    assert_eq!(pm.handle_access(pid, handle), Some(0x0012_0089));
+}
+
+#[test]
 fn boot_status_file_handle_is_typed_and_process_local() {
     let mut pm = ProcessManager::new();
     let first = pm.create_process("first.exe", None, None);

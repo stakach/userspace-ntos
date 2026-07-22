@@ -37,6 +37,7 @@ const STATUS_PENDING: NtStatus = 0x0000_0103;
 const STATUS_SOME_NOT_MAPPED: NtStatus = 0x0000_0107;
 const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
+const STATUS_NO_SUCH_FILE: NtStatus = 0xC000_000F;
 #[cfg(not(target_arch = "x86_64"))]
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
@@ -1051,6 +1052,10 @@ const FILE_CREATE: u32 = 2;
 #[cfg(target_arch = "x86_64")]
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 #[cfg(target_arch = "x86_64")]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(target_arch = "x86_64")]
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+#[cfg(target_arch = "x86_64")]
 const FILE_GENERIC_READ: u32 = 0x0012_0089;
 #[cfg(target_arch = "x86_64")]
 const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
@@ -1201,6 +1206,7 @@ unsafe fn boot_nt_open_file(
     desired_access: u32,
     object_attributes: *const BootObjectAttributes,
     iosb: *mut [u64; 2],
+    share_access: u32,
     open_options: u32,
 ) -> NtStatus {
     type NtOpenFile = unsafe extern "system" fn(
@@ -1220,7 +1226,7 @@ unsafe fn boot_nt_open_file(
             desired_access,
             object_attributes,
             iosb,
-            0,
+            share_access,
             open_options,
         )
     }
@@ -4001,6 +4007,7 @@ pub unsafe extern "system" fn rtl_lock_boot_status_data(handle: *mut *mut c_void
                 FILE_ALL_ACCESS,
                 &oa,
                 &mut iosb,
+                0,
                 FILE_SYNCHRONOUS_IO_NONALERT,
             )
         };
@@ -11229,6 +11236,88 @@ unsafe fn read_actctx_descriptor(
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn read_activation_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtStatus> {
+    let path_bytes = nt_path
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or(STATUS_NAME_TOO_LONG)?;
+    let mut name = UnicodeString::default();
+    name.length = path_bytes;
+    name.maximum_length = path_bytes;
+    name.buffer = nt_path.as_ptr() as u64;
+    let attributes = boot_status_object_attributes(&name);
+    let mut handle = 0u64;
+    let mut iosb = [0u64; 2];
+    let status = unsafe {
+        boot_nt_open_file(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut iosb,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+
+    let result = (|| {
+        let mut manifest = Vec::new();
+        loop {
+            let remaining = nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
+                .saturating_add(1)
+                .saturating_sub(manifest.len());
+            let requested = remaining.min(0x4000);
+            if requested == 0 {
+                return Err(
+                    nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                );
+            }
+            let old_length = manifest.len();
+            manifest
+                .try_reserve_exact(requested)
+                .map_err(|_| STATUS_NO_MEMORY)?;
+            manifest.resize(old_length + requested, 0);
+            iosb = [0; 2];
+            let byte_offset = i64::try_from(old_length).map_err(|_| STATUS_NO_MEMORY)?;
+            let status = unsafe {
+                boot_nt_read_file(
+                    handle,
+                    &mut iosb,
+                    manifest.as_mut_ptr().add(old_length).cast(),
+                    requested as u32,
+                    &byte_offset,
+                )
+            };
+            let information = usize::try_from(iosb[1]).unwrap_or(usize::MAX);
+            let disposition = nt_ntdll::rtl::activation::manifest_read_disposition(
+                old_length,
+                requested,
+                status,
+                information,
+            );
+            match disposition {
+                Ok(nt_ntdll::rtl::activation::ManifestReadDisposition::Continue) => {
+                    manifest.truncate(old_length + information);
+                }
+                Ok(nt_ntdll::rtl::activation::ManifestReadDisposition::Complete) => {
+                    manifest.truncate(old_length + information);
+                    return Ok(manifest);
+                }
+                Err(status) => {
+                    manifest.truncate(old_length);
+                    return Err(status);
+                }
+            }
+        }
+    })();
+    let _ = unsafe { boot_nt_close(handle) };
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn current_active_activation_context_no_addref() -> *mut c_void {
     let teb = unsafe { &*(current_teb() as *const Teb) };
     let stack = teb.activation_context_stack_pointer as *const u8;
@@ -11524,7 +11613,8 @@ pub unsafe extern "system" fn rtl_deactivate_activation_context_unsafe_fast(
 
 /// `RtlCreateActivationContext(ULONG Flags, PVOID ActivationContextData, ULONG ExtraBytes,
 /// PVOID Callback, PVOID CallbackData, PVOID* ActCtx) -> NTSTATUS` — validate the ReactOS `ACTCTXW`
-/// contract, load its manifest resource, parse the root assembly, and create a registered context.
+/// contract, load its embedded or file-backed manifest, parse the root assembly, and create a
+/// registered context.
 ///
 /// # Safety
 /// `act_ctx` writable.
@@ -11551,46 +11641,95 @@ pub unsafe extern "system" fn rtl_create_activation_context(
         if descriptor.uses_unsupported_resolution() {
             return nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX;
         }
-        let required = nt_ntdll::rtl::activation::ACTCTX_FLAG_RESOURCE_NAME_VALID
-            | nt_ntdll::rtl::activation::ACTCTX_FLAG_HMODULE_VALID;
-        if descriptor.flags & required != required || descriptor.module == 0 {
+        let source_mode = match nt_ntdll::rtl::activation::classify_source_mode(&descriptor) {
+            Ok(mode) => mode,
+            Err(status) => return status,
+        };
+        if source_mode == nt_ntdll::rtl::activation::ActivationContextSourceMode::PeFileResource {
             return nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX;
         }
-
-        let resource_path = [
-            24usize,
-            descriptor.resource_name,
-            descriptor.language_id as usize,
-        ];
-        let mut data_entry = core::ptr::null_mut();
-        let status = ldr_find_resource_u(
-            descriptor.module as *mut c_void,
-            resource_path.as_ptr().cast(),
-            3,
-            &mut data_entry,
-        );
-        if status != STATUS_SUCCESS {
-            return status;
-        }
-        let mut manifest_address = core::ptr::null_mut();
-        let mut manifest_size = 0u32;
-        let status = ldr_access_resource(
-            descriptor.module as *mut c_void,
-            data_entry,
-            &mut manifest_address,
-            &mut manifest_size,
-        );
-        if status != STATUS_SUCCESS {
-            return status;
-        }
-        if manifest_address.is_null() || manifest_size == 0 || manifest_size > 16 * 1024 * 1024 {
-            return 0xC015_0003; // STATUS_SXS_INVALID_ACTCTXDATA_FORMAT
-        }
-        let manifest_bytes = core::slice::from_raw_parts(
-            manifest_address as *const u8,
-            manifest_size as usize,
-        );
-        let parsed = match nt_ntdll::rtl::activation_manifest::parse_manifest(manifest_bytes) {
+        let assembly_directory =
+            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID != 0
+            {
+                match copy_utf16_z_bounded(descriptor.assembly_directory as *const u16, 32 * 1024) {
+                    Ok(directory) => directory,
+                    Err(status) => return status,
+                }
+            } else {
+                Vec::new()
+            };
+        let (manifest, source) = match source_mode {
+            nt_ntdll::rtl::activation::ActivationContextSourceMode::LoadedModuleResource => {
+                let resource_path = [
+                    24usize,
+                    descriptor.resource_name,
+                    descriptor.language_id as usize,
+                ];
+                let mut data_entry = core::ptr::null_mut();
+                let status = ldr_find_resource_u(
+                    descriptor.module as *mut c_void,
+                    resource_path.as_ptr().cast(),
+                    3,
+                    &mut data_entry,
+                );
+                if status != STATUS_SUCCESS {
+                    return status;
+                }
+                let mut manifest_address = core::ptr::null_mut();
+                let mut manifest_size = 0u32;
+                let status = ldr_access_resource(
+                    descriptor.module as *mut c_void,
+                    data_entry,
+                    &mut manifest_address,
+                    &mut manifest_size,
+                );
+                if status != STATUS_SUCCESS {
+                    return status;
+                }
+                if manifest_address.is_null()
+                    || manifest_size == 0
+                    || manifest_size as usize > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
+                {
+                    return nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT;
+                }
+                let bytes = core::slice::from_raw_parts(
+                    manifest_address as *const u8,
+                    manifest_size as usize,
+                );
+                let mut manifest = Vec::new();
+                if manifest.try_reserve_exact(bytes.len()).is_err() {
+                    return STATUS_NO_MEMORY;
+                }
+                manifest.extend_from_slice(bytes);
+                let source = match copy_ldr_full_name(descriptor.module) {
+                    Ok(source) => source,
+                    Err(status) => return status,
+                };
+                (manifest, source)
+            }
+            nt_ntdll::rtl::activation::ActivationContextSourceMode::ManifestFile => {
+                let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
+                    Ok(source) => source,
+                    Err(status) => return status,
+                };
+                let cwd = peb_current_directory();
+                let resolved = match nt_ntdll::rtl::activation::resolve_manifest_source(
+                    &source,
+                    (!assembly_directory.is_empty()).then_some(assembly_directory.as_slice()),
+                    &cwd,
+                ) {
+                    Some(resolved) => resolved,
+                    None => return STATUS_NO_SUCH_FILE,
+                };
+                let manifest = match read_activation_manifest_file(&resolved.nt_path) {
+                    Ok(manifest) => manifest,
+                    Err(status) => return status,
+                };
+                (manifest, resolved.dos_path)
+            }
+            nt_ntdll::rtl::activation::ActivationContextSourceMode::PeFileResource => unreachable!(),
+        };
+        let parsed = match nt_ntdll::rtl::activation_manifest::parse_manifest(&manifest) {
             Ok(parsed) => parsed,
             Err(status) => return status,
         };
@@ -11608,10 +11747,6 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 Ok(section) => section,
                 Err(status) => return status,
             };
-        let source = match copy_ldr_full_name(descriptor.module) {
-            Ok(source) => source,
-            Err(status) => return status,
-        };
         let application_directory =
             if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
             {
@@ -11620,26 +11755,29 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Err(status) => return status,
                 }
             } else {
-                match parent_directory_with_separator(&source) {
+                let application_module = if descriptor.flags
+                    & nt_ntdll::rtl::activation::ACTCTX_FLAG_HMODULE_VALID
+                    != 0
+                {
+                    descriptor.module
+                } else {
+                    let peb = current_peb();
+                    if peb == 0 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    core::ptr::read_unaligned(
+                        core::ptr::addr_of!((*(peb as *const nt_ntdll_layout::Peb)).image_base_address),
+                    ) as usize
+                };
+                let application_path = match copy_ldr_full_name(application_module) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                match parent_directory_with_separator(&application_path) {
                     Ok(directory) => directory,
                     Err(status) => return status,
                 }
             };
-        let assembly_directory =
-            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID != 0
-            {
-                match copy_utf16_z_bounded(descriptor.assembly_directory as *const u16, 32 * 1024) {
-                    Ok(directory) => directory,
-                    Err(status) => return status,
-                }
-            } else {
-                Vec::new()
-            };
-        let mut manifest = Vec::new();
-        if manifest.try_reserve_exact(manifest_bytes.len()).is_err() {
-            return STATUS_NO_MEMORY;
-        }
-        manifest.extend_from_slice(manifest_bytes);
         let memory = crate::process_heap_alloc(core::mem::size_of::<
             nt_ntdll::rtl::activation::ActivationContextObject,
         >()) as *mut nt_ntdll::rtl::activation::ActivationContextObject;

@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use super::guid::Guid;
+use super::{guid::Guid, path::DosPathType};
 use crate::NtStatus;
 
 pub const FRAME_FLAG_RELEASE_ON_DEACTIVATION: u32 = 0x01;
@@ -19,8 +19,11 @@ pub const CALLER_FRAME_FORMAT_WHISTLER: u32 = 1;
 pub const STATUS_SXS_EARLY_DEACTIVATION: NtStatus = 0xC015_000F;
 pub const STATUS_SXS_INVALID_DEACTIVATION: NtStatus = 0xC015_0010;
 pub const STATUS_SXS_CANT_GEN_ACTCTX: NtStatus = 0xC015_0002;
+pub const STATUS_SXS_INVALID_ACTCTXDATA_FORMAT: NtStatus = 0xC015_0003;
 pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
+pub const STATUS_END_OF_FILE: NtStatus = 0xC000_0011;
 pub const INVALID_COOKIE: usize = usize::MAX;
+pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 pub const ACTCTX_MAGIC: u32 = 0xC07E_3E11;
 pub const ACTCTX_FAKE_HANDLE: usize = 0x00F0_0BAA;
@@ -82,6 +85,113 @@ impl ActCtxDescriptor {
 
     pub fn uses_unsupported_resolution(&self) -> bool {
         self.flags & (ACTCTX_FLAG_SET_PROCESS_DEFAULT | ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationContextSourceMode {
+    ManifestFile,
+    LoadedModuleResource,
+    PeFileResource,
+}
+
+pub fn classify_source_mode(
+    descriptor: &ActCtxDescriptor,
+) -> Result<ActivationContextSourceMode, NtStatus> {
+    let resource = descriptor.flags & ACTCTX_FLAG_RESOURCE_NAME_VALID != 0;
+    let module = descriptor.flags & ACTCTX_FLAG_HMODULE_VALID != 0;
+    match (
+        resource,
+        module,
+        descriptor.source != 0,
+        descriptor.module != 0,
+    ) {
+        (false, _, true, _) => Ok(ActivationContextSourceMode::ManifestFile),
+        (true, true, _, true) => Ok(ActivationContextSourceMode::LoadedModuleResource),
+        (true, false, true, _) => Ok(ActivationContextSourceMode::PeFileResource),
+        _ => Err(crate::STATUS_INVALID_PARAMETER),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedManifestSource {
+    pub dos_path: Vec<u16>,
+    pub nt_path: Vec<u16>,
+}
+
+/// Resolve a manifest filename the same way CreateActCtx does: only a plain relative source is
+/// first based on `assembly_directory`; the resulting name is then resolved against the CWD.
+pub fn resolve_manifest_source(
+    source: &[u16],
+    assembly_directory: Option<&[u16]>,
+    current_directory: &[u16],
+) -> Option<ResolvedManifestSource> {
+    if source.is_empty()
+        || matches!(
+            super::path::determine_dos_path_name_type(source),
+            DosPathType::DriveRelative | DosPathType::RootLocalDevice | DosPathType::Unknown
+        )
+    {
+        return None;
+    }
+
+    let candidate = if super::path::determine_dos_path_name_type(source) == DosPathType::Relative {
+        if let Some(directory) = assembly_directory.filter(|directory| !directory.is_empty()) {
+            let mut joined = Vec::with_capacity(directory.len() + source.len() + 1);
+            joined.extend_from_slice(directory);
+            if !joined
+                .last()
+                .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+            {
+                joined.push(b'\\' as u16);
+            }
+            joined.extend_from_slice(source);
+            joined
+        } else {
+            source.to_vec()
+        }
+    } else {
+        source.to_vec()
+    };
+    let dos_path = super::environment::full_path_units(&candidate, current_directory);
+    let nt_path = super::path::dos_path_name_to_nt_path_name(&dos_path)?;
+    Some(ResolvedManifestSource { dos_path, nt_path })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestReadDisposition {
+    Continue,
+    Complete,
+}
+
+/// Validate one synchronous NtReadFile result before extending the manifest buffer.
+pub fn manifest_read_disposition(
+    total: usize,
+    requested: usize,
+    status: NtStatus,
+    information: usize,
+) -> Result<ManifestReadDisposition, NtStatus> {
+    if status == STATUS_END_OF_FILE {
+        return if information == 0 {
+            Ok(ManifestReadDisposition::Complete)
+        } else {
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        };
+    }
+    if status != crate::STATUS_SUCCESS {
+        return Err(status);
+    }
+    if information > requested
+        || total
+            .checked_add(information)
+            .is_none_or(|length| length > MAX_MANIFEST_BYTES)
+    {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    if information == 0 {
+        Ok(ManifestReadDisposition::Complete)
+    } else {
+        Ok(ManifestReadDisposition::Continue)
     }
 }
 
@@ -390,6 +500,8 @@ pub fn caller_frame_can_deactivate(flags: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::*;
 
     #[test]
@@ -529,6 +641,104 @@ mod tests {
         descriptor.resource_name = 2;
         descriptor.flags |= 0x100;
         assert_eq!(descriptor.validate(), Err(crate::STATUS_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn activation_context_source_modes_require_real_inputs() {
+        let manifest = ActCtxDescriptor {
+            size: 56,
+            source: 1,
+            ..ActCtxDescriptor::default()
+        };
+        assert_eq!(
+            classify_source_mode(&manifest),
+            Ok(ActivationContextSourceMode::ManifestFile)
+        );
+        assert_eq!(
+            classify_source_mode(&ActCtxDescriptor {
+                flags: ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_HMODULE_VALID,
+                resource_name: 1,
+                module: 2,
+                ..manifest
+            }),
+            Ok(ActivationContextSourceMode::LoadedModuleResource)
+        );
+        assert_eq!(
+            classify_source_mode(&ActCtxDescriptor {
+                flags: ACTCTX_FLAG_RESOURCE_NAME_VALID,
+                resource_name: 1,
+                ..manifest
+            }),
+            Ok(ActivationContextSourceMode::PeFileResource)
+        );
+        assert_eq!(
+            classify_source_mode(&ActCtxDescriptor {
+                source: 0,
+                ..manifest
+            }),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn manifest_sources_resolve_against_assembly_directory_then_cwd() {
+        let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+        let resolved = resolve_manifest_source(
+            &wide("service.manifest"),
+            Some(&wide("side\\manifests")),
+            &wide("C:\\ReactOS\\System32"),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf16_lossy(&resolved.dos_path),
+            "C:\\ReactOS\\System32\\side\\manifests\\service.manifest"
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&resolved.nt_path),
+            "\\??\\C:\\ReactOS\\System32\\side\\manifests\\service.manifest"
+        );
+
+        let absolute = resolve_manifest_source(
+            &wide("D:\\manifests\\service.manifest"),
+            Some(&wide("ignored")),
+            &wide("C:\\ReactOS"),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf16_lossy(&absolute.dos_path),
+            "D:\\manifests\\service.manifest"
+        );
+        assert!(
+            resolve_manifest_source(&wide("C:relative.manifest"), None, &wide("C:\\x")).is_none()
+        );
+    }
+
+    #[test]
+    fn manifest_read_results_are_bounded_and_require_consistent_counts() {
+        assert_eq!(
+            manifest_read_disposition(0, 4096, crate::STATUS_SUCCESS, 1024),
+            Ok(ManifestReadDisposition::Continue)
+        );
+        assert_eq!(
+            manifest_read_disposition(1024, 4096, crate::STATUS_SUCCESS, 0),
+            Ok(ManifestReadDisposition::Complete)
+        );
+        assert_eq!(
+            manifest_read_disposition(1024, 4096, STATUS_END_OF_FILE, 0),
+            Ok(ManifestReadDisposition::Complete)
+        );
+        assert_eq!(
+            manifest_read_disposition(0, 8, crate::STATUS_SUCCESS, 9),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+        assert_eq!(
+            manifest_read_disposition(MAX_MANIFEST_BYTES, 1, crate::STATUS_SUCCESS, 1),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+        assert_eq!(
+            manifest_read_disposition(0, 1, STATUS_END_OF_FILE, 1),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
     }
 
     #[test]

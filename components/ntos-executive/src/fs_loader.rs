@@ -90,6 +90,54 @@ pub(crate) unsafe fn fat_read_file(fs: &Fat32, first_cluster: u32, size: u32, de
     written
 }
 
+/// Read one byte range from a FAT file into a caller-owned buffer.
+pub(crate) unsafe fn fat_read_file_range(
+    fs: &Fat32,
+    first_cluster: u32,
+    size: u32,
+    offset: u32,
+    output: &mut [u8],
+) -> usize {
+    if offset >= size || output.is_empty() {
+        return 0;
+    }
+    let wanted = output.len().min((size - offset) as usize);
+    let cluster_bytes = fs.spc.saturating_mul(fs.bps);
+    if cluster_bytes == 0 {
+        return 0;
+    }
+    let mut cluster = first_cluster;
+    let mut skip_clusters = offset / cluster_bytes;
+    while skip_clusters != 0 && cluster >= 2 && cluster < 0x0FFF_FFF8 {
+        cluster = fat_next(fs, cluster);
+        skip_clusters -= 1;
+    }
+    let mut within_cluster = offset % cluster_bytes;
+    let mut written = 0usize;
+    while cluster >= 2 && cluster < 0x0FFF_FFF8 && written < wanted {
+        for sector in 0..fs.spc {
+            let sector_start = sector * fs.bps;
+            if within_cluster >= sector_start + fs.bps {
+                continue;
+            }
+            let start = within_cluster.saturating_sub(sector_start) as usize;
+            let data = fat_read_sector(fs, fat_cluster_sector(fs, cluster) + sector);
+            let count = (fs.bps as usize - start).min(wanted - written);
+            core::ptr::copy_nonoverlapping(data.add(start), output.as_mut_ptr().add(written), count);
+            written += count;
+            within_cluster = sector_start + fs.bps;
+            if written == wanted {
+                break;
+            }
+        }
+        within_cluster = 0;
+        if written < wanted {
+            cluster = fat_next(fs, cluster);
+        }
+    }
+    written
+}
+
 /// Like `dir_find` but matches EITHER the 8.3 short entry OR the reassembled long (LFN) name of
 /// `comp` — case-insensitive ASCII — so names WITHOUT a clean 8.3 alias (e.g. `advapi32_vista.dll`,
 /// `windowscodecs.dll`) resolve by their real name. Returns `(first_cluster, size, attr)`. VFAT
@@ -254,18 +302,18 @@ pub(crate) fn name_to_83(comp: &[u8]) -> [u8; 11] {
 /// — sufficient for the real ReactOS tree, whose names carry clean 8.3 aliases. Each non-final
 /// component must be a directory (FAT attr bit 0x10). This is the FS-backed-by-path primitive:
 /// the seam a full `\SystemRoot\system32\X` loader generalizes (see P7).
-pub(crate) unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
+pub(crate) unsafe fn fat_open_path_entry(fs: &Fat32, path: &[u8]) -> Option<(u32, u32, u8)> {
     let mut cur = fs.root_cl;
     let mut start = 0usize;
     let mut i = 0usize;
-    let mut result: Option<(u32, u32)> = None;
+    let mut result: Option<(u32, u32, u8)> = None;
     while i <= path.len() {
         let is_sep = i == path.len() || path[i] == b'\\' || path[i] == b'/';
         if is_sep {
             if i > start {
                 let (cl, sz, attr) = dir_find_lfn(fs, cur, &path[start..i])?;
                 if i == path.len() {
-                    result = Some((cl, sz)); // final component = the file
+                    result = Some((cl, sz, attr));
                 } else {
                     if (attr & 0x10) == 0 {
                         return None; // intermediate must be a directory
@@ -278,6 +326,11 @@ pub(crate) unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)
         i += 1;
     }
     result
+}
+
+pub(crate) unsafe fn fat_open_path(fs: &Fat32, path: &[u8]) -> Option<(u32, u32)> {
+    let (cluster, size, attributes) = fat_open_path_entry(fs, path)?;
+    (attributes & 0x10 == 0).then_some((cluster, size))
 }
 
 /// Open `\reactos\system32\<leaf>` from the volume (the common ReactOS binary location) via the

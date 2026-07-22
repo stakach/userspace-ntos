@@ -100,14 +100,84 @@ pub fn is_named_pipe_path(path: &[u16]) -> bool {
 
     fn starts_ascii_case_insensitive(path: &[u16], prefix: &[u8]) -> bool {
         path.len() >= prefix.len()
-            && path.iter().zip(prefix).all(|(&unit, &byte)| {
-                unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte)
-            })
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
     }
 
     starts_ascii_case_insensitive(path, DOS_PIPE)
         || starts_ascii_case_insensitive(path, DOS_DEVICES_PIPE)
         || starts_ascii_case_insensitive(path, DEVICE_PIPE)
+}
+
+/// Translate the local NT/DOS path forms used by user-mode file opens into a lowercase,
+/// root-relative path for the executive's mounted FAT volume.
+pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Vec<u8>> {
+    if system_root.is_empty()
+        || system_root
+            .iter()
+            .any(|byte| !byte.is_ascii() || matches!(byte, b'\\' | b'/' | b':'))
+    {
+        return None;
+    }
+    let mut folded = Vec::with_capacity(path.len());
+    let mut previous_separator = false;
+    for &unit in path {
+        if unit > 0x7f {
+            return None;
+        }
+        let mut byte = (unit as u8).to_ascii_lowercase();
+        if byte == b'/' {
+            byte = b'\\';
+        }
+        if byte == b'\\' {
+            if previous_separator {
+                continue;
+            }
+            previous_separator = true;
+        } else {
+            previous_separator = false;
+        }
+        folded.push(byte);
+    }
+
+    let system_prefix = b"\\systemroot";
+    let dos_prefix = b"\\??\\c:\\";
+    let dos_devices_prefix = b"\\dosdevices\\c:\\";
+    let drive_prefix = b"c:\\";
+    let mut relative = Vec::new();
+    if folded.starts_with(system_prefix)
+        && folded
+            .get(system_prefix.len())
+            .is_none_or(|byte| *byte == b'\\')
+    {
+        relative.extend(system_root.iter().map(u8::to_ascii_lowercase));
+        relative.extend_from_slice(&folded[system_prefix.len()..]);
+    } else if folded.starts_with(dos_prefix) {
+        relative.extend_from_slice(&folded[dos_prefix.len()..]);
+    } else if folded.starts_with(dos_devices_prefix) {
+        relative.extend_from_slice(&folded[dos_devices_prefix.len()..]);
+    } else if folded.starts_with(drive_prefix) {
+        relative.extend_from_slice(&folded[drive_prefix.len()..]);
+    } else {
+        return None;
+    }
+
+    let mut normalized = Vec::with_capacity(relative.len());
+    for component in relative.split(|byte| *byte == b'\\') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+        if component == b".." || component.contains(&b':') {
+            return None;
+        }
+        if !normalized.is_empty() {
+            normalized.push(b'\\');
+        }
+        normalized.extend_from_slice(component);
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// Case-insensitive component-wise prefix test.
