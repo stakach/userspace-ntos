@@ -292,3 +292,79 @@ fn privilege_overrides_and_kernel_bypass() {
     )
     .granted());
 }
+
+#[test]
+fn token_duplicate_is_independent_and_effective_only() {
+    let mut source = AccessToken::system();
+    source.groups[0].enabled = false;
+    let duplicate = source
+        .duplicate(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Delegation,
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(duplicate.token_type, TokenType::Impersonation);
+    assert_eq!(
+        duplicate.impersonation_level,
+        SecurityImpersonationLevel::Delegation
+    );
+    assert!(duplicate.groups.iter().all(|group| group.enabled));
+    assert!(duplicate
+        .privileges
+        .iter()
+        .all(|privilege| privilege.enabled));
+
+    source.groups[1].enabled = false;
+    assert!(duplicate.groups.iter().all(|group| group.enabled));
+}
+
+#[test]
+fn impersonation_duplicate_cannot_raise_its_level() {
+    let source = AccessToken::system()
+        .duplicate(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Identification,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        source.duplicate(
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            false,
+        ),
+        Err(STATUS_BAD_IMPERSONATION_LEVEL)
+    );
+    assert_eq!(
+        source.duplicate(
+            TokenType::Primary,
+            SecurityImpersonationLevel::Identification,
+            false,
+        ),
+        Err(STATUS_BAD_IMPERSONATION_LEVEL)
+    );
+}
+
+#[test]
+fn token_store_reference_outlives_assigning_handle() {
+    let mut store = TokenStore::new();
+    let primary = store.insert(AccessToken::system());
+    let impersonation = store
+        .duplicate(
+            primary,
+            TokenType::Impersonation,
+            SecurityImpersonationLevel::Impersonation,
+            false,
+        )
+        .unwrap();
+
+    store.retain(impersonation).unwrap(); // thread reference
+    assert_eq!(store.reference_count(impersonation), Some(2));
+    assert_eq!(store.release(impersonation), Ok(false)); // close assigning handle
+    assert!(store.get(impersonation).is_some());
+    assert_eq!(store.release(impersonation), Ok(true)); // revert thread
+    assert!(store.get(impersonation).is_none());
+    assert!(store.get(primary).is_some());
+}

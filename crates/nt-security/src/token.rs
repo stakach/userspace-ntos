@@ -6,11 +6,40 @@ use alloc::vec::Vec;
 use crate::sid::{Luid, Sid};
 
 /// Token type (spec §7.2).
+#[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TokenType {
-    Primary,
-    Impersonation,
+    Primary = 1,
+    Impersonation = 2,
 }
+
+/// Native `SECURITY_IMPERSONATION_LEVEL` ordering.
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SecurityImpersonationLevel {
+    Anonymous = 0,
+    Identification = 1,
+    Impersonation = 2,
+    Delegation = 3,
+}
+
+impl TryFrom<u32> for SecurityImpersonationLevel {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Anonymous),
+            1 => Ok(Self::Identification),
+            2 => Ok(Self::Impersonation),
+            3 => Ok(Self::Delegation),
+            _ => Err(STATUS_BAD_IMPERSONATION_LEVEL),
+        }
+    }
+}
+
+pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
+pub const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
 
 /// A group in a token (spec §7.3). v0.1 attributes: enabled / deny-only / owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +126,8 @@ pub const SE_CREATE_GLOBAL: &str = "SeCreateGlobalPrivilege";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessToken {
     pub token_type: TokenType,
+    /// Meaningful for impersonation tokens; primary tokens keep this at `Anonymous`.
+    pub impersonation_level: SecurityImpersonationLevel,
     pub user: Sid,
     pub groups: Vec<TokenGroup>,
     pub privileges: Vec<TokenPrivilege>,
@@ -107,6 +138,39 @@ pub struct AccessToken {
 }
 
 impl AccessToken {
+    /// Duplicate this token using the native token type, impersonation-level, and effective-only
+    /// rules. The returned token owns independent group and privilege vectors.
+    pub fn duplicate(
+        &self,
+        token_type: TokenType,
+        impersonation_level: SecurityImpersonationLevel,
+        effective_only: bool,
+    ) -> Result<Self, u32> {
+        if self.token_type == TokenType::Impersonation {
+            if impersonation_level > self.impersonation_level
+                || (token_type == TokenType::Primary
+                    && self.impersonation_level < SecurityImpersonationLevel::Impersonation)
+            {
+                return Err(STATUS_BAD_IMPERSONATION_LEVEL);
+            }
+        }
+
+        let mut duplicate = self.clone();
+        duplicate.token_type = token_type;
+        duplicate.impersonation_level = if token_type == TokenType::Impersonation {
+            impersonation_level
+        } else {
+            SecurityImpersonationLevel::Anonymous
+        };
+        if effective_only {
+            duplicate.groups.retain(|group| group.enabled);
+            duplicate
+                .privileges
+                .retain(|privilege| privilege.enabled);
+        }
+        Ok(duplicate)
+    }
+
     /// Whether the named privilege is present + enabled (spec §9.7).
     pub fn has_privilege(&self, name: &str) -> bool {
         self.privileges.iter().any(|p| p.name == name && p.enabled)
@@ -237,6 +301,7 @@ impl AccessToken {
     pub fn system() -> Self {
         AccessToken {
             token_type: TokenType::Primary,
+            impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_system(),
             groups: vec![
                 TokenGroup::enabled(Sid::administrators()),
@@ -280,6 +345,7 @@ impl AccessToken {
     pub fn admin(machine: u32) -> Self {
         AccessToken {
             token_type: TokenType::Primary,
+            impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_account(machine, 1001),
             groups: vec![
                 TokenGroup::enabled(Sid::administrators()),
@@ -304,6 +370,7 @@ impl AccessToken {
     pub fn user(machine: u32) -> Self {
         AccessToken {
             token_type: TokenType::Primary,
+            impersonation_level: SecurityImpersonationLevel::Anonymous,
             user: Sid::local_account(machine, 1000),
             groups: vec![
                 TokenGroup::enabled(Sid::users()),
@@ -316,5 +383,117 @@ impl AccessToken {
             session_id: 1,
             authentication_id: Luid::new(0x2_0000),
         }
+    }
+}
+
+/// Stable identity for one token object in a [`TokenStore`]. Zero is never valid.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TokenId(u32);
+
+impl TokenId {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    fn slot(self) -> usize {
+        self.0 as usize - 1
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TokenObject {
+    token: AccessToken,
+    references: u32,
+}
+
+/// Monotonic token-object arena. Process fields, thread impersonation contexts, and handles each
+/// hold an explicit reference, so closing the handle used to assign a thread token cannot destroy
+/// the thread's effective security context.
+#[derive(Clone, Debug, Default)]
+pub struct TokenStore {
+    objects: Vec<Option<TokenObject>>,
+}
+
+impl TokenStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            objects: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Insert a token with one owning reference.
+    pub fn insert(&mut self, token: AccessToken) -> TokenId {
+        self.objects.push(Some(TokenObject {
+            token,
+            references: 1,
+        }));
+        TokenId(self.objects.len() as u32)
+    }
+
+    pub fn get(&self, id: TokenId) -> Option<&AccessToken> {
+        self.objects.get(id.slot())?.as_ref().map(|entry| &entry.token)
+    }
+
+    pub fn get_mut(&mut self, id: TokenId) -> Option<&mut AccessToken> {
+        self.objects
+            .get_mut(id.slot())?
+            .as_mut()
+            .map(|entry| &mut entry.token)
+    }
+
+    pub fn reference_count(&self, id: TokenId) -> Option<u32> {
+        self.objects
+            .get(id.slot())?
+            .as_ref()
+            .map(|entry| entry.references)
+    }
+
+    pub fn retain(&mut self, id: TokenId) -> Result<(), u32> {
+        let entry = self
+            .objects
+            .get_mut(id.slot())
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        entry.references = entry.references.checked_add(1).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(())
+    }
+
+    /// Release one reference. Returns `true` when the object was destroyed.
+    pub fn release(&mut self, id: TokenId) -> Result<bool, u32> {
+        let slot = id.slot();
+        let entry = self
+            .objects
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if entry.references > 1 {
+            entry.references -= 1;
+            return Ok(false);
+        }
+        self.objects[slot] = None;
+        Ok(true)
+    }
+
+    /// Create an independent token object with one owning reference.
+    pub fn duplicate(
+        &mut self,
+        source: TokenId,
+        token_type: TokenType,
+        impersonation_level: SecurityImpersonationLevel,
+        effective_only: bool,
+    ) -> Result<TokenId, u32> {
+        let duplicate = self
+            .get(source)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .duplicate(token_type, impersonation_level, effective_only)?;
+        Ok(self.insert(duplicate))
     }
 }
