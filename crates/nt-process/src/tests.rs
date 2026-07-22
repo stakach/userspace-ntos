@@ -143,6 +143,51 @@ fn token_handles_preserve_owner_and_access() {
 }
 
 #[test]
+fn stable_token_handles_return_identity_on_close() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let token = nt_security::TokenId::from_raw(7).unwrap();
+    let handle = pm
+        .insert_handle(caller, HandleObject::TokenObject(token), 0x2c)
+        .unwrap();
+
+    assert_eq!(pm.take_handle(caller, handle), Ok(HandleObject::TokenObject(token)));
+    assert_eq!(pm.lookup_handle(caller, handle), None);
+    assert_eq!(pm.take_handle(caller, handle), Err(STATUS_INVALID_HANDLE));
+}
+
+#[test]
+fn thread_impersonation_replaces_reverts_and_falls_back_to_primary() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("security.exe", None, None);
+    let first = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let second = pm.create_thread(pid, 0x2000, 0, false).unwrap();
+    let primary = nt_security::TokenId::from_raw(1).unwrap();
+    let impersonation = nt_security::TokenId::from_raw(2).unwrap();
+    pm.replace_process_primary_token(pid, Some(primary)).unwrap();
+
+    assert_eq!(pm.effective_token(first), Some(primary));
+    assert_eq!(pm.effective_token(second), Some(primary));
+    let context = ImpersonationContext {
+        token: impersonation,
+        copy_on_open: false,
+        effective_only: false,
+        level: nt_security::SecurityImpersonationLevel::Impersonation,
+    };
+    assert_eq!(pm.replace_thread_impersonation(first, Some(context)), Ok(None));
+    assert_eq!(pm.thread_impersonation(first), Some(context));
+    assert_eq!(pm.effective_token(first), Some(impersonation));
+    assert_eq!(pm.effective_token(second), Some(primary));
+
+    assert_eq!(
+        pm.replace_thread_impersonation(first, None),
+        Ok(Some(context))
+    );
+    assert_eq!(pm.thread_impersonation(first), None);
+    assert_eq!(pm.effective_token(first), Some(primary));
+}
+
+#[test]
 fn break_on_termination_state_is_persistent_and_handle_checked() {
     const PROCESS_QUERY_INFORMATION: u32 = 0x400;
     let mut pm = ProcessManager::new();

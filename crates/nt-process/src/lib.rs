@@ -17,6 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_pe_loader::{MappedImage, PeError, PeFile};
+use nt_security::TokenId;
 
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -123,6 +124,9 @@ pub struct NtProcess {
     pub main_thread: Option<ThreadId>,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
+    /// Stable primary-token identity. The external token store owns the object bytes and reference
+    /// count; the process holds one reference while this slot is populated.
+    primary_token: Option<TokenId>,
     /// Opaque `W32PROCESS` pointer parked by win32k via `PsSetProcessWin32Process`
     /// (read back with `PsGetProcessWin32Process`). `None` until win32k attaches.
     pub win32_process: Option<u64>,
@@ -166,6 +170,8 @@ pub enum HandleObject {
     IoCompletion(u32),
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
+    /// A stable, independently owned token object.
+    TokenObject(TokenId),
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
@@ -202,6 +208,9 @@ pub struct NtThread {
     pub state: ThreadState,
     pub is_system_thread: bool,
     pub exit_status: Option<u32>,
+    /// Active impersonation context. The thread owns a token reference independently of the user
+    /// handle that assigned it.
+    impersonation: Option<ImpersonationContext>,
     pub suspend_count: u32,
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
@@ -212,6 +221,15 @@ pub struct NtThread {
     pub teb_base: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
     break_on_termination: bool,
+}
+
+/// Per-thread state installed through `ThreadImpersonationToken`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ImpersonationContext {
+    pub token: TokenId,
+    pub copy_on_open: bool,
+    pub effective_only: bool,
+    pub level: nt_security::SecurityImpersonationLevel,
 }
 
 /// The win32k per-system callout function pointers registered via
@@ -339,6 +357,7 @@ impl ProcessManager {
                 main_thread: None,
                 state,
                 exit_status: None,
+                primary_token: None,
                 win32_process: None,
                 win32_window_station: None,
                 process_cookie: 0,
@@ -403,6 +422,44 @@ impl ProcessManager {
     pub fn thread(&self, tid: ThreadId) -> Option<&NtThread> {
         self.threads.get(&tid)
     }
+
+    /// Replace a process primary-token reference and return the prior identity to its owner.
+    pub fn replace_process_primary_token(
+        &mut self,
+        pid: ProcessId,
+        token: Option<TokenId>,
+    ) -> Result<Option<TokenId>, u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(core::mem::replace(&mut process.primary_token, token))
+    }
+
+    pub fn process_primary_token(&self, pid: ProcessId) -> Option<TokenId> {
+        self.processes.get(&pid)?.primary_token
+    }
+
+    /// Replace or clear a thread impersonation context. The returned context lets the caller
+    /// release the old token reference after retaining the replacement.
+    pub fn replace_thread_impersonation(
+        &mut self,
+        tid: ThreadId,
+        context: Option<ImpersonationContext>,
+    ) -> Result<Option<ImpersonationContext>, u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(core::mem::replace(&mut thread.impersonation, context))
+    }
+
+    pub fn thread_impersonation(&self, tid: ThreadId) -> Option<ImpersonationContext> {
+        self.threads.get(&tid)?.impersonation
+    }
+
+    /// Select the thread impersonation token when present, otherwise its process primary token.
+    pub fn effective_token(&self, tid: ThreadId) -> Option<TokenId> {
+        let thread = self.threads.get(&tid)?;
+        thread
+            .impersonation
+            .map(|context| context.token)
+            .or_else(|| self.process_primary_token(thread.process_id))
+    }
     pub fn process_count(&self) -> usize {
         self.processes.len()
     }
@@ -439,6 +496,7 @@ impl ProcessManager {
                 state: ThreadState::Ready,
                 is_system_thread,
                 exit_status: None,
+                impersonation: None,
                 suspend_count: 0,
                 win32_thread: None,
                 teb_base: 0,
@@ -932,17 +990,20 @@ impl ProcessManager {
             .as_ref()
             .map(|e| e.granted_access)
     }
-    /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
-    pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
+    /// Remove a handle and return its object identity so the owning subsystem can release object
+    /// references after the table entry is gone.
+    pub fn take_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<HandleObject, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
         let slot = handle_to_slot(handle).ok_or(STATUS_INVALID_HANDLE)?;
-        match proc.handles.get_mut(slot) {
-            Some(e @ Some(_)) => {
-                *e = None;
-                Ok(())
-            }
-            _ => Err(STATUS_INVALID_HANDLE),
-        }
+        proc.handles
+            .get_mut(slot)
+            .and_then(Option::take)
+            .map(|entry| entry.object)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+    /// `NtClose` (spec §8.1): remove a handle from `pid`'s table (frees the slot for reuse).
+    pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> Result<(), u32> {
+        self.take_handle(pid, handle).map(|_| ())
     }
     /// Close the first handle in `pid`'s table whose entry refers to `object` (spec §8.1), freeing
     /// the slot; returns whether one was found. A host that assigns its own handle VALUES (outside

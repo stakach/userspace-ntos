@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-pe-loader = { workspace = true }
+nt-security = { workspace = true }
 
 [dev-dependencies]
 nt-driver-test-fixtures = { workspace = true }
