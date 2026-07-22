@@ -1784,10 +1784,11 @@ unsafe fn snap_module(
 // UNICODE_STRING: Length@0x00(u16), MaximumLength@0x02(u16), Buffer@0x08(ptr).
 // ---------------------------------------------------------------------------------------------
 
-/// Size of one `LDR_DATA_TABLE_ENTRY` we materialize (x64; the layout crate's full struct is 0x70+;
-/// round to 0x80 for alignment headroom).
+/// Size of one `LDR_DATA_TABLE_ENTRY`, rounded up to 16 bytes. The native tail includes
+/// `EntryPointActivationContext@0x88` and `PatchInformation@0x90`.
 #[cfg(target_arch = "x86_64")]
-const LDR_ENTRY_SIZE: u64 = 0x80;
+const LDR_ENTRY_SIZE: u64 =
+    (core::mem::size_of::<nt_ntdll_layout::LdrDataTableEntry>() as u64 + 15) & !15;
 /// Size of the `PEB_LDR_DATA` head (round to 0x60).
 #[cfg(target_arch = "x86_64")]
 const PEB_LDR_DATA_SIZE: u64 = 0x60;

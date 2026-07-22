@@ -56,6 +56,13 @@ fn ldr_offsets() {
     assert_eq!(offset_of!(LdrDataTableEntry, entry_point), 0x38);
     assert_eq!(offset_of!(LdrDataTableEntry, full_dll_name), 0x48);
     assert_eq!(offset_of!(LdrDataTableEntry, base_dll_name), 0x58);
+    assert_eq!(offset_of!(LdrDataTableEntry, time_date_stamp), 0x80);
+    assert_eq!(
+        offset_of!(LdrDataTableEntry, entry_point_activation_context),
+        0x88
+    );
+    assert_eq!(offset_of!(LdrDataTableEntry, patch_information), 0x90);
+    assert_eq!(size_of::<LdrDataTableEntry>(), 0x98);
 }
 
 #[test]

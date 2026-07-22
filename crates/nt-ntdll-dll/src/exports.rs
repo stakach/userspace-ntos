@@ -82,8 +82,11 @@ static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
+static LDR_MANIFEST_PROBER_ROUTINE: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static RTL_START_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
+static RTL_EXIT_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
 static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
 static LDR_TOP_LEVEL_CALLOUT_TEB: AtomicU64 = AtomicU64::new(0);
 
@@ -8765,13 +8768,14 @@ pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
     STATUS_SUCCESS
 }
 
-/// `LdrSetDllManifestProber(PVOID Prober)` — install the SxS manifest-probe callback. No SxS plane →
-/// no-op (the loader proceeds without manifest probing).
+/// `LdrSetDllManifestProber(PVOID Prober)` — install or clear the process manifest-probe callback.
 ///
 /// # Safety
 /// `prober` a valid callback or NULL.
 #[export_name = "LdrSetDllManifestProber"]
-pub unsafe extern "system" fn ldr_set_dll_manifest_prober(_prober: *mut c_void) {}
+pub unsafe extern "system" fn ldr_set_dll_manifest_prober(prober: *mut c_void) {
+    LDR_MANIFEST_PROBER_ROUTINE.store(prober as u64, Ordering::Release);
+}
 
 /// `LdrSetAppCompatDllRedirectionCallback(ULONG Flags,
 /// PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION CallbackFunction, PVOID CallbackData)
@@ -14413,16 +14417,18 @@ pub unsafe extern "system" fn rtl_set_io_completion_callback(
     STATUS_SUCCESS
 }
 
-/// `RtlSetThreadPoolStartFunc(PVOID StartFunc, PVOID ExitFunc) -> NTSTATUS` — install the thread-pool
-/// worker start/exit hooks. No plane → STATUS_SUCCESS no-op.
+/// `RtlSetThreadPoolStartFunc(PVOID StartFunc, PVOID ExitFunc) -> NTSTATUS` — install or clear the
+/// process thread-pool worker lifecycle hooks.
 ///
 /// # Safety
 /// `start_func`/`exit_func` valid callbacks or NULL.
 #[export_name = "RtlSetThreadPoolStartFunc"]
 pub unsafe extern "system" fn rtl_set_thread_pool_start_func(
-    _start_func: *mut c_void,
-    _exit_func: *mut c_void,
+    start_func: *mut c_void,
+    exit_func: *mut c_void,
 ) -> NtStatus {
+    RTL_START_POOL_THREAD.store(start_func as u64, Ordering::Release);
+    RTL_EXIT_POOL_THREAD.store(exit_func as u64, Ordering::Release);
     STATUS_SUCCESS
 }
 

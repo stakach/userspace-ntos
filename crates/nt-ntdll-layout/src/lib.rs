@@ -373,6 +373,10 @@ const _: () = assert!(offset_of!(LdrDataTableEntry, dll_base) == 0x30);
 const _: () = assert!(offset_of!(LdrDataTableEntry, entry_point) == 0x38);
 const _: () = assert!(offset_of!(LdrDataTableEntry, full_dll_name) == 0x48);
 const _: () = assert!(offset_of!(LdrDataTableEntry, base_dll_name) == 0x58);
+const _: () = assert!(offset_of!(LdrDataTableEntry, time_date_stamp) == 0x80);
+const _: () = assert!(offset_of!(LdrDataTableEntry, entry_point_activation_context) == 0x88);
+const _: () = assert!(offset_of!(LdrDataTableEntry, patch_information) == 0x90);
+const _: () = assert!(size_of::<LdrDataTableEntry>() == 0x98);
 
 // RTL_USER_PROCESS_PARAMETERS — rtltypes.h (x64).
 const _: () = assert!(offset_of!(RtlUserProcessParameters, length) == 0x04);
