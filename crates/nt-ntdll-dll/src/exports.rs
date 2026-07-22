@@ -16474,6 +16474,114 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     }
 }
 
+/// `RtlExitUserProcess(NTSTATUS Status) -> VOID`.
+///
+/// Run process loader shutdown notifications, then terminate the current process through the native
+/// process service. This function does not return on success.
+///
+/// # Safety
+/// Terminates the calling process.
+#[export_name = "RtlExitUserProcess"]
+pub unsafe extern "system" fn rtl_exit_user_process(status: NtStatus) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let _ = ldr_shutdown_process();
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_terminate_process)(-1, status);
+        core::arch::asm!("int3");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = status;
+    }
+}
+
+/// `RtlFreeUserThreadStack(HANDLE ProcessHandle, HANDLE ThreadHandle) -> VOID`.
+///
+/// Ported from ReactOS `sdk/lib/rtl/thread.c`: query `ThreadBasicInformation`, read the target
+/// `TEB.DeallocationStack`, and release that reservation in the supplied process. Query/read/free
+/// failures are intentionally ignored because the API has no return value.
+///
+/// # Safety
+/// `process_handle` and `thread_handle` are native handles valid in the calling process.
+#[export_name = "RtlFreeUserThreadStack"]
+pub unsafe extern "system" fn rtl_free_user_thread_stack(
+    process_handle: *mut c_void,
+    thread_handle: *mut c_void,
+) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        const THREAD_BASIC_INFORMATION: u32 = 0;
+        const THREAD_BASIC_INFORMATION_SIZE: usize = 48;
+        const MEM_RELEASE: u32 = 0x0000_8000;
+
+        let mut basic_info = [0u8; THREAD_BASIC_INFORMATION_SIZE];
+        let mut return_length = 0u32;
+        let query_status = core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_query_information_thread)(
+            thread_handle,
+            THREAD_BASIC_INFORMATION,
+            basic_info.as_mut_ptr() as *mut c_void,
+            THREAD_BASIC_INFORMATION_SIZE as u32,
+            &mut return_length,
+        );
+        if (query_status as i32) < 0 {
+            return;
+        }
+
+        // THREAD_BASIC_INFORMATION.TebBaseAddress is the pointer-width field at offset 8 on x64.
+        let teb = core::ptr::read_unaligned(basic_info.as_ptr().add(8) as *const usize);
+        if teb == 0 {
+            return;
+        }
+        let remote_deallocation_stack =
+            (teb + core::mem::offset_of!(Teb, deallocation_stack)) as *const c_void;
+        let mut stack_base: *mut c_void = core::ptr::null_mut();
+        let mut bytes_read = 0usize;
+        let read_status = core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(
+                *mut c_void,
+                *const c_void,
+                *mut c_void,
+                usize,
+                *mut usize,
+            ) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_read_virtual_memory)(
+            process_handle,
+            remote_deallocation_stack,
+            &mut stack_base as *mut *mut c_void as *mut c_void,
+            core::mem::size_of::<*mut c_void>(),
+            &mut bytes_read,
+        );
+        if (read_status as i32) < 0
+            || bytes_read != core::mem::size_of::<*mut c_void>()
+            || stack_base.is_null()
+        {
+            return;
+        }
+
+        let mut region_size = 0usize;
+        let _ = core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut usize, u32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_free_virtual_memory)(
+            process_handle,
+            &mut stack_base,
+            &mut region_size,
+            MEM_RELEASE,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (process_handle, thread_handle);
+    }
+}
+
 /// `RtlComputeImportTableHash(HANDLE FileHandle, PCHAR Hash, ULONG ImportTableHashSize) -> NTSTATUS`
 /// — hash a module's import table (used by the loader-integrity path). Not needed on the boot path;
 /// zero the hash + STATUS_SUCCESS (an empty hash — the caller stores it, no verification consumer).
@@ -22271,6 +22379,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_dispatch_exception as usize,
         ki_user_exception_dispatcher as usize,
         rtl_exit_user_thread as usize,
+        rtl_exit_user_process as usize,
+        rtl_free_user_thread_stack as usize,
         rtl_compute_import_table_hash as usize,
         rtl_flush_secure_memory_cache as usize,
         rtl_set_critical_section_spin_count as usize,
