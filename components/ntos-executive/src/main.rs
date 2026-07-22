@@ -58,7 +58,7 @@ mod driver_launch;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
@@ -605,6 +605,8 @@ pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 pub const TEB_VA: u64 = 0x0000_0100_0057_0000;
 pub const PEB_VA: u64 = 0x0000_0100_0058_0000;
 pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
+static SYSTEM_TIME_ZONE_BIAS_100NS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_TIME_ZONE_ID: AtomicU32 = AtomicU32::new(0);
 pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 /// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is
 /// resolved to point here, so the PE calls named ntdll functions like real Windows code.
@@ -733,6 +735,24 @@ pub const LSASS_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 4 * DEMAND_SCRATCH_WINDO
 /// so a fully-dynamic pi > current requires assigning those windows too (the follow-up); this ceiling
 /// makes the SLOT arrays ready and the overflow LOUD in the meantime.
 pub const MAX_PI: usize = 16;
+static mut KUSER_PAGE_ALIAS: [u64; MAX_PI] = [0; MAX_PI];
+
+unsafe fn kuser_page_alias_put(pi: u64, alias: u64) {
+    let index = pi as usize;
+    if index < MAX_PI {
+        let aliases = core::ptr::addr_of_mut!(KUSER_PAGE_ALIAS) as *mut u64;
+        core::ptr::write(aliases.add(index), alias);
+    }
+}
+
+unsafe fn kuser_page_alias_get(pi: usize) -> u64 {
+    if pi < MAX_PI {
+        let aliases = core::ptr::addr_of!(KUSER_PAGE_ALIAS) as *const u64;
+        core::ptr::read(aliases.add(pi))
+    } else {
+        0
+    }
+}
 /// Hosted-process DLL VA arena. Images receive stable bases at activation and pack at Windows'
 /// 64 KiB granularity. The arena ends at the win32k client window, stays below NLS at 0xA000_0000,
 /// and remains inside the existing 0x8000_0000..0xC000_0000 1 GiB PD range. csrsrv activates first
@@ -4316,6 +4336,8 @@ struct ExecNtHandler {
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
     /// the executive heap is small). None if the hive wasn't staged on the disk.
     hive: Option<RegfHive<'static>>,
+    /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
+    time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
     /// its entries are inline (no nested heap) so pushes never reallocate.
     obj_ns: alloc::vec::Vec<ObjEntry>,

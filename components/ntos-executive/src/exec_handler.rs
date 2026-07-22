@@ -87,6 +87,65 @@ unsafe fn ensure_boot_status_data() {
     }
 }
 
+fn seed_time_zone(hive: Option<&RegfHive<'_>>) -> nt_kernel_exec::timezone::TimeZoneInformation {
+    use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
+
+    let mut information = TimeZoneInformation::default();
+    let Some(hive) = hive else {
+        return information;
+    };
+    let Some(key) = hive.open_key("ControlSet001\\Control\\TimeZoneInformation") else {
+        return information;
+    };
+    for (name, field) in [
+        ("Bias", TimeZoneRegistryField::Bias),
+        ("StandardName", TimeZoneRegistryField::StandardName),
+        ("StandardBias", TimeZoneRegistryField::StandardBias),
+        ("StandardStart", TimeZoneRegistryField::StandardStart),
+        ("DaylightName", TimeZoneRegistryField::DaylightName),
+        ("DaylightBias", TimeZoneRegistryField::DaylightBias),
+        ("DaylightStart", TimeZoneRegistryField::DaylightStart),
+    ] {
+        if let Some((value_type, data)) = hive.value(key, name) {
+            let _ = information.apply_registry_value(field, value_type, &data);
+        }
+    }
+    information
+}
+
+fn effective_time_zone(
+    information: nt_kernel_exec::timezone::TimeZoneInformation,
+    current_time: u64,
+) -> nt_kernel_exec::timezone::EffectiveTimeZone {
+    information.effective_at(current_time as i64).unwrap_or(
+        nt_kernel_exec::timezone::EffectiveTimeZone {
+            id: nt_kernel_exec::timezone::TIME_ZONE_ID_UNKNOWN,
+            bias_100ns: i64::from(information.bias) * nt_kernel_exec::timezone::TICKS_PER_MINUTE,
+        },
+    )
+}
+
+unsafe fn publish_time_zone(
+    information: nt_kernel_exec::timezone::TimeZoneInformation,
+    current_time: u64,
+) {
+    let effective = effective_time_zone(information, current_time);
+    SYSTEM_TIME_ZONE_BIAS_100NS.store(effective.bias_100ns as u64, Ordering::Relaxed);
+    SYSTEM_TIME_ZONE_ID.store(effective.id, Ordering::Relaxed);
+    for pi in 0..MAX_PI {
+        let alias = unsafe { kuser_page_alias_get(pi) };
+        if alias != 0 {
+            unsafe {
+                nt_ntdll_layout::kuser::publish_time_zone(
+                    alias as *mut u8,
+                    effective.bias_100ns,
+                    effective.id,
+                )
+            };
+        }
+    }
+}
+
 impl ExecNtHandler {
     pub(crate) fn new() -> Self {
         // SAFETY: HIVEBUF is a fixed, executive-lifetime mapping the storage host filled from
@@ -101,8 +160,11 @@ impl ExecNtHandler {
                 RegfHive::new(bytes)
             }
         };
+        let time_zone_information = seed_time_zone(hive.as_ref());
+        unsafe { publish_time_zone(time_zone_information, nt_system_time_100ns()) };
         let mut handler = ExecNtHandler {
             hive,
+            time_zone_information,
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
                 v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
@@ -1891,6 +1953,7 @@ impl ExecNtHandler {
         }
         false
     }
+
     /// Cross-AS byte-buffer write to the current process's VA `va` — mirror first, else 8-byte chunks
     /// via [`xas_write_u64`] (each demand-fills a not-yet-faulted DLL/heap page as needed). The last
     /// partial word is read-modify-written so trailing bytes past `src` in that word are preserved.
@@ -3985,6 +4048,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 use nt_syscall::system_information::{
                     query_plan, SystemBasicInformation, SystemInformationKind,
                     SystemTimeOfDayInformation, SYSTEM_BASIC_INFORMATION_CLASS,
+                    SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
                     SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
                 };
 
@@ -4002,6 +4066,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     SYSTEM_BASIC_INFORMATION_CLASS
                         | SYSTEM_PROCESSOR_INFORMATION_CLASS
                         | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS
+                        | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS
                 ) {
                     return STATUS_INVALID_INFO_CLASS;
                 }
@@ -4070,14 +4135,29 @@ impl NativeSyscallHandler for ExecNtHandler {
                         self.xas_try_write_buf(buf, &output)
                     }
                     SystemInformationKind::TimeOfDay => {
+                        let current_time = nt_system_time_100ns();
+                        let effective =
+                            effective_time_zone(self.time_zone_information, current_time);
+                        if SYSTEM_TIME_ZONE_BIAS_100NS.load(Ordering::Relaxed)
+                            != effective.bias_100ns as u64
+                            || SYSTEM_TIME_ZONE_ID.load(Ordering::Relaxed) != effective.id
+                        {
+                            unsafe {
+                                publish_time_zone(self.time_zone_information, current_time)
+                            };
+                        }
                         let output = SystemTimeOfDayInformation {
                             boot_time_100ns: NT_SYSTEM_TIME_BOOT_100NS,
-                            current_time_100ns: nt_system_time_100ns(),
-                            time_zone_bias_100ns: 0,
-                            time_zone_id: 0,
+                            current_time_100ns: current_time,
+                            time_zone_bias_100ns: effective.bias_100ns,
+                            time_zone_id: effective.id,
                         }
                         .encode();
                         self.xas_try_write_buf(buf, &output[..plan.copy_length])
+                    }
+                    SystemInformationKind::CurrentTimeZone => {
+                        let output = self.time_zone_information.encode();
+                        self.xas_try_write_buf(buf, &output)
                     }
                 };
                 if wrote { 0 } else { STATUS_ACCESS_VIOLATION }
@@ -5908,11 +5988,55 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Err(status) => status,
                 }
             },
+            NativeService::NtSetSystemInformation => unsafe {
+                use nt_syscall::system_information::{
+                    set_current_time_zone_plan, SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS,
+                    SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE,
+                };
+
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+
+                let class = args[0] as u32;
+                if class != SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS {
+                    return 0;
+                }
+                let buffer = args[1];
+                let length = args[2] as usize;
+                if length != 0 && buffer & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if length != 0 {
+                    let Some(last) = buffer.checked_add(length as u64 - 1) else {
+                        return STATUS_ACCESS_VIOLATION;
+                    };
+                    if last > 0x0000_07ff_fffe_ffff {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                let copy_length = match set_current_time_zone_plan(length) {
+                    Ok(copy_length) => copy_length,
+                    Err(status) => return status,
+                };
+                let mut encoded = [0u8; SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE];
+                if copy_length != encoded.len() || !self.xas_read(buffer, &mut encoded) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let Some(information) =
+                    nt_kernel_exec::timezone::TimeZoneInformation::decode_prefix(&encoded)
+                else {
+                    return 0xC000_0004;
+                };
+                self.time_zone_information = information;
+                // The hosted clock is already UTC-backed, so changing timezone metadata does not
+                // retime a local CMOS clock. Publish the new bias/id to every KUSER page instead.
+                unsafe { publish_time_zone(information, nt_system_time_100ns()) };
+                0
+            },
             NativeService::NtFreeVirtualMemory
             | NativeService::NtTestAlert
             | NativeService::NtCreateKeyedEvent
             | NativeService::NtInitializeRegistry
-            | NativeService::NtSetSystemInformation
             | NativeService::NtUnmapViewOfSection
             | NativeService::NtSetSecurityObject
             // winlogon's SetDefaultLanguage(NULL) sets the system default UI locale after reading the

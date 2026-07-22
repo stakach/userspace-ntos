@@ -5,10 +5,12 @@ use crate::{STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
+pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS: u32 = 44;
 
 pub const SYSTEM_BASIC_INFORMATION_SIZE: usize = 0x40;
 pub const SYSTEM_PROCESSOR_INFORMATION_SIZE: usize = 0x0c;
 pub const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 0x30;
+pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE: usize = 0xac;
 
 pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 
@@ -208,6 +210,7 @@ pub enum SystemInformationKind {
     Basic,
     Processor,
     TimeOfDay,
+    CurrentTimeZone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,10 +268,32 @@ pub fn query_plan(class: u32, buffer_length: usize) -> Result<QueryPlan, QueryEr
                 return_length: buffer_length as u32,
             })
         }
+        SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS => {
+            if buffer_length != SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE {
+                return Err(QueryError {
+                    status: STATUS_INFO_LENGTH_MISMATCH,
+                    return_length: SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE as u32,
+                });
+            }
+            Ok(QueryPlan {
+                kind: SystemInformationKind::CurrentTimeZone,
+                copy_length: SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE,
+                return_length: SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE as u32,
+            })
+        }
         _ => Err(QueryError {
             status: STATUS_INVALID_INFO_CLASS,
             return_length: 0,
         }),
+    }
+}
+
+/// Validate class 44's set length and return the prefix consumed by the kernel.
+pub fn set_current_time_zone_plan(buffer_length: usize) -> Result<usize, u32> {
+    if buffer_length < SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE {
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    } else {
+        Ok(SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE)
     }
 }
 
@@ -433,6 +458,28 @@ mod tests {
             STATUS_INFO_LENGTH_MISMATCH
         );
         assert_eq!(query_plan(3, 49).unwrap_err().return_length, 0);
+    }
+
+    #[test]
+    fn current_timezone_uses_reactos_query_and_set_length_rules() {
+        for length in [0, 171, 173] {
+            let error = query_plan(SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS, length).unwrap_err();
+            assert_eq!(error.status, STATUS_INFO_LENGTH_MISMATCH);
+            assert_eq!(error.return_length, 172);
+        }
+        let plan = query_plan(SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS, 172).unwrap();
+        assert_eq!(plan.kind, SystemInformationKind::CurrentTimeZone);
+        assert_eq!(plan.copy_length, 172);
+        assert_eq!(plan.return_length, 172);
+
+        for length in [0, 171] {
+            assert_eq!(
+                set_current_time_zone_plan(length),
+                Err(STATUS_INFO_LENGTH_MISMATCH),
+            );
+        }
+        assert_eq!(set_current_time_zone_plan(172), Ok(172));
+        assert_eq!(set_current_time_zone_plan(173), Ok(172));
     }
 
     #[test]

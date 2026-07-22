@@ -165,6 +165,11 @@ unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
         interrupt_time,
         NT_SYSTEM_TIME_BOOT_100NS.saturating_add(interrupt_time),
     );
+    nt_ntdll_layout::kuser::update_time_zone(
+        page,
+        SYSTEM_TIME_ZONE_BIAS_100NS.load(Ordering::Relaxed) as i64,
+        SYSTEM_TIME_ZONE_ID.load(Ordering::Relaxed),
+    );
 }
 
 /// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
@@ -787,6 +792,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let kscr = scr + 0x6000; // next free page in the env-scratch window (past env at +0x4000/+0x5000)
         let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
         unsafe { initialize_kuser_snapshot(kscr) };
+        kuser_page_alias_put(pi, kscr);
         let _ = page_map(copy_cap(kuser_f), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads

@@ -6,6 +6,7 @@ pub const TICK_COUNT_MULTIPLIER: usize = 0x004;
 pub const INTERRUPT_TIME: usize = 0x008;
 pub const SYSTEM_TIME: usize = 0x014;
 pub const TIME_ZONE_BIAS: usize = 0x020;
+pub const TIME_ZONE_ID: usize = 0x240;
 pub const IMAGE_NUMBER_LOW: usize = 0x02c;
 pub const IMAGE_NUMBER_HIGH: usize = 0x02e;
 pub const NT_SYSTEM_ROOT: usize = 0x030;
@@ -64,7 +65,7 @@ pub fn initialize_page(
     put_u32(page, TICK_COUNT_MULTIPLIER, TICK_COUNT_MULTIPLIER_ONE_MS);
     put_ksystem_time(page, INTERRUPT_TIME, interrupt_time_100ns);
     put_ksystem_time(page, SYSTEM_TIME, system_time_100ns);
-    put_ksystem_time(page, TIME_ZONE_BIAS, 0);
+    update_time_zone(page, 0, 0);
     put_u16(page, IMAGE_NUMBER_LOW, information.image_number_low);
     put_u16(page, IMAGE_NUMBER_HIGH, information.image_number_high);
     put_utf16_z(page, NT_SYSTEM_ROOT, b"C:\\Windows");
@@ -88,6 +89,28 @@ pub fn initialize_page(
         ACTIVE_PROCESSOR_COUNT,
         information.active_processor_count,
     );
+}
+
+/// Publish the effective timezone fields consumed directly through `KUSER_SHARED_DATA`.
+pub fn update_time_zone(page: &mut [u8; PAGE_SIZE], bias_100ns: i64, time_zone_id: u32) {
+    put_ksystem_time(page, TIME_ZONE_BIAS, bias_100ns as u64);
+    put_u32(page, TIME_ZONE_ID, time_zone_id);
+}
+
+/// Publish timezone fields to a live, concurrently readable shared-data page.
+///
+/// # Safety
+/// `page` is an 8-byte-aligned, writable `KUSER_SHARED_DATA` page mapping.
+pub unsafe fn publish_time_zone(page: *mut u8, bias_100ns: i64, time_zone_id: u32) {
+    let bias = bias_100ns as u64;
+    let high = (bias >> 32) as u32;
+    debug_assert_eq!(page as usize & 7, 0);
+    unsafe {
+        // Readers retry unless High1 == High2. Publish High2 first, then Low+High1 atomically.
+        core::ptr::write_volatile(page.add(TIME_ZONE_BIAS + 8) as *mut u32, high);
+        core::ptr::write_volatile(page.add(TIME_ZONE_BIAS) as *mut u64, bias);
+        core::ptr::write_volatile(page.add(TIME_ZONE_ID) as *mut u32, time_zone_id);
+    }
 }
 
 pub fn processor_features(feature_bits: u32) -> [u8; PROCESSOR_FEATURE_COUNT] {
@@ -173,5 +196,18 @@ mod tests {
         const PF_XSAVE_ENABLED: usize = 17;
         let features = processor_features(u32::MAX);
         assert_eq!(features[PF_XSAVE_ENABLED], 0);
+    }
+
+    #[test]
+    fn publishes_signed_timezone_bias_and_id() {
+        #[repr(align(8))]
+        struct AlignedPage([u8; PAGE_SIZE]);
+
+        let mut page = AlignedPage([0u8; PAGE_SIZE]);
+        unsafe { publish_time_zone(page.0.as_mut_ptr(), -36_000_000_000, 2) };
+        assert_eq!(read_u32(&page.0, TIME_ZONE_BIAS), 0x9e3b_9800);
+        assert_eq!(read_u32(&page.0, TIME_ZONE_BIAS + 4), 0xffff_fff7);
+        assert_eq!(read_u32(&page.0, TIME_ZONE_BIAS + 8), 0xffff_fff7);
+        assert_eq!(read_u32(&page.0, TIME_ZONE_ID), 2);
     }
 }
