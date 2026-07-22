@@ -4617,6 +4617,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtQueryDebugFilterState, SSN_NT_QUERY_DEBUG_FILTER_STATE as u32),
             (NativeService::NtSetDebugFilterState, SSN_NT_SET_DEBUG_FILTER_STATE as u32),
             (NativeService::NtOpenThreadToken, SSN_NT_OPEN_THREAD_TOKEN as u32),
+            (NativeService::NtRaiseHardError, 190),
             // Workstream A batch 2 (group A): create-handle + no-op services.
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),

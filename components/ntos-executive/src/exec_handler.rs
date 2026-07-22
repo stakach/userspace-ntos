@@ -3701,6 +3701,91 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
             // the process token.
             NativeService::NtOpenThreadToken => 0xC000007C,
+            NativeService::NtRaiseHardError => unsafe {
+                use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
+
+                let number_of_parameters = args[1] as u32;
+                let unicode_mask = args[2] as u32;
+                let parameters = args[3];
+                let response = args[5];
+                if let Err(status) = validate_request(
+                    number_of_parameters,
+                    parameters != 0,
+                    args[4] as u32,
+                ) {
+                    return status;
+                }
+                if response == 0 || !self.probe_user_output(response, 4) {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+
+                let mut captured = [0u64; 5];
+                if parameters != 0 {
+                    let byte_len = number_of_parameters as usize * 8;
+                    let raw = core::slice::from_raw_parts_mut(
+                        captured.as_mut_ptr() as *mut u8,
+                        byte_len,
+                    );
+                    if !self.xas_read(parameters, raw) {
+                        return nt_syscall::STATUS_ACCESS_VIOLATION;
+                    }
+
+                    for i in 0..number_of_parameters as usize {
+                        if unicode_mask & (1 << i) == 0 {
+                            continue;
+                        }
+                        let mut descriptor = [0u8; 16];
+                        if captured[i] == 0 || !self.xas_read(captured[i], &mut descriptor) {
+                            return nt_syscall::STATUS_ACCESS_VIOLATION;
+                        }
+                        let maximum_length =
+                            u16::from_le_bytes([descriptor[2], descriptor[3]]) as usize;
+                        let buffer = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
+                        let mut offset = 0usize;
+                        let mut probe = [0u8; 64];
+                        while offset < maximum_length {
+                            let n = (maximum_length - offset).min(probe.len());
+                            if buffer == 0
+                                || !self.xas_read(buffer + offset as u64, &mut probe[..n])
+                            {
+                                return nt_syscall::STATUS_ACCESS_VIOLATION;
+                            }
+                            offset += n;
+                        }
+                    }
+                }
+
+                print_str(b"[harderr] pi=");
+                print_u64(self.pi as u64);
+                print_str(b" status=0x");
+                print_hex(args[0] as u32);
+                print_str(b" n=");
+                print_u64(number_of_parameters as u64);
+                print_str(b" mask=0x");
+                print_hex(unicode_mask);
+                print_str(b" option=");
+                print_u64(args[4]);
+                for i in 0..number_of_parameters as usize {
+                    if unicode_mask & (1 << i) == 0 {
+                        continue;
+                    }
+                    let text = self.read_ustr_pe(captured[i]);
+                    let ascii: alloc::vec::Vec<u8> = text
+                        .iter()
+                        .map(|&ch| if ch <= 0x7f { ch as u8 } else { b'?' })
+                        .collect();
+                    print_str(b" text=");
+                    print_str(&ascii);
+                }
+                print_str(b"\n");
+
+                // No executive hard-error LPC port is registered yet. ReactOS' ExpRaiseHardError
+                // returns directly to the caller in that state and reports ResponseReturnToCaller.
+                if !self.xas_write_u32(response, RESPONSE_RETURN_TO_CALLER) {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                nt_syscall::STATUS_SUCCESS
+            },
             // NtCreatePort(*PortHandle[R10=args[0]], *ObjectAttributes[RDX=args[1]],
             // MaxConnInfo[R8=args[2]], MaxMsg[R9=args[3]], MaxPool[stack]). Create a REAL named port
             // in the isolated LPC connection broker (control plane) and hand the caller its handle.

@@ -17,6 +17,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 pub mod system_information;
+pub mod hard_error;
 
 // NTSTATUS (spec §18)
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -106,6 +107,7 @@ pub enum NativeService {
     NtGetPlugPlayEvent,
     NtPlugPlayControl,
     NtSetSystemPowerState,
+    NtRaiseHardError,
     // Additional services the executive hosts for real binaries (smss/csrss). These are real
     // Win7-SP1 native services migrated off the executive's hand-wired dispatch ladder into this
     // registered table (Workstream A: converge all native dispatch onto the `NativeServiceTable`).
@@ -241,6 +243,7 @@ impl NativeService {
             NtGetPlugPlayEvent => "NtGetPlugPlayEvent",
             NtPlugPlayControl => "NtPlugPlayControl",
             NtSetSystemPowerState => "NtSetSystemPowerState",
+            NtRaiseHardError => "NtRaiseHardError",
             NtProtectVirtualMemory => "NtProtectVirtualMemory",
             NtDisplayString => "NtDisplayString",
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
@@ -323,6 +326,7 @@ impl NativeService {
             NtCreateKeyedEvent | NtReleaseKeyedEvent | NtWaitForKeyedEvent => (4, 4),
             NtQueryPerformanceCounter => (2, 2),
             NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
+            NtRaiseHardError => (6, 6),
             NtOpenSection => (0, 4),
             // Group-C ladder migrations: these handlers read their register args via the executive's
             // IPC helpers (get_recv_mr) + stack args off the caller's SP directly, and use the arg
@@ -415,6 +419,7 @@ impl NativeService {
         NativeService::NtGetPlugPlayEvent,
         NativeService::NtPlugPlayControl,
         NativeService::NtSetSystemPowerState,
+        NativeService::NtRaiseHardError,
         NativeService::NtProtectVirtualMemory,
         NativeService::NtDisplayString,
         NativeService::NtQueryDebugFilterState,

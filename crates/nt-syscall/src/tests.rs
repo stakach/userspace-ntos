@@ -292,6 +292,18 @@ fn group_c_ladder_migrations_register() {
 }
 
 #[test]
+fn hard_error_registers_with_exact_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtRaiseHardError, 190)],
+    );
+    let entry = table.lookup(190).unwrap();
+    assert_eq!(entry.service, NativeService::NtRaiseHardError);
+    assert_eq!((entry.min_args, entry.max_args), (6, 6));
+    assert_eq!(entry.service.name(), "NtRaiseHardError");
+}
+
+#[test]
 fn reactos_global_atom_family_registers_with_exact_contracts() {
     let pairs = [
         (NativeService::NtAddAtom, 8u32),
