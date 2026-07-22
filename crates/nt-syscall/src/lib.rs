@@ -99,6 +99,8 @@ pub enum NativeService {
     NtSuspendProcess,
     // Security / token (§16.7)
     NtOpenProcessToken,
+    NtOpenProcessTokenEx,
+    NtDuplicateToken,
     NtAccessCheck,
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
@@ -116,6 +118,7 @@ pub enum NativeService {
     NtQueryDebugFilterState,
     NtSetDebugFilterState,
     NtOpenThreadToken,
+    NtOpenThreadTokenEx,
     // Object-creation services the executive hands a fake handle for (SmpInit's \SmApiPort, the
     // SM/CSR worker threads, events/semaphores) — real LPC/thread objects are later work.
     NtCreatePort,
@@ -236,6 +239,8 @@ impl NativeService {
             NtResumeProcess => "NtResumeProcess",
             NtSuspendProcess => "NtSuspendProcess",
             NtOpenProcessToken => "NtOpenProcessToken",
+            NtOpenProcessTokenEx => "NtOpenProcessTokenEx",
+            NtDuplicateToken => "NtDuplicateToken",
             NtAccessCheck => "NtAccessCheck",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
@@ -249,6 +254,7 @@ impl NativeService {
             NtQueryDebugFilterState => "NtQueryDebugFilterState",
             NtSetDebugFilterState => "NtSetDebugFilterState",
             NtOpenThreadToken => "NtOpenThreadToken",
+            NtOpenThreadTokenEx => "NtOpenThreadTokenEx",
             NtCreatePort => "NtCreatePort",
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
@@ -315,7 +321,9 @@ impl NativeService {
             | NtSetSystemPowerState | NtOpenEvent | NtOpenSemaphore | NtReleaseSemaphore => (3, 3),
             NtGetPlugPlayEvent => (4, 4),
             NtQueryValueKey => (4, 6),
-            NtOpenThreadToken | NtCreateIoCompletion => (4, 4),
+            NtOpenThreadToken | NtOpenProcessTokenEx | NtSetInformationThread
+            | NtCreateIoCompletion => (4, 4),
+            NtOpenThreadTokenEx => (5, 5),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
             | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent
@@ -325,7 +333,7 @@ impl NativeService {
             NtWaitForSingleObject => (3, 3),
             NtCreateKeyedEvent | NtReleaseKeyedEvent | NtWaitForKeyedEvent => (4, 4),
             NtQueryPerformanceCounter => (2, 2),
-            NtQueryVirtualMemory | NtAllocateVirtualMemory => (6, 6),
+            NtQueryVirtualMemory | NtAllocateVirtualMemory | NtDuplicateToken => (6, 6),
             NtRaiseHardError => (6, 6),
             NtOpenSection => (0, 4),
             // Group-C ladder migrations: these handlers read their register args via the executive's
@@ -349,7 +357,7 @@ impl NativeService {
             // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
             NtCreatePort | NtCreateThread
             | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
-            | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
+            | NtSetInformationProcess | NtTestAlert
             | NtFlushInstructionCache
             | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
             | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
@@ -477,6 +485,9 @@ impl NativeService {
         NativeService::NtOpenSemaphore,
         NativeService::NtQuerySemaphore,
         NativeService::NtReleaseSemaphore,
+        NativeService::NtOpenProcessTokenEx,
+        NativeService::NtDuplicateToken,
+        NativeService::NtOpenThreadTokenEx,
     ];
 }
 

@@ -227,6 +227,9 @@ fn win7_table_registers_migrated_services() {
         (NativeService::NtQueryDebugFilterState, 148),
         (NativeService::NtSetDebugFilterState, 222),
         (NativeService::NtOpenThreadToken, 135),
+        (NativeService::NtOpenThreadTokenEx, 136),
+        (NativeService::NtOpenProcessTokenEx, 130),
+        (NativeService::NtDuplicateToken, 72),
     ];
     let t = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &pairs);
     assert_eq!(t.len(), pairs.len());
@@ -242,8 +245,35 @@ fn win7_table_registers_migrated_services() {
     assert_eq!(NativeService::NtProtectVirtualMemory.arg_count(), (5, 5));
     assert_eq!(NativeService::NtQueryInformationProcess.arg_count(), (5, 5));
     assert_eq!(NativeService::NtOpenThreadToken.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtOpenThreadTokenEx.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtOpenProcessTokenEx.arg_count(), (4, 4));
+    assert_eq!(NativeService::NtDuplicateToken.arg_count(), (6, 6));
+    assert_eq!(NativeService::NtSetInformationThread.arg_count(), (4, 4));
     assert_eq!(NativeService::NtQueryDebugFilterState.arg_count(), (2, 2));
     assert_eq!(NativeService::NtSetDebugFilterState.arg_count(), (3, 3));
+}
+
+#[test]
+fn duplicate_token_dispatch_preserves_all_six_arguments() {
+    struct Capture(Vec<u64>);
+
+    impl NativeSyscallHandler for Capture {
+        fn handle(&mut self, _: &NativeCallContext, args: &[u64], _: &mut Vec<u8>) -> u32 {
+            self.0.extend_from_slice(args);
+            STATUS_SUCCESS
+        }
+    }
+
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtDuplicateToken, 72)],
+    );
+    let dispatcher = NativeSyscallDispatcher::new(table);
+    let args = [1, 2, 3, 4, 5, 6];
+    let mut capture = Capture(Vec::new());
+    let result = dispatcher.dispatch(72, &args, &origin(ProcessorMode::UserMode), &mut capture);
+    assert_eq!(result.status, STATUS_SUCCESS);
+    assert_eq!(capture.0, args);
 }
 
 #[test]

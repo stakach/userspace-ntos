@@ -537,10 +537,12 @@ pub const SSN_NT_CLOSE: u64 = 27;
 /// NtDeleteValueKey — smss deletes SAFEBOOT_OPTION from \Session Manager\Environment (sminit.c:2321).
 /// Registry writes aren't modelled (the regf hive is read-only) → best-effort no-op success.
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
-/// Security-token SSNs SmpInit hits. NtOpenThreadToken returns STATUS_NO_TOKEN until impersonation
-/// lands; NtOpenProcessToken opens the target EPROCESS's mutable primary token.
+/// Security-token SSNs. The Ex opens differ only by their handle-attribute argument.
+pub const SSN_NT_DUPLICATE_TOKEN: u64 = 72;
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
+pub const SSN_NT_OPEN_THREAD_TOKEN_EX: u64 = 136;
 pub const SSN_NT_OPEN_PROCESS_TOKEN: u64 = 129;
+pub const SSN_NT_OPEN_PROCESS_TOKEN_EX: u64 = 130;
 /// NtQueryInformationToken — csrss's CsrServerInitialization queries its process token (identity,
 /// session, statistics) after opening it. Class in RDX; TOKEN_* struct copied out to R8.
 pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
@@ -4658,6 +4660,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtQueryDebugFilterState, SSN_NT_QUERY_DEBUG_FILTER_STATE as u32),
             (NativeService::NtSetDebugFilterState, SSN_NT_SET_DEBUG_FILTER_STATE as u32),
             (NativeService::NtOpenThreadToken, SSN_NT_OPEN_THREAD_TOKEN as u32),
+            (NativeService::NtOpenThreadTokenEx, SSN_NT_OPEN_THREAD_TOKEN_EX as u32),
             (NativeService::NtRaiseHardError, 190),
             // Workstream A batch 2 (group A): create-handle + no-op services.
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
@@ -4680,6 +4683,8 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCompleteConnectPort, SSN_NT_COMPLETE_CONNECT_PORT as u32),
             (NativeService::NtRequestWaitReplyPort, SSN_NT_REQUEST_WAIT_REPLY_PORT as u32),
             (NativeService::NtOpenProcessToken, SSN_NT_OPEN_PROCESS_TOKEN as u32),
+            (NativeService::NtOpenProcessTokenEx, SSN_NT_OPEN_PROCESS_TOKEN_EX as u32),
+            (NativeService::NtDuplicateToken, SSN_NT_DUPLICATE_TOKEN as u32),
             (NativeService::NtMakeTemporaryObject, SSN_NT_MAKE_TEMPORARY_OBJECT as u32),
             (NativeService::NtFreeVirtualMemory, SSN_NT_FREE_VM as u32),
             (NativeService::NtSetInformationThread, SSN_NT_SET_INFO_THREAD as u32),
