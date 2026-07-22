@@ -4801,6 +4801,13 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
 /// Parameters describing a hosted second thread for [`spawn_hosted_thread`]. All VAs in the
 /// `*_va`/`*_base` fields live in the TARGET process's VSpace (`pml4`) except `scr` and
 /// `stack_mirror_va`, which are in the EXECUTIVE's VSpace (`CAP_INIT_THREAD_VSPACE`).
+#[derive(Clone, Copy)]
+struct LoaderThreadContext {
+    loader_va: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
+}
+
 struct HostedThread {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
@@ -4812,6 +4819,8 @@ struct HostedThread {
     entry_rip: u64,
     arg0: u64,
     arg1: u64,
+    /// Native loader initialization state. `None` retains the direct-entry trampoline.
+    loader_context: Option<LoaderThreadContext>,
     /// Executive-side scratch base (≥ 3 pages: TEB, TEB2/ACS, trampoline) used to write the env
     /// before the frames are mapped into `pml4`.
     scr: u64,
@@ -4918,9 +4927,21 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
     core::ptr::write_volatile((scr + 0x48) as *mut u64, t.cid_thread);
     core::ptr::write_volatile((scr + 0x60) as *mut u64, t.peb_va);
-    core::ptr::write_volatile((scr + 0x08) as *mut u64, t.stack_base + t.stack_frames * 0x1000);
-    core::ptr::write_volatile((scr + 0x10) as *mut u64, t.stack_base);
-    core::ptr::write_volatile((scr + 0x1478) as *mut u64, t.stack_base);
+    let (teb_stack_base, teb_stack_limit, deallocation_stack) = match t.loader_context {
+        Some(loader) => (
+            loader.initial_teb.stack_base,
+            loader.initial_teb.stack_limit,
+            loader.initial_teb.allocated_stack_base,
+        ),
+        None => (
+            t.stack_base + t.stack_frames * 0x1000,
+            t.stack_base,
+            t.stack_base,
+        ),
+    };
+    core::ptr::write_volatile((scr + 0x08) as *mut u64, teb_stack_base);
+    core::ptr::write_volatile((scr + 0x10) as *mut u64, teb_stack_limit);
+    core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     let acs_va = t.teb_va + 0x1800;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
     // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
@@ -4988,15 +5009,45 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     } else {
         page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
     };
-    let tb = nt_thread_start::Amd64ThreadContext {
-        rip: t.entry_rip,
-        rsp: 0,
-        rcx: t.arg0,
-        rdx: t.arg1,
-    }
-    .call_trampoline();
-    for (j, &b) in tb.iter().enumerate() {
-        core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+    if let Some(loader) = t.loader_context {
+        const CONTEXT_OFFSET: u64 = 0x1900;
+        let context_scratch = scr + CONTEXT_OFFSET;
+        let context_target = t.teb_va + CONTEXT_OFFSET;
+        core::ptr::write_volatile(
+            (context_scratch + nt_thread_start::CONTEXT_RCX_OFFSET) as *mut u64,
+            loader.start.rcx,
+        );
+        core::ptr::write_volatile(
+            (context_scratch + nt_thread_start::CONTEXT_RDX_OFFSET) as *mut u64,
+            loader.start.rdx,
+        );
+        core::ptr::write_volatile(
+            (context_scratch + nt_thread_start::CONTEXT_RSP_OFFSET) as *mut u64,
+            loader.start.rsp,
+        );
+        core::ptr::write_volatile(
+            (context_scratch + nt_thread_start::CONTEXT_RIP_OFFSET) as *mut u64,
+            loader.start.rip,
+        );
+        let tb = nt_thread_start::Amd64ThreadContext::loader_trampoline(
+            loader.loader_va,
+            NTDLL_BASE,
+            context_target,
+        );
+        for (j, &b) in tb.iter().enumerate() {
+            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        }
+    } else {
+        let tb = nt_thread_start::Amd64ThreadContext {
+            rip: t.entry_rip,
+            rsp: 0,
+            rcx: t.arg0,
+            rdx: t.arg1,
+        }
+        .call_trampoline();
+        for (j, &b) in tb.iter().enumerate() {
+            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        }
     }
     let tramp_tgt_cap = copy_cap(tramp);
     let e_tramp_tgt_map = if t.diag {
@@ -8517,10 +8568,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let ldr_initialize_thunk_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "LdrInitializeThunk")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
                     img_spawn::OUR_LDRP_RVA.store(smss_ldrp_rva, Ordering::Relaxed);
+                    img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA
+                        .store(ldr_initialize_thunk_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.store(callback_dispatcher_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
