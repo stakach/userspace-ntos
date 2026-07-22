@@ -108,6 +108,61 @@ impl<'a> RegfHive<'a> {
         Some(s)
     }
 
+    /// The original-case name of a key node.
+    fn key_name_raw(&self, nk: KeyRef) -> Option<String> {
+        let b = self.cell_body(nk)?;
+        if b.get(0..2)? != b"nk" {
+            return None;
+        }
+        let flags = u16le(b, 0x02)?;
+        let name_len = u16le(b, 0x48)? as usize;
+        let raw = b.get(0x4c..0x4c + name_len)?;
+        let mut s = String::new();
+        if flags & 0x20 != 0 {
+            for &c in raw {
+                s.push(c as char);
+            }
+        } else {
+            for pair in raw.chunks_exact(2) {
+                let w = u16::from_le_bytes([pair[0], pair[1]]);
+                s.push(char::from_u32(w as u32)?);
+            }
+        }
+        Some(s)
+    }
+
+    /// Reconstruct a key's `\`-separated path relative to the hive root.
+    ///
+    /// The root itself is `""`. Malformed parent links, cycles, and paths deeper than 256 keys are
+    /// rejected. This is useful when a mutable overlay must shadow a value reached through an
+    /// already-open read-only hive key.
+    pub fn key_path(&self, nk: KeyRef) -> Option<String> {
+        let mut components = Vec::new();
+        let mut seen = Vec::new();
+        let mut current = nk;
+        for _ in 0..256 {
+            if current == self.root {
+                components.reverse();
+                return Some(components.join("\\"));
+            }
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            let body = self.cell_body(current)?;
+            if body.get(0..2)? != b"nk" {
+                return None;
+            }
+            components.push(self.key_name_raw(current)?);
+            let parent = u32le(body, 0x10)?;
+            if parent == u32::MAX {
+                return None;
+            }
+            current = parent;
+        }
+        None
+    }
+
     /// Iterate the immediate subkeys of `nk` as `(folded_name, nk_offset)`.
     pub fn subkeys(&self, nk: KeyRef) -> Vec<(String, KeyRef)> {
         let mut out = Vec::new();
@@ -313,6 +368,58 @@ fn fold(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_nk(data: &mut [u8], cell: u32, parent: u32, name: &[u8]) {
+        let offset = HBIN_BASE + cell as usize;
+        data[offset..offset + 4].copy_from_slice(&(-0x80i32).to_le_bytes());
+        let body = offset + 4;
+        data[body..body + 2].copy_from_slice(b"nk");
+        write_u16(data, body + 0x02, 0x20); // compressed (single-byte) name
+        write_u32(data, body + 0x10, parent);
+        write_u16(data, body + 0x48, name.len() as u16);
+        data[body + 0x4c..body + 0x4c + name.len()].copy_from_slice(name);
+    }
+
+    fn path_test_hive() -> Vec<u8> {
+        const ROOT: u32 = 0x20;
+        const CHILD: u32 = 0xa0;
+        const GRANDCHILD: u32 = 0x120;
+        let mut data = vec![0u8; 0x2000];
+        data[..4].copy_from_slice(b"regf");
+        write_u32(&mut data, 0x24, ROOT);
+        write_nk(&mut data, ROOT, u32::MAX, b"SYSTEM");
+        write_nk(&mut data, CHILD, ROOT, b"ControlSet001");
+        write_nk(&mut data, GRANDCHILD, CHILD, b"Control");
+        data
+    }
+
+    #[test]
+    fn reconstructs_key_path_relative_to_root() {
+        let data = path_test_hive();
+        let hive = RegfHive::new(&data).expect("valid test hive");
+        assert_eq!(hive.key_path(hive.root()).as_deref(), Some(""));
+        assert_eq!(hive.key_path(0xa0).as_deref(), Some("ControlSet001"));
+        assert_eq!(
+            hive.key_path(0x120).as_deref(),
+            Some("ControlSet001\\Control")
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_key_parents() {
+        let mut data = path_test_hive();
+        write_u32(&mut data, HBIN_BASE + 0xa0 + 4 + 0x10, 0x120);
+        let hive = RegfHive::new(&data).expect("valid test hive");
+        assert_eq!(hive.key_path(0x120), None);
+    }
 
     #[test]
     fn reactos_system_hive_session_manager() {
