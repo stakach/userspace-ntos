@@ -3056,6 +3056,54 @@ impl NativeSyscallHandler for ExecNtHandler {
                         Err(status) => return status,
                     }
                 };
+                // IFEO leaf names can be counted strings in an untouched image/ntdll `.rdata`
+                // page. Recover them through the PE-aware reader only when the relative root is the
+                // real IFEO overlay; keep legacy paint-time name handling unchanged everywhere else.
+                let root_is_ifeo = root_target
+                    .and_then(|target| self.registry_target_path(target))
+                    .is_some_and(|root| {
+                        root.ends_with(r"\image file execution options")
+                    });
+                if path.is_empty() && root_is_ifeo {
+                    for &w in &self.read_objattr_name_pe(oa) {
+                        if let Some(c) = char::from_u32(w as u32) {
+                            path.push(c);
+                        }
+                    }
+                }
+                // Registry overlays are machine-global, so keys created by configuration code must
+                // be openable by every process. This is especially important for loader IFEO keys:
+                // a configured image option may be created by services/setup and consumed while
+                // SMSS, CSRSS, or winlogon loads an image. Restricting overlay lookup to pi 3/4 made
+                // those real values permanently unreachable. This exact-key lookup changes nothing
+                // when the overlay is empty and does not synthesize missing SOFTWARE paths.
+                let overlay_full = if root_target == Some(MACHINE_ROOT_KEY) {
+                    let mut full = alloc::string::String::from(r"\Registry\Machine\");
+                    full.push_str(&path);
+                    Some(full)
+                } else if let Some(parent) =
+                    root_target.and_then(|target| self.registry_target_path(target))
+                {
+                    let mut full = parent;
+                    if !path.is_empty() {
+                        full.push('\\');
+                        full.push_str(&path);
+                    }
+                    Some(full)
+                } else if root_target.is_none() {
+                    Some(path.clone())
+                } else {
+                    None
+                };
+                if let Some(ref full) = overlay_full {
+                    if let Some(index) = self.overlay.find(&self.overlay_canon(full)) {
+                        return self.mint_registry_key(
+                            OVERLAY_KEY_TAG | index as u32,
+                            args[1] as u32,
+                            args[0],
+                        );
+                    }
+                }
                 // winlogon (pi 2) — msgina's `GetRegistrySettings` (WlxInitialize) opens the Winlogon
                 // key `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`. advapi32's
                 // `RegOpenKeyExW(HKLM, subkey)` first maps HKLM by opening `\Registry\Machine`, then
@@ -3819,12 +3867,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
+                let output_length = args[4] as u32 as usize;
+                if args[5] == 0 || !self.probe_user_output(args[5], 4) {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if output_length != 0
+                    && (args[3] == 0 || !self.probe_user_output(args[3], output_length))
+                {
+                    return 0xC000_0005;
+                }
                 // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
                 // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).
                 // BATCH 41 — winlogon (pi 2) too: msgina's L"DefaultPassword" value name is a msgina.dll
                 // `.rdata` literal, so recover it cross-AS from the PE (the mirror-only smss_read_ustr
                 // returns empty for it). read_ustr_pe uses xas_read → resolves any resident/PE page.
-                let name16 = if self.pi == 2 || self.pi == 3 || self.pi == 4 {
+                let key_is_ifeo = self
+                    .registry_target_path(key)
+                    .is_some_and(|path| path.contains(r"\image file execution options\"));
+                let name16 = if self.pi == 2 || self.pi == 3 || self.pi == 4 || key_is_ifeo {
                     self.read_ustr_pe(args[1])
                 } else {
                     smss_read_ustr(args[1])
@@ -3875,33 +3935,43 @@ impl NativeSyscallHandler for ExecNtHandler {
                         // *ResultLength: use the cross-AS writer for pi 3/4 + the winlogon Nls read
                         // (advapi's out-param may be a heap/stack the plain mirror can't reach — same
                         // reason as the data write below); everything else stays mirror-only (byte-identical).
-                        if self.pi == 3 || self.pi == 4 || use_xas_write {
-                            self.xas_write_buf(args[5], &(info.len() as u32).to_le_bytes());
+                        let result_length = (info.len() as u32).to_le_bytes();
+                        let result_length_written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                            self.xas_try_write_buf(args[5], &result_length)
                         } else {
-                            smss_copyout(args[5], &(info.len() as u32).to_le_bytes());
+                            smss_copyout(args[5], &result_length)
+                        };
+                        if !result_length_written {
+                            return 0xC000_0005;
                         }
-                        if info.len() > args[4] as usize {
+                        if info.len() > output_length {
                             // BUFFER_OVERFLOW: real NtQueryValueKey still fills as much of the buffer as
                             // fits (the KEY_VALUE_PARTIAL_INFORMATION header carries Type + DataLength,
                             // which advapi's RegQueryValueExW reads to size the retry / set dwSize when
                             // lpData is NULL). Writing NOTHING left advapi with a garbage dwType/dwSize →
                             // SetDefaultLanguage bailed. Write the truncated prefix so the header lands.
-                            let n = args[4] as usize;
+                            let n = output_length;
                             if n > 0 {
-                                if self.pi == 3 || self.pi == 4 || use_xas_write {
-                                    self.xas_write_buf(args[3], &info[..n]);
+                                let written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                                    self.xas_try_write_buf(args[3], &info[..n])
                                 } else {
-                                    smss_copyout(args[3], &info[..n]);
+                                    smss_copyout(args[3], &info[..n])
+                                };
+                                if !written {
+                                    return 0xC000_0005;
                                 }
                             }
                             0x8000_0005 // STATUS_BUFFER_OVERFLOW
                         } else {
                             // services'/winlogon's out-buffer may be an advapi32 heap allocation the mirror
                             // can't reach → use the cross-AS writer so the value data actually lands.
-                            if self.pi == 3 || self.pi == 4 || use_xas_write {
-                                self.xas_write_buf(args[3], &info);
+                            let written = if self.pi == 3 || self.pi == 4 || use_xas_write {
+                                self.xas_try_write_buf(args[3], &info)
                             } else {
-                                smss_copyout(args[3], &info);
+                                smss_copyout(args[3], &info)
+                            };
+                            if !written {
+                                return 0xC000_0005;
                             }
                             0 // STATUS_SUCCESS
                         }
