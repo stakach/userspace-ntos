@@ -810,7 +810,8 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
 // semantics (handle minting, the registry, the create→insert latch, the single-instance
 // window-station cache) live in the crate.
 use nt_object_manager::win32k_ob::{
-    init_desktop_body, ObHandleTable, ObKind, DESKTOPINFO_SIZE, DESKTOP_BODY_SIZE,
+    init_desktop_body, link_thread_to_desktop, ObHandleTable, ObKind, DESKTOPINFO_SIZE,
+    DESKTOP_BODY_SIZE,
 };
 
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
@@ -3602,6 +3603,7 @@ unsafe fn setup_dispatch_context() {
 /// Offsets (checked build, confirmed by disasm):
 ///   +0x2d8 WindowListHead     — `InsertTailList(&pti->WindowListHead,…)` IntCreateWindow window.c:2142
 ///   +0x2e8 W32CallbackListHead — `InsertTailList(&pti->W32CallbackListHead,…)` IntCbAllocateMemory
+///   +0x148 PtiLink             — membership in the current DESKTOP.PtiList
 ///   +0x88  pClientInfo         — `pti->pClientInfo->dwTIFlags = …` IntCreateDesktop
 /// Real win32k `InitializeListHead`s the lists in CreateThreadInfo (main.c) and points pClientInfo at
 /// the thread's CLIENTINFO. `pool_alloc` returns zeroed memory, so an already-initialized field is
@@ -3612,11 +3614,12 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     //   +0xB0  SentMessagesListHead   (message.c / co_MsqSendMessage)
     //   +0x2d8 WindowListHead         (IntCreateWindow window.c:2142)
     //   +0x2e8 W32CallbackListHead    (IntCbAllocateMemory callback.c)
+    //   +0x148 PtiLink                (IntSetThreadDesktop desktop.c:3463/3471)
     //   +0x188 PostedMessagesListHead — `InsertTailList(&pti->PostedMessagesListHead,…)` MsqPostMessage
     //          (msgqueue.c:1369). NtUserPostMessage(SAS window, WLX_WM_SAS) posts here; a NULL (zeroed)
     //          list head → InsertTailList derefs head->Blink (offset +8) → null-deref at cr2=0x8.
     //          Offset computed from the SentMessagesListHead@0xB0 anchor per win32.h THREADINFO layout.
-    for off in [0xB0u64, 0x188, 0x2d8, 0x2e8] {
+    for off in [0xB0u64, 0x148, 0x188, 0x2d8, 0x2e8] {
         let head = w32thread + off;
         write_volatile(head as *mut u64, head); // Flink = &head
         write_volatile((head + 8) as *mut u64, head); // Blink = &head
@@ -3866,6 +3869,9 @@ unsafe fn create_winsta_and_desktop() {
             if t == 0 { PH_W32THREAD_VA } else { t }
         };
         let desk_pdeskinfo = read_volatile((desk_body + 0x08) as *const u64); // DESKTOP.pDeskInfo
+        if !link_thread_to_desktop(desk_body as *mut u8, pti as *mut u8) {
+            print_str(b"[win32k-host] WARN: failed to link dispatch thread into Default desktop\n");
+        }
         write_volatile((pti + THREADINFO_RPDESK_OFF) as *mut u64, desk_body); // pti->rpdesk = pdesk
         write_volatile((pti + THREADINFO_PDESKINFO_OFF) as *mut u64, desk_pdeskinfo); // = rpdesk->pDeskInfo
         // Latch for per-dispatch re-assertion (see BOUND_DESK_* + dispatch_loop top).

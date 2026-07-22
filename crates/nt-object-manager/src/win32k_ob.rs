@@ -101,6 +101,12 @@ pub mod desktop {
     pub const SHELL_HOOK_WINDOWS: usize = 0xE0;
 }
 
+/// THREADINFO field offsets used by the desktop membership invariant.
+pub mod thread_info {
+    /// `LIST_ENTRY PtiLink` — membership in `THREADINFO.rpdesk->PtiList`.
+    pub const PTI_LINK: usize = 0x148;
+}
+
 /// Body size to allocate for a `DESKTOP` (real `sizeof(DESKTOP)` is ~0x100; headroom, zeroed).
 pub const DESKTOP_BODY_SIZE: u64 = 0x200;
 /// Body size to allocate for a `DESKTOPINFO` (+ `szDesktopName` tail, zeroed).
@@ -318,6 +324,27 @@ pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
         core::ptr::write_unaligned(desktop_body.add(off) as *mut u64, head); // Flink = &head
         core::ptr::write_unaligned(desktop_body.add(off + 8) as *mut u64, head); // Blink = &head
     }
+}
+
+/// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
+/// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized.
+///
+/// # Safety
+/// `desktop_body` and `thread_body` must point to writable DESKTOP/THREADINFO bodies containing
+/// the fields described by [`desktop::PTI_LIST`] and [`thread_info::PTI_LINK`].
+pub unsafe fn link_thread_to_desktop(desktop_body: *mut u8, thread_body: *mut u8) -> bool {
+    let head = desktop_body.add(desktop::PTI_LIST);
+    let entry = thread_body.add(thread_info::PTI_LINK);
+    let tail = core::ptr::read_unaligned(head.add(8) as *const u64) as *mut u8;
+    if tail.is_null() {
+        return false;
+    }
+
+    core::ptr::write_unaligned(entry as *mut u64, head as u64);
+    core::ptr::write_unaligned(entry.add(8) as *mut u64, tail as u64);
+    core::ptr::write_unaligned(tail as *mut u64, entry as u64);
+    core::ptr::write_unaligned(head.add(8) as *mut u64, entry as u64);
+    true
 }
 
 #[cfg(test)]
@@ -546,5 +573,28 @@ mod tests {
                 assert_eq!(blink, base + off as u64);
             }
         }
+    }
+
+    #[test]
+    fn desktop_thread_link_has_all_insert_tail_backlinks() {
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut thread = [0u8; 0x300];
+        let head = unsafe { body.as_mut_ptr().add(desktop::PTI_LIST) } as u64;
+        let entry = unsafe { thread.as_mut_ptr().add(thread_info::PTI_LINK) } as u64;
+        unsafe {
+            init_desktop_body(body.as_mut_ptr(), 0x1000);
+            assert!(link_thread_to_desktop(body.as_mut_ptr(), thread.as_mut_ptr()));
+            assert_eq!(core::ptr::read_unaligned(head as *const u64), entry);
+            assert_eq!(core::ptr::read_unaligned((head + 8) as *const u64), entry);
+            assert_eq!(core::ptr::read_unaligned(entry as *const u64), head);
+            assert_eq!(core::ptr::read_unaligned((entry + 8) as *const u64), head);
+        }
+    }
+
+    #[test]
+    fn desktop_thread_link_rejects_uninitialized_head() {
+        let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut thread = [0u8; 0x300];
+        assert!(!unsafe { link_thread_to_desktop(body.as_mut_ptr(), thread.as_mut_ptr()) });
     }
 }
