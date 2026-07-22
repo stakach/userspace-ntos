@@ -37,6 +37,76 @@ fn is_sep(c: u16) -> bool {
     c == b'\\' as u16 || c == b'/' as u16
 }
 
+/// Largest byte count an NT `UNICODE_STRING` buffer may describe, including its terminal NUL.
+pub const MAX_UNICODE_STRING_BUFFER_BYTES: usize = 0xfffe;
+
+/// Compute the byte capacity required to append counted UTF-16 strings and a terminal NUL.
+pub fn multi_append_required_bytes(
+    original_length: u16,
+    source_lengths: impl IntoIterator<Item = u16>,
+) -> Option<u16> {
+    let mut required = original_length as usize;
+    for length in source_lengths {
+        required = required.checked_add(length as usize)?;
+    }
+    required = required.checked_add(core::mem::size_of::<u16>())?;
+    (required <= MAX_UNICODE_STRING_BUFFER_BYTES).then_some(required as u16)
+}
+
+/// Separator edits needed by `RtlAppendPathElement` around the supplied element.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppendPathElementPlan {
+    /// Separator to insert before the element.
+    pub before: Option<u16>,
+    /// Whether to omit the element's leading separator because the path already ends in one.
+    pub skip_element_leading: bool,
+    /// Separator to append after the element to preserve a trailing separator from the path.
+    pub after: Option<u16>,
+}
+
+/// Plan the separator handling performed by `RtlAppendPathElement`.
+pub fn append_path_element_plan(
+    path: &[u16],
+    element: &[u16],
+    only_backslash_is_separator: bool,
+) -> AppendPathElementPlan {
+    if element.is_empty() {
+        return AppendPathElementPlan::default();
+    }
+
+    let separator =
+        |unit: u16| unit == b'\\' as u16 || (!only_backslash_is_separator && unit == b'/' as u16);
+    let path_style = path.iter().take(3).copied().find(|&unit| separator(unit));
+    let path_trailing = path.last().copied().filter(|&unit| separator(unit));
+    let element_leading = element.first().copied().filter(|&unit| separator(unit));
+    let element_trailing = element.last().copied().filter(|&unit| separator(unit));
+
+    let before = if path_trailing.is_none() && element_leading.is_none() {
+        Some(if only_backslash_is_separator {
+            b'\\' as u16
+        } else {
+            element_trailing.or(path_style).unwrap_or(b'\\' as u16)
+        })
+    } else {
+        None
+    };
+    let after = if path_trailing.is_some() && element_trailing.is_none() {
+        Some(if only_backslash_is_separator {
+            b'\\' as u16
+        } else {
+            path_trailing.unwrap()
+        })
+    } else {
+        None
+    };
+
+    AppendPathElementPlan {
+        before,
+        skip_element_leading: path_trailing.is_some() && element_leading.is_some(),
+        after,
+    }
+}
+
 /// `RtlDetermineDosPathNameType_U`: classify a DOS path.
 pub fn determine_dos_path_name_type(path: &[u16]) -> DosPathType {
     let n = path.len();
@@ -239,6 +309,59 @@ mod tests {
     }
     fn s(v: &[u16]) -> std::string::String {
         std::string::String::from_utf16(v).unwrap()
+    }
+
+    fn append_element(path: &str, element: &str, only_backslash: bool) -> std::string::String {
+        let mut path = u(path);
+        let element = u(element);
+        let plan = append_path_element_plan(&path, &element, only_backslash);
+        path.extend(plan.before);
+        path.extend_from_slice(&element[usize::from(plan.skip_element_leading)..]);
+        path.extend(plan.after);
+        s(&path)
+    }
+
+    #[test]
+    fn multi_append_capacity_includes_terminal_nul() {
+        assert_eq!(multi_append_required_bytes(4, [6, 8]), Some(20));
+        assert_eq!(multi_append_required_bytes(0, []), Some(2));
+        assert_eq!(multi_append_required_bytes(0xfffc, []), Some(0xfffe));
+        assert_eq!(multi_append_required_bytes(0xfffe, []), None);
+        assert_eq!(multi_append_required_bytes(0xff00, [0x100]), None);
+    }
+
+    #[test]
+    fn append_path_element_separator_matrix() {
+        let cases = [
+            ("a", "bar", "a\\bar"),
+            ("/a", "bar", "/a/bar"),
+            ("a/", "bar", "a/bar/"),
+            ("a", "/b", "a/b"),
+            ("a", "bar/", "a/bar/"),
+            ("/a/", "bar", "/a/bar/"),
+            ("/a", "/b", "/a/b"),
+            ("/a", "bar/", "/a/bar/"),
+            ("a/", "/b", "a/b/"),
+            ("a/", "bar/", "a/bar/"),
+            ("a", "/b/", "a/b/"),
+            ("/a/", "/b", "/a/b/"),
+            ("/a/", "bar/", "/a/bar/"),
+            ("/a", "/b/", "/a/b/"),
+            ("a/", "/b/", "a/b/"),
+            ("/a/", "/b/", "/a/b/"),
+        ];
+        for (path, element, expected) in cases {
+            assert_eq!(append_element(path, element, false), expected);
+        }
+    }
+
+    #[test]
+    fn append_path_element_preserves_separator_style() {
+        assert_eq!(append_element("C:\\dir", "leaf", false), "C:\\dir\\leaf");
+        assert_eq!(append_element("C:/dir", "leaf", false), "C:/dir/leaf");
+        assert_eq!(append_element("/root", "leaf\\", false), "/root\\leaf\\");
+        assert_eq!(append_element("/root", "leaf", true), "/root\\leaf");
+        assert_eq!(append_element("unchanged", "", false), "unchanged");
     }
 
     #[test]

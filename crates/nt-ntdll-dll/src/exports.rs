@@ -18443,6 +18443,8 @@ const RTL_BUFFER_SIZE: usize = 0x10;
 const RTL_BUFFER_STATIC_SIZE: usize = 0x18;
 const RTL_BUFFER_RESERVED_ALLOCATED_SIZE: usize = 0x20;
 const RTL_SKIP_BUFFER_COPY: u32 = 0x0000_0001;
+const RTL_UNICODE_STRING_BUFFER_BYTE_BUFFER: usize = 0x10;
+const RTL_APPEND_PATH_ELEMENT_ONLY_BACKSLASH_IS_SEPARATOR: u32 = 0x0000_0001;
 
 /// `RtlpEnsureBufferSize(ULONG Flags, PRTL_BUFFER Buffer, SIZE_T RequiredSize) -> NTSTATUS`.
 ///
@@ -18509,6 +18511,130 @@ pub unsafe extern "system" fn rtlp_ensure_buffer_size(
         let _ = (current, static_buffer);
         STATUS_NOT_IMPLEMENTED
     }
+}
+
+/// `RtlMultiAppendUnicodeStringBuffer(PRTL_UNICODE_STRING_BUFFER, ULONG,
+/// PCUNICODE_STRING) -> NTSTATUS` (`base/ntdll/buffer.c:111`).
+///
+/// # Safety
+/// The destination and source descriptors must satisfy the native RTL buffer contracts.
+#[export_name = "RtlMultiAppendUnicodeStringBuffer"]
+pub unsafe extern "system" fn rtl_multi_append_unicode_string_buffer(
+    destination: *mut c_void,
+    number_of_sources: u32,
+    source_array: *const UnicodeString,
+) -> NtStatus {
+    let destination_string = destination as PUnicodeString;
+    // Native ntdll deliberately relies on its pointer contracts here rather than returning a
+    // synthetic validation status.
+    let original_length = unsafe { (*destination_string).length };
+    let required = rtl::path::multi_append_required_bytes(
+        original_length,
+        (0..number_of_sources as usize).map(|index| unsafe { (*source_array.add(index)).length }),
+    );
+    let Some(required) = required else {
+        return STATUS_NAME_TOO_LONG;
+    };
+
+    let byte_buffer = unsafe {
+        (destination as *mut u8).add(RTL_UNICODE_STRING_BUFFER_BYTE_BUFFER) as *mut c_void
+    };
+    let status = unsafe { rtlp_ensure_buffer_size(0, byte_buffer, required as usize) };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let output = unsafe { core::ptr::read_unaligned(byte_buffer as *const *mut u8) };
+    unsafe {
+        (*destination_string).maximum_length = required;
+        (*destination_string).length = required - 2;
+        (*destination_string).buffer = output as u64;
+    }
+
+    let mut cursor = original_length as usize;
+    for index in 0..number_of_sources as usize {
+        let source = unsafe { core::ptr::read(source_array.add(index)) };
+        let length = source.length as usize;
+        if length != 0 {
+            // RtlMoveMemory permits an in-buffer source when no reallocation was needed.
+            unsafe {
+                core::ptr::copy(source.buffer as *const u8, output.add(cursor), length);
+            }
+        }
+        cursor += length;
+    }
+    unsafe { core::ptr::write_unaligned(output.add(cursor) as *mut u16, 0) };
+    STATUS_SUCCESS
+}
+
+/// `RtlAppendPathElement(ULONG, PRTL_UNICODE_STRING_BUFFER, PCUNICODE_STRING) -> NTSTATUS`
+/// (`base/ntdll/curdir.c:4871`).
+///
+/// # Safety
+/// `path` and `element` must point to valid native descriptors and backing buffers.
+#[export_name = "RtlAppendPathElement"]
+pub unsafe extern "system" fn rtl_append_path_element(
+    flags: u32,
+    path: *mut c_void,
+    element: PCUnicodeString,
+) -> NtStatus {
+    if flags & !RTL_APPEND_PATH_ELEMENT_ONLY_BACKSLASH_IS_SEPARATOR != 0
+        || path.is_null()
+        || element.is_null()
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let path_string = path as PUnicodeString;
+    let mut element_string = unsafe { *element };
+    if element_string.length == 0 {
+        return STATUS_SUCCESS;
+    }
+
+    let path_units = unsafe {
+        if (*path_string).length == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(
+                (*path_string).buffer as *const u16,
+                (*path_string).length as usize / 2,
+            )
+        }
+    };
+    let element_units = unsafe {
+        core::slice::from_raw_parts(
+            element_string.buffer as *const u16,
+            element_string.length as usize / 2,
+        )
+    };
+    let plan = rtl::path::append_path_element_plan(
+        path_units,
+        element_units,
+        flags & RTL_APPEND_PATH_ELEMENT_ONLY_BACKSLASH_IS_SEPARATOR != 0,
+    );
+
+    let before_unit = plan.before.unwrap_or(0);
+    let after_unit = plan.after.unwrap_or(0);
+    let mut before = UnicodeString::default();
+    let mut after = UnicodeString::default();
+    if plan.before.is_some() {
+        before.length = 2;
+        before.maximum_length = 2;
+        before.buffer = core::ptr::addr_of!(before_unit) as u64;
+    }
+    if plan.after.is_some() {
+        after.length = 2;
+        after.maximum_length = 2;
+        after.buffer = core::ptr::addr_of!(after_unit) as u64;
+    }
+    if plan.skip_element_leading {
+        element_string.buffer += 2;
+        element_string.length = element_string.length.wrapping_sub(2);
+        element_string.maximum_length = element_string.maximum_length.wrapping_sub(2);
+    }
+
+    let sources = [before, element_string, after];
+    unsafe { rtl_multi_append_unicode_string_buffer(path, sources.len() as u32, sources.as_ptr()) }
 }
 
 /// `RtlSecondsSince1970ToTime(ULONG SecondsSince1970, PLARGE_INTEGER Time)` — convert to NT time
@@ -22060,6 +22186,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_multi_byte_to_unicode_size as usize,
         rtl_unicode_to_multi_byte_size as usize,
         rtlp_ensure_buffer_size as usize,
+        rtl_multi_append_unicode_string_buffer as usize,
+        rtl_append_path_element as usize,
         rtl_oem_string_to_unicode_string as usize,
         rtl_unicode_string_to_oem_string as usize,
         rtl_unicode_string_to_counted_oem_string as usize,
