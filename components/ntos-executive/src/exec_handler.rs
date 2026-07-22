@@ -101,7 +101,7 @@ impl ExecNtHandler {
                 RegfHive::new(bytes)
             }
         };
-        ExecNtHandler {
+        let mut handler = ExecNtHandler {
             hive,
             // Reserve up front so the backing buffer is allocated BELOW the heap
             // mark taken in service_sec_image and never reallocates during the
@@ -303,13 +303,7 @@ impl ExecNtHandler {
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
-            primary_tokens: alloc::vec![
-                nt_security::AccessToken::system(),
-                nt_security::AccessToken::system(),
-                nt_security::AccessToken::system(),
-                nt_security::AccessToken::system(),
-                nt_security::AccessToken::system(),
-            ],
+            token_store: nt_security::TokenStore::with_capacity(64),
             // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
             // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
             // runtime and is retained past the per-syscall bump reset because the loop pins the heap
@@ -318,7 +312,13 @@ impl ExecNtHandler {
             overlay: nt_hive_core::RegistryOverlay::with_capacity(64),
             overlay_dirty: false,
             dll_loaded_dirty: false,
+        };
+        for pi in 0..5 {
+            let pid = PM_PIDS[pi].load(Ordering::Relaxed) as nt_process::ProcessId;
+            let token = handler.token_store.insert(nt_security::AccessToken::system());
+            let _ = handler.pm.replace_process_primary_token(pid, Some(token));
         }
+        handler
     }
     /// Intern a `KeyRef` into `key_handles` (deduped) and return the 4-aligned key handle. Handles
     /// are 4-aligned because advapi32's `MapDefaultKey` clears HKEY bit 0. Dedup keeps the table
@@ -908,7 +908,11 @@ impl ExecNtHandler {
             .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
     }
 
-    fn token_index_for_handle(&self, handle: u64, required_access: u32) -> Result<usize, u32> {
+    fn token_id_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<nt_security::TokenId, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
@@ -917,8 +921,12 @@ impl ExecNtHandler {
             .pm
             .lookup_handle(caller, handle as nt_process::Handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
-        let token_pid = match object {
-            nt_process::HandleObject::Token(pid) => pid,
+        let token = match object {
+            nt_process::HandleObject::TokenObject(token) => token,
+            nt_process::HandleObject::Token(pid) => self
+                .pm
+                .process_primary_token(pid)
+                .ok_or(STATUS_INVALID_HANDLE)?,
             _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
         };
         let granted = self
@@ -928,13 +936,40 @@ impl ExecNtHandler {
         if granted & required_access != required_access {
             return Err(STATUS_ACCESS_DENIED);
         }
-        self.pi_for_pid(token_pid).ok_or(STATUS_INVALID_HANDLE)
+        self.token_store
+            .get(token)
+            .map(|_| token)
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     fn current_token_has_privilege(&self, name: &str) -> bool {
-        self.primary_tokens
-            .get(self.pi)
+        self.pm
+            .effective_token(self.current_tid as nt_process::ThreadId)
+            .and_then(|token| self.token_store.get(token))
             .is_some_and(|token| token.has_privilege(name))
+    }
+
+    fn release_handle_object(&mut self, object: nt_process::HandleObject) {
+        match object {
+            nt_process::HandleObject::TokenObject(token) => {
+                let _ = self.token_store.release(token);
+            }
+            nt_process::HandleObject::IoCompletion(id) => {
+                let _ = self.io_completion_ports.release(id);
+            }
+            _ => {}
+        }
+    }
+
+    fn close_process_handle(&mut self, pid: nt_process::ProcessId, handle: u64) -> bool {
+        match self.pm.take_handle(pid, handle as nt_process::Handle) {
+            Ok(object) => {
+                self.release_handle_object(object);
+                PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn serialize_sid(sid: &nt_security::Sid, output: &mut [u8]) -> Option<usize> {
@@ -965,22 +1000,32 @@ impl ExecNtHandler {
         }
         let target_pid = match self.resolve_process_handle(process_handle) {
             Some(pid) => pid,
-            None => return STATUS_INVALID_HANDLE,
+            None => return nt_process::STATUS_INVALID_HANDLE,
         };
         if self.pi_for_pid(target_pid).is_none() {
             return STATUS_INVALID_HANDLE;
         }
+        let token = match self.pm.process_primary_token(target_pid) {
+            Some(token) => token,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
         let caller_pid = match self.pm_pid_for_pi(self.pi) {
             Some(pid) => pid,
             None => return STATUS_INVALID_HANDLE,
         };
+        if self.token_store.retain(token).is_err() {
+            return STATUS_INVALID_HANDLE;
+        }
         let handle = match self.pm.insert_handle(
             caller_pid,
-            nt_process::HandleObject::Token(target_pid),
+            nt_process::HandleObject::TokenObject(token),
             desired_access,
         ) {
             Ok(handle) => handle,
-            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+            Err(_) => {
+                let _ = self.token_store.release(token);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
         };
         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
         let count = self.pm.handle_count(caller_pid) as u64;
@@ -988,7 +1033,9 @@ impl ExecNtHandler {
             PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
         }
         if !self.xas_write_u64(out, handle as u64) {
-            let _ = self.pm.close_handle(caller_pid, handle);
+            if let Ok(object) = self.pm.take_handle(caller_pid, handle) {
+                self.release_handle_object(object);
+            }
             return STATUS_ACCESS_VIOLATION;
         }
         0
@@ -1054,12 +1101,14 @@ impl ExecNtHandler {
 
         let required_access = TOKEN_ADJUST_PRIVILEGES
             | if previous_state != 0 { TOKEN_QUERY } else { 0 };
-        let token_index = match self.token_index_for_handle(args[0], required_access) {
-            Ok(index) => index,
+        let token_id = match self.token_id_for_handle(args[0], required_access) {
+            Ok(token) => token,
             Err(status) => return status,
         };
-        let plan = self.primary_tokens[token_index]
-            .plan_privilege_adjustment(disable_all, &requested);
+        let plan = match self.token_store.get(token_id) {
+            Some(token) => token.plan_privilege_adjustment(disable_all, &requested),
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
         let required_length = 4 + plan.changed * 12;
         if previous_state != 0 {
             if !self.xas_write_u32(return_length, required_length as u32) {
@@ -1073,11 +1122,14 @@ impl ExecNtHandler {
         // The exact ReactOS SYSTEM token has 24 privileges, so this is sufficient even for
         // DisableAllPrivileges and remains allocation-free across the executive heap reset.
         let mut previous = [nt_security::PrivilegeAdjustment::default(); 24];
-        let result = self.primary_tokens[token_index].adjust_privileges(
-            disable_all,
-            &requested,
-            &mut previous[..plan.changed],
-        );
+        let result = match self.token_store.get_mut(token_id) {
+            Some(token) => token.adjust_privileges(
+                disable_all,
+                &requested,
+                &mut previous[..plan.changed],
+            ),
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
         if previous_state != 0 {
             let mut output = [0u8; 4 + 24 * 12];
             output[..4].copy_from_slice(&(result.changed as u32).to_le_bytes());
@@ -2270,20 +2322,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtClose => {
                 let mut closed = false;
                 if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-                    let completion_id = match self
-                        .pm
-                        .lookup_handle(pid, args[0] as nt_process::Handle)
-                    {
-                        Some(nt_process::HandleObject::IoCompletion(id)) => Some(id),
-                        _ => None,
-                    };
-                    if self.pm.close_handle(pid, args[0] as nt_process::Handle).is_ok() {
-                        closed = true;
-                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                        if let Some(id) = completion_id {
-                            let _ = self.io_completion_ports.release(id);
-                        }
-                    }
+                    closed = self.close_process_handle(pid, args[0]);
                 }
                 if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
                 {
@@ -2303,6 +2342,13 @@ impl NativeSyscallHandler for ExecNtHandler {
 
                 let Some(source_pid) = self.resolve_process_handle(args[0]) else {
                     return STATUS_INVALID_HANDLE;
+                };
+                let source_token = match self
+                    .pm
+                    .lookup_handle(source_pid, args[1] as nt_process::Handle)
+                {
+                    Some(nt_process::HandleObject::TokenObject(token)) => Some(token),
+                    _ => None,
                 };
                 let options = args[6] as u32;
                 let mut target_pid_for_peak = None;
@@ -2327,6 +2373,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                             desired_access,
                         ) {
                         Ok(handle) => {
+                            if let Some(token) = source_token {
+                                if self.token_store.retain(token).is_err() {
+                                    let _ = self.pm.take_handle(target_pid, handle);
+                                    return STATUS_INVALID_HANDLE;
+                                }
+                            }
                             native_duplicate = true;
                             Ok(Some(handle as u64))
                         }
@@ -2346,16 +2398,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
 
                 if options & DUPLICATE_CLOSE_SOURCE != 0 {
-                    let closed_native = self
-                        .pm
-                        .close_handle(source_pid, args[1] as nt_process::Handle)
-                        .is_ok();
+                    let closed_native = self.close_process_handle(source_pid, args[1]);
                     if closed_native
                         || unsafe {
                             crate::win32k_subsystem::close_user_object_handle(args[1])
                         }
                     {
-                        PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                        if !closed_native {
+                            PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 if self.current_badge == 12 {
@@ -5498,11 +5549,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                let token_index = match self.token_index_for_handle(args[0], TOKEN_QUERY) {
-                    Ok(index) => index,
+                let token_id = match self.token_id_for_handle(args[0], TOKEN_QUERY) {
+                    Ok(token) => token,
                     Err(status) => return status,
                 };
-                let token = &self.primary_tokens[token_index];
+                let token = match self.token_store.get(token_id) {
+                    Some(token) => token,
+                    None => return 0xC000_0008,
+                };
                 let mut output = [0u8; 4 + 24 * 12];
                 let needed = match class {
                     1 => {

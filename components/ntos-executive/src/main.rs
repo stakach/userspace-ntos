@@ -4507,9 +4507,9 @@ struct ExecNtHandler {
     /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
     /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
     pm: nt_process::ProcessManager,
-    /// One mutable primary token per hosted EPROCESS, indexed by process index. Constructed below
-    /// the syscall heap mark; privilege adjustments only mutate inline entries and never allocate.
-    primary_tokens: alloc::vec::Vec<nt_security::AccessToken>,
+    /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
+    /// handles and ETHREAD impersonation contexts retain independent references.
+    token_store: nt_security::TokenStore,
     /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
     /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
     /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay
