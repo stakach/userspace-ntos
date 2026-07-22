@@ -11542,6 +11542,32 @@ pub unsafe extern "system" fn rtl_pc_to_file_header(
     image_base
 }
 
+/// `RtlLookupFunctionTable(DWORD64 ControlPc, PDWORD64 ImageBase, PULONG Length)` — locate the
+/// image's exception-directory runtime-function table (`sdk/lib/rtl/amd64/unwind.c:82`).
+///
+/// # Safety
+/// `image_base` and `length` are writable. `control_pc` is an address in a loaded image or a miss.
+#[export_name = "RtlLookupFunctionTable"]
+pub unsafe extern "system" fn rtl_lookup_function_table(
+    control_pc: u64,
+    image_base: *mut u64,
+    length: *mut u32,
+) -> *mut c_void {
+    let mut local_base = core::ptr::null_mut();
+    let found = unsafe { rtl_pc_to_file_header(control_pc as *mut c_void, &mut local_base) };
+    if found.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let mut size = 0u32;
+    let table = unsafe { rtl_image_directory_entry_to_data(local_base, 1, 3, &mut size) };
+    unsafe {
+        *image_base = local_base as u64;
+        *length = size / 12;
+    }
+    table
+}
+
 // ---- handle tables (RTL_HANDLE_TABLE) — real inline single-threaded --------------------------------
 // RTL_HANDLE_TABLE (x64): MaximumNumberOfHandles:u32@0, SizeOfHandleTableEntry:u32@4,
 // Reserved[2]@8, FreeHandles:ptr@0x10, CommittedHandles:ptr@0x18, UnCommittedHandles:ptr@0x20,
@@ -23034,6 +23060,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_image_rva_to_va as usize,
         rtl_address_in_section_table as usize,
         rtl_pc_to_file_header as usize,
+        rtl_lookup_function_table as usize,
         rtl_initialize_handle_table as usize,
         rtl_destroy_handle_table as usize,
         rtl_allocate_handle as usize,
