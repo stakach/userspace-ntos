@@ -251,6 +251,15 @@ pub struct Peb {
     /// `SessionId` (offset 0x2C0).
     pub session_id: u32,
     _rsvd_2c4: [u8; 4],
+    _rsvd_2c8: [u8; 0x2F8 - 0x2C8],
+    /// Process activation-context representation consumed by this ntdll (offset 0x2F8).
+    pub activation_context_data: u64,
+    /// `ProcessAssemblyStorageMap` (offset 0x300).
+    pub process_assembly_storage_map: u64,
+    /// `SystemDefaultActivationContextData` (offset 0x308).
+    pub system_default_activation_context_data: u64,
+    /// `SystemAssemblyStorageMap` (offset 0x310).
+    pub system_assembly_storage_map: u64,
 }
 
 /// `TEB` — the Thread Environment Block (`peb_teb.h`, x64). Named fields the hosted binaries touch
@@ -341,6 +350,10 @@ const _: () = assert!(offset_of!(Peb, oem_code_page_data) == 0xA8); // live-RE N
 const _: () = assert!(offset_of!(Peb, unicode_case_table_data) == 0xB0); // live-RE l_intl
 const _: () = assert!(offset_of!(Peb, nt_global_flag) == 0xBC); // C_ASSERT(... NtGlobalFlag) == 0x0BC
 const _: () = assert!(offset_of!(Peb, session_id) == 0x2C0); // C_ASSERT(... SessionId) == 0x2C0
+const _: () = assert!(offset_of!(Peb, activation_context_data) == 0x2F8);
+const _: () = assert!(offset_of!(Peb, process_assembly_storage_map) == 0x300);
+const _: () = assert!(offset_of!(Peb, system_default_activation_context_data) == 0x308);
+const _: () = assert!(offset_of!(Peb, system_assembly_storage_map) == 0x310);
 
 // TEB — NDK peb_teb.h `_STRUCT64` C_ASSERT block + live-RE StaticUnicodeString/ActCtx offsets.
 const _: () = assert!(offset_of!(Teb, nt_tib) == 0x000); // C_ASSERT(... NtTib) == 0x000

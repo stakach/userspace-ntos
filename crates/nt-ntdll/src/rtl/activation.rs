@@ -97,6 +97,9 @@ pub struct ActivationContextObject {
     references: AtomicU32,
     pub source: Vec<u16>,
     pub application_directory: Vec<u16>,
+    pub assembly_directory: Vec<u16>,
+    pub encoded_assembly_identity: Vec<u16>,
+    pub file_count: u32,
     pub manifest: Vec<u8>,
     pub dll_redirects: Vec<DllRedirect>,
     pub dll_redirect_section: Vec<u8>,
@@ -160,12 +163,17 @@ impl ActivationContextObject {
         manifest: Vec<u8>,
         dll_redirects: Vec<DllRedirect>,
         dll_redirect_section: Vec<u8>,
+        encoded_assembly_identity: Vec<u16>,
     ) -> Self {
+        let file_count = u32::try_from(dll_redirects.len()).unwrap_or(u32::MAX);
         Self {
             magic: AtomicU32::new(ACTCTX_MAGIC),
             references: AtomicU32::new(1),
             source,
             application_directory: Vec::new(),
+            assembly_directory: Vec::new(),
+            encoded_assembly_identity,
+            file_count,
             manifest,
             dll_redirects,
             dll_redirect_section,
@@ -507,6 +515,7 @@ mod tests {
         let object = ActivationContextObject::new(
             Vec::new(),
             b"<assembly/>".to_vec(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );

@@ -2148,7 +2148,8 @@ unsafe fn size_of_image(base: u64) -> u32 {
 
 /// Materialize ONE `LDR_DATA_TABLE_ENTRY` at a freshly-bumped VA for the module `base` with base name
 /// `name_lc` (lowercased, no `.dll`). Fills DllBase / EntryPoint / SizeOfImage / LoadCount / a
-/// `FullDllName` + `BaseDllName` UNICODE_STRING (both pointing at heap-copied UTF-16 `<name>.dll`).
+/// `FullDllName` resolved from the process image path or current System32 loader root, plus a
+/// `BaseDllName` pointing at a persistent UTF-16 `<name>.dll`.
 /// The `LIST_ENTRY` links are left zero here (threaded by [`thread_ldr_lists`]). Returns the entry VA
 /// (0 on region exhaustion).
 ///
@@ -2166,9 +2167,7 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
         for i in 0..(LDR_ENTRY_SIZE / 8) {
             core::ptr::write_unaligned((entry + i * 8) as *mut u64, 0);
         }
-        // Build a UTF-16 "<name>.dll" name buffer in the region (persistent). The FullDllName is the
-        // same leaf here (a full path would need the resolved DLL path; the leaf satisfies the
-        // GetModuleFileNameW/LdrGetDllHandle base-name match + is non-NULL for walkers).
+        // Build a UTF-16 "<name>.dll" base-name buffer in the region (persistent).
         let nchars = name_lc.len() + 4; // + ".dll"
         let name_bytes = (nchars * 2) as u64;
         let namebuf = ldr_bump(name_bytes + 2); // + NUL
@@ -2186,6 +2185,62 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
         }
         core::ptr::write_unaligned((namebuf + w) as *mut u16, 0); // NUL
 
+        // The root image already has its exact path in ProcessParameters.ImagePathName. Every DLL
+        // this loader currently maps is resolved by the executive from System32, so materialize that
+        // resolved loader path rather than publishing the base-name leaf as FullDllName.
+        let mut image_path_buffer = 0u64;
+        let mut image_path_units = 0usize;
+        if base == EXE_BASE {
+            let peb: u64;
+            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+            if peb != 0 {
+                let parameters = core::ptr::read_unaligned((peb + 0x20) as *const u64);
+                if parameters != 0 {
+                    let length = core::ptr::read_unaligned((parameters + 0x60) as *const u16);
+                    let maximum =
+                        core::ptr::read_unaligned((parameters + 0x62) as *const u16);
+                    let buffer = core::ptr::read_unaligned((parameters + 0x68) as *const u64);
+                    if length & 1 == 0
+                        && length != 0
+                        && length <= maximum
+                        && length <= u16::MAX - 2
+                        && buffer != 0
+                    {
+                        image_path_buffer = buffer;
+                        image_path_units = length as usize / 2;
+                    }
+                }
+            }
+            if image_path_units == 0 {
+                return 0;
+            }
+        }
+        const SYSTEM32_PREFIX: &[u8] = b"\\SystemRoot\\System32\\";
+        let full_units = if image_path_units != 0 {
+            image_path_units
+        } else {
+            SYSTEM32_PREFIX.len() + nchars
+        };
+        let full_bytes = (full_units * 2) as u64;
+        let fullbuf = ldr_bump(full_bytes + 2);
+        if fullbuf == 0 {
+            return 0;
+        }
+        if image_path_units != 0 {
+            core::ptr::copy_nonoverlapping(
+                image_path_buffer as *const u16,
+                fullbuf as *mut u16,
+                image_path_units,
+            );
+        } else {
+            let mut offset = 0usize;
+            for &unit in SYSTEM32_PREFIX.iter().chain(name_lc).chain(b".dll") {
+                core::ptr::write_unaligned((fullbuf as *mut u16).add(offset), unit as u16);
+                offset += 1;
+            }
+        }
+        core::ptr::write_unaligned((fullbuf as *mut u16).add(full_units), 0);
+
         core::ptr::write_unaligned((entry + 0x30) as *mut u64, base); // DllBase
         let epr = entry_point_rva(base);
         let ep = if epr != 0 { base + epr as u64 } else { 0 };
@@ -2193,13 +2248,12 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
         core::ptr::write_unaligned((entry + 0x40) as *mut u32, size_of_image(base)); // SizeOfImage
 
         // FullDllName @0x48, BaseDllName @0x58 — both UNICODE_STRING{Length,MaxLength,_,Buffer}.
-        let ustr = |off: u64| {
-            core::ptr::write_unaligned((entry + off) as *mut u16, name_bytes as u16); // Length
-            core::ptr::write_unaligned((entry + off + 2) as *mut u16, name_bytes as u16); // MaximumLength
-            core::ptr::write_unaligned((entry + off + 8) as *mut u64, namebuf); // Buffer
-        };
-        ustr(0x48); // FullDllName
-        ustr(0x58); // BaseDllName
+        core::ptr::write_unaligned((entry + 0x48) as *mut u16, full_bytes as u16);
+        core::ptr::write_unaligned((entry + 0x4A) as *mut u16, (full_bytes + 2) as u16);
+        core::ptr::write_unaligned((entry + 0x50) as *mut u64, fullbuf);
+        core::ptr::write_unaligned((entry + 0x58) as *mut u16, name_bytes as u16);
+        core::ptr::write_unaligned((entry + 0x5A) as *mut u16, (name_bytes + 2) as u16);
+        core::ptr::write_unaligned((entry + 0x60) as *mut u64, namebuf);
         let load_count = if base == EXE_BASE || name_lc.eq_ignore_ascii_case(b"ntdll") {
             nt_ntdll::loader::lifecycle::LOAD_COUNT_PINNED
         } else {
@@ -2335,6 +2389,13 @@ pub unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
             };
             for &entry in &entries[..count] {
                 let status = crate::exports::ldr_prepare_entry_activation_context(entry);
+                if status != 0 {
+                    return status;
+                }
+            }
+            if count != 0 {
+                let status =
+                    crate::exports::ldr_initialize_process_activation_context(entries[0]);
                 if status != 0 {
                     return status;
                 }

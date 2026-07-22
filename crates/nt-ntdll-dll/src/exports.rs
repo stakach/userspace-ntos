@@ -85,6 +85,7 @@ static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 static LDR_MANIFEST_PROBER_ROUTINE: AtomicU64 = AtomicU64::new(0);
+static RTL_PROCESS_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static RTL_START_POOL_THREAD: AtomicU64 = AtomicU64::new(0);
@@ -11023,6 +11024,105 @@ unsafe fn activation_context_register(
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn process_activation_context_no_addref() -> *mut c_void {
+    RTL_PROCESS_ACTIVATION_CONTEXT.load(Ordering::Acquire) as *mut c_void
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_peb_process_activation_context(context: *mut c_void) {
+    let peb = unsafe { current_peb() };
+    if peb != 0 {
+        // Our RtlQueryInformationActivationContext consumes the registered object handle directly.
+        // Publish that representation in the native x64 PEB ActivationContextData slot.
+        let slot = unsafe {
+            core::ptr::addr_of_mut!((*(peb as *mut nt_ntdll_layout::Peb)).activation_context_data)
+        };
+        unsafe { core::ptr::write_volatile(slot, context as u64) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_publish_process_activation_context(entry: u64) -> NtStatus {
+    if entry == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let context = unsafe { core::ptr::read_unaligned((entry + 0x88) as *const *mut c_void) };
+    if context.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let current = RTL_PROCESS_ACTIVATION_CONTEXT.load(Ordering::Acquire);
+    if current == context as u64 {
+        unsafe { publish_peb_process_activation_context(context) };
+        return STATUS_SUCCESS;
+    }
+    if current != 0 {
+        return 0xC015_000E; // STATUS_SXS_PROCESS_DEFAULT_ALREADY_SET
+    }
+    if !unsafe { activation_context_try_add_ref(context) } {
+        return STATUS_INVALID_PARAMETER;
+    }
+    match RTL_PROCESS_ACTIVATION_CONTEXT.compare_exchange(
+        0,
+        context as u64,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            unsafe { publish_peb_process_activation_context(context) };
+            STATUS_SUCCESS
+        }
+        Err(observed) => {
+            unsafe { activation_context_release(context) };
+            if observed == context as u64 {
+                unsafe { publish_peb_process_activation_context(context) };
+                STATUS_SUCCESS
+            } else {
+                0xC015_000E
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_initialize_process_activation_context(entry: u64) -> NtStatus {
+    if entry == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let slot = (entry + 0x88) as *mut *mut c_void;
+    if unsafe { core::ptr::read_unaligned(slot) }.is_null() {
+        let module = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const usize) };
+        let mut descriptor = [0u8; 56];
+        unsafe {
+            core::ptr::write_unaligned(descriptor.as_mut_ptr() as *mut u32, 56);
+            core::ptr::write_unaligned(
+                descriptor.as_mut_ptr().add(4) as *mut u32,
+                nt_ntdll::rtl::activation::ACTCTX_FLAG_RESOURCE_NAME_VALID
+                    | nt_ntdll::rtl::activation::ACTCTX_FLAG_HMODULE_VALID,
+            );
+            core::ptr::write_unaligned(descriptor.as_mut_ptr().add(32) as *mut usize, 1);
+            core::ptr::write_unaligned(descriptor.as_mut_ptr().add(48) as *mut usize, module);
+        }
+        let mut context = core::ptr::null_mut();
+        let status = unsafe {
+            rtl_create_activation_context(
+                0,
+                descriptor.as_mut_ptr().cast(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut context,
+            )
+        };
+        // Absence or invalidity of an executable manifest is non-fatal, matching ReactOS actctx_init.
+        if status != STATUS_SUCCESS {
+            return STATUS_SUCCESS;
+        }
+        unsafe { core::ptr::write_unaligned(slot, context) };
+    }
+    unsafe { ldr_publish_process_activation_context(entry) }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn copy_utf16_z_bounded(value: *const u16, limit: usize) -> Result<Vec<u16>, NtStatus> {
     if value.is_null() {
         return Ok(Vec::new());
@@ -11040,6 +11140,48 @@ unsafe fn copy_utf16_z_bounded(value: *const u16, limit: usize) -> Result<Vec<u1
         copy.push(unsafe { core::ptr::read_unaligned(value.add(index)) });
     }
     Ok(copy)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_ldr_full_name(base: usize) -> Result<Vec<u16>, NtStatus> {
+    let entry = unsafe { find_ldr_entry_for_base(base as u64) };
+    if entry == 0 {
+        return Err(STATUS_DLL_NOT_FOUND);
+    }
+    let length = unsafe {
+        core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME) as *const u16) as usize
+    };
+    let maximum = unsafe {
+        core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 2) as *const u16) as usize
+    };
+    let buffer = unsafe {
+        core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 8) as *const *const u16)
+    };
+    if length & 1 != 0 || length > maximum || (length != 0 && buffer.is_null()) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(length / 2)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    if length != 0 {
+        result.extend_from_slice(unsafe { core::slice::from_raw_parts(buffer, length / 2) });
+    }
+    Ok(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parent_directory_with_separator(path: &[u16]) -> Result<Vec<u16>, NtStatus> {
+    let length = path
+        .iter()
+        .rposition(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+        .map_or(0, |separator| separator + 1);
+    let mut directory = Vec::new();
+    directory
+        .try_reserve_exact(length)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    directory.extend_from_slice(&path[..length]);
+    Ok(directory)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -11452,6 +11594,13 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             Ok(parsed) => parsed,
             Err(status) => return status,
         };
+        let encoded_assembly_identity =
+            match nt_ntdll::rtl::activation_manifest::encode_assembly_identity(
+                &parsed.assembly_identity,
+            ) {
+                Ok(identity) => identity,
+                Err(status) => return status,
+            };
         let dll_redirect_section =
             match nt_ntdll::rtl::activation_section::build_dll_redirection_section(
                 &parsed.dll_redirects,
@@ -11459,10 +11608,33 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 Ok(section) => section,
                 Err(status) => return status,
             };
-        let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
+        let source = match copy_ldr_full_name(descriptor.module) {
             Ok(source) => source,
             Err(status) => return status,
         };
+        let application_directory =
+            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
+            {
+                match copy_utf16_z_bounded(descriptor.application_name as *const u16, 32 * 1024) {
+                    Ok(application) => application,
+                    Err(status) => return status,
+                }
+            } else {
+                match parent_directory_with_separator(&source) {
+                    Ok(directory) => directory,
+                    Err(status) => return status,
+                }
+            };
+        let assembly_directory =
+            if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID != 0
+            {
+                match copy_utf16_z_bounded(descriptor.assembly_directory as *const u16, 32 * 1024) {
+                    Ok(directory) => directory,
+                    Err(status) => return status,
+                }
+            } else {
+                Vec::new()
+            };
         let mut manifest = Vec::new();
         if manifest.try_reserve_exact(manifest_bytes.len()).is_err() {
             return STATUS_NO_MEMORY;
@@ -11481,18 +11653,11 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 manifest,
                 parsed.dll_redirects,
                 dll_redirect_section,
+                encoded_assembly_identity,
             ),
         );
-        if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0 {
-            match copy_utf16_z_bounded(descriptor.application_name as *const u16, 32 * 1024) {
-                Ok(application) => (*memory).application_directory = application,
-                Err(status) => {
-                    core::ptr::drop_in_place(memory);
-                    crate::process_heap_free(memory.cast());
-                    return status;
-                }
-            }
-        }
+        (*memory).application_directory = application_directory;
+        (*memory).assembly_directory = assembly_directory;
         let status = activation_context_register(memory);
         if status != STATUS_SUCCESS {
             core::ptr::drop_in_place(memory);
@@ -11621,73 +11786,80 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
 
         #[cfg(target_arch = "x86_64")]
         {
-            let context = current_active_activation_context_no_addref();
-            let Some(object) = activation_context_acquire_registered(context) else {
-                return STATUS_SXS_KEY_NOT_FOUND;
-            };
-            let object = &*object;
             let key_name = core::slice::from_raw_parts(key_buffer, key_length / 2);
-            let found = match nt_ntdll::rtl::activation_section::find_dll_redirection(
-                &object.dll_redirect_section,
-                key_name,
-            ) {
-                Ok(Some(found)) => found,
-                Ok(None) => {
-                    activation_context_release(context);
-                    return STATUS_SXS_KEY_NOT_FOUND;
+            let active = current_active_activation_context_no_addref();
+            let process = process_activation_context_no_addref();
+            for (index, context) in [active, process].into_iter().enumerate() {
+                if context.is_null() || (index == 1 && context == active) {
+                    continue;
                 }
-                Err(status) => {
-                    activation_context_release(context);
-                    return status;
-                }
-            };
+                let Some(object_ptr) = activation_context_acquire_registered(context) else {
+                    continue;
+                };
+                let object = &*object_ptr;
+                let found = match nt_ntdll::rtl::activation_section::find_dll_redirection(
+                    &object.dll_redirect_section,
+                    key_name,
+                ) {
+                    Ok(Some(found)) => found,
+                    Ok(None) => {
+                        activation_context_release(context);
+                        continue;
+                    }
+                    Err(status) => {
+                        activation_context_release(context);
+                        return status;
+                    }
+                };
 
-            if returned_data.is_null() {
-                activation_context_release(context);
+                if returned_data.is_null() {
+                    activation_context_release(context);
+                    return STATUS_SUCCESS;
+                }
+                let section_base = object.dll_redirect_section.as_ptr();
+                core::ptr::write_unaligned((returned_data as *mut u8).add(4) as *mut u32, 1);
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(8) as *mut *const u8,
+                    section_base.add(found.data_offset as usize),
+                );
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(16) as *mut u32,
+                    found.data_length,
+                );
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(24) as *mut *const u8,
+                    core::ptr::null(),
+                );
+                core::ptr::write_unaligned((returned_data as *mut u8).add(32) as *mut u32, 0);
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(40) as *mut *const u8,
+                    section_base,
+                );
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(48) as *mut u32,
+                    object.dll_redirect_section.len() as u32,
+                );
+                let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(56) as *mut *mut c_void,
+                    if return_context {
+                        context
+                    } else {
+                        core::ptr::null_mut()
+                    },
+                );
+                if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
+                    core::ptr::write_unaligned(
+                        (returned_data as *mut u8).add(64) as *mut u32,
+                        found.assembly_roster_index,
+                    );
+                }
+                if !return_context {
+                    activation_context_release(context);
+                }
                 return STATUS_SUCCESS;
             }
-            let section_base = object.dll_redirect_section.as_ptr();
-            core::ptr::write_unaligned((returned_data as *mut u8).add(4) as *mut u32, 1);
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(8) as *mut *const u8,
-                section_base.add(found.data_offset as usize),
-            );
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(16) as *mut u32,
-                found.data_length,
-            );
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(24) as *mut *const u8,
-                core::ptr::null(),
-            );
-            core::ptr::write_unaligned((returned_data as *mut u8).add(32) as *mut u32, 0);
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(40) as *mut *const u8,
-                section_base,
-            );
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(48) as *mut u32,
-                object.dll_redirect_section.len() as u32,
-            );
-            let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
-            core::ptr::write_unaligned(
-                (returned_data as *mut u8).add(56) as *mut *mut c_void,
-                if return_context {
-                    context
-                } else {
-                    core::ptr::null_mut()
-                },
-            );
-            if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
-                core::ptr::write_unaligned(
-                    (returned_data as *mut u8).add(64) as *mut u32,
-                    found.assembly_roster_index,
-                );
-            }
-            if !return_context {
-                activation_context_release(context);
-            }
-            return STATUS_SUCCESS;
+            return STATUS_SXS_KEY_NOT_FOUND;
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -11712,8 +11884,19 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
     STATUS_SXS_KEY_NOT_FOUND
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn rebase_activation_query_pointers(buffer: *mut u8, fields: &[usize]) {
+    for &field in fields {
+        let slot = unsafe { buffer.add(field) as *mut u64 };
+        let relative = unsafe { core::ptr::read_unaligned(slot) };
+        if relative != 0 {
+            unsafe { core::ptr::write_unaligned(slot, buffer as u64 + relative) };
+        }
+    }
+}
+
 /// `RtlQueryInformationActivationContext(...) -> NTSTATUS` — resolve the requested context and
-/// return `ACTIVATION_CONTEXT_BASIC_INFORMATION`. Other information classes remain explicit.
+/// return native Basic, Detailed, or AssemblyDetailed information.
 ///
 /// # Safety
 /// Args per the ABI; `info` null or writable for `info_len` bytes.
@@ -11722,7 +11905,7 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
 pub unsafe extern "system" fn rtl_query_information_activation_context(
     flags: u32,
     act_ctx: *mut c_void,
-    _sub_instance: *mut c_void,
+    sub_instance: *mut c_void,
     info_class: u32,
     info: *mut c_void,
     info_len: usize,
@@ -11731,8 +11914,8 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
     if !ret_len.is_null() {
         unsafe { core::ptr::write_unaligned(ret_len, 0) };
     }
-    if info_class != nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS {
-        return 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+    if !matches!(info_class, 1..=3) {
+        return nt_ntdll::STATUS_NOT_IMPLEMENTED;
     }
 
     let mut selected = act_ctx;
@@ -11765,6 +11948,11 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
             }
             selected =
                 core::ptr::read_unaligned((entry + 0x88) as *const *mut c_void);
+        } else if selected.is_null()
+            && info_class
+                != nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS
+        {
+            selected = process_activation_context_no_addref();
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -11772,28 +11960,143 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
         let _ = flags;
     }
 
-    if !ret_len.is_null() {
+    if info_class == nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS {
+        if !ret_len.is_null() {
+            unsafe {
+                core::ptr::write_unaligned(
+                    ret_len,
+                    nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_SIZE,
+                )
+            };
+        }
+        if info.is_null() {
+            return nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL;
+        }
+        if let Err(status) = nt_ntdll::rtl::activation::validate_basic_query(flags, info_len) {
+            return status;
+        }
         unsafe {
-            core::ptr::write_unaligned(
-                ret_len,
-                nt_ntdll::rtl::activation::ACTIVATION_CONTEXT_BASIC_INFORMATION_SIZE,
-            )
-        };
+            core::ptr::write_unaligned(info as *mut *mut c_void, selected);
+            core::ptr::write_unaligned((info as *mut u8).add(8) as *mut u32, 0);
+        }
+        if flags & nt_ntdll::rtl::activation::QUERY_FLAG_NO_ADDREF == 0 {
+            unsafe { rtl_add_ref_activation_context(selected) };
+        }
+        return STATUS_SUCCESS;
     }
-    if info.is_null() {
-        return nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL;
-    }
-    if let Err(status) = nt_ntdll::rtl::activation::validate_basic_query(flags, info_len) {
-        return status;
-    }
+
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::ptr::write_unaligned(info as *mut *mut c_void, selected);
-        core::ptr::write_unaligned((info as *mut u8).add(8) as *mut u32, 0);
+        let Some(object_ptr) = activation_context_acquire_registered(selected) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let object = &*object_ptr;
+        let manifest_path = (!object.source.is_empty()).then_some(object.source.as_slice());
+        let application_directory = (!object.application_directory.is_empty())
+            .then_some(object.application_directory.as_slice());
+        let assembly_directory = (!object.assembly_directory.is_empty())
+            .then_some(object.assembly_directory.as_slice());
+        let status = if info_class == 2 {
+            let query = nt_ntdll::rtl::activation_query::DetailedQuery {
+                format_version: 1,
+                assembly_count: 1,
+                root_manifest_path_type: if manifest_path.is_some() {
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE
+                } else {
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_NONE
+                },
+                root_manifest_path: manifest_path,
+                root_configuration_path_type:
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_NONE,
+                root_configuration_path: None,
+                application_directory_path_type:
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE,
+                application_directory_path: application_directory,
+            };
+            match nt_ntdll::rtl::activation_query::detailed_required_size(&query) {
+                Err(status) => status,
+                Ok(required) => {
+                    if !ret_len.is_null() {
+                        core::ptr::write_unaligned(ret_len, required);
+                    }
+                    if info.is_null() || info_len < required {
+                        nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
+                    } else {
+                        let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
+                        match nt_ntdll::rtl::activation_query::pack_detailed_into(
+                            &query,
+                            output,
+                        ) {
+                            Ok(_) => {
+                                rebase_activation_query_pointers(
+                                    info.cast(),
+                                    &nt_ntdll::rtl::activation_query::DETAILED_INFORMATION_POINTER_FIELDS,
+                                );
+                                STATUS_SUCCESS
+                            }
+                            Err(status) => status,
+                        }
+                    }
+                }
+            }
+        } else {
+            if sub_instance.is_null() {
+                activation_context_release(selected);
+                return STATUS_INVALID_PARAMETER;
+            }
+            let roster_index = core::ptr::read_unaligned(sub_instance as *const u32);
+            if let Err(status) =
+                nt_ntdll::rtl::activation_query::validate_roster_index(roster_index, 1)
+            {
+                activation_context_release(selected);
+                return status;
+            }
+            let query = nt_ntdll::rtl::activation_query::AssemblyDetailedQuery {
+                encoded_assembly_identity: Some(&object.encoded_assembly_identity),
+                manifest_path_type: if manifest_path.is_some() {
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE
+                } else {
+                    nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_NONE
+                },
+                manifest_path,
+                assembly_directory_name: assembly_directory,
+                file_count: object.file_count,
+            };
+            match nt_ntdll::rtl::activation_query::assembly_detailed_required_size(&query) {
+                Err(status) => status,
+                Ok(required) => {
+                    if !ret_len.is_null() {
+                        core::ptr::write_unaligned(ret_len, required);
+                    }
+                    if info.is_null() || info_len < required {
+                        nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
+                    } else {
+                        let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
+                        match nt_ntdll::rtl::activation_query::pack_assembly_detailed_into(
+                            &query,
+                            output,
+                        ) {
+                            Ok(_) => {
+                                rebase_activation_query_pointers(
+                                    info.cast(),
+                                    &nt_ntdll::rtl::activation_query::ASSEMBLY_DETAILED_INFORMATION_POINTER_FIELDS,
+                                );
+                                STATUS_SUCCESS
+                            }
+                            Err(status) => status,
+                        }
+                    }
+                }
+            }
+        };
+        activation_context_release(selected);
+        status
     }
-    if flags & nt_ntdll::rtl::activation::QUERY_FLAG_NO_ADDREF == 0 {
-        unsafe { rtl_add_ref_activation_context(selected) };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (selected, sub_instance, info, info_len);
+        STATUS_NOT_IMPLEMENTED
     }
-    STATUS_SUCCESS
 }
 
 /// `RtlAllocateActivationContextStack(PVOID* Stack) -> NTSTATUS` — allocate and initialize a native

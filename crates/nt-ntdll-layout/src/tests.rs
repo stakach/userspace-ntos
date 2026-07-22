@@ -20,6 +20,13 @@ fn peb_offsets() {
     assert_eq!(offset_of!(Peb, unicode_case_table_data), 0xB0);
     assert_eq!(offset_of!(Peb, nt_global_flag), 0xBC);
     assert_eq!(offset_of!(Peb, session_id), 0x2C0);
+    assert_eq!(offset_of!(Peb, activation_context_data), 0x2F8);
+    assert_eq!(offset_of!(Peb, process_assembly_storage_map), 0x300);
+    assert_eq!(
+        offset_of!(Peb, system_default_activation_context_data),
+        0x308
+    );
+    assert_eq!(offset_of!(Peb, system_assembly_storage_map), 0x310);
 }
 
 #[test]
@@ -50,7 +57,10 @@ fn teb_offsets() {
 fn ldr_offsets() {
     assert_eq!(offset_of!(PebLdrData, in_load_order_module_list), 0x10);
     assert_eq!(offset_of!(PebLdrData, in_memory_order_module_list), 0x20);
-    assert_eq!(offset_of!(PebLdrData, in_initialization_order_module_list), 0x30);
+    assert_eq!(
+        offset_of!(PebLdrData, in_initialization_order_module_list),
+        0x30
+    );
     assert_eq!(offset_of!(LdrDataTableEntry, in_memory_order_links), 0x10);
     assert_eq!(offset_of!(LdrDataTableEntry, dll_base), 0x30);
     assert_eq!(offset_of!(LdrDataTableEntry, entry_point), 0x38);
@@ -69,7 +79,10 @@ fn ldr_offsets() {
 fn process_params_offsets() {
     assert_eq!(offset_of!(RtlUserProcessParameters, length), 0x04);
     assert_eq!(offset_of!(RtlUserProcessParameters, standard_input), 0x20);
-    assert_eq!(offset_of!(RtlUserProcessParameters, current_directory_dospath), 0x38);
+    assert_eq!(
+        offset_of!(RtlUserProcessParameters, current_directory_dospath),
+        0x38
+    );
     assert_eq!(offset_of!(RtlUserProcessParameters, dll_path), 0x50);
     assert_eq!(offset_of!(RtlUserProcessParameters, image_path_name), 0x60);
     assert_eq!(offset_of!(RtlUserProcessParameters, command_line), 0x70);

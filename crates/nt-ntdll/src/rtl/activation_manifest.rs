@@ -13,6 +13,16 @@ const STATUS_SXS_INVALID_ACTCTXDATA_FORMAT: NtStatus = 0xC015_0003;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedManifest {
     pub dll_redirects: Vec<DllRedirect>,
+    pub assembly_identity: AssemblyIdentity,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssemblyIdentity {
+    pub name: Option<Vec<u16>>,
+    pub processor_architecture: Option<Vec<u16>>,
+    pub public_key_token: Option<Vec<u16>>,
+    pub kind: Option<Vec<u16>>,
+    pub version: [u16; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +68,114 @@ impl Attribute {
 pub fn parse_manifest(bytes: &[u8]) -> Result<ParsedManifest, NtStatus> {
     let input = decode_manifest(bytes)?;
     Parser::new(&input).parse()
+}
+
+pub fn encode_assembly_identity(identity: &AssemblyIdentity) -> Result<Vec<u16>, NtStatus> {
+    let mut output = Vec::new();
+    output.try_reserve(128).map_err(|_| STATUS_NO_MEMORY)?;
+    if let Some(name) = &identity.name {
+        output.extend_from_slice(name);
+    }
+    append_identity_attribute(
+        &mut output,
+        ",processorArchitecture=\"",
+        identity.processor_architecture.as_deref(),
+    )?;
+    append_identity_attribute(
+        &mut output,
+        ",publicKeyToken=\"",
+        identity.public_key_token.as_deref(),
+    )?;
+    append_identity_attribute(&mut output, ",type=\"", identity.kind.as_deref())?;
+    extend_ascii(&mut output, ",version=\"")?;
+    for (index, component) in identity.version.iter().copied().enumerate() {
+        if index != 0 {
+            output.push(b'.' as u16);
+        }
+        push_decimal_u16(&mut output, component)?;
+    }
+    output.push(b'"' as u16);
+    Ok(output)
+}
+
+fn append_identity_attribute(
+    output: &mut Vec<u16>,
+    prefix: &str,
+    value: Option<&[u16]>,
+) -> Result<(), NtStatus> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    extend_ascii(output, prefix)?;
+    output
+        .try_reserve(value.len() + 1)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    output.extend_from_slice(value);
+    output.push(b'"' as u16);
+    Ok(())
+}
+
+fn extend_ascii(output: &mut Vec<u16>, value: &str) -> Result<(), NtStatus> {
+    output
+        .try_reserve(value.len())
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    output.extend(value.bytes().map(u16::from));
+    Ok(())
+}
+
+fn push_decimal_u16(output: &mut Vec<u16>, value: u16) -> Result<(), NtStatus> {
+    let mut digits = [0u16; 5];
+    let mut remaining = value;
+    let mut count = 0usize;
+    loop {
+        digits[count] = b'0' as u16 + remaining % 10;
+        count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    output.try_reserve(count).map_err(|_| STATUS_NO_MEMORY)?;
+    output.extend(digits[..count].iter().rev().copied());
+    Ok(())
+}
+
+fn parse_assembly_version(input: &[u16]) -> Result<[u16; 4], NtStatus> {
+    if input.is_empty() {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    let mut result = [0u16; 4];
+    let mut start = 0usize;
+    let mut index = 0usize;
+    loop {
+        if index == result.len() {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let end = input[start..]
+            .iter()
+            .position(|unit| *unit == b'.' as u16)
+            .map_or(input.len(), |offset| start + offset);
+        if start == end {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let mut value = 0u16;
+        for unit in &input[start..end] {
+            if !(b'0' as u16..=b'9' as u16).contains(unit) {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            value = value
+                .checked_mul(10)
+                .and_then(|current| current.checked_add(*unit - b'0' as u16))
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        }
+        result[index] = value;
+        index += 1;
+        if end == input.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    Ok(result)
 }
 
 fn decode_manifest(bytes: &[u8]) -> Result<Vec<u16>, NtStatus> {
@@ -144,6 +262,7 @@ struct Parser<'a> {
     position: usize,
     unsupported: bool,
     redirects: Vec<DllRedirect>,
+    identity: Option<AssemblyIdentity>,
 }
 
 impl<'a> Parser<'a> {
@@ -153,6 +272,7 @@ impl<'a> Parser<'a> {
             position: 0,
             unsupported: false,
             redirects: Vec::new(),
+            identity: None,
         }
     }
 
@@ -206,6 +326,9 @@ impl<'a> Parser<'a> {
                     if direct_child && local_eq(self.input, tag.name(), "file") {
                         self.add_file_redirect(tag)?;
                     }
+                    if direct_child && local_eq(self.input, tag.name(), "assemblyIdentity") {
+                        self.set_assembly_identity(tag)?;
+                    }
                     if !tag.self_closing {
                         stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
                         stack.push(tag.name());
@@ -223,6 +346,7 @@ impl<'a> Parser<'a> {
         }
         Ok(ParsedManifest {
             dll_redirects: self.redirects,
+            assembly_identity: self.identity.unwrap_or_default(),
         })
     }
 
@@ -271,6 +395,30 @@ impl<'a> Parser<'a> {
             .try_reserve(1)
             .map_err(|_| STATUS_NO_MEMORY)?;
         self.redirects.push(DllRedirect { name, load_from });
+        Ok(())
+    }
+
+    fn set_assembly_identity(&mut self, tag: Tag) -> Result<(), NtStatus> {
+        if self.identity.is_some() {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let mut identity = AssemblyIdentity::default();
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            let value = || decode_attribute_value(&self.input[attribute.value()]);
+            if local_eq(self.input, attribute.name(), "name") {
+                identity.name = Some(value()?);
+            } else if local_eq(self.input, attribute.name(), "processorArchitecture") {
+                identity.processor_architecture = Some(value()?);
+            } else if local_eq(self.input, attribute.name(), "publicKeyToken") {
+                identity.public_key_token = Some(value()?);
+            } else if local_eq(self.input, attribute.name(), "type") {
+                identity.kind = Some(value()?);
+            } else if local_eq(self.input, attribute.name(), "version") {
+                identity.version = parse_assembly_version(&value()?)?;
+            }
+        }
+        self.identity = Some(identity);
         Ok(())
     }
 
@@ -735,6 +883,47 @@ mod tests {
         let parsed = parse_manifest(manifest).unwrap();
         assert_eq!(parsed.dll_redirects[0].name, wide("a&b.dll"));
         assert_eq!(parsed.dll_redirects[0].load_from, Some(wide("sub/d.dll")));
+    }
+
+    #[test]
+    fn retains_and_encodes_root_assembly_identity() {
+        let manifest = br#"<assembly manifestVersion="1.0">
+            <assemblyIdentity name="sample.app" processorArchitecture="amd64"
+                publicKeyToken="001122aabbccddff" type="win32" version="6.1.2.345"/>
+            </assembly>"#;
+        let parsed = parse_manifest(manifest).unwrap();
+        assert_eq!(parsed.assembly_identity.name, Some(wide("sample.app")));
+        assert_eq!(parsed.assembly_identity.version, [6, 1, 2, 345]);
+        assert_eq!(
+            encode_assembly_identity(&parsed.assembly_identity).unwrap(),
+            wide(
+                "sample.app,processorArchitecture=\"amd64\",publicKeyToken=\"001122aabbccddff\",type=\"win32\",version=\"6.1.2.345\""
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_identity_and_invalid_versions() {
+        for manifest in [
+            br#"<assembly manifestVersion="1.0"><assemblyIdentity version="1.2.3.4.5"/></assembly>"#
+                .as_slice(),
+            br#"<assembly manifestVersion="1.0"><assemblyIdentity version="1.2.x.4"/></assembly>"#,
+            br#"<assembly manifestVersion="1.0"><assemblyIdentity/><assemblyIdentity/></assembly>"#,
+        ] {
+            assert_eq!(
+                parse_manifest(manifest),
+                Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_fills_omitted_identity_version_components() {
+        let parsed = parse_manifest(
+            br#"<assembly manifestVersion="1.0"><assemblyIdentity version="1.2.3"/></assembly>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.assembly_identity.version, [1, 2, 3, 0]);
     }
 
     #[test]
