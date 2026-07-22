@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-syscall = { workspace = true }
+nt-ntdll-layout = { workspace = true }
 nt-pe-loader = { workspace = true }
 nt-process = { workspace = true }
 nt-config-manager = { workspace = true }

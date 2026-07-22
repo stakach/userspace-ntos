@@ -54,6 +54,15 @@ fn kuser_shared_data_version() {
     assert_eq!(k[kuser_off::PRODUCT_TYPE_IS_VALID], 1);
     assert_eq!(KUSER_SHARED_DATA_VA, 0x7FFE_0000);
     assert_eq!(read_u32(&k, kuser_off::COOKIE), 0xA3B1_C2D3);
+    assert_eq!(k[kuser_off::PROCESSOR_FEATURES], 0);
+    assert_eq!(
+        read_u32(&k, nt_ntdll_layout::kuser::ACTIVE_PROCESSOR_COUNT),
+        1
+    );
+    assert_eq!(
+        read_u32(&k, nt_ntdll_layout::kuser::NUMBER_OF_PHYSICAL_PAGES),
+        0x1_0000
+    );
 }
 
 #[test]

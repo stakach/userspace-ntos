@@ -142,16 +142,12 @@ pub fn build_teb(
 
 // KUSER_SHARED_DATA field offsets (spec §12.2).
 pub mod kuser_off {
-    pub const TICK_COUNT_LOW: usize = 0x00;
-    pub const TICK_COUNT_MULTIPLIER: usize = 0x04;
-    pub const SYSTEM_TIME_LOW: usize = 0x14; // KSYSTEM_TIME { LowPart, High1Time, High2Time }
-    pub const NT_PRODUCT_TYPE: usize = 0x264;
-    pub const PRODUCT_TYPE_IS_VALID: usize = 0x268;
-    pub const NT_MAJOR_VERSION: usize = 0x26C;
-    pub const NT_MINOR_VERSION: usize = 0x270;
-    pub const PROCESSOR_FEATURES: usize = 0x274; // u8[64]
-    pub const COOKIE: usize = 0x330;
-    pub const SIZE: usize = 0x1000; // one page
+    pub use nt_ntdll_layout::kuser::{
+        COOKIE, NT_MAJOR_VERSION, NT_MINOR_VERSION, NT_PRODUCT_TYPE, PROCESSOR_FEATURES,
+        PRODUCT_TYPE_IS_VALID, SYSTEM_TIME as SYSTEM_TIME_LOW,
+        TICK_COUNT_LOW_DEPRECATED as TICK_COUNT_LOW, TICK_COUNT_MULTIPLIER,
+    };
+    pub const SIZE: usize = nt_ntdll_layout::kuser::PAGE_SIZE;
 }
 
 /// Build the read-only `KUSER_SHARED_DATA` page (spec §12.2): version + a plausible system time.
@@ -171,25 +167,21 @@ pub fn build_kuser_shared_data_with_cookie(
     system_cookie: u32,
 ) -> Vec<u8> {
     let mut k = vec![0u8; kuser_off::SIZE];
-    put_u32(&mut k, kuser_off::TICK_COUNT_LOW, tick_count);
-    put_u32(&mut k, kuser_off::TICK_COUNT_MULTIPLIER, 0x0FA0_0000);
-    // SystemTime as a KSYSTEM_TIME (High1 == High2 for a stable read).
-    put_u32(&mut k, kuser_off::SYSTEM_TIME_LOW, system_time_100ns as u32);
-    put_u32(
-        &mut k,
-        kuser_off::SYSTEM_TIME_LOW + 4,
-        (system_time_100ns >> 32) as u32,
+    nt_ntdll_layout::kuser::initialize_page(
+        k.as_mut_slice().try_into().unwrap(),
+        nt_ntdll_layout::kuser::StaticInformation {
+            nt_product_type: profile.product_type,
+            nt_major_version: profile.os_major,
+            nt_minor_version: profile.os_minor,
+            image_number_low: 0x014c,
+            image_number_high: 0x8664,
+            number_of_physical_pages: 0x1_0000,
+            active_processor_count: profile.number_of_processors,
+            processor_feature_bits: 0xa111_39fe,
+            cookie: system_cookie,
+        },
+        u64::from(tick_count) * 10_000,
+        system_time_100ns,
     );
-    put_u32(
-        &mut k,
-        kuser_off::SYSTEM_TIME_LOW + 8,
-        (system_time_100ns >> 32) as u32,
-    );
-    put_u32(&mut k, kuser_off::NT_PRODUCT_TYPE, profile.product_type);
-    k[kuser_off::PRODUCT_TYPE_IS_VALID] = 1;
-    put_u32(&mut k, kuser_off::NT_MAJOR_VERSION, profile.os_major);
-    put_u32(&mut k, kuser_off::NT_MINOR_VERSION, profile.os_minor);
-    k[kuser_off::PROCESSOR_FEATURES] = 1; // at least one feature bit plausible
-    put_u32(&mut k, kuser_off::COOKIE, system_cookie);
     k
 }

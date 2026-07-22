@@ -141,6 +141,30 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
     t
 }
 
+unsafe fn initialize_kuser_snapshot(scratch_va: u64) {
+    let interrupt_time = monotonic_time_100ns();
+    let processor = exec_handler::native_processor_information();
+    let page = unsafe { &mut *(scratch_va as *mut [u8; nt_ntdll_layout::kuser::PAGE_SIZE]) };
+    nt_ntdll_layout::kuser::initialize_page(
+        page,
+        nt_ntdll_layout::kuser::StaticInformation {
+            nt_product_type: 1,
+            nt_major_version: 6,
+            nt_minor_version: 1,
+            image_number_low: 0x014c,
+            image_number_high: 0x8664,
+            number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
+                .load(Ordering::Relaxed)
+                .min(u32::MAX as u64) as u32,
+            active_processor_count: SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u32,
+            processor_feature_bits: processor.processor_feature_bits,
+            cookie: SYSTEM_POINTER_COOKIE,
+        },
+        interrupt_time,
+        NT_SYSTEM_TIME_BOOT_100NS.saturating_add(interrupt_time),
+    );
+}
+
 /// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
 /// is written into fresh frames (via an executive scratch mapping) and mapped RX at
 /// PE_LOAD_BASE in the new VSpace; execution starts at the PE entry point. Returns the pml4.
@@ -207,6 +231,14 @@ pub(crate) unsafe fn spawn_pe_thread(
     let peb = alloc_frame();
     let _ = page_map(peb, env_scratch + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     core::ptr::write_volatile((env_scratch + 0x1000 + 0x10) as *mut u64, PE_LOAD_BASE); // ImageBaseAddress
+    core::ptr::write_volatile(
+        (env_scratch + 0x1000 + 0xb8) as *mut u32,
+        SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u32,
+    );
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x118) as *mut u32, 6);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x11c) as *mut u32, 1);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x120) as *mut u16, 7601);
+    core::ptr::write_volatile((env_scratch + 0x1000 + 0x124) as *mut u32, 2);
     let _ = page_map(copy_cap(peb), PEB_VA, RW_NX, pml4);
     // KUSER_SHARED_DATA at 0x7FFE0000 (PML4[0], vs the image at PML4[2]) — a fresh PT chain.
     let pdpt2 = alloc_slot();
@@ -226,11 +258,8 @@ pub(crate) unsafe fn spawn_pe_thread(
     let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
     let kuser = alloc_frame();
     let _ = page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    core::ptr::write_volatile(
-        (env_scratch + 0x3000 + 0x330) as *mut u32,
-        SYSTEM_POINTER_COOKIE,
-    );
-    let _ = page_map(copy_cap(kuser), KUSER_VA, RW_NX, pml4);
+    unsafe { initialize_kuser_snapshot(env_scratch + 0x3000) };
+    let _ = page_map(copy_cap(kuser), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
     // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
     let ntdll = alloc_frame();
     let _ = page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -569,6 +598,14 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0xA0) as *mut u64, NLS_SMSS_ANSI_VA);
         core::ptr::write_volatile((scr + 0x1000 + 0xA8) as *mut u64, NLS_SMSS_OEM_VA);
         core::ptr::write_volatile((scr + 0x1000 + 0xB0) as *mut u64, NLS_SMSS_CASE_VA);
+        core::ptr::write_volatile(
+            (scr + 0x1000 + 0xB8) as *mut u32,
+            SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u32,
+        );
+        core::ptr::write_volatile((scr + 0x1000 + 0x118) as *mut u32, 6);
+        core::ptr::write_volatile((scr + 0x1000 + 0x11c) as *mut u32, 1);
+        core::ptr::write_volatile((scr + 0x1000 + 0x120) as *mut u16, 7601);
+        core::ptr::write_volatile((scr + 0x1000 + 0x124) as *mut u32, 2);
         // ★ DIALOG BATCH 3 — PEB->GdiSharedHandleTable (x64 PEB+0xf8). Client-side gdi32's
         // GdiProcessSetup (gdi32 RVA 0x1100, run once from GdiDllInitialize/DllMain at process init)
         // copies PEB+0xf8 into its cached global (gdi32 RVA 0x4e188); every later GDI-handle validity
@@ -715,10 +752,8 @@ pub(crate) unsafe fn spawn_sec_image(
         let kuser_f = alloc_frame();
         let kscr = scr + 0x6000; // next free page in the env-scratch window (past env at +0x4000/+0x5000)
         let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
-        core::ptr::write_volatile((kscr + 0x2c) as *mut u16, 0x014c); // ImageNumberLow  (IMAGE_FILE_MACHINE_I386)
-        core::ptr::write_volatile((kscr + 0x2e) as *mut u16, 0x8664); // ImageNumberHigh (IMAGE_FILE_MACHINE_AMD64)
-        core::ptr::write_volatile((kscr + 0x330) as *mut u32, SYSTEM_POINTER_COOKIE);
-        let _ = page_map(copy_cap(kuser_f), KUSER_VA, RW_NX, pml4);
+        unsafe { initialize_kuser_snapshot(kscr) };
+        let _ = page_map(copy_cap(kuser_f), KUSER_VA, 2 | PAGE_EXECUTE_NEVER, pml4);
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
         // TEB/PEB/KUSER, NtQueryVirtualMemory, creates the process heap (RtlCreateHeap itself),

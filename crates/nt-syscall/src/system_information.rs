@@ -76,6 +76,7 @@ pub fn amd64_processor_information_from_cpuid(
     feature_ecx: u32,
     feature_edx: u32,
     extended_feature_edx: u32,
+    xstate_enabled: bool,
 ) -> SystemProcessorInformation {
     const KF_RDTSC: u32 = 0x0000_0002;
     const KF_CR4: u32 = 0x0000_0004;
@@ -163,7 +164,7 @@ pub fn amd64_processor_information_from_cpuid(
     if feature_ecx & (1 << 13) != 0 {
         bits |= KF_CMPXCHG16B;
     }
-    if feature_ecx & (1 << 26) != 0 {
+    if xstate_enabled && feature_ecx & (1 << 26) != 0 {
         bits |= KF_XSTATE;
     }
     if extended_feature_edx & (1 << 20) != 0 {
@@ -381,12 +382,21 @@ mod tests {
                 | (1 << 25)
                 | (1 << 26),
             1 << 20,
+            true,
         );
         assert_eq!(info.processor_architecture, PROCESSOR_ARCHITECTURE_AMD64);
         assert_eq!(info.processor_level, 6);
         assert_eq!(info.processor_revision, 0x9702);
         assert_ne!(info.processor_feature_bits & 0x0100_0000, 0);
         assert_ne!(info.processor_feature_bits & 0xa000_0000, 0);
+        assert_ne!(info.processor_feature_bits & 0x0080_0000, 0);
+    }
+
+    #[test]
+    fn xstate_requires_kernel_context_support() {
+        let info =
+            amd64_processor_information_from_cpuid(X86Vendor::Intel, 6 << 8, 1 << 26, 0, 0, false);
+        assert_eq!(info.processor_feature_bits & 0x0080_0000, 0);
     }
 
     #[test]

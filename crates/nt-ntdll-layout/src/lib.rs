@@ -31,6 +31,8 @@
 
 use core::mem::{offset_of, size_of};
 
+pub mod kuser;
+
 /// `LIST_ENTRY` — a doubly-linked list node (`ntdef.h`). 16 bytes on x64.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -348,6 +350,7 @@ const _: () = assert!(offset_of!(Peb, fast_peb_lock) == 0x38); // C_ASSERT(... F
 const _: () = assert!(offset_of!(Peb, ansi_code_page_data) == 0xA0); // live-RE NLS 1252
 const _: () = assert!(offset_of!(Peb, oem_code_page_data) == 0xA8); // live-RE NLS 437
 const _: () = assert!(offset_of!(Peb, unicode_case_table_data) == 0xB0); // live-RE l_intl
+const _: () = assert!(offset_of!(Peb, number_of_processors) == 0xB8);
 const _: () = assert!(offset_of!(Peb, nt_global_flag) == 0xBC); // C_ASSERT(... NtGlobalFlag) == 0x0BC
 const _: () = assert!(offset_of!(Peb, session_id) == 0x2C0); // C_ASSERT(... SessionId) == 0x2C0
 const _: () = assert!(offset_of!(Peb, activation_context_data) == 0x2F8);

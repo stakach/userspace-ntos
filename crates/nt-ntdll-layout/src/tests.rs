@@ -18,6 +18,7 @@ fn peb_offsets() {
     assert_eq!(offset_of!(Peb, ansi_code_page_data), 0xA0);
     assert_eq!(offset_of!(Peb, oem_code_page_data), 0xA8);
     assert_eq!(offset_of!(Peb, unicode_case_table_data), 0xB0);
+    assert_eq!(offset_of!(Peb, number_of_processors), 0xB8);
     assert_eq!(offset_of!(Peb, nt_global_flag), 0xBC);
     assert_eq!(offset_of!(Peb, session_id), 0x2C0);
     assert_eq!(offset_of!(Peb, activation_context_data), 0x2F8);

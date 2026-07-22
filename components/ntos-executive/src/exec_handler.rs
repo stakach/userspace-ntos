@@ -15,7 +15,8 @@ static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
-fn native_processor_information() -> nt_syscall::system_information::SystemProcessorInformation {
+pub(crate) fn native_processor_information(
+) -> nt_syscall::system_information::SystemProcessorInformation {
     use core::arch::x86_64::__cpuid;
     use nt_syscall::system_information::{
         amd64_processor_information_from_cpuid, X86Vendor,
@@ -48,6 +49,7 @@ fn native_processor_information() -> nt_syscall::system_information::SystemProce
         version.ecx,
         version.edx,
         extended_edx,
+        false, // rust-micro currently saves FXSAVE state, not XSAVE state.
     )
 }
 
