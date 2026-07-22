@@ -856,7 +856,7 @@ pub(crate) unsafe fn csr_rendezvous(
                                         let _ = csr_stack_write32(rdx, previous as u32);
                                     }
                                     if !previous {
-                                        wait_wake_event_set(index, &mut nt_handler.events);
+                                        wait_wake_dispatcher_set(nt_handler);
                                     }
                                     0
                                 }

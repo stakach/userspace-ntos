@@ -1068,7 +1068,7 @@ static PIPE_REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// ncacn_np rpcrt4 server posts an OVERLAPPED FSCTL_PIPE_LISTEN (STATUS_PENDING while no client) with a
 /// completion EVENT, then parks on `NtWaitForMultipleObjects([mgr_event, listen_event])` — it does NOT
 /// block on a pipe read. When the client (winlogon) connects/writes, the executive completes the
-/// pending listen + SIGNALs its event (via the existing `wait_wake_event_set` NtSetEvent path) so the
+/// pending listen + signals its event through the shared dispatcher wake path so the
 /// server's wait-array wakes → it reads the bind PDU → rpcrt4 emits bind_ack. `.bss`, cap 8.
 const PIPE_ASYNC_LISTEN_N: usize = 8;
 static mut PIPE_ASYNC_LISTENS: nt_io_manager::AsyncListenTable<PIPE_ASYNC_LISTEN_N> =
@@ -3303,19 +3303,21 @@ unsafe fn wait_park_multi(
     true
 }
 
-/// WAKE every waiter whose condition is now satisfied. AUTO-RESET events consumed by the first
-/// matching wake are cleared before later waiters are considered, so synchronization events wake
-/// one waiter while notification events wake all. Returns the number woken.
-unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
-    wait_wake_event(just_set, events, false)
+/// Wake every waiter whose dispatcher condition is satisfied. Synchronization events and semaphore
+/// tokens are consumed in waiter-slot order; notification events remain signaled.
+unsafe fn wait_wake_dispatcher_set(handler: &mut ExecNtHandler) -> u64 {
+    wait_wake_dispatcher(handler, None)
 }
 
 /// Pulse uses the same waiter selection, but clears the event before any parked thread resumes.
-unsafe fn wait_wake_event_pulse(just_set: usize, events: &mut EventStore) -> u64 {
-    wait_wake_event(just_set, events, true)
+unsafe fn wait_wake_dispatcher_pulse(just_set: usize, handler: &mut ExecNtHandler) -> u64 {
+    wait_wake_dispatcher(handler, Some(just_set))
 }
 
-unsafe fn wait_wake_event(just_set: usize, events: &mut EventStore, pulse: bool) -> u64 {
+unsafe fn wait_wake_dispatcher(
+    handler: &mut ExecNtHandler,
+    pulse_event: Option<usize>,
+) -> u64 {
     let mut wake_indices = [u64::MAX; WAITER_N];
     for i in 0..WAITER_N {
         let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
@@ -3332,11 +3334,12 @@ unsafe fn wait_wake_event(just_set: usize, events: &mut EventStore, pulse: bool)
         let mut wake_index = 0u64;
         let mut selected_slot = 0usize;
         if wait_all {
-            // Wake only when ALL events in the set are signalled.
+            // Check the whole set before consuming anything so an unsatisfied WaitAll never reserves
+            // an auto-reset event or semaphore token.
             let mut all = true;
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if !events.read_state(ev as u64) {
+                if !handler.dispatcher_ready(ev) {
                     all = false;
                     break;
                 }
@@ -3347,7 +3350,7 @@ unsafe fn wait_wake_event(just_set: usize, events: &mut EventStore, pulse: bool)
             // WaitAny: the first (lowest-index) signalled event determines the return value.
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if events.read_state(ev as u64) {
+                if handler.dispatcher_ready(ev) {
                     wake = true;
                     selected_slot = k;
                     wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
@@ -3358,22 +3361,21 @@ unsafe fn wait_wake_event(just_set: usize, events: &mut EventStore, pulse: bool)
         if !wake {
             continue;
         }
-        // Auto-reset the CONSUMED event (WaitAny: the one at wake_index; WaitAll: all of them) if it's
-        // an auto-reset event, so the next wait blocks again.
+        // Consume the selected dispatcher transaction only after the condition is known to hold.
         if wait_all {
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                events.consume_existing(ev as u64);
+                handler.dispatcher_consume(ev);
             }
         } else {
             let ev = WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed) as usize;
-            events.consume_existing(ev as u64);
+            handler.dispatcher_consume(ev);
         }
         wake_indices[i] = wake_index;
     }
 
-    if pulse {
-        let _ = events.reset_existing(just_set as u64);
+    if let Some(index) = pulse_event {
+        let _ = handler.events.reset_existing(index as u64);
     }
 
     let mut woken = 0u64;

@@ -15,6 +15,7 @@ extern crate alloc;
 mod completion;
 pub mod dbg;
 mod dpc;
+mod dispatcher_wait;
 mod event;
 mod interrupt;
 pub mod kevent;
@@ -32,6 +33,10 @@ mod work_item;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dpc::{DpcImportance, DpcQueue};
+pub use dispatcher_wait::{
+    consume_dispatcher, dispatcher_ready, poll_dispatchers, DispatcherObject,
+    DispatcherWaitResult,
+};
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};

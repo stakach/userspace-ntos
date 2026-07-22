@@ -2266,8 +2266,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if nt_handler.io_signal_event >= 0 {
-                    let event = nt_handler.io_signal_event as usize;
-                    let _ = wait_wake_event_set(event, &mut nt_handler.events);
+                    let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
                 // BATCH 33: latch a pipe-pending park request (the reply-cap steal happens at the reply
                 // site where resume_ip/sp/flags are known). Re-drive any parked pipe reads on a peer
@@ -2973,10 +2972,10 @@ pub(crate) unsafe fn service_sec_image(
                 // worker-thread half of the rpcrt4 two-thread handshake: the server WORKER thread
                 // (multiplexed via WINLOGON_WORKER_BADGE / SVC/LSASS listeners) runs
                 // rpcrt4_protseq_np_wait_for_new_connection = WaitForMultipleObjects([mgr_event,
-                // listen_events…]). We resolve the handle array to obj_ns events:
+                // listen_events…]). We resolve the handle array to dispatcher objects:
                 //   • WaitAny + any already signalled → immediate WAIT_0+index.
                 //   • WaitAll + all signalled → immediate WAIT_0.
-                //   • otherwise, if the set contains at least one REAL event (a live signaler exists —
+                //   • otherwise, if the set contains at least one real waitable object —
                 //     the main thread's signal_state_changed SetEvents mgr_event) → PARK on the set
                 //     (steal the reply cap, recv next, wake on NtSetEvent). ★ NO-DEADLOCK: only park
                 //     when a real event is present; a set of only fake handles → immediate WAIT_0.
@@ -2990,6 +2989,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut any_signalled_real = false;
                 let mut all_signalled = true;
                 let mut has_real_event = false;
+                let mut wait_identities = [u64::MAX; WAITER_MAX_EVENTS];
                 let mut wait_error: Option<u32> = if harr == 0
                     || count == 0
                     || count > WAITER_MAX_EVENTS
@@ -3003,7 +3003,7 @@ pub(crate) unsafe fn service_sec_image(
                 if wait_error.is_none() {
                     for k in 0..count {
                         let h = smss_stack_read(harr + (k as u64) * 8);
-                        match nt_handler.event_index_for_handle(h, SYNCHRONIZE_ACCESS) {
+                        match nt_handler.waitable_index_for_handle(h, SYNCHRONIZE_ACCESS) {
                             Ok(idx) => {
                                     if trace < 32 {
                                         print_str(b"[event] wait-item k="); print_u64(k as u64);
@@ -3013,8 +3013,9 @@ pub(crate) unsafe fn service_sec_image(
                                     has_real_event = true;
                                     park_wait_set[nev] = idx;
                                     park_wait_indices[nev] = k as u8;
+                                    wait_identities[k] = idx as u64;
                                     nev += 1;
-                                    if nt_handler.events.read_state(idx as u64) {
+                                    if nt_handler.dispatcher_ready(idx) {
                                         if any_signalled_idx < 0 {
                                             any_signalled_idx = k as i64;
                                             any_signalled_obj = idx;
@@ -3036,6 +3037,7 @@ pub(crate) unsafe fn service_sec_image(
                                 if any_signalled_idx < 0 {
                                     any_signalled_idx = k as i64;
                                 }
+                                wait_identities[k] = 0x8000_0000_0000_0000 | h;
                             }
                             Err(status) => {
                                 if trace < 32 {
@@ -3048,9 +3050,18 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                     }
+                    if wait_all && wait_error.is_none() {
+                        'duplicates: for left in 0..count {
+                            for right in left + 1..count {
+                                if wait_identities[left] == wait_identities[right] {
+                                    wait_error = Some(0xC000_0030); // STATUS_INVALID_PARAMETER_MIX
+                                    break 'duplicates;
+                                }
+                            }
+                        }
+                    }
                 }
-                // Consume (auto-reset) an event satisfied on the IMMEDIATE path (NT clears an auto-reset
-                // event that satisfies a wait). WaitAll: clear all consumed auto-reset events.
+                // Consume dispatcher state only after the complete immediate condition is satisfied.
                 let timeout_ptr = smss_stack_read(sp + 0x28);
                 let wait_due = if timeout_ptr == 0 {
                     None
@@ -3082,7 +3093,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = status as u64;
                 } else if wait_all {
                     if has_real_event && all_signalled {
-                        for k in 0..nev { nt_handler.events.consume_existing(park_wait_set[k] as u64); }
+                        for k in 0..nev { nt_handler.dispatcher_consume(park_wait_set[k]); }
                         result = 0; // WAIT_0 (all satisfied)
                     } else if zero_timeout {
                         result = 0x102;
@@ -3098,7 +3109,7 @@ pub(crate) unsafe fn service_sec_image(
                     // WaitAny
                     if any_signalled_idx >= 0 {
                         if any_signalled_real {
-                            nt_handler.events.consume_existing(any_signalled_obj as u64);
+                            nt_handler.dispatcher_consume(any_signalled_obj);
                         }
                         result = any_signalled_idx as u64; // WAIT_OBJECT_0 + index
                     } else if zero_timeout {
@@ -4328,7 +4339,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             // Array-wait park (NtWaitForMultipleObjects): PARK on the resolved event SET (WaitAny/All).
             // The matching NtSetEvent (signal_state_changed → SetEvent(mgr_event)) wakes it via
-            // wait_wake_event_set, returning WAIT_0+index. Pool/queue exhaustion → immediate fallback.
+            // dispatcher wake path, returning WAIT_0+index. Pool/queue exhaustion → immediate fallback.
             if park_wait_set_n > 0 && reply_main != 0 {
                 if park_wait_deadline.is_some() && !delay_timer_init() {
                     result = 0xC000_009A;
@@ -5143,7 +5154,7 @@ fn listener_badge_for_pi(pi: u32) -> u64 {
 /// `NtWaitForMultipleObjects([mgr_event, listen_event])`. The client just connected (npfs paired the
 /// ends by name), so ONE matching pending listen is now satisfied: fill its listen IOSB
 /// `{Status=SUCCESS, Information=0}` in the SERVER's VSpace (switch in the listener's mirror context
-/// for the copyout, then restore) and SIGNAL its completion event via the EXISTING `wait_wake_event_set`
+/// for the copyout, then restore) and signal its completion event via the shared dispatcher wake path
 /// NtSetEvent wake path — waking the server's wait-array so it reads the client's first PDU (the bind).
 /// Name-scoped so a `\ntsvcs` connect never wakes `\lsarpc`/`\samr` (which would spin their rpcrt4
 /// accept loop). Returns 1 if a listen was completed, else 0. Re-armable: rpcrt4 re-posts a fresh
@@ -5181,11 +5192,11 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
             nt_handler.xas_write_buf(l.iosb_va + 8, &0u64.to_le_bytes());
         }
         // SIGNAL the overlapped completion event → wakes the server's NtWaitForMultipleObjects. Reuse
-        // the exact NtSetEvent wake path: set the event's `signalled` flag then wake_event_set.
+        // the exact NtSetEvent wake path: set the event's `signalled` flag then reevaluate waiters.
         if l.event_obj_idx != u64::MAX {
             let idx = l.event_obj_idx as usize;
             let _ = nt_handler.events.set_existing(idx as u64);
-            let woken = wait_wake_event_set(idx, &mut nt_handler.events);
+            let woken = wait_wake_dispatcher_set(nt_handler);
             if PIPE_LISTEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
                 print_str(b"[pipe-listen] COMPLETE server fid=0x");
                 print_hex(l.server_file_id as u32);

@@ -579,6 +579,42 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
+    pub(crate) fn waitable_index_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        match self.event_index_for_handle(handle, required_access) {
+            Ok(index) => Ok(index),
+            Err(STATUS_OBJECT_TYPE_MISMATCH) => {
+                self.semaphore_index_for_handle(handle, required_access)
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    fn dispatcher_object(&self, index: usize) -> Option<nt_kernel_exec::DispatcherObject> {
+        match self.obj_ns.get(index).map(|entry| entry.kind) {
+            Some(2) => Some(nt_kernel_exec::DispatcherObject::Event(index as u64)),
+            Some(3) => Some(nt_kernel_exec::DispatcherObject::Semaphore(index as u64)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn dispatcher_ready(&self, index: usize) -> bool {
+        self.dispatcher_object(index).is_some_and(|object| {
+            nt_kernel_exec::dispatcher_ready(&self.events, &self.semaphores, object)
+        })
+    }
+
+    pub(crate) fn dispatcher_consume(&mut self, index: usize) -> bool {
+        let Some(object) = self.dispatcher_object(index) else {
+            return false;
+        };
+        nt_kernel_exec::consume_dispatcher(&mut self.events, &mut self.semaphores, object)
+    }
+
     pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
             return false;
@@ -4002,7 +4038,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         if !previous {
                             // SAFETY: native dispatch is serialized; event transition and waiter
                             // selection remain in this executive turn.
-                            unsafe { wait_wake_event_pulse(index, &mut self.events) };
+                            unsafe { wait_wake_dispatcher_pulse(index, self) };
                         }
                         if previous {
                             let _ = self.events.reset_existing(index as u64);
@@ -4113,7 +4149,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                         // SAFETY: native dispatch is serialized; the signal and waiter selection
                         // are one executive transition.
                         if !previous {
-                            unsafe { wait_wake_event_set(index, &mut self.events) };
+                            unsafe { wait_wake_dispatcher_set(self) };
                         }
                         0
                     }
@@ -4386,6 +4422,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Err(nt_kernel_exec::SemaphoreError::LimitExceeded) => return 0xC000_0047,
                     Err(nt_kernel_exec::SemaphoreError::NotFound) => return 0xC000_0008,
                 };
+                unsafe {
+                    wait_wake_dispatcher_set(self);
+                }
                 if previous_count != 0
                     && !unsafe { self.xas_write_u32(previous_count, previous as u32) }
                 {
@@ -4737,19 +4776,19 @@ impl NativeSyscallHandler for ExecNtHandler {
             // parking one of those would hang since nothing sets it). csrss (pi==1) stays immediate.
             NativeService::NtWaitForSingleObject => {
                 let handle = args[0];
-                match self.event_index_for_handle(handle, SYNCHRONIZE_ACCESS) {
+                match self.waitable_index_for_handle(handle, SYNCHRONIZE_ACCESS) {
                     Ok(idx) => {
-                        if self.events.read_state(idx as u64) {
+                        if self.dispatcher_ready(idx) {
                                 unsafe {
                                     print_str(b"[wait] pi=");
                                     print_u64(self.pi as u64);
-                                    print_str(b" NtWaitForSingleObject(event #");
+                                    print_str(b" NtWaitForSingleObject(dispatcher #");
                                     print_u64(idx as u64);
                                     print_str(b" '");
                                     for &c in self.obj_ns[idx].name() { debug_put_char(c); }
                                     print_str(b"') already SIGNALLED -> immediate WAIT_0\n");
                                 }
-                                self.events.consume_existing(idx as u64);
+                                self.dispatcher_consume(idx);
                                 return 0;
                         }
                         let timeout_ptr = args[2];
@@ -4766,12 +4805,12 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 }
                             }
                         }
-                            // Unsignaled real event → ask the loop to PARK this caller on it.
+                            // Unsignaled dispatcher object → ask the loop to park this caller on it.
                             self.wait_park_event = idx as i64;
                             unsafe {
                                 print_str(b"[wait] pi=");
                                 print_u64(self.pi as u64);
-                                print_str(b" NtWaitForSingleObject(event #");
+                                print_str(b" NtWaitForSingleObject(dispatcher #");
                                 print_u64(idx as u64);
                                 print_str(b" '");
                                 for &c in self.obj_ns[idx].name() { debug_put_char(c); }
