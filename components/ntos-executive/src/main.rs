@@ -495,6 +495,10 @@ pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
 pub const SSN_NT_CLEAR_EVENT: u64 = 26;
+pub const SSN_NT_PULSE_EVENT: u64 = 144;
+pub const SSN_NT_QUERY_EVENT: u64 = 155;
+pub const SSN_NT_RESET_EVENT: u64 = 210;
+pub const SSN_NT_SET_EVENT: u64 = 228;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 // NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
 pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
@@ -538,7 +542,7 @@ pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// post-loop self-test. NtOpenProcess (128) stays a handler METHOD until a live caller appears.
 pub const SSN_NT_TERMINATE_PROCESS: u64 = 266;
 pub const SSN_NT_TERMINATE_THREAD: u64 = 267;
-/// A distinctive fake handle we hand back for objects we don't yet model (ports, events, …), so it
+/// A distinctive fake handle we hand back for objects we don't yet model (ports, sections, ...), so it
 /// is recognisable in traces and never collides with a real (small) handle index.
 pub const FAKE_HANDLE: u64 = 0x5A5A_0001;
 /// ntdll's NtOpenDirectoryObject SSN (SmpInit opens \?? for DosDevices; served by the object ns).
@@ -977,16 +981,20 @@ static WAIT_REPLY_POOL_USED: AtomicU64 = AtomicU64::new(0);
 /// (it doubles as event[0]). Fixed-capacity; parking past capacity falls back to the immediate-return
 /// path (documented, never a hang).
 const WAITER_N: usize = 16;
-/// Max events a single multi-object waiter can wait on (NT MAXIMUM_WAIT_OBJECTS is 64; rpcrt4's
-/// np/sock server wait arrays are small — mgr_event + a handful of listen events — so 8 is ample and
-/// keeps the .bss table compact). Waits with more objects fall back to the immediate path.
-const WAITER_MAX_EVENTS: usize = 8;
+/// NT's architectural maximum for one multi-object wait.
+const WAITER_MAX_EVENTS: usize = 64;
 /// event[0] of each waiter's set (u32::MAX = free slot). Kept as the slot-free sentinel for backward
 /// compat with the single-object callers/spec.
 static WAITER_EVENT_IDX: [AtomicU64; WAITER_N] = [const { AtomicU64::new(u64::MAX) }; WAITER_N];
 /// The FULL event set for a multi-object waiter (event[1..count]; event[0] is WAITER_EVENT_IDX).
 static WAITER_EVENTS: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
     [const { [const { AtomicU64::new(u64::MAX) }; WAITER_MAX_EVENTS] }; WAITER_N];
+/// Original caller-array index for each compacted real event.
+static WAITER_RESULT_INDEX: [[AtomicU64; WAITER_MAX_EVENTS]; WAITER_N] =
+    [const { [const { AtomicU64::new(0) }; WAITER_MAX_EVENTS] }; WAITER_N];
+/// Serialized service-loop work buffers, kept off the bounded rootserver stack.
+static mut PARK_WAIT_SET_WORK: [usize; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS];
+static mut PARK_WAIT_INDEX_WORK: [u8; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS];
 /// Number of events in this waiter's set (1 for a single-object wait).
 static WAITER_EVENT_COUNT: [AtomicU64; WAITER_N] = [const { AtomicU64::new(0) }; WAITER_N];
 /// Wait mode: 0 = WaitAny (WAIT_TYPE WaitAnyObject — wake on the first signalled event, return its
@@ -1705,16 +1713,16 @@ static WL_LISTENER_TEB_QUERIED: AtomicU64 = AtomicU64::new(0);
 /// Kept off the bounded rootserver stack — this array as a local plus service_sec_image's other
 /// arrays would risk the guard page. In `.bss`, so growth to MAX_PI is free (no stack cost).
 /// Zeroed at service_sec_image entry; only that single loop touches it.
-static mut PFILLED: [[u64; 256]; MAX_PI] = [[0u64; 256]; MAX_PI];
+static mut PFILLED: [[u64; 512]; MAX_PI] = [[0u64; 512]; MAX_PI];
 /// SERVICE 10 stack relief: the per-iteration `filled_pages` WORKING buffer (loaded from / saved to
 /// `PFILLED[pi]` around each dispatch) lives in a static, not on the rootserver stack. Adding a
 /// 5th hosted process pushed `service_sec_image`'s frame — its `[u64;256]` working array plus the
 /// ~20 DLL-PE locals — over the stack guard on the DEEP FS-walk call chain (fat_open_path →
 /// dir_find_lfn), corrupting that loop's cluster variable → an infinite FAT cluster-chain spin
 /// (100% CPU, no panic). Single-threaded executive → one active pi per iteration → one shared buffer
-/// is safe. Removing this 2 KiB from the frame keeps the boot within the 4-page stack (no kernel
+/// is safe. Removing this 4 KiB from the frame keeps the boot within the 4-page stack (no kernel
 /// change → sel4test byte-identical).
-static mut FILLED_WORK: [u64; 256] = [0u64; 256];
+static mut FILLED_WORK: [u64; 512] = [0u64; 512];
 
 fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, Ordering::Relaxed)
@@ -2887,7 +2895,7 @@ unsafe fn wait_park(
     deadline: Option<u64>,
 ) -> bool {
     // Single-object wait = a 1-event WaitAny set.
-    wait_park_multi(&[event_idx], false, resume_ip, sp, flags, tid, deadline)
+    wait_park_multi(&[event_idx], &[0], false, resume_ip, sp, flags, tid, deadline)
 }
 
 unsafe fn wait_cancel_thread(tid: u64) {
@@ -3217,6 +3225,7 @@ unsafe fn terminate_hosted_thread_mechanism(
 /// WAITER_MAX_EVENTS`) → the caller must then fall back to an immediate reply (never a hang).
 unsafe fn wait_park_multi(
     events: &[usize],
+    result_indices: &[u8],
     wait_all: bool,
     resume_ip: u64,
     sp: u64,
@@ -3224,7 +3233,10 @@ unsafe fn wait_park_multi(
     tid: u64,
     deadline: Option<u64>,
 ) -> bool {
-    if events.is_empty() || events.len() > WAITER_MAX_EVENTS {
+    if events.is_empty()
+        || events.len() > WAITER_MAX_EVENTS
+        || result_indices.len() != events.len()
+    {
         return false;
     }
     // Find a free waiter slot.
@@ -3265,6 +3277,7 @@ unsafe fn wait_park_multi(
     // the active recv reply cap.
     for (k, &ev) in events.iter().enumerate() {
         WAITER_EVENTS[wslot][k].store(ev as u64, Ordering::Relaxed);
+        WAITER_RESULT_INDEX[wslot][k].store(result_indices[k] as u64, Ordering::Relaxed);
     }
     for k in events.len()..WAITER_MAX_EVENTS {
         WAITER_EVENTS[wslot][k].store(u64::MAX, Ordering::Relaxed);
@@ -3286,13 +3299,20 @@ unsafe fn wait_park_multi(
     true
 }
 
-/// WAKE every waiter whose wait condition is now satisfied, given the obj_ns event table. `just_set`
-/// is the event index just signalled (drives WaitAny index selection). AUTO-RESET events consumed by
-/// a wake have their `signalled` flag cleared (NT auto-reset semantics — e.g. rpcrt4's mgr_event /
-/// server_ready_event). Returns the number woken. Called from the NtSetEvent handler after setting the
-/// event's `signalled` flag.
+/// WAKE every waiter whose condition is now satisfied. AUTO-RESET events consumed by the first
+/// matching wake are cleared before later waiters are considered, so synchronization events wake
+/// one waiter while notification events wake all. Returns the number woken.
 unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
-    let mut woken = 0u64;
+    wait_wake_event(just_set, events, false)
+}
+
+/// Pulse uses the same waiter selection, but clears the event before any parked thread resumes.
+unsafe fn wait_wake_event_pulse(just_set: usize, events: &mut EventStore) -> u64 {
+    wait_wake_event(just_set, events, true)
+}
+
+unsafe fn wait_wake_event(just_set: usize, events: &mut EventStore, pulse: bool) -> u64 {
+    let mut wake_indices = [u64::MAX; WAITER_N];
     for i in 0..WAITER_N {
         let slot_ev0 = WAITER_EVENT_IDX[i].load(Ordering::Relaxed);
         if slot_ev0 == u64::MAX {
@@ -3306,6 +3326,7 @@ unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
         // Does this waiter's condition hold, and if WaitAny, which index fired?
         let mut wake = false;
         let mut wake_index = 0u64;
+        let mut selected_slot = 0usize;
         if wait_all {
             // Wake only when ALL events in the set are signalled.
             let mut all = true;
@@ -3319,13 +3340,13 @@ unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
             wake = all;
             wake_index = 0; // WaitAll returns WAIT_OBJECT_0
         } else {
-            // WaitAny: the first (lowest-index) signalled event determines the return value. `just_set`
-            // is guaranteed signalled; prefer the lowest index in the set that is signalled.
+            // WaitAny: the first (lowest-index) signalled event determines the return value.
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let ev = WAITER_EVENTS[i][k].load(Ordering::Relaxed) as usize;
-                if ev == just_set || events.read_state(ev as u64) {
+                if events.read_state(ev as u64) {
                     wake = true;
-                    wake_index = k as u64;
+                    selected_slot = k;
+                    wake_index = WAITER_RESULT_INDEX[i][k].load(Ordering::Relaxed);
                     break;
                 }
             }
@@ -3341,8 +3362,21 @@ unsafe fn wait_wake_event_set(just_set: usize, events: &mut EventStore) -> u64 {
                 events.consume_existing(ev as u64);
             }
         } else {
-            let ev = WAITER_EVENTS[i][wake_index as usize].load(Ordering::Relaxed) as usize;
+            let ev = WAITER_EVENTS[i][selected_slot].load(Ordering::Relaxed) as usize;
             events.consume_existing(ev as u64);
+        }
+        wake_indices[i] = wake_index;
+    }
+
+    if pulse {
+        let _ = events.reset_existing(just_set as u64);
+    }
+
+    let mut woken = 0u64;
+    for i in 0..WAITER_N {
+        let wake_index = wake_indices[i];
+        if wake_index == u64::MAX {
+            continue;
         }
         let cap = WAITER_REPLY_CAP[i].load(Ordering::Relaxed);
         if cap != 0 {
@@ -4061,6 +4095,7 @@ const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
 /// for win32k and cross-process compatibility.
 const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
 const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
@@ -4187,7 +4222,7 @@ struct ExecLoopCtx {
     lsass_pe: *const Option<nt_pe_loader::PeFile<'static>>,
     /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
     /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
-    filled_pages: *mut [u64; 256],
+    filled_pages: *mut [u64; 512],
     faults: *mut u64,
     /// The faulting image's persistent executive scratch base (smss's), and the two images
     /// NtQueryDefaultLocale may demand-fill from (the main image `pe` at PE_LOAD_BASE up to
@@ -4570,6 +4605,10 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),
             (NativeService::NtCreateEvent, SSN_NT_CREATE_EVENT as u32),
             (NativeService::NtClearEvent, SSN_NT_CLEAR_EVENT as u32),
+            (NativeService::NtPulseEvent, SSN_NT_PULSE_EVENT as u32),
+            (NativeService::NtQueryEvent, SSN_NT_QUERY_EVENT as u32),
+            (NativeService::NtResetEvent, SSN_NT_RESET_EVENT as u32),
+            (NativeService::NtSetEvent, SSN_NT_SET_EVENT as u32),
             (NativeService::NtOpenEvent, SSN_NT_OPEN_EVENT as u32),
             (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).

@@ -317,7 +317,6 @@ fn group_a_services_register_with_register_only_bounds() {
     let pairs = [
         (NativeService::NtCreatePort, 48u32),
         (NativeService::NtCreateThread, 55),
-        (NativeService::NtCreateEvent, 37),
         (NativeService::NtOpenProcessToken, 129),
         (NativeService::NtMakeTemporaryObject, 110),
         (NativeService::NtFreeVirtualMemory, 87),
@@ -347,15 +346,39 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
-fn clear_event_uses_the_native_single_argument_contract() {
+fn event_family_uses_native_numbers_and_argument_contracts() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,
-        &[(NativeService::NtClearEvent, 26)],
+        &[
+            (NativeService::NtClearEvent, 26),
+            (NativeService::NtCreateEvent, 37),
+            (NativeService::NtOpenEvent, 120),
+            (NativeService::NtPulseEvent, 144),
+            (NativeService::NtQueryEvent, 155),
+            (NativeService::NtResetEvent, 210),
+            (NativeService::NtSetEvent, 228),
+        ],
     );
-    let entry = table.lookup(26).unwrap();
-    assert_eq!(entry.service, NativeService::NtClearEvent);
-    assert_eq!((entry.min_args, entry.max_args), (1, 1));
+    for (service, ssn) in [
+        (NativeService::NtClearEvent, 26),
+        (NativeService::NtCreateEvent, 37),
+        (NativeService::NtOpenEvent, 120),
+        (NativeService::NtPulseEvent, 144),
+        (NativeService::NtQueryEvent, 155),
+        (NativeService::NtResetEvent, 210),
+        (NativeService::NtSetEvent, 228),
+    ] {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+    }
+    assert_eq!(NativeService::NtClearEvent.arg_count(), (1, 1));
+    assert_eq!(NativeService::NtPulseEvent.arg_count(), (2, 2));
+    assert_eq!(NativeService::NtQueryEvent.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtResetEvent.arg_count(), (2, 2));
+    assert_eq!(NativeService::NtSetEvent.arg_count(), (2, 2));
+    assert_eq!(NativeService::NtCreateEvent.arg_count(), (5, 5));
+    assert_eq!(NativeService::NtOpenEvent.arg_count(), (3, 3));
     assert_eq!(NativeService::NtClearEvent.name(), "NtClearEvent");
+    assert_eq!(NativeService::NtQueryEvent.name(), "NtQueryEvent");
 }
 
 #[test]

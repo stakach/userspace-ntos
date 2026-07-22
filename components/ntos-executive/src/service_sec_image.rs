@@ -32,7 +32,7 @@ unsafe fn seed_winlogon_thread_client_info(teb_alias: u64, pml4: u64) -> Option<
 
 unsafe fn observe_winlogon_completed_dispatch(
     dispatch: win32k_glue::CompletedWin32kDispatch,
-    filled_pages: &mut [u64; 256],
+    filled_pages: &mut [u64; 512],
     faults: usize,
     scratch_base: u64,
 ) {
@@ -219,10 +219,10 @@ pub(crate) unsafe fn service_sec_image(
     // page VA filled at each fault index → its persistent executive scratch is
     // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
     // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
-    // Working buffer for the current pi's demand-filled page VAs — a STATIC (not a 2 KiB stack local)
+    // Working buffer for the current pi's demand-filled page VAs — a STATIC (not a 4 KiB stack local)
     // so the 5th hosted process doesn't pressure the rootserver stack on the deep FS-walk call
     // chain (see FILLED_WORK). Loaded from / saved to `pfilled[pi]` around each dispatch below.
-    let filled_pages: &mut [u64; 256] = &mut *core::ptr::addr_of_mut!(FILLED_WORK);
+    let filled_pages: &mut [u64; 512] = &mut *core::ptr::addr_of_mut!(FILLED_WORK);
     // DIAG ring buffer of the last serviced SSNs, to locate the silent 0x80000005.
     let mut ssn_ring = [0u16; 32];
     let mut ssn_ring_badge = [0u8; 32];
@@ -452,11 +452,11 @@ pub(crate) unsafe fn service_sec_image(
     procs[0].pml4 = pml4;
     procs[0].scratch_base = scratch_base;
     procs[0].img_end = img_end;
-    // Per-process demand-fill bookkeeping — kept in a `static mut` (3×2 KiB) rather than on the
-    // bounded rootserver stack (a [[u64;256];3] local + the loop's other arrays would risk the guard
+    // Per-process demand-fill bookkeeping is kept in static storage rather than on the bounded
+    // rootserver stack (a local copy plus the loop's other arrays would risk the guard
     // page — the recurring stack-array-overflow hazard). service_sec_image runs once for the live
     // run; zero it at entry so the demo call (ntdll=None) starts clean too.
-    let pfilled: &mut [[u64; 256]; MAX_PI] = &mut *core::ptr::addr_of_mut!(PFILLED);
+    let pfilled: &mut [[u64; 512]; MAX_PI] = &mut *core::ptr::addr_of_mut!(PFILLED);
     for p in pfilled.iter_mut() {
         for e in p.iter_mut() {
             *e = 0;
@@ -1587,7 +1587,7 @@ pub(crate) unsafe fn service_sec_image(
             // The per-page body below is IDENTICAL for both — it just walks a wider window. `eager_mark`
             // makes this run exactly ONCE per (pi, image), so the whole-image pass is O(pages), not
             // O(pages^2): we start from `base`, and each page's mapped-state is checked via the scalable
-            // (pi,page) frame map / shared cache — NOT the 256-entry `filled_pages` linear scan.
+            // (pi,page) frame map / shared cache — not the bounded `filled_pages` linear scan.
             let do_eager = img_hi > base && !eager_done(pi as u64, base);
             let (batch_start, batch_pages) = if do_eager {
                 eager_mark(pi as u64, base);
@@ -1972,7 +1972,8 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_wait_event: i64 = -1;
             // Array-wait park (NtWaitForMultipleObjects): the resolved obj_ns event set + WaitAll flag.
             // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
-            let mut park_wait_set = [0usize; 8];
+            let park_wait_set = &mut *core::ptr::addr_of_mut!(PARK_WAIT_SET_WORK);
+            let park_wait_indices = &mut *core::ptr::addr_of_mut!(PARK_WAIT_INDEX_WORK);
             let mut park_wait_set_n: usize = 0;
             let mut park_wait_set_all = false;
             let mut park_wait_deadline: Option<u64> = None;
@@ -2068,7 +2069,7 @@ pub(crate) unsafe fn service_sec_image(
                     lsass_file_handle: &mut lsass_file_handle as *mut u64,
                     lsass_section_handle: &mut lsass_section_handle as *mut u64,
                     lsass_pe: &lsass_pe as *const Option<nt_pe_loader::PeFile<'static>>,
-                    filled_pages: filled_pages as *mut [u64; 256],
+                    filled_pages: filled_pages as *mut [u64; 512],
                     faults: &mut faults as *mut u64,
                     scratch_base,
                     // Erase the non-'static lifetime through a thin `*const ()` (the image bytes are
@@ -2888,6 +2889,7 @@ pub(crate) unsafe fn service_sec_image(
                             ntdll.map(|(_, p)| p),
                             &reg,
                             &dll_pes,
+                            &mut nt_handler,
                         )
                     } else {
                         print_str(b"[csr-rdv] no real CSR thread -> modeled accept\n");
@@ -2951,52 +2953,6 @@ pub(crate) unsafe fn service_sec_image(
                 // returns and csrss.exe's main continues. (One-time; NtRaiseHardError already routes to
                 // our diagnostic path.)
                 result = 0; // STATUS_SUCCESS
-            } else if m0 == 228 {
-                // NtSetEvent(EventHandle=R10, *PreviousState=RDX).
-                // If the handle names a real executive event, including a typed anonymous event,
-                // SET its `signalled` flag and WAKE every waiter parked on it (reply-cap park). This is
-                // the signaler half — e.g. lsass' LsarStartRpcServer SetEvent(LSA_RPC_SERVER_ACTIVE)
-                // wakes winlogon's WaitForLsass. Handles that aren't real events (smss subsystem/session
-                // events, rpcrt4 fakes) are accepted as a SUCCESS no-op (nothing parks on them).
-                let ev_handle = get_recv_mr(9); // R10 = EventHandle
-                match nt_handler.event_index_for_handle(ev_handle, EVENT_MODIFY_STATE) {
-                    Ok(idx) => {
-                        let previous = nt_handler.events.set_existing(idx as u64).unwrap_or(false);
-                        if m3 != 0 {
-                            smss_stack_write32(m3, previous as u32);
-                        }
-                        let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                        if trace < 32 {
-                            print_str(b"[event] set pi=");
-                            print_u64(pi as u64);
-                            print_str(b" badge=");
-                            print_u64(badge);
-                            print_str(b" h=0x");
-                            print_hex_u64(ev_handle);
-                            print_str(b" obj=");
-                            print_u64(idx as u64);
-                            print_str(if previous { b" previous=1\n" } else { b" previous=0\n" });
-                        }
-                        if nt_handler.obj_ns[idx].name() == b"lsa_rpc_server_active" {
-                            LSA_RPC_SERVER_ACTIVE_SIGNALLED.store(1, Ordering::Relaxed);
-                            print_str(b"[wait] lsass SIGNALLED LSA_RPC_SERVER_ACTIVE (event #");
-                            print_u64(idx as u64);
-                            print_str(b")\n");
-                        }
-                        // Wake any parked waiter whose condition is now satisfied (WaitAny/WaitAll over
-                        // its event set). Auto-reset events consumed by a wake are cleared inside.
-                        let woken = wait_wake_event_set(idx, &mut nt_handler.events);
-                        if woken > 0 {
-                            print_str(b"[wait] NtSetEvent(event #");
-                            print_u64(idx as u64);
-                            print_str(b") -> WOKE ");
-                            print_u64(woken);
-                            print_str(b" parked waiter(s)\n");
-                        }
-                        result = 0;
-                    }
-                    Err(status) => result = status as u64,
-                }
             } else if m0 == 45 {
                 // NtCreateMutant(MutantHandle=R10, DesiredAccess=RDX, ObjectAttributes=R8,
                 // InitialOwner=R9). rpcrt4's ncacn_np server init (StartRpcServer) creates sync
@@ -3007,19 +2963,6 @@ pub(crate) unsafe fn service_sec_image(
                     smss_stack_write(out, FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed));
                 }
                 result = 0;
-            } else if m0 == 210 {
-                // NtResetEvent(EventHandle=R10, *PreviousState=RDX).
-                let ev_handle = get_recv_mr(9);
-                match nt_handler.event_index_for_handle(ev_handle, EVENT_MODIFY_STATE) {
-                    Ok(idx) => {
-                        let previous = nt_handler.events.reset_existing(idx as u64).unwrap_or(false);
-                        if m3 != 0 {
-                            smss_stack_write32(m3, previous as u32);
-                        }
-                        result = 0;
-                    }
-                    Err(status) => result = status as u64,
-                }
             } else if m0 == 196 || m0 == 197 {
                 // NtReleaseMutant(196) / NtReleaseSemaphore(197) — legacy modeled objects.
                 result = 0;
@@ -3041,15 +2984,23 @@ pub(crate) unsafe fn service_sec_image(
                 let harr = m3; // RDX = HandleArray
                 let wait_type = get_recv_mr(7); // R8 = WaitType (1=Any, 0=All)
                 let wait_all = wait_type == 0;
-                let mut events = [0usize; 8];
                 let mut nev = 0usize;
                 let mut any_signalled_idx: i64 = -1; // handle-array index (k) of the first signalled
                 let mut any_signalled_obj: usize = 0; // obj_ns idx of that event (for auto-reset)
+                let mut any_signalled_real = false;
                 let mut all_signalled = true;
                 let mut has_real_event = false;
-                let mut wait_error: Option<u32> = None;
+                let mut wait_error: Option<u32> = if harr == 0
+                    || count == 0
+                    || count > WAITER_MAX_EVENTS
+                    || wait_type > 1
+                {
+                    Some(0xC000_000D) // STATUS_INVALID_PARAMETER
+                } else {
+                    None
+                };
                 let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
-                if harr != 0 && count > 0 && count <= 64 {
+                if wait_error.is_none() {
                     for k in 0..count {
                         let h = smss_stack_read(harr + (k as u64) * 8);
                         match nt_handler.event_index_for_handle(h, SYNCHRONIZE_ACCESS) {
@@ -3060,14 +3011,14 @@ pub(crate) unsafe fn service_sec_image(
                                         print_str(b" -> obj="); print_u64(idx as u64); print_str(b"\n");
                                     }
                                     has_real_event = true;
-                                    if nev < 8 {
-                                        events[nev] = idx;
-                                        nev += 1;
-                                    }
+                                    park_wait_set[nev] = idx;
+                                    park_wait_indices[nev] = k as u8;
+                                    nev += 1;
                                     if nt_handler.events.read_state(idx as u64) {
                                         if any_signalled_idx < 0 {
                                             any_signalled_idx = k as i64;
                                             any_signalled_obj = idx;
+                                            any_signalled_real = true;
                                         }
                                     } else {
                                         all_signalled = false;
@@ -3079,6 +3030,11 @@ pub(crate) unsafe fn service_sec_image(
                                     print_str(b"[event] wait-item k="); print_u64(k as u64);
                                     print_str(b" h=0x"); print_hex_u64(h);
                                     print_str(b" -> legacy\n");
+                                }
+                                // Compatibility sync handles are modeled as permanently signaled.
+                                // Preserve their original array position for WaitAny.
+                                if any_signalled_idx < 0 {
+                                    any_signalled_idx = k as i64;
                                 }
                             }
                             Err(status) => {
@@ -3126,12 +3082,11 @@ pub(crate) unsafe fn service_sec_image(
                     result = status as u64;
                 } else if wait_all {
                     if has_real_event && all_signalled {
-                        for k in 0..nev { nt_handler.events.consume_existing(events[k] as u64); }
+                        for k in 0..nev { nt_handler.events.consume_existing(park_wait_set[k] as u64); }
                         result = 0; // WAIT_0 (all satisfied)
                     } else if zero_timeout {
                         result = 0x102;
-                    } else if has_real_event && nev <= 8 {
-                        park_wait_set[..nev].copy_from_slice(&events[..nev]);
+                    } else if has_real_event {
                         park_wait_set_n = nev;
                         park_wait_set_all = true;
                         park_wait_deadline = finite_deadline;
@@ -3142,12 +3097,13 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     // WaitAny
                     if any_signalled_idx >= 0 {
-                        nt_handler.events.consume_existing(any_signalled_obj as u64);
+                        if any_signalled_real {
+                            nt_handler.events.consume_existing(any_signalled_obj as u64);
+                        }
                         result = any_signalled_idx as u64; // WAIT_OBJECT_0 + index
                     } else if zero_timeout {
                         result = 0x102;
-                    } else if has_real_event && nev <= 8 {
-                        park_wait_set[..nev].copy_from_slice(&events[..nev]);
+                    } else if has_real_event {
                         park_wait_set_n = nev;
                         park_wait_set_all = false;
                         park_wait_deadline = finite_deadline;
@@ -4378,6 +4334,7 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if wait_park_multi(
                     &park_wait_set[..park_wait_set_n],
+                    &park_wait_indices[..park_wait_set_n],
                     park_wait_set_all,
                     resume_ip,
                     sp,
@@ -5294,7 +5251,7 @@ unsafe fn prefill_client_large_string_pages(
     descriptor_va: u64,
     scratch_base: u64,
     faults: &mut u64,
-    filled_pages: &mut [u64; 256],
+    filled_pages: &mut [u64; 512],
     reg: &nt_dll_registry::Registry,
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
 ) {

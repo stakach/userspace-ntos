@@ -116,6 +116,10 @@ pub enum NativeService {
     NtCreateThread,
     NtCreateEvent,
     NtClearEvent,
+    NtPulseEvent,
+    NtQueryEvent,
+    NtResetEvent,
+    NtSetEvent,
     // NtOpenEvent — open an existing named event in \BaseNamedObjects (CreateEventW's
     // ERROR_ALREADY_EXISTS fallback + OpenEventW). Resolved against the executive object namespace.
     NtOpenEvent,
@@ -239,6 +243,10 @@ impl NativeService {
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
             NtClearEvent => "NtClearEvent",
+            NtPulseEvent => "NtPulseEvent",
+            NtQueryEvent => "NtQueryEvent",
+            NtResetEvent => "NtResetEvent",
+            NtSetEvent => "NtSetEvent",
             NtOpenEvent => "NtOpenEvent",
             NtOpenEventPair => "NtOpenEventPair",
             NtCreateSemaphore => "NtCreateSemaphore",
@@ -288,16 +296,18 @@ impl NativeService {
             NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom | NtClearEvent => (1, 1),
             NtResumeProcess | NtSuspendProcess | NtSetUuidSeed => (1, 1),
             NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
-            | NtQueryDebugFilterState => (2, 2),
+            | NtQueryDebugFilterState | NtPulseEvent | NtResetEvent | NtSetEvent => (2, 2),
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
             | NtSetDebugFilterState | NtOpenEventPair | NtPlugPlayControl
-            | NtSetSystemPowerState => (3, 3),
+            | NtSetSystemPowerState | NtOpenEvent => (3, 3),
             NtGetPlugPlayEvent => (4, 4),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtCreateIoCompletion => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
-            | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion => (5, 5),
+            | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent => {
+                (5, 5)
+            }
             NtWaitForSingleObject => (3, 3),
             NtCreateKeyedEvent | NtReleaseKeyedEvent | NtWaitForKeyedEvent => (4, 4),
             NtQueryPerformanceCounter => (2, 2),
@@ -309,7 +319,7 @@ impl NativeService {
             NtQueryAttributesFile | NtQuerySection | NtQueryDefaultLocale | NtSetDefaultLocale
             | NtCreateProcess | NtOpenFile | NtCreateSection | NtMapViewOfSection => (0, 4),
             NtOpenDirectoryObject | NtCreateDirectoryObject | NtCreateSymbolicLinkObject
-            | NtOpenSymbolicLinkObject | NtOpenEvent => (0, 4),
+            | NtOpenSymbolicLinkObject => (0, 4),
             // NtQueryDirectoryObject(Handle, Buffer, Length, ReturnSingleEntry, RestartScan,
             // *Context, *ReturnLength): the handler reads out-ptrs via register/stack helpers → cap.
             NtQueryDirectoryObject => (0, 4),
@@ -321,7 +331,7 @@ impl NativeService {
             // Group-A services the executive handles by reading registers directly (out-handle in
             // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
             // (register-only, no stack-arg reads) to keep dispatch side-effect-free for them.
-            NtCreatePort | NtCreateThread | NtCreateEvent
+            NtCreatePort | NtCreateThread
             | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
             | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
             | NtFlushInstructionCache | NtAdjustPrivilegesToken
@@ -336,6 +346,7 @@ impl NativeService {
             // NtCreateSemaphore is a real 5-arg ntdll call. The executive currently mints an opaque
             // closable handle, but ntdll must be allowed to pass the InitialCount stack arg.
             NtCreateSemaphore => (5, 5),
+            NtCreateEvent => (5, 5),
             // The filesystem-control handler forwards all native buffer arguments to the FSD.
             NtFsControlFile => (10, 10),
             _ => (0, 16), // permissive for the rest in v0.1
@@ -440,6 +451,11 @@ impl NativeService {
         NativeService::NtQueryDefaultLocale,
         NativeService::NtSetDefaultLocale,
         NativeService::NtCreateProcess,
+        // Append new services so the deterministic Test profile retains every established number.
+        NativeService::NtPulseEvent,
+        NativeService::NtQueryEvent,
+        NativeService::NtResetEvent,
+        NativeService::NtSetEvent,
     ];
 }
 

@@ -31,7 +31,7 @@ mod work_item;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dpc::{DpcImportance, DpcQueue};
-pub use event::{EventKind, EventStore, WaitManyResult, WaitResult};
+pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use lookaside::{

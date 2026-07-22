@@ -643,6 +643,15 @@ pub(crate) unsafe fn csr_stack_write(va: u64, v: u64) {
         core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u64, v);
     }
 }
+/// Write a u32 to the CSR thread's stack, returning false for an invalid output pointer.
+pub(crate) unsafe fn csr_stack_write32(va: u64, v: u32) -> bool {
+    if va >= CSR_STACK_BASE && va + 4 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u32, v);
+        true
+    } else {
+        false
+    }
+}
 /// Write a u16 to the CSR thread's stack (for PORT_MESSAGE.Type@0x04).
 pub(crate) unsafe fn csr_stack_write16(va: u64, v: u16) {
     if va >= CSR_STACK_BASE && va + 2 <= CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 {
@@ -701,7 +710,7 @@ pub(crate) unsafe fn csr_fill_page(
 /// `CSR_FAULT_EP`/`REPLY_CSRLOOP` services the thread's real syscalls until `NtCompleteConnectPort`.
 /// The thread's pre-loop `CsrConnectToUser` is in-process (no syscalls; ClientThreadSetup is a stub
 /// returning TRUE, and CsrLocateThreadInProcess returns non-NULL since csrss registered its static
-/// threads at init → no spin). On the connection: NtSetEvent (signal hRequestEvent, no-op) →
+/// threads at init → no spin). On the connection: NtSetEvent (signal the real hRequestEvent) →
 /// NtReplyWaitReceivePort (drain the broker's pending connection + marshal the PORT_MESSAGE:
 /// Type=LPC_CONNECTION_REQUEST, ClientId = the self-connect CID so CsrLocateThreadByClientId matches a
 /// registered CSR_THREAD → CsrProcess=CsrRootProcess → AllowConnection=TRUE) → [NtMapViewOfSection of
@@ -730,6 +739,7 @@ pub(crate) unsafe fn csr_rendezvous(
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
     reg: &nt_dll_registry::Registry,
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    nt_handler: &mut ExecNtHandler,
 ) -> u64 {
     const SSN_SET_EVENT: u64 = 228;
     const SSN_MAP_VIEW: u64 = 113;
@@ -825,10 +835,38 @@ pub(crate) unsafe fn csr_rendezvous(
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let rdx = m3;
-            let result = 0u64;
+            let mut result = 0u64;
             let mut done = false;
             match ssn {
-                SSN_SET_EVENT => {} // NtSetEvent(hRequestEvent) — no-op success
+                SSN_SET_EVENT => {
+                    let event_handle = get_recv_mr(9); // R10
+                    if rdx != 0
+                        && (rdx & 3 != 0
+                            || rdx < CSR_STACK_BASE
+                            || rdx > CSR_STACK_BASE + CSR_STACK_FRAMES * 0x1000 - 4)
+                    {
+                        result = if rdx & 3 != 0 { 0x8000_0002 } else { 0xC000_0005 };
+                    } else {
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 1;
+                        result = match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
+                            Ok(index) => match nt_handler.events.set_existing(index as u64) {
+                                Some(previous) => {
+                                    if rdx != 0 {
+                                        let _ = csr_stack_write32(rdx, previous as u32);
+                                    }
+                                    if !previous {
+                                        wait_wake_event_set(index, &mut nt_handler.events);
+                                    }
+                                    0
+                                }
+                                None => 0xC000_0008, // STATUS_INVALID_HANDLE
+                            },
+                            Err(status) => status as u64,
+                        };
+                        nt_handler.pi = saved_pi;
+                    }
+                }
                 SSN_MAP_VIEW => {} // NtMapViewOfSection (CSR shared section into CsrRootProcess) — success
                 SSN_REPLY_WAIT_RECV => {
                     let recvmsg = get_recv_mr(8); // R9 = &ReceiveMsg.Header

@@ -896,15 +896,15 @@ pub(crate) unsafe fn client_copyin_mapped(
 pub(crate) unsafe fn csrss_out_write(
     va: u64,
     val: u64,
-    filled_pages: &mut [u64; 256],
+    filled_pages: &mut [u64; 512],
     faults: &mut u64,
     scratch_base: u64,
     reg: &nt_dll_registry::Registry,
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
     pml4: u64,
-) {
+) -> bool {
     if smss_copyout(va, &val.to_le_bytes()) {
-        return;
+        return true;
     }
     let page = va & !0xFFFu64;
     let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
@@ -927,6 +927,46 @@ pub(crate) unsafe fn csrss_out_write(
     }
     if let Some(m) = sva {
         core::ptr::write_volatile(m as *mut u64, val);
+        true
+    } else {
+        false
+    }
+}
+/// Write a 32-bit OUT-param through the same demand-fill path as [`csrss_out_write`].
+pub(crate) unsafe fn csrss_out_write32(
+    va: u64,
+    val: u32,
+    filled_pages: &mut [u64; 512],
+    faults: &mut u64,
+    scratch_base: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    pml4: u64,
+) -> bool {
+    if smss_copyout(va, &val.to_le_bytes()) {
+        return true;
+    }
+    let page = va & !0xFFFu64;
+    let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
+    if sva.is_none() && (*faults as usize) < filled_pages.len() {
+        if let Some((i, rva)) = reg.dll_for_page(page) {
+            if let Some(pe) = dll_pes[i].as_ref() {
+                let scratch = scratch_base + *faults * 0x1000;
+                let f = alloc_frame();
+                let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
+                let rights = fill_image_page(pe, rva, scratch);
+                let _ = page_map(copy_cap(f), page, rights, pml4);
+                filled_pages[*faults as usize] = page;
+                sva = Some(scratch + (va & 0xFFF));
+                *faults += 1;
+            }
+        }
+    }
+    if let Some(m) = sva {
+        core::ptr::write_volatile(m as *mut u32, val);
+        true
+    } else {
+        false
     }
 }
 /// Read a UTF-16LE UNICODE_STRING (given its byte Length + Buffer VA) from smss into a UTF-16

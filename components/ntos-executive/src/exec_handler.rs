@@ -22,9 +22,10 @@ fn boot_status_data_ptr() -> *mut u8 {
 
 fn boot_status_path_matches(name: &[u16]) -> bool {
     name.len() == EXEC_BOOT_STATUS_PATH.len()
-        && name.iter().zip(EXEC_BOOT_STATUS_PATH.iter()).all(|(&wide, &ascii)| {
-            wide <= 0x7F && (wide as u8).to_ascii_lowercase() == ascii
-        })
+        && name
+            .iter()
+            .zip(EXEC_BOOT_STATUS_PATH.iter())
+            .all(|(&wide, &ascii)| wide <= 0x7F && (wide as u8).to_ascii_lowercase() == ascii)
 }
 
 unsafe fn reset_boot_status_data() {
@@ -73,10 +74,10 @@ impl ExecNtHandler {
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
                 v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
-                // The standard top-level directories the object manager pre-creates. SmpInit opens
-                // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
-                // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
-                // Names are stored folded (lowercase), matching obj lookups.
+                                                  // The standard top-level directories the object manager pre-creates. SmpInit opens
+                                                  // \?? (DosDevices) + creates drive-letter symlinks in it; the rest exist so later
+                                                  // opens (\KnownDlls, \Device, \BaseNamedObjects, …) resolve rather than miss.
+                                                  // Names are stored folded (lowercase), matching obj lookups.
                 for d in [
                     b"??".as_slice(),
                     b"device",
@@ -216,10 +217,11 @@ impl ExecNtHandler {
                         let running = pm
                             .process(pid)
                             .is_some_and(|p| p.state == nt_process::ProcessState::Running);
-                        let cid_ok = pm.client_id(tid) == Some(nt_process::ClientId {
-                            unique_process: pid,
-                            unique_thread: tid,
-                        });
+                        let cid_ok = pm.client_id(tid)
+                            == Some(nt_process::ClientId {
+                                unique_process: pid,
+                                unique_thread: tid,
+                            });
                         if pm.main_thread(pid) == Some(tid) && running && cid_ok {
                             mt_ok |= 1 << i;
                         }
@@ -237,10 +239,7 @@ impl ExecNtHandler {
                 for (i, &pid) in pids.iter().enumerate() {
                     for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                         if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-                            let _ = pm.set_thread_state(
-                                tid,
-                                nt_process::ThreadState::Initialized,
-                            );
+                            let _ = pm.set_thread_state(tid, nt_process::ThreadState::Initialized);
                             PM_POOL_TID[i][slot].store(tid as u64, Ordering::Relaxed);
                         }
                     }
@@ -310,7 +309,10 @@ impl ExecNtHandler {
         // consumers (DLL registry) + pi-scoped scalar comparisons. Append-only (no_reuse) keeps
         // each value monotonic for the run so external bindings never see a recycled value.
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
-            if let Ok(h) = self.pm.insert_handle(pid, nt_process::HandleObject::Opaque(0), 0) {
+            if let Ok(h) = self
+                .pm
+                .insert_handle(pid, nt_process::HandleObject::Opaque(0), 0)
+            {
                 let c = self.pm.handle_count(pid) as u64;
                 if c > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
                     PM_HANDLE_PEAK.store(c, Ordering::Relaxed);
@@ -327,7 +329,8 @@ impl ExecNtHandler {
     /// Mint a process-local handle backed by a typed filesystem `FILE_OBJECT` identity.
     pub(crate) fn mint_file_handle(&mut self, file_id: u64, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self.pm
+        let handle = self
+            .pm
             .insert_handle(pid, nt_process::HandleObject::File(file_id), access)
             .ok()?;
         let count = self.pm.handle_count(pid) as u64;
@@ -432,11 +435,7 @@ impl ExecNtHandler {
         const FILE_APPEND_DATA: u32 = 0x0000_0004;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        self.boot_status_check_access(
-            handle,
-            FILE_WRITE_DATA | FILE_APPEND_DATA,
-            GENERIC_WRITE,
-        )?;
+        self.boot_status_check_access(handle, FILE_WRITE_DATA | FILE_APPEND_DATA, GENERIC_WRITE)?;
         if len != 0 && buffer == 0 {
             return Err(STATUS_ACCESS_VIOLATION);
         }
@@ -468,7 +467,11 @@ impl ExecNtHandler {
         let tag = EVENT_HANDLE_TAG | event_index as u64;
         let handle = self
             .pm
-            .insert_handle(pid, nt_process::HandleObject::Opaque(tag), access)
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::Opaque(tag),
+                nt_kernel_exec::map_event_access(access),
+            )
             .ok()?;
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
@@ -478,8 +481,7 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
-    /// Resolve either a legacy global named-event handle or a typed process-local anonymous-event
-    /// handle. Process-local handles enforce the access requested by the operation.
+    /// Resolve a typed process-local event handle and enforce the access requested by the operation.
     pub(crate) fn event_index_for_handle(
         &self,
         handle: u64,
@@ -487,20 +489,23 @@ impl ExecNtHandler {
     ) -> Result<usize, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
         if handle >= OBJ_HANDLE_BASE {
             let index = (handle - OBJ_HANDLE_BASE) as usize;
-            return self
-                .obj_ns
-                .get(index)
-                .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
-                .map(|_| index)
-                .ok_or(STATUS_INVALID_HANDLE);
+            return match self.obj_ns.get(index) {
+                Some(entry) if entry.kind != 2 => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                _ => Err(STATUS_INVALID_HANDLE),
+            };
         }
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
         let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::Opaque(tag))
-                if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG => tag,
-            _ => return Err(STATUS_INVALID_HANDLE),
+                if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
+            {
+                tag
+            }
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(STATUS_INVALID_HANDLE),
         };
         let granted = self
             .pm
@@ -518,7 +523,9 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn is_legacy_opaque_handle(&self, handle: u64) -> bool {
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else { return false };
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            return false;
+        };
         matches!(
             self.pm.lookup_handle(pid, handle as nt_process::Handle),
             Some(nt_process::HandleObject::Opaque(0))
@@ -526,8 +533,13 @@ impl ExecNtHandler {
     }
     pub(crate) fn mint_io_completion_handle(&mut self, object_id: u32, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let handle = self.pm
-            .insert_handle(pid, nt_process::HandleObject::IoCompletion(object_id), access)
+        let handle = self
+            .pm
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::IoCompletion(object_id),
+                access,
+            )
             .ok()?;
         let count = self.pm.handle_count(pid) as u64;
         if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
@@ -538,7 +550,9 @@ impl ExecNtHandler {
     }
     fn io_completion_id_for(&self, handle: u64, required_access: u32) -> Result<u32, u32> {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        let pid = self.pm_pid_for_pi(self.pi).ok_or(nt_io_completion::STATUS_INVALID_HANDLE)?;
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_io_completion::STATUS_INVALID_HANDLE)?;
         let object_id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::IoCompletion(object_id)) => object_id,
             _ => return Err(nt_io_completion::STATUS_INVALID_HANDLE),
@@ -595,19 +609,20 @@ impl ExecNtHandler {
                 nt_process::ThreadState::Running
             },
         );
-        let h = match self
-            .pm
-            .insert_handle(pid, nt_process::HandleObject::Thread(t), desired_access)
-        {
-            Ok(handle) => handle,
-            Err(_) => {
-                let _ = self
-                    .pm
-                    .set_thread_state(t, nt_process::ThreadState::Initialized);
-                used.fetch_and(!(1 << slot), Ordering::Relaxed);
-                return None;
-            }
-        };
+        let h =
+            match self
+                .pm
+                .insert_handle(pid, nt_process::HandleObject::Thread(t), desired_access)
+            {
+                Ok(handle) => handle,
+                Err(_) => {
+                    let _ = self
+                        .pm
+                        .set_thread_state(t, nt_process::ThreadState::Initialized);
+                    used.fetch_and(!(1 << slot), Ordering::Relaxed);
+                    return None;
+                }
+            };
         if create_suspended {
             PM_POOL_SUSPENDED[self.pi].fetch_or(1 << slot, Ordering::Relaxed);
         } else {
@@ -622,7 +637,11 @@ impl ExecNtHandler {
     /// at boot for the non-leaking heap solution; this alloc-free field write completes it).
     pub(crate) fn bind_main_thread_entry(&mut self, pi: usize, entry: u64) {
         if let Some(tid) = PM_TIDS.get(pi).map(|t| t.load(Ordering::Relaxed)) {
-            if tid != 0 && self.pm.set_thread_start_address(tid as nt_process::ThreadId, entry) {
+            if tid != 0
+                && self
+                    .pm
+                    .set_thread_start_address(tid as nt_process::ThreadId, entry)
+            {
                 PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -634,8 +653,8 @@ impl ExecNtHandler {
     pub(crate) fn nt_open_process(&mut self, target_pid: nt_process::ProcessId) -> Option<u64> {
         let opener = self.pm_pid_for_pi(self.pi)?;
         self.pm.process(target_pid)?; // target must exist
-        // Path 1b: the returned VALUE is the opener's process-local dense handle for the typed
-        // Process(target_pid) object — so a later value→object lookup resolves the real EPROCESS.
+                                      // Path 1b: the returned VALUE is the opener's process-local dense handle for the typed
+                                      // Process(target_pid) object — so a later value→object lookup resolves the real EPROCESS.
         let h = self
             .pm
             .insert_handle(opener, nt_process::HandleObject::Process(target_pid), 0)
@@ -666,6 +685,25 @@ impl ExecNtHandler {
         if self.out_writes_n < self.out_writes.len() {
             self.out_writes[self.out_writes_n] = (ptr, val);
             self.out_writes_n += 1;
+        }
+    }
+
+    fn remember_csrss_event_handle(&mut self, handle: u64) {
+        if self.pi != 1 {
+            return;
+        }
+        if self.csrss_event_n < self.csrss_event_handles.len() {
+            self.csrss_event_handles[self.csrss_event_n] = handle;
+        } else {
+            self.csrss_event_handles[0] = self.csrss_event_handles[1];
+            self.csrss_event_handles[1] = handle;
+        }
+        self.csrss_event_n += 1;
+    }
+
+    fn close_current_handle(&mut self, handle: u64) {
+        if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+            let _ = self.pm.close_handle(pid, handle as nt_process::Handle);
         }
     }
     /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
@@ -774,16 +812,127 @@ impl ExecNtHandler {
     /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
     /// [`csrss_out_write`] (mirror → already-faulted page's scratch alias → demand-fill from the DLL
     /// PE). No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
-    pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) {
+    pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
         if let Some(ctx) = self.loop_ctx {
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
             let dll_pes = ctx.dll_pes();
-            csrss_out_write(va, val, filled_pages, faults, ctx.scratch_base, reg, dll_pes, ctx.pml4);
+            csrss_out_write(
+                va,
+                val,
+                filled_pages,
+                faults,
+                ctx.scratch_base,
+                reg,
+                dll_pes,
+                ctx.pml4,
+            )
         } else {
-            smss_copyout(va, &val.to_le_bytes());
+            smss_copyout(va, &val.to_le_bytes())
         }
+    }
+
+    /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
+    pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
+        if let Some(ctx) = self.loop_ctx {
+            let filled_pages = &mut *ctx.filled_pages;
+            let faults = &mut *ctx.faults;
+            let reg = &*ctx.reg;
+            let dll_pes = ctx.dll_pes();
+            csrss_out_write32(
+                va,
+                val,
+                filled_pages,
+                faults,
+                ctx.scratch_base,
+                reg,
+                dll_pes,
+                ctx.pml4,
+            )
+        } else {
+            smss_copyout(va, &val.to_le_bytes())
+        }
+    }
+
+    /// Probe a small writable event output before changing dispatcher state.
+    pub(crate) unsafe fn probe_event_output(&self, va: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if va == 0 || len > 8 || va.checked_add(len as u64).is_none() {
+            return false;
+        }
+        let Some(ctx) = self.loop_ctx else {
+            let mut bytes = [0u8; 8];
+            return self.xas_read(va, &mut bytes[..len]);
+        };
+        let end = va + len as u64;
+        let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
+        let stack_end = stack_base + ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
+        if va >= stack_base && end <= stack_end
+            || va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
+        {
+            return true;
+        }
+
+        fn writable_image_range(pe: &nt_pe_loader::PeFile, base: u64, va: u64, len: usize) -> bool {
+            let rva = match va.checked_sub(base) {
+                Some(rva) => rva,
+                None => return false,
+            };
+            let end = match rva.checked_add(len as u64) {
+                Some(end) => end,
+                None => return false,
+            };
+            pe.sections().iter().any(|section| {
+                let start = section.virtual_address as u64;
+                let section_end = start + section.virtual_size.max(section.size_of_raw_data) as u64;
+                rva >= start && end <= section_end && section.is_writable()
+            })
+        }
+
+        unsafe fn scratch_pages_available(
+            ctx: ExecLoopCtx,
+            va: u64,
+            len: usize,
+            may_fill: bool,
+        ) -> bool {
+            let filled_pages = unsafe { &*ctx.filled_pages };
+            let faults = unsafe { *ctx.faults } as usize;
+            let mut missing = 0usize;
+            let mut page = va & !0xFFF;
+            let last = (va + len as u64 - 1) & !0xFFF;
+            loop {
+                if unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }.is_none() {
+                    if !may_fill {
+                        return false;
+                    }
+                    missing += 1;
+                }
+                if page == last {
+                    break;
+                }
+                page += 0x1000;
+            }
+            faults + missing <= filled_pages.len()
+        }
+
+        if va >= PE_LOAD_BASE && end <= ctx.img_end {
+            return writable_image_range(&*ctx.pe, PE_LOAD_BASE, va, len);
+        }
+        if !ctx.ntdll_pe.is_null() && va >= ctx.nt_base && end <= ctx.nt_end {
+            return writable_image_range(&*ctx.ntdll_pe, ctx.nt_base, va, len)
+                && scratch_pages_available(ctx, va, len, false);
+        }
+        let reg = &*ctx.reg;
+        if let Some((index, _)) = reg.dll_for_page(va) {
+            if let Some(pe) = ctx.dll_pes()[index].as_ref() {
+                return writable_image_range(pe, reg.base(index), va, len)
+                    && scratch_pages_available(ctx, va, len, true);
+            }
+        }
+        false
     }
     /// Cross-AS byte-buffer write to the current process's VA `va` — mirror first, else 8-byte chunks
     /// via [`xas_write_u64`] (each demand-fills a not-yet-faulted DLL/heap page as needed). The last
@@ -883,6 +1032,109 @@ impl ExecNtHandler {
         }
         self.read_ustr_pe(objname)
     }
+
+    /// Validate event OBJECT_ATTRIBUTES and return its root handle plus optional object name.
+    pub(crate) unsafe fn read_event_object_attributes(
+        &self,
+        oa_va: u64,
+    ) -> Result<(u64, u32, Option<alloc::vec::Vec<u16>>), u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+
+        let mut oa = [0u8; 0x30];
+        if !self.xas_read(oa_va, &mut oa) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if u32::from_le_bytes(oa[0..4].try_into().unwrap()) < 0x30 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let root = u64::from_le_bytes(oa[8..16].try_into().unwrap());
+        let object_name = u64::from_le_bytes(oa[16..24].try_into().unwrap());
+        let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
+        if object_name == 0 {
+            return Ok((root, attributes, None));
+        }
+
+        let mut ustr = [0u8; 16];
+        if !self.xas_read(object_name, &mut ustr) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let length = u16::from_le_bytes(ustr[0..2].try_into().unwrap()) as usize;
+        let maximum = u16::from_le_bytes(ustr[2..4].try_into().unwrap()) as usize;
+        let buffer = u64::from_le_bytes(ustr[8..16].try_into().unwrap());
+        if length == 0 || length & 1 != 0 || length > maximum || length > 2048 || buffer == 0 {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        let mut bytes = alloc::vec![0u8; length];
+        if !self.xas_read(buffer, &mut bytes) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        let name = bytes
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect();
+        Ok((root, attributes, Some(name)))
+    }
+
+    fn event_root_index(&self, root: u64) -> Result<usize, u32> {
+        if root == 0 {
+            return Ok(0);
+        }
+        if root < OBJ_HANDLE_BASE {
+            return Err(0xC000_0008); // STATUS_INVALID_HANDLE
+        }
+        let index = (root - OBJ_HANDLE_BASE) as usize;
+        match self.obj_ns.get(index) {
+            Some(entry) if entry.kind == 0 => Ok(index),
+            Some(_) => Err(0xC000_0024), // STATUS_OBJECT_TYPE_MISMATCH
+            None => Err(0xC000_0008),    // STATUS_INVALID_HANDLE
+        }
+    }
+
+    /// Convert the byte-oriented subset supported by the compact object namespace without
+    /// truncating a full path to one leaf. Individual namespace entries are limited to 40 bytes.
+    fn event_object_path(name: &[u16]) -> Result<alloc::vec::Vec<u8>, u32> {
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        let mut path = alloc::vec::Vec::with_capacity(name.len());
+        for &unit in name {
+            if unit > 0x7f {
+                return Err(STATUS_OBJECT_NAME_INVALID);
+            }
+            path.push((unit as u8).to_ascii_lowercase());
+        }
+        let mut components = path.split(|&byte| byte == b'\\');
+        if path.first() == Some(&b'\\') {
+            components.next();
+        }
+        if components.any(|component| component.is_empty() || component.len() > 40) {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        Ok(path)
+    }
+
+    /// Apply native OBJECT_ATTRIBUTES path rules: a null RootDirectory requires an absolute name,
+    /// while a directory handle requires a relative name.
+    fn event_root_and_path<'a>(&self, root: u64, path: &'a [u8]) -> Result<(usize, &'a [u8]), u32> {
+        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+        if root == 0 {
+            if path.first() != Some(&b'\\') {
+                return Err(STATUS_OBJECT_NAME_INVALID);
+            }
+            return Ok((0, path));
+        }
+        if path.first() == Some(&b'\\') {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        Ok((self.event_root_index(root)?, path))
+    }
+
+    fn rollback_new_event(&mut self, index: usize) {
+        if index + 1 == self.obj_ns.len() {
+            self.obj_ns.pop();
+            self.events.remove_existing(index as u64);
+        }
+    }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
     /// or a relative `ntsvcs`) to npfs's leaf form `\ntsvcs` (UTF-16, leading backslash). npfs's
     /// NpFsdCreate strips the device prefix; the leaf is what the VCB prefix tree keys on.
@@ -890,7 +1142,13 @@ impl ExecNtHandler {
         // Lowercase ASCII copy for prefix stripping.
         let lc: alloc::vec::Vec<u16> = name16
             .iter()
-            .map(|&w| if (b'A' as u16..=b'Z' as u16).contains(&w) { w + 32 } else { w })
+            .map(|&w| {
+                if (b'A' as u16..=b'Z' as u16).contains(&w) {
+                    w + 32
+                } else {
+                    w
+                }
+            })
             .collect();
         // Find the last occurrence of "namedpipe\" or "pipe\" and take everything after it.
         let after = |needle: &[u16]| -> Option<usize> {
@@ -957,7 +1215,9 @@ impl ExecNtHandler {
 
     /// Resolve a process-local typed file handle to npfs's FILE_OBJECT context.
     pub(crate) fn npfs_file_id_for(&self, handle: u64) -> u64 {
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else { return 0 };
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            return 0;
+        };
         match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::File(file_id)) => file_id,
             _ => 0,
@@ -1057,7 +1317,12 @@ impl ExecNtHandler {
     /// Cache an established LPC connection (the data-plane record). Bounded by the pre-reserved
     /// capacity so the push never reallocates across the per-syscall bump reset. `connector_pi` =
     /// the current process (0=smss, 1=csrss).
-    pub(crate) fn cache_lpc_connection(&mut self, connection_id: u64, client_handle: u64, name: &[u16]) {
+    pub(crate) fn cache_lpc_connection(
+        &mut self,
+        connection_id: u64,
+        client_handle: u64,
+        name: &[u16],
+    ) {
         if self.lpc_connections.len() >= self.lpc_connections.capacity() {
             return;
         }
@@ -1167,26 +1432,43 @@ impl ExecNtHandler {
                 let sc = WINLOGON_CSR_FILL_SCRATCH + i * 0x1000;
                 let _ = page_map(f, sc, RW_NX, CAP_INIT_THREAD_VSPACE);
                 if i == 0 {
-                    core::ptr::write_volatile((sc + 0x08) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x0100);
+                    core::ptr::write_volatile(
+                        (sc + 0x08) as *mut u64,
+                        WINLOGON_CSR_STATIC_VA + 0x0100,
+                    );
                     let bssd = sc + 0x0100;
                     // WindowsDirectory = L"C:\Windows" (9 wchars)
                     core::ptr::write_volatile((bssd + 0x00) as *mut u16, 9 * 2);
                     core::ptr::write_volatile((bssd + 0x02) as *mut u16, 10 * 2);
-                    core::ptr::write_volatile((bssd + 0x08) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3000);
+                    core::ptr::write_volatile(
+                        (bssd + 0x08) as *mut u64,
+                        WINLOGON_CSR_STATIC_VA + 0x3000,
+                    );
                     // WindowsSystemDirectory = L"C:\Windows\System32" (18 wchars)
                     core::ptr::write_volatile((bssd + 0x10) as *mut u16, 18 * 2);
                     core::ptr::write_volatile((bssd + 0x12) as *mut u16, 19 * 2);
-                    core::ptr::write_volatile((bssd + 0x18) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3020);
+                    core::ptr::write_volatile(
+                        (bssd + 0x18) as *mut u64,
+                        WINLOGON_CSR_STATIC_VA + 0x3020,
+                    );
                     // NamedObjectDirectory = L"\BaseNamedObjects" (17 wchars)
                     core::ptr::write_volatile((bssd + 0x20) as *mut u16, 17 * 2);
                     core::ptr::write_volatile((bssd + 0x22) as *mut u16, 18 * 2);
-                    core::ptr::write_volatile((bssd + 0x28) as *mut u64, WINLOGON_CSR_STATIC_VA + 0x3060);
+                    core::ptr::write_volatile(
+                        (bssd + 0x28) as *mut u64,
+                        WINLOGON_CSR_STATIC_VA + 0x3060,
+                    );
                 } else if i == 3 {
                     write_wstr(sc + 0x000, "C:\\Windows");
                     write_wstr(sc + 0x020, "C:\\Windows\\System32");
                     write_wstr(sc + 0x060, "\\BaseNamedObjects");
                 }
-                let _ = page_map(copy_cap(f), WINLOGON_CSR_STATIC_VA + i * 0x1000, RW_NX, pml4);
+                let _ = page_map(
+                    copy_cap(f),
+                    WINLOGON_CSR_STATIC_VA + i * 0x1000,
+                    RW_NX,
+                    pml4,
+                );
                 // Release the scratch alias mapping of `f` (the target copy_cap is a distinct cap →
                 // unaffected) so the next process's fill can remap the same scratch VA.
                 let _ = page_unmap(f);
@@ -1271,6 +1553,9 @@ impl ExecNtHandler {
             if comp.is_empty() {
                 continue;
             }
+            if self.obj_ns.get(cur)?.kind != 0 {
+                return None;
+            }
             cur = self.obj_child(cur, comp)?;
         }
         Some(cur)
@@ -1283,7 +1568,13 @@ impl ExecNtHandler {
     }
     /// Insert a child (dir or symlink) under `parent`, or return the existing one (OPENIF/name
     /// collision → reuse). Returns the index, or None if the table is at capacity.
-    pub(crate) fn obj_insert(&mut self, parent: usize, leaf: &[u8], kind: u8, target: &[u8]) -> Option<usize> {
+    pub(crate) fn obj_insert(
+        &mut self,
+        parent: usize,
+        leaf: &[u8],
+        kind: u8,
+        target: &[u8],
+    ) -> Option<usize> {
         if let Some(i) = self.obj_child(parent, leaf) {
             return Some(i);
         }
@@ -1305,7 +1596,11 @@ impl ExecNtHandler {
     /// found by name-resolution but is still a real, waitable/signalable event. `auto_reset` marks it
     /// as a SynchronizationEvent (consumed on satisfying wait). The namespace index is the shared
     /// event identity; callers receive process-local typed handles referencing it.
-    pub(crate) fn obj_create_anon_event(&mut self, auto_reset: bool, initial_state: bool) -> Option<usize> {
+    pub(crate) fn obj_create_anon_event(
+        &mut self,
+        auto_reset: bool,
+        initial_state: bool,
+    ) -> Option<usize> {
         if self.obj_ns.len() >= self.obj_ns.capacity() {
             return None;
         }
@@ -1313,21 +1608,36 @@ impl ExecNtHandler {
         // events (they live under a private parent id 250 that no name walk reaches).
         let n = self.anon_event_seq;
         self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
-        let name = [b'a', (n & 0xff) as u8, ((n >> 8) & 0xff) as u8, ((n >> 16) & 0xff) as u8];
+        let name = [
+            b'a',
+            (n & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            ((n >> 16) & 0xff) as u8,
+        ];
         let mut e = ObjEntry::dir(&name, 250);
         e.kind = 2;
         self.obj_ns.push(e);
         let index = self.obj_ns.len() - 1;
         self.events.initialize(
             index as u64,
-            if auto_reset { EventKind::Synchronization } else { EventKind::Notification },
+            if auto_reset {
+                EventKind::Synchronization
+            } else {
+                EventKind::Notification
+            },
             initial_state,
         );
         Some(index)
     }
     /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
     /// resolve the parent from all but the last component, then insert the leaf. Existing → reused.
-    pub(crate) fn obj_create(&mut self, path: &[u8], root_idx: usize, kind: u8, target: &[u8]) -> Option<usize> {
+    pub(crate) fn obj_create(
+        &mut self,
+        path: &[u8],
+        root_idx: usize,
+        kind: u8,
+        target: &[u8],
+    ) -> Option<usize> {
         let (parent_path, leaf) = match path.iter().rposition(|&c| c == b'\\') {
             Some(p) => (&path[..p], &path[p + 1..]),
             None => (&[][..], path),
@@ -1342,6 +1652,9 @@ impl ExecNtHandler {
         } else {
             self.obj_resolve(parent_path, root_idx)?
         };
+        if self.obj_ns.get(parent)?.kind != 0 {
+            return None;
+        }
         if leaf.is_empty() {
             return Some(parent);
         }
@@ -1352,8 +1665,7 @@ impl ExecNtHandler {
     /// CurrentControlSet symlink) + strip the hive's mount prefix.
     pub(crate) fn resolve_key(&self, full_path: &str) -> Option<KeyRef> {
         let aliased = apply_ccs_alias(full_path);
-        let comps: alloc::vec::Vec<&str> =
-            aliased.split('\\').filter(|c| !c.is_empty()).collect();
+        let comps: alloc::vec::Vec<&str> = aliased.split('\\').filter(|c| !c.is_empty()).collect();
         if comps.len() < 3
             || !comps[0].eq_ignore_ascii_case("Registry")
             || !comps[1].eq_ignore_ascii_case("Machine")
@@ -1421,7 +1733,12 @@ impl ExecNtHandler {
     }
 }
 impl NativeSyscallHandler for ExecNtHandler {
-    fn handle(&mut self, ctx: &NativeCallContext, args: &[u64], _out: &mut alloc::vec::Vec<u8>) -> u32 {
+    fn handle(
+        &mut self,
+        ctx: &NativeCallContext,
+        args: &[u64],
+        _out: &mut alloc::vec::Vec<u8>,
+    ) -> u32 {
         match ctx.service {
             // NtClose(Handle[R10]=args[0]): free the handle in the caller's REAL EPROCESS handle
             // table by its SLOT (path 1b — the value IS the dense per-process table handle now, so
@@ -3399,30 +3716,14 @@ impl NativeSyscallHandler for ExecNtHandler {
             // on the power event. So the minted handle MUST reach the caller's *EventHandle — which
             // is arg1 = R10 (the x64 out-arg; the syscall stub moved the caller's RCX there, and RCX
             // at the fault holds the return IP, out of any writable range). For csrss that PHANDLE is
-            // a winsrv .data global, so QUEUE the write for the loop's per-process out-writer
-            // (csrss_out_write demand-pages the global; smss_stack_write handles an smss stack local).
+            // a winsrv .data global, so use the cross-address-space writer.
             // The out PHANDLE is arg1 = R10, and for csrss it is a winsrv .bss global. Our csrss
             // demand-fill window is only 256 pages (csrss demand-pages ~343), so `csrss_out_write`
             // cannot reliably reach winsrv's late .bss page — the handle would arrive back at winsrv
-            // as NULL (as it did pre-fix, masked by a fake). So instead of writing the flaky global,
-            // RECORD the minted handle (csrss only) and DELIVER it to win32k by substituting it into
-            // NtUserInitialize's event args at the forward point (see the SSN>=0x1000 arm). That gives
-            // win32k the REAL event handles winsrv created, which it models as typed Event objects.
-            // (Memory behaviour matches the pre-fix baseline: nothing is written to the caller here.)
+            // as NULL. RECORD the real handle for the existing NtUserInitialize substitution as a
+            // bounded fallback if that late .bss page is beyond the fill table.
+            // The handle now also names the same real EventStore object used by NtSet/Reset/Query.
             NativeService::NtCreateEvent => {
-                if self.pi == 1 {
-                    let h = self.mint_handle();
-                    // Keep the two most-recent csrss event handles in creation order (winsrv creates
-                    // hPowerRequestEvent then hMediaRequestEvent right before NtUserInitialize).
-                    if self.csrss_event_n < self.csrss_event_handles.len() {
-                        self.csrss_event_handles[self.csrss_event_n] = h;
-                    } else {
-                        self.csrss_event_handles[0] = self.csrss_event_handles[1];
-                        self.csrss_event_handles[1] = h;
-                    }
-                    self.csrss_event_n += 1;
-                    return 0; // csrss win32k-forward path is BYTE-IDENTICAL (no out-write)
-                }
                 // Services (pi 3): CreateEventW(SCM_START_EVENT/AUTOSTARTCOMPLETE/LSA_RPC_SERVER_ACTIVE/
                 // SECURITY_SERVICES_STARTED). NtCreateEvent(*EventHandle[R10]=args[0], ACCESS,
                 // *OA[R8]=args[2], EVENT_TYPE, InitialState). Register a REAL named event object in the
@@ -3434,20 +3735,38 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // Winlogon's unnamed rpcrt4 server_ready_event/mgr_event are a live cross-thread
                 // handshake. Model them as distinct events: the main thread signals mgr_event, the
                 // server worker consumes it and signals server_ready_event, and the main waiter wakes.
-                if self.pi != 1 { unsafe {
+                unsafe {
                     let out = args[0]; // R10 = *EventHandle
                     let oa = args[2]; // R8 = *OBJECT_ATTRIBUTES (0 = anonymous)
-                    // EventType[R9]=args[3], InitialState is the 5th arg (stack [sp+0x28]).
+                    // EventType[R9]=args[3], InitialState=args[4] from stack [sp+0x28].
+                    if args[3] > 1 {
+                        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                    }
+                    if out == 0 {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    if out & 7 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if !self.probe_event_output(out, 8) {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     let auto_reset = args[3] == 1;
-                    let init_state = smss_stack_read(get_recv_mr(16) + 0x28) & 1 != 0;
+                    let init_state = args[4] & 1 != 0;
                     if oa == 0 {
                         let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
                             return 0xC000_009A;
                         };
                         let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                            self.rollback_new_event(index);
                             return 0xC000_009A;
                         };
-                        self.xas_write_u64(out, event_handle);
+                        if !self.xas_write_u64(out, event_handle) {
+                            self.close_current_handle(event_handle);
+                            self.rollback_new_event(index);
+                            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        }
+                        self.remember_csrss_event_handle(event_handle);
                         let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
                         if trace < 64 || self.current_badge == 15 {
                             print_str(b"[event] create pi=");
@@ -3465,31 +3784,40 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                         return 0;
                     }
-                    let mut rd = [0u8; 8];
-                    let _ = self.xas_read(oa + 8, &mut rd);
-                    let root_dir = u64::from_le_bytes(rd);
-                    let name16 = self.read_objattr_name_pe(oa);
-                    if name16.is_empty() {
-                        let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
-                            return 0xC000_009A;
-                        };
-                        let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
-                            return 0xC000_009A;
-                        };
-                        self.xas_write_u64(out, event_handle);
-                        return 0;
-                    }
-                    let mut nbuf = [0u8; 40];
-                    let nlen = Self::fold_name(&name16, &mut nbuf);
-                    let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                        (root_dir - OBJ_HANDLE_BASE) as usize
-                    } else {
-                        // Named event with no BnO root handle → default to \BaseNamedObjects.
-                        self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                    let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                        Ok((root, _attributes, Some(name))) => (root, name),
+                        Ok((_root, _attributes, None)) => {
+                            let Some(index) = self.obj_create_anon_event(auto_reset, init_state) else {
+                                return 0xC000_009A;
+                            };
+                            let Some(event_handle) = self.mint_event_handle(index, args[1] as u32) else {
+                                self.rollback_new_event(index);
+                                return 0xC000_009A;
+                            };
+                            if !self.xas_write_u64(out, event_handle) {
+                                self.close_current_handle(event_handle);
+                                self.rollback_new_event(index);
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                            self.remember_csrss_event_handle(event_handle);
+                            return 0;
+                        }
+                        Err(status) => return status,
                     };
-                    let existed = self.obj_resolve(&nbuf[..nlen], root_idx)
-                        .map_or(false, |i| self.obj_ns[i].kind == 2);
-                    match self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
+                    let path = match Self::event_object_path(&name16) {
+                        Ok(path) => path,
+                        Err(status) => return status,
+                    };
+                    let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                        Ok(resolved) => resolved,
+                        Err(status) => return status,
+                    };
+                    let existing = self.obj_resolve(path, root_idx);
+                    if existing.is_some_and(|i| self.obj_ns[i].kind != 2) {
+                        return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                    }
+                    let existed = existing.is_some();
+                    match self.obj_create(path, root_idx, 2, &[]) {
                         Some(i) => {
                             if !existed {
                                 self.events.initialize(
@@ -3498,7 +3826,19 @@ impl NativeSyscallHandler for ExecNtHandler {
                                     init_state,
                                 );
                             }
-                            self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
+                            let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
+                                if !existed {
+                                    self.rollback_new_event(i);
+                                }
+                                return 0xC000_009A;
+                            };
+                            if !self.xas_write_u64(out, event_handle) {
+                                self.close_current_handle(event_handle);
+                                if !existed {
+                                    self.rollback_new_event(i);
+                                }
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
                             SERVICES_NAMED_EVENTS.fetch_add(1, Ordering::Relaxed);
                             if existed { 0x4000_0000 } else { 0 } // STATUS_OBJECT_NAME_EXISTS : SUCCESS
                         }
@@ -3506,8 +3846,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                             0xC000_009A
                         }
                     }
-                } } else {
-                    0
                 }
             }
             // NtClearEvent(EventHandle) clears a real event without returning its previous state.
@@ -3519,46 +3857,211 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Err(status) => status,
                 }
             }
+            NativeService::NtPulseEvent => {
+                let previous_state = args[1];
+                if previous_state != 0 && previous_state & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if previous_state != 0
+                    && !unsafe { self.probe_event_output(previous_state, 4) }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                match self.event_index_for_handle(args[0], EVENT_MODIFY_STATE) {
+                    Ok(index) => {
+                        let Some(previous) = self.events.set_existing(index as u64) else {
+                            return 0xC000_0008; // STATUS_INVALID_HANDLE
+                        };
+                        if !previous {
+                            // SAFETY: native dispatch is serialized; event transition and waiter
+                            // selection remain in this executive turn.
+                            unsafe { wait_wake_event_pulse(index, &mut self.events) };
+                        }
+                        if previous {
+                            let _ = self.events.reset_existing(index as u64);
+                        }
+                        if previous_state != 0 {
+                            if !unsafe { self.xas_write_u32(previous_state, previous as u32) } {
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                        }
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
+            NativeService::NtQueryEvent => {
+                const EVENT_BASIC_INFORMATION_SIZE: u64 = 8;
+                if args[1] != 0 {
+                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                }
+                if args[3] != EVENT_BASIC_INFORMATION_SIZE {
+                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                }
+                if args[2] == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if args[2] & 3 != 0 || (args[4] != 0 && args[4] & 3 != 0) {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !unsafe { self.probe_event_output(args[2], 8) }
+                    || (args[4] != 0 && !unsafe { self.probe_event_output(args[4], 4) })
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                match self.event_index_for_handle(args[0], EVENT_QUERY_STATE) {
+                    Ok(index) => {
+                        let Some((kind, signaled)) = self.events.query_existing(index as u64) else {
+                            return 0xC000_0008; // STATUS_INVALID_HANDLE
+                        };
+                        let event_type = match kind {
+                            EventKind::Notification => 0u32,
+                            EventKind::Synchronization => 1u32,
+                        };
+                        if !unsafe { self.xas_write_u32(args[2], event_type) }
+                            || !unsafe { self.xas_write_u32(args[2] + 4, signaled as u32) }
+                        {
+                            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        }
+                        if args[4] != 0 {
+                            if !unsafe {
+                                self.xas_write_u32(args[4], EVENT_BASIC_INFORMATION_SIZE as u32)
+                            } {
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                        }
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
+            NativeService::NtResetEvent => {
+                let previous_state = args[1];
+                if previous_state != 0 && previous_state & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if previous_state != 0
+                    && !unsafe { self.probe_event_output(previous_state, 4) }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                match self.event_index_for_handle(args[0], EVENT_MODIFY_STATE) {
+                    Ok(index) => {
+                        let Some(previous) = self.events.reset_existing(index as u64) else {
+                            return 0xC000_0008; // STATUS_INVALID_HANDLE
+                        };
+                        if previous_state != 0 {
+                            if !unsafe { self.xas_write_u32(previous_state, previous as u32) } {
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                        }
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
+            NativeService::NtSetEvent => {
+                let previous_state = args[1];
+                if previous_state != 0 && previous_state & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if previous_state != 0
+                    && !unsafe { self.probe_event_output(previous_state, 4) }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                match self.event_index_for_handle(args[0], EVENT_MODIFY_STATE) {
+                    Ok(index) => {
+                        let Some(previous) = self.events.set_existing(index as u64) else {
+                            return 0xC000_0008; // STATUS_INVALID_HANDLE
+                        };
+                        if previous_state != 0 {
+                            if !unsafe { self.xas_write_u32(previous_state, previous as u32) } {
+                                return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                            }
+                        }
+                        if self.obj_ns[index].name() == b"lsa_rpc_server_active" {
+                            LSA_RPC_SERVER_ACTIVE_SIGNALLED.store(1, Ordering::Relaxed);
+                        }
+                        // SAFETY: native dispatch is serialized; the signal and waiter selection
+                        // are one executive transition.
+                        if !previous {
+                            unsafe { wait_wake_event_set(index, &mut self.events) };
+                        }
+                        0
+                    }
+                    Err(status) => status,
+                }
+            }
             // NtOpenEvent(*EventHandle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]). CreateEventW's
             // ERROR_ALREADY_EXISTS fallback + OpenEventW resolve an existing named event. Return the
             // registered event's handle, or STATUS_OBJECT_NAME_NOT_FOUND if it doesn't exist (so the
-            // create-then-open logic behaves). Scoped to services (pi 3).
+            // create-then-open logic behaves).
             NativeService::NtOpenEvent => unsafe {
-                if self.pi != 3 && self.pi != 4 {
-                    let h = self.mint_handle();
-                    self.queue_write(args[0], h);
-                    return 0;
-                }
                 let out = args[0];
                 let oa = args[2];
-                let mut rd = [0u8; 8];
-                let _ = self.xas_read(oa + 8, &mut rd);
-                let root_dir = u64::from_le_bytes(rd);
-                let name16 = self.read_objattr_name_pe(oa);
-                let mut nbuf = [0u8; 40];
-                let nlen = Self::fold_name(&name16, &mut nbuf);
-                let root_idx = if root_dir >= OBJ_HANDLE_BASE {
-                    (root_dir - OBJ_HANDLE_BASE) as usize
-                } else {
-                    self.obj_resolve(b"\\BaseNamedObjects", 0).unwrap_or(0)
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if oa == 0 {
+                    return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => return 0xC000_0033, // STATUS_OBJECT_NAME_INVALID
+                    Err(status) => return status,
                 };
-                if let Some(i) = self.obj_resolve(&nbuf[..nlen], root_idx) {
-                    if self.obj_ns[i].kind == 2 {
-                        self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
-                        return 0;
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                if let Some(i) = self.obj_resolve(path, root_idx) {
+                    if self.obj_ns[i].kind != 2 {
+                        return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
                     }
+                    let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
+                        return 0xC000_009A;
+                    };
+                    if !self.xas_write_u64(out, event_handle) {
+                        self.close_current_handle(event_handle);
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    return 0;
                 }
                 // lsass (pi 4): \SeLsaInitEvent is created by ntoskrnl's SeRmInitPhase1 (the SRM), which
                 // we don't host — lsass' LsapRmInitializeServer (srm.c:194) NtOpenEvent's it then
                 // NtSetEvent's it to signal the kernel it's ready, and treats an open failure as FATAL.
                 // Model it: auto-create the event so the open + set succeed (like \SeRmCommandPort). The
                 // name folds to "selsainitevent". Scoped pi==4 so services/paint reads are unchanged.
-                if self.pi == 4 && nbuf[..nlen].windows(14).any(|w| w == b"selsainitevent") {
-                    if let Some(i) = self.obj_create(&nbuf[..nlen], root_idx, 2, &[]) {
+                if self.pi == 4 && path == b"\\selsainitevent" {
+                    if let Some(i) = self.obj_create(path, root_idx, 2, &[]) {
+                        let created = !self.events.contains(i as u64);
                         if !self.events.contains(i as u64) {
                             self.events.initialize(i as u64, EventKind::Notification, false);
                         }
-                        self.xas_write_u64(out, OBJ_HANDLE_BASE + i as u64);
+                        let Some(event_handle) = self.mint_event_handle(i, args[1] as u32) else {
+                            if created {
+                                self.rollback_new_event(i);
+                            }
+                            return 0xC000_009A;
+                        };
+                        if !self.xas_write_u64(out, event_handle) {
+                            self.close_current_handle(event_handle);
+                            if created {
+                                self.rollback_new_event(i);
+                            }
+                            return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                        }
                         return 0;
                     }
                 }

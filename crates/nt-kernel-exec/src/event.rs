@@ -17,6 +17,28 @@ pub enum EventKind {
     Synchronization,
 }
 
+/// Expand Win32 generic access bits into the event object's native access mask.
+pub fn map_event_access(mut access: u32) -> u32 {
+    const EVENT_QUERY_STATE: u32 = 0x0001;
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const EVENT_ALL_ACCESS: u32 = 0x001F_0003;
+
+    if access & 0x8000_0000 != 0 {
+        access |= 0x0002_0000 | EVENT_QUERY_STATE;
+    }
+    if access & 0x4000_0000 != 0 {
+        access |= 0x0002_0000 | EVENT_MODIFY_STATE;
+    }
+    if access & 0x2000_0000 != 0 {
+        access |= 0x0002_0000 | SYNCHRONIZE;
+    }
+    if access & (0x1000_0000 | 0x0200_0000) != 0 {
+        access |= EVENT_ALL_ACCESS;
+    }
+    access & !(0xF000_0000 | 0x0200_0000)
+}
+
 /// The result of a wait/poll.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WaitResult {
@@ -91,6 +113,24 @@ impl EventStore {
         self.events.iter().any(|event| event.ptr == ptr)
     }
 
+    /// Remove an initialized event identity. The executive uses this to roll back an object whose
+    /// newly-created handle could not be published to its caller.
+    pub fn remove_existing(&mut self, ptr: u64) -> bool {
+        let Some(index) = self.events.iter().position(|event| event.ptr == ptr) else {
+            return false;
+        };
+        self.events.remove(index);
+        true
+    }
+
+    /// Return the dispatcher type and signal state for an initialized event.
+    pub fn query_existing(&self, ptr: u64) -> Option<(EventKind, bool)> {
+        self.events
+            .iter()
+            .find(|event| event.ptr == ptr)
+            .map(|event| (event.kind, event.signaled))
+    }
+
     /// Strict `NtSetEvent` state transition. Unlike [`Self::set`], this never
     /// manufactures an event for an invalid handle.
     pub fn set_existing(&mut self, ptr: u64) -> Option<bool> {
@@ -133,12 +173,7 @@ impl EventStore {
 
     /// Poll `WaitAny`/`WaitAll` over existing event identities and apply NT
     /// synchronization-event consumption on success.
-    pub fn poll_many(
-        &mut self,
-        ptrs: &[u64],
-        wait_all: bool,
-        irql: &IrqlState,
-    ) -> WaitManyResult {
+    pub fn poll_many(&mut self, ptrs: &[u64], wait_all: bool, irql: &IrqlState) -> WaitManyResult {
         if !irql.can_wait() {
             return WaitManyResult::BadIrql;
         }
@@ -279,10 +314,24 @@ mod tests {
     fn strict_set_reset_report_previous_state() {
         let mut events = EventStore::new();
         events.initialize(7, EventKind::Notification, false);
+        assert_eq!(
+            events.query_existing(7),
+            Some((EventKind::Notification, false))
+        );
         assert_eq!(events.set_existing(7), Some(false));
         assert_eq!(events.set_existing(7), Some(true));
         assert_eq!(events.reset_existing(7), Some(true));
         assert_eq!(events.reset_existing(7), Some(false));
+        assert_eq!(events.query_existing(99), None);
+    }
+
+    #[test]
+    fn generic_event_access_maps_to_native_rights() {
+        assert_eq!(map_event_access(0x8000_0000) & 0x0001, 0x0001);
+        assert_eq!(map_event_access(0x4000_0000) & 0x0002, 0x0002);
+        assert_eq!(map_event_access(0x2000_0000) & 0x0010_0000, 0x0010_0000);
+        assert_eq!(map_event_access(0x1000_0000), 0x001F_0003);
+        assert_eq!(map_event_access(0x0200_0000), 0x001F_0003);
     }
 
     #[test]
@@ -296,6 +345,18 @@ mod tests {
         assert!(events.clear_existing(9));
         assert!(!events.read_state(9));
         assert!(!events.clear_existing(99));
+    }
+
+    #[test]
+    fn remove_existing_forgets_only_the_requested_identity() {
+        let mut events = EventStore::new();
+        events.initialize(0xE4, EventKind::Notification, true);
+        events.initialize(0xE5, EventKind::Synchronization, false);
+
+        assert!(events.remove_existing(0xE4));
+        assert!(!events.contains(0xE4));
+        assert!(events.contains(0xE5));
+        assert!(!events.remove_existing(0xE4));
     }
 
     #[test]
