@@ -22,6 +22,8 @@ pub struct ThreadDetachAction {
     pub call_tls: bool,
 }
 
+pub type ThreadAttachAction = ThreadDetachAction;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ThreadPlanError {
     CapacityExceeded,
@@ -54,6 +56,42 @@ impl<const N: usize> ThreadDetachPlan<N> {
     pub const fn executable_tls_base(&self) -> u64 {
         self.executable_tls_base
     }
+}
+
+pub type ThreadAttachPlan<const N: usize> = ThreadDetachPlan<N>;
+
+pub fn plan_thread_attach<const N: usize>(
+    process_shutdown: bool,
+    modules_in_initialization_order: &[ThreadModuleState],
+    executable_tls_base: u64,
+) -> Result<ThreadAttachPlan<N>, ThreadPlanError> {
+    let mut plan = ThreadAttachPlan::empty();
+    if process_shutdown {
+        return Ok(plan);
+    }
+    plan.executable_tls_base = executable_tls_base;
+
+    for module in modules_in_initialization_order {
+        let required = LDRP_IMAGE_DLL | LDRP_PROCESS_ATTACH_CALLED;
+        if module.base == 0
+            || module.entry_point_rva == 0
+            || module.is_ntdll
+            || module.flags & required != required
+            || module.flags & LDRP_DONT_CALL_FOR_THREADS != 0
+        {
+            continue;
+        }
+        if plan.len == N {
+            return Err(ThreadPlanError::CapacityExceeded);
+        }
+        plan.actions[plan.len] = ThreadAttachAction {
+            base: module.base,
+            entry_point_rva: module.entry_point_rva,
+            call_tls: module.has_tls,
+        };
+        plan.len += 1;
+    }
+    Ok(plan)
 }
 
 pub fn plan_thread_detach<const N: usize>(
@@ -124,6 +162,30 @@ pub fn drive_thread_detach<H: LoaderHost, const N: usize>(
     report
 }
 
+pub fn drive_thread_attach<H: LoaderHost, const N: usize>(
+    plan: &ThreadAttachPlan<N>,
+    host: &mut H,
+) -> ThreadDetachReport {
+    let mut report = ThreadDetachReport::default();
+    for action in plan.actions() {
+        if action.call_tls {
+            let _ = host.run_tls_callbacks(action.base, DllReason::ThreadAttach);
+            report.tls_calls += 1;
+        }
+        let _ = host.call_dll_main(
+            action.base,
+            action.entry_point_rva,
+            DllReason::ThreadAttach,
+        );
+        report.dll_main_calls += 1;
+    }
+    if plan.executable_tls_base() != 0 {
+        let _ = host.run_tls_callbacks(plan.executable_tls_base(), DllReason::ThreadAttach);
+        report.tls_calls += 1;
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -179,6 +241,49 @@ mod tests {
     }
 
     #[test]
+    fn attach_plan_preserves_initialization_order_and_filters_ineligible_modules() {
+        let mut no_entry = module(4);
+        no_entry.entry_point_rva = 0;
+        let mut disabled = module(5);
+        disabled.flags |= LDRP_DONT_CALL_FOR_THREADS;
+        let mut not_attached = module(6);
+        not_attached.flags &= !LDRP_PROCESS_ATTACH_CALLED;
+        let mut not_dll = module(7);
+        not_dll.flags &= !LDRP_IMAGE_DLL;
+        let mut ntdll = module(8);
+        ntdll.is_ntdll = true;
+        let mut tls = module(3);
+        tls.has_tls = true;
+        let modules = [module(1), module(2), tls, no_entry, disabled, not_attached, not_dll, ntdll];
+
+        let plan = plan_thread_attach::<3>(false, &modules, 9).unwrap();
+        assert_eq!(
+            plan.actions(),
+            &[
+                ThreadAttachAction { base: 1, entry_point_rva: 0x100, call_tls: false },
+                ThreadAttachAction { base: 2, entry_point_rva: 0x100, call_tls: false },
+                ThreadAttachAction { base: 3, entry_point_rva: 0x100, call_tls: true },
+            ]
+        );
+        assert_eq!(plan.executable_tls_base(), 9);
+    }
+
+    #[test]
+    fn process_shutdown_suppresses_all_thread_attach_callouts() {
+        let plan = plan_thread_attach::<1>(true, &[module(1)], 9).unwrap();
+        assert!(plan.actions().is_empty());
+        assert_eq!(plan.executable_tls_base(), 0);
+    }
+
+    #[test]
+    fn attach_planning_reports_capacity_before_any_dispatch() {
+        assert_eq!(
+            plan_thread_attach::<1>(false, &[module(1), module(2)], 0),
+            Err(ThreadPlanError::CapacityExceeded)
+        );
+    }
+
+    #[test]
     fn process_shutdown_suppresses_dlls_but_keeps_executable_tls() {
         let plan = plan_thread_detach::<1>(true, true, &[module(1)], 9).unwrap();
         assert!(plan.actions().is_empty());
@@ -223,6 +328,19 @@ mod tests {
         let mut host = OrderHost::default();
         assert_eq!(
             drive_thread_detach(&plan, &mut host),
+            ThreadDetachReport { tls_calls: 2, dll_main_calls: 2 }
+        );
+        assert_eq!(host.calls, [(1, 1), (2, 1), (2, 2), (1, 9)]);
+    }
+
+    #[test]
+    fn attach_driver_runs_forward_tls_before_dll_main_then_executable_tls() {
+        let mut first = module(1);
+        first.has_tls = true;
+        let plan = plan_thread_attach::<2>(false, &[first, module(2)], 9).unwrap();
+        let mut host = OrderHost::default();
+        assert_eq!(
+            drive_thread_attach(&plan, &mut host),
             ThreadDetachReport { tls_calls: 2, dll_main_calls: 2 }
         );
         assert_eq!(host.calls, [(1, 1), (2, 1), (2, 2), (1, 9)]);
