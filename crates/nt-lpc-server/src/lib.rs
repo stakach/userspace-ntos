@@ -189,6 +189,11 @@ impl Server {
 
     fn op_receive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
         let req: LpcReceiveRequest = read_req(buf)?;
+        if req.reply_msg_len_bytes != 0 {
+            let reply_msg = read_blob(buf, req.reply_msg_offset, req.reply_msg_len_bytes)?;
+            self.core
+                .send_message(req.port_handle, reply_msg, MessageAttrs::default())?;
+        }
         // A connection request on a listen port takes priority (the SM rendezvous
         // path — behavior preserved); else a data message on a comm port.
         let conn_try = self.core.receive(req.port_handle);
@@ -216,8 +221,13 @@ impl Server {
             Ok(Some(m)) => {
                 let n = m.bytes.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&m.bytes[..n]);
-                // detail0 = 0 (LPC surfaces no attributes); detail1 = PORT_MESSAGE type.
-                Ok(reply(NtStatus::SUCCESS, n as u32, 0, msg_type_of(&m.bytes) as u64))
+                // detail0 is the connection's accepted PortContext for listen-port receives.
+                Ok(reply(
+                    NtStatus::SUCCESS,
+                    n as u32,
+                    m.attrs.context.unwrap_or(0),
+                    msg_type_of(&m.bytes) as u64,
+                ))
             }
             Ok(None) => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
             Err(e) => {
@@ -242,7 +252,7 @@ impl Server {
                 out_buf[..n].copy_from_slice(&m.bytes[..n]);
                 Ok(reply(NtStatus::SUCCESS, n as u32, 0, msg_type_of(&m.bytes) as u64))
             }
-            None => Ok(ok()),
+            None => Ok(reply(NtStatus::PENDING, 0, 0, 0)),
         }
     }
 
@@ -544,5 +554,48 @@ mod tests {
         assert_eq!(r.information, 4);
         assert_eq!(&out[..4], b"ping");
         assert_eq!(r.detail0, 0, "LPC surfaces no attributes");
+    }
+
+    #[test]
+    fn synchronous_request_reply_uses_listen_port_and_context() {
+        let mut s = Server::new();
+        s.set_accept_policy(AcceptPolicy::Manual);
+        let (listen, connection) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            let listen = c.create_port(&utf16("\\SmApiPort"), 0, 0x148, 0).unwrap();
+            let pending = c.connect_port(&utf16("\\SmApiPort"), 0, &[]).unwrap();
+            (listen, pending.connection_id)
+        };
+        let (client, server) = {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            c.reply_wait_receive(listen).unwrap();
+            let server = c.accept_connect(connection, true, 0x5a5a).unwrap();
+            let client = c.complete_connect(connection).unwrap().0;
+            (client, server)
+        };
+        assert_ne!(server, 0);
+
+        {
+            let mut c = LpcClient::new(Direct {
+                server: &mut s,
+                out: [0; 512],
+            });
+            assert!(c.request_wait_reply(client, b"request").unwrap().is_empty());
+            let request = c.reply_wait_receive(listen).unwrap();
+            assert_eq!(request.connection_info, b"request");
+            assert_eq!(request.port_context, 0x5a5a);
+            let next = c
+                .reply_wait_receive_with_reply(listen, b"response")
+                .unwrap();
+            assert!(next.connection_info.is_empty());
+            let response = c.reply_wait_receive(client).unwrap();
+            assert_eq!(response.connection_info, b"response");
+        }
     }
 }

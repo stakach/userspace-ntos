@@ -173,6 +173,10 @@ struct Port {
     api: PortApi,
     /// Connection ids awaiting a receiver (Manual-policy FIFO).
     pending: Vec<u64>,
+    /// Connection whose request was most recently received through this listen port. LPC's
+    /// `NtReplyWaitReceivePort` replies through the listen handle, so the core retains this routing
+    /// identity until the server sends that reply.
+    reply_connection: Option<u64>,
 }
 
 struct Connection {
@@ -296,6 +300,7 @@ impl PortCore {
             named,
             api,
             pending: Vec::new(),
+            reply_connection: None,
         });
         handle
     }
@@ -451,7 +456,7 @@ impl PortCore {
         bytes: &[u8],
         attrs: MessageAttrs,
     ) -> Result<(), NtStatus> {
-        let msg = QueuedMessage {
+        let mut msg = QueuedMessage {
             bytes: bytes.to_vec(),
             attrs,
         };
@@ -460,6 +465,9 @@ impl PortCore {
                 continue;
             }
             if from_handle != 0 && conn.client_handle == from_handle {
+                if msg.attrs.context.is_none() {
+                    msg.attrs.context = Some(conn.port_context);
+                }
                 conn.server_inbox.push(msg);
                 return Ok(());
             }
@@ -467,6 +475,16 @@ impl PortCore {
                 conn.client_inbox.push(msg);
                 return Ok(());
             }
+        }
+        if let Some(port) = self.ports.iter_mut().find(|port| port.handle == from_handle) {
+            let connection_id = port.reply_connection.take().ok_or(NtStatus::INVALID_HANDLE)?;
+            let conn = self
+                .connections
+                .iter_mut()
+                .find(|conn| conn.id == connection_id && conn.state == ConnState::Connected)
+                .ok_or(NtStatus::INVALID_HANDLE)?;
+            conn.client_inbox.push(msg);
+            return Ok(());
         }
         Err(NtStatus::INVALID_HANDLE)
     }
@@ -489,6 +507,21 @@ impl PortCore {
                     Some(conn.server_inbox.remove(0))
                 });
             }
+        }
+        if let Some(port_index) = self.ports.iter().position(|port| port.handle == handle) {
+            let connection_index = self.connections.iter().position(|conn| {
+                conn.state == ConnState::Connected
+                    && conn.server_api == self.ports[port_index].api
+                    && conn.port_name == self.ports[port_index].name
+                    && !conn.server_inbox.is_empty()
+            });
+            if let Some(connection_index) = connection_index {
+                let connection_id = self.connections[connection_index].id;
+                let message = self.connections[connection_index].server_inbox.remove(0);
+                self.ports[port_index].reply_connection = Some(connection_id);
+                return Ok(Some(message));
+            }
+            return Ok(None);
         }
         Err(NtStatus::INVALID_HANDLE)
     }
@@ -665,5 +698,35 @@ mod tests {
         assert_eq!(got.bytes, b"pong");
         // drained
         assert!(core.receive_message(ch).unwrap().is_none());
+    }
+
+    #[test]
+    fn listen_port_reply_routes_to_the_requesting_connection() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let ph = core.create_port(&utf16("\\P"), PortApi::Lpc);
+        let mut clients = [0u64; 2];
+        for (index, context) in [0x1111, 0x2222].into_iter().enumerate() {
+            let cid = match core.connect(&utf16("\\P"), PortApi::Lpc, 0, &[]).unwrap() {
+                ConnectOutcome::Pending { connection_id } => connection_id,
+                _ => unreachable!(),
+            };
+            core.receive(ph).unwrap();
+            core.accept(cid, true, context).unwrap();
+            clients[index] = core.complete(cid).unwrap().0;
+        }
+
+        core.send_message(clients[1], b"second", MessageAttrs::default())
+            .unwrap();
+        let request = core.receive_message(ph).unwrap().unwrap();
+        assert_eq!(request.bytes, b"second");
+        assert_eq!(request.attrs.context, Some(0x2222));
+        core.send_message(ph, b"reply", MessageAttrs::default()).unwrap();
+
+        assert!(core.receive_message(clients[0]).unwrap().is_none());
+        assert_eq!(
+            core.receive_message(clients[1]).unwrap().unwrap().bytes,
+            b"reply"
+        );
     }
 }
