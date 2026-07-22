@@ -1539,6 +1539,18 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
             }
         }
     }
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        crate::exports::ldr_publish_loader_lock(peb);
+    }
+    let _loader_lock = match unsafe { crate::exports::acquire_loader_lock() } {
+        Ok(guard) => guard,
+        Err(status) => unsafe {
+            crate::exports::rtl_raise_status(status);
+            core::hint::unreachable_unchecked()
+        },
+    };
     // (2) Snap the EXE's imports against our export table + any dependent DLLs (csrsrv for csrss).
     // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
@@ -1572,7 +1584,9 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     unsafe {
         let status = run_process_attach(core::ptr::addr_of_mut!(MODULE_TABLE));
         if status != 0 {
+            drop(_loader_lock);
             crate::exports::rtl_raise_status(status);
+            core::hint::unreachable_unchecked();
         }
     }
     out

@@ -83,6 +83,30 @@ static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Process-wide loader lock in the exact x64 `RTL_CRITICAL_SECTION` layout. The no-debug sentinel
+/// makes the statically initialized lock valid before the process heap exists.
+#[repr(C, align(8))]
+struct LoaderCriticalSection {
+    debug_info: u64,
+    lock_count: AtomicI32,
+    recursion_count: i32,
+    owning_thread: AtomicU64,
+    lock_semaphore: AtomicU64,
+    spin_count: usize,
+}
+
+static mut LDR_LOADER_LOCK: LoaderCriticalSection = LoaderCriticalSection {
+    debug_info: u64::MAX,
+    lock_count: AtomicI32::new(-1),
+    recursion_count: 0,
+    owning_thread: AtomicU64::new(0),
+    lock_semaphore: AtomicU64::new(0),
+    spin_count: 0,
+};
+
+const _: [(); 40] = [(); core::mem::size_of::<LoaderCriticalSection>()];
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
 const SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET: usize = 16;
@@ -6495,6 +6519,10 @@ pub unsafe extern "system" fn ldr_register_dll_notification(
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        let _loader_lock = match acquire_loader_lock() {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         let entry = crate::process_heap_alloc(32) as u64;
         if entry == 0 {
             return STATUS_NO_MEMORY;
@@ -6521,6 +6549,10 @@ pub unsafe extern "system" fn ldr_register_dll_notification(
 pub unsafe extern "system" fn ldr_unregister_dll_notification(cookie: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        let _loader_lock = match acquire_loader_lock() {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         let head = ldr_notification_head();
         let mut cur = core::ptr::read_unaligned(head as *const u64);
         let wanted = cookie as u64;
@@ -6560,7 +6592,10 @@ pub unsafe extern "system" fn ldr_load_dll(
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: on-target; dll_name a valid UNICODE_STRING, base_addr writable.
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         unsafe { crate::on_target::ldr_load_dll(dll_name as *const c_void, base_addr) }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -6585,7 +6620,10 @@ pub unsafe extern "system" fn ldr_get_dll_handle(
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: on-target; dll_name a valid UNICODE_STRING, dll_handle writable.
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         unsafe { crate::on_target::ldr_get_dll_handle(dll_name as *const c_void, dll_handle) }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -6611,7 +6649,10 @@ pub unsafe extern "system" fn ldr_get_procedure_address(
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: on-target; base a mapped module, name an ANSI_STRING*/NULL, address writable.
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         unsafe { crate::on_target::ldr_get_procedure_address(base_address, name, ordinal, address) }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -6649,6 +6690,10 @@ pub unsafe extern "system" fn ldr_get_procedure_address_ex(
 pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         let entry = unsafe { find_ldr_entry_for_base(base_address as u64) };
         unsafe { record_unload_event_from_entry(entry, base_address) };
         if entry != 0 {
@@ -7998,36 +8043,120 @@ unsafe fn strnlen_raw(p: *const u8, n: usize) -> usize {
 //     "no options" contract; the loader uses defaults).
 // =================================================================================================
 
-/// `LdrLockLoaderLock(ULONG Flags, PULONG State, PULONG_PTR Cookie) -> NTSTATUS` — single-threaded
-/// loader lock. Acquire is always immediate (uncontended). State = 1 (acquired); Cookie = sentinel.
+fn loader_lock_ptr() -> *mut c_void {
+    core::ptr::addr_of_mut!(LDR_LOADER_LOCK).cast()
+}
+
+/// Publish the process-wide loader lock through the x64 `PEB.LoaderLock` field.
+///
+/// # Safety
+/// `peb` is the current process's writable PEB.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_publish_loader_lock(peb: u64) {
+    if peb != 0 {
+        unsafe { core::ptr::write_unaligned((peb + 0x110) as *mut u64, loader_lock_ptr() as u64) };
+    }
+}
+
+pub(crate) struct LoaderLockGuard(usize);
+
+impl Drop for LoaderLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard is created only after a successful matching acquisition.
+        let _ = unsafe { ldr_unlock_loader_lock(0, self.0) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn acquire_loader_lock() -> Result<LoaderLockGuard, NtStatus> {
+    let mut cookie = 0usize;
+    let status = unsafe { ldr_lock_loader_lock(0, core::ptr::null_mut(), &mut cookie) };
+    if nt_success(status) {
+        Ok(LoaderLockGuard(cookie))
+    } else {
+        Err(status)
+    }
+}
+
+#[inline]
+unsafe fn loader_lock_error(flags: u32, status: NtStatus) -> NtStatus {
+    if flags & nt_ntdll::loader::lock::LOCK_FLAG_RAISE_ON_ERRORS != 0 {
+        unsafe { rtl_raise_status(status) };
+    }
+    status
+}
+
+/// `LdrLockLoaderLock(ULONG Flags, PULONG State, PULONG_PTR Cookie) -> NTSTATUS` — acquire the
+/// process-wide recursive loader critical section and return a thread-bound unlock cookie.
 ///
 /// # Safety
 /// `state`/`cookie` null or writable.
 #[export_name = "LdrLockLoaderLock"]
 pub unsafe extern "system" fn ldr_lock_loader_lock(
-    _flags: u32,
+    flags: u32,
     state: *mut u32,
     cookie: *mut usize,
 ) -> NtStatus {
     if !state.is_null() {
-        // 1 = LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED.
-        // SAFETY: state writable per the contract.
-        unsafe { *state = 1 };
+        unsafe { *state = nt_ntdll::loader::lock::DISPOSITION_INVALID };
     }
     if !cookie.is_null() {
-        // SAFETY: cookie writable per the contract.
-        unsafe { *cookie = 1 };
+        unsafe { *cookie = 0 };
     }
+    if let Err(status) = nt_ntdll::loader::lock::validate_lock_request(
+        flags,
+        !state.is_null(),
+        !cookie.is_null(),
+    ) {
+        return unsafe { loader_lock_error(flags, status) };
+    }
+
+    if flags & nt_ntdll::loader::lock::LOCK_FLAG_TRY_ONLY != 0 {
+        if unsafe { rtl_try_enter_critical_section(loader_lock_ptr()) } == 0 {
+            unsafe { *state = nt_ntdll::loader::lock::DISPOSITION_LOCK_NOT_ACQUIRED };
+            return STATUS_SUCCESS;
+        }
+    } else {
+        let status = unsafe { rtl_enter_critical_section(loader_lock_ptr()) };
+        if !nt_success(status) {
+            return unsafe { loader_lock_error(flags, status) };
+        }
+    }
+
+    let acquisition = LDR_LOADER_LOCK_ACQUISITION_COUNT
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let value = nt_ntdll::loader::lock::make_cookie(unsafe { resource_current_thread() }, acquisition);
+    if !state.is_null() {
+        unsafe { *state = nt_ntdll::loader::lock::DISPOSITION_LOCK_ACQUIRED };
+    }
+    unsafe { *cookie = value };
     STATUS_SUCCESS
 }
 
-/// `LdrUnlockLoaderLock(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — release (no-op, uncontended).
+/// `LdrUnlockLoaderLock(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — validate the thread-bound
+/// cookie and release one recursion level of the process loader lock.
 ///
 /// # Safety
 /// `cookie` from `LdrLockLoaderLock`.
 #[export_name = "LdrUnlockLoaderLock"]
-pub unsafe extern "system" fn ldr_unlock_loader_lock(_flags: u32, _cookie: usize) -> NtStatus {
-    STATUS_SUCCESS
+pub unsafe extern "system" fn ldr_unlock_loader_lock(flags: u32, cookie: usize) -> NtStatus {
+    if let Err(status) = nt_ntdll::loader::lock::validate_unlock(
+        flags,
+        cookie,
+        unsafe { resource_current_thread() },
+    ) {
+        return unsafe { loader_lock_error(flags, status) };
+    }
+    if cookie == 0 {
+        return STATUS_SUCCESS;
+    }
+    let status = unsafe { rtl_leave_critical_section(loader_lock_ptr()) };
+    if nt_success(status) {
+        status
+    } else {
+        unsafe { loader_lock_error(flags, status) }
+    }
 }
 
 /// `LdrInitShimEngineDynamic(PVOID BaseAddress) -> BOOLEAN`.
@@ -8290,8 +8419,11 @@ pub unsafe extern "system" fn ldr_get_dll_handle_ex(
     dll_handle: *mut *mut c_void,
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: dll_name a UNICODE_STRING*, dll_handle writable — the LdrGetDllHandle contract.
     unsafe {
+        let _loader_lock = match acquire_loader_lock() {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         crate::on_target::ldr_get_dll_handle(dll_name, dll_handle)
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -8314,8 +8446,11 @@ pub unsafe extern "system" fn ldr_enumerate_loaded_modules(
     context: *mut c_void,
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: on-target; PEB @ gs:[0x60], Ldr @ PEB+0x18, InLoadOrderModuleList @ Ldr+0x10.
     unsafe {
+        let _loader_lock = match acquire_loader_lock() {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
         let peb: *const u8;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
         let ldr = *(peb.add(0x18) as *const *const u8);
