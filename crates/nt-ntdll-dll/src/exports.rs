@@ -16472,21 +16472,27 @@ pub unsafe extern "system" fn rtl_get_native_system_information(
     }
 }
 
-// ---- vectored exception handlers / SEH function tables (honest no-op/seam) ------------------------
+// ---- vectored exception handlers / SEH function tables --------------------------------------------
 
-/// `RtlAddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler) -> PVOID` —
-/// register a VEH. No VEH dispatch plane yet; return a non-null cookie (the Handler ptr) so the
-/// caller's "registration failed?" check passes. The handler simply won't be invoked (no exceptions
-/// on the boot path) — an honest no-op, never a fabricated dispatch.
+/// `RtlAddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler) -> PVOID`.
 ///
 /// # Safety
 /// `handler` a valid VEH callback.
 #[export_name = "RtlAddVectoredExceptionHandler"]
 pub unsafe extern "system" fn rtl_add_vectored_exception_handler(
-    _first: u32,
+    first: u32,
     handler: *mut c_void,
 ) -> *mut c_void {
-    handler
+    let handler = if handler.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute(handler) })
+    };
+    nt_ntdll::rtl::vectored_handler::vectored_handlers().add(
+        nt_ntdll::rtl::vectored_handler::HandlerList::Exception,
+        first,
+        handler,
+    )
 }
 
 /// `RtlRemoveVectoredExceptionHandler(PVOID Handle) -> ULONG` — 1 = removed.
@@ -16494,8 +16500,11 @@ pub unsafe extern "system" fn rtl_add_vectored_exception_handler(
 /// # Safety
 /// `handle` from `RtlAddVectoredExceptionHandler`.
 #[export_name = "RtlRemoveVectoredExceptionHandler"]
-pub unsafe extern "system" fn rtl_remove_vectored_exception_handler(_handle: *mut c_void) -> u32 {
-    1
+pub unsafe extern "system" fn rtl_remove_vectored_exception_handler(handle: *mut c_void) -> u32 {
+    nt_ntdll::rtl::vectored_handler::vectored_handlers().remove(
+        nt_ntdll::rtl::vectored_handler::HandlerList::Exception,
+        handle,
+    )
 }
 
 /// `RtlAddVectoredContinueHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler) -> PVOID`.
@@ -16504,10 +16513,19 @@ pub unsafe extern "system" fn rtl_remove_vectored_exception_handler(_handle: *mu
 /// `handler` a valid callback.
 #[export_name = "RtlAddVectoredContinueHandler"]
 pub unsafe extern "system" fn rtl_add_vectored_continue_handler(
-    _first: u32,
+    first: u32,
     handler: *mut c_void,
 ) -> *mut c_void {
-    handler
+    let handler = if handler.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute(handler) })
+    };
+    nt_ntdll::rtl::vectored_handler::vectored_handlers().add(
+        nt_ntdll::rtl::vectored_handler::HandlerList::Continue,
+        first,
+        handler,
+    )
 }
 
 /// `RtlRemoveVectoredContinueHandler(PVOID Handle) -> ULONG`.
@@ -16515,8 +16533,11 @@ pub unsafe extern "system" fn rtl_add_vectored_continue_handler(
 /// # Safety
 /// `handle` a registration cookie.
 #[export_name = "RtlRemoveVectoredContinueHandler"]
-pub unsafe extern "system" fn rtl_remove_vectored_continue_handler(_handle: *mut c_void) -> u32 {
-    1
+pub unsafe extern "system" fn rtl_remove_vectored_continue_handler(handle: *mut c_void) -> u32 {
+    nt_ntdll::rtl::vectored_handler::vectored_handlers().remove(
+        nt_ntdll::rtl::vectored_handler::HandlerList::Continue,
+        handle,
+    )
 }
 
 /// `RtlAddFunctionTable(PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount, DWORD64 BaseAddress)
@@ -16904,28 +16925,32 @@ pub unsafe extern "system" fn ki_raise_user_exception_dispatcher() {
     }
 }
 
-/// `KiUserExceptionDispatcher(PEXCEPTION_RECORD, PCONTEXT)` — the entry the kernel/executive jumps to
-/// for a delivered exception. BATCH 42: dispatches through the real machinery
-/// ([`crate::seh::ki_user_exception_dispatcher`]). (The software raise path lands here via
-/// `RtlRaiseException`; the hardware-fault redirection onto this entry is scoped-deferred executive
-/// work — see the `seh` module doc.)
+/// `KiUserExceptionDispatcher` — AMD64 stacked hardware-exception entry. ReactOS enters with a
+/// `KUSER_EXCEPTION_STACK` at RSP: CONTEXT at +0 and EXCEPTION_RECORD at +0x4D0. The naked shim
+/// constructs the normal RCX/RDX arguments and transfers to the shared dispatcher.
 ///
 /// # Safety
-/// `record`/`context` valid (a stacked EXCEPTION_RECORD + CONTEXT).
+/// RSP points to a valid `KUSER_EXCEPTION_STACK`.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "KiUserExceptionDispatcher"]
+pub unsafe extern "C" fn ki_user_exception_dispatcher() -> ! {
+    core::arch::naked_asm!(
+        "cld",
+        "lea rcx, [rsp + 0x4d0]",
+        "mov rdx, rsp",
+        "call {dispatch}",
+        "ud2",
+        dispatch = sym crate::seh::ki_user_exception_dispatcher,
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 #[export_name = "KiUserExceptionDispatcher"]
 pub unsafe extern "system" fn ki_user_exception_dispatcher(
-    record: *mut c_void,
-    context: *mut c_void,
+    _record: *mut c_void,
+    _context: *mut c_void,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: valid delivered records.
-    unsafe {
-        crate::seh::ki_user_exception_dispatcher(record, context as *mut u8);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (record, context);
-    }
 }
 
 /// `KiUserCallbackDispatcher` — the x64 user-mode entry for a kernel `KeUserModeCallback`.

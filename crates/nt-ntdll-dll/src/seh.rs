@@ -31,6 +31,7 @@ use nt_ntdll::rtl::exception::{
     self as ex, Context, ImageReader, RuntimeFunction, ScopeRecord, StackReader,
 };
 use nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables;
+use nt_ntdll::rtl::vectored_handler::{vectored_handlers, HandlerList};
 
 // =================================================================================================
 // The x64 CONTEXT — byte offsets (CONTEXT_AMD64, total 0x4D0). We read/write the register file
@@ -441,6 +442,22 @@ struct DispatcherContext {
 /// -> EXCEPTION_DISPOSITION`.
 type ExceptionRoutine = unsafe extern "C" fn(*mut c_void, u64, *mut u8, *mut c_void) -> i32;
 
+unsafe fn finish_vectored_dispatch(
+    record: *mut c_void,
+    context: *mut u8,
+    handled: bool,
+) -> bool {
+    // SAFETY: record/context remain valid for the duration of the dispatch entry.
+    unsafe {
+        let _ = vectored_handlers().call(
+            HandlerList::Continue,
+            record,
+            context.cast::<c_void>(),
+        );
+    }
+    handled
+}
+
 /// `RtlDispatchException(ExceptionRecord*, ContextRecord*) -> BOOLEAN`. The first pass: from the
 /// faulting frame, iterate up the stack via `RtlVirtualUnwind`; for each frame with a language
 /// handler, call it. `ExceptionContinueExecution` → resume (return TRUE). `ExceptionContinueSearch`
@@ -452,6 +469,16 @@ type ExceptionRoutine = unsafe extern "C" fn(*mut c_void, u64, *mut u8, *mut c_v
 pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> bool {
     if record.is_null() || context.is_null() {
         return false;
+    }
+    // SAFETY: the input pair stays live for every registered callback.
+    if unsafe {
+        vectored_handlers().call(
+            HandlerList::Exception,
+            record,
+            context.cast::<c_void>(),
+        )
+    } {
+        return unsafe { finish_vectored_dispatch(record, context, true) };
     }
     // Work on a COPY of the context so the first-pass unwind doesn't destroy the original (which a
     // handler needs to resume / which the unwind pass re-derives).
@@ -466,12 +493,12 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
     loop {
         guard += 1;
         if guard > 4096 {
-            return false; // runaway walk — bail (corrupt stack)
+            return unsafe { finish_vectored_dispatch(record, context, false) };
         }
         // SAFETY: work_ptr is our CONTEXT copy.
         let control_pc = unsafe { core::ptr::read_unaligned(work_ptr.add(CTX_RIP) as *const u64) };
         if control_pc == 0 {
-            return false;
+            return unsafe { finish_vectored_dispatch(record, context, false) };
         }
         let mut image_base: u64 = 0;
         // SAFETY: lookup + writable out.
@@ -484,11 +511,11 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
             unsafe {
                 let rsp = core::ptr::read_unaligned(work_ptr.add(CTX_RSP) as *const u64);
                 if rsp == 0 || rsp & 7 != 0 {
-                    return false;
+                    return finish_vectored_dispatch(record, context, false);
                 }
                 let ret = core::ptr::read_volatile(rsp as *const u64);
                 if ret == 0 {
-                    return false; // top of stack — unhandled
+                    return finish_vectored_dispatch(record, context, false);
                 }
                 core::ptr::write_unaligned(work_ptr.add(CTX_RIP) as *mut u64, ret);
                 core::ptr::write_unaligned(work_ptr.add(CTX_RSP) as *mut u64, rsp + 8);
@@ -544,7 +571,7 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
             match ex::Disposition::from_raw(disp_ret) {
                 ex::Disposition::ContinueExecution => {
                     // The handler fixed the fault: resume the original context.
-                    return true;
+                    return unsafe { finish_vectored_dispatch(record, context, true) };
                 }
                 ex::Disposition::ContinueSearch => { /* keep walking up */ }
                 // Nested/collided unwind: treat as continue-search for the software path (the full
@@ -912,7 +939,10 @@ pub unsafe fn c_specific_handler(
 ///
 /// # Safety
 /// `record`/`context` valid (a stacked EXCEPTION_RECORD + CONTEXT).
-pub unsafe fn ki_user_exception_dispatcher(record: *mut c_void, context: *mut u8) -> ! {
+pub unsafe extern "C" fn ki_user_exception_dispatcher(
+    record: *mut c_void,
+    context: *mut u8,
+) -> ! {
     // SAFETY: dispatch + resume/raise per the delivered records. Neither branch returns (a caught
     // handler unwinds via RtlUnwindEx; a fixed fault resumes; an unhandled one terminates).
     unsafe {

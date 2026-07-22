@@ -43,6 +43,7 @@ pub mod status;
 pub mod strings;
 pub mod time;
 pub mod user_stack;
+pub mod vectored_handler;
 
 // Re-export the counted-string type at the `rtl` root (used across the surface).
 pub use nt_compat_exports::rtl::UnicodeString;
