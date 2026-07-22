@@ -147,21 +147,36 @@ pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Ve
     let dos_devices_prefix = b"\\dosdevices\\c:\\";
     let drive_prefix = b"c:\\";
     let mut relative = Vec::new();
+    let from_dos_drive;
     if folded.starts_with(system_prefix)
         && folded
             .get(system_prefix.len())
             .is_none_or(|byte| *byte == b'\\')
     {
+        from_dos_drive = false;
         relative.extend(system_root.iter().map(u8::to_ascii_lowercase));
         relative.extend_from_slice(&folded[system_prefix.len()..]);
     } else if folded.starts_with(dos_prefix) {
+        from_dos_drive = true;
         relative.extend_from_slice(&folded[dos_prefix.len()..]);
     } else if folded.starts_with(dos_devices_prefix) {
+        from_dos_drive = true;
         relative.extend_from_slice(&folded[dos_devices_prefix.len()..]);
     } else if folded.starts_with(drive_prefix) {
+        from_dos_drive = true;
         relative.extend_from_slice(&folded[drive_prefix.len()..]);
     } else {
         return None;
+    }
+
+    // The hosted PEB exposes the canonical DOS SystemRoot as C:\Windows while the ReactOS tree is
+    // mounted under system_root on the FAT volume. Resolve both spellings to the same directory.
+    if from_dos_drive && (relative == b"windows" || relative.starts_with(b"windows\\")) {
+        let suffix = &relative[b"windows".len()..];
+        let mut rooted = Vec::with_capacity(system_root.len() + suffix.len());
+        rooted.extend(system_root.iter().map(u8::to_ascii_lowercase));
+        rooted.extend_from_slice(suffix);
+        relative = rooted;
     }
 
     let mut normalized = Vec::with_capacity(relative.len());

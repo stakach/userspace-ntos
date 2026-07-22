@@ -69,6 +69,11 @@ impl<const N: usize> StaticTlsCatalog<N> {
         self.len == 0
     }
 
+    /// Forget the current process catalog without copying its fixed-capacity backing array.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
     pub fn add(
         &mut self,
         module_base: u64,
@@ -182,5 +187,14 @@ mod tests {
             Err(StaticTlsError::CapacityExceeded)
         );
         assert_eq!(catalog.len(), 1);
+    }
+
+    #[test]
+    fn catalog_can_be_rebuilt_in_place() {
+        let mut catalog = StaticTlsCatalog::<2>::new();
+        catalog.add(1, directory(2, 3, 4, 0)).unwrap();
+        catalog.clear();
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.add(5, directory(6, 7, 8, 0)).unwrap().index, 0);
     }
 }

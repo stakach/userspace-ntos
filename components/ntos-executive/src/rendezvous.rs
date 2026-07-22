@@ -339,9 +339,8 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
 pub(crate) unsafe fn spawn_wl_listener_thread(
     slot: usize,
     pml4: u64,
-    entry_rip: u64,
-    arg0: u64,
-    arg1: u64,
+    start: nt_thread_start::Amd64ThreadContext,
+    initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
@@ -385,10 +384,17 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     spawn_hosted_thread(&HostedThread {
         pml4,
         client_pi: 2,
-        entry_rip,
-        arg0,
-        arg1,
-        loader_context: None,
+        entry_rip: start.rip,
+        arg0: start.rcx,
+        arg1: start.rdx,
+        loader_context: (slot == 0)
+            .then(|| img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed))
+            .filter(|&rva| rva != 0)
+            .map(|rva| LoaderThreadContext {
+                loader_va: NTDLL_BASE + rva,
+                start,
+                initial_teb,
+            }),
         scr,
         teb_va,
         stack_base,

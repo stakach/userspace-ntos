@@ -1390,14 +1390,18 @@ pub unsafe fn free_current_thread_static_tls() {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn initialize_process_static_tls(exe_base: u64, table: *const ModuleTable) -> u32 {
-    let mut catalog = nt_ntdll::loader::tls::StaticTlsCatalog::<MODULE_TABLE_CAP>::new();
-    if let Err(status) = unsafe { add_image_static_tls(&mut catalog, exe_base) } {
+    // Build directly in the process-local static. A stack-local catalog is about 14 KiB at the
+    // loader's 256-module capacity, and assigning it here lowers to one large memcpy during the
+    // earliest process initialization phase.
+    let catalog = unsafe { &mut *core::ptr::addr_of_mut!(STATIC_TLS_CATALOG) };
+    catalog.clear();
+    if let Err(status) = unsafe { add_image_static_tls(catalog, exe_base) } {
         return status;
     }
     let table = unsafe { &*table };
     for module in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
         if module.base != 0 && module.base != exe_base {
-            if let Err(status) = unsafe { add_image_static_tls(&mut catalog, module.base) } {
+            if let Err(status) = unsafe { add_image_static_tls(catalog, module.base) } {
                 return status;
             }
         }
@@ -1410,7 +1414,6 @@ unsafe fn initialize_process_static_tls(exe_base: u64, table: *const ModuleTable
             unsafe { core::ptr::write_unaligned((ldr_entry + 0x6e) as *mut u16, u16::MAX) };
         }
     }
-    unsafe { STATIC_TLS_CATALOG = catalog };
     unsafe { allocate_current_thread_static_tls() }
 }
 

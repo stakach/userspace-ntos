@@ -1241,6 +1241,28 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
+                let tcb = PM_MAIN_TCBS[pi].load(Ordering::Relaxed);
+                if tcb != 0 {
+                    let mut regs = [0u64; 20];
+                    win32k_glue::tcb_read_regs20(tcb, &mut regs);
+                    print_str(b"[vmf-low] rcx=0x");
+                    print_hex((regs[5] >> 32) as u32);
+                    print_hex(regs[5] as u32);
+                    print_str(b" rsi=0x");
+                    print_hex((regs[7] >> 32) as u32);
+                    print_hex(regs[7] as u32);
+                    print_str(b" rdi=0x");
+                    print_hex((regs[8] >> 32) as u32);
+                    print_hex(regs[8] as u32);
+                    print_str(b" rsp=0x");
+                    print_hex((regs[1] >> 32) as u32);
+                    print_hex(regs[1] as u32);
+                    print_str(b" ret=0x");
+                    let ret = smss_stack_read(regs[1] + 0x10);
+                    print_hex((ret >> 32) as u32);
+                    print_hex(ret as u32);
+                    print_str(b"\n");
+                }
                 // user32 GetThreadDesktopWnd (RVA 0x50009) dereferences
                 // `GetThreadDesktopInfo()->spwnd`. IntSetThreadDesktop can clear the client fields
                 // while the hosted per-thread desktop-heap view is being established. Repair the
@@ -1615,6 +1637,13 @@ pub(crate) unsafe fn service_sec_image(
                 // every process that faults it — real image sharing.
                 let shareable = base != PE_LOAD_BASE && page_rights(tpe, rva) == 2;
                 let cached = if shareable { dll_cache_get(bpage) } else { 0 };
+                // A forward run may overlap pages filled by an earlier run. The faulting page must
+                // still be handled, but speculative neighbours that are already resident must not
+                // be filled into a new frame and mapped over the live page (seL4 DeleteFirst).
+                if !is_fault_page && !shareable && filled_pages.contains(&bpage) {
+                    bi += 1;
+                    continue;
+                }
                 // ★ BATCH 25 — FIXUP-SURVIVAL (the general correctness fix). A per-process image page
                 // (a DLL's headers/.rdata/.idata/IAT or the main image) is filled ONCE from the raw
                 // on-disk PE, then the ON-TARGET ntdll loader applies base RELOCATIONS + snaps the IAT
@@ -2618,6 +2647,11 @@ pub(crate) unsafe fn service_sec_image(
                         |address| smss_stack_read(address),
                         ctx_va,
                     );
+                    let initial_teb_va = smss_stack_read(sp + 0x38);
+                    let initial_teb = nt_thread_start::InitialTeb64::read(
+                        |address| smss_stack_read(address),
+                        initial_teb_va,
+                    );
                     let tid = match slot {
                         0 => PM_LISTENER_TID.load(Ordering::Relaxed),
                         1 => WL_WORKER2_TID.load(Ordering::Relaxed),
@@ -2649,13 +2683,12 @@ pub(crate) unsafe fn service_sec_image(
                     let tcb = spawn_wl_listener_thread(
                         slot,
                         procs[2].pml4,
-                        start.rip,
-                        start.rcx,
-                        start.rdx,
+                        start,
+                        initial_teb,
                         cid_proc,
                         tid,
                         fault_ep,
-                        !suspended,
+                        false,
                     );
                     let teb_alias = match slot {
                         0 => WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000,
@@ -2669,6 +2702,9 @@ pub(crate) unsafe fn service_sec_image(
                     tcb_cell.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
+                    if !suspended {
+                        let _ = tcb_resume(tcb);
+                    }
                     print_str(b"[wl-thread] spawned tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" TEB=0x");

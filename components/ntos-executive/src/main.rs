@@ -201,7 +201,7 @@ pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_1080_0000;
 pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 KiB)
 /// csrss's own image mirror — its loader reads import-descriptor DLL names ("csrsrv.dll") from its
 /// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
-/// (inside the NTDLLBUF page table, 0xA0-0xC0). ACTIVE_IMAGE_MIRROR selects by the current badge.
+/// inside the shared-input page table. ACTIVE_IMAGE_MIRROR selects by the current badge.
 pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
 /// winlogon's per-process executive mirrors (3rd hosted process). Stack mirror sits beside the
 /// smss/csrss/SM mirrors in the FILEBUF PT (0x1068/0x1069/0x106A used → 0x106B free). Heap + image
@@ -756,12 +756,11 @@ const _: () = assert!(win32k_subsystem::CSRSS_W32_SHARED_VA
 /// Every leaf DLL (kernel32/user32/gdi32/advapi32/rpcrt4/msvcrt/ws2_32/basesrv/winsrv + lsass'
 /// lsasrv/samsrv/msv1_0 + all P5+ binaries) demand-loads with NO edit here.
 pub const DLL_PIN_COUNT: usize = 4;
-/// A larger buffer for the ~975 KiB ReactOS ntdll.dll (its own 2 MiB PT), shared host<->exec.
-pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_10A0_0000;
-pub const NTDLLBUF_FRAMES: u64 = 240; // 240*4K = 983040 > 975360
+/// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
+pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
+pub const NTDLLBUF_FRAMES: u64 = 384; // 1.5 MiB
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
-/// NTDLLBUF page table's 2 MiB region (0xA0_0000-0xC0_0000, past NTDLLBUF's 0xA0-0xB0), so they
-/// need no extra PT. spawn_sec_image later shares these frames into smss + points the PEB NLS
+/// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
 pub const NLS_ANSI_VADDR: u64 = 0x0000_0100_10B0_0000; // c_1252.nls (66082 B = 17 pages)
 pub const NLS_ANSI_FRAMES: u64 = 20;
@@ -771,9 +770,7 @@ pub const NLS_CASE_VADDR: u64 = 0x0000_0100_10B4_0000; // l_intl.nls (4870 B = 2
 pub const NLS_CASE_FRAMES: u64 = 4;
 /// c_20127.nls (US-ASCII, CP20127; 66082 B = 17 pages) — csrss's Win32 client stack maps the named
 /// section \Nls\NlsSectionCP20127 during a DllMain. Shares the NTDLLBUF 0xA0-0xC0 page table so it
-/// needs no extra PT. Placed at 0xB9_0000 — PAST HIVEBUF (0xB5_0000 + 64 frames = 0xB9_0000); the
-/// task's suggested 0xB6_0000 collides with the SYSTEM-hive buffer. Runs to 0xBD_0000, clear of
-/// the 0xC0_0000 region end.
+/// needs no extra PT. Placed past the SYSTEM hive buffer.
 pub const NLS_20127_VADDR: u64 = 0x0000_0100_10B9_0000;
 pub const NLS_20127_FRAMES: u64 = 20;
 /// The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, ~204 KiB regf), read off the disk by the
@@ -781,6 +778,7 @@ pub const NLS_20127_FRAMES: u64 = 20;
 /// the NT registry serves smss's real config. Shares the 0xA0-0xC0 page table (past the NLS bufs).
 pub const HIVEBUF_VADDR: u64 = 0x0000_0100_10B5_0000;
 pub const HIVEBUF_FRAMES: u64 = 64; // 256 KiB
+const _: () = assert!(NTDLLBUF_FRAMES * 0x1000 <= 0x20_0000);
 /// The same NLS frames shared into smss (own PT at the 0xE0_0000 2 MiB region). The PEB's
 /// AnsiCodePageData(@0x58)/OemCodePageData(@0x60)/UnicodeCaseTableData(@0x68) point here.
 pub const NLS_SMSS_ANSI_VA: u64 = 0x0000_0100_00E0_0000;
@@ -4878,12 +4876,20 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let scr = t.scr;
     if t.stack_mirror_va != 0 {
         let pt_base = t.stack_mirror_va & !0x1f_ffffu64;
-        let pt_index = ((pt_base - (SVC_LISTENER_STACK_MIRROR_VA & !0x1f_ffffu64)) >> 21) as u32;
-        let bit = 1u64 << pt_index;
-        if HOSTED_STACK_MIRROR_PT_BITS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-            let pt = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_base, CAP_INIT_THREAD_VSPACE);
+        let dynamic_base = SVC_LISTENER_STACK_MIRROR_VA & !0x1f_ffffu64;
+        // Low SM/CSR mirrors already live in FILEBUF's page table. Only create page tables for the
+        // dedicated high mirror window; checked_sub prevents low addresses wrapping the bit index.
+        if let Some(offset) = pt_base.checked_sub(dynamic_base) {
+            let pt_index = (offset >> 21) as u32;
+            if pt_index < 64 {
+                let bit = 1u64 << pt_index;
+                if HOSTED_STACK_MIRROR_PT_BITS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    let pt = alloc_slot();
+                    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+                    let _ =
+                        paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, pt_base, CAP_INIT_THREAD_VSPACE);
+                }
+            }
         }
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
@@ -4941,7 +4947,6 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     };
     core::ptr::write_volatile((scr + 0x08) as *mut u64, teb_stack_base);
     core::ptr::write_volatile((scr + 0x10) as *mut u64, teb_stack_limit);
-    core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     let acs_va = t.teb_va + 0x1800;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
     // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).
@@ -4950,6 +4955,8 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let teb2_live_mirror = copy_cap(teb2);
     let teb2_target_map = page_map(teb2, t.teb_va + 0x1000, RW_NX, t.pml4);
     let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    // DeallocationStack is in TEB page 2; populate it only after its scratch alias is mapped.
+    core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     let teb2_live_map = if t.stack_mirror_va != 0 {
         page_map(
             teb2_live_mirror,
@@ -7255,7 +7262,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..FILEBUF_FRAMES {
                 let _ = page_map(copy_cap(fb_start + i), FILEBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
-            // The ntdll buffer (240 frames, its own PT), mapped in the executive too.
+            // The generated ntdll buffer, mapped in the executive at its own 2 MiB region.
             let nb_pt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nb_pt);
             let _ = paging_struct_map(nb_pt, LBL_X86_PAGE_TABLE_MAP, NTDLLBUF_VADDR, CAP_INIT_THREAD_VSPACE);
@@ -7266,6 +7273,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for i in 0..NTDLLBUF_FRAMES {
                 let _ = page_map(copy_cap(nb_start + i), NTDLLBUF_VADDR + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
             }
+            // NLS, hive, and the csrss image mirror retain their original shared-input region.
+            let shared_input_pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, shared_input_pt);
+            let _ = paging_struct_map(shared_input_pt, LBL_X86_PAGE_TABLE_MAP, NLS_ANSI_VADDR, CAP_INIT_THREAD_VSPACE);
             // The server-DLL buffer (basesrv.dll + winsrv.dll, its own PT), mapped in the executive
             // too so it can parse them for the csrss ServerDll load path.
             let sb_pt = alloc_slot();
@@ -7333,7 +7344,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 }
                 st_static.store(start, Ordering::Relaxed);
             }
-            // The NLS buffers share the NTDLLBUF page table (0xA0-0xC0) — map contiguous frame runs
+            // The NLS buffers share the input page table (0xA0-0xC0) — map contiguous frame runs
             // in the executive too, and remember their cap bases for spawn_sec_image to share into
             // smss.
             let mut nls_starts = [0u64; 3];
@@ -7357,7 +7368,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             NLS_ANSI_START.store(nls_starts[0], Ordering::Relaxed);
             NLS_OEM_START.store(nls_starts[1], Ordering::Relaxed);
             NLS_CASE_START.store(nls_starts[2], Ordering::Relaxed);
-            // c_20127.nls (US-ASCII CP20127) — also shares the NTDLLBUF 0xA0-0xC0 PT (at 0xB9_0000,
+            // c_20127.nls (US-ASCII CP20127) — also shares the input 0xA0-0xC0 PT (at 0xB9_0000,
             // past HIVEBUF), so map its contiguous frame run in the executive with no extra PT.
             let nls20127_start = alloc_frame();
             for _ in 1..NLS_20127_FRAMES {
@@ -8537,6 +8548,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // IAT -> NTDLL_BASE+0x48f00 -> ntdll's .text page faults in and REAL NTDLL CODE
                 // EXECUTES. It runs until it derefs the (null) process params -> a safe stop.
                 let ntdll_size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x28) as *const u32);
+                assert!((ntdll_size as u64) <= NTDLLBUF_FRAMES * 0x1000);
                 let ntdll_bytes = core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
                 let si_fault = make_object(OBJ_ENDPOINT);
                 let si_fault_c = copy_cap(si_fault);

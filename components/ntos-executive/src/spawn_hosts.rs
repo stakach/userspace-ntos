@@ -337,8 +337,8 @@ pub(crate) unsafe fn spawn_storage_host(
 ) {
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
     // Device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA frame, shared word.
-    // Then the staging buffers, each with its own dedicated PT(s) — EXCEPT the NLS + SYSTEM-hive
-    // buffers, which share the NTDLLBUF page table (0xA0-0xC0 region) so map with pts=0.
+    // Then the staging buffers, each with its own dedicated PT(s). NLS + SYSTEM-hive share one
+    // input page table with each other, distinct from the relocated NTDLLBUF.
     let mut regions: [Region; 32] = [Region { source: FrameSource::Alias(0), base_va: 0, count: 0, rights: Rights::Uniform(RW_NX), pts: 0 }; 32];
     let mut n = 0usize;
     regions[n] = Region { source: FrameSource::Alias(ahci_bar_frame), base_va: AHCI_VADDR, count: 1, rights: Rights::Uniform(RW_NX), pts: 0 }; n += 1;
@@ -364,15 +364,15 @@ pub(crate) unsafe fn spawn_storage_host(
         regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: 1 };
         n += 1;
     }
-    // NLS + SYSTEM-hive buffers share the NTDLLBUF page table — NO dedicated PT.
-    for (start, vaddr, frames) in [
+    // NLS + SYSTEM-hive buffers share one page table; the first descriptor creates it.
+    for (index, (start, vaddr, frames)) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
         (nls20127_start, NLS_20127_VADDR, NLS_20127_FRAMES),
         (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
-    ] {
-        regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: 0 };
+    ].into_iter().enumerate() {
+        regions[n] = Region { source: FrameSource::Alias(start), base_va: vaddr, count: frames, rights: Rights::Uniform(RW_NX), pts: u64::from(index == 0) };
         n += 1;
     }
     let d = ComponentDescriptor {

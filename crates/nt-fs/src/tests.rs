@@ -56,6 +56,10 @@ fn local_nt_paths_resolve_to_the_fat_volume() {
         b"reactos\\winsxs\\manifests\\x.manifest"
     );
     assert_eq!(
+        nt_path_to_volume_relative(&utf16(r"\??\C:\Windows\System32"), b"reactos").unwrap(),
+        b"reactos\\system32"
+    );
+    assert_eq!(
         nt_path_to_volume_relative(&utf16(r"\??\C:\"), b"reactos").unwrap(),
         b""
     );
