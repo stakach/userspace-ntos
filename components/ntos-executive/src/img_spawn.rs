@@ -675,19 +675,35 @@ pub(crate) unsafe fn spawn_sec_image(
             }
             (s.len() * 2) as u16
         };
-        // (unicode_string field offset, scratch buffer offset, smss buffer VA offset, text).
+        // Keep buffers after the fixed RTL_USER_PROCESS_PARAMETERS body. CurrentDirectory reserves
+        // MAX_PATH UTF-16 units because RtlSetCurrentDirectory_U stores a trailing slash and may
+        // later replace the path in place.
+        const CURDIR_CAPACITY: u16 = 260 * 2;
+        const DLL_PATH_CAPACITY: u16 = 0xE0;
+        const IMAGE_PATH_CAPACITY: u16 = 0x200;
+        const COMMAND_LINE_CAPACITY: u16 = 0x600;
+        const CURDIR_BUFFER: u64 = 0x500;
+        const DLL_PATH_BUFFER: u64 = 0x720;
+        const IMAGE_PATH_BUFFER: u64 = 0x800;
+        const COMMAND_LINE_BUFFER: u64 = 0xA00;
+        const _: () = assert!(CURDIR_BUFFER + CURDIR_CAPACITY as u64 <= DLL_PATH_BUFFER);
+        const _: () = assert!(DLL_PATH_BUFFER + DLL_PATH_CAPACITY as u64 <= IMAGE_PATH_BUFFER);
+        const _: () = assert!(IMAGE_PATH_BUFFER + IMAGE_PATH_CAPACITY as u64 <= COMMAND_LINE_BUFFER);
+        const _: () = assert!(COMMAND_LINE_BUFFER + COMMAND_LINE_CAPACITY as u64 <= 0x1000);
+        // (UNICODE_STRING field, buffer offset, byte capacity, text).
         // ImagePathName + CommandLine are per-process (smss vs csrss) — the loader derives the DLL
         // search + the ".local" SxS probe from ImagePathName, and the image's entry parses CommandLine.
-        let ustrs: [(u64, u64, &[u8]); 4] = [
-            (0x38, 0x300, b"C:\\Windows"),           // CurrentDirectory.DosPath
-            (0x50, 0x340, b"C:\\Windows\\System32"), // DllPath
-            (0x60, 0x3A0, image_path),               // ImagePathName
-            (0x70, 0x480, cmd_line),                 // CommandLine
+        let ustrs: [(u64, u64, u16, &[u8]); 4] = [
+            (0x38, CURDIR_BUFFER, CURDIR_CAPACITY, b"C:\\Windows"),
+            (0x50, DLL_PATH_BUFFER, DLL_PATH_CAPACITY, b"C:\\Windows\\System32"),
+            (0x60, IMAGE_PATH_BUFFER, IMAGE_PATH_CAPACITY, image_path),
+            (0x70, COMMAND_LINE_BUFFER, COMMAND_LINE_CAPACITY, cmd_line),
         ];
-        for (foff, boff, text) in ustrs {
+        for (foff, boff, capacity, text) in ustrs {
             let len = wstr(pp + boff, text);
+            assert!(len.checked_add(2).is_some_and(|needed| needed <= capacity));
             core::ptr::write_volatile((pp + foff) as *mut u16, len); // Length
-            core::ptr::write_volatile((pp + foff + 2) as *mut u16, len + 2); // MaximumLength
+            core::ptr::write_volatile((pp + foff + 2) as *mut u16, capacity); // MaximumLength
             core::ptr::write_volatile((pp + foff + 8) as *mut u64, SMSS_PARAMS_VA + boff);
             // Buffer
         }

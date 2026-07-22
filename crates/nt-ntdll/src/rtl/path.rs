@@ -434,37 +434,62 @@ pub fn dos_path_name_to_nt_path_name_rel(name: &[u16], cwd: &[u16]) -> Option<Ve
 /// `RtlIsDosDeviceName_U`: recognise a reserved DOS device name (case-insensitive, with an optional
 /// extension, e.g. `CON`, `NUL.txt`, `COM1`, `LPT3`). Returns `true` if the path names a device.
 pub fn is_dos_device_name(path: &[u16]) -> bool {
-    // Take the final path component, strip any extension.
-    let start = path
-        .iter()
-        .rposition(|&c| is_sep(c) || c == b':' as u16)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let comp = &path[start..];
-    let dot = comp
-        .iter()
-        .position(|&c| c == b'.' as u16)
-        .unwrap_or(comp.len());
-    let stem = &comp[..dot];
-    if stem.is_empty() {
+    let path_type = determine_dos_path_name_type(path);
+    if matches!(path_type, DosPathType::Unknown | DosPathType::UncAbsolute) {
         return false;
     }
-    let up: Vec<u8> = stem
+    if path_type == DosPathType::LocalDevice {
+        return path.len() == 7
+            && path[0] == b'\\' as u16
+            && path[1] == b'\\' as u16
+            && path[2] == b'.' as u16
+            && path[3] == b'\\' as u16
+            && eq_ascii_ci(&path[4..], b"CON");
+    }
+
+    let mut end = path.len();
+    if end != 0 && path[end - 1] == b':' as u16 {
+        end -= 1;
+    }
+    while end != 0 && matches!(path[end - 1], 0x20 | 0x2e) {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    let start = path[..end]
         .iter()
-        .map(|&c| {
-            let c = c as u8;
-            if c.is_ascii_lowercase() {
-                c - 0x20
-            } else {
-                c
-            }
+        .rposition(|&c| is_sep(c))
+        .map_or(0, |position| position + 1)
+        .max(if end >= 2 && path[1] == b':' as u16 {
+            2
+        } else {
+            0
+        });
+    let component = &path[start..end];
+    let stem_end = component
+        .iter()
+        .position(|&c| c == b'.' as u16 || c == b':' as u16)
+        .unwrap_or(component.len());
+    let mut stem = &component[..stem_end];
+    while stem.last() == Some(&(b' ' as u16)) {
+        stem = &stem[..stem.len() - 1];
+    }
+    matches!(stem.len(), 3 | 4)
+        && (eq_ascii_ci(stem, b"CON")
+            || eq_ascii_ci(stem, b"PRN")
+            || eq_ascii_ci(stem, b"AUX")
+            || eq_ascii_ci(stem, b"NUL")
+            || (stem.len() == 4
+                && (eq_ascii_ci(&stem[..3], b"COM") || eq_ascii_ci(&stem[..3], b"LPT"))
+                && matches!(stem[3], 0x31..=0x39)))
+}
+
+fn eq_ascii_ci(value: &[u16], expected: &[u8]) -> bool {
+    value.len() == expected.len()
+        && value.iter().zip(expected).all(|(&unit, &byte)| {
+            unit <= u8::MAX as u16 && (unit as u8).to_ascii_uppercase() == byte
         })
-        .collect();
-    matches!(up.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL")
-        || (up.len() == 4
-            && (up.starts_with(b"COM") || up.starts_with(b"LPT"))
-            && up[3].is_ascii_digit()
-            && up[3] != b'0')
 }
 
 #[cfg(test)]
@@ -705,11 +730,18 @@ mod tests {
     fn dos_devices() {
         assert!(is_dos_device_name(&u("CON")));
         assert!(is_dos_device_name(&u("nul.txt")));
+        assert!(is_dos_device_name(&u("NUL. ")));
+        assert!(is_dos_device_name(&u("C:\\path\\CON:")));
         assert!(is_dos_device_name(&u("C:\\path\\COM1")));
         assert!(is_dos_device_name(&u("LPT3")));
+        assert!(is_dos_device_name(&u("\\\\.\\CON")));
         assert!(!is_dos_device_name(&u("COM0")));
         assert!(!is_dos_device_name(&u("README")));
         assert!(!is_dos_device_name(&u("CONSOLE")));
+        assert!(!is_dos_device_name(&u("\\\\server\\share\\NUL")));
+        assert!(!is_dos_device_name(&u("\\\\.\\NUL")));
+        assert!(!is_dos_device_name(&u("//./CON")));
+        assert!(!is_dos_device_name(&[0x014e, b'U' as u16, b'L' as u16]));
     }
 
     #[test]

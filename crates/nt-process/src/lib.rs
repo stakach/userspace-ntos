@@ -155,6 +155,10 @@ pub enum HandleObject {
         first_cluster: u32,
         size: u32,
     },
+    /// A directory on the executive's mounted FAT volume.
+    Directory {
+        first_cluster: u32,
+    },
     /// The executive-reserved `\SystemRoot\bootstat.dat` file used by RTL boot-status APIs.
     BootStatusFile,
     /// An executive I/O completion-port object, indexed in the executive's fixed object table.

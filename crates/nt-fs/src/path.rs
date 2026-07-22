@@ -177,7 +177,7 @@ pub fn nt_path_to_volume_relative(path: &[u16], system_root: &[u8]) -> Option<Ve
         }
         normalized.extend_from_slice(component);
     }
-    (!normalized.is_empty()).then_some(normalized)
+    Some(normalized)
 }
 
 /// Case-insensitive component-wise prefix test.

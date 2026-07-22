@@ -368,24 +368,6 @@ pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
     }
 }
 
-/// Does the `\reactos\system32` DIRECTORY exist on the executive's live FS (the KnownDLLs directory
-/// open)? Walks to `system32` under `reactos` and confirms it's a directory. Returns false if the
-/// FS isn't mounted yet. Real-FS authority for the System32 directory open in NtOpenFile.
-pub(crate) unsafe fn sys32_dir_exists() -> bool {
-    match exec_fs() {
-        // dir_find_lfn returns (cluster, size, attr); attr bit 0x10 = directory. Walk root→reactos→system32.
-        Some(fs) => {
-            match dir_find_lfn(&fs, fs.root_cl, b"reactos") {
-                Some((cl, _, attr)) if (attr & 0x10) != 0 => {
-                    matches!(dir_find_lfn(&fs, cl, b"system32"), Some((_, _, a)) if (a & 0x10) != 0)
-                }
-                _ => false,
-            }
-        }
-        None => false,
-    }
-}
-
 // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH LOADER (generic, zero-per-binary) ---------------------------
 // After the isolated storage host reports and PARKS, the executive drives the SAME AHCI HBA itself
 // (it owns the BAR cap at AHCI_VADDR + the DMA frame cap + the VT-d IO mapping at AHCI_IOVA) to

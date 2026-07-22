@@ -414,6 +414,29 @@ impl ExecNtHandler {
         Some(handle as u64)
     }
 
+    /// Mint a process-local handle for a directory on the mounted FAT volume.
+    pub(crate) fn mint_directory_handle(
+        &mut self,
+        first_cluster: u32,
+        access: u32,
+    ) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let handle = self
+            .pm
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::Directory { first_cluster },
+                access,
+            )
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
     fn disk_file_for(&self, handle: u64) -> Result<Option<(u32, u32)>, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
@@ -5658,32 +5681,53 @@ impl NativeSyscallHandler for ExecNtHandler {
             // Length[R9]=args[3], FsInformationClass[arg5]=args[4]). CsrServerInitialization probes a
             // handle's volume; no real FS → conservative answer. All writes queued (csrss-only).
             NativeService::NtQueryVolumeInformationFile => {
+                const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+                let file_handle = args[0];
                 let iosb = args[1];
                 let buf = args[2];
                 let len = args[3];
                 // FsInformationClass is a ULONG; the 8-byte stack slot has garbage in the high dword.
                 let class = args[4] & 0xFFFF_FFFF;
-                let info_bytes: u64;
-                if class == 4 {
-                    // FileFsDeviceInformation { DeviceType=FILE_DEVICE_DISK(7), Characteristics=0 }.
-                    self.queue_write(buf, 0x0000_0000_0000_0007);
-                    info_bytes = 8;
-                } else {
-                    print_str(b"[ntos-exec] NtQueryVolumeInformationFile class=");
-                    print_u64(class);
-                    print_str(b" len=");
-                    print_u64(len);
-                    print_str(b"\n");
-                    let n = len.min(32) / 8;
-                    for k in 0..n {
-                        self.queue_write(buf + k * 8, 0);
+                if class != 4 {
+                    return STATUS_INVALID_INFO_CLASS;
+                }
+                if len < 8 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if iosb == 0 || buf == 0 {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if let Some(pid) = self.pm_pid_for_pi(self.pi) {
+                    let object = self
+                        .pm
+                        .lookup_handle(pid, file_handle as nt_process::Handle);
+                    let is_file = matches!(
+                        object,
+                        Some(
+                            nt_process::HandleObject::Directory { .. }
+                                | nt_process::HandleObject::DiskFile { .. }
+                                | nt_process::HandleObject::File(_)
+                                | nt_process::HandleObject::BootStatusFile
+                                | nt_process::HandleObject::Opaque(_)
+                        )
+                    );
+                    if !is_file {
+                        return if object.is_some() {
+                            STATUS_OBJECT_TYPE_MISMATCH
+                        } else {
+                            STATUS_INVALID_HANDLE
+                        };
                     }
-                    info_bytes = len.min(32);
                 }
-                if iosb != 0 {
-                    self.queue_write(iosb, 0); // Status = STATUS_SUCCESS
-                    self.queue_write(iosb + 8, info_bytes); // Information = bytes written
-                }
+                // FileFsDeviceInformation { DeviceType=FILE_DEVICE_DISK(7),
+                // Characteristics=FILE_DEVICE_IS_MOUNTED(0x20) }.
+                self.queue_write(buf, 0x0000_0020_0000_0007);
+                self.queue_write(iosb, 0); // Status = STATUS_SUCCESS
+                self.queue_write(iosb + 8, 8); // Information = bytes written
                 0
             }
             // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress[RDX]=args[1], ZeroBits,
@@ -6772,19 +6816,35 @@ impl NativeSyscallHandler for ExecNtHandler {
                     );
                     return status;
                 }
-                // The System32 DIRECTORY open (SmpCreateInitialSession → KnownDLLs) resolves through
-                // the REAL \reactos FS: the substring classifies the probe, the FS by-path
-                // authoritatively confirms \reactos\system32 exists AND is a directory
-                // (`sys32_dir_exists`). Path-form independent.
-                let is_sys32_dir = want_dir
-                    && nb[..nlen].windows(8).any(|w| w == b"system32")
-                    && sys32_dir_exists();
+                // Directory opens resolve authoritatively against the mounted FAT volume. The
+                // empty volume-relative path denotes the FAT root directory.
+                let volume_entry = if want_dir {
+                    nt_fs::nt_path_to_volume_relative(&name16, b"reactos")
+                        .and_then(|path| {
+                            exec_fs().and_then(|fs| {
+                                if path.is_empty() {
+                                    Some((fs.root_cl, 0, 0x10))
+                                } else {
+                                    fat_open_path_entry(&fs, &path)
+                                }
+                            })
+                        })
+                } else {
+                    None
+                };
+                let volume_directory = volume_entry
+                    .filter(|(_, _, attributes)| attributes & 0x10 != 0)
+                    .map(|(first_cluster, _, _)| first_cluster);
+                let volume_not_directory = volume_entry
+                    .is_some_and(|(_, _, attributes)| attributes & 0x10 == 0);
                 // csrss/winlogon/services/lsass.exe FILE opens (SmpExecuteImage /
                 // RtlCreateUserProcess / winlogon's CreateProcessInternalW): the substring classifies
                 // WHICH EXE, existence resolves against its CANONICAL leaf on the real \reactos FS
                 // (`exe_probe_canon` + `sys32_exists`) — path-form/malformed-path independent, no
                 // hand-maintained list. Loader manifest opens are unaffected (SxS rejected).
-                let exe_canon = Self::exe_probe_canon(&nb[..nlen], is_sxs);
+                let exe_canon = (!want_dir)
+                    .then(|| Self::exe_probe_canon(&nb[..nlen], is_sxs))
+                    .flatten();
                 let exe_exists = exe_canon.is_some_and(|leaf| sys32_exists(leaf));
                 let is_csrss = exe_exists && nb[..nlen].windows(5).any(|w| w == b"csrss");
                 let is_winlogon = exe_exists && nb[..nlen].windows(8).any(|w| w == b"winlogon");
@@ -6798,14 +6858,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // owns namespace/existence (csrss.exe + System32 dir here). pi>=1 = csrss OR winlogon
                 // (both load DLLs); smss (pi==0) still misses so its KnownDLLs opens fail + it
                 // launches csrss/winlogon.
-                let mut dll_i = if self.pi >= 1 { reg.resolve_name(&nb[..nlen]) } else { None };
+                let mut dll_i = if self.pi >= 1 && !want_dir {
+                    reg.resolve_name(&nb[..nlen])
+                } else {
+                    None
+                };
                 // TRUE syscall-time DEMAND-LOAD: a DLL-loading process (pi>=1) whose loader requests a
                 // DLL not yet registered (resolve miss) + not an SxS probe → resolve it BY PATH from
                 // the real \reactos\system32 FS, load into the pool, activate a reserved registry slot,
                 // relocate, and stash its parsed PE. From here it behaves exactly like a boot-pinned
                 // DLL (NtCreateSection/NtMapViewOfSection/the fault router all go through the registry +
                 // dll_pes). This is what retires the eager DLL list — no maintained table.
-                if self.pi >= 1 && dll_i.is_none() && !is_sxs {
+                if self.pi >= 1 && !want_dir && dll_i.is_none() && !is_sxs {
                     if let Some(slot) = demand_load_dll(
                         reg,
                         ctx.dll_pe_store,
@@ -6829,8 +6893,36 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
                 let mut opened_handle = 0;
-                let status: u32 = if is_sys32_dir || is_csrss || is_winlogon || is_services || is_lsass || dll_i.is_some() {
-                    let h = self.mint_handle();
+                let status: u32 = if volume_directory.is_some()
+                    || is_csrss
+                    || is_winlogon
+                    || is_services
+                    || is_lsass
+                    || dll_i.is_some()
+                {
+                    let h = if let Some(first_cluster) = volume_directory {
+                        self.mint_directory_handle(first_cluster, desired_access)
+                    } else {
+                        Some(self.mint_handle())
+                    };
+                    let Some(h) = h else {
+                        let status = 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                        let iosb = get_recv_mr(8);
+                        if iosb != 0 {
+                            smss_stack_write32(iosb, status);
+                            smss_stack_write(iosb + 8, 0);
+                        }
+                        loader_trace_record(
+                            self.pi,
+                            LoaderOp::OpenFile,
+                            status,
+                            dll_i,
+                            0,
+                            0,
+                            &nb[..nlen],
+                        );
+                        return status;
+                    };
                     opened_handle = h;
                     smss_stack_write(get_recv_mr(9), h); // *FileHandle
                     if is_csrss {
@@ -6862,7 +6954,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         print_str(&nb[..nlen.min(80)]);
                         print_str(b" -> 0xC0000034\n");
                     }
-                    0xC0000034 // no filesystem yet → not found (smss skips / uses defaults)
+                    if volume_not_directory {
+                        0xC000_0103 // STATUS_NOT_A_DIRECTORY
+                    } else {
+                        0xC000_0034 // no filesystem yet → not found (smss skips / uses defaults)
+                    }
                 };
                 loader_trace_record(
                     self.pi,

@@ -51,6 +51,7 @@ const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
 const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022;
 const STATUS_OBJECT_NAME_INVALID: NtStatus = 0xC000_0033;
+const STATUS_NOT_A_DIRECTORY: NtStatus = 0xC000_0103;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225;
 const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_DLL_NOT_FOUND: NtStatus = 0xC000_0135;
@@ -1232,6 +1233,35 @@ unsafe fn boot_nt_open_file(
             iosb,
             share_access,
             open_options,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_nt_query_volume_information_file(
+    file_handle: u64,
+    iosb: *mut [u64; 2],
+    information: *mut c_void,
+    length: u32,
+    information_class: u32,
+) -> NtStatus {
+    type NtQueryVolumeInformationFile = unsafe extern "system" fn(
+        u64,
+        *mut [u64; 2],
+        *mut c_void,
+        u32,
+        u32,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtQueryVolumeInformationFile ABI to the generated trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtQueryVolumeInformationFile>(
+            nt_ntdll::trap_stubs::nt_query_volume_information_file,
+        )(
+            file_handle,
+            iosb,
+            information,
+            length,
+            information_class,
         )
     }
 }
@@ -10396,41 +10426,46 @@ pub unsafe extern "system" fn rtl_get_current_directory_u(
         if params.is_null() {
             return 0;
         }
-        let cd = params.add(0x38); // CurrentDirectory.DosPath UNICODE_STRING
-        let len = *(cd as *const u16) as usize; // Length (bytes)
-        let src = *(cd.add(8) as *const *const u16); // Buffer
-        if src.is_null() {
-            return 0;
-        }
-        let units = len / 2;
-        if units == 0 {
-            return 0;
-        }
-        let has_trailing_slash = *src.add(units - 1) == b'\\' as u16;
-        if !has_trailing_slash {
-            let required = len + 2;
+        rtl_acquire_peb_lock();
+        let result = (|| {
+            let cd = params.add(0x38); // CurrentDirectory.DosPath UNICODE_STRING
+            let len = *(cd as *const u16) as usize; // Length (bytes)
+            let src = *(cd.add(8) as *const *const u16); // Buffer
+            if src.is_null() {
+                return 0;
+            }
+            let units = len / 2;
+            if units == 0 {
+                return 0;
+            }
+            let has_trailing_slash = *src.add(units - 1) == b'\\' as u16;
+            if !has_trailing_slash {
+                let required = len + 2;
+                if buffer.is_null() || (buffer_length as usize) < required {
+                    return required as u32;
+                }
+                core::ptr::copy_nonoverlapping(src, buffer, units);
+                *buffer.add(units) = 0;
+                return len as u32;
+            }
+
+            let is_drive_root = units <= 1 || (units >= 2 && *src.add(units - 2) == b':' as u16);
+            let required = if is_drive_root { len + 2 } else { len };
             if buffer.is_null() || (buffer_length as usize) < required {
                 return required as u32;
             }
+
             core::ptr::copy_nonoverlapping(src, buffer, units);
-            *buffer.add(units) = 0;
-            return len as u32;
-        }
-
-        let is_drive_root = units <= 1 || (units >= 2 && *src.add(units - 2) == b':' as u16);
-        let required = if is_drive_root { len + 2 } else { len };
-        if buffer.is_null() || (buffer_length as usize) < required {
-            return required as u32;
-        }
-
-        core::ptr::copy_nonoverlapping(src, buffer, units);
-        if is_drive_root {
-            *buffer.add(units) = 0;
-            len as u32
-        } else {
-            *buffer.add(units - 1) = 0;
-            (len - 2) as u32
-        }
+            if is_drive_root {
+                *buffer.add(units) = 0;
+                len as u32
+            } else {
+                *buffer.add(units - 1) = 0;
+                (len - 2) as u32
+            }
+        })();
+        rtl_release_peb_lock();
+        result
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -10439,10 +10474,8 @@ pub unsafe extern "system" fn rtl_get_current_directory_u(
     }
 }
 
-/// `RtlSetCurrentDirectory_U(PCUNICODE_STRING Path) -> NTSTATUS` — set the CWD. Canonicalizes the
-/// input against the current PEB CWD, stores a trailing-slash DOS path in
-/// `PEB->ProcessParameters->CurrentDirectory.DosPath`, and updates the string length. Opening and
-/// caching the directory handle is deferred until a live CWD-handle consumer exists.
+/// `RtlSetCurrentDirectory_U(PCUNICODE_STRING Path) -> NTSTATUS` — canonicalize and open the
+/// directory, then atomically replace both `CURDIR.DosPath` and its cached directory handle.
 ///
 /// # Safety
 /// `path` a valid UNICODE_STRING.
@@ -10452,10 +10485,19 @@ pub unsafe extern "system" fn rtl_set_current_directory_u(path: PCUnicodeString)
         return STATUS_INVALID_PARAMETER;
     }
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: on-target; PEB @ gs:[0x60], ProcessParameters @ PEB+0x20, CurrentDirectory @ +0x38.
     unsafe {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const FILE_TRAVERSE: u32 = 0x0000_0020;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_DIRECTORY_FILE: u32 = 0x1;
+        const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+
         let peb: *const u8;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        if peb.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
         let params = *(peb.add(0x20) as *const *const u8);
         if params.is_null() {
             return STATUS_INVALID_PARAMETER;
@@ -10465,30 +10507,100 @@ pub unsafe extern "system" fn rtl_set_current_directory_u(path: PCUnicodeString)
         if src.is_null() || len == 0 {
             return STATUS_OBJECT_NAME_INVALID;
         }
-        let dst = *(cd.add(8) as *const *mut u16); // existing DosPath.Buffer
-        let dst_max = *(cd.add(2) as *const u16) as usize; // MaximumLength
-        if dst.is_null() {
-            return STATUS_INVALID_PARAMETER;
-        }
-
         let input = core::slice::from_raw_parts(src, len / 2);
-        let cwd = peb_current_directory();
-        let mut full = nt_ntdll::rtl::environment::full_path_units(input, &cwd);
-        if full.is_empty() {
-            return STATUS_OBJECT_NAME_INVALID;
-        }
-        if full.last().copied() != Some(b'\\' as u16) {
-            full.push(b'\\' as u16);
+        if nt_ntdll::rtl::path::is_dos_device_name(input) {
+            return STATUS_NOT_A_DIRECTORY;
         }
 
-        let needed = (full.len() + 1) * 2;
-        if needed > dst_max || full.len() > (u16::MAX as usize / 2) {
-            return STATUS_NAME_TOO_LONG;
+        let mut old_handle = 0u64;
+        rtl_acquire_peb_lock();
+        let status = (|| {
+            let dst = *(cd.add(8) as *const *mut u16); // existing DosPath.Buffer
+            let dst_max = *(cd.add(2) as *const u16) as usize; // MaximumLength
+            if dst.is_null() {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            let cwd = peb_current_directory();
+            let full = nt_ntdll::rtl::environment::full_path_units(input, &cwd);
+            if full.is_empty() {
+                return STATUS_OBJECT_NAME_INVALID;
+            }
+            let mut stored_full = full.clone();
+            if stored_full.last().copied() != Some(b'\\' as u16) {
+                stored_full.push(b'\\' as u16);
+            }
+            let needed = (stored_full.len() + 1) * 2;
+            if needed > dst_max || stored_full.len() > (u16::MAX as usize / 2) {
+                return STATUS_NAME_TOO_LONG;
+            }
+
+            let mut full_for_open = full;
+            full_for_open.push(0);
+            let mut nt_name = UnicodeString::default();
+            let conversion = rtl_dos_path_name_to_nt_path_name_u_impl(
+                full_for_open.as_ptr(),
+                &mut nt_name,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                false,
+            );
+            if conversion != STATUS_SUCCESS {
+                return conversion;
+            }
+
+            let object_attributes = BootObjectAttributes {
+                length: core::mem::size_of::<BootObjectAttributes>() as u32,
+                _p0: 0,
+                root_directory: 0,
+                object_name: &nt_name as *const UnicodeString as u64,
+                attributes: OBJ_CASE_INSENSITIVE | 0x2, // OBJ_INHERIT
+                _p1: 0,
+                security_descriptor: 0,
+                security_qos: 0,
+            };
+            let mut new_handle = 0u64;
+            let mut iosb = [0u64; 2];
+            let open_status = boot_nt_open_file(
+                &mut new_handle,
+                SYNCHRONIZE | FILE_TRAVERSE,
+                &object_attributes,
+                &mut iosb,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            );
+            if nt_name.buffer != 0 {
+                let _ = crate::process_heap_free(nt_name.buffer as *mut u8);
+            }
+            if !nt_success(open_status) {
+                return open_status;
+            }
+
+            let mut device_information = [0u32; 2];
+            let volume_status = boot_nt_query_volume_information_file(
+                new_handle,
+                &mut iosb,
+                device_information.as_mut_ptr().cast(),
+                core::mem::size_of_val(&device_information) as u32,
+                4, // FileFsDeviceInformation
+            );
+            if !nt_success(volume_status) {
+                let _ = boot_nt_close(new_handle);
+                return volume_status;
+            }
+
+            old_handle = core::ptr::read_unaligned(cd.add(0x10) as *const u64);
+            core::ptr::copy_nonoverlapping(stored_full.as_ptr(), dst, stored_full.len());
+            *dst.add(stored_full.len()) = 0;
+            *(cd as *mut u16) = (stored_full.len() * 2) as u16;
+            core::ptr::write_unaligned(cd.add(0x10) as *mut u64, new_handle);
+            STATUS_SUCCESS
+        })();
+        rtl_release_peb_lock();
+        if nt_success(status) && old_handle != 0 {
+            let _ = boot_nt_close(old_handle & !0x3);
         }
-        core::ptr::copy_nonoverlapping(full.as_ptr(), dst, full.len());
-        *dst.add(full.len()) = 0;
-        *(cd as *mut u16) = (full.len() * 2) as u16; // update Length
-        STATUS_SUCCESS
+        status
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

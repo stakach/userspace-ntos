@@ -257,13 +257,31 @@ impl CurrentDirectory {
 pub fn full_path_units(name: &[u16], cwd: &[u16]) -> Vec<u16> {
     // Convert both to lossy Strings for the pure logic (paths are ASCII-ish DOS paths; any non-BMP is
     // preserved via char round-trip). Using String keeps ONE canonicalization implementation.
-    let name_s = String::from_utf16_lossy(name);
+    let mut name_s = String::from_utf16_lossy(name);
+    name_s = name_s.replace('/', "\\");
     let cwd_s = String::from_utf16_lossy(cwd);
     let mut cd = CurrentDirectory::default();
     if !cwd_s.is_empty() {
         cd.set(&cwd_s);
     }
-    let full = cd.full_path(&name_s);
+    let name_bytes = name_s.as_bytes();
+    let same_drive_relative = name_bytes.len() >= 2
+        && name_bytes[1] == b':'
+        && name_bytes.get(2) != Some(&b'\\')
+        && cwd_s.as_bytes().get(1) == Some(&b':')
+        && name_bytes[0].eq_ignore_ascii_case(&cwd_s.as_bytes()[0]);
+    let full = if same_drive_relative {
+        if name_bytes.len() == 2 {
+            canonicalize(&cwd_s)
+        } else {
+            let mut combined = cwd_s.trim_end_matches('\\').to_string();
+            combined.push('\\');
+            combined.push_str(&name_s[2..]);
+            canonicalize(&combined)
+        }
+    } else {
+        cd.full_path(&name_s)
+    };
     full.encode_utf16()
         .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
         .collect()
@@ -480,6 +498,26 @@ mod tests {
         assert_eq!(
             s(&full_path_units(&u("sub/f.exe"), &u("C:\\Windows"))),
             "C:\\Windows\\sub\\f.exe"
+        );
+        assert_eq!(
+            s(&full_path_units(&u("sub/../dir"), &u("C:\\Windows"))),
+            "C:\\Windows\\dir"
+        );
+        assert_eq!(
+            s(&full_path_units(&u("C:"), &u("C:\\Windows"))),
+            "C:\\Windows"
+        );
+        assert_eq!(
+            s(&full_path_units(&u("c:system32"), &u("C:\\Windows"))),
+            "C:\\Windows\\system32"
+        );
+        assert_eq!(
+            s(&full_path_units(&u("C:\\x"), &u("C:\\Windows"))),
+            "C:\\x"
+        );
+        assert_eq!(
+            s(&full_path_units(&u("C:\\"), &u("C:\\Windows"))),
+            "C:\\"
         );
     }
 

@@ -553,6 +553,20 @@ fn disk_file_handles_preserve_backing_extent() {
 }
 
 #[test]
+fn directory_handles_preserve_backing_identity_and_access() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("walker.exe", None, None);
+    let object = HandleObject::Directory {
+        first_cluster: 0x2345,
+    };
+    let handle = pm.insert_handle(pid, object, 0x0010_0020).unwrap();
+    assert_eq!(pm.lookup_handle(pid, handle), Some(object));
+    assert_eq!(pm.handle_access(pid, handle), Some(0x0010_0020));
+    assert_eq!(pm.close_handle(pid, handle), Ok(()));
+    assert_eq!(pm.lookup_handle(pid, handle), None);
+}
+
+#[test]
 fn boot_status_file_handle_is_typed_and_process_local() {
     let mut pm = ProcessManager::new();
     let first = pm.create_process("first.exe", None, None);
