@@ -2078,6 +2078,9 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_listen_iosb_va = 0;
                 nt_handler.pipe_connect_redrive = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
+                nt_handler.sm_request_port = 0;
+                nt_handler.sm_request_message = 0;
+                nt_handler.sm_reply_message = 0;
                 nt_handler.csr_spawn_request = 0;
                 nt_handler.csr_start_request = 0;
                 nt_handler.csr_rendezvous_conn = 0;
@@ -3008,6 +3011,28 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[sm-rdv] WALL: rendezvous produced no client handle\n");
                         handled = false;
                         result = 0xC0000001;
+                    }
+                }
+                if nt_handler.sm_request_port != 0 {
+                    let completed = sm_api_request_rendezvous(
+                        nt_handler.sm_request_port,
+                        nt_handler.sm_request_message,
+                        nt_handler.sm_reply_message,
+                        procs[0].pml4,
+                        smss_pe,
+                        procs[0].img_end,
+                        nt_base,
+                        nt_end,
+                        ntdll.map(|(_, p)| p),
+                        &mut nt_handler,
+                    );
+                    if completed {
+                        result = 0;
+                        routed_lpc = true;
+                    } else {
+                        print_str(b"[sm-api] WALL: synchronous SM request did not complete\n");
+                        result = 0xC0000001;
+                        handled = false;
                     }
                 }
                 // Authentic CSR accept: winlogon's NtSecureConnectPort left the broker connection

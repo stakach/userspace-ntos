@@ -4384,6 +4384,12 @@ struct ExecNtHandler {
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
     lpc_rendezvous_conn: u64,
     lpc_rendezvous_out: u64,
+    /// A synchronous SMSS request on its established `\\SmApiPort` client connection. The loop
+    /// delivers it to the parked real SmpApiLoop and resumes this caller only after the worker's
+    /// reply is available.
+    sm_request_port: u64,
+    sm_request_message: u64,
+    sm_reply_message: u64,
     /// One-based CSRSS runtime-thread slot awaiting TCB construction. Slots 1 and 2 are the real
     /// CsrApiRequestThread and CsrSbApiRequestThread respectively.
     csr_spawn_request: u8,

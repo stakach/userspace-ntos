@@ -182,6 +182,9 @@ impl ExecNtHandler {
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
+            sm_request_port: 0,
+            sm_request_message: 0,
+            sm_reply_message: 0,
             csr_spawn_request: 0,
             csr_start_request: 0,
             csr_rendezvous_conn: 0,
@@ -1105,7 +1108,7 @@ impl ExecNtHandler {
         }
     }
 
-    fn close_current_handle(&mut self, handle: u64) {
+    pub(crate) fn close_current_handle(&mut self, handle: u64) {
         if let Some(pid) = self.pm_pid_for_pi(self.pi) {
             let _ = self.pm.close_handle(pid, handle as nt_process::Handle);
         }
@@ -1808,6 +1811,20 @@ impl ExecNtHandler {
             name: buf,
             name_len: n as u8,
         });
+    }
+
+    pub(crate) fn lpc_connection_is(&self, handle: u64, connector_pi: usize, name: &[u8]) -> bool {
+        self.lpc_connections.iter().any(|connection| {
+            connection.client_handle == handle
+                && connection.connector_pi as usize == connector_pi
+                && connection.name_len as usize == name.len()
+                && connection.name[..name.len()]
+                    .iter()
+                    .zip(name.iter())
+                    .all(|(&wide, &ascii)| {
+                        wide <= 0x7f && (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
+                    })
+        })
     }
     /// Service winlogon's kernel32 CSR client connect (NtSecureConnectPort → \Windows\ApiPort).
     ///
@@ -4361,6 +4378,13 @@ impl NativeSyscallHandler for ExecNtHandler {
             // LpcConnRecord — never a round-trip to the isolated broker. (Interim: a real acceptor would
             // be csrss's CsrApiRequestThread; this models it, like SM path A.)
             NativeService::NtRequestWaitReplyPort => unsafe {
+                if self.pi == 0 && self.lpc_connection_is(args[0], 0, b"\\smapiport") {
+                    self.sm_request_port = args[0];
+                    self.sm_request_message = args[1];
+                    self.sm_reply_message = args[2];
+                    print_str(b"[sm-api] routing SMSS request to real SmpApiLoop\n");
+                    return 0;
+                }
                 let reqmsg = args[1]; // RDX = &ApiMessage.Header (request, in/out = same buffer)
                 // CSR_API_MESSAGE: PORT_MESSAGE Header(0x28), CsrCaptureData@0x28, ApiNumber@0x30,
                 // Status@0x34. Read ApiNumber, model the CSR server: every call → STATUS_SUCCESS.
@@ -7363,15 +7387,17 @@ impl NativeSyscallHandler for ExecNtHandler {
                     // couldn't run past its CSR connect); recognized now → smss proceeds + winlogon
                     // (higher prio) keeps running.
                     winlogon_pe.as_ref().map(|p| {
-                        (
-                            nt_dll_registry::image_info(
-                                PE_LOAD_BASE,
-                                p.entry_point_rva(),
-                                p.size_of_image(),
-                                false,
-                            ),
-                            b"winlogon.exe" as &[u8],
-                        )
+                        let mut info = nt_dll_registry::image_info(
+                            PE_LOAD_BASE,
+                            p.entry_point_rva(),
+                            p.size_of_image(),
+                            false,
+                        );
+                        let (major, minor) = p.subsystem_version();
+                        info[0x20..0x24].copy_from_slice(&(p.subsystem() as u32).to_le_bytes());
+                        info[0x24..0x26].copy_from_slice(&minor.to_le_bytes());
+                        info[0x26..0x28].copy_from_slice(&major.to_le_bytes());
+                        (info, b"winlogon.exe" as &[u8])
                     })
                 } else if self.pi == 2
                     && *ctx.services_section_handle != 0
@@ -7436,6 +7462,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                     print_str(b" entry=0x");
                     print_hex((entry >> 32) as u32);
                     print_hex(entry as u32);
+                    print_str(b" subsystem=");
+                    print_u64(u32::from_le_bytes(bytes[0x20..0x24].try_into().unwrap()) as u64);
                     print_str(b"\n");
                     0
                 } else {

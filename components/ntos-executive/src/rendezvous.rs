@@ -58,6 +58,35 @@ pub(crate) unsafe fn sm_stack_write32(va: u64, v: u32) {
         core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u32, v);
     }
 }
+pub(crate) unsafe fn sm_stack_read(va: u64) -> u64 {
+    if va >= SM_STACK_BASE && va + 8 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        core::ptr::read_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *const u64)
+    } else {
+        0
+    }
+}
+unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
+    if va < SM_STACK_BASE || va + bytes.len() as u64 > SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(
+        bytes.as_ptr(),
+        (SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u8,
+        bytes.len(),
+    );
+    true
+}
+unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
+    if va < SM_STACK_BASE || va + bytes.len() as u64 > SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(
+        (SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *const u8,
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    true
+}
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
 /// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
 /// through an isolated executive scratch (SM_FILL_SCRATCH_BASE, its own PT) then mapped into smss's
@@ -266,8 +295,17 @@ pub(crate) unsafe fn sm_rendezvous(
                 SSN_SET_INFO_THREAD => {} // RtlSetThreadIsCritical → no-op success
                 SSN_OPEN_PROCESS => {
                     // SmpHandleConnectionRequest opens the connecting CSRSS process by the real CID.
-                    // The handle is private to the SM worker and used only for the session query/context.
-                    sm_stack_write(get_recv_mr(9), 0xC500);
+                    // Mint the handle in SMSS's real table; SmpSbCreateSession later uses the saved
+                    // CSRSS process handle as NtDuplicateObject's target process.
+                    let client_id = get_recv_mr(8);
+                    let target_pid = sm_stack_read(client_id) as nt_process::ProcessId;
+                    let saved_pi = nt_handler.pi;
+                    nt_handler.pi = 0;
+                    match nt_handler.nt_open_process(target_pid) {
+                        Some(handle) => sm_stack_write(get_recv_mr(9), handle),
+                        None => result = nt_process::STATUS_INVALID_HANDLE as u64,
+                    }
+                    nt_handler.pi = saved_pi;
                 }
                 SSN_QUERY_INFO_PROCESS => {
                     // ProcessBasicInformation initializes SmUniqueProcessId from the real SMSS
@@ -391,7 +429,12 @@ pub(crate) unsafe fn sm_rendezvous(
                     };
                     nt_handler.pi = saved_pi;
                 }
-                SSN_CLOSE => {}
+                SSN_CLOSE => {
+                    let saved_pi = nt_handler.pi;
+                    nt_handler.pi = 0;
+                    nt_handler.close_current_handle(get_recv_mr(9));
+                    nt_handler.pi = saved_pi;
+                }
                 _ => {
                     print_str(b"[sm-rdv] WALL: unexpected SSN=");
                     print_u64(ssn);
@@ -416,6 +459,279 @@ pub(crate) unsafe fn sm_rendezvous(
         break;
     }
     client_handle
+}
+
+/// Deliver one synchronous SMSS request to the already-parked real `SmpApiLoop`. The LPC broker
+/// owns the byte queues and listen-port reply association; this driver owns the two seL4
+/// continuations and services the worker's nested kernel calls until it either replies or reaches
+/// the nested SB request that the next increment must dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sm_api_request_rendezvous(
+    client_port: u64,
+    request_va: u64,
+    reply_va: u64,
+    smss_pml4: u64,
+    smss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    nt_handler: &mut ExecNtHandler,
+) -> bool {
+    const SSN_OPEN_PROCESS: u64 = 128;
+    const SSN_QUERY_INFO_PROCESS: u64 = 161;
+    const SSN_DUPLICATE_OBJECT: u64 = 71;
+    const SSN_REQUEST_WAIT_REPLY: u64 = 208;
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_CLOSE: u64 = 27;
+    const SSN_SET_INFO_THREAD: u64 = 238;
+    const DUPLICATE_CLOSE_SOURCE: u32 = 1;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+
+    let ep = SM_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_SMLOOP_SLOT.load(Ordering::Relaxed);
+    if ep == 0 || reply == 0 || SM_RECEIVE_PARKED.swap(0, Ordering::Relaxed) == 0 {
+        return false;
+    }
+
+    let mut length_bytes = [0u8; 4];
+    if !nt_handler.xas_read(request_va, &mut length_bytes) {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let request_len = u16::from_le_bytes([length_bytes[2], length_bytes[3]]) as usize;
+    if !(0x28..=0x148).contains(&request_len) {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let mut request = [0u8; 0x148];
+    if !nt_handler.xas_read(request_va, &mut request[..request_len]) {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
+    request[8..16].copy_from_slice(&PM_PIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    request[16..24].copy_from_slice(&PM_TIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    if request_len >= 0x7c {
+        print_str(b"[sm-api] SmExecPgm wire subsystem=");
+        print_u64(u32::from_le_bytes(request[0x78..0x7c].try_into().unwrap()) as u64);
+        print_str(b"\n");
+    }
+    let sent = lpc_client()
+        .and_then(|client| client.request_wait_reply(client_port, &request[..request_len]).ok())
+        .is_some();
+    if !sent {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+
+    let listen_port = SM_RECVPORT.load(Ordering::Relaxed);
+    let Some(received) = lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
+    else {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    };
+    let recvmsg = SM_RECVMSG.load(Ordering::Relaxed);
+    if received.connection_info.len() != request_len
+        || !sm_stack_copyout(recvmsg, &received.connection_info)
+    {
+        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    sm_stack_write16(recvmsg + 4, nt_lpc_abi::msg_type::LPC_REQUEST);
+    sm_stack_write(recvmsg + 8, PM_PIDS[0].load(Ordering::Relaxed));
+    sm_stack_write(recvmsg + 16, PM_TIDS[0].load(Ordering::Relaxed));
+    let context_out = SM_RECV_RDX.load(Ordering::Relaxed);
+    if context_out != 0 {
+        sm_stack_write(context_out, received.port_context);
+    }
+    set_reply_mr(15, 0);
+    set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
+    set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
+    send_on_reply(reply, 18, 0, 0, 0, 0);
+
+    let mut fill_idx = 0;
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    for _ in 0..8000 {
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0;
+            let rsp = m1;
+            let arg1 = m2;
+            let arg3 = get_recv_mr(4);
+            let arg4 = get_recv_mr(5);
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn;
+            m2 = 0;
+            mi = (2u64 << 12) | (mi & 0x7f);
+        }
+        match mi >> 12 {
+            6 => {
+                let page = m1 & !0xfff;
+                if m1 < 0x10000
+                    || !sm_fill_page(
+                        page, smss_pml4, smss_pe, img_end, nt_base, nt_end, ntdll_pe,
+                        &mut fill_idx,
+                    )
+                {
+                    print_str(b"[sm-api] unresolved worker fault\n");
+                    return false;
+                }
+                send_on_reply(reply, 0, 0, 0, 0, 0);
+            }
+            3 => {
+                let Some(pe) = ntdll_pe else { return false };
+                if m0 < nt_base
+                    || m0 >= nt_end
+                    || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
+                {
+                    return false;
+                }
+                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+            }
+            2 => {
+                let ssn = m0;
+                let sp = get_recv_mr(16);
+                let flags = get_recv_mr(17);
+                let rdx = m3;
+                let mut result = 0u64;
+                print_str(b"[sm-api] worker SSN=");
+                print_u64(ssn);
+                print_str(b"\n");
+                match ssn {
+                    SSN_SET_INFO_THREAD => {}
+                    SSN_OPEN_PROCESS => {
+                        let cid = get_recv_mr(8);
+                        let target_pid = sm_stack_read(cid) as nt_process::ProcessId;
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 0;
+                        match nt_handler.nt_open_process(target_pid) {
+                            Some(handle) => sm_stack_write(get_recv_mr(9), handle),
+                            None => result = nt_process::STATUS_INVALID_HANDLE as u64,
+                        }
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_QUERY_INFO_PROCESS => {
+                        let class = rdx;
+                        let buffer = get_recv_mr(7);
+                        if class == 0 {
+                            sm_stack_write(buffer + 0x20, PM_PIDS[0].load(Ordering::Relaxed));
+                        } else if class == 24 {
+                            sm_stack_write32(buffer, 0);
+                        }
+                    }
+                    SSN_DUPLICATE_OBJECT => {
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 0;
+                        let source_process = get_recv_mr(9);
+                        let source_handle = rdx;
+                        let target_process = get_recv_mr(7);
+                        let target_out = get_recv_mr(8);
+                        let options = sm_stack_read(sp + 0x38) as u32;
+                        let source_pid = nt_handler.resolve_process_handle(source_process);
+                        let target_pid = nt_handler.resolve_process_handle(target_process);
+                        result = match (source_pid, target_pid) {
+                            (Some(source_pid), Some(target_pid)) => {
+                                let desired_access = (options & DUPLICATE_SAME_ACCESS == 0)
+                                    .then_some(sm_stack_read(sp + 0x28) as u32);
+                                match nt_handler.pm.duplicate_handle_with_access(
+                                    source_pid,
+                                    source_handle as nt_process::Handle,
+                                    target_pid,
+                                    desired_access,
+                                ) {
+                                    Ok(handle) => {
+                                        sm_stack_write(target_out, handle as u64);
+                                        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+                                        0
+                                    }
+                                    Err(status) => status as u64,
+                                }
+                            }
+                            _ => nt_process::STATUS_INVALID_HANDLE as u64,
+                        };
+                        if options & DUPLICATE_CLOSE_SOURCE != 0 {
+                            if let Some(source_pid) = source_pid {
+                                let _ = nt_handler
+                                    .pm
+                                    .close_handle(source_pid, source_handle as nt_process::Handle);
+                            }
+                        }
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_CLOSE => {
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 0;
+                        nt_handler.close_current_handle(get_recv_mr(9));
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_REQUEST_WAIT_REPLY => {
+                        print_str(b"[sm-api] reached nested SbpCreateSession request\n");
+                        return false;
+                    }
+                    SSN_REPLY_WAIT_RECV => {
+                        let reply_msg = get_recv_mr(7);
+                        let mut reply_bytes = [0u8; 0x148];
+                        let reply_len = if reply_msg != 0 {
+                            let total = ((sm_stack_read(reply_msg) >> 16) as u16) as usize;
+                            if !(0x28..=0x148).contains(&total)
+                                || !sm_stack_copyin(reply_msg, &mut reply_bytes[..total])
+                            {
+                                return false;
+                            }
+                            total
+                        } else {
+                            0
+                        };
+                        let _ = lpc_client().and_then(|client| {
+                            client
+                                .reply_wait_receive_with_reply(listen_port, &reply_bytes[..reply_len])
+                                .ok()
+                        });
+                        let Some(response) =
+                            lpc_client().and_then(|client| client.reply_wait_receive(client_port).ok())
+                        else {
+                            return false;
+                        };
+                        if response.connection_info.is_empty()
+                            || !nt_handler.xas_try_write_buf(reply_va, &response.connection_info)
+                        {
+                            return false;
+                        }
+                        SM_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
+                        SM_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                        SM_RECV_SP.store(sp, Ordering::Relaxed);
+                        SM_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                        SM_RECV_RDX.store(rdx, Ordering::Relaxed);
+                        SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                        print_str(b"[sm-api] real SmpApiLoop reply completed\n");
+                        return true;
+                    }
+                    _ => {
+                        print_str(b"[sm-api] unexpected worker SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        return false;
+                    }
+                }
+                set_reply_mr(15, 0);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+                send_on_reply(reply, 18, result, 0, 0, rdx);
+            }
+            _ => return false,
+        }
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    false
 }
 
 /// Number of committed stack frames for the CSR API thread (deeper than SM: CsrApiRequestThread →

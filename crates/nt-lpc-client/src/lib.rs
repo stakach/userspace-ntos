@@ -191,11 +191,13 @@ impl<B: Backend> LpcClient<B> {
             .backend
             .call(opcode::LPC_OP_REPLY_WAIT_RECEIVE, &buf, &mut out);
         NtStatus(r.status).to_result()?;
+        let msg_type = r.detail1 as u16;
+        let is_connection = msg_type == msg_type::LPC_CONNECTION_REQUEST;
         Ok(ReceiveResult {
-            connection_id: r.detail0,
-            msg_type: r.detail1 as u16,
+            connection_id: if is_connection { r.detail0 } else { 0 },
+            msg_type,
             subsystem_type: (r.detail1 >> 32) as u32,
-            port_context: r.detail0,
+            port_context: if is_connection { 0 } else { r.detail0 },
             connection_info: out[..(r.information as usize).min(out.len())].to_vec(),
         })
     }
