@@ -53,6 +53,137 @@ pub enum RemoveResult {
     Empty(u32),
 }
 
+pub const INFINITE_DEADLINE: u64 = u64::MAX;
+
+/// Executive-owned state for one blocking `NtRemoveIoCompletion` call. Addresses are kept opaque;
+/// the executive validates them before parking and writes them in the waiter's process on wake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletionWaiter {
+    pub port_id: u32,
+    pub process_index: u8,
+    pub _reserved: [u8; 3],
+    pub reply_cap: u64,
+    pub resume_ip: u64,
+    pub resume_sp: u64,
+    pub resume_flags: u64,
+    pub thread_id: u64,
+    pub badge: u64,
+    pub key_context_out: u64,
+    pub apc_context_out: u64,
+    pub io_status_block_out: u64,
+    pub deadline_100ns: u64,
+    sequence: u64,
+}
+
+/// Allocation-free FIFO wait table shared by completion ports.
+pub struct CompletionWaiterTable<const WAITERS: usize> {
+    slots: [Option<CompletionWaiter>; WAITERS],
+    next_sequence: u64,
+}
+
+impl<const WAITERS: usize> CompletionWaiterTable<WAITERS> {
+    pub const fn new() -> Self {
+        assert!(WAITERS > 0);
+        Self {
+            slots: [None; WAITERS],
+            next_sequence: 0,
+        }
+    }
+
+    pub fn insert(&mut self, mut waiter: CompletionWaiter) -> Result<(), u32> {
+        if waiter.reply_cap == 0
+            || self
+                .slots
+                .iter()
+                .flatten()
+                .any(|existing| existing.reply_cap == waiter.reply_cap)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        waiter.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        *slot = Some(waiter);
+        Ok(())
+    }
+
+    /// Release the newest waiter for `port_id`, matching NT KQUEUE/IOCP LIFO thread scheduling.
+    /// Packet order remains FIFO in [`CompletionPortTable`].
+    pub fn pop_port(&mut self, port_id: u32) -> Option<CompletionWaiter> {
+        let index = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
+            .filter(|(_, waiter)| waiter.port_id == port_id)
+            .max_by_key(|(_, waiter)| waiter.sequence)
+            .map(|(index, _)| index)?;
+        self.slots[index].take()
+    }
+
+    /// Remove the oldest waiter owned by a terminating thread.
+    pub fn pop_thread(&mut self, thread_id: u64) -> Option<CompletionWaiter> {
+        self.pop_oldest_matching(|waiter| waiter.thread_id == thread_id)
+    }
+
+    /// Remove the earliest expired waiter. Equal deadlines retain park order.
+    pub fn pop_due(&mut self, now_100ns: u64) -> Option<CompletionWaiter> {
+        let index = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
+            .filter(|(_, waiter)| {
+                waiter.deadline_100ns != INFINITE_DEADLINE && waiter.deadline_100ns <= now_100ns
+            })
+            .min_by_key(|(_, waiter)| (waiter.deadline_100ns, waiter.sequence))
+            .map(|(index, _)| index)?;
+        self.slots[index].take()
+    }
+
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|waiter| waiter.deadline_100ns)
+            .filter(|deadline| *deadline != INFINITE_DEADLINE)
+            .min()
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn pop_oldest_matching(
+        &mut self,
+        predicate: impl Fn(&CompletionWaiter) -> bool,
+    ) -> Option<CompletionWaiter> {
+        let index = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
+            .filter(|(_, waiter)| predicate(waiter))
+            .min_by_key(|(_, waiter)| waiter.sequence)
+            .map(|(index, _)| index)?;
+        self.slots[index].take()
+    }
+}
+
+impl<const WAITERS: usize> Default for CompletionWaiterTable<WAITERS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateResult {
     pub id: u32,
@@ -94,6 +225,14 @@ impl<const PACKETS: usize, const NAME_UNITS: usize> CompletionPort<PACKETS, NAME
         &self.name[..self.name_len as usize]
     }
 
+    fn retain(&mut self) -> Result<(), u32> {
+        self.references = self
+            .references
+            .checked_add(1)
+            .ok_or(STATUS_QUOTA_EXCEEDED)?;
+        Ok(())
+    }
+
     fn reset(&mut self) {
         *self = Self::empty();
     }
@@ -125,7 +264,7 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         }
         if !name.is_empty() {
             if let Some(index) = self.find_name(name, case_insensitive) {
-                self.ports[index].references = self.ports[index].references.saturating_add(1);
+                self.ports[index].retain()?;
                 return Ok(CreateResult {
                     id: index as u32,
                     created: false,
@@ -156,8 +295,13 @@ impl<const PORTS: usize, const PACKETS: usize, const NAME_UNITS: usize>
         let index = self
             .find_name(name, case_insensitive)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        self.ports[index].references = self.ports[index].references.saturating_add(1);
+        self.ports[index].retain()?;
         Ok(index as u32)
+    }
+
+    /// Hold an executive-internal reference while a blocking remove is parked.
+    pub fn retain(&mut self, id: u32) -> Result<(), u32> {
+        self.port_mut(id)?.retain()
     }
 
     pub fn release(&mut self, id: u32) -> Result<(), u32> {
@@ -270,6 +414,18 @@ mod tests {
             apc_context: value + 1,
             status: value as u32,
             information: value + 2,
+        }
+    }
+
+    fn waiter(port_id: u32, value: u64, deadline_100ns: u64) -> CompletionWaiter {
+        CompletionWaiter {
+            port_id,
+            process_index: value as u8,
+            reply_cap: value,
+            thread_id: value + 100,
+            key_context_out: value + 200,
+            deadline_100ns,
+            ..CompletionWaiter::default()
         }
     }
 
@@ -407,6 +563,35 @@ mod tests {
     }
 
     #[test]
+    fn parked_waiter_reference_survives_last_handle_close() {
+        let mut ports = Ports::new();
+        let id = ports.create(&[], 1, false).unwrap().id;
+        ports.retain(id).unwrap();
+        ports.release(id).unwrap();
+        assert_eq!(ports.depth(id), Ok(0));
+        ports.enqueue(id, packet(1)).unwrap();
+        assert_eq!(
+            ports.remove(id, RemoveMode::Poll),
+            Ok(RemoveResult::Packet(packet(1)))
+        );
+        ports.release(id).unwrap();
+        assert_eq!(ports.depth(id), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(ports.create(&[], 2, false).unwrap().id, id);
+    }
+
+    #[test]
+    fn every_reference_path_reports_overflow_without_saturating() {
+        let mut ports = Ports::new();
+        let name = [b'x' as u16];
+        let id = ports.create(&name, 1, false).unwrap().id;
+        ports.ports[id as usize].references = u16::MAX;
+        assert_eq!(ports.retain(id), Err(STATUS_QUOTA_EXCEEDED));
+        assert_eq!(ports.open(&name, false), Err(STATUS_QUOTA_EXCEEDED));
+        assert_eq!(ports.create(&name, 9, false), Err(STATUS_QUOTA_EXCEEDED));
+        assert_eq!(ports.ports[id as usize].references, u16::MAX);
+    }
+
+    #[test]
     fn transport_adapter_maps_surt_fields_without_transport_dependency() {
         let mut ports = Ports::new();
         let id = ports.create(&[], 1, false).unwrap().id;
@@ -430,5 +615,68 @@ mod tests {
                 information: 0x3333,
             }))
         );
+    }
+
+    #[test]
+    fn completion_packets_are_fifo_but_waiters_are_lifo_per_port() {
+        let mut waiters = CompletionWaiterTable::<4>::new();
+        waiters.insert(waiter(1, 10, INFINITE_DEADLINE)).unwrap();
+        waiters.insert(waiter(2, 20, INFINITE_DEADLINE)).unwrap();
+        waiters.insert(waiter(1, 30, INFINITE_DEADLINE)).unwrap();
+        assert_eq!(waiters.pop_port(1).unwrap().reply_cap, 30);
+        assert_eq!(waiters.pop_port(1).unwrap().reply_cap, 10);
+        assert_eq!(waiters.pop_port(1), None);
+        assert_eq!(waiters.pop_port(2).unwrap().reply_cap, 20);
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn completion_waiter_capacity_and_reply_identity_are_enforced() {
+        let mut waiters = CompletionWaiterTable::<2>::new();
+        assert_eq!(
+            waiters.insert(waiter(1, 0, INFINITE_DEADLINE)),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
+        assert_eq!(
+            waiters.insert(waiter(2, 1, INFINITE_DEADLINE)),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        waiters.insert(waiter(2, 2, INFINITE_DEADLINE)).unwrap();
+        assert_eq!(
+            waiters.insert(waiter(3, 3, INFINITE_DEADLINE)),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+    }
+
+    #[test]
+    fn completion_waiter_deadlines_are_ordered_and_infinite_is_ignored() {
+        let mut waiters = CompletionWaiterTable::<5>::new();
+        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
+        waiters.insert(waiter(1, 2, 200)).unwrap();
+        waiters.insert(waiter(2, 3, 100)).unwrap();
+        waiters.insert(waiter(3, 4, 100)).unwrap();
+        assert_eq!(waiters.next_deadline(), Some(100));
+        assert_eq!(waiters.pop_due(99), None);
+        assert_eq!(waiters.pop_due(100).unwrap().reply_cap, 3);
+        assert_eq!(waiters.pop_due(100).unwrap().reply_cap, 4);
+        assert_eq!(waiters.next_deadline(), Some(200));
+        assert_eq!(waiters.pop_due(200).unwrap().reply_cap, 2);
+        assert_eq!(waiters.next_deadline(), None);
+        assert_eq!(waiters.len(), 1);
+    }
+
+    #[test]
+    fn completion_waiters_cancel_by_thread_without_disturbing_others() {
+        let mut waiters = CompletionWaiterTable::<4>::new();
+        waiters.insert(waiter(1, 1, INFINITE_DEADLINE)).unwrap();
+        let mut second = waiter(1, 2, INFINITE_DEADLINE);
+        second.thread_id = 101;
+        waiters.insert(second).unwrap();
+        waiters.insert(waiter(2, 3, INFINITE_DEADLINE)).unwrap();
+        assert_eq!(waiters.pop_thread(101).unwrap().reply_cap, 1);
+        assert_eq!(waiters.pop_thread(101).unwrap().reply_cap, 2);
+        assert_eq!(waiters.pop_thread(101), None);
+        assert_eq!(waiters.pop_port(2).unwrap().reply_cap, 3);
     }
 }
