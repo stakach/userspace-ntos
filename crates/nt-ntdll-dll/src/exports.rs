@@ -125,6 +125,16 @@ static mut LDR_LOADER_LOCK: LoaderCriticalSection = LoaderCriticalSection {
     spin_count: 0,
 };
 
+/// Process-wide PEB lock. The static no-debug form is valid before the process heap exists.
+static mut FAST_PEB_LOCK: LoaderCriticalSection = LoaderCriticalSection {
+    debug_info: u64::MAX,
+    lock_count: AtomicI32::new(-1),
+    recursion_count: 0,
+    owning_thread: AtomicU64::new(0),
+    lock_semaphore: AtomicU64::new(0),
+    spin_count: 0,
+};
+
 static mut LDR_DLL_NOTIFICATION_LOCK: LoaderCriticalSection = LoaderCriticalSection {
     debug_info: u64::MAX,
     lock_count: AtomicI32::new(-1),
@@ -8600,14 +8610,21 @@ fn loader_lock_ptr() -> *mut c_void {
     core::ptr::addr_of_mut!(LDR_LOADER_LOCK).cast()
 }
 
-/// Publish the process-wide loader lock through the x64 `PEB.LoaderLock` field.
+fn fast_peb_lock_ptr() -> *mut c_void {
+    core::ptr::addr_of_mut!(FAST_PEB_LOCK).cast()
+}
+
+/// Publish process-wide loader/PEB locks before import processing and DLL attach.
 ///
 /// # Safety
 /// `peb` is the current process's writable PEB.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn ldr_publish_loader_lock(peb: u64) {
+pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) {
     if peb != 0 {
-        unsafe { core::ptr::write_unaligned((peb + 0x110) as *mut u64, loader_lock_ptr() as u64) };
+        unsafe {
+            core::ptr::write_unaligned((peb + 0x38) as *mut u64, fast_peb_lock_ptr() as u64);
+            core::ptr::write_unaligned((peb + 0x110) as *mut u64, loader_lock_ptr() as u64);
+        }
     }
 }
 

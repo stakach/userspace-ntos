@@ -2206,7 +2206,7 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     unsafe {
         let peb: u64;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
-        crate::exports::ldr_publish_loader_lock(peb);
+        crate::exports::ldr_publish_process_locks(peb);
     }
     let _loader_lock = match unsafe { crate::exports::acquire_loader_lock() } {
         Ok(guard) => guard,
