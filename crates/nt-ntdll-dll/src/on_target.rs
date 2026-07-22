@@ -24,7 +24,7 @@
 
 extern crate alloc;
 
-use core::ffi::c_void;
+use core::{ffi::c_void, marker::PhantomData};
 
 use nt_ntdll::heap::{Backing, Heap};
 
@@ -492,6 +492,9 @@ unsafe fn attach_dfs(
     let Some(module_index) = (unsafe { (*table).index_by_base(base) }) else {
         return 0xC000_0135; // STATUS_DLL_NOT_FOUND
     };
+    if unsafe { !(*table).mods[module_index].imports_ready } {
+        return 0xC000_0135; // never run module callouts over a partial or failed IAT
+    }
     if unsafe { (*table).mods[module_index].attached || (*table).mods[module_index].attaching } {
         return 0;
     }
@@ -561,6 +564,15 @@ unsafe fn attach_dfs(
             set_ldr_process_attached(base, true);
             return 0; // resource-only DLL — nothing to run
         }
+        let mut activation_frame = [0u64; 7];
+        let _activation_context =
+            match ModuleActivationContextGuard::enter(base, &mut activation_frame) {
+                Ok(guard) => guard,
+                Err(status) => {
+                    (*table).mods[module_index].attaching = false;
+                    return status;
+                }
+            };
         // ★ RE-SNAP this module's imports RIGHT BEFORE its DllMain runs. The executive demand-fills a
         // hosted DLL's per-process pages (headers/.rdata/.idata/IAT) lazily and from the ON-DISK PE
         // (raw, un-snapped thunks); a page we snapped earlier (during the static import walk) can be
@@ -573,7 +585,11 @@ unsafe fn attach_dfs(
         let ntdll_base = (*table).find(b"ntdll");
         if ntdll_base != 0 {
             let mut sink = SnapResult::default();
-            snap_module(base, ntdll_base, &mut *table, &mut sink, 0);
+            snap_module(base, ntdll_base, table, &mut sink, 0);
+            if sink.status != 0 {
+                (*table).mods[module_index].attaching = false;
+                return sink.status;
+            }
         }
         {
             let mut mb = [0u8; 64];
@@ -637,8 +653,13 @@ unsafe fn rollback_process_attach(table: *mut ModuleTable, attached: &[u64]) {
         }
         if unsafe { !is_ntdll_base(&*table, base) && entry_point_rva(base) != 0 } {
             unsafe {
-                call_tls_initializers(base, DLL_PROCESS_DETACH);
-                let _ = call_dll_main(base, DLL_PROCESS_DETACH, 0);
+                let mut activation_frame = [0u64; 7];
+                if let Ok(_activation_context) =
+                    ModuleActivationContextGuard::enter(base, &mut activation_frame)
+                {
+                    call_tls_initializers(base, DLL_PROCESS_DETACH);
+                    let _ = call_dll_main(base, DLL_PROCESS_DETACH, 0);
+                };
             }
         }
         unsafe {
@@ -672,6 +693,12 @@ pub unsafe fn ldr_shutdown_process() -> u32 {
             continue;
         }
         unsafe {
+            let mut activation_frame = [0u64; 7];
+            let Ok(_activation_context) =
+                ModuleActivationContextGuard::enter(base, &mut activation_frame)
+            else {
+                return STATUS_NO_MEMORY as u32;
+            };
             call_tls_initializers(base, DLL_PROCESS_DETACH);
             let _ = call_dll_main(base, DLL_PROCESS_DETACH, 1);
         }
@@ -764,6 +791,8 @@ pub struct SnapResult {
     pub spot_iat_value: u64,
     /// The IAT slot RVA the spot value came from.
     pub spot_iat_rva: u32,
+    /// First loader-entry preparation failure observed while recursively snapping.
+    pub status: u32,
 }
 
 /// **Snap smss's ntdll imports in-process** against OUR export table.
@@ -927,6 +956,15 @@ struct LoadedMod {
     /// Process-attach lifecycle persisted across static initialization and runtime LdrLoadDll calls.
     attached: bool,
     attaching: bool,
+    /// The mapped image's ordinary and delay import tables have been snapped at least once.
+    imports_ready: bool,
+    /// A snap transaction currently owns this mapping; dependency back-edges may resolve it but
+    /// no TLS callback or DllMain may run until the transaction commits.
+    imports_in_progress: bool,
+    /// The last import transaction failed; the mapped image and Ldr entry remain retryable.
+    imports_failed: bool,
+    /// A runtime load reached DllMain but failed before publishing a handle/notification.
+    attach_failed: bool,
 }
 
 /// The per-drive module table (single-threaded loader; a process's LdrpInitialize runs once, on one
@@ -951,6 +989,10 @@ static mut MODULE_TABLE: ModuleTable = ModuleTable {
         base: 0,
         attached: false,
         attaching: false,
+        imports_ready: false,
+        imports_in_progress: false,
+        imports_failed: false,
+        attach_failed: false,
     }; MODULE_TABLE_CAP],
     count: 0,
     attach_order: nt_ntdll::loader::lifecycle::AttachLedger::new(),
@@ -960,7 +1002,7 @@ static mut MODULE_TABLE: ModuleTable = ModuleTable {
 impl ModuleTable {
     /// Insert `(name, base)` (name already lowercased, no `.dll` suffix). Ignores overflow + dups.
     fn insert(&mut self, name: &[u8], base: u64) {
-        if self.find(name) != 0 {
+        if self.find_any(name) != 0 {
             return; // already present
         }
         if self.count >= MODULE_TABLE_CAP {
@@ -972,6 +1014,10 @@ impl ModuleTable {
             base,
             attached: false,
             attaching: false,
+            imports_ready: false,
+            imports_in_progress: false,
+            imports_failed: false,
+            attach_failed: false,
         };
         let n = name.len().min(32);
         m.name[..n].copy_from_slice(&name[..n]);
@@ -982,6 +1028,18 @@ impl ModuleTable {
 
     /// Find a loaded module by lowercased base name; returns its base (0 if absent).
     fn find(&self, name: &[u8]) -> u64 {
+        for m in &self.mods[..self.count] {
+            if (!m.imports_failed || m.imports_in_progress)
+                && m.nlen as usize == name.len()
+                && &m.name[..name.len()] == name
+            {
+                return m.base;
+            }
+        }
+        0
+    }
+
+    fn find_any(&self, name: &[u8]) -> u64 {
         for m in &self.mods[..self.count] {
             if m.nlen as usize == name.len() && &m.name[..name.len()] == name {
                 return m.base;
@@ -994,6 +1052,46 @@ impl ModuleTable {
         self.mods[..self.count]
             .iter()
             .position(|module| module.base == base)
+    }
+
+    fn imports_ready(&self, base: u64) -> bool {
+        self.index_by_base(base)
+            .is_some_and(|index| self.mods[index].imports_ready)
+    }
+
+    fn begin_imports(&mut self, base: u64) {
+        if let Some(index) = self.index_by_base(base) {
+            self.mods[index].imports_ready = false;
+            self.mods[index].imports_in_progress = true;
+            self.mods[index].imports_failed = false;
+        }
+    }
+
+    fn set_imports_ready(&mut self, base: u64) {
+        if let Some(index) = self.index_by_base(base) {
+            self.mods[index].imports_ready = true;
+            self.mods[index].imports_in_progress = false;
+            self.mods[index].imports_failed = false;
+        }
+    }
+
+    fn set_imports_failed(&mut self, base: u64) {
+        if let Some(index) = self.index_by_base(base) {
+            self.mods[index].imports_ready = false;
+            self.mods[index].imports_in_progress = false;
+            self.mods[index].imports_failed = true;
+        }
+    }
+
+    fn attach_failed(&self, base: u64) -> bool {
+        self.index_by_base(base)
+            .is_some_and(|index| self.mods[index].attach_failed)
+    }
+
+    fn set_attach_failed(&mut self, base: u64, failed: bool) {
+        if let Some(index) = self.index_by_base(base) {
+            self.mods[index].attach_failed = failed;
+        }
     }
 }
 
@@ -1177,7 +1275,7 @@ unsafe fn snap_descriptor_against(
     ilt_rva: u32,
     iat_rva: u32,
     dep_base: u64,
-    table: &mut ModuleTable,
+    table: *mut ModuleTable,
     out: &mut SnapResult,
 ) {
     // SAFETY: caller contract — mapped images, writable IAT.
@@ -1198,12 +1296,23 @@ unsafe fn snap_descriptor_against(
                 let ibn_rva = (thunk & 0x7fff_ffff) as u32;
                 let mut namebuf = [0u8; 96];
                 let nlen = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
-                resolve_export_addr(dep_base, false, &namebuf[..nlen], 0, table, 0)
+                resolve_export_addr(
+                    dep_base,
+                    false,
+                    &namebuf[..nlen],
+                    0,
+                    table,
+                    &mut out.status,
+                    0,
+                )
             } else {
                 // by ordinal.
                 let ord = (thunk & 0xffff) as u32;
-                resolve_export_addr(dep_base, true, &[], ord, table, 0)
+                resolve_export_addr(dep_base, true, &[], ord, table, &mut out.status, 0)
             };
+            if out.status != 0 {
+                return;
+            }
             if addr != 0 {
                 core::ptr::write_unaligned(iat as *mut u64, addr);
                 out.resolved += 1;
@@ -1289,10 +1398,14 @@ unsafe fn resolve_export_addr(
     by_ordinal: bool,
     name: &[u8],
     ordinal: u32,
-    table: &mut ModuleTable,
+    table: *mut ModuleTable,
+    load_status: &mut u32,
     depth: u32,
 ) -> u64 {
     if depth > 8 {
+        if *load_status == 0 {
+            *load_status = 0xC000_0001; // STATUS_UNSUCCESSFUL
+        }
         return 0; // forwarder-cycle / over-deep guard
     }
     // SAFETY: mapped-image export walk per the contract.
@@ -1337,14 +1450,21 @@ unsafe fn resolve_export_addr(
         let tmod_lc = &tmod[..tlen];
 
         // Find the forwarder-target module (load it if not already mapped — as LdrpSnapThunk does).
-        let mut tbase = table.find(tmod_lc);
+        let mut tbase = (&*table).find(tmod_lc);
         if tbase == 0 {
-            let loaded = load_dependent_dll(tmod_lc);
-            if loaded != 0 {
-                table.insert(tmod_lc, loaded);
-                let mut sink = SnapResult::default();
-                snap_module(loaded, table.find(b"ntdll"), table, &mut sink, depth + 1);
-                tbase = loaded;
+            let mut sink = SnapResult::default();
+            tbase = load_and_snap_dependency(
+                tmod_lc,
+                (&*table).find(b"ntdll"),
+                table,
+                &mut sink,
+                depth + 1,
+            );
+            if sink.status != 0 {
+                if *load_status == 0 {
+                    *load_status = sink.status;
+                }
+                return 0;
             }
         }
         if tbase == 0 {
@@ -1360,9 +1480,9 @@ unsafe fn resolve_export_addr(
                     ord = ord * 10 + (c - b'0') as u32;
                 }
             }
-            resolve_export_addr(tbase, true, &[], ord, table, depth + 1)
+            resolve_export_addr(tbase, true, &[], ord, table, load_status, depth + 1)
         } else {
-            resolve_export_addr(tbase, false, sym_part, 0, table, depth + 1)
+            resolve_export_addr(tbase, false, sym_part, 0, table, load_status, depth + 1)
         }
     }
 }
@@ -1445,6 +1565,43 @@ unsafe fn load_dependent_dll(name_lc: &[u8]) -> u64 {
         return 0;
     }
     base_address
+}
+
+/// Return an existing dependency or complete one retained failed import transaction in place.
+/// A failed mapping remains registered because the executive cannot safely unmap it yet; retrying
+/// that exact base avoids duplicate mappings and preserves the loader entry's owned state.
+#[cfg(target_arch = "x86_64")]
+unsafe fn load_and_snap_dependency(
+    name_lc: &[u8],
+    ntdll_base: u64,
+    table: *mut ModuleTable,
+    out: &mut SnapResult,
+    depth: u32,
+) -> u64 {
+    let existing = unsafe { (&*table).find(name_lc) };
+    if existing != 0 {
+        return existing;
+    }
+    let retained = unsafe { (&*table).find_any(name_lc) };
+    let base = if retained != 0 {
+        retained
+    } else {
+        let loaded = unsafe { load_dependent_dll(name_lc) };
+        if loaded == 0 {
+            return 0;
+        }
+        unsafe { (&mut *table).insert(name_lc, loaded) };
+        loaded
+    };
+    let status = unsafe { add_runtime_ldr_module(base, name_lc) };
+    if status != 0 {
+        if out.status == 0 {
+            out.status = status;
+        }
+        return 0;
+    }
+    unsafe { snap_module(base, ntdll_base, table, out, depth) };
+    if out.status == 0 { base } else { 0 }
 }
 
 /// `NtMapViewOfSection` — a dedicated 10-arg caller (its arity exceeds syscall8's 8). Uses the same
@@ -1593,6 +1750,13 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     // smss imports only ntdll (dep-free); csrss also imports csrsrv.dll — which this loads + snaps.
     // SAFETY: on-target mapped-image walk + IAT write + dependent-DLL load syscalls.
     let out = unsafe { snap_all_imports(smss_base, ntdll_base) };
+    if out.status != 0 {
+        drop(_loader_lock);
+        unsafe {
+            crate::exports::rtl_raise_status(out.status);
+            core::hint::unreachable_unchecked()
+        }
+    }
     // (2.5) BUILD `PEB->Ldr` (PEB+0x18) — the three circularly-linked LDR_DATA_TABLE_ENTRY lists,
     // one entry per loaded module (the EXE + ntdll + every cascaded/delay DLL now in MODULE_TABLE).
     // Real ntdll's LdrpInitializeProcess builds this BEFORE running init routines, and hosted code
@@ -1600,9 +1764,14 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
     // NULL → GetModuleFileNameW(NULL)'s `[Peb->Ldr]+0x10` InLoadOrder walk derefs NULL+0x10 (the
     // kernel32+0xff13 wall). `image_base` (the EXE) is recorded as list entry 0.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped images; the process heap is installed.
-    unsafe {
-        let table = &*core::ptr::addr_of!(MODULE_TABLE);
-        build_peb_ldr(table, smss_base);
+    let ldr_status =
+        unsafe { build_peb_ldr(core::ptr::addr_of!(MODULE_TABLE), smss_base) };
+    if ldr_status != 0 {
+        drop(_loader_lock);
+        unsafe {
+            crate::exports::rtl_raise_status(ldr_status);
+            core::hint::unreachable_unchecked()
+        }
     }
     // (2.6) BATCH 42 — LIVE SEH self-test: validate the REAL RtlLookupFunctionEntry +
     // RtlVirtualUnwind against our own compiled `.pdata`/`.xdata` (proves the live table walk +
@@ -1650,8 +1819,9 @@ pub unsafe fn snap_all_imports(image_base: u64, ntdll_base: u64) -> SnapResult {
     // SAFETY: single-threaded loader context — MODULE_TABLE is touched only on the main thread while
     // LdrpInitialize runs (no other thread exists yet). The recursive helper honours the contract.
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
-        table.insert(b"ntdll", ntdll_base);
+        let table = core::ptr::addr_of_mut!(MODULE_TABLE);
+        (&mut *table).insert(b"ntdll", ntdll_base);
+        (&mut *table).set_imports_ready(ntdll_base);
         snap_module(image_base, ntdll_base, table, &mut out, 0);
     }
     out
@@ -1666,55 +1836,87 @@ pub unsafe fn snap_all_imports(image_base: u64, ntdll_base: u64) -> SnapResult {
 unsafe fn snap_module(
     image_base: u64,
     ntdll_base: u64,
-    table: &mut ModuleTable,
+    table: *mut ModuleTable,
     out: &mut SnapResult,
     depth: u32,
 ) {
+    if out.status != 0 {
+        unsafe { (&mut *table).set_imports_failed(image_base) };
+        return;
+    }
     if depth > 8 {
+        if out.status == 0 {
+            out.status = 0xC000_0001; // STATUS_UNSUCCESSFUL
+        }
+        unsafe { (&mut *table).set_imports_failed(image_base) };
         return; // cycle / over-deep guard — csrss's graph is 2 deep at most
     }
+    unsafe { (&mut *table).begin_imports(image_base) };
+    let mut imports_ready = ModuleImportsReadyGuard {
+        table,
+        base: image_base,
+        committed: false,
+    };
+    let mut activation_frame = [0u64; 7];
+    let _activation_context =
+        match unsafe { ModuleActivationContextGuard::enter(image_base, &mut activation_frame) } {
+            Ok(guard) => guard,
+            Err(status) => {
+                if out.status == 0 {
+                    out.status = status;
+                }
+                return;
+            }
+        };
     // SAFETY: reading the mapped import directory + writing the mapped RW IAT per the contract.
     unsafe {
         let (idir_rva, _sz) = data_directory(image_base, 1); // IMAGE_DIRECTORY_ENTRY_IMPORT = 1
-        if idir_rva == 0 {
-            return;
-        }
-        let mut desc = image_base + idir_rva as u64;
-        loop {
-            let oft = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
-            let name_rva = rd32(desc, 12); // Name RVA
-            let ft = rd32(desc, 16); // FirstThunk (IAT) RVA
-            if name_rva == 0 && ft == 0 {
-                break; // terminator
-            }
-            let ilt_rva = if oft != 0 { oft } else { ft };
+        if idir_rva != 0 {
+            let mut desc = image_base + idir_rva as u64;
+            loop {
+                let oft = rd32(desc, 0); // OriginalFirstThunk (ILT) RVA
+                let name_rva = rd32(desc, 12); // Name RVA
+                let ft = rd32(desc, 16); // FirstThunk (IAT) RVA
+                if name_rva == 0 && ft == 0 {
+                    break; // terminator
+                }
+                let ilt_rva = if oft != 0 { oft } else { ft };
 
-            // Resolve this dependency's base: ntdll / an already-loaded module / load it now.
-            let mut base = [0u8; 32];
-            let bn = import_desc_basename(image_base, name_rva, &mut base);
-            let dep_name = &base[..bn];
-            let mut dep_base = table.find(dep_name);
-            if dep_base == 0 {
-                // Not loaded yet — map it (the executive assigns its fixed registry base), record it,
-                // then recursively snap ITS imports before we snap this module against it.
-                let loaded = load_dependent_dll(dep_name);
-                if loaded != 0 {
-                    table.insert(dep_name, loaded);
-                    snap_module(loaded, ntdll_base, table, out, depth + 1);
-                    dep_base = loaded;
+                // Resolve this dependency's base: ntdll / an already-loaded module / load it now.
+                let mut base = [0u8; 32];
+                let bn = import_desc_basename(image_base, name_rva, &mut base);
+                let dep_name = &base[..bn];
+                let mut dep_base = (&*table).find(dep_name);
+                if dep_base == 0 {
+                    dep_base = load_and_snap_dependency(
+                        dep_name,
+                        ntdll_base,
+                        table,
+                        out,
+                        depth + 1,
+                    );
+                    if out.status != 0 {
+                        return;
+                    }
                 }
-            }
-            if dep_base != 0 {
-                snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
-            } else {
-                // Could not resolve the dependency — count its thunks as missing (honest, not faked).
-                let mut ilt = image_base + ilt_rva as u64;
-                while core::ptr::read_unaligned(ilt as *const u64) != 0 {
-                    out.missing += 1;
-                    ilt += 8;
+                if dep_base != 0 {
+                    snap_descriptor_against(image_base, ilt_rva, ft, dep_base, table, out);
+                    if out.status != 0 {
+                        return;
+                    }
+                } else {
+                    // Could not resolve the dependency — count its thunks as missing (honest, not faked).
+                    let mut ilt = image_base + ilt_rva as u64;
+                    while core::ptr::read_unaligned(ilt as *const u64) != 0 {
+                        out.missing += 1;
+                        ilt += 8;
+                    }
                 }
+                desc += 20;
             }
-            desc += 20;
+        }
+        if out.status != 0 {
+            return;
         }
         // BATCH 14 — also EAGERLY bind DELAY imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13). A VC++
         // delay-load leaves the delay-IAT pointing at `__delayLoadHelper2`, which at first call does
@@ -1739,23 +1941,33 @@ unsafe fn snap_module(
                     let mut base = [0u8; 32];
                     let bn = import_desc_basename(image_base, name_rva, &mut base);
                     let dep_name = &base[..bn];
-                    let mut dep_base = table.find(dep_name);
+                    let mut dep_base = (&*table).find(dep_name);
                     if dep_base == 0 {
-                        let loaded = load_dependent_dll(dep_name);
-                        if loaded != 0 {
-                            table.insert(dep_name, loaded);
-                            snap_module(loaded, ntdll_base, table, out, depth + 1);
-                            dep_base = loaded;
+                        dep_base = load_and_snap_dependency(
+                            dep_name,
+                            ntdll_base,
+                            table,
+                            out,
+                            depth + 1,
+                        );
+                        if out.status != 0 {
+                            return;
                         }
                     }
                     if dep_base != 0 {
                         // Snap the delay INT (int_rva) → the delay IAT (iat_rva), exactly like a normal
                         // import descriptor. The delay-load helper is now bypassed for this DLL.
                         snap_descriptor_against(image_base, int_rva, iat_rva, dep_base, table, out);
+                        if out.status != 0 {
+                            return;
+                        }
                     }
                 }
                 ddesc += 32; // sizeof(ImgDelayDescr)
             }
+        }
+        if out.status == 0 {
+            imports_ready.commit();
         }
     }
 }
@@ -1789,6 +2001,81 @@ unsafe fn snap_module(
 #[cfg(target_arch = "x86_64")]
 const LDR_ENTRY_SIZE: u64 =
     (core::mem::size_of::<nt_ntdll_layout::LdrDataTableEntry>() as u64 + 15) & !15;
+
+#[cfg(target_arch = "x86_64")]
+struct ModuleActivationContextGuard<'a> {
+    frame: *mut c_void,
+    _storage: PhantomData<&'a mut [u64; 7]>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<'a> ModuleActivationContextGuard<'a> {
+    unsafe fn enter(base: u64, storage: &'a mut [u64; 7]) -> Result<Self, u32> {
+        let context = unsafe { crate::exports::ldr_entry_activation_context_for_base(base) };
+        if context.is_null() {
+            return Ok(Self {
+                frame: core::ptr::null_mut(),
+                _storage: PhantomData,
+            });
+        }
+        storage.fill(0);
+        storage[0] = core::mem::size_of_val(storage) as u64;
+        storage[1] = nt_ntdll::rtl::activation::CALLER_FRAME_FORMAT_WHISTLER as u64;
+        let frame = unsafe {
+            crate::exports::rtl_activate_activation_context_unsafe_fast(
+                storage.as_mut_ptr().cast(),
+                context,
+            )
+        };
+        if frame.is_null() {
+            Err(STATUS_NO_MEMORY as u32)
+        } else {
+            Ok(Self {
+                frame: storage.as_mut_ptr().cast(),
+                _storage: PhantomData,
+            })
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ModuleActivationContextGuard<'_> {
+    fn drop(&mut self) {
+        if !self.frame.is_null() {
+            let _ = unsafe {
+                crate::exports::rtl_deactivate_activation_context_unsafe_fast(self.frame)
+            };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct ModuleImportsReadyGuard {
+    table: *mut ModuleTable,
+    base: u64,
+    committed: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ModuleImportsReadyGuard {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ModuleImportsReadyGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.committed {
+                (&mut *self.table).set_imports_ready(self.base);
+            } else {
+                (&mut *self.table).set_imports_failed(self.base);
+            }
+        };
+    }
+}
+
 /// Size of the `PEB_LDR_DATA` head (round to 0x60).
 #[cfg(target_arch = "x86_64")]
 const PEB_LDR_DATA_SIZE: u64 = 0x60;
@@ -1980,13 +2267,13 @@ unsafe fn thread_ldr_lists() {
 /// On-target; `exe_base` + every `table` base are mapped PE images; the process heap is installed;
 /// `gs:[0x60]` = PEB (byte-exact x64 layout).
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
+pub unsafe fn build_peb_ldr(table: *const ModuleTable, exe_base: u64) -> u32 {
     // SAFETY: on-target; reserve the region + raw writes into it + the gs-relative PEB write.
     unsafe {
         // Reserve the process-lifetime region for the head + entries + name buffers.
         let region = nt_allocate_virtual_memory(LDR_REGION_SIZE);
         if region == 0 {
-            return; // honest: no region → no Ldr (the walk still faults, but we didn't fabricate)
+            return STATUS_NO_MEMORY as u32;
         }
         {
             let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
@@ -1997,7 +2284,7 @@ pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
         // Head first.
         let ldr_va = ldr_bump(PEB_LDR_DATA_SIZE);
         if ldr_va == 0 {
-            return;
+            return STATUS_NO_MEMORY as u32;
         }
         // Zero + fill the fixed head fields.
         for i in 0..(PEB_LDR_DATA_SIZE / 8) {
@@ -2012,12 +2299,17 @@ pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
 
         // Entry 0 = the EXE (its base name from its own PE export dir isn't reliable; derive a leaf
         // from a fixed "image" tag — GetModuleFileNameW(NULL) matches by DllBase, not by name).
-        add_ldr_module(exe_base, b"image");
+        if add_ldr_module(exe_base, b"image") == 0 {
+            return STATUS_NO_MEMORY as u32;
+        }
 
         // Then every module in MODULE_TABLE (ntdll + all deps), skipping any whose base == exe_base.
-        for m in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+        let table_count = (&*table).count.min(MODULE_TABLE_CAP);
+        for m in &(&*table).mods[..table_count] {
             if m.base >= 0x1_0000 && m.base != exe_base {
-                add_ldr_module(m.base, &m.name[..m.nlen as usize]);
+                if add_ldr_module(m.base, &m.name[..m.nlen as usize]) == 0 {
+                    return STATUS_NO_MEMORY as u32;
+                }
             }
         }
 
@@ -2029,6 +2321,24 @@ pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
         if peb != 0 {
             core::ptr::write_volatile((peb + 0x18) as *mut u64, ldr_va);
+        }
+
+        // Static imports were snapped before the Ldr region existed. Materialize their inherited
+        // activation-context ownership now, before any TLS callback or DllMain can run.
+        {
+            let mut entries = [0u64; LDR_MAX_ENTRIES];
+            let count = {
+                let state = &*core::ptr::addr_of!(LDR_STATE);
+                let count = state.count.min(LDR_MAX_ENTRIES);
+                entries[..count].copy_from_slice(&state.entry_vas[..count]);
+                count
+            };
+            for &entry in &entries[..count] {
+                let status = crate::exports::ldr_prepare_entry_activation_context(entry);
+                if status != 0 {
+                    return status;
+                }
+            }
         }
 
         {
@@ -2052,6 +2362,7 @@ pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
             mn = crate::write_u32_dec(&mut mb, mn, st.count as u32);
             crate::dbg_print_bytes(mb.as_ptr(), mn);
         }
+        0
     }
 }
 
@@ -2060,27 +2371,65 @@ pub unsafe fn build_peb_ldr(table: &ModuleTable, exe_base: u64) {
 /// # Safety
 /// On-target; `base` a mapped PE image; the Ldr region is reserved.
 #[cfg(target_arch = "x86_64")]
-unsafe fn add_ldr_module(base: u64, name_lc: &[u8]) {
+unsafe fn ldr_entry_for_base(base: u64) -> u64 {
+    let state = unsafe { &*core::ptr::addr_of!(LDR_STATE) };
+    for &entry in &state.entry_vas[..state.count.min(LDR_MAX_ENTRIES)] {
+        if unsafe { core::ptr::read_unaligned((entry + 0x30) as *const u64) } == base {
+            return entry;
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_ldr_module(base: u64, name_lc: &[u8]) -> u64 {
     // SAFETY: single-threaded loader; region reserved.
     unsafe {
-        let st = &mut *core::ptr::addr_of_mut!(LDR_STATE);
-        // De-dupe: already recorded?
-        for i in 0..st.count {
-            let e = st.entry_vas[i];
-            if core::ptr::read_unaligned((e + 0x30) as *const u64) == base {
-                return;
-            }
+        let existing = ldr_entry_for_base(base);
+        if existing != 0 {
+            return existing;
         }
-        if st.count >= LDR_MAX_ENTRIES {
-            return;
+        let count = (&*core::ptr::addr_of!(LDR_STATE)).count;
+        if count >= LDR_MAX_ENTRIES {
+            return 0;
         }
         let entry = build_ldr_entry(base, name_lc);
         if entry == 0 {
-            return;
+            return 0;
         }
-        st.entry_vas[st.count] = entry;
-        st.count += 1;
+        let state = &mut *core::ptr::addr_of_mut!(LDR_STATE);
+        state.entry_vas[count] = entry;
+        state.count = count + 1;
+        entry
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_runtime_ldr_module(base: u64, name_lc: &[u8]) -> u32 {
+    if unsafe { (&*core::ptr::addr_of!(LDR_STATE)).ldr_va } == 0 {
+        return 0;
+    }
+    unsafe { (&mut *core::ptr::addr_of_mut!(MODULE_TABLE)).begin_imports(base) };
+    let existing = unsafe { ldr_entry_for_base(base) };
+    let entry = if existing != 0 {
+        existing
+    } else {
+        unsafe { add_ldr_module(base, name_lc) }
+    };
+    if entry == 0 {
+        unsafe { (&mut *core::ptr::addr_of_mut!(MODULE_TABLE)).set_imports_failed(base) };
+        return STATUS_NO_MEMORY as u32;
+    }
+    let status = unsafe {
+        if existing == 0 {
+            thread_ldr_lists();
+        }
+        crate::exports::ldr_prepare_entry_activation_context(entry)
+    };
+    if status != 0 {
+        unsafe { (&mut *core::ptr::addr_of_mut!(MODULE_TABLE)).set_imports_failed(base) };
+    }
+    status
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2186,25 +2535,48 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
         let table_ptr = core::ptr::addr_of_mut!(MODULE_TABLE);
         // Already loaded? Return its base.
         let existing = (&*table_ptr).find(dep);
-        let newly_loaded = existing == 0;
-        let base = if !newly_loaded {
-            let status = ldr_add_ref_dll(existing, false);
-            if status != 0 {
-                return status;
+        let retained = (&*table_ptr).find_any(dep);
+        let mut newly_loaded = existing == 0;
+        let mut reference_added = false;
+        let base = if existing != 0 {
+            if !(&*table_ptr).imports_ready(existing) {
+                return 0xC000_0135; // STATUS_DLL_NOT_FOUND while this mapping is still in progress
+            }
+            if (&*table_ptr).attach_failed(existing) {
+                // The first caller never received a handle, so its initial count still owns this
+                // retry and must not be incremented again before DllMain succeeds.
+                newly_loaded = true;
+            } else {
+                let status = ldr_add_ref_dll(existing, false);
+                if status != 0 {
+                    return status;
+                }
+                reference_added = true;
             }
             existing
         } else {
-            let loaded = load_dependent_dll(dep);
-            if loaded == 0 {
-                return 0xC000_0135; // STATUS_DLL_NOT_FOUND
-            }
+            let loaded = if retained != 0 {
+                retained
+            } else {
+                let loaded = load_dependent_dll(dep);
+                if loaded == 0 {
+                    return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+                }
+                (&mut *table_ptr).insert(dep, loaded);
+                loaded
+            };
             {
-                let table = &mut *table_ptr;
-                table.insert(dep, loaded);
+                let status = add_runtime_ldr_module(loaded, dep);
+                if status != 0 {
+                    return status;
+                }
                 // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
-                let ntdll_base = table.find(b"ntdll");
+                let ntdll_base = (&*table_ptr).find(b"ntdll");
                 let mut out = SnapResult::default();
-                snap_module(loaded, ntdll_base, table, &mut out, 0);
+                snap_module(loaded, ntdll_base, table_ptr, &mut out, 0);
+                if out.status != 0 {
+                    return out.status;
+                }
             }
             // BATCH 15 — link the runtime-loaded module (+ any deps it pulled in) into PEB->Ldr so a
             // later GetModuleFileNameW / LdrGetDllHandle walk finds it + still terminates circularly.
@@ -2226,8 +2598,18 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
         };
         let attach_status = run_process_attach_root(table_ptr, base);
         if attach_status != 0 {
+            if reference_added {
+                let rollback_status = ldr_release_dll_reference(base);
+                if rollback_status != 0 {
+                    return rollback_status;
+                }
+            }
+            if newly_loaded {
+                (&mut *table_ptr).set_attach_failed(base, true);
+            }
             return attach_status;
         }
+        (&mut *table_ptr).set_attach_failed(base, false);
         if newly_loaded {
             crate::exports::ldr_send_dll_notifications_for_base(base, 1);
         }
@@ -2481,9 +2863,22 @@ pub unsafe fn ldr_get_procedure_address(
     // forwarder handling the static import snap does (else a forwarded proc address would be the
     // forwarder STRING, faulting on the first call).
     let addr = unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
+        let table = core::ptr::addr_of_mut!(MODULE_TABLE);
         if name.is_null() {
-            resolve_export_addr(base, true, &[], ordinal, table, 0)
+            let mut load_status = 0;
+            let address = resolve_export_addr(
+                base,
+                true,
+                &[],
+                ordinal,
+                table,
+                &mut load_status,
+                0,
+            );
+            if load_status != 0 {
+                return load_status;
+            }
+            address
         } else {
             // ANSI_STRING { Length(u16)@0, MaximumLength(u16)@2, Buffer(ptr)@8 }.
             let length = core::ptr::read_unaligned(name as *const u16) as usize;
@@ -2496,7 +2891,20 @@ pub unsafe fn ldr_get_procedure_address(
                 for i in 0..l {
                     nb[i] = core::ptr::read_unaligned((buffer as *const u8).add(i));
                 }
-                resolve_export_addr(base, false, &nb[..l], 0, table, 0)
+                let mut load_status = 0;
+                let address = resolve_export_addr(
+                    base,
+                    false,
+                    &nb[..l],
+                    0,
+                    table,
+                    &mut load_status,
+                    0,
+                );
+                if load_status != 0 {
+                    return load_status;
+                }
+                address
             }
         }
     };

@@ -8742,6 +8742,67 @@ pub unsafe extern "system" fn ldr_set_dll_manifest_prober(prober: *mut c_void) {
     LDR_MANIFEST_PROBER_ROUTINE.store(prober as u64, Ordering::Release);
 }
 
+#[cfg(target_arch = "x86_64")]
+type LdrManifestProber = unsafe extern "system" fn(
+    dll_handle: *mut c_void,
+    full_dll_name: *const u16,
+    activation_context: *mut *mut c_void,
+) -> NtStatus;
+
+/// Probe one newly-created loader entry for an embedded manifest, or inherit the caller's active
+/// context when the prober is not installed or finds no usable manifest. The published slot owns
+/// exactly one reference until the entry is actually finalized.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_prepare_entry_activation_context(entry: u64) -> NtStatus {
+    if entry == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let slot = (entry + 0x88) as *mut *mut c_void;
+    if !unsafe { core::ptr::read_unaligned(slot) }.is_null() {
+        return STATUS_SUCCESS;
+    }
+
+    let mut context = core::ptr::null_mut();
+    let prober = LDR_MANIFEST_PROBER_ROUTINE.load(Ordering::Acquire);
+    if prober != 0 {
+        let callback: LdrManifestProber = unsafe { core::mem::transmute(prober as usize) };
+        let dll_base = unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) };
+        let full_name =
+            unsafe { core::ptr::read_unaligned((entry + LDR_FULL_DLL_NAME + 8) as *const u64) };
+        let status = unsafe {
+            callback(
+                dll_base as *mut c_void,
+                full_name as *const u16,
+                &mut context,
+            )
+        };
+        if nt_success(status) && !context.is_null() {
+            unsafe { core::ptr::write_unaligned(slot, context) };
+            return STATUS_SUCCESS;
+        }
+        if !context.is_null() {
+            unsafe { rtl_release_activation_context(context) };
+            context = core::ptr::null_mut();
+        }
+    }
+
+    let status = unsafe { rtl_get_active_activation_context(&mut context) };
+    if nt_success(status) {
+        unsafe { core::ptr::write_unaligned(slot, context) };
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_entry_activation_context_for_base(base: u64) -> *mut c_void {
+    let entry = unsafe { find_ldr_entry_for_base(base) };
+    if entry == 0 {
+        core::ptr::null_mut()
+    } else {
+        unsafe { core::ptr::read_unaligned((entry + 0x88) as *const *mut c_void) }
+    }
+}
+
 /// `LdrSetAppCompatDllRedirectionCallback(ULONG Flags,
 /// PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION CallbackFunction, PVOID CallbackData)
 /// -> NTSTATUS`.
