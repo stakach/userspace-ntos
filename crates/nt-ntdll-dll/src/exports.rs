@@ -81,6 +81,8 @@ static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
+static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
+static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
 const SYSTEM_TIME_OF_DAY_TIMEZONE_BIAS_OFFSET: usize = 16;
@@ -2383,6 +2385,22 @@ pub unsafe extern "system" fn rtl_get_current_peb() -> *mut c_void {
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { current_peb() as *mut c_void }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// `NtCurrentTeb() -> PTEB`.
+///
+/// This is a user-mode ntdll helper, not a syscall. On amd64 the TEB self pointer lives at
+/// `gs:[0x30]`.
+#[export_name = "NtCurrentTeb"]
+pub unsafe extern "system" fn nt_current_teb() -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { current_teb() as *mut c_void }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -7695,6 +7713,30 @@ pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
 #[export_name = "LdrSetDllManifestProber"]
 pub unsafe extern "system" fn ldr_set_dll_manifest_prober(_prober: *mut c_void) {}
 
+/// `LdrSetAppCompatDllRedirectionCallback(ULONG Flags,
+/// PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION CallbackFunction, PVOID CallbackData)
+/// -> NTSTATUS`.
+///
+/// Store the process-local AppCompat redirection callback. The recursive DLL loader does not consult
+/// it yet, but callers can install/clear the callback without losing the registration state.
+///
+/// # Safety
+/// `callback_function` is either NULL or a valid callback with the ReactOS
+/// `PLDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK_FUNCTION` ABI.
+#[export_name = "LdrSetAppCompatDllRedirectionCallback"]
+pub unsafe extern "system" fn ldr_set_app_compat_dll_redirection_callback(
+    flags: u32,
+    callback_function: *mut c_void,
+    callback_data: *mut c_void,
+) -> NtStatus {
+    if flags != 0 {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT.store(callback_data as u64, Ordering::Release);
+    LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK.store(callback_function as u64, Ordering::Release);
+    STATUS_SUCCESS
+}
+
 /// `LdrOpenImageFileOptionsKey(PCUNICODE_STRING SubKey, BOOLEAN Wow64, PHANDLE NewKeyHandle)
 /// -> NTSTATUS` — open the IFEO registry key for an image. No IFEO consulted → NULL handle +
 /// STATUS_OBJECT_NAME_NOT_FOUND (the "no options" contract; the loader uses defaults).
@@ -7855,6 +7897,10 @@ const RESOURCE_NAME_LEVEL: u32 = 1;
 const RESOURCE_LANGUAGE_LEVEL: u32 = 2;
 const IMAGE_RESOURCE_NAME_IS_STRING: u32 = 0x8000_0000;
 const IMAGE_RESOURCE_DATA_IS_DIRECTORY: u32 = 0x8000_0000;
+const LDR_RES_ALLOW_ANY: u32 = 0x0000_0002;
+const LDR_RES_REQUIRE_FOUR_KEYS_A: u32 = 0x0000_0001;
+const LDR_RES_REQUIRE_FOUR_KEYS_B: u32 = 0x0000_0040;
+const LDR_RES_KEY4_MASK: u32 = LDR_RES_REQUIRE_FOUR_KEYS_A | LDR_RES_REQUIRE_FOUR_KEYS_B;
 const LDR_ENUM_RESOURCE_INFO_SIZE: usize = 40;
 const LDR_ENUM_RESOURCE_INFO_TYPE: usize = 0;
 const LDR_ENUM_RESOURCE_INFO_NAME: usize = 8;
@@ -8039,6 +8085,170 @@ unsafe fn decode_res_name<'a>(
     }
 }
 
+unsafe fn ldr_res_language_id(language: usize) -> Result<usize, NtStatus> {
+    if language <= 0xffff {
+        return Ok(language);
+    }
+    let Some(lcid) = (unsafe { rtl_supported_locale_name_to_lcid(language as *const u16) }) else {
+        return Err(STATUS_RESOURCE_LANG_NOT_FOUND);
+    };
+    Ok((lcid & 0xffff) as usize)
+}
+
+fn ldr_res_effective_data_count(count: u32, flags: u32) -> Result<u32, NtStatus> {
+    if count == 3 {
+        return Ok(3);
+    }
+    if count == 4 && (flags & LDR_RES_KEY4_MASK) != 0 {
+        return Ok(3);
+    }
+    if (flags & LDR_RES_ALLOW_ANY) != 0 && count >= 3 {
+        return Ok(3);
+    }
+    Err(STATUS_INVALID_PARAMETER)
+}
+
+unsafe fn ldr_res_write_culture_name(
+    language: usize,
+    culture_name: *mut c_void,
+    culture_name_length: *mut u32,
+) {
+    if culture_name_length.is_null() {
+        return;
+    }
+
+    let lcid = if language <= 0xffff {
+        language as u32
+    } else {
+        match unsafe { rtl_supported_locale_name_to_lcid(language as *const u16) } {
+            Some(lcid) => lcid,
+            None => {
+                unsafe { core::ptr::write_unaligned(culture_name_length, 0) };
+                return;
+            }
+        }
+    };
+    let Some(locale) = rtl_supported_lcid_to_locale(lcid) else {
+        unsafe { core::ptr::write_unaligned(culture_name_length, 0) };
+        return;
+    };
+
+    let required = ((locale.len() + 1) * 2) as u32;
+    let capacity = unsafe { core::ptr::read_unaligned(culture_name_length) };
+    unsafe { core::ptr::write_unaligned(culture_name_length, required) };
+    if culture_name.is_null() || (capacity != 0 && capacity < required) {
+        return;
+    }
+
+    let out = culture_name as *mut u16;
+    for (i, &byte) in locale.iter().enumerate() {
+        unsafe { core::ptr::write_unaligned(out.add(i), byte as u16) };
+    }
+    unsafe { core::ptr::write_unaligned(out.add(locale.len()), 0) };
+}
+
+unsafe fn ldr_res_zero_access_outputs(
+    resource_buffer: *mut *mut c_void,
+    resource_length: *mut usize,
+) {
+    unsafe {
+        if !resource_buffer.is_null() {
+            core::ptr::write_unaligned(resource_buffer, core::ptr::null_mut());
+        }
+        if !resource_length.is_null() {
+            core::ptr::write_unaligned(resource_length, 0);
+        }
+    }
+}
+
+unsafe fn ldr_res_access_from_path(
+    dll_handle: *mut c_void,
+    resource_path: *const usize,
+    resource_path_count: u32,
+    flags: u32,
+    resource_buffer: *mut *mut c_void,
+    resource_length: *mut usize,
+    culture_name: *mut c_void,
+    culture_name_length: *mut u32,
+) -> NtStatus {
+    if resource_path.is_null() {
+        unsafe { ldr_res_zero_access_outputs(resource_buffer, resource_length) };
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Ok(count) = ldr_res_effective_data_count(resource_path_count, flags) else {
+        unsafe { ldr_res_zero_access_outputs(resource_buffer, resource_length) };
+        return STATUS_INVALID_PARAMETER;
+    };
+
+    let language = unsafe { core::ptr::read_unaligned(resource_path.add(2)) };
+    let mut data_entry = core::ptr::null_mut();
+    let status = unsafe {
+        ldr_find_resource_u(
+            dll_handle,
+            resource_path as *const c_void,
+            count,
+            &mut data_entry,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe { ldr_res_zero_access_outputs(resource_buffer, resource_length) };
+        return status;
+    }
+
+    let mut buffer = core::ptr::null_mut();
+    let mut length = 0u32;
+    let status = unsafe { ldr_access_resource(dll_handle, data_entry, &mut buffer, &mut length) };
+    if status != STATUS_SUCCESS {
+        unsafe { ldr_res_zero_access_outputs(resource_buffer, resource_length) };
+        return status;
+    }
+
+    unsafe {
+        if !resource_buffer.is_null() {
+            core::ptr::write_unaligned(resource_buffer, buffer);
+        }
+        if !resource_length.is_null() {
+            core::ptr::write_unaligned(resource_length, length as usize);
+        }
+        ldr_res_write_culture_name(language, culture_name, culture_name_length);
+    }
+    STATUS_SUCCESS
+}
+
+unsafe fn ldr_resource_root(
+    dll_handle: *mut c_void,
+    resource_directory: *mut *mut c_void,
+    out_headers: *mut *mut c_void,
+) -> NtStatus {
+    let dll_handle = ldr_untag_resource_module(dll_handle);
+    if dll_handle.is_null() {
+        return STATUS_RESOURCE_DATA_NOT_FOUND;
+    }
+
+    unsafe {
+        let headers = rtl_image_nt_header(dll_handle);
+        if headers.is_null() {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        if !out_headers.is_null() {
+            core::ptr::write_unaligned(out_headers, headers);
+        }
+
+        let mut size = 0u32;
+        let root = rtl_image_directory_entry_to_data(dll_handle, 1, 2, &mut size);
+        if root.is_null() || (size as usize) < rtl::pe_resource::DIR_SIZE {
+            if !resource_directory.is_null() {
+                core::ptr::write_unaligned(resource_directory, core::ptr::null_mut());
+            }
+            return STATUS_RESOURCE_DATA_NOT_FOUND;
+        }
+        if !resource_directory.is_null() {
+            core::ptr::write_unaligned(resource_directory, root);
+        }
+    }
+    STATUS_SUCCESS
+}
+
 /// The shared `LdrFindResource*` body: locate the resource section of `dll_handle`, walk the tree per
 /// `(Type, Name, Language, Level)`, and hand back the mapped VA of the matched node (a directory when
 /// `want_dir`, else an `IMAGE_RESOURCE_DATA_ENTRY`).
@@ -8195,6 +8405,232 @@ pub unsafe extern "system" fn ldr_find_resource_directory_u(
 ) -> NtStatus {
     // SAFETY: forwarded per the LdrFindResourceDirectory_U contract (want directory).
     unsafe { ldr_find_resource_impl(dll_handle, resource_info, level, resource_directory, true) }
+}
+
+/// `LdrResFindResource(PVOID DllHandle, PCWSTR Type, PCWSTR Name, PCWSTR Language,
+/// PVOID* ResourceBuffer, PSIZE_T ResourceLength, PVOID CultureName, PULONG CultureNameLength,
+/// ULONG Flags) -> NTSTATUS`.
+///
+/// Vista+ resource helper. We resolve the supplied module's mapped `.rsrc` tree through the same
+/// `LdrFindResource_U`/`LdrAccessResource` implementation used by Kernel32 `FindResource*`.
+///
+/// # Safety
+/// `dll_handle` is a mapped module; string arguments are resource ids or NUL-terminated UTF-16;
+/// optional outputs are writable.
+#[export_name = "LdrResFindResource"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn ldr_res_find_resource(
+    dll_handle: *mut c_void,
+    resource_type: *const u16,
+    resource_name: *const u16,
+    language: *const u16,
+    resource_buffer: *mut *mut c_void,
+    resource_length: *mut usize,
+    culture_name: *mut c_void,
+    culture_name_length: *mut u32,
+    flags: u32,
+) -> NtStatus {
+    let Ok(language_id) = (unsafe { ldr_res_language_id(language as usize) }) else {
+        unsafe { ldr_res_zero_access_outputs(resource_buffer, resource_length) };
+        return STATUS_RESOURCE_LANG_NOT_FOUND;
+    };
+    let path = [resource_type as usize, resource_name as usize, language_id];
+    unsafe {
+        ldr_res_access_from_path(
+            dll_handle,
+            path.as_ptr(),
+            3,
+            flags,
+            resource_buffer,
+            resource_length,
+            culture_name,
+            culture_name_length,
+        )
+    }
+}
+
+/// `LdrResFindResourceDirectory(PVOID DllHandle, PCWSTR Type, PCWSTR Name,
+/// PIMAGE_RESOURCE_DIRECTORY* ResourceDirectory, PVOID CultureName, PULONG CultureNameLength,
+/// ULONG Flags) -> NTSTATUS`.
+///
+/// # Safety
+/// `dll_handle` is a mapped module; type/name are resource ids or NUL-terminated UTF-16; optional
+/// outputs are writable.
+#[export_name = "LdrResFindResourceDirectory"]
+pub unsafe extern "system" fn ldr_res_find_resource_directory(
+    dll_handle: *mut c_void,
+    resource_type: *const u16,
+    resource_name: *const u16,
+    resource_directory: *mut *mut c_void,
+    culture_name: *mut c_void,
+    culture_name_length: *mut u32,
+    _flags: u32,
+) -> NtStatus {
+    let path = [resource_type as usize, resource_name as usize, 0usize];
+    let status = unsafe {
+        ldr_find_resource_directory_u(
+            dll_handle,
+            path.as_ptr() as *const c_void,
+            2,
+            resource_directory,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        unsafe { ldr_res_write_culture_name(0, culture_name, culture_name_length) };
+    } else if !resource_directory.is_null() {
+        unsafe { core::ptr::write_unaligned(resource_directory, core::ptr::null_mut()) };
+    }
+    status
+}
+
+/// `LdrResSearchResource(PVOID DllHandle, PULONG_PTR ResourcePath, ULONG ResourcePathCount,
+/// ULONG Flags, PVOID* ResourceBuffer, PSIZE_T ResourceLength, PWSTR CultureName,
+/// PULONG CultureNameLength) -> NTSTATUS`.
+///
+/// # Safety
+/// `resource_path` is readable for `resource_path_count` `ULONG_PTR`s; optional outputs writable.
+#[export_name = "LdrResSearchResource"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn ldr_res_search_resource(
+    dll_handle: *mut c_void,
+    resource_path: *const usize,
+    resource_path_count: u32,
+    flags: u32,
+    resource_buffer: *mut *mut c_void,
+    resource_length: *mut usize,
+    culture_name: *mut u16,
+    culture_name_length: *mut u32,
+) -> NtStatus {
+    unsafe {
+        ldr_res_access_from_path(
+            dll_handle,
+            resource_path,
+            resource_path_count,
+            flags,
+            resource_buffer,
+            resource_length,
+            culture_name as *mut c_void,
+            culture_name_length,
+        )
+    }
+}
+
+/// `LdrpResGetResourceDirectory(PVOID DllHandle, SIZE_T Size, ULONG Flags,
+/// PIMAGE_RESOURCE_DIRECTORY* ResourceDirectory, PIMAGE_NT_HEADERS* OutHeaders) -> NTSTATUS`.
+///
+/// Returns the mapped image's real resource root and NT headers. `Size`/`Flags` are reserved for the
+/// alternate-resource mapping modes; the in-process mapped image already carries the needed bounds.
+///
+/// # Safety
+/// Optional out-pointers are writable.
+#[export_name = "LdrpResGetResourceDirectory"]
+pub unsafe extern "system" fn ldrp_res_get_resource_directory(
+    dll_handle: *mut c_void,
+    _size: usize,
+    _flags: u32,
+    resource_directory: *mut *mut c_void,
+    out_headers: *mut *mut c_void,
+) -> NtStatus {
+    unsafe { ldr_resource_root(dll_handle, resource_directory, out_headers) }
+}
+
+/// `LdrpResGetRCConfig(PVOID DllHandle, SIZE_T Length, PMUI_RC_CONFIG* Config, ULONG Flags,
+/// BOOLEAN AlternateResource) -> NTSTATUS`.
+///
+/// MUI RC config is stored as resource type `"MUI"`, name `1` on the ReactOS/Wine path. Return a
+/// pointer to the mapped resource when present; otherwise report the real resource miss.
+///
+/// # Safety
+/// `config` is writable when non-null.
+#[export_name = "LdrpResGetRCConfig"]
+pub unsafe extern "system" fn ldrp_res_get_rc_config(
+    dll_handle: *mut c_void,
+    _length: usize,
+    config: *mut *mut c_void,
+    flags: u32,
+    _alternate_resource: u8,
+) -> NtStatus {
+    if config.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe { core::ptr::write_unaligned(config, core::ptr::null_mut()) };
+
+    let mui_type = [b'M' as u16, b'U' as u16, b'I' as u16, 0];
+    let path = [mui_type.as_ptr() as usize, 1usize, 0usize];
+    let mut buffer = core::ptr::null_mut();
+    let mut length = 0usize;
+    let status = unsafe {
+        ldr_res_access_from_path(
+            dll_handle,
+            path.as_ptr(),
+            3,
+            flags | LDR_RES_ALLOW_ANY,
+            &mut buffer,
+            &mut length,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status == STATUS_SUCCESS {
+        unsafe { core::ptr::write_unaligned(config, buffer) };
+    }
+    status
+}
+
+/// `LdrResRelease(PVOID DllHandle, PCWSTR CultureNameOrId, ULONG Reserved, ULONG Flags)
+/// -> NTSTATUS`.
+///
+/// The current loader maps resources from the primary module and keeps no per-culture satellite
+/// state for these APIs, so release is a validated no-op.
+///
+/// # Safety
+/// `dll_handle` is a module/resource handle.
+#[export_name = "LdrResRelease"]
+pub unsafe extern "system" fn ldr_res_release(
+    dll_handle: *mut c_void,
+    _culture_name_or_id: *const u16,
+    _reserved: usize,
+    _flags: u32,
+) -> NtStatus {
+    if ldr_untag_resource_module(dll_handle).is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    STATUS_SUCCESS
+}
+
+/// `LdrpResGetMappingSize(PVOID BaseAddress, PSIZE_T Size, ULONG Flags,
+/// BOOLEAN GetFileSizeFromLoadAsDataTable) -> VOID`.
+///
+/// # Safety
+/// `size` is writable when non-null.
+#[export_name = "LdrpResGetMappingSize"]
+pub unsafe extern "system" fn ldrp_res_get_mapping_size(
+    base_address: *mut c_void,
+    size: *mut usize,
+    _flags: u32,
+    get_file_size_from_load_as_data_table: u8,
+) {
+    if size.is_null() {
+        return;
+    }
+    let mut mapping_size = 0usize;
+    if get_file_size_from_load_as_data_table != 0 {
+        if let Some(record) = find_load_as_data_table_record(base_address) {
+            mapping_size = record.file_size.load(Ordering::Acquire);
+        }
+    }
+    if mapping_size == 0 {
+        let base = ldr_untag_resource_module(base_address);
+        if !base.is_null() {
+            unsafe {
+                let headers = rtl_image_nt_header(base);
+                if !headers.is_null() {
+                    mapping_size = image_read_u32(headers, 24 + 56) as usize;
+                }
+            }
+        }
+    }
+    unsafe { core::ptr::write_unaligned(size, mapping_size) };
 }
 
 /// `LdrEnumResources(PVOID ImageBase, PLDR_RESOURCE_INFO ResourceInfo, ULONG Level,
@@ -20841,6 +21277,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_try_acquire_peb_lock as usize,
         rtl_release_peb_lock as usize,
         rtl_get_current_peb as usize,
+        nt_current_teb as usize,
         rtl_dll_shutdown_in_progress as usize,
         rtl_get_nt_global_flags as usize,
         rtl_nt_status_to_dos_error as usize,
@@ -21676,11 +22113,19 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_shutdown_process as usize,
         ldr_shutdown_thread as usize,
         ldr_set_dll_manifest_prober as usize,
+        ldr_set_app_compat_dll_redirection_callback as usize,
         ldr_open_image_file_options_key as usize,
         ldr_query_image_file_key_option as usize,
         ldr_find_resource_u as usize,
         ldr_find_resource_ex_u as usize,
         ldr_find_resource_directory_u as usize,
+        ldr_res_find_resource as usize,
+        ldr_res_find_resource_directory as usize,
+        ldr_res_search_resource as usize,
+        ldrp_res_get_resource_directory as usize,
+        ldrp_res_get_rc_config as usize,
+        ldr_res_release as usize,
+        ldrp_res_get_mapping_size as usize,
         ldr_enum_resources as usize,
         ldr_access_resource as usize,
         ldr_load_alternate_resource_module as usize,
