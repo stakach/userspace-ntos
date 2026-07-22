@@ -16,12 +16,16 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+pub mod system_information;
+
 // NTSTATUS (spec §18)
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000_001C;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 
 /// The processor mode a service runs on behalf of (spec §8.4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

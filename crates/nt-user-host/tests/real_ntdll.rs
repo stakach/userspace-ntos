@@ -81,8 +81,8 @@ fn drive_real_ntdll_stubs_end_to_end() {
     // Real NtQueryValueKey stub (eax=0x14) → Answer == 42.
     let q = img.invoke(&d, "NtQueryValueKey", &[kh, 0, 0, 0], &origin(), &mut ks);
     assert_eq!(u32::from_le_bytes(q.output[..4].try_into().unwrap()), 42);
-    // Real NtQuerySystemInformation stub (eax=0x33) → NumberOfProcessors, and it reached the
-    // service keyed by that real number.
+    // Real NtQuerySystemInformation stub (eax=0x33) → full NT5 x64 basic information, and it
+    // reached the service keyed by that real number.
     let si = img.invoke(
         &d,
         "NtQuerySystemInformation",
@@ -90,7 +90,8 @@ fn drive_real_ntdll_stubs_end_to_end() {
         &origin(),
         &mut ks,
     );
-    assert_eq!(u32::from_le_bytes(si.output[..4].try_into().unwrap()), 1);
+    assert_eq!(si.output.len(), 0x40);
+    assert_eq!(si.output[0x38], 1);
     assert_eq!(
         ks.last_service(),
         Some(NativeService::NtQuerySystemInformation)

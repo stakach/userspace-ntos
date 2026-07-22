@@ -15,6 +15,42 @@ static EXEC_BOOT_STATUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut EXEC_BOOT_STATUS_DATA: [u8; EXEC_BOOT_STATUS_FILE_SIZE] =
     [0; EXEC_BOOT_STATUS_FILE_SIZE];
 
+fn native_processor_information() -> nt_syscall::system_information::SystemProcessorInformation {
+    use core::arch::x86_64::__cpuid;
+    use nt_syscall::system_information::{
+        amd64_processor_information_from_cpuid, X86Vendor,
+    };
+
+    // SAFETY: CPUID is available in the x86_64 execution environment.
+    let vendor_leaf = unsafe { __cpuid(0) };
+    let mut vendor_bytes = [0u8; 12];
+    vendor_bytes[0..4].copy_from_slice(&vendor_leaf.ebx.to_le_bytes());
+    vendor_bytes[4..8].copy_from_slice(&vendor_leaf.edx.to_le_bytes());
+    vendor_bytes[8..12].copy_from_slice(&vendor_leaf.ecx.to_le_bytes());
+    let vendor = match &vendor_bytes {
+        b"GenuineIntel" => X86Vendor::Intel,
+        b"AuthenticAMD" => X86Vendor::Amd,
+        _ => X86Vendor::Other,
+    };
+    // SAFETY: leaf 1 exists on every x86_64 processor.
+    let version = unsafe { __cpuid(1) };
+    // SAFETY: extended leaf zero reports whether leaf 0x80000001 is available.
+    let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
+    let extended_edx = if max_extended >= 0x8000_0001 {
+        // SAFETY: availability was checked above.
+        unsafe { __cpuid(0x8000_0001) }.edx
+    } else {
+        0
+    };
+    amd64_processor_information_from_cpuid(
+        vendor,
+        version.eax,
+        version.ecx,
+        version.edx,
+        extended_edx,
+    )
+}
+
 #[inline]
 fn boot_status_data_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(EXEC_BOOT_STATUS_DATA) as *mut u8
@@ -1010,15 +1046,30 @@ impl ExecNtHandler {
 
     /// Probe a small writable event output before changing dispatcher state.
     pub(crate) unsafe fn probe_event_output(&self, va: u64, len: usize) -> bool {
+        len <= 8 && self.probe_user_output(va, len)
+    }
+
+    /// Probe an arbitrary user output range without changing its contents.
+    pub(crate) unsafe fn probe_user_output(&self, va: u64, len: usize) -> bool {
         if len == 0 {
             return true;
         }
-        if va == 0 || len > 8 || va.checked_add(len as u64).is_none() {
+        if va == 0 || va.checked_add(len as u64).is_none() {
             return false;
         }
         let Some(ctx) = self.loop_ctx else {
+            let mut address = va;
+            let mut remaining = len;
             let mut bytes = [0u8; 8];
-            return self.xas_read(va, &mut bytes[..len]);
+            while remaining != 0 {
+                let chunk = remaining.min(bytes.len());
+                if !self.xas_read(address, &mut bytes[..chunk]) {
+                    return false;
+                }
+                address += chunk as u64;
+                remaining -= chunk;
+            }
+            return true;
         };
         let end = va + len as u64;
         let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
@@ -3132,40 +3183,108 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
             },
             // NtQuerySystemInformation(Class[R10]=args[0], Buffer[RDX]=args[1], Len[R8]=args[2],
-            // *RetLen[R9]=args[3]). RtlCreateHeap needs SystemBasicInformation (class 0): PageSize,
-            // AllocationGranularity, and the user-mode address range. Copyout the fields it reads.
+            // *RetLen[R9]=args[3]). Fixed class layouts and size policy live in nt-syscall; this
+            // layer supplies the live machine/time facts and performs user-buffer probing/copyout.
             NativeService::NtQuerySystemInformation => unsafe {
-                let class = args[0];
+                use nt_syscall::system_information::{
+                    query_plan, SystemBasicInformation, SystemInformationKind,
+                    SystemTimeOfDayInformation, SYSTEM_BASIC_INFORMATION_CLASS,
+                    SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+                };
+
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+
+                let class = args[0] as u32;
                 let buf = args[1];
-                let len = args[2];
-                let retlen_ptr = args[3]; // R9 = *ReturnLength (a register)
-                if class == 0 {
-                    smss_stack_write(buf + 0x08, 0x1000); // PageSize
-                    smss_stack_write(buf + 0x18, 0x10000); // AllocationGranularity
-                    smss_stack_write(buf + 0x20, 0x10000); // MinimumUserModeAddress
-                    smss_stack_write(buf + 0x28, 0x0000_7FFF_FFFE_FFFF); // MaximumUserModeAddress
-                    smss_stack_write(retlen_ptr, 0x40);
-                } else if class == 3 {
-                    // SystemTimeOfDayInformation. RtlLocalTimeToSystemTime reads TimeZoneBias at
-                    // offset 0x10. Publish UTC bias for now, but through the real syscall-backed
-                    // class so timezone policy can move here later.
-                    const TOD_LEN: usize = 48;
-                    if retlen_ptr != 0 {
-                        self.xas_write_buf(retlen_ptr, &(TOD_LEN as u32).to_le_bytes());
-                    }
-                    if buf == 0 {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
-                    if len < TOD_LEN as u64 {
-                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
-                    }
-                    let mut info = [0u8; TOD_LEN];
-                    info[8..16].copy_from_slice(&nt_system_time_100ns().to_le_bytes());
-                    // TimeZoneBias @ 0x10 remains zero: local time == system time until registry
-                    // timezone policy is wired into this handler.
-                    self.xas_write_buf(buf, &info);
+                let len = args[2] as usize;
+                let retlen_ptr = args[3];
+
+                if !matches!(
+                    class,
+                    SYSTEM_BASIC_INFORMATION_CLASS
+                        | SYSTEM_PROCESSOR_INFORMATION_CLASS
+                        | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS
+                ) {
+                    return STATUS_INVALID_INFO_CLASS;
                 }
-                0
+                if len != 0 && buf & 3 != 0 {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if len != 0 && !self.probe_user_output(buf, len) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if retlen_ptr != 0 {
+                    if retlen_ptr & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    if !self.probe_user_output(retlen_ptr, 4) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if !self.xas_write_u32(retlen_ptr, 0) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+
+                let plan = match query_plan(class, len) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        if retlen_ptr != 0 {
+                            self.xas_write_u32(retlen_ptr, error.return_length);
+                        }
+                        return error.status;
+                    }
+                };
+                if retlen_ptr != 0 {
+                    self.xas_write_u32(retlen_ptr, plan.return_length);
+                }
+
+                let wrote = match plan.kind {
+                    SystemInformationKind::Basic => {
+                        let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
+                        let affinity = if processors >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << processors) - 1
+                        };
+                        let output = SystemBasicInformation {
+                            timer_resolution_100ns: 10_000,
+                            page_size: 0x1000,
+                            number_of_physical_pages: SYSTEM_PHYSICAL_PAGES
+                                .load(Ordering::Relaxed)
+                                .min(u32::MAX as u64) as u32,
+                            lowest_physical_page_number: SYSTEM_LOWEST_PHYSICAL_PAGE
+                                .load(Ordering::Relaxed)
+                                .min(u32::MAX as u64) as u32,
+                            highest_physical_page_number: SYSTEM_HIGHEST_PHYSICAL_PAGE
+                                .load(Ordering::Relaxed)
+                                .min(u32::MAX as u64) as u32,
+                            allocation_granularity: 0x1_0000,
+                            minimum_user_mode_address: 0x1_0000,
+                            maximum_user_mode_address: 0x0000_07ff_fffe_ffff,
+                            active_processors_affinity_mask: affinity,
+                            number_of_processors: processors,
+                        }
+                        .encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
+                    SystemInformationKind::Processor => {
+                        let output = native_processor_information().encode();
+                        self.xas_try_write_buf(buf, &output)
+                    }
+                    SystemInformationKind::TimeOfDay => {
+                        let output = SystemTimeOfDayInformation {
+                            boot_time_100ns: NT_SYSTEM_TIME_BOOT_100NS,
+                            current_time_100ns: nt_system_time_100ns(),
+                            time_zone_bias_100ns: 0,
+                            time_zone_id: 0,
+                        }
+                        .encode();
+                        self.xas_try_write_buf(buf, &output[..plan.copy_length])
+                    }
+                };
+                if wrote { 0 } else { STATUS_ACCESS_VIOLATION }
             },
             // NtQueryInformationProcess(Handle[R10]=args[0], Class[RDX]=args[1], Buffer[R8]=args[2],
             // Len[R9]=args[3], *RetLen[arg5]=args[4]).

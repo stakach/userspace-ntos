@@ -945,6 +945,10 @@ const REG_KEY: &str = r"\Registry\Machine\System\CurrentControlSet\Services\From
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
 static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_LOWEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_HIGHEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
 
 /// Fix (B) — per-caller MCS reply objects so the executive's dispatch composes with nested service.
 /// The kernel has a SINGLE per-TCB `reply_to` stash; `finish_call` (endpoint.rs) UNCONDITIONALLY
@@ -6021,6 +6025,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
     IMAGE_FRAMES_COUNT.store(img.end - img.start, Ordering::Relaxed);
+
+    let mut physical_pages = 0u64;
+    let mut lowest_page = u64::MAX;
+    let mut highest_page = 0u64;
+    for index in 0..(bi.untyped.end - bi.untyped.start) as usize {
+        let desc = bi.untyped_list[index];
+        if desc.is_device != 0 || u32::from(desc.size_bits) < PAGING_BITS || desc.size_bits >= 64 {
+            continue;
+        }
+        let pages = 1u64 << (desc.size_bits as u32 - PAGING_BITS);
+        let first = desc.paddr >> PAGING_BITS;
+        physical_pages = physical_pages.saturating_add(pages);
+        lowest_page = lowest_page.min(first);
+        highest_page = highest_page.max(first.saturating_add(pages - 1));
+    }
+    SYSTEM_PHYSICAL_PAGES.store(physical_pages, Ordering::Relaxed);
+    SYSTEM_LOWEST_PHYSICAL_PAGE.store(
+        if lowest_page == u64::MAX { 0 } else { lowest_page },
+        Ordering::Relaxed,
+    );
+    SYSTEM_HIGHEST_PHYSICAL_PAGE.store(highest_page, Ordering::Relaxed);
+    SYSTEM_PROCESSOR_COUNT.store(bi.num_nodes.clamp(1, 64), Ordering::Relaxed);
 
     // Fix (B): retype two MCS Reply objects (OBJ_REPLY=6, fixed size, size_bits=0) into the
     // executive's root cspace — one for the main service loop (csrss/smss), one for win32k's

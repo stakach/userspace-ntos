@@ -101,7 +101,7 @@ fn dispatch_registry_and_memory_and_time() {
     );
     assert_eq!(alloc.status, STATUS_SUCCESS);
     assert!(u64::from_le_bytes(alloc.output[..8].try_into().unwrap()) >= 0x1_0000);
-    // NtQuerySystemInformation(SystemBasicInformation) → NumberOfProcessors.
+    // NtQuerySystemInformation(SystemBasicInformation) → full NT5 x64 structure.
     let sysinfo = d.dispatch_service(
         NativeService::NtQuerySystemInformation,
         &[0, 0, 0, 0],
@@ -109,9 +109,10 @@ fn dispatch_registry_and_memory_and_time() {
         &mut ks,
     );
     assert_eq!(
-        u32::from_le_bytes(sysinfo.output[..4].try_into().unwrap()),
-        1
+        u32::from_le_bytes(sysinfo.output[8..12].try_into().unwrap()),
+        0x1000
     );
+    assert_eq!(sysinfo.output[0x38], 1);
     // NtQuerySystemTime → the KUSER time.
     let time = d.dispatch_service(NativeService::NtQuerySystemTime, &[0], &origin(), &mut ks);
     assert_eq!(

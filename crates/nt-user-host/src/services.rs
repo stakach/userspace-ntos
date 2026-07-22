@@ -9,21 +9,21 @@ use nt_address_space::{AddressSpace, ViewType, PAGE_READWRITE};
 use nt_config_manager::{ConfigManager, RegistryKeyId};
 use nt_fs::{FileSystem, FILE_READ_DATA, FILE_WRITE_DATA};
 use nt_process::ProcessManager;
+use nt_syscall::system_information::{
+    SystemBasicInformation, SystemProcessorInformation, SystemTimeOfDayInformation,
+    PROCESSOR_ARCHITECTURE_AMD64, SYSTEM_BASIC_INFORMATION_CLASS,
+    SYSTEM_PROCESSOR_INFORMATION_CLASS, SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+};
 use nt_syscall::{
     NativeCallContext, NativeService, NativeSyscallHandler, STATUS_INVALID_HANDLE,
-    STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 
 use crate::profile::WindowsProfile;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
-
-// System information classes (spec §16.5).
-const SYSTEM_BASIC_INFORMATION: u64 = 0;
-const SYSTEM_TIME_OF_DAY_INFORMATION: u64 = 3;
 
 /// The kernel-services layer the dispatcher routes to (spec §7). Owns the subsystem managers +
 /// a simulated user object namespace (registry/file paths indexed by a syscall argument, standing
@@ -204,13 +204,52 @@ impl NativeSyscallHandler for KernelServices {
                 STATUS_SUCCESS
             }
             NativeService::NtQuerySystemInformation => match args[0] {
-                SYSTEM_BASIC_INFORMATION => {
-                    out.extend_from_slice(&self.profile.number_of_processors.to_le_bytes());
-                    out.extend_from_slice(&4096u32.to_le_bytes()); // page size
+                class if class == SYSTEM_BASIC_INFORMATION_CLASS as u64 => {
+                    let processors = self.profile.number_of_processors.clamp(1, 64) as u8;
+                    let affinity = if processors == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << processors) - 1
+                    };
+                    out.extend_from_slice(
+                        &SystemBasicInformation {
+                            timer_resolution_100ns: 10_000,
+                            page_size: 0x1000,
+                            number_of_physical_pages: 0x1_0000,
+                            lowest_physical_page_number: 0,
+                            highest_physical_page_number: 0xffff,
+                            allocation_granularity: 0x1_0000,
+                            minimum_user_mode_address: 0x1_0000,
+                            maximum_user_mode_address: 0x0000_07ff_fffe_ffff,
+                            active_processors_affinity_mask: affinity,
+                            number_of_processors: processors,
+                        }
+                        .encode(),
+                    );
                     STATUS_SUCCESS
                 }
-                SYSTEM_TIME_OF_DAY_INFORMATION => {
-                    out.extend_from_slice(&self.system_time_100ns.to_le_bytes());
+                class if class == SYSTEM_PROCESSOR_INFORMATION_CLASS as u64 => {
+                    out.extend_from_slice(
+                        &SystemProcessorInformation {
+                            processor_architecture: PROCESSOR_ARCHITECTURE_AMD64,
+                            processor_level: 6,
+                            processor_revision: 0,
+                            processor_feature_bits: 0xa111_39fe,
+                        }
+                        .encode(),
+                    );
+                    STATUS_SUCCESS
+                }
+                class if class == SYSTEM_TIME_OF_DAY_INFORMATION_CLASS as u64 => {
+                    out.extend_from_slice(
+                        &SystemTimeOfDayInformation {
+                            boot_time_100ns: 0,
+                            current_time_100ns: self.system_time_100ns,
+                            time_zone_bias_100ns: 0,
+                            time_zone_id: 0,
+                        }
+                        .encode(),
+                    );
                     STATUS_SUCCESS
                 }
                 _ => STATUS_INVALID_INFO_CLASS,
