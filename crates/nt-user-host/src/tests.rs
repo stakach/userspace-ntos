@@ -53,6 +53,7 @@ fn kuser_shared_data_version() {
     assert_eq!(read_u32(&k, kuser_off::NT_MAJOR_VERSION), 10);
     assert_eq!(k[kuser_off::PRODUCT_TYPE_IS_VALID], 1);
     assert_eq!(KUSER_SHARED_DATA_VA, 0x7FFE_0000);
+    assert_eq!(read_u32(&k, kuser_off::COOKIE), 0xA3B1_C2D3);
 }
 
 #[test]

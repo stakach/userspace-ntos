@@ -591,6 +591,7 @@ pub const PE_SCRATCH_VADDR: u64 = 0x0000_0100_1052_0000;
 pub const TEB_VA: u64 = 0x0000_0100_0057_0000;
 pub const PEB_VA: u64 = 0x0000_0100_0058_0000;
 pub const KUSER_VA: u64 = 0x0000_0000_7FFE_0000;
+pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 /// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is
 /// resolved to point here, so the PE calls named ntdll functions like real Windows code.
 pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;

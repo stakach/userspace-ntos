@@ -129,11 +129,16 @@ fn reserved_handle_table_never_reallocates() {
     // Handles are the NT convention: non-zero multiples of 4, dense from 4.
     assert_eq!(handles[0], 4);
     assert_eq!(handles[1], 8);
-    assert_eq!(pm.lookup_handle(pid, 4), Some(HandleObject::Opaque(0x5A5A_0000)));
+    assert_eq!(
+        pm.lookup_handle(pid, 4),
+        Some(HandleObject::Opaque(0x5A5A_0000))
+    );
     // Closing frees the slot; the next insert reuses it (still no realloc).
     pm.close_handle(pid, 4).unwrap();
     assert_eq!(pm.lookup_handle(pid, 4), None);
-    let reused = pm.insert_handle(pid, HandleObject::Opaque(0xBEEF), 0).unwrap();
+    let reused = pm
+        .insert_handle(pid, HandleObject::Opaque(0xBEEF), 0)
+        .unwrap();
     assert_eq!(reused, 4); // first free slot reused
     assert_eq!(pm.handle_capacity(pid), cap0);
     // Malformed handles are rejected, not panics.
@@ -155,7 +160,7 @@ fn pre_created_main_thread_bound_at_spawn() {
     assert!(pm.set_thread_start_address(tid, 0x1400_18e60));
     assert_eq!(pm.thread(tid).unwrap().start_address, 0x1400_18e60);
     assert!(!pm.set_thread_start_address(9999, 0)); // unknown tid rejected, not a panic
-    // Teardown: terminate the process → signalled, thread terminated, exit status readable.
+                                                    // Teardown: terminate the process → signalled, thread terminated, exit status readable.
     assert!(!pm.is_process_signaled(pid));
     pm.terminate_process(pid, 0x1234).unwrap();
     assert!(pm.is_process_signaled(pid));
@@ -174,23 +179,31 @@ fn runtime_thread_create_with_teb_and_handle() {
     let pid = pm.create_process("winlogon.exe", None, None);
     pm.reserve_handles(pid, 16);
     let main = pm.create_thread(pid, 0, 0, false).unwrap(); // main (identity at boot)
-    // Pool: one extra ETHREAD pre-created at boot (entry/teb unknown yet).
+                                                            // Pool: one extra ETHREAD pre-created at boot (entry/teb unknown yet).
     let listener = pm.create_thread(pid, 0, 0, false).unwrap();
     assert_ne!(listener, main);
     assert_eq!(pm.main_thread(pid), Some(main)); // the pool thread is NOT the main thread
-    // Runtime NtCreateThread: bind the RPC listener start routine + record its mapped TEB.
+                                                 // Runtime NtCreateThread: bind the RPC listener start routine + record its mapped TEB.
     assert!(pm.set_thread_start_address(listener, 0x7ff0_1234));
     assert!(pm.set_thread_teb(listener, 0x0000_0100_1049_0000));
     assert_eq!(pm.thread_teb(listener), Some(0x0000_0100_1049_0000));
     assert_eq!(pm.thread_teb(main), Some(0)); // TEB unbound until mapped
     assert!(!pm.set_thread_teb(9999, 0)); // unknown tid rejected, not a panic
-    // Mint a typed Thread(tid) handle in the caller's table → resolvable for 162.
-    let h = pm.insert_handle(pid, HandleObject::Thread(listener), 0).unwrap();
-    assert_eq!(pm.lookup_handle(pid, h), Some(HandleObject::Thread(listener)));
+                                          // Mint a typed Thread(tid) handle in the caller's table → resolvable for 162.
+    let h = pm
+        .insert_handle(pid, HandleObject::Thread(listener), 0)
+        .unwrap();
+    assert_eq!(
+        pm.lookup_handle(pid, h),
+        Some(HandleObject::Thread(listener))
+    );
     // The ClientId a host writes to NtCreateThread's *ClientId out-param.
     assert_eq!(
         pm.client_id(listener),
-        Some(ClientId { unique_process: pid, unique_thread: listener })
+        Some(ClientId {
+            unique_process: pid,
+            unique_thread: listener
+        })
     );
 }
 
@@ -247,12 +260,7 @@ fn terminate_thread_handle_resolution_checks_identity_type_and_access() {
         Ok(current)
     );
     assert_eq!(
-        pm.resolve_terminate_thread_handle(
-            caller,
-            current,
-            u64::MAX - 1,
-            THREAD_TERMINATE,
-        ),
+        pm.resolve_terminate_thread_handle(caller, current, u64::MAX - 1, THREAD_TERMINATE,),
         Ok(current)
     );
     let denied = pm
@@ -305,8 +313,10 @@ fn close_by_object_tag() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("host.exe", None, None);
     pm.reserve_handles(pid, 16);
-    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0001), 0).unwrap();
-    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0002), 0).unwrap();
+    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0001), 0)
+        .unwrap();
+    pm.insert_handle(pid, HandleObject::Opaque(0x5A5A_0002), 0)
+        .unwrap();
     assert_eq!(pm.handle_count(pid), 2);
     assert!(pm.close_handle_by_object(pid, HandleObject::Opaque(0x5A5A_0001)));
     assert_eq!(pm.handle_count(pid), 1);
@@ -316,7 +326,8 @@ fn close_by_object_tag() {
     assert!(!pm.close_handle_by_object(pid, HandleObject::Opaque(0xDEAD)));
     // Typed entries coexist and are matched by identity.
     let other = pm.create_process("b.exe", None, None);
-    pm.insert_handle(pid, HandleObject::Process(other), 0).unwrap();
+    pm.insert_handle(pid, HandleObject::Process(other), 0)
+        .unwrap();
     assert!(pm.close_handle_by_object(pid, HandleObject::Process(other)));
     assert_eq!(pm.handle_count(pid), 1); // the surviving Opaque(0x5A5A_0002)
 }
@@ -438,7 +449,9 @@ fn handle_values_are_process_local() {
     let mut pm = ProcessManager::new();
     let a = pm.create_process("proc_a.exe", None, None);
     let b = pm.create_process("proc_b.exe", None, None);
-    let ha = pm.insert_handle(a, HandleObject::Opaque(0xA11CE), 0).unwrap();
+    let ha = pm
+        .insert_handle(a, HandleObject::Opaque(0xA11CE), 0)
+        .unwrap();
     let hb = pm.insert_handle(b, HandleObject::Opaque(0xB0B), 0).unwrap();
     assert_eq!(ha, 4);
     assert_eq!(hb, 4); // COLLIDES with a's value — legal, they're in different namespaces
@@ -456,8 +469,14 @@ fn file_objects_are_typed_and_process_local() {
     let first_handle = pm.insert_handle(first, HandleObject::File(41), 1).unwrap();
     let second_handle = pm.insert_handle(second, HandleObject::File(99), 2).unwrap();
     assert_eq!(first_handle, second_handle);
-    assert_eq!(pm.lookup_handle(first, first_handle), Some(HandleObject::File(41)));
-    assert_eq!(pm.lookup_handle(second, second_handle), Some(HandleObject::File(99)));
+    assert_eq!(
+        pm.lookup_handle(first, first_handle),
+        Some(HandleObject::File(41))
+    );
+    assert_eq!(
+        pm.lookup_handle(second, second_handle),
+        Some(HandleObject::File(99))
+    );
 }
 
 #[test]
@@ -524,4 +543,27 @@ fn append_only_handles_never_recycle_a_closed_value() {
     let h2 = pm.insert_handle(pid, HandleObject::Opaque(3), 0).unwrap();
     assert_eq!(h2, 12);
     assert_eq!(pm.lookup_handle(pid, 12), Some(HandleObject::Opaque(3)));
+}
+
+#[test]
+fn process_cookie_is_nonzero_process_local_and_first_writer_wins() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+
+    assert_eq!(pm.process_cookie(first), Some(0));
+    assert_eq!(pm.get_or_initialize_process_cookie(first, 0), None);
+    assert_eq!(
+        pm.get_or_initialize_process_cookie(first, 0x1122_3344),
+        Some(0x1122_3344)
+    );
+    assert_eq!(
+        pm.get_or_initialize_process_cookie(first, 0xaabb_ccdd),
+        Some(0x1122_3344)
+    );
+    assert_eq!(
+        pm.get_or_initialize_process_cookie(second, 0x5566_7788),
+        Some(0x5566_7788)
+    );
+    assert_eq!(pm.process_cookie(0xffff_fffe), None);
 }

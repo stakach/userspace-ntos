@@ -144,7 +144,11 @@ pub(crate) unsafe fn build_sec_image_text() -> alloc::vec::Vec<u8> {
 /// Spawn an isolated user process running a real PE `mapped` (by nt-pe-loader): the PE image
 /// is written into fresh frames (via an executive scratch mapping) and mapped RX at
 /// PE_LOAD_BASE in the new VSpace; execution starts at the PE entry point. Returns the pml4.
-pub(crate) unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_ep_c: u64, sysarg_c: u64) -> u64 {
+pub(crate) unsafe fn spawn_pe_thread(
+    mapped: &nt_pe_loader::MappedImage,
+    fault_ep_c: u64,
+    sysarg_c: u64,
+) -> u64 {
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
     let pdpt = alloc_slot();
@@ -163,10 +167,19 @@ pub(crate) unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_e
     let pages = (mapped.bytes.len() + 0xFFF) / 0x1000;
     for i in 0..pages {
         let f = alloc_frame();
-        let _ = page_map(f, PE_SCRATCH_VADDR + i as u64 * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+        let _ = page_map(
+            f,
+            PE_SCRATCH_VADDR + i as u64 * 0x1000,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        );
         for j in 0..0x1000usize {
             let src = i * 0x1000 + j;
-            let byte = if src < mapped.bytes.len() { mapped.bytes[src] } else { 0 };
+            let byte = if src < mapped.bytes.len() {
+                mapped.bytes[src]
+            } else {
+                0
+            };
             core::ptr::write_volatile((PE_SCRATCH_VADDR + src as u64) as *mut u8, byte);
         }
         let cp = copy_cap(f);
@@ -199,14 +212,25 @@ pub(crate) unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_e
     let pdpt2 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt2);
     let pd2 = alloc_slot();
-    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd2);
+    let _ = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_X86_PAGE_DIRECTORY,
+        PAGING_BITS,
+        1,
+        pd2,
+    );
     let pt2 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt2);
     let _ = paging_struct_map(pdpt2, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
     let _ = paging_struct_map(pd2, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4);
     let _ = paging_struct_map(pt2, LBL_X86_PAGE_TABLE_MAP, KUSER_VA, pml4);
-    let kuser = alloc_frame(); // zeroed; the stub only touches it (proves the fixed VA maps)
-    let _ = page_map(kuser, KUSER_VA, RW_NX, pml4);
+    let kuser = alloc_frame();
+    let _ = page_map(kuser, env_scratch + 0x3000, RW_NX, CAP_INIT_THREAD_VSPACE);
+    core::ptr::write_volatile(
+        (env_scratch + 0x3000 + 0x330) as *mut u32,
+        SYSTEM_POINTER_COOKIE,
+    );
+    let _ = page_map(copy_cap(kuser), KUSER_VA, RW_NX, pml4);
     // The provided "ntdll": a page of syscall stubs the PE's IAT resolves to, mapped RX.
     let ntdll = alloc_frame();
     let _ = page_map(ntdll, env_scratch + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -218,13 +242,34 @@ pub(crate) unsafe fn spawn_pe_thread(mapped: &nt_pe_loader::MappedImage, fault_e
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        cnode,
+        raw,
+        CN_GUARD_BADGE,
+    );
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        cnode,
+        LBL_CNODE_COPY << 12,
+        CT_FAULT,
+        fault_ep_c,
+        0,
+    );
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        tcb,
+        LBL_TCB_SET_IPC_BUFFER << 12,
+        IPCBUF_VADDR,
+        ipcbuf,
+        0,
+    );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, mapped.entry_point(), stack_top, 0);
     // The Windows TEB anchor: GS base = TEB_VA, so the PE's `GS:[0x30]` is the TEB self-pointer.
@@ -251,7 +296,11 @@ pub(crate) unsafe fn page_rights(pe: &nt_pe_loader::PeFile, rva: u32) -> u64 {
     }
     for s in pe.sections() {
         if rva >= s.virtual_address && rva < s.virtual_address + page_up(s.virtual_size) {
-            return if s.is_executable() { 2 /* RX */ } else { RW_NX };
+            return if s.is_executable() {
+                2 /* RX */
+            } else {
+                RW_NX
+            };
         }
     }
     RW_NX // gap
@@ -279,7 +328,11 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
             if in_sec < s.size_of_raw_data {
                 put(s.pointer_to_raw_data + in_sec, s.size_of_raw_data - in_sec);
             }
-            return if s.is_executable() { 2 /* RX */ } else { RW_NX };
+            return if s.is_executable() {
+                2 /* RX */
+            } else {
+                RW_NX
+            };
         }
     }
     RW_NX // gap between sections — a zero page
@@ -337,14 +390,24 @@ pub(crate) unsafe fn spawn_sec_image(
         // Reserve a PT in the EXECUTIVE's own VSpace for the heap copyin mirror window.
         let hpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, hpt);
-        let _ = paging_struct_map(hpt, LBL_X86_PAGE_TABLE_MAP, heap_mirror, CAP_INIT_THREAD_VSPACE);
+        let _ = paging_struct_map(
+            hpt,
+            LBL_X86_PAGE_TABLE_MAP,
+            heap_mirror,
+            CAP_INIT_THREAD_VSPACE,
+        );
         // A dedicated PT for the IMAGE copyin mirror, when the process needs its own (winlogon: its
         // image mirror is a fresh VA with no pre-existing PT, unlike smss's IMAGE_MIRROR (FILEBUF PT)
         // and csrss's CSRSS_IMAGE_MIRROR (NTDLLBUF PT), which pass image_mirror=0 to reuse those).
         if image_mirror != 0 {
             let ipt = alloc_slot();
             let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ipt);
-            let _ = paging_struct_map(ipt, LBL_X86_PAGE_TABLE_MAP, image_mirror, CAP_INIT_THREAD_VSPACE);
+            let _ = paging_struct_map(
+                ipt,
+                LBL_X86_PAGE_TABLE_MAP,
+                image_mirror,
+                CAP_INIT_THREAD_VSPACE,
+            );
         }
     }
     for i in 0..STACK_FRAMES {
@@ -353,7 +416,12 @@ pub(crate) unsafe fn spawn_sec_image(
         // Mirror the stack into the executive so it can read/write a syscall's stack-based
         // pointer args (copyin/copyout).
         if setup_env {
-            let _ = page_map(copy_cap(f), stack_mirror + i * 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
+            let _ = page_map(
+                copy_cap(f),
+                stack_mirror + i * 0x1000,
+                RW_NX,
+                CAP_INIT_THREAD_VSPACE,
+            );
         }
         // Record the INITIAL committed stack frames for a GUI client (csrss pi 1 / winlogon pi 2) so
         // win32k can share them per-client. Unlike demand-grown stack pages (fault site), these are
@@ -399,8 +467,8 @@ pub(crate) unsafe fn spawn_sec_image(
             .unwrap_or(0);
         core::ptr::write_volatile((scr + 0x40) as *mut u64, process_id); // ClientId.UniqueProcess
         core::ptr::write_volatile((scr + 0x48) as *mut u64, thread_id); // ClientId.UniqueThread
-        // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
-        // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
+                                                                        // NtTib.StackBase(+0x08)/StackLimit(+0x10) — LdrpInitialize queries the memory region at
+                                                                        // [TEB+0x10] (StackLimit) via NtQueryVirtualMemory; leaving it 0 would query address 0.
         core::ptr::write_volatile((scr + 0x08) as *mut u64, STACK_BASE + STACK_FRAMES * 0x1000);
         core::ptr::write_volatile((scr + 0x10) as *mut u64, STACK_BASE);
         // TEB->ActivationContextStackPointer (x64 TEB+0x2C8): the loader's actctx code
@@ -423,26 +491,26 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x18) as *mut u32, 0); // Flags
         core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1); // NextCookieSequenceNumber
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
-        // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
-        // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
-        // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
-        // ..., alloc=FALSE) (e.g. ntdll+0xf05e). With MaximumLength=0 that returns
-        // STATUS_BUFFER_OVERFLOW (0x80000005), which propagates out of LdrpWalkImportDescriptor and
-        // fails process init. Set MaximumLength = 261*sizeof(WCHAR) = 522 and point Buffer at the
-        // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
+                                                                // TEB->StaticUnicodeString (x64 TEB+0x1258) + StaticUnicodeBuffer (TEB+0x1268, WCHAR[261];
+                                                                // ReactOS C_ASSERT_FIELD win2003_x64.c:158). The loader converts DLL/manifest names into
+                                                                // this fixed per-thread buffer via RtlAnsiStringToUnicodeString(&Teb->StaticUnicodeString,
+                                                                // ..., alloc=FALSE) (e.g. ntdll+0xf05e). With MaximumLength=0 that returns
+                                                                // STATUS_BUFFER_OVERFLOW (0x80000005), which propagates out of LdrpWalkImportDescriptor and
+                                                                // fails process init. Set MaximumLength = 261*sizeof(WCHAR) = 522 and point Buffer at the
+                                                                // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
         core::ptr::write_volatile((scr + 0x5000 + 0x25a) as *mut u16, 522); // MaximumLength
         core::ptr::write_volatile((scr + 0x5000 + 0x260) as *mut u64, SMSS_TEB_VA + 0x1268); // Buffer
-        // BATCH 39 — client-side win32k CLIENTINFO.pDeskInfo. An interactive GUI client (winlogon)
-        // eventually calls user32 `GetThreadDesktopWnd()` (= `ValidateHwndOrDesk(HWND_DESKTOP)`),
-        // whose `GetThreadDesktopInfo()` reads `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and then
-        // derefs `pDeskInfo->spwnd` (DESKTOPINFO+0x10). In real Windows win32k maps the desktop heap
-        // into the process and fills CLIENTINFO.pDeskInfo when the thread connects to a desktop; our
-        // host has not wired that per-thread desktop-heap view, so pDeskInfo stayed NULL and winlogon
-        // NULL-derefed at `[pDeskInfo+0x10]` (cr2=0x10, user32 GetThreadDesktopWnd RVA 0x50009). Give
-        // the client a self-contained, readable DESKTOPINFO here (a WND page it can map+read), so
-        // GetThreadDesktopWnd returns a valid (zeroed) desktop window instead of faulting.
-        // DESKTOPINFO @ SMSS_DESKINFO_VA: pvDesktopBase@0x00, pvDesktopLimit@0x08, spwnd@0x10. A
-        // zeroed WND at +0x800 (same page, bracketed by base/limit so DesktopPtrToUser accepts it).
+                                                                                             // BATCH 39 — client-side win32k CLIENTINFO.pDeskInfo. An interactive GUI client (winlogon)
+                                                                                             // eventually calls user32 `GetThreadDesktopWnd()` (= `ValidateHwndOrDesk(HWND_DESKTOP)`),
+                                                                                             // whose `GetThreadDesktopInfo()` reads `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and then
+                                                                                             // derefs `pDeskInfo->spwnd` (DESKTOPINFO+0x10). In real Windows win32k maps the desktop heap
+                                                                                             // into the process and fills CLIENTINFO.pDeskInfo when the thread connects to a desktop; our
+                                                                                             // host has not wired that per-thread desktop-heap view, so pDeskInfo stayed NULL and winlogon
+                                                                                             // NULL-derefed at `[pDeskInfo+0x10]` (cr2=0x10, user32 GetThreadDesktopWnd RVA 0x50009). Give
+                                                                                             // the client a self-contained, readable DESKTOPINFO here (a WND page it can map+read), so
+                                                                                             // GetThreadDesktopWnd returns a valid (zeroed) desktop window instead of faulting.
+                                                                                             // DESKTOPINFO @ SMSS_DESKINFO_VA: pvDesktopBase@0x00, pvDesktopLimit@0x08, spwnd@0x10. A
+                                                                                             // zeroed WND at +0x800 (same page, bracketed by base/limit so DesktopPtrToUser accepts it).
         let deskinfo = alloc_frame();
         let _ = page_map(deskinfo, scr + 0x7000, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((scr + 0x7000 + 0x00) as *mut u64, SMSS_DESKINFO_VA); // pvDesktopBase
@@ -454,8 +522,8 @@ pub(crate) unsafe fn spawn_sec_image(
         // before it ever reads pDeskInfo (so a valid pDeskInfo alone doesn't stop the crash). Seed it
         // non-NULL (point at the readable DESKTOPINFO page) so GetThreadDesktopWnd reaches pDeskInfo.
         core::ptr::write_volatile((scr + 0x78) as *mut u64, SMSS_DESKINFO_VA); // TEB.Win32ThreadInfo
-        // TEB.Win32ClientInfo (x64 TEB+0x800): pDeskInfo@+0x20 (TEB+0x820), ulClientDelta@+0x28
-        // (TEB+0x828 = 0: the WND already carries its client VA — no server->client shift needed).
+                                                                               // TEB.Win32ClientInfo (x64 TEB+0x800): pDeskInfo@+0x20 (TEB+0x820), ulClientDelta@+0x28
+                                                                               // (TEB+0x828 = 0: the WND already carries its client VA — no server->client shift needed).
         core::ptr::write_volatile((scr + 0x820) as *mut u64, SMSS_DESKINFO_VA); // CLIENTINFO.pDeskInfo
         core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
         let _ = page_map(copy_cap(teb2), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
@@ -486,12 +554,12 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0x880) as *mut u32, 64); // SizeOfBitMap
         core::ptr::write_volatile((scr + 0x1000 + 0x888) as *mut u64, SMSS_PEB_VA + 0x80); // Buffer
         core::ptr::write_volatile((scr + 0x1000 + 0x78) as *mut u64, SMSS_PEB_VA + 0x880); // Peb->TlsBitmap
-        // TlsExpansionBitmap header @ PEB+0x8A0 → { 1024, &TlsExpansionBitmapBits(PEB+0x240) }.
+                                                                                           // TlsExpansionBitmap header @ PEB+0x8A0 → { 1024, &TlsExpansionBitmapBits(PEB+0x240) }.
         core::ptr::write_volatile((scr + 0x1000 + 0x8A0) as *mut u32, 1024); // SizeOfBitMap
         core::ptr::write_volatile((scr + 0x1000 + 0x8A8) as *mut u64, SMSS_PEB_VA + 0x240); // Buffer
         core::ptr::write_volatile((scr + 0x1000 + 0x238) as *mut u64, SMSS_PEB_VA + 0x8A0); // Peb->TlsExpansionBitmap
-        // Bit 0 of the main TLS bitmap is reserved (index 0 = the implicit TLS slot); real ntdll sets
-        // it so TlsAlloc never hands out index 0. TlsBitmapBits[0] @ PEB+0x80.
+                                                                                            // Bit 0 of the main TLS bitmap is reserved (index 0 = the implicit TLS slot); real ntdll sets
+                                                                                            // it so TlsAlloc never hands out index 0. TlsBitmapBits[0] @ PEB+0x80.
         core::ptr::write_volatile((scr + 0x1000 + 0x80) as *mut u32, 1);
         // NLS code-page data pointers — LdrpInitializeProcess (ntdll+0x9e81) reads these and
         // passes them to RtlInitNlsTables, which builds the WideChar<->MultiByte tables
@@ -512,8 +580,8 @@ pub(crate) unsafe fn spawn_sec_image(
         // processes never touch GDI so seeding is unnecessary (and would map an unused 1.5 MiB table).
         if pi == 2 {
             let gdi_server_base = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR
-                    + win32k_subsystem::SH_GDI_TABLE_BASE) as *const u64,
+                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
+                    as *const u64,
             );
             core::ptr::write_volatile(
                 (scr + 0x1000 + 0xf8) as *mut u64,
@@ -527,9 +595,21 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, nls_pt);
         let _ = paging_struct_map(nls_pt, LBL_X86_PAGE_TABLE_MAP, NLS_SMSS_ANSI_VA, pml4);
         for (start, va, frames) in [
-            (NLS_ANSI_START.load(Ordering::Relaxed), NLS_SMSS_ANSI_VA, NLS_ANSI_FRAMES),
-            (NLS_OEM_START.load(Ordering::Relaxed), NLS_SMSS_OEM_VA, NLS_OEM_FRAMES),
-            (NLS_CASE_START.load(Ordering::Relaxed), NLS_SMSS_CASE_VA, NLS_CASE_FRAMES),
+            (
+                NLS_ANSI_START.load(Ordering::Relaxed),
+                NLS_SMSS_ANSI_VA,
+                NLS_ANSI_FRAMES,
+            ),
+            (
+                NLS_OEM_START.load(Ordering::Relaxed),
+                NLS_SMSS_OEM_VA,
+                NLS_OEM_FRAMES,
+            ),
+            (
+                NLS_CASE_START.load(Ordering::Relaxed),
+                NLS_SMSS_CASE_VA,
+                NLS_CASE_FRAMES,
+            ),
         ] {
             for i in 0..frames {
                 let _ = page_map(copy_cap(start + i), va + i * 0x1000, RW_NX, pml4);
@@ -546,9 +626,9 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = page_map(params, pp, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((pp + 0x00) as *mut u32, 0x1000); // MaximumLength
         core::ptr::write_volatile((pp + 0x04) as *mut u32, 0x1000); // Length
-        // Flags = RTL_USER_PROCESS_PARAMETERS_NORMALIZED (0x1): our UNICODE_STRING Buffers are
-        // absolute pointers, so RtlNormalizeProcessParams must NOT add the base to them (it would
-        // otherwise double them → 2*SMSS_PARAMS_VA + off, a wild pointer).
+                                                                    // Flags = RTL_USER_PROCESS_PARAMETERS_NORMALIZED (0x1): our UNICODE_STRING Buffers are
+                                                                    // absolute pointers, so RtlNormalizeProcessParams must NOT add the base to them (it would
+                                                                    // otherwise double them → 2*SMSS_PARAMS_VA + off, a wild pointer).
         core::ptr::write_volatile((pp + 0x08) as *mut u32, 0x1);
         // write `s` as UTF-16LE at scratch VA `dst`; return byte length.
         let wstr = |dst: u64, s: &[u8]| -> u16 {
@@ -571,7 +651,8 @@ pub(crate) unsafe fn spawn_sec_image(
             let len = wstr(pp + boff, text);
             core::ptr::write_volatile((pp + foff) as *mut u16, len); // Length
             core::ptr::write_volatile((pp + foff + 2) as *mut u16, len + 2); // MaximumLength
-            core::ptr::write_volatile((pp + foff + 8) as *mut u64, SMSS_PARAMS_VA + boff); // Buffer
+            core::ptr::write_volatile((pp + foff + 8) as *mut u64, SMSS_PARAMS_VA + boff);
+            // Buffer
         }
         // Environment block (RTL_USER_PROCESS_PARAMETERS+0x80). kernel32's init walks this as a
         // list of UTF-16LE `NAME=VALUE` strings, each wide-NUL-terminated, the block ended by an
@@ -612,7 +693,13 @@ pub(crate) unsafe fn spawn_sec_image(
         let kpdpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, kpdpt);
         let kpd = alloc_slot();
-        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, kpd);
+        let _ = untyped_retype(
+            CAP_INIT_UNTYPED,
+            OBJ_X86_PAGE_DIRECTORY,
+            PAGING_BITS,
+            1,
+            kpd,
+        );
         let kpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, kpt);
         let _ = paging_struct_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4);
@@ -630,6 +717,7 @@ pub(crate) unsafe fn spawn_sec_image(
         let _ = page_map(kuser_f, kscr, RW_NX, CAP_INIT_THREAD_VSPACE);
         core::ptr::write_volatile((kscr + 0x2c) as *mut u16, 0x014c); // ImageNumberLow  (IMAGE_FILE_MACHINE_I386)
         core::ptr::write_volatile((kscr + 0x2e) as *mut u16, 0x8664); // ImageNumberHigh (IMAGE_FILE_MACHINE_AMD64)
+        core::ptr::write_volatile((kscr + 0x330) as *mut u32, SYSTEM_POINTER_COOKIE);
         let _ = page_map(copy_cap(kuser_f), KUSER_VA, RW_NX, pml4);
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
@@ -649,18 +737,18 @@ pub(crate) unsafe fn spawn_sec_image(
         tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&(SMSS_PEB_VA + 0x900).to_le_bytes()); // movabs rcx, Context (placeholder)
-        // SystemArgument1 (RDX) = the ntdll base — LdrpInitializeProcess builds ntdll's
-        // LDR_DATA_TABLE_ENTRY from it (the kernel passes it via the initial APC). RDX=0 left the
-        // ntdll DllBase null → LdrpAllocateModuleEntry(RtlImageNtHeader(0)=0) returned null.
+                                                                    // SystemArgument1 (RDX) = the ntdll base — LdrpInitializeProcess builds ntdll's
+                                                                    // LDR_DATA_TABLE_ENTRY from it (the kernel passes it via the initial APC). RDX=0 left the
+                                                                    // ntdll DllBase null → LdrpAllocateModuleEntry(RtlImageNtHeader(0)=0) returned null.
         tb.extend_from_slice(&[0x48, 0xBA]);
         tb.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // movabs rdx, NTDLL_BASE
-        // Step 4.B: OUR ntdll's in-process LoaderHost snaps smss's imports against OUR export table,
-        // which needs smss's own image base. Pass it in R8 (SystemArgument2) when calling OUR
-        // LdrpInitialize (ldrpinit_rva != 0). The real ReactOS ntdll ignores SystemArgument2, but to
-        // keep the flag-OFF / pi>=1 path BYTE-IDENTICAL we still emit `xor r8d,r8d` there.
-        // Our ntdll's in-process LoaderHost snaps the child's imports against OUR export table, which
-        // needs the child's own image base — pass it in R8 (SystemArgument2). (Our ntdll is THE ntdll
-        // for every process, so this is always taken.)
+                                                         // Step 4.B: OUR ntdll's in-process LoaderHost snaps smss's imports against OUR export table,
+                                                         // which needs smss's own image base. Pass it in R8 (SystemArgument2) when calling OUR
+                                                         // LdrpInitialize (ldrpinit_rva != 0). The real ReactOS ntdll ignores SystemArgument2, but to
+                                                         // keep the flag-OFF / pi>=1 path BYTE-IDENTICAL we still emit `xor r8d,r8d` there.
+                                                         // Our ntdll's in-process LoaderHost snaps the child's imports against OUR export table, which
+                                                         // needs the child's own image base — pass it in R8 (SystemArgument2). (Our ntdll is THE ntdll
+                                                         // for every process, so this is always taken.)
         let eff_ldrp = effective_ldrp_rva(ldrpinit_rva);
         if eff_ldrp != 0 {
             tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
@@ -674,11 +762,11 @@ pub(crate) unsafe fn spawn_sec_image(
         let ldrp_off = eff_ldrp;
         tb.extend_from_slice(&(NTDLL_BASE + ldrp_off).to_le_bytes()); // movabs rax, LdrpInitialize
         tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (runs the whole loader, then RETURNS here)
-        // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
-        // Windows KiUserApcDispatcher would then NtContinue to the image entry; we have no APC
-        // dispatcher, so chain straight to smss's native entry (NtProcessStartup) with RCX=PEB.
-        // `call` (not jmp) gives the entry the ABI-correct rsp≡8(mod16); the entry never returns
-        // (it ends in NtTerminateProcess), and the trailing jmp$ is a safety net if it does.
+                                             // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
+                                             // Windows KiUserApcDispatcher would then NtContinue to the image entry; we have no APC
+                                             // dispatcher, so chain straight to smss's native entry (NtProcessStartup) with RCX=PEB.
+                                             // `call` (not jmp) gives the entry the ABI-correct rsp≡8(mod16); the entry never returns
+                                             // (it ends in NtTerminateProcess), and the trailing jmp$ is a safety net if it does.
         tb.extend_from_slice(&[0x48, 0xB9]);
         tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
         tb.extend_from_slice(&[0x48, 0xB8]);
@@ -696,13 +784,34 @@ pub(crate) unsafe fn spawn_sec_image(
     let raw = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     let cnode = alloc_slot();
-    let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12, cnode, raw, CN_GUARD_BADGE);
+    let _ = syscall5(
+        SYS_SEND,
+        CAP_INIT_THREAD_CNODE,
+        LBL_CNODE_MINT << 12,
+        cnode,
+        raw,
+        CN_GUARD_BADGE,
+    );
     let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_PML4, pml4, 0);
-    let _ = syscall5(SYS_SEND, cnode, LBL_CNODE_COPY << 12, CT_FAULT, fault_ep_c, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        cnode,
+        LBL_CNODE_COPY << 12,
+        CT_FAULT,
+        fault_ep_c,
+        0,
+    );
     let tcb = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     let _ = tcb_set_space(tcb, CT_FAULT, cnode, pml4);
-    let _ = syscall5(SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, IPCBUF_VADDR, ipcbuf, 0);
+    let _ = syscall5(
+        SYS_SEND,
+        tcb,
+        LBL_TCB_SET_IPC_BUFFER << 12,
+        IPCBUF_VADDR,
+        ipcbuf,
+        0,
+    );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
     let _ = tcb_write_registers(tcb, entry, stack_top, 0);
     if setup_env {
@@ -798,7 +907,12 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
 /// image, ntdll, csrsrv .data, …), so a syscall handler can copy OUT an out-param that doesn't live
 /// in the stack/heap/image mirrors. Returns the executive VA aliasing `va`, or None if `va`'s page
 /// hasn't been faulted in (so isn't in `filled_pages`).
-pub(crate) unsafe fn scratch_for(va: u64, filled_pages: &[u64], nfilled: usize, scratch_base: u64) -> Option<u64> {
+pub(crate) unsafe fn scratch_for(
+    va: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
     let page = va & !0xFFFu64;
     for i in 0..nfilled.min(filled_pages.len()) {
         if filled_pages[i] == page {
@@ -855,7 +969,8 @@ pub(crate) unsafe fn client_copyin_mapped(
                     }
                 };
                 if frame == 0 {
-                    if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base) {
+                    if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base)
+                    {
                         source
                     } else {
                         return false;
@@ -876,11 +991,7 @@ pub(crate) unsafe fn client_copyin_mapped(
                 }
             }
         };
-        core::ptr::copy_nonoverlapping(
-            source as *const u8,
-            dst.as_mut_ptr().add(copied),
-            chunk,
-        );
+        core::ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr().add(copied), chunk);
         if temporary_cap != 0 {
             let _ = page_unmap(temporary_cap);
         }

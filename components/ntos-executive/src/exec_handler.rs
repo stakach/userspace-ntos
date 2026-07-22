@@ -2990,8 +2990,41 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     0
                 } else if class == 36 {
-                    // ProcessCookie — a per-process value ntdll caches for RtlEncode/DecodePointer.
-                    smss_stack_write(buf, 0x1a2b_3c4d);
+                    // ProcessCookie is a stable per-process ULONG and is queryable only through the
+                    // current-process pseudo handle, matching ReactOS's XP-compatible contract.
+                    if args[0] != u64::MAX {
+                        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                    }
+                    if args[3] != 4 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let retlen = args[4];
+                    if buf == 0
+                        || !self.probe_event_output(buf, 4)
+                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
+                    {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+                        return 0xC000_0008; // STATUS_INVALID_HANDLE
+                    };
+                    let time = nt_system_time_100ns();
+                    let mut candidate = time as u32
+                        ^ (time >> 32) as u32
+                        ^ pid
+                        ^ self.current_tid as u32
+                        ^ (self.pi as u32).wrapping_mul(0x9E37_79B9);
+                    if candidate == 0 {
+                        candidate = 0xBB40_E64E;
+                    }
+                    let Some(cookie) = self.pm.get_or_initialize_process_cookie(pid, candidate) else {
+                        return 0xC000_009A; // STATUS_INSUFFICIENT_RESOURCES
+                    };
+                    if !self.xas_write_u32(buf, cookie)
+                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
+                    {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
                     0
                 } else if class == 28 {
                     // ProcessLUIDDeviceMapsEnabled — a ULONG BOOL. Not enabled → 0.

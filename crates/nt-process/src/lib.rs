@@ -128,6 +128,8 @@ pub struct NtProcess {
     /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
     /// `PsGetProcessWin32WindowStation`).
     pub win32_window_station: Option<u64>,
+    /// Lazy, stable `ProcessCookie` returned by `NtQueryInformationProcess` class 36.
+    process_cookie: u32,
     /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
     /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
     /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
@@ -323,6 +325,7 @@ impl ProcessManager {
                 exit_status: None,
                 win32_process: None,
                 win32_window_station: None,
+                process_cookie: 0,
                 handles: Vec::new(),
             },
         );
@@ -359,6 +362,26 @@ impl ProcessManager {
 
     pub fn process(&self, pid: ProcessId) -> Option<&NtProcess> {
         self.processes.get(&pid)
+    }
+    /// Return the initialized per-process pointer cookie, or zero before its first query.
+    pub fn process_cookie(&self, pid: ProcessId) -> Option<u32> {
+        self.processes
+            .get(&pid)
+            .map(|process| process.process_cookie)
+    }
+
+    /// Initialize a process cookie once. Zero is rejected because it is the process object's
+    /// uninitialized sentinel.
+    pub fn get_or_initialize_process_cookie(
+        &mut self,
+        pid: ProcessId,
+        candidate: u32,
+    ) -> Option<u32> {
+        let process = self.processes.get_mut(&pid)?;
+        if process.process_cookie == 0 && candidate != 0 {
+            process.process_cookie = candidate;
+        }
+        (process.process_cookie != 0).then_some(process.process_cookie)
     }
     pub fn thread(&self, tid: ThreadId) -> Option<&NtThread> {
         self.threads.get(&tid)

@@ -150,6 +150,7 @@ pub mod kuser_off {
     pub const NT_MAJOR_VERSION: usize = 0x26C;
     pub const NT_MINOR_VERSION: usize = 0x270;
     pub const PROCESSOR_FEATURES: usize = 0x274; // u8[64]
+    pub const COOKIE: usize = 0x330;
     pub const SIZE: usize = 0x1000; // one page
 }
 
@@ -158,6 +159,16 @@ pub fn build_kuser_shared_data(
     profile: &WindowsProfile,
     system_time_100ns: u64,
     tick_count: u32,
+) -> Vec<u8> {
+    build_kuser_shared_data_with_cookie(profile, system_time_100ns, tick_count, 0xA3B1_C2D3)
+}
+
+/// Build KUSER_SHARED_DATA with the kernel-owned system pointer cookie.
+pub fn build_kuser_shared_data_with_cookie(
+    profile: &WindowsProfile,
+    system_time_100ns: u64,
+    tick_count: u32,
+    system_cookie: u32,
 ) -> Vec<u8> {
     let mut k = vec![0u8; kuser_off::SIZE];
     put_u32(&mut k, kuser_off::TICK_COUNT_LOW, tick_count);
@@ -179,5 +190,6 @@ pub fn build_kuser_shared_data(
     put_u32(&mut k, kuser_off::NT_MAJOR_VERSION, profile.os_major);
     put_u32(&mut k, kuser_off::NT_MINOR_VERSION, profile.os_minor);
     k[kuser_off::PROCESSOR_FEATURES] = 1; // at least one feature bit plausible
+    put_u32(&mut k, kuser_off::COOKIE, system_cookie);
     k
 }

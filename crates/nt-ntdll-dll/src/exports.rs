@@ -5132,7 +5132,9 @@ pub unsafe extern "system" fn rtl_unhandled_exception_filter(ptrs: *mut c_void) 
 /// Stores the caller-supplied function pointer after ntdll pointer encoding.
 #[export_name = "RtlSetUnhandledExceptionFilter"]
 pub unsafe extern "system" fn rtl_set_unhandled_exception_filter(filter: *mut c_void) {
-    let encoded = nt_ntdll::rtl::encode::encode_pointer(filter as u64, process_cookie());
+    let encoded = process_cookie()
+        .map(|cookie| nt_ntdll::rtl::encode::encode_pointer(filter as u64, cookie))
+        .unwrap_or(filter as u64);
     RTL_UNHANDLED_EXCEPTION_FILTER.store(encoded, Ordering::Release);
 }
 
@@ -15017,16 +15019,17 @@ pub unsafe extern "system" fn rtl_query_atom_in_atom_table(
     }
 }
 
-// ---- encode/decode pointer (process cookie from PEB->Cookie@0x2C0? actually @0x0? use 0) ----------
+// ---- encode/decode pointer -----------------------------------------------------------------------
 
-/// `RtlEncodePointer(PVOID Ptr) -> PVOID`. The process cookie is 0 until wired (a documented seam);
-/// with cookie 0 the transform is identity — a valid (weaker) encoding, never a corrupted pointer.
+/// `RtlEncodePointer(PVOID Ptr) -> PVOID`.
 ///
 /// # Safety
 /// Pure arithmetic on the pointer value.
 #[export_name = "RtlEncodePointer"]
 pub unsafe extern "system" fn rtl_encode_pointer(ptr: *mut c_void) -> *mut c_void {
-    nt_ntdll::rtl::encode::encode_pointer(ptr as u64, process_cookie()) as *mut c_void
+    process_cookie()
+        .map(|cookie| nt_ntdll::rtl::encode::encode_pointer(ptr as u64, cookie))
+        .unwrap_or(ptr as u64) as *mut c_void
 }
 
 /// `RtlDecodePointer(PVOID Ptr) -> PVOID`.
@@ -15035,7 +15038,9 @@ pub unsafe extern "system" fn rtl_encode_pointer(ptr: *mut c_void) -> *mut c_voi
 /// Pure arithmetic.
 #[export_name = "RtlDecodePointer"]
 pub unsafe extern "system" fn rtl_decode_pointer(ptr: *mut c_void) -> *mut c_void {
-    nt_ntdll::rtl::encode::decode_pointer(ptr as u64, process_cookie()) as *mut c_void
+    process_cookie()
+        .map(|cookie| nt_ntdll::rtl::encode::decode_pointer(ptr as u64, cookie))
+        .unwrap_or(ptr as u64) as *mut c_void
 }
 
 /// `RtlEncodeSystemPointer(PVOID Ptr) -> PVOID`.
@@ -15044,7 +15049,8 @@ pub unsafe extern "system" fn rtl_decode_pointer(ptr: *mut c_void) -> *mut c_voi
 /// Pure arithmetic.
 #[export_name = "RtlEncodeSystemPointer"]
 pub unsafe extern "system" fn rtl_encode_system_pointer(ptr: *mut c_void) -> *mut c_void {
-    nt_ntdll::rtl::encode::encode_system_pointer(ptr as u64, 0) as *mut c_void
+    let cookie = core::ptr::read_volatile((KUSER_SHARED_DATA_VA + 0x330) as *const u32);
+    nt_ntdll::rtl::encode::encode_system_pointer(ptr as u64, cookie) as *mut c_void
 }
 
 /// `RtlDecodeSystemPointer(PVOID Ptr) -> PVOID`.
@@ -15053,13 +15059,18 @@ pub unsafe extern "system" fn rtl_encode_system_pointer(ptr: *mut c_void) -> *mu
 /// Pure arithmetic.
 #[export_name = "RtlDecodeSystemPointer"]
 pub unsafe extern "system" fn rtl_decode_system_pointer(ptr: *mut c_void) -> *mut c_void {
-    nt_ntdll::rtl::encode::decode_system_pointer(ptr as u64, 0) as *mut c_void
+    let cookie = core::ptr::read_volatile((KUSER_SHARED_DATA_VA + 0x330) as *const u32);
+    nt_ntdll::rtl::encode::decode_system_pointer(ptr as u64, cookie) as *mut c_void
 }
 
-/// The per-process pointer-encoding cookie. Read from PEB+0x40 (`ProcessCookie` isn't there on x64;
-/// the loader publishes it). Until the loader wires it, 0 (identity encode — safe, just weaker).
-fn process_cookie() -> u64 {
-    0
+fn process_cookie() -> Option<u32> {
+    type Query = unsafe extern "system" fn(isize, u32, *mut u32, u32, *mut u32) -> NtStatus;
+    let query: Query = unsafe {
+        core::mem::transmute(nt_ntdll::trap_stubs::nt_query_information_process as *const ())
+    };
+    let mut cookie = 0u32;
+    let status = unsafe { query(-1, 36, &mut cookie, 4, core::ptr::null_mut()) };
+    (status == STATUS_SUCCESS).then_some(cookie)
 }
 
 // ---- time family (host-tested nt_ntdll::rtl::time) -----------------------------------------------
@@ -16566,8 +16577,8 @@ pub unsafe extern "system" fn rtl_add_function_table(
 /// `function_table` from `RtlAddFunctionTable`.
 #[export_name = "RtlDeleteFunctionTable"]
 pub unsafe extern "system" fn rtl_delete_function_table(function_table: *mut c_void) -> u8 {
-    nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables()
-        .delete(function_table.cast()) as u8
+    nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables().delete(function_table.cast())
+        as u8
 }
 
 /// `RtlInstallFunctionTableCallback(...) -> BOOLEAN` — register a callback-backed unwind range.
