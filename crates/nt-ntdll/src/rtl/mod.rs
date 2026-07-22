@@ -44,6 +44,7 @@ pub mod privilege;
 pub mod process_params;
 pub mod propvariant;
 pub mod random;
+pub mod registry;
 pub mod resource;
 pub mod security;
 pub mod splay;
