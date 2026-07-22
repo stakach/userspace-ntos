@@ -56,6 +56,7 @@ struct OverlayValue {
     name_folded: String,
     ty: u32,
     data: Vec<u8>,
+    deleted: bool,
 }
 
 /// A key created in the overlay: its canonical path + the values written on it.
@@ -124,33 +125,77 @@ impl RegistryOverlay {
             v.name_raw = String::from(name);
             v.data.clear();
             v.data.extend_from_slice(data);
+            v.deleted = false;
         } else {
             k.values.push(OverlayValue {
                 name_raw: String::from(name),
                 name_folded: folded,
                 ty,
                 data: data.to_vec(),
+                deleted: false,
             });
         }
         true
+    }
+
+    /// Hide a value in this overlay, including a value that exists only in the read-only base hive.
+    /// The tombstone remains addressable so a later [`Self::set_value`] can replace it in place.
+    /// Returns `false` if `idx` is out of range.
+    pub fn delete_value(&mut self, idx: usize, name: &str) -> bool {
+        let folded = fold(name);
+        let Some(k) = self.keys.get_mut(idx) else {
+            return false;
+        };
+        if let Some(v) = k.values.iter_mut().find(|v| v.name_folded == folded) {
+            v.name_raw = String::from(name);
+            v.data.clear();
+            v.deleted = true;
+        } else {
+            k.values.push(OverlayValue {
+                name_raw: String::from(name),
+                name_folded: folded,
+                ty: 0,
+                data: Vec::new(),
+                deleted: true,
+            });
+        }
+        true
+    }
+
+    /// Whether this overlay explicitly hides `name` from the read-only base hive.
+    pub fn value_is_deleted(&self, idx: usize, name: &str) -> bool {
+        let folded = fold(name);
+        self.keys
+            .get(idx)
+            .and_then(|k| k.values.iter().find(|v| v.name_folded == folded))
+            .is_some_and(|v| v.deleted)
     }
 
     /// Read a value by name (case-insensitive) on an overlay key: `(reg_type, data)`.
     pub fn value(&self, idx: usize, name: &str) -> Option<(u32, &[u8])> {
         let folded = fold(name);
         let k = self.keys.get(idx)?;
-        k.values.iter().find(|v| v.name_folded == folded).map(|v| (v.ty, v.data.as_slice()))
+        k.values
+            .iter()
+            .find(|v| v.name_folded == folded && !v.deleted)
+            .map(|v| (v.ty, v.data.as_slice()))
     }
 
     /// Number of values set on an overlay key.
     pub fn values_len(&self, idx: usize) -> usize {
-        self.keys.get(idx).map_or(0, |k| k.values.len())
+        self.keys
+            .get(idx)
+            .map_or(0, |k| k.values.iter().filter(|v| !v.deleted).count())
     }
 
     /// Enumerate the value at `i` on an overlay key: `(original-case name, reg_type, data)`.
     pub fn value_by_index(&self, idx: usize, i: usize) -> Option<(&str, u32, &[u8])> {
         let k = self.keys.get(idx)?;
-        k.values.get(i).map(|v| (v.name_raw.as_str(), v.ty, v.data.as_slice()))
+        k.values
+            .iter()
+            .filter(|v| !v.deleted)
+            .nth(i)
+            .map(|v| (v.name_raw.as_str(), v.ty, v.data.as_slice()))
     }
 
     /// The immediate child key-name components (already canonical/folded) of `parent_canon`.
@@ -228,6 +273,36 @@ mod tests {
         ov.set_value(i, "V", 1, b"hello"); // same folded name, new type + data
         assert_eq!(ov.values_len(i), 1);
         assert_eq!(ov.value(i, "v"), Some((1u32, &b"hello"[..])));
+    }
+
+    #[test]
+    fn delete_value_tombstones_overlay_and_base_values() {
+        let mut ov = RegistryOverlay::new();
+        let (i, _) = ov.create(r"\k");
+        ov.set_value(i, "Present", 4, &1u32.to_le_bytes());
+
+        assert!(ov.delete_value(i, "present"));
+        assert!(ov.value_is_deleted(i, "PRESENT"));
+        assert_eq!(ov.value(i, "Present"), None);
+        assert_eq!(ov.values_len(i), 0);
+        assert!(ov.value_by_index(i, 0).is_none());
+
+        assert!(ov.delete_value(i, "BaseOnly"));
+        assert!(ov.value_is_deleted(i, "baseonly"));
+        assert_eq!(ov.values_len(i), 0);
+    }
+
+    #[test]
+    fn set_value_revives_a_tombstone_in_place() {
+        let mut ov = RegistryOverlay::new();
+        let (i, _) = ov.create(r"\k");
+        ov.delete_value(i, "Value");
+        ov.set_value(i, "VALUE", 1, b"new");
+
+        assert!(!ov.value_is_deleted(i, "value"));
+        assert_eq!(ov.value(i, "value"), Some((1, &b"new"[..])));
+        assert_eq!(ov.values_len(i), 1);
+        assert_eq!(ov.value_by_index(i, 0).map(|v| v.0), Some("VALUE"));
     }
 
     #[test]
