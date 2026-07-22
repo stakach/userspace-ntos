@@ -155,6 +155,114 @@ impl<const N: usize> Default for AttachLedger<N> {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ThreadInitState {
+    Reserved,
+    Committed,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ThreadInitEntry {
+    teb: u64,
+    state: ThreadInitState,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ThreadInitError {
+    InvalidTeb,
+    CapacityExceeded,
+    NotReserved,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ThreadReserveOutcome {
+    Created,
+    AlreadyReserved,
+    AlreadyCommitted,
+}
+
+/// Fixed-capacity ownership ledger balancing future thread-attach and thread-detach callouts.
+pub struct ThreadInitLedger<const N: usize> {
+    entries: [Option<ThreadInitEntry>; N],
+    len: usize,
+}
+
+impl<const N: usize> ThreadInitLedger<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; N],
+            len: 0,
+        }
+    }
+
+    pub fn reserve(&mut self, teb: u64) -> Result<ThreadReserveOutcome, ThreadInitError> {
+        if teb == 0 {
+            return Err(ThreadInitError::InvalidTeb);
+        }
+        if let Some(entry) = self.entries[..self.len]
+            .iter()
+            .flatten()
+            .find(|entry| entry.teb == teb)
+        {
+            return Ok(match entry.state {
+                ThreadInitState::Reserved => ThreadReserveOutcome::AlreadyReserved,
+                ThreadInitState::Committed => ThreadReserveOutcome::AlreadyCommitted,
+            });
+        }
+        if self.len == N {
+            return Err(ThreadInitError::CapacityExceeded);
+        }
+        self.entries[self.len] = Some(ThreadInitEntry {
+            teb,
+            state: ThreadInitState::Reserved,
+        });
+        self.len += 1;
+        Ok(ThreadReserveOutcome::Created)
+    }
+
+    pub fn commit(&mut self, teb: u64) -> Result<(), ThreadInitError> {
+        if teb == 0 {
+            return Err(ThreadInitError::InvalidTeb);
+        }
+        let Some(entry) = self.entries[..self.len]
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.teb == teb)
+        else {
+            return Err(ThreadInitError::NotReserved);
+        };
+        entry.state = ThreadInitState::Committed;
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, teb: u64) -> bool {
+        self.remove_if_state(teb, ThreadInitState::Reserved)
+            .is_some()
+    }
+
+    pub fn take_committed_for_shutdown(&mut self, teb: u64) -> bool {
+        self.remove_if_state(teb, ThreadInitState::Committed)
+            .is_some()
+    }
+
+    fn remove_if_state(&mut self, teb: u64, state: ThreadInitState) -> Option<ThreadInitEntry> {
+        let index = self.entries[..self.len]
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.teb == teb && entry.state == state))?;
+        let removed = self.entries[index];
+        self.entries.copy_within(index + 1..self.len, index);
+        self.len -= 1;
+        self.entries[self.len] = None;
+        removed
+    }
+}
+
+impl<const N: usize> Default for ThreadInitLedger<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Apply `LdrAddRefDll` semantics to a loader entry's load count.
 pub fn add_reference(load_count: u16, pin: bool) -> u16 {
     if load_count == LOAD_COUNT_PINNED || pin {
@@ -256,6 +364,36 @@ mod tests {
         assert!(is_thread_within_loader_callout(0x1000, 0x1000));
         assert!(!is_thread_within_loader_callout(0x1000, 0x2000));
         assert!(!is_thread_within_loader_callout(0, 0));
+    }
+
+    #[test]
+    fn thread_init_ledger_balances_committed_threads_once() {
+        let mut ledger = ThreadInitLedger::<2>::new();
+        assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::Created));
+        assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::AlreadyReserved));
+        assert!(!ledger.take_committed_for_shutdown(0x1000));
+
+        assert_eq!(ledger.commit(0x1000), Ok(()));
+        assert_eq!(ledger.commit(0x1000), Ok(()));
+        assert_eq!(ledger.reserve(0x1000), Ok(ThreadReserveOutcome::AlreadyCommitted));
+        assert!(ledger.take_committed_for_shutdown(0x1000));
+        assert!(!ledger.take_committed_for_shutdown(0x1000));
+    }
+
+    #[test]
+    fn thread_init_ledger_handles_cancel_capacity_and_invalid_transitions() {
+        let mut ledger = ThreadInitLedger::<1>::new();
+        assert_eq!(ledger.reserve(0), Err(ThreadInitError::InvalidTeb));
+        assert_eq!(ledger.commit(0), Err(ThreadInitError::InvalidTeb));
+        assert_eq!(ledger.commit(1), Err(ThreadInitError::NotReserved));
+        assert_eq!(ledger.reserve(1), Ok(ThreadReserveOutcome::Created));
+        assert_eq!(ledger.reserve(2), Err(ThreadInitError::CapacityExceeded));
+        assert!(ledger.cancel(1));
+        assert!(!ledger.cancel(1));
+        assert_eq!(ledger.reserve(2), Ok(ThreadReserveOutcome::Created));
+        assert_eq!(ledger.commit(2), Ok(()));
+        assert!(!ledger.cancel(2));
+        assert!(ledger.take_committed_for_shutdown(2));
     }
 
     #[test]

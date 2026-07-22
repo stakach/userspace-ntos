@@ -32,6 +32,7 @@ pub mod notification;
 pub mod order;
 pub mod peb;
 pub mod resolve;
+pub mod thread;
 
 #[cfg(test)]
 mod tests;

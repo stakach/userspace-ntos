@@ -29,7 +29,7 @@ use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
-use nt_ntdll_layout::{Teb, UnicodeString};
+use nt_ntdll_layout::{Peb, Teb, UnicodeString};
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
@@ -9087,13 +9087,76 @@ pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
     STATUS_SUCCESS
 }
 
-/// `LdrShutdownThread() -> NTSTATUS` — run per-DLL DLL_THREAD_DETACH on thread exit. No-op success.
+/// `LdrShutdownThread() -> NTSTATUS` — run balanced per-DLL thread detach callouts and release
+/// supported current-thread loader storage. Threads which never completed loader thread
+/// initialization do not receive synthetic detach notifications. Static-image TLS remains gated
+/// with the matching thread-attach implementation.
 ///
 /// # Safety
-/// Reads no memory.
+/// Reads the current TEB and may invoke mapped module entry points.
 #[export_name = "LdrShutdownThread"]
 pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb_address = current_teb();
+        if let Ok(_loader_lock) = acquire_loader_lock() {
+            let process_shutdown = RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0;
+            let _ = crate::on_target::ldr_shutdown_thread(teb_address, process_shutdown);
+        }
+
+        let teb = &mut *(teb_address as *mut Teb);
+        let expansion_slots = teb.tls_expansion_slots as *mut u8;
+        teb.tls_expansion_slots = 0;
+        if !expansion_slots.is_null() {
+            crate::process_heap_free(expansion_slots);
+        }
+        shutdown_thread_fls(teb);
+        if teb.has_fiber_data != 0 {
+            let fiber = teb.nt_tib.fiber_data as *mut u8;
+            teb.nt_tib.fiber_data = 0;
+            teb.has_fiber_data = 0;
+            if !fiber.is_null() {
+                crate::process_heap_free(fiber);
+            }
+        }
+        rtl_free_thread_activation_context_stack();
+    }
     STATUS_SUCCESS
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn shutdown_thread_fls(teb: &mut Teb) {
+    let data = teb.fls_data;
+    if data == 0 {
+        return;
+    }
+
+    rtl_acquire_peb_lock();
+    let peb = &mut *(teb.process_environment_block as *mut Peb);
+    let high_index = peb.fls_high_index.min(127) as usize;
+    let callbacks = peb.fls_callback;
+    let flink = core::ptr::read_unaligned(data as *const u64);
+    let blink = core::ptr::read_unaligned((data + 8) as *const u64);
+    if flink != 0 && blink != 0 {
+        core::ptr::write_unaligned(blink as *mut u64, flink);
+        core::ptr::write_unaligned((flink + 8) as *mut u64, blink);
+    }
+    rtl_release_peb_lock();
+
+    if callbacks != 0 {
+        for index in 1..=high_index {
+            let value = core::ptr::read_unaligned((data + 0x10 + index as u64 * 8) as *const u64);
+            let callback =
+                core::ptr::read_unaligned((callbacks + index as u64 * 8) as *const u64);
+            if value != 0 && callback != 0 {
+                let callback: unsafe extern "system" fn(*mut c_void) =
+                    core::mem::transmute(callback as usize);
+                callback(value as *mut c_void);
+            }
+        }
+    }
+    teb.fls_data = 0;
+    crate::process_heap_free(data as *mut u8);
 }
 
 /// `LdrSetDllManifestProber(PVOID Prober)` — install or clear the process manifest-probe callback.
@@ -19756,6 +19819,7 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: forwards to NtTerminateThread(NtCurrentThread=-2, status); does not return.
     unsafe {
+        let _ = ldr_shutdown_thread();
         core::mem::transmute::<
             unsafe extern "C" fn(),
             unsafe extern "system" fn(isize, NtStatus) -> NtStatus,

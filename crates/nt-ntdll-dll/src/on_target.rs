@@ -709,6 +709,92 @@ pub unsafe fn ldr_shutdown_process() -> u32 {
     0
 }
 
+/// Run balanced thread-detach callbacks for a thread whose loader initialization committed.
+///
+/// # Safety
+/// The process loader lock is held and `teb` identifies the current live TEB.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_shutdown_thread(teb: u64, process_shutdown: bool) -> u32 {
+    const DLL_THREAD_DETACH: u32 = 3;
+    let committed = unsafe {
+        (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).take_committed_for_shutdown(teb)
+    };
+    let table = unsafe { &*core::ptr::addr_of!(MODULE_TABLE) };
+    let mut modules = [nt_ntdll::loader::thread::ThreadModuleState::default(); MODULE_TABLE_CAP];
+    let mut count = 0usize;
+    if committed {
+        for &base in table.attach_order.as_slice() {
+            if count == modules.len() {
+                return STATUS_NO_MEMORY as u32;
+            }
+            let entry = unsafe { ldr_entry_for_base(base) };
+            let flags = if entry != 0 {
+                unsafe { core::ptr::read_unaligned((entry + 0x68) as *const u32) }
+            } else {
+                0
+            };
+            let (tls_rva, tls_size) = unsafe { data_directory(base, 9) };
+            modules[count] = nt_ntdll::loader::thread::ThreadModuleState {
+                base,
+                entry_point_rva: unsafe { entry_point_rva(base) },
+                flags,
+                has_tls: tls_rva != 0 && tls_size >= 0x28,
+                is_ntdll: is_ntdll_base(table, base),
+            };
+            count += 1;
+        }
+    }
+    let executable_tls_base = if committed {
+        let base = unsafe { EXE_BASE };
+        let (tls_rva, tls_size) = if base != 0 {
+            unsafe { data_directory(base, 9) }
+        } else {
+            (0, 0)
+        };
+        if tls_rva != 0 && tls_size >= 0x28 {
+            base
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let Ok(plan) = nt_ntdll::loader::thread::plan_thread_detach::<MODULE_TABLE_CAP>(
+        committed,
+        process_shutdown,
+        &modules[..count],
+        executable_tls_base,
+    ) else {
+        return STATUS_NO_MEMORY as u32;
+    };
+
+    let _callout = unsafe { crate::exports::enter_loader_callout() };
+    for action in plan.actions() {
+        let mut activation_frame = [0u64; 7];
+        let Ok(_activation_context) =
+            (unsafe { ModuleActivationContextGuard::enter(action.base, &mut activation_frame) })
+        else {
+            continue;
+        };
+        if action.call_tls {
+            unsafe { call_tls_initializers(action.base, DLL_THREAD_DETACH) };
+        }
+        let _ = unsafe { call_dll_main(action.base, DLL_THREAD_DETACH, 0) };
+    }
+    if plan.executable_tls_base() != 0 {
+        let mut activation_frame = [0u64; 7];
+        if let Ok(_activation_context) = unsafe {
+            ModuleActivationContextGuard::enter(
+                plan.executable_tls_base(),
+                &mut activation_frame,
+            )
+        } {
+            unsafe { call_tls_initializers(plan.executable_tls_base(), DLL_THREAD_DETACH) };
+        };
+    }
+    0
+}
+
 /// True if `base` is our own ntdll (matched by the table's `b"ntdll"` entry) — it has no C DllMain.
 #[cfg(target_arch = "x86_64")]
 fn is_ntdll_base(table: &ModuleTable, base: u64) -> bool {
@@ -1000,6 +1086,12 @@ static mut MODULE_TABLE: ModuleTable = ModuleTable {
     count: 0,
     attach_order: nt_ntdll::loader::lifecycle::AttachLedger::new(),
 };
+
+/// Balances future per-thread attach and detach callouts. No current thread is committed until the
+/// secondary-thread initialization path begins issuing DLL_THREAD_ATTACH.
+#[cfg(target_arch = "x86_64")]
+static mut THREAD_INIT_LEDGER: nt_ntdll::loader::lifecycle::ThreadInitLedger<MODULE_TABLE_CAP> =
+    nt_ntdll::loader::lifecycle::ThreadInitLedger::new();
 
 #[cfg(target_arch = "x86_64")]
 impl ModuleTable {

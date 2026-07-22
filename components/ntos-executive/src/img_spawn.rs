@@ -590,6 +590,15 @@ pub(crate) unsafe fn spawn_sec_image(
                                                                                             // Bit 0 of the main TLS bitmap is reserved (index 0 = the implicit TLS slot); real ntdll sets
                                                                                             // it so TlsAlloc never hands out index 0. TlsBitmapBits[0] @ PEB+0x80.
         core::ptr::write_volatile((scr + 0x1000 + 0x80) as *mut u32, 1);
+        // FLS globals used by kernel32 FlsAlloc/FlsSetValue. x64 PEB: FlsListHead@0x328,
+        // FlsBitmap@0x338, FlsBitmapBits[4]@0x340, FlsHighIndex@0x350. The bitmap header lives in
+        // the same process-lifetime PEB tail as the TLS headers; bit 0 is reserved.
+        core::ptr::write_volatile((scr + 0x1000 + 0x328) as *mut u64, SMSS_PEB_VA + 0x328);
+        core::ptr::write_volatile((scr + 0x1000 + 0x330) as *mut u64, SMSS_PEB_VA + 0x328);
+        core::ptr::write_volatile((scr + 0x1000 + 0x8C0) as *mut u32, 128);
+        core::ptr::write_volatile((scr + 0x1000 + 0x8C8) as *mut u64, SMSS_PEB_VA + 0x340);
+        core::ptr::write_volatile((scr + 0x1000 + 0x338) as *mut u64, SMSS_PEB_VA + 0x8C0);
+        core::ptr::write_volatile((scr + 0x1000 + 0x340) as *mut u32, 1);
         // NLS code-page data pointers — LdrpInitializeProcess (ntdll+0x9e81) reads these and
         // passes them to RtlInitNlsTables, which builds the WideChar<->MultiByte tables
         // RtlUnicodeToMultiByteN needs (else it indexes a null table). x64 PEB (verified from the

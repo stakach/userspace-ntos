@@ -262,6 +262,18 @@ pub struct Peb {
     pub system_default_activation_context_data: u64,
     /// `SystemAssemblyStorageMap` (offset 0x310).
     pub system_assembly_storage_map: u64,
+    _rsvd_318: [u8; 0x320 - 0x318],
+    /// `FlsCallback` (offset 0x320).
+    pub fls_callback: u64,
+    /// `FlsListHead` (offset 0x328).
+    pub fls_list_head: ListEntry,
+    /// `FlsBitmap` (offset 0x338).
+    pub fls_bitmap: u64,
+    /// `FlsBitmapBits[4]` (offset 0x340).
+    pub fls_bitmap_bits: [u32; 4],
+    /// `FlsHighIndex` (offset 0x350).
+    pub fls_high_index: u32,
+    _rsvd_354: [u8; 4],
 }
 
 /// `TEB` — the Thread Environment Block (`peb_teb.h`, x64). Named fields the hosted binaries touch
@@ -307,7 +319,9 @@ pub struct Teb {
     _rsvd_147a: [u8; 6],
     /// `DeallocationStack` (offset 0x1478).
     pub deallocation_stack: u64,
-    _rsvd_1480: [u8; 0x1690 - 0x1480],
+    /// `TlsSlots[64]` (offset 0x1480).
+    pub tls_slots: [u64; 64],
+    _rsvd_1680: [u8; 0x1690 - 0x1680],
     /// `Vdm` (offset 0x1690).
     pub vdm: u64,
     _rsvd_1698: [u8; 0x16B0 - 0x1698],
@@ -316,7 +330,10 @@ pub struct Teb {
     _rsvd_16b4: [u8; 0x1740 - 0x16B4],
     /// `GdiBatchCount` (offset 0x1740).
     pub gdi_batch_count: u32,
-    _rsvd_1744: [u8; 0x1760 - 0x1744],
+    _rsvd_1744: [u8; 2],
+    /// `HasFiberData` (offset 0x1746 in the hosted ReactOS x64 kernel32 ABI).
+    pub has_fiber_data: u8,
+    _rsvd_1747: [u8; 0x1760 - 0x1747],
     /// `WaitingOnLoaderLock` (offset 0x1760).
     pub waiting_on_loader_lock: u32,
     _rsvd_1764: [u8; 0x1780 - 0x1764],
@@ -327,7 +344,9 @@ pub struct Teb {
     pub current_transaction_handle: u64,
     /// `ActiveFrame` (offset 0x17C0).
     pub active_frame: u64,
-    _rsvd_17c8: [u8; 0x17EE - 0x17C8],
+    /// `FlsData` (offset 0x17C8).
+    pub fls_data: u64,
+    _rsvd_17d0: [u8; 0x17EE - 0x17D0],
     /// `SameTebFlags` (offset 0x17EE); bit 3 is `DbgSkipThreadAttach`.
     pub same_teb_flags: u16,
 }
@@ -357,6 +376,11 @@ const _: () = assert!(offset_of!(Peb, activation_context_data) == 0x2F8);
 const _: () = assert!(offset_of!(Peb, process_assembly_storage_map) == 0x300);
 const _: () = assert!(offset_of!(Peb, system_default_activation_context_data) == 0x308);
 const _: () = assert!(offset_of!(Peb, system_assembly_storage_map) == 0x310);
+const _: () = assert!(offset_of!(Peb, fls_callback) == 0x320);
+const _: () = assert!(offset_of!(Peb, fls_list_head) == 0x328);
+const _: () = assert!(offset_of!(Peb, fls_bitmap) == 0x338);
+const _: () = assert!(offset_of!(Peb, fls_bitmap_bits) == 0x340);
+const _: () = assert!(offset_of!(Peb, fls_high_index) == 0x350);
 
 // TEB — NDK peb_teb.h `_STRUCT64` C_ASSERT block + live-RE StaticUnicodeString/ActCtx offsets.
 const _: () = assert!(offset_of!(Teb, nt_tib) == 0x000); // C_ASSERT(... NtTib) == 0x000
@@ -371,13 +395,16 @@ const _: () = assert!(offset_of!(Teb, last_status_value) == 0x1250); // C_ASSERT
 const _: () = assert!(offset_of!(Teb, static_unicode_string) == 0x1258); // live-RE (smss overflow fix)
 const _: () = assert!(offset_of!(Teb, static_unicode_buffer) == 0x1268);
 const _: () = assert!(offset_of!(Teb, deallocation_stack) == 0x1478);
+const _: () = assert!(offset_of!(Teb, tls_slots) == 0x1480);
 const _: () = assert!(offset_of!(Teb, vdm) == 0x1690); // C_ASSERT(... Vdm) == 0x1690
 const _: () = assert!(offset_of!(Teb, hard_error_mode) == 0x16B0); // C_ASSERT(... HardErrorMode) == 0x16B0
 const _: () = assert!(offset_of!(Teb, gdi_batch_count) == 0x1740); // C_ASSERT(... GdiBatchCount) == 0x1740
+const _: () = assert!(offset_of!(Teb, has_fiber_data) == 0x1746);
 const _: () = assert!(offset_of!(Teb, waiting_on_loader_lock) == 0x1760); // C_ASSERT(...) == 0x1760
 const _: () = assert!(offset_of!(Teb, tls_expansion_slots) == 0x1780); // C_ASSERT(... TlsExpansionSlots) == 0x1780
 const _: () = assert!(offset_of!(Teb, current_transaction_handle) == 0x17B8); // C_ASSERT(...) == 0x17B8
 const _: () = assert!(offset_of!(Teb, active_frame) == 0x17C0); // C_ASSERT(... ActiveFrame) == 0x17C0
+const _: () = assert!(offset_of!(Teb, fls_data) == 0x17C8);
 const _: () = assert!(offset_of!(Teb, same_teb_flags) == 0x17EE); // C_ASSERT(...) == 0x17EE
 
 // PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY — ldrtypes.h.
