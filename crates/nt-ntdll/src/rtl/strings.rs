@@ -72,11 +72,9 @@ pub fn downcase_char(c: u16) -> u16 {
 
 /// `RtlUpperChar`: upper-case one ANSI/OEM byte for the single-byte boot code-page path.
 pub fn upcase_ansi_byte(b: u8) -> u8 {
-    let up = upcase_char(b as u16);
-    if up <= u8::MAX as u16 {
-        up as u8
-    } else {
-        b
+    match b {
+        b'a'..=b'z' => b - 0x20,
+        _ => b,
     }
 }
 
@@ -171,7 +169,9 @@ pub fn compare_string(a: &[u8], b: &[u8], case_insensitive: bool) -> i32 {
         } else {
             b[i]
         };
-        let diff = lhs as i32 - rhs as i32;
+        // STRING.Buffer is PCHAR. Preserve the signed-CHAR promotion ReactOS uses rather than
+        // comparing the underlying bytes as unsigned values.
+        let diff = lhs as i8 as i32 - rhs as i8 as i32;
         if diff != 0 {
             return diff;
         }
@@ -537,7 +537,13 @@ mod tests {
         assert!(equal_string(b"Service", b"SERVICE", true));
         assert!(prefix_string(b"\\Device", b"\\DEVICE\\Harddisk0", true));
         assert_eq!(upper_string(b"aBz9!"), b"ABZ9!");
-        assert_eq!(upcase_ansi_byte(0xE9), 0xC9);
+        assert_eq!(upper_string(&[b'a', b'Z', 0xE9, 0xFF, 0]), [b'A', b'Z', 0xE9, 0xFF, 0]);
+        for byte in 0x80..=0xff {
+            assert_eq!(upcase_ansi_byte(byte), byte);
+        }
+        assert_eq!(compare_string(&[0x80], &[0], false), -128);
+        assert_ne!(compare_string(&[0xE9], &[0xC9], true), 0);
+        assert!(!equal_string(&[0xE9], &[0xC9], true));
     }
 
     #[test]

@@ -21334,12 +21334,11 @@ pub unsafe extern "system" fn rtl_append_string_to_string(
     if destination.is_null() || source.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: source/destination are valid STRING descriptors per the contract.
-    let source_bytes = match unsafe { counted_bytes(source) } {
-        Some(bytes) => bytes,
-        None => return STATUS_INVALID_PARAMETER,
+    // Read descriptor fields before moving bytes: source and destination buffers may overlap.
+    let (source_buffer, source_len) = unsafe {
+        ((*source).buffer as *const u8, (*source).length as usize)
     };
-    if source_bytes.is_empty() {
+    if source_len == 0 {
         return STATUS_SUCCESS;
     }
     // SAFETY: destination is valid per the contract.
@@ -21350,16 +21349,16 @@ pub unsafe extern "system" fn rtl_append_string_to_string(
             (*destination).maximum_length as usize,
         )
     };
-    if dlen.saturating_add(source_bytes.len()) > dmax {
+    if dlen + source_len > dmax {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    if dbuf.is_null() {
+    if dbuf.is_null() || source_buffer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: capacity check proves the append range is writable.
+    // SAFETY: capacity proves the append range is writable; `copy` preserves RtlMoveMemory overlap.
     unsafe {
-        core::ptr::copy_nonoverlapping(source_bytes.as_ptr(), dbuf.add(dlen), source_bytes.len());
-        (*destination).length = (dlen + source_bytes.len()) as u16;
+        core::ptr::copy(source_buffer, dbuf.add(dlen), source_len);
+        (*destination).length = (dlen + source_len) as u16;
     }
     STATUS_SUCCESS
 }
@@ -21392,15 +21391,15 @@ pub unsafe extern "system" fn rtl_append_asciiz_to_string(
             (*destination).maximum_length as usize,
         )
     };
-    if dlen.saturating_add(source_len) > dmax {
+    if dlen + source_len > dmax {
         return STATUS_BUFFER_TOO_SMALL;
     }
     if dbuf.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: capacity check proves the append range is writable.
+    // SAFETY: capacity proves the append range is writable; `copy` preserves RtlMoveMemory overlap.
     unsafe {
-        core::ptr::copy_nonoverlapping(source, dbuf.add(dlen), source_len);
+        core::ptr::copy(source, dbuf.add(dlen), source_len);
         (*destination).length = (dlen + source_len) as u16;
     }
     STATUS_SUCCESS
@@ -21423,25 +21422,23 @@ pub unsafe extern "system" fn rtl_copy_string(
         unsafe { (*destination).length = 0 };
         return;
     }
-    // SAFETY: source/destination are valid STRING descriptors per the contract.
-    let source_bytes = match unsafe { counted_bytes(source) } {
-        Some(bytes) => bytes,
-        None => {
-            unsafe { (*destination).length = 0 };
-            return;
-        }
-    };
-    // SAFETY: destination is valid per the contract.
-    let (dbuf, dmax) = unsafe {
+    // Read both descriptors before copying because exact and partial buffer aliasing are valid.
+    let (source_buffer, source_len, dbuf, dmax) = unsafe {
         (
+            (*source).buffer as *const u8,
+            (*source).length as usize,
             (*destination).buffer as *mut u8,
             (*destination).maximum_length as usize,
         )
     };
-    let copy_len = source_bytes.len().min(dmax);
-    if copy_len != 0 && !dbuf.is_null() {
-        // SAFETY: copy_len is bounded by destination MaximumLength.
-        unsafe { core::ptr::copy_nonoverlapping(source_bytes.as_ptr(), dbuf, copy_len) };
+    let copy_len = source_len.min(dmax);
+    if copy_len != 0 {
+        if dbuf.is_null() || source_buffer.is_null() {
+            unsafe { (*destination).length = 0 };
+            return;
+        }
+        // SAFETY: copy_len is bounded by both counted source and destination MaximumLength.
+        unsafe { core::ptr::copy(source_buffer, dbuf, copy_len) };
     }
     // SAFETY: destination valid.
     unsafe { (*destination).length = copy_len as u16 };
@@ -21487,8 +21484,22 @@ pub unsafe extern "system" fn rtl_prefix_string(
     string: PCUnicodeString,
     case_insensitive: u8,
 ) -> u8 {
-    let prefix = unsafe { counted_bytes(prefix) }.unwrap_or(&[]);
-    let string = unsafe { counted_bytes(string) }.unwrap_or(&[]);
+    if prefix.is_null() || string.is_null() {
+        return 0;
+    }
+    let (prefix_buffer, prefix_len, string_buffer, string_len) = unsafe {
+        (
+            (*prefix).buffer as *const u8,
+            (*prefix).length as usize,
+            (*string).buffer as *const u8,
+            (*string).length as usize,
+        )
+    };
+    if string_len < prefix_len || prefix_buffer.is_null() || string_buffer.is_null() {
+        return 0;
+    }
+    let prefix = unsafe { core::slice::from_raw_parts(prefix_buffer, prefix_len) };
+    let string = unsafe { core::slice::from_raw_parts(string_buffer, string_len) };
     u8::from(rtl::strings::prefix_string(
         prefix,
         string,
@@ -21517,19 +21528,25 @@ pub unsafe extern "system" fn rtl_upper_string(
     if destination.is_null() || source.is_null() {
         return;
     }
-    let source_bytes = unsafe { counted_bytes(source) }.unwrap_or(&[]);
-    // SAFETY: destination is valid per the contract.
-    let (dbuf, dmax) = unsafe {
+    // Work through raw pointers so `RtlUpperString(&s, &s)` remains well-defined.
+    let (source_buffer, source_len, dbuf, dmax) = unsafe {
         (
+            (*source).buffer as *const u8,
+            (*source).length as usize,
             (*destination).buffer as *mut u8,
             (*destination).maximum_length as usize,
         )
     };
-    let copy_len = source_bytes.len().min(dmax);
-    if copy_len != 0 && !dbuf.is_null() {
-        for (i, b) in source_bytes.iter().copied().take(copy_len).enumerate() {
-            // SAFETY: i < copy_len <= MaximumLength.
-            unsafe { *dbuf.add(i) = rtl::strings::upcase_ansi_byte(b) };
+    let copy_len = source_len.min(dmax);
+    if copy_len != 0 {
+        if dbuf.is_null() || source_buffer.is_null() {
+            unsafe { (*destination).length = 0 };
+            return;
+        }
+        for i in 0..copy_len {
+            // SAFETY: both pointers describe at least copy_len bytes; forward access matches ReactOS.
+            let byte = unsafe { *source_buffer.add(i) };
+            unsafe { *dbuf.add(i) = rtl::strings::upcase_ansi_byte(byte) };
         }
     }
     // SAFETY: destination valid.
