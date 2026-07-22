@@ -512,6 +512,9 @@ pub(crate) unsafe fn spawn_sec_image(
         let acs_va = SMSS_TEB_VA + 0x1800; // in the 2nd TEB page
         core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
         let _ = page_map(copy_cap(teb), SMSS_TEB_VA, RW_NX, pml4);
+        if pi == 1 || pi == 2 {
+            csrss_frame_put(pi, SMSS_TEB_VA, teb);
+        }
         // The x64 TEB is ~0x1800 bytes (TLS slots etc.) — map a second page holding the
         // ACTIVATION_CONTEXT_STACK (written via scratch, then shared into smss).
         let teb2 = alloc_frame();
@@ -559,6 +562,9 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x820) as *mut u64, SMSS_DESKINFO_VA); // CLIENTINFO.pDeskInfo
         core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
         let _ = page_map(copy_cap(teb2), SMSS_TEB_VA + 0x1000, RW_NX, pml4);
+        if pi == 1 || pi == 2 {
+            csrss_frame_put(pi, SMSS_TEB_VA + 0x1000, teb2);
+        }
         // PEB: ProcessParameters @0x20.
         let peb = alloc_frame();
         let _ = page_map(peb, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);

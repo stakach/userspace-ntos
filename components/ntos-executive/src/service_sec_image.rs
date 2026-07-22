@@ -3675,7 +3675,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
                 // hosted client's process via the synthetic handle the DriverEntry attach used.
-                let d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_subsystem::FAKE_PROCESS_HANDLE } else { a0 };
+                let mut d_a0 = if a0 == 0xFFFF_FFFF_FFFF_FFFF { win32k_subsystem::FAKE_PROCESS_HANDLE } else { a0 };
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a csrss user pointer (its stack) NOT mapped in win32k's VSpace — passing it
                 // raw makes win32k's handler fault/spin on an address win32k_dispatch can't resolve.
@@ -3711,6 +3711,50 @@ pub(crate) unsafe fn service_sec_image(
                 // OBJECT_ATTRIBUTES.Length via its stack mirror (pi-selected) so we can tell a stale
                 // (wrong-client) frame in win32k from a genuinely-bad OA the client built.
                 if m0 == 0x122f {
+                    let mut oa = [0u8; 0x30];
+                    let oa_ok = img_spawn::client_copyin_mapped(
+                        pi as u64,
+                        a0,
+                        &mut oa,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
+                    let object_name = if oa_ok {
+                        u64::from_le_bytes(oa[0x10..0x18].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let mut name = [0u8; 0x10];
+                    let name_ok = object_name != 0
+                        && img_spawn::client_copyin_mapped(
+                            pi as u64,
+                            object_name,
+                            &mut name,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
+                    let name_lengths = if name_ok {
+                        u32::from_le_bytes(name[0..4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let name_buffer = if name_ok {
+                        u64::from_le_bytes(name[8..16].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let mut prefix = [0u8; 8];
+                    let prefix_ok = name_buffer != 0
+                        && img_spawn::client_copyin_mapped(
+                            pi as u64,
+                            name_buffer,
+                            &mut prefix,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
                     print_str(b"[w32diag] 0x122f OA=0x");
                     print_hex((a0 >> 32) as u32);
                     print_hex(a0 as u32);
@@ -3718,7 +3762,68 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(smss_stack_read(a0) as u32);
                     print_str(b" pi=");
                     print_u64(pi as u64);
+                    print_str(b" graph=");
+                    print_u64(oa_ok as u64);
+                    print_str(b"/");
+                    print_u64(name_ok as u64);
+                    print_str(b"/");
+                    print_u64(prefix_ok as u64);
+                    print_str(b" ObjectName=0x");
+                    print_hex((object_name >> 32) as u32);
+                    print_hex(object_name as u32);
+                    print_str(b" LenMax=0x");
+                    print_hex(name_lengths);
+                    print_str(b" Buffer=0x");
+                    print_hex((name_buffer >> 32) as u32);
+                    print_hex(name_buffer as u32);
+                    print_str(b" text4=0x");
+                    print_hex(u64::from_le_bytes(prefix) as u32);
                     print_str(b"\n");
+
+                    // win32k is an isolated component, so capture the nested user pointer graph at
+                    // the executive boundary just as NtUserCreateWindowStation's ProbeForRead block
+                    // does in a monolithic kernel. Preserve scalar handles/flags and the caller's
+                    // security descriptor pointer; only the OA, counted-string descriptor, and its
+                    // bounded UTF-16 buffer need rebasing into the shared argument window.
+                    let name_len = (name_lengths & 0xffff) as usize;
+                    let name_max = (name_lengths >> 16) as usize;
+                    let arg = win32k_subsystem::WIN32K_ARG_VADDR;
+                    let arg_bytes = (win32k_subsystem::WIN32K_ARG_FRAMES * 0x1000) as usize;
+                    let graph_valid = oa_ok
+                        && name_ok
+                        && prefix_ok
+                        && name_len != 0
+                        && name_len & 1 == 0
+                        && name_len <= name_max
+                        && name_max <= arg_bytes - 0x40;
+                    if graph_valid {
+                        core::ptr::write_bytes(arg as *mut u8, 0, arg_bytes);
+                        core::ptr::copy_nonoverlapping(oa.as_ptr(), arg as *mut u8, oa.len());
+                        core::ptr::copy_nonoverlapping(
+                            name.as_ptr(),
+                            (arg + 0x30) as *mut u8,
+                            name.len(),
+                        );
+                        let name_out = core::slice::from_raw_parts_mut(
+                            (arg + 0x40) as *mut u8,
+                            name_max,
+                        );
+                        if img_spawn::client_copyin_mapped(
+                            pi as u64,
+                            name_buffer,
+                            name_out,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        ) {
+                            core::ptr::write_unaligned((arg + 0x10) as *mut u64, arg + 0x30);
+                            core::ptr::write_unaligned((arg + 0x38) as *mut u64, arg + 0x40);
+                            d_a0 = arg;
+                            print_str(b"[w32marshal] captured named window-station OA graph bytes=");
+                            print_u64(0x40 + name_max as u64);
+                            print_str(b"\n");
+                        }
+                    }
                 }
                 // ★ THE COUNTED DESKTOP PAINT — winlogon's OWN natural NtUserSwitchDesktop paints the
                 // framebuffer, and THIS is the source of the `exec_win32k_desktop_painted` gate spec
@@ -3896,6 +4001,11 @@ pub(crate) unsafe fn service_sec_image(
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
+                    let client_teb = nt_handler
+                        .pm
+                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .filter(|teb| *teb != 0)
+                        .unwrap_or(SMSS_TEB_VA);
                     if pi >= 1 && m0 == 0x1077 && a3 != 0 {
                         prefill_client_large_string_pages(
                             pi as u64,
@@ -3914,6 +4024,7 @@ pub(crate) unsafe fn service_sec_image(
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            teb: client_teb,
                             peb_mirror,
                         },
                     );
@@ -4017,6 +4128,7 @@ pub(crate) unsafe fn service_sec_image(
                                         pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                                         badge,
                                         tid: nt_handler.current_tid,
+                                        teb: client_teb,
                                         peb_mirror,
                                     },
                                 );
@@ -4056,12 +4168,18 @@ pub(crate) unsafe fn service_sec_image(
                         4 => LSASS_ENV_SCRATCH_VA + 0x1000,
                         _ => 0,
                     };
+                    let client_teb = nt_handler
+                        .pm
+                        .thread_teb(nt_handler.current_tid as nt_process::ThreadId)
+                        .filter(|teb| *teb != 0)
+                        .unwrap_or(SMSS_TEB_VA);
                     redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
                             badge,
                             tid: nt_handler.current_tid,
+                            teb: client_teb,
                             peb_mirror,
                         },
                         resume_ip,

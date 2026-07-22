@@ -4960,6 +4960,9 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let teb_scratch = copy_cap(teb);
     let teb_live_mirror = copy_cap(teb);
     let teb_target_map = page_map(teb, t.teb_va, RW_NX, t.pml4);
+    if t.client_pi != 0 {
+        csrss_frame_put(t.client_pi, t.teb_va, teb);
+    }
     let teb_scratch_map = page_map(teb_scratch, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
     let teb_live_map = if t.stack_mirror_va != 0 {
         page_map(
@@ -4996,6 +4999,9 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     let teb2_scratch = copy_cap(teb2);
     let teb2_live_mirror = copy_cap(teb2);
     let teb2_target_map = page_map(teb2, t.teb_va + 0x1000, RW_NX, t.pml4);
+    if t.client_pi != 0 {
+        csrss_frame_put(t.client_pi, t.teb_va + 0x1000, teb2);
+    }
     let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
     // DeallocationStack is in TEB page 2; populate it only after its scratch alias is mapped.
     core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);

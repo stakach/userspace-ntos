@@ -234,11 +234,12 @@ pub const SH_GDI_TABLE_SIZE: u64 = 0x130; // out: full hosted GDI handle-table b
 pub const SH_REQ_PROCESS_ID: u64 = 0x138; // in: routed caller's real Process Manager pid (u64)
 pub const SH_REQ_NESTED_CALLBACK: u64 = 0x140; // in: dispatch is nested inside a parked user callback
 pub const SH_REQ_CLIENT_PI: u64 = 0x148; // in: executive hosted-process index for this dispatch
+pub const SH_REQ_CLIENT_TEB: u64 = 0x150; // in: routed caller's current-thread TEB user VA
 const _: () = assert!(SH_SAS_DESKINFO > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
 /// tail of the existing shared page; both the component stub and executive pump access it here.
 pub const SH_USER_CALLBACK: u64 = 0x200;
-const _: () = assert!(SH_REQ_CLIENT_PI < SH_USER_CALLBACK);
+const _: () = assert!(SH_REQ_CLIENT_TEB < SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 
 /// The win64 TOTAL argument count for a win32k SSN (ReactOS w32ksvc64.h — the SSN space winlogon.exe
@@ -3122,6 +3123,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
     let process_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ID) as *const u64);
     let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
+    let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
     let top_level = read_volatile(
         (WIN32K_SHARED_VADDR + SH_REQ_NESTED_CALLBACK) as *const u64,
     ) == 0;
@@ -3129,6 +3131,16 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         WIN32K_CURRENT_PROCESS_ID.store(process_id, Ordering::Relaxed);
         write_volatile((PH_EPROCESS_VA + 0xd0) as *mut u64, process_id);
     }
+    // The established compatibility context remains load-bearing for win32k's early initialization.
+    // Switch to the routed client's real TEB only where ReactOS may call kernel-mode NtCurrentTeb()
+    // while capturing a user window-station/desktop name. The client attach path identity-maps the
+    // registered TEB pages, so this remains the caller's live StaticUnicodeString/CLIENTINFO view.
+    let teb_context = if ssn == 0x122f || ssn == 0x122d {
+        client_teb
+    } else {
+        WIN32K_KPCR_VA
+    };
+    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb_context);
     // The top-level SetThreadDesktop call begins with the client thread owning no windows. The desktop windows
     // IntCreateDesktop builds live on gptiDesktopThread, which our single-threaded host merged with
     // the dispatch thread — so winlogon's NtUserSetThreadDesktop (desktop.c:3331 IsListEmpty check)
@@ -3499,12 +3511,10 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
 /// Build the "current process/thread" context win32k's INLINED accessors read during a dispatch —
 /// distinct from the bring-up attach phase (which is happy with a zeroed KPCR: its optional
 /// environment getter early-returns STATUS_NOT_FOUND when `gs:[0x30]==0`). During a routed dispatch,
-/// win32k reads the current process the inlined way: `proc = [[gs:0x30] + 0x60]` (KPCR.Used_Self →
-/// current EPROCESS) and then walks it — `UserCreateWinstaDirectory` reads `proc->SessionId@0x2c0`
-/// (want 0 → session-0 winsta path) while the process-env getter walks `proc[+0x20] → [+0x80]` (a
-/// wide param string). Model the WHOLE chain against the same fake EPROCESS the import trampoline
-/// (`s_current_process`) returns, so gs-inlined and trampoline resolution agree:
-///   gs:[0x30] (KPCR.Used_Self) = KPCR self; [KPCR+0x60] = PH_EPROCESS; PH_EPROCESS.SessionId(0x2c0)=0;
+/// Most of the existing bootstrap path models process/session queries through `gs:[0x30]` pointing
+/// at this KPCR placeholder. The per-request dispatch substitutes a real client TEB only for the
+/// window-station/desktop capture handlers that call NtCurrentTeb. Model the bootstrap EPROCESS
+/// chain against the same fake EPROCESS the import trampoline returns:
 ///   PH_EPROCESS[+0x20] = Q (non-null, else the env getter faults — it has no NULL check there);
 ///   Q[+0x80] = an empty wide string (first WCHAR 0 → getter returns cleanly).
 /// One coherent context covers every csrss dispatch (single client, session 0); a multi-session model
@@ -3512,8 +3522,8 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i32 {
 unsafe fn setup_dispatch_context() {
     let q = PH_EPROCESS_VA + 0x900; // a zeroed sub-region used as PH_EPROCESS[+0x20]
     let zstr = PH_EPROCESS_VA + 0xA00; // empty wide string (WCHAR 0, already zeroed)
-    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA); // KPCR.Used_Self = self
-    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, PH_EPROCESS_VA); // [Used_Self+0x60] = EPROCESS
+    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA); // bootstrap compatibility context
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, PH_EPROCESS_VA);
     write_volatile((PH_EPROCESS_VA + 0x2c0) as *mut u32, 0); // SessionId = 0
     // EPROCESS.UniqueProcessId (this ReactOS win32k reads it at offset 0xd0 —
     // confirmed by disassembling co_IntRegisterLogonProcess: `mov rax,[Process+0xd0]`).

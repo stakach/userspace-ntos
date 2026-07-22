@@ -27,6 +27,7 @@ static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PEB: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PID: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_TEB: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -83,6 +84,7 @@ pub(crate) struct Win32kClientContext {
     pub pid: u64,
     pub badge: u64,
     pub tid: u64,
+    pub teb: u64,
     pub peb_mirror: u64,
 }
 
@@ -1033,6 +1035,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             pid: USER_CALLBACK_CLIENT_PID.load(Ordering::Relaxed),
             badge: request.client_badge,
             tid: request.client_tid,
+            teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
         };
         if !redirect_pending_user_callback(
@@ -1385,10 +1388,10 @@ pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64) {
 /// Attach win32k's client window to GUI client `pi` (the KeStackAttachProcess model). If a DIFFERENT
 /// client is currently attached, DETACH it: Unmap all its leaf client pages from win32k so the new
 /// client's colliding VAs re-fault to THIS client's frames. Idempotent when `pi` is already attached.
-pub(crate) unsafe fn w32_client_attach(pi: u64) {
+pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     let prev = W32_ATTACHED_PI.load(Ordering::Relaxed);
     if prev == pi {
-        return;
+        return true;
     }
     let n = core::ptr::read(core::ptr::addr_of!(W32_ATTACH_N));
     let slots = core::ptr::addr_of!(W32_ATTACH_SLOT) as *const u64;
@@ -1396,7 +1399,15 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) {
         // Unmap win32k's mapping of the previous client's page (arch Unmap uses this cap's win32k
         // asid → csrss/winlogon's own VSpace mapping is untouched). Cap slot is leaked (bump CNode,
         // XL 131072-slot pool → bounded for bring-up); a fresh copy_cap is used on the re-map.
-        let _ = page_unmap(core::ptr::read(slots.add(i)));
+        let error = page_unmap(core::ptr::read(slots.add(i)));
+        if error != 0 {
+            print_str(b"[w32attach] page_unmap failed page=0x");
+            print_hex(core::ptr::read((core::ptr::addr_of!(W32_ATTACH_PAGE) as *const u64).add(i)) as u32);
+            print_str(b" error=");
+            print_u64(error);
+            print_str(b"\n");
+            return false;
+        }
     }
     print_str(b"[w32attach] client ");
     print_u64(prev);
@@ -1407,6 +1418,7 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) {
     print_str(b" client pages)\n");
     core::ptr::write(core::ptr::addr_of_mut!(W32_ATTACH_N), 0);
     W32_ATTACHED_PI.store(pi, Ordering::Relaxed);
+    true
 }
 /// Share GUI client `pi`'s frame for `page` into win32k's VSpace at the SAME VA (identity) so
 /// win32k's handler dereferences the caller's real user memory. Returns false if the page isn't
@@ -1425,7 +1437,18 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
     // the client so writes propagate back (out-params). Non-executable — client data, not code.
     let cc = copy_cap(fr);
-    page_map(cc, page, RW_NX, w_pml4);
+    let error = page_map(cc, page, RW_NX, w_pml4);
+    if error != 0 {
+        print_str(b"[w32attach] page_map failed page=0x");
+        print_hex((page >> 32) as u32);
+        print_hex(page as u32);
+        print_str(b" pi=");
+        print_u64(pi);
+        print_str(b" error=");
+        print_u64(error);
+        print_str(b"\n");
+        return false;
+    }
     w32_attach_record(page, cc);
     true
 }
@@ -1609,7 +1632,14 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
     win32k_dispatch_wide(
         ssn, a0, a1, a2, a3, 0, 0,
-        Win32kClientContext { pi, pid: 0, badge: 0, tid: 0, peb_mirror: 0 },
+        Win32kClientContext {
+            pi,
+            pid: 0,
+            badge: 0,
+            tid: 0,
+            teb: crate::SMSS_TEB_VA,
+            peb_mirror: 0,
+        },
     )
 }
 
@@ -1636,12 +1666,17 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     if w_fault == 0 {
         return (0xC000_0001u32 as i32, false);
     }
+    // A suspended callback only carries the compact pump identity. Latch the full dispatch's TEB
+    // here so a callback-driven nested win32k call retains the same current-thread context.
+    USER_CALLBACK_CLIENT_TEB.store(client.teb, Ordering::Relaxed);
     // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
     // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
     let client_pi = client.pi as u64;
-    w32_client_attach(client_pi);
+    if !w32_client_attach(client_pi) {
+        return (0xC000_0001u32 as i32, false);
+    }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
@@ -1691,6 +1726,10 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_CLIENT_PI) as *mut u64,
         client.pi as u64,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_CLIENT_TEB) as *mut u64,
+        client.teb,
     );
     // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
     // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.
