@@ -1195,6 +1195,18 @@ impl ExecNtHandler {
             Some(c) => c,
             None => return false,
         };
+        let filled_pages = &*ctx.filled_pages;
+        let faults = *ctx.faults as usize;
+        if client_copyin_mapped(
+            self.pi as u64,
+            va,
+            dst,
+            filled_pages,
+            faults,
+            ctx.scratch_base,
+        ) {
+            return true;
+        }
         let reg = &*ctx.reg;
         let dll_pes = ctx.dll_pes();
         let mut done = 0usize;
@@ -1232,6 +1244,16 @@ impl ExecNtHandler {
     /// PE). No-op if there is no loop context. Used for services (pi 3) NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
         if let Some(ctx) = self.loop_ctx {
+            if va & 0xFFF <= 0xFF8 {
+                let alias = csrss_frame_alias_get(self.pi as u64, va & !0xFFF);
+                if alias != 0 {
+                    core::ptr::write_volatile(
+                        (alias + (va & 0xFFF)) as *mut u64,
+                        val,
+                    );
+                    return true;
+                }
+            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
@@ -1254,6 +1276,16 @@ impl ExecNtHandler {
     /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
     pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
         if let Some(ctx) = self.loop_ctx {
+            if va & 0xFFF <= 0xFFC {
+                let alias = csrss_frame_alias_get(self.pi as u64, va & !0xFFF);
+                if alias != 0 {
+                    core::ptr::write_volatile(
+                        (alias + (va & 0xFFF)) as *mut u32,
+                        val,
+                    );
+                    return true;
+                }
+            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
@@ -1327,6 +1359,7 @@ impl ExecNtHandler {
 
         unsafe fn scratch_pages_available(
             ctx: ExecLoopCtx,
+            pi: u64,
             va: u64,
             len: usize,
             may_fill: bool,
@@ -1337,7 +1370,10 @@ impl ExecNtHandler {
             let mut page = va & !0xFFF;
             let last = (va + len as u64 - 1) & !0xFFF;
             loop {
-                if unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }.is_none() {
+                let has_alias = unsafe { csrss_frame_alias_get(pi, page) } != 0;
+                if !has_alias
+                    && unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }.is_none()
+                {
                     if !may_fill {
                         return false;
                     }
@@ -1348,7 +1384,10 @@ impl ExecNtHandler {
                 }
                 page += 0x1000;
             }
-            faults + missing <= filled_pages.len()
+            missing == 0
+                || faults
+                    .checked_add(missing)
+                    .is_some_and(|needed| needed <= filled_pages.len())
         }
 
         if va >= PE_LOAD_BASE && end <= ctx.img_end {
@@ -1356,13 +1395,13 @@ impl ExecNtHandler {
         }
         if !ctx.ntdll_pe.is_null() && va >= ctx.nt_base && end <= ctx.nt_end {
             return writable_image_range(&*ctx.ntdll_pe, ctx.nt_base, va, len)
-                && scratch_pages_available(ctx, va, len, false);
+                && scratch_pages_available(ctx, self.pi as u64, va, len, false);
         }
         let reg = &*ctx.reg;
         if let Some((index, _)) = reg.dll_for_page(va) {
             if let Some(pe) = ctx.dll_pes()[index].as_ref() {
                 return writable_image_range(pe, reg.base(index), va, len)
-                    && scratch_pages_available(ctx, va, len, true);
+                    && scratch_pages_available(ctx, self.pi as u64, va, len, true);
             }
         }
         false
@@ -7176,50 +7215,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0xC0000002
                 }
             },
-            // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId[RDX]=args[1]). Write en-US (0x409) to
-            // the output, which ntdll points at one of its own .data GLOBALS (not the stack) — so copy
-            // out through the target image page's persistent executive scratch mapping, demand-filling
-            // the page first if LdrpInitialize hasn't touched it yet.
+            // NtQueryDefaultLocale(UserProfile, *DefaultLocaleId[RDX]=args[1]). The caller may pass a
+            // stack local (winsrv's hard-error cache) or an image/DLL global (ntdll loader state), so
+            // use the common cross-address-space DWORD copyout and report a bad pointer truthfully.
             NativeService::NtQueryDefaultLocale => unsafe {
-                let ctx = self.loop_ctx.unwrap();
                 let out = args[1]; // RDX = *DefaultLocaleId
-                let pg = out & !0xFFFu64;
-                let filled_pages = &mut *ctx.filled_pages;
-                let faults = &mut *ctx.faults;
-                let mut idx = usize::MAX;
-                for i in 0..(*faults as usize).min(filled_pages.len()) {
-                    if filled_pages[i] == pg {
-                        idx = i;
-                        break;
-                    }
+                if out == 0 || out & 3 != 0 {
+                    return if out == 0 { 0xC000_0005 } else { 0x8000_0002 };
                 }
-                if idx == usize::MAX && (*faults as usize) < filled_pages.len() {
-                    let (base, tpe): (u64, *const nt_pe_loader::PeFile<'static>) =
-                        if pg >= PE_LOAD_BASE && pg < ctx.img_end {
-                            (PE_LOAD_BASE, ctx.pe)
-                        } else if ctx.nt_base != 0 && pg >= ctx.nt_base && pg < ctx.nt_end {
-                            (ctx.nt_base, ctx.ntdll_pe)
-                        } else {
-                            (0u64, ctx.pe)
-                        };
-                    if base != 0 {
-                        let scratch = ctx.scratch_base + *faults * 0x1000;
-                        let f = alloc_frame();
-                        let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                        let rights = fill_image_page(&*tpe, (pg - base) as u32, scratch);
-                        let _ = page_map(copy_cap(f), pg, rights, ctx.pml4);
-                        filled_pages[*faults as usize] = pg;
-                        idx = *faults as usize;
-                        *faults += 1;
-                    }
-                }
-                if idx != usize::MAX {
-                    core::ptr::write_volatile(
-                        (ctx.scratch_base + idx as u64 * 0x1000 + (out & 0xFFF)) as *mut u32,
-                        0x409,
-                    );
-                }
-                0
+                if self.xas_write_u32(out, 0x409) { 0 } else { 0xC000_0005 }
             },
             // NtCreateSection(*SectionHandle[R10], access[RDX], *OA[R8], *MaxSize[R9],
             // PageProtection[sp+0x28], AllocationAttributes[sp+0x30], FileHandle[sp+0x38]).
