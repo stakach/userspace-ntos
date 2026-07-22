@@ -103,6 +103,22 @@ impl Resource {
     /// `RtlAcquireResourceShared(Resource, Wait)` for `current_thread`. Faithful to
     /// `resource.c:RtlAcquireResourceShared` (single evaluation).
     pub fn acquire_shared(&mut self, current_thread: u64, wait: bool) -> Acquire {
+        self.acquire_shared_inner(current_thread, wait, false)
+    }
+
+    /// Re-evaluate a shared acquisition after the shared semaphore wait returned successfully. The
+    /// releasing thread already added this reader to `number_active`, so the non-writer path must not
+    /// increment it a second time.
+    pub fn acquire_shared_after_wait(&mut self, current_thread: u64) -> Acquire {
+        self.acquire_shared_inner(current_thread, true, true)
+    }
+
+    fn acquire_shared_inner(
+        &mut self,
+        current_thread: u64,
+        wait: bool,
+        precharged: bool,
+    ) -> Acquire {
         if self.number_active < 0 {
             // An exclusive holder is active.
             if self.owning_thread == current_thread {
@@ -118,7 +134,9 @@ impl Resource {
             }
         } else {
             // Free or shared → add a reader.
-            self.number_active += 1;
+            if !precharged {
+                self.number_active += 1;
+            }
             Acquire::Granted
         }
     }
@@ -300,6 +318,9 @@ mod tests {
         // No writer queued → releasing wakes ALL queued readers and installs the reader count.
         assert_eq!(r.release(), Some(SemaphoreRelease::Shared(2)));
         assert_eq!(r.shared_waiters, 0);
+        assert_eq!(r.number_active, 2);
+        assert_eq!(r.acquire_shared_after_wait(T2), Acquire::Granted);
+        assert_eq!(r.acquire_shared_after_wait(0x3333), Acquire::Granted);
         assert_eq!(r.number_active, 2);
     }
 

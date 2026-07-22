@@ -12647,6 +12647,35 @@ unsafe fn resource_close_handle(handle: u64) {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn resource_wait_for_semaphore(handle: u64) -> NtStatus {
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(u64, u8, *const i64) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(handle, 0, core::ptr::null())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn resource_release_semaphore(handle: u64, count: u32) {
+    let _ = unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(u64, i32, *mut i32) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_release_semaphore)(
+            handle,
+            count as i32,
+            core::ptr::null_mut(),
+        )
+    };
+}
+
+#[inline]
+fn nt_success(status: NtStatus) -> bool {
+    status as i32 >= 0
+}
+
 /// The current thread id (`NtCurrentTeb()->ClientId.UniqueThread`, TEB @0x48). On the host this is
 /// a fixed sentinel — the model only compares it for owner-recursion, and host tests exercise that
 /// directly against the pure core.
@@ -12778,8 +12807,7 @@ pub unsafe extern "system" fn rtl_delete_resource(resource: *mut c_void) {
 }
 
 /// `RtlAcquireResourceShared(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN`. Ref
-/// `resource.c:RtlAcquireResourceShared`. Single-threaded: an uncontended shared acquire is always
-/// granted; the writer-held / no-wait case returns FALSE without blocking.
+/// `resource.c:RtlAcquireResourceShared`.
 ///
 /// # Safety
 /// `resource` from `RtlInitializeResource`.
@@ -12788,16 +12816,38 @@ pub unsafe extern "system" fn rtl_acquire_resource_shared(resource: *mut c_void,
     if resource.is_null() {
         return 0;
     }
-    // SAFETY: resource valid per the contract.
-    unsafe {
-        let tid = resource_current_thread();
-        let mut r = resource_load(resource);
-        let granted = matches!(
-            r.acquire_shared(tid, wait != 0),
-            nt_ntdll::rtl::resource::Acquire::Granted
-        );
-        resource_store(resource, &r);
-        u8::from(granted)
+    let tid = unsafe { resource_current_thread() };
+    let mut resumed = false;
+    loop {
+        let _ = unsafe { rtl_enter_critical_section(resource) };
+        let mut state = unsafe { resource_load(resource) };
+        let outcome = if resumed {
+            state.acquire_shared_after_wait(tid)
+        } else {
+            state.acquire_shared(tid, wait != 0)
+        };
+        unsafe { resource_store(resource, &state) };
+        match outcome {
+            nt_ntdll::rtl::resource::Acquire::Granted => {
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                return 1;
+            }
+            nt_ntdll::rtl::resource::Acquire::Failed => {
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                return 0;
+            }
+            nt_ntdll::rtl::resource::Acquire::Blocked => {
+                let semaphore = unsafe {
+                    *(resource.byte_add(RES_SHARED_SEMAPHORE) as *const u64)
+                };
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                #[cfg(target_arch = "x86_64")]
+                if !nt_success(unsafe { resource_wait_for_semaphore(semaphore) }) {
+                    return 0;
+                }
+                resumed = true;
+            }
+        }
     }
 }
 
@@ -12814,16 +12864,32 @@ pub unsafe extern "system" fn rtl_acquire_resource_exclusive(
     if resource.is_null() {
         return 0;
     }
-    // SAFETY: resource valid per the contract.
-    unsafe {
-        let tid = resource_current_thread();
-        let mut r = resource_load(resource);
-        let granted = matches!(
-            r.acquire_exclusive(tid, wait != 0),
-            nt_ntdll::rtl::resource::Acquire::Granted
-        );
-        resource_store(resource, &r);
-        u8::from(granted)
+    let tid = unsafe { resource_current_thread() };
+    loop {
+        let _ = unsafe { rtl_enter_critical_section(resource) };
+        let mut state = unsafe { resource_load(resource) };
+        let outcome = state.acquire_exclusive(tid, wait != 0);
+        unsafe { resource_store(resource, &state) };
+        match outcome {
+            nt_ntdll::rtl::resource::Acquire::Granted => {
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                return 1;
+            }
+            nt_ntdll::rtl::resource::Acquire::Failed => {
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                return 0;
+            }
+            nt_ntdll::rtl::resource::Acquire::Blocked => {
+                let semaphore = unsafe {
+                    *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *const u64)
+                };
+                let _ = unsafe { rtl_leave_critical_section(resource) };
+                #[cfg(target_arch = "x86_64")]
+                if !nt_success(unsafe { resource_wait_for_semaphore(semaphore) }) {
+                    return 0;
+                }
+            }
+        }
     }
 }
 
@@ -12837,20 +12903,28 @@ pub unsafe extern "system" fn rtl_release_resource(resource: *mut c_void) {
     if resource.is_null() {
         return;
     }
-    // SAFETY: resource valid per the contract.
-    unsafe {
-        let mut r = resource_load(resource);
-        // The single-threaded runtime never has a real queued waiter to wake; the counter update is
-        // the observable effect.
-        let _wake = r.release();
-        resource_store(resource, &r);
+    let _ = unsafe { rtl_enter_critical_section(resource) };
+    let mut state = unsafe { resource_load(resource) };
+    let wake = state.release();
+    unsafe { resource_store(resource, &state) };
+    #[cfg(target_arch = "x86_64")]
+    if let Some(wake) = wake {
+        let (offset, count) = match wake {
+            nt_ntdll::rtl::resource::SemaphoreRelease::Shared(count) => {
+                (RES_SHARED_SEMAPHORE, count)
+            }
+            nt_ntdll::rtl::resource::SemaphoreRelease::Exclusive(count) => {
+                (RES_EXCLUSIVE_SEMAPHORE, count)
+            }
+        };
+        let semaphore = unsafe { *(resource.byte_add(offset) as *const u64) };
+        unsafe { resource_release_semaphore(semaphore, count) };
     }
+    let _ = unsafe { rtl_leave_critical_section(resource) };
 }
 
-/// `RtlConvertSharedToExclusive(PRTL_RESOURCE)` — upgrade the sole reader to a writer. Ref
-/// `resource.c:RtlConvertSharedToExclusive`. If it is not the sole reader the real body blocks on the
-/// exclusive semaphore; single-threaded, there is no other reader to release it, so we finalise the
-/// upgrade in place (the same end state the real re-entry tail installs).
+/// `RtlConvertSharedToExclusive(PRTL_RESOURCE)` — upgrade a reader to a writer. Ref
+/// `resource.c:RtlConvertSharedToExclusive`.
 ///
 /// # Safety
 /// `resource` from `RtlInitializeResource`, held shared by the caller.
@@ -12859,20 +12933,26 @@ pub unsafe extern "system" fn rtl_convert_shared_to_exclusive(resource: *mut c_v
     if resource.is_null() {
         return;
     }
-    // SAFETY: resource valid per the contract.
-    unsafe {
-        let tid = resource_current_thread();
-        let mut r = resource_load(resource);
-        if matches!(
-            r.convert_shared_to_exclusive(tid),
-            nt_ntdll::rtl::resource::Acquire::Blocked
-        ) {
-            // No concurrent reader can wake us on this runtime → finalise the upgrade directly.
-            r.exclusive_waiters = r.exclusive_waiters.saturating_sub(1);
-            r.finish_shared_to_exclusive(tid);
-        }
-        resource_store(resource, &r);
+    let tid = unsafe { resource_current_thread() };
+    let _ = unsafe { rtl_enter_critical_section(resource) };
+    let mut state = unsafe { resource_load(resource) };
+    let outcome = state.convert_shared_to_exclusive(tid);
+    unsafe { resource_store(resource, &state) };
+    if matches!(outcome, nt_ntdll::rtl::resource::Acquire::Granted) {
+        let _ = unsafe { rtl_leave_critical_section(resource) };
+        return;
     }
+    let semaphore = unsafe { *(resource.byte_add(RES_EXCLUSIVE_SEMAPHORE) as *const u64) };
+    let _ = unsafe { rtl_leave_critical_section(resource) };
+    #[cfg(target_arch = "x86_64")]
+    if !nt_success(unsafe { resource_wait_for_semaphore(semaphore) }) {
+        return;
+    }
+    let _ = unsafe { rtl_enter_critical_section(resource) };
+    let mut state = unsafe { resource_load(resource) };
+    state.finish_shared_to_exclusive(tid);
+    unsafe { resource_store(resource, &state) };
+    let _ = unsafe { rtl_leave_critical_section(resource) };
 }
 
 /// `RtlConvertExclusiveToShared(PRTL_RESOURCE)` — downgrade the writer to a reader, waking queued
@@ -12885,12 +12965,16 @@ pub unsafe extern "system" fn rtl_convert_exclusive_to_shared(resource: *mut c_v
     if resource.is_null() {
         return;
     }
-    // SAFETY: resource valid per the contract.
-    unsafe {
-        let mut r = resource_load(resource);
-        let _wake = r.convert_exclusive_to_shared();
-        resource_store(resource, &r);
+    let _ = unsafe { rtl_enter_critical_section(resource) };
+    let mut state = unsafe { resource_load(resource) };
+    let wake = state.convert_exclusive_to_shared();
+    unsafe { resource_store(resource, &state) };
+    #[cfg(target_arch = "x86_64")]
+    if let Some(nt_ntdll::rtl::resource::SemaphoreRelease::Shared(count)) = wake {
+        let semaphore = unsafe { *(resource.byte_add(RES_SHARED_SEMAPHORE) as *const u64) };
+        unsafe { resource_release_semaphore(semaphore, count) };
     }
+    let _ = unsafe { rtl_leave_critical_section(resource) };
 }
 
 /// `RtlDumpResource(PRTL_RESOURCE)` — a debug dump (DbgPrint the active/waiter counts). We have no
