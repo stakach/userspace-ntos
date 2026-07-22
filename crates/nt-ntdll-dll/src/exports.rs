@@ -22421,15 +22421,25 @@ pub unsafe extern "system" fn csr_verify_region(address: *const c_void, length: 
     STATUS_SUCCESS
 }
 
-/// `CsrNewThread() -> NTSTATUS` — register a new thread with the CSR client runtime (marks the TEB
-/// CSR fields). No CSR client runtime state to update yet → STATUS_SUCCESS (the observable no-op:
-/// the thread simply isn't CSR-registered, which the boot path tolerates).
+/// `CsrNewThread() -> NTSTATUS` — register the connected CSR API port as this thread's native
+/// termination port.
 ///
 /// # Safety
-/// Reads no memory.
+/// Reads the process CSR connection and issues `NtRegisterThreadTerminatePort`.
 #[export_name = "CsrNewThread"]
 pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        let port = unsafe { crate::on_target::csr_api_port() };
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_register_thread_terminate_port)(port)
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// `CsrIdentifyAlertableThread() -> NTSTATUS`.

@@ -80,6 +80,12 @@ pub unsafe fn csr_process_id() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_PROCESS_ID)) }
 }
 
+/// Return the connected CSR API port handle.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn csr_api_port() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CSR_API_PORT)) }
+}
+
 /// Return the client/server CSR port-memory delta.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn csr_port_memory_delta() -> isize {
