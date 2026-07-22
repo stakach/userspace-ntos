@@ -16,6 +16,7 @@ pub mod avl_table;
 pub mod bitmap;
 pub mod compression;
 pub mod convert;
+pub mod dos8dot3;
 pub mod encode;
 pub mod environment;
 pub mod exception;

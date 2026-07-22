@@ -315,6 +315,65 @@ fn nls_unicode_default_char() -> u16 {
     }
 }
 
+fn nls_map_extended_oem(unit: u16) -> Option<rtl::dos8dot3::OemMappedChar> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if nls_is_oem_dbcs() {
+            let unicode_to_oem = NLS_UNICODE_TO_MB_OEM_TABLE;
+            let oem_to_unicode = NLS_OEM_TO_UNICODE_TABLE;
+            let lead_info = NLS_OEM_LEAD_BYTE_INFO;
+            if unicode_to_oem.is_null() || oem_to_unicode.is_null() || lead_info.is_null() {
+                return None;
+            }
+
+            let oem = core::ptr::read_unaligned(unicode_to_oem.add(unit as usize));
+            let high = (oem >> 8) as usize;
+            let low = (oem & 0xff) as usize;
+            let round_tripped = if high != 0 {
+                let offset = core::ptr::read_unaligned(lead_info.add(high)) as usize;
+                if offset == 0 {
+                    return None;
+                }
+                core::ptr::read_unaligned(lead_info.add(offset + low))
+            } else {
+                core::ptr::read_unaligned(oem_to_unicode.add(low))
+            };
+            let upcase = nls_upcase_unit(round_tripped);
+            let final_oem = core::ptr::read_unaligned(unicode_to_oem.add(upcase as usize));
+            if final_oem == NLS_OEM_DEFAULT_CHAR as u16 {
+                return None;
+            }
+            return Some(rtl::dos8dot3::OemMappedChar {
+                unit: upcase,
+                width: if final_oem >> 8 != 0 { 2 } else { 1 },
+            });
+        }
+
+        let unicode_to_oem = NLS_UNICODE_TO_OEM_TABLE;
+        let oem_to_unicode = NLS_OEM_TO_UNICODE_TABLE;
+        if unicode_to_oem.is_null() || oem_to_unicode.is_null() {
+            return None;
+        }
+        let oem = core::ptr::read_unaligned(unicode_to_oem.add(unit as usize));
+        let round_tripped = core::ptr::read_unaligned(oem_to_unicode.add(oem as usize));
+        let upcase = nls_upcase_unit(round_tripped);
+        let final_oem = core::ptr::read_unaligned(unicode_to_oem.add(upcase as usize));
+        if final_oem == NLS_OEM_DEFAULT_CHAR {
+            None
+        } else {
+            Some(rtl::dos8dot3::OemMappedChar {
+                unit: upcase,
+                width: 1,
+            })
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = unit;
+        None
+    }
+}
+
 unsafe fn rtl_mb_to_unicode_n_dbcs(
     unicode_str: *mut u16,
     unicode_size: u32,
@@ -10961,6 +11020,42 @@ pub unsafe extern "system" fn rtl_is_name_legal_dos_8dot3(
         unsafe { *spaces_present = u8::from(s.contains(&0x20)) };
     }
     u8::from(nt_ntdll::rtl::strings::is_name_legal_dos_8dot3(s))
+}
+
+/// `RtlGenerate8dot3Name(PCUNICODE_STRING, BOOLEAN, PGENERATE_NAME_CONTEXT,
+/// PUNICODE_STRING) -> VOID` (`sdk/lib/rtl/dos8dot3.c:79`).
+///
+/// # Safety
+/// All descriptors and buffers must satisfy the native API contract. The output buffer must hold
+/// the generated candidate; native ntdll neither allocates nor checks `MaximumLength`.
+#[export_name = "RtlGenerate8dot3Name"]
+pub unsafe extern "system" fn rtl_generate_8dot3_name(
+    name: PCUnicodeString,
+    allow_extended_characters: u8,
+    context: *mut rtl::dos8dot3::GenerateNameContext,
+    name_8dot3: PUnicodeString,
+) {
+    let source = unsafe {
+        if (*name).length == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts((*name).buffer as *const u16, (*name).length as usize / 2)
+        }
+    };
+    let generated = rtl::dos8dot3::generate_8dot3_name(
+        source,
+        allow_extended_characters != 0,
+        unsafe { &mut *context },
+        nls_map_extended_oem,
+    );
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            generated.as_ptr(),
+            (*name_8dot3).buffer as *mut u16,
+            generated.len(),
+        );
+        (*name_8dot3).length = (generated.len() * 2) as u16;
+    }
 }
 
 /// `RtlGUIDFromString(PCUNICODE_STRING GuidString, GUID* Guid) -> NTSTATUS`.
@@ -22742,6 +22837,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtlp_apply_length_function as usize,
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
+        rtl_generate_8dot3_name as usize,
         rtl_guid_from_string as usize,
         rtl_string_from_guid as usize,
         rtl_image_nt_header_ex as usize,
