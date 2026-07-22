@@ -29,7 +29,7 @@ use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
-use nt_ntdll_layout::{Peb, Teb, UnicodeString};
+use nt_ntdll_layout::{ListEntry, Peb, Teb, UnicodeString};
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
@@ -133,6 +133,21 @@ static mut FAST_PEB_LOCK: LoaderCriticalSection = LoaderCriticalSection {
     owning_thread: AtomicU64::new(0),
     lock_semaphore: AtomicU64::new(0),
     spin_count: 0,
+};
+
+#[repr(C, align(8))]
+struct FlsBitmapHeader {
+    size_of_bitmap: u32,
+    _padding: u32,
+    buffer: u64,
+}
+
+const _: [(); 16] = [(); core::mem::size_of::<FlsBitmapHeader>()];
+
+static mut FLS_BITMAP_HEADER: FlsBitmapHeader = FlsBitmapHeader {
+    size_of_bitmap: 128,
+    _padding: 0,
+    buffer: 0,
 };
 
 static mut LDR_DLL_NOTIFICATION_LOCK: LoaderCriticalSection = LoaderCriticalSection {
@@ -2793,6 +2808,287 @@ pub unsafe extern "system" fn rtl_release_peb_lock() {
         if !cs.is_null() {
             let _ = rtl_leave_critical_section(cs);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct RtlFlsData {
+    list_entry: ListEntry,
+    values: rtl::fls::ValueSlots,
+}
+
+#[cfg(target_arch = "x86_64")]
+const _: [(); 0x410] = [(); core::mem::size_of::<RtlFlsData>()];
+
+#[cfg(target_arch = "x86_64")]
+struct PebLockGuard;
+
+#[cfg(target_arch = "x86_64")]
+impl PebLockGuard {
+    unsafe fn acquire() -> Self {
+        unsafe { rtl_acquire_peb_lock() };
+        Self
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for PebLockGuard {
+    fn drop(&mut self) {
+        unsafe { rtl_release_peb_lock() };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn allocate_zeroed_fls_data() -> *mut RtlFlsData {
+    let data =
+        unsafe { crate::process_heap_alloc(core::mem::size_of::<RtlFlsData>()) } as *mut RtlFlsData;
+    if !data.is_null() {
+        unsafe { core::ptr::write_bytes(data.cast::<u8>(), 0, core::mem::size_of::<RtlFlsData>()) };
+    }
+    data
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn insert_fls_data_tail(peb: &mut Peb, data: *mut RtlFlsData) {
+    let head = core::ptr::addr_of_mut!(peb.fls_list_head);
+    let tail = unsafe { (*head).blink as *mut ListEntry };
+    unsafe {
+        (*data).list_entry.flink = head as u64;
+        (*data).list_entry.blink = tail as u64;
+        (*tail).flink = core::ptr::addr_of_mut!((*data).list_entry) as u64;
+        (*head).blink = core::ptr::addr_of_mut!((*data).list_entry) as u64;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn unlink_fls_data(data: *mut RtlFlsData) {
+    let flink = unsafe { (*data).list_entry.flink as *mut ListEntry };
+    let blink = unsafe { (*data).list_entry.blink as *mut ListEntry };
+    if !flink.is_null() && !blink.is_null() {
+        unsafe {
+            (*blink).flink = flink as u64;
+            (*flink).blink = blink as u64;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn invoke_fls_callback(action: rtl::fls::CallbackAction) {
+    let callback: unsafe extern "system" fn(*mut c_void) =
+        unsafe { core::mem::transmute(action.callback as usize) };
+    unsafe { callback(action.value as *mut c_void) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn process_fls_data_callbacks(data: *mut RtlFlsData, lock_for_unlink: bool) {
+    let (callbacks, high_index) = if lock_for_unlink {
+        let _peb_lock = unsafe { PebLockGuard::acquire() };
+        let peb = unsafe { current_peb() as *const Peb };
+        unsafe { unlink_fls_data(data) };
+        unsafe { ((*peb).fls_callback, (*peb).fls_high_index.min(127)) }
+    } else {
+        let peb = unsafe { current_peb() as *const Peb };
+        unsafe { unlink_fls_data(data) };
+        unsafe { ((*peb).fls_callback, (*peb).fls_high_index.min(127)) }
+    };
+
+    for index in 1..=high_index {
+        let value = unsafe { (*data).values[index as usize] };
+        if value == 0 {
+            continue;
+        }
+        if callbacks != 0 {
+            if let Some(action) = rtl::fls::rundown_action(
+                unsafe { &*(callbacks as *const rtl::fls::CallbackSlots) },
+                unsafe { &(*data).values },
+                high_index,
+                index,
+            ) {
+                unsafe { invoke_fls_callback(action) };
+            }
+        }
+    }
+}
+
+/// `RtlFlsAlloc(PFLS_CALLBACK_FUNCTION Callback, PULONG Index) -> NTSTATUS`.
+///
+/// # Safety
+/// `index_out` is writable. `callback` is null or a valid x64 FLS callback.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlFlsAlloc"]
+pub unsafe extern "system" fn rtl_fls_alloc(
+    callback: *mut c_void,
+    index_out: *mut u32,
+) -> NtStatus {
+    if index_out.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let _peb_lock = unsafe { PebLockGuard::acquire() };
+    let peb = unsafe { &mut *(current_peb() as *mut Peb) };
+    if peb.fls_callback == 0 {
+        let callbacks =
+            unsafe { crate::process_heap_alloc(core::mem::size_of::<rtl::fls::CallbackSlots>()) }
+                as *mut rtl::fls::CallbackSlots;
+        if callbacks.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        unsafe {
+            core::ptr::write_bytes(
+                callbacks.cast::<u8>(),
+                0,
+                core::mem::size_of::<rtl::fls::CallbackSlots>(),
+            )
+        };
+        peb.fls_callback = callbacks as u64;
+    }
+
+    let reservation = match rtl::fls::reserve(&mut peb.fls_bitmap_bits) {
+        Ok(reservation) => reservation,
+        Err(rtl::fls::FlsError::NoSlots) => return STATUS_NO_MEMORY,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+    let teb = unsafe { &mut *(current_teb() as *mut Teb) };
+    let data = if teb.fls_data == 0 {
+        let data = unsafe { allocate_zeroed_fls_data() };
+        if data.is_null() {
+            rtl::fls::rollback_reservation(&mut peb.fls_bitmap_bits, reservation);
+            return STATUS_NO_MEMORY;
+        }
+        teb.fls_data = data as u64;
+        unsafe { insert_fls_data_tail(peb, data) };
+        data
+    } else {
+        teb.fls_data as *mut RtlFlsData
+    };
+    let allocated_index = reservation.index();
+    rtl::fls::commit_reservation(
+        reservation,
+        unsafe { &mut *(peb.fls_callback as *mut rtl::fls::CallbackSlots) },
+        unsafe { &mut (*data).values },
+        callback as u64,
+        &mut peb.fls_high_index,
+    );
+    unsafe { core::ptr::write_unaligned(index_out, allocated_index) };
+    STATUS_SUCCESS
+}
+
+/// `RtlFlsFree(ULONG Index) -> NTSTATUS`.
+///
+/// # Safety
+/// Registered callbacks and every FLS list entry must remain valid under the process PEB lock.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlFlsFree"]
+pub unsafe extern "system" fn rtl_fls_free(index: u32) -> NtStatus {
+    let _peb_lock = unsafe { PebLockGuard::acquire() };
+    let peb = unsafe { current_peb() as *mut Peb };
+    let callback_address = unsafe { (*peb).fls_callback };
+    if callback_address == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let plan = match rtl::fls::begin_free(
+        unsafe { &mut (*peb).fls_bitmap_bits },
+        unsafe { &*(callback_address as *const rtl::fls::CallbackSlots) },
+        index,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => return STATUS_INVALID_PARAMETER,
+    };
+
+    let head = unsafe { core::ptr::addr_of_mut!((*peb).fls_list_head) as u64 };
+    let mut entry = unsafe { (*peb).fls_list_head.flink };
+    while entry != 0 && entry != head {
+        let data = entry as *mut RtlFlsData;
+        if let Some(action) = rtl::fls::callback_action(&plan, unsafe { &(*data).values }) {
+            unsafe { invoke_fls_callback(action) };
+        }
+        let _ = rtl::fls::clear_value(unsafe { &mut (*data).values }, index);
+        entry = unsafe { (*data).list_entry.flink };
+    }
+    rtl::fls::finish_free(
+        unsafe { &mut *(callback_address as *mut rtl::fls::CallbackSlots) },
+        plan,
+    );
+    STATUS_SUCCESS
+}
+
+/// `RtlFlsGetValue(ULONG Index, PVOID *Value) -> NTSTATUS`.
+///
+/// # Safety
+/// `value_out` is writable.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlFlsGetValue"]
+pub unsafe extern "system" fn rtl_fls_get_value(
+    index: u32,
+    value_out: *mut *mut c_void,
+) -> NtStatus {
+    if value_out.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let teb = unsafe { &*(current_teb() as *const Teb) };
+    let values = if teb.fls_data == 0 {
+        None
+    } else {
+        Some(unsafe { &(*(teb.fls_data as *const RtlFlsData)).values })
+    };
+    match rtl::fls::get_value(values, index) {
+        Ok(value) => {
+            unsafe { core::ptr::write_unaligned(value_out, value as *mut c_void) };
+            STATUS_SUCCESS
+        }
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `RtlFlsSetValue(ULONG Index, PVOID Value) -> NTSTATUS`.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlFlsSetValue"]
+pub unsafe extern "system" fn rtl_fls_set_value(index: u32, value: *mut c_void) -> NtStatus {
+    if index < rtl::fls::FIRST_USER_SLOT || index >= rtl::fls::SLOT_COUNT as u32 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let teb = unsafe { current_teb() as *mut Teb };
+    if unsafe { (*teb).fls_data } == 0 {
+        let data = unsafe { allocate_zeroed_fls_data() };
+        if data.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        {
+            let _peb_lock = unsafe { PebLockGuard::acquire() };
+            let peb = unsafe { &mut *(current_peb() as *mut Peb) };
+            unsafe { insert_fls_data_tail(peb, data) };
+            unsafe { (*teb).fls_data = data as u64 };
+        }
+    }
+    match rtl::fls::set_value(
+        unsafe { &mut (*((*teb).fls_data as *mut RtlFlsData)).values },
+        index,
+        value as u64,
+    ) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// `RtlProcessFlsData(PVOID Data, ULONG Flags)`.
+///
+/// Bit zero unlinks the block and runs callbacks; bit one frees it. Other bits are ignored.
+///
+/// # Safety
+/// `data` is null or a live `RTL_FLS_DATA` allocated by this ntdll.
+#[cfg(target_arch = "x86_64")]
+#[export_name = "RtlProcessFlsData"]
+pub unsafe extern "system" fn rtl_process_fls_data(data: *mut c_void, flags: u32) {
+    let data = data as *mut RtlFlsData;
+    if data.is_null() {
+        return;
+    }
+    if flags & 1 != 0 {
+        unsafe { process_fls_data_callbacks(data, false) };
+    }
+    if flags & 2 != 0 {
+        unsafe { crate::process_heap_free(data.cast::<u8>()) };
     }
 }
 
@@ -8614,6 +8910,10 @@ fn fast_peb_lock_ptr() -> *mut c_void {
     core::ptr::addr_of_mut!(FAST_PEB_LOCK).cast()
 }
 
+fn fls_bitmap_header_ptr() -> *mut FlsBitmapHeader {
+    core::ptr::addr_of_mut!(FLS_BITMAP_HEADER)
+}
+
 /// Publish process-wide loader/PEB locks before import processing and DLL attach.
 ///
 /// # Safety
@@ -8624,6 +8924,12 @@ pub(crate) unsafe fn ldr_publish_process_locks(peb: u64) {
         unsafe {
             core::ptr::write_unaligned((peb + 0x38) as *mut u64, fast_peb_lock_ptr() as u64);
             core::ptr::write_unaligned((peb + 0x110) as *mut u64, loader_lock_ptr() as u64);
+            let fls_list_head = peb + 0x328;
+            core::ptr::write_unaligned((fls_list_head) as *mut u64, fls_list_head);
+            core::ptr::write_unaligned((fls_list_head + 8) as *mut u64, fls_list_head);
+            core::ptr::write_unaligned((peb + 0x340) as *mut [u32; 4], [1, 0, 0, 0]);
+            (*fls_bitmap_header_ptr()).buffer = peb + 0x340;
+            core::ptr::write_unaligned((peb + 0x338) as *mut u64, fls_bitmap_header_ptr() as u64);
         }
     }
 }
@@ -9211,20 +9517,29 @@ pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
             crate::on_target::free_current_thread_static_tls();
         }
 
-        let teb = &mut *(teb_address as *mut Teb);
-        let expansion_slots = teb.tls_expansion_slots as *mut u8;
-        teb.tls_expansion_slots = 0;
+        let expansion_slots = {
+            let teb = &mut *(teb_address as *mut Teb);
+            let expansion_slots = teb.tls_expansion_slots as *mut u8;
+            teb.tls_expansion_slots = 0;
+            expansion_slots
+        };
         if !expansion_slots.is_null() {
             crate::process_heap_free(expansion_slots);
         }
-        shutdown_thread_fls(teb);
-        if teb.has_fiber_data != 0 {
-            let fiber = teb.nt_tib.fiber_data as *mut u8;
-            teb.nt_tib.fiber_data = 0;
-            teb.has_fiber_data = 0;
-            if !fiber.is_null() {
-                crate::process_heap_free(fiber);
+        shutdown_thread_fls(teb_address);
+        let fiber = {
+            let teb = &mut *(teb_address as *mut Teb);
+            if teb.has_fiber_data == 0 {
+                core::ptr::null_mut()
+            } else {
+                let fiber = teb.nt_tib.fiber_data as *mut u8;
+                teb.nt_tib.fiber_data = 0;
+                teb.has_fiber_data = 0;
+                fiber
             }
+        };
+        if !fiber.is_null() {
+            crate::process_heap_free(fiber);
         }
         rtl_free_thread_activation_context_stack();
     }
@@ -9232,38 +9547,14 @@ pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn shutdown_thread_fls(teb: &mut Teb) {
-    let data = teb.fls_data;
+unsafe fn shutdown_thread_fls(teb_address: u64) {
+    let data = unsafe { (*(teb_address as *const Teb)).fls_data };
     if data == 0 {
         return;
     }
-
-    rtl_acquire_peb_lock();
-    let peb = &mut *(teb.process_environment_block as *mut Peb);
-    let high_index = peb.fls_high_index.min(127) as usize;
-    let callbacks = peb.fls_callback;
-    let flink = core::ptr::read_unaligned(data as *const u64);
-    let blink = core::ptr::read_unaligned((data + 8) as *const u64);
-    if flink != 0 && blink != 0 {
-        core::ptr::write_unaligned(blink as *mut u64, flink);
-        core::ptr::write_unaligned((flink + 8) as *mut u64, blink);
-    }
-    rtl_release_peb_lock();
-
-    if callbacks != 0 {
-        for index in 1..=high_index {
-            let value = core::ptr::read_unaligned((data + 0x10 + index as u64 * 8) as *const u64);
-            let callback =
-                core::ptr::read_unaligned((callbacks + index as u64 * 8) as *const u64);
-            if value != 0 && callback != 0 {
-                let callback: unsafe extern "system" fn(*mut c_void) =
-                    core::mem::transmute(callback as usize);
-                callback(value as *mut c_void);
-            }
-        }
-    }
-    teb.fls_data = 0;
-    crate::process_heap_free(data as *mut u8);
+    unsafe { process_fls_data_callbacks(data as *mut RtlFlsData, true) };
+    unsafe { crate::process_heap_free(data as *mut u8) };
+    unsafe { (*(teb_address as *mut Teb)).fls_data = 0 };
 }
 
 /// `LdrSetDllManifestProber(PVOID Prober)` — install or clear the process manifest-probe callback.
@@ -25814,6 +26105,11 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_acquire_peb_lock as usize,
         rtl_try_acquire_peb_lock as usize,
         rtl_release_peb_lock as usize,
+        rtl_fls_alloc as usize,
+        rtl_fls_free as usize,
+        rtl_fls_get_value as usize,
+        rtl_fls_set_value as usize,
+        rtl_process_fls_data as usize,
         rtl_get_current_peb as usize,
         nt_current_teb as usize,
         rtl_dll_shutdown_in_progress as usize,
