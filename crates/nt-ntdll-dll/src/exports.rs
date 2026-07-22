@@ -2630,6 +2630,38 @@ pub unsafe extern "system" fn rtl_get_ace(
     STATUS_SUCCESS
 }
 
+/// `RtlFindAceByType(PACL Acl, UCHAR AceType, PULONG Index) -> PVOID`.
+///
+/// Walk the ACL through the same validated ACE indexing path as `RtlGetAce` and return the first ACE
+/// whose header type matches. `Index` is written only when a match is found.
+///
+/// # Safety
+/// `acl` is a valid ACL; `index` is writable when non-null.
+#[export_name = "RtlFindAceByType"]
+pub unsafe extern "system" fn rtl_find_ace_by_type(
+    acl: *mut c_void,
+    ace_type: u8,
+    index: *mut u32,
+) -> *mut c_void {
+    if acl.is_null() {
+        return core::ptr::null_mut();
+    }
+    let ace_count = unsafe { core::ptr::read_unaligned((acl as *const u8).add(4) as *const u16) };
+    for ace_index in 0..ace_count as u32 {
+        let mut ace = core::ptr::null_mut();
+        if unsafe { rtl_get_ace(acl, ace_index, &mut ace) } != STATUS_SUCCESS {
+            return core::ptr::null_mut();
+        }
+        if unsafe { core::ptr::read_unaligned(ace as *const u8) } == ace_type {
+            if !index.is_null() {
+                unsafe { core::ptr::write_unaligned(index, ace_index) };
+            }
+            return ace;
+        }
+    }
+    core::ptr::null_mut()
+}
+
 /// `RtlAddAccessAllowedAce(PACL, ULONG AceRevision, ACCESS_MASK, PSID) -> NTSTATUS`. Step 4.C: real.
 /// Appends an `ACCESS_ALLOWED_ACE { AceType=0, AceFlags=0, AceSize, Mask, Sid }` after the ACL's
 /// existing ACEs, bumping `AceCount`. Validates the ACE fits within `AclSize` (STATUS_ALLOTTED_SPACE_
@@ -14286,6 +14318,28 @@ unsafe fn rtl_handle_integer_atom_name(atom_name: *const u16, atom: *mut u16) ->
     Some(STATUS_SUCCESS)
 }
 
+/// `RtlGetIntegerAtom(PCWSTR AtomName, PUSHORT IntegerAtom) -> BOOLEAN`.
+///
+/// Recognize MAKEINTATOM pointer values and `#<decimal>` strings through the shared, host-tested
+/// atom parser. Ordinary string atom names return FALSE.
+///
+/// # Safety
+/// `atom_name` follows the MAKEINTATOM-or-NUL-terminated-string contract; `integer_atom` is writable
+/// when non-null.
+#[export_name = "RtlGetIntegerAtom"]
+pub unsafe extern "system" fn rtl_get_integer_atom(
+    atom_name: *const u16,
+    integer_atom: *mut u16,
+) -> u8 {
+    let Some(atom) = (unsafe { nt_ntdll::rtl::atom::check_integer_atom(atom_name) }) else {
+        return 0;
+    };
+    if !integer_atom.is_null() {
+        unsafe { core::ptr::write_unaligned(integer_atom, atom) };
+    }
+    1
+}
+
 /// `RtlCreateAtomTable(ULONG NumberOfBuckets, PVOID* AtomTable) -> NTSTATUS`.
 ///
 /// # Safety
@@ -21674,6 +21728,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_dacl_security_descriptor as usize,
         rtl_create_acl as usize,
         rtl_get_ace as usize,
+        rtl_find_ace_by_type as usize,
         rtl_add_access_allowed_ace as usize,
         rtl_allocate_and_initialize_sid as usize,
         rtl_adjust_privilege as usize,
@@ -22353,6 +22408,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_find_most_significant_bit as usize,
         rtl_find_least_significant_bit as usize,
         rtl_create_atom_table as usize,
+        rtl_get_integer_atom as usize,
         rtl_add_atom_to_atom_table as usize,
         rtl_lookup_atom_in_atom_table as usize,
         rtl_delete_atom_from_atom_table as usize,
