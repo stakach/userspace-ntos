@@ -13313,6 +13313,16 @@ pub unsafe extern "system" fn rtl_deregister_wait_ex(
     STATUS_SUCCESS
 }
 
+/// `RtlDeregisterWait(HANDLE WaitHandle) -> NTSTATUS` — synchronous compatibility entry point over
+/// `RtlDeregisterWaitEx` with no completion event (`sdk/lib/rtl/wait.c:270`).
+///
+/// # Safety
+/// `wait_handle` is a record returned by `RtlRegisterWait`.
+#[export_name = "RtlDeregisterWait"]
+pub unsafe extern "system" fn rtl_deregister_wait(wait_handle: *mut c_void) -> NtStatus {
+    unsafe { rtl_deregister_wait_ex(wait_handle, core::ptr::null_mut()) }
+}
+
 /// `RtlSetIoCompletionCallback(HANDLE FileHandle, PIO_APC_ROUTINE Callback, ULONG Flags) -> NTSTATUS`
 /// — bind an I/O completion callback (thread-pool). No plane → STATUS_SUCCESS no-op.
 ///
@@ -23086,6 +23096,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_delete_timer_queue as usize,
         rtl_queue_work_item as usize,
         rtl_register_wait as usize,
+        rtl_deregister_wait as usize,
         rtl_deregister_wait_ex as usize,
         rtl_set_io_completion_callback as usize,
         rtl_set_thread_pool_start_func as usize,
