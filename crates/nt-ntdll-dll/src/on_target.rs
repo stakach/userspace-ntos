@@ -2690,22 +2690,40 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
 /// `base` is a mapped module recorded in `PEB->Ldr`; the loader lock is held by the caller.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
-    match unsafe { crate::exports::ldr_reference_module(base, pin) } {
-        Ok(true) => {}
-        Ok(false) => return 0,
-        Err(status) => return status,
-    }
     let mut visited = [0u64; MODULE_TABLE_CAP];
     let mut visited_count = 0usize;
-    unsafe {
-        reference_module_dfs(
+    let status = unsafe {
+        collect_reference_modules_dfs(
             core::ptr::addr_of!(MODULE_TABLE),
             base,
-            pin,
             &mut visited,
             &mut visited_count,
         )
+    };
+    if status != 0 {
+        return status;
     }
+
+    // Plan the full graph before publishing any count. A missing late loader entry therefore
+    // leaves every earlier module unchanged, and an already-pinned root still propagates a pin to
+    // non-pinned dependencies.
+    let mut count_ptrs = [0u64; MODULE_TABLE_CAP];
+    let mut next_counts = [0u16; MODULE_TABLE_CAP];
+    for (index, &module) in visited[..visited_count].iter().enumerate() {
+        match unsafe { crate::exports::ldr_plan_module_reference(module, pin) } {
+            Ok((count_ptr, next)) => {
+                count_ptrs[index] = count_ptr as u64;
+                next_counts[index] = next;
+            }
+            Err(status) => return status,
+        }
+    }
+    for index in 0..visited_count {
+        unsafe {
+            core::ptr::write_unaligned(count_ptrs[index] as *mut u16, next_counts[index]);
+        }
+    }
+    0
 }
 
 /// Release one loader reference from `base` and each loaded import edge it owns. The transaction is
@@ -2827,10 +2845,9 @@ unsafe fn collect_reference_releases(
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn reference_module_dfs(
+unsafe fn collect_reference_modules_dfs(
     table: *const ModuleTable,
     base: u64,
-    pin: bool,
     visited: &mut [u64; MODULE_TABLE_CAP],
     visited_count: &mut usize,
 ) -> u32 {
@@ -2859,11 +2876,8 @@ unsafe fn reference_module_dfs(
         let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
         let dependency = unsafe { (&*table).find(&name[..length]) };
         if dependency >= 0x1_0000 {
-            if let Err(status) = unsafe { crate::exports::ldr_reference_module(dependency, pin) } {
-                return status;
-            }
             let status = unsafe {
-                reference_module_dfs(table, dependency, pin, visited, visited_count)
+                collect_reference_modules_dfs(table, dependency, visited, visited_count)
             };
             if status != 0 {
                 return status;

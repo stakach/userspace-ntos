@@ -2,6 +2,37 @@
 
 pub const LOAD_COUNT_PINNED: u16 = u16::MAX;
 
+pub const GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT: u32 = 0x0000_0001;
+pub const GET_DLL_HANDLE_EX_PIN: u32 = 0x0000_0002;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GetDllHandleAction {
+    Unchanged,
+    AddReference,
+    Pin,
+}
+
+/// Validate `LdrGetDllHandleEx` flags and select the module-lifetime transition. Pinning is the
+/// only form that permits a null output handle; pin and unchanged-refcount are contradictory.
+pub fn get_dll_handle_action(
+    flags: u32,
+    output_handle_present: bool,
+) -> Option<GetDllHandleAction> {
+    if flags & !(GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT | GET_DLL_HANDLE_EX_PIN) != 0
+        || flags == GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT | GET_DLL_HANDLE_EX_PIN
+        || (!output_handle_present && flags & GET_DLL_HANDLE_EX_PIN == 0)
+    {
+        return None;
+    }
+    Some(if flags & GET_DLL_HANDLE_EX_PIN != 0 {
+        GetDllHandleAction::Pin
+    } else if flags & GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT != 0 {
+        GetDllHandleAction::Unchanged
+    } else {
+        GetDllHandleAction::AddReference
+    })
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceReleasePlan {
     Pinned,
@@ -133,6 +164,12 @@ pub fn add_reference(load_count: u16, pin: bool) -> u16 {
     }
 }
 
+/// Plan an add-reference update without mutating loader state. Keeping this pure lets the target
+/// loader validate an entire import graph before publishing any count changes.
+pub fn plan_reference_add(load_count: u16, pin: bool) -> u16 {
+    add_reference(load_count, pin)
+}
+
 /// Thread callouts may only be disabled for a module without an allocated TLS slot.
 pub fn can_disable_thread_callouts(tls_index: u16) -> bool {
     tls_index == 0
@@ -157,6 +194,55 @@ mod tests {
     fn pin_is_permanent() {
         assert_eq!(add_reference(1, true), LOAD_COUNT_PINNED);
         assert_eq!(add_reference(LOAD_COUNT_PINNED, true), LOAD_COUNT_PINNED);
+    }
+
+    #[test]
+    fn reference_add_plans_are_side_effect_free_and_saturate_at_pinned() {
+        assert_eq!(plan_reference_add(1, false), 2);
+        assert_eq!(plan_reference_add(0xfffe, false), LOAD_COUNT_PINNED);
+        assert_eq!(
+            plan_reference_add(LOAD_COUNT_PINNED, false),
+            LOAD_COUNT_PINNED
+        );
+        assert_eq!(plan_reference_add(1, true), LOAD_COUNT_PINNED);
+    }
+
+    #[test]
+    fn get_dll_handle_ex_selects_reference_behavior() {
+        assert_eq!(
+            get_dll_handle_action(0, true),
+            Some(GetDllHandleAction::AddReference)
+        );
+        assert_eq!(
+            get_dll_handle_action(GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT, true),
+            Some(GetDllHandleAction::Unchanged)
+        );
+        assert_eq!(
+            get_dll_handle_action(GET_DLL_HANDLE_EX_PIN, true),
+            Some(GetDllHandleAction::Pin)
+        );
+        assert_eq!(
+            get_dll_handle_action(GET_DLL_HANDLE_EX_PIN, false),
+            Some(GetDllHandleAction::Pin)
+        );
+    }
+
+    #[test]
+    fn get_dll_handle_ex_rejects_invalid_flags_and_missing_output() {
+        assert_eq!(get_dll_handle_action(0, false), None);
+        assert_eq!(
+            get_dll_handle_action(GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT, false),
+            None
+        );
+        assert_eq!(
+            get_dll_handle_action(
+                GET_DLL_HANDLE_EX_UNCHANGED_REFCOUNT | GET_DLL_HANDLE_EX_PIN,
+                true
+            ),
+            None
+        );
+        assert_eq!(get_dll_handle_action(4, true), None);
+        assert_eq!(get_dll_handle_action(u32::MAX, true), None);
     }
 
     #[test]

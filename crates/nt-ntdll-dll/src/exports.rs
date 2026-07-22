@@ -6772,20 +6772,22 @@ pub(crate) unsafe fn ldr_send_dll_notifications_for_base(base: u64, reason: u32)
     }
 }
 
-/// Increment or pin the canonical loader entry load count for `base`.
+/// Plan an increment or pin of the canonical loader entry load count for `base`.
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn ldr_reference_module(base: u64, pin: bool) -> Result<bool, NtStatus> {
+pub(crate) unsafe fn ldr_plan_module_reference(
+    base: u64,
+    pin: bool,
+) -> Result<(*mut u16, u16), NtStatus> {
     let entry = unsafe { find_ldr_entry_for_base(base) };
     if entry == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let load_count = unsafe { core::ptr::read_unaligned((entry + LDR_LOAD_COUNT) as *const u16) };
-    if load_count == nt_ntdll::loader::lifecycle::LOAD_COUNT_PINNED {
-        return Ok(false);
-    }
-    let updated = nt_ntdll::loader::lifecycle::add_reference(load_count, pin);
-    unsafe { core::ptr::write_unaligned((entry + LDR_LOAD_COUNT) as *mut u16, updated) };
-    Ok(true)
+    let load_count_ptr = (entry + LDR_LOAD_COUNT) as *mut u16;
+    let load_count = unsafe { core::ptr::read_unaligned(load_count_ptr) };
+    Ok((
+        load_count_ptr,
+        nt_ntdll::loader::lifecycle::plan_reference_add(load_count, pin),
+    ))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -8903,30 +8905,62 @@ pub unsafe extern "system" fn ldr_get_file_name_from_load_as_data_table(
 }
 
 /// `LdrGetDllHandleEx(ULONG Flags, PCWSTR DllPath, PULONG DllCharacteristics, PUNICODE_STRING
-/// DllName, PVOID* DllHandle) -> NTSTATUS` — find a loaded module by name. Delegate to the on-target
-/// module table (via `LdrGetDllHandle`), ignoring the path/characteristics refinements.
+/// DllName, PVOID* DllHandle) -> NTSTATUS` — find a loaded module by name, optionally retaining or
+/// permanently pinning it and its loaded import graph.
 ///
 /// # Safety
 /// `dll_name` a valid UNICODE_STRING*; `dll_handle` writable.
 #[export_name = "LdrGetDllHandleEx"]
 pub unsafe extern "system" fn ldr_get_dll_handle_ex(
-    _flags: u32,
+    flags: u32,
     _dll_path: *const u16,
     _dll_characteristics: *mut u32,
     dll_name: *const c_void,
     dll_handle: *mut *mut c_void,
 ) -> NtStatus {
+    if !dll_handle.is_null() {
+        unsafe { core::ptr::write_unaligned(dll_handle, core::ptr::null_mut()) };
+    }
+    let Some(action) = nt_ntdll::loader::lifecycle::get_dll_handle_action(
+        flags,
+        !dll_handle.is_null(),
+    ) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if dll_name.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let _loader_lock = match acquire_loader_lock() {
             Ok(guard) => guard,
             Err(status) => return status,
         };
-        crate::on_target::ldr_get_dll_handle(dll_name, dll_handle)
+        let mut found = core::ptr::null_mut();
+        let status = crate::on_target::ldr_get_dll_handle(dll_name, &mut found);
+        if !nt_success(status) {
+            return status;
+        }
+        let status = match action {
+            nt_ntdll::loader::lifecycle::GetDllHandleAction::Unchanged => STATUS_SUCCESS,
+            nt_ntdll::loader::lifecycle::GetDllHandleAction::AddReference => {
+                crate::on_target::ldr_add_ref_dll(found as u64, false)
+            }
+            nt_ntdll::loader::lifecycle::GetDllHandleAction::Pin => {
+                crate::on_target::ldr_add_ref_dll(found as u64, true)
+            }
+        };
+        if !nt_success(status) {
+            return status;
+        }
+        if !dll_handle.is_null() {
+            core::ptr::write_unaligned(dll_handle, found);
+        }
+        STATUS_SUCCESS
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (dll_name, dll_handle);
+        let _ = (action, dll_name, dll_handle);
         STATUS_NOT_IMPLEMENTED
     }
 }
@@ -8939,10 +8973,15 @@ pub unsafe extern "system" fn ldr_get_dll_handle_ex(
 /// `callback` a valid LDR_ENUM_CALLBACK.
 #[export_name = "LdrEnumerateLoadedModules"]
 pub unsafe extern "system" fn ldr_enumerate_loaded_modules(
-    _reserved: u8,
-    callback: extern "system" fn(*mut c_void, *mut c_void, *mut u8),
+    reserved: u8,
+    callback: *mut c_void,
     context: *mut c_void,
 ) -> NtStatus {
+    if reserved != 0 || callback.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let callback: extern "system" fn(*mut c_void, *mut c_void, *mut u8) =
+        unsafe { core::mem::transmute(callback) };
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let _loader_lock = match acquire_loader_lock() {
