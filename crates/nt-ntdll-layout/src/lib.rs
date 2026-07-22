@@ -330,7 +330,9 @@ pub struct Teb {
     _rsvd_16b4: [u8; 0x1740 - 0x16B4],
     /// `GdiBatchCount` (offset 0x1740).
     pub gdi_batch_count: u32,
-    _rsvd_1744: [u8; 2],
+    _rsvd_1744: [u8; 1],
+    /// `FreeStackOnTermination` (offset 0x1745 in the ReactOS NT 5.2 x64 ABI).
+    pub free_stack_on_termination: u8,
     /// `HasFiberData` (offset 0x1746 in the hosted ReactOS x64 kernel32 ABI).
     pub has_fiber_data: u8,
     _rsvd_1747: [u8; 0x1760 - 0x1747],
@@ -399,6 +401,7 @@ const _: () = assert!(offset_of!(Teb, tls_slots) == 0x1480);
 const _: () = assert!(offset_of!(Teb, vdm) == 0x1690); // C_ASSERT(... Vdm) == 0x1690
 const _: () = assert!(offset_of!(Teb, hard_error_mode) == 0x16B0); // C_ASSERT(... HardErrorMode) == 0x16B0
 const _: () = assert!(offset_of!(Teb, gdi_batch_count) == 0x1740); // C_ASSERT(... GdiBatchCount) == 0x1740
+const _: () = assert!(offset_of!(Teb, free_stack_on_termination) == 0x1745);
 const _: () = assert!(offset_of!(Teb, has_fiber_data) == 0x1746);
 const _: () = assert!(offset_of!(Teb, waiting_on_loader_lock) == 0x1760); // C_ASSERT(...) == 0x1760
 const _: () = assert!(offset_of!(Teb, tls_expansion_slots) == 0x1780); // C_ASSERT(... TlsExpansionSlots) == 0x1780

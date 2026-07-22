@@ -4920,6 +4920,7 @@ unsafe fn spawn_hosted_thread(t: &HostedThread) -> u64 {
     core::ptr::write_volatile((scr + 0x60) as *mut u64, t.peb_va);
     core::ptr::write_volatile((scr + 0x08) as *mut u64, t.stack_base + t.stack_frames * 0x1000);
     core::ptr::write_volatile((scr + 0x10) as *mut u64, t.stack_base);
+    core::ptr::write_volatile((scr + 0x1478) as *mut u64, t.stack_base);
     let acs_va = t.teb_va + 0x1800;
     core::ptr::write_volatile((scr + 0x2c8) as *mut u64, acs_va);
     // TEB page 2: the ACTIVATION_CONTEXT_STACK + StaticUnicodeString (MaximumLength=522, Buffer in TEB).

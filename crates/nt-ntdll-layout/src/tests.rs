@@ -44,6 +44,7 @@ fn teb_offsets() {
     assert_eq!(offset_of!(Teb, static_unicode_string), 0x1258);
     assert_eq!(offset_of!(Teb, static_unicode_buffer), 0x1268);
     assert_eq!(offset_of!(Teb, deallocation_stack), 0x1478);
+    assert_eq!(offset_of!(Teb, free_stack_on_termination), 0x1745);
     assert_eq!(offset_of!(Teb, vdm), 0x1690);
     assert_eq!(offset_of!(Teb, hard_error_mode), 0x16B0);
     assert_eq!(offset_of!(Teb, gdi_batch_count), 0x1740);

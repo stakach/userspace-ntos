@@ -19820,6 +19820,7 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     // SAFETY: forwards to NtTerminateThread(NtCurrentThread=-2, status); does not return.
     unsafe {
         let _ = ldr_shutdown_thread();
+        (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
         core::mem::transmute::<
             unsafe extern "C" fn(),
             unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
