@@ -68,22 +68,28 @@ macro_rules! generate_trap_stubs {
             // `crate::native_call` for the wire layout. Selected when `native_transport` is ON.
             //
             // Windows-ABI entry: rcx=arg1, rdx=arg2, r8=arg3, r9=arg4, args5+ on the stack; rsp at
-            // entry points AT the return address (caller's stack args at [rsp+0x28]…). We capture
-            // that rsp (MR1) so the executive reads stack args + writes stack out-params via its
-            // mirror — a native Call transfers no rsp/stack (unlike the UnknownSyscall fault frame).
+            // entry points AT the return address (caller's stack args at [rsp+0x28]…). We preserve
+            // that entry rsp in MR1 so the executive reads stack args + writes stack out-params via
+            // its mirror — a native Call transfers no rsp/stack (unlike an UnknownSyscall fault).
             #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
             #[unsafe(naked)]
             #[export_name = $name]
             /// Generated `Nt*` native-Call stub (seL4 `Call` on CT_FAULT; NTSTATUS in reply MR0).
             pub extern "C" fn $fn() {
                 core::arch::naked_asm!(
+                    // seL4's register-message ABI uses Windows x64 nonvolatile registers. Save them
+                    // before constructing the message; the original caller RSP is now rsp+24.
+                    "push rdi",
+                    "push rsi",
+                    "push r15",
                     // Stash args3/4 into the IPC buffer as MR4/MR5 (only 4 MRs ride in registers).
                     // IPC buffer word[i] = MR i at byte (8 + i*8); MR4 @ +0x28, MR5 @ +0x30.
                     "movabs rax, 0x00000100105FB000",   // IPCBUF_VADDR (fixed per-process VA)
                     "mov qword ptr [rax + 0x28], r8",   // MR4 = arg3
                     "mov qword ptr [rax + 0x30], r9",   // MR5 = arg4
-                    // Build the register message. Capture rsp (MR1) BEFORE any push.
-                    "mov r8, rsp",                      // MR1 = caller rsp
+                    // Build the register message with the entry RSP so executive stack-argument
+                    // reads still address the Windows caller's home area.
+                    "lea r8, [rsp + 24]",               // MR1 = caller rsp
                     "mov r9, rcx",                      // MR2 = arg1 (rcx)
                     "mov r15, rdx",                     // MR3 = arg2 (rdx)
                     concat!("mov r10d, ", stringify!($ssn)), // MR0 = SSN
@@ -92,7 +98,11 @@ macro_rules! generate_trap_stubs {
                     "mov esi, 0x04E54006",              // rsi = (0x4E54<<12)|6 = label 0x4E54, len 6
                     "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
                     "syscall",                          // native seL4 Call → executive Recv/Reply
-                    // Reply: MR0 (r10) = NTSTATUS. Move to rax (the C return register) and ret.
+                    // Reply: MR0 (r10) = NTSTATUS. Restore every nonvolatile register before the
+                    // Windows caller resumes, then move the status to the C return register.
+                    "pop r15",
+                    "pop rsi",
+                    "pop rdi",
                     "mov rax, r10",
                     "ret",
                 );

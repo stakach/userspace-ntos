@@ -127,6 +127,41 @@ fn main() -> ExitCode {
         check(zw_stub.first() == Some(&0xe9), "ZwCallbackReturn is a tail-jump alias");
     }
 
+    // Native seL4 message registers overlap Windows x64 nonvolatile rdi/rsi/r15. Every naked Nt*
+    // export must save and restore them because arbitrary ReactOS callers keep live state there.
+    let image = pe.map(pe.image_base()).expect("map emitted ntdll");
+    let mut bad_native_abi = Vec::new();
+    for syscall in NT_SYSCALLS {
+        let Some(export) = exports.iter().find(|export| export.name == syscall.name) else {
+            continue;
+        };
+        let Some(stub) = image
+            .bytes
+            .get(export.rva as usize..export.rva as usize + 128)
+        else {
+            bad_native_abi.push(syscall.name);
+            continue;
+        };
+        let saves = stub.starts_with(&[0x57, 0x56, 0x41, 0x57]);
+        let restores = stub
+            .windows(8)
+            .any(|bytes| bytes == [0x41, 0x5f, 0x5e, 0x5f, 0x4c, 0x89, 0xd0, 0xc3]);
+        if !saves || !restores {
+            bad_native_abi.push(syscall.name);
+        }
+    }
+    check(
+        bad_native_abi.is_empty(),
+        &format!(
+            "all {} native Nt* stubs preserve rdi/rsi/r15 ({} violations)",
+            NT_SYSCALLS.len(),
+            bad_native_abi.len()
+        ),
+    );
+    if !bad_native_abi.is_empty() {
+        eprintln!("   native ABI violations: {bad_native_abi:?}");
+    }
+
     // Base relocations parse cleanly (the .reloc directory the loader will apply).
     match pe.relocations() {
         Ok(relocs) => check(!relocs.is_empty(), &format!("base relocations parse ({} fixups)", relocs.len())),
