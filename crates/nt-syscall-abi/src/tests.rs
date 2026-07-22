@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` exports the current hosted ReactOS set imports plus
 /// `NtSecureConnectPort` (SSN 218), which ntdll's own `CsrpConnectToServer` calls internally, and
 /// `NtCallbackReturn` (SSN 22), required by `KiUserCallbackDispatcher`.
-const REQUIRED_NT_COUNT: usize = 201;
-const REQUIRED_ZW_COUNT: usize = 201;
+const REQUIRED_NT_COUNT: usize = 206;
+const REQUIRED_ZW_COUNT: usize = 206;
 
 #[test]
 fn required_counts() {

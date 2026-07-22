@@ -17297,6 +17297,7 @@ zw_alias!(
     nt_create_paging_file
 );
 zw_alias!(zw_create_port, "ZwCreatePort", nt_create_port);
+zw_alias!(zw_create_process, "ZwCreateProcess", nt_create_process);
 zw_alias!(
     zw_create_process_ex,
     "ZwCreateProcessEx",
@@ -17489,6 +17490,11 @@ zw_alias!(
     "ZwOpenProcessToken",
     nt_open_process_token
 );
+zw_alias!(
+    zw_open_process_token_ex,
+    "ZwOpenProcessTokenEx",
+    nt_open_process_token_ex
+);
 zw_alias!(zw_open_section, "ZwOpenSection", nt_open_section);
 zw_alias!(zw_open_semaphore, "ZwOpenSemaphore", nt_open_semaphore);
 zw_alias!(
@@ -17501,6 +17507,11 @@ zw_alias!(
     zw_open_thread_token,
     "ZwOpenThreadToken",
     nt_open_thread_token
+);
+zw_alias!(
+    zw_open_thread_token_ex,
+    "ZwOpenThreadTokenEx",
+    nt_open_thread_token_ex
 );
 zw_alias!(zw_open_timer, "ZwOpenTimer", nt_open_timer);
 zw_alias!(
@@ -17663,6 +17674,11 @@ zw_alias!(
     zw_read_virtual_memory,
     "ZwReadVirtualMemory",
     nt_read_virtual_memory
+);
+zw_alias!(
+    zw_register_thread_terminate_port,
+    "ZwRegisterThreadTerminatePort",
+    nt_register_thread_terminate_port
 );
 zw_alias!(
     zw_release_keyed_event,
@@ -17835,6 +17851,7 @@ zw_alias!(
     "ZwTerminateThread",
     nt_terminate_thread
 );
+zw_alias!(zw_test_alert, "ZwTestAlert", nt_test_alert);
 zw_alias!(zw_unload_driver, "ZwUnloadDriver", nt_unload_driver);
 zw_alias!(zw_unload_key, "ZwUnloadKey", nt_unload_key);
 zw_alias!(zw_unlock_file, "ZwUnlockFile", nt_unlock_file);
@@ -22101,6 +22118,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_create_named_pipe_file as *const () as usize,
         zw_create_paging_file as *const () as usize,
         zw_create_port as *const () as usize,
+        zw_create_process as *const () as usize,
         zw_create_process_ex as *const () as usize,
         zw_create_section as *const () as usize,
         zw_create_semaphore as *const () as usize,
@@ -22161,11 +22179,13 @@ pub unsafe extern "C" fn export_anchor() {
         zw_open_object_audit_alarm as *const () as usize,
         zw_open_process as *const () as usize,
         zw_open_process_token as *const () as usize,
+        zw_open_process_token_ex as *const () as usize,
         zw_open_section as *const () as usize,
         zw_open_semaphore as *const () as usize,
         zw_open_symbolic_link_object as *const () as usize,
         zw_open_thread as *const () as usize,
         zw_open_thread_token as *const () as usize,
+        zw_open_thread_token_ex as *const () as usize,
         zw_open_timer as *const () as usize,
         zw_plug_play_control as *const () as usize,
         zw_power_information as *const () as usize,
@@ -22208,6 +22228,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_read_file as *const () as usize,
         zw_read_file_scatter as *const () as usize,
         zw_read_virtual_memory as *const () as usize,
+        zw_register_thread_terminate_port as *const () as usize,
         zw_release_keyed_event as *const () as usize,
         zw_release_mutant as *const () as usize,
         zw_release_semaphore as *const () as usize,
@@ -22255,6 +22276,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_terminate_job_object as *const () as usize,
         zw_terminate_process as *const () as usize,
         zw_terminate_thread as *const () as usize,
+        zw_test_alert as *const () as usize,
         zw_unload_driver as *const () as usize,
         zw_unload_key as *const () as usize,
         zw_unlock_file as *const () as usize,
