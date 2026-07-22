@@ -283,11 +283,17 @@ unsafe fn format_impl<F: FormatInput, A: Arguments, O: Output>(
                 let pointer = unsafe { args.next(ArgumentKind::Pointer) } as usize;
                 unsafe { write_count(pointer, length, position) };
             }
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
-                // Consume the correctly promoted argument, but fail explicitly until the float
-                // renderer lands. Callers must never receive a plausible partial string.
-                let _ = unsafe { args.next(ArgumentKind::Double) };
-                return Err(());
+            b'f' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
+                let value = f64::from_bits(unsafe { args.next(ArgumentKind::Double) });
+                emit_float(
+                    output,
+                    &mut position,
+                    value,
+                    spec,
+                    flags,
+                    width,
+                    precision,
+                )?;
             }
             other => {
                 emit(output, &mut position, b'%' as u16)?;
@@ -315,6 +321,7 @@ unsafe fn parse_length<F: FormatInput>(format: &F, index: usize) -> (Length, usi
             }
         }
         b'L' => (Length::L, 1),
+        b'F' => (Length::L, 1),
         b'w' => (Length::W, 1),
         b'I' => {
             let second = unsafe { format.unit(index + 1) };
@@ -433,6 +440,303 @@ unsafe fn emit_string<O: Output>(
         }
         Ok(())
     })
+}
+
+struct FloatText {
+    bytes: [u8; 512],
+    length: usize,
+}
+
+impl FloatText {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 512],
+            length: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), ()> {
+        let slot = self.bytes.get_mut(self.length).ok_or(())?;
+        *slot = byte;
+        self.length += 1;
+        Ok(())
+    }
+
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        for byte in bytes {
+            self.push(*byte)?;
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, index: usize) {
+        if index >= self.length {
+            return;
+        }
+        self.bytes.copy_within(index + 1..self.length, index);
+        self.length -= 1;
+    }
+
+    fn exponent_index(&self) -> Option<usize> {
+        self.bytes[..self.length]
+            .iter()
+            .position(|byte| *byte == b'e' || *byte == b'E')
+    }
+
+    fn strip_fraction_zeroes(&mut self, keep_point: bool) {
+        let mut end = self.exponent_index().unwrap_or(self.length);
+        if !self.bytes[..end].contains(&b'.') {
+            return;
+        }
+        while end > 0 && self.bytes[end - 1] == b'0' {
+            self.remove(end - 1);
+            end -= 1;
+        }
+        if end > 0 && self.bytes[end - 1] == b'.' && !keep_point {
+            self.remove(end - 1);
+        }
+    }
+}
+
+impl core::fmt::Write for FloatText {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        self.extend(value.as_bytes()).map_err(|_| core::fmt::Error)
+    }
+}
+
+fn pow10(exponent: usize) -> f64 {
+    let mut value = 1.0;
+    for _ in 0..exponent {
+        value *= 10.0;
+    }
+    value
+}
+
+fn decimal_exponent(mut value: f64) -> i32 {
+    if value == 0.0 {
+        return 0;
+    }
+    let mut exponent = 0i32;
+    while value >= 10.0 {
+        value /= 10.0;
+        exponent += 1;
+    }
+    while value < 1.0 {
+        value *= 10.0;
+        exponent -= 1;
+    }
+    exponent
+}
+
+fn push_decimal_u64(text: &mut FloatText, value: u64, minimum_digits: usize) -> Result<(), ()> {
+    let mut reversed = [0u8; 32];
+    let mut count = 0usize;
+    let mut remaining = value;
+    loop {
+        reversed[count] = b'0' + (remaining % 10) as u8;
+        count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    for _ in count..minimum_digits {
+        text.push(b'0')?;
+    }
+    for digit in reversed[..count].iter().rev() {
+        text.push(*digit)?;
+    }
+    Ok(())
+}
+
+fn fixed_scaled(value: u64, fraction: usize, extra_zeroes: usize) -> Result<FloatText, ()> {
+    let mut digits = FloatText::new();
+    push_decimal_u64(&mut digits, value, fraction + 1)?;
+    if fraction == 0 {
+        for _ in 0..extra_zeroes {
+            digits.push(b'0')?;
+        }
+        return Ok(digits);
+    }
+    let point = digits.length - fraction;
+    if digits.length == digits.bytes.len() {
+        return Err(());
+    }
+    digits.bytes.copy_within(point..digits.length, point + 1);
+    digits.bytes[point] = b'.';
+    digits.length += 1;
+    for _ in 0..extra_zeroes {
+        digits.push(b'0')?;
+    }
+    Ok(digits)
+}
+
+fn render_fixed(value: f64, precision: usize) -> Result<FloatText, ()> {
+    let computed = precision.min(17);
+    let extra = precision.saturating_sub(computed);
+    let scale = pow10(computed);
+    let scaled = value * scale;
+    if scaled.is_finite() && scaled <= u64::MAX as f64 - 1.0 {
+        return fixed_scaled((scaled + 0.5) as u64, computed, extra);
+    }
+
+    // Large fixed values cannot pass through the u64-scaled ReactOS algorithm. Core's
+    // allocation-free Dragon fallback keeps the output correct and bounded for all finite f64s.
+    let mut text = FloatText::new();
+    use core::fmt::Write;
+    core::write!(&mut text, "{value:.computed$}").map_err(|_| ())?;
+    for _ in 0..extra {
+        text.push(b'0')?;
+    }
+    Ok(text)
+}
+
+fn render_scientific(
+    value: f64,
+    precision: usize,
+    upper: bool,
+) -> Result<(FloatText, i32), ()> {
+    let computed = precision.min(17);
+    let extra = precision.saturating_sub(computed);
+    let mut exponent = decimal_exponent(value);
+    let normalized = if value == 0.0 {
+        0.0
+    } else if exponent >= 0 {
+        value / pow10(exponent as usize)
+    } else {
+        value * pow10((-exponent) as usize)
+    };
+    let scale = pow10(computed);
+    let mut scaled = (normalized * scale + 0.5) as u64;
+    let carry = pow10(computed + 1) as u64;
+    if scaled >= carry {
+        exponent += 1;
+        scaled /= 10;
+    }
+    let mut text = fixed_scaled(scaled, computed, extra)?;
+    text.push(if upper { b'E' } else { b'e' })?;
+    text.push(if exponent < 0 { b'-' } else { b'+' })?;
+    let magnitude = exponent.unsigned_abs() as u64;
+    push_decimal_u64(&mut text, magnitude, 3)?;
+    Ok((text, exponent))
+}
+
+fn ensure_decimal_point(text: &mut FloatText) -> Result<(), ()> {
+    let end = text.exponent_index().unwrap_or(text.length);
+    if text.bytes[..end].contains(&b'.') {
+        return Ok(());
+    }
+    if text.length == text.bytes.len() {
+        return Err(());
+    }
+    text.bytes.copy_within(end..text.length, end + 1);
+    text.bytes[end] = b'.';
+    text.length += 1;
+    Ok(())
+}
+
+fn render_float_magnitude(
+    value: f64,
+    spec: u8,
+    precision: Option<usize>,
+    alternate: bool,
+) -> Result<FloatText, ()> {
+    let requested = precision.unwrap_or(6);
+    if value.is_nan() || value.is_infinite() {
+        let mut text = FloatText::new();
+        text.push(b'1')?;
+        if requested != 0 || alternate {
+            text.push(b'.')?;
+        }
+        text.extend(if value.is_nan() { b"#QNAN" } else { b"#INF" })?;
+        return Ok(text);
+    }
+
+    match spec {
+        b'e' | b'E' => {
+            let (mut text, _) = render_scientific(value, requested, spec == b'E')?;
+            if alternate && requested == 0 {
+                ensure_decimal_point(&mut text)?;
+            }
+            Ok(text)
+        }
+        b'g' | b'G' => {
+            let significant = if requested == 0 { 1 } else { requested };
+            let fractional = significant.saturating_sub(1);
+            let exponent = decimal_exponent(value);
+            if exponent < -4 || exponent >= fractional as i32 {
+                let (mut text, _) =
+                    render_scientific(value, fractional, spec == b'G')?;
+                if alternate {
+                    ensure_decimal_point(&mut text)?;
+                }
+                Ok(text)
+            } else {
+                let decimals = if exponent >= 0 {
+                    fractional.saturating_sub(exponent as usize)
+                } else {
+                    fractional.saturating_add((-exponent) as usize)
+                };
+                let mut text = render_fixed(value, decimals)?;
+                text.strip_fraction_zeroes(alternate);
+                if alternate {
+                    ensure_decimal_point(&mut text)?;
+                }
+                Ok(text)
+            }
+        }
+        // ReactOS NT5 has hexadecimal a/A marked TODO and deliberately falls through to decimal f.
+        b'f' | b'a' | b'A' => {
+            let mut text = render_fixed(value, requested)?;
+            if alternate && requested == 0 {
+                ensure_decimal_point(&mut text)?;
+            }
+            Ok(text)
+        }
+        _ => Err(()),
+    }
+}
+
+fn emit_float<O: Output>(
+    output: &mut O,
+    position: &mut usize,
+    value: f64,
+    spec: u8,
+    flags: Flags,
+    width: usize,
+    precision: Option<usize>,
+) -> Result<(), ()> {
+    let negative = value < 0.0;
+    let magnitude = if negative { -value } else { value };
+    let text = render_float_magnitude(magnitude, spec, precision, flags.alternate)?;
+    let sign = if negative {
+        Some(b'-' as u16)
+    } else if flags.plus {
+        Some(b'+' as u16)
+    } else if flags.space {
+        Some(b' ' as u16)
+    } else {
+        None
+    };
+    let content = text.length + sign.is_some() as usize;
+    let padding = width.saturating_sub(content);
+    let zero_pad = flags.zero && !flags.left;
+    if !flags.left && !zero_pad {
+        emit_repeat(output, position, b' ' as u16, padding)?;
+    }
+    if let Some(sign) = sign {
+        emit(output, position, sign)?;
+    }
+    if zero_pad {
+        emit_repeat(output, position, b'0' as u16, padding)?;
+    }
+    for byte in &text.bytes[..text.length] {
+        emit(output, position, *byte as u16)?;
+    }
+    if flags.left {
+        emit_repeat(output, position, b' ' as u16, padding)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -676,5 +980,70 @@ mod tests {
             Ok(b"abc!".to_vec())
         );
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn float_fixed_rounding_specials_and_legacy_hex_fallthrough() {
+        assert_eq!(
+            render(b"%f\0", &[3.14159265359f64.to_bits()]),
+            Ok(b"3.141593".to_vec())
+        );
+        assert_eq!(render(b"%.0f\0", &[0.5f64.to_bits()]), Ok(b"1".to_vec()));
+        assert_eq!(
+            render(b"%.0f\0", &[(-0.5f64).to_bits()]),
+            Ok(b"-1".to_vec())
+        );
+        assert_eq!(
+            render(b"%f\0", &[(-0.0f64).to_bits()]),
+            Ok(b"0.000000".to_vec())
+        );
+        assert_eq!(render(b"%#.0f\0", &[0.6f64.to_bits()]), Ok(b"1.".to_vec()));
+        assert_eq!(
+            render(b"%.20f\0", &[1.0f64.to_bits()]),
+            Ok(b"1.00000000000000000000".to_vec())
+        );
+        assert_eq!(render(b"%a %A\0", &[8.6f64.to_bits(), 8.6f64.to_bits()]), Ok(b"8.600000 8.600000".to_vec()));
+        assert_eq!(render(b"%f\0", &[f64::NAN.to_bits()]), Ok(b"1.#QNAN".to_vec()));
+        assert_eq!(render(b"%f\0", &[f64::INFINITY.to_bits()]), Ok(b"1.#INF".to_vec()));
+        assert_eq!(render(b"%f\0", &[f64::NEG_INFINITY.to_bits()]), Ok(b"-1.#INF".to_vec()));
+    }
+
+    #[test]
+    fn float_scientific_general_and_width_match_nt5() {
+        assert_eq!(
+            render(b"% 014.4e\0", &[8.6f64.to_bits()]),
+            Ok(b" 008.6000e+000".to_vec())
+        );
+        assert_eq!(
+            render(b"%.1e\0", &[9.96f64.to_bits()]),
+            Ok(b"1.0e+001".to_vec())
+        );
+        assert_eq!(
+            render(b"%.2E\0", &[0.0125f64.to_bits()]),
+            Ok(b"1.25E-002".to_vec())
+        );
+        assert_eq!(render(b"%g\0", &[8.6f64.to_bits()]), Ok(b"8.6".to_vec()));
+        assert_eq!(render(b"%g\0", &[0.0005f64.to_bits()]), Ok(b"0.0005".to_vec()));
+        assert_eq!(
+            render(b"%g\0", &[0.00005f64.to_bits()]),
+            Ok(b"5.00000e-005".to_vec())
+        );
+        assert_eq!(
+            render(b"%g\0", &[100000.0f64.to_bits()]),
+            Ok(b"1.00000e+005".to_vec())
+        );
+        assert_eq!(
+            render(b"%#1.1g\0", &[789456123.0f64.to_bits()]),
+            Ok(b"8.e+008".to_vec())
+        );
+        assert_eq!(
+            render(b"%G\0", &[0.00005f64.to_bits()]),
+            Ok(b"5.00000E-005".to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_upper_f_is_a_modifier_and_does_not_consume_an_argument() {
+        assert_eq!(render(b"%F\0", &[8.6f64.to_bits()]), Ok(Vec::new()));
     }
 }
