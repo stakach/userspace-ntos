@@ -1915,13 +1915,14 @@ unsafe fn resolve_export_addr(
 /// Load a dependent DLL BY NAME (the executive resolves it against the real `\reactos\system32` FS +
 /// its DLL registry, assigning the module its fixed base — csrsrv → 0x8000_0000). Issues
 /// `NtOpenFile → NtCreateSection(SEC_IMAGE) → NtMapViewOfSection`; returns the mapped base (0 on
-/// failure). `name_lc` is the lowercased base name (no `.dll`); we build a `<name>.dll` path leaf.
+/// failure). `name_lc` is the lowercased leaf with a trailing `.dll` removed. We add the default
+/// extension only when the leaf has no extension, preserving names such as `winspool.drv`.
 ///
 /// # Safety
 /// On-target hosted process; issues real syscalls the executive services.
 #[cfg(target_arch = "x86_64")]
 unsafe fn load_dependent_dll(name_lc: &[u8]) -> u64 {
-    // Build a NUL-terminated UTF-16 leaf `<name>.dll` for the OBJECT_ATTRIBUTES.ObjectName. The
+    // Build a NUL-terminated UTF-16 leaf for the OBJECT_ATTRIBUTES.ObjectName. The
     // executive's NtOpenFile matches the DLL by a substring of the object name (reg.resolve_name /
     // demand_load_dll), so a bare leaf suffices.
     let mut wname = [0u16; 40];
@@ -1930,9 +1931,11 @@ unsafe fn load_dependent_dll(name_lc: &[u8]) -> u64 {
         wname[wn] = b as u16;
         wn += 1;
     }
-    for &b in b".dll" {
-        wname[wn] = b as u16;
-        wn += 1;
+    if !name_lc.contains(&b'.') {
+        for &b in b".dll" {
+            wname[wn] = b as u16;
+            wn += 1;
+        }
     }
     // UNICODE_STRING { Length, MaximumLength, Buffer } (x64: u16,u16,pad,ptr).
     #[repr(C)]
