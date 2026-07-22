@@ -2222,15 +2222,14 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 }
                 thread_ldr_lists();
             }
-            crate::exports::ldr_send_dll_notifications_for_base(loaded, 1);
             loaded
         };
         let attach_status = run_process_attach_root(table_ptr, base);
         if attach_status != 0 {
-            if newly_loaded {
-                crate::exports::ldr_send_dll_notifications_for_base(base, 2);
-            }
             return attach_status;
+        }
+        if newly_loaded {
+            crate::exports::ldr_send_dll_notifications_for_base(base, 1);
         }
         if !base_addr.is_null() {
             core::ptr::write_unaligned(base_addr, base as *mut c_void);
@@ -2261,6 +2260,124 @@ pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
             &mut visited_count,
         )
     }
+}
+
+/// Release one loader reference from `base` and each loaded import edge it owns. The transaction is
+/// committed only when every count remains nonzero; actual detach/unmap remains a separate path.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_release_dll_reference(base: u64) -> u32 {
+    use nt_ntdll::loader::lifecycle::{ReferenceReleaseLedger, ReferenceReleasePlan};
+
+    match unsafe { crate::exports::ldr_plan_module_release(base, 1) } {
+        Ok((_, _, ReferenceReleasePlan::Pinned)) => return 0,
+        Ok((_, _, ReferenceReleasePlan::TeardownRequired)) => return 0xC000_0002,
+        Ok((_, _, ReferenceReleasePlan::Invalid)) => return 0xC000_000D,
+        Ok((_, _, ReferenceReleasePlan::DecrementTo(_))) => {}
+        Err(status) => return status,
+    }
+    let table = core::ptr::addr_of!(MODULE_TABLE);
+    if unsafe { (&*table).index_by_base(base) }.is_none() {
+        return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+    }
+
+    let mut ledger = ReferenceReleaseLedger::<MODULE_TABLE_CAP>::new();
+    if !ledger.record(base) {
+        return 0xC000_0017; // STATUS_NO_MEMORY
+    }
+    let mut visited = [0u64; MODULE_TABLE_CAP];
+    let mut visited_count = 0usize;
+    let collect_status = unsafe {
+        collect_reference_releases(
+            table,
+            base,
+            &mut ledger,
+            &mut visited,
+            &mut visited_count,
+        )
+    };
+    if collect_status != 0 {
+        return collect_status;
+    }
+
+    let mut count_ptrs = [0u64; MODULE_TABLE_CAP];
+    let mut next = [0u16; MODULE_TABLE_CAP];
+    for (index, release) in ledger.as_slice().iter().enumerate() {
+        let (count_ptr, current, plan) = match unsafe {
+            crate::exports::ldr_plan_module_release(release.base, release.releases)
+        } {
+            Ok(plan) => plan,
+            Err(status) => return status,
+        };
+        count_ptrs[index] = count_ptr as u64;
+        match plan {
+            ReferenceReleasePlan::Pinned => next[index] = current,
+            ReferenceReleasePlan::DecrementTo(value) => next[index] = value,
+            ReferenceReleasePlan::TeardownRequired => return 0xC000_0002,
+            ReferenceReleasePlan::Invalid => return 0xC000_000D,
+        }
+    }
+
+    for (index, _) in ledger.as_slice().iter().enumerate() {
+        let count_ptr = count_ptrs[index] as *mut u16;
+        let current = unsafe { core::ptr::read_unaligned(count_ptr) };
+        if next[index] == current {
+            continue;
+        }
+        unsafe { core::ptr::write_unaligned(count_ptr, next[index]) };
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn collect_reference_releases(
+    table: *const ModuleTable,
+    base: u64,
+    ledger: &mut nt_ntdll::loader::lifecycle::ReferenceReleaseLedger<MODULE_TABLE_CAP>,
+    visited: &mut [u64; MODULE_TABLE_CAP],
+    visited_count: &mut usize,
+) -> u32 {
+    if visited[..*visited_count].contains(&base) {
+        return 0;
+    }
+    if *visited_count >= MODULE_TABLE_CAP {
+        return 0xC000_0017;
+    }
+    visited[*visited_count] = base;
+    *visited_count += 1;
+
+    let (imports_rva, _) = unsafe { data_directory(base, 1) };
+    if imports_rva == 0 {
+        return 0;
+    }
+    let mut descriptor = base + imports_rva as u64;
+    let mut descriptor_count = 0usize;
+    loop {
+        let name_rva = unsafe { rd32(descriptor, 12) };
+        let first_thunk = unsafe { rd32(descriptor, 16) };
+        if name_rva == 0 || first_thunk == 0 {
+            break;
+        }
+        let mut name = [0u8; 32];
+        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+        let dependency = unsafe { (&*table).find(&name[..length]) };
+        if dependency >= 0x1_0000 {
+            if !ledger.record(dependency) {
+                return 0xC000_0017;
+            }
+            let status = unsafe {
+                collect_reference_releases(table, dependency, ledger, visited, visited_count)
+            };
+            if status != 0 {
+                return status;
+            }
+        }
+        descriptor += 20;
+        descriptor_count += 1;
+        if descriptor_count >= MODULE_TABLE_CAP {
+            return 0xC000_007B;
+        }
+    }
+    0
 }
 
 #[cfg(target_arch = "x86_64")]

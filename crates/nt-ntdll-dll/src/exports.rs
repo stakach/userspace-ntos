@@ -6145,7 +6145,6 @@ static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_
     }
 };
     RTL_UNLOAD_EVENT_TRACE_NUMBER];
-static RTL_UNLOAD_EVENT_TRACE_INDEX: AtomicU32 = AtomicU32::new(0);
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_SIZE: u32 = RTL_UNLOAD_EVENT_TRACE_SIZE;
 static RTL_UNLOAD_EVENT_TRACE_ELEMENT_COUNT: u32 = RTL_UNLOAD_EVENT_TRACE_NUMBER as u32;
 
@@ -6478,80 +6477,28 @@ pub(crate) unsafe fn ldr_reference_module(base: u64, pin: bool) -> Result<bool, 
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn record_unload_event_from_entry(entry: u64, base_address: *mut c_void) {
-    let sequence = RTL_UNLOAD_EVENT_TRACE_INDEX
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
-    let slot = (sequence as usize - 1) % RTL_UNLOAD_EVENT_TRACE_NUMBER;
-    let trace = unsafe {
-        (core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut RtlUnloadEventTrace).add(slot)
-    };
-
-    unsafe {
-        (*trace).base_address = base_address;
-        (*trace).size_of_image = 0;
-        (*trace).sequence = sequence;
-        (*trace).time_date_stamp = 0;
-        (*trace).check_sum = 0;
-        (*trace).image_name = [0u16; 32];
+pub(crate) unsafe fn ldr_plan_module_release(
+    base: u64,
+    releases: u32,
+) -> Result<
+    (
+        *mut u16,
+        u16,
+        nt_ntdll::loader::lifecycle::ReferenceReleasePlan,
+    ),
+    NtStatus,
+> {
+    let entry = unsafe { find_ldr_entry_for_base(base) };
+    if entry == 0 {
+        return Err(STATUS_DLL_NOT_FOUND);
     }
-
-    let base = if entry != 0 {
-        unsafe { core::ptr::read_unaligned((entry + LDR_DLL_BASE) as *const u64) }
-    } else {
-        base_address as u64
-    };
-    if base != 0 {
-        let nt_headers = unsafe { rtl_image_nt_header(base as *mut c_void) };
-        if !nt_headers.is_null() {
-            unsafe {
-                (*trace).time_date_stamp = image_read_u32(nt_headers, 8);
-                (*trace).check_sum = image_read_u32(nt_headers, 24 + 64);
-                (*trace).size_of_image = image_read_u32(nt_headers, 24 + 56);
-            }
-        }
-    }
-
-    if entry != 0 {
-        let ldr_size =
-            unsafe { core::ptr::read_unaligned((entry + LDR_SIZE_OF_IMAGE) as *const u32) };
-        if ldr_size != 0 {
-            unsafe { (*trace).size_of_image = ldr_size };
-        }
-        let name = entry + LDR_BASE_DLL_NAME;
-        let name_len = unsafe { core::ptr::read_unaligned(name as *const u16) } as usize / 2;
-        let name_buf = unsafe { core::ptr::read_unaligned((name + 8) as *const u64) } as *const u16;
-        if !name_buf.is_null() {
-            let count = name_len.min(32);
-            for i in 0..count {
-                unsafe {
-                    (*trace).image_name[i] = core::ptr::read_unaligned(name_buf.add(i));
-                }
-            }
-            if count < 32 {
-                unsafe { (*trace).image_name[count] = 0 };
-            }
-        }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn record_unload_event_from_entry(_entry: u64, base_address: *mut c_void) {
-    let sequence = RTL_UNLOAD_EVENT_TRACE_INDEX
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
-    let slot = (sequence as usize - 1) % RTL_UNLOAD_EVENT_TRACE_NUMBER;
-    let trace = unsafe {
-        (core::ptr::addr_of_mut!(RTL_UNLOAD_EVENT_TRACE) as *mut RtlUnloadEventTrace).add(slot)
-    };
-    unsafe {
-        (*trace).base_address = base_address;
-        (*trace).size_of_image = 0;
-        (*trace).sequence = sequence;
-        (*trace).time_date_stamp = 0;
-        (*trace).check_sum = 0;
-        (*trace).image_name = [0u16; 32];
-    }
+    let load_count_ptr = (entry + LDR_LOAD_COUNT) as *mut u16;
+    let load_count = unsafe { core::ptr::read_unaligned(load_count_ptr) };
+    Ok((
+        load_count_ptr,
+        load_count,
+        nt_ntdll::loader::lifecycle::plan_reference_release(load_count, releases),
+    ))
 }
 
 /// `LdrFindEntryForAddress(PVOID Address, PLDR_DATA_TABLE_ENTRY *Module) -> NTSTATUS`.
@@ -6850,11 +6797,9 @@ pub unsafe extern "system" fn ldr_get_procedure_address_ex(
     unsafe { ldr_get_procedure_address(base_address, name, ordinal, address) }
 }
 
-/// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Ref
-/// `references/reactos/dll/ntdll/ldr/ldrapi.c:LdrUnloadDll`. We keep loaded modules mapped for the
-/// process lifetime (no ref-count teardown yet — the ServerDlls live forever), so this reports
-/// SUCCESS without unmapping (the observable contract for a still-referenced DLL). Not a fabricated
-/// result: real ntdll also keeps a DLL mapped while its ref-count > 0.
+/// `LdrUnloadDll(PVOID BaseAddress) -> NTSTATUS`. Pinned and still-referenced modules are handled
+/// transactionally. A release that would require detach/unlink/unmap returns
+/// `STATUS_NOT_IMPLEMENTED` without mutating counts or publishing an unload notification.
 ///
 /// # Safety
 /// `base_address` a previously-loaded module base.
@@ -6862,21 +6807,23 @@ pub unsafe extern "system" fn ldr_get_procedure_address_ex(
 pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
+        if RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0 {
+            return STATUS_SUCCESS;
+        }
         let _loader_lock = match unsafe { acquire_loader_lock() } {
             Ok(guard) => guard,
             Err(status) => return status,
         };
-        let entry = unsafe { find_ldr_entry_for_base(base_address as u64) };
-        unsafe { record_unload_event_from_entry(entry, base_address) };
-        if entry != 0 {
-            unsafe { ldr_send_dll_notifications_for_entry(entry, 2) };
+        if RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0 {
+            return STATUS_SUCCESS;
         }
+        return unsafe { crate::on_target::ldr_release_dll_reference(base_address as u64) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    unsafe {
-        record_unload_event_from_entry(0, base_address);
+    {
+        let _ = base_address;
+        STATUS_NOT_IMPLEMENTED
     }
-    STATUS_SUCCESS
 }
 
 // =================================================================================================

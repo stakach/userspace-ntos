@@ -2,6 +2,80 @@
 
 pub const LOAD_COUNT_PINNED: u16 = u16::MAX;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceReleasePlan {
+    Pinned,
+    DecrementTo(u16),
+    TeardownRequired,
+    Invalid,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceRelease {
+    pub base: u64,
+    pub releases: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceReleaseLedger<const N: usize> {
+    entries: [ReferenceRelease; N],
+    len: usize,
+}
+
+impl<const N: usize> ReferenceReleaseLedger<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [ReferenceRelease {
+                base: 0,
+                releases: 0,
+            }; N],
+            len: 0,
+        }
+    }
+
+    pub fn record(&mut self, base: u64) -> bool {
+        if let Some(entry) = self.entries[..self.len]
+            .iter_mut()
+            .find(|entry| entry.base == base)
+        {
+            let Some(next) = entry.releases.checked_add(1) else {
+                return false;
+            };
+            entry.releases = next;
+            return true;
+        }
+        if self.len == N {
+            return false;
+        }
+        self.entries[self.len] = ReferenceRelease { base, releases: 1 };
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[ReferenceRelease] {
+        &self.entries[..self.len]
+    }
+}
+
+impl<const N: usize> Default for ReferenceReleaseLedger<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn plan_reference_release(load_count: u16, releases: u32) -> ReferenceReleasePlan {
+    if load_count == LOAD_COUNT_PINNED {
+        return ReferenceReleasePlan::Pinned;
+    }
+    if releases == 0 || load_count == 0 || releases > u32::from(load_count) {
+        return ReferenceReleasePlan::Invalid;
+    }
+    if releases == u32::from(load_count) {
+        return ReferenceReleasePlan::TeardownRequired;
+    }
+    ReferenceReleasePlan::DecrementTo(load_count - releases as u16)
+}
+
 /// Persistent successful process-attach order, used in reverse for process shutdown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachLedger<const N: usize> {
@@ -96,6 +170,56 @@ mod tests {
         assert!(is_thread_within_loader_callout(0x1000, 0x1000));
         assert!(!is_thread_within_loader_callout(0x1000, 0x2000));
         assert!(!is_thread_within_loader_callout(0, 0));
+    }
+
+    #[test]
+    fn reference_release_plans_never_publish_a_zero_count() {
+        assert_eq!(
+            plan_reference_release(LOAD_COUNT_PINNED, 99),
+            ReferenceReleasePlan::Pinned
+        );
+        assert_eq!(
+            plan_reference_release(3, 1),
+            ReferenceReleasePlan::DecrementTo(2)
+        );
+        assert_eq!(
+            plan_reference_release(3, 2),
+            ReferenceReleasePlan::DecrementTo(1)
+        );
+        assert_eq!(
+            plan_reference_release(1, 1),
+            ReferenceReleasePlan::TeardownRequired
+        );
+        assert_eq!(
+            plan_reference_release(2, 2),
+            ReferenceReleasePlan::TeardownRequired
+        );
+        assert_eq!(plan_reference_release(0, 1), ReferenceReleasePlan::Invalid);
+        assert_eq!(plan_reference_release(1, 0), ReferenceReleasePlan::Invalid);
+        assert_eq!(plan_reference_release(1, 2), ReferenceReleasePlan::Invalid);
+    }
+
+    #[test]
+    fn release_ledger_preserves_import_edge_multiplicity() {
+        let mut ledger = ReferenceReleaseLedger::<3>::new();
+        assert!(ledger.record(10));
+        assert!(ledger.record(20));
+        assert!(ledger.record(10));
+        assert_eq!(
+            ledger.as_slice(),
+            &[
+                ReferenceRelease {
+                    base: 10,
+                    releases: 2
+                },
+                ReferenceRelease {
+                    base: 20,
+                    releases: 1
+                }
+            ]
+        );
+        assert!(ledger.record(30));
+        assert!(!ledger.record(40));
     }
 
     #[test]
