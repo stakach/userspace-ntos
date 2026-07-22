@@ -9102,6 +9102,7 @@ pub unsafe extern "system" fn ldr_shutdown_thread() -> NtStatus {
         if let Ok(_loader_lock) = acquire_loader_lock() {
             let process_shutdown = RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0;
             let _ = crate::on_target::ldr_shutdown_thread(teb_address, process_shutdown);
+            crate::on_target::free_current_thread_static_tls();
         }
 
         let teb = &mut *(teb_address as *mut Teb);

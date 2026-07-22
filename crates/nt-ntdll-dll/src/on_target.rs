@@ -27,6 +27,7 @@ extern crate alloc;
 use core::{ffi::c_void, marker::PhantomData};
 
 use nt_ntdll::heap::{Backing, Heap};
+use nt_ntdll_layout::Teb;
 
 // ---------------------------------------------------------------------------------------------
 // In-process Nt* syscall callers (the trap backend — `mov r10,rcx; mov eax,ssn; syscall`).
@@ -1094,6 +1095,171 @@ static mut THREAD_INIT_LEDGER: nt_ntdll::loader::lifecycle::ThreadInitLedger<MOD
     nt_ntdll::loader::lifecycle::ThreadInitLedger::new();
 
 #[cfg(target_arch = "x86_64")]
+static mut STATIC_TLS_CATALOG: nt_ntdll::loader::tls::StaticTlsCatalog<MODULE_TABLE_CAP> =
+    nt_ntdll::loader::tls::StaticTlsCatalog::new();
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_teb() -> *mut Teb {
+    let teb: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x30]",
+            out(reg) teb,
+            options(nostack, preserves_flags, readonly)
+        )
+    };
+    teb as *mut Teb
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn image_tls_directory(base: u64) -> Option<nt_ntdll::loader::tls::ImageTlsDirectory> {
+    let (rva, size) = unsafe { data_directory(base, 9) };
+    if rva == 0 || size < 0x28 {
+        return None;
+    }
+    let directory = base + rva as u64;
+    Some(nt_ntdll::loader::tls::ImageTlsDirectory {
+        start_address_of_raw_data: unsafe {
+            core::ptr::read_unaligned(directory as *const u64)
+        },
+        end_address_of_raw_data: unsafe {
+            core::ptr::read_unaligned((directory + 0x08) as *const u64)
+        },
+        address_of_index: unsafe {
+            core::ptr::read_unaligned((directory + 0x10) as *const u64)
+        },
+        address_of_callbacks: unsafe {
+            core::ptr::read_unaligned((directory + 0x18) as *const u64)
+        },
+        size_of_zero_fill: unsafe {
+            core::ptr::read_unaligned((directory + 0x20) as *const u32)
+        },
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_image_static_tls(
+    catalog: &mut nt_ntdll::loader::tls::StaticTlsCatalog<MODULE_TABLE_CAP>,
+    base: u64,
+) -> Result<(), u32> {
+    let Some(directory) = (unsafe { image_tls_directory(base) }) else {
+        return Ok(());
+    };
+    catalog
+        .add(base, directory)
+        .map(|_| ())
+        .map_err(|_| 0xC000_007B) // STATUS_INVALID_IMAGE_FORMAT
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn allocate_current_thread_static_tls() -> u32 {
+    let catalog = unsafe { &*core::ptr::addr_of!(STATIC_TLS_CATALOG) };
+    let teb = unsafe { current_teb() };
+    if teb.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    unsafe { (*teb).thread_local_storage_pointer = 0 };
+    if catalog.is_empty() {
+        return 0;
+    }
+
+    let vector_size = match catalog.len().checked_mul(core::mem::size_of::<u64>()) {
+        Some(size) => size,
+        None => return STATUS_NO_MEMORY as u32,
+    };
+    let vector = unsafe { crate::process_heap_alloc(vector_size) } as *mut u64;
+    if vector.is_null() {
+        return STATUS_NO_MEMORY as u32;
+    }
+    unsafe { core::ptr::write_bytes(vector.cast::<u8>(), 0, vector_size) };
+
+    for entry in catalog.entries() {
+        let Some(size) = entry.allocation_size() else {
+            unsafe { free_static_tls_vector(vector) };
+            return STATUS_NO_MEMORY as u32;
+        };
+        let block = unsafe { crate::process_heap_alloc(size.max(1)) };
+        if block.is_null() {
+            unsafe { free_static_tls_vector(vector) };
+            return STATUS_NO_MEMORY as u32;
+        }
+        if entry.raw_data_size != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    entry.raw_data_address as *const u8,
+                    block,
+                    entry.raw_data_size,
+                )
+            };
+        }
+        if entry.zero_fill_size != 0 {
+            unsafe {
+                core::ptr::write_bytes(
+                    block.add(entry.raw_data_size),
+                    0,
+                    entry.zero_fill_size,
+                )
+            };
+        }
+        unsafe { core::ptr::write(vector.add(entry.index as usize), block as u64) };
+    }
+    unsafe { (*teb).thread_local_storage_pointer = vector as u64 };
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn free_static_tls_vector(vector: *mut u64) {
+    if vector.is_null() {
+        return;
+    }
+    let catalog = unsafe { &*core::ptr::addr_of!(STATIC_TLS_CATALOG) };
+    for entry in catalog.entries() {
+        let block = unsafe { core::ptr::read(vector.add(entry.index as usize)) } as *mut u8;
+        if !block.is_null() {
+            let _ = unsafe { crate::process_heap_free(block) };
+        }
+    }
+    let _ = unsafe { crate::process_heap_free(vector.cast()) };
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn free_current_thread_static_tls() {
+    let teb = unsafe { current_teb() };
+    if teb.is_null() {
+        return;
+    }
+    let vector = unsafe { (*teb).thread_local_storage_pointer as *mut u64 };
+    unsafe { (*teb).thread_local_storage_pointer = 0 };
+    unsafe { free_static_tls_vector(vector) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn initialize_process_static_tls(exe_base: u64, table: *const ModuleTable) -> u32 {
+    let mut catalog = nt_ntdll::loader::tls::StaticTlsCatalog::<MODULE_TABLE_CAP>::new();
+    if let Err(status) = unsafe { add_image_static_tls(&mut catalog, exe_base) } {
+        return status;
+    }
+    let table = unsafe { &*table };
+    for module in &table.mods[..table.count.min(MODULE_TABLE_CAP)] {
+        if module.base != 0 && module.base != exe_base {
+            if let Err(status) = unsafe { add_image_static_tls(&mut catalog, module.base) } {
+                return status;
+            }
+        }
+    }
+
+    for entry in catalog.entries() {
+        unsafe { core::ptr::write_unaligned(entry.address_of_index as *mut u32, entry.index) };
+        let ldr_entry = unsafe { ldr_entry_for_base(entry.module_base) };
+        if ldr_entry != 0 {
+            unsafe { core::ptr::write_unaligned((ldr_entry + 0x6e) as *mut u16, u16::MAX) };
+        }
+    }
+    unsafe { STATIC_TLS_CATALOG = catalog };
+    unsafe { allocate_current_thread_static_tls() }
+}
+
+#[cfg(target_arch = "x86_64")]
 impl ModuleTable {
     /// Insert `(name, base)` (name already lowercased, no `.dll` suffix). Ignores overflow + dups.
     fn insert(&mut self, name: &[u8], base: u64) {
@@ -1865,6 +2031,16 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64, startup_reserved: u64)
         drop(_loader_lock);
         unsafe {
             crate::exports::rtl_raise_status(ldr_status);
+            core::hint::unreachable_unchecked()
+        }
+    }
+    let tls_status = unsafe {
+        initialize_process_static_tls(smss_base, core::ptr::addr_of!(MODULE_TABLE))
+    };
+    if tls_status != 0 {
+        drop(_loader_lock);
+        unsafe {
+            crate::exports::rtl_raise_status(tls_status);
             core::hint::unreachable_unchecked()
         }
     }
