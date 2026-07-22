@@ -56,6 +56,7 @@ const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_DLL_NOT_FOUND: NtStatus = 0xC000_0135;
 const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
 const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
+const STATUS_UNKNOWN_REVISION: NtStatus = 0xC000_0058;
 const STATUS_IMAGE_CHECKSUM_MISMATCH: NtStatus = 0xC000_0221;
 const STATUS_FILE_TOO_LARGE: NtStatus = 0xC000_0904;
 const STATUS_SHARING_VIOLATION: NtStatus = 0xC000_0043;
@@ -19529,23 +19530,64 @@ pub unsafe extern "system" fn rtl_free_user_thread_stack(
     }
 }
 
-/// `RtlComputeImportTableHash(HANDLE FileHandle, PCHAR Hash, ULONG ImportTableHashSize) -> NTSTATUS`
-/// — hash a module's import table (used by the loader-integrity path). Not needed on the boot path;
-/// zero the hash + STATUS_SUCCESS (an empty hash — the caller stores it, no verification consumer).
+/// `RtlComputeImportTableHash(HANDLE FileHandle, PCHAR Hash, ULONG Revision) -> NTSTATUS` — compute
+/// the NT5 revision-1 canonical MD5 over the raw PE import table.
 ///
 /// # Safety
-/// `hash` writable for `size` bytes.
+/// `hash` must be writable for 16 bytes.
 #[export_name = "RtlComputeImportTableHash"]
 pub unsafe extern "system" fn rtl_compute_import_table_hash(
-    _file_handle: *mut c_void,
+    file_handle: *mut c_void,
     hash: *mut u8,
-    size: u32,
+    revision: u32,
 ) -> NtStatus {
-    if !hash.is_null() {
-        // SAFETY: hash writable for size bytes per the contract.
-        unsafe { core::ptr::write_bytes(hash, 0, size as usize) };
+    if revision != 1 {
+        return STATUS_UNKNOWN_REVISION;
     }
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        if file_handle.is_null() {
+            return STATUS_INVALID_HANDLE;
+        }
+        if hash.is_null() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let image = match unsafe {
+            read_file_handle_bounded(
+                file_handle as u64,
+                nt_ntdll::rtl::image_verify::MAX_IMAGE_FILE_BYTES,
+                STATUS_FILE_TOO_LARGE,
+            )
+        } {
+            Ok(image) => image,
+            Err(status) => return status,
+        };
+        let digest = match nt_ntdll::rtl::import_table_hash::compute_import_table_hash(
+            &image, revision,
+        ) {
+            Ok(digest) => digest,
+            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::UnknownRevision) => {
+                return STATUS_UNKNOWN_REVISION;
+            }
+            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceDataNotFound) => {
+                return STATUS_RESOURCE_DATA_NOT_FOUND;
+            }
+            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::ResourceNameNotFound) => {
+                return STATUS_RESOURCE_NAME_NOT_FOUND;
+            }
+            Err(nt_ntdll::rtl::import_table_hash::ImportTableHashError::NoMemory) => {
+                return STATUS_NO_MEMORY;
+            }
+        };
+        // SAFETY: the caller supplies a writable 16-byte hash buffer.
+        unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), hash, digest.len()) };
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (file_handle, hash);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlFlushSecureMemoryCache(PVOID MemoryCache, SIZE_T MemoryLength) -> BOOLEAN` — flush a secure

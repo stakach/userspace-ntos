@@ -29,6 +29,7 @@ pub mod generic_table;
 pub mod guid;
 pub mod image;
 pub mod image_verify;
+pub mod import_table_hash;
 pub mod integer;
 pub mod locale;
 pub mod memory;
