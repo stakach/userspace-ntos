@@ -1,8 +1,6 @@
 //! Pure policy for Image File Execution Options loader queries.
 
-use alloc::vec::Vec;
-
-use crate::{rtl::integer::unicode_string_to_integer, NtStatus};
+use crate::NtStatus;
 
 pub const REG_SZ: u32 = 1;
 pub const REG_BINARY: u32 = 3;
@@ -43,6 +41,58 @@ pub fn image_file_options_subkey(path: &[u16]) -> &[u16] {
     match path.iter().rposition(|unit| *unit == b'\\' as u16) {
         Some(separator) => &path[separator + 1..],
         None => path,
+    }
+}
+
+fn unicode_le_string_to_integer(data: &[u8]) -> u32 {
+    let units = data.len() / 2;
+    let unit = |index: usize| {
+        let offset = index * 2;
+        u16::from_le_bytes([data[offset], data[offset + 1]])
+    };
+    let mut index = 0usize;
+    while index < units && unit(index) <= b' ' as u16 {
+        index += 1;
+    }
+    let negative = if index < units && unit(index) == b'+' as u16 {
+        index += 1;
+        false
+    } else if index < units && unit(index) == b'-' as u16 {
+        index += 1;
+        true
+    } else {
+        false
+    };
+    let mut base = 10u32;
+    if index + 1 < units && unit(index) == b'0' as u16 {
+        base = match unit(index + 1) {
+            c if c == b'b' as u16 => 2,
+            c if c == b'o' as u16 => 8,
+            c if c == b'x' as u16 => 16,
+            _ => 10,
+        };
+        if base != 10 {
+            index += 2;
+        }
+    }
+    let mut value = 0u32;
+    while index < units {
+        let digit = match unit(index) {
+            0x30..=0x39 => (unit(index) - 0x30) as u32,
+            0x41..=0x5a => (unit(index) - 0x41 + 10) as u32,
+            0x61..=0x7a => (unit(index) - 0x61 + 10) as u32,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        value = value.wrapping_mul(base).wrapping_add(digit);
+        index += 1;
+    }
+    if negative {
+        0u32.wrapping_sub(value)
+    } else {
+        value
     }
 }
 
@@ -108,11 +158,7 @@ pub fn plan_key_option(
                     Some(data_length),
                 );
             }
-            let mut units = Vec::with_capacity(data.len() / 2 - 1);
-            for pair in data[..data.len() - 2].chunks_exact(2) {
-                units.push(u16::from_le_bytes([pair[0], pair[1]]));
-            }
-            let value = unicode_string_to_integer(&units, 0).unwrap_or(0);
+            let value = unicode_le_string_to_integer(&data[..data.len() - 2]);
             ImageFileOptionQuery {
                 status: STATUS_SUCCESS,
                 returned_length: Some(data_length),
@@ -145,6 +191,7 @@ pub fn plan_key_option(
 mod tests {
     use super::*;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     fn partial(value_type: u32, data: &[u8]) -> Vec<u8> {
         let mut value = vec![0u8; PARTIAL_INFORMATION_DATA_OFFSET];

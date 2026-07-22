@@ -24,7 +24,11 @@
 
 extern crate alloc;
 
-use core::{ffi::c_void, marker::PhantomData};
+use core::{
+    ffi::c_void,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use nt_ntdll::heap::{Backing, Heap};
 use nt_ntdll_layout::Teb;
@@ -73,6 +77,10 @@ static mut CSR_API_PORT: u64 = 0;
 static mut CSR_PORT_MEMORY_DELTA: isize = 0;
 #[cfg(target_arch = "x86_64")]
 static mut CSR_PROCESS_ID: u64 = 0;
+
+/// Process-local cached IFEO roots. A loaded ntdll image has private writable data in each process,
+/// matching ReactOS's `ImageExecOptionsKey` / `Wow64ExecOptionsKey` globals.
+static IMAGE_EXEC_OPTIONS_KEY: AtomicU64 = AtomicU64::new(0);
 
 /// Return the connected CSR process id (`CsrGetProcessId`).
 #[cfg(target_arch = "x86_64")]
@@ -5377,10 +5385,15 @@ unsafe fn open_key_utf16(root: u64, name: &[u16]) -> u64 {
 /// Open a UTF-16 registry path and preserve the native status for compatibility helpers.
 #[cfg(target_arch = "x86_64")]
 unsafe fn open_key_utf16_status(root: u64, name: &[u16]) -> (u32, u64) {
+    unsafe { open_key_utf16_access_status(root, name, 0x2_0019) }
+}
+
+/// Open a UTF-16 registry path with the requested native access mask.
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_key_utf16_access_status(root: u64, name: &[u16], access: u64) -> (u32, u64) {
     let mut oa = [0u8; 0x30];
     let mut us = [0u8; 0x10];
     let mut handle: u64 = 0;
-    const KEY_READ: u64 = 0x2_0019;
     // SAFETY: valid stack buffers; name is a valid UTF-16 slice.
     unsafe {
         build_oa(
@@ -5393,12 +5406,242 @@ unsafe fn open_key_utf16_status(root: u64, name: &[u16]) -> (u32, u64) {
         let st = syscall4(
             SSN_NT_OPEN_KEY,
             &mut handle as *mut u64 as u64,
-            KEY_READ,
+            access,
             oa.as_ptr() as u64,
             0,
         );
         return (st as u32, handle);
     }
+}
+
+const IMAGE_FILE_OPTIONS_PATH_BYTES: &[u8; 91] =
+    b"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+const STATUS_INVALID_PARAMETER_U32: u32 = 0xC000_000D;
+const STATUS_NAME_TOO_LONG_U32: u32 = 0xC000_0106;
+const STATUS_OBJECT_PATH_SYNTAX_BAD_U32: u32 = 0xC000_003B;
+
+/// Live implementation of `LdrOpenImageFileOptionsKey`.
+///
+/// # Safety
+/// `sub_key` is a valid `UNICODE_STRING`; `new_key_handle` is writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_open_image_file_options_key(
+    sub_key: *const u8,
+    wow64: u8,
+    new_key_handle: *mut u64,
+) -> u32 {
+    // ReactOS's x64 Wow64 IFEO root is the empty absolute string. A native object-manager open of
+    // that path fails; avoid our executive's legacy empty-name HKLM fallback.
+    if wow64 != 0 {
+        return STATUS_OBJECT_PATH_SYNTAX_BAD_U32;
+    }
+    if sub_key.is_null() || new_key_handle.is_null() {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let length = unsafe { core::ptr::read_unaligned(sub_key as *const u16) } as usize;
+    let maximum = unsafe { core::ptr::read_unaligned(sub_key.add(2) as *const u16) } as usize;
+    let buffer = unsafe { core::ptr::read_unaligned(sub_key.add(8) as *const u64) } as *const u16;
+    if length & 1 != 0 || length > maximum || (length != 0 && buffer.is_null()) {
+        return STATUS_INVALID_PARAMETER_U32;
+    }
+    let path = if length == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(buffer, length / 2) }
+    };
+    let basename = nt_ntdll::loader::ifeo::image_file_options_subkey(path);
+
+    let cache = &IMAGE_EXEC_OPTIONS_KEY;
+    let mut root = cache.load(Ordering::Acquire);
+    if root == 0 {
+        // Materialize the path on the caller's stack. The executive can always read hosted stacks;
+        // an untouched ntdll `.rdata` pointer may not have a demand-filled cross-AS alias yet.
+        let mut root_path = [0u16; IMAGE_FILE_OPTIONS_PATH_BYTES.len()];
+        for (index, byte) in IMAGE_FILE_OPTIONS_PATH_BYTES.iter().enumerate() {
+            unsafe { core::ptr::write_volatile(&mut root_path[index], *byte as u16) };
+        }
+        let (status, opened) = unsafe {
+            open_key_utf16_access_status(0, &root_path, 0x8) // KEY_ENUMERATE_SUB_KEYS
+        };
+        if (status as i32) < 0 {
+            return status;
+        }
+        root = match cache.compare_exchange(0, opened, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => opened,
+            Err(existing) => {
+                let _ = unsafe { syscall4(SSN_NT_CLOSE, opened, 0, 0, 0) };
+                existing
+            }
+        };
+    }
+
+    let (status, image_key) = unsafe {
+        open_key_utf16_access_status(root, basename, 0x8000_0000) // GENERIC_READ
+    };
+    if (status as i32) >= 0 {
+        unsafe { core::ptr::write_unaligned(new_key_handle, image_key) };
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn bounded_value_name(value: *const u16, descriptor: &mut [u64; 2]) -> Result<u64, u32> {
+    if value.is_null() {
+        descriptor[0] = 0;
+        descriptor[1] = 0;
+        return Ok(descriptor.as_ptr() as u64);
+    }
+    let mut units = 0usize;
+    while units <= 0x7ffe && unsafe { core::ptr::read_unaligned(value.add(units)) } != 0 {
+        units += 1;
+    }
+    if units > 0x7ffe {
+        return Err(STATUS_NAME_TOO_LONG_U32);
+    }
+    let bytes = (units * 2) as u16;
+    descriptor[0] = bytes as u64 | ((bytes.saturating_add(2) as u64) << 16);
+    descriptor[1] = value as u64;
+    Ok(descriptor.as_ptr() as u64)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn apply_image_file_option_query(
+    partial: &[u8],
+    requested_type: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    returned_length: *mut u32,
+) -> u32 {
+    use nt_ntdll::loader::ifeo::ImageFileOptionOutput;
+
+    let plan = nt_ntdll::loader::ifeo::plan_key_option(
+        partial,
+        requested_type,
+        !buffer.is_null(),
+        buffer_size,
+    );
+    if let Some(length) = plan.returned_length {
+        if !returned_length.is_null() {
+            unsafe { core::ptr::write_unaligned(returned_length, length) };
+        }
+    }
+    match plan.output {
+        Some(ImageFileOptionOutput::Bytes(bytes)) if !bytes.is_empty() => unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+        },
+        Some(ImageFileOptionOutput::Dword(value)) => unsafe {
+            core::ptr::write_unaligned(buffer.cast::<u32>(), value);
+        },
+        _ => {}
+    }
+    plan.status
+}
+
+/// Live implementation of `LdrQueryImageFileKeyOption`.
+///
+/// # Safety
+/// Pointer arguments follow the native loader contract.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_query_image_file_key_option(
+    key_handle: u64,
+    value_name: *const u16,
+    requested_type: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    returned_length: *mut u32,
+) -> u32 {
+    let mut value_name_descriptor = [0u64; 2];
+    let value_name_pointer =
+        match unsafe { bounded_value_name(value_name, &mut value_name_descriptor) } {
+            Ok(pointer) => pointer,
+            Err(status) => return status,
+        };
+    let mut stack_info = [0u8; 1024];
+    let mut result_length = 0u32;
+    let mut status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            value_name_pointer,
+            2, // KeyValuePartialInformation
+            stack_info.as_mut_ptr() as u64,
+            stack_info.len() as u64,
+            &mut result_length as *mut u32 as u64,
+        ) as u32
+    };
+    if status != nt_ntdll::loader::ifeo::STATUS_BUFFER_OVERFLOW {
+        if (status as i32) < 0 {
+            return status;
+        }
+        let returned = result_length as usize;
+        if returned < 12 || returned > stack_info.len() {
+            return nt_ntdll::loader::ifeo::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        return unsafe {
+            apply_image_file_option_query(
+                &stack_info[..returned],
+                requested_type,
+                buffer,
+                buffer_size,
+                returned_length,
+            )
+        };
+    }
+
+    if result_length < 12 {
+        return nt_ntdll::loader::ifeo::STATUS_INFO_LENGTH_MISMATCH;
+    }
+    let data_length = u32::from_le_bytes(stack_info[8..12].try_into().unwrap()) as usize;
+    let required = match 12usize.checked_add(data_length) {
+        Some(size) if size <= result_length as usize => size,
+        _ => return nt_ntdll::loader::ifeo::STATUS_INFO_LENGTH_MISMATCH,
+    };
+    let allocation_size = match 16usize
+        .checked_add(data_length)
+        .map(|size| size.max(result_length as usize))
+    {
+        Some(size) if size >= required => size,
+        None => return STATUS_NO_MEMORY as u32,
+        _ => return nt_ntdll::loader::ifeo::STATUS_INFO_LENGTH_MISMATCH,
+    };
+    let heap_info = unsafe { crate::process_heap_alloc(allocation_size) };
+    if heap_info.is_null() {
+        return STATUS_NO_MEMORY as u32;
+    }
+    unsafe { core::ptr::write_bytes(heap_info, 0, allocation_size) };
+    result_length = 0;
+    status = unsafe {
+        syscall6(
+            SSN_NT_QUERY_VALUE_KEY,
+            key_handle,
+            value_name_pointer,
+            2,
+            heap_info as u64,
+            allocation_size as u64,
+            &mut result_length as *mut u32 as u64,
+        ) as u32
+    };
+    let result = if (status as i32) >= 0 {
+        let returned = result_length as usize;
+        if returned < 12 || returned > allocation_size {
+            unsafe { crate::process_heap_free(heap_info) };
+            return nt_ntdll::loader::ifeo::STATUS_INFO_LENGTH_MISMATCH;
+        }
+        let partial = unsafe { core::slice::from_raw_parts(heap_info, returned) };
+        unsafe {
+            apply_image_file_option_query(
+                partial,
+                requested_type,
+                buffer,
+                buffer_size,
+                returned_length,
+            )
+        }
+    } else {
+        status
+    };
+    unsafe { crate::process_heap_free(heap_info) };
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

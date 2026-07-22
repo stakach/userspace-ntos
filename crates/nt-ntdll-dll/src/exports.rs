@@ -4404,7 +4404,7 @@ pub unsafe extern "system" fn rtl_assert(
 /// `LdrQueryImageFileExecutionOptions(PUNICODE_STRING SubKey, PCWSTR ValueName, ULONG Type, PVOID
 /// Buffer, ULONG BufferSize, PULONG ReturnedLength) -> NTSTATUS`. Reads
 /// `\Registry\Machine\...\Image File Execution Options\<image>`. Honest seam (needs the live
-/// registry plane). Returns OBJECT_NAME_NOT_FOUND-style failure so callers take the default path.
+/// registry plane). Missing option keys propagate OBJECT_NAME_NOT_FOUND so callers take defaults.
 ///
 /// # Safety
 /// Standard contract.
@@ -4433,9 +4433,7 @@ pub unsafe extern "system" fn ldr_query_image_file_execution_options(
 
 /// `LdrQueryImageFileExecutionOptionsEx(..., BOOLEAN Wow64) -> NTSTATUS`.
 ///
-/// Faithful wrapper over the IFEO key-open/key-query helpers. The current registry model has no
-/// per-image IFEO keys, so the helper path normally returns `STATUS_OBJECT_NAME_NOT_FOUND`; keeping
-/// the wrapper real preserves close-on-success behavior when the key plane is later expanded.
+/// Faithful wrapper over the live IFEO key-open/key-query helpers, including per-image handle close.
 ///
 /// # Safety
 /// Standard IFEO pointer contract.
@@ -4454,7 +4452,7 @@ pub unsafe extern "system" fn ldr_query_image_file_execution_options_ex(
     let status = unsafe {
         ldr_open_image_file_options_key(sub_key as *const c_void, wow64, &mut key_handle)
     };
-    if status != STATUS_SUCCESS {
+    if (status as i32) < 0 {
         return status;
     }
 
@@ -9346,41 +9344,75 @@ pub unsafe extern "system" fn ldr_set_app_compat_dll_redirection_callback(
 }
 
 /// `LdrOpenImageFileOptionsKey(PCUNICODE_STRING SubKey, BOOLEAN Wow64, PHANDLE NewKeyHandle)
-/// -> NTSTATUS` — open the IFEO registry key for an image. No IFEO consulted → NULL handle +
-/// STATUS_OBJECT_NAME_NOT_FOUND (the "no options" contract; the loader uses defaults).
+/// -> NTSTATUS` — open the final image-name component below the process-cached native/Wow64 IFEO
+/// root. Missing roots/images propagate the native open status.
 ///
 /// # Safety
 /// `new_key_handle` writable.
 #[export_name = "LdrOpenImageFileOptionsKey"]
 pub unsafe extern "system" fn ldr_open_image_file_options_key(
-    _sub_key: *const c_void,
-    _wow64: u8,
+    sub_key: *const c_void,
+    wow64: u8,
     new_key_handle: *mut *mut c_void,
 ) -> NtStatus {
-    if !new_key_handle.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *new_key_handle = core::ptr::null_mut() };
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::ldr_open_image_file_options_key(
+                sub_key.cast::<u8>(),
+                wow64,
+                new_key_handle.cast::<u64>(),
+            )
+        };
     }
-    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (sub_key, wow64, new_key_handle);
+        0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+    }
 }
 
 /// `LdrQueryImageFileKeyOption(HANDLE KeyHandle, PCWSTR ValueName, ULONG Type, PVOID Buffer,
-/// ULONG BufferSize, PULONG ReturnedLength) -> NTSTATUS` — read an IFEO value. None present →
-/// STATUS_OBJECT_NAME_NOT_FOUND.
+/// ULONG BufferSize, PULONG ReturnedLength) -> NTSTATUS` — query and convert an IFEO value through
+/// `NtQueryValueKey(KeyValuePartialInformation)`, with the native stack-buffer/heap-retry policy.
 ///
 /// # Safety
 /// `buffer` writable for `buffer_size` bytes.
 #[export_name = "LdrQueryImageFileKeyOption"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn ldr_query_image_file_key_option(
-    _key_handle: *mut c_void,
-    _value_name: *const u16,
-    _type: u32,
-    _buffer: *mut c_void,
-    _buffer_size: u32,
-    _returned_length: *mut u32,
+    key_handle: *mut c_void,
+    value_name: *const u16,
+    value_type: u32,
+    buffer: *mut c_void,
+    buffer_size: u32,
+    returned_length: *mut u32,
 ) -> NtStatus {
-    0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::ldr_query_image_file_key_option(
+                key_handle as u64,
+                value_name,
+                value_type,
+                buffer,
+                buffer_size,
+                returned_length,
+            )
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            key_handle,
+            value_name,
+            value_type,
+            buffer,
+            buffer_size,
+            returned_length,
+        );
+        0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+    }
 }
 
 /// `STATUS_RESOURCE_TYPE_NOT_FOUND`.
