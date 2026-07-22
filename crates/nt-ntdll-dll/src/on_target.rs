@@ -5240,6 +5240,8 @@ pub unsafe extern "system" fn rtlp_nt_set_value_key(
 // ---------------------------------------------------------------------------------------------
 
 const SSN_NT_OPEN_KEY: u32 = 125;
+const SSN_NT_CREATE_KEY: u32 = 43;
+const SSN_NT_DELETE_VALUE_KEY: u32 = 68;
 const SSN_NT_ENUMERATE_VALUE_KEY: u32 = 77;
 const SSN_NT_QUERY_VALUE_KEY: u32 = 185;
 
@@ -5272,6 +5274,7 @@ const REG_MULTI_SZ: u32 = 7;
 
 const ENTRY_SIZE: usize = 0x38;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
 
 /// The RTL_QUERY_REGISTRY_TABLE entry, read field-by-field from the caller's array.
 struct QueryEntry {
@@ -5398,19 +5401,88 @@ unsafe fn open_key_utf16_status(root: u64, name: &[u16]) -> (u32, u64) {
     }
 }
 
-/// Resolve the RelativeTo base key path into a UTF-16 vec (absolute NT path), or `None` for
-/// RTL_REGISTRY_HANDLE (Path itself is the handle) / RTL_REGISTRY_ABSOLUTE (Path is already absolute).
 #[cfg(target_arch = "x86_64")]
-fn registry_base_path(relative_to: u32) -> Option<&'static str> {
-    match relative_to & !(RTL_REGISTRY_OPTIONAL | 0x2000_0000) {
-        RTL_REGISTRY_SERVICES => Some("\\Registry\\Machine\\System\\CurrentControlSet\\Services"),
-        RTL_REGISTRY_CONTROL => Some("\\Registry\\Machine\\System\\CurrentControlSet\\Control"),
-        RTL_REGISTRY_WINDOWS_NT => {
-            Some("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion")
+unsafe fn registry_unicode_string(slot: &mut [u64; 2], value: *const u16) -> u64 {
+    if value.is_null() {
+        slot[0] = 0;
+        slot[1] = 0;
+        return slot.as_ptr() as u64;
+    }
+    let units = unsafe { wlen(value) };
+    let bytes = units.saturating_mul(2).min(u16::MAX as usize) as u16;
+    let maximum = bytes.saturating_add(2);
+    slot[0] = bytes as u64 | ((maximum as u64) << 16);
+    slot[1] = value as u64;
+    slot.as_ptr() as u64
+}
+
+/// ReactOS `RtlpGetRegistryHandle`: return `(status, handle, opened_here)`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_get_registry_handle(
+    relative_to: u32,
+    path: *const u16,
+    create: bool,
+) -> (u32, u64, bool) {
+    if relative_to & RTL_REGISTRY_HANDLE != 0 {
+        return (0, path as u64, false);
+    }
+    let path_slice = if path.is_null() {
+        None
+    } else {
+        Some(unsafe { core::slice::from_raw_parts(path, wlen(path)) })
+    };
+    let full = match nt_ntdll::rtl::registry::resolve_path(relative_to, path_slice, None) {
+        Ok(path) => path,
+        Err(status) => return (status, 0, false),
+    };
+    let mut oa = [0u8; 0x30];
+    let mut us = [0u8; 0x10];
+    let mut handle = 0u64;
+    unsafe {
+        build_oa(
+            oa.as_mut_ptr(),
+            us.as_mut_ptr(),
+            0,
+            full.as_ptr(),
+            full.len(),
+        );
+        core::ptr::write(
+            oa.as_mut_ptr().add(0x18) as *mut u32,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        );
+    }
+    let status = if create {
+        unsafe {
+            syscall8(
+                SSN_NT_CREATE_KEY,
+                &mut handle as *mut u64 as u64,
+                0x4000_0000, // GENERIC_WRITE
+                oa.as_ptr() as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ) as u32
         }
-        4 => Some("\\Registry\\Machine\\Hardware\\DeviceMap"),
-        5 => Some("\\Registry\\User\\.Default"),
-        _ => None, // ABSOLUTE / HANDLE — caller handles
+    } else {
+        unsafe {
+            syscall4(
+                SSN_NT_OPEN_KEY,
+                &mut handle as *mut u64 as u64,
+                0x8200_0000, // MAXIMUM_ALLOWED | GENERIC_READ
+                oa.as_ptr() as u64,
+                0,
+            ) as u32
+        }
+    };
+    (status, handle, (status as i32) >= 0)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rtl_close_registry_handle(opened_here: bool, handle: u64) {
+    if opened_here {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
     }
 }
 
@@ -5421,51 +5493,73 @@ fn registry_base_path(relative_to: u32) -> Option<&'static str> {
 /// `path` is a NUL-terminated UTF-16 path, NULL, or a handle in RTL_REGISTRY_HANDLE mode.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn rtl_check_registry_key(relative_to: u32, path: *const u16) -> u32 {
-    use alloc::vec::Vec;
-    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-    const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
-    const RTL_REGISTRY_MAXIMUM: u32 = 6;
-
-    if relative_to & RTL_REGISTRY_HANDLE != 0 {
-        let handle = path as u64;
-        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
-        return STATUS_SUCCESS_U as u32;
-    }
-
-    let base_kind = relative_to & !RTL_REGISTRY_OPTIONAL;
-    if base_kind >= RTL_REGISTRY_MAXIMUM {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let path_length = if path.is_null() {
-        0
-    } else {
-        unsafe { wlen(path) }
-    };
-    if base_kind == RTL_REGISTRY_ABSOLUTE && path_length == 0 {
-        return STATUS_OBJECT_PATH_SYNTAX_BAD;
-    }
-
-    let mut full = Vec::new();
-    if let Some(base) = registry_base_path(base_kind) {
-        full.extend(base.encode_utf16());
-    }
-    if path_length != 0 {
-        let mut path_slice = unsafe { core::slice::from_raw_parts(path, path_length) };
-        if base_kind != RTL_REGISTRY_ABSOLUTE && path_slice.first().copied() == Some(b'\\' as u16) {
-            path_slice = &path_slice[1..];
-        }
-        if !full.is_empty() && !path_slice.is_empty() {
-            full.push(b'\\' as u16);
-        }
-        full.extend_from_slice(path_slice);
-    }
-
-    let (status, handle) = unsafe { open_key_utf16_status(0, &full) };
-    if status != STATUS_SUCCESS_U as u32 {
+    let (status, handle, opened_here) =
+        unsafe { rtl_get_registry_handle(relative_to, path, false) };
+    if (status as i32) < 0 {
         return status;
     }
-    let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
-    STATUS_SUCCESS_U as u32
+    if relative_to & RTL_REGISTRY_HANDLE != 0 {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+    } else {
+        unsafe { rtl_close_registry_handle(opened_here, handle) };
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_create_registry_key(relative_to: u32, path: *const u16) -> u32 {
+    let (status, handle, opened_here) = unsafe { rtl_get_registry_handle(relative_to, path, true) };
+    if (status as i32) >= 0 {
+        unsafe { rtl_close_registry_handle(opened_here, handle) };
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_delete_registry_value(
+    relative_to: u32,
+    path: *const u16,
+    value_name: *const u16,
+) -> u32 {
+    let (status, handle, opened_here) = unsafe { rtl_get_registry_handle(relative_to, path, true) };
+    if (status as i32) < 0 {
+        return status;
+    }
+    let mut name = [0u64; 2];
+    let name_ptr = unsafe { registry_unicode_string(&mut name, value_name) };
+    let result = unsafe { syscall4(SSN_NT_DELETE_VALUE_KEY, handle, name_ptr, 0, 0) as u32 };
+    unsafe { rtl_close_registry_handle(opened_here, handle) };
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_write_registry_value(
+    relative_to: u32,
+    path: *const u16,
+    value_name: *const u16,
+    value_type: u32,
+    value_data: *const c_void,
+    value_length: u32,
+) -> u32 {
+    let (status, handle, opened_here) = unsafe { rtl_get_registry_handle(relative_to, path, true) };
+    if (status as i32) < 0 {
+        return status;
+    }
+    let mut name = [0u64; 2];
+    let name_ptr = unsafe { registry_unicode_string(&mut name, value_name) };
+    let result = unsafe {
+        syscall6(
+            SSN_NT_SET_VALUE_KEY,
+            handle,
+            name_ptr,
+            0,
+            value_type as u64,
+            value_data as u64,
+            value_length as u64,
+        ) as u32
+    };
+    unsafe { rtl_close_registry_handle(opened_here, handle) };
+    result
 }
 
 /// Does the NUL-terminated UTF-16 `name_ptr` equal the ASCII `want` (case-sensitive)?
@@ -6156,46 +6250,15 @@ pub unsafe fn rtl_query_registry_values(
     if query_table.is_null() {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
-    // Build the absolute base key path (base + '\' + Path), then open it.
-    let base_key: u64 = if (relative_to & RTL_REGISTRY_HANDLE) != 0 {
-        // Path IS the handle.
-        path as u64
-    } else {
-        let mut full: Vec<u16> = Vec::new();
-        if (relative_to & !(RTL_REGISTRY_OPTIONAL | 0x2000_0000)) == RTL_REGISTRY_ABSOLUTE {
-            // Path is already absolute.
-        } else if let Some(base) = registry_base_path(relative_to) {
-            full.extend(base.encode_utf16());
-        }
-        if !path.is_null() {
-            // SAFETY: path is NUL-terminated per the contract.
-            let plen = unsafe { wlen(path) };
-            if plen != 0 {
-                // Real ntdll skips a leading '\' on Path unless ABSOLUTE (the "HACK!" at
-                // registry.c:529).
-                // SAFETY: [path, path+plen) is the string.
-                let pslice = unsafe { core::slice::from_raw_parts(path, plen) };
-                if !full.is_empty() {
-                    full.push(b'\\' as u16);
-                }
-                full.extend_from_slice(pslice);
-            }
-        }
-        if full.is_empty() {
-            return 0xC000_000D;
-        }
-        // SAFETY: on-target key open.
-        let h = unsafe { open_key_utf16(0, &full) };
-        if h == 0 {
-            // Base key not found. If OPTIONAL, this is fine (SUCCESS); else fail.
-            return if (relative_to & RTL_REGISTRY_OPTIONAL) != 0 {
-                STATUS_SUCCESS_U as u32
-            } else {
-                0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
-            };
-        }
-        h
-    };
+    let (open_status, base_key, base_opened_here) =
+        unsafe { rtl_get_registry_handle(relative_to, path, false) };
+    if (open_status as i32) < 0 {
+        return if (relative_to & RTL_REGISTRY_OPTIONAL) != 0 {
+            STATUS_SUCCESS_U as u32
+        } else {
+            open_status
+        };
+    }
 
     // A reusable KeyValueFullInformation buffer.
     let mut info = [0u8; 2048];
@@ -6361,10 +6424,7 @@ pub unsafe fn rtl_query_registry_values(
         // SAFETY: close the subkey handle.
         unsafe { syscall4(SSN_NT_CLOSE, current_key, 0, 0, 0) };
     }
-    if (relative_to & RTL_REGISTRY_HANDLE) == 0 {
-        // SAFETY: close the base key we opened.
-        unsafe { syscall4(SSN_NT_CLOSE, base_key, 0, 0, 0) };
-    }
+    unsafe { rtl_close_registry_handle(base_opened_here, base_key) };
     status
 }
 

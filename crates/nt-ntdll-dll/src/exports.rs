@@ -3845,6 +3845,90 @@ pub unsafe extern "system" fn rtl_check_registry_key(
     }
 }
 
+/// `RtlCreateRegistryKey(ULONG RelativeTo, PCWSTR Path) -> NTSTATUS`.
+///
+/// # Safety
+/// `path` is NULL, a NUL-terminated UTF-16 path, or a key handle in `RTL_REGISTRY_HANDLE` mode.
+#[export_name = "RtlCreateRegistryKey"]
+pub unsafe extern "system" fn rtl_create_registry_key(
+    relative_to: u32,
+    path: *const u16,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::rtl_create_registry_key(relative_to, path) as NtStatus }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (relative_to, path);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlDeleteRegistryValue(ULONG RelativeTo, PCWSTR Path, PCWSTR ValueName) -> NTSTATUS`.
+///
+/// # Safety
+/// Pointer arguments follow the native registry helper contract.
+#[export_name = "RtlDeleteRegistryValue"]
+pub unsafe extern "system" fn rtl_delete_registry_value(
+    relative_to: u32,
+    path: *const u16,
+    value_name: *const u16,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            crate::on_target::rtl_delete_registry_value(relative_to, path, value_name) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (relative_to, path, value_name);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlWriteRegistryValue(ULONG RelativeTo, PCWSTR Path, PCWSTR ValueName, ULONG ValueType,
+/// PVOID ValueData, ULONG ValueLength) -> NTSTATUS`.
+///
+/// # Safety
+/// Pointer arguments follow the native registry helper contract.
+#[export_name = "RtlWriteRegistryValue"]
+pub unsafe extern "system" fn rtl_write_registry_value(
+    relative_to: u32,
+    path: *const u16,
+    value_name: *const u16,
+    value_type: u32,
+    value_data: *const c_void,
+    value_length: u32,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            crate::on_target::rtl_write_registry_value(
+                relative_to,
+                path,
+                value_name,
+                value_type,
+                value_data,
+                value_length,
+            ) as NtStatus
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            relative_to,
+            path,
+            value_name,
+            value_type,
+            value_data,
+            value_length,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 // =================================================================================================
 // Rtl* — critical-process markers + boot-status. Live-plane wrappers (honest seams).
 // =================================================================================================
@@ -25360,6 +25444,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_dos_search_path_u as usize,
         rtl_query_registry_values as usize,
         rtl_check_registry_key as usize,
+        rtl_create_registry_key as usize,
+        rtl_delete_registry_value as usize,
+        rtl_write_registry_value as usize,
         rtl_set_process_is_critical as usize,
         rtl_set_thread_is_critical as usize,
         rtl_create_boot_status_data_file as usize,
