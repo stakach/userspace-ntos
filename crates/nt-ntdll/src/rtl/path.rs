@@ -64,6 +64,81 @@ pub struct AppendPathElementPlan {
     pub after: Option<u16>,
 }
 
+/// Fully composed names returned by `RtlComputePrivatizedDllName_U`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivatizedDllNames {
+    /// Image-directory-relative DLL name.
+    pub real: Vec<u16>,
+    /// `<full image path>.Local\<dll>` redirection candidate.
+    pub local: Vec<u16>,
+}
+
+/// The composed names cannot be represented by native `UNICODE_STRING` descriptors.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PrivatizedDllNameTooLong;
+
+/// Compose the two paths used by `RtlComputePrivatizedDllName_U`.
+pub fn compute_privatized_dll_names(
+    image_path: &[u16],
+    dll_name: &[u16],
+) -> Result<PrivatizedDllNames, PrivatizedDllNameTooLong> {
+    let basename_start = dll_name
+        .iter()
+        .rposition(|&unit| is_sep(unit))
+        .map_or(0, |position| position + 1);
+    let basename = &dll_name[basename_start..];
+    let has_extension = basename
+        .iter()
+        .rposition(|&unit| unit == b'.' as u16)
+        .is_some_and(|position| position > 0);
+    let default_extension: &[u16] = if has_extension {
+        &[]
+    } else {
+        &[b'.' as u16, b'D' as u16, b'L' as u16, b'L' as u16]
+    };
+
+    let image_directory_length = image_path
+        .iter()
+        .rposition(|&unit| is_sep(unit))
+        .map_or(image_path.len(), |position| position + 1);
+    let real_length = image_directory_length
+        .checked_add(basename.len())
+        .and_then(|length| length.checked_add(default_extension.len()))
+        .ok_or(PrivatizedDllNameTooLong)?;
+    let local_suffix = [
+        b'.' as u16,
+        b'L' as u16,
+        b'o' as u16,
+        b'c' as u16,
+        b'a' as u16,
+        b'l' as u16,
+        b'\\' as u16,
+    ];
+    let local_length = image_path
+        .len()
+        .checked_add(local_suffix.len())
+        .and_then(|length| length.checked_add(basename.len()))
+        .and_then(|length| length.checked_add(default_extension.len()))
+        .ok_or(PrivatizedDllNameTooLong)?;
+
+    // ReactOS uses `>` for LocalName and `>=` for RealName against the 65534-byte limit.
+    if local_length > 32_766 || real_length >= 32_766 {
+        return Err(PrivatizedDllNameTooLong);
+    }
+
+    let mut real = Vec::with_capacity(real_length);
+    real.extend_from_slice(&image_path[..image_directory_length]);
+    real.extend_from_slice(basename);
+    real.extend_from_slice(default_extension);
+
+    let mut local = Vec::with_capacity(local_length);
+    local.extend_from_slice(image_path);
+    local.extend_from_slice(&local_suffix);
+    local.extend_from_slice(basename);
+    local.extend_from_slice(default_extension);
+    Ok(PrivatizedDllNames { real, local })
+}
+
 /// Plan the separator handling performed by `RtlAppendPathElement`.
 pub fn append_path_element_plan(
     path: &[u16],
@@ -362,6 +437,44 @@ mod tests {
         assert_eq!(append_element("/root", "leaf\\", false), "/root\\leaf\\");
         assert_eq!(append_element("/root", "leaf", true), "/root\\leaf");
         assert_eq!(append_element("unchanged", "", false), "unchanged");
+    }
+
+    #[test]
+    fn privatized_dll_names_match_reactos_cases() {
+        let image = u("C:\\Windows\\System32\\app.exe");
+        let cases = [
+            ("kernel32.dll", "kernel32.dll"),
+            ("kernel32", "kernel32.DLL"),
+            ("kernel32.dll.dll", "kernel32.dll.dll"),
+            ("kernel32.", "kernel32."),
+            (".kernel32", ".kernel32.DLL"),
+            ("..kernel32", "..kernel32"),
+            ("test\\kernel32.dll", "kernel32.dll"),
+            ("test.dll/kernel32", "kernel32.DLL"),
+            ("//", ".DLL"),
+            ("\\", ".DLL"),
+            ("", ".DLL"),
+        ];
+        for (input, expected) in cases {
+            let names = compute_privatized_dll_names(&image, &u(input)).unwrap();
+            assert_eq!(
+                s(&names.real),
+                alloc::format!("C:\\Windows\\System32\\{expected}")
+            );
+            assert_eq!(
+                s(&names.local),
+                alloc::format!("C:\\Windows\\System32\\app.exe.Local\\{expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn privatized_dll_name_limits_match_descriptor_rules() {
+        let local_limit_image = alloc::vec![b'a' as u16; 32_761];
+        assert!(compute_privatized_dll_names(&local_limit_image, &[]).is_err());
+
+        let real_limit_image = alloc::vec![b'a' as u16; 32_762];
+        assert!(compute_privatized_dll_names(&real_limit_image, &[]).is_err());
     }
 
     #[test]

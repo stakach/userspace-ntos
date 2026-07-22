@@ -11058,6 +11058,113 @@ pub unsafe extern "system" fn rtl_generate_8dot3_name(
     }
 }
 
+/// `RtlComputePrivatizedDllName_U(PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING) -> NTSTATUS`
+/// (`sdk/lib/rtl/path.c:584`).
+///
+/// # Safety
+/// All three descriptors must be valid. Caller-owned output buffers must be writable through their
+/// `MaximumLength`; replacement buffers are allocated from the process heap when necessary.
+#[export_name = "RtlComputePrivatizedDllName_U"]
+pub unsafe extern "system" fn rtl_compute_privatized_dll_name_u(
+    dll_name: PCUnicodeString,
+    real_name: PUnicodeString,
+    local_name: PUnicodeString,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
+        const PROCESS_PARAMETERS_FLAGS: usize = 0x08;
+        const PROCESS_PARAMETERS_IMAGE_PATH: usize = 0x60;
+
+        let parameters = core::ptr::read_unaligned((current_peb() + 0x20) as *const u64);
+        let flags = core::ptr::read_unaligned(
+            (parameters as usize + PROCESS_PARAMETERS_FLAGS) as *const u32,
+        );
+        let mut image_path = core::ptr::read_unaligned(
+            (parameters as usize + PROCESS_PARAMETERS_IMAGE_PATH) as PCUnicodeString,
+        );
+        if flags & RTL_USER_PROCESS_PARAMETERS_NORMALIZED == 0 {
+            image_path.buffer += parameters;
+        }
+
+        let image = if image_path.length == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(
+                image_path.buffer as *const u16,
+                image_path.length as usize / 2,
+            )
+        };
+        let dll = if (*dll_name).length == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(
+                (*dll_name).buffer as *const u16,
+                (*dll_name).length as usize / 2,
+            )
+        };
+        let names = match rtl::path::compute_privatized_dll_names(image, dll) {
+            Ok(names) => names,
+            Err(_) => return STATUS_NAME_TOO_LONG,
+        };
+
+        let original_real = *real_name;
+        let original_local = *local_name;
+        let local_required = (names.local.len() + 1) * 2;
+        let real_required = (names.real.len() + 1) * 2;
+
+        let mut copy_local = original_local;
+        let local_allocated = local_required > copy_local.maximum_length as usize;
+        if local_allocated {
+            let buffer = crate::process_heap_alloc(local_required) as *mut u16;
+            if buffer.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            copy_local.buffer = buffer as u64;
+            copy_local.maximum_length = local_required as u16;
+        }
+
+        let mut copy_real = original_real;
+        let real_allocated = real_required > copy_real.maximum_length as usize;
+        if real_allocated {
+            let buffer = crate::process_heap_alloc(real_required) as *mut u16;
+            if buffer.is_null() {
+                if local_allocated {
+                    let _ = crate::process_heap_free(copy_local.buffer as *mut u8);
+                }
+                return STATUS_NO_MEMORY;
+            }
+            copy_real.buffer = buffer as u64;
+            copy_real.maximum_length = real_required as u16;
+        }
+
+        core::ptr::copy_nonoverlapping(
+            names.local.as_ptr(),
+            copy_local.buffer as *mut u16,
+            names.local.len(),
+        );
+        core::ptr::write((copy_local.buffer as *mut u16).add(names.local.len()), 0);
+        copy_local.length = (names.local.len() * 2) as u16;
+
+        core::ptr::copy_nonoverlapping(
+            names.real.as_ptr(),
+            copy_real.buffer as *mut u16,
+            names.real.len(),
+        );
+        core::ptr::write((copy_real.buffer as *mut u16).add(names.real.len()), 0);
+        copy_real.length = (names.real.len() * 2) as u16;
+
+        *real_name = copy_real;
+        *local_name = copy_local;
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dll_name, real_name, local_name);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `RtlGUIDFromString(PCUNICODE_STRING GuidString, GUID* Guid) -> NTSTATUS`.
 ///
 /// # Safety
@@ -22838,6 +22945,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_is_dos_device_name_u as usize,
         rtl_is_name_legal_dos_8dot3 as usize,
         rtl_generate_8dot3_name as usize,
+        rtl_compute_privatized_dll_name_u as usize,
         rtl_guid_from_string as usize,
         rtl_string_from_guid as usize,
         rtl_image_nt_header_ex as usize,
