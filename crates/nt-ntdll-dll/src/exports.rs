@@ -4415,6 +4415,92 @@ pub unsafe extern "system" fn dbg_user_break_point() {
     }
 }
 
+/// `RtlApplicationVerifierStop(ULONG_PTR Code, PCSTR Message, PVOID Value1, PCSTR Description1,
+/// ... Value4, PCSTR Description4)` -- emit the native verifier diagnostic and break into the
+/// debugger. Ported from ReactOS `sdk/lib/rtl/appverifier.c`.
+///
+/// # Safety
+/// `message` and each description are NULL or readable NUL-terminated narrow strings.
+#[export_name = "RtlApplicationVerifierStop"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_application_verifier_stop(
+    code: usize,
+    message: *const u8,
+    value1: *mut c_void,
+    description1: *const u8,
+    value2: *mut c_void,
+    description2: *const u8,
+    value3: *mut c_void,
+    description3: *const u8,
+    value4: *mut c_void,
+    description4: *const u8,
+) {
+    let mut message_buf = [0u8; DBG_CSTR_ARGUMENT_SIZE];
+    let mut description_bufs = [[0u8; DBG_CSTR_ARGUMENT_SIZE]; 4];
+    let message_len = if message.is_null() {
+        message_buf[..6].copy_from_slice(b"(null)");
+        6
+    } else {
+        unsafe { copy_cstr_bounded(message, &mut message_buf) }
+    };
+    let description_ptrs = [description1, description2, description3, description4];
+    let mut description_lengths = [0usize; 4];
+    for index in 0..description_ptrs.len() {
+        description_lengths[index] = if description_ptrs[index].is_null() {
+            description_bufs[index][..6].copy_from_slice(b"(null)");
+            6
+        } else {
+            unsafe { copy_cstr_bounded(description_ptrs[index], &mut description_bufs[index]) }
+        };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let process_id = {
+        let teb: u64;
+        // SAFETY: the x64 TEB self pointer is gs:[0x30], and ClientId.UniqueProcess is at +0x40.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[0x30]",
+                out(reg) teb,
+                options(nostack, preserves_flags, readonly)
+            );
+            core::ptr::read_unaligned((teb + 0x40) as *const usize)
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let process_id = 0usize;
+
+    let values = [
+        (
+            value1 as usize,
+            &description_bufs[0][..description_lengths[0]],
+        ),
+        (
+            value2 as usize,
+            &description_bufs[1][..description_lengths[1]],
+        ),
+        (
+            value3 as usize,
+            &description_bufs[2][..description_lengths[2]],
+        ),
+        (
+            value4 as usize,
+            &description_bufs[3][..description_lengths[3]],
+        ),
+    ];
+    let rendered = nt_ntdll::dbg::render_application_verifier_stop(
+        code,
+        process_id,
+        &message_buf[..message_len],
+        &values,
+    );
+    let mut stack_output = [0u8; 2048];
+    let output_len = rendered.len().min(stack_output.len());
+    stack_output[..output_len].copy_from_slice(&rendered[..output_len]);
+    unsafe { dbg_emit_stack_bytes(&stack_output[..output_len]) };
+    unsafe { dbg_break_point() };
+}
+
 // =================================================================================================
 // A_SHA* — legacy SHA-1 compatibility exports.
 // =================================================================================================
@@ -22260,6 +22346,7 @@ pub unsafe extern "C" fn export_anchor() {
         dbg_print as usize,
         dbg_break_point as usize,
         dbg_user_break_point as usize,
+        rtl_application_verifier_stop as usize,
         a_sha_init as usize,
         a_sha_update as usize,
         a_sha_final as usize,

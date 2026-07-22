@@ -98,6 +98,54 @@ pub fn render_with_prefix(prefix: &[u8], fmt: &[u8], args: &[FmtArg]) -> Vec<u8>
     out
 }
 
+fn push_hex(out: &mut Vec<u8>, value: u64, minimum_digits: usize) {
+    let significant_digits = if value == 0 {
+        1
+    } else {
+        ((64 - value.leading_zeros() as usize) + 3) / 4
+    };
+    let digits = significant_digits.max(minimum_digits);
+    for index in (0..digits).rev() {
+        let digit = ((value >> (index * 4)) & 0xf) as u8;
+        out.push(if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        });
+    }
+}
+
+/// Render the diagnostic emitted by `RtlApplicationVerifierStop` before it raises a debugger
+/// breakpoint. The value descriptions are narrow strings, matching the native ten-argument ABI.
+pub fn render_application_verifier_stop(
+    code: usize,
+    process_id: usize,
+    message: &[u8],
+    values: &[(usize, &[u8]); 4],
+) -> Vec<u8> {
+    const BANNER: &[u8] = b"**************************************************\n";
+
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(BANNER);
+    out.extend_from_slice(b"VERIFIER STOP ");
+    push_hex(&mut out, code as u64, 8);
+    out.extend_from_slice(b": pid ");
+    push_hex(&mut out, process_id as u64, 4);
+    out.extend_from_slice(b":  ");
+    out.extend_from_slice(message);
+    out.push(b'\n');
+
+    for (value, description) in values {
+        out.extend_from_slice(b"    0x");
+        push_hex(&mut out, *value as u64, 16);
+        out.extend_from_slice(b" : ");
+        out.extend_from_slice(description);
+        out.push(b'\n');
+    }
+    out.extend_from_slice(BANNER);
+    out
+}
+
 /// `DbgPrintEx(ComponentId, Level, Format, …)` decision + render: returns `Some(bytes)` if the
 /// component/level filter passes, else `None` (suppressed — NOT printed, and NOT faked). The caller
 /// emits `Some` via the debug service.
@@ -242,6 +290,47 @@ mod tests {
             render_with_prefix(b"[smss] ", b"start %s", &[FmtArg::Str(b"csrss\0")]),
             b"[smss] start csrss"
         );
+    }
+
+    #[test]
+    fn application_verifier_stop_matches_native_shape() {
+        let rendered = render_application_verifier_stop(
+            0x2a,
+            0x19,
+            b"bad handle",
+            &[
+                (1, b"first"),
+                (0xfeed, b"second"),
+                (0, b"third"),
+                (usize::MAX, b"fourth"),
+            ],
+        );
+        assert_eq!(
+            rendered,
+            concat!(
+                "**************************************************\n",
+                "VERIFIER STOP 0000002a: pid 0019:  bad handle\n",
+                "    0x0000000000000001 : first\n",
+                "    0x000000000000feed : second\n",
+                "    0x0000000000000000 : third\n",
+                "    0xffffffffffffffff : fourth\n",
+                "**************************************************\n",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn application_verifier_stop_does_not_truncate_large_ids() {
+        let rendered = render_application_verifier_stop(
+            0x1_0000_0000,
+            0x1_0000,
+            b"message",
+            &[(0, b"one"), (0, b"two"), (0, b"three"), (0, b"four")],
+        );
+        assert!(rendered
+            .windows(b"VERIFIER STOP 100000000: pid 10000".len())
+            .any(|window| window == b"VERIFIER STOP 100000000: pid 10000"));
     }
 
     #[test]
