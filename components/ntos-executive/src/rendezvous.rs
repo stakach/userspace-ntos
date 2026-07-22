@@ -45,46 +45,62 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
 pub(crate) unsafe fn sm_stack_write(va: u64, v: u64) {
     if va >= SM_STACK_BASE && va + 8 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
         core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u64, v);
+    } else if va >= SMSS_ALLOC_VA && va + 8 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        core::ptr::write_volatile((SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)) as *mut u64, v);
     }
 }
 /// Write a u16 to the SM-loop thread's stack (for PORT_MESSAGE.Type@0x04).
 pub(crate) unsafe fn sm_stack_write16(va: u64, v: u16) {
     if va >= SM_STACK_BASE && va + 2 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
         core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u16, v);
+    } else if va >= SMSS_ALLOC_VA && va + 2 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        core::ptr::write_volatile((SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)) as *mut u16, v);
     }
 }
 pub(crate) unsafe fn sm_stack_write32(va: u64, v: u32) {
     if va >= SM_STACK_BASE && va + 4 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
         core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u32, v);
+    } else if va >= SMSS_ALLOC_VA && va + 4 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        core::ptr::write_volatile((SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)) as *mut u32, v);
     }
 }
 pub(crate) unsafe fn sm_stack_read(va: u64) -> u64 {
     if va >= SM_STACK_BASE && va + 8 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
         core::ptr::read_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *const u64)
+    } else if va >= SMSS_ALLOC_VA && va + 8 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
+        core::ptr::read_volatile((SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)) as *const u64)
     } else {
         0
     }
 }
 unsafe fn sm_stack_copyout(va: u64, bytes: &[u8]) -> bool {
-    if va < SM_STACK_BASE || va + bytes.len() as u64 > SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+    let mirror = if va >= SM_STACK_BASE
+        && va + bytes.len() as u64 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000
+    {
+        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
+    } else if va >= SMSS_ALLOC_VA
+        && va + bytes.len() as u64 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
+    {
+        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
+    } else {
         return false;
-    }
-    core::ptr::copy_nonoverlapping(
-        bytes.as_ptr(),
-        (SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u8,
-        bytes.len(),
-    );
+    };
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), mirror as *mut u8, bytes.len());
     true
 }
 unsafe fn sm_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
-    if va < SM_STACK_BASE || va + bytes.len() as u64 > SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+    let mirror = if va >= SM_STACK_BASE
+        && va + bytes.len() as u64 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000
+    {
+        SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)
+    } else if va >= SMSS_ALLOC_VA
+        && va + bytes.len() as u64 <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
+    {
+        SMSS_HEAP_MIRROR_VA + (va - SMSS_ALLOC_VA)
+    } else {
         return false;
-    }
-    core::ptr::copy_nonoverlapping(
-        (SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *const u8,
-        bytes.as_mut_ptr(),
-        bytes.len(),
-    );
+    };
+    core::ptr::copy_nonoverlapping(mirror as *const u8, bytes.as_mut_ptr(), bytes.len());
     true
 }
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
@@ -476,6 +492,11 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
     nt_base: u64,
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    csrss_img_end: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> bool {
     const SSN_OPEN_PROCESS: u64 = 128;
@@ -669,8 +690,23 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                         nt_handler.pi = saved_pi;
                     }
                     SSN_REQUEST_WAIT_REPLY => {
-                        print_str(b"[sm-api] reached nested SbpCreateSession request\n");
-                        return false;
+                        print_str(b"[sm-api] driving nested SbpCreateSession request\n");
+                        if !csr_sb_api_request_rendezvous(
+                            get_recv_mr(9),
+                            rdx,
+                            get_recv_mr(7),
+                            csrss_pml4,
+                            csrss_pe,
+                            csrss_img_end,
+                            nt_base,
+                            nt_end,
+                            ntdll_pe,
+                            reg,
+                            dll_pes,
+                            nt_handler,
+                        ) {
+                            return false;
+                        }
                     }
                     SSN_REPLY_WAIT_RECV => {
                         let reply_msg = get_recv_mr(7);
@@ -1268,6 +1304,49 @@ unsafe fn csr_sb_stack_write16(va: u64, v: u16) {
         );
     }
 }
+unsafe fn csr_sb_stack_write32(va: u64, v: u32) {
+    if va >= CSR_SB_STACK_BASE && va + 4 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile(
+            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *mut u32,
+            v,
+        );
+    }
+}
+unsafe fn csr_sb_stack_read(va: u64) -> u64 {
+    if va >= CSR_SB_STACK_BASE && va + 8 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
+        core::ptr::read_volatile(
+            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *const u64,
+        )
+    } else {
+        0
+    }
+}
+unsafe fn csr_sb_stack_copyout(va: u64, bytes: &[u8]) -> bool {
+    if va < CSR_SB_STACK_BASE
+        || va + bytes.len() as u64 > CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000
+    {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(
+        bytes.as_ptr(),
+        (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *mut u8,
+        bytes.len(),
+    );
+    true
+}
+unsafe fn csr_sb_stack_copyin(va: u64, bytes: &mut [u8]) -> bool {
+    if va < CSR_SB_STACK_BASE
+        || va + bytes.len() as u64 > CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000
+    {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(
+        (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *const u8,
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    true
+}
 
 /// Demand-fill one code/data page for the CSR API thread during the rendezvous. The page is in
 /// csrss's own image (PE_LOAD_BASE..img_end), ntdll, or a mapped registry DLL (csrsrv/user32/…, via
@@ -1460,6 +1539,300 @@ unsafe fn csr_sb_accept_connection(
         m3 = nm3;
     }
     0
+}
+
+/// Drive one ordinary SB request through the real `CsrSbApiRequestThread`. The worker receives the
+/// brokered bytes on its named listen port, executes csrsrv's dispatcher, sends the reply from its
+/// next `NtReplyWaitReceivePort`, and remains parked for the following session-manager request.
+#[allow(clippy::too_many_arguments)]
+unsafe fn csr_sb_api_request_rendezvous(
+    client_port: u64,
+    request_va: u64,
+    reply_va: u64,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    nt_handler: &mut ExecNtHandler,
+) -> bool {
+    const SSN_SET_INFO_PROCESS: u64 = 237;
+    const SSN_QUERY_INFO_THREAD: u64 = 162;
+    const SSN_QUERY_OBJECT: u64 = 170;
+    const SSN_SET_INFO_OBJECT: u64 = 236;
+    const SSN_RESUME_THREAD: u64 = 214;
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_CLOSE: u64 = 27;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+
+    let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_CSR_SB_SLOT.load(Ordering::Relaxed);
+    let was_parked = CSR_SB_RECEIVE_PARKED.swap(0, Ordering::Relaxed);
+    print_str(b"[csr-sb-api] enter client=0x");
+    print_hex_u64(client_port);
+    print_str(b" request=0x");
+    print_hex_u64(request_va);
+    print_str(b" parked=");
+    print_u64(was_parked);
+    print_str(b"\n");
+    if ep == 0 || reply == 0 || was_parked == 0 {
+        print_str(b"[csr-sb-api] missing endpoint/reply/parked receive\n");
+        return false;
+    }
+    let request_len = ((sm_stack_read(request_va) >> 16) as u16) as usize;
+    print_str(b"[csr-sb-api] request length=");
+    print_u64(request_len as u64);
+    print_str(b" listen=0x");
+    print_hex_u64(CSR_SB_RECVPORT.load(Ordering::Relaxed));
+    print_str(b"\n");
+    if !(0x28..=0x120).contains(&request_len) {
+        print_str(b"[csr-sb-api] invalid request length\n");
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let mut request = [0u8; 0x120];
+    if !sm_stack_copyin(request_va, &mut request[..request_len]) {
+        print_str(b"[csr-sb-api] request is outside SM worker stack\n");
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    request[4..6].copy_from_slice(&nt_lpc_abi::msg_type::LPC_REQUEST.to_le_bytes());
+    request[8..16].copy_from_slice(&PM_PIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    request[16..24].copy_from_slice(&PM_TIDS[0].load(Ordering::Relaxed).to_le_bytes());
+    if lpc_client()
+        .and_then(|client| client.request_wait_reply(client_port, &request[..request_len]).ok())
+        .is_none()
+    {
+        print_str(b"[csr-sb-api] broker request send failed\n");
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    let listen_port = CSR_SB_RECVPORT.load(Ordering::Relaxed);
+    let Some(received) = lpc_client().and_then(|client| client.reply_wait_receive(listen_port).ok())
+    else {
+        print_str(b"[csr-sb-api] broker listen receive failed\n");
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    };
+    let recvmsg = CSR_SB_RECVMSG.load(Ordering::Relaxed);
+    if received.connection_info.len() != request_len
+        || !csr_sb_stack_copyout(recvmsg, &received.connection_info)
+    {
+        print_str(b"[csr-sb-api] received length/copyout mismatch got=");
+        print_u64(received.connection_info.len() as u64);
+        print_str(b"\n");
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return false;
+    }
+    csr_sb_stack_write16(recvmsg + 4, nt_lpc_abi::msg_type::LPC_REQUEST);
+    csr_sb_stack_write(recvmsg + 8, PM_PIDS[0].load(Ordering::Relaxed));
+    csr_sb_stack_write(recvmsg + 16, PM_TIDS[0].load(Ordering::Relaxed));
+    let context_out = CSR_SB_RECV_RDX.load(Ordering::Relaxed);
+    if context_out != 0 {
+        csr_sb_stack_write(context_out, received.port_context);
+    }
+    set_reply_mr(15, 0);
+    set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
+    set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
+    send_on_reply(reply, 18, 0, 0, 0, 0);
+
+    let mut fill_idx = 0;
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    for _ in 0..8000 {
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0;
+            let rsp = m1;
+            let arg1 = m2;
+            let arg3 = get_recv_mr(4);
+            let arg4 = get_recv_mr(5);
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn;
+            m2 = 0;
+            mi = (2u64 << 12) | (mi & 0x7f);
+        }
+        match mi >> 12 {
+            6 => {
+                let page = m1 & !0xfff;
+                if m1 < 0x10000
+                    || !csr_fill_page(
+                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
+                        reg, dll_pes, &mut fill_idx,
+                    )
+                {
+                    print_str(b"[csr-sb-api] unresolved worker fault\n");
+                    return false;
+                }
+                send_on_reply(reply, 0, 0, 0, 0, 0);
+            }
+            3 => {
+                let Some(pe) = ntdll_pe else { return false };
+                if m0 < nt_base
+                    || m0 >= nt_end
+                    || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
+                {
+                    return false;
+                }
+                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+            }
+            2 => {
+                let ssn = m0;
+                let sp = get_recv_mr(16);
+                let flags = get_recv_mr(17);
+                let rdx = m3;
+                let mut result = 0u64;
+                print_str(b"[csr-sb-api] worker SSN=");
+                print_u64(ssn);
+                print_str(b"\n");
+                match ssn {
+                    SSN_SET_INFO_PROCESS | SSN_SET_INFO_OBJECT => {}
+                    SSN_QUERY_INFO_THREAD => {
+                        let caller_pid = PM_PIDS[1].load(Ordering::Relaxed) as nt_process::ProcessId;
+                        if nt_handler
+                            .pm
+                            .resolve_thread_handle(
+                                caller_pid,
+                                CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
+                                get_recv_mr(9),
+                                0,
+                            )
+                            .is_err()
+                        {
+                            result = nt_process::STATUS_INVALID_HANDLE as u64;
+                        } else if rdx == 1 {
+                            let buffer = get_recv_mr(7);
+                            for offset in (0..0x20).step_by(8) {
+                                csr_sb_stack_write(buffer + offset, 0);
+                            }
+                        }
+                    }
+                    SSN_QUERY_OBJECT => {
+                        let buffer = get_recv_mr(7);
+                        csr_sb_stack_write16(buffer, 0);
+                        let result_len = csr_sb_stack_read(sp + 0x28);
+                        if result_len != 0 {
+                            csr_sb_stack_write32(result_len, 2);
+                        }
+                    }
+                    SSN_RESUME_THREAD => {
+                        let caller_pid = PM_PIDS[1].load(Ordering::Relaxed) as nt_process::ProcessId;
+                        let tid = match nt_handler.pm.resolve_thread_handle(
+                            caller_pid,
+                            CSR_SB_TID.load(Ordering::Relaxed) as nt_process::ThreadId,
+                            get_recv_mr(9),
+                            THREAD_SUSPEND_RESUME,
+                        ) {
+                            Ok(tid) => tid,
+                            Err(status) => {
+                                result = status as u64;
+                                0
+                            }
+                        };
+                        if tid != 0 {
+                            let previous = nt_handler
+                                .pm
+                                .thread(tid)
+                                .map(|thread| thread.suspend_count)
+                                .unwrap_or(0);
+                            let main_pi = (0..MAX_PI)
+                                .find(|&index| PM_TIDS[index].load(Ordering::Relaxed) == tid as u64);
+                            if previous == 1 {
+                                let tcb = main_pi
+                                    .map(|index| PM_MAIN_TCBS[index].load(Ordering::Relaxed))
+                                    .unwrap_or(0);
+                                if tcb <= 1 || tcb_resume(tcb) != 0 {
+                                    result = 0xC0000001;
+                                }
+                            }
+                            if result == 0 {
+                                match nt_handler.pm.resume_thread(tid) {
+                                    Ok(previous) => {
+                                        if rdx != 0 {
+                                            csr_sb_stack_write32(rdx, previous);
+                                        }
+                                        print_str(b"[csr-sb-api] resumed main tid=");
+                                        print_u64(tid as u64);
+                                        print_str(b" previous=");
+                                        print_u64(previous as u64);
+                                        print_str(b"\n");
+                                    }
+                                    Err(status) => result = status as u64,
+                                }
+                            }
+                        }
+                    }
+                    SSN_CLOSE => {
+                        let saved_pi = nt_handler.pi;
+                        nt_handler.pi = 1;
+                        nt_handler.close_current_handle(get_recv_mr(9));
+                        nt_handler.pi = saved_pi;
+                    }
+                    SSN_REPLY_WAIT_RECV => {
+                        let reply_msg = get_recv_mr(7);
+                        let mut reply_bytes = [0u8; 0x120];
+                        let reply_len = if reply_msg != 0 {
+                            let total = ((csr_sb_stack_read(reply_msg) >> 16) as u16) as usize;
+                            if !(0x28..=0x120).contains(&total)
+                                || !csr_sb_stack_copyin(reply_msg, &mut reply_bytes[..total])
+                            {
+                                return false;
+                            }
+                            total
+                        } else {
+                            0
+                        };
+                        let _ = lpc_client().and_then(|client| {
+                            client
+                                .reply_wait_receive_with_reply(listen_port, &reply_bytes[..reply_len])
+                                .ok()
+                        });
+                        let Some(response) =
+                            lpc_client().and_then(|client| client.reply_wait_receive(client_port).ok())
+                        else {
+                            return false;
+                        };
+                        if response.connection_info.is_empty()
+                            || !sm_stack_copyout(reply_va, &response.connection_info)
+                        {
+                            return false;
+                        }
+                        CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
+                        CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                        CSR_SB_RECV_SP.store(sp, Ordering::Relaxed);
+                        CSR_SB_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                        CSR_SB_RECV_RDX.store(rdx, Ordering::Relaxed);
+                        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                        print_str(b"[csr-sb-api] real SbpCreateSession reply completed\n");
+                        return true;
+                    }
+                    _ => {
+                        print_str(b"[csr-sb-api] unexpected worker SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        return false;
+                    }
+                }
+                set_reply_mr(15, 0);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+                send_on_reply(reply, 18, result, 0, 0, rdx);
+            }
+            _ => return false,
+        }
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    false
 }
 
 /// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one connection accept for

@@ -3024,6 +3024,11 @@ pub(crate) unsafe fn service_sec_image(
                         nt_base,
                         nt_end,
                         ntdll.map(|(_, p)| p),
+                        procs[1].pml4,
+                        csrss_pe.as_ref().unwrap(),
+                        procs[1].img_end,
+                        &reg,
+                        &dll_pes,
                         &mut nt_handler,
                     );
                     if completed {
