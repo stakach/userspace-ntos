@@ -113,7 +113,10 @@ mod tests {
                     + size_of::<AlpcDataViewAttr>()
             )
         );
-        assert_eq!(message_attribute_buffer_size(0), Some(size_of::<AlpcMessageAttributes>()));
+        assert_eq!(
+            message_attribute_buffer_size(0),
+            Some(size_of::<AlpcMessageAttributes>())
+        );
     }
 
     #[test]
@@ -145,7 +148,10 @@ mod tests {
             None
         );
         assert_eq!(
-            message_attribute_offset(msg_attr_flag::VIEW, msg_attr_flag::VIEW | msg_attr_flag::HANDLE),
+            message_attribute_offset(
+                msg_attr_flag::VIEW,
+                msg_attr_flag::VIEW | msg_attr_flag::HANDLE
+            ),
             None
         );
     }

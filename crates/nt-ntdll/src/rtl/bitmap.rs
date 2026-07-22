@@ -300,9 +300,8 @@ mod tests {
     use super::*;
 
     fn contains_run(runs: &[BitmapRun], starting_index: u32, number_of_bits: u32) -> bool {
-        runs.iter().any(|run| {
-            run.starting_index == starting_index && run.number_of_bits == number_of_bits
-        })
+        runs.iter()
+            .any(|run| run.starting_index == starting_index && run.number_of_bits == number_of_bits)
     }
 
     #[test]

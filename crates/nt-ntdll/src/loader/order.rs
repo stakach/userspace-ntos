@@ -83,7 +83,10 @@ fn visit(
 }
 
 /// Convenience: the init order as module **names** (for tests / diagnostics / `PEB->Ldr` build).
-pub fn initialization_order_names(state: &LoaderState, roots: &[&str]) -> Vec<alloc::string::String> {
+pub fn initialization_order_names(
+    state: &LoaderState,
+    roots: &[&str],
+) -> Vec<alloc::string::String> {
     initialization_order(state, roots)
         .into_iter()
         .map(|i| state.modules[i].name.clone())

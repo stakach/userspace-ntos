@@ -63,12 +63,14 @@ pub fn syscall(backend: Backend, ssn: u32, args: &[u64]) -> NtStatus {
         // We marshal here (host-tested via `marshal`), then hit the honest send seam: the real IPC
         // send lands in Step 6. Marshalling-then-NOT_IMPLEMENTED never fabricates a result.
         Backend::Sel4Call => {
-            let _msg = crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
+            let _msg =
+                crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
             // Real seL4 `Call` to the servicing endpoint carrying `_msg` — Step 6.
             STATUS_NOT_IMPLEMENTED
         }
         Backend::SurtRing => {
-            let _entry = crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
+            let _entry =
+                crate::marshal::marshal(ssn, args.len(), &crate::marshal::FlatArgSource(args));
             // Real SURT ring submission carrying `_entry` — Step 6.
             STATUS_NOT_IMPLEMENTED
         }

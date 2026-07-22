@@ -188,9 +188,7 @@ pub fn snap_module(
 
 /// Snap **every** module in the set (the full-graph import resolution the loader performs). Returns
 /// the resolutions grouped by importing module (`(module_name, resolutions)`), or the first error.
-pub fn snap_all(
-    state: &LoaderState,
-) -> Result<Vec<(String, Vec<ResolvedImport>)>, ResolveError> {
+pub fn snap_all(state: &LoaderState) -> Result<Vec<(String, Vec<ResolvedImport>)>, ResolveError> {
     let mut out = Vec::new();
     for m in &state.modules {
         let resolved = snap_module(state, &m.name)?;

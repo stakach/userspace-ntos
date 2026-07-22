@@ -2147,13 +2147,8 @@ pub unsafe extern "system" fn rtl_default_np_acl(acl: *mut *mut c_void) -> NtSta
 
     #[cfg(target_arch = "x86_64")]
     {
-        const ACL_BYTES: usize = ACL_HEADER
-            + 5 * (ACE_HEADER + 4)
-            + (8 + 4)
-            + (8 + 8)
-            + (8 + 4)
-            + (8 + 4)
-            + (8 + 4);
+        const ACL_BYTES: usize =
+            ACL_HEADER + 5 * (ACE_HEADER + 4) + (8 + 4) + (8 + 8) + (8 + 4) + (8 + 4) + (8 + 4);
         const NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
         const WORLD_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 1];
 
@@ -2163,8 +2158,9 @@ pub unsafe extern "system" fn rtl_default_np_acl(acl: *mut *mut c_void) -> NtSta
             return STATUS_NO_MEMORY;
         }
         // SAFETY: p is a writable ACL buffer of ACL_BYTES.
-        let mut status =
-            unsafe { crate::exports::rtl_create_acl(p as *mut c_void, ACL_BYTES as u32, ACL_REVISION2) };
+        let mut status = unsafe {
+            crate::exports::rtl_create_acl(p as *mut c_void, ACL_BYTES as u32, ACL_REVISION2)
+        };
         let mut sid = [0u8; 16];
         if status == STATUS_SUCCESS {
             let local_system = stack_sid(&mut sid, NT_AUTHORITY, &[SECURITY_LOCAL_SYSTEM_RID]);

@@ -403,7 +403,9 @@ mod tests {
             let g = h.reallocate(p, 128).unwrap();
             assert_eq!(g, p, "expected in-place grow into trailing free block");
             assert!(h.size_of(g).unwrap() >= 128);
-            assert!(core::slice::from_raw_parts(g, 64).iter().all(|&x| x == 0x5A)); // preserved
+            assert!(core::slice::from_raw_parts(g, 64)
+                .iter()
+                .all(|&x| x == 0x5A)); // preserved
 
             // Now block a successor so the next grow must relocate.
             let _blocker = h.allocate(64).unwrap();
@@ -411,7 +413,9 @@ mod tests {
             core::ptr::write_bytes(p2, 0x33, 32);
             let r = h.reallocate(p2, 512).unwrap();
             assert!(h.size_of(r).unwrap() >= 512);
-            assert!(core::slice::from_raw_parts(r, 32).iter().all(|&x| x == 0x33)); // preserved
+            assert!(core::slice::from_raw_parts(r, 32)
+                .iter()
+                .all(|&x| x == 0x33)); // preserved
         }
     }
 

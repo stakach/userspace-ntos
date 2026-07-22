@@ -125,7 +125,6 @@ pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut
     core::ptr::null_mut()
 }
 
-
 /// `RtlSizeHeap` core — the payload size of a live block (from [`process_heap_alloc`]). Returns
 /// `None` for a null / not-live pointer.
 ///

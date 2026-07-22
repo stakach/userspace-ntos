@@ -107,7 +107,12 @@ mod tests {
 
     #[test]
     fn msginfo_roundtrip() {
-        for &(label, len) in &[(0u64, 0u64), (2, 4), (NT_NATIVE_SYSCALL_LABEL, 6), (0xABCD, 0x7F)] {
+        for &(label, len) in &[
+            (0u64, 0u64),
+            (2, 4),
+            (NT_NATIVE_SYSCALL_LABEL, 6),
+            (0xABCD, 0x7F),
+        ] {
             let mi = pack_msginfo(label, len);
             assert_eq!(msginfo_label(mi), label);
             assert_eq!(msginfo_length(mi), len);

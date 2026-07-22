@@ -130,7 +130,12 @@ pub fn nt_create_file(
 ) -> NtStatus {
     table.invoke(
         "NtCreateFile",
-        &[file_handle_out, desired_access, object_attributes, io_status_block],
+        &[
+            file_handle_out,
+            desired_access,
+            object_attributes,
+            io_status_block,
+        ],
     )
 }
 
@@ -156,5 +161,8 @@ pub fn nt_wait_for_single_object(
     alertable: bool,
     timeout: u64,
 ) -> NtStatus {
-    table.invoke("NtWaitForSingleObject", &[handle, alertable as u64, timeout])
+    table.invoke(
+        "NtWaitForSingleObject",
+        &[handle, alertable as u64, timeout],
+    )
 }

@@ -110,8 +110,16 @@ struct LiveImage;
 impl ImageReader for LiveImage {
     fn lookup_function(&self, control_pc: u64) -> Option<(u64, RuntimeFunction)> {
         // SAFETY: on-target; reads mapped PE headers of the loaded modules.
-        let (base, begin, end, unwind) = unsafe { crate::on_target::seh_lookup_function(control_pc) }?;
-        Some((base, RuntimeFunction { begin, end, unwind_info: unwind }))
+        let (base, begin, end, unwind) =
+            unsafe { crate::on_target::seh_lookup_function(control_pc) }?;
+        Some((
+            base,
+            RuntimeFunction {
+                begin,
+                end,
+                unwind_info: unwind,
+            },
+        ))
     }
     fn read_u8(&self, image_base: u64, rva: u32) -> Option<u8> {
         // SAFETY: image_base+rva is inside a mapped module image (the .xdata the unwinder reads
@@ -320,7 +328,9 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
         }
         let mut image_base: u64 = 0;
         // SAFETY: lookup + writable out.
-        let func = unsafe { rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut()) };
+        let func = unsafe {
+            rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut())
+        };
         if func.is_null() {
             // A leaf frame (no .pdata): pop the return address directly and continue.
             // SAFETY: reads/writes our CONTEXT copy + the live stack.
@@ -479,7 +489,8 @@ pub unsafe fn rtl_unwind_ex(
         // Mark the caller's record as unwinding.
         // SAFETY: record+4 is ExceptionFlags.
         unsafe {
-            let flags = core::ptr::read_unaligned((exception_record as *const u8).add(4) as *const u32);
+            let flags =
+                core::ptr::read_unaligned((exception_record as *const u8).add(4) as *const u32);
             core::ptr::write_unaligned(
                 (exception_record as *mut u8).add(4) as *mut u32,
                 flags | ex::EXCEPTION_UNWINDING,
@@ -510,7 +521,9 @@ pub unsafe fn rtl_unwind_ex(
         }
         let mut image_base: u64 = 0;
         // SAFETY: lookup.
-        let func = unsafe { rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut()) };
+        let func = unsafe {
+            rtl_lookup_function_entry(control_pc, &mut image_base, core::ptr::null_mut())
+        };
         if func.is_null() {
             // Leaf: pop return addr and continue.
             // SAFETY: stack read + CONTEXT write.
@@ -567,7 +580,12 @@ pub unsafe fn rtl_unwind_ex(
             let routine: ExceptionRoutine = unsafe { core::mem::transmute(handler) };
             // SAFETY: calling the termination handler; it runs the __finally blocks.
             unsafe {
-                routine(record, establisher, work_ptr, &mut disp as *mut _ as *mut c_void);
+                routine(
+                    record,
+                    establisher,
+                    work_ptr,
+                    &mut disp as *mut _ as *mut c_void,
+                );
             }
         }
     }
@@ -694,7 +712,10 @@ pub unsafe fn c_specific_handler(
                 record: *mut c_void,
                 context: *mut u8,
             }
-            let ptrs = ExceptionPointers { record: exception_record, context: _context_record };
+            let ptrs = ExceptionPointers {
+                record: exception_record,
+                context: _context_record,
+            };
             // SAFETY: `filt` is a filter routine in a loaded image; the SEH filter ABI.
             unsafe {
                 let f: unsafe extern "C" fn(*const c_void, u64) -> i32 = core::mem::transmute(filt);
@@ -853,9 +874,9 @@ unsafe extern "C" fn restore_context(_context: *mut u8) -> ! {
         "movaps xmm14, [rcx + 0x280]",
         "movaps xmm15, [rcx + 0x290]",
         // Load the target RSP, then push the target Rip so a final `ret` transfers to it.
-        "mov rsp, [rcx + 0x98]",       // target Rsp
-        "mov rax, [rcx + 0xF8]",       // target Rip
-        "push rax",                    // return address = target Rip
+        "mov rsp, [rcx + 0x98]", // target Rsp
+        "mov rax, [rcx + 0xF8]", // target Rip
+        "push rax",              // return address = target Rip
         // Restore the GPRs (RAX/RCX restored last since we still need RCX as the CONTEXT ptr).
         "mov rbx, [rcx + 0x90]",
         "mov rbp, [rcx + 0xA0]",
@@ -870,9 +891,9 @@ unsafe extern "C" fn restore_context(_context: *mut u8) -> ! {
         "mov r14, [rcx + 0xE8]",
         "mov r15, [rcx + 0xF0]",
         "mov rdx, [rcx + 0x88]",
-        "mov rax, [rcx + 0x78]",       // target Rax (the unwind return value)
-        "mov rcx, [rcx + 0x80]",       // target Rcx (restored last)
-        "ret",                         // jump to the pushed target Rip
+        "mov rax, [rcx + 0x78]", // target Rax (the unwind return value)
+        "mov rcx, [rcx + 0x80]", // target Rcx (restored last)
+        "ret",                   // jump to the pushed target Rip
     );
 }
 
@@ -967,7 +988,11 @@ pub unsafe fn run_selftest() {
             if nib != 0 || started || i == 0 {
                 started = true;
                 if *n < buf.len() {
-                    buf[*n] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                    buf[*n] = if nib < 10 {
+                        b'0' + nib
+                    } else {
+                        b'a' + nib - 10
+                    };
                     *n += 1;
                 }
             }

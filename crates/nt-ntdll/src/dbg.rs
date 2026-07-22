@@ -101,7 +101,12 @@ pub fn render_with_prefix(prefix: &[u8], fmt: &[u8], args: &[FmtArg]) -> Vec<u8>
 /// `DbgPrintEx(ComponentId, Level, Format, …)` decision + render: returns `Some(bytes)` if the
 /// component/level filter passes, else `None` (suppressed — NOT printed, and NOT faked). The caller
 /// emits `Some` via the debug service.
-pub fn print_ex(filter: ComponentFilter, level: u32, fmt: &[u8], args: &[FmtArg]) -> Option<Vec<u8>> {
+pub fn print_ex(
+    filter: ComponentFilter,
+    level: u32,
+    fmt: &[u8],
+    args: &[FmtArg],
+) -> Option<Vec<u8>> {
     if filter.should_print(level) {
         Some(render(fmt, args))
     } else {
@@ -194,7 +199,9 @@ mod tests {
     #[test]
     fn level_bit_filtering() {
         // Enable WARNING (bit 1) + INFO (bit 3).
-        let f = ComponentFilter { mask: (1 << level::WARNING) | (1 << level::INFO) };
+        let f = ComponentFilter {
+            mask: (1 << level::WARNING) | (1 << level::INFO),
+        };
         assert!(f.should_print(level::WARNING));
         assert!(f.should_print(level::INFO));
         assert!(!f.should_print(level::TRACE));
@@ -220,7 +227,10 @@ mod tests {
     fn print_ex_suppresses_without_faking() {
         let f = ComponentFilter::default();
         // ERROR prints.
-        assert_eq!(print_ex(f, level::ERROR, b"boom %d", &[FmtArg::Int(1)]), Some(b"boom 1".to_vec()));
+        assert_eq!(
+            print_ex(f, level::ERROR, b"boom %d", &[FmtArg::Int(1)]),
+            Some(b"boom 1".to_vec())
+        );
         // TRACE suppressed → None (NOT an empty "success").
         assert_eq!(print_ex(f, level::TRACE, b"noisy", &[]), None);
     }

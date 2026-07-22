@@ -61,8 +61,8 @@ pub mod crt;
 pub mod crypto;
 pub mod csr;
 pub mod dbg;
-pub mod heap;
 pub mod handle_table;
+pub mod heap;
 pub mod ki;
 pub mod loader;
 pub mod marshal;
@@ -71,8 +71,8 @@ pub mod nls;
 pub mod rtl;
 pub mod stubs;
 pub mod sync;
-pub mod trap_stubs;
 pub mod transport;
+pub mod trap_stubs;
 
 /// `NTSTATUS` — the 32-bit status every `Nt*` stub returns in `rax` (`STATUS_SUCCESS` = 0).
 pub type NtStatus = u32;

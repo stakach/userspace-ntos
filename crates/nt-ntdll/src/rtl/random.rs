@@ -53,7 +53,7 @@ mod tests {
         assert_eq!(a, b); // same seed -> same sequence
         let c = uniform(&mut s1);
         assert_ne!(a, c); // advances
-        // Stays in range.
+                          // Stays in range.
         for _ in 0..1000 {
             assert!(uniform(&mut s1) < 0x7fff_ffff);
         }

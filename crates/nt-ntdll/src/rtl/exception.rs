@@ -1558,7 +1558,7 @@ mod tests {
         // Return address at 0x8028 points into frame B (0x14000000+0x1250).
         stack.put(0x8020, 0xAAAA_AAAA); // saved RBX in A
         stack.put(0x8028, 0x14000000 + 0x1250); // return into B
-        // Frame B: RSP now 0x8030. Pop RBX from 0x8030 -> RBX_B, RSP 0x8038. Return addr = caller.
+                                                // Frame B: RSP now 0x8030. Pop RBX from 0x8030 -> RBX_B, RSP 0x8038. Return addr = caller.
         stack.put(0x8030, 0xBBBB_BBBB); // saved RBX in B
         stack.put(0x8038, 0xDEAD_C0DE); // final caller return
 
@@ -1662,7 +1662,7 @@ mod tests {
         let mut stack = MockStack::new();
         stack.put(0x6000, 0x1400_1234); // trap-frame RIP at [RSP]
         stack.put(0x6000 + 0x18, 0x9999_0000); // trap-frame RSP at [RSP+0x18]
-        // A poisoned cell where a spurious return-address pop WOULD read from (must NOT be used).
+                                               // A poisoned cell where a spurious return-address pop WOULD read from (must NOT be used).
         stack.put(0x9999_0000, 0xDEAD_DEAD);
         let mut ctx = Context::default();
         ctx.set_rsp(0x6000);

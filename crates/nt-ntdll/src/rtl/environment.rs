@@ -329,8 +329,8 @@ pub fn is_normalized(flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use alloc::vec;
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn env_set_query_delete() {
@@ -385,9 +385,7 @@ mod tests {
 
     #[test]
     fn env_block_parses_hidden_drive_current_directory_entries() {
-        let mut block: Vec<u16> = "=C:=C:\\Windows\0Path=C:\\bin\0\0"
-            .encode_utf16()
-            .collect();
+        let mut block: Vec<u16> = "=C:=C:\\Windows\0Path=C:\\bin\0\0".encode_utf16().collect();
         let e = Environment::from_block(&block);
         assert_eq!(e.query("=C:"), Some("C:\\Windows"));
         assert_eq!(e.query("Path"), Some("C:\\bin"));

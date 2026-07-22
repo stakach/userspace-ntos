@@ -327,11 +327,14 @@ generate_trap_stubs! {
 /// ABI table (the const table above carries `argc: 0`; the real arity is resolved here to keep a
 /// single source of truth for arities).
 pub fn trap_stub(name: &str) -> Option<TrapStubMeta> {
-    TRAP_STUBS.iter().find(|s| s.name == name).map(|s| TrapStubMeta {
-        name: s.name,
-        ssn: s.ssn,
-        argc: argc_of(s.name),
-    })
+    TRAP_STUBS
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| TrapStubMeta {
+            name: s.name,
+            ssn: s.ssn,
+            argc: argc_of(s.name),
+        })
 }
 
 #[cfg(test)]

@@ -244,8 +244,8 @@ pub fn create_process_parameters(input: &ParamsInput) -> BuiltParams {
     // --- 3. Header fixed fields. -------------------------------------------------------------------
     write_u32(&mut block, 0x00, length); // MaximumLength
     write_u32(&mut block, 0x04, length); // Length
-    // ppb.c sets Flags = NORMALIZED here, then DeNormalizes at the end → NORMALIZED clear. We build
-    // de-normalized directly, so Flags is left clear (0). (The export/caller sets debug/reserve bits.)
+                                         // ppb.c sets Flags = NORMALIZED here, then DeNormalizes at the end → NORMALIZED clear. We build
+                                         // de-normalized directly, so Flags is left clear (0). (The export/caller sets debug/reserve bits.)
     write_u32(&mut block, OFF_FLAGS, 0);
 
     // --- 4. Pack the strings (RtlpCopyParameterString), Dest starts after the header. --------------
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(wlen, 0);
         assert_eq!(wmax, 2); // sizeof(WCHAR)
         assert_ne!(wbuf, 0); // a buffer was allocated
-        // RuntimeData NullString → MaximumLength 0 → Buffer NULL.
+                             // RuntimeData NullString → MaximumLength 0 → Buffer NULL.
         let (rlen, rmax, rbuf, _) = read_string(&built.block, OFF_RUNTIME_DATA);
         assert_eq!(rlen, 0);
         assert_eq!(rmax, 0);

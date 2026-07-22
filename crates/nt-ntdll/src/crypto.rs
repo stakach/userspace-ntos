@@ -147,11 +147,23 @@ pub fn md4_init(context: &mut Md4Context) {
 }
 
 pub fn md4_update(context: &mut Md4Context, input: &[u8]) {
-    md_update(&mut context.buf, &mut context.i, &mut context.input, input, md4_transform);
+    md_update(
+        &mut context.buf,
+        &mut context.i,
+        &mut context.input,
+        input,
+        md4_transform,
+    );
 }
 
 pub fn md4_final(context: &mut Md4Context) {
-    md_final(&mut context.buf, &mut context.i, &mut context.input, &mut context.digest, md4_transform);
+    md_final(
+        &mut context.buf,
+        &mut context.i,
+        &mut context.input,
+        &mut context.digest,
+        md4_transform,
+    );
 }
 
 pub fn md5_init(context: &mut Md5Context) {
@@ -160,11 +172,23 @@ pub fn md5_init(context: &mut Md5Context) {
 }
 
 pub fn md5_update(context: &mut Md5Context, input: &[u8]) {
-    md_update(&mut context.buf, &mut context.i, &mut context.input, input, md5_transform);
+    md_update(
+        &mut context.buf,
+        &mut context.i,
+        &mut context.input,
+        input,
+        md5_transform,
+    );
 }
 
 pub fn md5_final(context: &mut Md5Context) {
-    md_final(&mut context.buf, &mut context.i, &mut context.input, &mut context.digest, md5_transform);
+    md_final(
+        &mut context.buf,
+        &mut context.i,
+        &mut context.input,
+        &mut context.digest,
+        md5_transform,
+    );
 }
 
 fn md_update(
@@ -286,7 +310,10 @@ fn md4_transform(state: &mut [u32; 4], block: &[u8; 64]) {
     let mut r = *state;
     for i in 0..16 {
         let f = (r[1] & r[2]) | ((!r[1]) & r[3]);
-        r[0] = r[0].wrapping_add(f).wrapping_add(x[i]).rotate_left([3, 7, 11, 19][i & 3]);
+        r[0] = r[0]
+            .wrapping_add(f)
+            .wrapping_add(x[i])
+            .rotate_left([3, 7, 11, 19][i & 3]);
         r.rotate_right(1);
     }
     for i in 0..16 {
@@ -316,19 +343,73 @@ fn md4_transform(state: &mut [u32; 4], block: &[u8; 64]) {
 fn md5_transform(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6,
-        10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     const K: [u32; 64] = [
-        0xD76A_A478, 0xE8C7_B756, 0x2420_70DB, 0xC1BD_CEEE, 0xF57C_0FAF, 0x4787_C62A, 0xA830_4613,
-        0xFD46_9501, 0x6980_98D8, 0x8B44_F7AF, 0xFFFF_5BB1, 0x895C_D7BE, 0x6B90_1122, 0xFD98_7193,
-        0xA679_438E, 0x49B4_0821, 0xF61E_2562, 0xC040_B340, 0x265E_5A51, 0xE9B6_C7AA, 0xD62F_105D,
-        0x0244_1453, 0xD8A1_E681, 0xE7D3_FBC8, 0x21E1_CDE6, 0xC337_07D6, 0xF4D5_0D87, 0x455A_14ED,
-        0xA9E3_E905, 0xFCEF_A3F8, 0x676F_02D9, 0x8D2A_4C8A, 0xFFFA_3942, 0x8771_F681, 0x6D9D_6122,
-        0xFDE5_380C, 0xA4BE_EA44, 0x4BDE_CFA9, 0xF6BB_4B60, 0xBEBF_BC70, 0x289B_7EC6, 0xEAA1_27FA,
-        0xD4EF_3085, 0x0488_1D05, 0xD9D4_D039, 0xE6DB_99E5, 0x1FA2_7CF8, 0xC4AC_5665, 0xF429_2244,
-        0x432A_FF97, 0xAB94_23A7, 0xFC93_A039, 0x655B_59C3, 0x8F0C_CC92, 0xFFEF_F47D, 0x8584_5DD1,
-        0x6FA8_7E4F, 0xFE2C_E6E0, 0xA301_4314, 0x4E08_11A1, 0xF753_7E82, 0xBD3A_F235, 0x2AD7_D2BB,
+        0xD76A_A478,
+        0xE8C7_B756,
+        0x2420_70DB,
+        0xC1BD_CEEE,
+        0xF57C_0FAF,
+        0x4787_C62A,
+        0xA830_4613,
+        0xFD46_9501,
+        0x6980_98D8,
+        0x8B44_F7AF,
+        0xFFFF_5BB1,
+        0x895C_D7BE,
+        0x6B90_1122,
+        0xFD98_7193,
+        0xA679_438E,
+        0x49B4_0821,
+        0xF61E_2562,
+        0xC040_B340,
+        0x265E_5A51,
+        0xE9B6_C7AA,
+        0xD62F_105D,
+        0x0244_1453,
+        0xD8A1_E681,
+        0xE7D3_FBC8,
+        0x21E1_CDE6,
+        0xC337_07D6,
+        0xF4D5_0D87,
+        0x455A_14ED,
+        0xA9E3_E905,
+        0xFCEF_A3F8,
+        0x676F_02D9,
+        0x8D2A_4C8A,
+        0xFFFA_3942,
+        0x8771_F681,
+        0x6D9D_6122,
+        0xFDE5_380C,
+        0xA4BE_EA44,
+        0x4BDE_CFA9,
+        0xF6BB_4B60,
+        0xBEBF_BC70,
+        0x289B_7EC6,
+        0xEAA1_27FA,
+        0xD4EF_3085,
+        0x0488_1D05,
+        0xD9D4_D039,
+        0xE6DB_99E5,
+        0x1FA2_7CF8,
+        0xC4AC_5665,
+        0xF429_2244,
+        0x432A_FF97,
+        0xAB94_23A7,
+        0xFC93_A039,
+        0x655B_59C3,
+        0x8F0C_CC92,
+        0xFFEF_F47D,
+        0x8584_5DD1,
+        0x6FA8_7E4F,
+        0xFE2C_E6E0,
+        0xA301_4314,
+        0x4E08_11A1,
+        0xF753_7E82,
+        0xBD3A_F235,
+        0x2AD7_D2BB,
         0xEB86_D391,
     ];
 
@@ -437,15 +518,24 @@ mod tests {
     fn md4_known_vectors() {
         assert_eq!(
             md4_digest(b""),
-            [0x31, 0xD6, 0xCF, 0xE0, 0xD1, 0x6A, 0xE9, 0x31, 0xB7, 0x3C, 0x59, 0xD7, 0xE0, 0xC0, 0x89, 0xC0]
+            [
+                0x31, 0xD6, 0xCF, 0xE0, 0xD1, 0x6A, 0xE9, 0x31, 0xB7, 0x3C, 0x59, 0xD7, 0xE0, 0xC0,
+                0x89, 0xC0
+            ]
         );
         assert_eq!(
             md4_digest(b"abc"),
-            [0xA4, 0x48, 0x01, 0x7A, 0xAF, 0x21, 0xD8, 0x52, 0x5F, 0xC1, 0x0A, 0xE8, 0x7A, 0xA6, 0x72, 0x9D]
+            [
+                0xA4, 0x48, 0x01, 0x7A, 0xAF, 0x21, 0xD8, 0x52, 0x5F, 0xC1, 0x0A, 0xE8, 0x7A, 0xA6,
+                0x72, 0x9D
+            ]
         );
         assert_eq!(
             md4_digest(b"abcdefghijklmnopqrstuvwxyz"),
-            [0xD7, 0x9E, 0x1C, 0x30, 0x8A, 0xA5, 0xBB, 0xCD, 0xEE, 0xA8, 0xED, 0x63, 0xDF, 0x41, 0x2D, 0xA9]
+            [
+                0xD7, 0x9E, 0x1C, 0x30, 0x8A, 0xA5, 0xBB, 0xCD, 0xEE, 0xA8, 0xED, 0x63, 0xDF, 0x41,
+                0x2D, 0xA9
+            ]
         );
     }
 
@@ -453,15 +543,24 @@ mod tests {
     fn md5_known_vectors() {
         assert_eq!(
             md5_digest(b""),
-            [0xD4, 0x1D, 0x8C, 0xD9, 0x8F, 0x00, 0xB2, 0x04, 0xE9, 0x80, 0x09, 0x98, 0xEC, 0xF8, 0x42, 0x7E]
+            [
+                0xD4, 0x1D, 0x8C, 0xD9, 0x8F, 0x00, 0xB2, 0x04, 0xE9, 0x80, 0x09, 0x98, 0xEC, 0xF8,
+                0x42, 0x7E
+            ]
         );
         assert_eq!(
             md5_digest(b"abc"),
-            [0x90, 0x01, 0x50, 0x98, 0x3C, 0xD2, 0x4F, 0xB0, 0xD6, 0x96, 0x3F, 0x7D, 0x28, 0xE1, 0x7F, 0x72]
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3C, 0xD2, 0x4F, 0xB0, 0xD6, 0x96, 0x3F, 0x7D, 0x28, 0xE1,
+                0x7F, 0x72
+            ]
         );
         assert_eq!(
             md5_digest(b"abcdefghijklmnopqrstuvwxyz"),
-            [0xC3, 0xFC, 0xD3, 0xD7, 0x61, 0x92, 0xE4, 0x00, 0x7D, 0xFB, 0x49, 0x6C, 0xCA, 0x67, 0xE1, 0x3B]
+            [
+                0xC3, 0xFC, 0xD3, 0xD7, 0x61, 0x92, 0xE4, 0x00, 0x7D, 0xFB, 0x49, 0x6C, 0xCA, 0x67,
+                0xE1, 0x3B
+            ]
         );
     }
 

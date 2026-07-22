@@ -122,7 +122,10 @@ mod tests {
     #[test]
     fn marshals_register_only_service() {
         // NtClose(Handle) — 1 arg, register only.
-        let src = SliceArgSource { regs: &[0xdead], stack: &[] };
+        let src = SliceArgSource {
+            regs: &[0xdead],
+            stack: &[],
+        };
         let m = marshal_named("NtClose", 27, &src);
         assert_eq!(m.ssn, 27);
         assert_eq!(m.args, vec![0xdead]);
@@ -132,7 +135,10 @@ mod tests {
     #[test]
     fn marshals_exactly_four_register_args() {
         // NtOpenProcess(Handle*, Access, ObjAttr*, ClientId*) — 4 args, all in registers.
-        let src = SliceArgSource { regs: &[1, 2, 3, 4], stack: &[99, 100] };
+        let src = SliceArgSource {
+            regs: &[1, 2, 3, 4],
+            stack: &[99, 100],
+        };
         let m = marshal_named("NtOpenProcess", 128, &src);
         // Exactly 4 gathered; the stack window is NOT swept past the arity.
         assert_eq!(m.args, vec![1, 2, 3, 4]);
@@ -144,10 +150,16 @@ mod tests {
         // trap backend leaves on the caller's stack but a seL4/SURT send MUST gather.
         let regs = [0xA, 0xB, 0xC, 0xD];
         let stack = [0x5, 0x6, 0x7, 0x8, 0x9, 0xA0, 0xB0]; // args 5..=11
-        let src = SliceArgSource { regs: &regs, stack: &stack };
+        let src = SliceArgSource {
+            regs: &regs,
+            stack: &stack,
+        };
         let m = marshal_named("NtCreateFile", 39, &src);
         assert_eq!(m.argc(), 11);
-        assert_eq!(m.args, vec![0xA, 0xB, 0xC, 0xD, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA0, 0xB0]);
+        assert_eq!(
+            m.args,
+            vec![0xA, 0xB, 0xC, 0xD, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA0, 0xB0]
+        );
     }
 
     #[test]
@@ -155,7 +167,10 @@ mod tests {
         // NtCreateNamedPipeFile = 14 args (the widest). 4 reg + 10 stack.
         let regs = [1, 2, 3, 4];
         let stack: [u64; 10] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
-        let src = SliceArgSource { regs: &regs, stack: &stack };
+        let src = SliceArgSource {
+            regs: &regs,
+            stack: &stack,
+        };
         let m = marshal_named("NtCreateNamedPipeFile", 46, &src);
         assert_eq!(m.argc(), 14);
         assert_eq!(m.args.last(), Some(&14));
@@ -177,7 +192,10 @@ mod tests {
     fn arity_bounds_the_gather_exactly() {
         // Extra register/stack values past the arity are never gathered (no over-read into
         // caller garbage).
-        let src = SliceArgSource { regs: &[1, 2, 3, 4], stack: &[5, 6, 7, 8] };
+        let src = SliceArgSource {
+            regs: &[1, 2, 3, 4],
+            stack: &[5, 6, 7, 8],
+        };
         let m = marshal(0, 2, &src); // pretend a 2-arg service
         assert_eq!(m.args, vec![1, 2]);
     }

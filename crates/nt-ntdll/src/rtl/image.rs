@@ -135,7 +135,7 @@ mod tests {
         b[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
         b[coff + 16..coff + 18].copy_from_slice(&0xF0u16.to_le_bytes());
         b[coff + 18..coff + 20].copy_from_slice(&0x22u16.to_le_bytes()); // EXECUTABLE|LARGE_ADDR
-        // Optional header @ coff+20.
+                                                                         // Optional header @ coff+20.
         let opt = coff + 20;
         b[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+ magic
         b[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // AddressOfEntryPoint
@@ -146,7 +146,7 @@ mod tests {
         b[opt + 60..opt + 64].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfHeaders
         b[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
         b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-        // Section table @ opt + 0xF0.
+                                                                       // Section table @ opt + 0xF0.
         let sec = opt + 0xF0;
         b[sec..sec + 8].copy_from_slice(b".text\0\0\0");
         b[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize

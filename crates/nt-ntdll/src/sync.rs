@@ -352,7 +352,9 @@ pub enum RunOnceBegin {
 impl RunOnce {
     /// `RtlRunOnceInitialize`.
     pub const fn new() -> Self {
-        RunOnce { state: RUN_ONCE_UNINIT }
+        RunOnce {
+            state: RUN_ONCE_UNINIT,
+        }
     }
 
     /// `RtlRunOnceBeginInitialize`: claim the run for this caller if uninitialised.
@@ -417,7 +419,10 @@ mod tests {
         assert_eq!(cs.try_enter(T2), Acquire::Contended);
         assert!(cs.lock_count >= 1);
         // The blocking seam must NOT fabricate success on the unwired host transport.
-        assert_eq!(WaitSeam::wait_for_ownership(&cs), crate::STATUS_NOT_IMPLEMENTED);
+        assert_eq!(
+            WaitSeam::wait_for_ownership(&cs),
+            crate::STATUS_NOT_IMPLEMENTED
+        );
         // The owner leaving with a queued waiter reports a wake is required.
         assert_eq!(cs.leave(T1), Some(true));
         assert_eq!(WaitSeam::wake_one(&cs), crate::STATUS_NOT_IMPLEMENTED);
@@ -455,7 +460,7 @@ mod tests {
         assert_eq!(dbg.entry_count, 0);
         assert_eq!(dbg.contention_count, 0);
         assert_eq!(dbg.flags_spare, 0); // the +0x28 union starts zeroed
-        // Empty LIST_ENTRY: both links point at the list head (debug_addr+0x10).
+                                        // Empty LIST_ENTRY: both links point at the list head (debug_addr+0x10).
         assert_eq!(dbg.process_locks_flink, debug_addr + 0x10);
         assert_eq!(dbg.process_locks_blink, debug_addr + 0x10);
     }

@@ -314,12 +314,18 @@ fn build_head_links(
     sel: ListSel,
 ) -> ListEntry {
     let (head_off, node_off) = match sel {
-        ListSel::Load => (link_offsets::HEAD_IN_LOAD_ORDER, link_offsets::ENTRY_IN_LOAD_ORDER),
+        ListSel::Load => (
+            link_offsets::HEAD_IN_LOAD_ORDER,
+            link_offsets::ENTRY_IN_LOAD_ORDER,
+        ),
         ListSel::Memory => (
             link_offsets::HEAD_IN_MEMORY_ORDER,
             link_offsets::ENTRY_IN_MEMORY_ORDER,
         ),
-        ListSel::Init => (link_offsets::HEAD_IN_INIT_ORDER, link_offsets::ENTRY_IN_INIT_ORDER),
+        ListSel::Init => (
+            link_offsets::HEAD_IN_INIT_ORDER,
+            link_offsets::ENTRY_IN_INIT_ORDER,
+        ),
     };
     let head_va = layout.ldr_va + head_off;
     let node_vas: Vec<u64> = order.iter().map(|&mi| entry_va[mi] + node_off).collect();

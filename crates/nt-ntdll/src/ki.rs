@@ -160,7 +160,11 @@ pub fn callback_request(frame: &CallbackFrame) -> Result<CallbackRequest, Callba
         if frame.input == 0 {
             return Err(CallbackError::NullInput);
         }
-        if frame.input.checked_add(u64::from(frame.input_length) - 1).is_none() {
+        if frame
+            .input
+            .checked_add(u64::from(frame.input_length) - 1)
+            .is_none()
+        {
             return Err(CallbackError::InputRangeOverflow);
         }
     }
@@ -269,7 +273,13 @@ mod tests {
 
     #[test]
     fn apc_dispatch_calls_routine_then_resumes() {
-        let f = ApcFrame { routine: 0x1000, arg1: 1, arg2: 2, arg3: 3, context: 0x7FFF_0000 };
+        let f = ApcFrame {
+            routine: 0x1000,
+            arg1: 1,
+            arg2: 2,
+            arg3: 3,
+            context: 0x7FFF_0000,
+        };
         let d = apc_dispatcher(&f);
         assert_eq!(d.call_routine, 0x1000);
         assert_eq!(d.resume_context, 0x7FFF_0000);
@@ -277,7 +287,13 @@ mod tests {
 
     #[test]
     fn apc_dispatch_bare_alert() {
-        let f = ApcFrame { routine: 0, arg1: 0, arg2: 0, arg3: 0, context: 0x1234 };
+        let f = ApcFrame {
+            routine: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            context: 0x1234,
+        };
         let d = apc_dispatcher(&f);
         assert_eq!(d.call_routine, 0); // no routine — just resume
         assert_eq!(d.resume_context, 0x1234);
@@ -285,7 +301,10 @@ mod tests {
 
     #[test]
     fn exception_dispatch_continue_on_handled() {
-        let frames = [FrameModel { control_pc: 0x1400_1000, handler: Some(Disposition::ContinueExecution) }];
+        let frames = [FrameModel {
+            control_pc: 0x1400_1000,
+            handler: Some(Disposition::ContinueExecution),
+        }];
         assert_eq!(
             exception_dispatcher(&rec(), &frames, 0xC0FFEE),
             ExceptionOutcome::Continue { context: 0xC0FFEE }
@@ -294,8 +313,14 @@ mod tests {
 
     #[test]
     fn exception_dispatch_last_chance_when_unhandled() {
-        let frames = [FrameModel { control_pc: 0x1400_1000, handler: Some(Disposition::ContinueSearch) }];
-        assert_eq!(exception_dispatcher(&rec(), &frames, 0), ExceptionOutcome::LastChance);
+        let frames = [FrameModel {
+            control_pc: 0x1400_1000,
+            handler: Some(Disposition::ContinueSearch),
+        }];
+        assert_eq!(
+            exception_dispatcher(&rec(), &frames, 0),
+            ExceptionOutcome::LastChance
+        );
     }
 
     #[test]
@@ -317,7 +342,11 @@ mod tests {
     #[test]
     fn callback_out_of_range_is_rejected() {
         let table = [0xAAAA];
-        let request = CallbackRequest { api_index: 5, input: 0, input_length: 0 };
+        let request = CallbackRequest {
+            api_index: 5,
+            input: 0,
+            input_length: 0,
+        };
         assert_eq!(
             callback_dispatcher(request, &table),
             Err(CallbackError::IndexOutOfRange)
@@ -331,25 +360,46 @@ mod tests {
         let frame = CallbackFrame::default();
         let base = core::ptr::addr_of!(frame) as usize;
         assert_eq!(core::ptr::addr_of!(frame.input) as usize - base, 0x20);
-        assert_eq!(core::ptr::addr_of!(frame.input_length) as usize - base, 0x28);
+        assert_eq!(
+            core::ptr::addr_of!(frame.input_length) as usize - base,
+            0x28
+        );
         assert_eq!(core::ptr::addr_of!(frame.api_index) as usize - base, 0x2c);
-        assert_eq!(core::ptr::addr_of!(frame.machine_frame) as usize - base, 0x30);
+        assert_eq!(
+            core::ptr::addr_of!(frame.machine_frame) as usize - base,
+            0x30
+        );
         let machine = core::ptr::addr_of!(frame.machine_frame) as usize;
-        assert_eq!(core::ptr::addr_of!(frame.machine_frame.rip) as usize - machine, 0x00);
-        assert_eq!(core::ptr::addr_of!(frame.machine_frame.eflags) as usize - machine, 0x10);
-        assert_eq!(core::ptr::addr_of!(frame.machine_frame.rsp) as usize - machine, 0x18);
+        assert_eq!(
+            core::ptr::addr_of!(frame.machine_frame.rip) as usize - machine,
+            0x00
+        );
+        assert_eq!(
+            core::ptr::addr_of!(frame.machine_frame.eflags) as usize - machine,
+            0x10
+        );
+        assert_eq!(
+            core::ptr::addr_of!(frame.machine_frame.rsp) as usize - machine,
+            0x18
+        );
     }
 
     #[test]
     fn callback_request_validates_null_and_overflowing_input() {
-        let null = CallbackFrame { input_length: 1, ..Default::default() };
+        let null = CallbackFrame {
+            input_length: 1,
+            ..Default::default()
+        };
         assert_eq!(callback_request(&null), Err(CallbackError::NullInput));
         let overflow = CallbackFrame {
             input: u64::MAX,
             input_length: 2,
             ..Default::default()
         };
-        assert_eq!(callback_request(&overflow), Err(CallbackError::InputRangeOverflow));
+        assert_eq!(
+            callback_request(&overflow),
+            Err(CallbackError::InputRangeOverflow)
+        );
         let empty = CallbackFrame::default();
         assert_eq!(callback_request(&empty).unwrap().input, 0);
     }
@@ -357,17 +407,36 @@ mod tests {
     #[test]
     fn callback_table_slot_validates_base_index_and_overflow() {
         assert_eq!(callback_table_slot(0, 20, 0), Err(CallbackError::NullTable));
-        assert_eq!(callback_table_slot(0x1004, 20, 0), Err(CallbackError::UnalignedTable));
-        assert_eq!(callback_table_slot(0x1000, 20, 20), Err(CallbackError::IndexOutOfRange));
-        assert_eq!(callback_table_slot(u64::MAX - 7, 20, 1), Err(CallbackError::TableRangeOverflow));
+        assert_eq!(
+            callback_table_slot(0x1004, 20, 0),
+            Err(CallbackError::UnalignedTable)
+        );
+        assert_eq!(
+            callback_table_slot(0x1000, 20, 20),
+            Err(CallbackError::IndexOutOfRange)
+        );
+        assert_eq!(
+            callback_table_slot(u64::MAX - 7, 20, 1),
+            Err(CallbackError::TableRangeOverflow)
+        );
         assert_eq!(callback_table_slot(0x1000, 20, 3), Ok(0x1018));
     }
 
     #[test]
     fn callback_rejects_null_routine() {
-        let request = CallbackRequest { api_index: 0, input: 0, input_length: 0 };
-        assert_eq!(callback_dispatcher(request, &[0]), Err(CallbackError::NullRoutine));
-        assert_eq!(CallbackError::NullRoutine.status(), STATUS_INVALID_PARAMETER);
+        let request = CallbackRequest {
+            api_index: 0,
+            input: 0,
+            input_length: 0,
+        };
+        assert_eq!(
+            callback_dispatcher(request, &[0]),
+            Err(CallbackError::NullRoutine)
+        );
+        assert_eq!(
+            CallbackError::NullRoutine.status(),
+            STATUS_INVALID_PARAMETER
+        );
     }
 
     #[test]

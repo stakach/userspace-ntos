@@ -150,10 +150,7 @@ pub fn ldrp_initialize<H: LoaderHost>(
     // missing module/export/forwarder-cycle is a real STATUS — never a spin.
     let snapped = resolve::snap_all(state).map_err(map_resolve_error)?;
     for (importer, resolutions) in &snapped {
-        let base = state
-            .find(importer)
-            .map(|m| m.base)
-            .unwrap_or(0);
+        let base = state.find(importer).map(|m| m.base).unwrap_or(0);
         for r in resolutions {
             let st = host.write_iat_slot(base, r.iat_slot_rva, r.address);
             if st != STATUS_SUCCESS {
@@ -169,8 +166,10 @@ pub fn ldrp_initialize<H: LoaderHost>(
         alloc::vec![params.root_module.as_str()]
     };
     let init_idx = order::initialization_order(state, &root_refs);
-    let init_order: Vec<alloc::string::String> =
-        init_idx.iter().map(|&i| state.modules[i].name.clone()).collect();
+    let init_order: Vec<alloc::string::String> = init_idx
+        .iter()
+        .map(|&i| state.modules[i].name.clone())
+        .collect();
 
     // (6) Build PEB->Ldr (load order = the module set's load order; init order from (5)).
     let load_order: Vec<usize> = (0..state.modules.len()).collect();

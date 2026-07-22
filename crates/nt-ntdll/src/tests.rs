@@ -13,7 +13,9 @@ fn stub_table_covers_all_required_nt_services() {
     assert_eq!(t.len(), NT_SYSCALLS.len());
     // Every shared-ABI entry has a stub resolving to the right SSN.
     for e in NT_SYSCALLS {
-        let s = t.get(e.name).unwrap_or_else(|| panic!("missing stub {}", e.name));
+        let s = t
+            .get(e.name)
+            .unwrap_or_else(|| panic!("missing stub {}", e.name));
         assert_eq!(s.ssn, e.ssn);
     }
 }
@@ -63,8 +65,14 @@ fn transport_backend_implemented_flags() {
 fn transport_seams_return_not_implemented_on_host() {
     // The declared seL4/SURT seams (and the trap on non-x86 hosts) return NOT_IMPLEMENTED rather
     // than fabricating success.
-    assert_eq!(transport::syscall(Backend::Sel4Call, 27, &[0]), STATUS_NOT_IMPLEMENTED);
-    assert_eq!(transport::syscall(Backend::SurtRing, 27, &[0]), STATUS_NOT_IMPLEMENTED);
+    assert_eq!(
+        transport::syscall(Backend::Sel4Call, 27, &[0]),
+        STATUS_NOT_IMPLEMENTED
+    );
+    assert_eq!(
+        transport::syscall(Backend::SurtRing, 27, &[0]),
+        STATUS_NOT_IMPLEMENTED
+    );
 }
 
 #[test]
@@ -101,7 +109,10 @@ fn rtl_proof_slice_reuses_nt_compat_exports() {
     // RtlCompareUnicodeString / RtlEqualUnicodeString (case-insensitive).
     let a = [b'a' as u16];
     let b = [b'A' as u16];
-    assert_eq!(rtl::rtl_compare_unicode_string(&a, &b, true), core::cmp::Ordering::Equal);
+    assert_eq!(
+        rtl::rtl_compare_unicode_string(&a, &b, true),
+        core::cmp::Ordering::Equal
+    );
     assert!(rtl::rtl_equal_unicode_string(&a, &b, true));
     assert!(!rtl::rtl_equal_unicode_string(&a, &b, false));
 

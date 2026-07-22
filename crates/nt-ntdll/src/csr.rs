@@ -363,13 +363,7 @@ pub unsafe fn raw_capture_message_unicode_string_in_place(
         let buffer = string_buffer(unicode_string) as *const u8;
         let length = string_length(unicode_string) as u32;
         let maximum = string_maximum_length(unicode_string) as u32;
-        raw_capture_message_string(
-            capture_buffer,
-            buffer,
-            length,
-            maximum,
-            unicode_string,
-        );
+        raw_capture_message_string(capture_buffer, buffer, length, maximum, unicode_string);
 
         let captured_length = string_length(unicode_string) as usize;
         let captured_maximum = string_maximum_length(unicode_string) as usize;
@@ -957,12 +951,7 @@ mod tests {
         let mut wide = [b'A' as u16, b'B' as u16, 0];
         let mut desc = [0u8; 16];
         unsafe {
-            write_raw_string(
-                &mut desc,
-                4,
-                6,
-                wide.as_mut_ptr() as *mut u8,
-            );
+            write_raw_string(&mut desc, 4, 6, wide.as_mut_ptr() as *mut u8);
             init_raw_capture_buffer(raw.as_mut_ptr(), size, 1);
             raw_capture_message_unicode_string_in_place(raw.as_mut_ptr(), desc.as_mut_ptr());
             let (length, maximum, buffer) = read_raw_string(&desc);

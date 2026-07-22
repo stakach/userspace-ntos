@@ -319,8 +319,18 @@ fn init_order_tolerates_a_cycle() {
 #[test]
 fn peb_ldr_lists_thread_and_walk_back() {
     let mut st = LoaderState::new();
-    st.add(LoadedModule::mock("app.exe", 0x1_0000, vec![], vec![imports("b.dll", &[])]));
-    st.add(LoadedModule::mock("b.dll", 0x2_0000, vec![], vec![imports("ntdll.dll", &[])]));
+    st.add(LoadedModule::mock(
+        "app.exe",
+        0x1_0000,
+        vec![],
+        vec![imports("b.dll", &[])],
+    ));
+    st.add(LoadedModule::mock(
+        "b.dll",
+        0x2_0000,
+        vec![],
+        vec![imports("ntdll.dll", &[])],
+    ));
     st.add(LoadedModule::mock("ntdll.dll", 0x3_0000, vec![], vec![]));
 
     let load_order: Vec<usize> = (0..st.modules.len()).collect();
@@ -333,7 +343,10 @@ fn peb_ldr_lists_thread_and_walk_back() {
 
     // Walking InInitializationOrder recovers them in INIT order (deps first: ntdll, b, app).
     let init_walk = peb::walk_in_init_order(&built);
-    let init_names: Vec<String> = init_order.iter().map(|&i| st.modules[i].name.clone()).collect();
+    let init_names: Vec<String> = init_order
+        .iter()
+        .map(|&i| st.modules[i].name.clone())
+        .collect();
     assert_eq!(init_walk, init_names);
     assert_eq!(init_walk.first().unwrap(), "ntdll.dll");
     assert_eq!(init_walk.last().unwrap(), "app.exe");
@@ -370,7 +383,10 @@ fn circular_links_close_the_list_and_walk_terminates() {
     let mut cur = h.flink;
     let mut visited = 0usize;
     while cur != head {
-        assert_ne!(cur, 0, "NULL flink during walk — the exact GetModuleFileNameW fault");
+        assert_ne!(
+            cur, 0,
+            "NULL flink during walk — the exact GetModuleFileNameW fault"
+        );
         visited += 1;
         cur = node_link(cur).flink;
         assert!(visited <= 3, "walk did not terminate — list not closed");
@@ -398,7 +414,10 @@ fn circular_links_incremental_runtime_add_reappends() {
     let (h, m) = peb::circular_links(head, &after);
     assert_eq!(h.blink, 0x2800, "runtime module is the new list tail");
     assert_eq!(m[2].flink, head, "new tail closes the list");
-    assert_eq!(m[1].flink, 0x2800, "prior tail now links to the runtime module");
+    assert_eq!(
+        m[1].flink, 0x2800,
+        "prior tail now links to the runtime module"
+    );
 }
 
 #[test]
@@ -415,7 +434,10 @@ fn ldr_entry_fields_are_populated() {
     assert_eq!(e.entry.entry_point, 0xABCD_0000 + 0x1234);
     // base_dll_name length in bytes = 2 * "ntdll.dll".len().
     assert_eq!(e.entry.base_dll_name.length as usize, "ntdll.dll".len() * 2);
-    assert_eq!(e.base_name_utf16, "ntdll.dll".encode_utf16().collect::<Vec<u16>>());
+    assert_eq!(
+        e.base_name_utf16,
+        "ntdll.dll".encode_utf16().collect::<Vec<u16>>()
+    );
 }
 
 // --- (4) LdrpInitialize orchestration + LoaderHost seam -----------------------------------------
@@ -423,7 +445,12 @@ fn ldr_entry_fields_are_populated() {
 fn three_module_set() -> LoaderState {
     let mut st = LoaderState::new();
     // app.exe imports one func from b.dll; b.dll imports NtClose from ntdll (a forwarder!).
-    let mut app = LoadedModule::mock("app.exe", 0x1_0000, vec![], vec![imports("b.dll", &["BInit"])]);
+    let mut app = LoadedModule::mock(
+        "app.exe",
+        0x1_0000,
+        vec![],
+        vec![imports("b.dll", &["BInit"])],
+    );
     app.entry_point_rva = 0x500;
     st.add(app);
 
@@ -469,7 +496,10 @@ fn ldrp_initialize_drives_the_whole_graph() {
     let res = init::ldrp_initialize(&st, &params, &mut host).unwrap();
 
     // Normalized flag set.
-    assert_eq!(res.normalized_flags & nt_ntdll_layout::RTL_USER_PROC_PARAMS_NORMALIZED, 1);
+    assert_eq!(
+        res.normalized_flags & nt_ntdll_layout::RTL_USER_PROC_PARAMS_NORMALIZED,
+        1
+    );
     // Non-zero cookie.
     assert_ne!(res.process_cookie, 0);
 
@@ -488,11 +518,14 @@ fn ldrp_initialize_drives_the_whole_graph() {
     // DLL_PROCESS_ATTACH called for the DLLs (not app.exe), in init order (deps first).
     let attach_names: Vec<u64> = host.dll_main_calls.iter().map(|(b, _, _)| *b).collect();
     // ntdll_vista (0x4) and ntdll (0x3) before b (0x2); app (0x1) never gets a DllMain.
-    assert!(host.dll_main_calls.iter().all(|(b, _, r)| *b != 0x1_0000 && *r == DllReason::ProcessAttach));
+    assert!(host
+        .dll_main_calls
+        .iter()
+        .all(|(b, _, r)| *b != 0x1_0000 && *r == DllReason::ProcessAttach));
     let pos = |b: u64| attach_names.iter().position(|x| *x == b);
     assert!(pos(0x2_0000) > pos(0x3_0000)); // b initialized after its import dependency ntdll
-    // ntdll_vista is a FORWARDER target of ntdll, not an import edge, so it is loaded + initialized
-    // but not ordered by the import graph — it just must be present (all 3 DLLs get a DllMain).
+                                            // ntdll_vista is a FORWARDER target of ntdll, not an import edge, so it is loaded + initialized
+                                            // but not ordered by the import graph — it just must be present (all 3 DLLs get a DllMain).
     assert!(attach_names.contains(&0x4_0000));
     assert_eq!(host.dll_main_calls.len(), 3); // b, ntdll, ntdll_vista (not app.exe)
 
@@ -520,7 +553,12 @@ fn ldrp_initialize_fails_when_dll_main_returns_false() {
 #[test]
 fn ldrp_initialize_reports_missing_dependency() {
     let mut st = LoaderState::new();
-    st.add(LoadedModule::mock("app.exe", 0x1_0000, vec![], vec![imports("gone.dll", &["X"])]));
+    st.add(LoadedModule::mock(
+        "app.exe",
+        0x1_0000,
+        vec![],
+        vec![imports("gone.dll", &["X"])],
+    ));
     let mut host = MockHost::new();
     let params = InitParams {
         root_module: "app.exe".to_string(),

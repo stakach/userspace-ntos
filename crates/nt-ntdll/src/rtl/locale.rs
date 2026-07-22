@@ -243,8 +243,12 @@ mod tests {
 
     #[test]
     fn query_without_buffer_reports_required_size() {
-        let query =
-            query_preferred_ui_languages(PreferredUiLanguageKind::System, MUI_LANGUAGE_ID, false, 0);
+        let query = query_preferred_ui_languages(
+            PreferredUiLanguageKind::System,
+            MUI_LANGUAGE_ID,
+            false,
+            0,
+        );
         assert_eq!(query.status, STATUS_SUCCESS);
         assert_eq!(query.count, 1);
         assert_eq!(query.required, 6);
