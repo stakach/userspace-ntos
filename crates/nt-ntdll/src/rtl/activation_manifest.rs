@@ -270,10 +270,7 @@ impl<'a> Parser<'a> {
         self.redirects
             .try_reserve(1)
             .map_err(|_| STATUS_NO_MEMORY)?;
-        self.redirects.push(DllRedirect {
-            name,
-            load_from: load_from.unwrap_or_default(),
-        });
+        self.redirects.push(DllRedirect { name, load_from });
         Ok(())
     }
 
@@ -691,6 +688,7 @@ mod tests {
             <asm:assembly xmlns:asm="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
               <asm:file asm:name="first.dll" />
               <file name="second.dll" loadFrom="side\second.dll"></file>
+              <file name="empty.dll" loadFrom="" />
             </asm:assembly>"#;
         let parsed = parse_manifest(manifest).unwrap();
         assert_eq!(
@@ -698,11 +696,15 @@ mod tests {
             vec![
                 DllRedirect {
                     name: wide("first.dll"),
-                    load_from: Vec::new(),
+                    load_from: None,
                 },
                 DllRedirect {
                     name: wide("second.dll"),
-                    load_from: wide("side\\second.dll"),
+                    load_from: Some(wide("side\\second.dll")),
+                },
+                DllRedirect {
+                    name: wide("empty.dll"),
+                    load_from: Some(Vec::new()),
                 },
             ]
         );
@@ -732,7 +734,7 @@ mod tests {
             </assembly>"#;
         let parsed = parse_manifest(manifest).unwrap();
         assert_eq!(parsed.dll_redirects[0].name, wide("a&b.dll"));
-        assert_eq!(parsed.dll_redirects[0].load_from, wide("sub/d.dll"));
+        assert_eq!(parsed.dll_redirects[0].load_from, Some(wide("sub/d.dll")));
     }
 
     #[test]

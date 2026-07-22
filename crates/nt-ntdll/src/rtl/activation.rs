@@ -87,7 +87,8 @@ impl ActCtxDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DllRedirect {
     pub name: Vec<u16>,
-    pub load_from: Vec<u16>,
+    /// `None` means no attribute; `Some(empty)` preserves an explicit `loadFrom=""` segment.
+    pub load_from: Option<Vec<u16>>,
 }
 
 #[repr(C)]
@@ -98,6 +99,7 @@ pub struct ActivationContextObject {
     pub application_directory: Vec<u16>,
     pub manifest: Vec<u8>,
     pub dll_redirects: Vec<DllRedirect>,
+    pub dll_redirect_section: Vec<u8>,
 }
 
 const _: () = assert!(core::mem::align_of::<ActivationContextObject>() <= 16);
@@ -153,7 +155,12 @@ impl<const N: usize> Default for ActivationContextRegistry<N> {
 }
 
 impl ActivationContextObject {
-    pub fn new(source: Vec<u16>, manifest: Vec<u8>, dll_redirects: Vec<DllRedirect>) -> Self {
+    pub fn new(
+        source: Vec<u16>,
+        manifest: Vec<u8>,
+        dll_redirects: Vec<DllRedirect>,
+        dll_redirect_section: Vec<u8>,
+    ) -> Self {
         Self {
             magic: AtomicU32::new(ACTCTX_MAGIC),
             references: AtomicU32::new(1),
@@ -161,6 +168,7 @@ impl ActivationContextObject {
             application_directory: Vec::new(),
             manifest,
             dll_redirects,
+            dll_redirect_section,
         }
     }
 
@@ -496,7 +504,12 @@ mod tests {
 
     #[test]
     fn activation_object_reference_lifetime_is_atomic_and_bounded() {
-        let object = ActivationContextObject::new(Vec::new(), b"<assembly/>".to_vec(), Vec::new());
+        let object = ActivationContextObject::new(
+            Vec::new(),
+            b"<assembly/>".to_vec(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(object.is_valid());
         assert_eq!(object.reference_count(), 1);
         assert!(object.try_add_ref());

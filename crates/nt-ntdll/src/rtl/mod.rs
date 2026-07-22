@@ -13,6 +13,7 @@
 
 pub mod activation;
 pub mod activation_manifest;
+pub mod activation_section;
 pub mod atom;
 pub mod avl_table;
 pub mod bitmap;

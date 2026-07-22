@@ -62,6 +62,8 @@ const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
 const STATUS_PROCESS_IS_TERMINATING: NtStatus = 0xC000_010A;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
+const STATUS_SXS_SECTION_NOT_FOUND: NtStatus = 0xC015_0001;
+const STATUS_SXS_KEY_NOT_FOUND: NtStatus = 0xC015_0008;
 #[cfg(not(target_arch = "x86_64"))]
 const DBG_TRUE: NtStatus = 1;
 #[cfg(not(target_arch = "x86_64"))]
@@ -10833,8 +10835,7 @@ pub unsafe extern "system" fn rtl_find_message(
 // =================================================================================================
 // BATCH 4 — Rtl* activation-context (SxS) / path / guid / image / handle-table / resource-lock /
 // timer-queue / thread-pool / debug-buffer families.
-//   * SxS: per-thread activation stacks use the native x64 layouts. Manifest parsing and activation
-//     context section lookup remain limited to the process-default fallback.
+//   * SxS: native x64 per-thread stacks plus bounded manifest-backed DLL-redirection sections.
 //   * path/guid: real bodies over the host-tested nt_ntdll::rtl::{path,guid}.
 //   * image: real bodies over nt_ntdll::rtl::image (a mapped image = a byte slice from the base).
 //   * handle-table / resource-lock: real inline (single-threaded).
@@ -10887,6 +10888,27 @@ unsafe fn activation_context_try_add_ref(handle: *mut c_void) -> bool {
     }
     unsafe {
         (&*(value as *const nt_ntdll::rtl::activation::ActivationContextObject)).try_add_ref()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn activation_context_acquire_registered(
+    handle: *mut c_void,
+) -> Option<*const nt_ntdll::rtl::activation::ActivationContextObject> {
+    let value = handle as usize;
+    if value <= 1 || value == usize::MAX {
+        return None;
+    }
+    let _guard = unsafe { acquire_activation_context_lock() }.ok()?;
+    let registry = unsafe { &*core::ptr::addr_of!(RTL_ACTIVATION_CONTEXT_REGISTRY) };
+    if !registry.contains(value) {
+        return None;
+    }
+    let object = value as *const nt_ntdll::rtl::activation::ActivationContextObject;
+    if unsafe { (&*object).try_add_ref() } {
+        Some(object)
+    } else {
+        None
     }
 }
 
@@ -11001,6 +11023,21 @@ unsafe fn read_actctx_descriptor(
     }
     descriptor.validate()?;
     Ok(descriptor)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_active_activation_context_no_addref() -> *mut c_void {
+    let teb = unsafe { &*(current_teb() as *const Teb) };
+    let stack = teb.activation_context_stack_pointer as *const u8;
+    if stack.is_null() {
+        return core::ptr::null_mut();
+    }
+    let frame = unsafe { core::ptr::read_unaligned(stack as *const u64) };
+    if frame == 0 {
+        core::ptr::null_mut()
+    } else {
+        unsafe { core::ptr::read_unaligned((frame + 8) as *const *mut c_void) }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -11354,6 +11391,13 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             Ok(parsed) => parsed,
             Err(status) => return status,
         };
+        let dll_redirect_section =
+            match nt_ntdll::rtl::activation_section::build_dll_redirection_section(
+                &parsed.dll_redirects,
+            ) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
         let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
             Ok(source) => source,
             Err(status) => return status,
@@ -11375,6 +11419,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                 source,
                 manifest,
                 parsed.dll_redirects,
+                dll_redirect_section,
             ),
         );
         if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0 {
@@ -11443,8 +11488,8 @@ pub unsafe extern "system" fn rtl_zombify_activation_context(act_ctx: *mut c_voi
     }
 }
 
-/// `RtlGetActiveActivationContext(PVOID* ActCtx) -> NTSTATUS` — report the active context = none
-/// (NULL = the process default). The caller then uses the default search path.
+/// `RtlGetActiveActivationContext(PVOID* ActCtx) -> NTSTATUS` — return an owned reference to the
+/// current thread's top activation context, or NULL when there is no active context.
 ///
 /// # Safety
 /// `act_ctx` writable.
@@ -11457,18 +11502,7 @@ pub unsafe extern "system" fn rtl_get_active_activation_context(
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let teb = &*(current_teb() as *const Teb);
-        let stack = teb.activation_context_stack_pointer as *const u8;
-        let context = if stack.is_null() {
-            core::ptr::null_mut()
-        } else {
-            let frame = core::ptr::read_unaligned(stack as *const u64);
-            if frame == 0 {
-                core::ptr::null_mut()
-            } else {
-                core::ptr::read_unaligned((frame + 8) as *const *mut c_void)
-            }
-        };
+        let context = current_active_activation_context_no_addref();
         rtl_add_ref_activation_context(context);
         core::ptr::write_unaligned(act_ctx, context);
     }
@@ -11480,24 +11514,129 @@ pub unsafe extern "system" fn rtl_get_active_activation_context(
 }
 
 /// `RtlFindActivationContextSectionString(ULONG Flags, PGUID ExtGuid, ULONG SectionId,
-/// PUNICODE_STRING StringToFind, PVOID ReturnedData) -> NTSTATUS` — resolve a redirected name via
-/// SxS. No manifest data → STATUS_SXS_KEY_NOT_FOUND (0xC0150004): the caller falls back to the
-/// unredirected name (the manifest-less behavior). NEVER a fabricated redirection.
+/// PUNICODE_STRING StringToFind, PVOID ReturnedData) -> NTSTATUS` — resolve a DLL redirection from
+/// the current thread's active context and expose context-owned native section data.
 ///
 /// # Safety
 /// Args per the RtlFindActivationContextSectionString ABI.
 #[export_name = "RtlFindActivationContextSectionString"]
 pub unsafe extern "system" fn rtl_find_activation_context_section_string(
-    _flags: u32,
+    flags: u32,
     _ext_guid: *const c_void,
-    _section_id: u32,
-    _string_to_find: *const c_void,
-    _returned_data: *mut c_void,
+    section_id: u32,
+    string_to_find: *const c_void,
+    returned_data: *mut c_void,
 ) -> NtStatus {
-    0xC015_0004 // STATUS_SXS_KEY_NOT_FOUND
+    const FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX: u32 = 0x01;
+    const ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION: u32 = 2;
+    const ACTCTX_SECTION_KEYED_DATA_MIN_SIZE: u32 = 64;
+    const ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE: u32 = 68;
+
+    if flags & !FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0
+        || string_to_find.is_null()
+        || (flags != 0 && returned_data.is_null())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        let key = string_to_find as *const u8;
+        let key_length = core::ptr::read_unaligned(key as *const u16) as usize;
+        let key_maximum = core::ptr::read_unaligned(key.add(2) as *const u16) as usize;
+        let key_buffer = core::ptr::read_unaligned(key.add(8) as *const *const u16);
+        if key_buffer.is_null() || key_length & 1 != 0 || key_length > key_maximum {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let output_size = if returned_data.is_null() {
+            0
+        } else {
+            core::ptr::read_unaligned(returned_data as *const u32)
+        };
+        if !returned_data.is_null() && output_size < ACTCTX_SECTION_KEYED_DATA_MIN_SIZE {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if section_id != ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION {
+            return STATUS_SXS_SECTION_NOT_FOUND;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let context = current_active_activation_context_no_addref();
+            let Some(object) = activation_context_acquire_registered(context) else {
+                return STATUS_SXS_KEY_NOT_FOUND;
+            };
+            let object = &*object;
+            let key_name = core::slice::from_raw_parts(key_buffer, key_length / 2);
+            let found = match nt_ntdll::rtl::activation_section::find_dll_redirection(
+                &object.dll_redirect_section,
+                key_name,
+            ) {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    activation_context_release(context);
+                    return STATUS_SXS_KEY_NOT_FOUND;
+                }
+                Err(status) => {
+                    activation_context_release(context);
+                    return status;
+                }
+            };
+
+            if returned_data.is_null() {
+                activation_context_release(context);
+                return STATUS_SUCCESS;
+            }
+            let section_base = object.dll_redirect_section.as_ptr();
+            core::ptr::write_unaligned((returned_data as *mut u8).add(4) as *mut u32, 1);
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(8) as *mut *const u8,
+                section_base.add(found.data_offset as usize),
+            );
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(16) as *mut u32,
+                found.data_length,
+            );
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(24) as *mut *const u8,
+                core::ptr::null(),
+            );
+            core::ptr::write_unaligned((returned_data as *mut u8).add(32) as *mut u32, 0);
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(40) as *mut *const u8,
+                section_base,
+            );
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(48) as *mut u32,
+                object.dll_redirect_section.len() as u32,
+            );
+            let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
+            core::ptr::write_unaligned(
+                (returned_data as *mut u8).add(56) as *mut *mut c_void,
+                if return_context {
+                    context
+                } else {
+                    core::ptr::null_mut()
+                },
+            );
+            if output_size >= ACTCTX_SECTION_KEYED_DATA_ROSTER_SIZE {
+                core::ptr::write_unaligned(
+                    (returned_data as *mut u8).add(64) as *mut u32,
+                    found.assembly_roster_index,
+                );
+            }
+            if !return_context {
+                activation_context_release(context);
+            }
+            return STATUS_SUCCESS;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (key_buffer, key_length, output_size);
+            STATUS_SXS_KEY_NOT_FOUND
+        }
+    }
 }
 
-/// `RtlFindActivationContextSectionGuid(...)` — same "no manifest" contract.
+/// `RtlFindActivationContextSectionGuid(...)` — GUID-backed activation sections are not yet built.
 ///
 /// # Safety
 /// Args per the RtlFindActivationContextSectionGuid ABI.
@@ -11509,7 +11648,7 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
     _guid_to_find: *const c_void,
     _returned_data: *mut c_void,
 ) -> NtStatus {
-    0xC015_0004
+    STATUS_SXS_KEY_NOT_FOUND
 }
 
 /// `RtlQueryInformationActivationContext(...) -> NTSTATUS` — resolve the requested context and
@@ -11542,18 +11681,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
             if !selected.is_null() {
                 return STATUS_INVALID_PARAMETER;
             }
-            let teb = &*(current_teb() as *const Teb);
-            let stack = teb.activation_context_stack_pointer as *const u8;
-            selected = if stack.is_null() {
-                core::ptr::null_mut()
-            } else {
-                let frame = core::ptr::read_unaligned(stack as *const u64);
-                if frame == 0 {
-                    core::ptr::null_mut()
-                } else {
-                    core::ptr::read_unaligned((frame + 8) as *const *mut c_void)
-                }
-            };
+            selected = current_active_activation_context_no_addref();
         } else if flags
             & (nt_ntdll::rtl::activation::QUERY_FLAG_IS_HMODULE
                 | nt_ntdll::rtl::activation::QUERY_FLAG_IS_ADDRESS)
