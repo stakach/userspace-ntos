@@ -1,5 +1,8 @@
 //! Activation-context stack layouts and transition validation.
 
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::NtStatus;
 
 pub const FRAME_FLAG_RELEASE_ON_DEACTIVATION: u32 = 0x01;
@@ -14,7 +17,219 @@ pub const CALLER_FRAME_FORMAT_WHISTLER: u32 = 1;
 
 pub const STATUS_SXS_EARLY_DEACTIVATION: NtStatus = 0xC015_000F;
 pub const STATUS_SXS_INVALID_DEACTIVATION: NtStatus = 0xC015_0010;
+pub const STATUS_SXS_CANT_GEN_ACTCTX: NtStatus = 0xC015_0002;
+pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 pub const INVALID_COOKIE: usize = usize::MAX;
+
+pub const ACTCTX_MAGIC: u32 = 0xC07E_3E11;
+pub const ACTCTX_FAKE_HANDLE: usize = 0x00F0_0BAA;
+pub const ACTCTX_FLAG_PROCESSOR_ARCHITECTURE_VALID: u32 = 0x01;
+pub const ACTCTX_FLAG_LANGID_VALID: u32 = 0x02;
+pub const ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID: u32 = 0x04;
+pub const ACTCTX_FLAG_RESOURCE_NAME_VALID: u32 = 0x08;
+pub const ACTCTX_FLAG_SET_PROCESS_DEFAULT: u32 = 0x10;
+pub const ACTCTX_FLAG_APPLICATION_NAME_VALID: u32 = 0x20;
+pub const ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF: u32 = 0x40;
+pub const ACTCTX_FLAG_HMODULE_VALID: u32 = 0x80;
+pub const ACTCTX_FLAGS_ALL: u32 = 0xff;
+
+pub const QUERY_FLAG_USE_ACTIVE: u32 = 0x01;
+pub const QUERY_FLAG_IS_HMODULE: u32 = 0x02;
+pub const QUERY_FLAG_IS_ADDRESS: u32 = 0x04;
+pub const QUERY_FLAG_NO_ADDREF: u32 = 0x8000_0000;
+pub const QUERY_FLAGS_ALL: u32 =
+    QUERY_FLAG_USE_ACTIVE | QUERY_FLAG_IS_HMODULE | QUERY_FLAG_IS_ADDRESS | QUERY_FLAG_NO_ADDREF;
+pub const ACTIVATION_CONTEXT_BASIC_INFORMATION_CLASS: u32 = 1;
+pub const ACTIVATION_CONTEXT_BASIC_INFORMATION_SIZE: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActCtxDescriptor {
+    pub size: u32,
+    pub flags: u32,
+    pub source: usize,
+    pub processor_architecture: u16,
+    pub language_id: u16,
+    pub assembly_directory: usize,
+    pub resource_name: usize,
+    pub application_name: usize,
+    pub module: usize,
+}
+
+impl ActCtxDescriptor {
+    pub fn validate(&self) -> Result<(), NtStatus> {
+        if self.flags & !ACTCTX_FLAGS_ALL != 0 || self.size < 16 {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        let required = [
+            (ACTCTX_FLAG_PROCESSOR_ARCHITECTURE_VALID, 18usize),
+            (ACTCTX_FLAG_LANGID_VALID, 20),
+            (ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID, 32),
+            (ACTCTX_FLAG_RESOURCE_NAME_VALID, 40),
+            (ACTCTX_FLAG_APPLICATION_NAME_VALID, 48),
+            (ACTCTX_FLAG_HMODULE_VALID, 56),
+        ];
+        for (flag, size) in required {
+            if self.flags & flag != 0 && self.size < size as u32 {
+                return Err(crate::STATUS_INVALID_PARAMETER);
+            }
+        }
+        if self.flags & ACTCTX_FLAG_RESOURCE_NAME_VALID != 0 && self.resource_name == 0 {
+            return Err(crate::STATUS_INVALID_PARAMETER);
+        }
+        Ok(())
+    }
+
+    pub fn uses_unsupported_resolution(&self) -> bool {
+        self.flags & (ACTCTX_FLAG_SET_PROCESS_DEFAULT | ACTCTX_FLAG_SOURCE_IS_ASSEMBLYREF) != 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DllRedirect {
+    pub name: Vec<u16>,
+    pub load_from: Vec<u16>,
+}
+
+#[repr(C)]
+pub struct ActivationContextObject {
+    magic: AtomicU32,
+    references: AtomicU32,
+    pub source: Vec<u16>,
+    pub application_directory: Vec<u16>,
+    pub manifest: Vec<u8>,
+    pub dll_redirects: Vec<DllRedirect>,
+}
+
+const _: () = assert!(core::mem::align_of::<ActivationContextObject>() <= 16);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivationContextRegistry<const N: usize> {
+    entries: [usize; N],
+    len: usize,
+}
+
+impl<const N: usize> ActivationContextRegistry<N> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [0; N],
+            len: 0,
+        }
+    }
+
+    pub fn insert(&mut self, handle: usize) -> bool {
+        if handle == 0 || handle == usize::MAX || self.contains(handle) {
+            return false;
+        }
+        if self.len == N {
+            return false;
+        }
+        self.entries[self.len] = handle;
+        self.len += 1;
+        true
+    }
+
+    pub fn contains(&self, handle: usize) -> bool {
+        self.entries[..self.len].contains(&handle)
+    }
+
+    pub fn remove(&mut self, handle: usize) -> bool {
+        let Some(index) = self.entries[..self.len]
+            .iter()
+            .position(|entry| *entry == handle)
+        else {
+            return false;
+        };
+        self.entries.copy_within(index + 1..self.len, index);
+        self.len -= 1;
+        self.entries[self.len] = 0;
+        true
+    }
+}
+
+impl<const N: usize> Default for ActivationContextRegistry<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivationContextObject {
+    pub fn new(source: Vec<u16>, manifest: Vec<u8>, dll_redirects: Vec<DllRedirect>) -> Self {
+        Self {
+            magic: AtomicU32::new(ACTCTX_MAGIC),
+            references: AtomicU32::new(1),
+            source,
+            application_directory: Vec::new(),
+            manifest,
+            dll_redirects,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.magic.load(Ordering::Acquire) == ACTCTX_MAGIC
+    }
+
+    pub fn reference_count(&self) -> u32 {
+        self.references.load(Ordering::Acquire)
+    }
+
+    pub fn try_add_ref(&self) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        let mut current = self.references.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return false;
+            };
+            if current == 0 {
+                return false;
+            }
+            match self.references.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Drop one reference. Returns `true` exactly once, when the owner must destroy the object.
+    pub fn release_ref(&self) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        let mut current = self.references.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.references.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) if current == 1 => {
+                    self.magic.store(0, Ordering::Release);
+                    return true;
+                }
+                Ok(_) => return false,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+pub fn validate_basic_query(flags: u32, buffer_size: usize) -> Result<(), NtStatus> {
+    let _ = flags;
+    if buffer_size < ACTIVATION_CONTEXT_BASIC_INFORMATION_SIZE {
+        return Err(STATUS_BUFFER_TOO_SMALL);
+    }
+    Ok(())
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -232,5 +447,89 @@ mod tests {
         assert!(!caller_frame_can_deactivate(
             FRAME_FLAG_ACTIVATED | FRAME_FLAG_DEACTIVATED
         ));
+    }
+
+    #[test]
+    fn actctx_descriptor_checks_flagged_field_boundaries() {
+        for (flag, size) in [
+            (ACTCTX_FLAG_PROCESSOR_ARCHITECTURE_VALID, 18),
+            (ACTCTX_FLAG_LANGID_VALID, 20),
+            (ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID, 32),
+            (ACTCTX_FLAG_RESOURCE_NAME_VALID, 40),
+            (ACTCTX_FLAG_APPLICATION_NAME_VALID, 48),
+            (ACTCTX_FLAG_HMODULE_VALID, 56),
+        ] {
+            let descriptor = ActCtxDescriptor {
+                size,
+                flags: flag,
+                source: 1,
+                assembly_directory: 2,
+                resource_name: 3,
+                application_name: 4,
+                module: 5,
+                ..ActCtxDescriptor::default()
+            };
+            assert_eq!(descriptor.validate(), Ok(()));
+            assert_eq!(
+                ActCtxDescriptor {
+                    size: size - 1,
+                    ..descriptor
+                }
+                .validate(),
+                Err(crate::STATUS_INVALID_PARAMETER)
+            );
+        }
+
+        let mut descriptor = ActCtxDescriptor {
+            size: 56,
+            flags: ACTCTX_FLAG_RESOURCE_NAME_VALID,
+            source: 1,
+            resource_name: 2,
+            ..ActCtxDescriptor::default()
+        };
+        descriptor.resource_name = 0;
+        assert_eq!(descriptor.validate(), Err(crate::STATUS_INVALID_PARAMETER));
+        descriptor.resource_name = 2;
+        descriptor.flags |= 0x100;
+        assert_eq!(descriptor.validate(), Err(crate::STATUS_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn activation_object_reference_lifetime_is_atomic_and_bounded() {
+        let object = ActivationContextObject::new(Vec::new(), b"<assembly/>".to_vec(), Vec::new());
+        assert!(object.is_valid());
+        assert_eq!(object.reference_count(), 1);
+        assert!(object.try_add_ref());
+        assert_eq!(object.reference_count(), 2);
+        assert!(!object.release_ref());
+        assert_eq!(object.reference_count(), 1);
+        assert!(object.release_ref());
+        assert!(!object.is_valid());
+        assert!(!object.try_add_ref());
+        assert!(!object.release_ref());
+    }
+
+    #[test]
+    fn basic_query_validates_flags_and_buffer_size() {
+        assert_eq!(
+            validate_basic_query(0, ACTIVATION_CONTEXT_BASIC_INFORMATION_SIZE - 1),
+            Err(STATUS_BUFFER_TOO_SMALL)
+        );
+        assert_eq!(validate_basic_query(u32::MAX, 16), Ok(()));
+        assert_eq!(validate_basic_query(QUERY_FLAG_NO_ADDREF, 16), Ok(()));
+    }
+
+    #[test]
+    fn activation_registry_rejects_unregistered_and_interior_handles() {
+        let mut registry = ActivationContextRegistry::<2>::new();
+        assert!(registry.insert(0x1000));
+        assert!(registry.contains(0x1000));
+        assert!(!registry.contains(0x1008));
+        assert!(!registry.insert(0x1000));
+        assert!(registry.insert(0x2000));
+        assert!(!registry.insert(0x3000));
+        assert!(registry.remove(0x1000));
+        assert!(!registry.contains(0x1000));
+        assert!(!registry.remove(0x1008));
     }
 }

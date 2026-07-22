@@ -79,6 +79,11 @@ pub fn image_rva_to_va(bytes: &[u8], load_base: u64, rva: u32) -> Option<u64> {
     }
 }
 
+/// Return whether an RVA-backed byte span is wholly contained in the mapped image.
+pub fn image_span_is_valid(size_of_image: u32, rva: u32, size: u32) -> bool {
+    rva <= size_of_image && size <= size_of_image - rva
+}
+
 /// `RtlImageRvaToSection` — the section name covering `rva`, if any.
 pub fn image_rva_to_section(bytes: &[u8], rva: u32) -> Option<alloc::string::String> {
     let pe = PeFile::parse(bytes).ok()?;
@@ -183,6 +188,15 @@ mod tests {
         assert!(image_rva_to_va(&img, 0x1_4000_0000, 0x9000).is_none());
         assert_eq!(image_rva_to_section(&img, 0x1000).as_deref(), Some(".text"));
         assert!(image_rva_to_section(&img, 0x8000).is_none());
+    }
+
+    #[test]
+    fn image_spans_must_fit_without_wrapping() {
+        assert!(image_span_is_valid(0x4000, 0x1000, 0x3000));
+        assert!(image_span_is_valid(0x4000, 0x4000, 0));
+        assert!(!image_span_is_valid(0x4000, 0x4000, 1));
+        assert!(!image_span_is_valid(0x4000, 0x5000, 0));
+        assert!(!image_span_is_valid(u32::MAX, u32::MAX - 1, 4));
     }
 
     #[test]
