@@ -370,8 +370,9 @@ pub(crate) unsafe fn fill_image_page(pe: &nt_pe_loader::PeFile, rva: u32, dst: u
 }
 
 /// Demand-load a PE via SEC_IMAGE: build a fresh VSpace, RESERVE the image VA (page tables
-/// present, image pages ABSENT), map a stack + IPC buffer, and start the entry point. The image
-/// pages fault in on demand (service_sec_image fills each by RVA). Returns the pml4.
+/// present, image pages ABSENT), map a stack + IPC buffer, and prepare the entry point. Process zero
+/// is the bootstrapped SMSS and starts immediately. Child processes remain suspended until their
+/// creator resumes the typed initial-thread handle returned by `NtCreateThread`.
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
     pe: &nt_pe_loader::PeFile,
@@ -908,7 +909,9 @@ pub(crate) unsafe fn spawn_sec_image(
         // IPCBUF_VADDR — the VA the ntdll native stub writes MR4/MR5 to.
         PM_MAIN_IPCBUF[pi as usize].store(ipcbuf, Ordering::Relaxed);
     }
-    let _ = tcb_resume(tcb);
+    if pi == 0 {
+        let _ = tcb_resume(tcb);
+    }
     pml4
 }
 

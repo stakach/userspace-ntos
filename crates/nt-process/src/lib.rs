@@ -25,6 +25,7 @@ pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+pub const STATUS_SUSPEND_COUNT_EXCEEDED: u32 = 0xC000_004A;
 pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_00E9;
 pub const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 
@@ -754,6 +755,40 @@ impl ProcessManager {
         }
         t.state = state;
         Ok(())
+    }
+
+    /// Increment a thread's suspend count and return its previous value. The first suspension
+    /// removes the thread from the runnable set; nested suspensions retain that state until the
+    /// matching final resume.
+    pub fn suspend_thread(&mut self, tid: ThreadId) -> Result<u32, u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.state == ThreadState::Terminated {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let previous = thread.suspend_count;
+        thread.suspend_count = thread
+            .suspend_count
+            .checked_add(1)
+            .ok_or(STATUS_SUSPEND_COUNT_EXCEEDED)?;
+        thread.state = ThreadState::Suspended;
+        Ok(previous)
+    }
+
+    /// Decrement a thread's suspend count and return its previous value. A zero-count resume is a
+    /// successful no-op, matching `NtResumeThread`; the final resume makes the thread ready.
+    pub fn resume_thread(&mut self, tid: ThreadId) -> Result<u32, u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.state == ThreadState::Terminated {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let previous = thread.suspend_count;
+        if previous != 0 {
+            thread.suspend_count -= 1;
+            if thread.suspend_count == 0 {
+                thread.state = ThreadState::Ready;
+            }
+        }
+        Ok(previous)
     }
 
     // --- termination + signalling (spec §12.3, §21) --------------------------

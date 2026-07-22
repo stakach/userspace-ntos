@@ -2078,7 +2078,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pipe_listen_iosb_va = 0;
                 nt_handler.pipe_connect_redrive = 0;
                 nt_handler.lpc_rendezvous_conn = 0;
-                nt_handler.csr_spawn_request = false;
+                nt_handler.csr_spawn_request = 0;
+                nt_handler.csr_start_request = 0;
                 nt_handler.csr_rendezvous_conn = 0;
                 // Group-C handlers reach the loop's section/registry/demand-fill state through this
                 // ctx of raw refs (rebuilt each iteration at the current loop locals).
@@ -2140,6 +2141,71 @@ pub(crate) unsafe fn service_sec_image(
                     result = res.status as u64;
                     if nt_handler.stop {
                         handled = false; // handler couldn't service → stop with the SSN recorded
+                    }
+                }
+                // NtResumeThread for a CSRSS server worker is a serialized run-to-receive action.
+                // Execute it immediately after dispatch, while the main CSRSS Call is still bound to
+                // REPLY_MAIN and therefore cannot race this worker on the shared native IPC frame.
+                if nt_handler.csr_start_request != 0 {
+                    // The nested CSR endpoint receive replaces the kernel's implicit reply_to.
+                    // Preserve the main caller by forcing the tail through its bound REPLY_MAIN cap.
+                    routed_csr = true;
+                    print_str(b"[csr-thread] outer start role=");
+                    print_u64(nt_handler.csr_start_request as u64);
+                    print_str(b"\n");
+                    if nt_handler.csr_start_request == 1 {
+                        let tcb = CSR_LOOP_TCB.load(Ordering::Relaxed);
+                        if tcb > 1 {
+                            let _ = tcb_resume(tcb);
+                            let _ = csr_rendezvous(
+                                0,
+                                procs[1].pml4,
+                                csrss_pe.as_ref().unwrap(),
+                                procs[1].img_end,
+                                nt_base,
+                                nt_end,
+                                ntdll.map(|(_, p)| p),
+                                &reg,
+                                &dll_pes,
+                                &mut nt_handler,
+                            );
+                            if CSR_API_RECEIVE_PARKED.load(Ordering::Relaxed) == 0 {
+                                result = 0xC000_0001;
+                            } else {
+                                let tid = CSR_API_TID.load(Ordering::Relaxed);
+                                let _ = nt_handler.pm.set_thread_state(
+                                    tid as nt_process::ThreadId,
+                                    nt_process::ThreadState::Running,
+                                );
+                            }
+                        } else {
+                            result = 0xC000_0001;
+                        }
+                    } else if nt_handler.csr_start_request == 2 {
+                        let tcb = CSR_SB_LOOP_TCB.load(Ordering::Relaxed);
+                        if tcb > 1 {
+                            let _ = tcb_resume(tcb);
+                            if !csr_sb_startup(
+                                procs[1].pml4,
+                                csrss_pe.as_ref().unwrap(),
+                                procs[1].img_end,
+                                nt_base,
+                                nt_end,
+                                ntdll.map(|(_, p)| p),
+                                &reg,
+                                &dll_pes,
+                            ) {
+                                result = 0xC000_0001;
+                            } else {
+                                let tid = CSR_SB_TID.load(Ordering::Relaxed);
+                                let _ = nt_handler.pm.set_thread_state(
+                                    tid as nt_process::ThreadId,
+                                    nt_process::ThreadState::Running,
+                                );
+                            }
+                        } else {
+                            result = 0xC000_0001;
+                        }
                     }
                 }
                 // A successful self-termination is a control-flow action, not a status-returning
@@ -2400,6 +2466,7 @@ pub(crate) unsafe fn service_sec_image(
                     // Register csrss's per-process state (slot 1) so badge-2 faults resolve against
                     // ITS VSpace/image and a private scratch window.
                     procs[1].pml4 = cpml4;
+                    CSRSS_SPAWNED.store(1, Ordering::Relaxed);
                     procs[1].img_end = PE_LOAD_BASE + image_extent(cpe);
                     procs[1].scratch_base = CSRSS_SCRATCH_BASE;
                     map_demand_scratch_pts(CSRSS_SCRATCH_BASE); // own 64 MiB scratch window PTs
@@ -2612,7 +2679,7 @@ pub(crate) unsafe fn service_sec_image(
                 // the REAL CSR API thread in csrss's VSpace (pi == 1 here → pml4 = csrss's PML4,
                 // ACTIVE_STACK_MIRROR = csrss's mirror). Same CONTEXT ABI as SM: Context* at [sp+0x30],
                 // CONTEXT.Rip@0xF8 = CsrApiRequestThread, CONTEXT.Rcx@0x80 = Parameter (hRequestEvent).
-                if nt_handler.csr_spawn_request && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
+                if nt_handler.csr_spawn_request == 1 && CSR_LOOP_TCB.swap(1, Ordering::Relaxed) == 0 {
                     let ctx_va = smss_stack_read(sp + 0x30);
                     let entry_rip = smss_stack_read(ctx_va + 0xF8);
                     let param = smss_stack_read(ctx_va + 0x80);
@@ -2622,11 +2689,30 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" param=0x");
                     print_hex(param as u32);
                     print_str(b"\n");
-                    let tcb = spawn_csr_loop_thread(pml4, entry_rip, param);
+                    let pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0) as u64;
+                    let tid = CSR_API_TID.load(Ordering::Relaxed);
+                    let tcb = spawn_csr_loop_thread(pml4, entry_rip, param, pid, tid);
                     CSR_LOOP_TCB.store(tcb, Ordering::Relaxed);
                     print_str(b"[csr-loop] spawned tcb=0x");
                     print_hex(tcb as u32);
                     print_str(b" (parks on its first fault to csr_fault_ep)\n");
+                }
+                if nt_handler.csr_spawn_request == 2
+                    && CSR_SB_LOOP_TCB.swap(1, Ordering::Relaxed) == 0
+                {
+                    let ctx_va = smss_stack_read(sp + 0x30);
+                    let entry_rip = smss_stack_read(ctx_va + 0xF8);
+                    let param = smss_stack_read(ctx_va + 0x80);
+                    let pid = nt_handler.pm_pid_for_pi(1).unwrap_or(0) as u64;
+                    let tid = CSR_SB_TID.load(Ordering::Relaxed);
+                    print_str(b"[csr-sb] spawning REAL CsrSbApiRequestThread: entry=0x");
+                    print_hex((entry_rip >> 32) as u32);
+                    print_hex(entry_rip as u32);
+                    print_str(b" tid=");
+                    print_u64(tid);
+                    print_str(b"\n");
+                    let tcb = spawn_csr_sb_loop_thread(pml4, entry_rip, param, pid, tid);
+                    CSR_SB_LOOP_TCB.store(tcb, Ordering::Relaxed);
                 }
                 // ★ GENERAL NtCreateThread: winlogon's first NtCreateThread (its RPC listener) — spawn
                 // the REAL thread in winlogon's VSpace (pi == 2 here → pml4 = winlogon's PML4,
@@ -2892,6 +2978,12 @@ pub(crate) unsafe fn service_sec_image(
                         nt_base,
                         nt_end,
                         ntdll.map(|(_, p)| p),
+                        procs[1].pml4,
+                        csrss_pe.as_ref().unwrap(),
+                        procs[1].img_end,
+                        &reg,
+                        &dll_pes,
+                        &mut nt_handler,
                     );
                     if client_handle != 0 {
                         // csrss's *PortHandle is a csrsrv/csrss VA (demand-fill window) — csrss_out_write.
@@ -5438,10 +5530,11 @@ fn pi_is_top_level(badge: u64) -> bool {
 #[inline]
 unsafe fn live_top_badges() -> u64 {
     let mut m = 1u64 << 0; // smss always live
-    if WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1 {
-        m |= (1u64 << CSRSS_BADGE) | (1u64 << WINLOGON_BADGE);
-    } else if csrss_is_live() {
+    if CSRSS_SPAWNED.load(Ordering::Relaxed) == 1 {
         m |= 1u64 << CSRSS_BADGE;
+    }
+    if WINLOGON_SPAWNED.load(Ordering::Relaxed) == 1 {
+        m |= 1u64 << WINLOGON_BADGE;
     }
     if SERVICES_SPAWNED.load(Ordering::Relaxed) == 1 {
         m |= 1u64 << SERVICES_BADGE;
@@ -5450,13 +5543,4 @@ unsafe fn live_top_badges() -> u64 {
         m |= 1u64 << LSASS_BADGE;
     }
     m
-}
-
-/// csrss is live as soon as smss spawns it (winlogon then follows). Approximated by CSRSS having
-/// demand-faulted — but to avoid threading `procs` here, csrss liveness is folded into the
-/// WINLOGON_SPAWNED gate above (csrss always spawns before winlogon). This returns false so the
-/// only extra bit is added via WINLOGON_SPAWNED; kept as a seam for a future explicit CSRSS_SPAWNED.
-#[inline]
-fn csrss_is_live() -> bool {
-    false
 }

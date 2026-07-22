@@ -53,6 +53,11 @@ pub(crate) unsafe fn sm_stack_write16(va: u64, v: u16) {
         core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u16, v);
     }
 }
+pub(crate) unsafe fn sm_stack_write32(va: u64, v: u32) {
+    if va >= SM_STACK_BASE && va + 4 <= SM_STACK_BASE + SM_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile((SM_STACK_MIRROR_VA + (va - SM_STACK_BASE)) as *mut u32, v);
+    }
+}
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
 /// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
 /// through an isolated executive scratch (SM_FILL_SCRATCH_BASE, its own PT) then mapped into smss's
@@ -115,6 +120,12 @@ pub(crate) unsafe fn sm_rendezvous(
     nt_base: u64,
     nt_end: u64,
     ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    csrss_img_end: u64,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+    nt_handler: &mut ExecNtHandler,
 ) -> u64 {
     const PID_SMSS: u64 = 4; // any nonzero value; must match on both sides (self-connect ClientId)
     const SSN_SET_INFO_THREAD: u64 = 238;
@@ -122,6 +133,10 @@ pub(crate) unsafe fn sm_rendezvous(
     const SSN_REPLY_WAIT_RECV: u64 = 203;
     const SSN_ACCEPT_CONNECT: u64 = 0;
     const SSN_COMPLETE_CONNECT: u64 = 31;
+    const SSN_CONNECT_PORT: u64 = 33;
+    const SSN_OPEN_PROCESS: u64 = 128;
+    const SSN_SET_EVENT: u64 = 228;
+    const SSN_CLOSE: u64 = 27;
     let ep = SM_FAULT_EP.load(Ordering::Relaxed);
     let reply = REPLY_SMLOOP_SLOT.load(Ordering::Relaxed);
     if ep == 0 || reply == 0 {
@@ -204,11 +219,21 @@ pub(crate) unsafe fn sm_rendezvous(
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let rdx = m3;
-            let result = 0u64;
+            let mut result = 0u64;
             let mut stop_rdv = false;
             let mut done = false;
+            if guard < 64 {
+                print_str(b"[sm-rdv] worker SSN=");
+                print_u64(ssn);
+                print_str(b"\n");
+            }
             match ssn {
                 SSN_SET_INFO_THREAD => {} // RtlSetThreadIsCritical → no-op success
+                SSN_OPEN_PROCESS => {
+                    // SmpHandleConnectionRequest opens the connecting CSRSS process by the real CID.
+                    // The handle is private to the SM worker and used only for the session query/context.
+                    sm_stack_write(get_recv_mr(9), 0xC500);
+                }
                 SSN_QUERY_INFO_PROCESS => {
                     // ProcessBasicInformation (class 0): write UniqueProcessId@+0x20 = PID_SMSS so
                     // SmUniqueProcessId is set → the connection request's ClientId matches (self-connect).
@@ -216,6 +241,8 @@ pub(crate) unsafe fn sm_rendezvous(
                     let buf = get_recv_mr(7); // R8 = buffer
                     if class == 0 {
                         sm_stack_write(buf + 0x20, PID_SMSS);
+                    } else if class == 24 {
+                        sm_stack_write32(buf, 0); // ProcessSessionInformation: session 0
                     }
                 }
                 SSN_REPLY_WAIT_RECV => {
@@ -226,8 +253,24 @@ pub(crate) unsafe fn sm_rendezvous(
                         Some(r) if r.connection_id != 0 => {
                             // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
                             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
-                            sm_stack_write(recvmsg + 0x08, PID_SMSS); // ClientId.UniqueProcess
-                            sm_stack_write(recvmsg + 0x10, PID_SMSS + 4); // ClientId.UniqueThread
+                            sm_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
+                            sm_stack_write(recvmsg + 0x10, PM_TIDS[1].load(Ordering::Relaxed));
+                            sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
+                            for (i, chunk) in r.connection_info.chunks_exact(2).take(120).enumerate() {
+                                sm_stack_write16(
+                                    recvmsg + 0x2c + i as u64 * 2,
+                                    u16::from_le_bytes([chunk[0], chunk[1]]),
+                                );
+                            }
+                            print_str(b"[sm-rdv] delivered connection cid=");
+                            print_u64(PM_PIDS[1].load(Ordering::Relaxed));
+                            print_str(b"/");
+                            print_u64(PM_TIDS[1].load(Ordering::Relaxed));
+                            print_str(b" subsystem=");
+                            print_u64(r.subsystem_type as u64);
+                            print_str(b" info_len=");
+                            print_u64(r.connection_info.len() as u64);
+                            print_str(b"\n");
                         }
                         _ => {
                             // No pending connection (the 2nd receive): leave the thread PARKED — do NOT
@@ -248,13 +291,60 @@ pub(crate) unsafe fn sm_rendezvous(
                     if let Some((ch, _)) = lpc_client().and_then(|c| c.complete_connect(conn_id).ok()) {
                         client_handle = ch;
                     }
-                    // Reply (below), then BREAK: the connection is done. SmpApiLoop loops back to its
-                    // next NtReplyWaitReceivePort, which faults FRESH to sm_fault_ep (no receiver) and
-                    // re-parks — so a LATER connect's rendezvous can recv that fresh fault (rather than
-                    // this rendezvous draining an empty receive, which would leave the thread blocked
-                    // on a reply and deadlock the next connect).
-                    done = true;
+                    print_str(b"[sm-rdv] forward NtCompleteConnectPort replied; awaiting reverse connect\n");
+                    // Continue into SmpHandleConnectionRequest's reverse connection and real event set.
                 }
+                SSN_CONNECT_PORT => {
+                    let out = get_recv_mr(9);
+                    let sb_name: alloc::vec::Vec<u16> = "\\Windows\\SbApiPort".encode_utf16().collect();
+                    let reverse = lpc_client().and_then(|c| c.connect_port(&sb_name, 0, &[]).ok());
+                    match reverse {
+                        Some(r) if r.pending => {
+                            let handle = csr_sb_accept_connection(
+                                r.connection_id,
+                                csrss_pml4,
+                                csrss_pe,
+                                csrss_img_end,
+                                nt_base,
+                                nt_end,
+                                ntdll_pe,
+                                reg,
+                                dll_pes,
+                            );
+                            if handle == 0 {
+                                result = 0xC000_0001;
+                                stop_rdv = true;
+                            } else {
+                                sm_stack_write(out, handle);
+                            }
+                        }
+                        Some(r) if r.handle != 0 => sm_stack_write(out, r.handle),
+                        _ => {
+                            result = 0xC000_0001;
+                            stop_rdv = true;
+                        }
+                    }
+                }
+                SSN_SET_EVENT => {
+                    let event_handle = get_recv_mr(9);
+                    let saved_pi = nt_handler.pi;
+                    nt_handler.pi = 0;
+                    result = match nt_handler.event_index_for_handle(event_handle, EVENT_MODIFY_STATE) {
+                        Ok(index) => match nt_handler.events.set_existing(index as u64) {
+                            Some(previous) => {
+                                if !previous {
+                                    wait_wake_dispatcher_set(nt_handler);
+                                }
+                                print_str(b"[sm-rdv] real NtSetEvent completed subsystem readiness\n");
+                                0
+                            }
+                            None => 0xC000_0008,
+                        },
+                        Err(status) => status as u64,
+                    };
+                    nt_handler.pi = saved_pi;
+                }
+                SSN_CLOSE => {}
                 _ => {
                     print_str(b"[sm-rdv] WALL: unexpected SSN=");
                     print_u64(ssn);
@@ -293,12 +383,13 @@ pub const CSR_STACK_FRAMES: u64 = 8;
 /// first fault/syscall until `csr_rendezvous` drains it for winlogon's CSR connect. `param` is the
 /// hRequestEvent handle (CsrApiRequestThread's PVOID Parameter). The TEB carries the self-connect
 /// ClientId so the thread's own bookkeeping is consistent.
-pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, param: u64) -> u64 {
-    // NOT resumed here: CsrApiRequestThread's pre-loop CsrConnectToUser touches CsrRootProcess's
-    // thread list under csrss's process lock, which csrss's MAIN thread is still mutating during init
-    // (CsrAddStaticServerThread). Resuming now would race. Instead `csr_rendezvous` resumes it lazily,
-    // by which time csrss main has finished init + parked → the CSR thread runs alone in csrss's VSpace.
-    // The TEB carries the self-connect ClientId (0x40/0x48) so the thread's own bookkeeping is consistent.
+pub(crate) unsafe fn spawn_csr_loop_thread(
+    csrss_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    pid: u64,
+    tid: u64,
+) -> u64 {
     spawn_hosted_thread(&HostedThread {
         pml4: csrss_pml4,
         client_pi: 1,
@@ -315,8 +406,8 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         peb_va: SMSS_PEB_VA,
         stack_mirror_va: CSR_STACK_MIRROR_VA,
         fault_ep: CSR_FAULT_EP.load(Ordering::Relaxed),
-        cid_proc: CSR_STATIC_CID_PROC,
-        cid_thread: CSR_STATIC_CID_THREAD,
+        cid_proc: pid,
+        cid_thread: tid,
         resume: false,
         prio: 0,
         // BATCH 6: csrss (pi 1, badge 2) also runs on OUR native ntdll, so the CSR API thread uses the native
@@ -325,6 +416,135 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         ipcbuf_frame: PM_MAIN_IPCBUF[1].load(Ordering::Relaxed),
         diag: false,
     })
+}
+
+/// Spawn the real CSRSS session-manager API worker. ReactOS creates it suspended and performs the
+/// first resume itself, so construction deliberately leaves the TCB stopped.
+pub(crate) unsafe fn spawn_csr_sb_loop_thread(
+    csrss_pml4: u64,
+    entry_rip: u64,
+    param: u64,
+    pid: u64,
+    tid: u64,
+) -> u64 {
+    spawn_hosted_thread(&HostedThread {
+        pml4: csrss_pml4,
+        client_pi: 1,
+        entry_rip,
+        arg0: param,
+        arg1: 0,
+        loader_context: None,
+        scr: CSR_SB_ENV_SCRATCH_VA,
+        teb_va: CSR_SB_TEB_VA,
+        stack_base: CSR_SB_STACK_BASE,
+        stack_frames: CSR_SB_STACK_FRAMES,
+        ipcbuf_va: CSR_SB_IPCBUF_VA,
+        tramp_va: CSR_SB_TRAMP_VA,
+        peb_va: SMSS_PEB_VA,
+        stack_mirror_va: CSR_SB_STACK_MIRROR_VA,
+        fault_ep: CSR_SB_FAULT_EP.load(Ordering::Relaxed),
+        cid_proc: pid,
+        cid_thread: tid,
+        resume: false,
+        prio: 0,
+        native: true,
+        ipcbuf_frame: PM_MAIN_IPCBUF[1].load(Ordering::Relaxed),
+        diag: false,
+    })
+}
+
+/// Run the real SB worker from its initial resume through demand faults to its first blocking
+/// NtReplyWaitReceivePort. The retained reply object is the durable parked receive for later SM
+/// session messages; no synthetic status is returned to the worker.
+pub(crate) unsafe fn csr_sb_startup(
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) -> bool {
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_CSR_SB_SLOT.load(Ordering::Relaxed);
+    if ep == 0 || reply == 0 {
+        return false;
+    }
+    let mut fill_idx = 0;
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    for _ in 0..8000 {
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0;
+            let rsp = m1;
+            let arg1 = m2;
+            let arg3 = get_recv_mr(4);
+            let arg4 = get_recv_mr(5);
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn;
+            m2 = 0;
+            mi = (2u64 << 12) | (mi & 0x7f);
+        }
+        match mi >> 12 {
+            6 => {
+                let page = m1 & !0xfff;
+                if m1 < 0x10000
+                    || !csr_fill_page(
+                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
+                        reg, dll_pes, &mut fill_idx,
+                    )
+                {
+                    print_str(b"[csr-sb] unresolved startup fault\n");
+                    return false;
+                }
+                send_on_reply(reply, 0, 0, 0, 0, 0);
+            }
+            3 => {
+                let Some(pe) = ntdll_pe else { return false };
+                if m0 < nt_base
+                    || m0 >= nt_end
+                    || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
+                {
+                    return false;
+                }
+                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+            }
+            2 if m0 == SSN_REPLY_WAIT_RECV => {
+                CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
+                CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                CSR_SB_RECV_SP.store(get_recv_mr(16), Ordering::Relaxed);
+                CSR_SB_RECV_FLAGS.store(get_recv_mr(17), Ordering::Relaxed);
+                CSR_SB_RECV_RDX.store(m3, Ordering::Relaxed);
+                CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                print_str(b"[csr-sb] real worker parked on NtReplyWaitReceivePort\n");
+                return true;
+            }
+            2 => {
+                print_str(b"[csr-sb] unexpected startup SSN=");
+                print_u64(m0);
+                print_str(b"\n");
+                return false;
+            }
+            label => {
+                print_str(b"[csr-sb] unexpected startup label=");
+                print_u64(label);
+                print_str(b"\n");
+                return false;
+            }
+        }
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    false
 }
 
 /// Spawn winlogon's rpcrt4 server WORKER thread (its first NtCreateThread = RPCRT4_server_thread) in
@@ -672,6 +892,22 @@ pub(crate) unsafe fn csr_stack_write16(va: u64, v: u16) {
         core::ptr::write_volatile((CSR_STACK_MIRROR_VA + (va - CSR_STACK_BASE)) as *mut u16, v);
     }
 }
+unsafe fn csr_sb_stack_write(va: u64, v: u64) {
+    if va >= CSR_SB_STACK_BASE && va + 8 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile(
+            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *mut u64,
+            v,
+        );
+    }
+}
+unsafe fn csr_sb_stack_write16(va: u64, v: u16) {
+    if va >= CSR_SB_STACK_BASE && va + 2 <= CSR_SB_STACK_BASE + CSR_SB_STACK_FRAMES * 0x1000 {
+        core::ptr::write_volatile(
+            (CSR_SB_STACK_MIRROR_VA + (va - CSR_SB_STACK_BASE)) as *mut u16,
+            v,
+        );
+    }
+}
 
 /// Demand-fill one code/data page for the CSR API thread during the rendezvous. The page is in
 /// csrss's own image (PE_LOAD_BASE..img_end), ntdll, or a mapped registry DLL (csrsrv/user32/…, via
@@ -710,13 +946,160 @@ pub(crate) unsafe fn csr_fill_page(
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, spt);
         let _ = paging_struct_map(spt, LBL_X86_PAGE_TABLE_MAP, CSR_FILL_SCRATCH_BASE, CAP_INIT_THREAD_VSPACE);
     }
-    let scratch = CSR_FILL_SCRATCH_BASE + (*fill_idx).min(511) * 0x1000;
+    let scratch_index = CSR_FILL_NEXT.fetch_add(1, Ordering::Relaxed);
+    if scratch_index >= 512 {
+        return false;
+    }
+    let scratch = CSR_FILL_SCRATCH_BASE + scratch_index * 0x1000;
     *fill_idx += 1;
     let f = alloc_frame();
     let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
     let rights = fill_image_page(tpe, (page - base) as u32, scratch);
     let _ = page_map(copy_cap(f), page, rights, csrss_pml4);
     true
+}
+
+/// Deliver SMSS's reverse connection to the already-parked real CsrSbApiRequestThread and drive
+/// its real accept/complete calls. Returns the client-side communication handle used by SMSS.
+#[allow(clippy::too_many_arguments)]
+unsafe fn csr_sb_accept_connection(
+    conn_id: u64,
+    csrss_pml4: u64,
+    csrss_pe: &nt_pe_loader::PeFile,
+    img_end: u64,
+    nt_base: u64,
+    nt_end: u64,
+    ntdll_pe: Option<&nt_pe_loader::PeFile>,
+    reg: &nt_dll_registry::Registry,
+    dll_pes: &[&Option<nt_pe_loader::PeFile>],
+) -> u64 {
+    const SSN_REPLY_WAIT_RECV: u64 = 203;
+    const SSN_ACCEPT_CONNECT: u64 = 0;
+    const SSN_COMPLETE_CONNECT: u64 = 31;
+    let ep = CSR_SB_FAULT_EP.load(Ordering::Relaxed);
+    let reply = REPLY_CSR_SB_SLOT.load(Ordering::Relaxed);
+    if ep == 0 || reply == 0 || CSR_SB_RECEIVE_PARKED.swap(0, Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let recvmsg = CSR_SB_RECVMSG.load(Ordering::Relaxed);
+    let port = CSR_SB_RECVPORT.load(Ordering::Relaxed);
+    let delivered = lpc_client()
+        .and_then(|c| c.reply_wait_receive(port).ok())
+        .is_some_and(|r| r.connection_id == conn_id);
+    if !delivered {
+        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+        return 0;
+    }
+    csr_sb_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
+    csr_sb_stack_write(recvmsg + 0x08, PM_PIDS[0].load(Ordering::Relaxed));
+    csr_sb_stack_write(recvmsg + 0x10, PM_TIDS[0].load(Ordering::Relaxed));
+    set_reply_mr(15, 0);
+    set_reply_mr(16, CSR_SB_RECV_SP.load(Ordering::Relaxed));
+    set_reply_mr(17, CSR_SB_RECV_FLAGS.load(Ordering::Relaxed));
+    send_on_reply(
+        reply,
+        18,
+        0,
+        0,
+        0,
+        CSR_SB_RECV_RDX.load(Ordering::Relaxed),
+    );
+
+    let mut client_handle = 0;
+    let mut fill_idx = 0;
+    let (_badge, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    for _ in 0..8000 {
+        if (mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+            let ssn = m0;
+            let rsp = m1;
+            let arg1 = m2;
+            let arg3 = get_recv_mr(4);
+            let arg4 = get_recv_mr(5);
+            set_recv_mr(9, arg1);
+            set_recv_mr(7, arg3);
+            set_recv_mr(8, arg4);
+            set_recv_mr(16, rsp);
+            set_recv_mr(17, 0);
+            m0 = ssn;
+            m2 = 0;
+            mi = (2u64 << 12) | (mi & 0x7f);
+        }
+        match mi >> 12 {
+            6 => {
+                let page = m1 & !0xfff;
+                if m1 < 0x10000
+                    || !csr_fill_page(
+                        page, csrss_pml4, csrss_pe, img_end, nt_base, nt_end, ntdll_pe,
+                        reg, dll_pes, &mut fill_idx,
+                    )
+                {
+                    return 0;
+                }
+                send_on_reply(reply, 0, 0, 0, 0, 0);
+            }
+            3 => {
+                let Some(pe) = ntdll_pe else { return 0 };
+                if m0 < nt_base
+                    || m0 >= nt_end
+                    || pe_byte_at_rva(pe, (m0 - nt_base) as u32) != Some(0xcd)
+                {
+                    return 0;
+                }
+                send_on_reply(reply, 3, m0 + 3, m1, m2, 0);
+            }
+            2 => {
+                let ssn = m0;
+                let sp = get_recv_mr(16);
+                let flags = get_recv_mr(17);
+                let rdx = m3;
+                match ssn {
+                    SSN_ACCEPT_CONNECT => {
+                        let out = get_recv_mr(9);
+                        let accept = get_recv_mr(8) != 0;
+                        let server_handle = lpc_client()
+                            .and_then(|c| c.accept_connect(conn_id, accept, rdx).ok())
+                            .unwrap_or(0);
+                        csr_sb_stack_write(out, server_handle);
+                    }
+                    SSN_COMPLETE_CONNECT => {
+                        if let Some((handle, _)) =
+                            lpc_client().and_then(|c| c.complete_connect(conn_id).ok())
+                        {
+                            client_handle = handle;
+                        }
+                    }
+                    SSN_REPLY_WAIT_RECV => {
+                        CSR_SB_RECVMSG.store(get_recv_mr(8), Ordering::Relaxed);
+                        CSR_SB_RECVPORT.store(get_recv_mr(9), Ordering::Relaxed);
+                        CSR_SB_RECV_SP.store(sp, Ordering::Relaxed);
+                        CSR_SB_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                        CSR_SB_RECV_RDX.store(rdx, Ordering::Relaxed);
+                        CSR_SB_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                        print_str(b"[csr-sb] authentic reverse connection accepted; worker re-parked\n");
+                        return client_handle;
+                    }
+                    _ => {
+                        print_str(b"[csr-sb] unexpected reverse-connect SSN=");
+                        print_u64(ssn);
+                        print_str(b"\n");
+                        return 0;
+                    }
+                }
+                set_reply_mr(15, 0);
+                set_reply_mr(16, sp);
+                set_reply_mr(17, flags);
+                send_on_reply(reply, 18, 0, 0, 0, rdx);
+            }
+            _ => return 0,
+        }
+        let (_badge, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
+        mi = nmi;
+        m0 = nm0;
+        m1 = nm1;
+        m2 = nm2;
+        m3 = nm3;
+    }
+    0
 }
 
 /// AUTHENTIC CSR accept: drive csrss's REAL `CsrApiRequestThread` through one connection accept for
@@ -768,16 +1151,37 @@ pub(crate) unsafe fn csr_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
-    // Lazily resume the CSR thread on the FIRST rendezvous (csrss main has finished init + parked, so
-    // the thread runs alone in csrss's VSpace — no race on the CSR process/thread lists). Subsequent
-    // rendezvous re-recv the thread already re-parked on its next NtReplyWaitReceivePort.
-    if CSR_RESUMED.swap(1, Ordering::Relaxed) == 0 {
-        let tcb = CSR_LOOP_TCB.load(Ordering::Relaxed);
-        if tcb != 0 && tcb != 1 {
-            let _ = tcb_resume(tcb);
-        }
-    }
-    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        if CSR_API_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
+            let recvmsg = CSR_API_RECVMSG.load(Ordering::Relaxed);
+            let port = CSR_API_RECVPORT.load(Ordering::Relaxed);
+            let Some(r) = lpc_client().and_then(|c| c.reply_wait_receive(port).ok()) else {
+                CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                return 0;
+            };
+            if r.connection_id == 0 {
+                CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                return 0;
+            }
+            CSR_MSGS.fetch_add(1, Ordering::Relaxed);
+            csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
+            csr_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
+            csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
+            set_reply_mr(15, 0);
+            set_reply_mr(16, CSR_API_RECV_SP.load(Ordering::Relaxed));
+            set_reply_mr(17, CSR_API_RECV_FLAGS.load(Ordering::Relaxed));
+            send_on_reply(
+                reply,
+                18,
+                0,
+                0,
+                0,
+                CSR_API_RECV_RDX.load(Ordering::Relaxed),
+            );
+            recv_full_r12(ep, reply)
+        } else {
+            recv_full_r12(ep, reply)
+        };
     loop {
         guard += 1;
         if guard > 8000 {
@@ -854,6 +1258,9 @@ pub(crate) unsafe fn csr_rendezvous(
             match ssn {
                 SSN_SET_EVENT => {
                     let event_handle = get_recv_mr(9); // R10
+                    print_str(b"[csr-rdv] real NtSetEvent handle=0x");
+                    print_hex(event_handle as u32);
+                    print_str(b"\n");
                     if rdx != 0
                         && (rdx & 3 != 0
                             || rdx < CSR_STACK_BASE
@@ -894,11 +1301,20 @@ pub(crate) unsafe fn csr_rendezvous(
                             // real path (NtReplyWaitReceivePort returning a real connection) — count it.
                             CSR_MSGS.fetch_add(1, Ordering::Relaxed);
                             csr_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
-                            csr_stack_write(recvmsg + 0x08, CSR_STATIC_CID_PROC); // ClientId.UniqueProcess
-                            csr_stack_write(recvmsg + 0x10, CSR_STATIC_CID_THREAD); // ClientId.UniqueThread
+                            csr_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
+                            csr_stack_write(recvmsg + 0x10, CSR_API_TID.load(Ordering::Relaxed));
                         }
                         _ => {
                             // No pending connection (the re-park receive): leave the thread PARKED.
+                            CSR_API_RECVMSG.store(recvmsg, Ordering::Relaxed);
+                            CSR_API_RECVPORT.store(port, Ordering::Relaxed);
+                            CSR_API_RECV_SP.store(sp, Ordering::Relaxed);
+                            CSR_API_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                            CSR_API_RECV_RDX.store(rdx, Ordering::Relaxed);
+                            CSR_API_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                            print_str(b"[csr-rdv] real API worker parked on NtReplyWaitReceivePort port=0x");
+                            print_hex(port as u32);
+                            print_str(b"\n");
                             break;
                         }
                     }

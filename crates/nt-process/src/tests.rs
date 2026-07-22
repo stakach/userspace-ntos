@@ -36,6 +36,24 @@ fn process_thread_lifecycle_and_signal() {
 }
 
 #[test]
+fn nested_thread_suspend_resume_tracks_previous_count() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("suspended.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+
+    assert_eq!(pm.suspend_thread(tid), Ok(0));
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Suspended);
+    assert_eq!(pm.suspend_thread(tid), Ok(1));
+    assert_eq!(pm.thread(tid).unwrap().suspend_count, 2);
+
+    assert_eq!(pm.resume_thread(tid), Ok(2));
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Suspended);
+    assert_eq!(pm.resume_thread(tid), Ok(1));
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Ready);
+    assert_eq!(pm.resume_thread(tid), Ok(0));
+}
+
+#[test]
 fn system_thread_does_not_exit_process() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("svc.exe", None, None);

@@ -278,6 +278,15 @@ pub const CSR_ENV_SCRATCH_VA: u64 = 0x0000_0100_1071_0000;
 /// Isolated executive scratch (its own PT) for demand-filling the CSR thread's code pages
 /// (CsrApiRequestThread/CsrApiHandleConnectionRequest in csrsrv + ntdll/csrss) during the rendezvous.
 pub const CSR_FILL_SCRATCH_BASE: u64 = 0x0000_0100_1310_0000;
+// CSRSS's second startup thread runs CsrSbApiRequestThread. It shares the process image/PEB and
+// native IPC mapping with the API worker, but needs distinct stack/TEB/trampoline and fault objects.
+pub const CSR_SB_STACK_BASE: u64 = 0x0000_0100_104C_0000;
+pub const CSR_SB_STACK_FRAMES: u64 = 8;
+pub const CSR_SB_IPCBUF_VA: u64 = 0x0000_0100_104E_0000;
+pub const CSR_SB_TEB_VA: u64 = 0x0000_0100_104F_0000;
+pub const CSR_SB_TRAMP_VA: u64 = 0x0000_0100_1051_0000;
+pub const CSR_SB_STACK_MIRROR_VA: u64 = 0x0000_0100_106F_0000;
+pub const CSR_SB_ENV_SCRATCH_VA: u64 = 0x0000_0100_107F_0000;
 // --- General NtCreateThread: a REAL Nth thread in ANY hosted process (first live user: winlogon's
 // RPC listener thread). Reuses the SM numeric VSpace VAs (0x1044-0x104B) in the TARGET process's OWN
 // pml4 (isolated from smss/csrss's threads at the same VAs) — they fall in the STACK_BASE 2 MiB PT
@@ -1174,19 +1183,35 @@ static REPLY_CSRLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 /// The CSR API thread's TCB (0 until csrss's first NtCreateThread spawns it; one real thread suffices
 /// for one connection accept — CsrpCheckRequestThreads does NOT fire on the connection path).
 static CSR_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
+static CSR_API_TID: AtomicU64 = AtomicU64::new(0);
+/// CsrSbApiRequestThread has its own TCB and endpoint. It initially parks on its first code fault;
+/// the SB message-plane rendezvous can drive that endpoint independently of the API worker.
+static CSR_SB_FAULT_EP: AtomicU64 = AtomicU64::new(0);
+static REPLY_CSR_SB_SLOT: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_TID: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECVMSG: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECVPORT: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECV_SP: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
+static CSR_API_RECV_RDX: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECVMSG: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECVPORT: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECV_SP: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
+static CSR_SB_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the CSR_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static CSR_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
-/// Set once the CSR API thread has been resumed (lazily, at the first `csr_rendezvous`).
-static CSR_RESUMED: AtomicU64 = AtomicU64::new(0);
+static CSR_FILL_NEXT: AtomicU64 = AtomicU64::new(0);
 /// Count of csrss's NtCreatePort calls (its port names are unreadable csrsrv .data globals, so they
 /// are assigned canonical names by creation order: 0 = \Windows\ApiPort, 1 = \Windows\SbApiPort).
 static CSR_CREATEPORT_N: AtomicU64 = AtomicU64::new(0);
-/// The self-connect ClientId (FLAGGED simplification, like SM's PID_SMSS): written to the faked
+/// The self-connect ClientId uses the real csrss EPROCESS/ETHREAD identity written to
 /// CsrApiRequestThread's *ClientId out-param (so csrss's CsrAddStaticServerThread registers a
 /// CSR_THREAD with this CID) AND marshaled into the connection-request PORT_MESSAGE, so csrss's real
 /// CsrLocateThreadByClientId finds it → CsrProcess=CsrRootProcess → AllowConnection=TRUE → accept.
-const CSR_STATIC_CID_PROC: u64 = 0x0000_0000_0000_0244; // csrss's CSR pid (arbitrary, must be consistent)
-const CSR_STATIC_CID_THREAD: u64 = 0x0000_0000_0000_0248;
 /// General NtCreateThread: a dedicated fault endpoint the RPC-listener (and any future park-only Nth
 /// thread) faults to — NO standing receiver, so the thread PARKS on its first fault (its real TEB
 /// stays mapped + queryable by the main thread). 0 = not yet retyped. Distinct from SM/CSR EPs so a
@@ -3150,7 +3175,11 @@ unsafe fn drop_current_syscall_reply() -> bool {
 }
 
 fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
-    if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
+    if tid == CSR_API_TID.load(Ordering::Relaxed) {
+        Some(&CSR_LOOP_TCB)
+    } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
+        Some(&CSR_SB_LOOP_TCB)
+    } else if tid == PM_LISTENER_TID.load(Ordering::Relaxed) {
         Some(&WL_LISTENER_TCB)
     } else if tid == WL_WORKER2_TID.load(Ordering::Relaxed) {
         Some(&WL_WORKER2_TCB)
@@ -4346,10 +4375,11 @@ struct ExecNtHandler {
     /// drives `sm_rendezvous`, writes the completed client comm-port handle, and replies csrss. 0 = none.
     lpc_rendezvous_conn: u64,
     lpc_rendezvous_out: u64,
-    /// Authentic CSR accept (mirrors the SM path): set by csrss's FIRST `NtCreateThread` (its
-    /// `CsrApiRequestThread`) so the LOOP spawns the REAL CSR API thread (`spawn_csr_loop_thread`,
-    /// which needs csrss's PML4 + the caller's SP — loop-resident). Parks on `CSR_FAULT_EP`.
-    csr_spawn_request: bool,
+    /// One-based CSRSS runtime-thread slot awaiting TCB construction. Slots 1 and 2 are the real
+    /// CsrApiRequestThread and CsrSbApiRequestThread respectively.
+    csr_spawn_request: u8,
+    /// One-based CSRSS worker to run, serialized, from its initial resume to its first port receive.
+    csr_start_request: u8,
     /// General NtCreateThread: set by winlogon's FIRST `NtCreateThread` (its RPC listener) so the LOOP
     /// spawns the REAL listener thread (`spawn_wl_listener_thread`, which needs winlogon's PML4 + the
     /// caller's SP to read the CONTEXT — loop-resident). Parks on `WL_LISTENER_FAULT_EP`.
@@ -5204,6 +5234,7 @@ static WIN32KBUF_START: AtomicU64 = AtomicU64::new(0);
 static WINLOGONBUF_START: AtomicU64 = AtomicU64::new(0);
 /// Set once smss's NtCreateProcess spawns winlogon as the 3rd hosted process (its ntdll loader then
 /// runs, multiplexed by badge). Read by the post-run spec checks to prove the milestone.
+static CSRSS_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
 /// How many pages winlogon's ntdll loader demand-faulted (slot 2), for the spec-check report.
 static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -6151,6 +6182,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let e_rc = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rc);
     if e_rc == 0 {
         REPLY_CSRLOOP_SLOT.store(rc, Ordering::Relaxed);
+    }
+    // The SB worker is resumed by ReactOS during CsrSbApiPortInitialize. Keep its early faults
+    // isolated from the API rendezvous until the session-registration message plane drives it.
+    CSR_SB_FAULT_EP.store(make_object(OBJ_ENDPOINT), Ordering::Relaxed);
+    let rcsb = alloc_slot();
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, rcsb) == 0 {
+        REPLY_CSR_SB_SLOT.store(rcsb, Ordering::Relaxed);
     }
     // General NtCreateThread: a dedicated fault endpoint (no standing receiver) that the RPC-listener
     // and any future park-only Nth thread faults to → it PARKS on its first fault, its real TEB left

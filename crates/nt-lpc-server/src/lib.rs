@@ -197,7 +197,19 @@ impl Server {
             msg_type,
         }) = conn_try
         {
-            return Ok(reply(NtStatus::SUCCESS, 0, connection_id, msg_type as u64));
+            let info = self.core.connection_info(connection_id).unwrap_or(&[]);
+            let n = info.len().min(out_buf.len());
+            out_buf[..n].copy_from_slice(&info[..n]);
+            let subsystem_type = self
+                .core
+                .connection_subsystem_type(connection_id)
+                .unwrap_or(0);
+            return Ok(reply(
+                NtStatus::SUCCESS,
+                n as u32,
+                connection_id,
+                msg_type as u64 | ((subsystem_type as u64) << 32),
+            ));
         }
         let is_listen_port = conn_try.is_ok(); // valid listen port, nothing pending
         match self.core.receive_message(req.port_handle) {
@@ -446,7 +458,7 @@ mod tests {
             port_handle = c
                 .create_port(&utf16("\\SmApiPort"), 0x88, 0x148, 0)
                 .unwrap();
-            let r = c.connect_port(&utf16("\\SmApiPort"), 2, &[]).unwrap();
+            let r = c.connect_port(&utf16("\\SmApiPort"), 2, b"sb-connect-info").unwrap();
             assert!(r.pending, "manual policy must leave the connect pending");
             conn_id = r.connection_id;
         }
@@ -460,6 +472,8 @@ mod tests {
             let recv = c.reply_wait_receive(port_handle).unwrap();
             assert_eq!(recv.connection_id, conn_id);
             assert_eq!(recv.msg_type, msg_type::LPC_CONNECTION_REQUEST);
+            assert_eq!(recv.subsystem_type, 2);
+            assert_eq!(recv.connection_info, b"sb-connect-info");
             let sh = c.accept_connect(conn_id, true, 0xC0DE).unwrap();
             assert_ne!(sh, 0);
             let (client_handle, done_id) = c.complete_connect(conn_id).unwrap();

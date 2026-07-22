@@ -182,7 +182,8 @@ impl ExecNtHandler {
             anon_event_seq: 0,
             lpc_rendezvous_conn: 0,
             lpc_rendezvous_out: 0,
-            csr_spawn_request: false,
+            csr_spawn_request: 0,
+            csr_start_request: 0,
             csr_rendezvous_conn: 0,
             csr_rendezvous_out: 0,
             // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
@@ -3856,6 +3857,57 @@ impl NativeSyscallHandler for ExecNtHandler {
             // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
             // running smss thread in smss's VSpace) is the next path-B step.
             NativeService::NtCreateThread => {
+                // CSRSS creates two suspended server workers during initialization. Back both with
+                // real ETHREADs and typed handles so ReactOS's NtResumeThread calls control their
+                // actual TCBs. Slot 0 is CsrApiRequestThread; slot 1 is CsrSbApiRequestThread.
+                if matches!(ctx.service, NativeService::NtCreateThread) && self.pi == 1 {
+                    unsafe {
+                        if args[3] != u64::MAX || CSR_SB_TID.load(Ordering::Relaxed) != 0 {
+                            return 0xC000_009A;
+                        }
+                        let sp = get_recv_mr(16);
+                        let ctx_va = smss_stack_read(sp + 0x30);
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            ctx_va,
+                        );
+                        if let Some((slot, tid, handle)) =
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                        {
+                            let teb = match slot {
+                                0 => CSR_TEB_VA,
+                                1 => CSR_SB_TEB_VA,
+                                _ => return 0xC000_009A,
+                            };
+                            self.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
+                            let pid = self.pm_pid_for_pi(1).unwrap_or(0);
+                            self.queue_write(args[0], handle);
+                            let cid_ptr = smss_stack_read(sp + 0x28);
+                            if cid_ptr != 0 {
+                                self.queue_write(cid_ptr, pid as u64);
+                                self.queue_write(cid_ptr + 8, tid);
+                            }
+                            if slot == 0 {
+                                CSR_API_TID.store(tid, Ordering::Relaxed);
+                            } else {
+                                CSR_SB_TID.store(tid, Ordering::Relaxed);
+                            }
+                            self.csr_spawn_request = slot as u8 + 1;
+                            print_str(b"[csr-thread] create slot=");
+                            print_u64(slot as u64);
+                            print_str(b" tid=");
+                            print_u64(tid);
+                            print_str(b" handle=0x");
+                            print_hex(handle as u32);
+                            print_str(b" suspended=");
+                            print_u64(create_suspended as u64);
+                            print_str(b"\n");
+                            return 0;
+                        }
+                    }
+                    return 0xC000_009A;
+                }
                 // ★ GENERAL NtCreateThread (real service): winlogon's FIRST NtCreateThread is its RPC
                 // listener. Route it through the REAL nt-process ETHREAD lifecycle: pop a pool ETHREAD
                 // for the caller, bind the caller's StartRoutine + TEB, mint a TYPED Thread(tid) handle,
@@ -3863,12 +3915,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // to spawn the REAL seL4 thread in the caller's VSpace (`spawn_wl_listener_thread`). The
                 // no-op (a bare fake handle) is RETIRED for this path — kernel32/rpcrt4 now read a real
                 // TEB/ClientId (NtQueryInformationThread(162) resolves the typed handle → the ETHREAD).
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 2
-                    && args[3] != u64::MAX
-                {
+                if matches!(ctx.service, NativeService::NtCreateThread) && args[3] != u64::MAX {
                     unsafe {
-                        let caller_pid = match self.pm_pid_for_pi(2) {
+                        let caller_pid = match self.pm_pid_for_pi(self.pi) {
                             Some(pid) => pid,
                             None => return 0xC000_0008,
                         };
@@ -3880,6 +3929,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                             Some(tid) => tid,
                             None => return 0xC000_0008,
                         };
+                        let sp = get_recv_mr(16);
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
                         let handle = match self.pm.insert_handle(
                             caller_pid,
                             nt_process::HandleObject::Thread(tid),
@@ -3890,22 +3941,34 @@ impl NativeSyscallHandler for ExecNtHandler {
                         };
                         PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
                         self.queue_write(args[0], handle);
-                        let sp = get_recv_mr(16);
                         let cid_ptr = smss_stack_read(sp + 0x28);
                         if cid_ptr != 0 {
                             self.queue_write(cid_ptr, target_pid as u64);
                             self.queue_write(cid_ptr + 8, tid as u64);
                         }
+                        if create_suspended {
+                            if let Err(status) = self.pm.suspend_thread(tid) {
+                                return status;
+                            }
+                        } else if let Some(target_pi) = self.pi_for_pid(target_pid) {
+                            let tcb = PM_MAIN_TCBS[target_pi].load(Ordering::Relaxed);
+                            if tcb <= 1 || tcb_resume(tcb) != 0 {
+                                return 0xC000_0001;
+                            }
+                            let _ = self.pm.set_thread_state(tid, nt_process::ThreadState::Ready);
+                        }
                         let trace = THREAD_LIFECYCLE_TRACE_N.fetch_add(1, Ordering::Relaxed);
                         if trace < 4 {
-                            print_str(
-                                b"[thread-life] create caller=winlogon badge=4 foreign_process=0x",
-                            );
+                            print_str(b"[thread-life] create caller_pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" foreign_process=0x");
                             print_hex(args[3] as u32);
                             print_str(b" resolved_pid=");
                             print_u64(target_pid as u64);
                             print_str(b" main_tid=");
                             print_u64(tid as u64);
+                            print_str(b" suspended=");
+                            print_u64(create_suspended as u64);
                             print_str(b" handle=0x");
                             print_hex(handle as u32);
                             print_str(b" status=0\n");
@@ -4267,27 +4330,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                 {
                     self.sm_spawn_request = true;
                 }
-                // Authentic CSR accept: csrss's FIRST NtCreateThread is its CsrApiRequestThread
-                // (CsrApiPortInitialize runs before CsrSbApiPortInitialize). Spawn ONE real thread.
-                // ★ Also write a chosen ClientId to the *ClientId out-param ([sp+0x28] = arg5): csrss's
-                // CsrAddStaticServerThread then registers a CSR_THREAD with this CID, so the connection
-                // rendezvous can marshal the SAME CID into the connect message → CsrLocateThreadByClientId
-                // finds it → CsrProcess=CsrRootProcess → the accept is ALLOWED (the self-connect
-                // simplification, analogous to SM's PID_SMSS — FLAGGED residual).
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 1
-                    && CSR_LOOP_TCB.load(Ordering::Relaxed) == 0
-                {
-                    unsafe {
-                        let sp = get_recv_mr(16);
-                        let cid_ptr = smss_stack_read(sp + 0x28); // arg5 = *ClientId
-                        if cid_ptr != 0 {
-                            self.queue_write(cid_ptr, CSR_STATIC_CID_PROC);
-                            self.queue_write(cid_ptr + 8, CSR_STATIC_CID_THREAD);
-                        }
-                    }
-                    self.csr_spawn_request = true;
-                }
                 0
             }
             // NtSecureConnectPort — the CSR client connect (kernel32's CsrClientConnectToServer →
@@ -4347,6 +4389,27 @@ impl NativeSyscallHandler for ExecNtHandler {
             // via sm_rendezvous. This is what unblocks csrss's SmConnectToSm.
             NativeService::NtConnectPort => unsafe {
                 let name16 = self.read_lpc_name(args[1]);
+                let sp = get_recv_mr(16);
+                let conn_info_ptr = smss_stack_read(sp + 0x38);
+                let conn_info_len_ptr = smss_stack_read(sp + 0x40);
+                let mut conn_info = [0u8; 0xF4];
+                let mut conn_info_len = 0usize;
+                if conn_info_ptr != 0 && conn_info_len_ptr != 0 {
+                    let mut length = [0u8; 4];
+                    if self.xas_read(conn_info_len_ptr, &mut length) {
+                        conn_info_len = (u32::from_le_bytes(length) as usize).min(conn_info.len());
+                        if conn_info_len != 0
+                            && !self.xas_read(conn_info_ptr, &mut conn_info[..conn_info_len])
+                        {
+                            return 0xC000_0005;
+                        }
+                    }
+                }
+                let subsystem_type = if conn_info_len >= 4 {
+                    u32::from_le_bytes(conn_info[..4].try_into().unwrap())
+                } else {
+                    0
+                };
                 // \SeRmCommandPort — the Security Reference Monitor's command port, created by the SRM
                 // in ntoskrnl (SeRmInitPhase1). lsass's lsasrv LsapRmInitializeServer (srm.c:216)
                 // NtConnectPort's it during LsapInitLsa. We don't host a real SRM, so MODEL the port:
@@ -4394,7 +4457,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                     print_str(b" (broker-owned)\n");
                 }
-                match lpc_client().map(|c| c.connect_port(&name16, 0, &[])) {
+                match lpc_client().map(|c| {
+                    c.connect_port(
+                        &name16,
+                        subsystem_type,
+                        &conn_info[..conn_info_len],
+                    )
+                }) {
                     Some(Ok(r)) => {
                         if !r.pending && r.handle != 0 {
                             // AutoAccept (interim): the broker modelled the acceptor — complete now.
@@ -4993,9 +5062,20 @@ impl NativeSyscallHandler for ExecNtHandler {
             },
             NativeService::NtResumeThread => unsafe {
                 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+                print_str(b"[thread-life] NtResumeThread pi=");
+                print_u64(self.pi as u64);
+                print_str(b" handle=0x");
+                print_hex(args[0] as u32);
+                print_str(b" previous_ptr=0x");
+                print_hex((args[1] >> 32) as u32);
+                print_hex(args[1] as u32);
+                print_str(b"\n");
                 let caller_pid = match self.pm_pid_for_pi(self.pi) {
                     Some(pid) => pid,
-                    None => return nt_process::STATUS_INVALID_HANDLE,
+                    None => {
+                        print_str(b"[thread-life] resume failed: caller has no EPROCESS\n");
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    }
                 };
                 let tid = match self.pm.resolve_thread_handle(
                     caller_pid,
@@ -5004,11 +5084,40 @@ impl NativeSyscallHandler for ExecNtHandler {
                     THREAD_SUSPEND_RESUME,
                 ) {
                     Ok(tid) => tid as u64,
-                    Err(status) => return status,
+                    Err(status) => {
+                        print_str(b"[thread-life] resume failed: handle resolution status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        return status;
+                    }
                 };
                 let Some((pi, slot)) = runtime_thread_slot(tid) else {
+                    let Some(main_pi) = (0..MAX_PI)
+                        .find(|&index| PM_TIDS[index].load(Ordering::Relaxed) == tid)
+                    else {
+                        return nt_process::STATUS_INVALID_HANDLE;
+                    };
+                    let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
+                        Ok(previous) => previous,
+                        Err(status) => return status,
+                    };
+                    print_str(b"[thread-life] resume main tid=");
+                    print_u64(tid);
+                    print_str(b" pi=");
+                    print_u64(main_pi as u64);
+                    print_str(b" previous=");
+                    print_u64(previous as u64);
+                    print_str(b"\n");
                     if args[1] != 0 {
-                        self.queue_write(args[1], 0);
+                        if !self.xas_write_u32(args[1], previous) {
+                            return 0xC000_0005;
+                        }
+                    }
+                    if previous == 1 {
+                        let tcb = PM_MAIN_TCBS[main_pi].load(Ordering::Relaxed);
+                        if tcb <= 1 || tcb_resume(tcb) != 0 {
+                            return 0xC000_0001;
+                        }
                     }
                     return 0;
                 };
@@ -5022,7 +5131,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     let bit = 1u64 << slot;
                     PM_POOL_SUSPENDED[pi].fetch_and(!bit, Ordering::Relaxed);
                     if args[1] != 0 {
-                        self.queue_write(args[1], 1);
+                        if !self.xas_write_u32(args[1], 1) {
+                            return 0xC000_0005;
+                        }
                     }
                     print_str(b"[scm-worker] NtResumeThread -> SUCCESS (not resumed; trampoline-entry fault, see frontier)\n");
                     return 0;
@@ -5034,12 +5145,32 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0
                 };
                 if args[1] != 0 {
-                    self.queue_write(args[1], previous);
+                    if !self.xas_write_u32(args[1], previous as u32) {
+                        return 0xC000_0005;
+                    }
                 }
                 if previous != 0 {
                     let _ = self
                         .pm
-                        .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Running);
+                        .set_thread_state(tid as nt_process::ThreadId, nt_process::ThreadState::Ready);
+                    let csr_role = if tid == CSR_API_TID.load(Ordering::Relaxed) {
+                        1
+                    } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
+                        2
+                    } else {
+                        0
+                    };
+                    if csr_role != 0 {
+                        // The outer loop owns CSRSS's shared native IPC frame. It resumes this TCB,
+                        // drives it to a blocked port receive, then replies to the main thread.
+                        self.csr_start_request = csr_role;
+                        print_str(b"[csr-thread] resume scheduled role=");
+                        print_u64(csr_role as u64);
+                        print_str(b" tid=");
+                        print_u64(tid);
+                        print_str(b" previous=1\n");
+                        return 0;
+                    }
                     let tcb = hosted_thread_tcb_cell(tid)
                         .map(|cell| cell.load(Ordering::Relaxed))
                         .unwrap_or(0);

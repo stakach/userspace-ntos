@@ -41,10 +41,12 @@ pub struct ConnectResult {
 }
 
 /// The outcome of a receive: a delivered connection request (or message).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiveResult {
     pub connection_id: u64,
     pub msg_type: u16,
+    pub subsystem_type: u32,
+    pub connection_info: Vec<u8>,
 }
 
 /// The LPC client.
@@ -180,6 +182,8 @@ impl<B: Backend> LpcClient<B> {
         Ok(ReceiveResult {
             connection_id: r.detail0,
             msg_type: r.detail1 as u16,
+            subsystem_type: (r.detail1 >> 32) as u32,
+            connection_info: out[..(r.information as usize).min(out.len())].to_vec(),
         })
     }
 }
