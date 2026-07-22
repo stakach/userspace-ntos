@@ -347,6 +347,18 @@ fn group_a_services_register_with_register_only_bounds() {
 }
 
 #[test]
+fn clear_event_uses_the_native_single_argument_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtClearEvent, 26)],
+    );
+    let entry = table.lookup(26).unwrap();
+    assert_eq!(entry.service, NativeService::NtClearEvent);
+    assert_eq!((entry.min_args, entry.max_args), (1, 1));
+    assert_eq!(NativeService::NtClearEvent.name(), "NtClearEvent");
+}
+
+#[test]
 fn io_completion_family_registers_at_reactos_numbers() {
     let pairs = [
         (NativeService::NtCreateIoCompletion, 40u32),

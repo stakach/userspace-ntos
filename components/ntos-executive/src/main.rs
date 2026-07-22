@@ -494,6 +494,7 @@ pub const SSN_NT_WAIT_FOR_KEYED_EVENT: u64 = 292;
 pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
+pub const SSN_NT_CLEAR_EVENT: u64 = 26;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 // NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
 pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
@@ -4568,6 +4569,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreatePort, SSN_NT_CREATE_PORT as u32),
             (NativeService::NtCreateThread, SSN_NT_CREATE_THREAD as u32),
             (NativeService::NtCreateEvent, SSN_NT_CREATE_EVENT as u32),
+            (NativeService::NtClearEvent, SSN_NT_CLEAR_EVENT as u32),
             (NativeService::NtOpenEvent, SSN_NT_OPEN_EVENT as u32),
             (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).

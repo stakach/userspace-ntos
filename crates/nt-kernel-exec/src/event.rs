@@ -286,6 +286,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_clear_requires_an_existing_event_and_is_idempotent() {
+        let mut events = EventStore::new();
+        events.initialize(8, EventKind::Notification, true);
+        events.initialize(9, EventKind::Synchronization, true);
+        assert!(events.clear_existing(8));
+        assert!(!events.read_state(8));
+        assert!(events.clear_existing(8));
+        assert!(events.clear_existing(9));
+        assert!(!events.read_state(9));
+        assert!(!events.clear_existing(99));
+    }
+
+    #[test]
     fn wait_any_returns_array_index_and_consumes_only_selected_auto_event() {
         let irql = IrqlState::new();
         let mut events = EventStore::new();

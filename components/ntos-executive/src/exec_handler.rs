@@ -3510,6 +3510,15 @@ impl NativeSyscallHandler for ExecNtHandler {
                     0
                 }
             }
+            // NtClearEvent(EventHandle) clears a real event without returning its previous state.
+            // Handle resolution enforces EVENT_MODIFY_STATE for typed process-local handles.
+            NativeService::NtClearEvent => {
+                match self.event_index_for_handle(args[0], EVENT_MODIFY_STATE) {
+                    Ok(index) if self.events.clear_existing(index as u64) => 0,
+                    Ok(_) => 0xC000_0008, // STATUS_INVALID_HANDLE
+                    Err(status) => status,
+                }
+            }
             // NtOpenEvent(*EventHandle[R10]=args[0], DesiredAccess, *OA[R8]=args[2]). CreateEventW's
             // ERROR_ALREADY_EXISTS fallback + OpenEventW resolve an existing named event. Return the
             // registered event's handle, or STATUS_OBJECT_NAME_NOT_FOUND if it doesn't exist (so the

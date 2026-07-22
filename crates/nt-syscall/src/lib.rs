@@ -115,6 +115,7 @@ pub enum NativeService {
     NtCreatePort,
     NtCreateThread,
     NtCreateEvent,
+    NtClearEvent,
     // NtOpenEvent — open an existing named event in \BaseNamedObjects (CreateEventW's
     // ERROR_ALREADY_EXISTS fallback + OpenEventW). Resolved against the executive object namespace.
     NtOpenEvent,
@@ -237,6 +238,7 @@ impl NativeService {
             NtCreatePort => "NtCreatePort",
             NtCreateThread => "NtCreateThread",
             NtCreateEvent => "NtCreateEvent",
+            NtClearEvent => "NtClearEvent",
             NtOpenEvent => "NtOpenEvent",
             NtOpenEventPair => "NtOpenEventPair",
             NtCreateSemaphore => "NtCreateSemaphore",
@@ -283,7 +285,7 @@ impl NativeService {
     pub fn arg_count(self) -> (u8, u8) {
         use NativeService::*;
         match self {
-            NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom => (1, 1),
+            NtClose | NtQuerySystemTime | NtDisplayString | NtDeleteAtom | NtClearEvent => (1, 1),
             NtResumeProcess | NtSuspendProcess | NtSetUuidSeed => (1, 1),
             NtTerminateProcess | NtTerminateThread | NtUnmapViewOfSection | NtDelayExecution
             | NtQueryDebugFilterState => (2, 2),
@@ -398,6 +400,7 @@ impl NativeService {
         NativeService::NtCreatePort,
         NativeService::NtCreateThread,
         NativeService::NtCreateEvent,
+        NativeService::NtClearEvent,
         NativeService::NtOpenEvent,
         NativeService::NtOpenEventPair,
         NativeService::NtCreateSemaphore,
