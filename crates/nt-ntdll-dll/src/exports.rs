@@ -66,6 +66,7 @@ const DBG_TRUE: NtStatus = 1;
 #[cfg(not(target_arch = "x86_64"))]
 const DEBUG_FILTER_COMPONENTS: usize = 256;
 const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
+const TEB_EXCEPTION_CODE_OFFSET: u64 = 0x2C0;
 const KUSER_SHARED_DATA_VA: usize = 0x7FFE_0000;
 const KUSER_PROCESSOR_FEATURES_OFFSET: usize = 0x274;
 const KUSER_PROCESSOR_FEATURES_LEN: u32 = 64;
@@ -4121,6 +4122,27 @@ pub unsafe extern "system" fn ldr_query_module_service_tags(
 #[export_name = "LdrSetMUICacheType"]
 pub extern "system" fn ldr_set_mui_cache_type(_cache_type: u32) -> NtStatus {
     STATUS_SUCCESS
+}
+
+/// `LdrInitializeThunk(ULONG_PTR Unknown1, ULONG_PTR Unknown2, ULONG_PTR Unknown3,
+/// ULONG_PTR ApcContext)`.
+///
+/// ReactOS' amd64 thunk moves the APC context from R9 into RCX and jumps to `LdrpInit`. Our live
+/// loader entry is `LdrpInitialize(Context, NtDllBase, ImageBase)`, so keep the same register
+/// mapping: argument 4 becomes the loader context, arguments 2/3 remain the image bases supplied by
+/// the executive/trampoline.
+///
+/// # Safety
+/// Called by the initial user-mode thread/APC trampoline with loader-owned context values.
+#[export_name = "LdrInitializeThunk"]
+pub unsafe extern "system" fn ldr_initialize_thunk(
+    _unknown1: usize,
+    ntdll_base: *mut c_void,
+    image_base: *mut c_void,
+    apc_context: *mut c_void,
+) {
+    // SAFETY: forwards the trampoline-provided loader context to the real in-process loader entry.
+    unsafe { crate::LdrpInitialize(apc_context, ntdll_base, image_base) };
 }
 
 // =================================================================================================
@@ -15478,6 +15500,76 @@ pub unsafe extern "system" fn rtl_virtual_unwind(
     }
 }
 
+/// `KiUserApcDispatcher` — user-mode APC entry.
+///
+/// ReactOS enters this symbol with `RSP` pointing at an amd64 `CONTEXT` frame. The first four qwords
+/// are `P1Home..P4Home`, used as `(NormalContext, SystemArgument1, SystemArgument2, NormalRoutine)`.
+/// After the optional normal routine returns, resume the delivered context through our real
+/// `RtlRestoreContext` path.
+///
+/// # Safety
+/// Entered only by the executive/kernel with a valid `CONTEXT` frame at `RSP`.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[export_name = "KiUserApcDispatcher"]
+pub unsafe extern "C" fn ki_user_apc_dispatcher() -> ! {
+    core::arch::naked_asm!(
+        // CONTEXT.P4Home = NormalRoutine. A null routine is a bare alert: just resume.
+        "mov r10, [rsp + 0x18]",
+        "test r10, r10",
+        "jz 1f",
+        // NormalRoutine(NormalContext, SystemArgument1, SystemArgument2).
+        "mov rcx, [rsp + 0x00]",
+        "mov rdx, [rsp + 0x08]",
+        "mov r8,  [rsp + 0x10]",
+        "call r10",
+        // RtlRestoreContext(ContextRecord=rsp, ExceptionRecord=NULL). Does not return.
+        "1:",
+        "mov rcx, rsp",
+        "xor edx, edx",
+        "call {restore_context}",
+        "int3",
+        restore_context = sym rtl_restore_context,
+    );
+}
+
+/// Host fallback for the exported APC dispatcher.
+///
+/// # Safety
+/// Host builds do not receive kernel-delivered APC frames.
+#[cfg(not(target_arch = "x86_64"))]
+#[export_name = "KiUserApcDispatcher"]
+pub unsafe extern "system" fn ki_user_apc_dispatcher(
+    _routine: *mut c_void,
+    _arg1: *mut c_void,
+    _arg2: *mut c_void,
+    _arg3: *mut c_void,
+) {
+}
+
+/// `KiRaiseUserExceptionDispatcher()` — convert `TEB.ExceptionCode` into a user-mode exception and
+/// enter the same SEH raise path as `RtlRaiseException`.
+///
+/// # Safety
+/// Entered by the kernel after setting `TEB.ExceptionCode`.
+#[export_name = "KiRaiseUserExceptionDispatcher"]
+pub unsafe extern "system" fn ki_raise_user_exception_dispatcher() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        const EXCEPTION_RECORD_SIZE: usize = 0x98;
+        let teb = current_teb();
+        let code = if teb != 0 {
+            core::ptr::read_unaligned((teb + TEB_EXCEPTION_CODE_OFFSET) as *const u32)
+        } else {
+            STATUS_UNSUCCESSFUL
+        };
+        let mut record = [0u8; EXCEPTION_RECORD_SIZE];
+        core::ptr::write_unaligned(record.as_mut_ptr() as *mut u32, code);
+        crate::seh::rtl_raise_exception(record.as_mut_ptr() as *mut c_void);
+        rtl_raise_status(code);
+    }
+}
+
 /// `KiUserExceptionDispatcher(PEXCEPTION_RECORD, PCONTEXT)` — the entry the kernel/executive jumps to
 /// for a delivered exception. BATCH 42: dispatches through the real machinery
 /// ([`crate::seh::ki_user_exception_dispatcher`]). (The software raise path lands here via
@@ -20677,6 +20769,7 @@ pub unsafe extern "C" fn export_anchor() {
         ldr_process_initialization_complete as usize,
         ldr_query_module_service_tags as usize,
         ldr_set_mui_cache_type as usize,
+        ldr_initialize_thunk as usize,
         dbg_print as usize,
         dbg_break_point as usize,
         dbg_user_break_point as usize,
@@ -20975,6 +21068,8 @@ pub unsafe extern "C" fn export_anchor() {
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors3: &[usize] = &[
+        ki_user_apc_dispatcher as *const () as usize,
+        ki_raise_user_exception_dispatcher as usize,
         ki_user_callback_dispatcher as *const () as usize,
         zw_accept_connect_port as *const () as usize,
         zw_access_check as *const () as usize,
