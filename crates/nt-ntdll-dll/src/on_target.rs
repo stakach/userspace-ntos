@@ -490,7 +490,7 @@ unsafe fn attach_dfs(
 ) -> u32 {
     const DLL_PROCESS_ATTACH: u32 = 1;
     const DLL_PROCESS_DETACH: u32 = 0;
-    if base < 0x1_0000 || depth > 16 {
+    if base < 0x1_0000 || depth as usize >= MODULE_GRAPH_DEPTH_LIMIT {
         return 0xC000_0001; // STATUS_UNSUCCESSFUL
     }
     let Some(module_index) = (unsafe { (*table).index_by_base(base) }) else {
@@ -1186,6 +1186,12 @@ const SSN_NT_MAP_VIEW_OF_SECTION: u32 = 113;
 /// graph is unaffected; the cost is a larger static table + a deeper DFS `visited`/`entry_vas`).
 #[cfg(target_arch = "x86_64")]
 const MODULE_TABLE_CAP: usize = 256;
+/// Bound recursive import/attach walks without rejecting the dependency depth in the staged
+/// System32 corpus. Module-table in-progress state breaks cycles; this limit only protects the
+/// loader stack from corrupt graphs.
+#[cfg(target_arch = "x86_64")]
+const MODULE_GRAPH_DEPTH_LIMIT: usize = 64;
+const _: () = assert!(MODULE_GRAPH_DEPTH_LIMIT <= MODULE_TABLE_CAP);
 
 /// A loaded dependent module: its lowercased base name (`.dll` optional, ≤ 31 bytes) + mapped base.
 /// The image we started snapping from (the EXE, `image_base`) is seeded as entry 0; ntdll as entry 1.
@@ -2273,12 +2279,12 @@ unsafe fn snap_module(
         unsafe { (&mut *table).set_imports_failed(image_base) };
         return;
     }
-    if depth > 8 {
+    if depth as usize >= MODULE_GRAPH_DEPTH_LIMIT {
         if out.status == 0 {
             out.status = 0xC000_0001; // STATUS_UNSUCCESSFUL
         }
         unsafe { (&mut *table).set_imports_failed(image_base) };
-        return; // cycle / over-deep guard — csrss's graph is 2 deep at most
+        return; // corrupt graph: a simple path cannot exceed the table's unique-module capacity
     }
     unsafe { (&mut *table).begin_imports(image_base) };
     let mut imports_ready = ModuleImportsReadyGuard {
@@ -2366,7 +2372,7 @@ unsafe fn snap_module(
                 if name_rva == 0 && iat_rva == 0 {
                     break; // terminator
                 }
-                if depth <= 8 && int_rva != 0 && iat_rva != 0 {
+                if int_rva != 0 && iat_rva != 0 {
                     let mut base = [0u8; 32];
                     let bn = import_desc_basename(image_base, name_rva, &mut base);
                     let dep_name = &base[..bn];

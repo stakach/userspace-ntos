@@ -3,6 +3,7 @@
 //! `LdrpInitialize` orchestration over a mock module set + a recording [`MockHost`].
 extern crate std;
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -312,6 +313,31 @@ fn init_order_tolerates_a_cycle() {
     assert_eq!(names.len(), 3);
     // app is a dependent of both → last.
     assert_eq!(names.last().unwrap(), "app.exe");
+}
+
+#[test]
+fn init_order_accepts_a_deep_acyclic_graph() {
+    let mut st = LoaderState::new();
+    for i in 0..32 {
+        let name = format!("m{i}.dll");
+        let deps = if i + 1 < 32 {
+            let dependency = format!("m{}.dll", i + 1);
+            vec![imports(&dependency, &[])]
+        } else {
+            vec![]
+        };
+        st.add(LoadedModule::mock(
+            &name,
+            0x1_0000 + i as u64 * 0x1_0000,
+            vec![],
+            deps,
+        ));
+    }
+
+    let names = order::initialization_order_names(&st, &["m0.dll"]);
+    assert_eq!(names.len(), 32);
+    assert_eq!(names.first().unwrap(), "m31.dll");
+    assert_eq!(names.last().unwrap(), "m0.dll");
 }
 
 // --- (3) PEB->Ldr construction + list threading ------------------------------------------------
