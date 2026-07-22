@@ -2048,6 +2048,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.stop = false;
                 nt_handler.overlay_dirty = false;
                 nt_handler.dll_loaded_dirty = false;
+                nt_handler.token_dirty = false;
                 nt_handler.out_writes_n = 0;
                 nt_handler.spawn_request = false;
                 nt_handler.winlogon_spawn_request = false;
@@ -2300,6 +2301,10 @@ pub(crate) unsafe fn service_sec_image(
                 // pool bytes + dll_pe_store write are already reset-safe; this covers the registry fill.
                 if nt_handler.dll_loaded_dirty {
                     nt_handler.dll_loaded_dirty = false;
+                    heap_mark = allocator::mark();
+                }
+                if nt_handler.token_dirty {
+                    nt_handler.token_dirty = false;
                     heap_mark = allocator::mark();
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
@@ -3489,23 +3494,6 @@ pub(crate) unsafe fn service_sec_image(
                 // designed end of smss's lifetime; the loop now terminates on winlogon's next wall.
                 park_caller = true;
                 result = 0;
-            } else if m0 == 136 {
-                // NtOpenThreadTokenEx — winlogon's InitKeyboardLayouts calls RegOpenKeyExW(
-                // HKEY_CURRENT_USER, "Keyboard Layout\\Preload") -> RtlOpenCurrentUser ->
-                // NtOpenThreadToken(Ex). winlogon runs as SYSTEM with no impersonation token, so the
-                // authentic result is STATUS_NO_TOKEN (0xC000007C) -> RtlOpenCurrentUser falls back to
-                // the process-token user key (\Registry\User\S-1-5-18), which misses our SYSTEM-only
-                // hive -> InitKeyboardLayouts loads the default US layout instead. (Mirrors the
-                // NtOpenThreadToken=135 handler; 136 is the Ex variant the real ntdll uses.)
-                result = 0xC000007C;
-            } else if m0 == 130 {
-                // NtOpenProcessTokenEx(ProcessHandle=R10, DesiredAccess=RDX, HandleAttributes=R8,
-                // *TokenHandle=R9). RtlOpenCurrentUser falls here after NtOpenThreadTokenEx=NO_TOKEN to
-                // fetch the process primary token. Ex differs only by handle attributes here; route
-                // it through the same typed-token/open-access path as NtOpenProcessToken.
-                let out = get_recv_mr(8); // R9 = *TokenHandle
-                result =
-                    nt_handler.nt_open_process_token(get_recv_mr(9), m3 as u32, out) as u64;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE
                     || badge == WINLOGON_BADGE

@@ -4512,6 +4512,9 @@ struct ExecNtHandler {
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references.
     token_store: nt_security::TokenStore,
+    /// Set when a successful token duplication allocated durable group/privilege vectors above the
+    /// service loop's current bump-heap mark. The loop advances the mark before its next reset.
+    token_dirty: bool,
     /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
     /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
     /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay

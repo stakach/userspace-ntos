@@ -304,6 +304,7 @@ impl ExecNtHandler {
                 pm
             },
             token_store: nt_security::TokenStore::with_capacity(64),
+            token_dirty: false,
             // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
             // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
             // runtime and is retained past the per-syscall bump reset because the loop pins the heap
@@ -972,6 +973,42 @@ impl ExecNtHandler {
         }
     }
 
+    /// Transfer one existing token reference into a new caller-local handle. Every failure path
+    /// releases that reference; success leaves the handle as its sole owner.
+    unsafe fn insert_owned_token_handle(
+        &mut self,
+        caller_pid: nt_process::ProcessId,
+        token: nt_security::TokenId,
+        desired_access: u32,
+        out: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        let handle = match self.pm.insert_handle(
+            caller_pid,
+            nt_process::HandleObject::TokenObject(token),
+            desired_access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = self.token_store.release(token);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        };
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        let count = self.pm.handle_count(caller_pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        if !self.xas_write_u64(out, handle as u64) {
+            if let Ok(object) = self.pm.take_handle(caller_pid, handle) {
+                self.release_handle_object(object);
+            }
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
     fn serialize_sid(sid: &nt_security::Sid, output: &mut [u8]) -> Option<usize> {
         let count = u8::try_from(sid.sub_authorities.len()).ok()?;
         let length = 8usize.checked_add(sid.sub_authorities.len().checked_mul(4)?)?;
@@ -994,7 +1031,6 @@ impl ExecNtHandler {
     ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         if !self.probe_user_output(out, 8) {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -1016,27 +1052,233 @@ impl ExecNtHandler {
         if self.token_store.retain(token).is_err() {
             return STATUS_INVALID_HANDLE;
         }
-        let handle = match self.pm.insert_handle(
-            caller_pid,
-            nt_process::HandleObject::TokenObject(token),
-            desired_access,
+        self.insert_owned_token_handle(caller_pid, token, desired_access, out)
+    }
+
+    unsafe fn nt_duplicate_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const TOKEN_DUPLICATE: u32 = 0x0002;
+
+        let token_type = match args[4] as u32 {
+            1 => nt_security::TokenType::Primary,
+            2 => nt_security::TokenType::Impersonation,
+            _ => return STATUS_INVALID_PARAMETER,
+        };
+        let out = args[5];
+        if !self.probe_user_output(out, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let mut level = nt_security::SecurityImpersonationLevel::Anonymous;
+        if args[2] != 0 {
+            let mut oa = [0u8; 48];
+            if !self.xas_read(args[2], &mut oa) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if u32::from_le_bytes(oa[0..4].try_into().unwrap()) != 48 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let qos = u64::from_le_bytes(oa[40..48].try_into().unwrap());
+            if qos != 0 {
+                let mut captured = [0u8; 12];
+                if !self.xas_read(qos, &mut captured) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if u32::from_le_bytes(captured[0..4].try_into().unwrap()) != 12 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                level = match nt_security::SecurityImpersonationLevel::try_from(
+                    u32::from_le_bytes(captured[4..8].try_into().unwrap()),
+                ) {
+                    Ok(level) => level,
+                    Err(status) => return status,
+                };
+            }
+        }
+
+        let source = match self.token_id_for_handle(args[0], TOKEN_DUPLICATE) {
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let desired_access = if args[1] as u32 == 0 {
+            match self
+                .pm
+                .handle_access(caller_pid, args[0] as nt_process::Handle)
+            {
+                Some(access) => access,
+                None => return nt_process::STATUS_INVALID_HANDLE,
+            }
+        } else {
+            args[1] as u32
+        };
+        let duplicate = match self.token_store.duplicate(
+            source,
+            token_type,
+            level,
+            (args[3] as u8) != 0,
         ) {
-            Ok(handle) => handle,
-            Err(_) => {
-                let _ = self.token_store.release(token);
-                return STATUS_INSUFFICIENT_RESOURCES;
+            Ok(token) => token,
+            Err(status) => return status,
+        };
+        let status = self.insert_owned_token_handle(caller_pid, duplicate, desired_access, out);
+        if status == 0 {
+            self.token_dirty = true;
+        }
+        status
+    }
+
+    unsafe fn nt_open_thread_token(&mut self, args: &[u64], extended: bool) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_CANT_OPEN_ANONYMOUS: u32 = 0xC000_00A6;
+        const STATUS_NO_TOKEN: u32 = 0xC000_007C;
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+
+        let out = args[if extended { 4 } else { 3 }];
+        if !self.probe_user_output(out, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            args[0],
+            THREAD_QUERY_INFORMATION,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let context = match self.pm.thread_impersonation(tid) {
+            Some(context) => context,
+            None => return STATUS_NO_TOKEN,
+        };
+        if context.level == nt_security::SecurityImpersonationLevel::Anonymous {
+            return STATUS_CANT_OPEN_ANONYMOUS;
+        }
+
+        // OpenAsSelf affects the object access check identity. The current token model has no token
+        // DACL yet, so both identities grant the requested mask without changing which token opens.
+        let owned = if context.copy_on_open {
+            match self.token_store.duplicate(
+                context.token,
+                nt_security::TokenType::Impersonation,
+                context.level,
+                context.effective_only,
+            ) {
+                Ok(token) => token,
+                Err(status) => return status,
+            }
+        } else {
+            if let Err(status) = self.token_store.retain(context.token) {
+                return status;
+            }
+            context.token
+        };
+        let status = self.insert_owned_token_handle(caller_pid, owned, args[1] as u32, out);
+        if status == 0 && context.copy_on_open {
+            self.token_dirty = true;
+        }
+        status
+    }
+
+    unsafe fn nt_set_thread_impersonation_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+        const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
+        const THREAD_SET_THREAD_TOKEN: u32 = 0x0080;
+        const TOKEN_IMPERSONATE: u32 = 0x0004;
+
+        if args[3] != 8 {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        let mut captured = [0u8; 8];
+        if args[2] == 0 || !self.xas_read(args[2], &mut captured) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let token_handle = u64::from_le_bytes(captured);
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let tid = match self.pm.resolve_thread_handle(
+            caller_pid,
+            self.current_tid as nt_process::ThreadId,
+            args[0],
+            THREAD_SET_THREAD_TOKEN,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+
+        let replacement = if token_handle == 0 {
+            None
+        } else {
+            let token = match self.token_id_for_handle(token_handle, TOKEN_IMPERSONATE) {
+                Ok(token) => token,
+                Err(status) => return status,
+            };
+            let (token_type, level) = match self.token_store.get(token) {
+                Some(token) => (token.token_type, token.impersonation_level),
+                None => return nt_process::STATUS_INVALID_HANDLE,
+            };
+            if token_type != nt_security::TokenType::Impersonation {
+                return STATUS_BAD_TOKEN_TYPE;
+            }
+            if let Err(status) = self.token_store.retain(token) {
+                return status;
+            }
+            Some(nt_process::ImpersonationContext {
+                token,
+                copy_on_open: false,
+                effective_only: false,
+                level,
+            })
+        };
+
+        let old = match self.pm.replace_thread_impersonation(tid, replacement) {
+            Ok(old) => old,
+            Err(status) => {
+                if let Some(context) = replacement {
+                    let _ = self.token_store.release(context.token);
+                }
+                return status;
             }
         };
-        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
-        let count = self.pm.handle_count(caller_pid) as u64;
-        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
-            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
-        }
-        if !self.xas_write_u64(out, handle as u64) {
-            if let Ok(object) = self.pm.take_handle(caller_pid, handle) {
-                self.release_handle_object(object);
+
+        let teb = self.pm.thread(tid).map(|thread| thread.teb_base).unwrap_or(0);
+        let teb = if teb != 0 {
+            teb
+        } else if tid == self.current_tid as nt_process::ThreadId {
+            if self.pi == 0 { SMSS_TEB_VA } else { TEB_VA }
+        } else {
+            0
+        };
+        if teb != 0 {
+            let mut state = [0u8; 8];
+            state[..4].copy_from_slice(
+                &(if replacement.is_some() { u32::MAX } else { 0 }).to_le_bytes(),
+            );
+            state[4] = u8::from(replacement.is_some());
+            if !self.xas_try_write_buf(
+                teb + nt_ntdll_layout::TEB_IMPERSONATION_LOCALE_OFFSET,
+                &state,
+            ) {
+                let _ = self.pm.replace_thread_impersonation(tid, old);
+                if let Some(context) = replacement {
+                    let _ = self.token_store.release(context.token);
+                }
+                return STATUS_ACCESS_VIOLATION;
             }
-            return STATUS_ACCESS_VIOLATION;
+        }
+        if let Some(context) = old {
+            let _ = self.token_store.release(context.token);
         }
         0
     }
@@ -3791,9 +4033,12 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtSetDebugFilterState requires SeDebugPrivilege in ReactOS/NT. We do not model that
             // privilege plane yet, so deny the mutation instead of fabricating a changed mask.
             NativeService::NtSetDebugFilterState => 0xC0000022,
-            // NtOpenThreadToken — no impersonation token → STATUS_NO_TOKEN; the caller falls back to
-            // the process token.
-            NativeService::NtOpenThreadToken => 0xC000007C,
+            NativeService::NtOpenThreadToken => unsafe {
+                self.nt_open_thread_token(args, false)
+            },
+            NativeService::NtOpenThreadTokenEx => unsafe {
+                self.nt_open_thread_token(args, true)
+            },
             NativeService::NtRaiseHardError => unsafe {
                 use nt_syscall::hard_error::{validate_request, RESPONSE_RETURN_TO_CALLER};
 
@@ -5149,6 +5394,10 @@ impl NativeSyscallHandler for ExecNtHandler {
             NativeService::NtOpenProcessToken => unsafe {
                 self.nt_open_process_token(args[0], args[1] as u32, args[2])
             },
+            NativeService::NtOpenProcessTokenEx => unsafe {
+                self.nt_open_process_token(args[0], args[1] as u32, args[3])
+            },
+            NativeService::NtDuplicateToken => unsafe { self.nt_duplicate_token(args) },
             NativeService::NtResumeThread => unsafe {
                 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
                 print_str(b"[thread-life] NtResumeThread pi=");
@@ -5389,6 +5638,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
             },
             NativeService::NtSetInformationThread => unsafe {
+                if args[1] == 5 {
+                    return self.nt_set_thread_impersonation_token(args);
+                }
                 if args[1] != 18 {
                     return 0;
                 }
@@ -5541,6 +5793,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
                 const TOKEN_QUERY: u32 = 0x0008;
                 let class = args[1];
                 let buf = args[2];
@@ -5548,6 +5801,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let retlen_ptr = args[4];
                 if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
                     return STATUS_ACCESS_VIOLATION;
+                }
+                if class == 9 && len != 4 {
+                    return STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let token_id = match self.token_id_for_handle(args[0], TOKEN_QUERY) {
                     Ok(token) => token,
@@ -5589,6 +5845,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                             Self::serialize_sid(&token.primary_group, &mut output[8..]).unwrap_or(0);
                         output[..8].copy_from_slice(&buf.wrapping_add(8).to_le_bytes());
                         8 + sid_length
+                    }
+                    8 => {
+                        output[..4].copy_from_slice(&(token.token_type as u32).to_le_bytes());
+                        4
+                    }
+                    9 => {
+                        if token.token_type != nt_security::TokenType::Impersonation {
+                            return STATUS_INVALID_INFO_CLASS;
+                        }
+                        output[..4]
+                            .copy_from_slice(&(token.impersonation_level as u32).to_le_bytes());
+                        4
                     }
                     _ => return STATUS_INVALID_INFO_CLASS,
                 };

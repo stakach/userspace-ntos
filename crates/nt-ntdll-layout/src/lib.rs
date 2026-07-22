@@ -341,7 +341,12 @@ pub struct Teb {
     _rsvd_1764: [u8; 0x1780 - 0x1764],
     /// `TlsExpansionSlots` (offset 0x1780).
     pub tls_expansion_slots: u64,
-    _rsvd_1788: [u8; 0x17B8 - 0x1788],
+    _rsvd_1788: [u8; 0x1798 - 0x1788],
+    /// `ImpersonationLocale` (offset 0x1798).
+    pub impersonation_locale: u32,
+    /// `IsImpersonating` (offset 0x179C).
+    pub is_impersonating: u8,
+    _rsvd_179d: [u8; 0x17B8 - 0x179D],
     /// `CurrentTransactionHandle` (offset 0x17B8).
     pub current_transaction_handle: u64,
     /// `ActiveFrame` (offset 0x17C0).
@@ -405,10 +410,15 @@ const _: () = assert!(offset_of!(Teb, free_stack_on_termination) == 0x1745);
 const _: () = assert!(offset_of!(Teb, has_fiber_data) == 0x1746);
 const _: () = assert!(offset_of!(Teb, waiting_on_loader_lock) == 0x1760); // C_ASSERT(...) == 0x1760
 const _: () = assert!(offset_of!(Teb, tls_expansion_slots) == 0x1780); // C_ASSERT(... TlsExpansionSlots) == 0x1780
+const _: () = assert!(offset_of!(Teb, impersonation_locale) == 0x1798);
+const _: () = assert!(offset_of!(Teb, is_impersonating) == 0x179C);
 const _: () = assert!(offset_of!(Teb, current_transaction_handle) == 0x17B8); // C_ASSERT(...) == 0x17B8
 const _: () = assert!(offset_of!(Teb, active_frame) == 0x17C0); // C_ASSERT(... ActiveFrame) == 0x17C0
 const _: () = assert!(offset_of!(Teb, fls_data) == 0x17C8);
 const _: () = assert!(offset_of!(Teb, same_teb_flags) == 0x17EE); // C_ASSERT(...) == 0x17EE
+
+pub const TEB_IMPERSONATION_LOCALE_OFFSET: u64 = offset_of!(Teb, impersonation_locale) as u64;
+pub const TEB_IS_IMPERSONATING_OFFSET: u64 = offset_of!(Teb, is_impersonating) as u64;
 
 // PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY — ldrtypes.h.
 const _: () = assert!(offset_of!(PebLdrData, in_load_order_module_list) == 0x10);
