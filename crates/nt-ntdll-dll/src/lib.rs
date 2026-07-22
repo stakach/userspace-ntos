@@ -23,6 +23,7 @@
 #![allow(internal_features)]
 // `memcpy`/`memset` are exported weak (compiler-builtins-mem also emits them) — needs `linkage`.
 #![feature(linkage)]
+#![feature(c_variadic)]
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;

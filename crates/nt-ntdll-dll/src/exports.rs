@@ -25,7 +25,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::ffi::c_void;
+use core::ffi::{c_void, VaList};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
@@ -5146,98 +5146,187 @@ fn ordering_to_int(o: core::cmp::Ordering) -> i32 {
     }
 }
 
-/// `sprintf(char* buf, const char* fmt, ...) -> int`. Variadic on the C side; we declare only the
-/// fixed args (the ABI leaves the variadic tail untouched, which we never read). At 4.0b it writes
-/// an empty NUL-terminated string and returns 0 (IAT-resolve seam; real formatting is the Dbg/CRT
-/// plane in 4.B).
-///
-/// # Safety
-/// `buf` writable for at least 1 byte.
+struct VaArguments<'a> {
+    list: VaList<'a>,
+}
+
+impl nt_ntdll::printf::Arguments for VaArguments<'_> {
+    unsafe fn next(&mut self, kind: nt_ntdll::printf::ArgumentKind) -> u64 {
+        use nt_ntdll::printf::ArgumentKind;
+        match kind {
+            ArgumentKind::Int => unsafe { self.list.next_arg::<i32>() as u32 as u64 },
+            ArgumentKind::UInt => unsafe { self.list.next_arg::<u32>() as u64 },
+            ArgumentKind::I64 => unsafe { self.list.next_arg::<i64>() as u64 },
+            ArgumentKind::U64 => unsafe { self.list.next_arg::<u64>() },
+            ArgumentKind::Pointer => unsafe {
+                self.list.next_arg::<*const c_void>() as usize as u64
+            },
+            ArgumentKind::Double => unsafe { self.list.next_arg::<f64>().to_bits() },
+        }
+    }
+}
+
+struct NarrowOutput {
+    buffer: *mut u8,
+    capacity: usize,
+    position: usize,
+}
+
+impl nt_ntdll::printf::Output for NarrowOutput {
+    fn write(&mut self, unit: u16) -> bool {
+        if self.position == self.capacity {
+            return false;
+        }
+        // SAFETY: the caller supplied `capacity` writable bytes.
+        unsafe { core::ptr::write(self.buffer.add(self.position), unit as u8) };
+        self.position += 1;
+        true
+    }
+}
+
+struct WideOutput {
+    buffer: *mut u16,
+    capacity: usize,
+    position: usize,
+}
+
+impl nt_ntdll::printf::Output for WideOutput {
+    fn write(&mut self, unit: u16) -> bool {
+        if self.position == self.capacity {
+            return false;
+        }
+        // SAFETY: the caller supplied `capacity` writable UTF-16 units.
+        unsafe { core::ptr::write_unaligned(self.buffer.add(self.position), unit) };
+        self.position += 1;
+        true
+    }
+}
+
+struct CountingOutput;
+
+impl nt_ntdll::printf::Output for CountingOutput {
+    fn write(&mut self, _unit: u16) -> bool {
+        true
+    }
+}
+
+fn printf_result(result: Result<usize, ()>) -> i32 {
+    match result {
+        Ok(length) if length <= i32::MAX as usize => length as i32,
+        _ => -1,
+    }
+}
+
+unsafe fn format_narrow_va(
+    buffer: *mut u8,
+    capacity: usize,
+    format: *const u8,
+    list: VaList<'_>,
+) -> i32 {
+    let mut args = VaArguments { list };
+    if buffer.is_null() {
+        let mut output = CountingOutput;
+        return printf_result(unsafe {
+            nt_ntdll::printf::format_narrow(format, &mut args, &mut output)
+        });
+    }
+    let mut output = NarrowOutput {
+        buffer,
+        capacity,
+        position: 0,
+    };
+    let result = unsafe { nt_ntdll::printf::format_narrow(format, &mut args, &mut output) };
+    if let Ok(length) = result {
+        if length < capacity {
+            unsafe { core::ptr::write(buffer.add(length), 0) };
+        }
+    }
+    printf_result(result)
+}
+
+unsafe fn format_wide_va(
+    buffer: *mut u16,
+    capacity: usize,
+    format: *const u16,
+    list: VaList<'_>,
+) -> i32 {
+    let mut args = VaArguments { list };
+    if buffer.is_null() {
+        let mut output = CountingOutput;
+        return printf_result(unsafe {
+            nt_ntdll::printf::format_wide(format, &mut args, &mut output)
+        });
+    }
+    let mut output = WideOutput {
+        buffer,
+        capacity,
+        position: 0,
+    };
+    let result = unsafe { nt_ntdll::printf::format_wide(format, &mut args, &mut output) };
+    if let Ok(length) = result {
+        if length < capacity {
+            unsafe { core::ptr::write_unaligned(buffer.add(length), 0) };
+        }
+    }
+    printf_result(result)
+}
+
+/// `sprintf(char*, const char*, ...)` with the NT5 CRT formatting contract.
 #[export_name = "sprintf"]
-pub unsafe extern "C" fn sprintf(buf: *mut u8, _fmt: *const u8) -> i32 {
-    if !buf.is_null() {
-        // SAFETY: buf valid for >= 1 byte per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+pub unsafe extern "C" fn sprintf(buf: *mut u8, format: *const u8, args: ...) -> i32 {
+    unsafe { format_narrow_va(buf, i32::MAX as usize, format, args) }
 }
 
-/// `_snprintf(char* buf, size_t count, const char* fmt, ...) -> int`. Variadic on the C side; this
-/// matches the current formatting seam used by `sprintf`/`_vsnprintf`: resolve the import, write an
-/// empty NUL-terminated string when possible, and return 0 until the full CRT formatter is wired.
-///
-/// # Safety
-/// `buf` writable for `count` bytes.
+/// `_snprintf`: returns `-1` only when rendering exceeds `count`; exact fit is unterminated.
 #[export_name = "_snprintf"]
-pub unsafe extern "C" fn snprintf(buf: *mut u8, count: usize, _fmt: *const u8) -> i32 {
-    if !buf.is_null() && count > 0 {
-        // SAFETY: buf valid for count bytes per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+pub unsafe extern "C" fn snprintf(
+    buf: *mut u8,
+    count: usize,
+    format: *const u8,
+    args: ...,
+) -> i32 {
+    unsafe { format_narrow_va(buf, count, format, args) }
 }
 
-/// `swprintf(wchar_t* buf, const wchar_t* fmt, ...) -> int` — variadic wide; same 4.0b seam.
-///
-/// # Safety
-/// `buf` writable for at least 1 wchar.
+/// NT5 non-conforming `swprintf(wchar_t*, const wchar_t*, ...)`.
 #[export_name = "swprintf"]
-pub unsafe extern "C" fn swprintf(buf: *mut u16, _fmt: *const u16) -> i32 {
-    if !buf.is_null() {
-        // SAFETY: buf valid for >= 1 wchar per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+pub unsafe extern "C" fn swprintf(buf: *mut u16, format: *const u16, args: ...) -> i32 {
+    unsafe { format_wide_va(buf, i32::MAX as usize, format, args) }
 }
 
-/// `vsprintf(char* buf, const char* fmt, va_list) -> int`. Same formatting seam as `sprintf`.
-///
-/// # Safety
-/// `buf` writable for at least 1 byte.
 #[export_name = "vsprintf"]
-pub unsafe extern "C" fn vsprintf(buf: *mut u8, _fmt: *const u8, _args: *mut c_void) -> i32 {
-    if !buf.is_null() {
-        // SAFETY: buf valid for >= 1 byte per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+pub unsafe extern "C" fn vsprintf(
+    buf: *mut u8,
+    format: *const u8,
+    args: VaList<'_>,
+) -> i32 {
+    unsafe { format_narrow_va(buf, i32::MAX as usize, format, args) }
 }
 
-/// `_vsnprintf(char* buf, size_t count, const char* fmt, va_list) -> int`. The `va_list` is opaque
-/// in `no_std`; 4.0b writes an empty string + returns 0 (IAT-resolve seam; real render in 4.B).
-///
-/// # Safety
-/// `buf` writable for `count` bytes.
 #[export_name = "_vsnprintf"]
 pub unsafe extern "C" fn vsnprintf(
     buf: *mut u8,
     count: usize,
-    _fmt: *const u8,
-    _args: *mut c_void,
+    format: *const u8,
+    args: VaList<'_>,
 ) -> i32 {
-    if !buf.is_null() && count > 0 {
-        // SAFETY: buf valid for count bytes per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+    unsafe { format_narrow_va(buf, count, format, args) }
 }
 
-/// `_vsnwprintf(wchar_t* buf, size_t count, const wchar_t* fmt, va_list) -> int`. Same 4.0b seam.
-///
-/// # Safety
-/// `buf` writable for `count` wchars.
 #[export_name = "_vsnwprintf"]
 pub unsafe extern "C" fn vsnwprintf(
     buf: *mut u16,
     count: usize,
-    _fmt: *const u16,
-    _args: *mut c_void,
+    format: *const u16,
+    args: VaList<'_>,
 ) -> i32 {
-    if !buf.is_null() && count > 0 {
-        // SAFETY: buf valid for count wchars per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+    unsafe { format_wide_va(buf, count, format, args) }
+}
+
+/// `_vscwprintf`: count the UTF-16 units required, excluding the terminator.
+#[export_name = "_vscwprintf"]
+pub unsafe extern "C" fn vscwprintf(format: *const u16, args: VaList<'_>) -> i32 {
+    unsafe { format_wide_va(core::ptr::null_mut(), 0, format, args) }
 }
 
 /// `__C_specific_handler(ExceptionRecord*, EstablisherFrame, ContextRecord*, DispatcherContext*)`
@@ -6117,19 +6206,15 @@ pub unsafe extern "system" fn rtl_format_current_user_key_path(
     }
 }
 
-/// `_snwprintf(wchar_t* buf, size_t count, const wchar_t* fmt, ...) -> int` — variadic wide; the 4.0b
-/// seam (writes an empty string; real formatting is the CRT plane). Declares only the fixed args (the
-/// Win64 ABI leaves the variadic tail in caller regs/stack, which we never read).
-///
-/// # Safety
-/// `buf` writable for at least 1 unit.
+/// `_snwprintf`: bounded UTF-16 formatting with the NT5 exact-fit contract.
 #[export_name = "_snwprintf"]
-pub unsafe extern "C" fn snwprintf(buf: *mut u16, count: usize, _fmt: *const u16) -> i32 {
-    if !buf.is_null() && count > 0 {
-        // SAFETY: buf valid for >= 1 unit per the contract.
-        unsafe { *buf = 0 };
-    }
-    0
+pub unsafe extern "C" fn snwprintf(
+    buf: *mut u16,
+    count: usize,
+    format: *const u16,
+    args: ...,
+) -> i32 {
+    unsafe { format_wide_va(buf, count, format, args) }
 }
 
 /// `wcsncpy(wchar_t* dst, const wchar_t* src, size_t n) -> wchar_t*` — copy up to `n` units,
@@ -24896,6 +24981,7 @@ pub unsafe extern "C" fn export_anchor() {
         vsprintf as usize,
         vsnprintf as usize,
         vsnwprintf as usize,
+        vscwprintf as usize,
         c_specific_handler as usize,
         // BATCH 2 — csrsrv's 12 ntdll imports.
         rtl_free_sid as usize,
