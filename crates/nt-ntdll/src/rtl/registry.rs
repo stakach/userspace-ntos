@@ -1,6 +1,7 @@
 //! Pure path policy shared by the `Rtl*Registry*` exports.
 
 use alloc::vec::Vec;
+use core::ops::Range;
 
 pub const RTL_REGISTRY_ABSOLUTE: u32 = 0;
 pub const RTL_REGISTRY_SERVICES: u32 = 1;
@@ -13,8 +14,10 @@ pub const RTL_REGISTRY_HANDLE: u32 = 0x4000_0000;
 pub const RTL_REGISTRY_OPTIONAL: u32 = 0x8000_0000;
 
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+pub const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 
 pub const REG_SZ: u32 = 1;
 pub const REG_EXPAND_SZ: u32 = 2;
@@ -109,6 +112,73 @@ pub fn direct_copy_plan(
     Ok(DirectCopyPlan::Typed {
         copy_length: value_length,
         value_type,
+    })
+}
+
+/// Split a well-formed UTF-16LE `REG_MULTI_SZ` into byte ranges that include each string's NUL.
+/// The final empty-string terminator is not returned.
+pub fn multi_sz_ranges(value: &[u8]) -> Result<Vec<Range<usize>>, u32> {
+    if value.len() < 4 || value.len() & 1 != 0 || value[value.len() - 4..] != [0, 0, 0, 0] {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    let units = value.len() / 2;
+    let value_end = units - 2;
+    let unit = |index: usize| {
+        let offset = index * 2;
+        u16::from_le_bytes([value[offset], value[offset + 1]])
+    };
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < value_end {
+        let mut end = start;
+        while end < units && unit(end) != 0 {
+            end += 1;
+        }
+        if end >= units {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        ranges.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
+        ranges.push(start * 2..(end + 1) * 2);
+        start = end + 1;
+    }
+    Ok(ranges)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyValueFullInformation<'a> {
+    pub value_type: u32,
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+}
+
+/// Validate and borrow a native `KEY_VALUE_FULL_INFORMATION` record.
+pub fn parse_key_value_full_information(
+    information: &[u8],
+) -> Result<KeyValueFullInformation<'_>, u32> {
+    if information.len() < 0x14 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let value_type = u32::from_le_bytes(information[4..8].try_into().unwrap());
+    let data_offset = u32::from_le_bytes(information[8..12].try_into().unwrap()) as usize;
+    let data_length = u32::from_le_bytes(information[12..16].try_into().unwrap()) as usize;
+    let name_length = u32::from_le_bytes(information[16..20].try_into().unwrap()) as usize;
+    let name_end = 0x14usize
+        .checked_add(name_length)
+        .ok_or(STATUS_INFO_LENGTH_MISMATCH)?;
+    let data_end = data_offset
+        .checked_add(data_length)
+        .ok_or(STATUS_INFO_LENGTH_MISMATCH)?;
+    if name_length & 1 != 0
+        || name_end > information.len()
+        || data_offset < 0x14
+        || data_end > information.len()
+    {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    Ok(KeyValueFullInformation {
+        value_type,
+        name: &information[0x14..name_end],
+        data: &information[data_offset..data_end],
     })
 }
 
@@ -328,6 +398,68 @@ mod tests {
         assert_eq!(
             direct_copy_plan(8, 12, DirectDestination::Raw { first_long: 19 }),
             Err(STATUS_BUFFER_TOO_SMALL)
+        );
+    }
+
+    #[test]
+    fn splits_multi_sz_with_each_terminator() {
+        let mut value = Vec::new();
+        for unit in ['A' as u16, 0, 'B' as u16, 'C' as u16, 0, 0] {
+            value.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(multi_sz_ranges(&value), Ok(vec![0..4, 4..10]));
+        assert_eq!(multi_sz_ranges(&[0, 0, 0, 0]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn rejects_malformed_multi_sz_without_overread() {
+        assert_eq!(multi_sz_ranges(&[]), Err(STATUS_OBJECT_TYPE_MISMATCH));
+        assert_eq!(
+            multi_sz_ranges(&[b'A', 0, 0]),
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        );
+        assert_eq!(
+            multi_sz_ranges(&[b'A', 0, b'B', 0, 0, 0]),
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn parses_bounded_full_value_information() {
+        let mut information = vec![0u8; 32];
+        information[4..8].copy_from_slice(&4u32.to_le_bytes());
+        information[8..12].copy_from_slice(&24u32.to_le_bytes());
+        information[12..16].copy_from_slice(&4u32.to_le_bytes());
+        information[16..20].copy_from_slice(&2u32.to_le_bytes());
+        information[20..22].copy_from_slice(&[b'X', 0]);
+        information[24..28].copy_from_slice(&42u32.to_le_bytes());
+        assert_eq!(
+            parse_key_value_full_information(&information),
+            Ok(KeyValueFullInformation {
+                value_type: 4,
+                name: &[b'X', 0],
+                data: &42u32.to_le_bytes(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_full_value_information() {
+        for (data_offset, data_length, name_length) in
+            [(24u32, 16u32, 2u32), (8, 4, 2), (24, 4, 13), (24, 4, 3)]
+        {
+            let mut information = vec![0u8; 32];
+            information[8..12].copy_from_slice(&data_offset.to_le_bytes());
+            information[12..16].copy_from_slice(&data_length.to_le_bytes());
+            information[16..20].copy_from_slice(&name_length.to_le_bytes());
+            assert_eq!(
+                parse_key_value_full_information(&information),
+                Err(STATUS_INFO_LENGTH_MISMATCH)
+            );
+        }
+        assert_eq!(
+            parse_key_value_full_information(&[0; 19]),
+            Err(STATUS_INFO_LENGTH_MISMATCH)
         );
     }
 }

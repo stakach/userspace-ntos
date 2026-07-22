@@ -5268,12 +5268,7 @@ const RTL_QUERY_REGISTRY_NOEXPAND: u32 = 0x10;
 const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x20;
 
 /// RTL_REGISTRY_* RelativeTo bases (the subset smss uses).
-const RTL_REGISTRY_ABSOLUTE: u32 = 0;
-const RTL_REGISTRY_SERVICES: u32 = 1;
-const RTL_REGISTRY_CONTROL: u32 = 2;
-const RTL_REGISTRY_WINDOWS_NT: u32 = 3;
 const RTL_REGISTRY_HANDLE: u32 = 0x4000_0000;
-const RTL_REGISTRY_OPTIONAL: u32 = 0x8000_0000;
 
 const REG_NONE: u32 = 0;
 const REG_SZ: u32 = 1;
@@ -5285,7 +5280,9 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_KERNEL_HANDLE: u32 = 0x200;
 
 /// The RTL_QUERY_REGISTRY_TABLE entry, read field-by-field from the caller's array.
+#[derive(Clone, Copy)]
 struct QueryEntry {
+    table_entry: u64,
     query_routine: u64,
     flags: u32,
     name: u64,
@@ -5304,6 +5301,7 @@ unsafe fn read_query_entry(e: *const u8) -> QueryEntry {
     // SAFETY: e is a valid entry per the caller.
     unsafe {
         QueryEntry {
+            table_entry: e as u64,
             query_routine: core::ptr::read_unaligned(e as *const u64),
             flags: core::ptr::read_unaligned(e.add(0x08) as *const u32),
             name: core::ptr::read_unaligned(e.add(0x10) as *const u64),
@@ -5318,6 +5316,169 @@ unsafe fn read_query_entry(e: *const u8) -> QueryEntry {
 /// The RTL_QUERY_REGISTRY_ROUTINE ABI: `(ValueName, ValueType, ValueData, ValueLength, Context,
 /// EntryContext) -> NTSTATUS`.
 type OnTargetQueryRoutine = unsafe extern "system" fn(u64, u32, u64, u32, u64, u64) -> u32;
+
+const REGISTRY_INFO_STACK_SIZE: usize = 2048;
+
+struct RegistryInfoBuffer {
+    stack: [u8; REGISTRY_INFO_STACK_SIZE],
+    heap: alloc::vec::Vec<u8>,
+    used: usize,
+}
+
+impl RegistryInfoBuffer {
+    fn as_slice(&self) -> &[u8] {
+        if self.heap.is_empty() {
+            &self.stack[..self.used]
+        } else {
+            &self.heap[..self.used]
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn registry_full_information(
+    service: u32,
+    key: u64,
+    selector: u64,
+) -> Result<RegistryInfoBuffer, u32> {
+    let mut result = RegistryInfoBuffer {
+        stack: [0u8; REGISTRY_INFO_STACK_SIZE],
+        heap: alloc::vec::Vec::new(),
+        used: 0,
+    };
+    let mut required = 0u32;
+    let mut status = unsafe {
+        syscall6(
+            service,
+            key,
+            selector,
+            KEY_VALUE_FULL_INFORMATION,
+            result.stack.as_mut_ptr() as u64,
+            result.stack.len() as u64,
+            &mut required as *mut u32 as u64,
+        ) as u32
+    };
+    if status == STATUS_BUFFER_OVERFLOW_U as u32 || status == 0xC000_0023 {
+        let size = required as usize;
+        if size <= result.stack.len() {
+            return Err(0xC000_0004); // STATUS_INFO_LENGTH_MISMATCH
+        }
+        result
+            .heap
+            .try_reserve_exact(size)
+            .map_err(|_| STATUS_NO_MEMORY as u32)?;
+        result.heap.resize(size, 0);
+        required = 0;
+        status = unsafe {
+            syscall6(
+                service,
+                key,
+                selector,
+                KEY_VALUE_FULL_INFORMATION,
+                result.heap.as_mut_ptr() as u64,
+                result.heap.len() as u64,
+                &mut required as *mut u32 as u64,
+            ) as u32
+        };
+    }
+    if (status as i32) < 0 {
+        return Err(status);
+    }
+    let used = required as usize;
+    let capacity = if result.heap.is_empty() {
+        result.stack.len()
+    } else {
+        result.heap.len()
+    };
+    if used < 0x14 || used > capacity {
+        return Err(0xC000_0004);
+    }
+    result.used = used;
+    Ok(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn dispatch_direct_value(entry_context: u64, ty: u32, data: u64, len: u32) -> u32 {
+    use nt_ntdll::rtl::registry::{
+        direct_copy_plan, DirectCopyPlan, DirectDestination, STATUS_BUFFER_TOO_SMALL,
+    };
+
+    if entry_context == 0 || (len != 0 && data == 0) {
+        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+    }
+    let destination = if matches!(ty, REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ) {
+        DirectDestination::UnicodeString {
+            buffer_present: unsafe {
+                core::ptr::read_unaligned((entry_context + 8) as *const u64) != 0
+            },
+            maximum_length: unsafe { core::ptr::read_unaligned((entry_context + 2) as *const u16) },
+        }
+    } else if len <= 4 {
+        DirectDestination::Raw { first_long: 0 }
+    } else {
+        DirectDestination::Raw {
+            first_long: unsafe { core::ptr::read_unaligned(entry_context as *const i32) },
+        }
+    };
+    let plan = match direct_copy_plan(ty, len, destination) {
+        Ok(plan) => plan,
+        Err(STATUS_BUFFER_TOO_SMALL) => return STATUS_SUCCESS_U as u32,
+        Err(status) => return status,
+    };
+    match plan {
+        DirectCopyPlan::UnicodeString {
+            copy_length,
+            string_length,
+            allocate,
+        } => {
+            let buffer = if allocate {
+                let allocation = unsafe { crate::process_heap_alloc(copy_length as usize) };
+                if allocation.is_null() {
+                    return STATUS_NO_MEMORY as u32;
+                }
+                unsafe {
+                    core::ptr::write_unaligned((entry_context + 2) as *mut u16, copy_length);
+                    core::ptr::write_unaligned((entry_context + 8) as *mut u64, allocation as u64);
+                }
+                allocation
+            } else {
+                unsafe { core::ptr::read_unaligned((entry_context + 8) as *const u64) as *mut u8 }
+            };
+            if copy_length != 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data as *const u8, buffer, copy_length as usize)
+                };
+            }
+            unsafe { core::ptr::write_unaligned(entry_context as *mut u16, string_length) };
+        }
+        DirectCopyPlan::Raw { copy_length } => {
+            if copy_length != 0 && entry_context != data {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data as *const u8,
+                        entry_context as *mut u8,
+                        copy_length as usize,
+                    )
+                };
+            }
+        }
+        DirectCopyPlan::Typed {
+            copy_length,
+            value_type,
+        } => unsafe {
+            core::ptr::write_unaligned(entry_context as *mut u32, copy_length);
+            core::ptr::write_unaligned((entry_context + 4) as *mut u32, value_type);
+            if copy_length != 0 {
+                core::ptr::copy_nonoverlapping(
+                    data as *const u8,
+                    (entry_context + 8) as *mut u8,
+                    copy_length as usize,
+                );
+            }
+        },
+    }
+    STATUS_SUCCESS_U as u32
+}
 
 /// `wcslen` over a live UTF-16 pointer.
 ///
@@ -5857,38 +6018,39 @@ unsafe fn dispatch_value(
         && len >= 4
         && !unsafe { name_is(name_ptr, b"ObjectDirectories") }
     {
-        let units = (len as usize) / 2;
-        // SAFETY: [data, data+len) is the value body; interpret as UTF-16.
-        let blob: &[u16] = unsafe { core::slice::from_raw_parts(data as *const u16, units) };
-        // ValueEnd = Data + Length - 2*sizeof(NUL): stop before the block's terminating empty string.
-        // (units - 2 leaves off the final double-NUL, matching registry.c's `ValueEnd`.)
-        let value_end = units.saturating_sub(2);
-        let mut start = 0usize;
+        let blob = unsafe { core::slice::from_raw_parts(data, len as usize) };
+        let ranges = match nt_ntdll::rtl::registry::multi_sz_ranges(blob) {
+            Ok(ranges) => ranges,
+            Err(status) => return status,
+        };
+        let mut direct_context = entry.entry_context;
         let mut status = STATUS_SUCCESS_U as u32;
-        while start < value_end {
-            // Advance past this sub-string's terminating NUL (registry.c: `while (*p++);`).
-            let mut p = start;
-            while p < units && blob[p] != 0 {
-                p += 1;
+        for range in ranges {
+            let mut current_entry = *entry;
+            if (entry.flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
+                current_entry.entry_context = direct_context;
+                direct_context = direct_context.wrapping_add(16);
+                unsafe {
+                    core::ptr::write_unaligned(
+                        (entry.table_entry + 0x18) as *mut u64,
+                        direct_context,
+                    )
+                };
             }
-            p += 1; // include the terminating NUL, exactly like `p` post-incremented past it
-            let sub_len_bytes = ((p - start) * 2) as u32; // Length INCLUDING the NUL
-                                                          // SAFETY: the sub-string [start,p) lies within the value body; call the routine as REG_SZ.
             let st = unsafe {
                 dispatch_value(
-                    entry,
+                    &current_entry,
                     name_ptr,
                     REG_SZ,
-                    (data as *const u16).add(start) as *const u8,
-                    sub_len_bytes,
+                    data.add(range.start),
+                    range.len() as u32,
                     context,
                 )
             };
-            if st != STATUS_SUCCESS_U as u32 {
+            if (st as i32) < 0 {
                 status = st;
                 break;
             }
-            start = p;
         }
         return status;
     }
@@ -5917,11 +6079,7 @@ unsafe fn dispatch_value(
         (ty, data as u64, len)
     };
     if (entry.flags & RTL_QUERY_REGISTRY_DIRECT) != 0 {
-        // DIRECT: copy into the EntryContext UNICODE_STRING (REG_SZ) — smss's Session Manager table
-        // uses callbacks, so this path is minimal (copy the raw bytes into a UNICODE_STRING buffer if
-        // one is present). We conservatively only handle the callback case; DIRECT returns SUCCESS.
-        let _ = (ty_out, data_out, len_out);
-        return STATUS_SUCCESS_U as u32;
+        return unsafe { dispatch_direct_value(entry.entry_context, ty_out, data_out, len_out) };
     }
     if entry.query_routine == 0 {
         return STATUS_SUCCESS_U as u32;
@@ -6496,15 +6654,9 @@ pub unsafe fn rtl_query_registry_values(
     let (open_status, base_key, base_opened_here) =
         unsafe { rtl_get_registry_handle(relative_to, path, false) };
     if (open_status as i32) < 0 {
-        return if (relative_to & RTL_REGISTRY_OPTIONAL) != 0 {
-            STATUS_SUCCESS_U as u32
-        } else {
-            open_status
-        };
+        return open_status;
     }
 
-    // A reusable KeyValueFullInformation buffer.
-    let mut info = [0u8; 2048];
     let mut status: u32 = STATUS_SUCCESS_U as u32;
     let mut e = query_table;
     let mut current_key = base_key;
@@ -6515,6 +6667,14 @@ pub unsafe fn rtl_query_registry_values(
         if entry.query_routine == 0
             && (entry.flags & (RTL_QUERY_REGISTRY_SUBKEY | RTL_QUERY_REGISTRY_DIRECT)) == 0
         {
+            break;
+        }
+        if (entry.flags & RTL_QUERY_REGISTRY_DIRECT) != 0
+            && (entry.name == 0
+                || (entry.flags & RTL_QUERY_REGISTRY_SUBKEY) != 0
+                || entry.query_routine != 0)
+        {
+            status = 0xC000_000D; // STATUS_INVALID_PARAMETER
             break;
         }
 
@@ -6541,60 +6701,57 @@ pub unsafe fn rtl_query_registry_values(
                     // ProcessValues: enumerate every value, dispatch the routine.
                     let mut index: u32 = 0;
                     loop {
-                        let mut result_len: u32 = 0;
-                        // SAFETY: enumerate value `index` into `info`.
-                        let st = unsafe {
-                            syscall6(
+                        let value_info = match unsafe {
+                            registry_full_information(
                                 SSN_NT_ENUMERATE_VALUE_KEY,
                                 current_key,
                                 index as u64,
-                                KEY_VALUE_FULL_INFORMATION,
-                                info.as_mut_ptr() as u64,
-                                info.len() as u64,
-                                &mut result_len as *mut u32 as u64,
                             )
-                        };
-                        if st == STATUS_NO_MORE_ENTRIES {
-                            status = STATUS_SUCCESS_U as u32;
-                            break;
-                        }
-                        if st != STATUS_SUCCESS_U {
-                            // Buffer overflow or error: stop enumerating this subkey.
-                            break;
-                        }
-                        // Parse the KeyValueFullInformation.
-                        // SAFETY: `info` holds a valid KEY_VALUE_FULL_INFORMATION.
-                        unsafe {
-                            let ty = core::ptr::read_unaligned(info.as_ptr().add(4) as *const u32);
-                            let data_off =
-                                core::ptr::read_unaligned(info.as_ptr().add(8) as *const u32)
-                                    as usize;
-                            let data_len =
-                                core::ptr::read_unaligned(info.as_ptr().add(0x0c) as *const u32);
-                            let name_len =
-                                core::ptr::read_unaligned(info.as_ptr().add(0x10) as *const u32)
-                                    as usize;
-                            // The name follows the 0x14-byte header; NUL-terminate a local copy.
-                            let mut name_buf: Vec<u16> = Vec::with_capacity(name_len / 2 + 1);
-                            for k in 0..(name_len / 2) {
-                                name_buf.push(core::ptr::read_unaligned(
-                                    info.as_ptr().add(0x14 + k * 2) as *const u16,
-                                ));
-                            }
-                            name_buf.push(0);
-                            let data_ptr = info.as_ptr().add(data_off);
-                            let st2 = dispatch_value(
-                                &entry,
-                                name_buf.as_ptr(),
-                                ty,
-                                data_ptr,
-                                data_len,
-                                context,
-                            );
-                            if st2 != STATUS_SUCCESS_U as u32 {
-                                status = st2;
+                        } {
+                            Ok(info) => info,
+                            Err(error) if error == STATUS_NO_MORE_ENTRIES as u32 => {
+                                status = STATUS_SUCCESS_U as u32;
                                 break;
                             }
+                            Err(error) => {
+                                status = error;
+                                break;
+                            }
+                        };
+                        let info = value_info.as_slice();
+                        let parsed =
+                            match nt_ntdll::rtl::registry::parse_key_value_full_information(info) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    status = error;
+                                    break;
+                                }
+                            };
+                        let mut name_buf: Vec<u16> = Vec::new();
+                        if name_buf
+                            .try_reserve_exact(parsed.name.len() / 2 + 1)
+                            .is_err()
+                        {
+                            status = STATUS_NO_MEMORY as u32;
+                            break;
+                        }
+                        for pair in parsed.name.chunks_exact(2) {
+                            name_buf.push(u16::from_le_bytes([pair[0], pair[1]]));
+                        }
+                        name_buf.push(0);
+                        let st2 = unsafe {
+                            dispatch_value(
+                                &entry,
+                                name_buf.as_ptr(),
+                                parsed.value_type,
+                                parsed.data.as_ptr(),
+                                parsed.data.len() as u32,
+                                context,
+                            )
+                        };
+                        if (st2 as i32) < 0 {
+                            status = st2;
+                            break;
                         }
                         index += 1;
                     }
@@ -6615,48 +6772,47 @@ pub unsafe fn rtl_query_registry_values(
                 core::ptr::write(oa_us.as_mut_ptr().add(2) as *mut u16, bytes);
                 core::ptr::write(oa_us.as_mut_ptr().add(8) as *mut u64, entry.name);
             }
-            let mut result_len: u32 = 0;
-            // SAFETY: query the named value into `info`.
-            let st = unsafe {
-                syscall6(
+            match unsafe {
+                registry_full_information(
                     SSN_NT_QUERY_VALUE_KEY,
                     current_key,
                     oa_us.as_ptr() as u64,
-                    KEY_VALUE_FULL_INFORMATION,
-                    info.as_mut_ptr() as u64,
-                    info.len() as u64,
-                    &mut result_len as *mut u32 as u64,
                 )
-            };
-            if st == STATUS_SUCCESS_U {
-                // SAFETY: `info` holds a valid KEY_VALUE_FULL_INFORMATION.
-                unsafe {
-                    let ty = core::ptr::read_unaligned(info.as_ptr().add(4) as *const u32);
-                    let data_off =
-                        core::ptr::read_unaligned(info.as_ptr().add(8) as *const u32) as usize;
-                    let data_len = core::ptr::read_unaligned(info.as_ptr().add(0x0c) as *const u32);
-                    let st2 = dispatch_value(
-                        &entry,
-                        entry.name as *const u16,
-                        ty,
-                        info.as_ptr().add(data_off),
-                        data_len,
-                        context,
-                    );
-                    if st2 != STATUS_SUCCESS_U as u32 {
+            } {
+                Ok(value_info) => {
+                    match nt_ntdll::rtl::registry::parse_key_value_full_information(
+                        value_info.as_slice(),
+                    ) {
+                        Ok(parsed) => {
+                            let st2 = unsafe {
+                                dispatch_value(
+                                    &entry,
+                                    entry.name as *const u16,
+                                    parsed.value_type,
+                                    parsed.data.as_ptr(),
+                                    parsed.data.len() as u32,
+                                    context,
+                                )
+                            };
+                            if (st2 as i32) < 0 {
+                                status = st2;
+                            }
+                        }
+                        Err(error) => status = error,
+                    }
+                }
+                Err(0xC000_0034) => {
+                    // Value absent → fall to the caller's default (if any).
+                    let st2 = unsafe { dispatch_default(&entry, context) };
+                    if (st2 as i32) < 0 {
                         status = st2;
                     }
                 }
-            } else {
-                // Value absent → fall to the caller's default (if any).
-                let st2 = unsafe { dispatch_default(&entry, context) };
-                if st2 != STATUS_SUCCESS_U as u32 {
-                    status = st2;
-                }
+                Err(error) => status = error,
             }
         }
 
-        if status != STATUS_SUCCESS_U as u32 {
+        if (status as i32) < 0 {
             break;
         }
         e = e.wrapping_add(ENTRY_SIZE);
