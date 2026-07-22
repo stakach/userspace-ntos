@@ -19,6 +19,7 @@ use crate::profile::WindowsProfile;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 
 // System information classes (spec §16.5).
 const SYSTEM_BASIC_INFORMATION: u64 = 0;
@@ -169,6 +170,33 @@ impl NativeSyscallHandler for KernelServices {
                 .terminate_process(args[0] as u32, args[1] as u32)
                 .map(|_| STATUS_SUCCESS)
                 .unwrap_or(STATUS_INVALID_HANDLE),
+            NativeService::NtQueryInformationProcess => {
+                if args.get(1).copied() != Some(36) {
+                    return STATUS_INVALID_INFO_CLASS;
+                }
+                if args.first().copied() != Some(u64::MAX) {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if args.get(3).copied() != Some(4) {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let mut candidate = self.system_time_100ns as u32
+                    ^ (self.system_time_100ns >> 32) as u32
+                    ^ ctx.process_id
+                    ^ ctx.thread_id;
+                if candidate == 0 {
+                    candidate = 0xBB40_E64E;
+                }
+                let Some(cookie) = self
+                    .pm
+                    .get_or_initialize_process_cookie(ctx.process_id, candidate)
+                else {
+                    return STATUS_INVALID_HANDLE;
+                };
+                out.extend_from_slice(&cookie.to_le_bytes());
+                out.extend_from_slice(&4u32.to_le_bytes());
+                STATUS_SUCCESS
+            }
             NativeService::NtClose => STATUS_SUCCESS,
             // KUSER-backed time (spec §16.5).
             NativeService::NtQuerySystemTime => {

@@ -121,6 +121,54 @@ fn dispatch_registry_and_memory_and_time() {
 }
 
 #[test]
+fn process_cookie_query_is_exact_and_stable() {
+    let d = NativeSyscallDispatcher::new(NativeServiceTable::test_profile());
+    let mut ks = build_services();
+    let pid = ks.pm.create_process("cookie.exe", None, None);
+    assert_eq!(pid, 4);
+
+    let first = d.dispatch_service(
+        NativeService::NtQueryInformationProcess,
+        &[u64::MAX, 36, 0, 4, 0],
+        &origin(),
+        &mut ks,
+    );
+    assert_eq!(first.status, STATUS_SUCCESS);
+    assert_eq!(first.output.len(), 8);
+    let cookie = u32::from_le_bytes(first.output[..4].try_into().unwrap());
+    assert_ne!(cookie, 0);
+    assert_eq!(&first.output[4..], &4u32.to_le_bytes());
+
+    let repeated = d.dispatch_service(
+        NativeService::NtQueryInformationProcess,
+        &[u64::MAX, 36, 0, 4, 0],
+        &origin(),
+        &mut ks,
+    );
+    assert_eq!(&repeated.output[..4], &cookie.to_le_bytes());
+    assert_eq!(
+        d.dispatch_service(
+            NativeService::NtQueryInformationProcess,
+            &[4, 36, 0, 4, 0],
+            &origin(),
+            &mut ks,
+        )
+        .status,
+        0xC000_000D
+    );
+    assert_eq!(
+        d.dispatch_service(
+            NativeService::NtQueryInformationProcess,
+            &[u64::MAX, 36, 0, 8, 0],
+            &origin(),
+            &mut ks,
+        )
+        .status,
+        0xC000_0004
+    );
+}
+
+#[test]
 fn dispatch_file_create_write_read() {
     let d = NativeSyscallDispatcher::new(NativeServiceTable::test_profile());
     let mut ks = build_services();

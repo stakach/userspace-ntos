@@ -43,7 +43,7 @@ struct ListEntry {
 #[repr(C)]
 struct HandlerEntry {
     list_entry: ListEntry,
-    handler: VectoredHandler,
+    encoded_handler: u64,
     references: u32,
 }
 
@@ -173,6 +173,7 @@ impl VectoredHandlers {
         list: HandlerList,
         first: u32,
         handler: Option<VectoredHandler>,
+        cookie: Option<u32>,
     ) -> *mut c_void {
         let Some(handler) = handler else {
             return ptr::null_mut();
@@ -192,7 +193,11 @@ impl VectoredHandlers {
                         flink: ptr::null_mut(),
                         blink: ptr::null_mut(),
                     },
-                    handler,
+                    encoded_handler: cookie
+                        .map(|cookie| {
+                            super::encode::encode_pointer(handler as usize as u64, cookie)
+                        })
+                        .unwrap_or(handler as usize as u64),
                     references: 1,
                 },
             );
@@ -257,6 +262,14 @@ impl VectoredHandlers {
         found as u32
     }
 
+    #[cfg(test)]
+    fn encoded_handler_for_test(self: Pin<&Self>, handle: *mut c_void) -> Option<u64> {
+        let this = self.get_ref();
+        let _guard = this.lock();
+        let entry = handle.cast::<HandlerEntry>();
+        (!entry.is_null()).then(|| unsafe { (*entry).encoded_handler })
+    }
+
     /// Invoke handlers in order. Returns true only when one requests continued execution. Continue
     /// lists use the same traversal but callers ignore this return value.
     ///
@@ -267,6 +280,7 @@ impl VectoredHandlers {
         list: HandlerList,
         exception_record: *mut c_void,
         context_record: *mut c_void,
+        cookie: Option<u32>,
     ) -> bool {
         let this = self.get_ref();
         let mut guard = Some(this.lock());
@@ -285,11 +299,16 @@ impl VectoredHandlers {
             let entry = current.cast::<HandlerEntry>();
             // SAFETY: current is linked under the lock; the reference prevents callback removal
             // from freeing the entry while user code runs.
-            let handler = unsafe {
+            let encoded_handler = unsafe {
                 (*entry).references += 1;
-                (*entry).handler
+                (*entry).encoded_handler
             };
             drop(guard.take());
+            let handler_address = cookie
+                .map(|cookie| super::encode::decode_pointer(encoded_handler, cookie))
+                .unwrap_or(encoded_handler);
+            let handler: VectoredHandler =
+                unsafe { core::mem::transmute(handler_address as usize) };
             let result = unsafe { handler(&mut pointers) };
             guard = Some(this.lock());
 
@@ -456,12 +475,29 @@ mod tests {
     #[test]
     fn first_handler_runs_at_head_and_execution_stops() {
         let handlers = registry();
-        let tail = handlers
-            .as_ref()
-            .add(HandlerList::Exception, 0, Some(handler_one));
-        let head = handlers
-            .as_ref()
-            .add(HandlerList::Exception, 1, Some(handler_two));
+        let tail = handlers.as_ref().add(
+            HandlerList::Exception,
+            0,
+            Some(handler_one),
+            Some(0x1234_5678),
+        );
+        let head = handlers.as_ref().add(
+            HandlerList::Exception,
+            1,
+            Some(handler_two),
+            Some(0x1234_5678),
+        );
+        assert_eq!(
+            handlers.as_ref().encoded_handler_for_test(head),
+            Some(crate::rtl::encode::encode_pointer(
+                handler_two as usize as u64,
+                0x1234_5678,
+            ))
+        );
+        assert_ne!(
+            handlers.as_ref().encoded_handler_for_test(head),
+            Some(handler_two as usize as u64)
+        );
         let mut state = call_state(handlers.as_ref());
 
         assert!(unsafe {
@@ -469,6 +505,7 @@ mod tests {
                 HandlerList::Exception,
                 ptr::addr_of_mut!(state).cast(),
                 ptr::null_mut(),
+                Some(0x1234_5678),
             )
         });
         assert_eq!(&state.order[..state.count], &[2]);
@@ -481,7 +518,7 @@ mod tests {
         let handlers = registry();
         let handle = handlers
             .as_ref()
-            .add(HandlerList::Continue, 0, Some(handler_one));
+            .add(HandlerList::Continue, 0, Some(handler_one), None);
         assert_eq!(handlers.as_ref().remove(HandlerList::Exception, handle), 0);
         assert_eq!(handlers.as_ref().remove(HandlerList::Continue, handle), 1);
         assert_eq!(handlers.as_ref().remove(HandlerList::Continue, handle), 0);
@@ -491,16 +528,19 @@ mod tests {
     fn callback_can_remove_itself() {
         let handlers = registry();
         let mut state = call_state(handlers.as_ref());
-        state.self_handle =
-            handlers
-                .as_ref()
-                .add(HandlerList::Exception, 0, Some(self_removing_handler));
+        state.self_handle = handlers.as_ref().add(
+            HandlerList::Exception,
+            0,
+            Some(self_removing_handler),
+            Some(0xaabb_ccdd),
+        );
 
         assert!(!unsafe {
             handlers.as_ref().call(
                 HandlerList::Exception,
                 ptr::addr_of_mut!(state).cast(),
                 ptr::null_mut(),
+                Some(0xaabb_ccdd),
             )
         });
         assert_eq!(&state.order[..state.count], &[3]);
@@ -515,12 +555,10 @@ mod tests {
     #[test]
     fn null_handler_is_rejected() {
         let handlers = registry();
-        assert!(
-            handlers
-                .as_ref()
-                .add(HandlerList::Exception, 0, None)
-                .is_null()
-        );
+        assert!(handlers
+            .as_ref()
+            .add(HandlerList::Exception, 0, None, Some(1))
+            .is_null());
     }
 
     #[test]

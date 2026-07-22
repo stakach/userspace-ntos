@@ -27,10 +27,10 @@
 
 use core::ffi::c_void;
 
+use nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables;
 use nt_ntdll::rtl::exception::{
     self as ex, Context, ImageReader, RuntimeFunction, ScopeRecord, StackReader,
 };
-use nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables;
 use nt_ntdll::rtl::vectored_handler::{vectored_handlers, HandlerList};
 
 // =================================================================================================
@@ -442,17 +442,14 @@ struct DispatcherContext {
 /// -> EXCEPTION_DISPOSITION`.
 type ExceptionRoutine = unsafe extern "C" fn(*mut c_void, u64, *mut u8, *mut c_void) -> i32;
 
-unsafe fn finish_vectored_dispatch(
-    record: *mut c_void,
-    context: *mut u8,
-    handled: bool,
-) -> bool {
+unsafe fn finish_vectored_dispatch(record: *mut c_void, context: *mut u8, handled: bool) -> bool {
     // SAFETY: record/context remain valid for the duration of the dispatch entry.
     unsafe {
         let _ = vectored_handlers().call(
             HandlerList::Continue,
             record,
             context.cast::<c_void>(),
+            crate::exports::process_cookie(),
         );
     }
     handled
@@ -476,6 +473,7 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
             HandlerList::Exception,
             record,
             context.cast::<c_void>(),
+            crate::exports::process_cookie(),
         )
     } {
         return unsafe { finish_vectored_dispatch(record, context, true) };
@@ -939,10 +937,7 @@ pub unsafe fn c_specific_handler(
 ///
 /// # Safety
 /// `record`/`context` valid (a stacked EXCEPTION_RECORD + CONTEXT).
-pub unsafe extern "C" fn ki_user_exception_dispatcher(
-    record: *mut c_void,
-    context: *mut u8,
-) -> ! {
+pub unsafe extern "C" fn ki_user_exception_dispatcher(record: *mut c_void, context: *mut u8) -> ! {
     // SAFETY: dispatch + resume/raise per the delivered records. Neither branch returns (a caught
     // handler unwinds via RtlUnwindEx; a fixed fault resumes; an unhandled one terminates).
     unsafe {

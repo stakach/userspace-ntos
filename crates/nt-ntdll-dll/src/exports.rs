@@ -15063,7 +15063,7 @@ pub unsafe extern "system" fn rtl_decode_system_pointer(ptr: *mut c_void) -> *mu
     nt_ntdll::rtl::encode::decode_system_pointer(ptr as u64, cookie) as *mut c_void
 }
 
-fn process_cookie() -> Option<u32> {
+pub(crate) fn process_cookie() -> Option<u32> {
     type Query = unsafe extern "system" fn(isize, u32, *mut u32, u32, *mut u32) -> NtStatus;
     let query: Query = unsafe {
         core::mem::transmute(nt_ntdll::trap_stubs::nt_query_information_process as *const ())
@@ -16503,6 +16503,7 @@ pub unsafe extern "system" fn rtl_add_vectored_exception_handler(
         nt_ntdll::rtl::vectored_handler::HandlerList::Exception,
         first,
         handler,
+        process_cookie(),
     )
 }
 
@@ -16536,6 +16537,7 @@ pub unsafe extern "system" fn rtl_add_vectored_continue_handler(
         nt_ntdll::rtl::vectored_handler::HandlerList::Continue,
         first,
         handler,
+        process_cookie(),
     )
 }
 
