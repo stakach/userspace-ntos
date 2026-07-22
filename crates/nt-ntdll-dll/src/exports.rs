@@ -5209,6 +5209,200 @@ pub unsafe extern "system" fn rtl_expand_environment_strings_u(
     }
 }
 
+/// `RtlExpandEnvironmentStrings(PWSTR Environment, PCWSTR Source, SIZE_T SourceLength,
+/// PWSTR Destination, SIZE_T DestinationLength, PSIZE_T ReturnLength) -> NTSTATUS`.
+///
+/// The buffer form counts source/destination lengths in UTF-16 code units while the `_U` form uses
+/// byte-counted `UNICODE_STRING`s. Keep one live expansion implementation and translate the ABI
+/// without changing its buffer-too-small or required-length behavior.
+///
+/// # Safety
+/// `source` is readable for `source_length` UTF-16 units; `destination` is writable for
+/// `destination_length` units when non-null; `return_length` is writable when non-null.
+#[export_name = "RtlExpandEnvironmentStrings"]
+pub unsafe extern "system" fn rtl_expand_environment_strings(
+    environment: *const u16,
+    source: *const u16,
+    source_length: usize,
+    destination: *mut u16,
+    destination_length: usize,
+    return_length: *mut usize,
+) -> NtStatus {
+    if (source.is_null() && source_length != 0)
+        || (destination.is_null() && destination_length != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(source_bytes) = source_length.checked_mul(2) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(destination_bytes) = destination_length.checked_mul(2) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if source_bytes > u16::MAX as usize || destination_bytes > u16::MAX as usize {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    // Build the byte-exact descriptors without naming their private x64 padding field.
+    let mut source_string: UnicodeString = unsafe { core::mem::zeroed() };
+    source_string.length = source_bytes as u16;
+    source_string.maximum_length = source_bytes as u16;
+    source_string.buffer = source as u64;
+    let mut destination_string: UnicodeString = unsafe { core::mem::zeroed() };
+    destination_string.maximum_length = destination_bytes as u16;
+    destination_string.buffer = destination as u64;
+    let mut required_bytes = 0u32;
+    // SAFETY: the descriptors above cover the caller-provided buffers.
+    let status = unsafe {
+        rtl_expand_environment_strings_u(
+            environment,
+            &source_string,
+            &mut destination_string,
+            &mut required_bytes,
+        )
+    };
+    if !return_length.is_null() {
+        // The raw-buffer API reports UTF-16 code units including the trailing NUL.
+        unsafe { core::ptr::write_unaligned(return_length, (required_bytes as usize) / 2) };
+    }
+    status
+}
+
+/// `RtlQueryEnvironmentVariable(PWSTR Environment, PCWSTR Name, SIZE_T NameLength, PWSTR Value,
+/// SIZE_T ValueLength, PSIZE_T ReturnLength) -> NTSTATUS`.
+///
+/// This is the raw-buffer adapter for the live `_U` environment lookup. On success ReturnLength is
+/// the value length excluding NUL; on `STATUS_BUFFER_TOO_SMALL` it includes the required NUL, as in
+/// ReactOS `sdk/lib/rtl/env.c`.
+///
+/// # Safety
+/// `name` is readable for `name_length` UTF-16 units; `value` is writable for `value_length` units;
+/// `return_length` is a required writable pointer.
+#[export_name = "RtlQueryEnvironmentVariable"]
+pub unsafe extern "system" fn rtl_query_environment_variable(
+    environment: *const u16,
+    name: *const u16,
+    name_length: usize,
+    value: *mut u16,
+    value_length: usize,
+    return_length: *mut usize,
+) -> NtStatus {
+    if return_length.is_null()
+        || name_length == 0
+        || name.is_null()
+        || (value.is_null() && value_length != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(name_bytes) = name_length.checked_mul(2) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(value_bytes) = value_length.checked_mul(2) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if name_bytes > u16::MAX as usize || value_bytes > u16::MAX as usize {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    // Build the byte-exact descriptors without naming their private x64 padding field.
+    let mut name_string: UnicodeString = unsafe { core::mem::zeroed() };
+    name_string.length = name_bytes as u16;
+    name_string.maximum_length = name_bytes as u16;
+    name_string.buffer = name as u64;
+    let mut value_string: UnicodeString = unsafe { core::mem::zeroed() };
+    value_string.maximum_length = value_bytes as u16;
+    value_string.buffer = value as u64;
+    // SAFETY: the descriptors above cover the caller-provided buffers.
+    let status = unsafe {
+        rtl_query_environment_variable_u(
+            environment as *mut c_void,
+            &name_string,
+            &mut value_string,
+        )
+    };
+    let mut required_units = (value_string.length as usize) / 2;
+    if status == STATUS_BUFFER_TOO_SMALL {
+        required_units = required_units.saturating_add(1);
+    }
+    unsafe { core::ptr::write_unaligned(return_length, required_units) };
+    status
+}
+
+/// `RtlSetCurrentEnvironment(PWSTR NewEnvironment, PWSTR *OldEnvironment) -> VOID`.
+///
+/// Swap the environment pointer in the current process parameters under the PEB lock. Ownership of
+/// the previous block is returned to the caller when requested, matching the ReactOS contract.
+///
+/// # Safety
+/// `new_environment` is a valid environment block; `old_environment` is writable when non-null.
+#[export_name = "RtlSetCurrentEnvironment"]
+pub unsafe extern "system" fn rtl_set_current_environment(
+    new_environment: *mut u16,
+    old_environment: *mut *mut u16,
+) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        rtl_acquire_peb_lock();
+        let peb = current_peb();
+        let params = if peb == 0 {
+            0
+        } else {
+            core::ptr::read((peb + 0x20) as *const u64)
+        };
+        let previous = if params == 0 {
+            core::ptr::null_mut()
+        } else {
+            let slot = (params + 0x80) as *mut *mut u16;
+            let previous = core::ptr::read(slot);
+            core::ptr::write(slot, new_environment);
+            previous
+        };
+        rtl_release_peb_lock();
+        if !old_environment.is_null() {
+            core::ptr::write(old_environment, previous);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (new_environment, old_environment);
+    }
+}
+
+/// `RtlSetEnvironmentStrings(PWCHAR NewEnvironment, ULONG NewEnvironmentSize) -> NTSTATUS`.
+///
+/// Materialize an owned copy of the supplied byte-sized environment block and install it as the
+/// live process environment. The caller may release or reuse its source buffer after return.
+///
+/// # Safety
+/// `new_environment` is readable for `new_environment_size` bytes and contains a Windows UTF-16
+/// environment block.
+#[export_name = "RtlSetEnvironmentStrings"]
+pub unsafe extern "system" fn rtl_set_environment_strings(
+    new_environment: *const u16,
+    new_environment_size: u32,
+) -> NtStatus {
+    let size = new_environment_size as usize;
+    if new_environment.is_null() || size < 2 || size & 1 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let copy = unsafe { crate::process_heap_alloc(size) } as *mut u16;
+        if copy.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(new_environment as *const u8, copy as *mut u8, size);
+            rtl_set_current_environment(copy, core::ptr::null_mut());
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_NO_MEMORY
+    }
+}
+
 /// `RtlOpenCurrentUser(ACCESS_MASK, PHANDLE) -> NTSTATUS`. Live driver (opens the default user key via
 /// NtOpenKey; `references/reactos/sdk/lib/rtl/registry.c:702`).
 ///
@@ -22137,6 +22331,10 @@ pub unsafe extern "C" fn export_anchor() {
     core::hint::black_box(anchors_ldr);
     let anchors_pathenv: &[usize] = &[
         rtl_destroy_environment as usize,
+        rtl_expand_environment_strings as usize,
+        rtl_query_environment_variable as usize,
+        rtl_set_current_environment as usize,
+        rtl_set_environment_strings as usize,
         rtl_get_current_directory_u as usize,
         rtl_set_current_directory_u as usize,
         rtl_get_full_path_name_u as usize,
