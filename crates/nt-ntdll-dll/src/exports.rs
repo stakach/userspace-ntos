@@ -18739,19 +18739,39 @@ pub unsafe extern "system" fn rtl_run_decode_unicode_string(hash: u8, string: PU
         if ptr.is_null() {
             return;
         }
-        if len > 1 {
-            let mut i = len;
-            while i > 1 {
-                let a = core::ptr::read(ptr.add((i - 1) as usize));
-                let b = core::ptr::read(ptr.add((i - 2) as usize));
-                core::ptr::write(ptr.add((i - 1) as usize), a ^ b ^ hash);
-                i -= 1;
-            }
-        }
-        if len >= 1 {
-            let a = core::ptr::read(ptr);
-            core::ptr::write(ptr, a ^ (hash | 0x43));
-        }
+        let bytes = core::slice::from_raw_parts_mut(ptr, len as usize);
+        rtl::encode::run_decode_unicode_bytes(hash, bytes);
+    }
+}
+
+/// `RtlRunEncodeUnicodeString(PUCHAR Hash, PUNICODE_STRING String)` — in-place XOR encoding over
+/// the raw `Length` bytes (`sdk/lib/rtl/encode.c:42`). A zero hash is seeded from the real system
+/// time syscall and always replaced with a nonzero value.
+///
+/// # Safety
+/// `hash` is writable and `string` describes a writable buffer of `Length` bytes.
+#[export_name = "RtlRunEncodeUnicodeString"]
+pub unsafe extern "system" fn rtl_run_encode_unicode_string(hash: *mut u8, string: PUnicodeString) {
+    let selected = rtl::encode::run_encode_hash_with(unsafe { *hash }, || {
+        let mut time = 0i64;
+        #[cfg(target_arch = "x86_64")]
+        let status = unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(*mut i64) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_query_system_time)(&mut time)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let status = STATUS_NOT_IMPLEMENTED;
+        (status & 0x8000_0000 == 0).then_some(time)
+    });
+    unsafe { *hash = selected };
+
+    let length = unsafe { (*string).length as usize };
+    if length != 0 {
+        let buffer = unsafe { (*string).buffer as *mut u8 };
+        let bytes = unsafe { core::slice::from_raw_parts_mut(buffer, length) };
+        rtl::encode::run_encode_unicode_bytes(selected, bytes);
     }
 }
 
@@ -21959,6 +21979,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_copy_luid as usize,
         rtl_copy_luid_and_attributes_array as usize,
         rtl_equal_luid as usize,
+        rtl_run_decode_unicode_string as usize,
+        rtl_run_encode_unicode_string as usize,
         rtl_init_string as usize,
         rtl_delete_critical_section as usize,
         rtl_initialize_critical_section_and_spin_count as usize,

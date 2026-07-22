@@ -38,6 +38,46 @@ pub fn decode_system_pointer(encoded: u64, system_cookie: u64) -> u64 {
     decode_pointer(encoded, system_cookie)
 }
 
+/// Select the nonzero byte seed used by `RtlRunEncodeUnicodeString`.
+///
+/// A caller-supplied nonzero hash wins. Otherwise ntdll scans bytes 1 through 7 of the current
+/// system time in native little-endian order and falls back to one if the query failed or all
+/// candidate bytes were zero.
+pub fn run_encode_hash_with(hash: u8, query_system_time: impl FnOnce() -> Option<i64>) -> u8 {
+    if hash != 0 {
+        return hash;
+    }
+    query_system_time()
+        .and_then(|time| {
+            time.to_le_bytes()[1..]
+                .iter()
+                .copied()
+                .find(|&byte| byte != 0)
+        })
+        .unwrap_or(1)
+}
+
+/// Encode the raw bytes covered by a `UNICODE_STRING.Length` in place.
+pub fn run_encode_unicode_bytes(hash: u8, bytes: &mut [u8]) {
+    let Some(first) = bytes.first_mut() else {
+        return;
+    };
+    *first ^= hash | 0x43;
+    for index in 1..bytes.len() {
+        bytes[index] ^= bytes[index - 1] ^ hash;
+    }
+}
+
+/// Decode the raw bytes covered by a `UNICODE_STRING.Length` in place.
+pub fn run_decode_unicode_bytes(hash: u8, bytes: &mut [u8]) {
+    for index in (1..bytes.len()).rev() {
+        bytes[index] ^= bytes[index - 1] ^ hash;
+    }
+    if let Some(first) = bytes.first_mut() {
+        *first ^= hash | 0x43;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +113,53 @@ mod tests {
     fn zero_cookie_is_still_bijective() {
         // A zero cookie degenerates to XOR-0 + rotate-0 = identity, still a valid bijection.
         assert_eq!(decode_pointer(encode_pointer(0x99, 0), 0), 0x99);
+    }
+
+    #[test]
+    fn run_encode_matches_known_vectors() {
+        let mut empty = [];
+        run_encode_unicode_bytes(0x12, &mut empty);
+        assert_eq!(empty, []);
+
+        let mut one = [0xaa];
+        run_encode_unicode_bytes(0x20, &mut one);
+        assert_eq!(one, [0xc9]);
+
+        let mut odd = [1, 2, 3];
+        run_encode_unicode_bytes(5, &mut odd);
+        assert_eq!(odd, [0x46, 0x41, 0x47]);
+
+        let mut even = [0x10, 0x20, 0x30, 0x40];
+        run_encode_unicode_bytes(0x12, &mut even);
+        assert_eq!(even, [0x43, 0x71, 0x53, 0x01]);
+    }
+
+    #[test]
+    fn run_encode_decode_round_trip_for_byte_lengths() {
+        for length in 0..=9 {
+            let mut value = [0u8; 9];
+            for (index, byte) in value[..length].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(29).wrapping_add(7);
+            }
+            let original = value;
+            run_encode_unicode_bytes(0xa6, &mut value[..length]);
+            run_decode_unicode_bytes(0xa6, &mut value[..length]);
+            assert_eq!(value, original);
+        }
+    }
+
+    #[test]
+    fn run_encode_hash_uses_time_bytes_and_nonzero_fallback() {
+        assert_eq!(
+            run_encode_hash_with(0x7c, || panic!("unexpected query")),
+            0x7c
+        );
+        assert_eq!(
+            run_encode_hash_with(0, || Some(0x1122_3344_5566_7700)),
+            0x77
+        );
+        assert_eq!(run_encode_hash_with(0, || Some(0xfe)), 1);
+        assert_eq!(run_encode_hash_with(0, || Some(0)), 1);
+        assert_eq!(run_encode_hash_with(0, || None), 1);
     }
 }
