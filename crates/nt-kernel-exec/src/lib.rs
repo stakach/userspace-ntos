@@ -25,6 +25,7 @@ pub mod rtl_atom;
 pub mod rtl_bitmap;
 pub mod session_section;
 mod runtime;
+mod semaphore;
 mod spin;
 mod timer;
 mod work_item;
@@ -39,6 +40,7 @@ pub use lookaside::{
     POOL_TYPE_PAGED,
 };
 pub use runtime::{KernelExecRuntime, ReadyCallback};
+pub use semaphore::{map_semaphore_access, SemaphoreError, SemaphoreStore};
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{Clock, FakeClock, TimerQueue};
 pub use work_item::WorkQueue;
