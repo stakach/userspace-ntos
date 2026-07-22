@@ -17,6 +17,7 @@ pub mod bitmap;
 pub mod compression;
 pub mod convert;
 pub mod dos8dot3;
+pub mod dynamic_function_table;
 pub mod encode;
 pub mod environment;
 pub mod exception;

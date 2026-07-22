@@ -851,23 +851,43 @@ pub unsafe fn seh_containing_image(pc: u64) -> u64 {
     0
 }
 
-/// `RtlLookupFunctionEntry`'s core: given an absolute control PC, find `(image_base,
-/// RVA of the RUNTIME_FUNCTION)` for the covering function by binary-searching the containing
-/// module's `.pdata`. Returns `(image_base, begin, end, unwind_info)` or `None` (leaf / no entry).
+/// Static image lookup state used to preserve the native dynamic-table fallback rule.
+#[cfg(target_arch = "x86_64")]
+pub enum SehStaticLookup {
+    /// No loaded image with an exception directory owns the PC; dynamic tables may be consulted.
+    NoTable { image_base: Option<u64> },
+    /// A loaded image exception table owns the PC range but has no covering row.
+    TableMiss { image_base: u64 },
+    /// The static table contains the covering runtime-function row.
+    Found {
+        base: u64,
+        begin: u32,
+        end: u32,
+        unwind_info: u32,
+    },
+}
+
+/// `RtlLookupFunctionEntry`'s static core: find a containing loaded image and binary-search its
+/// `.pdata`, distinguishing a table miss from absence of any static table.
 ///
 /// # Safety
 /// Reads mapped PE headers + `.pdata` of the containing module.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn seh_lookup_function(pc: u64) -> Option<(u64, u32, u32, u32)> {
+pub unsafe fn seh_lookup_static_function(pc: u64) -> SehStaticLookup {
     // SAFETY: mapped-image reads per the contract.
     unsafe {
         let base = seh_containing_image(pc);
         if base == 0 {
-            return None;
+            return SehStaticLookup::NoTable { image_base: None };
         }
         let (pdata_rva, pdata_sz) = data_directory(base, DIRECTORY_ENTRY_EXCEPTION);
-        if pdata_rva == 0 || pdata_sz < 12 {
-            return None; // no exception directory (a leaf-only module)
+        if pdata_rva == 0 {
+            return SehStaticLookup::NoTable {
+                image_base: Some(base),
+            };
+        }
+        if pdata_sz < 12 {
+            return SehStaticLookup::TableMiss { image_base: base };
         }
         // Fault the .pdata pages in (they may not have been demand-filled yet).
         touch_range(base + pdata_rva as u64, pdata_sz as u64);
@@ -892,7 +912,29 @@ pub unsafe fn seh_lookup_function(pc: u64) -> Option<(u64, u32, u32, u32)> {
                 break;
             }
         }
-        found.map(|(b, e, u)| (base, b, e, u))
+        match found {
+            Some((begin, end, unwind_info)) => SehStaticLookup::Found {
+                base,
+                begin,
+                end,
+                unwind_info,
+            },
+            None => SehStaticLookup::TableMiss { image_base: base },
+        }
+    }
+}
+
+/// Compatibility projection for existing static-only callers.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn seh_lookup_function(pc: u64) -> Option<(u64, u32, u32, u32)> {
+    match unsafe { seh_lookup_static_function(pc) } {
+        SehStaticLookup::Found {
+            base,
+            begin,
+            end,
+            unwind_info,
+        } => Some((base, begin, end, unwind_info)),
+        SehStaticLookup::NoTable { .. } | SehStaticLookup::TableMiss { .. } => None,
     }
 }
 

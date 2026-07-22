@@ -134,6 +134,7 @@ pub const DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 
 /// A `RUNTIME_FUNCTION` (`.pdata` row, 12 bytes on x64): `[BeginAddress, EndAddress,
 /// UnwindInfoAddress]` — all RVAs relative to the image base.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeFunction {
     /// `BeginAddress` (RVA of the function's first instruction).

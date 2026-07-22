@@ -30,6 +30,7 @@ use core::ffi::c_void;
 use nt_ntdll::rtl::exception::{
     self as ex, Context, ImageReader, RuntimeFunction, ScopeRecord, StackReader,
 };
+use nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables;
 
 // =================================================================================================
 // The x64 CONTEXT — byte offsets (CONTEXT_AMD64, total 0x4D0). We read/write the register file
@@ -126,19 +127,67 @@ unsafe fn context_to_raw(c: &Context, ctx_ptr: *mut u8) {
 /// (RVAs == memory offsets for mapped images).
 struct LiveImage;
 
+/// Resolve a runtime-function entry using the native static-first rule. A miss inside a loaded
+/// image's existing exception directory is final; only absence of a static table falls back to the
+/// process dynamic-function-table registry.
+unsafe fn resolve_function_entry(
+    control_pc: u64,
+    image_base_out: *mut u64,
+) -> Option<(u64, RuntimeFunction, *mut c_void)> {
+    match unsafe { crate::on_target::seh_lookup_static_function(control_pc) } {
+        crate::on_target::SehStaticLookup::Found {
+            base,
+            begin,
+            end,
+            unwind_info,
+        } => {
+            if !image_base_out.is_null() {
+                unsafe { *image_base_out = base };
+            }
+            let row = unsafe { pdata_row_ptr(base, begin) };
+            (!row.is_null()).then_some((
+                base,
+                RuntimeFunction {
+                    begin,
+                    end,
+                    unwind_info,
+                },
+                row,
+            ))
+        }
+        crate::on_target::SehStaticLookup::TableMiss { image_base } => {
+            if !image_base_out.is_null() {
+                unsafe { *image_base_out = image_base };
+            }
+            None
+        }
+        crate::on_target::SehStaticLookup::NoTable { image_base } => {
+            let mut local_base = image_base.unwrap_or(0);
+            let base_out = if image_base_out.is_null() {
+                &mut local_base
+            } else {
+                unsafe { &mut *image_base_out }
+            };
+            if let Some(image_base) = image_base {
+                *base_out = image_base;
+            }
+            let row = unsafe { dynamic_function_tables().lookup(control_pc, base_out) };
+            if row.is_null() {
+                None
+            } else {
+                let base = *base_out;
+                Some((base, unsafe { core::ptr::read_unaligned(row) }, row.cast()))
+            }
+        }
+    }
+}
+
 impl ImageReader for LiveImage {
     fn lookup_function(&self, control_pc: u64) -> Option<(u64, RuntimeFunction)> {
-        // SAFETY: on-target; reads mapped PE headers of the loaded modules.
-        let (base, begin, end, unwind) =
-            unsafe { crate::on_target::seh_lookup_function(control_pc) }?;
-        Some((
-            base,
-            RuntimeFunction {
-                begin,
-                end,
-                unwind_info: unwind,
-            },
-        ))
+        // SAFETY: on-target static image lookup plus the process dynamic registry.
+        let mut base = 0u64;
+        let (base, function, _) = unsafe { resolve_function_entry(control_pc, &mut base) }?;
+        Some((base, function))
     }
     fn read_u8(&self, image_base: u64, rva: u32) -> Option<u8> {
         // SAFETY: image_base+rva is inside a mapped module image (the .xdata the unwinder reads
@@ -272,27 +321,15 @@ pub unsafe fn rtl_lookup_function_entry(
     image_base_out: *mut u64,
     _history_table: *mut c_void,
 ) -> *mut c_void {
-    // SAFETY: on-target module scan.
-    let looked = unsafe { crate::on_target::seh_lookup_function(control_pc) };
-    match looked {
-        Some((base, begin, _end, _unwind)) => {
+    match unsafe { resolve_function_entry(control_pc, image_base_out) } {
+        Some((base, _function, row)) => {
             if !image_base_out.is_null() {
                 // SAFETY: writable per the contract.
                 unsafe { *image_base_out = base };
             }
-            // Return a pointer to the actual RUNTIME_FUNCTION row in the image's .pdata. We recompute
-            // its address: the row's begin RVA lets us locate it (the loader returned begin already).
-            // Re-derive the .pdata row pointer.
-            // SAFETY: reads mapped PE headers.
-            unsafe { pdata_row_ptr(base, begin) }
+            row
         }
-        None => {
-            if !image_base_out.is_null() {
-                // SAFETY: writable per the contract.
-                unsafe { *image_base_out = 0 };
-            }
-            core::ptr::null_mut()
-        }
+        None => core::ptr::null_mut(),
     }
 }
 

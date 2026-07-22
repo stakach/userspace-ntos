@@ -16520,18 +16520,23 @@ pub unsafe extern "system" fn rtl_remove_vectored_continue_handler(_handle: *mut
 }
 
 /// `RtlAddFunctionTable(PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount, DWORD64 BaseAddress)
-/// -> BOOLEAN` — register a `.pdata` table for SEH. No dynamic SEH unwind on the boot path; accept
-/// the registration (TRUE) as a no-op (the static image `.pdata` is what the boot uses).
+/// -> BOOLEAN` — register the caller's original, potentially unsorted unwind table.
 ///
 /// # Safety
 /// `function_table` valid for `entry_count` RUNTIME_FUNCTIONs.
 #[export_name = "RtlAddFunctionTable"]
 pub unsafe extern "system" fn rtl_add_function_table(
-    _function_table: *mut c_void,
-    _entry_count: u32,
-    _base_address: u64,
+    function_table: *mut c_void,
+    entry_count: u32,
+    base_address: u64,
 ) -> u8 {
-    1
+    unsafe {
+        nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables().add(
+            function_table.cast(),
+            entry_count,
+            base_address,
+        ) as u8
+    }
 }
 
 /// `RtlDeleteFunctionTable(PRUNTIME_FUNCTION FunctionTable) -> BOOLEAN`.
@@ -16539,25 +16544,49 @@ pub unsafe extern "system" fn rtl_add_function_table(
 /// # Safety
 /// `function_table` from `RtlAddFunctionTable`.
 #[export_name = "RtlDeleteFunctionTable"]
-pub unsafe extern "system" fn rtl_delete_function_table(_function_table: *mut c_void) -> u8 {
-    1
+pub unsafe extern "system" fn rtl_delete_function_table(function_table: *mut c_void) -> u8 {
+    nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables()
+        .delete(function_table.cast()) as u8
 }
 
-/// `RtlInstallFunctionTableCallback(...) -> BOOLEAN` — dynamic function-table callback. No-op TRUE.
+/// `RtlInstallFunctionTableCallback(...) -> BOOLEAN` — register a callback-backed unwind range.
 ///
 /// # Safety
 /// Args per the RtlInstallFunctionTableCallback ABI.
 #[export_name = "RtlInstallFunctionTableCallback"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_install_function_table_callback(
-    _table_identifier: u64,
-    _base_address: u64,
-    _length: u32,
-    _callback: *mut c_void,
-    _context: *mut c_void,
-    _out_of_process_dll: *const u16,
+    table_identifier: u64,
+    base_address: u64,
+    length: u32,
+    callback: *mut c_void,
+    context: *mut c_void,
+    out_of_process_dll: *const u16,
 ) -> u8 {
-    1
+    let callback = if callback.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute(callback) })
+    };
+    unsafe {
+        nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables().install_callback(
+            table_identifier,
+            base_address,
+            length,
+            callback,
+            context,
+            out_of_process_dll,
+        ) as u8
+    }
+}
+
+/// `RtlGetFunctionTableListHead() -> PLIST_ENTRY` — return the process registry's actual circular
+/// list sentinel.
+#[export_name = "RtlGetFunctionTableListHead"]
+pub extern "system" fn rtl_get_function_table_list_head() -> *mut c_void {
+    nt_ntdll::rtl::dynamic_function_table::dynamic_function_tables()
+        .list_head()
+        .cast()
 }
 
 /// `RtlLookupFunctionEntry(DWORD64 ControlPc, PDWORD64 ImageBase, PVOID HistoryTable)
@@ -23138,6 +23167,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_add_function_table as usize,
         rtl_delete_function_table as usize,
         rtl_install_function_table_callback as usize,
+        rtl_get_function_table_list_head as usize,
         rtl_lookup_function_entry as usize,
         rtl_capture_context as usize,
         rtl_raise_status as usize,
