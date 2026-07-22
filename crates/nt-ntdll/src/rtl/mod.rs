@@ -25,6 +25,7 @@ pub mod dynamic_function_table;
 pub mod encode;
 pub mod environment;
 pub mod exception;
+pub mod fls;
 pub mod generic_table;
 pub mod guid;
 pub mod image;
