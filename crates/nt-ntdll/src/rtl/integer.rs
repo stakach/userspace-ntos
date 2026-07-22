@@ -16,6 +16,23 @@ pub fn integer_to_char(value: u32, base: u32) -> Option<Vec<u8>> {
     unsigned_to_char(value as u64, base)
 }
 
+/// Format a 32-bit integer as UTF-16 and left-pad it with zeroes to `width` code units.
+///
+/// This is the pure core of `RtlConvertLCIDToString`. A value wider than `width` is preserved in
+/// full; only the minimum width is enforced.
+pub fn integer_to_unicode_padded(value: u32, base: u32, width: usize) -> Option<Vec<u16>> {
+    let mut digits = integer_to_unicode(value, base)?;
+    if digits.len() < width {
+        let zeros = width - digits.len();
+        let mut padded = Vec::with_capacity(width);
+        padded.resize(zeros, b'0' as u16);
+        padded.append(&mut digits);
+        Some(padded)
+    } else {
+        Some(digits)
+    }
+}
+
 /// `RtlLargeIntegerToChar`: format a 64-bit value in `base` (2/8/10/16) into ASCII bytes.
 pub fn large_integer_to_char(value: u64, base: u32) -> Option<Vec<u8>> {
     unsigned_to_char(value, base)
@@ -201,6 +218,17 @@ mod tests {
         assert!(integer_to_char(1, 7).is_none());
         assert!(integer_to_char(1, 3).is_none());
         assert!(large_integer_to_char(1, 12).is_none());
+    }
+
+    #[test]
+    fn padded_unicode_format() {
+        assert_eq!(integer_to_unicode_padded(0x409, 16, 4).unwrap(), u("0409"));
+        assert_eq!(
+            integer_to_unicode_padded(0x10409, 16, 4).unwrap(),
+            u("10409")
+        );
+        assert_eq!(integer_to_unicode_padded(7, 10, 3).unwrap(), u("007"));
+        assert!(integer_to_unicode_padded(7, 7, 3).is_none());
     }
 
     #[test]

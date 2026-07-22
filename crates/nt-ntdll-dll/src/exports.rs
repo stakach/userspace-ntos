@@ -15770,6 +15770,40 @@ pub unsafe extern "system" fn rtl_culture_name_to_lcid(
     1
 }
 
+/// `RtlConvertLCIDToString(LCID Lcid, ULONG Base, ULONG Padding, PWSTR Result, ULONG Size)
+/// -> NTSTATUS`.
+///
+/// Format the LCID using the same bases as `RtlIntegerToUnicodeString`, pad it with leading zeroes
+/// to the requested width, and NUL-terminate the caller's WCHAR buffer. `Size` is in WCHARs.
+///
+/// # Safety
+/// `result` is writable for `size` UTF-16 code units.
+#[export_name = "RtlConvertLCIDToString"]
+pub unsafe extern "system" fn rtl_convert_lcid_to_string(
+    lcid: u32,
+    base: u32,
+    padding: u32,
+    result: *mut u16,
+    size: u32,
+) -> NtStatus {
+    if result.is_null() {
+        return STATUS_INVALID_PARAMETER_4;
+    }
+    let base = if base == 0 { 10 } else { base };
+    let digits = match rtl::integer::integer_to_unicode_padded(lcid, base, padding as usize) {
+        Some(digits) => digits,
+        None => return STATUS_INVALID_PARAMETER_2,
+    };
+    if digits.len().saturating_add(1) > size as usize {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(digits.as_ptr(), result, digits.len());
+        core::ptr::write(result.add(digits.len()), 0);
+    }
+    STATUS_SUCCESS
+}
+
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
 /// -> NTSTATUS`. Compare against the version reported by `RtlGetVersion`, honoring ReactOS'
 /// `TypeMask`/`ConditionMask` semantics.
@@ -22213,6 +22247,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_locale_name_to_lcid as usize,
         rtl_lcid_to_culture_name as usize,
         rtl_culture_name_to_lcid as usize,
+        rtl_convert_lcid_to_string as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
         rtl_get_current_processor_number_ex as usize,
