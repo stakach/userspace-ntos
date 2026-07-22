@@ -20,7 +20,8 @@ mod rva;
 
 pub use exports::ExportedSymbol;
 pub use headers::{
-    DataDirectory, Headers, Section, DIRECTORY_ENTRY_EXPORT, DIRECTORY_ENTRY_TLS,
+    DataDirectory, Headers, Section, DIRECTORY_ENTRY_EXPORT, DIRECTORY_ENTRY_RESOURCE,
+    DIRECTORY_ENTRY_TLS,
 };
 pub use image::MappedImage;
 pub use imports::{ImportRef, ImportedDll};
@@ -210,9 +211,20 @@ impl<'a> PeFile<'a> {
 
     /// Read `len` raw file bytes at `rva` (via the section table), without materialising a full
     /// mapped image — enough to inspect an export's code (e.g. a syscall stub).
-    pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&[u8]> {
-        let off = rva::rva_to_file_offset(&self.sections, rva).ok()?;
-        self.bytes.get(off..off + len)
+    pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&'a [u8]> {
+        let length = u32::try_from(len).ok()?;
+        let _end_rva = rva.checked_add(length)?;
+        let section = self.sections.iter().find(|section| {
+            let delta = rva.checked_sub(section.virtual_address);
+            delta.is_some_and(|delta| {
+                delta <= section.size_of_raw_data
+                    && length <= section.size_of_raw_data.saturating_sub(delta)
+            })
+        })?;
+        let delta = rva - section.virtual_address;
+        let off = (section.pointer_to_raw_data as usize).checked_add(delta as usize)?;
+        let end = off.checked_add(len)?;
+        self.bytes.get(off..end)
     }
 
     /// Parse the base-relocation table (spec §7.2).

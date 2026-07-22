@@ -24,6 +24,7 @@ pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 pub const STATUS_END_OF_FILE: NtStatus = 0xC000_0011;
 pub const INVALID_COOKIE: usize = usize::MAX;
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ACTIVATION_PE_BYTES: usize = u32::MAX as usize;
 
 pub const ACTCTX_MAGIC: u32 = 0xC07E_3E11;
 pub const ACTCTX_FAKE_HANDLE: usize = 0x00F0_0BAA;
@@ -119,6 +120,40 @@ pub struct ResolvedManifestSource {
     pub nt_path: Vec<u16>,
 }
 
+/// Construct the sidecar path for an external PE source. Only an originally numeric selector
+/// contributes its decimal id; pointer-form selectors, including `#123`, use `.manifest`.
+pub fn associated_manifest_source(
+    source: &ResolvedManifestSource,
+    numeric_resource: Option<u16>,
+) -> Option<ResolvedManifestSource> {
+    fn append_suffix(path: &[u16], numeric_resource: Option<u16>) -> Option<Vec<u16>> {
+        let mut result = Vec::new();
+        result.try_reserve(path.len().checked_add(16)?).ok()?;
+        result.extend_from_slice(path);
+        if let Some(id) = numeric_resource.filter(|id| *id != 1) {
+            result.push(b'.' as u16);
+            let mut divisor = 10_000u16;
+            while divisor > 1 && id / divisor == 0 {
+                divisor /= 10;
+            }
+            loop {
+                result.push(b'0' as u16 + (id / divisor) % 10);
+                if divisor == 1 {
+                    break;
+                }
+                divisor /= 10;
+            }
+        }
+        result.extend(".manifest".encode_utf16());
+        Some(result)
+    }
+
+    Some(ResolvedManifestSource {
+        dos_path: append_suffix(&source.dos_path, numeric_resource)?,
+        nt_path: append_suffix(&source.nt_path, numeric_resource)?,
+    })
+}
+
 /// Resolve a manifest filename the same way CreateActCtx does: only a plain relative source is
 /// first based on `assembly_directory`; the resulting name is then resolved against the CWD.
 pub fn resolve_manifest_source(
@@ -171,11 +206,30 @@ pub fn manifest_read_disposition(
     status: NtStatus,
     information: usize,
 ) -> Result<ManifestReadDisposition, NtStatus> {
+    bounded_read_disposition(
+        total,
+        requested,
+        status,
+        information,
+        MAX_MANIFEST_BYTES,
+        STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+    )
+}
+
+/// Validate one synchronous bounded file read. The caller selects the maximum and overflow status.
+pub fn bounded_read_disposition(
+    total: usize,
+    requested: usize,
+    status: NtStatus,
+    information: usize,
+    maximum: usize,
+    too_large_status: NtStatus,
+) -> Result<ManifestReadDisposition, NtStatus> {
     if status == STATUS_END_OF_FILE {
         return if information == 0 {
             Ok(ManifestReadDisposition::Complete)
         } else {
-            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+            Err(too_large_status)
         };
     }
     if status != crate::STATUS_SUCCESS {
@@ -184,9 +238,9 @@ pub fn manifest_read_disposition(
     if information > requested
         || total
             .checked_add(information)
-            .is_none_or(|length| length > MAX_MANIFEST_BYTES)
+            .is_none_or(|length| length > maximum)
     {
-        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        return Err(too_large_status);
     }
     if information == 0 {
         Ok(ManifestReadDisposition::Complete)
@@ -714,6 +768,25 @@ mod tests {
     }
 
     #[test]
+    fn associated_manifest_suffix_uses_only_original_numeric_selectors() {
+        let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+        let source = ResolvedManifestSource {
+            dos_path: wide("C:\\ReactOS\\app.exe"),
+            nt_path: wide("\\??\\C:\\ReactOS\\app.exe"),
+        };
+        for (numeric, expected) in [
+            (Some(1), "C:\\ReactOS\\app.exe.manifest"),
+            (Some(2), "C:\\ReactOS\\app.exe.2.manifest"),
+            (Some(u16::MAX), "C:\\ReactOS\\app.exe.65535.manifest"),
+            (None, "C:\\ReactOS\\app.exe.manifest"),
+        ] {
+            let sidecar = associated_manifest_source(&source, numeric).unwrap();
+            assert_eq!(String::from_utf16_lossy(&sidecar.dos_path), expected);
+            assert!(String::from_utf16_lossy(&sidecar.nt_path).ends_with(&expected[3..]));
+        }
+    }
+
+    #[test]
     fn manifest_read_results_are_bounded_and_require_consistent_counts() {
         assert_eq!(
             manifest_read_disposition(0, 4096, crate::STATUS_SUCCESS, 1024),
@@ -738,6 +811,10 @@ mod tests {
         assert_eq!(
             manifest_read_disposition(0, 1, STATUS_END_OF_FILE, 1),
             Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+        assert_eq!(
+            bounded_read_disposition(7, 2, crate::STATUS_SUCCESS, 2, 8, 0xdead_beef),
+            Err(0xdead_beef)
         );
     }
 

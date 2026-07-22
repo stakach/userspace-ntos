@@ -12,6 +12,7 @@ pub const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 /// Data-directory indices.
 pub const DIRECTORY_ENTRY_EXPORT: usize = 0;
 pub const DIRECTORY_ENTRY_IMPORT: usize = 1;
+pub const DIRECTORY_ENTRY_RESOURCE: usize = 2;
 pub const DIRECTORY_ENTRY_BASERELOC: usize = 5;
 pub const DIRECTORY_ENTRY_TLS: usize = 9;
 pub const DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;

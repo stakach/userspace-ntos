@@ -123,6 +123,22 @@ fn minimal_pe_parses_and_maps() {
 }
 
 #[test]
+fn raw_rva_reads_stay_within_the_backing_section() {
+    let pe_bytes = build_pe(
+        BASE,
+        0x1000,
+        0x2000,
+        &[text_section(0x1000, vec![0x90, 0xC3])],
+        &[],
+    );
+    let pe = PeFile::parse(&pe_bytes).unwrap();
+    assert_eq!(pe.bytes_at_rva(0x1000, 2), Some(&[0x90, 0xC3][..]));
+    assert_eq!(pe.bytes_at_rva(0x11ff, 1), Some(&[0][..]));
+    assert_eq!(pe.bytes_at_rva(0x11ff, 2), None);
+    assert_eq!(pe.bytes_at_rva(u32::MAX, 2), None);
+}
+
+#[test]
 fn imports_are_listed() {
     // A .rdata section at VA 0x2000 holding an import table for
     // ntoskrnl.exe!IoCreateDevice.
