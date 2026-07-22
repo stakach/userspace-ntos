@@ -33,6 +33,7 @@ pub mod order;
 pub mod peb;
 pub mod resolve;
 pub mod thread;
+pub mod tls;
 
 #[cfg(test)]
 mod tests;
