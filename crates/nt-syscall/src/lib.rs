@@ -345,7 +345,7 @@ impl NativeService {
             NtCreatePort | NtCreateThread
             | NtMakeTemporaryObject | NtOpenProcessToken | NtFreeVirtualMemory | NtSetValueKey
             | NtSetInformationThread | NtSetInformationProcess | NtTestAlert
-            | NtFlushInstructionCache | NtAdjustPrivilegesToken
+            | NtFlushInstructionCache
             | NtDeleteValueKey | NtInitializeRegistry | NtSetSystemInformation
             | NtSetSecurityObject | NtResumeThread | NtSetInformationObject
             // CSR message plane: the handler reads Request/Reply message ptrs via the register
@@ -354,6 +354,7 @@ impl NativeService {
             // Named-pipe / device I/O: the handler writes out-params (FileHandle in R10,
             // IoStatusBlock in R9) via the executive's register/stack helpers; register-only cap.
             | NtCreateNamedPipeFile => (0, 4),
+            NtAdjustPrivilegesToken => (6, 6),
             // NtCreateSemaphore is a real 5-arg ntdll call. The executive currently mints an opaque
             // closable handle, but ntdll must be allowed to pass the InitialCount stack arg.
             NtCreateSemaphore => (5, 5),

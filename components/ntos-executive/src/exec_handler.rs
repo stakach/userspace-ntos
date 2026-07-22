@@ -301,6 +301,13 @@ impl ExecNtHandler {
                 PM_HANDLE_CAP_BOOT.store(cap as u64, Ordering::Relaxed);
                 pm
             },
+            primary_tokens: alloc::vec![
+                nt_security::AccessToken::system(),
+                nt_security::AccessToken::system(),
+                nt_security::AccessToken::system(),
+                nt_security::AccessToken::system(),
+                nt_security::AccessToken::system(),
+            ],
             // The CM write plane. Pre-reserve the key vector up front (below the service_sec_image
             // heap mark) so it never reallocates; the per-key `String`/value `Vec` growth happens at
             // runtime and is retained past the per-syscall bump reset because the loop pins the heap
@@ -868,6 +875,197 @@ impl ExecNtHandler {
         match self.pm.lookup_handle(caller, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::Process(pid)) => Some(pid),
             _ => None,
+        }
+    }
+    fn pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
+        PM_PIDS
+            .iter()
+            .position(|stored| stored.load(Ordering::Relaxed) == pid as u64)
+    }
+
+    fn token_index_for_handle(&self, handle: u64, required_access: u32) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        let caller = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(caller, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let token_pid = match object {
+            nt_process::HandleObject::Token(pid) => pid,
+            _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+        };
+        let granted = self
+            .pm
+            .handle_access(caller, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        self.pi_for_pid(token_pid).ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    fn serialize_sid(sid: &nt_security::Sid, output: &mut [u8]) -> Option<usize> {
+        let count = u8::try_from(sid.sub_authorities.len()).ok()?;
+        let length = 8usize.checked_add(sid.sub_authorities.len().checked_mul(4)?)?;
+        let output = output.get_mut(..length)?;
+        output[0] = sid.revision;
+        output[1] = count;
+        output[2..8].copy_from_slice(&sid.identifier_authority);
+        for (index, authority) in sid.sub_authorities.iter().enumerate() {
+            let offset = 8 + index * 4;
+            output[offset..offset + 4].copy_from_slice(&authority.to_le_bytes());
+        }
+        Some(length)
+    }
+
+    pub(crate) unsafe fn nt_open_process_token(
+        &mut self,
+        process_handle: u64,
+        desired_access: u32,
+        out: u64,
+    ) -> u32 {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        if !self.probe_user_output(out, 8) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        let target_pid = match self.resolve_process_handle(process_handle) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        if self.pi_for_pid(target_pid).is_none() {
+            return STATUS_INVALID_HANDLE;
+        }
+        let caller_pid = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let handle = match self.pm.insert_handle(
+            caller_pid,
+            nt_process::HandleObject::Token(target_pid),
+            desired_access,
+        ) {
+            Ok(handle) => handle,
+            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+        };
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        let count = self.pm.handle_count(caller_pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        if !self.xas_write_u64(out, handle as u64) {
+            let _ = self.pm.close_handle(caller_pid, handle);
+            return STATUS_ACCESS_VIOLATION;
+        }
+        0
+    }
+
+    unsafe fn nt_adjust_privileges_token(&mut self, args: &[u64]) -> u32 {
+        const STATUS_SUCCESS: u32 = 0;
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+        const STATUS_NOT_ALL_ASSIGNED: u32 = 0x0000_0106;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+
+        let disable_all = args[1] != 0;
+        let new_state = args[2];
+        let buffer_length = args[3] as usize;
+        let previous_state = args[4];
+        let return_length = args[5];
+        if !disable_all && new_state == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut requested = alloc::vec::Vec::new();
+        if !disable_all {
+            let mut count_bytes = [0u8; 4];
+            if !self.xas_read(new_state, &mut count_bytes) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let count = u32::from_le_bytes(count_bytes) as usize;
+            let captured_size = match count.checked_mul(12).and_then(|n| n.checked_add(4)) {
+                Some(size) => size,
+                None => return STATUS_INVALID_PARAMETER,
+            };
+            if new_state.checked_add(captured_size as u64).is_none()
+                || requested.try_reserve_exact(count).is_err()
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            for index in 0..count {
+                let mut entry = [0u8; 12];
+                if !self.xas_read(new_state + 4 + index as u64 * 12, &mut entry) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                requested.push(nt_security::PrivilegeAdjustment {
+                    luid: nt_security::Luid {
+                        low: u32::from_le_bytes(entry[0..4].try_into().unwrap()),
+                        high: i32::from_le_bytes(entry[4..8].try_into().unwrap()),
+                    },
+                    attributes: u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+                });
+            }
+        }
+
+        if previous_state != 0
+            && (return_length == 0
+                || !self.probe_user_output(previous_state, buffer_length)
+                || !self.probe_user_output(return_length, 4))
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let required_access = TOKEN_ADJUST_PRIVILEGES
+            | if previous_state != 0 { TOKEN_QUERY } else { 0 };
+        let token_index = match self.token_index_for_handle(args[0], required_access) {
+            Ok(index) => index,
+            Err(status) => return status,
+        };
+        let plan = self.primary_tokens[token_index]
+            .plan_privilege_adjustment(disable_all, &requested);
+        let required_length = 4 + plan.changed * 12;
+        if previous_state != 0 {
+            if !self.xas_write_u32(return_length, required_length as u32) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if buffer_length < required_length {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+        }
+
+        // The exact ReactOS SYSTEM token has 24 privileges, so this is sufficient even for
+        // DisableAllPrivileges and remains allocation-free across the executive heap reset.
+        let mut previous = [nt_security::PrivilegeAdjustment::default(); 24];
+        let result = self.primary_tokens[token_index].adjust_privileges(
+            disable_all,
+            &requested,
+            &mut previous[..plan.changed],
+        );
+        if previous_state != 0 {
+            let mut output = [0u8; 4 + 24 * 12];
+            output[..4].copy_from_slice(&(result.changed as u32).to_le_bytes());
+            for (index, privilege) in previous[..result.changed].iter().enumerate() {
+                let offset = 4 + index * 12;
+                output[offset..offset + 4].copy_from_slice(&privilege.luid.low.to_le_bytes());
+                output[offset + 4..offset + 8]
+                    .copy_from_slice(&privilege.luid.high.to_le_bytes());
+                output[offset + 8..offset + 12]
+                    .copy_from_slice(&privilege.attributes.to_le_bytes());
+            }
+            if !self.xas_try_write_buf(previous_state, &output[..required_length]) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        if !disable_all && result.matched < requested.len() {
+            STATUS_NOT_ALL_ASSIGNED
+        } else {
+            STATUS_SUCCESS
         }
     }
     /// Queue an 8-byte out-param write for the loop to perform after dispatch (group B2). Silently
@@ -4620,12 +4818,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
                 0
             },
-            // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
+            // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle): resolve the target
+            // EPROCESS, open its primary token into the caller's typed handle table, and preserve
+            // the requested token access mask for later checks.
             NativeService::NtOpenProcessToken => unsafe {
-                let out = get_recv_mr(7); // R8
-                let h = self.mint_handle();
-                smss_stack_write(out, h);
-                0
+                self.nt_open_process_token(args[0], args[1] as u32, args[2])
             },
             NativeService::NtResumeThread => unsafe {
                 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
@@ -4774,7 +4971,6 @@ impl NativeSyscallHandler for ExecNtHandler {
             | NativeService::NtSetInformationProcess
             | NativeService::NtTestAlert
             | NativeService::NtCreateKeyedEvent
-            | NativeService::NtAdjustPrivilegesToken
             | NativeService::NtDeleteValueKey
             | NativeService::NtInitializeRegistry
             | NativeService::NtSetSystemInformation
@@ -4785,6 +4981,9 @@ impl NativeSyscallHandler for ExecNtHandler {
             // no-op SUCCESS (the LCID is validated; nothing consumes a stored system locale here).
             | NativeService::NtSetDefaultLocale
             | NativeService::NtSetInformationObject => 0,
+            NativeService::NtAdjustPrivilegesToken => unsafe {
+                self.nt_adjust_privileges_token(args)
+            },
             NativeService::NtResumeProcess | NativeService::NtSuspendProcess => {
                 let handle = args.first().copied().unwrap_or(0);
                 if self.resolve_process_handle(handle).is_some() {
@@ -4883,39 +5082,69 @@ impl NativeSyscallHandler for ExecNtHandler {
             // NtQueryInformationToken(TokenHandle, Class[RDX]=args[1], buf[R8]=args[2],
             // len[R9]=args[3], *RetLen[arg5]=args[4]). csrss runs as Local System (S-1-5-18).
             NativeService::NtQueryInformationToken => unsafe {
+                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+                const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+                const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+                const TOKEN_QUERY: u32 = 0x0008;
                 let class = args[1];
                 let buf = args[2];
-                let len = args[3];
+                let len = args[3] as usize;
                 let retlen_ptr = args[4];
-                match class {
-                    1 | 5 => {
-                        // TokenUser(1)/TokenPrimaryGroup(5): SID_AND_ATTRIBUTES + the S-1-5-18 SID.
-                        let needed: u32 = 0x1C;
-                        if len < needed as u64 {
-                            if let Some(m) = smss_mirror(retlen_ptr, 4) {
-                                core::ptr::write_volatile(m as *mut u32, needed);
-                            }
-                            0xC000_0023 // STATUS_BUFFER_TOO_SMALL
-                        } else if let Some(m) = smss_mirror(buf, needed as u64) {
-                            core::ptr::write_volatile((m + 0x00) as *mut u64, buf + 0x10); // Sid → +0x10
-                            core::ptr::write_volatile((m + 0x08) as *mut u32, 0); // Attributes
-                            core::ptr::write_volatile((m + 0x10) as *mut u64, 0x0500_0000_0000_0101); // Rev,Cnt,IdAuth
-                            core::ptr::write_volatile((m + 0x18) as *mut u32, 18); // SubAuthority[0]
-                            if let Some(rl) = smss_mirror(retlen_ptr, 4) {
-                                core::ptr::write_volatile(rl as *mut u32, needed);
-                            }
-                            0
-                        } else {
-                            0xC000_0023
+                if retlen_ptr == 0 || !self.probe_user_output(retlen_ptr, 4) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                let token_index = match self.token_index_for_handle(args[0], TOKEN_QUERY) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let token = &self.primary_tokens[token_index];
+                let mut output = [0u8; 4 + 24 * 12];
+                let needed = match class {
+                    1 => {
+                        // TOKEN_USER: aligned SID_AND_ATTRIBUTES followed by the user SID.
+                        let sid_length = Self::serialize_sid(&token.user, &mut output[16..])
+                            .unwrap_or(0);
+                        output[..8].copy_from_slice(&buf.wrapping_add(16).to_le_bytes());
+                        16 + sid_length
+                    }
+                    3 => {
+                        // TOKEN_PRIVILEGES: current attributes from the same mutable token adjusted
+                        // by NtAdjustPrivilegesToken.
+                        output[..4].copy_from_slice(&(token.privileges.len() as u32).to_le_bytes());
+                        for (index, privilege) in token.privileges.iter().enumerate() {
+                            let offset = 4 + index * 12;
+                            output[offset..offset + 4]
+                                .copy_from_slice(&privilege.luid.low.to_le_bytes());
+                            output[offset + 4..offset + 8]
+                                .copy_from_slice(&privilege.luid.high.to_le_bytes());
+                            output[offset + 8..offset + 12].copy_from_slice(
+                                &nt_security::AccessToken::privilege_attributes(privilege)
+                                    .to_le_bytes(),
+                            );
                         }
+                        4 + token.privileges.len() * 12
                     }
-                    _ => {
-                        print_str(b"[ntos-exec] NtQueryInformationToken class=");
-                        print_u64(class);
-                        print_str(b" (unhandled)\n");
-                        self.stop = true;
-                        0xC0000002
+                    5 => {
+                        // TOKEN_PRIMARY_GROUP: pointer followed immediately by the SID.
+                        let sid_length =
+                            Self::serialize_sid(&token.primary_group, &mut output[8..]).unwrap_or(0);
+                        output[..8].copy_from_slice(&buf.wrapping_add(8).to_le_bytes());
+                        8 + sid_length
                     }
+                    _ => return STATUS_INVALID_INFO_CLASS,
+                };
+                if !self.xas_write_u32(retlen_ptr, needed as u32) {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if len < needed {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if !self.probe_user_output(buf, needed)
+                    || !self.xas_try_write_buf(buf, &output[..needed])
+                {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    0
                 }
             },
             // NtQueryObject(Handle[R10]=args[0], class[RDX]=args[1], buf[R8]=args[2], len[R9]=args[3],

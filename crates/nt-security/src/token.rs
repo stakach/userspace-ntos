@@ -46,6 +46,25 @@ pub struct TokenPrivilege {
     pub name: &'static str,
     pub luid: Luid,
     pub enabled: bool,
+    pub enabled_by_default: bool,
+}
+
+pub const SE_PRIVILEGE_ENABLED_BY_DEFAULT: u32 = 0x0000_0001;
+pub const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+pub const SE_PRIVILEGE_REMOVED: u32 = 0x0000_0004;
+
+/// One `LUID_AND_ATTRIBUTES` entry used by the native token APIs.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrivilegeAdjustment {
+    pub luid: Luid,
+    pub attributes: u32,
+}
+
+/// Result of planning or applying an `NtAdjustPrivilegesToken` request.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrivilegeAdjustmentSummary {
+    pub matched: usize,
+    pub changed: usize,
 }
 
 // Required privilege names (spec §7.4).
@@ -59,6 +78,20 @@ pub const SE_TAKE_OWNERSHIP: &str = "SeTakeOwnershipPrivilege";
 pub const SE_TCB: &str = "SeTcbPrivilege";
 pub const SE_IMPERSONATE: &str = "SeImpersonatePrivilege";
 pub const SE_SHUTDOWN: &str = "SeShutdownPrivilege";
+pub const SE_CREATE_TOKEN: &str = "SeCreateTokenPrivilege";
+pub const SE_ASSIGN_PRIMARY_TOKEN: &str = "SeAssignPrimaryTokenPrivilege";
+pub const SE_LOCK_MEMORY: &str = "SeLockMemoryPrivilege";
+pub const SE_INCREASE_QUOTA: &str = "SeIncreaseQuotaPrivilege";
+pub const SE_SYSTEM_TIME: &str = "SeSystemtimePrivilege";
+pub const SE_PROFILE_SINGLE_PROCESS: &str = "SeProfileSingleProcessPrivilege";
+pub const SE_INCREASE_BASE_PRIORITY: &str = "SeIncreaseBasePriorityPrivilege";
+pub const SE_CREATE_PAGEFILE: &str = "SeCreatePagefilePrivilege";
+pub const SE_CREATE_PERMANENT: &str = "SeCreatePermanentPrivilege";
+pub const SE_AUDIT: &str = "SeAuditPrivilege";
+pub const SE_SYSTEM_ENVIRONMENT: &str = "SeSystemEnvironmentPrivilege";
+pub const SE_UNDOCK: &str = "SeUndockPrivilege";
+pub const SE_MANAGE_VOLUME: &str = "SeManageVolumePrivilege";
+pub const SE_CREATE_GLOBAL: &str = "SeCreateGlobalPrivilege";
 
 /// An access token — the subject's security identity (spec §7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,15 +132,108 @@ impl AccessToken {
         sids
     }
 
-    fn priv_enabled(name: &'static str, low: u32) -> TokenPrivilege {
+    fn privilege(name: &'static str, low: u32, enabled: bool) -> TokenPrivilege {
         TokenPrivilege {
             name,
             luid: Luid::new(low),
-            enabled: true,
+            enabled,
+            enabled_by_default: enabled,
         }
     }
 
-    /// The `LocalSystem` token (spec §17.1): all privileges, Administrators + Everyone groups.
+    fn priv_enabled(name: &'static str, low: u32) -> TokenPrivilege {
+        Self::privilege(name, low, true)
+    }
+
+    /// Return the native attribute bits for a privilege currently in the token.
+    pub fn privilege_attributes(privilege: &TokenPrivilege) -> u32 {
+        (if privilege.enabled_by_default {
+            SE_PRIVILEGE_ENABLED_BY_DEFAULT
+        } else {
+            0
+        }) | if privilege.enabled {
+            SE_PRIVILEGE_ENABLED
+        } else {
+            0
+        }
+    }
+
+    /// Count matches and state changes without mutating the token.
+    pub fn plan_privilege_adjustment(
+        &self,
+        disable_all: bool,
+        requested: &[PrivilegeAdjustment],
+    ) -> PrivilegeAdjustmentSummary {
+        let mut summary = PrivilegeAdjustmentSummary::default();
+        for privilege in &self.privileges {
+            let requested_attributes = if disable_all {
+                Some(0)
+            } else {
+                requested
+                    .iter()
+                    .find(|entry| entry.luid == privilege.luid)
+                    .map(|entry| entry.attributes)
+            };
+            let Some(attributes) = requested_attributes else {
+                continue;
+            };
+            summary.matched += 1;
+            let remove = attributes & SE_PRIVILEGE_REMOVED != 0;
+            let enable = attributes & SE_PRIVILEGE_ENABLED != 0;
+            if remove || privilege.enabled != enable {
+                summary.changed += 1;
+            }
+        }
+        summary
+    }
+
+    /// Apply a previously sized privilege adjustment and return the old states that changed.
+    /// `previous` must have room for the `changed` count returned by
+    /// [`Self::plan_privilege_adjustment`].
+    pub fn adjust_privileges(
+        &mut self,
+        disable_all: bool,
+        requested: &[PrivilegeAdjustment],
+        previous: &mut [PrivilegeAdjustment],
+    ) -> PrivilegeAdjustmentSummary {
+        let mut summary = PrivilegeAdjustmentSummary::default();
+        let mut index = 0;
+        while index < self.privileges.len() {
+            let requested_attributes = if disable_all {
+                Some(0)
+            } else {
+                requested
+                    .iter()
+                    .find(|entry| entry.luid == self.privileges[index].luid)
+                    .map(|entry| entry.attributes)
+            };
+            let Some(attributes) = requested_attributes else {
+                index += 1;
+                continue;
+            };
+            summary.matched += 1;
+            let remove = attributes & SE_PRIVILEGE_REMOVED != 0;
+            let enable = attributes & SE_PRIVILEGE_ENABLED != 0;
+            if remove || self.privileges[index].enabled != enable {
+                if let Some(slot) = previous.get_mut(summary.changed) {
+                    *slot = PrivilegeAdjustment {
+                        luid: self.privileges[index].luid,
+                        attributes: Self::privilege_attributes(&self.privileges[index]),
+                    };
+                }
+                summary.changed += 1;
+                if remove {
+                    self.privileges.remove(index);
+                    continue;
+                }
+                self.privileges[index].enabled = enable;
+            }
+            index += 1;
+        }
+        summary
+    }
+
+    /// The ReactOS `LocalSystem` primary token, including its exact initial privilege states.
     pub fn system() -> Self {
         AccessToken {
             token_type: TokenType::Primary,
@@ -119,15 +245,29 @@ impl AccessToken {
             ],
             privileges: vec![
                 Self::priv_enabled(SE_TCB, 7),
-                Self::priv_enabled(SE_SECURITY, 8),
-                Self::priv_enabled(SE_TAKE_OWNERSHIP, 9),
-                Self::priv_enabled(SE_LOAD_DRIVER, 10),
-                Self::priv_enabled(SE_BACKUP, 17),
-                Self::priv_enabled(SE_RESTORE, 18),
-                Self::priv_enabled(SE_SHUTDOWN, 19),
+                Self::privilege(SE_CREATE_TOKEN, 2, false),
+                Self::privilege(SE_TAKE_OWNERSHIP, 9, false),
+                Self::priv_enabled(SE_CREATE_PAGEFILE, 15),
+                Self::priv_enabled(SE_LOCK_MEMORY, 4),
+                Self::privilege(SE_ASSIGN_PRIMARY_TOKEN, 3, false),
+                Self::privilege(SE_INCREASE_QUOTA, 5, false),
+                Self::priv_enabled(SE_INCREASE_BASE_PRIORITY, 14),
+                Self::priv_enabled(SE_CREATE_PERMANENT, 16),
                 Self::priv_enabled(SE_DEBUG, 20),
+                Self::priv_enabled(SE_AUDIT, 21),
+                Self::privilege(SE_SECURITY, 8, false),
+                Self::privilege(SE_SYSTEM_ENVIRONMENT, 22, false),
                 Self::priv_enabled(SE_CHANGE_NOTIFY, 23),
+                Self::privilege(SE_BACKUP, 17, false),
+                Self::privilege(SE_RESTORE, 18, false),
+                Self::privilege(SE_SHUTDOWN, 19, false),
+                Self::privilege(SE_LOAD_DRIVER, 10, false),
+                Self::priv_enabled(SE_PROFILE_SINGLE_PROCESS, 13),
+                Self::privilege(SE_SYSTEM_TIME, 12, false),
+                Self::privilege(SE_UNDOCK, 25, false),
+                Self::privilege(SE_MANAGE_VOLUME, 28, false),
                 Self::priv_enabled(SE_IMPERSONATE, 29),
+                Self::priv_enabled(SE_CREATE_GLOBAL, 30),
             ],
             owner: Sid::administrators(),
             primary_group: Sid::local_system(),

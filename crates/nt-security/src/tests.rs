@@ -29,7 +29,8 @@ fn sid_wellknown_and_sddl() {
 fn default_tokens() {
     let sys = AccessToken::system();
     assert_eq!(sys.user, Sid::local_system());
-    assert!(sys.has_privilege(SE_LOAD_DRIVER) && sys.has_privilege(SE_DEBUG));
+    assert!(!sys.has_privilege(SE_LOAD_DRIVER));
+    assert!(sys.has_privilege(SE_DEBUG));
     let user = AccessToken::user(MACHINE);
     assert!(!user.has_privilege(SE_LOAD_DRIVER)); // standard user can't load drivers
     assert!(user.has_privilege(SE_CHANGE_NOTIFY));
@@ -41,6 +42,73 @@ fn default_tokens() {
         privilege_check(&user, SE_LOAD_DRIVER),
         Err(STATUS_PRIVILEGE_NOT_HELD)
     );
+}
+
+#[test]
+fn system_token_has_reactos_privilege_defaults() {
+    let token = AccessToken::system();
+    assert_eq!(token.privileges.len(), 24);
+    let enabled: alloc::vec::Vec<u32> = token
+        .privileges
+        .iter()
+        .filter(|privilege| privilege.enabled)
+        .map(|privilege| privilege.luid.low)
+        .collect();
+    assert_eq!(enabled, vec![7, 15, 4, 14, 16, 20, 21, 23, 13, 29, 30]);
+}
+
+#[test]
+fn privilege_adjustment_plans_applies_and_reports_previous_state() {
+    let mut token = AccessToken::system();
+    let requested = [
+        PrivilegeAdjustment {
+            luid: Luid::new(10),
+            attributes: SE_PRIVILEGE_ENABLED,
+        },
+        PrivilegeAdjustment {
+            luid: Luid::new(19),
+            attributes: SE_PRIVILEGE_ENABLED,
+        },
+        PrivilegeAdjustment {
+            luid: Luid::new(99),
+            attributes: SE_PRIVILEGE_ENABLED,
+        },
+    ];
+    let plan = token.plan_privilege_adjustment(false, &requested);
+    assert_eq!(plan.matched, 2);
+    assert_eq!(plan.changed, 2);
+
+    let mut previous = [PrivilegeAdjustment::default(); 2];
+    assert_eq!(token.adjust_privileges(false, &requested, &mut previous), plan);
+    assert_eq!(previous[0].luid, Luid::new(19));
+    assert_eq!(previous[1].luid, Luid::new(10));
+    assert_eq!(previous[0].attributes, 0);
+    assert_eq!(previous[1].attributes, 0);
+    assert!(token.has_privilege(SE_LOAD_DRIVER));
+    assert!(token.has_privilege(SE_SHUTDOWN));
+
+    let unchanged = token.plan_privilege_adjustment(false, &requested[..2]);
+    assert_eq!(unchanged.changed, 0);
+}
+
+#[test]
+fn disable_all_and_remove_privilege_follow_native_semantics() {
+    let mut token = AccessToken::system();
+    let plan = token.plan_privilege_adjustment(true, &[]);
+    assert_eq!(plan.matched, 24);
+    assert_eq!(plan.changed, 11);
+    let mut previous = [PrivilegeAdjustment::default(); 24];
+    let applied = token.adjust_privileges(true, &[], &mut previous);
+    assert_eq!(applied, plan);
+    assert!(token.privileges.iter().all(|privilege| !privilege.enabled));
+
+    let remove = [PrivilegeAdjustment {
+        luid: Luid::new(10),
+        attributes: SE_PRIVILEGE_REMOVED,
+    }];
+    assert_eq!(token.plan_privilege_adjustment(false, &remove).changed, 1);
+    token.adjust_privileges(false, &remove, &mut previous[..1]);
+    assert!(!token.privileges.iter().any(|privilege| privilege.luid.low == 10));
 }
 
 #[test]
@@ -189,10 +257,17 @@ fn privilege_overrides_and_kernel_bypass() {
         .status,
         STATUS_ACCESS_DENIED
     );
-    // System has it.
+    // System holds it disabled by default; enabling it makes the privilege override available.
+    let mut system = AccessToken::system();
+    let request = [PrivilegeAdjustment {
+        luid: Luid::new(8),
+        attributes: SE_PRIVILEGE_ENABLED,
+    }];
+    let mut previous = [PrivilegeAdjustment::default(); 1];
+    system.adjust_privileges(false, &request, &mut previous);
     let r = access_check(
         &sd,
-        &AccessToken::system(),
+        &system,
         ACCESS_SYSTEM_SECURITY,
         &map,
         ProcessorMode::UserMode,

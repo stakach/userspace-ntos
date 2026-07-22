@@ -141,12 +141,10 @@ pub const LUID_REMOTE_SHUTDOWN: u32 = 24;
 pub const PRIVILEGE_SET_ALL_NECESSARY: u32 = 1;
 
 /// The privilege LUID low-parts the **Local System** subject holds. Windows' LocalSystem token
-/// carries essentially every well-known privilege; this models the full well-known range so a
-/// `SePrivilegeCheck` for any standard privilege (e.g. `SeShutdownPrivilege`) legitimately passes for
-/// the SYSTEM init caller. (A real algorithm over the SYSTEM privilege set — not a bypass.)
+/// carries the 24 privileges installed by `SepCreateSystemProcessToken`. This list models
+/// assignment only; callers that need effective-token semantics must also check the enabled bit.
 pub const SYSTEM_PRIVILEGE_LUIDS: &[u32] = &[
-    2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 29,
-    30, 31, 33, 34, 35,
+    7, 2, 9, 15, 4, 3, 5, 14, 16, 20, 21, 8, 22, 23, 17, 18, 19, 10, 13, 12, 25, 28, 29, 30,
 ];
 
 /// A standard interactive user's held privileges — only `SeChangeNotifyPrivilege`. The unprivileged
@@ -443,8 +441,8 @@ mod tests {
             &[LUID_SHUTDOWN],
             true
         ));
-        // ALL_NECESSARY over multiple: SYSTEM holds both shutdown + remote-shutdown.
-        assert!(se_privilege_check(
+        // ReactOS does not install SeRemoteShutdownPrivilege in its SYSTEM token.
+        assert!(!se_privilege_check(
             SYSTEM_PRIVILEGE_LUIDS,
             &[LUID_SHUTDOWN, LUID_REMOTE_SHUTDOWN],
             true
@@ -466,14 +464,15 @@ mod tests {
 
     #[test]
     fn system_privilege_set_agrees_with_system_token() {
-        // The heap-free SYSTEM privilege set and the alloc-based SYSTEM AccessToken must agree that
-        // SYSTEM holds shutdown / load-driver / security / change-notify (no divergent SYSTEM models).
+        // The heap-free assigned set and alloc-based token agree on presence. Several privileges
+        // are deliberately disabled in the initial token, so `has_privilege` is false for them.
         let sys = crate::AccessToken::system();
-        assert!(sys.has_privilege(crate::SE_SHUTDOWN));
-        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_SHUTDOWN));
-        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_LOAD_DRIVER));
-        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_SECURITY));
-        assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&LUID_CHANGE_NOTIFY));
+        for luid in [LUID_SHUTDOWN, LUID_LOAD_DRIVER, LUID_SECURITY, LUID_CHANGE_NOTIFY] {
+            assert!(sys.privileges.iter().any(|privilege| privilege.luid.low == luid));
+            assert!(SYSTEM_PRIVILEGE_LUIDS.contains(&luid));
+        }
+        assert!(!sys.has_privilege(crate::SE_SHUTDOWN));
+        assert!(sys.has_privilege(crate::SE_CHANGE_NOTIFY));
     }
 
     #[test]

@@ -107,6 +107,24 @@ fn handle_table_operations() {
 }
 
 #[test]
+fn token_handles_preserve_owner_and_access() {
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let owner = pm.create_process("owner.exe", None, None);
+    let handle = pm
+        .insert_handle(caller, HandleObject::Token(owner), 0x28)
+        .unwrap();
+    assert_eq!(
+        pm.lookup_handle(caller, handle),
+        Some(HandleObject::Token(owner))
+    );
+    assert_eq!(pm.handle_access(caller, handle), Some(0x28));
+    assert_eq!(pm.lookup_handle(owner, handle), None);
+    pm.close_handle(caller, handle).unwrap();
+    assert_eq!(pm.lookup_handle(caller, handle), None);
+}
+
+#[test]
 fn reserved_handle_table_never_reallocates() {
     // The pre-reservable slot table (the executive's non-leaking heap-reset solution): reserve
     // capacity up front, then a burst of inserts writes into pre-allocated storage with NO

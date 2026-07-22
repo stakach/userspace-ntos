@@ -73,7 +73,7 @@ impl Sid {
 }
 
 /// A LUID (locally-unique identifier, spec §7.4).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Luid {
     pub low: u32,
     pub high: i32,

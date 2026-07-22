@@ -3264,16 +3264,11 @@ pub(crate) unsafe fn service_sec_image(
             } else if m0 == 130 {
                 // NtOpenProcessTokenEx(ProcessHandle=R10, DesiredAccess=RDX, HandleAttributes=R8,
                 // *TokenHandle=R9). RtlOpenCurrentUser falls here after NtOpenThreadTokenEx=NO_TOKEN to
-                // fetch the process (primary) token so it can read the user SID (NtQueryInformationToken
-                // TokenUser -> S-1-5-18) and open \Registry\User\<SID>. Mint a fake token handle to
-                // *TokenHandle (mirrors the NtOpenProcessToken=129 handler; 130 is the Ex variant).
+                // fetch the process primary token. Ex differs only by handle attributes here; route
+                // it through the same typed-token/open-access path as NtOpenProcessToken.
                 let out = get_recv_mr(8); // R9 = *TokenHandle
-                let h = nt_handler.next_handle;
-                nt_handler.next_handle += 1;
-                if out != 0 {
-                    smss_stack_write(out, h);
-                }
-                result = 0; // STATUS_SUCCESS
+                result =
+                    nt_handler.nt_open_process_token(get_recv_mr(9), m3 as u32, out) as u64;
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
                 && (badge == CSRSS_BADGE
                     || badge == WINLOGON_BADGE

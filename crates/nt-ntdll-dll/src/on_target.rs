@@ -2982,14 +2982,12 @@ pub unsafe fn ldr_get_procedure_address(
 // ---------------------------------------------------------------------------------------------
 // Step 4.C — RtlAdjustPrivilege over the live token plane.
 //
-// The real ntdll `RtlAdjustPrivilege` opens the process (or thread) token, builds a one-entry
-// TOKEN_PRIVILEGES, and calls `NtAdjustPrivilegesToken`. Our executive services `NtOpenProcessToken`
-// + `NtAdjustPrivilegesToken` + `NtClose` (as success no-ops for the smss bring-up), so routing the
-// real syscalls here is the honest live-plane implementation (not a fabricated success) — it issues
-// the actual token syscalls the real ntdll would, through our own trap stubs.
+// The real ntdll `RtlAdjustPrivilege` opens the selected process/thread token, adjusts one
+// privilege, and returns its prior enabled state. The executive owns the persistent token state.
 // ---------------------------------------------------------------------------------------------
 
 const SSN_NT_OPEN_PROCESS_TOKEN: u32 = 129;
+const SSN_NT_OPEN_THREAD_TOKEN: u32 = 135;
 const SSN_NT_ADJUST_PRIVILEGES_TOKEN: u32 = 12;
 const SSN_NT_CLOSE: u32 = 27;
 
@@ -3688,8 +3686,7 @@ unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
 
 /// `RtlAdjustPrivilege(Privilege, Enable, CurrentThread, WasEnabled)` — the live-token implementation.
 ///
-/// Opens the process token (the `CurrentThread` thread-token variant is not needed by smss and
-/// degrades to the process token), builds a one-entry `TOKEN_PRIVILEGES { count=1, luid={priv,0},
+/// Opens the selected token, builds a one-entry `TOKEN_PRIVILEGES { count=1, luid={priv,0},
 /// attrs=Enable?ENABLED:0 }`, calls `NtAdjustPrivilegesToken`, closes the token, and reports the prior
 /// enabled state in `*was_enabled`. Returns the `NtAdjustPrivilegesToken` status.
 ///
@@ -3699,22 +3696,36 @@ unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
 pub unsafe fn rtl_adjust_privilege(
     privilege: u32,
     enable: u8,
-    _current_thread: u8,
+    current_thread: u8,
     was_enabled: *mut u8,
 ) -> u64 {
-    // NtOpenProcessToken(NtCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &TokenHandle).
     let mut token: u64 = 0;
-    // SAFETY: on-target token syscall; &token is a valid stack out-param (the executive writes it
-    // through its stack mirror, matching NtOpenProcessToken's *TokenHandle out).
-    let st_open = unsafe {
-        syscall4(
-            SSN_NT_OPEN_PROCESS_TOKEN,
-            NT_CURRENT_PROCESS,
-            TOKEN_ADJUST_PRIVILEGES_QUERY as u64,
-            &mut token as *mut u64 as u64,
-            0,
-        )
+    let st_open = if current_thread != 0 {
+        // SAFETY: on-target NtOpenThreadToken call with a writable stack out-parameter.
+        unsafe {
+            syscall4(
+                SSN_NT_OPEN_THREAD_TOKEN,
+                NT_CURRENT_THREAD,
+                TOKEN_ADJUST_PRIVILEGES_QUERY as u64,
+                0,
+                &mut token as *mut u64 as u64,
+            )
+        }
+    } else {
+        // SAFETY: on-target NtOpenProcessToken call with a writable stack out-parameter.
+        unsafe {
+            syscall4(
+                SSN_NT_OPEN_PROCESS_TOKEN,
+                NT_CURRENT_PROCESS,
+                TOKEN_ADJUST_PRIVILEGES_QUERY as u64,
+                &mut token as *mut u64 as u64,
+                0,
+            )
+        }
     };
+    if st_open != 0 {
+        return st_open;
+    }
     // TOKEN_PRIVILEGES on the stack: PrivilegeCount(u32) + LUID_AND_ATTRIBUTES{ LUID(low u32,high
     // i32), Attributes(u32) }. Laid out as [count, luid_low, luid_high, attrs] u32s (16 bytes).
     let new_state: [u32; 4] = [
@@ -3723,7 +3734,7 @@ pub unsafe fn rtl_adjust_privilege(
         0,                                                  // Luid.HighPart
         if enable != 0 { SE_PRIVILEGE_ENABLED } else { 0 }, // Attributes
     ];
-    let mut old_state: [u32; 4] = [0; 4];
+    let mut old_state: [u32; 4] = [1, 0, 0, 0];
     let mut ret_len: u32 = 0;
     // NtAdjustPrivilegesToken(Token, DisableAll=FALSE, &NewState, sizeof(OldState), &OldState,
     //                         &ReturnLength).
@@ -3741,22 +3752,23 @@ pub unsafe fn rtl_adjust_privilege(
     };
     // NtClose(Token).
     // SAFETY: on-target; closing the token handle we opened.
-    if st_open == 0 {
-        let _ = unsafe { syscall4(SSN_NT_CLOSE, token, 0, 0, 0) };
+    let _ = unsafe { syscall4(SSN_NT_CLOSE, token, 0, 0, 0) };
+    if st_adj == 0x0000_0106 {
+        return 0xC000_0061; // STATUS_PRIVILEGE_NOT_HELD
+    }
+    if (st_adj as u32 as i32) < 0 {
+        return st_adj;
     }
     if !was_enabled.is_null() {
-        // Report whether the privilege was previously enabled (from OldState if it came back).
-        let prev = (old_state[3] & SE_PRIVILEGE_ENABLED) != 0;
+        let prev = if old_state[0] == 0 {
+            enable != 0
+        } else {
+            (old_state[3] & SE_PRIVILEGE_ENABLED) != 0
+        };
         // SAFETY: was_enabled is a valid writable byte per the contract.
         unsafe { core::ptr::write(was_enabled, prev as u8) };
     }
-    // The executive services the token plane as success no-ops; report the adjust status (which is
-    // STATUS_SUCCESS there). If the open failed, surface that instead.
-    if st_open != 0 {
-        st_open
-    } else {
-        st_adj
-    }
+    st_adj
 }
 
 // ---------------------------------------------------------------------------------------------

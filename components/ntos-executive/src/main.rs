@@ -523,21 +523,20 @@ pub const SSN_NT_QUERY_SECTION: u64 = 175;
 /// NtCreateDirectoryObject — SmpInit creates object-namespace directories (\Windows, \KnownDlls,
 /// \??/DosDevices, …). Out handle in RCX; faked until the object manager lands.
 pub const SSN_NT_CREATE_DIRECTORY_OBJECT: u64 = 36;
-/// NtClose — no handle table modelled, so closing a (fake) handle is a no-op success.
+/// NtClose — closes executive-owned entries in the caller's per-process handle table.
 pub const SSN_NT_CLOSE: u64 = 27;
 /// NtDeleteValueKey — smss deletes SAFEBOOT_OPTION from \Session Manager\Environment (sminit.c:2321).
 /// Registry writes aren't modelled (the regf hive is read-only) → best-effort no-op success.
 pub const SSN_NT_DELETE_VALUE_KEY: u64 = 68;
-/// Security-token SSNs SmpInit hits. NtOpenThreadToken → STATUS_NO_TOKEN (no impersonation token,
-/// the normal case → caller falls back to the process token). NtOpenProcessToken → fake token
-/// handle (out in R8). A real token/SID model is a later milestone.
+/// Security-token SSNs SmpInit hits. NtOpenThreadToken returns STATUS_NO_TOKEN until impersonation
+/// lands; NtOpenProcessToken opens the target EPROCESS's mutable primary token.
 pub const SSN_NT_OPEN_THREAD_TOKEN: u64 = 135;
 pub const SSN_NT_OPEN_PROCESS_TOKEN: u64 = 129;
 /// NtQueryInformationToken — csrss's CsrServerInitialization queries its process token (identity,
 /// session, statistics) after opening it. Class in RDX; TOKEN_* struct copied out to R8.
 pub const SSN_NT_QUERY_INFO_TOKEN: u64 = 163;
-/// NtAdjustPrivilegesToken — smss enables privileges it needs (SeTcb/SeLoadDriver/…). We don't
-/// model token privileges → no-op success (the enable "succeeds").
+/// NtAdjustPrivilegesToken — adjusts the persistent primary-token privilege set with native
+/// previous-state, access-check, and buffer-size semantics.
 pub const SSN_NT_ADJUST_PRIV_TOKEN: u64 = 12;
 /// Process/thread lifecycle SSNs (ReactOS numbering = sysfuncs.lst line − 1, cross-checked against
 /// NtClose=27/NtCreateProcess=49/NtCreateThread=55). NOT issued during the current boot (no hosted
@@ -4470,6 +4469,9 @@ struct ExecNtHandler {
     /// here; the seL4 VSpace/CSpace/TCB caps + mirror/scratch VAs (the create MECHANISM) stay in the
     /// executive (only the trusted root task holds those caps), linked to an EPROCESS by `PM_PIDS[pi]`.
     pm: nt_process::ProcessManager,
+    /// One mutable primary token per hosted EPROCESS, indexed by process index. Constructed below
+    /// the syscall heap mark; privilege adjustments only mutate inline entries and never allocate.
+    primary_tokens: alloc::vec::Vec<nt_security::AccessToken>,
     /// The Configuration Manager WRITE plane: an in-memory registry overlay ([`RegistryOverlay`])
     /// that shadows the read-only base hive. `NtCreateKey`/`NtSetValueKey` (services, pi 3) land
     /// created keys + set values here; reads (`NtOpenKey`/`NtQueryValueKey`) check the overlay
