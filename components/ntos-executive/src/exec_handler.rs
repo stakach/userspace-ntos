@@ -906,6 +906,12 @@ impl ExecNtHandler {
         self.pi_for_pid(token_pid).ok_or(STATUS_INVALID_HANDLE)
     }
 
+    fn current_token_has_privilege(&self, name: &str) -> bool {
+        self.primary_tokens
+            .get(self.pi)
+            .is_some_and(|token| token.has_privilege(name))
+    }
+
     fn serialize_sid(sid: &nt_security::Sid, output: &mut [u8]) -> Option<usize> {
         let count = u8::try_from(sid.sub_authorities.len()).ok()?;
         let length = 8usize.checked_add(sid.sub_authorities.len().checked_mul(4)?)?;
@@ -3505,6 +3511,40 @@ impl NativeSyscallHandler for ExecNtHandler {
                         smss_stack_write32(retlen, 48);
                     }
                     0
+                } else if class == 29 {
+                    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+                    if args[3] != 4 {
+                        return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                    }
+                    let retlen = args[4];
+                    if buf == 0
+                        || !self.probe_event_output(buf, 4)
+                        || (retlen != 0 && !self.probe_event_output(retlen, 4))
+                    {
+                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                    }
+                    let caller = match self.pm_pid_for_pi(self.pi) {
+                        Some(pid) => pid,
+                        None => return 0xC000_0008,
+                    };
+                    let pid = match self.pm.resolve_process_handle(
+                        caller,
+                        args[0],
+                        PROCESS_QUERY_INFORMATION,
+                    ) {
+                        Ok(pid) => pid,
+                        Err(status) => return status,
+                    };
+                    let enabled = self
+                        .pm
+                        .process_break_on_termination(pid)
+                        .unwrap_or(false) as u32;
+                    if !self.xas_write_u32(buf, enabled)
+                        || (retlen != 0 && !self.xas_write_u32(retlen, 4))
+                    {
+                        return 0xC000_0005;
+                    }
+                    0
                 } else if class == 36 {
                     // ProcessCookie is a stable per-process ULONG and is queryable only through the
                     // current-process pseudo handle, matching ReactOS's XP-compatible contract.
@@ -4966,9 +5006,78 @@ impl NativeSyscallHandler for ExecNtHandler {
             // attribute sets, per-object security, or a real handle table. (277
             // NtUnmapViewOfSection: we never reclaim a mapped view; 246 NtSetSecurityObject; 214
             // 236 NtSetInformationObject.)
+            NativeService::NtSetInformationProcess => unsafe {
+                if args[1] != 29 {
+                    return 0;
+                }
+                const PROCESS_SET_INFORMATION: u32 = 0x0200;
+                if args[3] != 4 {
+                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                    return 0xC000_0005;
+                }
+                if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
+                    return 0xC000_0061; // STATUS_PRIVILEGE_NOT_HELD
+                }
+                let caller = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return 0xC000_0008,
+                };
+                let pid = match self.pm.resolve_process_handle(
+                    caller,
+                    args[0],
+                    PROCESS_SET_INFORMATION,
+                ) {
+                    Ok(pid) => pid,
+                    Err(status) => return status,
+                };
+                match self.pm.set_process_break_on_termination(
+                    pid,
+                    u32::from_le_bytes(value) != 0,
+                ) {
+                    Ok(()) => 0,
+                    Err(status) => status,
+                }
+            },
+            NativeService::NtSetInformationThread => unsafe {
+                if args[1] != 18 {
+                    return 0;
+                }
+                const THREAD_SET_INFORMATION: u32 = 0x0020;
+                if args[3] != 4 {
+                    return 0xC000_0004;
+                }
+                let mut value = [0u8; 4];
+                if args[2] == 0 || !self.xas_read(args[2], &mut value) {
+                    return 0xC000_0005;
+                }
+                if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
+                    return 0xC000_0061;
+                }
+                let caller = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return 0xC000_0008,
+                };
+                let tid = match self.pm.resolve_thread_handle(
+                    caller,
+                    self.current_tid as nt_process::ThreadId,
+                    args[0],
+                    THREAD_SET_INFORMATION,
+                ) {
+                    Ok(tid) => tid,
+                    Err(status) => return status,
+                };
+                match self.pm.set_thread_break_on_termination(
+                    tid,
+                    u32::from_le_bytes(value) != 0,
+                ) {
+                    Ok(()) => 0,
+                    Err(status) => status,
+                }
+            },
             NativeService::NtFreeVirtualMemory
-            | NativeService::NtSetInformationThread
-            | NativeService::NtSetInformationProcess
             | NativeService::NtTestAlert
             | NativeService::NtCreateKeyedEvent
             | NativeService::NtDeleteValueKey
@@ -7269,6 +7378,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let handle = args.first().copied().unwrap_or(0);
                 let status = args.get(1).copied().unwrap_or(0) as u32;
                 if let Some(pid) = self.resolve_process_handle(handle) {
+                    if let Some(code) = self.pm.critical_process_termination_code(pid) {
+                        self.post_action = ExecPostAction::CriticalTermination {
+                            code,
+                            object: pid as u64,
+                        };
+                        return 0;
+                    }
                     let _ = self.pm.terminate_process(pid, status);
                 }
                 0 // STATUS_SUCCESS (matches the prior broker fallback for an unresolved handle)
@@ -7319,6 +7435,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                 };
                 let prior_state = self.pm.thread(target).map(|thread| thread.state);
                 let is_current = target == current_tid;
+                if let Some(code) = self.pm.critical_thread_termination_code(target) {
+                    self.post_action = ExecPostAction::CriticalTermination {
+                        code,
+                        object: target as u64,
+                    };
+                    return 0;
+                }
                 let outcome = if self.pi == 1 && self.pm.main_thread(caller_pid) == Some(target) {
                     self.pm.exit_thread(target, status)
                 } else {

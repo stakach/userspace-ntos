@@ -4496,6 +4496,7 @@ enum ExecPostAction {
     None,
     TerminateCurrentThread { tid: u64 },
     TerminateRemoteThread { tid: u64 },
+    CriticalTermination { code: u32, object: u64 },
 }
 
 /// One established LPC connection cached executive-side (the data-plane record — see

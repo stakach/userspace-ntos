@@ -2170,6 +2170,19 @@ pub(crate) unsafe fn service_sec_image(
                     ExecPostAction::TerminateRemoteThread { tid } => {
                         let _ = terminate_hosted_thread_mechanism(tid, &mut delay_queue);
                     }
+                    ExecPostAction::CriticalTermination { code, object } => {
+                        let reply_dropped = drop_current_syscall_reply();
+                        print_str(b"[critical-termination] bugcheck=0x");
+                        print_hex(code);
+                        print_str(b" object=0x");
+                        print_hex((object >> 32) as u32);
+                        print_hex(object as u32);
+                        print_str(b" reply-dropped=");
+                        print_u64(reply_dropped as u64);
+                        print_str(b" -> fatal stop\n");
+                        stop = code as u64;
+                        break;
+                    }
                     ExecPostAction::None => {}
                 }
                 // CM write plane: a handler that mutated the registry overlay (NtCreateKey/
@@ -3156,7 +3169,64 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(return_length as u32);
                     print_str(b"\n");
                 }
-                result = if cls != 0 {
+                result = if cls == 18 {
+                    const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+                    if len != 4 {
+                        if return_length != 0 {
+                            csrss_out_write32(
+                                return_length,
+                                4,
+                                &mut *filled_pages,
+                                &mut faults,
+                                scratch_base,
+                                &reg,
+                                &dll_pes,
+                                pml4,
+                            );
+                        }
+                        nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
+                    } else if buf == 0 {
+                        0xC000_0005
+                    } else if let Some(caller_pid) = nt_handler.pm_pid_for_pi(pi) {
+                        match nt_handler.pm.resolve_thread_handle(
+                            caller_pid,
+                            nt_handler.current_tid as nt_process::ThreadId,
+                            handle,
+                            THREAD_QUERY_INFORMATION,
+                        ) {
+                            Ok(tid) => {
+                                let enabled = nt_handler
+                                    .pm
+                                    .thread_break_on_termination(tid)
+                                    .unwrap_or(false) as u32;
+                                let wrote = csrss_out_write32(
+                                    buf,
+                                    enabled,
+                                    &mut *filled_pages,
+                                    &mut faults,
+                                    scratch_base,
+                                    &reg,
+                                    &dll_pes,
+                                    pml4,
+                                ) && (return_length == 0
+                                    || csrss_out_write32(
+                                        return_length,
+                                        4,
+                                        &mut *filled_pages,
+                                        &mut faults,
+                                        scratch_base,
+                                        &reg,
+                                        &dll_pes,
+                                        pml4,
+                                    ));
+                                if wrote { 0 } else { 0xC000_0005 }
+                            }
+                            Err(status) => status as u64,
+                        }
+                    } else {
+                        nt_process::STATUS_INVALID_HANDLE as u64
+                    }
+                } else if cls != 0 {
                     nt_process::STATUS_INVALID_INFO_CLASS as u64
                 } else if len != 0x30 {
                     if return_length != 0 {

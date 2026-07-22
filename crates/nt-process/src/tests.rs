@@ -125,6 +125,48 @@ fn token_handles_preserve_owner_and_access() {
 }
 
 #[test]
+fn break_on_termination_state_is_persistent_and_handle_checked() {
+    const PROCESS_QUERY_INFORMATION: u32 = 0x400;
+    let mut pm = ProcessManager::new();
+    let caller = pm.create_process("caller.exe", None, None);
+    let target = pm.create_process("target.exe", Some(caller), None);
+    let thread = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    assert_eq!(pm.process_break_on_termination(target), Some(false));
+    assert_eq!(pm.thread_break_on_termination(thread), Some(false));
+    pm.set_process_break_on_termination(target, true).unwrap();
+    pm.set_thread_break_on_termination(thread, true).unwrap();
+    assert_eq!(pm.process_break_on_termination(target), Some(true));
+    assert_eq!(pm.thread_break_on_termination(thread), Some(true));
+    assert_eq!(pm.critical_process_termination_code(target), Some(0xF4));
+    assert_eq!(pm.critical_thread_termination_code(thread), Some(0xF4));
+    pm.set_thread_break_on_termination(thread, false).unwrap();
+    assert_eq!(pm.critical_thread_termination_code(thread), Some(0xEF));
+
+    let denied = pm
+        .insert_handle(caller, HandleObject::Process(target), 0)
+        .unwrap();
+    assert_eq!(
+        pm.resolve_process_handle(caller, denied as u64, PROCESS_QUERY_INFORMATION),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    let allowed = pm
+        .insert_handle(
+            caller,
+            HandleObject::Process(target),
+            PROCESS_QUERY_INFORMATION,
+        )
+        .unwrap();
+    assert_eq!(
+        pm.resolve_process_handle(caller, allowed as u64, PROCESS_QUERY_INFORMATION),
+        Ok(target)
+    );
+    assert_eq!(
+        pm.resolve_process_handle(caller, u64::MAX, PROCESS_QUERY_INFORMATION),
+        Ok(caller)
+    );
+}
+
+#[test]
 fn reserved_handle_table_never_reallocates() {
     // The pre-reservable slot table (the executive's non-leaking heap-reset solution): reserve
     // capacity up front, then a burst of inserts writes into pre-allocated storage with NO

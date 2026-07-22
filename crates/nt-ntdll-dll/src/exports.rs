@@ -3065,8 +3065,7 @@ pub unsafe extern "system" fn rtl_allocate_and_initialize_sid(
 /// `RtlAdjustPrivilege(ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled)`.
 /// Step 4.C: routes to the LIVE token plane (opens the process token, calls
 /// `NtAdjustPrivilegesToken`, closes it) via our own trap stubs — the executive services these. This
-/// is what real ntdll does; the executive currently models the token plane as success no-ops, so the
-/// privilege adjust reports STATUS_SUCCESS and smss's SmpInit proceeds instead of hard-erroring.
+/// is what real ntdll does; the executive persists the primary-token privilege state.
 ///
 /// # Safety
 /// Standard contract; `was_enabled` null or a valid writable byte.

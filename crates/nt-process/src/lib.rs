@@ -130,6 +130,8 @@ pub struct NtProcess {
     pub win32_window_station: Option<u64>,
     /// Lazy, stable `ProcessCookie` returned by `NtQueryInformationProcess` class 36.
     process_cookie: u32,
+    /// `ProcessBreakOnTermination`, initially clear and mutable through the native info class.
+    break_on_termination: bool,
     /// Per-process handle table (spec §8.1). A dense **array of entries** indexed by handle slot —
     /// the real NT `HANDLE_TABLE` shape — rather than a `BTreeMap`. Slot `i` ↔ handle value
     /// `(i + 1) * 4` (NT handles are non-zero multiples of 4). Freed slots (`None`) are reused (as
@@ -203,6 +205,8 @@ pub struct NtThread {
     /// spawns the backing thread (its TEB is a per-thread page); read back by
     /// `NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress`. `0` until the TEB is mapped.
     pub teb_base: u64,
+    /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
+    break_on_termination: bool,
 }
 
 /// The win32k per-system callout function pointers registered via
@@ -333,6 +337,7 @@ impl ProcessManager {
                 win32_process: None,
                 win32_window_station: None,
                 process_cookie: 0,
+                break_on_termination: false,
                 handles: Vec::new(),
             },
         );
@@ -432,6 +437,7 @@ impl ProcessManager {
                 suspend_count: 0,
                 win32_thread: None,
                 teb_base: 0,
+                break_on_termination: false,
             },
         );
         Ok(tid)
@@ -577,6 +583,92 @@ impl ProcessManager {
         };
         self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
         Ok(tid)
+    }
+
+    /// Resolve a caller-local process handle (or `NtCurrentProcess`) with an access check.
+    pub fn resolve_process_handle(
+        &self,
+        caller_pid: ProcessId,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<ProcessId, u32> {
+        let pid = if handle == u64::MAX {
+            caller_pid
+        } else {
+            let handle = handle as Handle;
+            let pid = match self.lookup_handle(caller_pid, handle) {
+                Some(HandleObject::Process(pid)) => pid,
+                _ => return Err(STATUS_INVALID_HANDLE),
+            };
+            let granted = self
+                .handle_access(caller_pid, handle)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            if granted & required_access != required_access {
+                return Err(STATUS_ACCESS_DENIED);
+            }
+            pid
+        };
+        self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(pid)
+    }
+
+    pub fn process_break_on_termination(&self, pid: ProcessId) -> Option<bool> {
+        self.process(pid).map(|process| process.break_on_termination)
+    }
+
+    pub fn set_process_break_on_termination(
+        &mut self,
+        pid: ProcessId,
+        enabled: bool,
+    ) -> Result<(), u32> {
+        let process = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        process.break_on_termination = enabled;
+        Ok(())
+    }
+
+    pub fn thread_break_on_termination(&self, tid: ThreadId) -> Option<bool> {
+        self.thread(tid).map(|thread| thread.break_on_termination)
+    }
+
+    pub fn set_thread_break_on_termination(
+        &mut self,
+        tid: ThreadId,
+        enabled: bool,
+    ) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.break_on_termination = enabled;
+        Ok(())
+    }
+
+    /// Bugcheck code required before a direct process termination, if the process is critical.
+    pub fn critical_process_termination_code(&self, pid: ProcessId) -> Option<u32> {
+        self.process(pid)
+            .filter(|process| process.break_on_termination)
+            .map(|_| 0x0000_00F4) // CRITICAL_OBJECT_TERMINATION
+    }
+
+    /// Bugcheck code required before terminating `tid`. A critical ETHREAD uses
+    /// CRITICAL_OBJECT_TERMINATION; terminating the last active thread of a critical EPROCESS uses
+    /// CRITICAL_PROCESS_DIED.
+    pub fn critical_thread_termination_code(&self, tid: ThreadId) -> Option<u32> {
+        let thread = self.thread(tid)?;
+        if thread.break_on_termination {
+            return Some(0x0000_00F4);
+        }
+        let process = self.process(thread.process_id)?;
+        if !process.break_on_termination || thread.is_system_thread {
+            return None;
+        }
+        let other_active = self.threads.values().any(|candidate| {
+            candidate.thread_id != tid
+                && candidate.process_id == thread.process_id
+                && !candidate.is_system_thread
+                && !matches!(
+                    candidate.state,
+                    ThreadState::Initialized | ThreadState::Terminated
+                )
+        });
+        (!other_active).then_some(0x0000_00EF) // CRITICAL_PROCESS_DIED
     }
 
     /// Resolve the target of `NtTerminateThread`. In addition to the ordinary typed thread handle

@@ -3774,32 +3774,65 @@ pub unsafe fn rtl_adjust_privilege(
 // ---------------------------------------------------------------------------------------------
 // Step 4.C — RtlSetProcessIsCritical / RtlSetThreadIsCritical over the live info-class plane.
 //
-// Real ntdll calls NtSetInformationProcess(ProcessBreakOnTermination) / NtSetInformationThread
-// (ThreadBreakOnTermination) with a ULONG boolean. The executive services both info-set syscalls
-// (success no-ops), so routing the real syscalls here is the honest implementation — it issues the
-// actual SetInformation the real ntdll would, not a fabricated success.
+// Real ntdll optionally gates on PEB.NtGlobalFlag, queries the prior flag, then sets the persistent
+// EPROCESS/ETHREAD BreakOnTermination field through the native information classes.
 // ---------------------------------------------------------------------------------------------
 
 const SSN_NT_SET_INFORMATION_PROCESS: u32 = 237;
 const SSN_NT_SET_INFORMATION_THREAD: u32 = 238;
+const SSN_NT_QUERY_INFORMATION_PROCESS_CRITICAL: u32 = 161;
+const SSN_NT_QUERY_INFORMATION_THREAD_CRITICAL: u32 = 162;
 /// `ProcessBreakOnTermination` info class.
 const PROCESS_BREAK_ON_TERMINATION: u64 = 0x1D;
 /// `ThreadBreakOnTermination` info class.
 const THREAD_BREAK_ON_TERMINATION: u64 = 0x12;
 /// `NtCurrentThread()` pseudo-handle `(HANDLE)-2`.
 const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
+const FLG_ENABLE_SYSTEM_CRIT_BREAKS: u32 = 0x0010_0000;
+
+unsafe fn critical_breaks_enabled() -> bool {
+    let peb: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x60]",
+            out(reg) peb,
+            options(nostack, preserves_flags, readonly)
+        )
+    };
+    peb != 0
+        && unsafe { core::ptr::read_unaligned((peb + 0xBC) as *const u32) }
+            & FLG_ENABLE_SYSTEM_CRIT_BREAKS
+            != 0
+}
 
 /// `RtlSetProcessIsCritical(New, Old, CheckFlag)` — set/clear ProcessBreakOnTermination via a live
-/// `NtSetInformationProcess`. `*old` (if non-null) reports the prior state (best-effort: 0, since the
-/// executive doesn't return a queried prior value). Returns the syscall status.
+/// `NtSetInformationProcess`. `*old` reports the queried prior state when requested.
 ///
 /// # Safety
 /// On-target hosted-process; `old` null or a valid writable byte.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn rtl_set_process_is_critical(new: u8, old: *mut u8, _check_flag: u8) -> u64 {
+pub unsafe fn rtl_set_process_is_critical(new: u8, old: *mut u8, check_flag: u8) -> u64 {
     if !old.is_null() {
         // SAFETY: caller-provided writable byte.
         unsafe { core::ptr::write(old, 0) };
+    }
+    if check_flag != 0 && !unsafe { critical_breaks_enabled() } {
+        return 0xC000_0001; // STATUS_UNSUCCESSFUL
+    }
+    if !old.is_null() {
+        let mut previous = 0u32;
+        let _ = unsafe {
+            syscall6(
+                SSN_NT_QUERY_INFORMATION_PROCESS_CRITICAL,
+                NT_CURRENT_PROCESS,
+                PROCESS_BREAK_ON_TERMINATION,
+                &mut previous as *mut u32 as u64,
+                core::mem::size_of::<u32>() as u64,
+                0,
+                0,
+            )
+        };
+        unsafe { core::ptr::write(old, previous as u8) };
     }
     let value: u32 = (new != 0) as u32;
     // NtSetInformationProcess(NtCurrentProcess(), ProcessBreakOnTermination, &value, sizeof(ULONG)).
@@ -3821,10 +3854,28 @@ pub unsafe fn rtl_set_process_is_critical(new: u8, old: *mut u8, _check_flag: u8
 /// # Safety
 /// On-target hosted-process; `old` null or a valid writable byte.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn rtl_set_thread_is_critical(new: u8, old: *mut u8, _check_flag: u8) -> u64 {
+pub unsafe fn rtl_set_thread_is_critical(new: u8, old: *mut u8, check_flag: u8) -> u64 {
     if !old.is_null() {
         // SAFETY: caller-provided writable byte.
         unsafe { core::ptr::write(old, 0) };
+    }
+    if check_flag != 0 && !unsafe { critical_breaks_enabled() } {
+        return 0xC000_0001;
+    }
+    if !old.is_null() {
+        let mut previous = 0u32;
+        let _ = unsafe {
+            syscall6(
+                SSN_NT_QUERY_INFORMATION_THREAD_CRITICAL,
+                NT_CURRENT_THREAD,
+                THREAD_BREAK_ON_TERMINATION,
+                &mut previous as *mut u32 as u64,
+                core::mem::size_of::<u32>() as u64,
+                0,
+                0,
+            )
+        };
+        unsafe { core::ptr::write(old, previous as u8) };
     }
     let value: u32 = (new != 0) as u32;
     // NtSetInformationThread(NtCurrentThread(), ThreadBreakOnTermination, &value, sizeof(ULONG)).
