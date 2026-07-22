@@ -154,7 +154,8 @@ fn forwarder_cycle_is_an_error_not_a_spin() {
         vec![],
     ));
     let err = resolve::resolve_symbol(&st, "a.dll", Some("Foo"), None).unwrap_err();
-    assert!(matches!(err, resolve::ResolveError::ForwarderCycle { .. }));
+    assert!(matches!(&err, resolve::ResolveError::ForwarderCycle { .. }));
+    assert_eq!(err.nt_status(), resolve::STATUS_INVALID_IMAGE_FORMAT);
 }
 
 /// Forwarder by ORDINAL (`"dll.#3"`) resolves.
@@ -208,7 +209,8 @@ fn missing_module_is_a_structured_error() {
         vec![imports("nope.dll", &["X"])],
     ));
     let err = resolve::snap_module(&st, "app.exe").unwrap_err();
-    assert!(matches!(err, resolve::ResolveError::ModuleNotFound(_)));
+    assert!(matches!(&err, resolve::ResolveError::ModuleNotFound(_)));
+    assert_eq!(err.nt_status(), resolve::STATUS_DLL_NOT_FOUND);
 }
 
 #[test]
@@ -227,7 +229,49 @@ fn missing_export_is_a_structured_error() {
         vec![],
     ));
     let err = resolve::snap_module(&st, "app.exe").unwrap_err();
-    assert!(matches!(err, resolve::ResolveError::ExportNotFound { .. }));
+    assert!(matches!(&err, resolve::ResolveError::ExportNotFound { .. }));
+    assert_eq!(err.nt_status(), resolve::STATUS_ENTRYPOINT_NOT_FOUND);
+    assert_eq!(err.iat_poison(), resolve::BAD_IAT_VALUE);
+}
+
+#[test]
+fn missing_ordinal_has_distinct_native_status() {
+    let mut st = LoaderState::new();
+    st.add(LoadedModule::mock(
+        "app.exe",
+        0x1_0000,
+        vec![],
+        vec![ImportedDll {
+            name: "foo.dll".to_string(),
+            functions: vec![ImportRef::ByOrdinal {
+                ordinal: 17,
+                iat_slot_rva: 0x2000,
+            }],
+        }],
+    ));
+    st.add(LoadedModule::mock("foo.dll", 0x2_0000, vec![], vec![]));
+
+    let err = resolve::snap_module(&st, "app.exe").unwrap_err();
+    assert_eq!(err.nt_status(), resolve::STATUS_ORDINAL_NOT_FOUND);
+}
+
+#[test]
+fn malformed_forwarder_is_an_invalid_image() {
+    let mut st = LoaderState::new();
+    st.add(LoadedModule::mock(
+        "foo.dll",
+        0x2_0000,
+        vec![Export {
+            name: "Bad".to_string(),
+            ordinal: 1,
+            target: super::module::parse_forwarder("missing_separator"),
+        }],
+        vec![],
+    ));
+
+    let err = resolve::resolve_symbol(&st, "foo.dll", Some("Bad"), None).unwrap_err();
+    assert!(matches!(&err, resolve::ResolveError::MalformedForwarder(_)));
+    assert_eq!(err.nt_status(), resolve::STATUS_INVALID_IMAGE_FORMAT);
 }
 
 #[test]
@@ -606,6 +650,9 @@ fn ldrp_initialize_reports_missing_dependency() {
     };
     let err = init::ldrp_initialize(&mut st, &params, &mut host).unwrap_err();
     assert_eq!(err, init::STATUS_DLL_NOT_FOUND);
+    assert!(host.iat_writes.is_empty());
+    assert!(host.committed.is_none());
+    assert!(host.dll_main_calls.is_empty());
 }
 
 /// The NullHost never fakes a live op: map_image returns NOT_IMPLEMENTED, so init aborts honestly.

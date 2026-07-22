@@ -1689,7 +1689,8 @@ unsafe fn import_desc_basename(base: u64, name_rva: u32, out: &mut [u8; 32]) -> 
 }
 
 /// Snap ONE import descriptor's thunks against `dep_base`'s export directory (direct in-process IAT
-/// writes). Returns `(resolved, missing)`. `image_base` is the module whose IAT we patch;
+/// writes). The first unresolved thunk is poisoned and aborts the transaction with the exact
+/// name/ordinal status. `image_base` is the module whose IAT we patch;
 /// `ilt_rva`/`iat_rva` are its descriptor's OriginalFirstThunk/FirstThunk.
 ///
 /// # Safety
@@ -1716,7 +1717,8 @@ unsafe fn snap_descriptor_against(
             // kernel32!GetLastError → "ntdll.RtlGetLastWin32Error"). A forwarder RVA left un-followed
             // would write the forwarder-STRING address into the IAT → an instruction-fetch fault into
             // the target's .rdata on the first call (the kernel32+0xa9954 map=8 wall).
-            let addr = if thunk & (1u64 << 63) == 0 {
+            let by_ordinal = thunk & (1u64 << 63) != 0;
+            let addr = if !by_ordinal {
                 // by name: IMAGE_IMPORT_BY_NAME RVA = thunk & 0x7fffffff; +2 skips the Hint.
                 let ibn_rva = (thunk & 0x7fff_ffff) as u32;
                 let mut namebuf = [0u8; 96];
@@ -1736,17 +1738,31 @@ unsafe fn snap_descriptor_against(
                 resolve_export_addr(dep_base, true, &[], ord, table, &mut out.status, 0)
             };
             if out.status != 0 {
+                core::ptr::write_unaligned(
+                    iat as *mut u64,
+                    nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                );
+                out.missing += 1;
                 return;
             }
-            if addr != 0 {
-                core::ptr::write_unaligned(iat as *mut u64, addr);
-                out.resolved += 1;
-                if out.spot_iat_value == 0 {
-                    out.spot_iat_value = addr;
-                    out.spot_iat_rva = (iat - image_base) as u32;
-                }
-            } else {
+            if addr == 0 {
+                core::ptr::write_unaligned(
+                    iat as *mut u64,
+                    nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                );
                 out.missing += 1;
+                out.status = if by_ordinal {
+                    nt_ntdll::loader::resolve::STATUS_ORDINAL_NOT_FOUND
+                } else {
+                    nt_ntdll::loader::resolve::STATUS_ENTRYPOINT_NOT_FOUND
+                };
+                return;
+            }
+            core::ptr::write_unaligned(iat as *mut u64, addr);
+            out.resolved += 1;
+            if out.spot_iat_value == 0 {
+                out.spot_iat_value = addr;
+                out.spot_iat_rva = (iat - image_base) as u32;
             }
             ilt += 8;
             iat += 8;
@@ -1812,8 +1828,9 @@ unsafe fn is_forwarder(base: u64, rva: u32) -> bool {
 /// `nt-ntdll::loader::resolve`'s forwarder chain, but over live mapped images + the `MODULE_TABLE`
 /// (loading a forwarder-target DLL if not already present, exactly as `LdrpSnapThunk` does).
 ///
-/// Returns the absolute address, or 0 if unresolvable (missing export / target DLL). `depth` guards a
-/// pathological forwarder cycle (real chains are 1-2 hops).
+/// Returns the absolute address, or 0 if unresolvable. Structural/target-DLL failures are also
+/// reported through `load_status`; the caller classifies a direct missing export by selector kind.
+/// `depth` guards a pathological forwarder cycle (real chains are 1-2 hops).
 ///
 /// # Safety
 /// `dep_base` must be a mapped PE image; on-target (may load a forwarder-target DLL via syscalls).
@@ -1829,7 +1846,7 @@ unsafe fn resolve_export_addr(
 ) -> u64 {
     if depth > 8 {
         if *load_status == 0 {
-            *load_status = 0xC000_0001; // STATUS_UNSUCCESSFUL
+            *load_status = nt_ntdll::loader::resolve::STATUS_INVALID_IMAGE_FORMAT;
         }
         return 0; // forwarder-cycle / over-deep guard
     }
@@ -1854,9 +1871,16 @@ unsafe fn resolve_export_addr(
         let fwd = &fbuf[..flen];
         let dot = match fwd.iter().rposition(|&c| c == b'.') {
             Some(d) => d,
-            None => return 0, // malformed forwarder
+            None => {
+                *load_status = nt_ntdll::loader::resolve::STATUS_INVALID_IMAGE_FORMAT;
+                return 0;
+            }
         };
         let (mod_part, sym_part) = (&fwd[..dot], &fwd[dot + 1..]);
+        if mod_part.is_empty() || sym_part.is_empty() {
+            *load_status = nt_ntdll::loader::resolve::STATUS_INVALID_IMAGE_FORMAT;
+            return 0;
+        }
 
         // Lowercase the target module base name (strip a trailing ".dll" if present — forwarders
         // usually omit it, e.g. "ntdll", but be defensive).
@@ -1898,12 +1922,18 @@ unsafe fn resolve_export_addr(
 
         // Resolve the target symbol IN the target module — by ordinal (`#123`) or by name — RECURSING
         // (the target may itself be a forwarder).
-        if !sym_part.is_empty() && sym_part[0] == b'#' {
+        if sym_part[0] == b'#' {
+            if sym_part.len() == 1 {
+                *load_status = nt_ntdll::loader::resolve::STATUS_INVALID_IMAGE_FORMAT;
+                return 0;
+            }
             let mut ord = 0u32;
             for &c in &sym_part[1..] {
-                if c.is_ascii_digit() {
-                    ord = ord * 10 + (c - b'0') as u32;
+                if !c.is_ascii_digit() {
+                    *load_status = nt_ntdll::loader::resolve::STATUS_INVALID_IMAGE_FORMAT;
+                    return 0;
                 }
+                ord = ord * 10 + (c - b'0') as u32;
             }
             resolve_export_addr(tbase, true, &[], ord, table, load_status, depth + 1)
         } else {
@@ -2016,6 +2046,9 @@ unsafe fn load_and_snap_dependency(
     } else {
         let loaded = unsafe { load_dependent_dll(name_lc) };
         if loaded == 0 {
+            if out.status == 0 {
+                out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
+            }
             return 0;
         }
         unsafe { (&mut *table).insert(name_lc, loaded) };
@@ -2334,6 +2367,11 @@ unsafe fn snap_module(
                         depth + 1,
                     );
                     if out.status != 0 {
+                        core::ptr::write_unaligned(
+                            (image_base + ft as u64) as *mut u64,
+                            nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                        );
+                        out.missing += 1;
                         return;
                     }
                 }
@@ -2343,12 +2381,16 @@ unsafe fn snap_module(
                         return;
                     }
                 } else {
-                    // Could not resolve the dependency — count its thunks as missing (honest, not faked).
-                    let mut ilt = image_base + ilt_rva as u64;
-                    while core::ptr::read_unaligned(ilt as *const u64) != 0 {
-                        out.missing += 1;
-                        ilt += 8;
-                    }
+                    // A required dependency could not be mapped. Poison the first callable slot and
+                    // fail the transaction; publishing a raw ILT value here turns a loader error into
+                    // a later low-address instruction-fetch fault.
+                    core::ptr::write_unaligned(
+                        (image_base + ft as u64) as *mut u64,
+                        nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                    );
+                    out.missing += 1;
+                    out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
+                    return;
                 }
                 desc += 20;
             }
@@ -2389,6 +2431,11 @@ unsafe fn snap_module(
                             depth + 1,
                         );
                         if out.status != 0 {
+                            core::ptr::write_unaligned(
+                                (image_base + iat_rva as u64) as *mut u64,
+                                nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                            );
+                            out.missing += 1;
                             return;
                         }
                     }
@@ -2399,6 +2446,14 @@ unsafe fn snap_module(
                         if out.status != 0 {
                             return;
                         }
+                    } else {
+                        core::ptr::write_unaligned(
+                            (image_base + iat_rva as u64) as *mut u64,
+                            nt_ntdll::loader::resolve::BAD_IAT_VALUE,
+                        );
+                        out.missing += 1;
+                        out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
+                        return;
                     }
                 }
                 ddesc += 32; // sizeof(ImgDelayDescr)
@@ -3422,7 +3477,11 @@ pub unsafe fn ldr_get_procedure_address(
         }
     };
     if addr == 0 {
-        return 0xC000_0139; // STATUS_ENTRYPOINT_NOT_FOUND
+        return if name.is_null() {
+            nt_ntdll::loader::resolve::STATUS_ORDINAL_NOT_FOUND
+        } else {
+            nt_ntdll::loader::resolve::STATUS_ENTRYPOINT_NOT_FOUND
+        };
     }
     if !address.is_null() {
         // SAFETY: address writable per the contract.

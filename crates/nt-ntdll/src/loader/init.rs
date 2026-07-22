@@ -279,9 +279,5 @@ fn root_entry_va(state: &LoaderState, root: &str) -> u64 {
 
 /// Map a [`resolve::ResolveError`] to the matching NT status (honest misses, never a spin).
 fn map_resolve_error(e: resolve::ResolveError) -> NtStatus {
-    match e {
-        resolve::ResolveError::ModuleNotFound(_) => STATUS_DLL_NOT_FOUND,
-        resolve::ResolveError::ExportNotFound { .. } => STATUS_ENTRYPOINT_NOT_FOUND,
-        resolve::ResolveError::ForwarderCycle { .. } => STATUS_UNSUCCESSFUL,
-    }
+    e.nt_status()
 }

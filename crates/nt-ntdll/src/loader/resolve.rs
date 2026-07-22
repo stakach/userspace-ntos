@@ -21,6 +21,26 @@ use super::module::{Export, ExportTarget, ForwardSelector, LoaderState};
 /// The maximum forwarder-chain depth before we declare a cycle (defensive — real chains are ≤ 2–3).
 const MAX_FORWARDER_DEPTH: usize = 16;
 
+/// `STATUS_DLL_NOT_FOUND`.
+pub const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+/// `STATUS_ORDINAL_NOT_FOUND`.
+pub const STATUS_ORDINAL_NOT_FOUND: u32 = 0xC000_0138;
+/// `STATUS_ENTRYPOINT_NOT_FOUND`.
+pub const STATUS_ENTRYPOINT_NOT_FOUND: u32 = 0xC000_0139;
+/// `STATUS_INVALID_IMAGE_FORMAT`.
+pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
+/// Poison written by the native loader into an IAT slot whose import could not be resolved.
+pub const BAD_IAT_VALUE: u64 = 0x0000_0000_FFBA_DD11;
+
+/// Whether an export lookup selected a name or an ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectorKind {
+    /// A case-sensitive exported symbol name.
+    Name,
+    /// A PE export ordinal.
+    Ordinal,
+}
+
 /// A structured import-resolution failure (never a spin, never a fabricated address).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
@@ -32,12 +52,41 @@ pub enum ResolveError {
         module: String,
         /// The symbol name (or `"#<ordinal>"`).
         symbol: String,
+        /// The selector form controls the native failure status.
+        selector: SelectorKind,
     },
+    /// A forwarder string did not contain a usable module and selector.
+    MalformedForwarder(String),
     /// A forwarder chain exceeded [`MAX_FORWARDER_DEPTH`] — a cycle or pathological chain.
     ForwarderCycle {
         /// The forwarder chain that looped (for diagnostics).
         chain: Vec<String>,
     },
+}
+
+impl ResolveError {
+    /// Map a structured resolver failure to the status returned by the native loader.
+    pub const fn nt_status(&self) -> u32 {
+        match self {
+            Self::ModuleNotFound(_) => STATUS_DLL_NOT_FOUND,
+            Self::ExportNotFound {
+                selector: SelectorKind::Name,
+                ..
+            } => STATUS_ENTRYPOINT_NOT_FOUND,
+            Self::ExportNotFound {
+                selector: SelectorKind::Ordinal,
+                ..
+            } => STATUS_ORDINAL_NOT_FOUND,
+            Self::MalformedForwarder(_) | Self::ForwarderCycle { .. } => {
+                STATUS_INVALID_IMAGE_FORMAT
+            }
+        }
+    }
+
+    /// Value written to a failed import's IAT slot before aborting the snap transaction.
+    pub const fn iat_poison(&self) -> u64 {
+        BAD_IAT_VALUE
+    }
 }
 
 /// A single resolved import: the IAT slot RVA (where the address goes) + the resolved target
@@ -78,11 +127,17 @@ fn resolve_in_module(
     .ok_or_else(|| ResolveError::ExportNotFound {
         module: module_name.to_string(),
         symbol: selector.display(),
+        selector: selector.kind(),
     })?;
 
     match &export.target {
         ExportTarget::Address(addr) => Ok(*addr),
         ExportTarget::Forwarder { dll, func } => {
+            if dll.is_empty()
+                || matches!(func, ForwardSelector::Name(name) if name.is_empty())
+            {
+                return Err(ResolveError::MalformedForwarder(forwarder_key(dll, func)));
+            }
             // Record the hop; detect a repeat (cycle) explicitly, and bound the depth.
             let hop = forwarder_key(dll, func);
             if chain.contains(&hop) {
@@ -122,6 +177,13 @@ enum Selector {
 }
 
 impl Selector {
+    fn kind(&self) -> SelectorKind {
+        match self {
+            Self::Name(_) => SelectorKind::Name,
+            Self::Ordinal(_) => SelectorKind::Ordinal,
+        }
+    }
+
     fn display(&self) -> String {
         match self {
             Selector::Name(n) => n.clone(),
@@ -149,6 +211,7 @@ pub fn resolve_symbol(
             return Err(ResolveError::ExportNotFound {
                 module: dll.to_string(),
                 symbol: String::new(),
+                selector: SelectorKind::Name,
             })
         }
     };
