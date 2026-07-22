@@ -44,6 +44,7 @@ const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+const STATUS_NOT_SUPPORTED: NtStatus = 0xC000_00BB;
 const STATUS_INVALID_PARAMETER_1: NtStatus = 0xC000_00EF;
 const STATUS_INVALID_PARAMETER_3: NtStatus = 0xC000_00F1;
 const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008;
@@ -55,6 +56,8 @@ const STATUS_NAME_TOO_LONG: NtStatus = 0xC000_0106;
 const STATUS_DLL_NOT_FOUND: NtStatus = 0xC000_0135;
 const STATUS_INVALID_COMPUTER_NAME: NtStatus = 0xC000_0122;
 const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
+const STATUS_IMAGE_CHECKSUM_MISMATCH: NtStatus = 0xC000_0221;
+const STATUS_FILE_TOO_LARGE: NtStatus = 0xC000_0904;
 const STATUS_SHARING_VIOLATION: NtStatus = 0xC000_0043;
 const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
 const STATUS_INVALID_PARAMETER_4: NtStatus = 0xC000_00F2;
@@ -4349,26 +4352,95 @@ pub unsafe extern "system" fn ldr_query_image_file_execution_options_ex(
     query_status
 }
 
-/// `LdrVerifyImageMatchesChecksum(HANDLE ImageFileHandle, ...) -> NTSTATUS`. Honest seam (checksum
-/// verification against the live mapped image — Step 4.B). Returns success (checksum-OK) since we
-/// don't reject images at 4.0b — matching the common ntdll behavior when checksum==0.
+#[cfg(target_arch = "x86_64")]
+unsafe fn verify_image_file_handle(
+    image_file_handle: *mut c_void,
+    import_callback: *mut c_void,
+    import_callback_parameter: *mut c_void,
+    image_characteristics: *mut u16,
+) -> NtStatus {
+    type ImportCallback = unsafe extern "system" fn(*mut c_void, *const u8);
+
+    let tagged_handle = image_file_handle as usize;
+    let raw_handle = tagged_handle & !1;
+    if raw_handle == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let image = match unsafe {
+        read_file_handle_bounded(
+            raw_handle as u64,
+            nt_ntdll::rtl::image_verify::MAX_IMAGE_FILE_BYTES,
+            STATUS_FILE_TOO_LARGE,
+        )
+    } {
+        Ok(image) => image,
+        Err(status) => return status,
+    };
+    let verified = match nt_ntdll::rtl::image_verify::verify_image(
+        &image,
+        tagged_handle & 1 != 0,
+        !import_callback.is_null(),
+    ) {
+        Ok(verified) => verified,
+        Err(_) => return STATUS_IMAGE_CHECKSUM_MISMATCH,
+    };
+
+    if !image_characteristics.is_null() {
+        unsafe { core::ptr::write_unaligned(image_characteristics, verified.characteristics) };
+    }
+    if !import_callback.is_null() {
+        let callback =
+            unsafe { core::mem::transmute::<*mut c_void, ImportCallback>(import_callback) };
+        for name in verified.import_names {
+            // The checked PE parser guarantees that the borrowed name is followed by a NUL byte.
+            unsafe { callback(import_callback_parameter, name.as_ptr()) };
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// Verify the PE image read from `ImageFileHandle`, report its characteristics, and enumerate its
+/// imported module names. A low-bit-tagged KnownDLL handle skips only the checksum comparison; the
+/// real executive handle used for I/O has that policy bit removed.
 ///
 /// # Safety
-/// Standard contract.
+/// `import_callback` has the `LDR_IMPORT_MODULE_CALLBACK` ABI and `image_characteristics`, when
+/// non-null, is writable.
 #[export_name = "LdrVerifyImageMatchesChecksum"]
 pub unsafe extern "system" fn ldr_verify_image_matches_checksum(
-    _image_file_handle: *mut c_void,
-    _import_callback: *mut c_void,
-    _import_callback_parameter: *mut c_void,
-    _image_characteristics: *mut u16,
+    image_file_handle: *mut c_void,
+    import_callback: *mut c_void,
+    import_callback_parameter: *mut c_void,
+    image_characteristics: *mut u16,
 ) -> NtStatus {
-    STATUS_SUCCESS // checksum treated as valid (default; the real map/verify is Step 4.B)
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            verify_image_file_handle(
+                image_file_handle,
+                import_callback,
+                import_callback_parameter,
+                image_characteristics,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            image_file_handle,
+            import_callback,
+            import_callback_parameter,
+            image_characteristics,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `LdrVerifyImageMatchesChecksumEx(HANDLE ImageFileHandle, PLDR_VERIFY_IMAGE_INFO VerifyInfo)`.
 ///
-/// Extended wrapper around the checksum verifier. The current loader accepts mapped boot images; when
-/// the caller asks for image characteristics, publish zero rather than leaving the field stale.
+/// Extended wrapper around the checksum verifier. Callback and characteristics flags are honored;
+/// custom section creation returns `STATUS_NOT_SUPPORTED` until general file-backed sections exist
+/// in the executive.
 ///
 /// # Safety
 /// `verify_info` points to an `LDR_VERIFY_IMAGE_INFO`-compatible buffer.
@@ -4380,9 +4452,13 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
     if verify_info.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    const LDR_VERIFY_IMAGE_INFO_MIN_SIZE: u32 = 58;
+    const LDR_VERIFY_IMAGE_INFO_SIZE: u32 = 0x40;
     const LDR_VERIFY_IMAGE_FLAG_USE_CALLBACK: u32 = 0x1;
+    const LDR_VERIFY_IMAGE_FLAG_USE_SECTION_INFO: u32 = 0x2;
     const LDR_VERIFY_IMAGE_FLAG_RETURN_IMAGE_CHARACTERISTICS: u32 = 0x4;
+    const LDR_VERIFY_IMAGE_VALID_FLAGS: u32 = LDR_VERIFY_IMAGE_FLAG_USE_CALLBACK
+        | LDR_VERIFY_IMAGE_FLAG_USE_SECTION_INFO
+        | LDR_VERIFY_IMAGE_FLAG_RETURN_IMAGE_CHARACTERISTICS;
     const LDR_VERIFY_CALLBACK_ROUTINE_OFFSET: usize = 0x08;
     const LDR_VERIFY_CALLBACK_PARAMETER_OFFSET: usize = 0x10;
     const LDR_VERIFY_IMAGE_CHARACTERISTICS_OFFSET: usize = 0x38;
@@ -4390,8 +4466,11 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
     let bytes = verify_info as *mut u8;
     let info_size = unsafe { core::ptr::read_unaligned(bytes as *const u32) };
     let flags = unsafe { core::ptr::read_unaligned(bytes.add(4) as *const u32) };
-    if info_size < LDR_VERIFY_IMAGE_INFO_MIN_SIZE {
-        return STATUS_INFO_LENGTH_MISMATCH;
+    if info_size != LDR_VERIFY_IMAGE_INFO_SIZE || flags & !LDR_VERIFY_IMAGE_VALID_FLAGS != 0 {
+        return STATUS_INVALID_PARAMETER_2;
+    }
+    if flags & LDR_VERIFY_IMAGE_FLAG_USE_SECTION_INFO != 0 {
+        return STATUS_NOT_SUPPORTED;
     }
 
     let (callback, parameter) = if flags & LDR_VERIFY_IMAGE_FLAG_USE_CALLBACK != 0 {
@@ -4413,11 +4492,21 @@ pub unsafe extern "system" fn ldr_verify_image_matches_checksum_ex(
     } else {
         core::ptr::null_mut()
     };
-    if !characteristics.is_null() {
-        unsafe { core::ptr::write_unaligned(characteristics, 0) };
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            verify_image_file_handle(
+                image_file_handle,
+                callback,
+                parameter,
+                characteristics,
+            )
+        }
     }
-    unsafe {
-        ldr_verify_image_matches_checksum(image_file_handle, callback, parameter, characteristics)
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (image_file_handle, callback, parameter, characteristics);
+        STATUS_NOT_IMPLEMENTED
     }
 }
 
@@ -11377,7 +11466,7 @@ unsafe fn open_activation_file(nt_path: &[u16]) -> Result<u64, NtStatus> {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn read_activation_file_handle(
+unsafe fn read_file_handle_bounded(
     handle: u64,
     maximum: usize,
     too_large_status: NtStatus,
@@ -11443,7 +11532,7 @@ unsafe fn read_activation_file(
     too_large_status: NtStatus,
 ) -> Result<Vec<u8>, NtStatus> {
     let handle = unsafe { open_activation_file(nt_path)? };
-    let result = unsafe { read_activation_file_handle(handle, maximum, too_large_status) };
+    let result = unsafe { read_file_handle_bounded(handle, maximum, too_large_status) };
     let _ = unsafe { boot_nt_close(handle) };
     result
 }
@@ -11463,7 +11552,7 @@ unsafe fn read_activation_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtSt
 unsafe fn read_associated_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtStatus> {
     let handle = unsafe { open_activation_file(nt_path) }.map_err(|_| STATUS_RESOURCE_NAME_NOT_FOUND)?;
     let result = unsafe {
-        read_activation_file_handle(
+        read_file_handle_bounded(
             handle,
             nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES,
             nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
@@ -11918,7 +12007,7 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(handle) => handle,
                     Err(status) => return status,
                 };
-                let pe_contents = read_activation_file_handle(
+                let pe_contents = read_file_handle_bounded(
                     pe_handle,
                     nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES,
                     STATUS_INVALID_IMAGE_FORMAT,

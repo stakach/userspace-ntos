@@ -198,8 +198,27 @@ impl<'a> PeFile<'a> {
     /// Read a NUL-terminated ASCII string at `rva` (via the section table). Used by the loader to
     /// read forwarder strings (`"TARGETDLL.func"`) out of the export directory.
     pub fn cstr_at_rva(&self, rva: u32) -> Result<alloc::string::String, PeError> {
-        let raw = rva::cstr_at_rva(self.bytes, &self.sections, rva)?;
+        let raw = self.cstr_bytes_at_rva(rva)?;
         Ok(alloc::string::String::from_utf8_lossy(raw).into_owned())
+    }
+
+    /// Borrow a NUL-terminated byte string at `rva`, excluding the terminator. The returned slice
+    /// points into the raw file and is followed by the validated NUL byte, which lets loader APIs
+    /// pass the original ANSI import name to a callback without changing non-UTF-8 bytes.
+    pub fn cstr_bytes_at_rva(&self, rva: u32) -> Result<&'a [u8], PeError> {
+        if rva < self.headers.size_of_headers {
+            const MAX_NAME_LEN: usize = 512;
+            let start = rva as usize;
+            let header_end = (self.headers.size_of_headers as usize).min(self.bytes.len());
+            let bytes = self.bytes.get(start..header_end).ok_or(PeError::Truncated)?;
+            let end = bytes
+                .iter()
+                .take(MAX_NAME_LEN + 1)
+                .position(|byte| *byte == 0)
+                .ok_or(PeError::ImportTableInvalid)?;
+            return Ok(&bytes[..end]);
+        }
+        rva::cstr_at_rva(self.bytes, &self.sections, rva)
     }
 
     /// True if the image has a TLS directory (data dir 9) — its TLS callbacks must run around
@@ -213,7 +232,10 @@ impl<'a> PeFile<'a> {
     /// mapped image — enough to inspect an export's code (e.g. a syscall stub).
     pub fn bytes_at_rva(&self, rva: u32, len: usize) -> Option<&'a [u8]> {
         let length = u32::try_from(len).ok()?;
-        let _end_rva = rva.checked_add(length)?;
+        let end_rva = rva.checked_add(length)?;
+        if rva < self.headers.size_of_headers && end_rva <= self.headers.size_of_headers {
+            return self.bytes.get(rva as usize..end_rva as usize);
+        }
         let section = self.sections.iter().find(|section| {
             let delta = rva.checked_sub(section.virtual_address);
             delta.is_some_and(|delta| {

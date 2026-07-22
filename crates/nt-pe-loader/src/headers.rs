@@ -1,6 +1,6 @@
 //! DOS + PE/COFF + optional-header + section-table parsing (spec §7.2).
 
-use crate::{u16_at, u32_at, u64_at, PeError};
+use crate::{bytes_at, u16_at, u32_at, u64_at, PeError};
 
 pub const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
 pub const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
@@ -81,6 +81,11 @@ impl Headers {
 
         // Optional header (PE32+) at fh + 20.
         let oh = fh.checked_add(20).ok_or(PeError::Truncated)?;
+        let optional_size = size_of_optional_header as usize;
+        bytes_at(b, oh, optional_size)?;
+        if optional_size < 112 {
+            return Err(PeError::Truncated);
+        }
         let magic = u16_at(b, oh)?;
         if magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
             return Err(PeError::NotPe32Plus(magic));
@@ -99,6 +104,12 @@ impl Headers {
 
         let mut data_directories = [DataDirectory::default(); 16];
         let count = (number_of_rva_and_sizes as usize).min(16);
+        if 112usize
+            .checked_add(count.checked_mul(8).ok_or(PeError::Truncated)?)
+            .is_none_or(|required| required > optional_size)
+        {
+            return Err(PeError::Truncated);
+        }
         for (i, dir) in data_directories.iter_mut().enumerate().take(count) {
             let dd = oh + 112 + i * 8;
             *dir = DataDirectory {

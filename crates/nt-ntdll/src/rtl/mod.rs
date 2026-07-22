@@ -28,6 +28,7 @@ pub mod exception;
 pub mod generic_table;
 pub mod guid;
 pub mod image;
+pub mod image_verify;
 pub mod integer;
 pub mod locale;
 pub mod memory;
