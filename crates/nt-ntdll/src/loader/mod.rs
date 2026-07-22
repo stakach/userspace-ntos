@@ -24,6 +24,7 @@
 //! shim engine loads, by policy, not by a name blocklist. See [`init::ShimPolicy`].
 
 pub mod host;
+pub mod ifeo;
 pub mod init;
 pub mod lifecycle;
 pub mod lock;

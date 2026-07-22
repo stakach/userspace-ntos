@@ -168,43 +168,60 @@ pub fn integer_to_unicode(value: u32, base: u32) -> Option<Vec<u16>> {
     Some(digits)
 }
 
-/// `RtlUnicodeStringToInteger`: parse a UTF-16 unsigned integer in `base`
-/// (`0` auto-detects `0x`). Returns `None` on the first invalid digit.
+/// `RtlUnicodeStringToInteger`: parse a counted UTF-16 integer in `base`.
+///
+/// Base zero recognizes the native lowercase `0b`, `0o`, and `0x` prefixes. Arithmetic wraps as a
+/// Windows `ULONG`; a valid base with no leading digits produces zero. `None` only denotes an
+/// unsupported explicit base.
 pub fn unicode_string_to_integer(s: &[u16], mut base: u32) -> Option<u32> {
     let mut i = 0;
-    // Skip leading ASCII whitespace.
-    while i < s.len() && (s[i] == b' ' as u16 || s[i] == b'\t' as u16) {
+    while i < s.len() && s[i] <= b' ' as u16 {
         i += 1;
     }
+    let negative = if i < s.len() && s[i] == b'+' as u16 {
+        i += 1;
+        false
+    } else if i < s.len() && s[i] == b'-' as u16 {
+        i += 1;
+        true
+    } else {
+        false
+    };
     if base == 0 {
-        if i + 1 < s.len() && s[i] == b'0' as u16 && (s[i + 1] | 0x20) == b'x' as u16 {
-            base = 16;
-            i += 2;
-        } else {
-            base = 10;
+        base = 10;
+        if i + 1 < s.len() && s[i] == b'0' as u16 {
+            base = match s[i + 1] {
+                c if c == b'b' as u16 => 2,
+                c if c == b'o' as u16 => 8,
+                c if c == b'x' as u16 => 16,
+                _ => 10,
+            };
+            if base != 10 {
+                i += 2;
+            }
         }
+    } else if !matches!(base, 2 | 8 | 10 | 16) {
+        return None;
     }
     let mut acc: u32 = 0;
-    let mut any = false;
     while i < s.len() {
         let c = s[i];
         let d = match c {
             0x30..=0x39 => (c - 0x30) as u32,
-            0x41..=0x46 => (c - 0x41 + 10) as u32,
-            0x61..=0x66 => (c - 0x61 + 10) as u32,
+            0x41..=0x5a => (c - 0x41 + 10) as u32,
+            0x61..=0x7a => (c - 0x61 + 10) as u32,
             _ => break,
         };
         if d >= base {
             break;
         }
-        acc = acc.checked_mul(base)?.checked_add(d)?;
-        any = true;
+        acc = acc.wrapping_mul(base).wrapping_add(d);
         i += 1;
     }
-    if any {
-        Some(acc)
+    if negative {
+        Some(0u32.wrapping_sub(acc))
     } else {
-        None
+        Some(acc)
     }
 }
 
@@ -330,6 +347,12 @@ mod tests {
         assert_eq!(unicode_string_to_integer(&u("0xFF"), 0), Some(255));
         assert_eq!(unicode_string_to_integer(&u("  42"), 10), Some(42));
         assert_eq!(unicode_string_to_integer(&u("1010"), 2), Some(10));
-        assert_eq!(unicode_string_to_integer(&u("notanumber"), 10), None);
+        assert_eq!(
+            unicode_string_to_integer(&u("-0o10"), 0),
+            Some(u32::MAX - 7)
+        );
+        assert_eq!(unicode_string_to_integer(&u("0b1010"), 0), Some(10));
+        assert_eq!(unicode_string_to_integer(&u("notanumber"), 10), Some(0));
+        assert_eq!(unicode_string_to_integer(&u("1"), 3), None);
     }
 }
