@@ -207,6 +207,7 @@ pub const NT_SYSCALLS: &[NtSyscall] = &[
     n("NtQueryPerformanceCounter", 173),
     n("NtQuerySection", 175),
     n("NtQuerySecurityObject", 176),
+    n("NtQuerySemaphore", 177),
     n("NtQuerySymbolicLinkObject", 178),
     n("NtQuerySystemEnvironmentValueEx", 180),
     n("NtQuerySystemInformation", 181),
@@ -478,6 +479,7 @@ pub const ZW_ALIASES: &[ZwAlias] = &[
     ),
     z("ZwQuerySection", "NtQuerySection", 175),
     z("ZwQuerySecurityObject", "NtQuerySecurityObject", 176),
+    z("ZwQuerySemaphore", "NtQuerySemaphore", 177),
     z(
         "ZwQuerySymbolicLinkObject",
         "NtQuerySymbolicLinkObject",
@@ -743,6 +745,7 @@ pub const NT_ARGC: &[(&str, u8)] = &[
     ("NtQueryPerformanceCounter", 2),
     ("NtQuerySection", 5),
     ("NtQuerySecurityObject", 5),
+    ("NtQuerySemaphore", 5),
     ("NtQuerySymbolicLinkObject", 3),
     ("NtQuerySystemEnvironmentValueEx", 5),
     ("NtQuerySystemInformation", 4),

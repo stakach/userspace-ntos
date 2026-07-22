@@ -252,6 +252,7 @@ generate_trap_stubs! {
     (nt_query_performance_counter, "NtQueryPerformanceCounter", 173),
     (nt_query_section, "NtQuerySection", 175),
     (nt_query_security_object, "NtQuerySecurityObject", 176),
+    (nt_query_semaphore, "NtQuerySemaphore", 177),
     (nt_query_symbolic_link_object, "NtQuerySymbolicLinkObject", 178),
     (nt_query_system_environment_value_ex, "NtQuerySystemEnvironmentValueEx", 180),
     (nt_query_system_information, "NtQuerySystemInformation", 181),

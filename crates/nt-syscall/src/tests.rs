@@ -382,6 +382,28 @@ fn event_family_uses_native_numbers_and_argument_contracts() {
 }
 
 #[test]
+fn semaphore_family_uses_native_numbers_and_argument_contracts() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[
+            (NativeService::NtCreateSemaphore, 53),
+            (NativeService::NtOpenSemaphore, 132),
+            (NativeService::NtQuerySemaphore, 177),
+            (NativeService::NtReleaseSemaphore, 197),
+        ],
+    );
+    for (service, ssn, argc) in [
+        (NativeService::NtCreateSemaphore, 53, (5, 5)),
+        (NativeService::NtOpenSemaphore, 132, (3, 3)),
+        (NativeService::NtQuerySemaphore, 177, (5, 5)),
+        (NativeService::NtReleaseSemaphore, 197, (3, 3)),
+    ] {
+        assert_eq!(table.lookup(ssn).unwrap().service, service);
+        assert_eq!(service.arg_count(), argc);
+    }
+}
+
+#[test]
 fn io_completion_family_registers_at_reactos_numbers() {
     let pairs = [
         (NativeService::NtCreateIoCompletion, 40u32),

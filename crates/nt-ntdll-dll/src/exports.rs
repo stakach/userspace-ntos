@@ -18151,6 +18151,7 @@ zw_alias!(
     nt_query_performance_counter
 );
 zw_alias!(zw_query_section, "ZwQuerySection", nt_query_section);
+zw_alias!(zw_query_semaphore, "ZwQuerySemaphore", nt_query_semaphore);
 zw_alias!(
     zw_query_security_object,
     "ZwQuerySecurityObject",
@@ -22900,6 +22901,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_query_performance_counter as *const () as usize,
         zw_query_section as *const () as usize,
         zw_query_security_object as *const () as usize,
+        zw_query_semaphore as *const () as usize,
         zw_query_symbolic_link_object as *const () as usize,
         zw_query_system_environment_value_ex as *const () as usize,
         zw_query_system_information as *const () as usize,

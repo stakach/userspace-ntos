@@ -127,6 +127,9 @@ pub enum NativeService {
     // the executive currently returns an object-open failure because no event-pair type is modelled.
     NtOpenEventPair,
     NtCreateSemaphore,
+    NtOpenSemaphore,
+    NtQuerySemaphore,
+    NtReleaseSemaphore,
     // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
     // SURT. The message data plane (request/reply/receive) is served directly by the executive
     // against its cached connection, so those ops are NOT in this table (they never round-trip to
@@ -250,6 +253,9 @@ impl NativeService {
             NtOpenEvent => "NtOpenEvent",
             NtOpenEventPair => "NtOpenEventPair",
             NtCreateSemaphore => "NtCreateSemaphore",
+            NtOpenSemaphore => "NtOpenSemaphore",
+            NtQuerySemaphore => "NtQuerySemaphore",
+            NtReleaseSemaphore => "NtReleaseSemaphore",
             NtConnectPort => "NtConnectPort",
             NtSecureConnectPort => "NtSecureConnectPort",
             NtAcceptConnectPort => "NtAcceptConnectPort",
@@ -299,13 +305,14 @@ impl NativeService {
             | NtQueryDebugFilterState | NtPulseEvent | NtResetEvent | NtSetEvent => (2, 2),
             NtOpenKey | NtCreateKey | NtAddAtom | NtFindAtom | NtOpenIoCompletion
             | NtSetDebugFilterState | NtOpenEventPair | NtPlugPlayControl
-            | NtSetSystemPowerState | NtOpenEvent => (3, 3),
+            | NtSetSystemPowerState | NtOpenEvent | NtOpenSemaphore | NtReleaseSemaphore => (3, 3),
             NtGetPlugPlayEvent => (4, 4),
             NtQueryValueKey => (4, 6),
             NtOpenThreadToken | NtCreateIoCompletion => (4, 4),
             NtProtectVirtualMemory | NtQueryInformationProcess | NtQueryInformationToken
             | NtQueryObject | NtQueryVolumeInformationFile | NtQueryInformationAtom
-            | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent => {
+            | NtQueryIoCompletion | NtRemoveIoCompletion | NtSetIoCompletion | NtQueryEvent
+            | NtQuerySemaphore => {
                 (5, 5)
             }
             NtWaitForSingleObject => (3, 3),
@@ -456,6 +463,9 @@ impl NativeService {
         NativeService::NtQueryEvent,
         NativeService::NtResetEvent,
         NativeService::NtSetEvent,
+        NativeService::NtOpenSemaphore,
+        NativeService::NtQuerySemaphore,
+        NativeService::NtReleaseSemaphore,
     ];
 }
 
