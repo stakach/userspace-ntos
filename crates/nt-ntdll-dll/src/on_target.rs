@@ -36,6 +36,10 @@ use nt_ntdll::heap::{Backing, Heap};
 
 /// `NtAllocateVirtualMemory` SSN (shared `nt-syscall-abi` table).
 const SSN_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 18;
+/// `NtFreeVirtualMemory` SSN.
+const SSN_NT_FREE_VIRTUAL_MEMORY: u32 = 87;
+/// `NtProtectVirtualMemory` SSN.
+const SSN_NT_PROTECT_VIRTUAL_MEMORY: u32 = 143;
 
 /// `NtRequestWaitReplyPort` SSN (CSR API message data plane).
 #[cfg(target_arch = "x86_64")]
@@ -44,10 +48,18 @@ const SSN_NT_REQUEST_WAIT_REPLY_PORT: u32 = 208;
 /// `STATUS_NO_MEMORY`.
 const STATUS_NO_MEMORY: u64 = 0xC000_0017;
 
+/// `MEM_COMMIT`.
+const MEM_COMMIT: u32 = 0x0000_1000;
+/// `MEM_RESERVE`.
+const MEM_RESERVE: u32 = 0x0000_2000;
 /// `MEM_COMMIT | MEM_RESERVE`.
 const MEM_COMMIT_RESERVE: u32 = 0x0000_3000;
+/// `MEM_RELEASE`.
+const MEM_RELEASE: u32 = 0x0000_8000;
 /// `PAGE_READWRITE`.
 const PAGE_READWRITE: u32 = 0x04;
+/// `PAGE_GUARD`.
+const PAGE_GUARD: u32 = 0x100;
 /// `NtCurrentProcess()` pseudo-handle.
 const NT_CURRENT_PROCESS: u64 = u64::MAX; // (HANDLE)-1
 
@@ -105,7 +117,28 @@ pub unsafe fn csr_request_wait_reply(message: u64) -> u32 {
 /// Issues a real syscall serviced by the executive; only valid on-target in a hosted process.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
-    let mut base: u64 = 0; // 0 = let the executive pick the per-process bump base
+    // SAFETY: on-target hosted-process syscall.
+    match unsafe {
+        nt_allocate_virtual_memory_raw(0, size_in, 0, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    } {
+        Ok((base, _)) => base,
+        Err(_) => 0,
+    }
+}
+
+/// Issue `NtAllocateVirtualMemory` with explicit base/size/type.
+///
+/// # Safety
+/// On-target hosted-process syscall; the requested address range must be valid for the process.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_allocate_virtual_memory_raw(
+    base_in: u64,
+    size_in: usize,
+    zero_bits: u32,
+    allocation_type: u32,
+    protect: u32,
+) -> Result<(u64, usize), u32> {
+    let mut base: u64 = base_in;
     let mut region: u64 = size_in as u64;
     // arg1=ProcessHandle, arg2=&BaseAddress, arg3=ZeroBits, arg4=&RegionSize, arg5=AllocationType,
     // arg6=Protect. The executive reads/writes *BaseAddress + *RegionSize through its stack mirror.
@@ -114,17 +147,62 @@ pub(crate) unsafe fn nt_allocate_virtual_memory(size_in: usize) -> u64 {
         syscall6(
             SSN_NT_ALLOCATE_VIRTUAL_MEMORY,
             NT_CURRENT_PROCESS,
-            &mut base as *mut u64 as u64,
-            0,
-            &mut region as *mut u64 as u64,
-            MEM_COMMIT_RESERVE as u64,
-            PAGE_READWRITE as u64,
+            core::ptr::addr_of_mut!(base) as u64,
+            zero_bits as u64,
+            core::ptr::addr_of_mut!(region) as u64,
+            allocation_type as u64,
+            protect as u64,
         )
-    };
-    if status == 0 {
-        base
+    } as u32;
+    if (status as i32) < 0 {
+        Err(status)
     } else {
-        0
+        Ok((base, region as usize))
+    }
+}
+
+/// Issue `NtProtectVirtualMemory` for a current-process range.
+///
+/// # Safety
+/// On-target hosted-process syscall; the requested address range must be valid.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_protect_virtual_memory(base_in: u64, size_in: usize, protect: u32) -> u32 {
+    let mut base = base_in;
+    let mut size = size_in as u64;
+    let mut old_protect = 0u32;
+    // SAFETY: base/size/old_protect are stack locals for syscall out-params.
+    unsafe {
+        syscall6(
+            SSN_NT_PROTECT_VIRTUAL_MEMORY,
+            NT_CURRENT_PROCESS,
+            core::ptr::addr_of_mut!(base) as u64,
+            core::ptr::addr_of_mut!(size) as u64,
+            protect as u64,
+            core::ptr::addr_of_mut!(old_protect) as u64,
+            0,
+        ) as u32
+    }
+}
+
+/// Issue `NtFreeVirtualMemory(MEM_RELEASE)` for a current-process stack reservation.
+///
+/// # Safety
+/// On-target hosted-process syscall; `base_in` should be a stack allocation base.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nt_release_virtual_memory(base_in: u64) -> u32 {
+    let mut base = base_in;
+    let mut size = 0u64;
+    // SAFETY: base/size are stack locals for syscall out-params.
+    unsafe {
+        syscall6(
+            SSN_NT_FREE_VIRTUAL_MEMORY,
+            NT_CURRENT_PROCESS,
+            core::ptr::addr_of_mut!(base) as u64,
+            core::ptr::addr_of_mut!(size) as u64,
+            MEM_RELEASE as u64,
+            0,
+            0,
+        ) as u32
     }
 }
 
@@ -2818,6 +2896,130 @@ const CTX_RIP: usize = 0xF8;
 /// The amd64 CONTEXT record size (enough to hold through RIP@0xF8 + the extended area the kernel may
 /// touch); 0x4D0 is the real `sizeof(CONTEXT)` on x64.
 const CONTEXT_SIZE: usize = 0x4D0;
+
+/// Best-effort current-image stack defaults from `PEB->ImageBaseAddress` optional header.
+///
+/// # Safety
+/// On-target; reads the current PEB and mapped image headers.
+#[cfg(target_arch = "x86_64")]
+unsafe fn current_image_stack_defaults() -> (usize, usize) {
+    let mut commit = nt_ntdll::rtl::user_stack::DEFAULT_STACK_COMMIT;
+    let mut reserve = nt_ntdll::rtl::user_stack::DEFAULT_STACK_RESERVE;
+    // SAFETY: current hosted thread has a PEB at GS:[0x60].
+    unsafe {
+        let peb: *const u8;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
+        if peb.is_null() {
+            return (commit, reserve);
+        }
+        let image = core::ptr::read_unaligned(peb.add(0x10) as *const u64);
+        if image < 0x1_0000 || core::ptr::read_unaligned(image as *const u16) != 0x5A4D {
+            return (commit, reserve);
+        }
+        let e_lfanew = core::ptr::read_unaligned((image + 0x3C) as *const u32) as u64;
+        let nt = image + e_lfanew;
+        if core::ptr::read_unaligned(nt as *const u32) != 0x0000_4550 {
+            return (commit, reserve);
+        }
+        let opt = nt + 24;
+        let magic = core::ptr::read_unaligned(opt as *const u16);
+        if magic == 0x20B {
+            reserve = core::ptr::read_unaligned((opt + 0x48) as *const u64) as usize;
+            commit = core::ptr::read_unaligned((opt + 0x50) as *const u64) as usize;
+        } else if magic == 0x10B {
+            reserve = core::ptr::read_unaligned((opt + 0x48) as *const u32) as usize;
+            commit = core::ptr::read_unaligned((opt + 0x4C) as *const u32) as usize;
+        }
+    }
+    (commit, reserve)
+}
+
+/// `RtlCreateUserStack(CommittedStackSize, MaximumStackSize, ZeroBits, PageSize,
+/// ReserveAlignment, InitialTeb) -> NTSTATUS`.
+///
+/// # Safety
+/// On-target hosted process; `initial_teb` must be writable for an `INITIAL_TEB`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_create_user_stack(
+    committed_stack_size: usize,
+    maximum_stack_size: usize,
+    zero_bits: u32,
+    commit_alignment: usize,
+    reserve_alignment: usize,
+    initial_teb: *mut u64,
+) -> u32 {
+    if initial_teb.is_null() {
+        return 0xC000_000D; // STATUS_INVALID_PARAMETER
+    }
+    let (default_commit, default_reserve) = unsafe { current_image_stack_defaults() };
+    let layout = match nt_ntdll::rtl::user_stack::create_user_stack_layout(
+        committed_stack_size,
+        maximum_stack_size,
+        zero_bits,
+        commit_alignment,
+        reserve_alignment,
+        default_commit,
+        default_reserve,
+    ) {
+        Ok(layout) => layout,
+        Err(status) => return status,
+    };
+
+    let (allocation_base, actual_reserve) = match unsafe {
+        nt_allocate_virtual_memory_raw(0, layout.reserve, zero_bits, MEM_RESERVE, PAGE_READWRITE)
+    } {
+        Ok(pair) => pair,
+        Err(status) => return status,
+    };
+    let layout = nt_ntdll::rtl::user_stack::UserStackLayout {
+        reserve: actual_reserve,
+        ..layout
+    };
+    let stack_limit = allocation_base + layout.reserve as u64 - layout.commit as u64;
+    let commit_base = if layout.guard != 0 {
+        stack_limit - layout.guard as u64
+    } else {
+        stack_limit
+    };
+    let commit_size = layout.commit + layout.guard;
+    if let Err(status) = unsafe {
+        nt_allocate_virtual_memory_raw(commit_base, commit_size, 0, MEM_COMMIT, PAGE_READWRITE)
+    } {
+        let _ = unsafe { nt_release_virtual_memory(allocation_base) };
+        return status;
+    }
+    if layout.guard != 0 {
+        let status = unsafe {
+            nt_protect_virtual_memory(commit_base, layout.guard, PAGE_READWRITE | PAGE_GUARD)
+        };
+        if (status as i32) < 0 {
+            let _ = unsafe { nt_release_virtual_memory(allocation_base) };
+            return status;
+        }
+    }
+
+    let fields = nt_ntdll::rtl::user_stack::initial_teb_fields(allocation_base, layout);
+    // SAFETY: initial_teb points at five pointer-width fields.
+    unsafe {
+        core::ptr::write_unaligned(initial_teb.add(0), fields.previous_stack_base);
+        core::ptr::write_unaligned(initial_teb.add(1), fields.previous_stack_limit);
+        core::ptr::write_unaligned(initial_teb.add(2), fields.stack_base);
+        core::ptr::write_unaligned(initial_teb.add(3), fields.stack_limit);
+        core::ptr::write_unaligned(initial_teb.add(4), fields.allocated_stack_base);
+    }
+    0
+}
+
+/// `RtlFreeUserStack(DeallocationStack)`.
+///
+/// # Safety
+/// On-target hosted process; `deallocation_stack` should come from `RtlCreateUserStack`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_free_user_stack(deallocation_stack: u64) {
+    if deallocation_stack != 0 {
+        let _ = unsafe { nt_release_virtual_memory(deallocation_stack) };
+    }
+}
 
 /// An 8-arg syscall. TRAP transport (fallback): arg1..4 registers; arg5..8 on the stack.
 ///

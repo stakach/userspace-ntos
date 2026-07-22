@@ -3842,6 +3842,70 @@ pub unsafe extern "system" fn rtl_create_user_thread(
     }
 }
 
+/// `RtlCreateUserStack(SIZE_T CommittedStackSize, SIZE_T MaximumStackSize, ULONG ZeroBits,
+/// SIZE_T PageSize, SIZE_T ReserveAlignment, PINITIAL_TEB InitialTeb) -> NTSTATUS`.
+///
+/// ReactOS' public NT 6 export is only a spec stub, but the private `RtlpCreateUserStack`
+/// implementation in `sdk/lib/rtl/thread.c` is the real model: reserve the stack range, commit the top
+/// portion, make the low committed page a guard page, and return the addresses in `INITIAL_TEB`.
+///
+/// # Safety
+/// `initial_teb` is writable for five pointer-sized fields.
+#[export_name = "RtlCreateUserStack"]
+pub unsafe extern "system" fn rtl_create_user_stack(
+    committed_stack_size: usize,
+    maximum_stack_size: usize,
+    zero_bits: u32,
+    commit_alignment: usize,
+    reserve_alignment: usize,
+    initial_teb: *mut c_void,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; delegates to the VM-backed stack creator.
+        unsafe {
+            crate::on_target::rtl_create_user_stack(
+                committed_stack_size,
+                maximum_stack_size,
+                zero_bits,
+                commit_alignment,
+                reserve_alignment,
+                initial_teb as *mut u64,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (
+            committed_stack_size,
+            maximum_stack_size,
+            zero_bits,
+            commit_alignment,
+            reserve_alignment,
+            initial_teb,
+        );
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
+/// `RtlFreeUserStack(PVOID DeallocationStack)`.
+///
+/// # Safety
+/// `deallocation_stack` is null or the `INITIAL_TEB.DeallocationStack` returned by
+/// `RtlCreateUserStack`.
+#[export_name = "RtlFreeUserStack"]
+pub unsafe extern "system" fn rtl_free_user_stack(deallocation_stack: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: on-target; releases the stack reservation through NtFreeVirtualMemory.
+        unsafe { crate::on_target::rtl_free_user_stack(deallocation_stack as u64) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = deallocation_stack;
+    }
+}
+
 // =================================================================================================
 // Rtl* — assert
 // =================================================================================================
@@ -10376,6 +10440,22 @@ pub unsafe extern "system" fn rtl_image_rva_to_va(
     }
 }
 
+/// `RtlAddressInSectionTable(PIMAGE_NT_HEADERS NtHeaders, PVOID Base, ULONG Rva) -> PVOID`.
+///
+/// Compatibility wrapper over `RtlImageRvaToVa` without a caller-provided section cache.
+///
+/// # Safety
+/// `nt_headers` and `base` identify a PE image mapped as an ordinary file.
+#[export_name = "RtlAddressInSectionTable"]
+pub unsafe extern "system" fn rtl_address_in_section_table(
+    nt_headers: *mut c_void,
+    base: *mut c_void,
+    rva: u32,
+) -> *mut c_void {
+    // SAFETY: same raw pointer contract as RtlImageRvaToVa.
+    unsafe { rtl_image_rva_to_va(nt_headers, base, rva, core::ptr::null_mut()) }
+}
+
 /// `RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage) -> PVOID` — find the loader module whose
 /// image range contains `PcValue` and return that module's base.
 ///
@@ -14905,6 +14985,43 @@ pub unsafe extern "system" fn rtl_locale_name_to_lcid(
     }
     unsafe { *lcid = found };
     STATUS_SUCCESS
+}
+
+/// `RtlLCIDToCultureName(LCID Lcid, PUNICODE_STRING String) -> BOOLEAN`.
+///
+/// ReactOS forwards this to `RtlLcidToLocaleName` with neutral names allowed.
+///
+/// # Safety
+/// `string` is a writable `UNICODE_STRING` whose buffer is supplied by the caller.
+#[export_name = "RtlLCIDToCultureName"]
+pub unsafe extern "system" fn rtl_lcid_to_culture_name(lcid: u32, string: PUnicodeString) -> u8 {
+    let status =
+        unsafe { rtl_lcid_to_locale_name(lcid, string, RTL_LOCALE_ALLOW_NEUTRAL_NAMES, 0) };
+    u8::from(status == STATUS_SUCCESS)
+}
+
+/// `RtlCultureNameToLCID(PCUNICODE_STRING String, PLCID Lcid) -> BOOLEAN`.
+///
+/// # Safety
+/// `string` is a readable `UNICODE_STRING`; `lcid` is writable.
+#[export_name = "RtlCultureNameToLCID"]
+pub unsafe extern "system" fn rtl_culture_name_to_lcid(
+    string: PCUnicodeString,
+    lcid: *mut u32,
+) -> u8 {
+    if string.is_null() || lcid.is_null() {
+        return 0;
+    }
+    let buffer = unsafe { (*string).buffer as *const u16 };
+    if buffer.is_null() || unsafe { core::ptr::read(buffer) } == 0 {
+        return 0;
+    }
+
+    let Some(found) = (unsafe { rtl_supported_locale_name_to_lcid(buffer) }) else {
+        return 0;
+    };
+    unsafe { *lcid = found };
+    1
 }
 
 /// `RtlVerifyVersionInfo(PRTL_OSVERSIONINFOEXW VersionInfo, ULONG TypeMask, ULONGLONG ConditionMask)
@@ -20549,6 +20666,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_unlock_boot_status_data as usize,
         rtl_create_user_process as usize,
         rtl_create_user_thread as usize,
+        rtl_create_user_stack as usize,
+        rtl_free_user_stack as usize,
         rtl_assert as usize,
         ldr_query_image_file_execution_options as usize,
         ldr_query_image_file_execution_options_ex as usize,
@@ -21272,6 +21391,8 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_get_user_preferred_ui_languages as usize,
         rtl_lcid_to_locale_name as usize,
         rtl_locale_name_to_lcid as usize,
+        rtl_lcid_to_culture_name as usize,
+        rtl_culture_name_to_lcid as usize,
         rtl_verify_version_info as usize,
         rtl_get_current_processor_number as usize,
         rtl_get_current_processor_number_ex as usize,
@@ -21358,6 +21479,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_image_directory_entry_to_data as usize,
         rtl_image_rva_to_section as usize,
         rtl_image_rva_to_va as usize,
+        rtl_address_in_section_table as usize,
         rtl_pc_to_file_header as usize,
         rtl_initialize_handle_table as usize,
         rtl_allocate_handle as usize,
