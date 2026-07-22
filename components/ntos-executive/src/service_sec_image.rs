@@ -2967,11 +2967,14 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.lpc_rendezvous_conn != 0 {
                     let conn_id = nt_handler.lpc_rendezvous_conn;
                     let out_ptr = nt_handler.lpc_rendezvous_out;
-                    print_str(b"[sm-rdv] csrss NtConnectPort pending (conn=");
+                    print_str(b"[sm-rdv] caller pi=");
+                    print_u64(pi as u64);
+                    print_str(b" NtConnectPort pending (conn=");
                     print_u64(conn_id);
                     print_str(b") -> driving the real SmpApiLoop accept\n");
                     let client_handle = sm_rendezvous(
                         conn_id,
+                        pi,
                         procs[0].pml4,
                         smss_pe,
                         procs[0].img_end,
@@ -2986,17 +2989,20 @@ pub(crate) unsafe fn service_sec_image(
                         &mut nt_handler,
                     );
                     if client_handle != 0 {
-                        // csrss's *PortHandle is a csrsrv/csrss VA (demand-fill window) — csrss_out_write.
-                        csrss_out_write(out_ptr, client_handle, &mut *filled_pages, &mut faults,
-                            scratch_base, &reg, &dll_pes, pml4);
-                        let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName (for the cache record)
-                        nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
-                        result = 0; // STATUS_SUCCESS
-                        routed_lpc = true;
-                        print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
-                        print_hex((client_handle >> 32) as u32);
-                        print_hex(client_handle as u32);
-                        print_str(b" -> csrss NtConnectPort SUCCESS\n");
+                        if nt_handler.xas_write_u64(out_ptr, client_handle) {
+                            let name16 = nt_handler.read_lpc_name(m3); // RDX = PortName
+                            nt_handler.cache_lpc_connection(conn_id, client_handle, &name16);
+                            result = 0; // STATUS_SUCCESS
+                            routed_lpc = true;
+                            print_str(b"[sm-rdv] AUTHENTIC accept complete: client handle=0x");
+                            print_hex((client_handle >> 32) as u32);
+                            print_hex(client_handle as u32);
+                            print_str(b" -> caller NtConnectPort SUCCESS\n");
+                        } else {
+                            print_str(b"[sm-rdv] WALL: failed client handle copyout\n");
+                            handled = false;
+                            result = 0xC0000005;
+                        }
                     } else {
                         // The rendezvous walled — stop cleanly with a diagnostic (don't hand csrss junk).
                         print_str(b"[sm-rdv] WALL: rendezvous produced no client handle\n");

@@ -114,6 +114,7 @@ pub(crate) unsafe fn sm_fill_page(
 /// NtReplyWaitReceivePort (no pending connection).
 pub(crate) unsafe fn sm_rendezvous(
     conn_id: u64,
+    connector_pi: usize,
     smss_pml4: u64,
     smss_pe: &nt_pe_loader::PeFile,
     img_end: u64,
@@ -127,7 +128,6 @@ pub(crate) unsafe fn sm_rendezvous(
     dll_pes: &[&Option<nt_pe_loader::PeFile>],
     nt_handler: &mut ExecNtHandler,
 ) -> u64 {
-    const PID_SMSS: u64 = 4; // any nonzero value; must match on both sides (self-connect ClientId)
     const SSN_SET_INFO_THREAD: u64 = 238;
     const SSN_QUERY_INFO_PROCESS: u64 = 161;
     const SSN_REPLY_WAIT_RECV: u64 = 203;
@@ -145,7 +145,43 @@ pub(crate) unsafe fn sm_rendezvous(
     let mut client_handle = 0u64;
     let mut fill_idx = 0u64;
     let mut guard = 0u64;
-    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) = recv_full_r12(ep, reply);
+    let (_b, mut mi, mut m0, mut m1, mut m2, mut m3) =
+        if SM_RECEIVE_PARKED.swap(0, Ordering::Relaxed) != 0 {
+            let recvmsg = SM_RECVMSG.load(Ordering::Relaxed);
+            let port = SM_RECVPORT.load(Ordering::Relaxed);
+            let Some(received) = lpc_client().and_then(|c| c.reply_wait_receive(port).ok()) else {
+                SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                return 0;
+            };
+            if received.connection_id != conn_id {
+                SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
+                return 0;
+            }
+            sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST);
+            sm_stack_write(recvmsg + 0x08, PM_PIDS[connector_pi].load(Ordering::Relaxed));
+            sm_stack_write(recvmsg + 0x10, PM_TIDS[connector_pi].load(Ordering::Relaxed));
+            sm_stack_write32(recvmsg + 0x28, received.subsystem_type);
+            for (i, chunk) in received.connection_info.chunks_exact(2).take(120).enumerate() {
+                sm_stack_write16(
+                    recvmsg + 0x2c + i as u64 * 2,
+                    u16::from_le_bytes([chunk[0], chunk[1]]),
+                );
+            }
+            print_str(b"[sm-rdv] resumed parked receive for pi=");
+            print_u64(connector_pi as u64);
+            print_str(b" cid=");
+            print_u64(PM_PIDS[connector_pi].load(Ordering::Relaxed));
+            print_str(b"/");
+            print_u64(PM_TIDS[connector_pi].load(Ordering::Relaxed));
+            print_str(b"\n");
+            set_reply_mr(15, 0);
+            set_reply_mr(16, SM_RECV_SP.load(Ordering::Relaxed));
+            set_reply_mr(17, SM_RECV_FLAGS.load(Ordering::Relaxed));
+            send_on_reply(reply, 18, 0, 0, 0, SM_RECV_RDX.load(Ordering::Relaxed));
+            recv_full_r12(ep, reply)
+        } else {
+            recv_full_r12(ep, reply)
+        };
     loop {
         guard += 1;
         if guard > 8000 {
@@ -221,7 +257,6 @@ pub(crate) unsafe fn sm_rendezvous(
             let rdx = m3;
             let mut result = 0u64;
             let mut stop_rdv = false;
-            let mut done = false;
             if guard < 64 {
                 print_str(b"[sm-rdv] worker SSN=");
                 print_u64(ssn);
@@ -235,12 +270,12 @@ pub(crate) unsafe fn sm_rendezvous(
                     sm_stack_write(get_recv_mr(9), 0xC500);
                 }
                 SSN_QUERY_INFO_PROCESS => {
-                    // ProcessBasicInformation (class 0): write UniqueProcessId@+0x20 = PID_SMSS so
-                    // SmUniqueProcessId is set → the connection request's ClientId matches (self-connect).
+                    // ProcessBasicInformation initializes SmUniqueProcessId from the real SMSS
+                    // EPROCESS identity; the later SMSS connection request carries the same CID.
                     let class = rdx;
                     let buf = get_recv_mr(7); // R8 = buffer
                     if class == 0 {
-                        sm_stack_write(buf + 0x20, PID_SMSS);
+                        sm_stack_write(buf + 0x20, PM_PIDS[0].load(Ordering::Relaxed));
                     } else if class == 24 {
                         sm_stack_write32(buf, 0); // ProcessSessionInformation: session 0
                     }
@@ -253,8 +288,14 @@ pub(crate) unsafe fn sm_rendezvous(
                         Some(r) if r.connection_id != 0 => {
                             // Marshal the connection-request PORT_MESSAGE onto the SM-loop stack.
                             sm_stack_write16(recvmsg + 0x04, nt_lpc_client::LPC_CONNECTION_REQUEST); // u2.s2.Type
-                            sm_stack_write(recvmsg + 0x08, PM_PIDS[1].load(Ordering::Relaxed));
-                            sm_stack_write(recvmsg + 0x10, PM_TIDS[1].load(Ordering::Relaxed));
+                            sm_stack_write(
+                                recvmsg + 0x08,
+                                PM_PIDS[connector_pi].load(Ordering::Relaxed),
+                            );
+                            sm_stack_write(
+                                recvmsg + 0x10,
+                                PM_TIDS[connector_pi].load(Ordering::Relaxed),
+                            );
                             sm_stack_write32(recvmsg + 0x28, r.subsystem_type);
                             for (i, chunk) in r.connection_info.chunks_exact(2).take(120).enumerate() {
                                 sm_stack_write16(
@@ -263,9 +304,9 @@ pub(crate) unsafe fn sm_rendezvous(
                                 );
                             }
                             print_str(b"[sm-rdv] delivered connection cid=");
-                            print_u64(PM_PIDS[1].load(Ordering::Relaxed));
+                            print_u64(PM_PIDS[connector_pi].load(Ordering::Relaxed));
                             print_str(b"/");
-                            print_u64(PM_TIDS[1].load(Ordering::Relaxed));
+                            print_u64(PM_TIDS[connector_pi].load(Ordering::Relaxed));
                             print_str(b" subsystem=");
                             print_u64(r.subsystem_type as u64);
                             print_str(b" info_len=");
@@ -275,6 +316,12 @@ pub(crate) unsafe fn sm_rendezvous(
                         _ => {
                             // No pending connection (the 2nd receive): leave the thread PARKED — do NOT
                             // reply. It re-blocks on this NtReplyWaitReceivePort until the next connect.
+                            SM_RECVMSG.store(recvmsg, Ordering::Relaxed);
+                            SM_RECVPORT.store(port, Ordering::Relaxed);
+                            SM_RECV_SP.store(sp, Ordering::Relaxed);
+                            SM_RECV_FLAGS.store(flags, Ordering::Relaxed);
+                            SM_RECV_RDX.store(rdx, Ordering::Relaxed);
+                            SM_RECEIVE_PARKED.store(1, Ordering::Relaxed);
                             stop_rdv = true;
                         }
                     }
@@ -359,9 +406,6 @@ pub(crate) unsafe fn sm_rendezvous(
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
             send_on_reply(reply, 18, result, 0, 0, rdx);
-            if done {
-                break;
-            }
             let (_b, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(ep, reply);
             mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
             continue;

@@ -4478,6 +4478,20 @@ impl NativeSyscallHandler for ExecNtHandler {
                             // image/ntdll refs (loop-resident), so it can't run here.
                             self.lpc_rendezvous_conn = r.connection_id;
                             self.lpc_rendezvous_out = args[0];
+                            print_str(b"[lpc-connect] pending pi=");
+                            print_u64(self.pi as u64);
+                            print_str(b" conn=");
+                            print_u64(r.connection_id);
+                            print_str(b" name=");
+                            for &unit in name16.iter().take(64) {
+                                let byte = if (0x20..=0x7e).contains(&unit) {
+                                    unit as u8
+                                } else {
+                                    b'?'
+                                };
+                                print_str(core::slice::from_ref(&byte));
+                            }
+                            print_str(b"\n");
                             0 // SUCCESS (the loop overrides with the rendezvous outcome)
                         } else {
                             0x0000_0103 // STATUS_PENDING (broker returned no handle + not pending)

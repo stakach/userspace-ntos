@@ -1172,6 +1172,15 @@ static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
 /// The SM-loop thread's TCB (0 until smss's first NtCreateThread spawns it; one real SmpApiLoop
 /// thread is enough — subsequent NtCreateThread stays a fake handle).
 static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
+/// The real SmpApiLoop's outstanding empty `NtReplyWaitReceivePort`. A completed rendezvous leaves
+/// the worker blocked here; the next connector is injected through this saved continuation instead
+/// of waiting for a new fault that cannot occur while the worker is parked.
+static SM_RECEIVE_PARKED: AtomicU64 = AtomicU64::new(0);
+static SM_RECVMSG: AtomicU64 = AtomicU64::new(0);
+static SM_RECVPORT: AtomicU64 = AtomicU64::new(0);
+static SM_RECV_SP: AtomicU64 = AtomicU64::new(0);
+static SM_RECV_FLAGS: AtomicU64 = AtomicU64::new(0);
+static SM_RECV_RDX: AtomicU64 = AtomicU64::new(0);
 /// Set once the SM_FILL_SCRATCH_BASE page table is created (lazily, in the first rendezvous).
 static SM_FILL_PT_DONE: AtomicU64 = AtomicU64::new(0);
 /// Authentic CSR accept (mirrors the SM triad): the REAL CsrApiRequestThread's dedicated fault EP
