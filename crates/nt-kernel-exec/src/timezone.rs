@@ -8,6 +8,13 @@ pub const TIME_ZONE_ID_STANDARD: u32 = 1;
 pub const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
 pub const TICKS_PER_MINUTE: i64 = 60 * 10_000_000;
 
+/// Byte length of a fixed WCHAR name through its first terminator, including that terminator.
+pub fn terminated_name_byte_length(name: &[u16; 32]) -> Option<u32> {
+    name.iter()
+        .position(|unit| *unit == 0)
+        .map(|index| ((index + 1) * 2) as u32)
+}
+
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const REG_BINARY: u32 = 3;
@@ -368,6 +375,15 @@ mod tests {
             REG_SZ,
             &[b'X', 0],
         ));
+
+        assert_eq!(
+            terminated_name_byte_length(&information.standard_name),
+            Some(44)
+        );
+        assert_eq!(terminated_name_byte_length(&[1; 32]), None);
+        let mut full = [1u16; 32];
+        full[31] = 0;
+        assert_eq!(terminated_name_byte_length(&full), Some(64));
     }
 
     #[test]

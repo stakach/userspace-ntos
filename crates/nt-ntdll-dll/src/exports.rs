@@ -16358,14 +16358,238 @@ pub unsafe extern "system" fn rtl_set_thread_pool_start_func(
     STATUS_SUCCESS
 }
 
-/// `RtlSetTimeZoneInformation(PRTL_TIME_ZONE_INFORMATION TimeZoneInformation) -> NTSTATUS` — set the
-/// system time zone. No time-zone plane → STATUS_SUCCESS no-op (UTC assumed).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeQueryRegistryTable {
+    query_routine: *mut c_void,
+    flags: u32,
+    name: *const u16,
+    entry_context: *mut c_void,
+    default_type: u32,
+    default_data: *const c_void,
+    default_length: u32,
+}
+
+impl NativeQueryRegistryTable {
+    const fn empty() -> Self {
+        Self {
+            query_routine: core::ptr::null_mut(),
+            flags: 0,
+            name: core::ptr::null(),
+            entry_context: core::ptr::null_mut(),
+            default_type: 0,
+            default_data: core::ptr::null(),
+            default_length: 0,
+        }
+    }
+
+    fn direct(name: *const u16, entry_context: *mut c_void) -> Self {
+        Self {
+            flags: 0x20, // RTL_QUERY_REGISTRY_DIRECT
+            name,
+            entry_context,
+            ..Self::empty()
+        }
+    }
+}
+
+#[repr(C)]
+struct NativeUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+const _: [(); 0x38] = [(); core::mem::size_of::<NativeQueryRegistryTable>()];
+const _: [(); 0x10] = [(); core::mem::size_of::<NativeUnicodeString>()];
+
+fn fill_stack_utf16(output: &mut [u16], ascii: &[u8]) {
+    assert!(ascii.len() < output.len());
+    // SAFETY: every index and the terminator fit in `output`; volatile stores also prevent these
+    // immutable local names from being promoted into PE `.rdata`.
+    unsafe {
+        for (index, byte) in ascii.iter().copied().enumerate() {
+            core::ptr::write_volatile(output.as_mut_ptr().add(index), u16::from(byte));
+        }
+        core::ptr::write_volatile(output.as_mut_ptr().add(ascii.len()), 0);
+    }
+}
+
+/// `RtlQueryTimeZoneInformation(PRTL_TIME_ZONE_INFORMATION TimeZoneInformation) -> NTSTATUS` —
+/// query the seven `Control\TimeZoneInformation` values through live DIRECT registry dispatch.
 ///
 /// # Safety
-/// `time_zone_information` a valid RTL_TIME_ZONE_INFORMATION.
+/// `time_zone_information` points to a writable 172-byte `RTL_TIME_ZONE_INFORMATION`.
+#[export_name = "RtlQueryTimeZoneInformation"]
+pub unsafe extern "system" fn rtl_query_time_zone_information(
+    time_zone_information: *mut c_void,
+) -> NtStatus {
+    // Reject NULL explicitly rather than relying on the native routine's access fault.
+    if time_zone_information.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let mut path = [0u16; 32];
+    let mut bias = [0u16; 32];
+    let mut standard_name = [0u16; 32];
+    let mut standard_bias = [0u16; 32];
+    let mut standard_start = [0u16; 32];
+    let mut daylight_name = [0u16; 32];
+    let mut daylight_bias = [0u16; 32];
+    let mut daylight_start = [0u16; 32];
+    fill_stack_utf16(&mut path, b"TimeZoneInformation");
+    fill_stack_utf16(&mut bias, b"Bias");
+    fill_stack_utf16(&mut standard_name, b"StandardName");
+    fill_stack_utf16(&mut standard_bias, b"StandardBias");
+    fill_stack_utf16(&mut standard_start, b"StandardStart");
+    fill_stack_utf16(&mut daylight_name, b"DaylightName");
+    fill_stack_utf16(&mut daylight_bias, b"DaylightBias");
+    fill_stack_utf16(&mut daylight_start, b"DaylightStart");
+
+    let output = time_zone_information as *mut u8;
+    let mut standard_string = NativeUnicodeString {
+        length: 0,
+        maximum_length: 64,
+        buffer: output.wrapping_add(0x04) as *mut u16,
+    };
+    let mut daylight_string = NativeUnicodeString {
+        length: 0,
+        maximum_length: 64,
+        buffer: output.wrapping_add(0x58) as *mut u16,
+    };
+    let mut table = [NativeQueryRegistryTable::empty(); 8];
+    table[0] = NativeQueryRegistryTable::direct(bias.as_ptr(), output as *mut c_void);
+    table[1] = NativeQueryRegistryTable::direct(
+        standard_name.as_ptr(),
+        &mut standard_string as *mut NativeUnicodeString as *mut c_void,
+    );
+    table[2] = NativeQueryRegistryTable::direct(
+        standard_bias.as_ptr(),
+        output.wrapping_add(0x54) as *mut c_void,
+    );
+    table[3] = NativeQueryRegistryTable::direct(
+        standard_start.as_ptr(),
+        output.wrapping_add(0x44) as *mut c_void,
+    );
+    table[4] = NativeQueryRegistryTable::direct(
+        daylight_name.as_ptr(),
+        &mut daylight_string as *mut NativeUnicodeString as *mut c_void,
+    );
+    table[5] = NativeQueryRegistryTable::direct(
+        daylight_bias.as_ptr(),
+        output.wrapping_add(0xa8) as *mut c_void,
+    );
+    table[6] = NativeQueryRegistryTable::direct(
+        daylight_start.as_ptr(),
+        output.wrapping_add(0x98) as *mut c_void,
+    );
+
+    // SAFETY: every table/name/context buffer remains live for this synchronous registry walk;
+    // the caller contract provides a writable 172-byte destination.
+    unsafe {
+        rtl_query_registry_values(
+            nt_ntdll::rtl::registry::RTL_REGISTRY_CONTROL,
+            path.as_ptr(),
+            table.as_mut_ptr() as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// `RtlSetTimeZoneInformation(PRTL_TIME_ZONE_INFORMATION TimeZoneInformation) -> NTSTATUS` — write
+/// the seven `Control\TimeZoneInformation` values in ReactOS order, stopping on the first failure.
+///
+/// # Safety
+/// `time_zone_information` points to a readable 172-byte `RTL_TIME_ZONE_INFORMATION`.
 #[export_name = "RtlSetTimeZoneInformation"]
-pub unsafe extern "system" fn rtl_set_time_zone_information(_tz: *const c_void) -> NtStatus {
-    STATUS_SUCCESS
+pub unsafe extern "system" fn rtl_set_time_zone_information(
+    time_zone_information: *const c_void,
+) -> NtStatus {
+    // Reject NULL explicitly rather than relying on the native routine's access fault.
+    if time_zone_information.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let mut path = [0u16; 32];
+    let mut bias = [0u16; 32];
+    let mut standard_name = [0u16; 32];
+    let mut standard_bias = [0u16; 32];
+    let mut standard_start = [0u16; 32];
+    let mut daylight_name = [0u16; 32];
+    let mut daylight_bias = [0u16; 32];
+    let mut daylight_start = [0u16; 32];
+    fill_stack_utf16(&mut path, b"TimeZoneInformation");
+    fill_stack_utf16(&mut bias, b"Bias");
+    fill_stack_utf16(&mut standard_name, b"StandardName");
+    fill_stack_utf16(&mut standard_bias, b"StandardBias");
+    fill_stack_utf16(&mut standard_start, b"StandardStart");
+    fill_stack_utf16(&mut daylight_name, b"DaylightName");
+    fill_stack_utf16(&mut daylight_bias, b"DaylightBias");
+    fill_stack_utf16(&mut daylight_start, b"DaylightStart");
+
+    const REG_SZ: u32 = 1;
+    const REG_BINARY: u32 = 3;
+    const REG_DWORD: u32 = 4;
+    let input = time_zone_information as *const u8;
+    let write = |name: *const u16, value_type: u32, offset: usize, length: u32| {
+        // SAFETY: the fixed path/name buffers are NUL-terminated and live for the synchronous
+        // write; each offset/length lies within the caller-provided 172-byte record.
+        unsafe {
+            rtl_write_registry_value(
+                nt_ntdll::rtl::registry::RTL_REGISTRY_CONTROL,
+                path.as_ptr(),
+                name,
+                value_type,
+                input.wrapping_add(offset) as *const c_void,
+                length,
+            )
+        }
+    };
+
+    let mut status = write(bias.as_ptr(), REG_DWORD, 0x00, 4);
+    if (status as i32) < 0 {
+        return status;
+    }
+    // SAFETY: the caller contract covers this 64-byte field; unaligned input is accepted.
+    let standard_name_value =
+        unsafe { core::ptr::read_unaligned(input.wrapping_add(0x04) as *const [u16; 32]) };
+    let Some(standard_name_length) =
+        nt_ntdll::rtl::timezone::terminated_name_byte_length(&standard_name_value)
+    else {
+        // Bound the native unbounded `wcslen` to the fixed WCHAR[32] field.
+        return STATUS_INVALID_PARAMETER;
+    };
+    status = write(standard_name.as_ptr(), REG_SZ, 0x04, standard_name_length);
+    if (status as i32) < 0 {
+        return status;
+    }
+    status = write(standard_bias.as_ptr(), REG_DWORD, 0x54, 4);
+    if (status as i32) < 0 {
+        return status;
+    }
+    status = write(standard_start.as_ptr(), REG_BINARY, 0x44, 16);
+    if (status as i32) < 0 {
+        return status;
+    }
+    // SAFETY: the caller contract covers this 64-byte field; unaligned input is accepted.
+    let daylight_name_value =
+        unsafe { core::ptr::read_unaligned(input.wrapping_add(0x58) as *const [u16; 32]) };
+    let Some(daylight_name_length) =
+        nt_ntdll::rtl::timezone::terminated_name_byte_length(&daylight_name_value)
+    else {
+        // Bound the native unbounded `wcslen` to the fixed WCHAR[32] field.
+        return STATUS_INVALID_PARAMETER;
+    };
+    status = write(daylight_name.as_ptr(), REG_SZ, 0x58, daylight_name_length);
+    if (status as i32) < 0 {
+        return status;
+    }
+    status = write(daylight_bias.as_ptr(), REG_DWORD, 0xa8, 4);
+    if (status as i32) < 0 {
+        return status;
+    }
+    write(daylight_start.as_ptr(), REG_BINARY, 0x98, 16)
 }
 
 // ---- debug buffer / stack backtrace / WOW64 fs-redirection (honest no-ops) ------------------------
@@ -26396,6 +26620,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_deregister_wait_ex as usize,
         rtl_set_io_completion_callback as usize,
         rtl_set_thread_pool_start_func as usize,
+        rtl_query_time_zone_information as usize,
         rtl_set_time_zone_information as usize,
         rtl_create_query_debug_buffer as usize,
         rtl_destroy_query_debug_buffer as usize,

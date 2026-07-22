@@ -51,6 +51,7 @@ pub mod splay;
 pub mod status;
 pub mod strings;
 pub mod time;
+pub mod timezone;
 pub mod user_stack;
 pub mod vectored_handler;
 
