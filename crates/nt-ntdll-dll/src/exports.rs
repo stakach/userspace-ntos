@@ -10306,6 +10306,80 @@ pub unsafe extern "system" fn rtl_allocate_activation_context_stack(
 #[export_name = "RtlFreeActivationContextStack"]
 pub unsafe extern "system" fn rtl_free_activation_context_stack(_stack: *mut c_void) {}
 
+/// `RtlFreeThreadActivationContextStack() -> VOID`.
+///
+/// Release the current thread's activation-context stack through the shared stack teardown path and
+/// clear `TEB.ActivationContextStackPointer`, as ReactOS does during thread shutdown.
+#[export_name = "RtlFreeThreadActivationContextStack"]
+pub unsafe extern "system" fn rtl_free_thread_activation_context_stack() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb = &mut *(current_teb() as *mut Teb);
+        rtl_free_activation_context_stack(teb.activation_context_stack_pointer as *mut c_void);
+        teb.activation_context_stack_pointer = 0;
+    }
+}
+
+/// `RtlIsActivationContextActive(HANDLE ActivationContext) -> BOOLEAN`.
+///
+/// Walk the current thread's activation stack. The manifest-less runtime normally has no stack, so
+/// this naturally returns FALSE without inventing a context.
+///
+/// # Safety
+/// Any installed activation stack/frame chain is readable and follows the native x64 layout.
+#[export_name = "RtlIsActivationContextActive"]
+pub unsafe extern "system" fn rtl_is_activation_context_active(
+    activation_context: *mut c_void,
+) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let stack = (*(current_teb() as *const Teb)).activation_context_stack_pointer as *const u8;
+        if stack.is_null() {
+            return 0;
+        }
+        let mut frame = core::ptr::read_unaligned(stack as *const *const u8);
+        while !frame.is_null() {
+            let frame_context = core::ptr::read_unaligned(frame.add(8) as *const *mut c_void);
+            if frame_context == activation_context {
+                return 1;
+            }
+            frame = core::ptr::read_unaligned(frame as *const *const u8);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = activation_context;
+    0
+}
+
+/// `RtlQueryInformationActiveActivationContext(ULONG Class, PVOID Buffer, SIZE_T BufferSize,
+/// PSIZE_T ReturnLength) -> NTSTATUS`.
+///
+/// ReactOS defines this as the active-context flag wrapper over
+/// `RtlQueryInformationActivationContext`; keep that single query implementation here as well.
+///
+/// # Safety
+/// `buffer` and `return_length` follow the selected activation-context information class contract.
+#[export_name = "RtlQueryInformationActiveActivationContext"]
+pub unsafe extern "system" fn rtl_query_information_active_activation_context(
+    info_class: u32,
+    buffer: *mut c_void,
+    buffer_size: usize,
+    return_length: *mut usize,
+) -> NtStatus {
+    const RTL_QUERY_ACTIVATION_CONTEXT_FLAG_USE_ACTIVE_ACTIVATION_CONTEXT: u32 = 0x1;
+    unsafe {
+        rtl_query_information_activation_context(
+            RTL_QUERY_ACTIVATION_CONTEXT_FLAG_USE_ACTIVE_ACTIVATION_CONTEXT,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            info_class,
+            buffer,
+            buffer_size,
+            return_length,
+        )
+    }
+}
+
 /// `RtlIsThreadWithinLoaderCallout() -> BOOLEAN` — are we inside a DllMain callout? The boot runs
 /// DllMains serially from the loader; report FALSE (the safe default — callers use it to avoid
 /// re-entrant loads; FALSE lets them proceed, which is correct for our single-threaded init).
@@ -22404,6 +22478,9 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_query_information_activation_context as usize,
         rtl_allocate_activation_context_stack as usize,
         rtl_free_activation_context_stack as usize,
+        rtl_free_thread_activation_context_stack as usize,
+        rtl_is_activation_context_active as usize,
+        rtl_query_information_active_activation_context as usize,
         rtl_is_thread_within_loader_callout as usize,
     ];
     core::hint::black_box(anchors_sxs);
