@@ -500,6 +500,9 @@ pub const SSN_NT_QUERY_EVENT: u64 = 155;
 pub const SSN_NT_RESET_EVENT: u64 = 210;
 pub const SSN_NT_SET_EVENT: u64 = 228;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
+pub const SSN_NT_OPEN_SEMAPHORE: u64 = 132;
+pub const SSN_NT_QUERY_SEMAPHORE: u64 = 177;
+pub const SSN_NT_RELEASE_SEMAPHORE: u64 = 197;
 // NT LPC connection-rendezvous SSNs (ReactOS ntdll — the one smss/csrss run).
 pub const SSN_NT_ACCEPT_CONNECT_PORT: u64 = 0;
 pub const SSN_NT_COMPLETE_CONNECT_PORT: u64 = 31;
@@ -4096,8 +4099,12 @@ const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
 /// for win32k and cross-process compatibility.
 const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
 const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
+const SEMAPHORE_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
+const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
+const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 /// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
@@ -4109,7 +4116,7 @@ struct ObjEntry {
     name: [u8; 40],   // leaf name, lowercased ASCII (len in name_len)
     name_len: u8,
     parent: u8,       // index of the parent directory; 0xFF = the root itself
-    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event
+    kind: u8,         // 0 = directory, 1 = symbolic link, 2 = event, 3 = semaphore
     target: [u8; 40], // symbolic-link target (kind == 1)
     target_len: u8,
 }
@@ -4275,6 +4282,8 @@ struct ExecNtHandler {
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
+    /// Counting semaphore state keyed by the same stable namespace indices.
+    semaphores: nt_kernel_exec::SemaphoreStore,
     /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its arena
     /// is allocated once in `new()` below the per-syscall heap mark; atom operations mutate only
     /// that fixed buffer, so duplicate refcounts and names survive bump-allocator rewinds and are
@@ -4612,6 +4621,9 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtSetEvent, SSN_NT_SET_EVENT as u32),
             (NativeService::NtOpenEvent, SSN_NT_OPEN_EVENT as u32),
             (NativeService::NtCreateSemaphore, SSN_NT_CREATE_SEMAPHORE as u32),
+            (NativeService::NtOpenSemaphore, SSN_NT_OPEN_SEMAPHORE as u32),
+            (NativeService::NtQuerySemaphore, SSN_NT_QUERY_SEMAPHORE as u32),
+            (NativeService::NtReleaseSemaphore, SSN_NT_RELEASE_SEMAPHORE as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
             (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),
             (NativeService::NtSecureConnectPort, SSN_NT_SECURE_CONNECT_PORT as u32),

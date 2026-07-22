@@ -97,6 +97,7 @@ impl ExecNtHandler {
                 v
             },
             events: nt_kernel_exec::EventStore::with_capacity(192),
+            semaphores: nt_kernel_exec::SemaphoreStore::with_capacity(192),
             global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(
                 GLOBAL_ATOM_CAPACITY,
             )
@@ -518,6 +519,62 @@ impl ExecNtHandler {
         self.obj_ns
             .get(index)
             .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
+            .map(|_| index)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn mint_semaphore_handle(&mut self, index: usize, access: u32) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(self.pi)?;
+        let tag = SEMAPHORE_HANDLE_TAG | index as u64;
+        let handle = self
+            .pm
+            .insert_handle(
+                pid,
+                nt_process::HandleObject::Opaque(tag),
+                nt_kernel_exec::map_semaphore_access(access),
+            )
+            .ok()?;
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        Some(handle as u64)
+    }
+
+    pub(crate) fn semaphore_index_for_handle(
+        &self,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<usize, u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+        if handle >= OBJ_HANDLE_BASE {
+            let index = (handle - OBJ_HANDLE_BASE) as usize;
+            return match self.obj_ns.get(index) {
+                Some(entry) if entry.kind != 3 => Err(STATUS_OBJECT_TYPE_MISMATCH),
+                _ => Err(STATUS_INVALID_HANDLE),
+            };
+        }
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Opaque(tag))
+                if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG => tag,
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(STATUS_INVALID_HANDLE),
+        };
+        let granted = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access != 0 && granted & required_access != required_access {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let index = (tag & 0xFFFF_FFFF) as usize;
+        self.obj_ns
+            .get(index)
+            .filter(|entry| entry.kind == 3 && self.semaphores.contains(index as u64))
             .map(|_| index)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -1135,6 +1192,13 @@ impl ExecNtHandler {
             self.events.remove_existing(index as u64);
         }
     }
+
+    fn rollback_new_semaphore(&mut self, index: usize) {
+        if index + 1 == self.obj_ns.len() {
+            self.obj_ns.pop();
+            self.semaphores.remove(index as u64);
+        }
+    }
     /// Normalize a caller's pipe path (`\Device\NamedPipe\ntsvcs`, `\??\pipe\ntsvcs`, `\??\PIPE\ntsvcs`,
     /// or a relative `ntsvcs`) to npfs's leaf form `\ntsvcs` (UTF-16, leading backslash). npfs's
     /// NpFsdCreate strips the device prefix; the leaf is what the VCB prefix tree keys on.
@@ -1627,6 +1691,36 @@ impl ExecNtHandler {
             },
             initial_state,
         );
+        Some(index)
+    }
+    pub(crate) fn obj_create_anon_semaphore(
+        &mut self,
+        initial: i32,
+        maximum: i32,
+    ) -> Option<usize> {
+        if self.obj_ns.len() >= self.obj_ns.capacity() {
+            return None;
+        }
+        let n = self.anon_event_seq;
+        self.anon_event_seq = self.anon_event_seq.wrapping_add(1);
+        let name = [
+            b's',
+            (n & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            ((n >> 16) & 0xff) as u8,
+        ];
+        let mut entry = ObjEntry::dir(&name, 250);
+        entry.kind = 3;
+        self.obj_ns.push(entry);
+        let index = self.obj_ns.len() - 1;
+        if self
+            .semaphores
+            .initialize(index as u64, initial, maximum)
+            .is_err()
+        {
+            self.obj_ns.pop();
+            return None;
+        }
         Some(index)
     }
     /// Create a dir/symlink named by `path` (which may be `\`-qualified or relative to `root_idx`):
@@ -3167,7 +3261,7 @@ impl NativeSyscallHandler for ExecNtHandler {
             // load-bearing for the AUTHENTIC path B (smss's real SmpApiLoop thread needs a REAL handle
             // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
             // running smss thread in smss's VSpace) is the next path-B step.
-            NativeService::NtCreateThread | NativeService::NtCreateSemaphore => {
+            NativeService::NtCreateThread => {
                 // ★ GENERAL NtCreateThread (real service): winlogon's FIRST NtCreateThread is its RPC
                 // listener. Route it through the REAL nt-process ETHREAD lifecycle: pop a pool ETHREAD
                 // for the caller, bind the caller's StartRoutine + TEB, mint a TYPED Thread(tid) handle,
@@ -4099,6 +4193,205 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
                 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+            },
+            NativeService::NtCreateSemaphore => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                let initial = args[3] as u32 as i32;
+                let maximum = args[4] as u32 as i32;
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if maximum <= 0 || initial < 0 || initial > maximum {
+                    return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                }
+
+                let create_anonymous = |this: &mut Self| -> Result<u32, u32> {
+                    let Some(index) = this.obj_create_anon_semaphore(initial, maximum) else {
+                        return Err(0xC000_009A); // STATUS_INSUFFICIENT_RESOURCES
+                    };
+                    let Some(handle) = this.mint_semaphore_handle(index, args[1] as u32) else {
+                        this.rollback_new_semaphore(index);
+                        return Err(0xC000_009A);
+                    };
+                    if !this.xas_write_u64(out, handle) {
+                        this.close_current_handle(handle);
+                        this.rollback_new_semaphore(index);
+                        return Err(0xC000_0005);
+                    }
+                    Ok(0)
+                };
+
+                if oa == 0 {
+                    return create_anonymous(self).unwrap_or_else(|status| status);
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => {
+                        return create_anonymous(self).unwrap_or_else(|status| status);
+                    }
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let existing = self.obj_resolve(path, root_idx);
+                if existing.is_some_and(|index| self.obj_ns[index].kind != 3) {
+                    return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                }
+                let existed = existing.is_some();
+                let Some(index) = self.obj_create(path, root_idx, 3, &[]) else {
+                    return 0xC000_009A;
+                };
+                if !existed
+                    && self
+                        .semaphores
+                        .initialize(index as u64, initial, maximum)
+                        .is_err()
+                {
+                    self.rollback_new_semaphore(index);
+                    return 0xC000_000D;
+                }
+                let Some(handle) = self.mint_semaphore_handle(index, args[1] as u32) else {
+                    if !existed {
+                        self.rollback_new_semaphore(index);
+                    }
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    if !existed {
+                        self.rollback_new_semaphore(index);
+                    }
+                    return 0xC000_0005;
+                }
+                if existed { 0x4000_0000 } else { 0 }
+            },
+            NativeService::NtOpenSemaphore => unsafe {
+                let out = args[0];
+                let oa = args[2];
+                if out == 0 {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if out & 7 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_event_output(out, 8) {
+                    return 0xC000_0005;
+                }
+                if oa == 0 {
+                    return 0xC000_000D; // STATUS_INVALID_PARAMETER
+                }
+                let (root_dir, name16) = match self.read_event_object_attributes(oa) {
+                    Ok((root, _attributes, Some(name))) => (root, name),
+                    Ok((_root, _attributes, None)) => return 0xC000_0033,
+                    Err(status) => return status,
+                };
+                let path = match Self::event_object_path(&name16) {
+                    Ok(path) => path,
+                    Err(status) => return status,
+                };
+                let (root_idx, path) = match self.event_root_and_path(root_dir, &path) {
+                    Ok(resolved) => resolved,
+                    Err(status) => return status,
+                };
+                let Some(index) = self.obj_resolve(path, root_idx) else {
+                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                };
+                if self.obj_ns[index].kind != 3 {
+                    return 0xC000_0024; // STATUS_OBJECT_TYPE_MISMATCH
+                }
+                let Some(handle) = self.mint_semaphore_handle(index, args[1] as u32) else {
+                    return 0xC000_009A;
+                };
+                if !self.xas_write_u64(out, handle) {
+                    self.close_current_handle(handle);
+                    return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtQuerySemaphore => {
+                const SEMAPHORE_BASIC_INFORMATION_SIZE: u64 = 8;
+                if args[1] != 0 {
+                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                }
+                if args[3] != SEMAPHORE_BASIC_INFORMATION_SIZE {
+                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                }
+                if args[2] == 0 {
+                    return 0xC000_0005;
+                }
+                if args[2] & 3 != 0 || (args[4] != 0 && args[4] & 3 != 0) {
+                    return 0x8000_0002;
+                }
+                if !unsafe { self.probe_event_output(args[2], 8) }
+                    || (args[4] != 0 && !unsafe { self.probe_event_output(args[4], 4) })
+                {
+                    return 0xC000_0005;
+                }
+                let index = match self.semaphore_index_for_handle(args[0], SEMAPHORE_QUERY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let Some((current, maximum)) = self.semaphores.query(index as u64) else {
+                    return 0xC000_0008;
+                };
+                if !unsafe { self.xas_write_u32(args[2], current as u32) }
+                    || !unsafe { self.xas_write_u32(args[2] + 4, maximum as u32) }
+                {
+                    return 0xC000_0005;
+                }
+                if args[4] != 0
+                    && !unsafe {
+                        self.xas_write_u32(args[4], SEMAPHORE_BASIC_INFORMATION_SIZE as u32)
+                    }
+                {
+                    return 0xC000_0005;
+                }
+                0
+            },
+            NativeService::NtReleaseSemaphore => {
+                let release_count = args[1] as u32 as i32;
+                let previous_count = args[2];
+                if previous_count != 0 && previous_count & 3 != 0 {
+                    return 0x8000_0002;
+                }
+                if previous_count != 0
+                    && !unsafe { self.probe_event_output(previous_count, 4) }
+                {
+                    return 0xC000_0005;
+                }
+                if release_count <= 0 {
+                    return 0xC000_000D;
+                }
+                let index =
+                    match self.semaphore_index_for_handle(args[0], SEMAPHORE_MODIFY_STATE) {
+                        Ok(index) => index,
+                        Err(status) => return status,
+                    };
+                let previous = match self.semaphores.release(index as u64, release_count) {
+                    Ok(previous) => previous,
+                    Err(nt_kernel_exec::SemaphoreError::InvalidCount) => return 0xC000_000D,
+                    Err(nt_kernel_exec::SemaphoreError::LimitExceeded) => return 0xC000_0047,
+                    Err(nt_kernel_exec::SemaphoreError::NotFound) => return 0xC000_0008,
+                };
+                if previous_count != 0
+                    && !unsafe { self.xas_write_u32(previous_count, previous as u32) }
+                {
+                    return 0xC000_0005;
+                }
+                0
             },
             // NtOpenProcessToken(ProcessHandle, DesiredAccess, *TokenHandle). R8 = out handle.
             NativeService::NtOpenProcessToken => unsafe {

@@ -2963,8 +2963,8 @@ pub(crate) unsafe fn service_sec_image(
                     smss_stack_write(out, FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed));
                 }
                 result = 0;
-            } else if m0 == 196 || m0 == 197 {
-                // NtReleaseMutant(196) / NtReleaseSemaphore(197) — legacy modeled objects.
+            } else if m0 == 196 {
+                // NtReleaseMutant(196) — legacy modeled object.
                 result = 0;
             } else if m0 == 280 && badge != 0 {
                 // ★ NtWaitForMultipleObjects(ObjectCount=R10, HandleArray=RDX, WaitType=R8,
