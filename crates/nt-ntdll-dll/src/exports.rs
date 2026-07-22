@@ -59,6 +59,7 @@ const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
 const STATUS_INVALID_PARAMETER_4: NtStatus = 0xC000_00F2;
 const STATUS_INVALID_PARAMETER_5: NtStatus = 0xC000_00F3;
 const STATUS_UNMAPPABLE_CHARACTER: NtStatus = 0xC000_0162;
+const STATUS_PROCESS_IS_TERMINATING: NtStatus = 0xC000_010A;
 const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 #[cfg(not(target_arch = "x86_64"))]
@@ -6730,6 +6731,9 @@ pub unsafe extern "system" fn ldr_load_dll(
     dll_name: PCUnicodeString,
     base_addr: *mut *mut c_void,
 ) -> NtStatus {
+    if RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0 {
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         let _loader_lock = match unsafe { acquire_loader_lock() } {
@@ -8682,14 +8686,48 @@ pub unsafe extern "system" fn ldr_enumerate_loaded_modules(
     }
 }
 
-/// `LdrShutdownProcess() -> NTSTATUS` — run per-DLL DLL_PROCESS_DETACH on process exit. The boot
-/// doesn't exit → no-op success.
+/// `LdrShutdownProcess() -> NTSTATUS` — run TLS and DLL process-detach callbacks once, in reverse
+/// successful process-attach order.
 ///
 /// # Safety
-/// Reads no memory.
+/// Reads the mapped module table and invokes initialized module entry points.
 #[export_name = "LdrShutdownProcess"]
 pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
-    RTL_DLL_SHUTDOWN_IN_PROGRESS.store(1, Ordering::Release);
+    if RTL_DLL_SHUTDOWN_IN_PROGRESS
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return STATUS_SUCCESS;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            let ldr = current_peb_ldr();
+            if ldr != 0 {
+                core::ptr::write_unaligned((ldr + 0x48) as *mut u8, 1);
+                core::ptr::write_unaligned(
+                    (ldr + 0x50) as *mut u64,
+                    resource_current_thread(),
+                );
+            }
+        }
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => {
+                RTL_DLL_SHUTDOWN_IN_PROGRESS.store(0, Ordering::Release);
+                unsafe {
+                    let ldr = current_peb_ldr();
+                    if ldr != 0 {
+                        core::ptr::write_unaligned((ldr + 0x48) as *mut u8, 0);
+                        core::ptr::write_unaligned((ldr + 0x50) as *mut u64, 0);
+                    }
+                }
+                return status;
+            }
+        };
+        unsafe { crate::on_target::ldr_shutdown_process() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     STATUS_SUCCESS
 }
 

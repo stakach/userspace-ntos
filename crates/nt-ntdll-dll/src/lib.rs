@@ -354,7 +354,7 @@ pub(crate) unsafe fn dbg_print_bytes(msg: *const u8, len: usize) {
 /// in-process image reads/writes (target x86_64 only).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn LdrpInitialize(
-    _context: *mut c_void,
+    context: *mut c_void,
     ntdll_base: *mut c_void,
     smss_base: *mut c_void,
 ) {
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn LdrpInitialize(
         if smss != 0 && ntdll != 0 {
             // (2)+(3) Real heap + in-process import snap against OUR export table.
             // SAFETY: on-target; both are mapped PE images in this VSpace.
-            let res = unsafe { on_target::ldrp_drive(smss, ntdll) };
+            let res = unsafe { on_target::ldrp_drive(smss, ntdll, context as u64) };
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).
@@ -398,7 +398,7 @@ pub unsafe extern "C" fn LdrpInitialize(
     {
         let _ = (ntdll_base, smss_base);
     }
-    core::hint::black_box(_context);
+    core::hint::black_box(context);
 }
 
 /// Append `v` as decimal into `buf[n..]`; return the new length. Stack-only (no alloc).
