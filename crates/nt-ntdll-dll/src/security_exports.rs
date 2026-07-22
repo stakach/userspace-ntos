@@ -2623,25 +2623,18 @@ pub unsafe extern "system" fn rtl_map_generic_mask(
 }
 
 // =================================================================================================
-// Privilege / impersonation / security-object seams
-//
-// These need the live token / Se plane (NtOpenProcessToken, NtAdjustPrivilegesToken,
-// NtDuplicateToken, ...). At this bring-up stage that plane is modeled as no-ops by the executive,
-// so the privilege/impersonation wrappers report SUCCESS (with an empty state) — matching what the
-// executive currently services. The x64 security-object helpers materialize heap-owned
+// Privilege / impersonation / security-object seams. The x64 privilege wrappers use the live token
+// syscalls; the security-object helpers materialize heap-owned
 // self-relative security descriptors for callers that expect `RtlNewSecurityObject` /
 // `RtlDeleteSecurityObject` to manage object descriptors before the executive grows full object SD
 // storage.
 // =================================================================================================
 
 /// `RtlAcquirePrivilege(PULONG Privilege, ULONG NumPriv, ULONG Flags, PVOID* ReturnedState)`.
-/// The real body impersonates + enables privileges via the token plane (`priv.c:110`). At this
-/// stage the executive treats privilege adjustment as a no-op, so we report SUCCESS with a NULL
-/// state (RtlReleasePrivilege then no-ops). Not a fabricated success of the *acquire* — it mirrors
-/// the executive's modeled token behavior.
+/// Ported from ReactOS `priv.c:110` over the target's live native-token plane.
 ///
 /// # Safety
-/// `returned_state` a writable out-pointer or NULL.
+/// `privilege` points to `count` LUID low parts and `returned_state` is writable.
 #[export_name = "RtlAcquirePrivilege"]
 pub unsafe extern "system" fn rtl_acquire_privilege(
     privilege: *mut u32,
@@ -2649,33 +2642,48 @@ pub unsafe extern "system" fn rtl_acquire_privilege(
     flags: u32,
     returned_state: *mut *mut c_void,
 ) -> NtStatus {
-    let _ = (privilege, count, flags);
-    // SAFETY: returned_state writable-or-NULL per the contract.
-    unsafe {
-        if !returned_state.is_null() {
-            *returned_state = core::ptr::null_mut();
-        }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            crate::on_target::rtl_acquire_privilege(privilege, count, flags, returned_state)
+                as NtStatus
+        };
     }
-    STATUS_SUCCESS
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (privilege, count, flags, returned_state);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlReleasePrivilege(PVOID ReturnedState) -> VOID`. Frees the state produced by
-/// RtlAcquirePrivilege — a no-op here since we never allocate one. Ported from `priv.c:363`.
+/// RtlAcquirePrivilege. Ported from `priv.c:363`.
 ///
 /// # Safety
-/// `state` a value previously returned by RtlAcquirePrivilege (here always NULL).
+/// `state` is a value previously returned by RtlAcquirePrivilege.
 #[export_name = "RtlReleasePrivilege"]
 pub unsafe extern "system" fn rtl_release_privilege(state: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::on_target::rtl_release_privilege(state);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = state;
 }
 
 /// `RtlImpersonateSelf(SECURITY_IMPERSONATION_LEVEL Level) -> NTSTATUS`. The real body opens +
-/// duplicates the process token onto the thread (`priv.c:45`). The executive models the token
-/// plane, so we report SUCCESS.
+/// duplicates the process token onto the thread (`priv.c:45`).
 #[export_name = "RtlImpersonateSelf"]
 pub extern "system" fn rtl_impersonate_self(level: u32) -> NtStatus {
-    let _ = level;
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { crate::on_target::rtl_impersonate_self(level) as NtStatus };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = level;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlNewSecurityObject(...)` — build a process-heap self-relative SD for a new object.

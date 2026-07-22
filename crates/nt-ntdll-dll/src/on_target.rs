@@ -3499,6 +3499,8 @@ pub unsafe fn ldr_get_procedure_address(
 
 const SSN_NT_OPEN_PROCESS_TOKEN: u32 = 129;
 const SSN_NT_OPEN_THREAD_TOKEN: u32 = 135;
+const SSN_NT_DUPLICATE_TOKEN: u32 = 72;
+const SSN_NT_SET_INFORMATION_THREAD: u32 = 238;
 const SSN_NT_ADJUST_PRIVILEGES_TOKEN: u32 = 12;
 const SSN_NT_CLOSE: u32 = 27;
 
@@ -4195,6 +4197,377 @@ unsafe fn syscall6(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     unsafe { native_syscall(ssn, a1, a2, a3, a4, a5, a6) }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct SecurityQualityOfService {
+    length: u32,
+    impersonation_level: u32,
+    context_tracking_mode: u8,
+    effective_only: u8,
+    _padding: u16,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct RtlAcquireState {
+    token: u64,
+    old_impersonation_token: u64,
+    old_privileges: *mut u8,
+    new_privileges: *mut u8,
+    flags: u32,
+    old_priv_buffer: [u8; 1024],
+}
+
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    assert!(core::mem::size_of::<SecurityQualityOfService>() == 12);
+    assert!(core::mem::align_of::<SecurityQualityOfService>() == 4);
+    assert!(core::mem::offset_of!(RtlAcquireState, token) == 0);
+    assert!(core::mem::offset_of!(RtlAcquireState, old_impersonation_token) == 8);
+    assert!(core::mem::offset_of!(RtlAcquireState, old_privileges) == 0x10);
+    assert!(core::mem::offset_of!(RtlAcquireState, new_privileges) == 0x18);
+    assert!(core::mem::offset_of!(RtlAcquireState, flags) == 0x20);
+    assert!(core::mem::offset_of!(RtlAcquireState, old_priv_buffer) == 0x24);
+    assert!(core::mem::size_of::<RtlAcquireState>() == 0x428);
+    assert!(core::mem::size_of::<ObjectAttributes>() == 0x30);
+    assert!(core::mem::offset_of!(ObjectAttributes, security_qos) == 0x28);
+};
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn close_if_nonzero(handle: u64) {
+    if handle != 0 {
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_current_thread_token(desired_access: u32, token: *mut u64) -> u64 {
+    let mut status = unsafe {
+        syscall4(
+            SSN_NT_OPEN_THREAD_TOKEN,
+            NT_CURRENT_THREAD,
+            desired_access as u64,
+            1,
+            token as u64,
+        )
+    };
+    if !nt_ntdll::rtl::privilege::nt_success(status as u32) {
+        status = unsafe {
+            syscall4(
+                SSN_NT_OPEN_THREAD_TOKEN,
+                NT_CURRENT_THREAD,
+                desired_access as u64,
+                0,
+                token as u64,
+            )
+        };
+    }
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn set_current_thread_token(token: u64) -> u64 {
+    let captured = token;
+    unsafe {
+        syscall4(
+            SSN_NT_SET_INFORMATION_THREAD,
+            NT_CURRENT_THREAD,
+            5,
+            core::ptr::addr_of!(captured) as u64,
+            core::mem::size_of::<u64>() as u64,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn duplicate_process_token(
+    desired_access: u32,
+    level: u32,
+    context_tracking_mode: u8,
+) -> Result<u64, u64> {
+    const TOKEN_DUPLICATE: u64 = 0x2;
+    let mut process_token = 0u64;
+    let status = unsafe {
+        syscall4(
+            SSN_NT_OPEN_PROCESS_TOKEN,
+            NT_CURRENT_PROCESS,
+            TOKEN_DUPLICATE,
+            core::ptr::addr_of_mut!(process_token) as u64,
+            0,
+        )
+    };
+    if !nt_ntdll::rtl::privilege::nt_success(status as u32) {
+        return Err(status);
+    }
+
+    let qos = SecurityQualityOfService {
+        length: core::mem::size_of::<SecurityQualityOfService>() as u32,
+        impersonation_level: level,
+        context_tracking_mode,
+        effective_only: 0,
+        _padding: 0,
+    };
+    let attributes = ObjectAttributes {
+        length: core::mem::size_of::<ObjectAttributes>() as u32,
+        _p0: 0,
+        root_directory: 0,
+        object_name: 0,
+        attributes: 0,
+        _p1: 0,
+        security_descriptor: 0,
+        security_qos: core::ptr::addr_of!(qos) as u64,
+    };
+    let mut duplicate = 0u64;
+    let status = unsafe {
+        syscall6(
+            SSN_NT_DUPLICATE_TOKEN,
+            process_token,
+            desired_access as u64,
+            core::ptr::addr_of!(attributes) as u64,
+            0,
+            2,
+            core::ptr::addr_of_mut!(duplicate) as u64,
+        )
+    };
+    unsafe { close_if_nonzero(process_token) };
+    if nt_ntdll::rtl::privilege::nt_success(status as u32) {
+        Ok(duplicate)
+    } else {
+        Err(status)
+    }
+}
+
+/// Live `RtlImpersonateSelf` token open, duplicate, and thread assignment sequence.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_impersonate_self(level: u32) -> u64 {
+    const TOKEN_IMPERSONATE: u32 = 0x4;
+    let duplicate = match unsafe { duplicate_process_token(TOKEN_IMPERSONATE, level, 0) } {
+        Ok(token) => token,
+        Err(status) => return status,
+    };
+    let status = unsafe { set_current_thread_token(duplicate) };
+    unsafe { close_if_nonzero(duplicate) };
+    status
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn free_acquire_state(state: *mut RtlAcquireState) {
+    if state.is_null() {
+        return;
+    }
+    let inline = unsafe { core::ptr::addr_of_mut!((*state).old_priv_buffer).cast::<u8>() };
+    let old = unsafe { (*state).old_privileges };
+    if !old.is_null() && old != inline {
+        let _ = unsafe { crate::process_heap_free(old) };
+    }
+    let _ = unsafe { crate::process_heap_free(state.cast::<u8>()) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn cleanup_failed_acquire(state: *mut RtlAcquireState) {
+    use nt_ntdll::rtl::privilege::RTL_ACQUIRE_PRIVILEGE_IMPERSONATE;
+
+    if unsafe { (*state).flags } & RTL_ACQUIRE_PRIVILEGE_IMPERSONATE != 0 {
+        let old = unsafe { (*state).old_impersonation_token };
+        let restore = unsafe { set_current_thread_token(old) };
+        if !nt_ntdll::rtl::privilege::nt_success(restore as u32) {
+            unsafe { crate::exports::rtl_raise_status(restore as u32) };
+        }
+        unsafe { close_if_nonzero(old) };
+    }
+    unsafe { close_if_nonzero((*state).token) };
+    unsafe { free_acquire_state(state) };
+}
+
+/// Live `RtlAcquirePrivilege` implementation over the executive token syscalls.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_acquire_privilege(
+    privileges: *const u32,
+    count: u32,
+    flags: u32,
+    returned_state: *mut *mut c_void,
+) -> u64 {
+    use nt_ntdll::rtl::privilege::{
+        acquire_allocation_size, acquire_strategy, normalize_acquire_flags,
+        normalize_adjust_status, nt_success, AcquireStrategy, RTL_ACQUIRE_PRIVILEGE_IMPERSONATE,
+    };
+
+    const TOKEN_IMPERSONATE: u32 = 0x4;
+    const TOKEN_ADJUST_QUERY: u32 = 0x28;
+    const TOKEN_ADJUST_QUERY_IMPERSONATE: u32 = 0x2C;
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+
+    let flags = match normalize_acquire_flags(flags) {
+        Ok(flags) => flags,
+        Err(status) => return status as u64,
+    };
+    let size = match acquire_allocation_size(count) {
+        Some(size) => size,
+        None => return STATUS_NO_MEMORY,
+    };
+    let state = unsafe { crate::process_heap_alloc(size) }.cast::<RtlAcquireState>();
+    if state.is_null() {
+        return STATUS_NO_MEMORY;
+    }
+    unsafe { core::ptr::write_bytes(state.cast::<u8>(), 0, size) };
+
+    let is_impersonating = unsafe { (*current_teb()).is_impersonating != 0 };
+    let strategy = acquire_strategy(is_impersonating, flags);
+    let mut status = 0u64;
+    match strategy {
+        AcquireStrategy::OpenExistingThreadToken => {
+            status = unsafe {
+                open_current_thread_token(
+                    TOKEN_ADJUST_QUERY,
+                    core::ptr::addr_of_mut!((*state).token),
+                )
+            };
+        }
+        AcquireStrategy::RevertThenDuplicateProcessToken => {
+            status = unsafe {
+                open_current_thread_token(
+                    TOKEN_IMPERSONATE,
+                    core::ptr::addr_of_mut!((*state).old_impersonation_token),
+                )
+            };
+            if nt_success(status as u32) {
+                unsafe { (*state).flags |= RTL_ACQUIRE_PRIVILEGE_IMPERSONATE };
+                status = unsafe { set_current_thread_token(0) };
+            }
+        }
+        AcquireStrategy::OpenProcessToken => {
+            status = unsafe {
+                syscall4(
+                    SSN_NT_OPEN_PROCESS_TOKEN,
+                    NT_CURRENT_PROCESS,
+                    TOKEN_ADJUST_QUERY as u64,
+                    core::ptr::addr_of_mut!((*state).token) as u64,
+                    0,
+                )
+            };
+        }
+        AcquireStrategy::DuplicateProcessToken => {}
+    }
+    if !nt_success(status as u32) {
+        unsafe { cleanup_failed_acquire(state) };
+        return status;
+    }
+
+    if matches!(
+        strategy,
+        AcquireStrategy::DuplicateProcessToken | AcquireStrategy::RevertThenDuplicateProcessToken
+    ) {
+        let duplicate =
+            match unsafe { duplicate_process_token(TOKEN_ADJUST_QUERY_IMPERSONATE, 3, 1) } {
+                Ok(token) => token,
+                Err(failure) => {
+                    unsafe { cleanup_failed_acquire(state) };
+                    return failure;
+                }
+            };
+        unsafe { (*state).token = duplicate };
+        status = unsafe { set_current_thread_token(duplicate) };
+        if !nt_success(status as u32) {
+            unsafe { cleanup_failed_acquire(state) };
+            return status;
+        }
+        unsafe { (*state).flags |= RTL_ACQUIRE_PRIVILEGE_IMPERSONATE };
+    }
+
+    let old_inline = unsafe { core::ptr::addr_of_mut!((*state).old_priv_buffer).cast::<u8>() };
+    let new_privileges = unsafe { state.cast::<u8>().add(0x424) };
+    unsafe {
+        (*state).old_privileges = old_inline;
+        (*state).new_privileges = new_privileges;
+        core::ptr::write_unaligned(new_privileges.cast::<u32>(), count);
+        for index in 0..count as usize {
+            let entry = new_privileges.add(4 + index * 12);
+            core::ptr::write_unaligned(
+                entry.cast::<u32>(),
+                core::ptr::read_unaligned(privileges.add(index)),
+            );
+            core::ptr::write_unaligned(entry.add(4).cast::<i32>(), 0);
+            core::ptr::write_unaligned(entry.add(8).cast::<u32>(), SE_PRIVILEGE_ENABLED);
+        }
+    }
+
+    let mut old_size = 1024u32;
+    loop {
+        let mut return_length = 1024u32;
+        status = unsafe {
+            syscall6(
+                SSN_NT_ADJUST_PRIVILEGES_TOKEN,
+                (*state).token,
+                0,
+                (*state).new_privileges as u64,
+                old_size as u64,
+                (*state).old_privileges as u64,
+                core::ptr::addr_of_mut!(return_length) as u64,
+            )
+        };
+        if status as u32 == STATUS_BUFFER_TOO_SMALL {
+            let replacement = unsafe { crate::process_heap_alloc(return_length as usize) };
+            if replacement.is_null() {
+                status = STATUS_NO_MEMORY;
+                break;
+            }
+            let prior = unsafe { (*state).old_privileges };
+            if prior != old_inline {
+                let _ = unsafe { crate::process_heap_free(prior) };
+            }
+            unsafe { (*state).old_privileges = replacement };
+            old_size = return_length;
+            continue;
+        }
+        status = normalize_adjust_status(count, status as u32) as u64;
+        break;
+    }
+
+    if !nt_success(status as u32) {
+        unsafe { cleanup_failed_acquire(state) };
+        return status;
+    }
+    unsafe { core::ptr::write(returned_state, state.cast::<c_void>()) };
+    status
+}
+
+/// Restore the state returned by `RtlAcquirePrivilege` and release its token references.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_release_privilege(state: *mut c_void) {
+    use nt_ntdll::rtl::privilege::{nt_success, RTL_ACQUIRE_PRIVILEGE_IMPERSONATE};
+
+    let state = state.cast::<RtlAcquireState>();
+    if state.is_null() {
+        return;
+    }
+    if unsafe { (*state).flags } & RTL_ACQUIRE_PRIVILEGE_IMPERSONATE != 0 {
+        let old = unsafe { (*state).old_impersonation_token };
+        let status = unsafe { set_current_thread_token(old) };
+        if !nt_success(status as u32) {
+            unsafe { crate::exports::rtl_raise_status(status as u32) };
+        }
+        unsafe { close_if_nonzero(old) };
+    } else {
+        let status = unsafe {
+            syscall6(
+                SSN_NT_ADJUST_PRIVILEGES_TOKEN,
+                (*state).token,
+                0,
+                (*state).old_privileges as u64,
+                0,
+                0,
+                0,
+            )
+        };
+        if !nt_success(status as u32) {
+            unsafe { crate::exports::rtl_raise_status(status as u32) };
+        }
+    }
+    unsafe { close_if_nonzero((*state).token) };
+    unsafe { free_acquire_state(state) };
+}
+
 /// `RtlAdjustPrivilege(Privilege, Enable, CurrentThread, WasEnabled)` — the live-token implementation.
 ///
 /// Opens the selected token, builds a one-entry `TOKEN_PRIVILEGES { count=1, luid={priv,0},
@@ -4212,16 +4585,8 @@ pub unsafe fn rtl_adjust_privilege(
 ) -> u64 {
     let mut token: u64 = 0;
     let st_open = if current_thread != 0 {
-        // SAFETY: on-target NtOpenThreadToken call with a writable stack out-parameter.
-        unsafe {
-            syscall4(
-                SSN_NT_OPEN_THREAD_TOKEN,
-                NT_CURRENT_THREAD,
-                TOKEN_ADJUST_PRIVILEGES_QUERY as u64,
-                0,
-                &mut token as *mut u64 as u64,
-            )
-        }
+        // SAFETY: tries OpenAsSelf first, then the caller's impersonation identity like ReactOS.
+        unsafe { open_current_thread_token(TOKEN_ADJUST_PRIVILEGES_QUERY, &mut token as *mut u64) }
     } else {
         // SAFETY: on-target NtOpenProcessToken call with a writable stack out-parameter.
         unsafe {
@@ -4290,7 +4655,6 @@ pub unsafe fn rtl_adjust_privilege(
 // ---------------------------------------------------------------------------------------------
 
 const SSN_NT_SET_INFORMATION_PROCESS: u32 = 237;
-const SSN_NT_SET_INFORMATION_THREAD: u32 = 238;
 const SSN_NT_QUERY_INFORMATION_PROCESS_CRITICAL: u32 = 161;
 const SSN_NT_QUERY_INFORMATION_THREAD_CRITICAL: u32 = 162;
 /// `ProcessBreakOnTermination` info class.
