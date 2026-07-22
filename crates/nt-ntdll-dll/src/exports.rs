@@ -5497,19 +5497,13 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_and_spin_count(
     cs: *mut c_void,
     spin_count: u32,
 ) -> NtStatus {
-    if cs.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract. Zero the struct, set the
-    // free-lock fields, then allocate + install a real DebugInfo (RtlInitializeCriticalSectionEx).
     unsafe {
-        core::ptr::write_bytes(cs as *mut u8, 0, 40);
-        *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
-        *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF; // SpinCount (bit31 masked)
-                                                                             // DebugInfo @ offset 0 — allocate + populate (msvcrt & others deref it).
-        install_cs_debug_info(cs);
+        rtl_initialize_critical_section_ex(
+            cs,
+            spin_count & !nt_ntdll::sync::RTL_CRITICAL_SECTION_ALL_FLAG_BITS,
+            0,
+        )
     }
-    STATUS_SUCCESS
 }
 
 /// `RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION, ULONG SpinCount, ULONG Flags) -> NTSTATUS`.
@@ -5528,18 +5522,49 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_ex(
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    const RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO: u32 = 0x0100_0000;
+    let (os_major, os_minor, processors) = unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let teb = &*(current_teb() as *const Teb);
+            let peb = teb.process_environment_block as *const nt_ntdll_layout::Peb;
+            if peb.is_null() {
+                (0, 0, 1)
+            } else {
+                (
+                    core::ptr::read_unaligned((peb as *const u8).add(0x118) as *const u32),
+                    core::ptr::read_unaligned((peb as *const u8).add(0x11c) as *const u32),
+                    (*peb).number_of_processors,
+                )
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            (6, 1, 1)
+        }
+    };
+    let (spin_count, flags) = match nt_ntdll::sync::critical_section_init_flags(
+        spin_count,
+        flags,
+        os_major,
+        os_minor,
+    ) {
+        Ok(config) => config,
+        Err(status) => return status,
+    };
     // SAFETY: cs valid per the contract.
     unsafe {
         core::ptr::write_bytes(cs as *mut u8, 0, 40);
         *((cs as *mut u8).add(0x08) as *mut i32) = -1; // LockCount = -1 (free)
-        *((cs as *mut u8).add(0x20) as *mut u32) = spin_count & 0x7FFF_FFFF;
-        if flags & RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO != 0 {
+        *((cs as *mut u8).add(0x20) as *mut usize) =
+            nt_ntdll::sync::effective_critical_section_spin_count(spin_count, processors);
+        if flags & nt_ntdll::sync::RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO != 0 {
             // Caller opted out of debug info: DebugInfo = LongToPtr(-1) (the NO_DEBUG sentinel).
             core::ptr::write(cs as *mut u64, u64::MAX);
         } else {
             #[cfg(target_arch = "x86_64")]
-            install_cs_debug_info(cs);
+            if install_cs_debug_info(cs) == 0 {
+                return STATUS_NO_MEMORY;
+            }
         }
     }
     STATUS_SUCCESS
@@ -17879,9 +17904,23 @@ pub unsafe extern "system" fn rtl_set_critical_section_spin_count(
     // LockSemaphore@0x18, SpinCount@0x20.
     // SAFETY: cs valid per the contract.
     unsafe {
-        let p = (cs as *mut u32).byte_add(0x20);
-        let prev = *p;
-        *p = spin;
+        let p = (cs as *mut u8).add(0x20) as *mut usize;
+        let prev = *p as u32;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let teb = &*(current_teb() as *const Teb);
+            let peb = teb.process_environment_block as *const nt_ntdll_layout::Peb;
+            let processors = if peb.is_null() {
+                1
+            } else {
+                (*peb).number_of_processors
+            };
+            *p = nt_ntdll::sync::effective_critical_section_spin_count(spin, processors);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            *p = 0;
+        }
         prev
     }
 }

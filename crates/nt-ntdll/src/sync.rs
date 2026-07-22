@@ -25,6 +25,47 @@ use crate::{NtStatus, STATUS_INVALID_SYSTEM_SERVICE};
 /// Sentinel `OwningThread` for "unowned".
 const NO_OWNER: u64 = 0;
 
+pub const RTL_CRITICAL_SECTION_ALL_FLAG_BITS: u32 = 0xFF00_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO: u32 = 0x0100_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_DYNAMIC_SPIN: u32 = 0x0200_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_STATIC_INIT: u32 = 0x0400_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_RESOURCE_TYPE: u32 = 0x0800_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO: u32 = 0x1000_0000;
+pub const STATUS_INVALID_PARAMETER_2: NtStatus = 0xC000_00F0;
+pub const STATUS_INVALID_PARAMETER_3: NtStatus = 0xC000_00F1;
+
+/// Validate and normalize `RtlInitializeCriticalSectionEx` parameters.
+pub fn critical_section_init_flags(
+    spin_count: u32,
+    flags: u32,
+    os_major: u32,
+    os_minor: u32,
+) -> Result<(u32, u32), NtStatus> {
+    let flags = flags & RTL_CRITICAL_SECTION_ALL_FLAG_BITS;
+    let mut allowed = RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO
+        | RTL_CRITICAL_SECTION_FLAG_DYNAMIC_SPIN
+        | RTL_CRITICAL_SECTION_FLAG_STATIC_INIT;
+    if (os_major, os_minor) >= (6, 1) {
+        allowed |=
+            RTL_CRITICAL_SECTION_FLAG_RESOURCE_TYPE | RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO;
+    }
+    if flags & !allowed != 0 {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    if spin_count & RTL_CRITICAL_SECTION_ALL_FLAG_BITS != 0 {
+        return Err(STATUS_INVALID_PARAMETER_2);
+    }
+    Ok((spin_count, flags))
+}
+
+pub fn effective_critical_section_spin_count(spin_count: u32, processors: u32) -> usize {
+    if processors > 1 {
+        spin_count as usize
+    } else {
+        0
+    }
+}
+
 /// Route a keyed-event syscall by name through the swappable transport. Resolves the SSN via the
 /// shared ABI table (single source of truth); an unknown name (never, for these two) returns
 /// [`STATUS_INVALID_SYSTEM_SERVICE`] rather than a silent success.
@@ -456,6 +497,38 @@ mod tests {
     fn cs_spin_count_masked() {
         let cs = CriticalSection::with_spin_count(0x8000_0400);
         assert_eq!(cs.spin_count, 0x400); // flag bits masked off
+    }
+
+    #[test]
+    fn cs_init_validates_flag_and_spin_parameter_indices() {
+        assert_eq!(
+            critical_section_init_flags(0x0100_0000, 0, 6, 1),
+            Err(STATUS_INVALID_PARAMETER_2)
+        );
+        assert_eq!(
+            critical_section_init_flags(0, 0x2000_0000, 6, 1),
+            Err(STATUS_INVALID_PARAMETER_3)
+        );
+        assert!(critical_section_init_flags(
+            4000,
+            RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO | 7,
+            6,
+            1
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cs_init_applies_version_and_processor_rules() {
+        assert!(
+            critical_section_init_flags(0, RTL_CRITICAL_SECTION_FLAG_RESOURCE_TYPE, 6, 1).is_ok()
+        );
+        assert_eq!(
+            critical_section_init_flags(0, RTL_CRITICAL_SECTION_FLAG_RESOURCE_TYPE, 6, 0),
+            Err(STATUS_INVALID_PARAMETER_3)
+        );
+        assert_eq!(effective_critical_section_spin_count(4000, 1), 0);
+        assert_eq!(effective_critical_section_spin_count(4000, 2), 4000);
     }
 
     #[test]
