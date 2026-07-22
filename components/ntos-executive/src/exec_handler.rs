@@ -5834,6 +5834,109 @@ impl NativeSyscallHandler for ExecNtHandler {
                 self.queue_write(iosb + 8, 8); // Information = bytes written
                 0
             }
+            // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+            // FileInformationClass). Resolve process-local ownership here; nt-fs owns the ABI layout.
+            NativeService::NtQueryInformationFile => unsafe {
+                let iosb = args[1];
+                let output = args[2];
+                let length = args[3] as usize;
+                let class = args[4] as u32;
+                let mut encoded = [0u8; 24];
+                let encoded_capacity = encoded.len();
+                let required = match nt_fs::encode_query_information(
+                    class,
+                    nt_fs::QueryMetadata::default(),
+                    &mut encoded[..length.min(encoded_capacity)],
+                ) {
+                    Ok(required) => required,
+                    Err(status) => return status,
+                };
+                if iosb == 0 || output == 0 {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                if iosb & 7 != 0 || output & 3 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if !self.probe_user_output(iosb, 16)
+                    || !self.probe_user_output(output, length)
+                {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                let pid = match self.pm_pid_for_pi(self.pi) {
+                    Some(pid) => pid,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let object = match self
+                    .pm
+                    .lookup_handle(pid, args[0] as nt_process::Handle)
+                {
+                    Some(object) => object,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let size_and_directory = match object {
+                    nt_process::HandleObject::DiskFile { size, .. } => Some((size as u64, false)),
+                    nt_process::HandleObject::Directory { .. } => Some((0, true)),
+                    nt_process::HandleObject::BootStatusFile => {
+                        Some((EXEC_BOOT_STATUS_FILE_SIZE as u64, false))
+                    }
+                    nt_process::HandleObject::Opaque(_) => {
+                        let ctx = match self.loop_ctx {
+                            Some(ctx) => ctx,
+                            None => return nt_fs::STATUS_INVALID_HANDLE,
+                        };
+                        let reg = &*ctx.reg;
+                        if let Some(index) = reg.index_for_file(self.pi, args[0]) {
+                            ctx.dll_pes()[index]
+                                .as_ref()
+                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else if self.pi == 0 && args[0] == *ctx.csrss_file_handle {
+                            (&*ctx.csrss_pe)
+                                .as_ref()
+                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else if self.pi == 0 && args[0] == *ctx.winlogon_file_handle {
+                            (&*ctx.winlogon_pe)
+                                .as_ref()
+                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else if self.pi == 2 && args[0] == *ctx.services_file_handle {
+                            (&*ctx.services_pe)
+                                .as_ref()
+                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else if self.pi == 2 && args[0] == *ctx.lsass_file_handle {
+                            (&*ctx.lsass_pe)
+                                .as_ref()
+                                .map(|pe| (pe.bytes().len() as u64, false))
+                        } else {
+                            None
+                        }
+                    }
+                    nt_process::HandleObject::File(_) => {
+                        return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+                    }
+                    _ => return 0xC000_0024, // STATUS_OBJECT_TYPE_MISMATCH
+                };
+                let (size, directory) = match size_and_directory {
+                    Some(metadata) => metadata,
+                    None => return nt_fs::STATUS_INVALID_HANDLE,
+                };
+                let metadata = nt_fs::QueryMetadata {
+                    allocation_size: size.saturating_add(0xFFF) & !0xFFF,
+                    end_of_file: size,
+                    number_of_links: 1,
+                    delete_pending: false,
+                    directory,
+                };
+                nt_fs::encode_query_information(class, metadata, &mut encoded)
+                    .expect("validated query class and length");
+                if !self.xas_try_write_buf(output, &encoded[..required]) {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                let mut iosb_bytes = [0u8; 16];
+                iosb_bytes[8..16].copy_from_slice(&(required as u64).to_le_bytes());
+                if !self.xas_try_write_buf(iosb, &iosb_bytes) {
+                    return nt_syscall::STATUS_ACCESS_VIOLATION;
+                }
+                nt_fs::STATUS_SUCCESS
+            }
             // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress[RDX]=args[1], ZeroBits,
             // *RegionSize[R9]=args[3], Type[arg5]=args[4], Protect). RESERVE (base in==0) picks a
             // per-process bump base; COMMIT maps frames + mirrors the first heap window (group C:

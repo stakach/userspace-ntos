@@ -570,6 +570,7 @@ pub const SSN_NT_OPEN_FILE: u64 = 122;
 pub const SSN_NT_QUERY_ATTRIBUTES_FILE: u64 = 145;
 /// NtQueryVolumeInformationFile — CsrServerInitialization queries volume info for a file handle.
 pub const SSN_NT_QUERY_VOLUME_INFO_FILE: u64 = 187;
+pub const SSN_NT_QUERY_INFORMATION_FILE: u64 = 158;
 /// PnP manager syscalls imported by umpnpmgr. We export and route them, but the executive has no
 /// PnP device tree/event queue yet, so the handler returns STATUS_NOT_IMPLEMENTED instead of
 /// fabricating hardware/device-manager success.
@@ -4598,6 +4599,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtSetIoCompletion, SSN_NT_SET_IO_COMPLETION as u32),
             (NativeService::NtWriteFile, 284),
             (NativeService::NtReadFile, 191),
+            (NativeService::NtQueryInformationFile, SSN_NT_QUERY_INFORMATION_FILE as u32),
             (NativeService::NtSetInformationFile, 233),
             (NativeService::NtFlushBuffersFile, 81),
             (NativeService::NtCreateNamedPipeFile, SSN_NT_CREATE_NAMED_PIPE_FILE as u32),

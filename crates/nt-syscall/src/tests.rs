@@ -394,6 +394,19 @@ fn event_family_uses_native_numbers_and_argument_contracts() {
 }
 
 #[test]
+fn query_information_file_uses_native_number_and_argument_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtQueryInformationFile, 158)],
+    );
+    assert_eq!(
+        table.lookup(158).map(|entry| entry.service),
+        Some(NativeService::NtQueryInformationFile)
+    );
+    assert_eq!(NativeService::NtQueryInformationFile.arg_count(), (5, 5));
+}
+
+#[test]
 fn semaphore_family_uses_native_numbers_and_argument_contracts() {
     let table = NativeServiceTable::from_numbers(
         UserlandAbiProfile::Windows7,

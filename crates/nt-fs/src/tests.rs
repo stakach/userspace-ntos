@@ -1,4 +1,40 @@
 use super::*;
+
+#[test]
+fn query_information_encodes_standard_layout() {
+    let metadata = QueryMetadata {
+        allocation_size: 0x2000,
+        end_of_file: 0x1234,
+        number_of_links: 2,
+        delete_pending: true,
+        directory: false,
+    };
+    let mut output = [0xCC; 40];
+    assert_eq!(
+        encode_query_information(FILE_STANDARD_INFORMATION, metadata, &mut output),
+        Ok(24)
+    );
+    assert_eq!(u64::from_le_bytes(output[0..8].try_into().unwrap()), 0x2000);
+    assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 0x1234);
+    assert_eq!(u32::from_le_bytes(output[16..20].try_into().unwrap()), 2);
+    assert_eq!(&output[20..24], &[1, 0, 0, 0]);
+}
+
+#[test]
+fn query_information_rejects_bad_contracts_without_mutating_output() {
+    let metadata = QueryMetadata::default();
+    let mut output = [0xCC; 40];
+    assert_eq!(
+        encode_query_information(FILE_STANDARD_INFORMATION, metadata, &mut output[..23]),
+        Err(STATUS_INFO_LENGTH_MISMATCH)
+    );
+    assert_eq!(&output[..23], &[0xCC; 23]);
+    assert_eq!(
+        encode_query_information(99, metadata, &mut output),
+        Err(STATUS_INVALID_INFO_CLASS)
+    );
+    assert_eq!(&output, &[0xCC; 40]);
+}
 use core::cell::RefCell;
 use nt_hive_core::{HiveKind, HiveLogOp, HiveManager, RegistryValueType};
 

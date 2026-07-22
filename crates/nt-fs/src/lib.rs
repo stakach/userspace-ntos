@@ -15,6 +15,7 @@ mod file_backing;
 mod fs;
 mod hive_provider;
 mod path;
+mod query;
 mod status;
 
 pub use file_backing::FileBacking;
@@ -24,6 +25,7 @@ pub use path::{
     is_named_pipe_path, normalize_separators, nt_path_to_volume_relative, MountManager,
     MEMFS_VOLUME,
 };
+pub use query::*;
 pub use status::*;
 
 #[cfg(test)]

@@ -342,6 +342,7 @@ impl NativeService {
             NtQueryKey => (5, 5),
             NtQuerySystemInformation => (4, 4),
             NtReadFile | NtWriteFile => (5, 9),
+            NtQueryInformationFile => (5, 5),
             NtCreateFile => (8, 11),
             // Group-A services the executive handles by reading registers directly (out-handle in
             // RCX/R8) or as pure no-ops — the handler ignores the arg vector, so cap max at 4
