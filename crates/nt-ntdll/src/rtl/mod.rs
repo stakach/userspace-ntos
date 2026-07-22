@@ -12,6 +12,7 @@
 //! coverage (A pure / A' CRT / B heap / C sync).
 
 pub mod atom;
+pub mod activation;
 pub mod avl_table;
 pub mod bitmap;
 pub mod compression;

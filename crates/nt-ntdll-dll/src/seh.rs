@@ -72,6 +72,19 @@ impl AlignedContext {
     }
 }
 
+#[repr(C)]
+struct RawExceptionRecord {
+    code: u32,
+    flags: u32,
+    chained_record: u64,
+    address: u64,
+    parameter_count: u32,
+    padding: u32,
+    information: [u64; 15],
+}
+
+const _: [(); 0x98] = [(); core::mem::size_of::<RawExceptionRecord>()];
+
 /// `NtContinue` SSN (shared `nt-syscall-abi` table).
 const SSN_NT_CONTINUE: u32 = 0x43;
 /// `NtRaiseException` SSN.
@@ -621,6 +634,20 @@ pub unsafe fn rtl_raise_exception(record: *mut c_void) {
         // services it, an `int3` (→ the kernel #BP handler) terminates deterministically.
         nt_raise_exception(record, ctx.as_mut_ptr(), 0 /*FirstChance=FALSE*/);
     }
+}
+
+/// Raise `status` as a noncontinuable software exception through the live x64 SEH dispatcher.
+pub unsafe fn rtl_raise_status(status: u32) {
+    let mut record = RawExceptionRecord {
+        code: status,
+        flags: ex::EXCEPTION_NONCONTINUABLE,
+        chained_record: 0,
+        address: 0,
+        parameter_count: 0,
+        padding: 0,
+        information: [0; 15],
+    };
+    unsafe { rtl_raise_exception((&mut record as *mut RawExceptionRecord).cast()) };
 }
 
 // =================================================================================================

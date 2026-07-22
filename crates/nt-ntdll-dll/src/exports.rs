@@ -10851,34 +10851,57 @@ pub unsafe extern "system" fn rtl_find_message(
 // =================================================================================================
 // BATCH 4 — Rtl* activation-context (SxS) / path / guid / image / handle-table / resource-lock /
 // timer-queue / thread-pool / debug-buffer families.
-//   * SxS: no activation-context plane hosted → the whole family is honest no-ops that report "no
-//     active context" (the caller falls back to the process default — which IS how a manifest-less
-//     process behaves). The Ex/UnsafeFast variants share the no-op.
+//   * SxS: per-thread activation stacks use the native x64 layouts. Manifest parsing and activation
+//     context section lookup remain limited to the process-default fallback.
 //   * path/guid: real bodies over the host-tested nt_ntdll::rtl::{path,guid}.
 //   * image: real bodies over nt_ntdll::rtl::image (a mapped image = a byte slice from the base).
 //   * handle-table / resource-lock: real inline (single-threaded).
 //   * timer-queue / thread-pool: no scheduler plane → honest STATUS_NOT_IMPLEMENTED / no-op.
 // =================================================================================================
 
-// ---- activation context (SxS) — no plane; report "no active context" -----------------------------
+// ---- activation context stack --------------------------------------------------------------------
 
-/// `RtlActivateActivationContext(ULONG Flags, PVOID ActCtx, PULONG_PTR Cookie) -> NTSTATUS` — push
-/// an activation context. No SxS plane; set the cookie to a sentinel + STATUS_SUCCESS (the caller
-/// pairs it with Deactivate, a matched no-op).
+#[cfg(target_arch = "x86_64")]
+unsafe fn ensure_activation_context_stack(teb: *mut u8) -> Result<*mut u8, NtStatus> {
+    if teb.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let slot = unsafe { teb.add(0x2c8) as *mut *mut c_void };
+    let status = unsafe { rtl_allocate_activation_context_stack(slot) };
+    if nt_success(status) {
+        Ok(unsafe { core::ptr::read_unaligned(slot) as *mut u8 })
+    } else {
+        Err(status)
+    }
+}
+
+/// `RtlActivateActivationContext(ULONG Flags, PVOID ActCtx, PULONG_PTR Cookie) -> NTSTATUS`.
 ///
 /// # Safety
 /// `cookie` null or writable.
 #[export_name = "RtlActivateActivationContext"]
 pub unsafe extern "system" fn rtl_activate_activation_context(
-    _flags: u32,
-    _act_ctx: *mut c_void,
+    flags: u32,
+    act_ctx: *mut c_void,
     cookie: *mut usize,
 ) -> NtStatus {
     if !cookie.is_null() {
-        // SAFETY: cookie writable per the contract.
-        unsafe { *cookie = 1 };
+        unsafe { core::ptr::write_unaligned(cookie, nt_ntdll::rtl::activation::INVALID_COOKIE) };
     }
-    STATUS_SUCCESS
+    if flags != 0 || cookie.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
+            rtl_activate_activation_context_ex(0, current_teb() as *mut c_void, act_ctx, cookie)
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (act_ctx, cookie);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlActivateActivationContextEx(ULONG Flags, PTEB Teb, PVOID ActCtx, PULONG_PTR Cookie)`.
@@ -10887,49 +10910,232 @@ pub unsafe extern "system" fn rtl_activate_activation_context(
 /// `cookie` null or writable.
 #[export_name = "RtlActivateActivationContextEx"]
 pub unsafe extern "system" fn rtl_activate_activation_context_ex(
-    _flags: u32,
-    _teb: *mut c_void,
-    _act_ctx: *mut c_void,
+    flags: u32,
+    teb: *mut c_void,
+    act_ctx: *mut c_void,
     cookie: *mut usize,
 ) -> NtStatus {
     if !cookie.is_null() {
-        // SAFETY: cookie writable per the contract.
-        unsafe { *cookie = 1 };
+        unsafe { core::ptr::write_unaligned(cookie, nt_ntdll::rtl::activation::INVALID_COOKIE) };
     }
-    STATUS_SUCCESS
+    if cookie.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if let Err(status) = nt_ntdll::rtl::activation::validate_activate_ex(
+        flags,
+        !teb.is_null(),
+        act_ctx as usize,
+    ) {
+        return status;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let stack = match ensure_activation_context_stack(teb as *mut u8) {
+            Ok(stack) => stack,
+            Err(status) => return status,
+        };
+        let frame = crate::process_heap_alloc(
+            nt_ntdll::rtl::activation::ActivationContextStackFrame::SIZE,
+        );
+        if frame.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        let active = core::ptr::read_unaligned(stack as *const u64);
+        core::ptr::write_unaligned(frame as *mut u64, active);
+        core::ptr::write_unaligned(frame.add(8) as *mut u64, act_ctx as u64);
+        let frame_flags = nt_ntdll::rtl::activation::heap_frame_flags(flags);
+        core::ptr::write_unaligned(frame.add(16) as *mut u32, frame_flags);
+        rtl_add_ref_activation_context(act_ctx);
+        core::ptr::write_unaligned(stack as *mut u64, frame as u64);
+        core::ptr::write_unaligned(cookie, frame as usize);
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = act_ctx;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlActivateActivationContextUnsafeFast(PRTL_ACTIVATION_CONTEXT_STACK_FRAME Frame, PVOID ActCtx)`
-/// — the inlined fast-path push. No-op (no SxS stack).
+/// — push a caller-owned frame on the current thread's activation stack.
 ///
 /// # Safety
 /// `frame` a valid RTL_ACTIVATION_CONTEXT_STACK_FRAME or NULL.
 #[export_name = "RtlActivateActivationContextUnsafeFast"]
 pub unsafe extern "system" fn rtl_activate_activation_context_unsafe_fast(
-    _frame: *mut c_void,
-    _act_ctx: *mut c_void,
+    frame: *mut c_void,
+    act_ctx: *mut c_void,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if frame.is_null() {
+            return core::ptr::null_mut();
+        }
+        let raw = frame as *mut u8;
+        let size = core::ptr::read_unaligned(raw as *const usize);
+        let format = core::ptr::read_unaligned(raw.add(8) as *const u32);
+        if !nt_ntdll::rtl::activation::validate_caller_frame(size, format) {
+            return core::ptr::null_mut();
+        }
+        let stack = match ensure_activation_context_stack(current_teb() as *mut u8) {
+            Ok(stack) => stack,
+            Err(_) => return core::ptr::null_mut(),
+        };
+        let active = core::ptr::read_unaligned(stack as *const u64);
+        let stack_frame = raw.add(16);
+        core::ptr::write_unaligned(stack_frame as *mut u64, active);
+        core::ptr::write_unaligned(stack_frame.add(8) as *mut u64, act_ctx as u64);
+        core::ptr::write_unaligned(
+            stack_frame.add(16) as *mut u32,
+            nt_ntdll::rtl::activation::FRAME_FLAG_ACTIVATED,
+        );
+        if size >= nt_ntdll::rtl::activation::CallerAllocatedFrameExtended::SIZE {
+            core::ptr::write_unaligned(raw.add(40) as *mut u64, !active);
+            core::ptr::write_unaligned(raw.add(48) as *mut u64, !(act_ctx as u64));
+        }
+        core::ptr::write_unaligned(stack as *mut u64, stack_frame as u64);
+        stack_frame as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (frame, act_ctx);
+        core::ptr::null_mut()
+    }
 }
 
-/// `RtlDeactivateActivationContext(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — pop. No-op success.
+/// `RtlDeactivateActivationContext(ULONG Flags, ULONG_PTR Cookie) -> NTSTATUS` — pop a heap frame.
 ///
 /// # Safety
 /// `cookie` from a matching Activate.
 #[export_name = "RtlDeactivateActivationContext"]
 pub unsafe extern "system" fn rtl_deactivate_activation_context(
-    _flags: u32,
-    _cookie: usize,
+    flags: u32,
+    cookie: usize,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if flags & !nt_ntdll::rtl::activation::DEACTIVATE_FLAG_FORCE_EARLY != 0 {
+            rtl_raise_status(STATUS_INVALID_PARAMETER);
+            return STATUS_INVALID_PARAMETER;
+        }
+        if cookie == nt_ntdll::rtl::activation::INVALID_COOKIE {
+            return STATUS_SUCCESS;
+        }
+        let teb = &*(current_teb() as *const Teb);
+        let stack = teb.activation_context_stack_pointer as *mut u8;
+        if stack.is_null() {
+            rtl_raise_status(nt_ntdll::rtl::activation::STATUS_SXS_INVALID_DEACTIVATION);
+            return nt_ntdll::rtl::activation::STATUS_SXS_INVALID_DEACTIVATION;
+        }
+        let top = core::ptr::read_unaligned(stack as *const u64);
+        let mut frame = top;
+        while frame != 0 && frame != cookie as u64 {
+            frame = core::ptr::read_unaligned(frame as *const u64);
+        }
+        let target_flags = if frame == 0 {
+            0
+        } else {
+            core::ptr::read_unaligned((frame + 16) as *const u32)
+        };
+        if let Err(status) = nt_ntdll::rtl::activation::validate_deactivation(
+            frame == cookie as u64 && frame != 0,
+            frame == top && frame != 0,
+            target_flags & nt_ntdll::rtl::activation::FRAME_FLAG_HEAP_ALLOCATED != 0,
+            flags,
+        ) {
+            rtl_raise_status(status);
+            return status;
+        }
+        let previous = core::ptr::read_unaligned(frame as *const u64);
+        core::ptr::write_unaligned(stack as *mut u64, previous);
+        let mut current = top;
+        while current != previous {
+            let next = core::ptr::read_unaligned(current as *const u64);
+            let context = core::ptr::read_unaligned((current + 8) as *const *mut c_void);
+            let frame_flags = core::ptr::read_unaligned((current + 16) as *const u32);
+            let release_count = nt_ntdll::rtl::activation::release_count(frame_flags);
+            for _ in 0..release_count {
+                rtl_release_activation_context(context);
+            }
+            if frame_flags & nt_ntdll::rtl::activation::FRAME_FLAG_HEAP_ALLOCATED != 0 {
+                crate::process_heap_free(current as *mut u8);
+            } else {
+                core::ptr::write_unaligned(
+                    (current + 16) as *mut u32,
+                    frame_flags | nt_ntdll::rtl::activation::FRAME_FLAG_DEACTIVATED,
+                );
+            }
+            current = next;
+        }
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (flags, cookie);
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `RtlDeactivateActivationContextUnsafeFast(PRTL_ACTIVATION_CONTEXT_STACK_FRAME Frame)` — no-op.
+/// `RtlDeactivateActivationContextUnsafeFast(PRTL_ACTIVATION_CONTEXT_STACK_FRAME Frame)` — pop a
+/// caller-owned frame from the current thread's activation stack.
 ///
 /// # Safety
 /// `frame` a valid stack frame or NULL.
 #[export_name = "RtlDeactivateActivationContextUnsafeFast"]
-pub unsafe extern "system" fn rtl_deactivate_activation_context_unsafe_fast(_frame: *mut c_void) {}
+pub unsafe extern "system" fn rtl_deactivate_activation_context_unsafe_fast(
+    frame: *mut c_void,
+) -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if frame.is_null() {
+            return core::ptr::null_mut();
+        }
+        let raw = frame as *mut u8;
+        let size = core::ptr::read_unaligned(raw as *const usize);
+        let format = core::ptr::read_unaligned(raw.add(8) as *const u32);
+        if !nt_ntdll::rtl::activation::validate_caller_frame(size, format) {
+            return core::ptr::null_mut();
+        }
+        let stack_frame = raw.add(16);
+        let teb = &*(current_teb() as *const Teb);
+        let stack = teb.activation_context_stack_pointer as *mut u8;
+        if stack.is_null() {
+            return core::ptr::null_mut();
+        }
+        let active = core::ptr::read_unaligned(stack as *const u64);
+        let previous = core::ptr::read_unaligned(stack_frame as *const u64);
+        let frame_flags = core::ptr::read_unaligned(stack_frame.add(16) as *const u32);
+        if !nt_ntdll::rtl::activation::caller_frame_can_deactivate(frame_flags) {
+            return core::ptr::null_mut();
+        }
+        if size >= nt_ntdll::rtl::activation::CallerAllocatedFrameExtended::SIZE {
+            let expected_context = core::ptr::read_unaligned(stack_frame.add(8) as *const u64);
+            let extra1 = core::ptr::read_unaligned(raw.add(40) as *const u64);
+            let extra2 = core::ptr::read_unaligned(raw.add(48) as *const u64);
+            if extra1 != !previous || extra2 != !expected_context {
+                return core::ptr::null_mut();
+            }
+        }
+        if frame_flags & nt_ntdll::rtl::activation::FRAME_FLAG_NOT_REALLY_ACTIVATED != 0 {
+            return stack_frame as *mut c_void;
+        }
+        if active != stack_frame as u64 {
+            return core::ptr::null_mut();
+        }
+        core::ptr::write_unaligned(stack as *mut u64, previous);
+        core::ptr::write_unaligned(
+            stack_frame.add(16) as *mut u32,
+            frame_flags | nt_ntdll::rtl::activation::FRAME_FLAG_DEACTIVATED,
+        );
+        previous as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = frame;
+        core::ptr::null_mut()
+    }
+}
 
 /// `RtlCreateActivationContext(ULONG Flags, PVOID ActivationContextData, ULONG ExtraBytes,
 /// PVOID Callback, PVOID CallbackData, PVOID* ActCtx) -> NTSTATUS` — build an activation context.
@@ -10988,9 +11194,29 @@ pub unsafe extern "system" fn rtl_zombify_activation_context(_act_ctx: *mut c_vo
 pub unsafe extern "system" fn rtl_get_active_activation_context(
     act_ctx: *mut *mut c_void,
 ) -> NtStatus {
-    if !act_ctx.is_null() {
-        // SAFETY: act_ctx writable per the contract.
-        unsafe { *act_ctx = core::ptr::null_mut() };
+    if act_ctx.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb = &*(current_teb() as *const Teb);
+        let stack = teb.activation_context_stack_pointer as *const u8;
+        let context = if stack.is_null() {
+            core::ptr::null_mut()
+        } else {
+            let frame = core::ptr::read_unaligned(stack as *const u64);
+            if frame == 0 {
+                core::ptr::null_mut()
+            } else {
+                core::ptr::read_unaligned((frame + 8) as *const *mut c_void)
+            }
+        };
+        rtl_add_ref_activation_context(context);
+        core::ptr::write_unaligned(act_ctx, context);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        *act_ctx = core::ptr::null_mut();
     }
     STATUS_SUCCESS
 }
@@ -11055,8 +11281,8 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
     STATUS_SUCCESS
 }
 
-/// `RtlAllocateActivationContextStack(PVOID* Stack) -> NTSTATUS` — allocate the per-thread SxS
-/// frame-list. No SxS stack; NULL out + STATUS_SUCCESS (the thread runs with no activation stack).
+/// `RtlAllocateActivationContextStack(PVOID* Stack) -> NTSTATUS` — allocate and initialize a native
+/// per-thread activation-context stack.
 ///
 /// # Safety
 /// `stack` writable.
@@ -11064,19 +11290,70 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
 pub unsafe extern "system" fn rtl_allocate_activation_context_stack(
     stack: *mut *mut c_void,
 ) -> NtStatus {
-    if !stack.is_null() {
-        // SAFETY: stack writable per the contract.
-        unsafe { *stack = core::ptr::null_mut() };
+    if stack.is_null() {
+        return STATUS_INVALID_PARAMETER;
     }
-    STATUS_SUCCESS
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if !core::ptr::read_unaligned(stack).is_null() {
+            return STATUS_SUCCESS;
+        }
+        let memory = crate::process_heap_alloc(
+            nt_ntdll::rtl::activation::ActivationContextStack::SIZE,
+        );
+        if memory.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        let initialized = nt_ntdll::rtl::activation::ActivationContextStack::new(memory as u64);
+        core::ptr::write(
+            memory as *mut nt_ntdll::rtl::activation::ActivationContextStack,
+            initialized,
+        );
+        core::ptr::write_unaligned(stack, memory as *mut c_void);
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// `RtlFreeActivationContextStack(PVOID Stack)` — no-op (none allocated).
+/// `RtlFreeActivationContextStack(PVOID Stack)` — release active heap frames and the stack.
 ///
 /// # Safety
 /// `stack` from `RtlAllocateActivationContextStack` or NULL.
 #[export_name = "RtlFreeActivationContextStack"]
-pub unsafe extern "system" fn rtl_free_activation_context_stack(_stack: *mut c_void) {}
+pub unsafe extern "system" fn rtl_free_activation_context_stack(stack: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if stack.is_null() {
+            return;
+        }
+        let mut frame = core::ptr::read_unaligned(stack as *const u64);
+        core::ptr::write_unaligned(stack as *mut u64, 0);
+        while frame != 0 {
+            let previous = core::ptr::read_unaligned(frame as *const u64);
+            let context = core::ptr::read_unaligned((frame + 8) as *const *mut c_void);
+            let flags = core::ptr::read_unaligned((frame + 16) as *const u32);
+            let release_count = nt_ntdll::rtl::activation::release_count(flags);
+            for _ in 0..release_count {
+                rtl_release_activation_context(context);
+            }
+            if flags & nt_ntdll::rtl::activation::FRAME_FLAG_HEAP_ALLOCATED != 0 {
+                crate::process_heap_free(frame as *mut u8);
+            } else {
+                core::ptr::write_unaligned(
+                    (frame + 16) as *mut u32,
+                    flags | nt_ntdll::rtl::activation::FRAME_FLAG_DEACTIVATED,
+                );
+            }
+            frame = previous;
+        }
+        crate::process_heap_free(stack as *mut u8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = stack;
+    }
+}
 
 /// `RtlFreeThreadActivationContextStack() -> VOID`.
 ///
@@ -17337,21 +17614,21 @@ pub unsafe extern "system" fn rtl_capture_context(context: *mut c_void) {
     }
 }
 
-/// `RtlRaiseStatus(NTSTATUS Status)` — raise a noncontinuable exception with `Status`. No SEH plane
-/// on the boot path; issue an `int 3` (debug break → the kernel #BP handler) so control does NOT
-/// silently continue past a raised status (an honest non-return, not a fabricated recovery).
+/// `RtlRaiseStatus(NTSTATUS Status)` — raise a noncontinuable exception with `Status` through the
+/// live software-SEH dispatcher.
 ///
 /// # Safety
-/// Does not return on target (int3).
+/// Does not return on target unless a native handler transfers control.
 #[export_name = "RtlRaiseStatus"]
-pub unsafe extern "system" fn rtl_raise_status(_status: NtStatus) {
+pub unsafe extern "system" fn rtl_raise_status(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: int3 traps to the kernel; RtlRaiseStatus does not return.
     unsafe {
-        core::arch::asm!("int3", options(noreturn));
+        crate::seh::rtl_raise_status(status);
     }
     #[cfg(not(target_arch = "x86_64"))]
-    {}
+    {
+        let _ = status;
+    }
 }
 
 /// `RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)` — BATCH 42: the REAL software raise
