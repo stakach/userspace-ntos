@@ -6338,6 +6338,22 @@ pub(crate) unsafe fn ldr_send_dll_notifications_for_base(base: u64, reason: u32)
     }
 }
 
+/// Increment or pin the canonical loader entry load count for `base`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn ldr_reference_module(base: u64, pin: bool) -> Result<bool, NtStatus> {
+    let entry = unsafe { find_ldr_entry_for_base(base) };
+    if entry == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let load_count = unsafe { core::ptr::read_unaligned((entry + LDR_LOAD_COUNT) as *const u16) };
+    if load_count == nt_ntdll::loader::lifecycle::LOAD_COUNT_PINNED {
+        return Ok(false);
+    }
+    let updated = nt_ntdll::loader::lifecycle::add_reference(load_count, pin);
+    unsafe { core::ptr::write_unaligned((entry + LDR_LOAD_COUNT) as *mut u16, updated) };
+    Ok(true)
+}
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn record_unload_event_from_entry(entry: u64, base_address: *mut c_void) {
     let sequence = RTL_UNLOAD_EVENT_TRACE_INDEX
@@ -8184,26 +8200,78 @@ pub unsafe extern "system" fn ldr_init_shim_engine_dynamic(base_address: *mut c_
     1
 }
 
-/// `LdrDisableThreadCalloutsForDll(PVOID DllHandle) -> NTSTATUS` — suppress DLL_THREAD_ATTACH/DETACH
-/// for a module. No per-thread callouts on the boot path → accept (STATUS_SUCCESS).
+/// `LdrDisableThreadCalloutsForDll(PVOID DllHandle) -> NTSTATUS` — persist thread-callout
+/// suppression in the module's loader flags when it has no allocated TLS slot.
 ///
 /// # Safety
 /// `dll_handle` a loaded module base.
 #[export_name = "LdrDisableThreadCalloutsForDll"]
 pub unsafe extern "system" fn ldr_disable_thread_callouts_for_dll(
-    _dll_handle: *mut c_void,
+    dll_handle: *mut c_void,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0 {
+        return STATUS_SUCCESS;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
+        let entry = unsafe { find_ldr_entry_for_base(dll_handle as u64) };
+        if entry == 0 {
+            return STATUS_DLL_NOT_FOUND;
+        }
+        let tls_index = unsafe { core::ptr::read_unaligned((entry + 0x6e) as *const u16) };
+        if !nt_ntdll::loader::lifecycle::can_disable_thread_callouts(tls_index) {
+            return STATUS_DLL_NOT_FOUND;
+        }
+        const LDRP_DONT_CALL_FOR_THREADS: u32 = 0x0004_0000;
+        let flags = unsafe { core::ptr::read_unaligned((entry + LDR_FLAGS) as *const u32) };
+        unsafe {
+            core::ptr::write_unaligned(
+                (entry + LDR_FLAGS) as *mut u32,
+                flags | LDRP_DONT_CALL_FOR_THREADS,
+            )
+        };
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = dll_handle;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
-/// `LdrAddRefDll(ULONG Flags, PVOID DllHandle) -> NTSTATUS` — pin/ref a loaded module. Our modules
-/// live for the process lifetime (no unload), so a ref is a no-op success.
+/// `LdrAddRefDll(ULONG Flags, PVOID DllHandle) -> NTSTATUS` — increment or permanently pin a loaded
+/// module's canonical load count.
 ///
 /// # Safety
 /// `dll_handle` a loaded module base.
 #[export_name = "LdrAddRefDll"]
-pub unsafe extern "system" fn ldr_add_ref_dll(_flags: u32, _dll_handle: *mut c_void) -> NtStatus {
-    STATUS_SUCCESS
+pub unsafe extern "system" fn ldr_add_ref_dll(flags: u32, dll_handle: *mut c_void) -> NtStatus {
+    const LDR_ADDREF_DLL_PIN: u32 = 1;
+    if flags & !LDR_ADDREF_DLL_PIN != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _loader_lock = match unsafe { acquire_loader_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
+        unsafe {
+            crate::on_target::ldr_add_ref_dll(
+                dll_handle as u64,
+                flags & LDR_ADDREF_DLL_PIN != 0,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = dll_handle;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `LdrProcessRelocationBlock(ULONG_PTR Address, ULONG Count, PUSHORT TypeOffset, LONG_PTR Delta)`.

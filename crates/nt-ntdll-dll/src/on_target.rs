@@ -1871,7 +1871,12 @@ unsafe fn build_ldr_entry(base: u64, name_lc: &[u8]) -> u64 {
         };
         ustr(0x48); // FullDllName
         ustr(0x58); // BaseDllName
-        core::ptr::write_unaligned((entry + 0x6C) as *mut u16, 1u16); // LoadCount = 1
+        let load_count = if base == EXE_BASE || name_lc.eq_ignore_ascii_case(b"ntdll") {
+            nt_ntdll::loader::lifecycle::LOAD_COUNT_PINNED
+        } else {
+            1
+        };
+        core::ptr::write_unaligned((entry + 0x6C) as *mut u16, load_count);
         entry
     }
 }
@@ -2141,6 +2146,10 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
         let existing = (&*table_ptr).find(dep);
         let newly_loaded = existing == 0;
         let base = if !newly_loaded {
+            let status = ldr_add_ref_dll(existing, false);
+            if status != 0 {
+                return status;
+            }
             existing
         } else {
             let loaded = load_dependent_dll(dep);
@@ -2186,6 +2195,82 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
         }
     }
     0 // STATUS_SUCCESS
+}
+
+/// Apply an ordinary or pin reference to `base` and propagate it across loaded import edges.
+///
+/// # Safety
+/// `base` is a mapped module recorded in `PEB->Ldr`; the loader lock is held by the caller.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_add_ref_dll(base: u64, pin: bool) -> u32 {
+    match unsafe { crate::exports::ldr_reference_module(base, pin) } {
+        Ok(true) => {}
+        Ok(false) => return 0,
+        Err(status) => return status,
+    }
+    let mut visited = [0u64; MODULE_TABLE_CAP];
+    let mut visited_count = 0usize;
+    unsafe {
+        reference_module_dfs(
+            core::ptr::addr_of!(MODULE_TABLE),
+            base,
+            pin,
+            &mut visited,
+            &mut visited_count,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn reference_module_dfs(
+    table: *const ModuleTable,
+    base: u64,
+    pin: bool,
+    visited: &mut [u64; MODULE_TABLE_CAP],
+    visited_count: &mut usize,
+) -> u32 {
+    if visited[..*visited_count].contains(&base) {
+        return 0;
+    }
+    if *visited_count >= MODULE_TABLE_CAP {
+        return 0xC000_0017; // STATUS_NO_MEMORY: bounded graph capacity exhausted.
+    }
+    visited[*visited_count] = base;
+    *visited_count += 1;
+
+    let (imports_rva, _) = unsafe { data_directory(base, 1) };
+    if imports_rva == 0 {
+        return 0;
+    }
+    let mut descriptor = base + imports_rva as u64;
+    let mut descriptor_count = 0usize;
+    loop {
+        let name_rva = unsafe { rd32(descriptor, 12) };
+        let first_thunk = unsafe { rd32(descriptor, 16) };
+        if name_rva == 0 || first_thunk == 0 {
+            break;
+        }
+        let mut name = [0u8; 32];
+        let length = unsafe { import_desc_basename(base, name_rva, &mut name) };
+        let dependency = unsafe { (&*table).find(&name[..length]) };
+        if dependency >= 0x1_0000 {
+            if let Err(status) = unsafe { crate::exports::ldr_reference_module(dependency, pin) } {
+                return status;
+            }
+            let status = unsafe {
+                reference_module_dfs(table, dependency, pin, visited, visited_count)
+            };
+            if status != 0 {
+                return status;
+            }
+        }
+        descriptor += 20;
+        descriptor_count += 1;
+        if descriptor_count >= MODULE_TABLE_CAP {
+            return 0xC000_007B; // STATUS_INVALID_IMAGE_FORMAT
+        }
+    }
+    0
 }
 
 /// `LdrGetDllHandle` in-process driver — return the base of an already-loaded module (does NOT load).

@@ -25,6 +25,7 @@
 
 pub mod host;
 pub mod init;
+pub mod lifecycle;
 pub mod lock;
 pub mod module;
 pub mod order;
