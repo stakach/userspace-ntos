@@ -40,6 +40,7 @@ pub mod path;
 pub mod pe_manifest;
 pub mod pe_resource;
 pub mod prefix;
+pub mod privilege;
 pub mod process_params;
 pub mod propvariant;
 pub mod random;
