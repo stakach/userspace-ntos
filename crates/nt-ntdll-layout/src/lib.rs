@@ -311,10 +311,14 @@ pub struct Teb {
     _rsvd_1764: [u8; 0x1780 - 0x1764],
     /// `TlsExpansionSlots` (offset 0x1780).
     pub tls_expansion_slots: u64,
-    _rsvd_1788: [u8; 0x17C0 - 0x1788],
+    _rsvd_1788: [u8; 0x17B8 - 0x1788],
+    /// `CurrentTransactionHandle` (offset 0x17B8).
+    pub current_transaction_handle: u64,
     /// `ActiveFrame` (offset 0x17C0).
     pub active_frame: u64,
-    _rsvd_17c8: [u8; 8],
+    _rsvd_17c8: [u8; 0x17EE - 0x17C8],
+    /// `SameTebFlags` (offset 0x17EE); bit 3 is `DbgSkipThreadAttach`.
+    pub same_teb_flags: u16,
 }
 
 // --- STATIC offset assertions (compile-time; each cites its source) ----------------------------
@@ -356,7 +360,9 @@ const _: () = assert!(offset_of!(Teb, hard_error_mode) == 0x16B0); // C_ASSERT(.
 const _: () = assert!(offset_of!(Teb, gdi_batch_count) == 0x1740); // C_ASSERT(... GdiBatchCount) == 0x1740
 const _: () = assert!(offset_of!(Teb, waiting_on_loader_lock) == 0x1760); // C_ASSERT(...) == 0x1760
 const _: () = assert!(offset_of!(Teb, tls_expansion_slots) == 0x1780); // C_ASSERT(... TlsExpansionSlots) == 0x1780
+const _: () = assert!(offset_of!(Teb, current_transaction_handle) == 0x17B8); // C_ASSERT(...) == 0x17B8
 const _: () = assert!(offset_of!(Teb, active_frame) == 0x17C0); // C_ASSERT(... ActiveFrame) == 0x17C0
+const _: () = assert!(offset_of!(Teb, same_teb_flags) == 0x17EE); // C_ASSERT(...) == 0x17EE
 
 // PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY — ldrtypes.h.
 const _: () = assert!(offset_of!(PebLdrData, in_load_order_module_list) == 0x10);

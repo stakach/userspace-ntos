@@ -41,7 +41,9 @@ fn teb_offsets() {
     assert_eq!(offset_of!(Teb, gdi_batch_count), 0x1740);
     assert_eq!(offset_of!(Teb, waiting_on_loader_lock), 0x1760);
     assert_eq!(offset_of!(Teb, tls_expansion_slots), 0x1780);
+    assert_eq!(offset_of!(Teb, current_transaction_handle), 0x17B8);
     assert_eq!(offset_of!(Teb, active_frame), 0x17C0);
+    assert_eq!(offset_of!(Teb, same_teb_flags), 0x17EE);
 }
 
 #[test]

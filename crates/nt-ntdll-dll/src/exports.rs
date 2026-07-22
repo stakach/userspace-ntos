@@ -29,7 +29,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
-use nt_ntdll_layout::UnicodeString;
+use nt_ntdll_layout::{Teb, UnicodeString};
 
 type NtStatus = u32;
 const STATUS_SUCCESS: NtStatus = 0x0000_0000;
@@ -5400,6 +5400,100 @@ pub unsafe extern "system" fn rtl_set_environment_strings(
     #[cfg(not(target_arch = "x86_64"))]
     {
         STATUS_NO_MEMORY
+    }
+}
+
+/// `RtlGetCurrentTransaction() -> HANDLE`.
+///
+/// Transaction context is thread-local on Windows and lives in `TEB.CurrentTransactionHandle`.
+#[export_name = "RtlGetCurrentTransaction"]
+pub unsafe extern "system" fn rtl_get_current_transaction() -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        (*(current_teb() as *const Teb)).current_transaction_handle as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlSetCurrentTransaction(HANDLE TransactionHandle) -> BOOLEAN`.
+///
+/// Store the calling thread's transaction context in the byte-exact TEB field.
+#[export_name = "RtlSetCurrentTransaction"]
+pub unsafe extern "system" fn rtl_set_current_transaction(transaction: *mut c_void) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        (*(current_teb() as *mut Teb)).current_transaction_handle = transaction as u64;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = transaction;
+    1
+}
+
+/// `RtlGetFrame() -> PTEB_ACTIVE_FRAME`.
+#[export_name = "RtlGetFrame"]
+pub unsafe extern "system" fn rtl_get_frame() -> *mut c_void {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        (*(current_teb() as *const Teb)).active_frame as *mut c_void
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// `RtlPushFrame(PTEB_ACTIVE_FRAME Frame) -> VOID`.
+///
+/// `TEB_ACTIVE_FRAME.Previous` is its first pointer-width field. Link the supplied frame to the
+/// current chain and publish it in `TEB.ActiveFrame`, matching ReactOS `rtl/debug.c`.
+///
+/// # Safety
+/// `frame` points to a writable `TEB_ACTIVE_FRAME`.
+#[export_name = "RtlPushFrame"]
+pub unsafe extern "system" fn rtl_push_frame(frame: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb = &mut *(current_teb() as *mut Teb);
+        core::ptr::write(frame as *mut *mut c_void, teb.active_frame as *mut c_void);
+        teb.active_frame = frame as u64;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = frame;
+}
+
+/// `RtlPopFrame(PTEB_ACTIVE_FRAME Frame) -> VOID`.
+///
+/// Restore `Frame->Previous` as the active TEB frame, matching ReactOS `rtl/debug.c`.
+///
+/// # Safety
+/// `frame` points to a readable `TEB_ACTIVE_FRAME`.
+#[export_name = "RtlPopFrame"]
+pub unsafe extern "system" fn rtl_pop_frame(frame: *mut c_void) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let previous = core::ptr::read(frame as *const *mut c_void);
+        (*(current_teb() as *mut Teb)).active_frame = previous as u64;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = frame;
+}
+
+/// `RtlIsCurrentThreadAttachExempt() -> BOOLEAN`.
+///
+/// The loader's per-thread attach exemption is the `DbgSkipThreadAttach` bit (bit 3) of
+/// `TEB.SameTebFlags`.
+#[export_name = "RtlIsCurrentThreadAttachExempt"]
+pub unsafe extern "system" fn rtl_is_current_thread_attach_exempt() -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        u8::from((*(current_teb() as *const Teb)).same_teb_flags & (1 << 3) != 0)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
     }
 }
 
@@ -22335,6 +22429,12 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_query_environment_variable as usize,
         rtl_set_current_environment as usize,
         rtl_set_environment_strings as usize,
+        rtl_get_current_transaction as usize,
+        rtl_set_current_transaction as usize,
+        rtl_get_frame as usize,
+        rtl_push_frame as usize,
+        rtl_pop_frame as usize,
+        rtl_is_current_thread_attach_exempt as usize,
         rtl_get_current_directory_u as usize,
         rtl_set_current_directory_u as usize,
         rtl_get_full_path_name_u as usize,
