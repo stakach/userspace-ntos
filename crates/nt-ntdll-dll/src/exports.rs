@@ -1436,18 +1436,17 @@ pub unsafe extern "system" fn rtl_allocate_heap(
     flags: u32,
     size: usize,
 ) -> *mut c_void {
+    if size >= 0x8000_0000 {
+        unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
+        return core::ptr::null_mut();
+    }
     // Step 4.C: route through the real `nt_ntdll::heap` process heap installed in-process by
     // LdrpInitialize (the `HeapHandle` is ignored — smss's process has exactly one heap). Honors
     // HEAP_ZERO_MEMORY (0x8); returns null on OOM / before the heap is installed (honest failure).
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: single-threaded loader context; the heap is installed by LdrpInitialize.
-        let p = unsafe { crate::process_heap_alloc(size) };
-        if !p.is_null() && (flags & 0x8) != 0 {
-            // HEAP_ZERO_MEMORY: the allocator does not zero; do it here.
-            // SAFETY: `p` is a fresh `size`-byte allocation from our heap.
-            unsafe { core::ptr::write_bytes(p, 0, size) };
-        }
+        let p = unsafe { crate::process_heap_alloc_with_flags(size, flags) };
         p as *mut c_void
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -5354,24 +5353,30 @@ pub unsafe extern "system" fn rtl_initialize_critical_section_ex(
 /// `ptr` from `RtlAllocateHeap`/`RtlReAllocateHeap`.
 #[export_name = "RtlReAllocateHeap"]
 pub unsafe extern "system" fn rtl_reallocate_heap(
-    _heap: *mut c_void,
-    _flags: u32,
+    heap: *mut c_void,
+    flags: u32,
     ptr: *mut c_void,
     size: usize,
 ) -> *mut c_void {
     #[cfg(target_arch = "x86_64")]
     {
         if ptr.is_null() {
-            // realloc(NULL, n) == alloc(n).
-            // SAFETY: single-threaded loader context.
-            return unsafe { crate::process_heap_alloc(size) } as *mut c_void;
+            unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_SUCCESS) };
+            return core::ptr::null_mut();
+        }
+        if size >= 0x8000_0000 {
+            unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
+            return core::ptr::null_mut();
         }
         // SAFETY: ptr from our heap; single-threaded loader.
-        unsafe { crate::process_heap_realloc(ptr as *mut u8, size) as *mut c_void }
+        let result = unsafe {
+            crate::process_heap_realloc_with_flags(ptr as *mut u8, size, flags, flags & 0x10 != 0)
+        };
+        result as *mut c_void
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (ptr, size);
+        let _ = (heap, flags, ptr, size);
         core::ptr::null_mut()
     }
 }
@@ -17426,8 +17431,8 @@ pub unsafe extern "system" fn rtl_set_heap_information(
 }
 
 /// `RtlGetUserInfoHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, PVOID* UserValue,
-/// PULONG UserFlags) -> BOOLEAN` — per-allocation user metadata. Not tracked; return FALSE (no user
-/// value) — never a fabricated value.
+/// PULONG UserFlags) -> BOOLEAN` -- return the live allocation's optional user value and its three
+/// settable user flags.
 ///
 /// # Safety
 /// `user_value`/`user_flags` null or writable.
@@ -17435,23 +17440,26 @@ pub unsafe extern "system" fn rtl_set_heap_information(
 pub unsafe extern "system" fn rtl_get_user_info_heap(
     _heap: *mut c_void,
     _flags: u32,
-    _base: *mut c_void,
+    base: *mut c_void,
     user_value: *mut *mut c_void,
     user_flags: *mut u32,
 ) -> u8 {
-    if !user_value.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *user_value = core::ptr::null_mut() };
+    #[cfg(target_arch = "x86_64")]
+    if let Some(info) = unsafe { crate::process_heap_user_info(base as *mut u8) } {
+        if info.has_user_value && !user_value.is_null() {
+            unsafe { *user_value = info.user_value as *mut c_void };
+        }
+        if !user_flags.is_null() {
+            unsafe { *user_flags = info.user_flags };
+        }
+        return 1;
     }
-    if !user_flags.is_null() {
-        // SAFETY: writable per the contract.
-        unsafe { *user_flags = 0 };
-    }
+    unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER) };
     0
 }
 
 /// `RtlSetUserValueHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, PVOID UserValue)
-/// -> BOOLEAN` — set per-allocation user metadata. Not tracked; return FALSE.
+/// -> BOOLEAN` -- store a value when the allocation requested `HEAP_SETTABLE_USER_VALUE`.
 ///
 /// # Safety
 /// `base` a live block or NULL.
@@ -17459,9 +17467,45 @@ pub unsafe extern "system" fn rtl_get_user_info_heap(
 pub unsafe extern "system" fn rtl_set_user_value_heap(
     _heap: *mut c_void,
     _flags: u32,
-    _base: *mut c_void,
-    _user_value: *mut c_void,
+    base: *mut c_void,
+    user_value: *mut c_void,
 ) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match unsafe { crate::process_heap_user_info(base as *mut u8) } {
+            Some(info) if !info.has_user_value => return 0,
+            Some(_) => {
+                return u8::from(unsafe {
+                    crate::process_heap_set_user_value(base as *mut u8, user_value as usize)
+                });
+            }
+            None => {}
+        }
+    }
+    unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER) };
+    0
+}
+
+/// `RtlSetUserFlagsHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, ULONG UserFlagsReset,
+/// ULONG UserFlagsSet) -> BOOLEAN` -- atomically reset and set per-allocation user flags.
+///
+/// # Safety
+/// `base` is a live allocation from the supplied heap.
+#[export_name = "RtlSetUserFlagsHeap"]
+pub unsafe extern "system" fn rtl_set_user_flags_heap(
+    _heap: *mut c_void,
+    _flags: u32,
+    base: *mut c_void,
+    user_flags_reset: u32,
+    user_flags_set: u32,
+) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    if unsafe {
+        crate::process_heap_set_user_flags(base as *mut u8, user_flags_reset, user_flags_set)
+    } {
+        return 1;
+    }
+    unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER) };
     0
 }
 
@@ -22875,6 +22919,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_set_heap_information as usize,
         rtl_get_user_info_heap as usize,
         rtl_set_user_value_heap as usize,
+        rtl_set_user_flags_heap as usize,
         rtl_query_tag_heap as usize,
     ];
     core::hint::black_box(anchors_heap);

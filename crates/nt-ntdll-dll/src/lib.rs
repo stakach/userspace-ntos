@@ -27,7 +27,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 
-use nt_ntdll::heap::Heap;
+use nt_ntdll::heap::{Heap, HeapUserInfo};
 
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
 /// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
@@ -82,10 +82,21 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
 /// Single-threaded loader context (smss is one thread until it spawns csrss).
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
+    unsafe { process_heap_alloc_with_flags(size, 0) }
+}
+
+/// Allocate from the process heap while retaining the native per-allocation user flags.
+///
+/// # Safety
+/// Single-threaded loader context (smss is one thread until it spawns csrss).
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *mut u8 {
     // SAFETY: single-threaded loader access to the installed heap.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h.allocate(size).unwrap_or(core::ptr::null_mut());
+            return h
+                .allocate_with_flags(size, flags)
+                .unwrap_or(core::ptr::null_mut());
         }
     }
     core::ptr::null_mut()
@@ -116,10 +127,26 @@ pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
 /// `ptr` must have come from [`process_heap_alloc`]/`process_heap_realloc`. Single-threaded loader.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    unsafe { process_heap_realloc_with_flags(ptr, new_size, 0, false) }
+}
+
+/// Reallocate a process-heap block with user metadata and in-place-only semantics.
+///
+/// # Safety
+/// `ptr` must be a live process-heap allocation. Single-threaded loader context.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_realloc_with_flags(
+    ptr: *mut u8,
+    new_size: usize,
+    flags: u32,
+    in_place_only: bool,
+) -> *mut u8 {
     // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h.reallocate(ptr, new_size).unwrap_or(core::ptr::null_mut());
+            return h
+                .reallocate_with_flags(ptr, new_size, flags, in_place_only)
+                .unwrap_or(core::ptr::null_mut());
         }
     }
     core::ptr::null_mut()
@@ -139,6 +166,45 @@ pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
         }
     }
     None
+}
+
+/// Read per-allocation user metadata from a live process-heap block.
+///
+/// # Safety
+/// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo> {
+    unsafe {
+        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
+            .as_ref()
+            .and_then(|heap| heap.user_info(ptr))
+    }
+}
+
+/// Store a process-heap allocation's optional user value.
+///
+/// # Safety
+/// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> bool {
+    unsafe {
+        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
+            .as_mut()
+            .is_some_and(|heap| heap.set_user_value(ptr, value))
+    }
+}
+
+/// Update a process-heap allocation's three settable user flags.
+///
+/// # Safety
+/// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn process_heap_set_user_flags(ptr: *mut u8, reset: u32, set: u32) -> bool {
+    unsafe {
+        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
+            .as_mut()
+            .is_some_and(|heap| heap.set_user_flags(ptr, reset, set))
+    }
 }
 
 /// The process-heap global allocator. Once [`LdrpInitialize`] installs the real heap, `alloc`/
