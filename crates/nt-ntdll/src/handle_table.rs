@@ -35,6 +35,21 @@ pub fn entry_index(base: usize, end: usize, entry: usize, entry_size: u32) -> Op
     u32::try_from(offset / entry_size).ok()
 }
 
+/// Resolve an index to an entry address inside a live table reservation.
+pub fn indexed_entry_address(
+    base: usize,
+    end: usize,
+    index: u32,
+    max_handles: u32,
+    entry_size: u32,
+) -> Option<usize> {
+    if base == 0 {
+        return None;
+    }
+    let entry = base.checked_add(entry_offset(index, max_handles, entry_size)?)?;
+    (entry < end).then_some(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +78,16 @@ mod tests {
         assert_eq!(entry_index(0x1000, 0x1040, 0x1021, 0x10), None);
         assert_eq!(entry_index(0x1000, 0x1040, 0x1040, 0x10), None);
         assert_eq!(entry_index(0x1000, 0x1040, 0x0ff0, 0x10), None);
+    }
+
+    #[test]
+    fn indexed_addresses_are_checked_against_table_bounds() {
+        assert_eq!(
+            indexed_entry_address(0x1000, 0x1040, 2, 4, 0x10),
+            Some(0x1020)
+        );
+        assert_eq!(indexed_entry_address(0x1000, 0x1040, 4, 4, 0x10), None);
+        assert_eq!(indexed_entry_address(0x1000, 0x1020, 2, 4, 0x10), None);
+        assert_eq!(indexed_entry_address(0, 0x1040, 0, 4, 0x10), None);
     }
 }

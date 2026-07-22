@@ -11598,6 +11598,41 @@ pub unsafe extern "system" fn rtl_initialize_handle_table(
     }
 }
 
+/// `RtlDestroyHandleTable(PRTL_HANDLE_TABLE) -> VOID` — release the table's VM reservation while
+/// leaving the descriptor fields unchanged, matching the native lifetime contract.
+///
+/// # Safety
+/// `table` was initialized by `RtlInitializeHandleTable`.
+#[export_name = "RtlDestroyHandleTable"]
+pub unsafe extern "system" fn rtl_destroy_handle_table(table: *mut c_void) {
+    if table.is_null() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let committed = rtl_handle_read_ptr(table, RTL_HANDLE_COMMITTED);
+        if committed != 0 {
+            const MEM_RELEASE: u32 = 0x0000_8000;
+            let mut base = committed as *mut c_void;
+            let mut size = 0usize;
+            let _ = core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *mut *mut c_void,
+                    *mut usize,
+                    u32,
+                ) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_free_virtual_memory)(
+                (-1isize) as *mut c_void,
+                &mut base,
+                &mut size,
+                MEM_RELEASE,
+            );
+        }
+    }
+}
+
 /// `RtlAllocateHandle(PRTL_HANDLE_TABLE HandleTable, PULONG HandleIndex) -> PRTL_HANDLE_TABLE_ENTRY`
 /// — reuse a freed entry or allocate the next entry from a stable VM-backed array.
 ///
@@ -11716,6 +11751,40 @@ pub unsafe extern "system" fn rtl_is_valid_handle(table: *mut c_void, entry: *mu
             0
         };
         u8::from(in_range && flags & 1 != 0)
+    }
+}
+
+/// `RtlIsValidIndexHandle(PRTL_HANDLE_TABLE, ULONG, PRTL_HANDLE_TABLE_ENTRY*) -> BOOLEAN`.
+/// The out pointer is written only when the indexed entry exists and has `RTL_HANDLE_VALID` set.
+///
+/// # Safety
+/// `table` is a live handle table and `entry_out` is null or writable.
+#[export_name = "RtlIsValidIndexHandle"]
+pub unsafe extern "system" fn rtl_is_valid_index_handle(
+    table: *mut c_void,
+    index: u32,
+    entry_out: *mut *mut c_void,
+) -> u8 {
+    if table.is_null() {
+        return 0;
+    }
+    unsafe {
+        let max = *(table as *const u32);
+        let entry_size = *((table as *const u32).add(1));
+        let committed = rtl_handle_read_ptr(table, RTL_HANDLE_COMMITTED);
+        let end = rtl_handle_read_ptr(table, RTL_HANDLE_MAX_RESERVED);
+        let Some(entry) =
+            nt_ntdll::handle_table::indexed_entry_address(committed, end, index, max, entry_size)
+        else {
+            return 0;
+        };
+        if rtl_is_valid_handle(table, entry as *mut c_void) == 0 {
+            return 0;
+        }
+        if !entry_out.is_null() {
+            *entry_out = entry as *mut c_void;
+        }
+        1
     }
 }
 
@@ -22956,9 +23025,11 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_address_in_section_table as usize,
         rtl_pc_to_file_header as usize,
         rtl_initialize_handle_table as usize,
+        rtl_destroy_handle_table as usize,
         rtl_allocate_handle as usize,
         rtl_free_handle as usize,
         rtl_is_valid_handle as usize,
+        rtl_is_valid_index_handle as usize,
         rtl_splay as usize,
         rtl_delete as usize,
         rtl_delete_no_splay as usize,
