@@ -418,10 +418,9 @@ pub(crate) unsafe fn load_dll_from_fs(
     (None, 0)
 }
 
-/// Extract the DLL leaf (`<stem>.dll`) + its stem from a folded (lowercased-ASCII) requested object
-/// name, which may be a full path (`\systemroot\system32\version.dll`) or a bare leaf. Returns
-/// `(leaf, stem)` as sub-slices of `name` on success, or `None` if there's no `.dll` leaf. The stem
-/// (no extension) is what the registry matches by substring; the leaf drives the FS open.
+/// Extract a loadable image leaf and its registry key from a folded requested object name. `.dll`
+/// keeps the historical extensionless key; an explicit `.drv` keeps its full leaf because registry
+/// normalization strips only the default DLL extension.
 fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
     // Find the last path separator; the leaf is everything after it.
     let start = name
@@ -430,12 +429,16 @@ fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
         .map(|p| p + 1)
         .unwrap_or(0);
     let leaf = &name[start..];
-    // Must end in ".dll" (the demand-load path is for DLLs only; EXEs load through the boot path).
-    if leaf.len() < 5 || !leaf.ends_with(b".dll") {
+    if leaf.len() < 5 {
         return None;
     }
-    let stem = &leaf[..leaf.len() - 4];
-    Some((leaf, stem))
+    if leaf.ends_with(b".dll") {
+        Some((leaf, &leaf[..leaf.len() - 4]))
+    } else if leaf.ends_with(b".drv") {
+        Some((leaf, leaf))
+    } else {
+        None
+    }
 }
 
 /// TRUE syscall-time demand-load: on a `resolve_name` MISS, resolve the requested DLL BY PATH from
@@ -446,8 +449,8 @@ fn split_dll_leaf(name: &[u8]) -> Option<(&[u8], &[u8])> {
 /// NtOpenFile→NtCreateSection→NtMapViewOfSection flow then treat it exactly like a boot-registered
 /// DLL (no code-path difference — it operates on the `PeFile` slice + the registry).
 ///
-/// Returns `None` if the name isn't a `.dll`, the file isn't on the FS, no reserved slot is free, or
-/// the parse fails — the caller then falls through to its normal "not found" answer.
+/// Returns `None` if the name isn't a supported DLL/driver image, the file isn't on the FS, no
+/// reserved slot is free, or the parse fails.
 ///
 /// PERSISTENCE: the pool bytes live in the atomic-`POOL_NEXT` cap-mapped arena (NOT the bump heap →
 /// survives the per-syscall reset). `dll_pe_store` is a `service_sec_image` stack local (also not the
