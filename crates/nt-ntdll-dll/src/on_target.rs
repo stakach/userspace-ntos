@@ -195,7 +195,7 @@ unsafe fn nt_protect_virtual_memory(base_in: u64, size_in: usize, protect: u32) 
 /// # Safety
 /// On-target hosted-process syscall; `base_in` should be a stack allocation base.
 #[cfg(target_arch = "x86_64")]
-unsafe fn nt_release_virtual_memory(base_in: u64) -> u32 {
+pub(crate) unsafe fn nt_release_virtual_memory(base_in: u64) -> u32 {
     let mut base = base_in;
     let mut size = 0u64;
     // SAFETY: base/size are stack locals for syscall out-params.
@@ -224,8 +224,10 @@ const PROCESS_HEAP_SIZE: usize = 0x10_0000;
 
 /// A [`Backing`] over a raw `NtAllocateVirtualMemory` region (base + len).
 pub struct HeapBacking {
-    base: *mut u8,
-    len: usize,
+    pub(crate) base: *mut u8,
+    pub(crate) len: usize,
+    /// RTL owns VM it reserved itself, but must leave caller-supplied section/view memory mapped.
+    pub(crate) owned: bool,
 }
 
 // SAFETY: `base..base+len` is a committed RW region from NtAllocateVirtualMemory, valid for the
@@ -253,6 +255,7 @@ unsafe fn create_process_heap() -> Option<(Heap<HeapBacking>, u64)> {
     Heap::create(HeapBacking {
         base: base as *mut u8,
         len: PROCESS_HEAP_SIZE,
+        owned: true,
     })
     .map(|h| (h, base))
 }

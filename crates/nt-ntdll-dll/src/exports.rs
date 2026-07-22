@@ -1499,7 +1499,7 @@ pub unsafe extern "system" fn rtl_unicode_string_to_integer(
 /// Standard `RtlAllocateHeap` contract.
 #[export_name = "RtlAllocateHeap"]
 pub unsafe extern "system" fn rtl_allocate_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     flags: u32,
     size: usize,
 ) -> *mut c_void {
@@ -1507,13 +1507,12 @@ pub unsafe extern "system" fn rtl_allocate_heap(
         unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
         return core::ptr::null_mut();
     }
-    // Step 4.C: route through the real `nt_ntdll::heap` process heap installed in-process by
-    // LdrpInitialize (the `HeapHandle` is ignored — smss's process has exactly one heap). Honors
-    // HEAP_ZERO_MEMORY (0x8); returns null on OOM / before the heap is installed (honest failure).
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: single-threaded loader context; the heap is installed by LdrpInitialize.
-        let p = unsafe { crate::process_heap_alloc_with_flags(size, flags) };
+        let p = unsafe { crate::heap_alloc_with_flags(heap as *mut u8, size, flags) };
+        if p.is_null() {
+            unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
+        }
         p as *mut c_void
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -1531,7 +1530,7 @@ pub unsafe extern "system" fn rtl_allocate_heap(
 /// Standard `RtlFreeHeap` contract.
 #[export_name = "RtlFreeHeap"]
 pub unsafe extern "system" fn rtl_free_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     _flags: u32,
     base: *mut c_void,
 ) -> u8 {
@@ -1542,10 +1541,12 @@ pub unsafe extern "system" fn rtl_free_heap(
         if base.is_null() {
             return 1; // TRUE — RtlFreeHeap(_, _, NULL) is a no-op success.
         }
-        // SAFETY: `base` came from RtlAllocateHeap/ReAllocateHeap (our heap); single-threaded.
-        if unsafe { crate::process_heap_free(base as *mut u8) } {
+        if unsafe { crate::heap_free(heap as *mut u8, base as *mut u8) } {
             1
         } else {
+            unsafe {
+                rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER)
+            };
             0
         }
     }
@@ -5468,28 +5469,131 @@ pub unsafe extern "system" fn rtl_char_to_integer(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RtlHeapParameters {
+    length: u32,
+    _padding: u32,
+    segment_reserve: usize,
+    segment_commit: usize,
+    decommit_free_block_threshold: usize,
+    decommit_total_free_threshold: usize,
+    maximum_allocation_size: usize,
+    virtual_memory_threshold: usize,
+    initial_commit: usize,
+    initial_reserve: usize,
+    commit_routine: usize,
+    reserved: [usize; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+fn heap_round_to_page(value: usize) -> Option<usize> {
+    value.checked_add(0xfff).map(|size| size & !0xfff)
+}
+
 /// `RtlCreateHeap(ULONG Flags, PVOID Base, SIZE_T Reserve, SIZE_T Commit, PVOID Lock, PVOID Params)
-/// -> PVOID`. We run a SINGLE process heap (installed by `LdrpInitialize`); every `RtlAllocateHeap`
-/// ignores the handle and routes to it. So a create returns a non-null sentinel handle (the process
-/// heap's identity) — callers store + pass it back, and our alloc/free ignore it. Never fabricates a
-/// second real arena; the one heap is real (ref `references/reactos/sdk/lib/rtl/heap.c:RtlCreateHeap`
-/// which returns the HEAP*; ours collapses to the single process heap by design).
+/// -> PVOID`. Each call formats an independent arena. A null base reserves and commits VM owned by
+/// RTL; a non-null base formats caller-owned memory such as the CSR shared port view.
 ///
 /// # Safety
 /// Standard `RtlCreateHeap` contract.
 #[export_name = "RtlCreateHeap"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_create_heap(
-    _flags: u32,
-    _base: *mut c_void,
-    _reserve: usize,
-    _commit: usize,
-    _lock: *mut c_void,
-    _params: *mut c_void,
+    flags: u32,
+    base: *mut c_void,
+    reserve: usize,
+    commit: usize,
+    lock: *mut c_void,
+    params: *mut c_void,
 ) -> *mut c_void {
-    // A stable non-null sentinel identifying "the process heap". RtlAllocateHeap ignores the handle
-    // and uses the single installed heap, so the value only needs to be non-null + consistent.
-    0x1 as *mut c_void
+    #[cfg(target_arch = "x86_64")]
+    {
+        const HEAP_NO_SERIALIZE: u32 = 0x1;
+        if flags & HEAP_NO_SERIALIZE != 0 && !lock.is_null() {
+            return core::ptr::null_mut();
+        }
+        let captured = if params.is_null() {
+            None
+        } else {
+            let candidate = unsafe { core::ptr::read_unaligned(params as *const RtlHeapParameters) };
+            (candidate.length as usize == core::mem::size_of::<RtlHeapParameters>())
+                .then_some(candidate)
+        };
+        if base.is_null() && captured.is_some_and(|value| value.commit_routine != 0) {
+            return core::ptr::null_mut();
+        }
+
+        let (arena_base, arena_len, owned) = if base.is_null() {
+            let rounded_commit = if commit == 0 {
+                0x1000
+            } else {
+                let Some(value) = heap_round_to_page(commit.max(0x1000)) else {
+                    return core::ptr::null_mut();
+                };
+                value
+            };
+            let requested = if reserve != 0 {
+                let Some(value) = heap_round_to_page(reserve) else {
+                    return core::ptr::null_mut();
+                };
+                value.max(rounded_commit)
+            } else if commit == 0 {
+                64 * 0x1000
+            } else {
+                let Some(value) = commit.checked_add(0xffff).map(|size| size & !0xffff) else {
+                    return core::ptr::null_mut();
+                };
+                value.max(rounded_commit)
+            };
+            let allocated = unsafe { crate::on_target::nt_allocate_virtual_memory(requested) };
+            if allocated == 0 {
+                return core::ptr::null_mut();
+            }
+            (allocated as *mut u8, requested, true)
+        } else {
+            if base as usize % nt_ntdll::heap::HEAP_ALIGN != 0 {
+                return core::ptr::null_mut();
+            }
+            let parameter_reserve = captured.map_or(0, |value| value.initial_reserve);
+            let length = reserve.max(parameter_reserve).max(commit);
+            let Some(length) = heap_round_to_page(length) else {
+                return core::ptr::null_mut();
+            };
+            if length == 0 {
+                return core::ptr::null_mut();
+            }
+            (base as *mut u8, length, false)
+        };
+
+        let backing = crate::on_target::HeapBacking {
+            base: arena_base,
+            len: arena_len,
+            owned,
+        };
+        let Some(heap) = nt_ntdll::heap::Heap::create(backing) else {
+            if owned {
+                unsafe { crate::on_target::nt_release_virtual_memory(arena_base as u64) };
+            }
+            return core::ptr::null_mut();
+        };
+        match crate::install_private_heap(heap) {
+            Ok(handle) => handle as *mut c_void,
+            Err(heap) => {
+                let backing = heap.destroy();
+                if backing.owned {
+                    unsafe { crate::on_target::nt_release_virtual_memory(backing.base as u64) };
+                }
+                core::ptr::null_mut()
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (flags, base, reserve, commit, lock, params);
+        core::ptr::null_mut()
+    }
 }
 
 /// `RtlUnhandledExceptionFilter(PEXCEPTION_POINTERS) -> LONG`. Ref
@@ -5799,10 +5903,18 @@ pub unsafe extern "system" fn rtl_reallocate_heap(
             unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
             return core::ptr::null_mut();
         }
-        // SAFETY: ptr from our heap; single-threaded loader.
         let result = unsafe {
-            crate::process_heap_realloc_with_flags(ptr as *mut u8, size, flags, flags & 0x10 != 0)
+            crate::heap_realloc_with_flags(
+                heap as *mut u8,
+                ptr as *mut u8,
+                size,
+                flags,
+                flags & 0x10 != 0,
+            )
         };
+        if result.is_null() {
+            unsafe { rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_NO_MEMORY) };
+        }
         result as *mut c_void
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -19818,7 +19930,7 @@ pub unsafe extern "system" fn rtl_is_critical_section_locked_by_thread(cs: *mut 
 /// `mem` a live block from the process heap (or NULL).
 #[export_name = "RtlSizeHeap"]
 pub unsafe extern "system" fn rtl_size_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     _flags: u32,
     mem: *mut c_void,
 ) -> usize {
@@ -19827,10 +19939,14 @@ pub unsafe extern "system" fn rtl_size_heap(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: mem came from the process heap per the contract.
-        match unsafe { crate::process_heap_size(mem as *mut u8) } {
+        match unsafe { crate::heap_size(heap as *mut u8, mem as *mut u8) } {
             Some(n) => n,
-            None => usize::MAX,
+            None => {
+                unsafe {
+                    rtl_set_last_win32_error_and_nt_status_from_nt_status(STATUS_INVALID_PARAMETER)
+                };
+                usize::MAX
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -19852,9 +19968,22 @@ pub unsafe extern "system" fn rtl_size_heap(
 pub unsafe extern "system" fn rtl_validate_heap(
     heap: *mut c_void,
     _flags: u32,
-    _mem: *mut c_void,
+    mem: *mut c_void,
 ) -> u8 {
-    u8::from(!heap.is_null())
+    #[cfg(target_arch = "x86_64")]
+    {
+        if mem.is_null() {
+            return u8::from(crate::heap_is_registered(heap as *mut u8));
+        }
+        return u8::from(unsafe {
+            crate::heap_size(heap as *mut u8, mem as *mut u8).is_some()
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (heap, mem);
+        0
+    }
 }
 
 /// `RtlDestroyHeap(PVOID HeapHandle) -> PVOID` — destroy a heap (returns NULL on success). We have
@@ -19866,7 +19995,27 @@ pub unsafe extern "system" fn rtl_validate_heap(
 /// `heap` a heap handle.
 #[export_name = "RtlDestroyHeap"]
 pub unsafe extern "system" fn rtl_destroy_heap(heap: *mut c_void) -> *mut c_void {
-    heap
+    if heap.is_null() {
+        return core::ptr::null_mut();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        match crate::remove_private_heap(heap as *mut u8) {
+            nt_ntdll::heap::HeapRemoval::Removed(removed) => {
+                let backing = removed.destroy();
+                if backing.owned {
+                    unsafe { crate::on_target::nt_release_virtual_memory(backing.base as u64) };
+                }
+                core::ptr::null_mut()
+            }
+            nt_ntdll::heap::HeapRemoval::ProcessHeap
+            | nt_ntdll::heap::HeapRemoval::NotFound => heap,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        heap
+    }
 }
 
 /// `RtlGetProcessHeaps(ULONG Count, PVOID* Heaps) -> ULONG` — enumerate the process's heaps. We have
@@ -19878,18 +20027,12 @@ pub unsafe extern "system" fn rtl_destroy_heap(heap: *mut c_void) -> *mut c_void
 pub unsafe extern "system" fn rtl_get_process_heaps(count: u32, heaps: *mut *mut c_void) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        // Read Peb->ProcessHeap: PEB @ gs:[0x60], ProcessHeap @ PEB+0x30.
-        // SAFETY: on-target; the PEB is mapped + gs points at the TEB.
-        let ph = unsafe {
-            let peb: *const u8;
-            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
-            *(peb.add(0x30) as *const *mut c_void)
+        let output: &mut [*mut u8] = if heaps.is_null() || count == 0 {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(heaps as *mut *mut u8, count as usize) }
         };
-        if count >= 1 && !heaps.is_null() {
-            // SAFETY: heaps writable for >= 1 entry per the check.
-            unsafe { *heaps = ph };
-        }
-        1
+        unsafe { crate::copy_process_heap_handles(output) as u32 }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -19942,22 +20085,37 @@ pub unsafe extern "system" fn rtl_walk_heap(_heap: *mut c_void, _entry: *mut c_v
 /// `info` writable for `length` bytes; `ret` null or writable.
 #[export_name = "RtlQueryHeapInformation"]
 pub unsafe extern "system" fn rtl_query_heap_information(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     class: u32,
     info: *mut c_void,
     length: usize,
     ret: *mut usize,
 ) -> NtStatus {
-    if class == 0 && !info.is_null() && length >= 4 {
-        // HeapCompatibilityInformation: 0 = standard front-end.
-        // SAFETY: info writable for >= 4 bytes per the check.
-        unsafe { *(info as *mut u32) = 0 };
-        if !ret.is_null() {
-            // SAFETY: ret writable.
-            unsafe { *ret = 4 };
-        }
+    if class != 0 {
+        return STATUS_UNSUCCESSFUL;
     }
-    STATUS_SUCCESS
+    if !ret.is_null() {
+        unsafe { *ret = 4 };
+    }
+    if length < 4 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if info.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some(mode) = crate::heap_compatibility(heap as *mut u8) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        unsafe { *(info as *mut u32) = mode };
+        STATUS_SUCCESS
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = heap;
+        STATUS_UNSUCCESSFUL
+    }
 }
 
 /// `RtlSetHeapInformation(PVOID HeapHandle, HEAP_INFORMATION_CLASS Class, PVOID Info, SIZE_T Length)
@@ -19968,12 +20126,33 @@ pub unsafe extern "system" fn rtl_query_heap_information(
 /// `info` valid for `length` bytes or NULL.
 #[export_name = "RtlSetHeapInformation"]
 pub unsafe extern "system" fn rtl_set_heap_information(
-    _heap: *mut c_void,
-    _class: u32,
-    _info: *mut c_void,
-    _length: usize,
+    heap: *mut c_void,
+    class: u32,
+    info: *mut c_void,
+    length: usize,
 ) -> NtStatus {
-    STATUS_SUCCESS
+    if class != 0 {
+        return STATUS_SUCCESS;
+    }
+    if length < 4 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if info.is_null() || unsafe { *(info as *const u32) } != 2 {
+        return STATUS_UNSUCCESSFUL;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::heap_enable_low_fragmentation(heap as *mut u8) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_PARAMETER
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = heap;
+        STATUS_UNSUCCESSFUL
+    }
 }
 
 /// `RtlGetUserInfoHeap(PVOID HeapHandle, ULONG Flags, PVOID BaseAddress, PVOID* UserValue,
@@ -19984,14 +20163,14 @@ pub unsafe extern "system" fn rtl_set_heap_information(
 /// `user_value`/`user_flags` null or writable.
 #[export_name = "RtlGetUserInfoHeap"]
 pub unsafe extern "system" fn rtl_get_user_info_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     _flags: u32,
     base: *mut c_void,
     user_value: *mut *mut c_void,
     user_flags: *mut u32,
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
-    if let Some(info) = unsafe { crate::process_heap_user_info(base as *mut u8) } {
+    if let Some(info) = unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8) } {
         if info.has_user_value && !user_value.is_null() {
             unsafe { *user_value = info.user_value as *mut c_void };
         }
@@ -20011,18 +20190,22 @@ pub unsafe extern "system" fn rtl_get_user_info_heap(
 /// `base` a live block or NULL.
 #[export_name = "RtlSetUserValueHeap"]
 pub unsafe extern "system" fn rtl_set_user_value_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     _flags: u32,
     base: *mut c_void,
     user_value: *mut c_void,
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        match unsafe { crate::process_heap_user_info(base as *mut u8) } {
+        match unsafe { crate::heap_user_info(heap as *mut u8, base as *mut u8) } {
             Some(info) if !info.has_user_value => return 0,
             Some(_) => {
                 return u8::from(unsafe {
-                    crate::process_heap_set_user_value(base as *mut u8, user_value as usize)
+                    crate::heap_set_user_value(
+                        heap as *mut u8,
+                        base as *mut u8,
+                        user_value as usize,
+                    )
                 });
             }
             None => {}
@@ -20039,7 +20222,7 @@ pub unsafe extern "system" fn rtl_set_user_value_heap(
 /// `base` is a live allocation from the supplied heap.
 #[export_name = "RtlSetUserFlagsHeap"]
 pub unsafe extern "system" fn rtl_set_user_flags_heap(
-    _heap: *mut c_void,
+    heap: *mut c_void,
     _flags: u32,
     base: *mut c_void,
     user_flags_reset: u32,
@@ -20047,7 +20230,12 @@ pub unsafe extern "system" fn rtl_set_user_flags_heap(
 ) -> u8 {
     #[cfg(target_arch = "x86_64")]
     if unsafe {
-        crate::process_heap_set_user_flags(base as *mut u8, user_flags_reset, user_flags_set)
+        crate::heap_set_user_flags(
+            heap as *mut u8,
+            base as *mut u8,
+            user_flags_reset,
+            user_flags_set,
+        )
     } {
         return 1;
     }

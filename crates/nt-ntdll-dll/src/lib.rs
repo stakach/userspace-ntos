@@ -28,9 +28,11 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 #[cfg(target_arch = "x86_64")]
+use core::mem::MaybeUninit;
+#[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use nt_ntdll::heap::{Heap, HeapUserInfo};
+use nt_ntdll::heap::{Heap, HeapRegistry, HeapRemoval, HeapUserInfo};
 
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
 /// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
@@ -53,6 +55,13 @@ pub mod seh;
 #[cfg(target_arch = "x86_64")]
 type ProcessHeap = Heap<on_target::HeapBacking>;
 
+/// The executive reserves sixteen PEB heap-list slots: one process heap and fifteen private heaps.
+#[cfg(target_arch = "x86_64")]
+const PRIVATE_HEAP_CAPACITY: usize = 15;
+
+#[cfg(target_arch = "x86_64")]
+type ProcessHeapRegistry = HeapRegistry<on_target::HeapBacking, PRIVATE_HEAP_CAPACITY>;
+
 /// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). `None` until
 /// initialization; all later access is covered by [`PROCESS_HEAP_LOCK`] so hosted worker threads
 /// cannot alias its mutable state. A global-alloc call before installation returns null.
@@ -61,7 +70,10 @@ type ProcessHeap = Heap<on_target::HeapBacking>;
 /// x86_64; on the host build the allocator is a no-op abort cell (there is no live allocation off
 /// target anyway).
 #[cfg(target_arch = "x86_64")]
-static mut PROCESS_HEAP: Option<ProcessHeap> = None;
+static mut PROCESS_HEAPS: MaybeUninit<ProcessHeapRegistry> = MaybeUninit::uninit();
+
+#[cfg(target_arch = "x86_64")]
+static mut PROCESS_HEAPS_INITIALIZED: bool = false;
 
 #[cfg(target_arch = "x86_64")]
 static PROCESS_HEAP_LOCK: AtomicBool = AtomicBool::new(false);
@@ -87,6 +99,41 @@ fn lock_process_heap() -> ProcessHeapLockGuard {
     ProcessHeapLockGuard
 }
 
+/// Access the registry while [`PROCESS_HEAP_LOCK`] is held, initializing its allocation-free
+/// storage on first use.
+#[cfg(target_arch = "x86_64")]
+unsafe fn process_heaps_locked() -> &'static mut ProcessHeapRegistry {
+    let initialized = core::ptr::addr_of_mut!(PROCESS_HEAPS_INITIALIZED);
+    let registry = core::ptr::addr_of_mut!(PROCESS_HEAPS);
+    if !unsafe { *initialized } {
+        unsafe {
+            (*registry).write(ProcessHeapRegistry::new());
+            *initialized = true;
+        }
+    }
+    unsafe { (*registry).assume_init_mut() }
+}
+
+/// Mirror the registry into the fixed PEB process-heap array maintained by the executive.
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_process_heaps_locked(registry: &ProcessHeapRegistry) {
+    let peb: *mut u8;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+    }
+    if peb.is_null() {
+        return;
+    }
+    let maximum = unsafe { core::ptr::read_unaligned(peb.add(0xEC) as *const u32) } as usize;
+    let list = unsafe { core::ptr::read_unaligned(peb.add(0xF0) as *const *mut *mut u8) };
+    if list.is_null() || maximum == 0 {
+        return;
+    }
+    let output = unsafe { core::slice::from_raw_parts_mut(list, maximum) };
+    let total = registry.copy_handles(output);
+    unsafe { core::ptr::write_unaligned(peb.add(0xE8) as *mut u32, total as u32) };
+}
+
 /// Install the process heap (called once by [`LdrpInitialize`] after `NtAllocateVirtualMemory`).
 ///
 /// # Safety
@@ -94,9 +141,181 @@ fn lock_process_heap() -> ProcessHeapLockGuard {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn install_process_heap(heap: ProcessHeap) {
     let _guard = lock_process_heap();
-    // SAFETY: the process-heap guard excludes every reader and writer; installation occurs once.
+    // SAFETY: the process-heap guard excludes every reader and writer.
     unsafe {
-        core::ptr::addr_of_mut!(PROCESS_HEAP).write(Some(heap));
+        let registry = process_heaps_locked();
+        if registry.install_process(heap).is_ok() {
+            publish_process_heaps_locked(registry);
+        }
+    }
+}
+
+/// Register a newly formatted private heap and return its stable backing-base handle.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn install_private_heap(heap: ProcessHeap) -> Result<*mut u8, ProcessHeap> {
+    let _guard = lock_process_heap();
+    unsafe {
+        let registry = process_heaps_locked();
+        let result = registry.insert_private(heap);
+        if result.is_ok() {
+            publish_process_heaps_locked(registry);
+        }
+        result
+    }
+}
+
+/// Unregister a private heap. The returned heap can be destroyed and its owned VM released after
+/// the registry lock has been dropped.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn remove_private_heap(handle: *mut u8) -> HeapRemoval<on_target::HeapBacking> {
+    let _guard = lock_process_heap();
+    unsafe {
+        let registry = process_heaps_locked();
+        let result = registry.remove_private(handle);
+        if matches!(&result, HeapRemoval::Removed(_)) {
+            publish_process_heaps_locked(registry);
+        }
+        result
+    }
+}
+
+/// Copy registered heap handles, returning the total count even when `output` is shorter.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn copy_process_heap_handles(output: &mut [*mut u8]) -> usize {
+    let _guard = lock_process_heap();
+    unsafe { process_heaps_locked().copy_handles(output) }
+}
+
+/// Whether an exact handle names a registered heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_is_registered(handle: *mut u8) -> bool {
+    let _guard = lock_process_heap();
+    unsafe { process_heaps_locked().find(handle).is_some() }
+}
+
+/// Read a heap's compatibility information.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_compatibility(handle: *mut u8) -> Option<u32> {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find(handle)
+            .map(Heap::compatibility_mode)
+    }
+}
+
+/// Enable low-fragmentation compatibility mode on one registered heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_enable_low_fragmentation(handle: *mut u8) -> bool {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .map(|heap| heap.enable_low_fragmentation())
+            .is_some()
+    }
+}
+
+/// Allocate from the heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_alloc_with_flags(
+    handle: *mut u8,
+    size: usize,
+    flags: u32,
+) -> *mut u8 {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .and_then(|heap| heap.allocate_with_flags(size, flags))
+            .unwrap_or(core::ptr::null_mut())
+    }
+}
+
+/// Free from the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_free(handle: *mut u8, ptr: *mut u8) -> bool {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .is_some_and(|heap| heap.free(ptr))
+    }
+}
+
+/// Reallocate within the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_realloc_with_flags(
+    handle: *mut u8,
+    ptr: *mut u8,
+    new_size: usize,
+    flags: u32,
+    in_place_only: bool,
+) -> *mut u8 {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .and_then(|heap| {
+                heap.reallocate_with_flags(ptr, new_size, flags, in_place_only)
+            })
+            .unwrap_or(core::ptr::null_mut())
+    }
+}
+
+/// Size a live allocation from the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_size(handle: *mut u8, ptr: *mut u8) -> Option<usize> {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find(handle)
+            .and_then(|heap| heap.size_of(ptr))
+    }
+}
+
+/// Read per-allocation user metadata from the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_user_info(
+    handle: *mut u8,
+    ptr: *mut u8,
+) -> Option<HeapUserInfo> {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find(handle)
+            .and_then(|heap| heap.user_info(ptr))
+    }
+}
+
+/// Store a user value on an allocation from the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_set_user_value(
+    handle: *mut u8,
+    ptr: *mut u8,
+    value: usize,
+) -> bool {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .is_some_and(|heap| heap.set_user_value(ptr, value))
+    }
+}
+
+/// Store user flags on an allocation from the exact heap named by `handle`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn heap_set_user_flags(
+    handle: *mut u8,
+    ptr: *mut u8,
+    reset: u32,
+    set: u32,
+) -> bool {
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find_mut(handle)
+            .is_some_and(|heap| heap.set_user_flags(ptr, reset, set))
     }
 }
 
@@ -119,15 +338,16 @@ pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *mut u8 {
     let _guard = lock_process_heap();
-    // SAFETY: the process-heap guard excludes all other access.
     unsafe {
-        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h
-                .allocate_with_flags(size, flags)
-                .unwrap_or(core::ptr::null_mut());
-        }
+        let registry = process_heaps_locked();
+        let Some(handle) = registry.process_handle() else {
+            return core::ptr::null_mut();
+        };
+        registry
+            .find_mut(handle)
+            .and_then(|heap| heap.allocate_with_flags(size, flags))
+            .unwrap_or(core::ptr::null_mut())
     }
-    core::ptr::null_mut()
 }
 
 /// `RtlFreeHeap` core — free `ptr` (returned by [`process_heap_alloc`]) back to the process heap.
@@ -139,13 +359,13 @@ pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
     let _guard = lock_process_heap();
-    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
-        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h.free(ptr);
-        }
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find_mut(handle))
+            .is_some_and(|heap| heap.free(ptr))
     }
-    false
 }
 
 /// `RtlReAllocateHeap` core — grow/shrink `ptr` to `new_size` in the process heap (in-place when
@@ -171,15 +391,14 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
     in_place_only: bool,
 ) -> *mut u8 {
     let _guard = lock_process_heap();
-    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
-        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h
-                .reallocate_with_flags(ptr, new_size, flags, in_place_only)
-                .unwrap_or(core::ptr::null_mut());
-        }
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find_mut(handle))
+            .and_then(|heap| heap.reallocate_with_flags(ptr, new_size, flags, in_place_only))
+            .unwrap_or(core::ptr::null_mut())
     }
-    core::ptr::null_mut()
 }
 
 /// `RtlSizeHeap` core — the payload size of a live block (from [`process_heap_alloc`]). Returns
@@ -190,13 +409,13 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
     let _guard = lock_process_heap();
-    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
-        if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-            return h.size_of(ptr);
-        }
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find(handle))
+            .and_then(|heap| heap.size_of(ptr))
     }
-    None
 }
 
 /// Read per-allocation user metadata from a live process-heap block.
@@ -207,8 +426,10 @@ pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
 pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo> {
     let _guard = lock_process_heap();
     unsafe {
-        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
-            .as_ref()
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find(handle))
             .and_then(|heap| heap.user_info(ptr))
     }
 }
@@ -221,8 +442,10 @@ pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo
 pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> bool {
     let _guard = lock_process_heap();
     unsafe {
-        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
-            .as_mut()
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find_mut(handle))
             .is_some_and(|heap| heap.set_user_value(ptr, value))
     }
 }
@@ -235,8 +458,10 @@ pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> 
 pub(crate) unsafe fn process_heap_set_user_flags(ptr: *mut u8, reset: u32, set: u32) -> bool {
     let _guard = lock_process_heap();
     unsafe {
-        (*core::ptr::addr_of_mut!(PROCESS_HEAP))
-            .as_mut()
+        let registry = process_heaps_locked();
+        registry
+            .process_handle()
+            .and_then(|handle| registry.find_mut(handle))
             .is_some_and(|heap| heap.set_user_flags(ptr, reset, set))
     }
 }

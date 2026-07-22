@@ -99,6 +99,8 @@ pub struct Heap<B: Backing> {
     region_len: usize,
     /// Whether the region has been formatted into an initial free block.
     formatted: bool,
+    /// Front-end type returned by `RtlQueryHeapInformation` class 0.
+    compatibility_mode: u32,
 }
 
 impl<B: Backing> Heap<B> {
@@ -115,6 +117,7 @@ impl<B: Backing> Heap<B> {
             backing,
             region_len,
             formatted: false,
+            compatibility_mode: 0,
         };
         // SAFETY: region is >= HDR+HEAP_ALIGN and valid per the Backing contract.
         unsafe {
@@ -139,6 +142,23 @@ impl<B: Backing> Heap<B> {
     /// the real process via `NtFreeVirtualMemory`).
     pub fn destroy(self) -> B {
         self.backing
+    }
+
+    /// Stable native heap handle. RTL heap handles identify the heap header at the start of its
+    /// backing region, so distinct backing regions naturally produce distinct handles.
+    pub fn handle(&self) -> *mut u8 {
+        self.backing.base()
+    }
+
+    /// Current `HeapCompatibilityInformation` value.
+    pub fn compatibility_mode(&self) -> u32 {
+        self.compatibility_mode
+    }
+
+    /// Enable the low-fragmentation front end. Native RTL only accepts value 2 and does not
+    /// support switching a heap back to the standard front end.
+    pub fn enable_low_fragmentation(&mut self) {
+        self.compatibility_mode = 2;
     }
 
     #[inline]
@@ -453,6 +473,161 @@ impl<B: Backing> Heap<B> {
     }
 }
 
+/// Result of attempting to remove a private heap from a [`HeapRegistry`].
+pub enum HeapRemoval<B: Backing> {
+    /// A private heap was removed and ownership is returned to the caller.
+    Removed(Heap<B>),
+    /// The handle names the distinguished process heap, which cannot be removed.
+    ProcessHeap,
+    /// The handle is null or does not name a registered heap.
+    NotFound,
+}
+
+/// Allocation-free per-process heap registry. The process heap is always enumerated first and
+/// private heaps retain creation order; removing one compacts the private portion.
+pub struct HeapRegistry<B: Backing, const N: usize> {
+    process: Option<Heap<B>>,
+    private: [Option<Heap<B>>; N],
+    private_len: usize,
+}
+
+impl<B: Backing, const N: usize> Default for HeapRegistry<B, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: Backing, const N: usize> HeapRegistry<B, N> {
+    /// Create an empty registry without allocating.
+    pub fn new() -> Self {
+        Self {
+            process: None,
+            private: core::array::from_fn(|_| None),
+            private_len: 0,
+        }
+    }
+
+    /// Install the one process heap. Returns its handle, or the supplied heap unchanged if a
+    /// process heap is already installed or its handle duplicates a registered private heap.
+    pub fn install_process(&mut self, heap: Heap<B>) -> Result<*mut u8, Heap<B>> {
+        let handle = heap.handle();
+        if self.process.is_some() || self.find(handle).is_some() {
+            return Err(heap);
+        }
+        self.process = Some(heap);
+        Ok(handle)
+    }
+
+    /// Register a private heap, preserving creation order.
+    pub fn insert_private(&mut self, heap: Heap<B>) -> Result<*mut u8, Heap<B>> {
+        let handle = heap.handle();
+        if self.private_len == N || self.find(handle).is_some() {
+            return Err(heap);
+        }
+        self.private[self.private_len] = Some(heap);
+        self.private_len += 1;
+        Ok(handle)
+    }
+
+    /// Number of registered heaps, including the process heap when installed.
+    pub fn len(&self) -> usize {
+        usize::from(self.process.is_some()) + self.private_len
+    }
+
+    /// Whether no heap has been installed.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The distinguished process-heap handle.
+    pub fn process_handle(&self) -> Option<*mut u8> {
+        self.process.as_ref().map(Heap::handle)
+    }
+
+    /// Look up a heap by its exact native handle.
+    pub fn find(&self, handle: *mut u8) -> Option<&Heap<B>> {
+        if handle.is_null() {
+            return None;
+        }
+        if let Some(heap) = self.process.as_ref() {
+            if heap.handle() == handle {
+                return Some(heap);
+            }
+        }
+        self.private[..self.private_len]
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|heap| heap.handle() == handle)
+    }
+
+    /// Mutable lookup by exact native handle.
+    pub fn find_mut(&mut self, handle: *mut u8) -> Option<&mut Heap<B>> {
+        if handle.is_null() {
+            return None;
+        }
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|heap| heap.handle() == handle)
+        {
+            return self.process.as_mut();
+        }
+        self.private[..self.private_len]
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .find(|heap| heap.handle() == handle)
+    }
+
+    /// Remove a private heap. The process heap is deliberately retained for the process lifetime.
+    pub fn remove_private(&mut self, handle: *mut u8) -> HeapRemoval<B> {
+        if handle.is_null() {
+            return HeapRemoval::NotFound;
+        }
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|heap| heap.handle() == handle)
+        {
+            return HeapRemoval::ProcessHeap;
+        }
+        let Some(index) = self.private[..self.private_len]
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|heap| heap.handle() == handle))
+        else {
+            return HeapRemoval::NotFound;
+        };
+        let removed = self.private[index].take().expect("occupied registry entry");
+        for slot in index..self.private_len - 1 {
+            self.private[slot] = self.private[slot + 1].take();
+        }
+        self.private_len -= 1;
+        self.private[self.private_len] = None;
+        HeapRemoval::Removed(removed)
+    }
+
+    /// Copy as many handles as fit while returning the total number available, matching
+    /// `RtlGetProcessHeaps` truncation semantics.
+    pub fn copy_handles(&self, output: &mut [*mut u8]) -> usize {
+        let mut written = 0usize;
+        if let Some(heap) = self.process.as_ref() {
+            if let Some(slot) = output.get_mut(written) {
+                *slot = heap.handle();
+            }
+            written += 1;
+        }
+        for heap in self.private[..self.private_len]
+            .iter()
+            .filter_map(Option::as_ref)
+        {
+            if let Some(slot) = output.get_mut(written) {
+                *slot = heap.handle();
+            }
+            written += 1;
+        }
+        written
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -745,5 +920,78 @@ mod tests {
         let h = heap(256);
         let b = h.destroy();
         assert!(b.len() >= 256);
+    }
+
+    #[test]
+    fn registry_routes_distinct_heaps_and_rejects_cross_heap_pointers() {
+        let mut registry = HeapRegistry::<VecBacking, 3>::new();
+        let process = registry.install_process(heap(1024)).ok().unwrap();
+        let private = registry.insert_private(heap(1024)).ok().unwrap();
+        assert_ne!(process, private);
+
+        let p = registry.find_mut(private).unwrap().allocate(64).unwrap();
+        // SAFETY: p belongs to `private`; using it against `process` deliberately tests rejection.
+        unsafe {
+            assert!(registry.find_mut(process).unwrap().free(p) == false);
+            assert!(registry.find_mut(private).unwrap().free(p));
+        }
+    }
+
+    #[test]
+    fn registry_enumerates_process_first_and_reports_truncated_total() {
+        let mut registry = HeapRegistry::<VecBacking, 3>::new();
+        let process = registry.install_process(heap(512)).ok().unwrap();
+        let first = registry.insert_private(heap(512)).ok().unwrap();
+        let second = registry.insert_private(heap(512)).ok().unwrap();
+        let mut one = [core::ptr::null_mut(); 1];
+        assert_eq!(registry.copy_handles(&mut one), 3);
+        assert_eq!(one, [process]);
+        let mut all = [core::ptr::null_mut(); 3];
+        assert_eq!(registry.copy_handles(&mut all), 3);
+        assert_eq!(all, [process, first, second]);
+    }
+
+    #[test]
+    fn registry_removal_compacts_and_refuses_process_heap() {
+        let mut registry = HeapRegistry::<VecBacking, 3>::new();
+        let process = registry.install_process(heap(512)).ok().unwrap();
+        let first = registry.insert_private(heap(512)).ok().unwrap();
+        let second = registry.insert_private(heap(512)).ok().unwrap();
+        assert!(matches!(
+            registry.remove_private(process),
+            HeapRemoval::ProcessHeap
+        ));
+        assert!(matches!(
+            registry.remove_private(first),
+            HeapRemoval::Removed(_)
+        ));
+        let mut handles = [core::ptr::null_mut(); 3];
+        assert_eq!(registry.copy_handles(&mut handles), 2);
+        assert_eq!(&handles[..2], &[process, second]);
+        assert!(matches!(
+            registry.remove_private(first),
+            HeapRemoval::NotFound
+        ));
+    }
+
+    #[test]
+    fn registry_capacity_failure_returns_the_unregistered_heap() {
+        let mut registry = HeapRegistry::<VecBacking, 1>::new();
+        registry.install_process(heap(512)).ok().unwrap();
+        registry.insert_private(heap(512)).ok().unwrap();
+        let rejected = registry.insert_private(heap(512)).unwrap_err();
+        assert_eq!(registry.len(), 2);
+        assert!(rejected.handle().is_null() == false);
+    }
+
+    #[test]
+    fn heap_compatibility_mode_is_per_heap_and_one_way() {
+        let mut standard = heap(512);
+        let low_fragmentation = heap(512);
+        assert_eq!(standard.compatibility_mode(), 0);
+        assert_eq!(low_fragmentation.compatibility_mode(), 0);
+        standard.enable_low_fragmentation();
+        assert_eq!(standard.compatibility_mode(), 2);
+        assert_eq!(low_fragmentation.compatibility_mode(), 0);
     }
 }
