@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use super::guid::Guid;
 use crate::NtStatus;
 
 pub const FRAME_FLAG_RELEASE_ON_DEACTIVATION: u32 = 0x01;
@@ -91,6 +92,20 @@ pub struct DllRedirect {
     pub load_from: Option<Vec<u16>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompatibilityElement {
+    pub id: Guid,
+    pub kind: u32,
+    pub max_version_tested: u64,
+}
+
+pub const COMPATIBILITY_ELEMENT_TYPE_OS: u32 = 1;
+pub const COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED: u32 = 3;
+pub const RUN_LEVEL_UNSPECIFIED: u32 = 0;
+pub const RUN_LEVEL_AS_INVOKER: u32 = 1;
+pub const RUN_LEVEL_HIGHEST_AVAILABLE: u32 = 2;
+pub const RUN_LEVEL_REQUIRE_ADMIN: u32 = 3;
+
 #[repr(C)]
 pub struct ActivationContextObject {
     magic: AtomicU32,
@@ -100,6 +115,9 @@ pub struct ActivationContextObject {
     pub assembly_directory: Vec<u16>,
     pub encoded_assembly_identity: Vec<u16>,
     pub file_count: u32,
+    pub compatibility: Vec<CompatibilityElement>,
+    pub run_level: u32,
+    pub ui_access: u32,
     pub manifest: Vec<u8>,
     pub dll_redirects: Vec<DllRedirect>,
     pub dll_redirect_section: Vec<u8>,
@@ -174,6 +192,9 @@ impl ActivationContextObject {
             assembly_directory: Vec::new(),
             encoded_assembly_identity,
             file_count,
+            compatibility: Vec::new(),
+            run_level: RUN_LEVEL_UNSPECIFIED,
+            ui_access: 0,
             manifest,
             dll_redirects,
             dll_redirect_section,

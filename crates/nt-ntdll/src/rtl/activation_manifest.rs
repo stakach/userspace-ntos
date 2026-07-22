@@ -5,7 +5,11 @@ use core::ops::Range;
 
 use crate::NtStatus;
 
-use super::activation::{DllRedirect, STATUS_SXS_CANT_GEN_ACTCTX};
+use super::activation::{
+    COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED, COMPATIBILITY_ELEMENT_TYPE_OS,
+    CompatibilityElement, DllRedirect, RUN_LEVEL_AS_INVOKER, RUN_LEVEL_HIGHEST_AVAILABLE,
+    RUN_LEVEL_REQUIRE_ADMIN, RUN_LEVEL_UNSPECIFIED, STATUS_SXS_CANT_GEN_ACTCTX,
+};
 
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_SXS_INVALID_ACTCTXDATA_FORMAT: NtStatus = 0xC015_0003;
@@ -14,6 +18,9 @@ const STATUS_SXS_INVALID_ACTCTXDATA_FORMAT: NtStatus = 0xC015_0003;
 pub struct ParsedManifest {
     pub dll_redirects: Vec<DllRedirect>,
     pub assembly_identity: AssemblyIdentity,
+    pub compatibility: Vec<CompatibilityElement>,
+    pub run_level: u32,
+    pub ui_access: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -263,6 +270,9 @@ struct Parser<'a> {
     unsupported: bool,
     redirects: Vec<DllRedirect>,
     identity: Option<AssemblyIdentity>,
+    compatibility: Vec<CompatibilityElement>,
+    run_level: u32,
+    ui_access: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -273,6 +283,9 @@ impl<'a> Parser<'a> {
             unsupported: false,
             redirects: Vec::new(),
             identity: None,
+            compatibility: Vec::new(),
+            run_level: RUN_LEVEL_UNSPECIFIED,
+            ui_access: 0,
         }
     }
 
@@ -329,6 +342,25 @@ impl<'a> Parser<'a> {
                     if direct_child && local_eq(self.input, tag.name(), "assemblyIdentity") {
                         self.set_assembly_identity(tag)?;
                     }
+                    if local_eq(self.input, tag.name(), "supportedOS")
+                        && local_stack_suffix(self.input, &stack, &["compatibility", "application"])
+                    {
+                        self.add_supported_os(tag)?;
+                    }
+                    if local_eq(self.input, tag.name(), "maxversiontested")
+                        && local_stack_suffix(self.input, &stack, &["compatibility", "application"])
+                    {
+                        self.add_max_version_tested(tag)?;
+                    }
+                    if local_eq(self.input, tag.name(), "requestedExecutionLevel")
+                        && local_stack_suffix(
+                            self.input,
+                            &stack,
+                            &["trustInfo", "security", "requestedPrivileges"],
+                        )
+                    {
+                        self.set_requested_execution_level(tag)?;
+                    }
                     if !tag.self_closing {
                         stack.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
                         stack.push(tag.name());
@@ -347,6 +379,9 @@ impl<'a> Parser<'a> {
         Ok(ParsedManifest {
             dll_redirects: self.redirects,
             assembly_identity: self.identity.unwrap_or_default(),
+            compatibility: self.compatibility,
+            run_level: self.run_level,
+            ui_access: self.ui_access,
         })
     }
 
@@ -419,6 +454,76 @@ impl<'a> Parser<'a> {
             }
         }
         self.identity = Some(identity);
+        Ok(())
+    }
+
+    fn add_supported_os(&mut self, tag: Tag) -> Result<(), NtStatus> {
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            if local_eq(self.input, attribute.name(), "Id") {
+                let value = decode_attribute_value(&self.input[attribute.value()])?;
+                if let Some(id) = super::guid::guid_from_string(&value) {
+                    self.compatibility
+                        .try_reserve(1)
+                        .map_err(|_| STATUS_NO_MEMORY)?;
+                    self.compatibility.push(CompatibilityElement {
+                        id,
+                        kind: COMPATIBILITY_ELEMENT_TYPE_OS,
+                        max_version_tested: 0,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_max_version_tested(&mut self, tag: Tag) -> Result<(), NtStatus> {
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            if local_eq(self.input, attribute.name(), "Id") {
+                let value = decode_attribute_value(&self.input[attribute.value()])?;
+                let [major, minor, build, revision] = parse_assembly_version(&value)?;
+                self.compatibility
+                    .try_reserve(1)
+                    .map_err(|_| STATUS_NO_MEMORY)?;
+                self.compatibility.push(CompatibilityElement {
+                    id: super::guid::Guid::default(),
+                    kind: COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED,
+                    max_version_tested: (u64::from(major) << 48)
+                        | (u64::from(minor) << 32)
+                        | (u64::from(build) << 16)
+                        | u64::from(revision),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn set_requested_execution_level(&mut self, tag: Tag) -> Result<(), NtStatus> {
+        if self.run_level != RUN_LEVEL_UNSPECIFIED {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        let mut position = tag.attrs_start;
+        while let Some(attribute) = next_attribute(self.input, &mut position, tag.attrs_end)? {
+            let value = decode_attribute_value(&self.input[attribute.value()])?;
+            if local_eq(self.input, attribute.name(), "level") {
+                self.run_level = if ascii_slice_eq_ci(&value, "asInvoker") {
+                    RUN_LEVEL_AS_INVOKER
+                } else if ascii_slice_eq_ci(&value, "highestAvailable") {
+                    RUN_LEVEL_HIGHEST_AVAILABLE
+                } else if ascii_slice_eq_ci(&value, "requireAdministrator") {
+                    RUN_LEVEL_REQUIRE_ADMIN
+                } else {
+                    RUN_LEVEL_UNSPECIFIED
+                };
+            } else if local_eq(self.input, attribute.name(), "uiAccess") {
+                if ascii_slice_eq_ci(&value, "true") {
+                    self.ui_access = 1;
+                } else if ascii_slice_eq_ci(&value, "false") {
+                    self.ui_access = 0;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -778,12 +883,29 @@ fn local_eq(input: &[u16], name: Range<usize>, expected: &str) -> bool {
     ascii_slice_eq(&qualified[local_start..], expected)
 }
 
+fn local_stack_suffix(input: &[u16], stack: &[Range<usize>], expected: &[&str]) -> bool {
+    stack.len() == expected.len() + 1
+        && local_eq(input, stack[0].clone(), "assembly")
+        && stack[1..]
+            .iter()
+            .zip(expected)
+            .all(|(name, expected)| local_eq(input, name.clone(), expected))
+}
+
 fn ascii_slice_eq(input: &[u16], expected: &str) -> bool {
     input.len() == expected.len()
         && input
             .iter()
             .zip(expected.bytes())
             .all(|(left, right)| *left == right as u16)
+}
+
+fn ascii_slice_eq_ci(input: &[u16], expected: &str) -> bool {
+    input.len() == expected.len()
+        && input
+            .iter()
+            .zip(expected.bytes())
+            .all(|(left, right)| *left <= 0x7f && (*left as u8).eq_ignore_ascii_case(&right))
 }
 
 fn ascii_eq_at(input: &[u16], start: usize, expected: &str) -> bool {
@@ -924,6 +1046,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.assembly_identity.version, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn parses_compatibility_and_requested_execution_level() {
+        let manifest = br#"<assembly manifestVersion="1.0">
+            <compatibility><application>
+              <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+              <supportedOS Id="not-a-guid"/>
+              <maxversiontested Id="10.0.18358"/>
+              <maxversiontested Id="2.3.4.5"/>
+            </application></compatibility>
+            <asmv3:trustInfo><asmv3:security><asmv3:requestedPrivileges>
+              <asmv3:requestedExecutionLevel level="RequireAdministrator" uiAccess="TRUE"/>
+            </asmv3:requestedPrivileges></asmv3:security></asmv3:trustInfo>
+            </assembly>"#;
+        let parsed = parse_manifest(manifest).unwrap();
+        assert_eq!(parsed.compatibility.len(), 3);
+        assert_eq!(parsed.compatibility[0].id.data1, 0x3513_8b9a);
+        assert_eq!(parsed.compatibility[0].kind, COMPATIBILITY_ELEMENT_TYPE_OS);
+        assert_eq!(
+            parsed.compatibility[1].kind,
+            COMPATIBILITY_ELEMENT_TYPE_MAX_VERSION_TESTED
+        );
+        assert_eq!(
+            parsed.compatibility[1].max_version_tested,
+            0x000a_0000_47b6_0000
+        );
+        assert_eq!(
+            parsed.compatibility[2].max_version_tested,
+            0x0002_0003_0004_0005
+        );
+        assert_eq!(parsed.run_level, RUN_LEVEL_REQUIRE_ADMIN);
+        assert_eq!(parsed.ui_access, 1);
+    }
+
+    #[test]
+    fn ignores_compatibility_elements_outside_the_native_hierarchy() {
+        let parsed = parse_manifest(
+            br#"<assembly manifestVersion="1.0">
+                <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+                <requestedExecutionLevel level="asInvoker" uiAccess="true"/>
+                </assembly>"#,
+        )
+        .unwrap();
+        assert!(parsed.compatibility.is_empty());
+        assert_eq!(parsed.run_level, RUN_LEVEL_UNSPECIFIED);
+        assert_eq!(parsed.ui_access, 0);
+    }
+
+    #[test]
+    fn rejects_duplicate_recognized_requested_execution_levels() {
+        let manifest = br#"<assembly manifestVersion="1.0">
+            <trustInfo><security><requestedPrivileges>
+              <requestedExecutionLevel level="asInvoker"/>
+              <requestedExecutionLevel level="highestAvailable"/>
+            </requestedPrivileges></security></trustInfo>
+            </assembly>"#;
+        assert_eq!(
+            parse_manifest(manifest),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_max_version_tested() {
+        let manifest = br#"<assembly manifestVersion="1.0">
+            <compatibility><application><maxversiontested Id="10.x"/></application></compatibility>
+            </assembly>"#;
+        assert_eq!(
+            parse_manifest(manifest),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
+        );
     }
 
     #[test]

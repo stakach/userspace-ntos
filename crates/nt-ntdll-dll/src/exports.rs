@@ -11658,6 +11658,9 @@ pub unsafe extern "system" fn rtl_create_activation_context(
         );
         (*memory).application_directory = application_directory;
         (*memory).assembly_directory = assembly_directory;
+        (*memory).compatibility = parsed.compatibility;
+        (*memory).run_level = parsed.run_level;
+        (*memory).ui_access = parsed.ui_access;
         let status = activation_context_register(memory);
         if status != STATUS_SUCCESS {
             core::ptr::drop_in_place(memory);
@@ -11896,7 +11899,7 @@ unsafe fn rebase_activation_query_pointers(buffer: *mut u8, fields: &[usize]) {
 }
 
 /// `RtlQueryInformationActivationContext(...) -> NTSTATUS` — resolve the requested context and
-/// return native Basic, Detailed, or AssemblyDetailed information.
+/// return native activation-context information classes 1 through 6.
 ///
 /// # Safety
 /// Args per the ABI; `info` null or writable for `info_len` bytes.
@@ -11914,7 +11917,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
     if !ret_len.is_null() {
         unsafe { core::ptr::write_unaligned(ret_len, 0) };
     }
-    if !matches!(info_class, 1..=3) {
+    if !matches!(info_class, 1..=6) {
         return nt_ntdll::STATUS_NOT_IMPLEMENTED;
     }
 
@@ -12039,7 +12042,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                     }
                 }
             }
-        } else {
+        } else if info_class == 3 {
             if sub_instance.is_null() {
                 activation_context_release(selected);
                 return STATUS_INVALID_PARAMETER;
@@ -12083,6 +12086,118 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                                 );
                                 STATUS_SUCCESS
                             }
+                            Err(status) => status,
+                        }
+                    }
+                }
+            }
+        } else if info_class == 4 {
+            if sub_instance.is_null() {
+                activation_context_release(selected);
+                return STATUS_INVALID_PARAMETER;
+            }
+            let index = nt_ntdll::rtl::activation_query::ActivationContextQueryIndex {
+                assembly_index: core::ptr::read_unaligned(sub_instance as *const u32),
+                file_index_in_assembly: core::ptr::read_unaligned(
+                    (sub_instance as *const u8).add(4) as *const u32,
+                ),
+            };
+            let (_, file_index) = match
+                nt_ntdll::rtl::activation_query::validate_file_query_index(
+                    index,
+                    &[object.dll_redirects.len()],
+                )
+            {
+                Ok(indices) => indices,
+                Err(status) => {
+                    activation_context_release(selected);
+                    return status;
+                }
+            };
+            let query = nt_ntdll::rtl::activation_query::FileDetailedQuery {
+                file_name: Some(&object.dll_redirects[file_index].name),
+            };
+            match nt_ntdll::rtl::activation_query::file_detailed_required_size(&query) {
+                Err(status) => status,
+                Ok(required) => {
+                    if !ret_len.is_null() {
+                        core::ptr::write_unaligned(ret_len, required);
+                    }
+                    if info.is_null() || info_len < required {
+                        nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
+                    } else {
+                        let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
+                        match nt_ntdll::rtl::activation_query::pack_file_detailed_into(
+                            &query,
+                            output,
+                        ) {
+                            Ok(_) => {
+                                rebase_activation_query_pointers(
+                                    info.cast(),
+                                    &nt_ntdll::rtl::activation_query::ASSEMBLY_FILE_DETAILED_INFORMATION_POINTER_FIELDS,
+                                );
+                                if !ret_len.is_null() {
+                                    core::ptr::write_unaligned(ret_len, 0);
+                                }
+                                STATUS_SUCCESS
+                            }
+                            Err(status) => status,
+                        }
+                    }
+                }
+            }
+        } else if info_class == 5 {
+            let query = nt_ntdll::rtl::activation_query::RunLevelQuery {
+                run_level: object.run_level,
+                ui_access: object.ui_access != 0,
+            };
+            let required = nt_ntdll::rtl::activation_query::runlevel_required_size();
+            if !ret_len.is_null() {
+                core::ptr::write_unaligned(ret_len, required);
+            }
+            if info.is_null() || info_len < required {
+                nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
+            } else {
+                let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
+                match nt_ntdll::rtl::activation_query::pack_runlevel_into(query, output) {
+                    Ok(_) => STATUS_SUCCESS,
+                    Err(status) => status,
+                }
+            }
+        } else {
+            let mut elements = Vec::new();
+            if elements.try_reserve_exact(object.compatibility.len()).is_err() {
+                activation_context_release(selected);
+                return STATUS_NO_MEMORY;
+            }
+            for element in &object.compatibility {
+                elements.push(nt_ntdll::rtl::activation_query::CompatibilityContextElement {
+                    id: nt_ntdll::rtl::activation_query::CompatibilityGuid {
+                        data1: element.id.data1,
+                        data2: element.id.data2,
+                        data3: element.id.data3,
+                        data4: element.id.data4,
+                    },
+                    element_type: element.kind,
+                    padding: 0,
+                    max_version_tested: element.max_version_tested,
+                });
+            }
+            match nt_ntdll::rtl::activation_query::compatibility_required_size(&elements) {
+                Err(status) => status,
+                Ok(required) => {
+                    if !ret_len.is_null() {
+                        core::ptr::write_unaligned(ret_len, required);
+                    }
+                    if info.is_null() || info_len < required {
+                        nt_ntdll::rtl::activation::STATUS_BUFFER_TOO_SMALL
+                    } else {
+                        let output = core::slice::from_raw_parts_mut(info.cast::<u8>(), required);
+                        match nt_ntdll::rtl::activation_query::pack_compatibility_into(
+                            &elements,
+                            output,
+                        ) {
+                            Ok(_) => STATUS_SUCCESS,
                             Err(status) => status,
                         }
                     }
