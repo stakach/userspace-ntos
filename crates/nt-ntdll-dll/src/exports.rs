@@ -10236,7 +10236,7 @@ pub unsafe extern "system" fn rtl_get_full_path_name_ustr_ex(
     static_string: PUnicodeString,
     dynamic_string: PUnicodeString,
     string_used: *mut PUnicodeString,
-    _file_part_prefix_cch: *mut usize,
+    file_part_prefix_cch: *mut usize,
     name_invalid: *mut u8,
     path_type: *mut u32,
     bytes_required: *mut usize,
@@ -10274,6 +10274,14 @@ pub unsafe extern "system" fn rtl_get_full_path_name_ustr_ex(
     let full = name_units.clone();
 
     let full_bytes = (full.len() * 2) as u16;
+    if !file_part_prefix_cch.is_null() {
+        let prefix = full
+            .iter()
+            .rposition(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+            .map_or(0, |separator| separator + 1);
+        // SAFETY: writable per the contract.
+        unsafe { *file_part_prefix_cch = prefix };
+    }
     if !bytes_required.is_null() {
         // SAFETY: writable. Bytes needed for the full path + NUL.
         unsafe { *bytes_required = (full_bytes + 2) as usize };
@@ -10798,30 +10806,94 @@ pub unsafe extern "system" fn rtl_dos_path_name_to_relative_nt_path_name_u_with_
 #[export_name = "RtlReleaseRelativeName"]
 pub unsafe extern "system" fn rtl_release_relative_name(_relative_name: *mut c_void) {}
 
-/// `RtlDosSearchPath_Ustr(ULONG Flags, PCUNICODE_STRING Path, PCUNICODE_STRING FileName,
-/// PCUNICODE_STRING DefaultExtension, PUNICODE_STRING StaticString, PUNICODE_STRING DynamicString,
-/// PCUNICODE_STRING* FullFileNameOut, PSIZE_T LengthNeeded, PSIZE_T FilePartPrefixCch,
-/// PSIZE_T BytesRequired) -> NTSTATUS`. The UNICODE_STRING search-path cousin. No live path-search
-/// plane (the loader already resolves modules by its own search) → return STATUS_NO_SUCH_FILE
-/// (0xC000000F) so the caller falls back — never a fabricated found path.
+/// `RtlDosSearchPath_Ustr` — search counted DOS paths through the real file-attribute syscall and
+/// return the selected full path through the caller's static/dynamic `UNICODE_STRING` buffers.
 ///
 /// # Safety
 /// Args per the RtlDosSearchPath_Ustr ABI.
 #[export_name = "RtlDosSearchPath_Ustr"]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "system" fn rtl_dos_search_path_ustr(
-    _flags: u32,
-    _path: *const c_void,
-    _file_name: *const c_void,
-    _default_extension: *const c_void,
-    _static_string: *mut c_void,
-    _dynamic_string: *mut c_void,
-    _full_file_name_out: *mut *const c_void,
-    _length_needed: *mut usize,
-    _file_part_prefix_cch: *mut usize,
-    _bytes_required: *mut usize,
+    flags: u32,
+    path: PCUnicodeString,
+    file_name: PCUnicodeString,
+    default_extension: PCUnicodeString,
+    static_string: PUnicodeString,
+    dynamic_string: PUnicodeString,
+    full_file_name_out: *mut PUnicodeString,
+    file_part_prefix_cch: *mut usize,
+    bytes_required: *mut usize,
 ) -> NtStatus {
-    0xC000_000F // STATUS_NO_SUCH_FILE
+    if !full_file_name_out.is_null() {
+        unsafe { *full_file_name_out = core::ptr::null_mut() };
+    }
+    if !file_part_prefix_cch.is_null() {
+        unsafe { *file_part_prefix_cch = 0 };
+    }
+    if !bytes_required.is_null() {
+        unsafe { *bytes_required = 0 };
+    }
+    if !dynamic_string.is_null() {
+        unsafe {
+            (*dynamic_string).length = 0;
+            (*dynamic_string).maximum_length = 0;
+            (*dynamic_string).buffer = 0;
+        }
+    }
+    if flags & !7 != 0
+        || path.is_null()
+        || file_name.is_null()
+        || (!static_string.is_null()
+            && !dynamic_string.is_null()
+            && full_file_name_out.is_null())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let path_units = unsafe { us_slice(path) };
+    let file_units = unsafe { us_slice(file_name) };
+    let extension_units = (!default_extension.is_null()).then(|| unsafe {
+        us_slice(default_extension)
+    });
+    let candidates = match nt_ntdll::rtl::path::dos_search_path_candidates(
+        flags,
+        path_units,
+        file_units,
+        extension_units,
+    ) {
+        Ok(candidates) => candidates,
+        Err(nt_ntdll::rtl::path::SearchPathError::NameTooLong) => return STATUS_NAME_TOO_LONG,
+    };
+
+    for candidate in candidates {
+        let mut terminated = candidate.clone();
+        terminated.push(0);
+        if unsafe { rtl_does_file_exists_u(terminated.as_ptr()) } == 0 {
+            continue;
+        }
+        let mut candidate_string = UnicodeString::default();
+        candidate_string.length = (candidate.len() * 2) as u16;
+        candidate_string.maximum_length = ((candidate.len() + 1) * 2) as u16;
+        candidate_string.buffer = candidate.as_ptr() as u64;
+        let status = unsafe {
+            rtl_get_full_path_name_ustr_ex(
+                &candidate_string,
+                static_string,
+                dynamic_string,
+                full_file_name_out,
+                file_part_prefix_cch,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                bytes_required,
+            )
+        };
+        return if status & 0x8000_0000 == 0 {
+            STATUS_SUCCESS
+        } else {
+            status
+        };
+    }
+    STATUS_NO_SUCH_FILE
 }
 
 /// `RtlFindMessage(PVOID DllHandle, ULONG MessageTableId, ULONG MessageLanguageId, ULONG MessageId,

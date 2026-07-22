@@ -11,6 +11,99 @@
 
 use alloc::vec::Vec;
 
+const UNICODE_STRING_MAX_UNITS_WITH_NUL: usize = (u16::MAX as usize) / 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPathError {
+    NameTooLong,
+}
+
+fn file_leaf_has_dot(file_name: &[u16]) -> bool {
+    file_name
+        .iter()
+        .rev()
+        .take_while(|unit| **unit != b'\\' as u16 && **unit != b'/' as u16)
+        .any(|unit| *unit == b'.' as u16)
+}
+
+fn checked_candidate(parts: &[&[u16]]) -> Result<Vec<u16>, SearchPathError> {
+    let length = parts
+        .iter()
+        .try_fold(0usize, |length, part| length.checked_add(part.len()));
+    let length = length.ok_or(SearchPathError::NameTooLong)?;
+    if length + 1 > UNICODE_STRING_MAX_UNITS_WITH_NUL {
+        return Err(SearchPathError::NameTooLong);
+    }
+    let mut candidate = Vec::new();
+    candidate
+        .try_reserve_exact(length)
+        .map_err(|_| SearchPathError::NameTooLong)?;
+    for part in parts {
+        candidate.extend_from_slice(part);
+    }
+    Ok(candidate)
+}
+
+/// Build the ordered DOS filenames probed by `RtlDosSearchPath_Ustr`. File existence and full-path
+/// expansion remain target concerns; this core handles path segmentation and extension rules.
+pub fn dos_search_path_candidates(
+    flags: u32,
+    path: &[u16],
+    file_name: &[u16],
+    extension: Option<&[u16]>,
+) -> Result<Vec<Vec<u16>>, SearchPathError> {
+    let mut candidates = Vec::new();
+    let path_type = determine_dos_path_name_type(file_name);
+    if path_type == DosPathType::Relative {
+        if flags & 2 != 0
+            && (file_name.starts_with(&[b'.' as u16, b'\\' as u16])
+                || file_name.starts_with(&[b'.' as u16, b'/' as u16])
+                || file_name.starts_with(&[b'.' as u16, b'.' as u16, b'\\' as u16])
+                || file_name.starts_with(&[b'.' as u16, b'.' as u16, b'/' as u16]))
+        {
+            return Ok(candidates);
+        }
+        let extension =
+            extension.filter(|extension| !extension.is_empty() && !file_leaf_has_dot(file_name));
+        let mut start = 0usize;
+        while start < path.len() {
+            let end = path[start..]
+                .iter()
+                .position(|unit| *unit == b';' as u16)
+                .map_or(path.len(), |offset| start + offset);
+            let segment = &path[start..end];
+            let separator = if segment.is_empty()
+                || segment
+                    .last()
+                    .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+            {
+                &[][..]
+            } else {
+                &[b'\\' as u16][..]
+            };
+            candidates.push(checked_candidate(&[
+                segment,
+                separator,
+                file_name,
+                extension.unwrap_or(&[]),
+            ])?);
+            if end == path.len() {
+                break;
+            }
+            start = end + 1;
+        }
+        return Ok(candidates);
+    }
+
+    candidates.push(checked_candidate(&[file_name])?);
+    if let Some(extension) = extension.filter(|extension| !extension.is_empty()) {
+        if flags & 4 != 0 || !file_leaf_has_dot(file_name) {
+            candidates.push(checked_candidate(&[file_name, extension])?);
+        }
+    }
+    Ok(candidates)
+}
+
 /// `RTL_PATH_TYPE` (`RtlDetermineDosPathNameType_U`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DosPathType {
@@ -617,5 +710,53 @@ mod tests {
         assert!(!is_dos_device_name(&u("COM0")));
         assert!(!is_dos_device_name(&u("README")));
         assert!(!is_dos_device_name(&u("CONSOLE")));
+    }
+
+    #[test]
+    fn search_candidates_follow_path_and_extension_rules() {
+        let candidates = dos_search_path_candidates(
+            0,
+            &u("C:\\one;D:\\two\\;;E:\\last"),
+            &u("app"),
+            Some(&u(".exe")),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates.iter().map(|value| s(value)).collect::<Vec<_>>(),
+            [
+                "C:\\one\\app.exe",
+                "D:\\two\\app.exe",
+                "app.exe",
+                "E:\\last\\app.exe",
+            ]
+        );
+        assert_eq!(
+            dos_search_path_candidates(0, &u("C:\\one"), &u("app.dll"), Some(&u(".exe"))).unwrap(),
+            [u("C:\\one\\app.dll")]
+        );
+    }
+
+    #[test]
+    fn search_candidates_handle_full_paths_and_flags() {
+        assert_eq!(
+            dos_search_path_candidates(0, &u("ignored"), &u("C:\\bin\\app"), Some(&u(".exe")))
+                .unwrap(),
+            [u("C:\\bin\\app"), u("C:\\bin\\app.exe")]
+        );
+        assert_eq!(
+            dos_search_path_candidates(0, &u("ignored"), &u("C:\\bin\\app.dll"), Some(&u(".exe")))
+                .unwrap(),
+            [u("C:\\bin\\app.dll")]
+        );
+        assert_eq!(
+            dos_search_path_candidates(4, &u("ignored"), &u("C:\\bin\\app.dll"), Some(&u(".exe")))
+                .unwrap(),
+            [u("C:\\bin\\app.dll"), u("C:\\bin\\app.dll.exe")]
+        );
+        assert!(
+            dos_search_path_candidates(2, &u("C:\\one"), &u("..\\app"), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
