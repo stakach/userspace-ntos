@@ -84,6 +84,7 @@ static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CALLBACK: AtomicU64 = AtomicU64::new(0);
 static LDR_APP_COMPAT_DLL_REDIRECTION_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static LDR_LOADER_LOCK_ACQUISITION_COUNT: AtomicU32 = AtomicU32::new(0);
+static LDR_TOP_LEVEL_CALLOUT_TEB: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide loader lock in the exact x64 `RTL_CRITICAL_SECTION` layout. The no-debug sentinel
 /// makes the statically initialized lock valid before the process heap exists.
@@ -8094,6 +8095,21 @@ pub(crate) unsafe fn acquire_loader_lock() -> Result<LoaderLockGuard, NtStatus> 
     }
 }
 
+pub(crate) struct LoaderCalloutGuard(u64);
+
+impl Drop for LoaderCalloutGuard {
+    fn drop(&mut self) {
+        LDR_TOP_LEVEL_CALLOUT_TEB.store(self.0, Ordering::Release);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn enter_loader_callout() -> LoaderCalloutGuard {
+    let teb = unsafe { current_teb() as u64 };
+    let previous = LDR_TOP_LEVEL_CALLOUT_TEB.swap(teb, Ordering::AcqRel);
+    LoaderCalloutGuard(previous)
+}
+
 #[inline]
 unsafe fn loader_lock_error(flags: u32, status: NtStatus) -> NtStatus {
     if flags & nt_ntdll::loader::lock::LOCK_FLAG_RAISE_ON_ERRORS != 0 {
@@ -10950,14 +10966,22 @@ pub unsafe extern "system" fn rtl_query_information_active_activation_context(
     }
 }
 
-/// `RtlIsThreadWithinLoaderCallout() -> BOOLEAN` — are we inside a DllMain callout? The boot runs
-/// DllMains serially from the loader; report FALSE (the safe default — callers use it to avoid
-/// re-entrant loads; FALSE lets them proceed, which is correct for our single-threaded init).
+/// `RtlIsThreadWithinLoaderCallout() -> BOOLEAN` — report whether this thread owns the active
+/// top-level TLS/DllMain callout transaction.
 ///
 /// # Safety
-/// Reads no cross-plane state.
+/// Reads the current TEB and process-local loader callout owner.
 #[export_name = "RtlIsThreadWithinLoaderCallout"]
 pub unsafe extern "system" fn rtl_is_thread_within_loader_callout() -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let owner = LDR_TOP_LEVEL_CALLOUT_TEB.load(Ordering::Acquire);
+        return u8::from(nt_ntdll::loader::lifecycle::is_thread_within_loader_callout(
+            owner,
+            unsafe { current_teb() as u64 },
+        ));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     0
 }
 

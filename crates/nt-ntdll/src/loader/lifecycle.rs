@@ -16,6 +16,11 @@ pub fn can_disable_thread_callouts(tls_index: u16) -> bool {
     tls_index == 0
 }
 
+/// Report whether the current TEB owns the active top-level loader callout transaction.
+pub fn is_thread_within_loader_callout(owner_teb: u64, current_teb: u64) -> bool {
+    owner_teb != 0 && owner_teb == current_teb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,5 +41,12 @@ mod tests {
     fn tls_slot_prevents_disabling_thread_callouts() {
         assert!(can_disable_thread_callouts(0));
         assert!(!can_disable_thread_callouts(1));
+    }
+
+    #[test]
+    fn loader_callout_state_is_teb_specific() {
+        assert!(is_thread_within_loader_callout(0x1000, 0x1000));
+        assert!(!is_thread_within_loader_callout(0x1000, 0x2000));
+        assert!(!is_thread_within_loader_callout(0, 0));
     }
 }

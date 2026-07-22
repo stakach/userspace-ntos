@@ -423,6 +423,7 @@ unsafe fn call_tls_initializers(base: u64, reason: u32) {
 /// module's imports immediately before its DllMain — see [`attach_dfs`]).
 #[cfg(target_arch = "x86_64")]
 unsafe fn run_process_attach(table: *mut ModuleTable) -> u32 {
+    let _callout = unsafe { crate::exports::enter_loader_callout() };
     // Post-order DFS: a module's DEPENDENCIES init before it (kernel32 before advapi32 before mpr,
     // etc.). A per-base visited set dedupes diamonds + breaks cycles. The order matters: mpr's
     // DllMain calls kernel32 functions, so kernel32 must have run InitCommandLines first. Reverse
@@ -460,6 +461,7 @@ unsafe fn run_process_attach(table: *mut ModuleTable) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn run_process_attach_root(table: *mut ModuleTable, base: u64) -> u32 {
+    let _callout = unsafe { crate::exports::enter_loader_callout() };
     let mut visited = [0u64; MODULE_TABLE_CAP];
     let mut visited_count = 0usize;
     let mut newly_attached = [0u64; MODULE_TABLE_CAP];
