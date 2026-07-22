@@ -319,10 +319,10 @@ pub(crate) unsafe fn spawn_csr_loop_thread(csrss_pml4: u64, entry_rip: u64, para
         cid_thread: CSR_STATIC_CID_THREAD,
         resume: false,
         prio: 0,
-        // BATCH 6: csrss (pi 2) also runs on OUR native ntdll → the CSR-API thread uses the native
+        // BATCH 6: csrss (pi 1, badge 2) also runs on OUR native ntdll, so the CSR API thread uses the native
         // transport, bound to csrss's main-thread ipcbuf frame at IPCBUF_VADDR.
         native: true,
-        ipcbuf_frame: PM_MAIN_IPCBUF[2].load(Ordering::Relaxed),
+        ipcbuf_frame: PM_MAIN_IPCBUF[1].load(Ordering::Relaxed),
         diag: false,
     })
 }
