@@ -18,6 +18,7 @@
 //! `__C_specific_handler`'s `SCOPE_TABLE` walk.
 
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions
@@ -292,6 +293,144 @@ pub trait StackReader {
     fn read_u64(&self, addr: u64) -> Option<u64>;
 }
 
+/// Lowest valid user-mode instruction address accepted by `RtlWalkFrameChain`.
+pub const USER_ADDRESS_LOW: u64 = 0x0000_0000_0001_0000;
+/// Highest valid user-mode instruction address accepted by ReactOS on x64.
+pub const USER_ADDRESS_HIGH: u64 = 0x0000_07ff_fffe_ffff;
+
+/// A hard failure while walking an x64 frame chain.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameWalkError {
+    /// The supplied TEB stack range is empty or inverted.
+    InvalidStackBounds,
+    /// The requested skipped/output frame count overflowed.
+    CountOverflow,
+    /// A leaf or unwind-code stack read fell outside the bounded stack or was unavailable.
+    StackRead,
+    /// A covering runtime function had unreadable or invalid unwind metadata.
+    UnwindData,
+}
+
+struct BoundedStack<'a> {
+    inner: &'a dyn StackReader,
+    low: u64,
+    high: u64,
+}
+
+impl StackReader for BoundedStack<'_> {
+    fn read_u64(&self, addr: u64) -> Option<u64> {
+        let end = addr.checked_add(size_of::<u64>() as u64)?;
+        if addr < self.low || end > self.high || addr & 7 != 0 {
+            return None;
+        }
+        self.inner.read_u64(addr)
+    }
+}
+
+/// Walk user-mode x64 frames from an already captured context. Leaf functions pop a return address;
+/// nonleaf functions use their `.pdata`/`.xdata` through [`virtual_unwind`]. Stack reads are bounded
+/// by the current TEB limits before being delegated to `stack`.
+///
+/// The returned count follows ReactOS: when `frames_to_skip` is nonzero it includes successfully
+/// skipped frames, while only `callers.len()` post-skip addresses are written.
+pub fn walk_frame_chain(
+    mut context: Context,
+    callers: &mut [u64],
+    frames_to_skip: usize,
+    stack_low: u64,
+    stack_high: u64,
+    image: &dyn ImageReader,
+    stack: &dyn StackReader,
+) -> Result<usize, FrameWalkError> {
+    if stack_low >= stack_high {
+        return Err(FrameWalkError::InvalidStackBounds);
+    }
+    let total = frames_to_skip
+        .checked_add(callers.len())
+        .ok_or(FrameWalkError::CountOverflow)?;
+    let bounded = BoundedStack {
+        inner: stack,
+        low: stack_low,
+        high: stack_high,
+    };
+    let mut control_pc = context.rip;
+
+    for index in 0..total {
+        if let Some((image_base, function)) = image.lookup_function(control_pc) {
+            virtual_unwind(
+                unw_flag::NHANDLER,
+                image_base,
+                control_pc,
+                function,
+                &mut context,
+                image,
+                &bounded,
+            )
+            .ok_or(FrameWalkError::UnwindData)?;
+        } else {
+            let rsp = context.rsp();
+            context.rip = bounded.read_u64(rsp).ok_or(FrameWalkError::StackRead)?;
+            context.set_rsp(
+                rsp.checked_add(size_of::<u64>() as u64)
+                    .ok_or(FrameWalkError::StackRead)?,
+            );
+        }
+
+        if !(USER_ADDRESS_LOW..=USER_ADDRESS_HIGH).contains(&context.rip)
+            || context.rsp() <= stack_low
+            || context.rsp() >= stack_high
+        {
+            return Ok(index);
+        }
+
+        control_pc = context.rip;
+        if index >= frames_to_skip {
+            callers[index - frames_to_skip] = control_pc;
+        }
+    }
+    Ok(total)
+}
+
+/// Validate the bounded request used by `RtlCaptureStackBackTrace`. The native routine adds one
+/// skipped frame for itself and rejects a total of 128 or more.
+pub fn stack_back_trace_request(
+    frames_to_skip: u32,
+    frames_to_capture: u32,
+) -> Option<(usize, usize)> {
+    let skip = frames_to_skip.checked_add(1)? as usize;
+    let total = skip.checked_add(frames_to_capture as usize)?;
+    (total < 128).then_some((skip, total))
+}
+
+/// Copy the requested post-skip frames and compute the native wrapping low-32-bit address hash.
+/// `None` means the walk did not get past all skipped frames, in which case the caller must leave
+/// its optional hash output untouched.
+pub fn project_stack_back_trace(
+    frames: &[u64],
+    frames_to_skip: usize,
+    back_trace: &mut [u64],
+) -> Option<(usize, u32)> {
+    if frames.len() <= frames_to_skip {
+        return None;
+    }
+    let count = back_trace.len().min(frames.len() - frames_to_skip);
+    let mut hash = 0u32;
+    for index in 0..count {
+        let address = frames[frames_to_skip + index];
+        back_trace[index] = address;
+        hash = hash.wrapping_add(address as u32);
+    }
+    Some((count, hash))
+}
+
+/// Select the two outputs used by `RtlGetCallersAddress` from its four-frame walk.
+pub fn callers_addresses(frames: &[u64; 4], frame_count: usize) -> (u64, u64) {
+    (
+        if frame_count >= 3 { frames[2] } else { 0 },
+        if frame_count == 4 { frames[3] } else { 0 },
+    )
+}
+
 // =================================================================================================
 // RtlLookupFunctionEntry — resolve a control PC through a (possibly chained) RUNTIME_FUNCTION
 // =================================================================================================
@@ -383,6 +522,12 @@ pub fn virtual_unwind(
     img: &dyn ImageReader,
     stack: &dyn StackReader,
 ) -> Option<UnwindResult> {
+    let covering_func = func;
+    let control_rva = u32::try_from(control_pc.checked_sub(image_base)?).ok()?;
+    if !covering_func.covers(control_rva) {
+        return None;
+    }
+
     // Resolve a chained-pointer RUNTIME_FUNCTION (low bit of UnwindInfoAddress set → the RVA points
     // at the parent RUNTIME_FUNCTION, not an UNWIND_INFO). Follow the chain to the real xdata.
     let mut func = func;
@@ -416,6 +561,8 @@ pub fn virtual_unwind(
         img,
         stack,
         0,
+        control_rva,
+        covering_func.end,
     )
 }
 
@@ -432,6 +579,8 @@ fn unwind_one(
     img: &dyn ImageReader,
     stack: &dyn StackReader,
     depth: u32,
+    control_rva: u32,
+    function_end_rva: u32,
 ) -> Option<UnwindResult> {
     if depth > 32 {
         return None; // pathological CHAININFO chain
@@ -451,6 +600,20 @@ fn unwind_one(
     // any register restores so the frame-register value is the live one.
     let establisher_frame =
         compute_establisher_frame(&hdr, image_base, unwind_rva, prologue_offset, ctx, img)?;
+
+    // A PC in an AMD64 epilogue must execute the remaining epilogue instructions, not reverse the
+    // entire prologue again. ReactOS recognizes the ABI's optional stack adjustment, nonvolatile
+    // pops, and final `ret` sequence.
+    if prologue_offset > hdr.size_of_prolog as u32
+        && hdr.count_of_codes != 0
+        && try_unwind_epilogue(image_base, control_rva, function_end_rva, ctx, img, stack)
+    {
+        return Some(UnwindResult {
+            image_base,
+            establisher_frame,
+            ..Default::default()
+        });
+    }
 
     // Walk the unwind codes. Each slot is (CodeOffset, op_byte) little-endian pairs; a code may
     // consume additional slots for its operand. We only APPLY a code if its CodeOffset has already
@@ -517,6 +680,108 @@ fn unwind_one(
         establisher_frame,
         img,
     ))
+}
+
+/// Recognize and execute the remaining instructions of a canonical AMD64 epilogue. The scan uses a
+/// local context and commits it only after reaching the function's final `ret`, so ordinary body
+/// instructions fall back to unwind-code interpretation without partially changing the context.
+fn try_unwind_epilogue(
+    image_base: u64,
+    control_rva: u32,
+    function_end_rva: u32,
+    ctx: &mut Context,
+    img: &dyn ImageReader,
+    stack: &dyn StackReader,
+) -> bool {
+    let Some(end_rva) = function_end_rva.checked_sub(1) else {
+        return false;
+    };
+    if control_rva > end_rva {
+        return false;
+    }
+
+    let read_u8 = |rva| img.read_u8(image_base, rva);
+    let read_u32 = |rva| img.read_u32(image_base, rva);
+    let mut local = *ctx;
+    let mut cursor = control_rva;
+
+    if let Some(instr) = read_u32(cursor) {
+        // 48 83 c4 ib / 48 81 c4 id: add rsp, immediate.
+        if instr & 0x00ff_fdff == 0x00c4_8148 {
+            if instr & 0x0000_ff00 == 0x0000_8300 {
+                local.set_rsp(local.rsp().wrapping_add((instr >> 24) as u64));
+                cursor = match cursor.checked_add(4) {
+                    Some(next) => next,
+                    None => return false,
+                };
+            } else {
+                let Some(imm) = read_u32(cursor.wrapping_add(3)) else {
+                    return false;
+                };
+                local.set_rsp(local.rsp().wrapping_add(imm as u64));
+                cursor = match cursor.checked_add(7) {
+                    Some(next) => next,
+                    None => return false,
+                };
+            }
+        // 48/49 8d 60..a7 [disp]: lea rsp, [nonvolatile + displacement].
+        } else if instr & 0x0038_fffe == 0x0020_8d48 {
+            let reg = (((instr >> 16) & 7) + ((instr & 1) * 8)) as usize;
+            let mode = (instr >> 22) & 3;
+            let (displacement, length) = match mode {
+                0 => (0i64, 3u32),
+                1 => (((instr >> 24) as u8 as i8) as i64, 4),
+                2 => {
+                    let Some(raw) = read_u32(cursor.wrapping_add(3)) else {
+                        return false;
+                    };
+                    (raw as i32 as i64, 7)
+                }
+                _ => return false,
+            };
+            local.set_rsp(local.gpr[reg].wrapping_add_signed(displacement));
+            cursor = match cursor.checked_add(length) {
+                Some(next) => next,
+                None => return false,
+            };
+        }
+    }
+
+    while cursor < end_rva {
+        let Some(opcode) = read_u8(cursor) else {
+            return false;
+        };
+        let (reg, length) = if opcode & 0xf8 == 0x58 {
+            ((opcode & 7) as usize, 1u32)
+        } else if (opcode == 0x41 || opcode == 0x49)
+            && read_u8(cursor.wrapping_add(1)).is_some_and(|next| next & 0xf8 == 0x58)
+        {
+            let next = read_u8(cursor.wrapping_add(1)).unwrap_or(0);
+            (((next & 7) + 8) as usize, 2)
+        } else {
+            return false;
+        };
+        let Some(value) = stack.read_u64(local.rsp()) else {
+            return false;
+        };
+        local.gpr[reg] = value;
+        local.set_rsp(local.rsp().wrapping_add(8));
+        cursor = match cursor.checked_add(length) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+
+    if cursor != end_rva || read_u8(cursor) != Some(0xc3) {
+        return false;
+    }
+    let Some(return_address) = stack.read_u64(local.rsp()) else {
+        return false;
+    };
+    local.rip = return_address;
+    local.set_rsp(local.rsp().wrapping_add(8));
+    *ctx = local;
+    true
 }
 
 /// Apply ONLY the unwind codes of a chained `UNWIND_INFO` (no return-address pop, no handler
@@ -1006,6 +1271,178 @@ mod tests {
             address: 0x1000,
             information: Vec::new(),
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // RtlWalkFrameChain / RtlCaptureStackBackTrace
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn frame_walk_leaf_frames_and_skip_prefix() {
+        let image = MockImage::new(0x1400_0000);
+        let mut stack = MockStack::new();
+        stack.put(0x2000, 0x1400_1111);
+        stack.put(0x2008, 0x1400_2222);
+        stack.put(0x2010, 0x1400_3333);
+        let mut context = Context::default();
+        context.rip = 0x1400_0100;
+        context.set_rsp(0x2000);
+        let mut callers = [0u64; 2];
+
+        let count =
+            walk_frame_chain(context, &mut callers, 1, 0x1000, 0x3000, &image, &stack).unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(callers, [0x1400_2222, 0x1400_3333]);
+    }
+
+    #[test]
+    fn frame_walk_uses_runtime_unwind_for_nonleaf_frame() {
+        let mut image = MockImage::new(0x1_4000_0000);
+        image.set_pdata(vec![RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        }]);
+        image.write(0x2000, &[0x01, 0, 0, 0]);
+        let mut stack = MockStack::new();
+        stack.put(0x2000, 0x1_4000_3000);
+        let mut context = Context::default();
+        context.rip = 0x1_4000_1050;
+        context.set_rsp(0x2000);
+        let mut callers = [0u64; 1];
+
+        let count =
+            walk_frame_chain(context, &mut callers, 0, 0x1000, 0x3000, &image, &stack).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(callers, [0x1_4000_3000]);
+    }
+
+    #[test]
+    fn frame_walk_stops_before_recording_invalid_frame() {
+        let image = MockImage::new(0x1400_0000);
+        let mut stack = MockStack::new();
+        stack.put(0x2000, USER_ADDRESS_LOW - 1);
+        let mut context = Context::default();
+        context.rip = 0x1400_0100;
+        context.set_rsp(0x2000);
+        let mut callers = [0xAAAA_AAAAu64; 1];
+
+        let count =
+            walk_frame_chain(context, &mut callers, 0, 0x1000, 0x3000, &image, &stack).unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(callers, [0xAAAA_AAAA]);
+    }
+
+    #[test]
+    fn frame_walk_rejects_missing_or_out_of_bounds_stack_reads() {
+        let image = MockImage::new(0x1400_0000);
+        let stack = MockStack::new();
+        let mut context = Context::default();
+        context.rip = 0x1400_0100;
+        context.set_rsp(0x1000);
+        let mut callers = [0u64; 1];
+
+        assert_eq!(
+            walk_frame_chain(context, &mut callers, 0, 0x1000, 0x3000, &image, &stack,),
+            Err(FrameWalkError::StackRead)
+        );
+        assert_eq!(
+            walk_frame_chain(context, &mut callers, 0, 0x3000, 0x3000, &image, &stack,),
+            Err(FrameWalkError::InvalidStackBounds)
+        );
+    }
+
+    #[test]
+    fn frame_walk_preserves_prior_output_at_stack_boundary() {
+        let image = MockImage::new(0x1400_0000);
+        let mut stack = MockStack::new();
+        stack.put(0x2ff0, 0x1400_1111);
+        stack.put(0x2ff8, 0x1400_2222);
+        let mut context = Context::default();
+        context.rip = 0x1400_0100;
+        context.set_rsp(0x2ff0);
+        let mut callers = [0xAAAA_AAAAu64; 2];
+
+        let count =
+            walk_frame_chain(context, &mut callers, 0, 0x1000, 0x3000, &image, &stack).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(callers, [0x1400_1111, 0xAAAA_AAAA]);
+    }
+
+    #[test]
+    fn stack_back_trace_request_enforces_native_limit() {
+        assert_eq!(stack_back_trace_request(0, 126), Some((1, 127)));
+        assert_eq!(stack_back_trace_request(0, 127), None);
+        assert_eq!(stack_back_trace_request(u32::MAX, 0), None);
+    }
+
+    #[test]
+    fn stack_back_trace_projection_copies_and_wraps_hash() {
+        let frames = [0x1000_0000_FFFF_FFF0, 0x20, 0x30, 0x40];
+        let mut trace = [0u64; 3];
+        let projected = project_stack_back_trace(&frames, 1, &mut trace);
+        assert_eq!(projected, Some((3, 0x90)));
+        assert_eq!(trace, [0x20, 0x30, 0x40]);
+
+        let mut untouched = [0xABCDu64; 1];
+        assert_eq!(
+            project_stack_back_trace(&frames[..1], 1, &mut untouched),
+            None
+        );
+        assert_eq!(untouched, [0xABCD]);
+    }
+
+    #[test]
+    fn callers_address_selection_matches_native_count_rules() {
+        let frames = [1, 2, 3, 4];
+        assert_eq!(callers_addresses(&frames, 2), (0, 0));
+        assert_eq!(callers_addresses(&frames, 3), (3, 0));
+        assert_eq!(callers_addresses(&frames, 4), (3, 4));
+        assert_eq!(callers_addresses(&frames, 5), (3, 0));
+    }
+
+    #[test]
+    fn virtual_unwind_executes_remaining_epilogue() {
+        let mut image = MockImage::new(0x1_4000_0000);
+        image.set_pdata(vec![RuntimeFunction {
+            begin: 0x1000,
+            end: 0x1100,
+            unwind_info: 0x2000,
+        }]);
+        // One ALLOC_SMALL(0x20) unwind code makes this a non-leaf function. At 0x10f8 the compiled
+        // epilogue is: add rsp,20h; pop rbx; pop rsi; pop rdi; ret.
+        image.write(0x2000, &[0x01, 4, 1, 0, 4, 0x32]);
+        image.write(0x10f8, &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x5e, 0x5f, 0xc3]);
+        let mut stack = MockStack::new();
+        stack.put(0x8020, 0xBBBB_BBBB);
+        stack.put(0x8028, 0x6666_6666);
+        stack.put(0x8030, 0x7777_7777);
+        stack.put(0x8038, 0x1_4000_3000);
+        let mut context = Context::default();
+        context.rip = 0x1_4000_10f8;
+        context.set_rsp(0x8000);
+
+        let result = virtual_unwind(
+            unw_flag::NHANDLER,
+            image.base,
+            context.rip,
+            image.pdata.functions[0],
+            &mut context,
+            &image,
+            &stack,
+        )
+        .unwrap();
+
+        assert_eq!(result.handler_rva, 0);
+        assert_eq!(context.gpr[REG_RBX], 0xBBBB_BBBB);
+        assert_eq!(context.gpr[REG_RSI], 0x6666_6666);
+        assert_eq!(context.gpr[REG_RDI], 0x7777_7777);
+        assert_eq!(context.rip, 0x1_4000_3000);
+        assert_eq!(context.rsp(), 0x8040);
     }
 
     // ------------------------------------------------------------------------------------------

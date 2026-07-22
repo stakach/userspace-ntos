@@ -3173,26 +3173,68 @@ pub unsafe extern "system" fn rtl_query_security_object(
 }
 
 /// `RtlCaptureStackBackTrace(ULONG FramesToSkip, ULONG FramesToCapture, PVOID* BackTrace,
-/// PULONG BackTraceHash) -> USHORT`. No frame-pointer stack walker at this stage; capture 0 frames
-/// and zero the hash. Returns the number captured (0).
+/// PULONG BackTraceHash) -> USHORT`. Walk up to 127 live AMD64 frames through
+/// `RtlWalkFrameChain`, copy the requested suffix, and return the wrapping low-32-bit address hash.
 ///
 /// # Safety
-/// `back_trace` a writable array of `frames_to_capture` slots (unused); `back_trace_hash` writable.
+/// `back_trace` must name `frames_to_capture` writable slots when that count is nonzero;
+/// `back_trace_hash` must be null or writable.
 #[export_name = "RtlCaptureStackBackTrace"]
+#[inline(never)]
 pub unsafe extern "system" fn rtl_capture_stack_back_trace(
     frames_to_skip: u32,
     frames_to_capture: u32,
     back_trace: *mut *mut c_void,
     back_trace_hash: *mut u32,
 ) -> u16 {
-    let _ = (frames_to_skip, frames_to_capture, back_trace);
-    // SAFETY: back_trace_hash writable-or-NULL per the contract.
-    unsafe {
-        if !back_trace_hash.is_null() {
-            *back_trace_hash = 0;
-        }
+    if frames_to_capture != 0 && back_trace.is_null() {
+        return 0;
     }
-    0
+    let Some((skip, total)) =
+        nt_ntdll::rtl::exception::stack_back_trace_request(frames_to_skip, frames_to_capture)
+    else {
+        return 0;
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut frames = [0u64; 128];
+        // SAFETY: `frames` has room for the validated total (< 128).
+        let frame_count = unsafe {
+            crate::seh::rtl_walk_frame_chain(
+                frames.as_mut_ptr().cast::<*mut c_void>(),
+                total as u32,
+                0,
+            ) as usize
+        };
+        if frame_count <= skip {
+            return 0;
+        }
+        // SAFETY: validated non-null for nonzero capture; this branch necessarily has at least one
+        // post-skip frame, so `frames_to_capture` is nonzero.
+        let output = unsafe {
+            core::slice::from_raw_parts_mut(back_trace.cast::<u64>(), frames_to_capture as usize)
+        };
+        let Some((count, hash)) = nt_ntdll::rtl::exception::project_stack_back_trace(
+            &frames[..frame_count.min(frames.len())],
+            skip,
+            output,
+        ) else {
+            return 0;
+        };
+        // SAFETY: optional writable output per the contract.
+        unsafe {
+            if !back_trace_hash.is_null() {
+                *back_trace_hash = hash;
+            }
+        }
+        count as u16
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (skip, total, back_trace_hash);
+        0
+    }
 }
 
 // =================================================================================================

@@ -51,6 +51,25 @@ const CONTEXT_SIZE: usize = 0x4D0;
 /// `CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT`.
 const CONTEXT_FULL: u32 = 0x0010_0007;
 
+/// Stack storage for an AMD64 `CONTEXT`. `RtlCaptureContext` uses aligned XMM stores, matching the
+/// platform ABI's 16-byte alignment requirement for this structure.
+#[repr(C, align(16))]
+pub(crate) struct AlignedContext([u8; CONTEXT_SIZE]);
+
+impl AlignedContext {
+    pub(crate) const fn zeroed() -> Self {
+        Self([0; CONTEXT_SIZE])
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+}
+
 /// `NtContinue` SSN (shared `nt-syscall-abi` table).
 const SSN_NT_CONTINUE: u32 = 0x43;
 /// `NtRaiseException` SSN.
@@ -144,6 +163,97 @@ impl StackReader for LiveStack {
         // SAFETY: `addr` is a stack address produced by unwinding real frames; the walk only reads
         // slots the prologue actually wrote (saved nonvols / the CALL return address).
         Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
+    }
+}
+
+/// `RtlWalkFrameChain(Callers, Count, Flags) -> ULONG`. Capture the current frame and walk through
+/// the live loader function tables and current TEB stack range. The high flag bits carry the native
+/// internal skip count; low flag bit 0 is only meaningful to kernel callers, so user-mode always
+/// remains constrained to user addresses.
+///
+/// # Safety
+/// `callers` must name `count` writable pointer slots when `count` is nonzero.
+#[export_name = "RtlWalkFrameChain"]
+#[inline(never)]
+pub unsafe extern "system" fn rtl_walk_frame_chain(
+    callers: *mut *mut c_void,
+    count: u32,
+    flags: u32,
+) -> u32 {
+    if count != 0 && callers.is_null() {
+        return 0;
+    }
+
+    let mut context = AlignedContext::zeroed();
+    let teb: u64;
+    // SAFETY: capture writes a full aligned CONTEXT and GS:[0x30] is the current x64 TEB pointer.
+    unsafe {
+        capture_context(context.as_mut_ptr());
+        core::ptr::write_unaligned(
+            context.as_mut_ptr().add(CTX_FLAGS) as *mut u32,
+            CONTEXT_FULL,
+        );
+        core::arch::asm!(
+            "mov {}, gs:[0x30]",
+            out(reg) teb,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    if teb == 0 {
+        return 0;
+    }
+
+    // SAFETY: the NT_TIB is the TEB prefix; StackBase/StackLimit are fixed at +0x08/+0x10.
+    let (stack_high, stack_low) = unsafe {
+        (
+            core::ptr::read_unaligned((teb + 0x08) as *const u64),
+            core::ptr::read_unaligned((teb + 0x10) as *const u64),
+        )
+    };
+    let output: &mut [u64] = if count == 0 {
+        &mut []
+    } else {
+        // SAFETY: validated non-null above; the caller provides `count` writable pointer slots.
+        unsafe { core::slice::from_raw_parts_mut(callers.cast::<u64>(), count as usize) }
+    };
+    // SAFETY: `context` contains the capture performed above.
+    let context = unsafe { context_from_raw(context.as_ptr()) };
+    ex::walk_frame_chain(
+        context,
+        output,
+        (flags >> 8) as usize,
+        stack_low,
+        stack_high,
+        &LiveImage,
+        &LiveStack,
+    )
+    .map_or(0, |frames| frames as u32)
+}
+
+/// `RtlGetCallersAddress(CallersAddress, CallersCaller)`. The native helper walks four frames and
+/// selects entries two and three after its own frame-walk prefix.
+///
+/// # Safety
+/// Non-null output pointers must be writable.
+#[export_name = "RtlGetCallersAddress"]
+#[inline(never)]
+pub unsafe extern "system" fn rtl_get_callers_address(
+    callers_address: *mut *mut c_void,
+    callers_caller: *mut *mut c_void,
+) {
+    let mut frames = [0u64; 4];
+    // SAFETY: `frames` provides four writable pointer-sized slots.
+    let count =
+        unsafe { rtl_walk_frame_chain(frames.as_mut_ptr().cast::<*mut c_void>(), 4, 0) as usize };
+    let (caller, caller_caller) = ex::callers_addresses(&frames, count);
+    // SAFETY: non-null outputs are writable per the contract.
+    unsafe {
+        if !callers_address.is_null() {
+            *callers_address = caller as *mut c_void;
+        }
+        if !callers_caller.is_null() {
+            *callers_caller = caller_caller as *mut c_void;
+        }
     }
 }
 
@@ -308,7 +418,7 @@ pub unsafe fn rtl_dispatch_exception(record: *mut c_void, context: *mut u8) -> b
     }
     // Work on a COPY of the context so the first-pass unwind doesn't destroy the original (which a
     // handler needs to resume / which the unwind pass re-derives).
-    let mut work = [0u8; CONTEXT_SIZE];
+    let mut work = AlignedContext::zeroed();
     // SAFETY: copying the caller's CONTEXT.
     unsafe {
         core::ptr::copy_nonoverlapping(context, work.as_mut_ptr(), CONTEXT_SIZE);
@@ -428,7 +538,7 @@ pub unsafe fn rtl_raise_exception(record: *mut c_void) {
     if record.is_null() {
         return;
     }
-    let mut ctx = [0u8; CONTEXT_SIZE];
+    let mut ctx = AlignedContext::zeroed();
     // SAFETY: capture the live register file into our stack CONTEXT.
     unsafe {
         capture_context(ctx.as_mut_ptr());
@@ -500,7 +610,7 @@ pub unsafe fn rtl_unwind_ex(
     };
 
     // Work on a copy so we can advance frame-by-frame while running finallys.
-    let mut work = [0u8; CONTEXT_SIZE];
+    let mut work = AlignedContext::zeroed();
     // SAFETY: copy the caller context.
     unsafe {
         core::ptr::copy_nonoverlapping(context_record, work.as_mut_ptr(), CONTEXT_SIZE);
@@ -929,7 +1039,7 @@ unsafe fn nt_raise_exception(record: *mut c_void, context: *mut u8, _first_chanc
 /// On-target; issues a real CONTEXT capture + unwind.
 #[inline(never)]
 unsafe fn seh_selftest_frame() -> (u64, u64, bool, u64, u64) {
-    let mut ctx = [0u8; CONTEXT_SIZE];
+    let mut ctx = AlignedContext::zeroed();
     // SAFETY: capture the live register file at THIS call site.
     unsafe {
         capture_context(ctx.as_mut_ptr());

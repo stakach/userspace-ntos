@@ -16691,7 +16691,7 @@ pub unsafe extern "system" fn rtl_unwind(
 ) {
     // SAFETY: capture the current context, then unwind to (target_ip, target_frame).
     unsafe {
-        let mut ctx = [0u8; 0x4D0];
+        let mut ctx = crate::seh::AlignedContext::zeroed();
         crate::seh::capture_context(ctx.as_mut_ptr());
         crate::seh::rtl_unwind_ex(
             target_frame as u64,
@@ -22304,6 +22304,13 @@ pub unsafe extern "system" fn rtl_set_last_win32_error(error: u32) {
 /// Never called; it only takes the addresses of the exports to anchor them for the linker.
 pub unsafe extern "C" fn export_anchor() {
     // Each `... as usize` is a runtime address-of that references the symbol, forcing retention.
+    #[cfg(target_arch = "x86_64")]
+    let anchors_seh: &[usize] = &[
+        crate::seh::rtl_walk_frame_chain as usize,
+        crate::seh::rtl_get_callers_address as usize,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    core::hint::black_box(anchors_seh);
     let anchors: &[usize] = &[
         rtl_init_unicode_string as usize,
         rtl_init_ansi_string as usize,
