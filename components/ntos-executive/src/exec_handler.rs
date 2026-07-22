@@ -103,12 +103,6 @@ impl ExecNtHandler {
         };
         let mut handler = ExecNtHandler {
             hive,
-            // Reserve up front so the backing buffer is allocated BELOW the heap
-            // mark taken in service_sec_image and never reallocates during the
-            // smss loop — its address stays stable across the per-syscall bump
-            // reset. Opens are deduped (below), so a bounded set of distinct keys
-            // never exceeds this.
-            key_handles: alloc::vec::Vec::with_capacity(256),
             obj_ns: {
                 let mut v = alloc::vec::Vec::with_capacity(192);
                 v.push(ObjEntry::dir(b"", 0xFF)); // 0 = root "\"
@@ -321,18 +315,72 @@ impl ExecNtHandler {
         }
         handler
     }
-    /// Intern a `KeyRef` into `key_handles` (deduped) and return the 4-aligned key handle. Handles
-    /// are 4-aligned because advapi32's `MapDefaultKey` clears HKEY bit 0. Dedup keeps the table
-    /// from growing unboundedly (a reallocation past the heap mark would be clobbered by the reset).
-    pub(crate) fn intern_key_handle(&mut self, kr: KeyRef) -> u64 {
-        let slot = match self.key_handles.iter().position(|&c| c == kr) {
-            Some(i) => i,
-            None => {
-                self.key_handles.push(kr);
-                self.key_handles.len() - 1
-            }
+    fn registry_map_access(desired: u32) -> u32 {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+        const KEY_READ: u32 = 0x0002_0019;
+        const KEY_WRITE: u32 = 0x0002_0006;
+        const KEY_ALL_ACCESS: u32 = 0x000F_003F;
+        let mut mapped = desired
+            & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL | MAXIMUM_ALLOWED);
+        if desired & (GENERIC_READ | GENERIC_EXECUTE) != 0 {
+            mapped |= KEY_READ;
+        }
+        if desired & GENERIC_WRITE != 0 {
+            mapped |= KEY_WRITE;
+        }
+        if desired & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+            mapped |= KEY_ALL_ACCESS;
+        }
+        mapped
+    }
+
+    /// Insert a process-local registry handle and copy it to the caller transactionally.
+    unsafe fn mint_registry_key(&mut self, target: KeyRef, desired: u32, out: u64) -> u32 {
+        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
+            return 0xC000_0008;
         };
-        KEY_HANDLE_BASE + (slot as u64) * 4
+        let handle = match self.pm.insert_handle(
+            pid,
+            nt_process::HandleObject::RegistryKey(target),
+            Self::registry_map_access(desired),
+        ) {
+            Ok(handle) => handle,
+            Err(_) => return 0xC000_009A,
+        };
+        PM_HANDLES_TRACKED.fetch_add(1, Ordering::Relaxed);
+        let count = self.pm.handle_count(pid) as u64;
+        if count > PM_HANDLE_PEAK.load(Ordering::Relaxed) {
+            PM_HANDLE_PEAK.store(count, Ordering::Relaxed);
+        }
+        if !self.xas_write_u64(out, handle as u64) {
+            let _ = self.pm.take_handle(pid, handle);
+            return 0xC000_0005;
+        }
+        0
+    }
+
+    /// Resolve a registry handle owned by the current process and enforce the requested key right.
+    fn resolve_registry_key(&self, handle: u64, required_access: u32) -> Result<KeyRef, u32> {
+        let pid = self.pm_pid_for_pi(self.pi).ok_or(0xC000_0008u32)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, handle as nt_process::Handle)
+            .ok_or(0xC000_0008u32)?;
+        let nt_process::HandleObject::RegistryKey(target) = object else {
+            return Err(0xC000_0024);
+        };
+        let access = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(0xC000_0008u32)?;
+        if access & required_access != required_access {
+            return Err(0xC000_0022);
+        }
+        Ok(target)
     }
     /// Canonical overlay path for a full NT key path (CurrentControlSet alias applied), matching
     /// `resolve_key`'s view so an overlay write and a later base-hive read agree on one key.
@@ -2846,6 +2894,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                         path.push(c);
                     }
                 }
+                let root_target = if root_dir == 0 {
+                    None
+                } else {
+                    match self.resolve_registry_key(root_dir, 0) {
+                        Ok(target) => Some(target),
+                        Err(status) => return status,
+                    }
+                };
                 // winlogon (pi 2) — msgina's `GetRegistrySettings` (WlxInitialize) opens the Winlogon
                 // key `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`. advapi32's
                 // `RegOpenKeyExW(HKLM, subkey)` first maps HKLM by opening `\Registry\Machine`, then
@@ -2853,18 +2909,18 @@ impl NativeSyscallHandler for ExecNtHandler {
                 // literals in `.rdata` pages winlogon/advapi32 never touch, so the pi==2 copyin mirror
                 // returns EMPTY for each → recover the real name from the backing PE image
                 // (`read_objattr_name_pe`, cross-AS via the registered DLL). Two exact, scoped matches:
-                //   (a) `\Registry\Machine` predefined-HKLM open → hand back MACHINE_ROOT_HANDLE so
+                //   (a) `\Registry\Machine` predefined-HKLM open → hand back a machine-root key so
                 //       advapi32's HKLM mapping SUCCEEDS. (Post-`SERVICES_CREATE_STARTED` the generic
                 //       empty-name branch below returns NOT_FOUND — which BROKE this open → the msgina
                 //       WlxShutdown(NULL) crash. Matching the recovered name distinguishes it from the
                 //       BasepIsProcessAllowed AppCertDlls empty-name open that must still miss.)
-                //   (b) the Winlogon subkey (relative to MACHINE_ROOT_HANDLE) → back its existence with
+                //   (b) the Winlogon subkey (relative to that root) → back its existence with
                 //       SYNTH_WINLOGON_KEY so the open succeeds and value reads miss (msgina applies its
                 //       documented registry defaults) → WlxInitialize writes `*pWlxContext` (non-NULL) →
                 //       GinaInit succeeds → no HandleShutdown → no WlxShutdown(NULL).
                 // Both are EXACT-name matches scoped to pi==2, so no other paint-time HKLM open outcome
                 // changes (broadly succeeding HKLM opens regressed the desktop paint; see the
-                // keyboard-layout note on MACHINE_ROOT_HANDLE).
+                // keyboard-layout note on the machine-root target).
                 if self.pi == 2 {
                     let eff_name = if !path.is_empty() {
                         path.clone()
@@ -2880,20 +2936,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                     };
                     if is_winlogon_key(&eff_name) {
                         WINLOGON_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                        let h = self.intern_key_handle(SYNTH_WINLOGON_KEY);
-                        self.xas_write_u64(args[0], h);
-                        return 0; // STATUS_SUCCESS — Winlogon key exists (values default via miss)
+                        return self.mint_registry_key(SYNTH_WINLOGON_KEY, args[1] as u32, args[0]);
                     }
                     // Exact `\Registry\Machine` predefined-HKLM open (rd absolute) → sentinel handle.
-                    if root_dir < KEY_HANDLE_BASE {
+                    if root_target.is_none() {
                         let comps: alloc::vec::Vec<&str> =
                             eff_name.split('\\').filter(|c| !c.is_empty()).collect();
                         if comps.len() == 2
                             && comps[0].eq_ignore_ascii_case("Registry")
                             && comps[1].eq_ignore_ascii_case("Machine")
                         {
-                            self.xas_write_u64(args[0], MACHINE_ROOT_HANDLE);
-                            return 0; // STATUS_SUCCESS — HKLM predefined root
+                            return self.mint_registry_key(
+                                MACHINE_ROOT_KEY,
+                                args[1] as u32,
+                                args[0],
+                            );
                         }
                     }
                     // winlogon InitializeSAS → SetDefaultLanguage(NULL) opens
@@ -2908,31 +2965,26 @@ impl NativeSyscallHandler for ExecNtHandler {
                     if is_nls_language_key(&eff_name) {
                         let full = alloc::format!("\\Registry\\Machine\\{}", eff_name);
                         if let Some(kr) = self.resolve_key(&full) {
-                            let h = self.intern_key_handle(kr);
-                            self.xas_write_u64(args[0], h);
-                            return 0; // STATUS_SUCCESS — real Nls\Language key
+                            return self.mint_registry_key(kr, args[1] as u32, args[0]);
                         }
                     }
                 }
                 // services (pi 3): resolve HKLM predefined roots + machine-relative subkeys against
                 // the real SYSTEM hive (::ROSSYS.HIV). A predefined `\Registry\Machine` open → the
                 // sentinel machine-root handle; a subkey relative to it (RootDirectory ==
-                // MACHINE_ROOT_HANDLE) or an absolute `\Registry\Machine\...` path → `resolve_key`;
+                // the machine-root target) or an absolute `\Registry\Machine\...` path → `resolve_key`;
                 // a subkey relative to a real hive handle → `open_key_from`. Self-contained + returns,
                 // so the winlogon/csrss paint-time key hacks below are untouched (byte-identical).
                 if self.pi == 3 || self.pi == 4 {
                     // Compute the FULL NT path being opened (predefined-root + overlay-relative
                     // cases). `None` = a hive-handle-relative open (path unknown, resolved below).
-                    // NOTE: MACHINE_ROOT_HANDLE (0x9_..) is numerically >= KEY_HANDLE_BASE (0x1_..),
-                    // so it MUST be matched BEFORE the generic real-handle branch.
-                    let full_opt: Option<alloc::string::String> = if root_dir == MACHINE_ROOT_HANDLE {
+                    let full_opt: Option<alloc::string::String> = if root_target
+                        == Some(MACHINE_ROOT_KEY)
+                    {
                         let mut full = alloc::string::String::from(r"\Registry\Machine\");
                         full.push_str(&path);
                         Some(full)
-                    } else if let Some(oidx) = (root_dir >= KEY_HANDLE_BASE)
-                        .then(|| ((root_dir - KEY_HANDLE_BASE) / 4) as usize)
-                        .and_then(|i| self.key_handles.get(i).copied())
-                        .and_then(overlay_key_idx)
+                    } else if let Some(oidx) = root_target.and_then(overlay_key_idx)
                     {
                         // Subkey relative to an OVERLAY (created) key → parent path + \ + name.
                         self.overlay.path(oidx).map(|p| {
@@ -2943,7 +2995,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                             }
                             full
                         })
-                    } else if root_dir >= KEY_HANDLE_BASE {
+                    } else if root_target.is_some() {
                         None // relative to a real hive handle — resolved via open_key_from below
                     } else {
                         // Absolute open (root_dir == 0). The predefined `\Registry\Machine` open
@@ -2954,8 +3006,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                             && comps[0].eq_ignore_ascii_case("Registry")
                             && comps[1].eq_ignore_ascii_case("Machine")
                         {
-                            self.xas_write_u64(args[0], MACHINE_ROOT_HANDLE);
-                            return 0; // predefined HKLM root → sentinel machine-root handle
+                            return self.mint_registry_key(
+                                MACHINE_ROOT_KEY,
+                                args[1] as u32,
+                                args[0],
+                            );
                         }
                         Some(path.clone())
                     };
@@ -2964,25 +3019,24 @@ impl NativeSyscallHandler for ExecNtHandler {
                     if let Some(ref full) = full_opt {
                         let canon = self.overlay_canon(full);
                         if let Some(oidx) = self.overlay.find(&canon) {
-                            let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
-                            self.xas_write_u64(args[0], h);
-                            return 0; // STATUS_SUCCESS
+                            return self.mint_registry_key(
+                                OVERLAY_KEY_TAG | (oidx as u32),
+                                args[1] as u32,
+                                args[0],
+                            );
                         }
                     }
                     // Base-hive resolution (unchanged from the read-only seam).
                     let cell: Option<KeyRef> = if let Some(ref full) = full_opt {
                         self.resolve_key(full)
                     } else {
-                        let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
-                        match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
+                        match (self.hive.as_ref(), root_target) {
                             (Some(h), Some(parent)) => h.open_key_from(parent, &path),
                             _ => None,
                         }
                     };
                     if let Some(cell) = cell {
-                        let h = self.intern_key_handle(cell);
-                        self.xas_write_u64(args[0], h);
-                        return 0; // STATUS_SUCCESS
+                        return self.mint_registry_key(cell, args[1] as u32, args[0]);
                     }
                     // lsass (pi 4): the SECURITY + SAM hives (\Registry\Machine\{SECURITY,SAM}) don't
                     // exist in our staged SYSTEM hive, but real ReactOS creates them at setup. lsass'
@@ -2999,75 +3053,59 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 let canon = self.overlay_canon(full);
                                 let (oidx, _) = self.overlay.create(&canon);
                                 self.overlay_dirty = true;
-                                let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
-                                self.xas_write_u64(args[0], h);
-                                return 0; // STATUS_SUCCESS (empty LSA/SAM hive root/subkey)
+                                return self.mint_registry_key(
+                                    OVERLAY_KEY_TAG | (oidx as u32),
+                                    args[1] as u32,
+                                    args[0],
+                                );
                             }
                         }
                     }
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_HANDLE). Match the layout key
+                // P5 PAINT-SAFE keyboard-layout fix (see MACHINE_ROOT_KEY). Match the layout key
                 // by NAME (its RootDirectory arrives as 0 — advapi32's MapDefaultKey HKLM handle
                 // doesn't round-trip into the subkey OA — so the sentinel-relative test isn't hit).
                 // This is the ONLY key resolved specially, so every other HKLM/HKCU subkey outcome is
                 // identical to pre-fix and win32k's paint-time client reads are unchanged (a broad
                 // DLL-.rdata read regressed the paint by letting ALL HKLM reads succeed).
                 if is_keyboard_layout_key(&path) {
-                    smss_copyout(args[0], &SYNTH_KBD_HANDLE.to_le_bytes());
                     KBD_LAYOUT_KEY_OPENED.fetch_add(1, Ordering::Relaxed);
-                    return 0; // STATUS_SUCCESS
+                    return self.mint_registry_key(SYNTH_KBD_KEY, args[1] as u32, args[0]);
                 }
                 // A subkey open relative to the predefined-root sentinel that is NOT the keyboard key:
                 // NOT_FOUND (preserves the pre-fix outcome for all non-keyboard predefined subkeys).
-                if root_dir == MACHINE_ROOT_HANDLE {
+                if root_target == Some(MACHINE_ROOT_KEY) {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
                 // An absolute open whose name is an unreadable DLL `.rdata` static (empty path) is a
                 // predefined-root open (HKLM/HKCU/HKCR); hand back the sentinel so MapDefaultKey
                 // succeeds (else the keyboard subkey open never fires). Non-keyboard subkeys stay
                 // not-found via the match above.
-                if root_dir < KEY_HANDLE_BASE
+                if root_target.is_none()
                     && path.is_empty()
                     && SERVICES_CREATE_STARTED.load(Ordering::Relaxed) == 0
                 {
-                    smss_copyout(args[0], &MACHINE_ROOT_HANDLE.to_le_bytes());
-                    return 0; // STATUS_SUCCESS
+                    return self.mint_registry_key(MACHINE_ROOT_KEY, args[1] as u32, args[0]);
                 }
                 // Once winlogon's Win32 create for services.exe has begun, an empty-name absolute open
                 // is BasepIsProcessAllowed's AppCertDlls key (its .rdata static reads empty in the
                 // mirror). Return NOT_FOUND so BasepIsProcessAllowed skips RtlQueryRegistryValues and
                 // returns SUCCESS (else that query fails c0000002 → "Process not allowed to launch").
-                // The keyboard-layout path that needs MACHINE_ROOT_HANDLE runs long before this.
-                if root_dir < KEY_HANDLE_BASE && path.is_empty() {
+                // The keyboard-layout path that needs the machine-root key runs long before this.
+                if root_target.is_none() && path.is_empty() {
                     return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
                 }
-                let cell = if root_dir >= KEY_HANDLE_BASE {
-                    let idx = ((root_dir - KEY_HANDLE_BASE) / 4) as usize;
-                    match (self.hive.as_ref(), self.key_handles.get(idx).copied()) {
-                        (Some(h), Some(parent)) => h.open_key_from(parent, &path),
+                let cell = if let Some(parent) = root_target {
+                    match self.hive.as_ref() {
+                        Some(h) => h.open_key_from(parent, &path),
                         _ => None,
                     }
                 } else {
                     self.resolve_key(&path)
                 };
                 match cell {
-                    Some(cell) => {
-                        // Dedup: smss reopens the same keys in a loop and NtClose is a no-op, so
-                        // return the existing handle for a known cell instead of growing the table
-                        // unboundedly (which would reallocate its buffer above the heap mark and
-                        // get clobbered by the per-syscall bump reset).
-                        let idx = match self.key_handles.iter().position(|&c| c == cell) {
-                            Some(i) => i,
-                            None => {
-                                self.key_handles.push(cell);
-                                self.key_handles.len() - 1
-                            }
-                        };
-                        let h = KEY_HANDLE_BASE + (idx as u64) * 4; // 4-aligned: advapi32 clears HKEY bit0
-                        smss_copyout(args[0], &h.to_le_bytes());
-                        0 // STATUS_SUCCESS
-                    }
+                    Some(cell) => self.mint_registry_key(cell, args[1] as u32, args[0]),
                     None => 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 }
             },
@@ -3086,6 +3124,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let mut rd = [0u8; 8];
                 let _ = self.xas_read(oa + 8, &mut rd); // OBJECT_ATTRIBUTES.RootDirectory @+8
                 let root_dir = u64::from_le_bytes(rd);
+                let root_target = if root_dir == 0 {
+                    None
+                } else {
+                    match self.resolve_registry_key(root_dir, 0x4) {
+                        Ok(target) => Some(target),
+                        Err(status) => return status,
+                    }
+                };
                 let name16 = self.read_objattr_name_pe(oa);
                 let mut name = alloc::string::String::new();
                 for &w in &name16 {
@@ -3094,18 +3140,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                     }
                 }
                 // Resolve the full NT path: predefined HKLM root, absolute, or overlay-relative.
-                let full: Option<alloc::string::String> = if root_dir == MACHINE_ROOT_HANDLE {
+                let full: Option<alloc::string::String> = if root_target == Some(MACHINE_ROOT_KEY) {
                     let mut f = alloc::string::String::from(r"\Registry\Machine\");
                     f.push_str(&name);
                     Some(f)
-                } else if root_dir == 0 {
+                } else if root_target.is_none() {
                     Some(name.clone())
-                } else if let Some(oidx) = ((root_dir - KEY_HANDLE_BASE) / 4)
-                    .try_into()
-                    .ok()
-                    .filter(|_| root_dir >= KEY_HANDLE_BASE)
-                    .and_then(|i: usize| self.key_handles.get(i).copied())
-                    .and_then(overlay_key_idx)
+                } else if let Some(oidx) = root_target.and_then(overlay_key_idx)
                 {
                     self.overlay.path(oidx).map(|p| {
                         let mut f = alloc::string::String::from(p);
@@ -3115,9 +3156,20 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                         f
                     })
+                } else if let (Some(hive), Some(parent)) = (self.hive.as_ref(), root_target) {
+                    hive.key_path(parent).map(|relative| {
+                        let mut f = alloc::string::String::from(r"\Registry\Machine\System");
+                        if !relative.is_empty() {
+                            f.push('\\');
+                            f.push_str(&relative);
+                        }
+                        if !name.is_empty() {
+                            f.push('\\');
+                            f.push_str(&name);
+                        }
+                        f
+                    })
                 } else {
-                    // Create relative to a real HIVE handle: the parent path isn't tracked (the SCM
-                    // doesn't take this path). Fall through to NOT_FOUND rather than mis-create.
                     None
                 };
                 let full = match full {
@@ -3130,8 +3182,14 @@ impl NativeSyscallHandler for ExecNtHandler {
                     self.overlay.find(&canon).is_some() || self.resolve_key(&full).is_some();
                 let (oidx, _) = self.overlay.create(&canon);
                 self.overlay_dirty = true;
-                let h = self.intern_key_handle(OVERLAY_KEY_TAG | (oidx as u32));
-                self.xas_write_u64(args[0], h); // *KeyHandle
+                let status = self.mint_registry_key(
+                    OVERLAY_KEY_TAG | (oidx as u32),
+                    args[1] as u32,
+                    args[0],
+                );
+                if status != 0 {
+                    return status;
+                }
                 // *Disposition (optional): arg6 at [sp+0x38].
                 let disp_ptr = smss_stack_read(get_recv_mr(16) + 0x38);
                 if disp_ptr != 0 {
@@ -3149,13 +3207,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                 if self.pi != 3 && self.pi != 4 {
                     return 0; // STATUS_SUCCESS (byte-identical no-op for smss/csrss/winlogon)
                 }
-                let key = match self
-                    .key_handles
-                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
-                    .copied()
-                {
-                    Some(k) => k,
-                    None => return 0, // unknown handle → benign success (prior no-op)
+                let key = match self.resolve_registry_key(args[0], 0x2) {
+                    Ok(key) => key,
+                    Err(status) => return status,
                 };
                 let oidx = match overlay_key_idx(key) {
                     Some(i) => i,
@@ -3188,13 +3242,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(h) => h,
                     None => return 0xC000_0008, // STATUS_INVALID_HANDLE
                 };
-                let key = match self
-                    .key_handles
-                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
-                    .copied()
-                {
-                    Some(k) => k,
-                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                let key = match self.resolve_registry_key(args[0], 0x1) {
+                    Ok(key) => key,
+                    Err(status) => return status,
                 };
                 let byname: Option<(alloc::string::String, u32, alloc::vec::Vec<u8>)> =
                     if key == SYNTH_CPU_KEY {
@@ -3244,13 +3294,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(h) => h,
                     None => return 0xC000_0008, // STATUS_INVALID_HANDLE
                 };
-                let key = match self
-                    .key_handles
-                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
-                    .copied()
-                {
-                    Some(k) => k,
-                    None => return 0xC000_0008,
+                let key = match self.resolve_registry_key(args[0], 0x8) {
+                    Ok(key) => key,
+                    Err(status) => return status,
                 };
                 // Overlay (created) keys track no enumerated subkeys here (the SCM creates leaf
                 // volatile keys); report the empty set rather than mis-reading the tag as an offset.
@@ -3303,13 +3349,9 @@ impl NativeSyscallHandler for ExecNtHandler {
                     Some(h) => h,
                     None => return 0xC000_0008,
                 };
-                let key = match self
-                    .key_handles
-                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
-                    .copied()
-                {
-                    Some(k) => k,
-                    None => return 0xC000_0008,
+                let key = match self.resolve_registry_key(args[0], 0x1) {
+                    Ok(key) => key,
+                    Err(status) => return status,
                 };
                 // Overlay (created) key: report its own value count (no subkeys tracked here).
                 if let Some(oidx) = overlay_key_idx(key) {
@@ -3632,13 +3674,9 @@ impl NativeSyscallHandler for ExecNtHandler {
             // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the synthetic CPU
             // key to build PROCESSOR_IDENTIFIER. Real-hive values by name → not-found (smss defaults).
             NativeService::NtQueryValueKey => unsafe {
-                let key = match self
-                    .key_handles
-                    .get((args[0].wrapping_sub(KEY_HANDLE_BASE) / 4) as usize)
-                    .copied()
-                {
-                    Some(k) => k,
-                    None => return 0xC000_0008, // STATUS_INVALID_HANDLE
+                let key = match self.resolve_registry_key(args[0], 0x1) {
+                    Ok(key) => key,
+                    Err(status) => return status,
                 };
                 // services (pi 3): the value name (e.g. L"SetupType") is a DLL `.rdata` literal the
                 // stack/heap/image mirror can't reach — read it from the backing PE (`read_ustr_pe`).

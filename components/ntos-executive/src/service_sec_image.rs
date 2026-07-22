@@ -417,7 +417,7 @@ pub(crate) unsafe fn service_sec_image(
     let mut nt_handler = ExecNtHandler::new();
     let mut delay_queue = nt_delay_execution::Queue::<DELAY_WAITER_N>::new();
     // Heap high-water mark taken AFTER all persistent state (the service table + the
-    // pre-reserved key_handles buffer) is allocated. Each smss syscall we service allocates
+    // pre-reserved process handle tables) is allocated. Each smss syscall we service allocates
     // transient Vec/String (copyin buffers, registry value info) on the no-free bump heap; without
     // reclamation a few hundred registry syscalls exhaust the 128 KiB heap and the executive
     // panics. Rewinding to this mark each iteration reclaims all per-syscall transients while

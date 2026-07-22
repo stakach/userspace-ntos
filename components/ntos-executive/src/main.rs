@@ -3889,9 +3889,6 @@ const NTDLL_STUB: &[u8] = &[
 /// so syscalls migrate from fake to real one family at a time while the tree stays green. v0.1
 /// covers only the trivial object calls; the registry family (real OBJECT_ATTRIBUTES copyin +
 /// a real hive) lands next, then process/section/token/port against the smss trace.
-/// Base for registry key handles the handler hands out (index into `key_handles`, offset so it
-/// never looks like a small/null handle).
-const KEY_HANDLE_BASE: u64 = 0x0000_0001_0000_0000;
 /// Sentinel `KeyRef` for the synthesized `\Registry\Machine\Hardware\…\CentralProcessor\0` key
 /// (the kernel's volatile HARDWARE hive, which we don't have on disk). Far above any real regf
 /// cell offset, so it never collides with a hive key.
@@ -3907,11 +3904,13 @@ const SYNTH_CPU_KEY: KeyRef = 0xFFFF_FF00;
 /// and let NtQueryValueKey miss (→ defaults). Far above any real regf cell offset (like SYNTH_CPU_KEY),
 /// so it never collides with a hive key.
 const SYNTH_WINLOGON_KEY: KeyRef = 0xFFFF_FF01;
-/// `key_handles` stores a `KeyRef` (u32). A real hive `KeyRef` is an hbin-relative cell offset
-/// (well under the ~204 KiB hive size). A `KeyRef` in the range `[OVERLAY_KEY_TAG,
-/// OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` instead names an OVERLAY (created) key — its low bits are the
-/// index into `ExecNtHandler::overlay`. The range sits far above any real cell offset and below
-/// `SYNTH_CPU_KEY` (0xFFFF_FF00), so it collides with neither.
+/// Typed key targets for predefined-machine-root and the synthetic keyboard-layout key. These are
+/// stored inside process-local `HandleObject::RegistryKey` entries; they are not handle values.
+const MACHINE_ROOT_KEY: KeyRef = 0xFFFF_FF02;
+const SYNTH_KBD_KEY: KeyRef = 0xFFFF_FF03;
+/// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
+/// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
+/// far above any real cell offset and below the synthetic key targets.
 const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
 const OVERLAY_KEY_MAX: u32 = 0x1000;
 /// True if a `KeyRef` is a synthetic/overlay handle (SYNTH_CPU_KEY, SYNTH_WINLOGON_KEY, or an overlay
@@ -3947,11 +3946,9 @@ const REG_OPENED_EXISTING_KEY: u32 = 2;
 /// That preserves the pre-fix outcome (not-found) for all non-keyboard opens, so win32k's paint-time
 /// client registry reads are byte-for-byte unchanged (a broad DLL-`.rdata`-name read was tried and
 /// regressed the desktop paint by letting ALL HKLM reads succeed → the interactive-winsta fork).
-const MACHINE_ROOT_HANDLE: u64 = 0x0000_0009_0000_0000;
-/// Sentinel key handle returned for the `HKLM\SYSTEM\...\Keyboard Layouts\<KLID>` open. Non-IME
+/// Synthetic key target returned for the `HKLM\SYSTEM\...\Keyboard Layouts\<KLID>` open. Non-IME
 /// KLIDs (e.g. 00000409) need only the key to OPEN — the optional "Layout Id" value read is allowed
 /// to miss (a query on this handle returns not-found → `IntLoadKeyboardLayout` keeps the default).
-const SYNTH_KBD_HANDLE: u64 = 0x0000_0009_0000_0010;
 
 /// True if `path` is a `...\Keyboard Layouts\<klid>` subkey (the plural "Keyboard Layouts" under
 /// `Control`, distinct from the singular HKCU `Keyboard Layout\Preload`/`Substitutes`). Matched
@@ -4319,9 +4316,8 @@ struct ExecNtHandler {
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
     /// the executive heap is small). None if the hive wasn't staged on the disk.
     hive: Option<RegfHive<'static>>,
-    key_handles: alloc::vec::Vec<KeyRef>,
     /// The minimal object-manager namespace (index 0 = root `\`). Pre-reserved below the heap mark
-    /// like `key_handles`; entries are inline (no nested heap) so pushes never reallocate.
+    /// its entries are inline (no nested heap) so pushes never reallocate.
     obj_ns: alloc::vec::Vec<ObjEntry>,
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
@@ -4488,7 +4484,7 @@ struct ExecNtHandler {
     /// completes through the server, the executive records the connection here so the future message
     /// bulk (NtRequestWaitReplyPort/NtReplyWaitReceivePort/NtReplyPort) is served by DIRECT cross-
     /// badge delivery against this cache — never a per-message round-trip to the server. Pre-reserved
-    /// below the heap mark (like `key_handles`) so pushes never reallocate across the per-syscall
+    /// below the heap mark so pushes never reallocate across the per-syscall
     /// bump reset. Records are `Copy` (inline name, no nested heap).
     lpc_connections: alloc::vec::Vec<LpcConnRecord>,
     /// winlogon's CSR client-connect LpcWrite heap-view base (0 = the CSR regions haven't been mapped
@@ -5269,7 +5265,7 @@ static WINLOGON_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Set when winlogon's kernel32 CreateProcessInternalW creates the services.exe SEC_IMAGE section —
 /// i.e. the Win32 process-create for services.exe has begun. Used to gate OFF the broad empty-name
-/// NtOpenKey → MACHINE_ROOT_HANDLE fallback (which the keyboard-layout path needed, but which makes
+/// NtOpenKey → machine-root fallback (which the keyboard-layout path needed, but which makes
 /// BasepIsProcessAllowed's AppCertDlls open spuriously succeed → RtlQueryRegistryValues fails
 /// c0000002 → "Process not allowed to launch"). The keyboard path runs long before services create.
 static SERVICES_CREATE_STARTED: AtomicU64 = AtomicU64::new(0);
