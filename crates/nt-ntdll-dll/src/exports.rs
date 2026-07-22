@@ -107,6 +107,15 @@ static mut LDR_LOADER_LOCK: LoaderCriticalSection = LoaderCriticalSection {
     spin_count: 0,
 };
 
+static mut LDR_DLL_NOTIFICATION_LOCK: LoaderCriticalSection = LoaderCriticalSection {
+    debug_info: u64::MAX,
+    lock_count: AtomicI32::new(-1),
+    recursion_count: 0,
+    owning_thread: AtomicU64::new(0),
+    lock_semaphore: AtomicU64::new(0),
+    spin_count: 0,
+};
+
 const _: [(); 40] = [(); core::mem::size_of::<LoaderCriticalSection>()];
 const SYSTEM_TIME_OF_DAY_INFORMATION_CLASS: u32 = 3;
 const SYSTEM_TIME_OF_DAY_INFORMATION_SIZE: usize = 48;
@@ -6084,6 +6093,18 @@ struct RtlUnloadEventTrace {
 
 #[cfg(target_arch = "x86_64")]
 static mut LDR_DLL_NOTIFICATION_LIST: [u64; 2] = [0, 0];
+#[cfg(target_arch = "x86_64")]
+static mut LDR_DLL_NOTIFICATION_RETIRED_HEAD: u64 = 0;
+#[cfg(target_arch = "x86_64")]
+const LDR_DLL_NOTIFICATION_CAP: usize = 256;
+#[cfg(target_arch = "x86_64")]
+const LDR_DLL_NOTIFICATION_RETAINED_CAP: usize = 1024;
+#[cfg(target_arch = "x86_64")]
+static mut LDR_DLL_NOTIFICATION_STATE: nt_ntdll::loader::notification::NotificationState =
+    nt_ntdll::loader::notification::NotificationState::new(
+        LDR_DLL_NOTIFICATION_CAP,
+        LDR_DLL_NOTIFICATION_RETAINED_CAP,
+    );
 static mut RTL_UNLOAD_EVENT_TRACE: [RtlUnloadEventTrace; RTL_UNLOAD_EVENT_TRACE_NUMBER] = [const {
     RtlUnloadEventTrace {
         base_address: core::ptr::null_mut(),
@@ -6286,10 +6307,72 @@ unsafe fn ldr_remove_notification_entry(entry: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn notification_lock_ptr() -> *mut c_void {
+    core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_LOCK).cast()
+}
+
+#[cfg(target_arch = "x86_64")]
+struct NotificationLockGuard;
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for NotificationLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { rtl_leave_critical_section(notification_lock_ptr()) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn acquire_notification_lock() -> Result<NotificationLockGuard, NtStatus> {
+    let status = unsafe { rtl_enter_critical_section(notification_lock_ptr()) };
+    if nt_success(status) {
+        Ok(NotificationLockGuard)
+    } else {
+        Err(status)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn retire_notification_entry(entry: u64) {
+    unsafe {
+        core::ptr::write_unaligned(
+            (entry + 32) as *mut u64,
+            LDR_DLL_NOTIFICATION_RETIRED_HEAD,
+        );
+        LDR_DLL_NOTIFICATION_RETIRED_HEAD = entry;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn free_retired_notification_entries(mut entry: u64) {
+    while entry != 0 {
+        let next = unsafe { core::ptr::read_unaligned((entry + 32) as *const u64) };
+        unsafe { crate::process_heap_free(entry as *mut u8) };
+        entry = next;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn ldr_send_dll_notifications_for_entry(entry: u64, reason: u32) {
+    let _notification_lock = match unsafe { acquire_notification_lock() } {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
     let head = unsafe { ldr_notification_head() };
-    let mut cur = unsafe { core::ptr::read_unaligned(head as *const u64) };
-    if cur == head {
+    let first = unsafe { core::ptr::read_unaligned(head as *const u64) };
+    let tail = unsafe { core::ptr::read_unaligned((head + 8) as *const u64) };
+    let mut cursor = nt_ntdll::loader::notification::DispatchCursor::new(head, first, tail);
+    let mut entries = [0u64; LDR_DLL_NOTIFICATION_CAP];
+    let mut entry_count = 0usize;
+    while let Some(current) = cursor.current() {
+        let next = unsafe { core::ptr::read_unaligned(current as *const u64) };
+        entries[entry_count] = current;
+        entry_count += 1;
+        cursor.advance(current, next);
+        if entry_count >= LDR_DLL_NOTIFICATION_CAP {
+            break;
+        }
+    }
+    if entry_count == 0 {
         return;
     }
 
@@ -6311,12 +6394,12 @@ unsafe fn ldr_send_dll_notifications_for_entry(entry: u64, reason: u32) {
         core::ptr::write_unaligned(data.as_mut_ptr().add(32) as *mut u32, image_size);
     }
 
-    let mut guard = 0usize;
-    while cur != 0 && cur != head && guard < 4096 {
-        let next = unsafe { core::ptr::read_unaligned(cur as *const u64) };
+    unsafe { (*core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE)).begin_dispatch() };
+    for &cur in &entries[..entry_count] {
         let callback = unsafe { core::ptr::read_unaligned((cur + 16) as *const u64) };
         let context = unsafe { core::ptr::read_unaligned((cur + 24) as *const u64) };
-        if callback != 0 {
+        let live = unsafe { core::ptr::read_unaligned((cur + 40) as *const u32) } != 0;
+        if live && callback != 0 {
             let f: LdrDllNotificationFunction = unsafe { core::mem::transmute(callback as usize) };
             unsafe {
                 f(
@@ -6326,9 +6409,19 @@ unsafe fn ldr_send_dll_notifications_for_entry(entry: u64, reason: u32) {
                 )
             };
         }
-        cur = next;
-        guard += 1;
     }
+    let retired = unsafe { (*core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE)).finish_dispatch() };
+    let retired_head = if retired != 0 {
+        unsafe {
+            let head = LDR_DLL_NOTIFICATION_RETIRED_HEAD;
+            LDR_DLL_NOTIFICATION_RETIRED_HEAD = 0;
+            head
+        }
+    } else {
+        0
+    };
+    drop(_notification_lock);
+    unsafe { free_retired_notification_entries(retired_head) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -6536,18 +6629,31 @@ pub unsafe extern "system" fn ldr_register_dll_notification(
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let _loader_lock = match acquire_loader_lock() {
-            Ok(guard) => guard,
-            Err(status) => return status,
-        };
-        let entry = crate::process_heap_alloc(32) as u64;
+        let entry = crate::process_heap_alloc(48) as u64;
         if entry == 0 {
             return STATUS_NO_MEMORY;
         }
-        core::ptr::write_bytes(entry as *mut u8, 0, 32);
+        core::ptr::write_bytes(entry as *mut u8, 0, 48);
         core::ptr::write_unaligned((entry + 16) as *mut u64, notification_function as u64);
         core::ptr::write_unaligned((entry + 24) as *mut u64, context as u64);
-        ldr_insert_notification_entry(entry);
+        core::ptr::write_unaligned((entry + 40) as *mut u32, 1);
+        {
+            let _notification_lock = match acquire_notification_lock() {
+                Ok(guard) => guard,
+                Err(status) => {
+                    crate::process_heap_free(entry as *mut u8);
+                    return status;
+                }
+            };
+            let state = &mut *core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE);
+            if !state.can_register() {
+                drop(_notification_lock);
+                crate::process_heap_free(entry as *mut u8);
+                return STATUS_NO_MEMORY;
+            }
+            ldr_insert_notification_entry(entry);
+            state.registered();
+        }
         core::ptr::write_unaligned(cookie, entry as *mut c_void);
         STATUS_SUCCESS
     }
@@ -6566,25 +6672,42 @@ pub unsafe extern "system" fn ldr_register_dll_notification(
 pub unsafe extern "system" fn ldr_unregister_dll_notification(cookie: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let _loader_lock = match acquire_loader_lock() {
-            Ok(guard) => guard,
-            Err(status) => return status,
-        };
-        let head = ldr_notification_head();
-        let mut cur = core::ptr::read_unaligned(head as *const u64);
-        let wanted = cookie as u64;
-        let mut guard = 0usize;
-        while cur != 0 && cur != head && guard < 4096 {
-            let next = core::ptr::read_unaligned(cur as *const u64);
-            if cur == wanted {
-                ldr_remove_notification_entry(cur);
-                crate::process_heap_free(cur as *mut u8);
-                return STATUS_SUCCESS;
+        let mut reclaim = 0u64;
+        let status = {
+            let _notification_lock = match acquire_notification_lock() {
+                Ok(guard) => guard,
+                Err(status) => return status,
+            };
+            let head = ldr_notification_head();
+            let mut cur = core::ptr::read_unaligned(head as *const u64);
+            let wanted = cookie as u64;
+            let mut guard = 0usize;
+            let mut status = STATUS_DLL_NOT_FOUND;
+            while cur != 0 && cur != head && guard < LDR_DLL_NOTIFICATION_CAP {
+                let next = core::ptr::read_unaligned(cur as *const u64);
+                if cur == wanted {
+                    ldr_remove_notification_entry(cur);
+                    core::ptr::write_unaligned((cur + 40) as *mut u32, 0);
+                    match (*core::ptr::addr_of_mut!(LDR_DLL_NOTIFICATION_STATE)).removed() {
+                        nt_ntdll::loader::notification::RemovalDisposition::Defer => {
+                            retire_notification_entry(cur)
+                        }
+                        nt_ntdll::loader::notification::RemovalDisposition::ReclaimNow => {
+                            reclaim = cur
+                        }
+                    }
+                    status = STATUS_SUCCESS;
+                    break;
+                }
+                cur = next;
+                guard += 1;
             }
-            cur = next;
-            guard += 1;
+            status
+        };
+        if reclaim != 0 {
+            crate::process_heap_free(reclaim as *mut u8);
         }
-        STATUS_DLL_NOT_FOUND
+        status
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

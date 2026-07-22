@@ -28,6 +28,7 @@ pub mod init;
 pub mod lifecycle;
 pub mod lock;
 pub mod module;
+pub mod notification;
 pub mod order;
 pub mod peb;
 pub mod resolve;
