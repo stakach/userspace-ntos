@@ -89,6 +89,11 @@ static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
 static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ldr_shutdown_in_progress() -> bool {
+    RTL_DLL_SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire) != 0
+}
 static LDR_SHIM_ENGINE_MODULE: AtomicU64 = AtomicU64::new(0);
 static LDR_MANIFEST_PROBER_ROUTINE: AtomicU64 = AtomicU64::new(0);
 static RTL_PROCESS_ACTIVATION_CONTEXT: AtomicU64 = AtomicU64::new(0);
@@ -1657,8 +1662,7 @@ pub unsafe extern "system" fn rtl_create_tag_heap(
 }
 
 /// `RtlFreeUnicodeString(PUNICODE_STRING)` — free a heap-allocated `UNICODE_STRING` buffer and zero
-/// the descriptor. With the heap seam not wired, freeing is a no-op but the descriptor is zeroed
-/// (the observable half of the contract) so callers don't reuse a stale buffer.
+/// the descriptor.
 ///
 /// # Safety
 /// `s` a valid writable `UNICODE_STRING`.
@@ -1667,11 +1671,15 @@ pub unsafe extern "system" fn rtl_free_unicode_string(s: PUnicodeString) {
     if s.is_null() {
         return;
     }
-    // SAFETY: s is a valid writable UNICODE_STRING per the contract.
-    unsafe {
-        (*s).length = 0;
-        (*s).maximum_length = 0;
-        (*s).buffer = 0;
+    let buffer = unsafe { (*s).buffer };
+    if buffer != 0 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let _ = crate::process_heap_free(buffer as *mut u8);
+        }
+        unsafe {
+            core::ptr::write_bytes(s, 0, 1);
+        }
     }
 }
 
@@ -9089,8 +9097,7 @@ pub unsafe extern "system" fn ldr_shutdown_process() -> NtStatus {
 
 /// `LdrShutdownThread() -> NTSTATUS` — run balanced per-DLL thread detach callouts and release
 /// supported current-thread loader storage. Threads which never completed loader thread
-/// initialization do not receive synthetic detach notifications. Static-image TLS remains gated
-/// with the matching thread-attach implementation.
+/// initialization do not receive synthetic detach notifications.
 ///
 /// # Safety
 /// Reads the current TEB and may invoke mapped module entry points.

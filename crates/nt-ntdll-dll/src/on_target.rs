@@ -710,6 +710,161 @@ pub unsafe fn ldr_shutdown_process() -> u32 {
     0
 }
 
+/// Allocate static TLS and deliver balanced DLL_THREAD_ATTACH notifications for the current thread.
+///
+/// # Safety
+/// The process loader data is initialized and this is the current thread's one loader entry pass.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ldr_initialize_thread() -> u32 {
+    const DLL_THREAD_ATTACH: u32 = 2;
+    const DLL_THREAD_DETACH: u32 = 3;
+    let _loader_lock = match unsafe { crate::exports::acquire_loader_lock() } {
+        Ok(guard) => guard,
+        Err(status) => return status,
+    };
+    let teb = unsafe { current_teb() } as u64;
+    let reserve = unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).reserve(teb) };
+    match reserve {
+        Ok(nt_ntdll::loader::lifecycle::ThreadReserveOutcome::Created) => {}
+        Ok(nt_ntdll::loader::lifecycle::ThreadReserveOutcome::AlreadyReserved)
+        | Ok(nt_ntdll::loader::lifecycle::ThreadReserveOutcome::AlreadyCommitted) => return 0,
+        Err(_) => return STATUS_NO_MEMORY as u32,
+    }
+    if crate::exports::ldr_shutdown_in_progress() {
+        unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
+        return 0;
+    }
+    let tls_status = unsafe { allocate_current_thread_static_tls() };
+    if tls_status != 0 {
+        unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
+        return tls_status;
+    }
+
+    let table = unsafe { &*core::ptr::addr_of!(MODULE_TABLE) };
+    let mut modules = [nt_ntdll::loader::thread::ThreadModuleState::default(); MODULE_TABLE_CAP];
+    let mut count = 0usize;
+    for &base in table.attach_order.as_slice() {
+        if count == modules.len() {
+            unsafe { free_current_thread_static_tls() };
+            unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
+            return STATUS_NO_MEMORY as u32;
+        }
+        let entry = unsafe { ldr_entry_for_base(base) };
+        let flags = if entry != 0 {
+            unsafe { core::ptr::read_unaligned((entry + 0x68) as *const u32) }
+        } else {
+            0
+        };
+        let (tls_rva, tls_size) = unsafe { data_directory(base, 9) };
+        modules[count] = nt_ntdll::loader::thread::ThreadModuleState {
+            base,
+            entry_point_rva: unsafe { entry_point_rva(base) },
+            flags,
+            has_tls: tls_rva != 0 && tls_size >= 0x28,
+            is_ntdll: is_ntdll_base(table, base),
+        };
+        count += 1;
+    }
+    let executable_tls_base = {
+        let base = unsafe { EXE_BASE };
+        let (tls_rva, tls_size) = if base != 0 {
+            unsafe { data_directory(base, 9) }
+        } else {
+            (0, 0)
+        };
+        if tls_rva != 0 && tls_size >= 0x28 {
+            base
+        } else {
+            0
+        }
+    };
+    let plan = match nt_ntdll::loader::thread::plan_thread_attach::<MODULE_TABLE_CAP>(
+        false,
+        &modules[..count],
+        executable_tls_base,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            unsafe { free_current_thread_static_tls() };
+            unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
+            return STATUS_NO_MEMORY as u32;
+        }
+    };
+
+    let _callout = unsafe { crate::exports::enter_loader_callout() };
+    let mut completed = 0usize;
+    let mut executable_tls_attached = false;
+    let mut failure = 0u32;
+    for action in plan.actions() {
+        if crate::exports::ldr_shutdown_in_progress() {
+            failure = 0xC000_010A; // STATUS_PROCESS_IS_TERMINATING
+            break;
+        }
+        let mut activation_frame = [0u64; 7];
+        let Ok(_activation_context) =
+            (unsafe { ModuleActivationContextGuard::enter(action.base, &mut activation_frame) })
+        else {
+            failure = STATUS_NO_MEMORY as u32;
+            break;
+        };
+        if action.call_tls {
+            unsafe { call_tls_initializers(action.base, DLL_THREAD_ATTACH) };
+        }
+        let _ = unsafe { call_dll_main(action.base, DLL_THREAD_ATTACH, 0) };
+        completed += 1;
+    }
+    if failure == 0 && plan.executable_tls_base() != 0 {
+        if crate::exports::ldr_shutdown_in_progress() {
+            failure = 0xC000_010A;
+        } else {
+            let mut activation_frame = [0u64; 7];
+            if let Ok(_activation_context) = unsafe {
+                ModuleActivationContextGuard::enter(
+                    plan.executable_tls_base(),
+                    &mut activation_frame,
+                )
+            } {
+                unsafe { call_tls_initializers(plan.executable_tls_base(), DLL_THREAD_ATTACH) };
+                executable_tls_attached = true;
+            } else {
+                failure = STATUS_NO_MEMORY as u32;
+            };
+        }
+    }
+    if failure == 0
+        && unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).commit(teb) }.is_ok()
+    {
+        return 0;
+    }
+    if failure == 0 {
+        failure = STATUS_NO_MEMORY as u32;
+    }
+
+    if executable_tls_attached {
+        let mut activation_frame = [0u64; 7];
+        if let Ok(_activation_context) = unsafe {
+            ModuleActivationContextGuard::enter(plan.executable_tls_base(), &mut activation_frame)
+        } {
+            unsafe { call_tls_initializers(plan.executable_tls_base(), DLL_THREAD_DETACH) };
+        };
+    }
+    for action in plan.actions()[..completed].iter().rev() {
+        let mut activation_frame = [0u64; 7];
+        let Ok(_activation_context) =
+            (unsafe { ModuleActivationContextGuard::enter(action.base, &mut activation_frame) })
+        else {
+            continue;
+        };
+        if action.call_tls {
+            unsafe { call_tls_initializers(action.base, DLL_THREAD_DETACH) };
+        }
+        let _ = unsafe { call_dll_main(action.base, DLL_THREAD_DETACH, 0) };
+    }
+    unsafe { free_current_thread_static_tls() };
+    unsafe { (*core::ptr::addr_of_mut!(THREAD_INIT_LEDGER)).cancel(teb) };
+    failure
+}
+
 /// Run balanced thread-detach callbacks for a thread whose loader initialization committed.
 ///
 /// # Safety

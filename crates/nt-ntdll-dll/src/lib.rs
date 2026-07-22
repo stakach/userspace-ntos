@@ -586,6 +586,21 @@ pub unsafe extern "C" fn LdrpInitialize(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        let peb: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[0x60]",
+                out(reg) peb,
+                options(nostack, preserves_flags, readonly)
+            )
+        };
+        if peb != 0 && unsafe { core::ptr::read_unaligned((peb + 0x18) as *const u64) } != 0 {
+            let status = unsafe { on_target::ldr_initialize_thread() };
+            if status != 0 {
+                unsafe { exports::rtl_raise_status(status) };
+            }
+            return;
+        }
         // (1) The Step-4.A proof line (kept as a diagnostic; stack buffer — see dbg_print_bytes).
         let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
         // SAFETY: on-target, marker is a mapped stack buffer.
