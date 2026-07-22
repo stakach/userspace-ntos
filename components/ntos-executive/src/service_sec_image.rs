@@ -2234,14 +2234,17 @@ pub(crate) unsafe fn service_sec_image(
                     heap_mark = allocator::mark();
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
-                // need demand-fill (csrss_out_write); smss out-ptrs are stack locals (smss_stack_write).
+                // need a persistent image-page alias; other hosted processes can also return values
+                // to DLL globals. Use the handler's common cross-address-space writer for both.
                 for k in 0..nt_handler.out_writes_n {
                     let (ptr, val) = nt_handler.out_writes[k];
-                    if badge == CSRSS_BADGE {
-                        csrss_out_write(ptr, val, &mut *filled_pages, &mut faults, scratch_base,
-                            &reg, &dll_pes, pml4);
-                    } else {
-                        smss_stack_write(ptr, val);
+                    if !nt_handler.xas_write_u64(ptr, val) {
+                        print_str(b"[copyout] failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" ptr=0x");
+                        print_hex((ptr >> 32) as u32);
+                        print_hex(ptr as u32);
+                        print_str(b"\n");
                     }
                 }
                 // Checkpoint B: NtWaitForSingleObject on an unsignaled real event asked to PARK this
@@ -3527,22 +3530,20 @@ pub(crate) unsafe fn service_sec_image(
                 // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap/image
                 // mirrors are already selected by `pi` above (smss_stack_read reaches winlogon's stack).
                 let a0 = get_recv_mr(9); // R10 = arg1
-                let mut a1 = m3; // RDX = arg2
-                let mut a2 = get_recv_mr(7); // R8 = arg3
+                let a1 = m3; // RDX = arg2
+                let a2 = get_recv_mr(7); // R8 = arg3
                 let a3 = get_recv_mr(8); // R9 = arg4
                 // NtUserInitialize(dwWinVersion=a0, hPowerRequestEvent=a1, hMediaRequestEvent=a2):
-                // winsrv created these events via NtCreateEvent but our csrss demand-fill window
-                // couldn't write the handle back to winsrv's late .bss global, so they arrive NULL
-                // (pre-fix a fake EPROCESS masked that). Substitute the REAL minted handles the
-                // executive recorded (creation order = power, media), so win32k models + references
-                // genuine typed Event objects. Only fills NULLs (a working marshal is respected).
+                // winsrv created these events via NtCreateEvent into its own image globals. Forward
+                // exactly what the caller supplied; no executive-side substitution is permitted.
                 if m0 == win32k_subsystem::SSN_NT_USER_INITIALIZE_REAL {
-                    if a1 == 0 {
-                        a1 = nt_handler.csrss_event_handles[0];
-                    }
-                    if a2 == 0 {
-                        a2 = nt_handler.csrss_event_handles[1];
-                    }
+                    print_str(b"[ntuser-init] raw power=0x");
+                    print_hex((a1 >> 32) as u32);
+                    print_hex(a1 as u32);
+                    print_str(b" media=0x");
+                    print_hex((a2 >> 32) as u32);
+                    print_hex(a2 as u32);
+                    print_str(b"\n");
                 }
                 // NtCurrentProcess() == (HANDLE)-1: win32k's ObReferenceObjectByHandle resolves the
                 // hosted client's process via the synthetic handle the DriverEntry attach used.

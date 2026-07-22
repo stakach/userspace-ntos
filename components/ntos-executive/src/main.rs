@@ -4435,12 +4435,6 @@ struct ExecNtHandler {
     /// accept), writes the completed client comm-port handle, and replies winlogon. 0 = none.
     csr_rendezvous_conn: u64,
     csr_rendezvous_out: u64,
-    /// The two most-recent csrss `NtCreateEvent` handles, in creation order (winsrv's power + media
-    /// request events). NtUserInitialize's SSN>=0x1000 forward substitutes these for its NULL event
-    /// args (our csrss demand-fill window can't write the handle back to winsrv's late .bss global),
-    /// so win32k receives + models the REAL Event objects. See the `NtCreateEvent` handler.
-    csrss_event_handles: [u64; 2],
-    csrss_event_n: usize,
     /// The DATA-plane cache of established LPC connections (control/data-plane split): the isolated
     /// nt-lpc-server owns the namespace + rendezvous, but is NOT on the message path. When a CONNECT
     /// completes through the server, the executive records the connection here so the future message

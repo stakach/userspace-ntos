@@ -185,8 +185,6 @@ impl ExecNtHandler {
             csr_spawn_request: false,
             csr_rendezvous_conn: 0,
             csr_rendezvous_out: 0,
-            csrss_event_handles: [0; 2],
-            csrss_event_n: 0,
             // Reserve up front (below the per-syscall heap mark) so pushes never reallocate: a
             // bounded set of LPC connections (csrss→\SmApiPort + smss's ports) never exceeds this.
             lpc_connections: alloc::vec::Vec::with_capacity(16),
@@ -1104,19 +1102,6 @@ impl ExecNtHandler {
             self.out_writes[self.out_writes_n] = (ptr, val);
             self.out_writes_n += 1;
         }
-    }
-
-    fn remember_csrss_event_handle(&mut self, handle: u64) {
-        if self.pi != 1 {
-            return;
-        }
-        if self.csrss_event_n < self.csrss_event_handles.len() {
-            self.csrss_event_handles[self.csrss_event_n] = handle;
-        } else {
-            self.csrss_event_handles[0] = self.csrss_event_handles[1];
-            self.csrss_event_handles[1] = handle;
-        }
-        self.csrss_event_n += 1;
     }
 
     fn close_current_handle(&mut self, handle: u64) {
@@ -4454,11 +4439,8 @@ impl NativeSyscallHandler for ExecNtHandler {
             // at the fault holds the return IP, out of any writable range). For csrss that PHANDLE is
             // a winsrv .data global, so use the cross-address-space writer.
             // The out PHANDLE is arg1 = R10, and for csrss it is a winsrv .bss global. Our csrss
-            // demand-fill window is only 256 pages (csrss demand-pages ~343), so `csrss_out_write`
-            // cannot reliably reach winsrv's late .bss page — the handle would arrive back at winsrv
-            // as NULL. RECORD the real handle for the existing NtUserInitialize substitution as a
-            // bounded fallback if that late .bss page is beyond the fill table.
-            // The handle now also names the same real EventStore object used by NtSet/Reset/Query.
+            // The handle names the same real EventStore object used by NtSet/Reset/Query. Late DLL
+            // globals are reached through their persistent cross-address-space page aliases.
             NativeService::NtCreateEvent => {
                 // Services (pi 3): CreateEventW(SCM_START_EVENT/AUTOSTARTCOMPLETE/LSA_RPC_SERVER_ACTIVE/
                 // SECURITY_SERVICES_STARTED). NtCreateEvent(*EventHandle[R10]=args[0], ACCESS,
@@ -4502,7 +4484,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                             self.rollback_new_event(index);
                             return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                         }
-                        self.remember_csrss_event_handle(event_handle);
                         let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
                         if trace < 64 || self.current_badge == 15 {
                             print_str(b"[event] create pi=");
@@ -4535,7 +4516,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 self.rollback_new_event(index);
                                 return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                             }
-                            self.remember_csrss_event_handle(event_handle);
                             return 0;
                         }
                         Err(status) => return status,
