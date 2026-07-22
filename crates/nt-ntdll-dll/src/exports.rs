@@ -3570,6 +3570,27 @@ pub unsafe extern "system" fn rtl_query_registry_values(
     }
 }
 
+/// `RtlCheckRegistryKey(ULONG RelativeTo, PCWSTR Path) -> NTSTATUS` — resolve and probe a registry
+/// key through the live NtOpenKey/NtClose transport (`sdk/lib/rtl/registry.c:586`).
+///
+/// # Safety
+/// `path` is NULL, a NUL-terminated UTF-16 path, or a handle in `RTL_REGISTRY_HANDLE` mode.
+#[export_name = "RtlCheckRegistryKey"]
+pub unsafe extern "system" fn rtl_check_registry_key(
+    relative_to: u32,
+    path: *const u16,
+) -> NtStatus {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { crate::on_target::rtl_check_registry_key(relative_to, path) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (relative_to, path);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 // =================================================================================================
 // Rtl* — critical-process markers + boot-status. Live-plane wrappers (honest seams).
 // =================================================================================================
@@ -22215,6 +22236,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_does_file_exists_u as usize,
         rtl_dos_search_path_u as usize,
         rtl_query_registry_values as usize,
+        rtl_check_registry_key as usize,
         rtl_set_process_is_critical as usize,
         rtl_set_thread_is_critical as usize,
         rtl_create_boot_status_data_file as usize,

@@ -3469,6 +3469,17 @@ unsafe fn build_oa(
 /// On-target hosted-process syscall.
 #[cfg(target_arch = "x86_64")]
 unsafe fn open_key_utf16(root: u64, name: &[u16]) -> u64 {
+    let (status, handle) = unsafe { open_key_utf16_status(root, name) };
+    if status == STATUS_SUCCESS_U as u32 {
+        handle
+    } else {
+        0
+    }
+}
+
+/// Open a UTF-16 registry path and preserve the native status for compatibility helpers.
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_key_utf16_status(root: u64, name: &[u16]) -> (u32, u64) {
     let mut oa = [0u8; 0x30];
     let mut us = [0u8; 0x10];
     let mut handle: u64 = 0;
@@ -3489,11 +3500,8 @@ unsafe fn open_key_utf16(root: u64, name: &[u16]) -> u64 {
             oa.as_ptr() as u64,
             0,
         );
-        if st != STATUS_SUCCESS_U {
-            return 0;
-        }
+        return (st as u32, handle);
     }
-    handle
 }
 
 /// Resolve the RelativeTo base key path into a UTF-16 vec (absolute NT path), or `None` for
@@ -3506,8 +3514,64 @@ fn registry_base_path(relative_to: u32) -> Option<&'static str> {
         RTL_REGISTRY_WINDOWS_NT => {
             Some("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion")
         }
+        4 => Some("\\Registry\\Machine\\Hardware\\DeviceMap"),
+        5 => Some("\\Registry\\User\\.Default"),
         _ => None, // ABSOLUTE / HANDLE — caller handles
     }
+}
+
+/// `RtlCheckRegistryKey` live driver: resolve the `RTL_REGISTRY_*` base, open read-only through
+/// NtOpenKey, close the resulting handle, and return the original open status.
+///
+/// # Safety
+/// `path` is a NUL-terminated UTF-16 path, NULL, or a handle in RTL_REGISTRY_HANDLE mode.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rtl_check_registry_key(relative_to: u32, path: *const u16) -> u32 {
+    use alloc::vec::Vec;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
+    const RTL_REGISTRY_MAXIMUM: u32 = 6;
+
+    if relative_to & RTL_REGISTRY_HANDLE != 0 {
+        let handle = path as u64;
+        let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+        return STATUS_SUCCESS_U as u32;
+    }
+
+    let base_kind = relative_to & !RTL_REGISTRY_OPTIONAL;
+    if base_kind >= RTL_REGISTRY_MAXIMUM {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let path_length = if path.is_null() {
+        0
+    } else {
+        unsafe { wlen(path) }
+    };
+    if base_kind == RTL_REGISTRY_ABSOLUTE && path_length == 0 {
+        return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    }
+
+    let mut full = Vec::new();
+    if let Some(base) = registry_base_path(base_kind) {
+        full.extend(base.encode_utf16());
+    }
+    if path_length != 0 {
+        let mut path_slice = unsafe { core::slice::from_raw_parts(path, path_length) };
+        if base_kind != RTL_REGISTRY_ABSOLUTE && path_slice.first().copied() == Some(b'\\' as u16) {
+            path_slice = &path_slice[1..];
+        }
+        if !full.is_empty() && !path_slice.is_empty() {
+            full.push(b'\\' as u16);
+        }
+        full.extend_from_slice(path_slice);
+    }
+
+    let (status, handle) = unsafe { open_key_utf16_status(0, &full) };
+    if status != STATUS_SUCCESS_U as u32 {
+        return status;
+    }
+    let _ = unsafe { syscall4(SSN_NT_CLOSE, handle, 0, 0, 0) };
+    STATUS_SUCCESS_U as u32
 }
 
 /// Does the NUL-terminated UTF-16 `name_ptr` equal the ASCII `want` (case-sensitive)?
