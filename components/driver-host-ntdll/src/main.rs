@@ -703,21 +703,34 @@ unsafe fn service_loop(fault_ep: u64, ntdll: &NtdllImage, peb: u64) -> SvcResult
             write_u64(a4, req_size.div_ceil(0x1000) * 0x1000);
         } else if ssn == s_nqip {
             let (info, len) = (a3, a4);
-            if info != 0 {
-                let mut o = 0u64;
-                while o + 8 <= len {
-                    write_u64(info + o, 0);
-                    o += 8;
-                }
-            }
-            if a2 == 0 && info != 0 && len >= 0x30 {
-                write_u64(info + 8, peb); // ProcessBasicInformation.PebBaseAddress
-            } else if a2 == 0x24 && info != 0 && len >= 4 {
-                write_u32(info, 0x1122_3344); // ProcessCookie
-            }
             let retlen = read_u64(sp + 0x28);
-            if retlen != 0 {
-                write_u32(retlen, len as u32);
+            if a2 == 0x24 {
+                if a1 != u64::MAX {
+                    rep[0] = 0xC000_000D; // STATUS_INVALID_PARAMETER
+                } else if len != 4 {
+                    rep[0] = 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                } else if info == 0 {
+                    rep[0] = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                } else {
+                    write_u32(info, 0x1122_3344);
+                    if retlen != 0 {
+                        write_u32(retlen, 4);
+                    }
+                }
+            } else {
+                if info != 0 {
+                    let mut o = 0u64;
+                    while o + 8 <= len {
+                        write_u64(info + o, 0);
+                        o += 8;
+                    }
+                }
+                if a2 == 0 && info != 0 && len >= 0x30 {
+                    write_u64(info + 8, peb); // ProcessBasicInformation.PebBaseAddress
+                }
+                if retlen != 0 {
+                    write_u32(retlen, len as u32);
+                }
             }
         } else if ssn == s_qsi {
             let (class, buf, blen) = (a1, a2, a3);
