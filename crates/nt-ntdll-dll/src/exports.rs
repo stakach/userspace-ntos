@@ -26,7 +26,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nt_ntdll::rtl;
 use nt_ntdll_layout::{Teb, UnicodeString};
@@ -1689,10 +1689,123 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 }
 
 // =================================================================================================
-// Rtl* — critical sections. The uncontended fast path is real (via nt_ntdll::sync); the contended
-// blocking path is the keyed-event seam (Step 6). At 4.0b we export the correct ABI over the raw
-// RTL_CRITICAL_SECTION pointer; the fast-path acquire/release semantics are honest.
+// Rtl* — critical sections. Contention blocks on a lazily-created synchronization event, with the
+// global keyed-event rendezvous as the same allocation-failure fallback ReactOS uses.
 // =================================================================================================
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_create_event() -> Result<u64, NtStatus> {
+    let mut handle = 0u64;
+    let status = unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut u64, u32, *mut c_void, u32, u8) -> NtStatus,
+        >(nt_ntdll::trap_stubs::nt_create_event)(
+            &mut handle,
+            0x001F_0003,
+            core::ptr::null_mut(),
+            1,
+            0,
+        )
+    };
+    if nt_success(status) {
+        Ok(handle)
+    } else {
+        Err(status)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_close(handle: u64) -> NtStatus {
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
+            nt_ntdll::trap_stubs::nt_close,
+        )(handle)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_wait_handle(cs: *mut c_void) -> u64 {
+    let slot = unsafe { &*(cs.byte_add(0x18) as *const AtomicU64) };
+    let existing = slot.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    let candidate = unsafe { critical_section_create_event() }.unwrap_or(u64::MAX);
+    match slot.compare_exchange(0, candidate, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => candidate,
+        Err(installed) => {
+            if candidate != u64::MAX {
+                let _ = unsafe { critical_section_close(candidate) };
+            }
+            installed
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_wait(cs: *mut c_void) -> NtStatus {
+    let handle = unsafe { critical_section_wait_handle(cs) };
+    if handle == u64::MAX {
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_wait_for_keyed_event)(
+                0,
+                cs as u64,
+                0,
+                core::ptr::null(),
+            )
+        }
+    } else {
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64, u8, *const i64) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(handle, 0, core::ptr::null())
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_wake_one(cs: *mut c_void) -> NtStatus {
+    let handle = unsafe { critical_section_wait_handle(cs) };
+    if handle == u64::MAX {
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_release_keyed_event)(
+                0,
+                cs as u64,
+                0,
+                core::ptr::null(),
+            )
+        }
+    } else {
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(u64, *mut i32) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_set_event)(handle, core::ptr::null_mut())
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn critical_section_owned_count(delta: i32) {
+    let teb: u64;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags, readonly));
+        let count = (teb as *mut u8).add(0x6c) as *mut u32;
+        if delta > 0 {
+            *count = (*count).wrapping_add(delta as u32);
+        } else {
+            *count = (*count).wrapping_sub(delta.unsigned_abs());
+        }
+    }
+}
 
 /// `RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION) -> NTSTATUS`.
 ///
@@ -1749,13 +1862,29 @@ pub unsafe extern "system" fn rtl_enter_critical_section(cs: *mut c_void) -> NtS
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // Uncontended fast path: atomically bump LockCount from -1 to 0. Contention → the keyed-event
-    // wait seam (Step 6). We take the interlocked increment; a positive prior value means contended
-    // and would block (honest seam — not spun/faked here).
-    // SAFETY: cs is a valid RTL_CRITICAL_SECTION per the contract.
+    let tid = unsafe { resource_current_thread() };
+    let lock_count = unsafe { &*(cs.byte_add(0x08) as *const AtomicI32) };
+    let new_count = lock_count.fetch_add(1, Ordering::Acquire) + 1;
+    if new_count != 0 {
+        let owner = unsafe { &*(cs.byte_add(0x10) as *const AtomicU64) };
+        if owner.load(Ordering::Acquire) == tid {
+            unsafe { *(cs.byte_add(0x0c) as *mut i32) += 1 };
+            return STATUS_SUCCESS;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let status = unsafe { critical_section_wait(cs) };
+            if !nt_success(status) {
+                lock_count.fetch_sub(1, Ordering::Release);
+                return status;
+            }
+        }
+    }
     unsafe {
-        let lock_count = &*((cs as *mut u8).add(0x08) as *mut core::sync::atomic::AtomicI32);
-        lock_count.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+        *(cs.byte_add(0x10) as *mut u64) = tid;
+        *(cs.byte_add(0x0c) as *mut i32) = 1;
+        #[cfg(target_arch = "x86_64")]
+        critical_section_owned_count(1);
     }
     STATUS_SUCCESS
 }
@@ -1769,10 +1898,31 @@ pub unsafe extern "system" fn rtl_leave_critical_section(cs: *mut c_void) -> NtS
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: cs is a valid RTL_CRITICAL_SECTION per the contract.
+    let recursion = unsafe { cs.byte_add(0x0c) as *mut i32 };
+    unsafe { *recursion -= 1 };
+    if unsafe { *recursion } < 0 {
+        return 0xC000_0001; // STATUS_UNSUCCESSFUL
+    }
+    let lock_count = unsafe { &*(cs.byte_add(0x08) as *const AtomicI32) };
+    if unsafe { *recursion } != 0 {
+        lock_count.fetch_sub(1, Ordering::Release);
+        return STATUS_SUCCESS;
+    }
     unsafe {
-        let lock_count = &*((cs as *mut u8).add(0x08) as *mut core::sync::atomic::AtomicI32);
-        lock_count.fetch_sub(1, core::sync::atomic::Ordering::Release);
+        *(cs.byte_add(0x10) as *mut u64) = 0;
+        #[cfg(target_arch = "x86_64")]
+        critical_section_owned_count(-1);
+    }
+    let new_count = lock_count.fetch_sub(1, Ordering::Release) - 1;
+    if new_count != -1 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let status = unsafe { critical_section_wake_one(cs) };
+            if !nt_success(status) {
+                unsafe { rtl_raise_status(status) };
+                return status;
+            }
+        }
     }
     STATUS_SUCCESS
 }
@@ -5274,6 +5424,15 @@ pub unsafe extern "system" fn rtl_delete_critical_section(cs: *mut c_void) -> Nt
     if cs.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    #[cfg(target_arch = "x86_64")]
+    let close_status = unsafe {
+        let handle = core::ptr::read(cs.byte_add(0x18) as *const u64);
+        if handle != 0 && handle != u64::MAX {
+            critical_section_close(handle)
+        } else {
+            STATUS_SUCCESS
+        }
+    };
     // SAFETY: cs a valid 40-byte RTL_CRITICAL_SECTION per the contract. Free the heap-allocated
     // DebugInfo (RtlpFreeDebugInfo) before wiping — skip NULL and the -1 NO_DEBUG_INFO sentinel.
     #[cfg(target_arch = "x86_64")]
@@ -5285,6 +5444,9 @@ pub unsafe extern "system" fn rtl_delete_critical_section(cs: *mut c_void) -> Nt
     }
     // SAFETY: cs valid per the contract.
     unsafe { core::ptr::write_bytes(cs as *mut u8, 0, 40) };
+    #[cfg(target_arch = "x86_64")]
+    return close_status;
+    #[cfg(not(target_arch = "x86_64"))]
     STATUS_SUCCESS
 }
 
@@ -17336,8 +17498,7 @@ pub unsafe extern "system" fn rtl_set_critical_section_spin_count(
     }
 }
 
-/// `RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) -> BOOLEAN` — non-blocking acquire. Single-
-/// threaded: if free (or owned by us), acquire; else FALSE. Model the interlocked LockCount.
+/// `RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) -> BOOLEAN` — non-blocking acquire.
 ///
 /// # Safety
 /// `cs` a valid RTL_CRITICAL_SECTION.
@@ -17346,20 +17507,27 @@ pub unsafe extern "system" fn rtl_try_enter_critical_section(cs: *mut c_void) ->
     if cs.is_null() {
         return 0;
     }
-    // SAFETY: cs valid per the contract. LockCount @ 8 (init -1 = free), RecursionCount @ 0xC.
-    unsafe {
-        let lock = (cs as *mut i32).byte_add(8);
-        let rec = (cs as *mut i32).byte_add(0xC);
-        if *lock == -1 {
-            *lock = 0;
-            *rec = 1;
-            1
-        } else {
-            // Single-threaded: treat as recursive re-entry (we are the only thread).
-            *lock += 1;
-            *rec += 1;
-            1
+    let tid = unsafe { resource_current_thread() };
+    let lock = unsafe { &*(cs.byte_add(0x08) as *const AtomicI32) };
+    if lock
+        .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        unsafe {
+            *(cs.byte_add(0x10) as *mut u64) = tid;
+            *(cs.byte_add(0x0c) as *mut i32) = 1;
+            #[cfg(target_arch = "x86_64")]
+            critical_section_owned_count(1);
         }
+        return 1;
+    }
+    let owner = unsafe { &*(cs.byte_add(0x10) as *const AtomicU64) };
+    if owner.load(Ordering::Acquire) == tid {
+        lock.fetch_add(1, Ordering::Relaxed);
+        unsafe { *(cs.byte_add(0x0c) as *mut i32) += 1 };
+        1
+    } else {
+        0
     }
 }
 
