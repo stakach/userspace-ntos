@@ -26,6 +26,8 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use nt_ntdll::heap::{Heap, HeapUserInfo};
 
@@ -50,10 +52,9 @@ pub mod seh;
 #[cfg(target_arch = "x86_64")]
 type ProcessHeap = Heap<on_target::HeapBacking>;
 
-/// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). Single-threaded
-/// during load (smss is one thread until it spawns), so a `static mut` accessed only from the loader
-/// thread is sound. `None` until `LdrpInitialize` creates it; a global-alloc call before then falls
-/// back to a null (allocation-failure) return — the honest behavior (never a bogus pointer).
+/// The **real process heap** installed in-process by [`LdrpInitialize`] (Step 4.B). `None` until
+/// initialization; all later access is covered by [`PROCESS_HEAP_LOCK`] so hosted worker threads
+/// cannot alias its mutable state. A global-alloc call before installation returns null.
 ///
 /// NOTE: the heap type is target-gated (`HeapBacking` is target-only), so this cell only exists on
 /// x86_64; on the host build the allocator is a no-op abort cell (there is no live allocation off
@@ -61,13 +62,38 @@ type ProcessHeap = Heap<on_target::HeapBacking>;
 #[cfg(target_arch = "x86_64")]
 static mut PROCESS_HEAP: Option<ProcessHeap> = None;
 
+#[cfg(target_arch = "x86_64")]
+static PROCESS_HEAP_LOCK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+struct ProcessHeapLockGuard;
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for ProcessHeapLockGuard {
+    fn drop(&mut self) {
+        PROCESS_HEAP_LOCK.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn lock_process_heap() -> ProcessHeapLockGuard {
+    while PROCESS_HEAP_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    ProcessHeapLockGuard
+}
+
 /// Install the process heap (called once by [`LdrpInitialize`] after `NtAllocateVirtualMemory`).
 ///
 /// # Safety
 /// Called once, single-threaded, during process load before any concurrent allocation.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn install_process_heap(heap: ProcessHeap) {
-    // SAFETY: single-threaded loader context; installed exactly once before concurrent use.
+    let _guard = lock_process_heap();
+    // SAFETY: the process-heap guard excludes every reader and writer; installation occurs once.
     unsafe {
         core::ptr::addr_of_mut!(PROCESS_HEAP).write(Some(heap));
     }
@@ -79,7 +105,7 @@ pub(crate) fn install_process_heap(heap: ProcessHeap) {
 /// null on OOM / before the heap is installed (an honest allocation failure — never a bogus pointer).
 ///
 /// # Safety
-/// Single-threaded loader context (smss is one thread until it spawns csrss).
+/// Serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
     unsafe { process_heap_alloc_with_flags(size, 0) }
@@ -88,10 +114,11 @@ pub(crate) unsafe fn process_heap_alloc(size: usize) -> *mut u8 {
 /// Allocate from the process heap while retaining the native per-allocation user flags.
 ///
 /// # Safety
-/// Single-threaded loader context (smss is one thread until it spawns csrss).
+/// Serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *mut u8 {
-    // SAFETY: single-threaded loader access to the installed heap.
+    let _guard = lock_process_heap();
+    // SAFETY: the process-heap guard excludes all other access.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
             return h
@@ -107,10 +134,11 @@ pub(crate) unsafe fn process_heap_alloc_with_flags(size: usize, flags: u32) -> *
 ///
 /// # Safety
 /// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`] (the real `RtlFreeHeap`
-/// trusts the caller's pointer identically). Single-threaded loader context.
+/// trusts the caller's pointer identically). Access is serialized by the process-heap guard.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
-    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    let _guard = lock_process_heap();
+    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
             return h.free(ptr);
@@ -124,7 +152,7 @@ pub(crate) unsafe fn process_heap_free(ptr: *mut u8) -> bool {
 /// the (possibly relocated) pointer, or null on OOM / before the heap is installed.
 ///
 /// # Safety
-/// `ptr` must have come from [`process_heap_alloc`]/`process_heap_realloc`. Single-threaded loader.
+/// `ptr` must have come from [`process_heap_alloc`]/`process_heap_realloc`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     unsafe { process_heap_realloc_with_flags(ptr, new_size, 0, false) }
@@ -133,7 +161,7 @@ pub(crate) unsafe fn process_heap_realloc(ptr: *mut u8, new_size: usize) -> *mut
 /// Reallocate a process-heap block with user metadata and in-place-only semantics.
 ///
 /// # Safety
-/// `ptr` must be a live process-heap allocation. Single-threaded loader context.
+/// `ptr` must be a live process-heap allocation.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_realloc_with_flags(
     ptr: *mut u8,
@@ -141,7 +169,8 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
     flags: u32,
     in_place_only: bool,
 ) -> *mut u8 {
-    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    let _guard = lock_process_heap();
+    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
             return h
@@ -156,10 +185,11 @@ pub(crate) unsafe fn process_heap_realloc_with_flags(
 /// `None` for a null / not-live pointer.
 ///
 /// # Safety
-/// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`]. Single-threaded loader.
+/// `ptr` must have come from [`process_heap_alloc`]/[`process_heap_realloc`].
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
-    // SAFETY: single-threaded loader access; ptr came from this heap per the contract.
+    let _guard = lock_process_heap();
+    // SAFETY: the process-heap guard excludes all other access; ptr follows the contract.
     unsafe {
         if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
             return h.size_of(ptr);
@@ -174,6 +204,7 @@ pub(crate) unsafe fn process_heap_size(ptr: *mut u8) -> Option<usize> {
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo> {
+    let _guard = lock_process_heap();
     unsafe {
         (*core::ptr::addr_of_mut!(PROCESS_HEAP))
             .as_ref()
@@ -187,6 +218,7 @@ pub(crate) unsafe fn process_heap_user_info(ptr: *mut u8) -> Option<HeapUserInfo
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> bool {
+    let _guard = lock_process_heap();
     unsafe {
         (*core::ptr::addr_of_mut!(PROCESS_HEAP))
             .as_mut()
@@ -200,6 +232,7 @@ pub(crate) unsafe fn process_heap_set_user_value(ptr: *mut u8, value: usize) -> 
 /// `ptr` must be a live process-heap allocation or an invalid pointer to reject.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn process_heap_set_user_flags(ptr: *mut u8, reset: u32, set: u32) -> bool {
+    let _guard = lock_process_heap();
     unsafe {
         (*core::ptr::addr_of_mut!(PROCESS_HEAP))
             .as_mut()
@@ -219,15 +252,10 @@ unsafe impl GlobalAlloc for ProcessHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: single-threaded loader access to the installed heap.
-            unsafe {
-                if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-                    // The heap guarantees 16-byte alignment; larger alignments over-allocate to fit.
-                    let want = layout.size().max(1) + layout.align().saturating_sub(1);
-                    return h.allocate(want).unwrap_or(core::ptr::null_mut());
-                }
+            if layout.align() > nt_ntdll::heap::HEAP_ALIGN {
+                return core::ptr::null_mut();
             }
-            core::ptr::null_mut()
+            unsafe { process_heap_alloc(layout.size().max(1)) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -238,12 +266,7 @@ unsafe impl GlobalAlloc for ProcessHeapAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: single-threaded loader access; ptr came from this heap.
-            unsafe {
-                if let Some(h) = (*core::ptr::addr_of_mut!(PROCESS_HEAP)).as_mut() {
-                    let _ = h.free(ptr);
-                }
-            }
+            let _ = unsafe { process_heap_free(ptr) };
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
