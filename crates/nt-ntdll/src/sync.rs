@@ -109,6 +109,7 @@ impl CriticalSection {
     pub fn try_enter(&mut self, tid: u64) -> Acquire {
         // Recursive re-entry: the owner re-takes its own lock without touching the wait plane.
         if self.owning_thread == tid && self.lock_count >= 0 {
+            self.lock_count += 1;
             self.recursion_count += 1;
             return Acquire::Recursed;
         }
@@ -137,6 +138,7 @@ impl CriticalSection {
         }
         self.recursion_count -= 1;
         if self.recursion_count > 0 {
+            self.lock_count -= 1;
             return Some(false); // still held recursively by the same thread
         }
         // Final leave: relinquish ownership.
@@ -144,6 +146,13 @@ impl CriticalSection {
         self.lock_count -= 1; // InterlockedDecrement
         let waiter_present = self.lock_count >= 0; // a queued waiter remains
         Some(waiter_present)
+    }
+
+    /// Complete ownership transfer after the contended wait is signaled. The waiter's earlier
+    /// `try_enter` already incremented `lock_count`, so handoff only installs owner and recursion.
+    pub fn finish_wait(&mut self, tid: u64) {
+        self.owning_thread = tid;
+        self.recursion_count = 1;
     }
 
     /// `RtlDeleteCriticalSection`: reset the descriptor (the real one also frees `LockSemaphore`).
@@ -405,8 +414,10 @@ mod tests {
         let mut cs = CriticalSection::new();
         assert_eq!(cs.try_enter(T1), Acquire::Acquired);
         assert_eq!(cs.try_enter(T1), Acquire::Recursed);
+        assert_eq!(cs.lock_count, 1);
         assert_eq!(cs.recursion_count, 2);
         assert_eq!(cs.leave(T1), Some(false)); // still held (recursion 2->1)
+        assert_eq!(cs.lock_count, 0);
         assert_eq!(cs.leave(T1), Some(false)); // now released
         assert_eq!(cs.owning_thread, NO_OWNER);
     }
@@ -425,6 +436,12 @@ mod tests {
         );
         // The owner leaving with a queued waiter reports a wake is required.
         assert_eq!(cs.leave(T1), Some(true));
+        assert_eq!(cs.lock_count, 0);
+        cs.finish_wait(T2);
+        assert_eq!(cs.owning_thread, T2);
+        assert_eq!(cs.recursion_count, 1);
+        assert_eq!(cs.leave(T2), Some(false));
+        assert_eq!(cs.lock_count, -1);
         assert_eq!(WaitSeam::wake_one(&cs), crate::STATUS_NOT_IMPLEMENTED);
     }
 

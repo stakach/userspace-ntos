@@ -486,14 +486,14 @@ fn three_module_set() -> LoaderState {
 
 #[test]
 fn ldrp_initialize_drives_the_whole_graph() {
-    let st = three_module_set();
+    let mut st = three_module_set();
     let mut host = MockHost::new();
     let params = InitParams {
         root_module: "app.exe".to_string(),
         cookie_seed: 0xDEAD_BEEF_CAFE_0000,
         ..InitParams::default()
     };
-    let res = init::ldrp_initialize(&st, &params, &mut host).unwrap();
+    let res = init::ldrp_initialize(&mut st, &params, &mut host).unwrap();
 
     // Normalized flag set.
     assert_eq!(
@@ -533,20 +533,34 @@ fn ldrp_initialize_drives_the_whole_graph() {
     assert_eq!(host.committed, Some((params.peb_va, params.teb_va)));
     assert_eq!(host.transferred, Some((0x1_0000 + 0x500, params.peb_va)));
     assert_eq!(res.entry_va, 0x1_0000 + 0x500);
+
+    let order = order::initialization_order(&st, &["app.exe"]);
+    let call_count = host.dll_main_calls.len();
+    assert!(
+        init::attach_modules(&mut st, &order, Some("app.exe"), &mut host)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(host.dll_main_calls.len(), call_count);
 }
 
 /// A DllMain returning FALSE fails the load with STATUS_DLL_INIT_FAILED.
 #[test]
 fn ldrp_initialize_fails_when_dll_main_returns_false() {
-    let st = three_module_set();
+    let mut st = three_module_set();
     let mut host = MockHost::new();
     host.dll_main_fail_base = Some(0x2_0000); // b.dll's DllMain returns FALSE
     let params = InitParams {
         root_module: "app.exe".to_string(),
         ..InitParams::default()
     };
-    let err = init::ldrp_initialize(&st, &params, &mut host).unwrap_err();
+    let err = init::ldrp_initialize(&mut st, &params, &mut host).unwrap_err();
     assert_eq!(err, init::STATUS_DLL_INIT_FAILED);
+    assert!(st.modules.iter().all(|module| !module.initialized));
+    assert!(host
+        .dll_main_calls
+        .iter()
+        .any(|(base, _, reason)| *base == 0x3_0000 && *reason == DllReason::ProcessDetach));
 }
 
 /// A missing dependency aborts LdrpInitialize with STATUS_DLL_NOT_FOUND (not a spin).
@@ -564,20 +578,20 @@ fn ldrp_initialize_reports_missing_dependency() {
         root_module: "app.exe".to_string(),
         ..InitParams::default()
     };
-    let err = init::ldrp_initialize(&st, &params, &mut host).unwrap_err();
+    let err = init::ldrp_initialize(&mut st, &params, &mut host).unwrap_err();
     assert_eq!(err, init::STATUS_DLL_NOT_FOUND);
 }
 
 /// The NullHost never fakes a live op: map_image returns NOT_IMPLEMENTED, so init aborts honestly.
 #[test]
 fn null_host_never_fakes_a_live_operation() {
-    let st = three_module_set();
+    let mut st = three_module_set();
     let mut host = NullHost;
     let params = InitParams {
         root_module: "app.exe".to_string(),
         ..InitParams::default()
     };
-    let err = init::ldrp_initialize(&st, &params, &mut host).unwrap_err();
+    let err = init::ldrp_initialize(&mut st, &params, &mut host).unwrap_err();
     assert_eq!(err, crate::STATUS_NOT_IMPLEMENTED);
 }
 
@@ -585,7 +599,7 @@ fn null_host_never_fakes_a_live_operation() {
 
 #[test]
 fn apphelp_not_loaded_without_a_shim_db() {
-    let st = three_module_set();
+    let mut st = three_module_set();
     let mut host = MockHost::new();
     // Default policy = NoShims → apphelp NOT loaded.
     let params = InitParams {
@@ -593,7 +607,7 @@ fn apphelp_not_loaded_without_a_shim_db() {
         shim_policy: ShimPolicy::NoShims,
         ..InitParams::default()
     };
-    let res = init::ldrp_initialize(&st, &params, &mut host).unwrap();
+    let res = init::ldrp_initialize(&mut st, &params, &mut host).unwrap();
     assert!(!res.loaded_apphelp);
 
     // With a matching shim DB → apphelp IS loaded.
@@ -603,7 +617,7 @@ fn apphelp_not_loaded_without_a_shim_db() {
         shim_policy: ShimPolicy::LoadShimEngine,
         ..InitParams::default()
     };
-    let res2 = init::ldrp_initialize(&st, &params2, &mut host2).unwrap();
+    let res2 = init::ldrp_initialize(&mut st, &params2, &mut host2).unwrap();
     assert!(res2.loaded_apphelp);
 }
 

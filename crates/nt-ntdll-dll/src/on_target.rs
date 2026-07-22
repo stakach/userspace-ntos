@@ -346,6 +346,12 @@ unsafe fn rd32_at(addr: u64) -> u32 {
 /// `entry_va` must be the mapped, executable entry point of a real DLL in this VSpace.
 #[cfg(target_arch = "x86_64")]
 unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
+    let entry = unsafe { base + entry_point_rva(base) as u64 };
+    unsafe { call_init_routine(entry, base, reason) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_init_routine(entry: u64, base: u64, reason: u32) -> u64 {
     let ret: u64;
     // SAFETY: entry_va is a mapped executable DLL entry; the callee follows the Win64 ABI. Rust keeps
     // rsp 16-aligned (≡0 mod 16) inside a function body, so we reserve EXACTLY 0x20 (shadow space,
@@ -358,7 +364,6 @@ unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
     // unlike an `and rsp,-16` scratch-save form which perturbs the surrounding frame's own SSE
     // spill/reload offsets).
     unsafe {
-        let entry = base + entry_point_rva(base) as u64;
         core::arch::asm!(
             "sub rsp, 0x20",
             "xor r8d, r8d",
@@ -375,6 +380,36 @@ unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
     ret
 }
 
+/// Invoke every PE TLS callback for `reason`. IMAGE_TLS_DIRECTORY64.AddressOfCallBacks is an
+/// absolute VA at offset 0x18 and points to a NULL-terminated callback array.
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_tls_initializers(base: u64, reason: u32) {
+    let (tls_rva, tls_size) = unsafe { data_directory(base, 9) };
+    if tls_rva == 0 || tls_size < 0x28 {
+        return;
+    }
+    let callbacks = unsafe {
+        core::ptr::read_unaligned((base + tls_rva as u64 + 0x18) as *const u64)
+    };
+    if callbacks == 0 {
+        return;
+    }
+    let mut index = 0u64;
+    loop {
+        let callback = unsafe {
+            core::ptr::read_unaligned((callbacks + index * 8) as *const u64)
+        };
+        if callback == 0 {
+            break;
+        }
+        let _ = unsafe { call_init_routine(callback, base, reason) };
+        index += 1;
+        if index >= 256 {
+            break;
+        }
+    }
+}
+
 /// Run `DLL_PROCESS_ATTACH` for every loaded DEPENDENT DLL (not the EXE, not our own ntdll), in
 /// reverse discovery order (leaf dependencies first — the DFS `snap_module` inserts a parent before
 /// its children, so the LAST-inserted entries are the deepest leaves). This is the live
@@ -387,7 +422,7 @@ unsafe fn call_dll_main(base: u64, reason: u32) -> u64 {
 /// valid `*mut ModuleTable` uniquely owned by the single-threaded loader (used mutably to RE-SNAP a
 /// module's imports immediately before its DllMain — see [`attach_dfs`]).
 #[cfg(target_arch = "x86_64")]
-unsafe fn run_process_attach(table: *mut ModuleTable) {
+unsafe fn run_process_attach(table: *mut ModuleTable) -> u32 {
     // Post-order DFS: a module's DEPENDENCIES init before it (kernel32 before advapi32 before mpr,
     // etc.). A per-base visited set dedupes diamonds + breaks cycles. The order matters: mpr's
     // DllMain calls kernel32 functions, so kernel32 must have run InitCommandLines first. Reverse
@@ -397,15 +432,53 @@ unsafe fn run_process_attach(table: *mut ModuleTable) {
         let count = (*table).count.min(MODULE_TABLE_CAP);
         let mut visited = [0u64; MODULE_TABLE_CAP];
         let mut vn = 0usize;
+        let mut newly_attached = [0u64; MODULE_TABLE_CAP];
+        let mut attached_count = 0usize;
         let mut i = 0usize;
         while i < count {
             let b = (*table).mods[i].base;
             if b >= 0x1_0000 {
-                attach_dfs(table, b, &mut visited, &mut vn, 0);
+                let status = attach_dfs(
+                    table,
+                    b,
+                    &mut visited,
+                    &mut vn,
+                    &mut newly_attached,
+                    &mut attached_count,
+                    0,
+                );
+                if status != 0 {
+                    rollback_process_attach(table, &newly_attached[..attached_count]);
+                    return status;
+                }
             }
             i += 1;
         }
+        0
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn run_process_attach_root(table: *mut ModuleTable, base: u64) -> u32 {
+    let mut visited = [0u64; MODULE_TABLE_CAP];
+    let mut visited_count = 0usize;
+    let mut newly_attached = [0u64; MODULE_TABLE_CAP];
+    let mut attached_count = 0usize;
+    let status = unsafe {
+        attach_dfs(
+            table,
+            base,
+            &mut visited,
+            &mut visited_count,
+            &mut newly_attached,
+            &mut attached_count,
+            0,
+        )
+    };
+    if status != 0 {
+        unsafe { rollback_process_attach(table, &newly_attached[..attached_count]) };
+    }
+    status
 }
 
 /// Recursively `DLL_PROCESS_ATTACH` `base`'s dependencies (post-order) then `base` itself. `visited`
@@ -420,16 +493,24 @@ unsafe fn attach_dfs(
     base: u64,
     visited: &mut [u64; MODULE_TABLE_CAP],
     vn: &mut usize,
+    newly_attached: &mut [u64; MODULE_TABLE_CAP],
+    attached_count: &mut usize,
     depth: u32,
-) {
+) -> u32 {
     const DLL_PROCESS_ATTACH: u32 = 1;
     if base < 0x1_0000 || depth > 16 {
-        return;
+        return 0xC000_0001; // STATUS_UNSUCCESSFUL
+    }
+    let Some(module_index) = (unsafe { (*table).index_by_base(base) }) else {
+        return 0xC000_0135; // STATUS_DLL_NOT_FOUND
+    };
+    if unsafe { (*table).mods[module_index].attached || (*table).mods[module_index].attaching } {
+        return 0;
     }
     // Already attached?
     for &v in visited.iter().take(*vn) {
         if v == base {
-            return;
+            return 0;
         }
     }
     // Mark visited BEFORE recursing (cycle break).
@@ -439,6 +520,7 @@ unsafe fn attach_dfs(
     }
     // SAFETY: base is a mapped PE image; the import walk reads mapped headers; `table` uniquely owned.
     unsafe {
+        (*table).mods[module_index].attaching = true;
         // Walk this module's imports; for each imported DLL found in the table, recurse first.
         let (idir_rva, _sz) = data_directory(base, 1);
         if idir_rva != 0 {
@@ -453,18 +535,38 @@ unsafe fn attach_dfs(
                 let bn = import_desc_basename(base, name_rva, &mut nb);
                 let dep = (*table).find(&nb[..bn]);
                 if dep >= 0x1_0000 && dep != base {
-                    attach_dfs(table, dep, visited, vn, depth + 1);
+                    let status = attach_dfs(
+                        table,
+                        dep,
+                        visited,
+                        vn,
+                        newly_attached,
+                        attached_count,
+                        depth + 1,
+                    );
+                    if status != 0 {
+                        (*table).mods[module_index].attaching = false;
+                        return status;
+                    }
                 }
                 desc += 20; // sizeof(IMAGE_IMPORT_DESCRIPTOR)
             }
         }
         // Skip our own ntdll (no C DllMain).
         if is_ntdll_base(&*table, base) {
-            return;
+            (*table).mods[module_index].attaching = false;
+            (*table).mods[module_index].attached = true;
+            record_attached(base, newly_attached, attached_count);
+            set_ldr_process_attached(base, true);
+            return 0;
         }
         let epr = entry_point_rva(base);
         if epr == 0 {
-            return; // resource-only DLL — nothing to run
+            (*table).mods[module_index].attaching = false;
+            (*table).mods[module_index].attached = true;
+            record_attached(base, newly_attached, attached_count);
+            set_ldr_process_attached(base, true);
+            return 0; // resource-only DLL — nothing to run
         }
         // ★ RE-SNAP this module's imports RIGHT BEFORE its DllMain runs. The executive demand-fills a
         // hosted DLL's per-process pages (headers/.rdata/.idata/IAT) lazily and from the ON-DISK PE
@@ -492,7 +594,52 @@ unsafe fn attach_dfs(
             mn = crate::write_u64_hex(&mut mb, mn, base);
             crate::dbg_print_bytes(mb.as_ptr(), mn);
         }
-        let _ = call_dll_main(base, DLL_PROCESS_ATTACH);
+        call_tls_initializers(base, DLL_PROCESS_ATTACH);
+        if call_dll_main(base, DLL_PROCESS_ATTACH) == 0 {
+            (*table).mods[module_index].attaching = false;
+            return 0xC000_0142; // STATUS_DLL_INIT_FAILED
+        }
+        (*table).mods[module_index].attaching = false;
+        (*table).mods[module_index].attached = true;
+        record_attached(base, newly_attached, attached_count);
+        set_ldr_process_attached(base, true);
+        0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn record_attached(
+    base: u64,
+    newly_attached: &mut [u64; MODULE_TABLE_CAP],
+    attached_count: &mut usize,
+) {
+    if *attached_count < MODULE_TABLE_CAP {
+        newly_attached[*attached_count] = base;
+        *attached_count += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn rollback_process_attach(table: *mut ModuleTable, attached: &[u64]) {
+    const DLL_PROCESS_DETACH: u32 = 0;
+    for &base in attached.iter().rev() {
+        let Some(index) = (unsafe { (*table).index_by_base(base) }) else {
+            continue;
+        };
+        if unsafe { !(*table).mods[index].attached } {
+            continue;
+        }
+        if unsafe { !is_ntdll_base(&*table, base) && entry_point_rva(base) != 0 } {
+            unsafe {
+                call_tls_initializers(base, DLL_PROCESS_DETACH);
+                let _ = call_dll_main(base, DLL_PROCESS_DETACH);
+            }
+        }
+        unsafe {
+            (*table).mods[index].attached = false;
+            (*table).mods[index].attaching = false;
+            set_ldr_process_attached(base, false);
+        }
     }
 }
 
@@ -741,6 +888,9 @@ struct LoadedMod {
     nlen: u8,
     /// The module's mapped base VA (0 = empty slot).
     base: u64,
+    /// Process-attach lifecycle persisted across static initialization and runtime LdrLoadDll calls.
+    attached: bool,
+    attaching: bool,
 }
 
 /// The per-drive module table (single-threaded loader; a process's LdrpInitialize runs once, on one
@@ -762,6 +912,8 @@ static mut MODULE_TABLE: ModuleTable = ModuleTable {
         name: [0u8; 32],
         nlen: 0,
         base: 0,
+        attached: false,
+        attaching: false,
     }; MODULE_TABLE_CAP],
     count: 0,
 };
@@ -780,6 +932,8 @@ impl ModuleTable {
             name: [0u8; 32],
             nlen: 0,
             base,
+            attached: false,
+            attaching: false,
         };
         let n = name.len().min(32);
         m.name[..n].copy_from_slice(&name[..n]);
@@ -796,6 +950,12 @@ impl ModuleTable {
             }
         }
         0
+    }
+
+    fn index_by_base(&self, base: u64) -> Option<usize> {
+        self.mods[..self.count]
+            .iter()
+            .position(|module| module.base == base)
     }
 }
 
@@ -1410,7 +1570,10 @@ pub unsafe fn ldrp_drive(smss_base: u64, ntdll_base: u64) -> SnapResult {
     // CRT startup does strdup(GetCommandLineA()), which strlen(NULL)-faults without this.
     // SAFETY: single-threaded loader; MODULE_TABLE holds mapped, snapped DLL images.
     unsafe {
-        run_process_attach(core::ptr::addr_of_mut!(MODULE_TABLE));
+        let status = run_process_attach(core::ptr::addr_of_mut!(MODULE_TABLE));
+        if status != 0 {
+            crate::exports::rtl_raise_status(status);
+        }
     }
     out
 }
@@ -1859,6 +2022,31 @@ unsafe fn add_ldr_module(base: u64, name_lc: &[u8]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn set_ldr_process_attached(base: u64, attached: bool) {
+    const LDRP_IMAGE_DLL: u32 = 0x0000_0004;
+    const LDRP_ENTRY_PROCESSED: u32 = 0x0000_4000;
+    const LDRP_PROCESS_ATTACH_CALLED: u32 = 0x0008_0000;
+    unsafe {
+        let state = &*core::ptr::addr_of!(LDR_STATE);
+        for &entry in &state.entry_vas[..state.count.min(LDR_MAX_ENTRIES)] {
+            if core::ptr::read_unaligned((entry + 0x30) as *const u64) != base {
+                continue;
+            }
+            let flags = (entry + 0x68) as *mut u32;
+            let mut value = core::ptr::read_unaligned(flags);
+            value |= LDRP_IMAGE_DLL | LDRP_ENTRY_PROCESSED;
+            if attached {
+                value |= LDRP_PROCESS_ATTACH_CALLED;
+            } else {
+                value &= !LDRP_PROCESS_ATTACH_CALLED;
+            }
+            core::ptr::write_unaligned(flags, value);
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // BATCH 2 — the runtime loader Ldr* drivers (LdrLoadDll / LdrGetDllHandle / LdrGetProcedureAddress).
 //
@@ -1934,39 +2122,31 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
     let dep = &name[..n];
     // SAFETY: single-threaded loader; MODULE_TABLE touched only here + snap.
     unsafe {
-        let table = &mut *core::ptr::addr_of_mut!(MODULE_TABLE);
+        let table_ptr = core::ptr::addr_of_mut!(MODULE_TABLE);
         // Already loaded? Return its base.
-        let existing = table.find(dep);
-        let base = if existing != 0 {
+        let existing = (&*table_ptr).find(dep);
+        let newly_loaded = existing == 0;
+        let base = if !newly_loaded {
             existing
         } else {
             let loaded = load_dependent_dll(dep);
             if loaded == 0 {
                 return 0xC000_0135; // STATUS_DLL_NOT_FOUND
             }
-            table.insert(dep, loaded);
-            // ★ DIALOG BATCH 3 — INTERIM hDllInstance seed for msgina. msgina is loaded at RUNTIME by
-            // winlogon's LoadGina→LoadLibraryW("msgina.dll"); this LdrLoadDll driver maps+snaps+threads
-            // PEB->Ldr but does NOT run the module's DLL_PROCESS_ATTACH DllMain. msgina's user-DllMain
-            // stores `hDllInstance = hinstDLL` on ATTACH (msgina.dll RVA 0x6d4e:
-            // `mov [rip→RVA 0x193c8], rax`, the ONLY write to that .data global — disasm-verified). Without
-            // it, `pgContext->hDllInstance` stays NULL → WlxDialogBoxParam→FindResourceW(NULL→the EXE,
-            // IDD_LOGON) misses → the logon dialog never resolves its template. Seed it directly here (the
-            // exact value the real DllMain would write = the module's own base). This stands in for
-            // "run DllMains on runtime LdrLoadDll" — a tracked ntdll-loader follow-up that currently
-            // cascades into a win32k desktop issue (batch-2), so this surgical seed is the interim.
-            if dep == b"msgina" {
-                unsafe { core::ptr::write_unaligned((loaded + 0x193c8) as *mut u64, loaded) };
+            {
+                let table = &mut *table_ptr;
+                table.insert(dep, loaded);
+                // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
+                let ntdll_base = table.find(b"ntdll");
+                let mut out = SnapResult::default();
+                snap_module(loaded, ntdll_base, table, &mut out, 0);
             }
-            // Snap the freshly-loaded DLL's own imports (ntdll + any deps) so it can run.
-            let ntdll_base = table.find(b"ntdll");
-            let mut out = SnapResult::default();
-            snap_module(loaded, ntdll_base, table, &mut out, 0);
             // BATCH 15 — link the runtime-loaded module (+ any deps it pulled in) into PEB->Ldr so a
             // later GetModuleFileNameW / LdrGetDllHandle walk finds it + still terminates circularly.
             // Re-thread from the FULL MODULE_TABLE (add_ldr_module de-dupes) to catch transitive deps
             // snap_module just mapped, not only `loaded` itself.
             {
+                let table = &*table_ptr;
                 let mut i = 0usize;
                 while i < table.count.min(MODULE_TABLE_CAP) {
                     let m = table.mods[i];
@@ -1980,6 +2160,13 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
             crate::exports::ldr_send_dll_notifications_for_base(loaded, 1);
             loaded
         };
+        let attach_status = run_process_attach_root(table_ptr, base);
+        if attach_status != 0 {
+            if newly_loaded {
+                crate::exports::ldr_send_dll_notifications_for_base(base, 2);
+            }
+            return attach_status;
+        }
         if !base_addr.is_null() {
             core::ptr::write_unaligned(base_addr, base as *mut c_void);
         }

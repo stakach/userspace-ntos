@@ -123,7 +123,7 @@ pub fn compute_process_cookie(seed: u64) -> u32 {
 /// `LdrpInitialize` — the orchestration. Drives the graph engine + the [`LoaderHost`] seams in the
 /// real Ldr order. Returns the [`InitResult`] on success, or the first failure's `NtStatus`.
 pub fn ldrp_initialize<H: LoaderHost>(
-    state: &LoaderState,
+    state: &mut LoaderState,
     params: &InitParams,
     host: &mut H,
 ) -> Result<InitResult, NtStatus> {
@@ -181,30 +181,8 @@ pub fn ldrp_initialize<H: LoaderHost>(
         return Err(st);
     }
 
-    // (7) Run TLS callbacks + DLL_PROCESS_ATTACH in dependency order (host seams). The EXE itself is
-    // last in init order and does NOT get a DllMain (its entry is invoked via the transfer instead).
-    for &i in &init_idx {
-        let m = &state.modules[i];
-        let is_root = !params.root_module.is_empty()
-            && super::module::normalize_module_name(&m.name)
-                == super::module::normalize_module_name(&params.root_module);
-        if is_root {
-            continue; // the EXE's entry is the transfer target, not a DllMain call
-        }
-        if m.has_tls {
-            let st = host.run_tls_callbacks(m.base, DllReason::ProcessAttach);
-            if st != STATUS_SUCCESS {
-                return Err(st);
-            }
-        }
-        if m.entry_point_rva != 0 {
-            let st = host.call_dll_main(m.base, m.entry_point_rva, DllReason::ProcessAttach);
-            if st != STATUS_SUCCESS {
-                // A DllMain returning FALSE fails the load (STATUS_DLL_INIT_FAILED).
-                return Err(st);
-            }
-        }
-    }
+    // (7) Run TLS callbacks + DLL_PROCESS_ATTACH as one rollback-capable transaction.
+    attach_modules(state, &init_idx, Some(&params.root_module), host)?;
 
     // (8) Transfer to the root module's entry (host seam; no return on-target).
     let entry_va = root_entry_va(state, &params.root_module);
@@ -218,6 +196,68 @@ pub fn ldrp_initialize<H: LoaderHost>(
         entry_va,
         loaded_apphelp: params.shim_policy.loads_apphelp(),
     })
+}
+
+/// Attach the not-yet-initialized modules in `init_idx`. On failure, detach exactly the modules this
+/// transaction initialized, in reverse order, and restore their `initialized` flags.
+pub fn attach_modules<H: LoaderHost>(
+    state: &mut LoaderState,
+    init_idx: &[usize],
+    root_module: Option<&str>,
+    host: &mut H,
+) -> Result<Vec<usize>, NtStatus> {
+    let normalized_root = root_module
+        .filter(|root| !root.is_empty())
+        .map(super::module::normalize_module_name);
+    let mut attached = Vec::new();
+    for &index in init_idx {
+        if index >= state.modules.len() || state.modules[index].initialized {
+            continue;
+        }
+        let module_name = super::module::normalize_module_name(&state.modules[index].name);
+        if normalized_root.as_ref() == Some(&module_name) {
+            continue;
+        }
+        let base = state.modules[index].base;
+        let entry_rva = state.modules[index].entry_point_rva;
+        let has_tls = state.modules[index].has_tls;
+        let status = if has_tls {
+            host.run_tls_callbacks(base, DllReason::ProcessAttach)
+        } else {
+            STATUS_SUCCESS
+        };
+        if status != STATUS_SUCCESS {
+            rollback_attach(state, &attached, host);
+            return Err(status);
+        }
+        if entry_rva != 0 {
+            let status = host.call_dll_main(base, entry_rva, DllReason::ProcessAttach);
+            if status != STATUS_SUCCESS {
+                rollback_attach(state, &attached, host);
+                return Err(STATUS_DLL_INIT_FAILED);
+            }
+        }
+        state.modules[index].initialized = true;
+        attached.push(index);
+    }
+    Ok(attached)
+}
+
+fn rollback_attach<H: LoaderHost>(state: &mut LoaderState, attached: &[usize], host: &mut H) {
+    for &index in attached.iter().rev() {
+        let module = &state.modules[index];
+        if module.has_tls {
+            let _ = host.run_tls_callbacks(module.base, DllReason::ProcessDetach);
+        }
+        if module.entry_point_rva != 0 {
+            let _ = host.call_dll_main(
+                module.base,
+                module.entry_point_rva,
+                DllReason::ProcessDetach,
+            );
+        }
+        state.modules[index].initialized = false;
+    }
 }
 
 /// The VA of the root module's entry (0 if no root / not found).
