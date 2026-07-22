@@ -168,6 +168,9 @@ pub enum HandleObject {
     BootStatusFile,
     /// An executive I/O completion-port object, indexed in the executive's fixed object table.
     IoCompletion(u32),
+    /// A Configuration Manager key target. The executive owns the read-only hive and mutable
+    /// overlay for the process lifetime; each handle independently owns only this typed reference.
+    RegistryKey(u32),
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
     /// A stable, independently owned token object.

@@ -676,6 +676,29 @@ fn io_completion_objects_are_typed_and_process_local() {
 }
 
 #[test]
+fn registry_key_handles_have_independent_process_local_lifetimes() {
+    let mut pm = ProcessManager::new();
+    let first = pm.create_process("first.exe", None, None);
+    let second = pm.create_process("second.exe", None, None);
+    let target = HandleObject::RegistryKey(0x1234);
+
+    let first_a = pm.insert_handle(first, target, 0x3).unwrap();
+    let first_b = pm.insert_handle(first, target, 0x1).unwrap();
+    let second_a = pm.insert_handle(second, target, 0x2).unwrap();
+
+    assert_eq!(pm.lookup_handle(first, first_a), Some(target));
+    assert_eq!(pm.lookup_handle(first, first_b), Some(target));
+    assert_eq!(pm.lookup_handle(second, second_a), Some(target));
+    assert_eq!(pm.handle_access(first, first_a), Some(0x3));
+    assert_eq!(pm.handle_access(first, first_b), Some(0x1));
+
+    pm.close_handle(first, first_a).unwrap();
+    assert_eq!(pm.lookup_handle(first, first_a), None);
+    assert_eq!(pm.lookup_handle(first, first_b), Some(target));
+    assert_eq!(pm.lookup_handle(second, second_a), Some(target));
+}
+
+#[test]
 fn append_only_handles_never_recycle_a_closed_value() {
     // With no_reuse set, a closed handle VALUE is never handed out again — the guarantee the
     // executive's per-process DLL registry relies on (a recycled value would collide with a stale
