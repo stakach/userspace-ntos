@@ -5207,10 +5207,10 @@ unsafe fn dbg_emit_variadic(format: *const u8, args: VaList<'_>) -> NtStatus {
         capacity: out.len(),
         position: 0,
     };
-    // DbgPrint truncates diagnostics to its fixed internal buffer. The formatter's overflow error
-    // only means the tail was dropped; emit the bounded prefix that was rendered successfully.
-    let _ = unsafe { nt_ntdll::printf::format_narrow(format, &mut values, &mut output) };
-    unsafe { dbg_emit_stack_bytes(&out[..output.position]) };
+    let overflowed =
+        unsafe { nt_ntdll::printf::format_narrow(format, &mut values, &mut output) }.is_err();
+    let emitted = nt_ntdll::dbg::finalize_print_buffer(&mut out, output.position, overflowed);
+    unsafe { dbg_emit_stack_bytes(&out[..emitted]) };
     STATUS_SUCCESS
 }
 
@@ -5239,6 +5239,7 @@ unsafe fn dbg_emit_formatted(
 
     let mut out = [0u8; DBG_PRINT_BUFFER_SIZE];
     let mut out_len = unsafe { copy_cstr_bounded(prefix, &mut out) };
+    let mut overflowed = out_len == out.len();
     let mut arg_index = 0usize;
     let mut next_arg = || {
         if va_list.is_null() {
@@ -5261,11 +5262,14 @@ unsafe fn dbg_emit_formatted(
             if out_len < out.len() {
                 out[out_len] = byte;
                 out_len += 1;
+            } else {
+                overflowed = true;
             }
         },
     );
 
-    unsafe { dbg_emit_stack_bytes(&out[..out_len]) };
+    let emitted = nt_ntdll::dbg::finalize_print_buffer(&mut out, out_len, overflowed);
+    unsafe { dbg_emit_stack_bytes(&out[..emitted]) };
     STATUS_SUCCESS
 }
 

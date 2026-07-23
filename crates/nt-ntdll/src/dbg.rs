@@ -98,6 +98,21 @@ pub fn render_with_prefix(prefix: &[u8], fmt: &[u8], args: &[FmtArg]) -> Vec<u8>
     out
 }
 
+/// Apply the native fixed-buffer overflow policy used by the DbgPrint family.
+///
+/// A successful render emits its exact byte count. When formatting overflows, ntdll replaces the
+/// final two buffer bytes with a newline and NUL and emits every byte except that terminator.
+pub fn finalize_print_buffer(buffer: &mut [u8], rendered_len: usize, overflowed: bool) -> usize {
+    if overflowed && buffer.len() >= 2 {
+        let end = buffer.len();
+        buffer[end - 2] = b'\n';
+        buffer[end - 1] = 0;
+        end - 1
+    } else {
+        rendered_len.min(buffer.len())
+    }
+}
+
 fn push_hex(out: &mut Vec<u8>, value: u64, minimum_digits: usize) {
     let significant_digits = if value == 0 {
         1
@@ -290,6 +305,21 @@ mod tests {
             render_with_prefix(b"[smss] ", b"start %s", &[FmtArg::Str(b"csrss\0")]),
             b"[smss] start csrss"
         );
+    }
+
+    #[test]
+    fn debug_print_success_preserves_rendered_length() {
+        let mut buffer = [b'x'; 8];
+        assert_eq!(finalize_print_buffer(&mut buffer, 3, false), 3);
+        assert_eq!(&buffer[..3], b"xxx");
+    }
+
+    #[test]
+    fn debug_print_overflow_ends_with_newline_and_hidden_nul() {
+        let mut buffer = [b'x'; 8];
+        assert_eq!(finalize_print_buffer(&mut buffer, 8, true), 7);
+        assert_eq!(&buffer[..7], b"xxxxxx\n");
+        assert_eq!(buffer[7], 0);
     }
 
     #[test]
