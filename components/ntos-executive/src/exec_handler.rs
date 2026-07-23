@@ -5004,14 +5004,25 @@ impl NativeSyscallHandler for ExecNtHandler {
                             |address| smss_stack_read(address),
                             ctx_va,
                         );
-                        let worker_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
-                        let worker_entry = NTDLL_BASE.wrapping_add(worker_rva);
+                        let scheduler_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
+                        let completion_rva = img_spawn::OUR_TP_COMPLETION_WORKER_RVA.load(Ordering::Relaxed);
+                        let scheduler_entry = NTDLL_BASE.wrapping_add(scheduler_rva);
+                        let completion_entry = NTDLL_BASE.wrapping_add(completion_rva);
                         // Native ntdll starts directly at RtlpWorkerThread. Kernel32's installed
                         // hook starts at BaseThreadStartup and carries RtlpWorkerThread in RCX.
-                        let is_tp_worker = worker_rva != 0
-                            && (start.rip == worker_entry || start.rcx == worker_entry);
-                        if is_tp_worker {
-                            if TP_WORKER_TID[self.pi].load(Ordering::Relaxed) != 0 {
+                        let tp_slot = if scheduler_rva != 0
+                            && (start.rip == scheduler_entry || start.rcx == scheduler_entry)
+                        {
+                            Some(0)
+                        } else if completion_rva != 0
+                            && (start.rip == completion_entry || start.rcx == completion_entry)
+                        {
+                            Some(1)
+                        } else {
+                            None
+                        };
+                        if let Some(tp_slot) = tp_slot {
+                            if TP_WORKER_TID[self.pi][tp_slot].load(Ordering::Relaxed) != 0 {
                                 return 0xC000_009A;
                             }
                             let create_suspended = smss_stack_read(sp + 0x40) != 0;
@@ -5020,8 +5031,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 create_suspended,
                                 args[1] as u32,
                             ) {
-                                self.pm
-                                    .set_thread_teb(tid as nt_process::ThreadId, TP_WORKER_TEB_VA);
+                                self.pm.set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(tp_slot));
                                 let pid = self.pm_pid_for_pi(self.pi).unwrap_or(0);
                                 self.queue_write(args[0], handle);
                                 let cid_ptr = smss_stack_read(sp + 0x28);
@@ -5029,12 +5039,13 @@ impl NativeSyscallHandler for ExecNtHandler {
                                     self.queue_write(cid_ptr, pid as u64);
                                     self.queue_write(cid_ptr + 8, tid);
                                 }
-                                TP_WORKER_TID[self.pi].store(tid, Ordering::Relaxed);
-                                self.tp_worker_spawn_request = self.pi as u8 + 1;
+                                TP_WORKER_TID[self.pi][tp_slot].store(tid, Ordering::Relaxed);
+                                self.tp_worker_spawn_request =
+                                    (1 + tp_slot * TP_WORKER_PI_COUNT + self.pi) as u8;
                                 print_str(b"[tp-worker] claimed pi=");
                                 print_u64(self.pi as u64);
                                 print_str(b" badge=");
-                                print_u64(tp_worker_badge(self.pi));
+                                print_u64(tp_worker_badge(self.pi, tp_slot));
                                 print_str(b" tid=");
                                 print_u64(tid);
                                 print_str(b" entry=0x");
@@ -5042,6 +5053,10 @@ impl NativeSyscallHandler for ExecNtHandler {
                                 print_hex(start.rip as u32);
                                 print_str(b" suspended=");
                                 print_u64(create_suspended as u64);
+                                if tp_slot != 0 {
+                                    print_str(b" slot=");
+                                    print_u64(tp_slot as u64);
+                                }
                                 print_str(b"\n");
                                 return 0;
                             }

@@ -5213,12 +5213,15 @@ const POOL_READY: u32 = 2;
 const WORKER_STOPPED: u32 = 0;
 const WORKER_STARTING: u32 = 1;
 const WORKER_ALIVE: u32 = 2;
+const WORKER_FAILED: u32 = 3;
 
 static WORK_POOL_INIT_STATE: AtomicU32 = AtomicU32::new(POOL_UNINITIALIZED);
 static WORK_POOL_PORT: AtomicU64 = AtomicU64::new(0);
 static RTL_ASYNC_WAKE_EVENT: AtomicU64 = AtomicU64::new(0);
-static RTL_ASYNC_WORKER_TID: AtomicU64 = AtomicU64::new(0);
-static WORK_POOL_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
+static RTL_SCHEDULER_WORKER_TID: AtomicU64 = AtomicU64::new(0);
+static RTL_COMPLETION_WORKER_TID: AtomicU64 = AtomicU64::new(0);
+static RTL_SCHEDULER_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
+static RTL_COMPLETION_WORKER_STATE: AtomicU32 = AtomicU32::new(WORKER_STOPPED);
 static WORK_POOL_COUNTER_LOCK: AtomicBool = AtomicBool::new(false);
 static mut WORK_POOL_COUNTERS: nt_rtl_work_item::PoolCounters =
     nt_rtl_work_item::PoolCounters::new();
@@ -5507,8 +5510,10 @@ unsafe fn rtl_async_current_tid() -> u64 {
 }
 
 unsafe fn rtl_async_on_worker() -> bool {
-    let worker = RTL_ASYNC_WORKER_TID.load(Ordering::Acquire);
-    worker != 0 && worker == unsafe { rtl_async_current_tid() }
+    let current = unsafe { rtl_async_current_tid() };
+    current != 0
+        && (current == RTL_SCHEDULER_WORKER_TID.load(Ordering::Acquire)
+            || current == RTL_COMPLETION_WORKER_TID.load(Ordering::Acquire))
 }
 
 unsafe fn initialize_work_pool() -> u32 {
@@ -5607,15 +5612,16 @@ unsafe fn call_start_pool_thread(
     }
 }
 
-unsafe fn start_work_pool_worker() -> u32 {
+unsafe fn start_pool_worker(worker_state: &AtomicU32, worker_routine: PoolThreadStart) -> u32 {
     loop {
-        match WORK_POOL_WORKER_STATE.load(Ordering::Acquire) {
+        match worker_state.load(Ordering::Acquire) {
             WORKER_ALIVE => return STATUS_SUCCESS_U32,
             WORKER_STARTING => {
                 let _ = unsafe { work_pool_delay(-10_000) };
             }
+            WORKER_FAILED => return STATUS_UNSUCCESSFUL_U32,
             WORKER_STOPPED => {
-                if WORK_POOL_WORKER_STATE
+                if worker_state
                     .compare_exchange(
                         WORKER_STOPPED,
                         WORKER_STARTING,
@@ -5628,18 +5634,18 @@ unsafe fn start_work_pool_worker() -> u32 {
                 }
                 break;
             }
-            _ => WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release),
+            _ => {
+                worker_state.store(WORKER_FAILED, Ordering::Release);
+                return STATUS_UNSUCCESSFUL_U32;
+            }
         }
     }
 
     let latch = nt_rtl_work_item::WorkerStartLatch::new();
-    let mut start = nt_rtl_work_item::WorkerStart::new(
-        rtlp_worker_thread as usize as u64,
-        latch.as_parameter(),
-    );
+    let mut start = nt_rtl_work_item::WorkerStart::new(worker_routine as usize as u64, latch.as_parameter());
     loop {
         let Some(action) = start.next_action() else {
-            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            worker_state.store(WORKER_STOPPED, Ordering::Release);
             return STATUS_UNSUCCESSFUL_U32;
         };
         let transition = match action {
@@ -5670,7 +5676,7 @@ unsafe fn start_work_pool_worker() -> u32 {
                 };
                 if !nt_rtl_work_item::nt_success(status) {
                     let _ = unsafe { syscall4(SSN_NT_CLOSE, thread_handle, 0, 0, 0) };
-                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                    worker_state.store(WORKER_STOPPED, Ordering::Release);
                     return status;
                 }
                 start.advance(nt_rtl_work_item::WorkerStartEvent::ResumeIssued)
@@ -5689,16 +5695,24 @@ unsafe fn start_work_pool_worker() -> u32 {
             nt_rtl_work_item::WorkerStartAction::Return(status) => {
                 let _ = start.advance(nt_rtl_work_item::WorkerStartEvent::ReturnDelivered);
                 if !nt_rtl_work_item::nt_success(status) {
-                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+                    worker_state.store(WORKER_STOPPED, Ordering::Release);
                 }
                 return status;
             }
         };
         if transition.is_err() {
-            WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
+            worker_state.store(WORKER_STOPPED, Ordering::Release);
             return STATUS_UNSUCCESSFUL_U32;
         }
     }
+}
+
+unsafe fn start_scheduler_worker() -> u32 {
+    unsafe { start_pool_worker(&RTL_SCHEDULER_WORKER_STATE, rtlp_worker_thread) }
+}
+
+unsafe fn start_completion_worker() -> u32 {
+    unsafe { start_pool_worker(&RTL_COMPLETION_WORKER_STATE, rtlp_completion_worker_thread) }
 }
 
 unsafe fn cleanup_failed_submission(submission: nt_rtl_work_item::Submission) -> u32 {
@@ -5808,7 +5822,7 @@ unsafe fn ensure_rtl_async_worker() -> u32 {
     if !nt_rtl_work_item::nt_success(status) {
         return status;
     }
-    unsafe { start_work_pool_worker() }
+    unsafe { start_scheduler_worker() }
 }
 
 unsafe fn allocate_timer_queue_locked() -> Option<u64> {
@@ -6364,7 +6378,7 @@ unsafe fn execute_timer_dispatch(queue_token: u64, dispatch: nt_rtl_timer_wait::
     }
 }
 
-unsafe fn rtl_async_execute_one_completion() -> Result<bool, u32> {
+unsafe fn rtl_async_execute_one_completion(timeout: Option<i64>) -> Result<bool, u32> {
     let port = WORK_POOL_PORT.load(Ordering::Acquire);
     if port == 0 {
         return Err(STATUS_UNSUCCESSFUL_U32);
@@ -6372,7 +6386,12 @@ unsafe fn rtl_async_execute_one_completion() -> Result<bool, u32> {
     let mut key = 0u64;
     let mut apc_context = 0u64;
     let mut io_status = [0u64; 2];
-    let timeout = 0i64;
+    let timeout_value = timeout.unwrap_or(0);
+    let timeout_pointer = if timeout.is_some() {
+        core::ptr::addr_of!(timeout_value) as u64
+    } else {
+        0
+    };
     let status = unsafe {
         syscall6(
             SSN_NT_REMOVE_IO_COMPLETION,
@@ -6380,7 +6399,7 @@ unsafe fn rtl_async_execute_one_completion() -> Result<bool, u32> {
             core::ptr::addr_of_mut!(key) as u64,
             core::ptr::addr_of_mut!(apc_context) as u64,
             io_status.as_mut_ptr() as u64,
-            core::ptr::addr_of!(timeout) as u64,
+            timeout_pointer,
             0,
         ) as u32
     };
@@ -6414,8 +6433,13 @@ unsafe fn rtl_async_wait_for_completion(event: u64) -> u32 {
     }
 }
 
-unsafe fn exit_work_pool_thread(status: u32) -> ! {
-    RTL_ASYNC_WORKER_TID.store(0, Ordering::Release);
+unsafe fn exit_work_pool_thread(
+    status: u32,
+    worker_state: &AtomicU32,
+    worker_tid: &AtomicU64,
+) -> ! {
+    worker_tid.store(0, Ordering::Release);
+    worker_state.store(WORKER_FAILED, Ordering::Release);
     let hook = crate::exports::rtl_exit_pool_thread_hook();
     if hook != 0 {
         let hook: ExitPoolThread = unsafe { core::mem::transmute(hook as usize) };
@@ -6437,24 +6461,19 @@ unsafe fn exit_work_pool_thread(status: u32) -> ! {
 
 #[export_name = "RtlpWorkerThread"]
 pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 {
-    WORK_POOL_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
     if parameter.is_null()
         || !unsafe { nt_rtl_work_item::WorkerStartLatch::acknowledge_parameter(parameter) }
     {
-        WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-        unsafe { exit_work_pool_thread(STATUS_INVALID_PARAMETER_U32) };
+        unsafe { exit_work_pool_thread(
+            STATUS_INVALID_PARAMETER_U32,
+            &RTL_SCHEDULER_WORKER_STATE,
+            &RTL_SCHEDULER_WORKER_TID,
+        ) };
     }
-    RTL_ASYNC_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
+    RTL_SCHEDULER_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
+    RTL_SCHEDULER_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
 
     loop {
-        let completion_ran = match unsafe { rtl_async_execute_one_completion() } {
-            Ok(ran) => ran,
-            Err(status) => {
-                WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-                unsafe { exit_work_pool_thread(status) };
-            }
-        };
-
         let now_ms = unsafe { rtl_async_now_ms() };
         let (timer_action, timeout_ms) = unsafe { next_timer_worker_action(now_ms) };
         match timer_action {
@@ -6467,20 +6486,49 @@ pub unsafe extern "system" fn rtlp_worker_thread(parameter: *mut c_void) -> u32 
                 completion,
             }) => unsafe { complete_timer_queue_exit(queue_token, completion) },
             None => {
-                if completion_ran {
-                    continue;
-                }
                 let wake_event = RTL_ASYNC_WAKE_EVENT.load(Ordering::Acquire);
                 if wake_event == 0 {
-                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-                    unsafe { exit_work_pool_thread(STATUS_UNSUCCESSFUL_U32) };
+                    unsafe { exit_work_pool_thread(
+                        STATUS_UNSUCCESSFUL_U32,
+                        &RTL_SCHEDULER_WORKER_STATE,
+                        &RTL_SCHEDULER_WORKER_TID,
+                    ) };
                 }
                 let wait_status = unsafe { rtl_async_wait(wake_event, timeout_ms) };
                 if !nt_rtl_work_item::nt_success(wait_status) && wait_status != STATUS_TIMEOUT_U32 {
-                    WORK_POOL_WORKER_STATE.store(WORKER_STOPPED, Ordering::Release);
-                    unsafe { exit_work_pool_thread(wait_status) };
+                    unsafe { exit_work_pool_thread(
+                        wait_status,
+                        &RTL_SCHEDULER_WORKER_STATE,
+                        &RTL_SCHEDULER_WORKER_TID,
+                    ) };
                 }
             }
+        }
+    }
+}
+
+#[export_name = "RtlpCompletionWorkerThread"]
+pub unsafe extern "system" fn rtlp_completion_worker_thread(parameter: *mut c_void) -> u32 {
+    if parameter.is_null()
+        || !unsafe { nt_rtl_work_item::WorkerStartLatch::acknowledge_parameter(parameter) }
+    {
+        unsafe { exit_work_pool_thread(
+            STATUS_INVALID_PARAMETER_U32,
+            &RTL_COMPLETION_WORKER_STATE,
+            &RTL_COMPLETION_WORKER_TID,
+        ) };
+    }
+    RTL_COMPLETION_WORKER_TID.store(unsafe { rtl_async_current_tid() }, Ordering::Release);
+    RTL_COMPLETION_WORKER_STATE.store(WORKER_ALIVE, Ordering::Release);
+
+    loop {
+        match unsafe { rtl_async_execute_one_completion(None) } {
+            Ok(true) | Ok(false) => {}
+            Err(status) => unsafe { exit_work_pool_thread(
+                status,
+                &RTL_COMPLETION_WORKER_STATE,
+                &RTL_COMPLETION_WORKER_TID,
+            ) },
         }
     }
 }
@@ -6541,7 +6589,7 @@ pub unsafe fn rtl_queue_work_item(function: u64, context: u64, flags: u32) -> u3
         return STATUS_QUOTA_EXCEEDED_U32;
     };
 
-    let status = unsafe { start_work_pool_worker() };
+    let status = unsafe { start_completion_worker() };
     if !nt_rtl_work_item::nt_success(status) {
         let _ = unsafe { cleanup_failed_submission(submission) };
         return status;

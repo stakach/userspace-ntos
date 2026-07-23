@@ -1040,6 +1040,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
 /// RIP/RCX/RDX remain intact and are restored by the loader trampoline.
 pub(crate) unsafe fn spawn_tp_worker_thread(
     pi: usize,
+    worker_slot: usize,
     pml4: u64,
     mut start: nt_thread_start::Amd64ThreadContext,
     cid_proc: u64,
@@ -1047,7 +1048,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     main_fault_ep: u64,
     resume: bool,
 ) -> u64 {
-    if pi >= TP_WORKER_PI_COUNT {
+    if pi >= TP_WORKER_PI_COUNT || worker_slot >= TP_WORKER_SLOT_COUNT {
         return 0;
     }
     let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
@@ -1056,13 +1057,13 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     }
 
     // ReactOS amd64 RtlInitializeContext: (StackBase - 6 pointers), align down to 16, then -8.
-    start.rsp = TP_WORKER_CONTEXT_RSP;
+    start.rsp = tp_worker_context_rsp(worker_slot);
     let initial_teb = nt_thread_start::InitialTeb64 {
-        stack_base: TP_WORKER_STACK_TOP,
-        stack_limit: TP_WORKER_STACK_BASE,
-        allocated_stack_base: TP_WORKER_STACK_BASE,
+        stack_base: tp_worker_stack_top(worker_slot),
+        stack_limit: tp_worker_stack_base(worker_slot),
+        allocated_stack_base: tp_worker_stack_base(worker_slot),
     };
-    let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi));
+    let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi, worker_slot));
     spawn_hosted_thread(&HostedThread {
         pml4,
         client_pi: pi as u64,
@@ -1074,14 +1075,14 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
             start,
             initial_teb,
         }),
-        scr: tp_worker_env_scratch_va(pi),
-        teb_va: TP_WORKER_TEB_VA,
-        stack_base: TP_WORKER_STACK_BASE,
+        scr: tp_worker_env_scratch_va(pi, worker_slot),
+        teb_va: tp_worker_teb_va(worker_slot),
+        stack_base: tp_worker_stack_base(worker_slot),
         stack_frames: TP_WORKER_STACK_FRAMES,
-        ipcbuf_va: TP_WORKER_IPCBUF_VA,
-        tramp_va: TP_WORKER_TRAMP_VA,
+        ipcbuf_va: tp_worker_ipcbuf_va(worker_slot),
+        tramp_va: tp_worker_tramp_va(worker_slot),
         peb_va: SMSS_PEB_VA,
-        stack_mirror_va: tp_worker_stack_mirror_va(pi),
+        stack_mirror_va: tp_worker_stack_mirror_va(pi, worker_slot),
         fault_ep: worker_ep,
         cid_proc,
         cid_thread,

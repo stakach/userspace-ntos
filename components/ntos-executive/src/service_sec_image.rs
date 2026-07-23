@@ -674,11 +674,13 @@ pub(crate) unsafe fn service_sec_image(
         let is_lsass_listener = badge == LSASS_LISTENER_BADGE;
         let is_lsass_listener2 = badge == LSASS_LISTENER2_BADGE;
         let is_lsass_listener3 = badge == LSASS_LISTENER3_BADGE;
-        // Generic ntdll thread-pool workers have one badge per owning process (16..20). Keep this
+        // Generic ntdll workers have one badge per process and role (slot 0: 16..20, slot 1: 21..25).
         // role orthogonal to the listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
-        let tp_worker_pi = tp_worker_pi_from_badge(badge);
-        let is_tp_worker = tp_worker_pi.is_some();
+        let tp_worker_identity = tp_worker_identity_from_badge(badge);
+        let tp_worker_pi = tp_worker_identity.map(|(pi, _)| pi);
+        let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
+        let is_tp_worker = tp_worker_identity.is_some();
         // winlogon's rpcrt4 server WORKER thread (pi 2, its own stack mirror/TEB) — same N-threads
         // multiplex. It runs the wait array (NtWaitForMultipleObjects → parks) that the main thread's
         // signal_state_changed wakes, completing the rpcrt4 server-thread handshake.
@@ -792,8 +794,8 @@ pub(crate) unsafe fn service_sec_image(
         // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
-        let (active_stack_base, active_stack_frames) = if is_tp_worker {
-            (TP_WORKER_STACK_BASE, TP_WORKER_STACK_FRAMES)
+        let (active_stack_base, active_stack_frames) = if let Some(slot) = tp_worker_slot {
+            (tp_worker_stack_base(slot), TP_WORKER_STACK_FRAMES)
         } else if is_svc_listener {
             (SVC_LISTENER_STACK_BASE, SVC_LISTENER_STACK_FRAMES)
         } else if is_scm_worker {
@@ -816,8 +818,8 @@ pub(crate) unsafe fn service_sec_image(
         ACTIVE_STACK_BASE.store(active_stack_base, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(active_stack_frames * 0x1000, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(
-            if let Some(tp_pi) = tp_worker_pi {
-                tp_worker_stack_mirror_va(tp_pi)
+            if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+                tp_worker_stack_mirror_va(tp_pi, tp_slot)
             } else if is_svc_listener {
                 // Per-thread sub-selection: the listener's OWN stack mirror (its syscall out-params /
                 // stack-arg reads land on its own stack, not services' main-thread stack).
@@ -1221,8 +1223,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(value as u32);
                     }
                 }
-                let tcb = tp_worker_pi
-                    .map(|tp_pi| TP_WORKER_TCB[tp_pi].load(Ordering::Relaxed))
+                let tcb = tp_worker_identity
+                    .map(|(tp_pi, tp_slot)| TP_WORKER_TCB[tp_pi][tp_slot].load(Ordering::Relaxed))
                     .unwrap_or_else(|| PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
@@ -1254,8 +1256,8 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
-                let tcb = tp_worker_pi
-                    .map(|tp_pi| TP_WORKER_TCB[tp_pi].load(Ordering::Relaxed))
+                let tcb = tp_worker_identity
+                    .map(|(tp_pi, tp_slot)| TP_WORKER_TCB[tp_pi][tp_slot].load(Ordering::Relaxed))
                     .unwrap_or_else(|| PM_MAIN_TCBS[pi].load(Ordering::Relaxed));
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
@@ -1284,8 +1286,8 @@ pub(crate) unsafe fn service_sec_image(
                 // exact fault in the TEB that owns it (main or one of winlogon's worker TEBs), then
                 // retry the instruction. This must precede the generic worker-wall park below.
                 if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
-                    let teb_alias = if tp_worker_pi == Some(2) {
-                        tp_worker_stack_mirror_va(2) + TP_WORKER_STACK_FRAMES * 0x1000
+                    let teb_alias = if let Some((2, tp_slot)) = tp_worker_identity {
+                        tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000
                     } else if is_wl_worker {
                         match badge {
                             WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
@@ -1296,8 +1298,9 @@ pub(crate) unsafe fn service_sec_image(
                         0x0000_0100_107C_0000
                     };
                     let tcb = match badge {
-                        badge if badge == tp_worker_badge(2) => {
-                            TP_WORKER_TCB[2].load(Ordering::Relaxed)
+                        _ if tp_worker_identity.is_some() => {
+                            let (_, tp_slot) = tp_worker_identity.unwrap();
+                            TP_WORKER_TCB[2][tp_slot].load(Ordering::Relaxed)
                         }
                         WINLOGON_WORKER_BADGE => WL_LISTENER_TCB.load(Ordering::Relaxed),
                         WINLOGON_WORKER2_BADGE => WL_WORKER2_TCB.load(Ordering::Relaxed),
@@ -1961,8 +1964,8 @@ pub(crate) unsafe fn service_sec_image(
             let resume_ip = m2; // RCX = syscall return address
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
-            let current_tid = if let Some(tp_pi) = tp_worker_pi {
-                TP_WORKER_TID[tp_pi].load(Ordering::Relaxed)
+            let current_tid = if let Some((tp_pi, tp_slot)) = tp_worker_identity {
+                TP_WORKER_TID[tp_pi][tp_slot].load(Ordering::Relaxed)
             } else if is_svc_listener {
                 SVC_LISTENER_TID.load(Ordering::Relaxed)
             } else if is_scm_worker {
@@ -3052,11 +3055,14 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 let tp_request = core::mem::replace(&mut nt_handler.tp_worker_spawn_request, 0);
                 if tp_request != 0 {
-                    let tp_pi = tp_request as usize - 1;
-                    if tp_pi < TP_WORKER_PI_COUNT {
+                    let identity = tp_request as usize - 1;
+                    let tp_pi = identity % TP_WORKER_PI_COUNT;
+                    let tp_slot = identity / TP_WORKER_PI_COUNT;
+                    if tp_slot < TP_WORKER_SLOT_COUNT {
                         spawn_requested_tp_worker(
                             &mut nt_handler,
                             tp_pi,
+                            tp_slot,
                             procs[tp_pi].pml4,
                             sp,
                             fault_ep,
@@ -4415,8 +4421,8 @@ pub(crate) unsafe fn service_sec_image(
                 // dispatch. (Only pi 2 is interactive + hits GetThreadDesktopWnd;
                 // the non-interactive services/lsass short-circuit before their user32 desktop path.)
                 if pi == 2 {
-                    let winlogon_teb_alias = if tp_worker_pi == Some(2) {
-                        tp_worker_stack_mirror_va(2) + TP_WORKER_STACK_FRAMES * 0x1000
+                    let winlogon_teb_alias = if let Some((2, tp_slot)) = tp_worker_identity {
+                        tp_worker_stack_mirror_va(2, tp_slot) + TP_WORKER_STACK_FRAMES * 0x1000
                     } else if is_wl_worker {
                         match badge {
                             WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA + WL_WORKER2_STACK_FRAMES * 0x1000,
@@ -5375,11 +5381,12 @@ pub(crate) unsafe fn service_sec_image(
 unsafe fn spawn_requested_tp_worker(
     nt_handler: &mut ExecNtHandler,
     pi: usize,
+    worker_slot: usize,
     pml4: u64,
     caller_sp: u64,
     fault_ep: u64,
 ) {
-    if TP_WORKER_TCB[pi]
+    if TP_WORKER_TCB[pi][worker_slot]
         .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
         .is_err()
     {
@@ -5391,13 +5398,14 @@ unsafe fn spawn_requested_tp_worker(
         |address| unsafe { smss_stack_read(address) },
         context_va,
     );
-    let tid = TP_WORKER_TID[pi].load(Ordering::Relaxed);
+    let tid = TP_WORKER_TID[pi][worker_slot].load(Ordering::Relaxed);
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
     let suspended = runtime_thread_slot(tid).is_some_and(|(pool_pi, slot)| {
         pool_pi == pi && PM_POOL_SUSPENDED[pool_pi].load(Ordering::Relaxed) & (1 << slot) != 0
     });
     let tcb = spawn_tp_worker_thread(
         pi,
+        worker_slot,
         pml4,
         start,
         cid_proc,
@@ -5405,19 +5413,21 @@ unsafe fn spawn_requested_tp_worker(
         fault_ep,
         !suspended,
     );
-    TP_WORKER_TCB[pi].store(tcb, Ordering::Relaxed);
-    nt_handler
-        .pm
-        .set_thread_teb(tid as nt_process::ThreadId, TP_WORKER_TEB_VA);
+    TP_WORKER_TCB[pi][worker_slot].store(tcb, Ordering::Relaxed);
+    nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, tp_worker_teb_va(worker_slot));
 
     print_str(b"[tp-worker] spawned pi=");
     print_u64(pi as u64);
     print_str(b" badge=");
-    print_u64(tp_worker_badge(pi));
+    print_u64(tp_worker_badge(pi, worker_slot));
     print_str(b" tid=");
     print_u64(tid);
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
+    if worker_slot != 0 {
+        print_str(b" slot=");
+        print_u64(worker_slot as u64);
+    }
     print_str(if suspended {
         b" suspended; NtResumeThread owns first run\n"
     } else {
@@ -5433,14 +5443,14 @@ unsafe fn spawn_requested_tp_worker(
 /// process index (0 smss, 1 csrss, 2 winlogon, 3 services, 4 lsass).
 #[inline]
 fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
-    let (stack_base, stack_frames, stack_mirror) = if let Some(tp_pi) =
-        tp_worker_pi_from_badge(badge)
+    let (stack_base, stack_frames, stack_mirror) = if let Some((tp_pi, tp_slot)) =
+        tp_worker_identity_from_badge(badge)
     {
         debug_assert_eq!(tp_pi, pi);
         (
-            TP_WORKER_STACK_BASE,
+            tp_worker_stack_base(tp_slot),
             TP_WORKER_STACK_FRAMES,
-            tp_worker_stack_mirror_va(tp_pi),
+            tp_worker_stack_mirror_va(tp_pi, tp_slot),
         )
     } else {
         match badge {
@@ -5965,7 +5975,7 @@ unsafe fn prefill_client_large_string_pages(
 /// winlogon=4, services=6, lsass=8.
 #[inline]
 fn owner_top_badge(badge: u64) -> u64 {
-    if let Some(pi) = tp_worker_pi_from_badge(badge) {
+    if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
         return match pi {
             1 => CSRSS_BADGE,
             2 => WINLOGON_BADGE,

@@ -418,6 +418,7 @@ pub const SCM_WORKER_STACK_MIRROR_VA: u64 = 0x0000_0100_1398_0000;
 // entrypoint exactly matches ntdll's exported worker gets this generic layout at the same target VAs
 // in each process (safe because every process has a distinct VSpace) and a per-pi mirror/scratch.
 pub const TP_WORKER_PI_COUNT: usize = 5;
+pub const TP_WORKER_SLOT_COUNT: usize = 2;
 pub const TP_WORKER_BADGE_BASE: u64 = 16;
 pub const TP_WORKER_STACK_BASE: u64 = 0x0000_0100_1058_0000;
 pub const TP_WORKER_STACK_FRAMES: u64 = 16;
@@ -429,30 +430,70 @@ pub const TP_WORKER_TRAMP_VA: u64 = 0x0000_0100_105B_0000;
 pub const TP_WORKER_EXEC_BASE: u64 = 0x0000_0100_13A0_0000;
 pub const TP_WORKER_EXEC_STRIDE: u64 = 0x0004_0000;
 pub const TP_WORKER_ENV_SCRATCH_OFFSET: u64 = 0x0002_0000;
+pub const TP_WORKER_SLOT1_REGION_BASE: u64 = 0x0000_0100_13E0_0000;
+pub const TP_WORKER_SLOT1_STACK_BASE: u64 = TP_WORKER_SLOT1_REGION_BASE;
+pub const TP_WORKER_SLOT1_IPCBUF_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x1_0000;
+pub const TP_WORKER_SLOT1_TEB_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x2_0000;
+pub const TP_WORKER_SLOT1_TRAMP_VA: u64 = TP_WORKER_SLOT1_REGION_BASE + 0x3_0000;
+pub const TP_WORKER_SLOT1_EXEC_BASE: u64 = 0x0000_0100_13C0_0000;
 
 #[inline]
-pub const fn tp_worker_badge(pi: usize) -> u64 {
-    TP_WORKER_BADGE_BASE + pi as u64
+pub const fn tp_worker_badge(pi: usize, slot: usize) -> u64 {
+    TP_WORKER_BADGE_BASE + slot as u64 * TP_WORKER_PI_COUNT as u64 + pi as u64
 }
 
 #[inline]
-pub const fn tp_worker_pi_from_badge(badge: u64) -> Option<usize> {
+pub const fn tp_worker_identity_from_badge(badge: u64) -> Option<(usize, usize)> {
     let offset = badge.wrapping_sub(TP_WORKER_BADGE_BASE);
-    if offset < TP_WORKER_PI_COUNT as u64 {
-        Some(offset as usize)
+    if offset < (TP_WORKER_PI_COUNT * TP_WORKER_SLOT_COUNT) as u64 {
+        Some((
+            offset as usize % TP_WORKER_PI_COUNT,
+            offset as usize / TP_WORKER_PI_COUNT,
+        ))
     } else {
         None
     }
 }
 
 #[inline]
-pub const fn tp_worker_stack_mirror_va(pi: usize) -> u64 {
-    TP_WORKER_EXEC_BASE + pi as u64 * TP_WORKER_EXEC_STRIDE
+pub const fn tp_worker_stack_base(slot: usize) -> u64 {
+    if slot == 0 { TP_WORKER_STACK_BASE } else { TP_WORKER_SLOT1_STACK_BASE }
 }
 
 #[inline]
-pub const fn tp_worker_env_scratch_va(pi: usize) -> u64 {
-    tp_worker_stack_mirror_va(pi) + TP_WORKER_ENV_SCRATCH_OFFSET
+pub const fn tp_worker_stack_top(slot: usize) -> u64 {
+    tp_worker_stack_base(slot) + TP_WORKER_STACK_FRAMES * 0x1000
+}
+
+#[inline]
+pub const fn tp_worker_context_rsp(slot: usize) -> u64 {
+    ((tp_worker_stack_top(slot) - 6 * 8) & !15) - 8
+}
+
+#[inline]
+pub const fn tp_worker_ipcbuf_va(slot: usize) -> u64 {
+    if slot == 0 { TP_WORKER_IPCBUF_VA } else { TP_WORKER_SLOT1_IPCBUF_VA }
+}
+
+#[inline]
+pub const fn tp_worker_teb_va(slot: usize) -> u64 {
+    if slot == 0 { TP_WORKER_TEB_VA } else { TP_WORKER_SLOT1_TEB_VA }
+}
+
+#[inline]
+pub const fn tp_worker_tramp_va(slot: usize) -> u64 {
+    if slot == 0 { TP_WORKER_TRAMP_VA } else { TP_WORKER_SLOT1_TRAMP_VA }
+}
+
+#[inline]
+pub const fn tp_worker_stack_mirror_va(pi: usize, slot: usize) -> u64 {
+    let base = if slot == 0 { TP_WORKER_EXEC_BASE } else { TP_WORKER_SLOT1_EXEC_BASE };
+    base + pi as u64 * TP_WORKER_EXEC_STRIDE
+}
+
+#[inline]
+pub const fn tp_worker_env_scratch_va(pi: usize, slot: usize) -> u64 {
+    tp_worker_stack_mirror_va(pi, slot) + TP_WORKER_ENV_SCRATCH_OFFSET
 }
 
 const fn hosted_thread_layout_is_disjoint(
@@ -488,6 +529,7 @@ const _: () = {
         nt_syscall_abi::native_ipc_buffer_va(LSASS_LISTENER3_TEB_VA) == LSASS_LISTENER3_IPCBUF_VA
     );
     assert!(nt_syscall_abi::native_ipc_buffer_va(TP_WORKER_TEB_VA) == TP_WORKER_IPCBUF_VA);
+    assert!(nt_syscall_abi::native_ipc_buffer_va(TP_WORKER_SLOT1_TEB_VA) == TP_WORKER_SLOT1_IPCBUF_VA);
     assert!(SM_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
     assert!(SM_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
@@ -526,18 +568,31 @@ const _: () = {
         TP_WORKER_TEB_VA,
         TP_WORKER_TRAMP_VA,
     ));
+    assert!(hosted_thread_layout_is_disjoint(
+        TP_WORKER_SLOT1_STACK_BASE,
+        TP_WORKER_STACK_FRAMES,
+        TP_WORKER_SLOT1_IPCBUF_VA,
+        TP_WORKER_SLOT1_TEB_VA,
+        TP_WORKER_SLOT1_TRAMP_VA,
+    ));
     assert!(TP_WORKER_STACK_BASE >= WORK_CLUSTER_BASE);
     assert!(TP_WORKER_TRAMP_VA + 0x1000 <= WORK_CLUSTER_BASE + 0x20_0000);
-    assert!(tp_worker_badge(0) == 16);
-    assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1) == 20);
+    assert!(tp_worker_badge(0, 0) == 16);
+    assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 0) == 20);
+    assert!(tp_worker_badge(0, 1) == 21);
+    assert!(tp_worker_badge(TP_WORKER_PI_COUNT - 1, 1) == 25);
     assert!(TP_WORKER_CONTEXT_RSP >= TP_WORKER_STACK_BASE);
     assert!(TP_WORKER_CONTEXT_RSP < TP_WORKER_STACK_TOP);
     assert!(TP_WORKER_CONTEXT_RSP & 15 == 8);
     assert!(TP_WORKER_EXEC_STRIDE >= TP_WORKER_ENV_SCRATCH_OFFSET + 0x4000);
     assert!(
-        tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1) + 0x4000
+        tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 0) + 0x4000
             <= TP_WORKER_EXEC_BASE + 0x20_0000
     );
+    assert!(TP_WORKER_SLOT1_REGION_BASE & 0x1f_ffff == 0);
+    assert!(TP_WORKER_SLOT1_TRAMP_VA + 0x1000 <= TP_WORKER_SLOT1_REGION_BASE + 0x20_0000);
+    assert!(tp_worker_env_scratch_va(TP_WORKER_PI_COUNT - 1, 1) + 0x4000
+        <= TP_WORKER_SLOT1_EXEC_BASE + 0x20_0000);
 };
 
 /// The fault-EP badge for services' SCM per-connection RPC worker — the main loop maps it to
@@ -1394,13 +1449,13 @@ static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER2_TID: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER3_TID: AtomicU64 = AtomicU64::new(0);
-/// One bounded generic ntdll thread-pool worker per boot process (pi 0..4). These identities remain
+/// Two bounded generic ntdll thread-pool workers per boot process (pi 0..4). These identities remain
 /// separate from the listener-specific state so badge routing cannot accidentally inherit a server
 /// listener's park/drop policy.
-static TP_WORKER_TID: [AtomicU64; TP_WORKER_PI_COUNT] =
-    [const { AtomicU64::new(0) }; TP_WORKER_PI_COUNT];
-static TP_WORKER_TCB: [AtomicU64; TP_WORKER_PI_COUNT] =
-    [const { AtomicU64::new(0) }; TP_WORKER_PI_COUNT];
+static TP_WORKER_TID: [[AtomicU64; TP_WORKER_SLOT_COUNT]; TP_WORKER_PI_COUNT] =
+    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; TP_WORKER_PI_COUNT];
+static TP_WORKER_TCB: [[AtomicU64; TP_WORKER_SLOT_COUNT]; TP_WORKER_PI_COUNT] =
+    [const { [const { AtomicU64::new(0) }; TP_WORKER_SLOT_COUNT] }; TP_WORKER_PI_COUNT];
 static PM_GENERAL_THREADS_CREATED: AtomicU64 = AtomicU64::new(0);
 static THREAD_LIFECYCLE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static THREAD_QUERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -2402,6 +2457,12 @@ unsafe fn map_cluster_pt(pml4: u64) {
     let pt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, WORK_CLUSTER_BASE, pml4);
+}
+
+unsafe fn map_tp_worker_slot1_pt(pml4: u64) {
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, TP_WORKER_SLOT1_REGION_BASE, pml4);
 }
 
 /// Build the page table for the relocated heap region (`HEAP_BASE`) in `pml4`. The generous heap
@@ -3422,11 +3483,20 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
+fn tp_worker_identity_for_tid(tid: u64) -> Option<(usize, usize)> {
+    for pi in 0..TP_WORKER_PI_COUNT {
+        for slot in 0..TP_WORKER_SLOT_COUNT {
+            if tid != 0 && tid == TP_WORKER_TID[pi][slot].load(Ordering::Relaxed) {
+                return Some((pi, slot));
+            }
+        }
+    }
+    None
+}
+
 fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
-    if let Some(index) = (0..TP_WORKER_PI_COUNT)
-        .find(|&index| tid != 0 && tid == TP_WORKER_TID[index].load(Ordering::Relaxed))
-    {
-        Some(&TP_WORKER_TCB[index])
+    if let Some((pi, slot)) = tp_worker_identity_for_tid(tid) {
+        Some(&TP_WORKER_TCB[pi][slot])
     } else if tid == CSR_API_TID.load(Ordering::Relaxed) {
         Some(&CSR_LOOP_TCB)
     } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
@@ -4661,8 +4731,8 @@ struct ExecNtHandler {
     /// As `lsass_listener_spawn` but for lsass' SECOND server thread (LsapRmServerThread).
     lsass_listener2_spawn: bool,
     lsass_listener3_spawn: bool,
-    /// One-based process index for a bounded generic ntdll thread-pool worker awaiting mechanism
-    /// construction in the loop. Zero means no request; values 1..=5 map to pi 0..=4.
+    /// Encoded generic ntdll worker identity awaiting mechanism construction. Zero means none;
+    /// `1 + slot * TP_WORKER_PI_COUNT + pi` identifies the process and worker role.
     tp_worker_spawn_request: u8,
     /// Checkpoint B: set by NtWaitForSingleObject when the target is a REAL named event whose
     /// `signalled` flag is 0 → the loop must PARK this caller (reply-cap park keyed by this obj_ns
@@ -5610,9 +5680,9 @@ static PM_TIDS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// NtTerminateThread can suspend/delete the exact mechanism instead of merely withholding reply.
 pub(crate) static PM_MAIN_TCBS: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
 /// Fixed pool of spare ETHREADs per process, pre-created below the reset mark so runtime thread
-/// creation remains allocation-free. Three slots cover the existing specialized fan-out and the
-/// fourth admits one generic ntdll thread-pool worker without reallocating under the loop reset.
-const PM_RUNTIME_THREAD_SLOTS: usize = 4;
+/// creation remains allocation-free. Three slots cover the existing specialized fan-out and two
+/// more admit the ntdll scheduler and completion worker without reallocating under the loop reset.
+const PM_RUNTIME_THREAD_SLOTS: usize = 5;
 static PM_POOL_TID: [[AtomicU64; PM_RUNTIME_THREAD_SLOTS]; MAX_PI] =
     [const { [const { AtomicU64::new(0) }; PM_RUNTIME_THREAD_SLOTS] }; MAX_PI];
 static PM_POOL_USED: [AtomicU64; MAX_PI] = [const { AtomicU64::new(0) }; MAX_PI];
@@ -8916,6 +8986,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 .map(|e| e.rva as u64)
                         })
                         .unwrap_or(0);
+                    let tp_completion_worker_rva = ntdll_pe
+                        .exports()
+                        .ok()
+                        .and_then(|es| {
+                            es.into_iter()
+                                .find(|e| e.name == "RtlpCompletionWorkerThread")
+                                .map(|e| e.rva as u64)
+                        })
+                        .unwrap_or(0);
                     // Publish it so EVERY hosted SEC_IMAGE spawn (csrss/winlogon/services/lsass, all
                     // spawned in service_sec_image.rs) calls OUR LdrpInitialize + uses the native
                     // transport — our ntdll is the ntdll for all of them, not just smss.
@@ -8924,6 +9003,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         .store(ldr_initialize_thunk_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA.store(callback_dispatcher_rva, Ordering::Relaxed);
                     img_spawn::OUR_TP_WORKER_RVA.store(tp_worker_rva, Ordering::Relaxed);
+                    img_spawn::OUR_TP_COMPLETION_WORKER_RVA.store(tp_completion_worker_rva, Ordering::Relaxed);
                     print_str(b"[ntos-exec] ntdll = OUR Rust ntdll, LdrpInitialize RVA=0x");
                     print_hex(smss_ldrp_rva as u32);
                     print_str(b"\n");

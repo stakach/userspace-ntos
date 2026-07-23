@@ -284,13 +284,15 @@ fn winlogon_callback_teb_alias(
         WINLOGON_WORKER3_BADGE if client.tid == WL_WORKER3_TID.load(Ordering::Relaxed) => {
             WINLOGON_WORKER3_STACK_MIRROR_VA + WL_WORKER3_STACK_FRAMES * 0x1000
         }
-        badge
-            if badge == tp_worker_badge(2)
-                && client.tid == TP_WORKER_TID[2].load(Ordering::Relaxed) =>
-        {
-            tp_worker_stack_mirror_va(2) + TP_WORKER_STACK_FRAMES * 0x1000
+        badge => {
+            let Some((pi, slot)) = tp_worker_identity_from_badge(badge) else {
+                return None;
+            };
+            if pi != 2 || client.tid != TP_WORKER_TID[2][slot].load(Ordering::Relaxed) {
+                return None;
+            }
+            tp_worker_stack_mirror_va(2, slot) + TP_WORKER_STACK_FRAMES * 0x1000
         }
-        _ => return None,
     };
     Some(alias)
 }

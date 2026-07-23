@@ -17,6 +17,8 @@ pub(crate) static OUR_KI_USER_CALLBACK_DISPATCHER_RVA: AtomicU64 = AtomicU64::ne
 /// RVA of ntdll's normal completion-port worker. An exact entrypoint match distinguishes the
 /// generic thread-pool worker from process-specific native threads that also use NtCreateThread.
 pub(crate) static OUR_TP_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
+/// RVA of ntdll's completion-only worker, hosted separately from the timer/wait scheduler.
+pub(crate) static OUR_TP_COMPLETION_WORKER_RVA: AtomicU64 = AtomicU64::new(0);
 
 /// The effective `LdrpInitialize` RVA for a spawn: the explicit `ldrpinit_rva` if the caller passed
 /// one, else the globally-derived OUR ntdll RVA. There is no real-ntdll fallback (our ntdll is THE
@@ -415,6 +417,7 @@ pub(crate) unsafe fn spawn_sec_image(
     let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, IMAGE_BASE, pml4);
     // The stack + IPC buffer live in the relocated cluster region (out of the ELF reserve).
     map_cluster_pt(pml4);
+    map_tp_worker_slot1_pt(pml4);
     // A second demand-mapped image (ntdll) — reserve its VA's page table too (same pdpt/pd
     // as the image since both are within one 1 GiB / 512 GiB slot; only the PT differs).
     if ntdll_base != 0 {
