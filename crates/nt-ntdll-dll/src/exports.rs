@@ -40,7 +40,6 @@ const STATUS_SOME_NOT_MAPPED: NtStatus = 0x0000_0107;
 const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
 const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001;
 const STATUS_NO_SUCH_FILE: NtStatus = 0xC000_000F;
-#[cfg(not(target_arch = "x86_64"))]
 const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002;
 const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
@@ -25734,34 +25733,113 @@ pub extern "C" fn misaligned_access() -> u32 {
     0
 }
 
-macro_rules! dbgui_noop {
-    ($export:literal, $fn:ident) => {
-        /// `DbgUi*` debugger-attach surface — no user-mode debugger present; returns
-        /// STATUS_SUCCESS / a null handle. The export exists so the Win32 stack's IAT resolves.
-        ///
-        /// # Safety
-        /// Called with the corresponding ntdll `DbgUi*` ABI; a no-op with no live debug object.
-        #[export_name = $export]
-        pub unsafe extern "system" fn $fn(
-            _a: *mut c_void,
-            _b: *mut c_void,
-            _c: *mut c_void,
-            _d: *mut c_void,
-        ) -> NtStatus {
-            STATUS_SUCCESS
-        }
-    };
+/// `DbgUiConnectToDbg() -> NTSTATUS`.
+///
+/// Reusing an installed per-thread debug object is complete. Creating the first object requires the
+/// executive debug-object plane, which is not available yet.
+#[export_name = "DbgUiConnectToDbg"]
+pub unsafe extern "system" fn dbg_ui_connect_to_dbg() -> NtStatus {
+    if !unsafe { dbg_ui_get_thread_debug_object() }.is_null() {
+        STATUS_SUCCESS
+    } else {
+        STATUS_NOT_IMPLEMENTED
+    }
 }
-dbgui_noop!("DbgUiConnectToDbg", dbg_ui_connect_to_dbg);
-dbgui_noop!("DbgUiContinue", dbg_ui_continue);
-dbgui_noop!(
-    "DbgUiConvertStateChangeStructure",
-    dbg_ui_convert_state_change_structure
-);
-dbgui_noop!("DbgUiDebugActiveProcess", dbg_ui_debug_active_process);
-dbgui_noop!("DbgUiStopDebugging", dbg_ui_stop_debugging);
-dbgui_noop!("DbgUiIssueRemoteBreakin", dbg_ui_issue_remote_breakin);
-dbgui_noop!("DbgUiWaitStateChange", dbg_ui_wait_state_change);
+
+/// `DbgUiContinue(PCLIENT_ID, NTSTATUS) -> NTSTATUS`.
+#[export_name = "DbgUiContinue"]
+pub unsafe extern "system" fn dbg_ui_continue(
+    _client_id: *const c_void,
+    _continue_status: NtStatus,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `DbgUiConvertStateChangeStructure(PDBGUI_WAIT_STATE_CHANGE, PDEBUG_EVENT) -> NTSTATUS`.
+///
+/// Converts every ReactOS debug state and resolves create-event TEB addresses through the real
+/// ThreadBasicInformation syscall. A failed thread query is represented by a null TEB, as native
+/// ntdll specifies.
+#[export_name = "DbgUiConvertStateChangeStructure"]
+pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
+    wait_state_change: *const c_void,
+    debug_event: *mut c_void,
+) -> NtStatus {
+    if wait_state_change.is_null() || debug_event.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let state = unsafe {
+        &*(wait_state_change
+            as *const [u8; nt_ntdll::dbg::DBGUI_WAIT_STATE_CHANGE_SIZE])
+    };
+    let event =
+        unsafe { &mut *(debug_event as *mut [u8; nt_ntdll::dbg::DEBUG_EVENT_SIZE]) };
+    match nt_ntdll::dbg::convert_state_change(state, event, |thread| {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            const THREAD_BASIC_INFORMATION: u32 = 0;
+            const THREAD_BASIC_INFORMATION_SIZE: usize = 48;
+            let mut information = [0u8; THREAD_BASIC_INFORMATION_SIZE];
+            let status = core::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    u32,
+                    *mut c_void,
+                    u32,
+                    *mut u32,
+                ) -> NtStatus,
+            >(nt_ntdll::trap_stubs::nt_query_information_thread)(
+                thread as *mut c_void,
+                THREAD_BASIC_INFORMATION,
+                information.as_mut_ptr().cast(),
+                THREAD_BASIC_INFORMATION_SIZE as u32,
+                core::ptr::null_mut(),
+            );
+            nt_success(status).then(|| {
+                core::ptr::read_unaligned(information.as_ptr().add(8).cast::<u64>())
+            })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = thread;
+            None
+        }
+    }) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    }
+}
+
+/// `DbgUiDebugActiveProcess(HANDLE) -> NTSTATUS`.
+#[export_name = "DbgUiDebugActiveProcess"]
+pub unsafe extern "system" fn dbg_ui_debug_active_process(_process: *mut c_void) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `DbgUiStopDebugging(HANDLE) -> NTSTATUS`.
+#[export_name = "DbgUiStopDebugging"]
+pub unsafe extern "system" fn dbg_ui_stop_debugging(_process: *mut c_void) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `DbgUiIssueRemoteBreakin(HANDLE) -> NTSTATUS`.
+///
+/// The foreign-process thread path does not yet honor the requested start context, so claiming
+/// success would create the wrong thread rather than execute `DbgUiRemoteBreakin`.
+#[export_name = "DbgUiIssueRemoteBreakin"]
+pub unsafe extern "system" fn dbg_ui_issue_remote_breakin(_process: *mut c_void) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
+
+/// `DbgUiWaitStateChange(PDBGUI_WAIT_STATE_CHANGE, PLARGE_INTEGER) -> NTSTATUS`.
+#[export_name = "DbgUiWaitStateChange"]
+pub unsafe extern "system" fn dbg_ui_wait_state_change(
+    _wait_state_change: *mut c_void,
+    _timeout: *const i64,
+) -> NtStatus {
+    STATUS_NOT_IMPLEMENTED
+}
 
 /// `DbgUiRemoteBreakin()` — debugger break-in thread entry. If the PEB says the process is being
 /// debugged, raise `DbgBreakPoint`, then terminate the current thread with STATUS_SUCCESS.
