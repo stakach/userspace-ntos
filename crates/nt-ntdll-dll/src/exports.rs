@@ -12121,6 +12121,397 @@ pub unsafe extern "system" fn rtl_dos_search_path_ustr(
     STATUS_NO_SUCH_FILE
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_validated_unicode_string(
+    string: PCUnicodeString,
+) -> Result<Vec<u16>, NtStatus> {
+    if string.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let descriptor = unsafe { core::ptr::read_unaligned(string) };
+    if descriptor.length & 1 != 0
+        || descriptor.maximum_length & 1 != 0
+        || descriptor.length > descriptor.maximum_length
+        || (descriptor.length != 0 && descriptor.buffer == 0)
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let units = descriptor.length as usize / 2;
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(units).map_err(|_| STATUS_NO_MEMORY)?;
+    if units != 0 {
+        copy.extend_from_slice(unsafe {
+            core::slice::from_raw_parts(descriptor.buffer as *const u16, units)
+        });
+    }
+    Ok(copy)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn isolation_system_root() -> Vec<u16> {
+    let root = (KUSER_SHARED_DATA_VA + 0x30) as *const u16;
+    let mut length = 0usize;
+    while length < 260 && unsafe { core::ptr::read_unaligned(root.add(length)) } != 0 {
+        length += 1;
+    }
+    unsafe { core::slice::from_raw_parts(root, length) }.to_vec()
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn isolation_dot_local_path(original: &[u16]) -> Result<Option<Vec<u16>>, NtStatus> {
+    const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
+    const RTL_USER_PROCESS_PARAMETERS_PRIVATE_DLL_PATH: u32 = 0x1000;
+    let parameters = unsafe { core::ptr::read_unaligned((current_peb() + 0x20) as *const u64) };
+    if parameters == 0 {
+        return Ok(None);
+    }
+    let flags =
+        unsafe { core::ptr::read_unaligned((parameters as usize + 0x08) as *const u32) };
+    if flags & RTL_USER_PROCESS_PARAMETERS_PRIVATE_DLL_PATH == 0 {
+        return Ok(None);
+    }
+    let mut image_path = unsafe {
+        core::ptr::read_unaligned(
+            (parameters as usize + 0x60) as *const nt_ntdll_layout::UnicodeString,
+        )
+    };
+    if flags & RTL_USER_PROCESS_PARAMETERS_NORMALIZED == 0 {
+        image_path.buffer = image_path
+            .buffer
+            .checked_add(parameters)
+            .ok_or(STATUS_NAME_TOO_LONG)?;
+    }
+    let image = if image_path.length == 0 || image_path.buffer == 0 {
+        &[][..]
+    } else {
+        unsafe {
+            core::slice::from_raw_parts(
+                image_path.buffer as *const u16,
+                image_path.length as usize / 2,
+            )
+        }
+    };
+    let names = nt_ntdll::rtl::path::compute_privatized_dll_names(image, original)
+        .map_err(|_| STATUS_NAME_TOO_LONG)?;
+    for candidate in [names.local, names.real] {
+        if candidate.contains(&0) {
+            continue;
+        }
+        let mut terminated = candidate.clone();
+        terminated.push(0);
+        if unsafe { rtl_does_file_exists_u(terminated.as_ptr()) } != 0 {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn isolation_actctx_path(
+    original: &[u16],
+    lookup_name: &[u16],
+    path_is_relative: bool,
+    system_root: &[u16],
+) -> Result<Option<Vec<u16>>, NtStatus> {
+    if !path_is_relative
+        && !nt_ntdll::rtl::activation_redirection::absolute_path_is_system32(
+            original,
+            system_root,
+        )
+    {
+        return Ok(None);
+    }
+    let active = unsafe { current_active_activation_context_no_addref() };
+    let process = unsafe { process_activation_context_no_addref() };
+    for (index, context) in [active, process].into_iter().enumerate() {
+        if context.is_null() || (index == 1 && context == active) {
+            continue;
+        }
+        let Some(object_ptr) = (unsafe { activation_context_acquire_registered(context) }) else {
+            continue;
+        };
+        let object = unsafe { &*object_ptr };
+        let found = match nt_ntdll::rtl::activation_section::find_dll_redirection(
+            &object.dll_redirect_section,
+            lookup_name,
+        ) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                unsafe { activation_context_release(context) };
+                continue;
+            }
+            Err(status) => {
+                unsafe { activation_context_release(context) };
+                return Err(status);
+            }
+        };
+        let redirection =
+            match nt_ntdll::rtl::activation_section::decode_dll_redirection(
+                &object.dll_redirect_section,
+                found,
+            ) {
+                Ok(redirection) => redirection,
+                Err(status) => {
+                    unsafe { activation_context_release(context) };
+                    return Err(status);
+                }
+            };
+        let path = (|| -> Result<Vec<u16>, NtStatus> {
+            let mut path = nt_ntdll::rtl::activation_redirection::compose_redirected_path(
+                &redirection,
+                &object.source,
+                &object.assembly_directory,
+                system_root,
+                lookup_name,
+            )?;
+            if redirection.flags
+                & nt_ntdll::rtl::activation_section::DLL_REDIRECTION_PATH_EXPAND
+                != 0
+            {
+                path = crate::on_target::expand_env_units(&path).ok_or(STATUS_UNSUCCESSFUL)?;
+                if path.last() == Some(&0) {
+                    path.pop();
+                }
+            }
+            Ok(path)
+        })();
+        unsafe { activation_context_release(context) };
+        return path.map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_isolation_redirection_output(
+    path: &[u16],
+    output_flags: u32,
+    static_string: PUnicodeString,
+    dynamic_string: PUnicodeString,
+    full_path: *mut PUnicodeString,
+    new_flags: *mut u32,
+    file_part_prefix_cch: *mut usize,
+    bytes_required: *mut usize,
+) -> NtStatus {
+    if static_string.is_null() && dynamic_string.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let static_descriptor = if static_string.is_null() {
+        None
+    } else {
+        let descriptor = unsafe { core::ptr::read_unaligned(static_string) };
+        if descriptor.maximum_length & 1 != 0
+            || (descriptor.maximum_length != 0 && descriptor.buffer == 0)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        Some(descriptor)
+    };
+    if path
+        .len()
+        .checked_add(1)
+        .is_none_or(|units| units > u16::MAX as usize / 2)
+    {
+        return STATUS_NAME_TOO_LONG;
+    }
+    let static_capacity = static_descriptor.map(|descriptor| descriptor.maximum_length as usize);
+    let selection = nt_ntdll::rtl::activation_redirection::select_output(
+        path.len(),
+        static_capacity,
+        !dynamic_string.is_null(),
+        !file_part_prefix_cch.is_null(),
+    );
+    let (selection, required) = match selection {
+        Ok(selection) => selection,
+        Err(status) => {
+            if !bytes_required.is_null() {
+                unsafe { core::ptr::write_unaligned(bytes_required, (path.len() + 1) * 2) };
+            }
+            return status;
+        }
+    };
+    if selection == nt_ntdll::rtl::activation_redirection::OutputSelection::ExistenceOnly {
+        return STATUS_SUCCESS;
+    }
+    let selected = match selection {
+        nt_ntdll::rtl::activation_redirection::OutputSelection::Static => static_string,
+        nt_ntdll::rtl::activation_redirection::OutputSelection::Dynamic => {
+            let buffer = crate::process_heap_alloc(required) as *mut u16;
+            if buffer.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            if let Some(mut descriptor) = static_descriptor {
+                descriptor.length = 0;
+                if descriptor.maximum_length >= 2 {
+                    unsafe { core::ptr::write_unaligned(descriptor.buffer as *mut u16, 0) };
+                }
+                unsafe { core::ptr::write_unaligned(static_string, descriptor) };
+            }
+            unsafe {
+                let mut descriptor = UnicodeString::default();
+                descriptor.maximum_length = required as u16;
+                descriptor.buffer = buffer as u64;
+                core::ptr::write_unaligned(
+                    dynamic_string,
+                    descriptor,
+                );
+            }
+            dynamic_string
+        }
+        nt_ntdll::rtl::activation_redirection::OutputSelection::ExistenceOnly => unreachable!(),
+    };
+    let mut selected_descriptor = unsafe { core::ptr::read_unaligned(selected) };
+    let buffer = selected_descriptor.buffer as *mut u16;
+    if buffer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buffer, path.len());
+        core::ptr::write_unaligned(buffer.add(path.len()), 0);
+        selected_descriptor.length = (path.len() * 2) as u16;
+        core::ptr::write_unaligned(selected, selected_descriptor);
+        if !full_path.is_null() {
+            core::ptr::write_unaligned(full_path, selected);
+        }
+        if !file_part_prefix_cch.is_null() {
+            core::ptr::write_unaligned(
+                file_part_prefix_cch,
+                nt_ntdll::rtl::activation_redirection::file_part_prefix_cch(path),
+            );
+        }
+        if !new_flags.is_null() {
+            core::ptr::write_unaligned(new_flags, output_flags);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// `RtlDosApplyFileIsolationRedirection_Ustr` resolves `.local` and activation-context DLL
+/// redirections into caller-owned or process-heap-backed counted strings.
+///
+/// # Safety
+/// All descriptors and optional outputs follow the native nine-argument ABI.
+#[export_name = "RtlDosApplyFileIsolationRedirection_Ustr"]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn rtl_dos_apply_file_isolation_redirection_ustr(
+    flags: u32,
+    original_name: PCUnicodeString,
+    extension: PCUnicodeString,
+    static_string: PUnicodeString,
+    dynamic_string: PUnicodeString,
+    full_path: *mut PUnicodeString,
+    new_flags: *mut u32,
+    file_part_prefix_cch: *mut usize,
+    bytes_required: *mut usize,
+) -> NtStatus {
+    if !new_flags.is_null() {
+        unsafe { core::ptr::write_unaligned(new_flags, 0) };
+    }
+    if !file_part_prefix_cch.is_null() {
+        unsafe { core::ptr::write_unaligned(file_part_prefix_cch, 0) };
+    }
+    if !bytes_required.is_null() {
+        unsafe { core::ptr::write_unaligned(bytes_required, 0) };
+    }
+    if !dynamic_string.is_null() {
+        unsafe { core::ptr::write_unaligned(dynamic_string, UnicodeString::default()) };
+    }
+    if original_name.is_null()
+        || (static_string.is_null() && dynamic_string.is_null() && !file_part_prefix_cch.is_null())
+        || (!static_string.is_null() && !dynamic_string.is_null() && full_path.is_null())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if flags
+            & !nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_FLAG_RESPECT_DOT_LOCAL
+            != 0
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let original_descriptor = core::ptr::read_unaligned(original_name);
+        if !static_string.is_null() {
+            let static_descriptor = core::ptr::read_unaligned(static_string);
+            if original_name == static_string
+                || (original_descriptor.buffer != 0
+                    && original_descriptor.buffer == static_descriptor.buffer)
+            {
+                return STATUS_SXS_KEY_NOT_FOUND;
+            }
+        }
+        let original = match copy_validated_unicode_string(original_name) {
+            Ok(original) => original,
+            Err(status) => return status,
+        };
+        let extension = if extension.is_null() {
+            None
+        } else {
+            match copy_validated_unicode_string(extension) {
+                Ok(extension) => Some(extension),
+                Err(status) => return status,
+            }
+        };
+        let prepared = match nt_ntdll::rtl::activation_redirection::prepare_isolation_name(
+            flags,
+            &original,
+            extension.as_deref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => return status,
+        };
+        if flags
+            & nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_FLAG_RESPECT_DOT_LOCAL
+            != 0
+        {
+            match isolation_dot_local_path(&prepared.lookup_name) {
+                Ok(Some(path)) => {
+                    return write_isolation_redirection_output(
+                        &path,
+                        nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_OUTFLAG_DOT_LOCAL_REDIRECT,
+                        static_string,
+                        dynamic_string,
+                        full_path,
+                        new_flags,
+                        file_part_prefix_cch,
+                        bytes_required,
+                    );
+                }
+                Ok(None) => {}
+                Err(status) => return status,
+            }
+        }
+        if !prepared.actctx_lookup_allowed {
+            return STATUS_SXS_KEY_NOT_FOUND;
+        }
+        let system_root = isolation_system_root();
+        let path = match isolation_actctx_path(
+            &original,
+            &prepared.lookup_name,
+            prepared.path_is_relative,
+            &system_root,
+        ) {
+            Ok(Some(path)) => path,
+            Ok(None) => return STATUS_SXS_KEY_NOT_FOUND,
+            Err(status) => return status,
+        };
+        write_isolation_redirection_output(
+            &path,
+            nt_ntdll::rtl::activation_redirection::RTL_DOS_APPLY_FILE_REDIRECTION_USTR_OUTFLAG_ACTCTX_REDIRECT,
+            static_string,
+            dynamic_string,
+            full_path,
+            new_flags,
+            file_part_prefix_cch,
+            bytes_required,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (flags, extension);
+        STATUS_NOT_IMPLEMENTED
+    }
+}
+
 /// `RtlFindMessage(PVOID DllHandle, ULONG MessageTableId, ULONG MessageLanguageId, ULONG MessageId,
 /// PMESSAGE_RESOURCE_ENTRY* MessageEntry) -> NTSTATUS` — look up a message-table string in a
 /// module's `.rsrc`. Mirrors ReactOS `sdk/lib/rtl/message.c`: find the `RT_MESSAGETABLE` resource
@@ -28784,6 +29175,7 @@ pub unsafe extern "C" fn export_anchor() {
         rtl_dos_path_name_to_relative_nt_path_name_u_with_status as usize,
         rtl_release_relative_name as usize,
         rtl_dos_search_path_ustr as usize,
+        rtl_dos_apply_file_isolation_redirection_ustr as *const () as usize,
         rtl_find_message as usize,
         rtl_format_message as *const () as usize,
         rtl_format_message_ex as *const () as usize,

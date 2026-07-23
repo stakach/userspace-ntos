@@ -14,6 +14,7 @@
 pub mod activation;
 pub mod activation_manifest;
 pub mod activation_query;
+pub mod activation_redirection;
 pub mod activation_section;
 pub mod activation_settings;
 pub mod atom;

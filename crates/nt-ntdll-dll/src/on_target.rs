@@ -8728,7 +8728,7 @@ unsafe fn dispatch_value(
 /// Expand a `%VAR%` UTF-16 string against the live PEB environment block. Returns the expanded units
 /// (NUL-terminated), or `None` if the env can't be read.
 #[cfg(target_arch = "x86_64")]
-fn expand_env_units(src: &[u16]) -> Option<alloc::vec::Vec<u16>> {
+pub(crate) fn expand_env_units(src: &[u16]) -> Option<alloc::vec::Vec<u16>> {
     use alloc::string::String;
     // Read NtCurrentPeb() = gs:[0x60] → ProcessParameters(+0x20) → Environment(+0x80).
     let env_ptr: *const u16;

@@ -48,6 +48,12 @@ pub struct DllRedirectionMatch {
     pub assembly_roster_index: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DllRedirectionData {
+    pub flags: u32,
+    pub path_segments: Vec<Vec<u16>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowClassAssembly<'a> {
     pub version: [u16; 4],
@@ -198,11 +204,17 @@ pub fn build_dll_redirection_section(redirects: &[DllRedirect]) -> Result<Vec<u8
                 .checked_add(REDIRECTION_SIZE)
                 .ok_or(STATUS_NO_MEMORY)?;
             let path_offset = data_offset.checked_add(data_size).ok_or(STATUS_NO_MEMORY)?;
-            let flags = if load_from.iter().any(|unit| *unit == b'%' as u16) {
-                DLL_REDIRECTION_PATH_EXPAND
-            } else {
-                0
-            };
+            let mut flags = 0;
+            if load_from.iter().any(|unit| *unit == b'%' as u16) {
+                flags |= DLL_REDIRECTION_PATH_EXPAND;
+            }
+            if !load_from
+                .last()
+                .copied()
+                .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
+            {
+                flags |= DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME;
+            }
 
             write_u32(&mut section, data_offset, to_u32(data_size)?)?;
             write_u32(&mut section, data_offset + 4, flags)?;
@@ -244,7 +256,7 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
         .ok()
         .and_then(|value| value.checked_mul(INDEX_SIZE))
         .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-    let mut expected = usize::try_from(index_offset)
+    usize::try_from(index_offset)
         .ok()
         .and_then(|value| value.checked_add(index_bytes))
         .filter(|value| *value <= section.len())
@@ -265,8 +277,7 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
         let index_data_length = read_offset(section, index + 16)?;
         let roster_index = read_u32(section, index + 20)?;
 
-        if name_offset != expected
-            || name_length == 0
+        if name_length == 0
             || name_length % 2 != 0
             || index_data_length != REDIRECTION_SIZE
             || roster_index == 0
@@ -276,11 +287,10 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
         let name_with_nul = name_length
             .checked_add(2)
             .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-        let name_storage = align4(name_with_nul).ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-        let expected_data = name_offset
-            .checked_add(name_storage)
-            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-        if data_offset != expected_data
+        if name_offset
+            .checked_add(name_with_nul)
+            .filter(|end| *end <= section.len())
+            .is_none()
             || data_offset
                 .checked_add(REDIRECTION_SIZE)
                 .filter(|end| *end <= section.len())
@@ -302,63 +312,83 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
         let total_path_length = read_offset(section, data_offset + 8)?;
         let path_count = read_u32(section, data_offset + 12)?;
         let path_segment_offset = read_offset(section, data_offset + 16)?;
-        expected = if path_count == 0 {
+        let allowed_flags = DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME
+            | DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT
+            | DLL_REDIRECTION_PATH_EXPAND
+            | DLL_REDIRECTION_PATH_SYSTEM_DEFAULT_REDIRECTED_SYSTEM32_DLL;
+        if flags & !allowed_flags != 0
+            || flags & DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT != 0
+                && flags & DLL_REDIRECTION_PATH_EXPAND != 0
+        {
+            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+        }
+        if path_count == 0 {
             if data_size != REDIRECTION_SIZE
-                || flags != DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT
+                || flags & DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT == 0
+                || flags & (DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME | DLL_REDIRECTION_PATH_EXPAND)
+                    != 0
                 || total_path_length != 0
                 || path_segment_offset != 0
             {
                 return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
             }
-            data_offset
-                .checked_add(REDIRECTION_SIZE)
-                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
-        } else if path_count == 1 {
+        } else {
+            let path_count =
+                usize::try_from(path_count).map_err(|_| STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+            let path_array_size = path_count
+                .checked_mul(PATH_SEGMENT_SIZE)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
             let expected_data_size = REDIRECTION_SIZE
-                .checked_add(PATH_SEGMENT_SIZE)
+                .checked_add(path_array_size)
                 .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
             if data_size != expected_data_size
-                || flags & !DLL_REDIRECTION_PATH_EXPAND != 0
-                || path_segment_offset
-                    != data_offset
-                        .checked_add(REDIRECTION_SIZE)
-                        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
-            {
-                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
-            }
-            let path_length = read_offset(section, path_segment_offset)?;
-            let path_offset = read_offset(
-                section,
-                path_segment_offset
-                    .checked_add(4)
-                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
-            )?;
-            let expected_path_offset = data_offset
-                .checked_add(expected_data_size)
-                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-            if path_offset != expected_path_offset
-                || path_length % 2 != 0
-                || align4(path_length) != Some(total_path_length)
-                || path_offset
-                    .checked_add(total_path_length)
+                || data_offset
+                    .checked_add(data_size)
                     .filter(|end| *end <= section.len())
                     .is_none()
-                || section_contains_unit(section, path_offset, path_length, 0)?
-                || path_has_percent(section, path_offset, path_length)?
-                    != (flags & DLL_REDIRECTION_PATH_EXPAND != 0)
+                || path_segment_offset
+                    .checked_add(path_array_size)
+                    .filter(|end| *end <= section.len())
+                    .is_none()
             {
                 return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
             }
-            path_offset
-                .checked_add(total_path_length)
-                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?
-        } else {
-            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
-        };
-    }
-
-    if expected != section.len() {
-        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            let mut raw_total_path_length = 0usize;
+            let mut aligned_total_path_length = 0usize;
+            for segment_index in 0..path_count {
+                let segment_offset = path_segment_offset
+                    .checked_add(
+                        segment_index
+                            .checked_mul(PATH_SEGMENT_SIZE)
+                            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+                    )
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+                let path_length = read_offset(section, segment_offset)?;
+                let path_offset = read_offset(section, segment_offset + 4)?;
+                let path_storage =
+                    align4(path_length).ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+                if path_length % 2 != 0
+                    || path_offset
+                        .checked_add(path_length)
+                        .filter(|end| *end <= section.len())
+                        .is_none()
+                    || section_contains_unit(section, path_offset, path_length, 0)?
+                {
+                    return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+                }
+                raw_total_path_length = raw_total_path_length
+                    .checked_add(path_length)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+                aligned_total_path_length = aligned_total_path_length
+                    .checked_add(path_storage)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+            }
+            if total_path_length != raw_total_path_length
+                && total_path_length != aligned_total_path_length
+            {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+        }
     }
     Ok(DllRedirectionSection {
         count,
@@ -404,6 +434,49 @@ pub fn find_dll_redirection(
         }));
     }
     Ok(None)
+}
+
+/// Decode the validated redirection payload returned by [`find_dll_redirection`].
+pub fn decode_dll_redirection(
+    section: &[u8],
+    matched: DllRedirectionMatch,
+) -> Result<DllRedirectionData, NtStatus> {
+    validate_dll_redirection_section(section)?;
+    let data_offset =
+        usize::try_from(matched.data_offset).map_err(|_| STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    if read_u32(section, data_offset)? != matched.data_length {
+        return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    let flags = read_u32(section, data_offset + 4)?;
+    let path_count = read_u32(section, data_offset + 12)?;
+    let mut path_segments = Vec::new();
+    path_segments
+        .try_reserve_exact(path_count as usize)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    let path_array_offset = read_offset(section, data_offset + 16)?;
+    for segment_index in 0..path_count as usize {
+        let segment_offset = path_array_offset
+            .checked_add(
+                segment_index
+                    .checked_mul(PATH_SEGMENT_SIZE)
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?,
+            )
+            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        let path_length = read_offset(section, segment_offset)?;
+        let path_offset = read_offset(section, segment_offset + 4)?;
+        let unit_count = path_length / 2;
+        let mut path = Vec::new();
+        path.try_reserve_exact(unit_count)
+            .map_err(|_| STATUS_NO_MEMORY)?;
+        for index in 0..unit_count {
+            path.push(read_u16(section, path_offset + index * 2)?);
+        }
+        path_segments.push(path);
+    }
+    Ok(DllRedirectionData {
+        flags,
+        path_segments,
+    })
 }
 
 /// Build the ReactOS window-class redirection string section in caller-supplied
@@ -1342,10 +1415,6 @@ fn section_name_eq(
     Ok(cursor == end)
 }
 
-fn path_has_percent(section: &[u8], offset: usize, length: usize) -> Result<bool, NtStatus> {
-    section_contains_unit(section, offset, length, b'%' as u16)
-}
-
 fn section_contains_unit(
     section: &[u8],
     offset: usize,
@@ -1595,7 +1664,7 @@ mod tests {
         assert_eq!(read_u32(&section, data), Ok(28));
         assert_eq!(
             read_u32(&section, data + 4),
-            Ok(DLL_REDIRECTION_PATH_EXPAND)
+            Ok(DLL_REDIRECTION_PATH_EXPAND | DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME)
         );
         assert_eq!(read_u32(&section, data + 12), Ok(1));
         assert_eq!(read_u32(&section, data + 16), Ok((data + 20) as u32));
@@ -1615,12 +1684,57 @@ mod tests {
         let data = found.data_offset as usize;
 
         assert_eq!(found.data_length, 28);
-        assert_eq!(read_u32(&section, data + 4), Ok(0));
+        assert_eq!(
+            read_u32(&section, data + 4),
+            Ok(DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME)
+        );
         assert_eq!(read_u32(&section, data + 8), Ok(0));
         assert_eq!(read_u32(&section, data + 12), Ok(1));
         assert_eq!(read_u32(&section, data + 20), Ok(0));
         assert_eq!(read_u32(&section, data + 24), Ok((data + 28) as u32));
         assert_eq!(section.len(), data + 28);
+    }
+
+    #[test]
+    fn validates_and_decodes_multiple_native_path_segments() {
+        let mut section = build_dll_redirection_section(&[DllRedirect {
+            name: wide("mapped.dll"),
+            load_from: Some(wide("ab")),
+        }])
+        .unwrap();
+        let found = find_dll_redirection(&section, &wide("mapped.dll"))
+            .unwrap()
+            .unwrap();
+        let data = found.data_offset as usize;
+        section.truncate(data + 20);
+        section.resize(data + 44, 0);
+        write_u32(&mut section, data, 36).unwrap();
+        write_u32(
+            &mut section,
+            data + 4,
+            DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME,
+        )
+        .unwrap();
+        write_u32(&mut section, data + 8, 8).unwrap();
+        write_u32(&mut section, data + 12, 2).unwrap();
+        write_u32(&mut section, data + 16, (data + 20) as u32).unwrap();
+        write_u32(&mut section, data + 20, 2).unwrap();
+        write_u32(&mut section, data + 24, (data + 36) as u32).unwrap();
+        write_u32(&mut section, data + 28, 2).unwrap();
+        write_u32(&mut section, data + 32, (data + 40) as u32).unwrap();
+        write_utf16(&mut section, data + 36, &wide("a")).unwrap();
+        write_utf16(&mut section, data + 40, &wide("b")).unwrap();
+
+        let found = find_dll_redirection(&section, &wide("mapped.dll"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_dll_redirection(&section, found),
+            Ok(DllRedirectionData {
+                flags: DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME,
+                path_segments: vec![wide("a"), wide("b")],
+            })
+        );
     }
 
     #[test]
