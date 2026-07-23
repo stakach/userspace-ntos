@@ -983,7 +983,7 @@ const _: () = assert!(win32k_subsystem::CSRSS_W32_SHARED_VA
 pub const DLL_PIN_COUNT: usize = 4;
 /// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 384; // 1.5 MiB
+pub const NTDLLBUF_FRAMES: u64 = 416; // 1.625 MiB, with growth headroom below one PT window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
@@ -1393,8 +1393,8 @@ static LSA_RPC_SERVER_ACTIVE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 /// object (REPLY_SMLOOP), mirroring REPLY_W32. 0 = not yet retyped.
 static SM_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static REPLY_SMLOOP_SLOT: AtomicU64 = AtomicU64::new(0);
-/// The SM-loop thread's TCB (0 until smss's first NtCreateThread spawns it; one real SmpApiLoop
-/// thread is enough — subsequent NtCreateThread stays a fake handle).
+/// The SM-loop thread's process-model identity and TCB.
+static SM_LOOP_TID: AtomicU64 = AtomicU64::new(0);
 static SM_LOOP_TCB: AtomicU64 = AtomicU64::new(0);
 /// The real SmpApiLoop's outstanding empty `NtReplyWaitReceivePort`. A completed rendezvous leaves
 /// the worker blocked here; the next connector is injected through this saved continuation instead
@@ -3574,6 +3574,8 @@ fn tp_worker_identity_for_tid(tid: u64) -> Option<(usize, usize)> {
 fn hosted_thread_tcb_cell(tid: u64) -> Option<&'static AtomicU64> {
     if let Some((pi, slot)) = tp_worker_identity_for_tid(tid) {
         Some(&TP_WORKER_TCB[pi][slot])
+    } else if tid == SM_LOOP_TID.load(Ordering::Relaxed) {
+        Some(&SM_LOOP_TCB)
     } else if tid == CSR_API_TID.load(Ordering::Relaxed) {
         Some(&CSR_LOOP_TCB)
     } else if tid == CSR_SB_TID.load(Ordering::Relaxed) {
@@ -3612,6 +3614,21 @@ fn runtime_thread_slot(tid: u64) -> Option<(usize, usize)> {
     None
 }
 
+unsafe fn pipe_io_cancel_thread(tid: u64) {
+    let table = &mut *core::ptr::addr_of_mut!(PIPE_WAITERS);
+    let mut reply_caps = [0u64; PIPE_WAITER_N];
+    let mut count = 0usize;
+    for (_, waiter) in table.drain_all().filter(|(_, waiter)| waiter.tid == tid) {
+        reply_caps[count] = waiter.reply_cap;
+        count += 1;
+    }
+    let _ = table.cancel_thread(tid);
+    for cap in reply_caps.into_iter().take(count).filter(|cap| *cap != 0) {
+        release_reply_pool_cap(cap);
+    }
+    let _ = (&mut *core::ptr::addr_of_mut!(PIPE_ASYNC_LISTENS)).cancel_thread(tid);
+}
+
 unsafe fn terminate_hosted_thread_mechanism(
     tid: u64,
     delay_queue: &mut nt_delay_execution::Queue<DELAY_WAITER_N>,
@@ -3622,6 +3639,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_timer_rearm(delay_queue);
     wait_cancel_thread(tid);
     keyed_wait_cancel_thread(tid);
+    pipe_io_cancel_thread(tid);
     let cell = match hosted_thread_tcb_cell(tid) {
         Some(cell) => cell,
         None => return false,

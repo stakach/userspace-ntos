@@ -29,8 +29,8 @@ pub(crate) unsafe fn spawn_sm_loop_thread(smss_pml4: u64, entry_rip: u64, port_h
         peb_va: SMSS_PEB_VA,
         stack_mirror_va: SM_STACK_MIRROR_VA,
         fault_ep: SM_FAULT_EP.load(Ordering::Relaxed),
-        cid_proc: 0,
-        cid_thread: 0,
+        cid_proc: PM_PIDS[0].load(Ordering::Relaxed),
+        cid_thread: SM_LOOP_TID.load(Ordering::Relaxed),
         resume: true,
         prio: 0,
         native: true,
@@ -225,6 +225,46 @@ unsafe fn sm_open_thread_call(
     nt_handler.pi = saved_pi;
     result
 }
+
+unsafe fn sm_set_thread_information_call(
+    nt_handler: &mut ExecNtHandler,
+    handle: u64,
+    information_class: u32,
+    information: u64,
+    information_length: u32,
+) -> u64 {
+    const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
+    const STATUS_DATATYPE_MISALIGNMENT: u64 = 0x8000_0002;
+    let expected = match ExecNtHandler::thread_set_length(information_class) {
+        Ok(length) => length,
+        Err(status) => return status as u64,
+    };
+    if information_length as usize != expected {
+        return nt_process::STATUS_INFO_LENGTH_MISMATCH as u64;
+    }
+    let mut value = [0u8; 8];
+    if expected != 0 {
+        if information & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !sm_stack_copyin(information, &mut value[..expected]) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    let saved_pi = nt_handler.pi;
+    let saved_tid = nt_handler.current_tid;
+    nt_handler.pi = 0;
+    nt_handler.current_tid = SM_LOOP_TID.load(Ordering::Relaxed);
+    let status = nt_handler.set_thread_information_captured(
+        handle,
+        information_class,
+        u64::from_le_bytes(value),
+    );
+    nt_handler.pi = saved_pi;
+    nt_handler.current_tid = saved_tid;
+    status as u64
+}
+
 /// Demand-fill one code/data page for the SM-loop thread during the rendezvous. The page is in smss's
 /// own image (PE_LOAD_BASE..img_end → `smss_pe`) or ntdll (nt_base..nt_end → `ntdll_pe`); it is filled
 /// through an isolated executive scratch (SM_FILL_SCRATCH_BASE, its own PT) then mapped into smss's
@@ -429,7 +469,15 @@ pub(crate) unsafe fn sm_rendezvous(
                 print_str(b"\n");
             }
             match ssn {
-                SSN_SET_INFO_THREAD => {} // RtlSetThreadIsCritical → no-op success
+                SSN_SET_INFO_THREAD => {
+                    result = sm_set_thread_information_call(
+                        nt_handler,
+                        get_recv_mr(9),
+                        rdx as u32,
+                        get_recv_mr(7),
+                        get_recv_mr(8) as u32,
+                    );
+                }
                 SSN_NT_OPEN_PROCESS => {
                     // SmpHandleConnectionRequest opens the connecting CSRSS process by the real CID.
                     // Mint the handle in SMSS's real table; SmpSbCreateSession later uses the saved
@@ -750,7 +798,15 @@ pub(crate) unsafe fn sm_api_request_rendezvous(
                 print_u64(ssn);
                 print_str(b"\n");
                 match ssn {
-                    SSN_SET_INFO_THREAD => {}
+                    SSN_SET_INFO_THREAD => {
+                        result = sm_set_thread_information_call(
+                            nt_handler,
+                            get_recv_mr(9),
+                            rdx as u32,
+                            get_recv_mr(7),
+                            get_recv_mr(8) as u32,
+                        );
+                    }
                     SSN_NT_OPEN_PROCESS => {
                         result = sm_open_process_call(
                             nt_handler,

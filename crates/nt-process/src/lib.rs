@@ -318,6 +318,7 @@ pub struct NtThread {
     pub thread_id: ThreadId,
     pub process_id: ProcessId,
     pub start_address: u64,
+    pub win32_start_address: u64,
     pub parameter: u64,
     pub state: ThreadState,
     pub is_system_thread: bool,
@@ -339,6 +340,10 @@ pub struct NtThread {
     pub teb_base: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
     break_on_termination: bool,
+    /// `ThreadPriorityBoost`: true when dynamic priority boosts are disabled.
+    disable_boost: bool,
+    /// `ThreadHideFromDebugger`, set-only-to-true through the native API.
+    hide_from_debugger: bool,
 }
 
 /// Per-thread state installed through `ThreadImpersonationToken`.
@@ -610,6 +615,7 @@ impl ProcessManager {
                 thread_id: tid,
                 process_id: pid,
                 start_address,
+                win32_start_address: start_address,
                 parameter,
                 state: ThreadState::Ready,
                 is_system_thread,
@@ -623,6 +629,8 @@ impl ProcessManager {
                 win32_thread: None,
                 teb_base: 0,
                 break_on_termination: false,
+                disable_boost: false,
+                hide_from_debugger: false,
             },
         );
         Ok(tid)
@@ -780,6 +788,8 @@ impl ProcessManager {
                 })
                 .count()
                 == 1) as u32),
+            14 => Ok(thread.disable_boost as u32),
+            17 => Ok(thread.hide_from_debugger as u32),
             18 => Ok(thread.break_on_termination as u32),
             20 => Ok((thread.state == ThreadState::Terminated) as u32),
             _ => Err(STATUS_INVALID_INFO_CLASS),
@@ -811,6 +821,32 @@ impl ProcessManager {
         };
         thread.create_time_100ns = create_time_100ns;
         true
+    }
+
+    pub fn thread_start_address(
+        &self,
+        caller_pid: ProcessId,
+        current_tid: ThreadId,
+        handle: u64,
+    ) -> Result<u64, u32> {
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        let tid =
+            self.resolve_thread_handle(caller_pid, current_tid, handle, THREAD_QUERY_INFORMATION)?;
+        self.thread(tid)
+            .map(|thread| thread.win32_start_address)
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub fn set_thread_disable_boost(&mut self, tid: ThreadId, disabled: bool) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.disable_boost = disabled;
+        Ok(())
+    }
+
+    pub fn set_thread_hide_from_debugger(&mut self, tid: ThreadId) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.hide_from_debugger = true;
+        Ok(())
     }
 
     /// Resolve a caller-local thread handle for an operation requiring `required_access`.
@@ -1061,6 +1097,7 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         thread.start_address = start_address;
+        thread.win32_start_address = start_address;
         thread.parameter = 0;
         thread.state = if create_suspended {
             ThreadState::Suspended
@@ -1076,6 +1113,8 @@ impl ProcessManager {
         thread.win32_thread = None;
         thread.teb_base = 0;
         thread.break_on_termination = false;
+        thread.disable_boost = false;
+        thread.hide_from_debugger = false;
         Ok(())
     }
 
@@ -1087,10 +1126,22 @@ impl ProcessManager {
         match self.threads.get_mut(&tid) {
             Some(t) => {
                 t.start_address = start_address;
+                t.win32_start_address = start_address;
                 true
             }
             None => false,
         }
+    }
+
+    /// Set the user-visible Win32 entry point without altering the scheduler's execution entry.
+    pub fn set_thread_win32_start_address(
+        &mut self,
+        tid: ThreadId,
+        start_address: u64,
+    ) -> Result<(), u32> {
+        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        thread.win32_start_address = start_address;
+        Ok(())
     }
 
     /// Bind a thread's TEB base VA (spec §7.2) — the host sets it once it maps the thread's TEB page

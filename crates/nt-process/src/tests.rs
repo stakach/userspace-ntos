@@ -702,6 +702,8 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
         .unwrap();
     assert_eq!(pm.suspend_thread(target), Ok(0));
     assert!(pm.set_thread_times(target, 100, 900, 30, 40));
+    pm.set_thread_disable_boost(target, true).unwrap();
+    pm.set_thread_hide_from_debugger(target).unwrap();
     pm.set_thread_break_on_termination(target, true).unwrap();
     let handle = pm
         .insert_handle(pid, HandleObject::Thread(target), THREAD_QUERY_INFORMATION)
@@ -722,7 +724,19 @@ fn thread_query_classes_use_access_checked_state_and_real_times() {
             user_time: 40,
         }
     );
+    assert_eq!(
+        pm.thread_start_address(pid, current, handle as u64),
+        Ok(0x2000)
+    );
+    pm.set_thread_win32_start_address(target, 0x3000).unwrap();
+    assert_eq!(pm.thread(target).unwrap().start_address, 0x2000);
+    assert_eq!(
+        pm.thread_start_address(pid, current, handle as u64),
+        Ok(0x3000)
+    );
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 12), Ok(0));
+    assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 14), Ok(1));
+    assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 17), Ok(1));
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 18), Ok(1));
     assert_eq!(pm.query_thread_u32(pid, current, handle as u64, 20), Ok(0));
 

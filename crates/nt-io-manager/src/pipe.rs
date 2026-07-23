@@ -652,6 +652,13 @@ impl<const N: usize> PipeWaiterTable<N> {
         self.slots.iter().all(|s| s.is_none())
     }
 
+    /// Whether `tid` currently owns any retained pending read/transceive IRP.
+    pub fn has_thread(&self, tid: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.is_some_and(|waiter| waiter.tid == tid))
+    }
+
     /// A snapshot copy of every parked waiter, for the executive to re-drive on a
     /// peer write. Copies (not references) so the executive can call npfs +
     /// `complete` without borrowing the table across its `&mut self` npfs route.
@@ -726,6 +733,8 @@ pub struct AsyncListen {
     pub event_obj_idx: u64,
     /// The server process index (whose VSpace the listen IOSB is written into).
     pub pi: u32,
+    /// The thread that issued this pending listen IRP.
+    pub tid: u64,
     /// The listener thread's fault-EP badge (for the mirror-context switch during the IOSB copyout).
     pub badge: u64,
     /// The listen IO_STATUS_BLOCK VA (filled `{Status=SUCCESS, Information=0}` on completion).
@@ -764,6 +773,25 @@ impl<const N: usize> Default for AsyncListenTable<N> {
 impl<const N: usize> AsyncListenTable<N> {
     pub const fn new() -> Self {
         Self { slots: [None; N] }
+    }
+
+    /// Whether `tid` currently owns any retained pending listen IRP.
+    pub fn has_thread(&self, tid: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.is_some_and(|listen| listen.tid == tid))
+    }
+
+    /// Cancel all pending listens issued by `tid`, returning the number removed.
+    pub fn cancel_thread(&mut self, tid: u64) -> usize {
+        let mut count = 0;
+        for slot in &mut self.slots {
+            if slot.is_some_and(|listen| listen.tid == tid) {
+                *slot = None;
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Record a pending async listen. If an entry already exists for `server_file_id`, it is REPLACED
@@ -887,6 +915,8 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert!(t.parked_on(0xAA));
         assert!(!t.parked_on(0xBB));
+        assert!(t.has_thread(7));
+        assert!(!t.has_thread(8));
         let w = t.get(slot).unwrap();
         assert_eq!(w.file_id, 0xAA);
         assert_eq!(w.pi, 3);
@@ -1335,6 +1365,7 @@ mod tests {
             server_file_id,
             event_obj_idx,
             pi: 3,
+            tid: 77,
             badge: 7,
             iosb_va: 0x9000 + server_file_id,
             name_hash: 0,
@@ -1359,6 +1390,9 @@ mod tests {
         let l = t.find(0xE802D50).unwrap();
         assert_eq!(l.event_obj_idx, 42);
         assert_eq!(l.pi, 3);
+        assert_eq!(l.tid, 77);
+        assert!(t.has_thread(77));
+        assert!(!t.has_thread(78));
         assert_eq!(l.iosb_va, 0x9000 + 0xE802D50);
         assert_eq!(t.get_slot_id(slot), Some(0xE802D50));
     }
@@ -1388,6 +1422,20 @@ mod tests {
         t.arm(al(0xE802D50, 99)).unwrap(); // re-arm same server, new event
         assert_eq!(t.len(), 1, "re-arm does not leak a second slot");
         assert_eq!(t.find(0xE802D50).unwrap().event_obj_idx, 99);
+    }
+
+    #[test]
+    fn async_listen_cancel_thread_removes_owned_irps() {
+        let mut t = AsyncListenTable::<8>::new();
+        t.arm(al(0xA, 1)).unwrap();
+        let mut other = al(0xB, 2);
+        other.tid = 88;
+        t.arm(other).unwrap();
+
+        assert_eq!(t.cancel_thread(77), 1);
+        assert!(!t.has_thread(77));
+        assert!(t.has_thread(88));
+        assert!(t.armed(0xB));
     }
 
     #[test]

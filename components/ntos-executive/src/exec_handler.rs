@@ -1390,9 +1390,53 @@ impl ExecNtHandler {
         match information_class {
             0 => Ok(0x30),
             1 => Ok(0x20),
-            12 | 18 | 20 => Ok(4),
+            9 | 11 => Ok(8),
+            12 | 14 | 16 | 18 | 20 => Ok(4),
+            17 => Ok(1),
             _ => Err(nt_process::STATUS_INVALID_INFO_CLASS),
         }
+    }
+
+    pub(crate) fn thread_set_length(information_class: u32) -> Result<usize, u32> {
+        match information_class {
+            9 | 14 => Ok(8),
+            17 => Ok(0),
+            18 => Ok(4),
+            _ => Err(nt_process::STATUS_INVALID_INFO_CLASS),
+        }
+    }
+
+    pub(crate) fn set_thread_information_captured(
+        &mut self,
+        handle: u64,
+        information_class: u32,
+        value: u64,
+    ) -> u32 {
+        if information_class == 18 && !self.current_token_has_privilege(nt_security::SE_DEBUG) {
+            return 0xC000_0061;
+        }
+        const THREAD_SET_INFORMATION: u32 = 0x0020;
+        let caller = match self.pm_pid_for_pi(self.pi) {
+            Some(pid) => pid,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        let tid = match self.pm.resolve_thread_handle(
+            caller,
+            self.current_tid as nt_process::ThreadId,
+            handle,
+            THREAD_SET_INFORMATION,
+        ) {
+            Ok(tid) => tid,
+            Err(status) => return status,
+        };
+        let update = match information_class {
+            9 => self.pm.set_thread_win32_start_address(tid, value),
+            14 => self.pm.set_thread_disable_boost(tid, value != 0),
+            17 => self.pm.set_thread_hide_from_debugger(tid),
+            18 => self.pm.set_thread_break_on_termination(tid, value as u32 != 0),
+            _ => return nt_process::STATUS_INVALID_INFO_CLASS,
+        };
+        update.map_or_else(|status| status, |()| 0)
     }
 
     pub(crate) fn query_thread_information_captured(
@@ -1445,7 +1489,19 @@ impl ExecNtHandler {
                 }
                 0x20
             }
-            12 | 18 | 20 => {
+            9 | 11 => {
+                let start_address =
+                    self.pm
+                        .thread_start_address(caller_pid, current_tid, handle)?;
+                let value = if information_class == 9 {
+                    start_address
+                } else {
+                    0
+                };
+                output[..8].copy_from_slice(&value.to_le_bytes());
+                8
+            }
+            12 | 14 | 18 | 20 => {
                 let value = self.pm.query_thread_u32(
                     caller_pid,
                     current_tid,
@@ -1454,6 +1510,28 @@ impl ExecNtHandler {
                 )?;
                 output[..4].copy_from_slice(&value.to_le_bytes());
                 4
+            }
+            16 => {
+                const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+                let tid = self.pm.resolve_thread_handle(
+                    caller_pid,
+                    current_tid,
+                    handle,
+                    THREAD_QUERY_INFORMATION,
+                )?;
+                let pending = unsafe {
+                    (&*core::ptr::addr_of!(PIPE_WAITERS)).has_thread(tid as u64)
+                        || (&*core::ptr::addr_of!(PIPE_ASYNC_LISTENS)).has_thread(tid as u64)
+                };
+                output[..4].copy_from_slice(&(pending as u32).to_le_bytes());
+                4
+            }
+            17 => {
+                let value = self
+                    .pm
+                    .query_thread_u32(caller_pid, current_tid, handle, information_class)?;
+                output[0] = value as u8;
+                1
             }
             _ => return Err(nt_process::STATUS_INVALID_INFO_CLASS),
         };
@@ -4370,9 +4448,8 @@ impl NativeSyscallHandler for ExecNtHandler {
                             server_file_id: fid,
                             event_obj_idx,
                             pi: self.pi as u32,
-                            // The listener badge is derived from pi at completion (pi 3 → SVC_LISTENER,
-                            // pi 4 → LSASS_LISTENER); store 0 as a placeholder.
-                            badge: 0,
+                            tid: self.current_tid,
+                            badge: self.current_badge,
                             iosb_va: iosb,
                             // The server pipe's leaf name-hash (recorded at NtCreateNamedPipeFile) so a
                             // client connect completes ONLY the matching-name listen.
@@ -5485,6 +5562,39 @@ impl NativeSyscallHandler for ExecNtHandler {
                         }
                     }
                 }
+                if matches!(ctx.service, NativeService::NtCreateThread)
+                    && self.pi == 0
+                    && SM_LOOP_TID.load(Ordering::Relaxed) == 0
+                {
+                    unsafe {
+                        let sp = get_recv_mr(16);
+                        let context = smss_stack_read(sp + 0x30);
+                        let start = nt_thread_start::Amd64ThreadContext::read(
+                            |address| smss_stack_read(address),
+                            context,
+                        );
+                        let create_suspended = smss_stack_read(sp + 0x40) != 0;
+                        if let Some((_slot, tid, handle)) =
+                            self.nt_create_thread_handle(start.rip, create_suspended, args[1] as u32)
+                        {
+                            self.pm
+                                .set_thread_teb(tid as nt_process::ThreadId, SM_TEB_VA);
+                            self.queue_write(args[0], handle);
+                            let client_id = smss_stack_read(sp + 0x28);
+                            if client_id != 0 {
+                                self.queue_write(
+                                    client_id,
+                                    self.pm_pid_for_pi(0).unwrap_or(0) as u64,
+                                );
+                                self.queue_write(client_id + 8, tid);
+                            }
+                            SM_LOOP_TID.store(tid, Ordering::Relaxed);
+                            self.sm_spawn_request = true;
+                            return 0;
+                        }
+                        return 0xC000_009A;
+                    }
+                }
                 let h = self.mint_handle();
                 self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
                 // Path B: smss creates its SmpApiLoop worker threads via NtCreateThread. Signal the
@@ -6491,43 +6601,31 @@ impl NativeSyscallHandler for ExecNtHandler {
                 }
             },
             NativeService::NtSetInformationThread => unsafe {
-                if args[1] == 5 {
+                let information_class = args[1] as u32;
+                if information_class == 5 {
                     return self.nt_set_thread_impersonation_token(args);
                 }
-                if args[1] != 18 {
-                    return 0;
-                }
-                const THREAD_SET_INFORMATION: u32 = 0x0020;
-                if args[3] != 4 {
+                let expected = match Self::thread_set_length(information_class) {
+                    Ok(length) => length,
+                    _ => return 0,
+                };
+                if args[3] as usize != expected {
                     return 0xC000_0004;
                 }
-                let mut value = [0u8; 4];
-                if args[2] == 0 || !self.xas_read(args[2], &mut value) {
-                    return 0xC000_0005;
+                let mut value = [0u8; 8];
+                if expected != 0 {
+                    if args[2] & 3 != 0 {
+                        return 0x8000_0002;
+                    }
+                    if args[2] == 0 || !self.xas_read(args[2], &mut value[..expected]) {
+                        return 0xC000_0005;
+                    }
                 }
-                if !self.current_token_has_privilege(nt_security::SE_DEBUG) {
-                    return 0xC000_0061;
-                }
-                let caller = match self.pm_pid_for_pi(self.pi) {
-                    Some(pid) => pid,
-                    None => return 0xC000_0008,
-                };
-                let tid = match self.pm.resolve_thread_handle(
-                    caller,
-                    self.current_tid as nt_process::ThreadId,
+                self.set_thread_information_captured(
                     args[0],
-                    THREAD_SET_INFORMATION,
-                ) {
-                    Ok(tid) => tid,
-                    Err(status) => return status,
-                };
-                match self.pm.set_thread_break_on_termination(
-                    tid,
-                    u32::from_le_bytes(value) != 0,
-                ) {
-                    Ok(()) => 0,
-                    Err(status) => status,
-                }
+                    information_class,
+                    u64::from_le_bytes(value),
+                )
             },
             NativeService::NtSetSystemInformation => unsafe {
                 use nt_syscall::system_information::{

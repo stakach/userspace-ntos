@@ -4884,8 +4884,8 @@ pub(crate) unsafe fn service_sec_image(
             // (no data yet). Steal this caller's reply cap into the PipeWaiterTable keyed by the reading
             // end fid (rotate REPLY_MAIN to a fresh pool object), recv the next event WITHOUT replying —
             // the caller stays blocked in-kernel. A later peer write re-drives it (pipe_redrive_all).
-            // Pool/table exhaustion → fall through to the immediate reply with STATUS_PENDING (degraded,
-            // never a hang). This REPLACES the old listener drop-park for pipe receives.
+            // Pool/table exhaustion returns STATUS_INSUFFICIENT_RESOURCES; returning PENDING without
+            // retaining an owned IRP would leave both completion and ThreadIsIoPending inconsistent.
             if park_pipe_fid != 0 && reply_main != 0 {
                 if pipe_wait_park(
                     park_pipe_fid,
@@ -4972,8 +4972,8 @@ pub(crate) unsafe fn service_sec_image(
                     badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
                     continue;
                 } else {
-                    print_str(b"[pipe-park] park unavailable -> return STATUS_PENDING\n");
-                    result = 0x0000_0103; // STATUS_PENDING (degraded fallback)
+                    print_str(b"[pipe-park] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
+                    result = 0xC000_009A;
                 }
             }
             let (nb, nmi, nm0, nm1, nm2, nm3) = if park_caller && reply_main != 0 {
@@ -5827,18 +5827,6 @@ unsafe fn pipe_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     woken
 }
 
-/// The badge of the RPC LISTENER thread for a server process index (pi 3 → services' SCM listener,
-/// pi 4 → lsass' LSA listener). The async listen's completion IOSB + its wait-array live on the
-/// listener thread's OWN stack/TEB, so the copyout must use the listener's mirror context.
-#[inline]
-fn listener_badge_for_pi(pi: u32) -> u64 {
-    match pi {
-        3 => SVC_LISTENER_BADGE,
-        4 => LSASS_LISTENER_BADGE,
-        _ => 0,
-    }
-}
-
 /// BATCH 34 — complete the pending async server `FSCTL_PIPE_LISTEN` matching `name_hash` after a
 /// client CONNECT to that same pipe name. The ncacn_np rpcrt4 SERVER posted an OVERLAPPED
 /// FSCTL_PIPE_LISTEN (STATUS_PENDING, no client) with a completion EVENT, then parked on
@@ -5869,7 +5857,7 @@ unsafe fn pipe_listen_complete_named(nt_handler: &mut ExecNtHandler, name_hash: 
     let mut completed = 0u64;
     {
         // Point the IOSB copyout at the SERVER listener's VSpace mirrors.
-        let badge = listener_badge_for_pi(l.pi);
+        let badge = l.badge;
         let (sb, ss, smv, hmv, imv) = mirror_ctx_for(badge, l.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
