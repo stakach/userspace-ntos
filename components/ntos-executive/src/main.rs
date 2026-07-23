@@ -996,7 +996,7 @@ const _: () = assert!(win32k_subsystem::CSRSS_W32_SHARED_VA
 pub const DLL_PIN_COUNT: usize = 4;
 /// Buffer for the generated ntdll.dll, shared host<->exec in its own 2 MiB page table.
 pub const NTDLLBUF_VADDR: u64 = 0x0000_0100_1440_0000;
-pub const NTDLLBUF_FRAMES: u64 = 416; // 1.625 MiB, with growth headroom below one PT window
+pub const NTDLLBUF_FRAMES: u64 = 480; // 1.875 MiB, with growth headroom below one PT window
 /// NLS code-page tables (c_1252.nls/c_437.nls/l_intl.nls), shared host<->exec. They live in the
 /// shared-input 2 MiB region (0xA0_0000-0xC0_0000). spawn_sec_image later shares these frames into smss + points the PEB NLS
 /// fields at them so RtlInitNlsTables/RtlUnicodeToMultiByteN work.
