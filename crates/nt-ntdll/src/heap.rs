@@ -185,6 +185,86 @@ pub const HEAP_SETTABLE_USER_VALUE: u32 = 0x0000_0100;
 /// The three caller-controlled heap-entry flags returned by `RtlGetUserInfoHeap`.
 pub const HEAP_SETTABLE_USER_FLAGS: u32 = 0x0000_0e00;
 
+/// Native `RTL_HEAP_WALK_ENTRY` flags.
+pub const RTL_HEAP_BUSY: u16 = 0x0001;
+pub const RTL_HEAP_SEGMENT: u16 = 0x0002;
+pub const RTL_HEAP_SETTABLE_VALUE: u16 = 0x0010;
+pub const RTL_HEAP_SETTABLE_FLAGS: u16 = 0x00e0;
+pub const RTL_HEAP_UNCOMMITTED_RANGE: u16 = 0x0100;
+
+/// Block-specific arm of `RTL_HEAP_WALK_ENTRY`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RtlHeapWalkBlock {
+    pub settable: usize,
+    pub tag_index: u16,
+    pub allocator_back_trace_index: u16,
+    pub reserved: [u32; 2],
+}
+
+/// Segment-specific arm of `RTL_HEAP_WALK_ENTRY`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RtlHeapWalkSegment {
+    pub committed_size: usize,
+    pub uncommitted_size: usize,
+    pub first_entry: *mut u8,
+    pub last_entry: *mut u8,
+}
+
+/// Native union carried by `RTL_HEAP_WALK_ENTRY`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union RtlHeapWalkDetails {
+    pub block: RtlHeapWalkBlock,
+    pub segment: RtlHeapWalkSegment,
+}
+
+/// ABI-compatible x64 heap-walk cursor and output record.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RtlHeapWalkEntry {
+    pub data_address: *mut u8,
+    pub data_size: usize,
+    pub overhead_bytes: u8,
+    pub segment_index: u8,
+    pub flags: u16,
+    pub details: RtlHeapWalkDetails,
+}
+
+impl RtlHeapWalkEntry {
+    /// A zero-address cursor restarts enumeration from the heap's segment descriptor.
+    pub const fn restart() -> Self {
+        Self {
+            data_address: core::ptr::null_mut(),
+            data_size: 0,
+            overhead_bytes: 0,
+            segment_index: 0,
+            flags: 0,
+            details: RtlHeapWalkDetails {
+                block: RtlHeapWalkBlock {
+                    settable: 0,
+                    tag_index: 0,
+                    allocator_back_trace_index: 0,
+                    reserved: [0; 2],
+                },
+            },
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeapWalkOutcome {
+    Entry,
+    NoMoreEntries,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeapWalkError {
+    InvalidAddress,
+    InvalidParameter,
+}
+
 /// User metadata associated with one live heap allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HeapUserInfo {
@@ -390,7 +470,7 @@ impl<B: Backing> Heap<B> {
         Some(next)
     }
 
-    fn find_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
+    fn find_physical_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
         if payload.is_null() {
             return None;
         }
@@ -404,12 +484,17 @@ impl<B: Backing> Heap<B> {
             let header = self.header_at_offset(offset)?;
             let next = self.validate_header(offset, previous_size, header)?;
             if offset.checked_add(HDR)? == relative {
-                return (!header.is_free()).then_some((offset, header));
+                return Some((offset, header));
             }
             previous_size = header.size;
             offset = next;
         }
         None
+    }
+
+    fn find_block(&self, payload: *const u8) -> Option<(usize, BlockHeader)> {
+        self.find_physical_block(payload)
+            .filter(|(_, header)| !header.is_free())
     }
 
     /// Validate either the complete physical block chain or one exact live allocation.
@@ -435,6 +520,128 @@ impl<B: Backing> Heap<B> {
             offset = next;
         }
         self.formatted && offset == self.region_len
+    }
+
+    fn segment_walk_entry(&self) -> RtlHeapWalkEntry {
+        RtlHeapWalkEntry {
+            data_address: self.backing.base(),
+            data_size: 0,
+            overhead_bytes: 0,
+            segment_index: 0,
+            flags: RTL_HEAP_SEGMENT,
+            details: RtlHeapWalkDetails {
+                segment: RtlHeapWalkSegment {
+                    committed_size: self.region_len,
+                    uncommitted_size: 0,
+                    // SAFETY: a formatted heap always has a complete first header.
+                    first_entry: unsafe { self.backing.base().add(HDR) },
+                    last_entry: self.region_end() as *mut u8,
+                },
+            },
+        }
+    }
+
+    fn block_walk_entry(
+        &self,
+        offset: usize,
+        header: BlockHeader,
+    ) -> Result<RtlHeapWalkEntry, HeapWalkError> {
+        let capacity = header.size - HDR;
+        // SAFETY: the validated block offset and header leave a complete payload in the region.
+        let payload = unsafe { self.backing.base().add(offset + HDR) };
+        let (data_size, overhead_bytes, flags, block) = if header.is_free() {
+            (
+                capacity,
+                u8::try_from(HDR).map_err(|_| HeapWalkError::InvalidParameter)?,
+                0,
+                RtlHeapWalkBlock {
+                    settable: 0,
+                    tag_index: 0,
+                    allocator_back_trace_index: 0,
+                    reserved: [0; 2],
+                },
+            )
+        } else {
+            let unused = usize::from(header.unused_bytes);
+            let mut flags =
+                RTL_HEAP_BUSY | ((header.user_flags >> 4) as u16 & RTL_HEAP_SETTABLE_FLAGS);
+            let settable = if header.has_user_value() {
+                flags |= RTL_HEAP_SETTABLE_VALUE;
+                header.user_value
+            } else {
+                0
+            };
+            (
+                capacity - unused,
+                u8::try_from(HDR + unused).map_err(|_| HeapWalkError::InvalidParameter)?,
+                flags,
+                RtlHeapWalkBlock {
+                    settable,
+                    tag_index: 0,
+                    allocator_back_trace_index: 0,
+                    reserved: [0; 2],
+                },
+            )
+        };
+        Ok(RtlHeapWalkEntry {
+            data_address: payload,
+            data_size,
+            overhead_bytes,
+            segment_index: 0,
+            flags,
+            details: RtlHeapWalkDetails { block },
+        })
+    }
+
+    /// Advance a native heap-walk cursor through the segment descriptor and physical blocks.
+    ///
+    /// A caller that needs a stable multi-call snapshot must retain `RtlLockHeap`, matching native
+    /// RTL. End-of-enumeration and validation errors leave the caller's entry unchanged.
+    pub fn walk_next(
+        &self,
+        entry: &mut RtlHeapWalkEntry,
+    ) -> Result<HeapWalkOutcome, HeapWalkError> {
+        if !self.validate(None) {
+            return Err(HeapWalkError::InvalidParameter);
+        }
+        let previous = *entry;
+        if previous.data_address.is_null() {
+            *entry = self.segment_walk_entry();
+            return Ok(HeapWalkOutcome::Entry);
+        }
+        if previous.segment_index != 0 {
+            return Err(HeapWalkError::InvalidAddress);
+        }
+
+        let next_offset = if previous.flags == RTL_HEAP_SEGMENT {
+            if previous.data_address != self.backing.base() {
+                return Err(HeapWalkError::InvalidAddress);
+            }
+            0
+        } else {
+            if previous.flags & !(RTL_HEAP_BUSY | RTL_HEAP_SETTABLE_VALUE | RTL_HEAP_SETTABLE_FLAGS)
+                != 0
+            {
+                return Err(HeapWalkError::InvalidParameter);
+            }
+            let (offset, header) = self
+                .find_physical_block(previous.data_address)
+                .ok_or(HeapWalkError::InvalidAddress)?;
+            let cursor_says_busy = previous.flags & RTL_HEAP_BUSY != 0;
+            if cursor_says_busy == header.is_free() || (header.is_free() && previous.flags != 0) {
+                return Err(HeapWalkError::InvalidParameter);
+            }
+            offset + header.size
+        };
+
+        if next_offset == self.region_len {
+            return Ok(HeapWalkOutcome::NoMoreEntries);
+        }
+        let header = self
+            .header_at_offset(next_offset)
+            .ok_or(HeapWalkError::InvalidParameter)?;
+        *entry = self.block_walk_entry(next_offset, header)?;
+        Ok(HeapWalkOutcome::Entry)
     }
 
     /// Split `block` so it holds exactly `need` bytes total, returning the tail to the free pool if
@@ -968,6 +1175,151 @@ mod tests {
             buf: vec![0u8; bytes + HEAP_ALIGN],
         })
         .unwrap()
+    }
+
+    fn next_walk_entry(heap: &Heap<VecBacking>, entry: &mut RtlHeapWalkEntry) -> RtlHeapWalkEntry {
+        assert_eq!(heap.walk_next(entry), Ok(HeapWalkOutcome::Entry));
+        *entry
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn heap_walk_entry_matches_native_x64_abi() {
+        assert_eq!(size_of::<RtlHeapWalkEntry>(), 0x38);
+        assert_eq!(align_of::<RtlHeapWalkEntry>(), 8);
+        assert_eq!(core::mem::offset_of!(RtlHeapWalkEntry, data_address), 0);
+        assert_eq!(core::mem::offset_of!(RtlHeapWalkEntry, data_size), 8);
+        assert_eq!(
+            core::mem::offset_of!(RtlHeapWalkEntry, overhead_bytes),
+            0x10
+        );
+        assert_eq!(core::mem::offset_of!(RtlHeapWalkEntry, flags), 0x12);
+        assert_eq!(core::mem::offset_of!(RtlHeapWalkEntry, details), 0x18);
+        assert_eq!(size_of::<RtlHeapWalkBlock>(), 0x18);
+        assert_eq!(size_of::<RtlHeapWalkSegment>(), 0x20);
+    }
+
+    #[test]
+    fn heap_walk_reports_segment_fresh_free_block_and_stable_end() {
+        let heap = heap(1024);
+        let mut entry = RtlHeapWalkEntry::restart();
+
+        let segment = next_walk_entry(&heap, &mut entry);
+        assert_eq!(segment.data_address, heap.handle());
+        assert_eq!(segment.data_size, 0);
+        assert_eq!(segment.overhead_bytes, 0);
+        assert_eq!(segment.segment_index, 0);
+        assert_eq!(segment.flags, RTL_HEAP_SEGMENT);
+        // SAFETY: the segment flag selects the segment union arm.
+        let details = unsafe { segment.details.segment };
+        assert_eq!(details.committed_size, heap.region_len);
+        assert_eq!(details.uncommitted_size, 0);
+        assert_eq!(details.first_entry, unsafe { heap.handle().add(HDR) });
+        assert_eq!(details.last_entry, heap.region_end() as *mut u8);
+
+        let block = next_walk_entry(&heap, &mut entry);
+        assert_eq!(block.data_address, unsafe { heap.handle().add(HDR) });
+        assert_eq!(block.data_size, heap.region_len - HDR);
+        assert_eq!(block.overhead_bytes, HDR as u8);
+        assert_eq!(block.flags, 0);
+        // SAFETY: a block row selects the block union arm.
+        let block_details = unsafe { block.details.block };
+        assert_eq!(block_details.settable, 0);
+        assert_eq!(block_details.reserved, [0; 2]);
+
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Ok(HeapWalkOutcome::NoMoreEntries)
+        );
+        assert_eq!(entry.data_address, block.data_address);
+        assert_eq!(entry.data_size, block.data_size);
+        assert_eq!(entry.flags, block.flags);
+    }
+
+    #[test]
+    fn heap_walk_reports_physical_order_requested_sizes_and_user_metadata() {
+        let mut heap = heap(2048);
+        let first = heap
+            .allocate_with_flags(17, HEAP_SETTABLE_USER_VALUE | 0x0a00)
+            .unwrap();
+        let middle = heap.allocate(33).unwrap();
+        let last = heap.allocate(49).unwrap();
+        // SAFETY: first/middle are exact live allocations from this heap.
+        unsafe {
+            assert!(heap.set_user_value(first, 0x1234_5678));
+            assert!(heap.free(middle));
+        }
+
+        let mut entry = RtlHeapWalkEntry::restart();
+        next_walk_entry(&heap, &mut entry);
+        let first_row = next_walk_entry(&heap, &mut entry);
+        assert_eq!(first_row.data_address, first);
+        assert_eq!(first_row.data_size, 17);
+        assert_eq!(
+            first_row.flags,
+            RTL_HEAP_BUSY | RTL_HEAP_SETTABLE_VALUE | 0x00a0
+        );
+        // SAFETY: the busy row selects the block union arm.
+        assert_eq!(unsafe { first_row.details.block }.settable, 0x1234_5678);
+
+        let free_row = next_walk_entry(&heap, &mut entry);
+        assert_eq!(free_row.data_address, middle);
+        assert_eq!(free_row.flags, 0);
+        assert!(free_row.data_size >= 33);
+
+        let last_row = next_walk_entry(&heap, &mut entry);
+        assert_eq!(last_row.data_address, last);
+        assert_eq!(last_row.data_size, 49);
+        assert_eq!(last_row.flags, RTL_HEAP_BUSY);
+
+        let tail = next_walk_entry(&heap, &mut entry);
+        assert_eq!(tail.flags, 0);
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Ok(HeapWalkOutcome::NoMoreEntries)
+        );
+    }
+
+    #[test]
+    fn heap_walk_restarts_and_rejects_stale_or_contradictory_cursors() {
+        let mut heap = heap(1024);
+        let allocation = heap.allocate(32).unwrap();
+        let mut entry = RtlHeapWalkEntry::restart();
+        next_walk_entry(&heap, &mut entry);
+        next_walk_entry(&heap, &mut entry);
+
+        let saved_address = entry.data_address;
+        entry.segment_index = 1;
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Err(HeapWalkError::InvalidAddress)
+        );
+        assert_eq!(entry.data_address, saved_address);
+
+        entry = RtlHeapWalkEntry::restart();
+        next_walk_entry(&heap, &mut entry);
+        entry.data_address = unsafe { allocation.add(1) };
+        entry.flags = RTL_HEAP_BUSY;
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Err(HeapWalkError::InvalidAddress)
+        );
+
+        entry.data_address = allocation;
+        entry.flags = 0;
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Err(HeapWalkError::InvalidParameter)
+        );
+
+        entry = RtlHeapWalkEntry::restart();
+        // SAFETY: corrupt the first in-band header without forming an invalid Rust value.
+        unsafe { (*heap.hdr(heap.handle())).reserved = 1 };
+        assert_eq!(
+            heap.walk_next(&mut entry),
+            Err(HeapWalkError::InvalidParameter)
+        );
+        assert!(entry.data_address.is_null());
     }
 
     #[test]

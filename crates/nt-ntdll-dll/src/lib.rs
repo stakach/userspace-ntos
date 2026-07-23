@@ -32,7 +32,9 @@ use core::mem::MaybeUninit;
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
-use nt_ntdll::heap::{Heap, HeapRegistry, HeapRemoval, HeapUserInfo};
+use nt_ntdll::heap::{
+    Heap, HeapRegistry, HeapRemoval, HeapUserInfo, HeapWalkError, HeapWalkOutcome, RtlHeapWalkEntry,
+};
 
 /// Step 4.0b — the `Rtl*` / `Ldr*` / `Dbg*` / CRT PE exports smss.exe imports (completes the export
 /// table so smss's FULL ntdll import set resolves against our DLL). See [`exports`].
@@ -580,6 +582,24 @@ pub(crate) fn heap_validate(handle: *mut u8, ptr: Option<*const u8>, flags: u32)
         process_heaps_locked()
             .find(handle)
             .is_some_and(|heap| heap.validate(ptr))
+    }
+}
+
+/// Advance a native heap-walk cursor on the exact registered heap.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn heap_walk(
+    handle: *mut u8,
+    entry: &mut RtlHeapWalkEntry,
+) -> Result<HeapWalkOutcome, HeapWalkError> {
+    let Some(_heap_guard) = lock_heap_operation(handle, false, false) else {
+        return Err(HeapWalkError::InvalidParameter);
+    };
+    let _guard = lock_process_heap();
+    unsafe {
+        process_heaps_locked()
+            .find(handle)
+            .ok_or(HeapWalkError::InvalidParameter)?
+            .walk_next(entry)
     }
 }
 

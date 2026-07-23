@@ -46,6 +46,7 @@ const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004;
 const STATUS_NO_MEMORY: NtStatus = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
 const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000D;
+const STATUS_INVALID_ADDRESS: NtStatus = 0xC000_0141;
 const STATUS_NOT_SUPPORTED: NtStatus = 0xC000_00BB;
 const STATUS_INVALID_PARAMETER_1: NtStatus = 0xC000_00EF;
 const STATUS_INVALID_PARAMETER_3: NtStatus = 0xC000_00F1;
@@ -20950,15 +20951,34 @@ pub unsafe extern "system" fn rtl_compact_heap(_heap: *mut c_void, _flags: u32) 
     0
 }
 
-/// `RtlWalkHeap(PVOID HeapHandle, PVOID Entry) -> NTSTATUS` — iterate heap blocks. We don't expose a
-/// walk interface; return STATUS_NO_MORE_ENTRIES (0x8000001A) so the caller's loop terminates
-/// cleanly rather than spinning.
+/// `RtlWalkHeap(PVOID HeapHandle, PRTL_HEAP_WALK_ENTRY Entry) -> NTSTATUS` — return the segment
+/// descriptor and then each physical busy/free block. The entry itself is the continuation cursor.
 ///
 /// # Safety
-/// `entry` a valid RTL_HEAP_WALK_ENTRY* or NULL.
+/// `entry` must be writable as one native `RTL_HEAP_WALK_ENTRY`.
 #[export_name = "RtlWalkHeap"]
-pub unsafe extern "system" fn rtl_walk_heap(_heap: *mut c_void, _entry: *mut c_void) -> NtStatus {
-    0x8000_001A // STATUS_NO_MORE_ENTRIES
+pub unsafe extern "system" fn rtl_walk_heap(
+    heap: *mut c_void,
+    entry: *mut nt_ntdll::heap::RtlHeapWalkEntry,
+) -> NtStatus {
+    if entry.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the caller provides the native in/out record for the duration of this call.
+        return match crate::heap_walk(heap.cast(), unsafe { &mut *entry }) {
+            Ok(nt_ntdll::heap::HeapWalkOutcome::Entry) => STATUS_SUCCESS,
+            Ok(nt_ntdll::heap::HeapWalkOutcome::NoMoreEntries) => STATUS_NO_MORE_ENTRIES,
+            Err(nt_ntdll::heap::HeapWalkError::InvalidAddress) => STATUS_INVALID_ADDRESS,
+            Err(nt_ntdll::heap::HeapWalkError::InvalidParameter) => STATUS_INVALID_PARAMETER,
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = heap;
+        STATUS_NOT_IMPLEMENTED
+    }
 }
 
 /// `RtlQueryHeapInformation(PVOID HeapHandle, HEAP_INFORMATION_CLASS Class, PVOID Info,
