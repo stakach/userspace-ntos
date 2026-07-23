@@ -13457,19 +13457,108 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
     }
 }
 
-/// `RtlFindActivationContextSectionGuid(...)` — GUID-backed activation sections are not yet built.
+/// `RtlFindActivationContextSectionGuid(...)` — resolve GUID-keyed activation-context entities.
+///
+/// CLR surrogates are backed by a real section. COM server/interface/type-library section IDs are
+/// recognized and report a missing key until their manifest models are added.
 ///
 /// # Safety
 /// Args per the RtlFindActivationContextSectionGuid ABI.
 #[export_name = "RtlFindActivationContextSectionGuid"]
 pub unsafe extern "system" fn rtl_find_activation_context_section_guid(
-    _flags: u32,
-    _ext_guid: *const c_void,
-    _section_id: u32,
-    _guid_to_find: *const c_void,
-    _returned_data: *mut c_void,
+    flags: u32,
+    ext_guid: *const c_void,
+    section_id: u32,
+    guid_to_find: *const c_void,
+    returned_data: *mut c_void,
 ) -> NtStatus {
-    STATUS_SXS_KEY_NOT_FOUND
+    if !ext_guid.is_null()
+        || flags & !FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0
+        || guid_to_find.is_null()
+        || returned_data.is_null()
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let output_size = unsafe { core::ptr::read_unaligned(returned_data as *const u32) };
+    if output_size < ACTCTX_SECTION_KEYED_DATA_MIN_SIZE {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !matches!(
+        section_id,
+        nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION
+            | nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_INTERFACE_REDIRECTION
+            | nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_COM_TYPE_LIBRARY_REDIRECTION
+            | nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_CLR_SURROGATES
+    ) {
+        return STATUS_SXS_SECTION_NOT_FOUND;
+    }
+    if section_id != nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_CLR_SURROGATES {
+        return STATUS_SXS_KEY_NOT_FOUND;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut encoded = [0u8; 16];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                guid_to_find as *const u8,
+                encoded.as_mut_ptr(),
+                encoded.len(),
+            );
+        }
+        let key = nt_ntdll::rtl::guid::Guid::from_windows_bytes(encoded);
+        let active = unsafe { current_active_activation_context_no_addref() };
+        let process = unsafe { process_activation_context_no_addref() };
+        for (index, context) in [active, process].into_iter().enumerate() {
+            if context.is_null() || (index == 1 && context == active) {
+                continue;
+            }
+            let Some(object_ptr) = (unsafe { activation_context_acquire_registered(context) })
+            else {
+                continue;
+            };
+            let object = unsafe { &*object_ptr };
+            let found = match nt_ntdll::rtl::activation_section::find_clr_surrogate(
+                &object.clr_surrogate_section,
+                &key,
+            ) {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    unsafe { activation_context_release(context) };
+                    continue;
+                }
+                Err(status) => {
+                    unsafe { activation_context_release(context) };
+                    return status;
+                }
+            };
+            let return_context = flags & FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX != 0;
+            unsafe {
+                write_activation_section_keyed_data(
+                    returned_data,
+                    output_size,
+                    &object.clr_surrogate_section,
+                    found.data_offset,
+                    found.data_length,
+                    if return_context {
+                        context
+                    } else {
+                        core::ptr::null_mut()
+                    },
+                    found.assembly_roster_index,
+                );
+            }
+            if !return_context {
+                unsafe { activation_context_release(context) };
+            }
+            return STATUS_SUCCESS;
+        }
+        STATUS_SXS_KEY_NOT_FOUND
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        STATUS_SXS_KEY_NOT_FOUND
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
