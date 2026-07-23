@@ -318,23 +318,42 @@ pub mod timer {
             Some(deadline.saturating_sub(now_ms).min(u32::MAX as u64) as u32)
         }
 
+        /// Timeout for the next timer that currently has callback capacity. A scheduler uses this
+        /// after [`ExpireResult::CallbackCapacity`] while also waiting on its wake event, so another
+        /// timer can still expire before an outstanding callback returns.
+        pub fn next_dispatch_timeout(&self, now_ms: u64) -> Option<u32> {
+            if self.inline_callback_id != 0 {
+                return None;
+            }
+            self.dispatchable_head_identity()
+                .map(|(_, deadline, _)| deadline.saturating_sub(now_ms).min(u32::MAX as u64) as u32)
+        }
+
         pub fn expire_one(&mut self, now_ms: u64) -> ExpireResult {
             if self.inline_callback_id != 0 {
                 return ExpireResult::InlineBusy;
             }
-            let Some((index, deadline, _)) = self.head_identity() else {
+            let Some((_, first_deadline, _)) = self.head_identity() else {
                 return ExpireResult::Idle;
             };
+            let Some((index, deadline, _)) = self.dispatchable_head_identity() else {
+                return if first_deadline <= now_ms {
+                    ExpireResult::CallbackCapacity
+                } else {
+                    ExpireResult::NotDue
+                };
+            };
             if deadline > now_ms {
+                if first_deadline <= now_ms {
+                    return ExpireResult::CallbackCapacity;
+                }
                 return ExpireResult::NotDue;
             }
-            let Some(callback_index) = self.slots[index]
+            let callback_index = self.slots[index]
                 .active_callbacks
                 .iter()
                 .position(|id| *id == 0)
-            else {
-                return ExpireResult::CallbackCapacity;
-            };
+                .expect("dispatchable timer has callback capacity");
             let firing_id = self.take_callback_id();
             let sequence = self.take_sequence();
             let (callback, context, generation, kind) = {
@@ -491,6 +510,17 @@ pub mod timer {
                 .iter()
                 .enumerate()
                 .filter(|(_, slot)| slot.phase == TimerPhase::Armed)
+                .map(|(index, slot)| (index, slot.deadline_ms, slot.sequence))
+                .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
+        }
+
+        fn dispatchable_head_identity(&self) -> Option<(usize, u64, u64)> {
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    slot.phase == TimerPhase::Armed && slot.active_callbacks.contains(&0)
+                })
                 .map(|(index, slot)| (index, slot.deadline_ms, slot.sequence))
                 .min_by_key(|(_, deadline, sequence)| (*deadline, *sequence))
         }
@@ -896,9 +926,12 @@ mod tests {
 
     #[test]
     fn callback_capacity_backpressures_and_wakes_scheduler() {
-        let mut queue = TimerQueue::<1>::new();
-        queue
+        let mut queue = TimerQueue::<2>::new();
+        let (primary, _) = queue
             .create_timer(0, spec(0, 1, WorkItemFlags::default()))
+            .unwrap();
+        let (secondary, _) = queue
+            .create_timer(0, spec(20, 0, WorkItemFlags::default()))
             .unwrap();
         let mut tickets: [Option<CallbackTicket>; 8] = core::array::from_fn(|_| None);
         for (now, ticket) in tickets.iter_mut().enumerate() {
@@ -907,15 +940,14 @@ mod tests {
             *ticket = Some(dispatch.ticket);
         }
         assert_eq!(queue.expire_one(8), ExpireResult::CallbackCapacity);
+        assert_eq!(queue.next_dispatch_timeout(8), Some(12));
         let completion = queue.callback_finished(tickets[0].take().unwrap()).unwrap();
         assert!(completion.wake_scheduler);
-        assert!(matches!(
-            queue.expire_one(8),
-            ExpireResult::Dispatch(Dispatch {
-                timer_fired: true,
-                ..
-            })
-        ));
+        let resumed = expire(&mut queue, 8);
+        assert_eq!(resumed.ticket.key(), primary);
+        assert!(resumed.timer_fired);
+        let other = expire(&mut queue, 20);
+        assert_eq!(other.ticket.key(), secondary);
     }
 
     #[test]
