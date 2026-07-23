@@ -4940,6 +4940,21 @@ impl NativeSyscallHandler for ExecNtHandler {
                 let fsctl = args[5];
                 let mut status: u64 = 0;
                 let mut information = 0u64;
+                // Match IopXxxControlFile: validate the caller's completion event for
+                // EVENT_MODIFY_STATE and clear it before issuing every request. In particular,
+                // rpcrt4 reuses a manual-reset event when it rearms a pipe listener; leaving the
+                // previous completion signalled manufactures a second accepted connection.
+                let event_obj_idx = if args[1] != 0 {
+                    match self.event_index_for_handle(args[1], EVENT_MODIFY_STATE) {
+                        Ok(index) => {
+                            let _ = self.events.reset_existing(index as u64);
+                            index as u64
+                        }
+                        Err(event_status) => return event_status,
+                    }
+                } else {
+                    u64::MAX
+                };
                 // ★ winlogon (pi 2) rpcrt4 worker: FSCTL_PIPE_LISTEN (0x110008) MUST report
                 // STATUS_PENDING (0x103), NOT SUCCESS. In rpcrt4_protseq_np_get_wait_array, SUCCESS →
                 // SetEvent(listen_event) → wait_for_new_connection wakes on the listen_event (index>0) →
@@ -5003,11 +5018,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                         match prepared {
                             Err(preparation_status) => status = preparation_status as u64,
                             Ok(()) => {
-                                if is_pipe_transceive && args[1] != 0 {
-                                    if let Ok(index) = self.event_index_for_handle(args[1], 0) {
-                                        let _ = self.events.reset_existing(index as u64);
-                                    }
-                                }
                                 if let Some((st, completed, _)) =
                                     self.npfs_route_raw(0xd, fsctl, fid, &input, &mut output)
                                 {
@@ -5039,12 +5049,7 @@ impl NativeSyscallHandler for ExecNtHandler {
                     self.pipe_park_buffer_len = args[9] as u32;
                     self.pipe_park_iosb_va = iosb;
                     self.pipe_park_apc_context = args[3];
-                    self.pipe_park_event_obj_idx = if args[1] != 0 {
-                        self.event_index_for_handle(args[1], 0)
-                            .map_or(u64::MAX, |index| index as u64)
-                    } else {
-                        u64::MAX
-                    };
+                    self.pipe_park_event_obj_idx = event_obj_idx;
                     self.pipe_park_transceive = true;
                 }
                 // ★ BATCH 34 — the async ncacn_np SERVER completion edge. A server (pi 3/4) posting an
@@ -5061,13 +5066,6 @@ impl NativeSyscallHandler for ExecNtHandler {
                     && (status as u32) == 0x0000_0103
                     && fid != 0
                 {
-                    // Resolve the overlapped completion Event (RDX = args[1]) to an obj_ns index in the
-                    // server's handle table. May be 0/absent (APC-mode); then event_obj_idx = u64::MAX.
-                    let event_obj_idx = if args[1] != 0 {
-                        self.event_index_for_handle(args[1], 0).map(|i| i as u64).unwrap_or(u64::MAX)
-                    } else {
-                        u64::MAX
-                    };
                     let table = &mut *core::ptr::addr_of_mut!(crate::PIPE_ASYNC_LISTENS);
                     if table
                         .arm(nt_io_manager::AsyncListen {
@@ -6250,18 +6248,11 @@ impl NativeSyscallHandler for ExecNtHandler {
                         return 0xC000_009A;
                     }
                 }
-                let h = self.mint_handle();
-                self.queue_write(args[0], h); // *Handle = R10 = args[0] (drained via smss_stack_write)
-                // Path B: smss creates its SmpApiLoop worker threads via NtCreateThread. Signal the
-                // loop to spawn ONE REAL SM-loop thread (the first). The loop reads the CONTEXT (Rip =
-                // SmpApiLoop, Rcx = \SmApiPort handle) off the caller's stack + spawns in smss's PML4.
-                if matches!(ctx.service, NativeService::NtCreateThread)
-                    && self.pi == 0
-                    && SM_LOOP_TCB.load(Ordering::Relaxed) == 0
-                {
-                    self.sm_spawn_request = true;
-                }
-                0
+                // A successful NtCreateThread must publish a typed Thread handle backed by an
+                // ETHREAD. Do not mint an opaque handle for an unrecognized or exhausted route:
+                // callers immediately query that handle as a thread, and fake success only defers
+                // the failure to STATUS_INVALID_HANDLE while corrupting their control flow.
+                0xC000_009A // STATUS_INSUFFICIENT_RESOURCES
             }
             // NtSecureConnectPort — the CSR client connect (kernel32's CsrClientConnectToServer →
             // \Windows\ApiPort, from winlogon's BaseDllInitialize). The SECURE variant (SecurityQos +

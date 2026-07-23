@@ -205,26 +205,21 @@ static mut PEER_COMPLETION_TRACE_COUNT: u32 = 0;
 // executive's pipe re-drive delivers THESE bytes to the parked reader instead of re-reading. The read
 // result buffer npfs fills for a pending read is the IRP's user buffer (== our `data`, METHOD_NEITHER).
 const COMPLETED_READ_CAP: usize = PENDING_IRP_CAP;
+const COMPLETED_READ_BYTE_CAP: usize = (FSD_ARG_FRAMES as usize) * 0x1000;
 #[derive(Clone, Copy)]
 struct CompletedRead {
     fid: u64,
     status: u32,
     info: u64,
-    irp: u64,
-    iosl: u64,
-    file_object: u64,
-    data: u64,
-    system_buffer: u64,
+    length: usize,
+    bytes: [u8; COMPLETED_READ_BYTE_CAP],
 }
 static mut COMPLETED_READS: [CompletedRead; COMPLETED_READ_CAP] = [CompletedRead {
     fid: 0,
     status: 0,
     info: 0,
-    irp: 0,
-    iosl: 0,
-    file_object: 0,
-    data: 0,
-    system_buffer: 0,
+    length: 0,
+    bytes: [0; COMPLETED_READ_BYTE_CAP],
 }; COMPLETED_READ_CAP];
 
 #[derive(Clone, Copy)]
@@ -244,31 +239,10 @@ static mut COMPLETED_WRITES: [CompletedWrite; COMPLETED_READ_CAP] = [CompletedWr
 pub(crate) unsafe fn take_completed_read(fid: u64) -> Option<(u32, u64, alloc::vec::Vec<u8>)> {
     let table = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
     let slot = table.iter_mut().find(|e| e.fid == fid && e.fid != 0)?;
-    let length = (slot.info as usize).min((FSD_ARG_FRAMES * 0x1000) as usize);
-    let source = if slot.system_buffer != 0 {
-        slot.system_buffer
-    } else {
-        slot.data
-    };
-    let mut bytes = alloc::vec![0u8; length];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = read_volatile((source + index as u64) as *const u8);
-    }
+    let bytes = alloc::vec::Vec::from(&slot.bytes[..slot.length]);
     let out = (slot.status, slot.info, bytes);
-    pool_free(slot.data);
-    pool_free(slot.iosl);
-    pool_free(slot.irp);
-    pool_free(slot.file_object);
-    *slot = CompletedRead {
-        fid: 0,
-        status: 0,
-        info: 0,
-        irp: 0,
-        iosl: 0,
-        file_object: 0,
-        data: 0,
-        system_buffer: 0,
-    };
+    slot.fid = 0;
+    slot.length = 0;
     Some(out)
 }
 
@@ -323,7 +297,9 @@ pub(crate) unsafe fn pool_alloc(size: u64) -> u64 {
 }
 
 unsafe fn pool_free(p: u64) {
-    if p == 0 || p < FSD_POOL_VADDR + POOL_DATA_OFF {
+    if p < FSD_POOL_VADDR + POOL_DATA_OFF
+        || p >= FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000
+    {
         return;
     }
     let head_slot = (FSD_POOL_VADDR + 8) as *mut u64;
@@ -488,23 +464,36 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // bytes live at the IRP's CURRENT AssociatedIrp.SystemBuffer (irp+0x18) — which npfs just
         // overwrote — NOT the stale `slot.data`. Reading `slot.data` returned 16 zero bytes (the
         // untouched original buffer), which is why rpcrt4 rejected the bind. Read irp+0x18 live.
-        let mut completion_owns_graph = false;
         if slot.major as u64 == IRP_MJ_READ {
             let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
             // The buffer npfs actually filled = the IRP's CURRENT SystemBuffer (it may have reassigned
             // it). Fall back to our original buffer only if npfs left it in place.
             let sysbuf = read_unaligned((irp + 0x18) as *const u64);
+            let irp_flags = read_unaligned((irp + 0x10) as *const u32);
             let ctable = &mut *core::ptr::addr_of_mut!(COMPLETED_READS);
             if let Some(cslot) = ctable.iter_mut().find(|e| e.fid == 0) {
+                let length = (information as usize).min(COMPLETED_READ_BYTE_CAP);
+                let source = if sysbuf != 0 { sysbuf } else { slot.data };
+                let pool_end = FSD_POOL_VADDR + FSD_POOL_FRAMES * 0x1000;
+                let source_valid = source >= FSD_POOL_VADDR + POOL_DATA_OFF
+                    && source
+                        .checked_add(length as u64)
+                        .is_some_and(|end| end <= pool_end);
                 cslot.fid = fid;
-                cslot.status = status;
-                cslot.info = information;
-                cslot.irp = slot.irp;
-                cslot.iosl = slot.iosl;
-                cslot.file_object = slot.file_object;
-                cslot.data = slot.data;
-                cslot.system_buffer = sysbuf;
-                completion_owns_graph = true;
+                cslot.status = if source_valid { status } else { 0xC000_0005 };
+                cslot.info = if source_valid { information } else { 0 };
+                cslot.length = if source_valid { length } else { 0 };
+                if source_valid {
+                    for index in 0..length {
+                        cslot.bytes[index] =
+                            read_volatile((source + index as u64) as *const u8);
+                    }
+                }
+            }
+            // IoCompleteRequest normally owns a replacement SystemBuffer carrying
+            // IRP_DEALLOCATE_BUFFER. Reclaim it while the component pool is mapped.
+            if sysbuf != slot.data && irp_flags & 0x20 != 0 {
+                pool_free(sysbuf);
             }
         } else if slot.major as u64 == IRP_MJ_WRITE {
             let fid = read_unaligned((slot.file_object + 0x18) as *const u64);
@@ -525,12 +514,12 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             print_u64(information);
             print_str(b"\n");
         }
-        if !completion_owns_graph {
-            pool_free(slot.data);
-            pool_free(slot.iosl);
-            pool_free(slot.irp);
-            pool_free(slot.file_object);
-        }
+        // The FSD pool exists only in the component VSpace. No graph pointer may escape this
+        // callback for root-side reclamation.
+        pool_free(slot.data);
+        pool_free(slot.iosl);
+        pool_free(slot.irp);
+        pool_free(slot.file_object);
         *slot = PendingIrp { irp: 0, iosl: 0, file_object: 0, data: 0, major: 0 };
     }
 }
