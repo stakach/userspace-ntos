@@ -199,6 +199,31 @@ pub fn prompt(prompt_bytes: &[u8], response_len: usize) -> PromptRequest {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AssertAction {
+    BreakRepeatedly,
+    BreakOnce,
+    Ignore,
+    TerminateProcess,
+    TerminateThread,
+    Reprompt,
+    RaiseFailure,
+}
+
+/// Decode the one-byte action accepted by `RtlAssert`. An absent debugger response fails the
+/// assertion instead of busy-looping in a process with no interactive debug channel.
+pub fn assert_action(response: Option<u8>) -> AssertAction {
+    match response {
+        Some(b'B' | b'b') => AssertAction::BreakRepeatedly,
+        Some(b'O' | b'o') => AssertAction::BreakOnce,
+        Some(b'I' | b'i') => AssertAction::Ignore,
+        Some(b'P' | b'p') => AssertAction::TerminateProcess,
+        Some(b'T' | b't') => AssertAction::TerminateThread,
+        Some(_) => AssertAction::Reprompt,
+        None => AssertAction::RaiseFailure,
+    }
+}
+
 /// The `int 0x2d` DebugService `ServiceClass` codes our kernel emulates (see
 /// `project_smss_sec_image`: the executive services `PRINT`/`PROMPT` and forwards to serial).
 pub mod service {
@@ -370,6 +395,17 @@ mod tests {
         assert_eq!(r.prompt.len(), 30);
         // The response buffer is filled by the DebugService (R8 on our kernel) — modelled, not faked.
         assert_eq!(service::PROMPT, 2);
+    }
+
+    #[test]
+    fn assert_actions_match_the_native_prompt() {
+        assert_eq!(assert_action(Some(b'B')), AssertAction::BreakRepeatedly);
+        assert_eq!(assert_action(Some(b'o')), AssertAction::BreakOnce);
+        assert_eq!(assert_action(Some(b'I')), AssertAction::Ignore);
+        assert_eq!(assert_action(Some(b'p')), AssertAction::TerminateProcess);
+        assert_eq!(assert_action(Some(b'T')), AssertAction::TerminateThread);
+        assert_eq!(assert_action(Some(b'?')), AssertAction::Reprompt);
+        assert_eq!(assert_action(None), AssertAction::RaiseFailure);
     }
 
     #[test]

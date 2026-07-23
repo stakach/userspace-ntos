@@ -4836,21 +4836,116 @@ pub unsafe extern "system" fn rtl_free_user_stack(deallocation_stack: *mut c_voi
 // Rtl* — assert
 // =================================================================================================
 
-/// `RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber, PCHAR Message)` — the
-/// checked-build assertion reporter. On our kernel this normally int-0x2d DbgPrompts; at 4.0b it is
-/// a no-op (the report/prompt is a live-plane debug transport). Never on a live path in a
-/// release-checked build.
+/// `RtlAssert(PVOID FailedAssertion, PVOID FileName, ULONG LineNumber, PCHAR Message)` — report the
+/// failed assertion, offer the native debug actions, and fail with STATUS_ASSERTION_FAILURE when no
+/// interactive debugger response is available.
 ///
 /// # Safety
-/// Standard contract; a no-op.
+/// String arguments are NUL-terminated when non-null. Break/terminate actions trap or exit.
 #[export_name = "RtlAssert"]
 pub unsafe extern "system" fn rtl_assert(
-    _failed_assertion: *mut c_void,
-    _file_name: *mut c_void,
-    _line_number: u32,
-    _message: *mut u8,
+    failed_assertion: *mut c_void,
+    file_name: *mut c_void,
+    line_number: u32,
+    message: *mut u8,
 ) {
-    // Checked-build only; no-op (the report path is the live DbgPrint/DbgPrompt seam).
+    const ASSERT_FORMAT: &[u8] =
+        b"\n*** Assertion failed: %s%s\n***   Source File: %s, line %lu\n\n\0";
+    const CONTEXT_FORMAT: &[u8] = b"Execute '.cxr %p' to dump context\n\0";
+    const PROMPT: &[u8] = b"Break repeatedly, break Once, Ignore, terminate Process or terminate Thread (boipt)? \0";
+    const EMPTY: &[u8] = b"\0";
+    const FLG_DISABLE_DEBUG_PROMPTS: u32 = 0x0800_0000;
+    const STATUS_ASSERTION_FAILURE: NtStatus = 0xc000_0420;
+
+    #[repr(align(16))]
+    struct AssertContext([u8; 0x4d0]);
+
+    let mut context = AssertContext([0; 0x4d0]);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "system" fn(*mut c_void),
+        >(rtl_capture_context)(context.0.as_mut_ptr().cast());
+    }
+
+    loop {
+        let mut arguments = [
+            if message.is_null() {
+                EMPTY.as_ptr() as u64
+            } else {
+                message as u64
+            },
+            failed_assertion as u64,
+            file_name as u64,
+            line_number as u64,
+        ];
+        let _ = unsafe {
+            dbg_emit_formatted(
+                core::ptr::null(),
+                ASSERT_FORMAT.as_ptr(),
+                arguments.as_mut_ptr().cast(),
+            )
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        if unsafe { rtl_get_nt_global_flags() } & FLG_DISABLE_DEBUG_PROMPTS != 0 {
+            unsafe { rtl_raise_status(STATUS_ASSERTION_FAILURE) };
+            return;
+        }
+
+        let mut response = [0u8; 2];
+        let response_length =
+            unsafe { dbg_prompt(PROMPT.as_ptr(), response.as_mut_ptr(), response.len() as u32) };
+        let action = nt_ntdll::dbg::assert_action(
+            (response_length != 0 && response[0] != 0).then_some(response[0]),
+        );
+        match action {
+            nt_ntdll::dbg::AssertAction::BreakRepeatedly
+            | nt_ntdll::dbg::AssertAction::BreakOnce => {
+                let mut arguments = [context.0.as_ptr() as u64];
+                let _ = unsafe {
+                    dbg_emit_formatted(
+                        core::ptr::null(),
+                        CONTEXT_FORMAT.as_ptr(),
+                        arguments.as_mut_ptr().cast(),
+                    )
+                };
+                unsafe { dbg_break_point() };
+                if action == nt_ntdll::dbg::AssertAction::BreakOnce {
+                    return;
+                }
+            }
+            nt_ntdll::dbg::AssertAction::Ignore => return,
+            nt_ntdll::dbg::AssertAction::TerminateProcess => {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let _ = core::mem::transmute::<
+                        unsafe extern "C" fn(),
+                        unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
+                    >(nt_ntdll::trap_stubs::nt_terminate_process)(
+                        -1, STATUS_UNSUCCESSFUL,
+                    );
+                }
+            }
+            nt_ntdll::dbg::AssertAction::TerminateThread => {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let _ = core::mem::transmute::<
+                        unsafe extern "C" fn(),
+                        unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
+                    >(nt_ntdll::trap_stubs::nt_terminate_thread)(
+                        -2, STATUS_UNSUCCESSFUL,
+                    );
+                }
+            }
+            nt_ntdll::dbg::AssertAction::Reprompt => {}
+            nt_ntdll::dbg::AssertAction::RaiseFailure => {
+                unsafe { rtl_raise_status(STATUS_ASSERTION_FAILURE) };
+                return;
+            }
+        }
+    }
 }
 
 // =================================================================================================
@@ -5190,13 +5285,6 @@ unsafe fn dbg_emit_stack_bytes(bytes: &[u8]) {
     {
         let _ = bytes;
     }
-}
-
-unsafe fn dbg_emit_literal(format: *const u8) -> NtStatus {
-    let mut out = [0u8; DBG_PRINT_BUFFER_SIZE];
-    let n = unsafe { copy_cstr_bounded(format, &mut out) };
-    unsafe { dbg_emit_stack_bytes(&out[..n]) };
-    STATUS_SUCCESS
 }
 
 unsafe fn dbg_emit_variadic(format: *const u8, args: VaList<'_>) -> NtStatus {
@@ -25490,20 +25578,40 @@ pub unsafe extern "C" fn vdbg_print_ex_with_prefix(
     unsafe { dbg_emit_formatted(prefix, format, args) }
 }
 
-/// `DbgPrompt(PCSTR Prompt, PCH Response, ULONG Length) -> ULONG` — prompt the debugger for input.
-/// The prompt is emitted through the debug-service print path. No interactive debugger is attached,
-/// so the response is the observable no-debugger empty string.
+/// `DbgPrompt(PCSTR Prompt, PCH Response, ULONG Length) -> ULONG` — issue the native
+/// `BREAKPOINT_PROMPT` debug service, passing the response buffer in R8.
 ///
 /// # Safety
-/// `response` writable for `length` bytes.
+/// `prompt` is NUL-terminated and `response` is writable for `length` bytes.
 #[export_name = "DbgPrompt"]
 pub unsafe extern "C" fn dbg_prompt(prompt: *const u8, response: *mut u8, length: u32) -> u32 {
-    let _ = unsafe { dbg_emit_literal(prompt) };
     if !response.is_null() && length > 0 {
-        // SAFETY: response valid for length bytes per the contract.
         unsafe { *response = 0 };
     }
-    0
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut prompt_copy = [0u8; DBG_PRINT_BUFFER_SIZE];
+        let prompt_length = unsafe { copy_cstr_bounded(prompt, &mut prompt_copy) };
+        let mut result = nt_ntdll::dbg::service::PROMPT as usize;
+        unsafe {
+            core::arch::asm!(
+                "int 0x2d",
+                "int3",
+                inout("rax") result,
+                in("rcx") prompt_copy.as_ptr(),
+                in("rdx") prompt_length,
+                in("r8") response,
+                in("r9") length as usize,
+                options(nostack),
+            );
+        }
+        result as u32
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = prompt;
+        0
+    }
 }
 
 /// `ShipAssert(...)` — checked-build diagnostic hook. Retail-compatible no-op.
