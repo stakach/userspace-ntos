@@ -1024,7 +1024,12 @@ pub(crate) unsafe fn client_copyin_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
         let mut temporary_cap = 0;
-        let source = if let Some(source) = smss_mirror(current, chunk as u64) {
+        let mirrored = if pi == 2 && wl_listener_stack_contains(current, chunk) {
+            None
+        } else {
+            smss_mirror(current, chunk as u64)
+        };
+        let source = if let Some(source) = mirrored {
             source
         } else {
             let page = current & !0xfff;
@@ -1056,7 +1061,9 @@ pub(crate) unsafe fn client_copyin_mapped(
                     }
                 } else {
                     let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
-                    let (cap, copy_error) = copy_cap_r(frame);
+                    let cap = client_copy_temp_cap();
+                    let _ = cnode_delete_r(cap);
+                    let copy_error = copy_cap_into_r(frame, cap);
                     temporary_cap = cap;
                     let map_error = if copy_error == 0 {
                         page_map_r(cap, alias, 2 | PAGE_EXECUTE_NEVER, CAP_INIT_THREAD_VSPACE)
@@ -1064,6 +1071,9 @@ pub(crate) unsafe fn client_copyin_mapped(
                         copy_error
                     };
                     if map_error != 0 {
+                        if temporary_cap != 0 {
+                            let _ = cnode_delete_r(temporary_cap);
+                        }
                         return false;
                     }
                     alias + (current & 0xfff)
@@ -1072,7 +1082,116 @@ pub(crate) unsafe fn client_copyin_mapped(
         };
         core::ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr().add(copied), chunk);
         if temporary_cap != 0 {
-            let _ = page_unmap(temporary_cap);
+            let _ = cnode_delete_r(temporary_cap);
+        }
+        copied += chunk;
+    }
+    true
+}
+
+pub(crate) unsafe fn client_read_u64_mapped(
+    pi: u64,
+    va: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    client_copyin_mapped(pi, va, &mut bytes, filled_pages, nfilled, scratch_base)
+        .then(|| u64::from_le_bytes(bytes))
+}
+
+pub(crate) unsafe fn client_write_mapped(
+    pi: u64,
+    va: u64,
+    src: &[u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    if pi == 2 && wl_listener_stack_contains(va, src.len()) {
+        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
+    }
+    smss_copyout(va, src)
+        || client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base)
+}
+
+pub(crate) unsafe fn client_write_u64_mapped(
+    pi: u64,
+    va: u64,
+    value: u64,
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    client_write_mapped(
+        pi,
+        va,
+        &value.to_le_bytes(),
+        filled_pages,
+        nfilled,
+        scratch_base,
+    )
+}
+
+/// Copy bytes to a client page that is already backed by a process-specific frame or demand-fill
+/// alias. This is the output counterpart to [`client_copyin_mapped`] for runtime thread stacks that
+/// do not use the fixed bootstrap stack mirror.
+pub(crate) unsafe fn client_copyout_mapped(
+    pi: u64,
+    va: u64,
+    src: &[u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    if src.is_empty() {
+        return true;
+    }
+    if va.checked_add(src.len() as u64).is_none() {
+        return false;
+    }
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let current = va + copied as u64;
+        let page_remaining = 0x1000usize - (current as usize & 0xfff);
+        let chunk = page_remaining.min(src.len() - copied);
+        let page = current & !0xfff;
+        let mut temporary_cap = 0;
+        let persistent_alias = csrss_frame_alias_get(pi, page);
+        let destination = if persistent_alias != 0 {
+            persistent_alias + (current & 0xfff)
+        } else {
+            let (frame, _) = csrss_frame_get_exact(pi, page);
+            if frame != 0 {
+                let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
+                let cap = client_copy_temp_cap();
+                let _ = cnode_delete_r(cap);
+                let copy_error = copy_cap_into_r(frame, cap);
+                temporary_cap = cap;
+                let map_error = if copy_error == 0 {
+                    page_map_r(cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE)
+                } else {
+                    copy_error
+                };
+                if map_error != 0 {
+                    if temporary_cap != 0 {
+                        let _ = cnode_delete_r(temporary_cap);
+                    }
+                    return false;
+                }
+                alias + (current & 0xfff)
+            } else if let Some(destination) =
+                scratch_for(current, filled_pages, nfilled, scratch_base)
+            {
+                destination
+            } else {
+                return false;
+            }
+        };
+        core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination as *mut u8, chunk);
+        if temporary_cap != 0 {
+            let _ = cnode_delete_r(temporary_cap);
         }
         copied += chunk;
     }

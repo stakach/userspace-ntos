@@ -1440,6 +1440,71 @@ pub(crate) unsafe fn service_sec_image(
                 // (the per-process detail above already printed; park_and_log adds the [parked] line).
                 park_and_log!(pi, b"null-deref", m0, addr);
             }
+            // Slot 0 returns from its fixed loader bootstrap stack into the reservation created by
+            // kernel32!BaseCreateStack. Grow only the next contiguous page in that reservation and
+            // advance the live TEB limit before retrying the fault.
+            if badge == WINLOGON_WORKER_BADGE {
+                let allocation_base = WL_LISTENER_STACK_ALLOCATION_BASE.load(Ordering::Acquire);
+                let stack_base = WL_LISTENER_STACK_BASE_REAL.load(Ordering::Acquire);
+                let mapped_low = WL_LISTENER_STACK_MAPPED_LOW.load(Ordering::Acquire);
+                if m3 & 1 == 0
+                    && page < stack_base
+                    && csrss_frame_get_exact(2, page).0 == 0
+                    && nt_thread_start::next_stack_growth_page(allocation_base, mapped_low, addr)
+                        == Some(page)
+                {
+                    let (frame, retype_error) = alloc_frame_r();
+                    let map_error = if retype_error == 0 {
+                        page_map_r(frame, page, RW_NX, pml4)
+                    } else {
+                        retype_error
+                    };
+                    if retype_error == 0 && map_error == 0 {
+                        csrss_frame_put(2, page, frame);
+                        if csrss_frame_get_exact(2, page).0 == frame {
+                            let teb_alias = WINLOGON_WORKER_STACK_MIRROR_VA
+                                + WL_LISTENER_STACK_FRAMES * 0x1000;
+                            core::ptr::write_volatile(
+                                (teb_alias + 0x10) as *mut u64,
+                                page + nt_thread_start::USER_PAGE_SIZE,
+                            );
+                            WL_LISTENER_STACK_MAPPED_LOW.store(page, Ordering::Release);
+                            print_str(b"[wl-worker] grew real stack page=0x");
+                            print_hex((page >> 32) as u32);
+                            print_hex(page as u32);
+                            print_str(b" allocation=0x");
+                            print_hex((allocation_base >> 32) as u32);
+                            print_hex(allocation_base as u32);
+                            print_str(b"\n");
+                            procs[pi].faults = faults;
+                            procs[pi].first = first;
+                            procs[pi].ntfaults = ntfaults;
+                            pfilled[pi] = *filled_pages;
+                            let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                reply_recv_badge(fault_ep, 0, 0, 0, 0, 0);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                    if frame != 0 {
+                        let _ = cnode_delete_r(frame);
+                    }
+                    print_str(b"[wl-worker] real stack growth failed page=0x");
+                    print_hex((page >> 32) as u32);
+                    print_hex(page as u32);
+                    print_str(b" retype=");
+                    print_u64(retype_error);
+                    print_str(b" map=");
+                    print_u64(map_error);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"wl-stack-growth", m0, addr);
+                }
+            }
             // Dynamic stack growth (Windows guard-page style): a fault just below the committed
             // stack commits a fresh zeroed page and restarts, so smss's stack grows on demand
             // instead of crashing at the 16 KiB initial commit. Bounded by STACK_GROWTH_FLOOR so it
@@ -2095,7 +2160,18 @@ pub(crate) unsafe fn service_sec_image(
                 argv[3] = get_recv_mr(8); // R9
                 let n = (entry.max_args as usize).min(16);
                 for i in 4..n {
-                    argv[i] = smss_stack_read(sp + 0x28 + (i as u64 - 4) * 8);
+                    let argument_va = sp + 0x28 + (i as u64 - 4) * 8;
+                    let mut bytes = [0u8; 8];
+                    if client_copyin_mapped(
+                        pi as u64,
+                        argument_va,
+                        &mut bytes,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    ) {
+                        argv[i] = u64::from_le_bytes(bytes);
+                    }
                 }
                 // Refresh the handler's per-call executive context, then clear the stop side-signal
                 // + out-write queue so a migrated handler can raise them (group A/B signals).
@@ -2881,6 +2957,33 @@ pub(crate) unsafe fn service_sec_image(
                     if seed_winlogon_thread_client_info(teb_alias, procs[2].pml4).is_none() {
                         print_str(b"[wl-thread] win32 client state not published before worker spawn\n");
                     }
+                    if slot == 0 {
+                        let mapped_low = initial_teb
+                            .stack_limit
+                            .checked_sub(nt_thread_start::USER_PAGE_SIZE)
+                            .filter(|&low| {
+                                initial_teb.allocated_stack_base & 0xfff == 0
+                                    && initial_teb.stack_base & 0xfff == 0
+                                    && initial_teb.allocated_stack_base <= low
+                                    && low < initial_teb.stack_base
+                                    && csrss_frame_get_exact(2, low).0 != 0
+                            })
+                            .unwrap_or(0);
+                        if mapped_low != 0 {
+                            WL_LISTENER_STACK_ALLOCATION_BASE.store(
+                                initial_teb.allocated_stack_base,
+                                Ordering::Release,
+                            );
+                            WL_LISTENER_STACK_BASE_REAL
+                                .store(initial_teb.stack_base, Ordering::Release);
+                            WL_LISTENER_STACK_MAPPED_LOW.store(mapped_low, Ordering::Release);
+                        } else {
+                            WL_LISTENER_STACK_ALLOCATION_BASE.store(0, Ordering::Release);
+                            WL_LISTENER_STACK_BASE_REAL.store(0, Ordering::Release);
+                            WL_LISTENER_STACK_MAPPED_LOW.store(0, Ordering::Release);
+                            print_str(b"[wl-thread] real stack reservation could not be armed\n");
+                        }
+                    }
                     tcb_cell.store(tcb, Ordering::Relaxed);
                     // Record the real TEB base on the ETHREAD (alloc-free) so 162 reports it.
                     nt_handler.pm.set_thread_teb(tid as nt_process::ThreadId, teb);
@@ -3245,7 +3348,15 @@ pub(crate) unsafe fn service_sec_image(
                 // is modeled (the wait/release paths below are no-ops). Additive.
                 let out = get_recv_mr(9); // R10 = *MutantHandle
                 if out != 0 {
-                    smss_stack_write(out, FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed));
+                    let value = FAKE_SYNC_HANDLE.fetch_add(4, Ordering::Relaxed);
+                    let _ = client_write_u64_mapped(
+                        pi as u64,
+                        out,
+                        value,
+                        filled_pages,
+                        faults as usize,
+                        scratch_base,
+                    );
                 }
                 result = 0;
             } else if m0 == 196 {
@@ -3288,7 +3399,14 @@ pub(crate) unsafe fn service_sec_image(
                 let trace = EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
                 if wait_error.is_none() {
                     for k in 0..count {
-                        let h = smss_stack_read(harr + (k as u64) * 8);
+                        let h = client_read_u64_mapped(
+                            pi as u64,
+                            harr + (k as u64) * 8,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                        .unwrap_or(0);
                         match nt_handler.waitable_index_for_handle(h, SYNCHRONIZE_ACCESS) {
                             Ok(idx) => {
                                     if trace < 32 {
@@ -3348,12 +3466,26 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 // Consume dispatcher state only after the complete immediate condition is satisfied.
-                let timeout_ptr = smss_stack_read(sp + 0x28);
+                let timeout_ptr = client_read_u64_mapped(
+                    pi as u64,
+                    sp + 0x28,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                )
+                .unwrap_or(0);
                 let wait_due = if timeout_ptr == 0 {
                     None
                 } else {
                     Some(nt_delay_execution::due_time(
-                        smss_stack_read(timeout_ptr) as i64,
+                        client_read_u64_mapped(
+                            pi as u64,
+                            timeout_ptr,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                        .unwrap_or(0) as i64,
                         monotonic_time_100ns(),
                         nt_system_time_100ns(),
                     ))
@@ -3423,7 +3555,14 @@ pub(crate) unsafe fn service_sec_image(
                 let buf = get_recv_mr(7); // R8 = ThreadInformation
                 let len = get_recv_mr(8); // R9 = ThreadInformationLength
                 let sp = get_recv_mr(16);
-                let return_length = smss_stack_read(sp + 0x28);
+                let return_length = client_read_u64_mapped(
+                    pi as u64,
+                    sp + 0x28,
+                    filled_pages,
+                    faults as usize,
+                    scratch_base,
+                )
+                .unwrap_or(0);
                 let trace = THREAD_QUERY_TRACE_N.fetch_add(1, Ordering::Relaxed);
                 if trace < 8 {
                     print_str(b"[thread-life] query caller_pi=");
@@ -3446,15 +3585,13 @@ pub(crate) unsafe fn service_sec_image(
                     const THREAD_QUERY_INFORMATION: u32 = 0x0040;
                     if len != 4 {
                         if return_length != 0 {
-                            csrss_out_write32(
+                            client_write_mapped(
+                                pi as u64,
                                 return_length,
-                                4,
-                                &mut *filled_pages,
-                                &mut faults,
+                                &4u32.to_le_bytes(),
+                                filled_pages,
+                                faults as usize,
                                 scratch_base,
-                                &reg,
-                                &dll_pes,
-                                pml4,
                             );
                         }
                         nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
@@ -3472,25 +3609,21 @@ pub(crate) unsafe fn service_sec_image(
                                     .pm
                                     .thread_break_on_termination(tid)
                                     .unwrap_or(false) as u32;
-                                let wrote = csrss_out_write32(
+                                let wrote = client_write_mapped(
+                                    pi as u64,
                                     buf,
-                                    enabled,
-                                    &mut *filled_pages,
-                                    &mut faults,
+                                    &enabled.to_le_bytes(),
+                                    filled_pages,
+                                    faults as usize,
                                     scratch_base,
-                                    &reg,
-                                    &dll_pes,
-                                    pml4,
                                 ) && (return_length == 0
-                                    || csrss_out_write32(
+                                    || client_write_mapped(
+                                        pi as u64,
                                         return_length,
-                                        4,
-                                        &mut *filled_pages,
-                                        &mut faults,
+                                        &4u32.to_le_bytes(),
+                                        filled_pages,
+                                        faults as usize,
                                         scratch_base,
-                                        &reg,
-                                        &dll_pes,
-                                        pml4,
                                     ));
                                 if wrote { 0 } else { 0xC000_0005 }
                             }
@@ -3503,8 +3636,14 @@ pub(crate) unsafe fn service_sec_image(
                     nt_process::STATUS_INVALID_INFO_CLASS as u64
                 } else if len != 0x30 {
                     if return_length != 0 {
-                        csrss_out_write(return_length, 0x30, &mut *filled_pages, &mut faults,
-                            scratch_base, &reg, &dll_pes, pml4);
+                        client_write_u64_mapped(
+                            pi as u64,
+                            return_length,
+                            0x30,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        );
                     }
                     nt_process::STATUS_INFO_LENGTH_MISMATCH as u64
                 } else if buf == 0 {
@@ -3533,12 +3672,24 @@ pub(crate) unsafe fn service_sec_image(
                                 (0x28, 0),
                             ];
                             for (off, v) in tbi {
-                                csrss_out_write(buf + off, v, &mut *filled_pages, &mut faults,
-                                    scratch_base, &reg, &dll_pes, pml4);
+                                client_write_u64_mapped(
+                                    pi as u64,
+                                    buf + off,
+                                    v,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                );
                             }
                             if return_length != 0 {
-                                csrss_out_write(return_length, 0x30, &mut *filled_pages, &mut faults,
-                                    scratch_base, &reg, &dll_pes, pml4);
+                                client_write_u64_mapped(
+                                    pi as u64,
+                                    return_length,
+                                    0x30,
+                                    filled_pages,
+                                    faults as usize,
+                                    scratch_base,
+                                );
                             }
                             WL_LISTENER_TEB_QUERIED.fetch_add(1, Ordering::Relaxed);
                             print_str(b"[thread-life] query resolved ETHREAD tid=");
@@ -3546,7 +3697,14 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" written_teb=0x");
                             print_hex((teb >> 32) as u32);
                             print_hex(teb as u32);
-                            let readback_teb = smss_stack_read(buf + 8);
+                            let readback_teb = client_read_u64_mapped(
+                                pi as u64,
+                                buf + 8,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            )
+                            .unwrap_or(0);
                             print_str(b" readback_teb=0x");
                             print_hex((readback_teb >> 32) as u32);
                             print_hex(readback_teb as u32);
@@ -4083,6 +4241,18 @@ pub(crate) unsafe fn service_sec_image(
                     // common nargs<=4 case it is byte-identical to the old register-only dispatch.
                     let sp = get_recv_mr(16);
                     let nargs = win32k_subsystem::win32k_ssn_argc(m0);
+                    let stack_arg_count = nargs.min(16).saturating_sub(4) as usize;
+                    let mut stack_args = [0u64; 12];
+                    for (index, value) in stack_args[..stack_arg_count].iter_mut().enumerate() {
+                        *value = client_read_u64_mapped(
+                            pi as u64,
+                            sp + 0x28 + index as u64 * 8,
+                            filled_pages,
+                            faults as usize,
+                            scratch_base,
+                        )
+                        .unwrap_or(0);
+                    }
                     let peb_mirror = match pi {
                         0 => 0x0000_0100_1074_1000,
                         1 => 0x0000_0100_1078_1000,
@@ -4108,7 +4278,14 @@ pub(crate) unsafe fn service_sec_image(
                         );
                     }
                     let r = win32k_glue::win32k_dispatch_wide(
-                        m0, d_a0, d_a1, a2, a3, sp, nargs,
+                        m0,
+                        d_a0,
+                        d_a1,
+                        a2,
+                        a3,
+                        sp,
+                        nargs,
+                        &stack_args[..stack_arg_count],
                         win32k_glue::Win32kClientContext {
                             pi: pi as u32,
                             pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
@@ -4116,6 +4293,7 @@ pub(crate) unsafe fn service_sec_image(
                             tid: nt_handler.current_tid,
                             teb: client_teb,
                             peb_mirror,
+                            scratch_base,
                         },
                     );
                     // DIAG: dump the retrieved MSG for winlogon's SAS GetMessage (a0=R10=&Msg). MSG =
@@ -4213,6 +4391,7 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     0,
                                     4,
+                                    &[],
                                     win32k_glue::Win32kClientContext {
                                         pi: pi as u32,
                                         pid: nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64,
@@ -4220,6 +4399,7 @@ pub(crate) unsafe fn service_sec_image(
                                         tid: nt_handler.current_tid,
                                         teb: client_teb,
                                         peb_mirror,
+                                        scratch_base,
                                     },
                                 );
                                 print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
@@ -4271,6 +4451,7 @@ pub(crate) unsafe fn service_sec_image(
                             tid: nt_handler.current_tid,
                             teb: client_teb,
                             peb_mirror,
+                            scratch_base,
                         },
                         resume_ip,
                         sp,

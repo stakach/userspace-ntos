@@ -447,6 +447,8 @@ pub(crate) struct UserCallbackClient {
     pub tid: u64,
     /// Executive alias of this process's PEB page, or zero when the dispatch has no user client.
     pub peb_mirror: u64,
+    /// Executive scratch mapping used to access this process's demand-paged user buffers.
+    pub scratch_base: u64,
 }
 
 /// win32k demand-fault verbosity budget: print the first 60 demand faults per dispatch (matches the

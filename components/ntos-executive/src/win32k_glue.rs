@@ -28,6 +28,7 @@ static USER_CALLBACK_DISPATCHER: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PEB: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_PID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CLIENT_TEB: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_CLIENT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 static mut USER_CALLBACK_CONTINUATIONS: nt_user_callback::ContinuationStack =
     nt_user_callback::ContinuationStack::new();
 static mut USER_CALLBACK_ACTIVE: nt_user_callback::ActiveCallbackStack =
@@ -86,6 +87,7 @@ pub(crate) struct Win32kClientContext {
     pub tid: u64,
     pub teb: u64,
     pub peb_mirror: u64,
+    pub scratch_base: u64,
 }
 
 pub(crate) fn user_callback_proofs() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
@@ -534,6 +536,7 @@ pub(crate) unsafe fn service_user_callback(
             }
             USER_CALLBACK_DISPATCHER.store(dispatcher, Ordering::Relaxed);
             USER_CALLBACK_CLIENT_PEB.store(client.peb_mirror, Ordering::Relaxed);
+            USER_CALLBACK_CLIENT_SCRATCH.store(client.scratch_base, Ordering::Relaxed);
             USER_CALLBACK_CLIENT_PID.store(
                 core::ptr::read_volatile(
                     (win32k_subsystem::WIN32K_SHARED_VADDR
@@ -708,7 +711,14 @@ unsafe fn redirect_pending_user_callback(
             + core::mem::size_of::<nt_user_callback::CallbackHeader>() as u64)
             as *const u8;
         let input = core::slice::from_raw_parts(shared, request.input_length as usize);
-        if !crate::img_spawn::smss_copyout(layout.input_pointer, input) {
+        if !crate::img_spawn::client_write_mapped(
+            client.pi as u64,
+            layout.input_pointer,
+            input,
+            &[],
+            0,
+            client.scratch_base,
+        ) {
             return false;
         }
     }
@@ -722,9 +732,13 @@ unsafe fn redirect_pending_user_callback(
         ) else {
             return false;
         };
-        if !crate::img_spawn::smss_copyout(
+        if !crate::img_spawn::client_write_mapped(
+            client.pi as u64,
             layout.input_pointer + WINDOWPROC_LPARAM_OFFSET,
             &reference.to_le_bytes(),
+            &[],
+            0,
+            client.scratch_base,
         ) {
             return false;
         }
@@ -741,7 +755,14 @@ unsafe fn redirect_pending_user_callback(
         core::ptr::addr_of!(frame) as *const u8,
         core::mem::size_of::<nt_user_callback::UserCalloutFrame>(),
     );
-    if !crate::img_spawn::smss_copyout(layout.frame_pointer, frame_bytes) {
+    if !crate::img_spawn::client_write_mapped(
+        client.pi as u64,
+        layout.frame_pointer,
+        frame_bytes,
+        &[],
+        0,
+        client.scratch_base,
+    ) {
         return false;
     }
 
@@ -781,6 +802,7 @@ unsafe fn resume_suspended_user_callback_component(
         badge: request.client_badge,
         tid: request.client_tid,
         peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
+        scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
     };
     let channel = crate::spawn_hosts::PumpChannel {
         fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
@@ -915,11 +937,25 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             .unwrap_or(0);
             let mut returned_result = [0u8; 8];
             let returned_read = result_length >= 0x40
-                && crate::img_spawn::smss_copyin(result_pointer + 0x38, &mut returned_result);
+                && crate::img_spawn::client_copyin_mapped(
+                    client_pi as u64,
+                    result_pointer + 0x38,
+                    &mut returned_result,
+                    &[],
+                    0,
+                    USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
+                );
             let mut expected_result = [0u8; 8];
             let expected_read = expected != 0
                 && request.input_length >= 0x40
-                && crate::img_spawn::smss_copyin(expected + 0x38, &mut expected_result);
+                && crate::img_spawn::client_copyin_mapped(
+                    client_pi as u64,
+                    expected + 0x38,
+                    &mut expected_result,
+                    &[],
+                    0,
+                    USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
+                );
             print_str(b"[callback-result] WM_NCCREATE pointer=0x");
             print_hex((result_pointer >> 32) as u32);
             print_hex(result_pointer as u32);
@@ -938,7 +974,14 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_hex(u64::from_le_bytes(expected_result) as u32);
             print_str(b"\n");
         }
-        if !crate::img_spawn::smss_copyin(result_pointer, output) {
+        if !crate::img_spawn::client_copyin_mapped(
+            client_pi as u64,
+            result_pointer,
+            output,
+            &[],
+            0,
+            USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
+        ) {
             abort_controlled_user_callbacks();
             return None;
         }
@@ -1045,6 +1088,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             tid: request.client_tid,
             teb: USER_CALLBACK_CLIENT_TEB.load(Ordering::Relaxed),
             peb_mirror: USER_CALLBACK_CLIENT_PEB.load(Ordering::Relaxed),
+            scratch_base: USER_CALLBACK_CLIENT_SCRATCH.load(Ordering::Relaxed),
         };
         if !redirect_pending_user_callback(
             chained_client,
@@ -1639,7 +1683,7 @@ pub(crate) unsafe fn load_framebuf_driver(host_pml4: u64) {
 pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (i32, bool) {
     let pi = W32_CLIENT_PI.load(Ordering::Relaxed) as u32;
     win32k_dispatch_wide(
-        ssn, a0, a1, a2, a3, 0, 0,
+        ssn, a0, a1, a2, a3, 0, 0, &[],
         Win32kClientContext {
             pi,
             pid: 0,
@@ -1647,6 +1691,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
             tid: 0,
             teb: crate::SMSS_TEB_VA,
             peb_mirror: 0,
+            scratch_base: crate::SM_FILL_SCRATCH_BASE,
         },
     )
 }
@@ -1667,6 +1712,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     a3: u64,
     caller_sp: u64,
     nargs: u64,
+    stack_args: &[u64],
     client: Win32kClientContext,
 ) -> (i32, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
@@ -1741,12 +1787,18 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     );
     // Stage the win64 STACK-ARG TAIL (args 5..N) from the client's stack. `nargs<=4` (or a 0-sp
     // self-test dispatch) leaves SH_REQ_NARGS=0 → win32k's dispatch_ssn takes the register-only path.
-    let staged = if nargs > 4 && caller_sp != 0 { nargs.min(16) } else { 0 };
+    let staged = if nargs > 4
+        && caller_sp != 0
+        && stack_args.len() >= nargs.min(16).saturating_sub(4) as usize
+    {
+        nargs.min(16)
+    } else {
+        0
+    };
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_NARGS) as *mut u64, staged);
     let mut i = 4u64;
     while i < staged {
-        // arg (i+1) is the (i-3)-th stack slot at [rsp + 0x28 + (i-4)*8].
-        let v = crate::img_spawn::smss_stack_read(caller_sp + 0x28 + (i - 4) * 8);
+        let v = stack_args[(i - 4) as usize];
         core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A4 + (i - 4) * 8) as *mut u64, v);
         i += 1;
     }
@@ -1777,6 +1829,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
             badge: client.badge,
             tid: client.tid,
             peb_mirror: client.peb_mirror,
+            scratch_base: client.scratch_base,
         }),
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,

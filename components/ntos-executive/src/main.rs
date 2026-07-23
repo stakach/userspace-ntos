@@ -1448,6 +1448,21 @@ static WL_LISTENER_FAULT_EP: AtomicU64 = AtomicU64::new(0);
 static WL_LISTENER_TCB: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER2_TCB: AtomicU64 = AtomicU64::new(0);
 static WL_WORKER3_TCB: AtomicU64 = AtomicU64::new(0);
+/// Slot-0's caller-created stack reservation. The fixed 0x1044 bootstrap stack is used only until
+/// LdrInitializeThunk restores this real context.
+static WL_LISTENER_STACK_ALLOCATION_BASE: AtomicU64 = AtomicU64::new(0);
+static WL_LISTENER_STACK_BASE_REAL: AtomicU64 = AtomicU64::new(0);
+static WL_LISTENER_STACK_MAPPED_LOW: AtomicU64 = AtomicU64::new(0);
+fn wl_listener_stack_contains(va: u64, len: usize) -> bool {
+    let allocation_base = WL_LISTENER_STACK_ALLOCATION_BASE.load(Ordering::Acquire);
+    let stack_base = WL_LISTENER_STACK_BASE_REAL.load(Ordering::Acquire);
+    allocation_base != 0
+        && stack_base > allocation_base
+        && va >= allocation_base
+        && va
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= stack_base)
+}
 /// The listener thread's real ETHREAD tid (a pool ETHREAD popped at NtCreateThread), and a count of
 /// real threads created through the general NtCreateThread path (for the counted spec).
 static PM_LISTENER_TID: AtomicU64 = AtomicU64::new(0);
@@ -2090,6 +2105,7 @@ static mut CSRSS_FRAME_VA: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_FR: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_ALIAS: [u64; CSRSS_FRAME_CAP] = [0; CSRSS_FRAME_CAP];
 static mut CSRSS_FRAME_N: usize = 0;
+static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
     csrss_frame_put_at(pi, page, fr, 0);
@@ -2140,6 +2156,35 @@ unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
         0
     } else {
         core::ptr::read((core::ptr::addr_of!(CSRSS_FRAME_ALIAS) as *const u64).add(index))
+    }
+}
+unsafe fn client_range_has_backing(pi: u64, va: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = va.checked_add(len as u64 - 1) else {
+        return false;
+    };
+    let mut page = va & !0xfff;
+    let last = end & !0xfff;
+    loop {
+        if csrss_frame_get_exact(pi, page).0 == 0 {
+            return false;
+        }
+        if page == last {
+            return true;
+        }
+        page += 0x1000;
+    }
+}
+unsafe fn client_copy_temp_cap() -> u64 {
+    let cap = CLIENT_COPY_TEMP_CAP.load(Ordering::Relaxed);
+    if cap != 0 {
+        cap
+    } else {
+        let cap = alloc_slot();
+        CLIENT_COPY_TEMP_CAP.store(cap, Ordering::Relaxed);
+        cap
     }
 }
 /// GUI client `pi`'s frame cap for page VA `page`, or 0 if not backed by a recorded per-process
@@ -2268,6 +2313,21 @@ unsafe fn copy_cap_r(src: u64) -> (u64, u64) {
         options(nostack),
     );
     (d, reply >> 12)
+}
+unsafe fn copy_cap_into_r(src: u64, dest: u64) -> u64 {
+    let reply: u64;
+    core::arch::asm!(
+        "syscall",
+        inout("rdx") SYS_CALL as u64 => _,
+        inout("rdi") CAP_INIT_THREAD_CNODE => _,
+        inout("rsi") LBL_CNODE_COPY << 12 => reply,
+        inout("r10") dest => _,
+        inout("r8") src => _,
+        inout("r9") 0u64 => _,
+        lateout("r15") _, lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+    reply >> 12
 }
 unsafe fn page_map_r(frame: u64, vaddr: u64, rights: u64, vspace: u64) -> u64 {
     let reply: u64;

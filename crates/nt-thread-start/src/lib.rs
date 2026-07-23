@@ -5,6 +5,7 @@ pub const CONTEXT_RDX_OFFSET: u64 = 0x88;
 pub const CONTEXT_RSP_OFFSET: u64 = 0x98;
 pub const CONTEXT_RIP_OFFSET: u64 = 0xf8;
 pub const AMD64_CONTEXT_SIZE: usize = 0x4d0;
+pub const USER_PAGE_SIZE: u64 = 0x1000;
 
 const CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const CONTEXT_MXCSR_OFFSET: usize = 0x34;
@@ -153,6 +154,26 @@ pub struct InitialTeb64 {
     pub stack_base: u64,
     pub stack_limit: u64,
     pub allocated_stack_base: u64,
+}
+
+/// Return the page that may be committed for a guard-style downward stack-growth fault.
+///
+/// `mapped_low` is the lowest page already backed in the reservation. Growth is deliberately
+/// contiguous: a skipped page or an address below the reservation is rejected.
+pub fn next_stack_growth_page(
+    allocation_base: u64,
+    mapped_low: u64,
+    fault_address: u64,
+) -> Option<u64> {
+    if allocation_base & (USER_PAGE_SIZE - 1) != 0
+        || mapped_low & (USER_PAGE_SIZE - 1) != 0
+        || mapped_low <= allocation_base
+    {
+        return None;
+    }
+    let page = fault_address & !(USER_PAGE_SIZE - 1);
+    (page >= allocation_base && page.checked_add(USER_PAGE_SIZE) == Some(mapped_low))
+        .then_some(page)
 }
 
 impl InitialTeb64 {
@@ -319,5 +340,26 @@ mod tests {
         assert_eq!(teb.stack_base, 0x9000);
         assert_eq!(teb.stack_limit, 0x8000);
         assert_eq!(teb.allocated_stack_base, 0x7000);
+    }
+
+    #[test]
+    fn stack_growth_accepts_only_the_next_reserved_page() {
+        assert_eq!(
+            next_stack_growth_page(0x7000_0000, 0x700f_e000, 0x700f_d123),
+            Some(0x700f_d000)
+        );
+        assert_eq!(
+            next_stack_growth_page(0x7000_0000, 0x700f_d000, 0x700f_cfff),
+            Some(0x700f_c000)
+        );
+        assert_eq!(
+            next_stack_growth_page(0x7000_0000, 0x700f_e000, 0x700f_cfff),
+            None
+        );
+        assert_eq!(
+            next_stack_growth_page(0x7000_0000, 0x7000_1000, 0x6fff_ffff),
+            None
+        );
+        assert_eq!(next_stack_growth_page(1, 0x700f_e000, 0x700f_d123), None);
     }
 }

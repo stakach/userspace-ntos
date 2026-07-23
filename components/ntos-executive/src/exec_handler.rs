@@ -1786,6 +1786,20 @@ impl ExecNtHandler {
     /// not in any mirror or frame table — but its bytes are exactly the (relocation-free) `.rdata`
     /// file content, which we read via the loaded PE. Handles a read that spans a page boundary.
     pub(crate) unsafe fn xas_read(&self, va: u64, dst: &mut [u8]) -> bool {
+        let dynamic_stack = self.pi == 2 && wl_listener_stack_contains(va, dst.len());
+        if dynamic_stack {
+            let Some(ctx) = self.loop_ctx.as_ref() else {
+                return false;
+            };
+            return client_copyin_mapped(
+                self.pi as u64,
+                va,
+                dst,
+                &*ctx.filled_pages,
+                *ctx.faults as usize,
+                ctx.scratch_base,
+            );
+        }
         if smss_copyin(va, dst) {
             return true;
         }
@@ -1852,6 +1866,16 @@ impl ExecNtHandler {
                     return true;
                 }
             }
+            if self.pi == 2 && wl_listener_stack_contains(va, core::mem::size_of::<u64>()) {
+                return client_copyout_mapped(
+                    self.pi as u64,
+                    va,
+                    &val.to_le_bytes(),
+                    &*ctx.filled_pages,
+                    *ctx.faults as usize,
+                    ctx.scratch_base,
+                );
+            }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
             let reg = &*ctx.reg;
@@ -1883,6 +1907,16 @@ impl ExecNtHandler {
                     );
                     return true;
                 }
+            }
+            if self.pi == 2 && wl_listener_stack_contains(va, core::mem::size_of::<u32>()) {
+                return client_copyout_mapped(
+                    self.pi as u64,
+                    va,
+                    &val.to_le_bytes(),
+                    &*ctx.filled_pages,
+                    *ctx.faults as usize,
+                    ctx.scratch_base,
+                );
             }
             let filled_pages = &mut *ctx.filled_pages;
             let faults = &mut *ctx.faults;
@@ -1931,6 +1965,9 @@ impl ExecNtHandler {
             return true;
         };
         let end = va + len as u64;
+        if self.pi == 2 && wl_listener_stack_contains(va, len) {
+            return client_range_has_backing(self.pi as u64, va, len);
+        }
         let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
         let stack_end = stack_base + ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
         if va >= stack_base && end <= stack_end
@@ -2014,8 +2051,34 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
+        let dynamic_stack = self.pi == 2 && wl_listener_stack_contains(va, src.len());
+        if dynamic_stack {
+            let Some(ctx) = self.loop_ctx.as_ref() else {
+                return false;
+            };
+            return client_copyout_mapped(
+                self.pi as u64,
+                va,
+                src,
+                &*ctx.filled_pages,
+                *ctx.faults as usize,
+                ctx.scratch_base,
+            );
+        }
         if smss_copyout(va, src) {
             return true;
+        }
+        if let Some(ctx) = self.loop_ctx.as_ref() {
+            if client_copyout_mapped(
+                self.pi as u64,
+                va,
+                src,
+                &*ctx.filled_pages,
+                *ctx.faults as usize,
+                ctx.scratch_base,
+            ) {
+                return true;
+            }
         }
         let mut i = 0usize;
         while i < src.len() {
