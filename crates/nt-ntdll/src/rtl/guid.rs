@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 
 /// A Windows `GUID` (`{ ULONG Data1; USHORT Data2; USHORT Data3; UCHAR Data4[8]; }`).
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Guid {
     /// First 32-bit field.
@@ -19,6 +20,48 @@ pub struct Guid {
     pub data3: u16,
     /// Trailing 8 bytes (rendered big-endian, split 2 + 6).
     pub data4: [u8; 8],
+}
+
+const _: () = assert!(core::mem::size_of::<Guid>() == 16);
+
+impl Guid {
+    /// Encode the native Windows in-memory representation.
+    pub const fn to_windows_bytes(self) -> [u8; 16] {
+        let data1 = self.data1.to_le_bytes();
+        let data2 = self.data2.to_le_bytes();
+        let data3 = self.data3.to_le_bytes();
+        [
+            data1[0],
+            data1[1],
+            data1[2],
+            data1[3],
+            data2[0],
+            data2[1],
+            data3[0],
+            data3[1],
+            self.data4[0],
+            self.data4[1],
+            self.data4[2],
+            self.data4[3],
+            self.data4[4],
+            self.data4[5],
+            self.data4[6],
+            self.data4[7],
+        ]
+    }
+
+    /// Decode the native Windows in-memory representation.
+    pub const fn from_windows_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            data2: u16::from_le_bytes([bytes[4], bytes[5]]),
+            data3: u16::from_le_bytes([bytes[6], bytes[7]]),
+            data4: [
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ],
+        }
+    }
 }
 
 #[inline]
@@ -68,23 +111,29 @@ pub fn guid_to_string(g: &Guid) -> Vec<u16> {
     out
 }
 
-/// `RtlGUIDFromString`: parse `{8-4-4-4-12}` (braces optional). Returns `None` on any malformed
-/// input.
+/// `RtlGUIDFromString`: parse the exact native `{8-4-4-4-12}` syntax.
 pub fn guid_from_string(s: &[u16]) -> Option<Guid> {
-    // Collect the hex nibbles, ignoring braces and dashes; require exactly 32 hex digits.
-    let mut nibbles: Vec<u8> = Vec::with_capacity(32);
-    for &u in s {
-        if u > 0x7F {
+    if s.len() != 38
+        || s[0] != b'{' as u16
+        || s[9] != b'-' as u16
+        || s[14] != b'-' as u16
+        || s[19] != b'-' as u16
+        || s[24] != b'-' as u16
+        || s[37] != b'}' as u16
+    {
+        return None;
+    }
+    let mut nibbles = [0u8; 32];
+    let mut count = 0usize;
+    for (index, &unit) in s.iter().enumerate() {
+        if matches!(index, 0 | 9 | 14 | 19 | 24 | 37) {
+            continue;
+        }
+        if unit > 0x7f || count == nibbles.len() {
             return None;
         }
-        let c = u as u8;
-        match c {
-            b'{' | b'}' | b'-' => {}
-            _ => nibbles.push(from_hex(c)?),
-        }
-    }
-    if nibbles.len() != 32 {
-        return None;
+        nibbles[count] = from_hex(unit as u8)?;
+        count += 1;
     }
     let byte = |i: usize| (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
     let data1 = ((byte(0) as u32) << 24)
@@ -130,18 +179,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_without_braces() {
-        let g = guid_from_string(
-            &"00000000-0000-0000-0000-000000000000"
-                .encode_utf16()
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(g, Some(Guid::default()));
+    fn native_byte_layout_roundtrips() {
+        let guid = Guid {
+            data1: 0x1122_3344,
+            data2: 0x5566,
+            data3: 0x7788,
+            data4: [0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10],
+        };
+        let bytes = [
+            0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x10,
+        ];
+        assert_eq!(guid.to_windows_bytes(), bytes);
+        assert_eq!(Guid::from_windows_bytes(bytes), guid);
     }
 
     #[test]
-    fn reject_malformed() {
-        assert!(guid_from_string(&"not-a-guid".encode_utf16().collect::<Vec<_>>()).is_none());
-        assert!(guid_from_string(&"{6ba7b810}".encode_utf16().collect::<Vec<_>>()).is_none());
+    fn parser_requires_exact_native_syntax() {
+        let upper = "{6BA7B810-9DAD-11D1-80B4-00C04FD430C8}"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        assert!(guid_from_string(&upper).is_some());
+        for malformed in [
+            "not-a-guid",
+            "{6ba7b810}",
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "{6ba7b8109-dad-11d1-80b4-00c04fd430c8}",
+            "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}x",
+            "{6ba7b810-9dad-11d1-80b4-00c04fd430cg}",
+        ] {
+            assert!(
+                guid_from_string(&malformed.encode_utf16().collect::<Vec<_>>()).is_none(),
+                "accepted malformed GUID: {malformed}"
+            );
+        }
     }
 }
