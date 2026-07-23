@@ -55,6 +55,11 @@ pub struct DllRedirectionData {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DllRedirectAssembly<'a> {
+    pub redirects: &'a [DllRedirect],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowClassAssembly<'a> {
     pub version: [u16; 4],
     pub files: &'a [DllRedirect],
@@ -105,40 +110,53 @@ pub struct ClrSurrogateMatch {
 }
 
 /// Build the exact ReactOS DLL-redirection string-section representation.
-///
-/// The bounded manifest parser supports one assembly, so every emitted index has roster index 1.
 pub fn build_dll_redirection_section(redirects: &[DllRedirect]) -> Result<Vec<u8>, NtStatus> {
-    let count = u32::try_from(redirects.len()).map_err(|_| STATUS_NO_MEMORY)?;
-    let index_bytes = redirects
-        .len()
+    build_dll_redirection_section_for_assemblies(&[DllRedirectAssembly { redirects }])
+}
+
+/// Build a DLL-redirection string section for an activation-context assembly roster.
+///
+/// Assembly roster indices are one-based and empty assemblies retain their position.
+pub fn build_dll_redirection_section_for_assemblies(
+    assemblies: &[DllRedirectAssembly<'_>],
+) -> Result<Vec<u8>, NtStatus> {
+    let redirect_count = assemblies.iter().try_fold(0usize, |count, assembly| {
+        count
+            .checked_add(assembly.redirects.len())
+            .ok_or(STATUS_NO_MEMORY)
+    })?;
+    let count = u32::try_from(redirect_count).map_err(|_| STATUS_NO_MEMORY)?;
+    let index_bytes = redirect_count
         .checked_mul(INDEX_SIZE)
         .ok_or(STATUS_NO_MEMORY)?;
     let mut total = HEADER_SIZE
         .checked_add(index_bytes)
         .ok_or(STATUS_NO_MEMORY)?;
 
-    for redirect in redirects {
-        if redirect.name.is_empty()
-            || redirect.name.contains(&0)
-            || redirect
-                .load_from
-                .as_ref()
-                .is_some_and(|value| value.contains(&0))
-        {
-            return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
-        }
-        let name_bytes = utf16_bytes_len(redirect.name.len())?;
-        let name_with_nul = name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?;
-        total = total
-            .checked_add(align4(name_with_nul).ok_or(STATUS_NO_MEMORY)?)
-            .and_then(|value| value.checked_add(REDIRECTION_SIZE))
-            .ok_or(STATUS_NO_MEMORY)?;
-        if let Some(load_from) = &redirect.load_from {
-            let path_bytes = utf16_bytes_len(load_from.len())?;
+    for assembly in assemblies {
+        for redirect in assembly.redirects {
+            if redirect.name.is_empty()
+                || redirect.name.contains(&0)
+                || redirect
+                    .load_from
+                    .as_ref()
+                    .is_some_and(|value| value.contains(&0))
+            {
+                return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+            }
+            let name_bytes = utf16_bytes_len(redirect.name.len())?;
+            let name_with_nul = name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?;
             total = total
-                .checked_add(PATH_SEGMENT_SIZE)
-                .and_then(|value| value.checked_add(align4(path_bytes)?))
+                .checked_add(align4(name_with_nul).ok_or(STATUS_NO_MEMORY)?)
+                .and_then(|value| value.checked_add(REDIRECTION_SIZE))
                 .ok_or(STATUS_NO_MEMORY)?;
+            if let Some(load_from) = &redirect.load_from {
+                let path_bytes = utf16_bytes_len(load_from.len())?;
+                total = total
+                    .checked_add(PATH_SEGMENT_SIZE)
+                    .and_then(|value| value.checked_add(align4(path_bytes)?))
+                    .ok_or(STATUS_NO_MEMORY)?;
+            }
         }
     }
     let total_u32 = u32::try_from(total).map_err(|_| STATUS_NO_MEMORY)?;
@@ -157,83 +175,96 @@ pub fn build_dll_redirection_section(redirects: &[DllRedirect]) -> Result<Vec<u8
     let mut cursor = HEADER_SIZE
         .checked_add(index_bytes)
         .ok_or(STATUS_NO_MEMORY)?;
-    for (position, redirect) in redirects.iter().enumerate() {
-        let index_offset = HEADER_SIZE
-            .checked_add(position.checked_mul(INDEX_SIZE).ok_or(STATUS_NO_MEMORY)?)
+    let mut position = 0usize;
+    for (assembly_index, assembly) in assemblies.iter().enumerate() {
+        let assembly_roster_index = assembly_index
+            .checked_add(1)
+            .and_then(|value| u32::try_from(value).ok())
             .ok_or(STATUS_NO_MEMORY)?;
-        let name_bytes = utf16_bytes_len(redirect.name.len())?;
-        let name_storage =
-            align4(name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?).ok_or(STATUS_NO_MEMORY)?;
-        let name_offset = cursor;
-        let data_offset = name_offset
-            .checked_add(name_storage)
-            .ok_or(STATUS_NO_MEMORY)?;
-        let hash = strings::hash_unicode_string(&redirect.name, true, HASH_ALGORITHM_X65599)
-            .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+        for redirect in assembly.redirects {
+            let index_offset = HEADER_SIZE
+                .checked_add(position.checked_mul(INDEX_SIZE).ok_or(STATUS_NO_MEMORY)?)
+                .ok_or(STATUS_NO_MEMORY)?;
+            let name_bytes = utf16_bytes_len(redirect.name.len())?;
+            let name_storage =
+                align4(name_bytes.checked_add(2).ok_or(STATUS_NO_MEMORY)?).ok_or(STATUS_NO_MEMORY)?;
+            let name_offset = cursor;
+            let data_offset = name_offset
+                .checked_add(name_storage)
+                .ok_or(STATUS_NO_MEMORY)?;
+            let hash = strings::hash_unicode_string(&redirect.name, true, HASH_ALGORITHM_X65599)
+                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
 
-        write_u32(&mut section, index_offset, hash)?;
-        write_u32(&mut section, index_offset + 4, to_u32(name_offset)?)?;
-        write_u32(&mut section, index_offset + 8, to_u32(name_bytes)?)?;
-        write_u32(&mut section, index_offset + 12, to_u32(data_offset)?)?;
-        // ReactOS leaves this at the fixed redirection-header size even when a path segment exists.
-        write_u32(&mut section, index_offset + 16, REDIRECTION_SIZE as u32)?;
-        write_u32(&mut section, index_offset + 20, 1)?;
-        write_utf16(&mut section, name_offset, &redirect.name)?;
-
-        if redirect.load_from.is_none() {
-            write_u32(&mut section, data_offset, REDIRECTION_SIZE as u32)?;
+            write_u32(&mut section, index_offset, hash)?;
+            write_u32(&mut section, index_offset + 4, to_u32(name_offset)?)?;
+            write_u32(&mut section, index_offset + 8, to_u32(name_bytes)?)?;
+            write_u32(&mut section, index_offset + 12, to_u32(data_offset)?)?;
+            // ReactOS leaves this at the fixed redirection-header size even when a path segment exists.
+            write_u32(&mut section, index_offset + 16, REDIRECTION_SIZE as u32)?;
             write_u32(
                 &mut section,
-                data_offset + 4,
-                DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT,
+                index_offset + 20,
+                assembly_roster_index,
             )?;
-            cursor = data_offset
-                .checked_add(REDIRECTION_SIZE)
-                .ok_or(STATUS_NO_MEMORY)?;
-        } else {
-            let load_from = redirect
-                .load_from
-                .as_ref()
-                .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
-            let path_bytes = utf16_bytes_len(load_from.len())?;
-            let path_storage = align4(path_bytes).ok_or(STATUS_NO_MEMORY)?;
-            let data_size = REDIRECTION_SIZE
-                .checked_add(PATH_SEGMENT_SIZE)
-                .ok_or(STATUS_NO_MEMORY)?;
-            let path_segment_offset = data_offset
-                .checked_add(REDIRECTION_SIZE)
-                .ok_or(STATUS_NO_MEMORY)?;
-            let path_offset = data_offset.checked_add(data_size).ok_or(STATUS_NO_MEMORY)?;
-            let mut flags = 0;
-            if load_from.iter().any(|unit| *unit == b'%' as u16) {
-                flags |= DLL_REDIRECTION_PATH_EXPAND;
-            }
-            if !load_from.is_empty()
-                && !load_from
-                    .last()
-                    .copied()
-                    .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
-            {
-                flags |= DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME;
-            }
+            write_utf16(&mut section, name_offset, &redirect.name)?;
 
-            write_u32(&mut section, data_offset, to_u32(data_size)?)?;
-            write_u32(&mut section, data_offset + 4, flags)?;
-            write_u32(&mut section, data_offset + 8, to_u32(path_storage)?)?;
-            write_u32(&mut section, data_offset + 12, 1)?;
-            write_u32(&mut section, data_offset + 16, to_u32(path_segment_offset)?)?;
-            write_u32(&mut section, path_segment_offset, to_u32(path_bytes)?)?;
-            write_u32(&mut section, path_segment_offset + 4, to_u32(path_offset)?)?;
-            write_utf16(&mut section, path_offset, load_from)?;
-            cursor = path_offset
-                .checked_add(path_storage)
-                .ok_or(STATUS_NO_MEMORY)?;
+            if redirect.load_from.is_none() {
+                write_u32(&mut section, data_offset, REDIRECTION_SIZE as u32)?;
+                write_u32(
+                    &mut section,
+                    data_offset + 4,
+                    DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT,
+                )?;
+                cursor = data_offset
+                    .checked_add(REDIRECTION_SIZE)
+                    .ok_or(STATUS_NO_MEMORY)?;
+            } else {
+                let load_from = redirect
+                    .load_from
+                    .as_ref()
+                    .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+                let path_bytes = utf16_bytes_len(load_from.len())?;
+                let path_storage = align4(path_bytes).ok_or(STATUS_NO_MEMORY)?;
+                let data_size = REDIRECTION_SIZE
+                    .checked_add(PATH_SEGMENT_SIZE)
+                    .ok_or(STATUS_NO_MEMORY)?;
+                let path_segment_offset = data_offset
+                    .checked_add(REDIRECTION_SIZE)
+                    .ok_or(STATUS_NO_MEMORY)?;
+                let path_offset = data_offset.checked_add(data_size).ok_or(STATUS_NO_MEMORY)?;
+                let mut flags = 0;
+                if load_from.iter().any(|unit| *unit == b'%' as u16) {
+                    flags |= DLL_REDIRECTION_PATH_EXPAND;
+                }
+                if !load_from.is_empty()
+                    && !load_from
+                        .last()
+                        .copied()
+                        .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
+                {
+                    flags |= DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME;
+                }
+
+                write_u32(&mut section, data_offset, to_u32(data_size)?)?;
+                write_u32(&mut section, data_offset + 4, flags)?;
+                write_u32(&mut section, data_offset + 8, to_u32(path_storage)?)?;
+                write_u32(&mut section, data_offset + 12, 1)?;
+                write_u32(&mut section, data_offset + 16, to_u32(path_segment_offset)?)?;
+                write_u32(&mut section, path_segment_offset, to_u32(path_bytes)?)?;
+                write_u32(&mut section, path_segment_offset + 4, to_u32(path_offset)?)?;
+                write_utf16(&mut section, path_offset, load_from)?;
+                cursor = path_offset
+                    .checked_add(path_storage)
+                    .ok_or(STATUS_NO_MEMORY)?;
+            }
+            position = position.checked_add(1).ok_or(STATUS_NO_MEMORY)?;
         }
     }
 
-    if cursor != total || total_u32 as usize != section.len() {
+    if position != redirect_count || cursor != total || total_u32 as usize != section.len() {
         return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
     }
+    validate_dll_redirection_section(&section)?;
     Ok(section)
 }
 
@@ -1625,6 +1656,142 @@ mod tests {
                 index_offset: 44,
                 length: 108,
             })
+        );
+    }
+
+    #[test]
+    fn builds_dll_redirection_for_two_assemblies_in_declaration_order() {
+        let root = [DllRedirect {
+            name: wide("root.dll"),
+            load_from: None,
+        }];
+        let dependency = [DllRedirect {
+            name: wide("dependency.dll"),
+            load_from: Some(wide("side\\dependency.dll")),
+        }];
+        let section = build_dll_redirection_section_for_assemblies(&[
+            DllRedirectAssembly { redirects: &root },
+            DllRedirectAssembly {
+                redirects: &dependency,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            validate_dll_redirection_section(&section),
+            Ok(DllRedirectionSection {
+                count: 2,
+                index_offset: 44,
+                length: section.len() as u32,
+            })
+        );
+        let root_match = find_dll_redirection(&section, &wide("ROOT.DLL"))
+            .unwrap()
+            .unwrap();
+        let dependency_match = find_dll_redirection(&section, &wide("DEPENDENCY.DLL"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_match.index_offset, HEADER_SIZE as u32);
+        assert_eq!(root_match.assembly_roster_index, 1);
+        assert_eq!(
+            dependency_match.index_offset,
+            (HEADER_SIZE + INDEX_SIZE) as u32
+        );
+        assert_eq!(dependency_match.assembly_roster_index, 2);
+    }
+
+    #[test]
+    fn empty_dll_redirect_assemblies_retain_their_roster_positions() {
+        let redirects = [DllRedirect {
+            name: wide("only.dll"),
+            load_from: None,
+        }];
+        let empty = DllRedirectAssembly { redirects: &[] };
+
+        let empty_first = build_dll_redirection_section_for_assemblies(&[
+            empty,
+            DllRedirectAssembly {
+                redirects: &redirects,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            find_dll_redirection(&empty_first, &wide("only.dll"))
+                .unwrap()
+                .unwrap()
+                .assembly_roster_index,
+            2
+        );
+
+        let empty_second = build_dll_redirection_section_for_assemblies(&[
+            DllRedirectAssembly {
+                redirects: &redirects,
+            },
+            empty,
+        ])
+        .unwrap();
+        assert_eq!(
+            find_dll_redirection(&empty_second, &wide("only.dll"))
+                .unwrap()
+                .unwrap()
+                .assembly_roster_index,
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_dll_name_across_assemblies_returns_roster_one() {
+        let root = [DllRedirect {
+            name: wide("same.dll"),
+            load_from: None,
+        }];
+        let dependency = [DllRedirect {
+            name: wide("SAME.DLL"),
+            load_from: Some(wide("dependency.dll")),
+        }];
+        let section = build_dll_redirection_section_for_assemblies(&[
+            DllRedirectAssembly { redirects: &root },
+            DllRedirectAssembly {
+                redirects: &dependency,
+            },
+        ])
+        .unwrap();
+
+        let found = find_dll_redirection(&section, &wide("same.dll"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.index_offset, HEADER_SIZE as u32);
+        assert_eq!(found.data_length, REDIRECTION_SIZE as u32);
+        assert_eq!(found.assembly_roster_index, 1);
+    }
+
+    #[test]
+    fn validates_multi_assembly_dll_roster_indices() {
+        let root = [DllRedirect {
+            name: wide("root.dll"),
+            load_from: None,
+        }];
+        let dependency = [DllRedirect {
+            name: wide("dependency.dll"),
+            load_from: None,
+        }];
+        let mut section = build_dll_redirection_section_for_assemblies(&[
+            DllRedirectAssembly { redirects: &root },
+            DllRedirectAssembly {
+                redirects: &dependency,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(read_u32(&section, HEADER_SIZE + 20), Ok(1));
+        assert_eq!(
+            read_u32(&section, HEADER_SIZE + INDEX_SIZE + 20),
+            Ok(2)
+        );
+        write_u32(&mut section, HEADER_SIZE + INDEX_SIZE + 20, 0).unwrap();
+        assert_eq!(
+            validate_dll_redirection_section(&section),
+            Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)
         );
     }
 

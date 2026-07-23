@@ -12,6 +12,7 @@
 //! coverage (A pure / A' CRT / B heap / C sync).
 
 pub mod activation;
+pub mod activation_dependency;
 pub mod activation_manifest;
 pub mod activation_query;
 pub mod activation_redirection;
