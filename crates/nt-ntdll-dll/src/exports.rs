@@ -5197,6 +5197,21 @@ unsafe fn dbg_emit_literal(format: *const u8) -> NtStatus {
     STATUS_SUCCESS
 }
 
+unsafe fn dbg_emit_variadic(format: *const u8, args: VaList<'_>) -> NtStatus {
+    let mut out = [0u8; DBG_PRINT_BUFFER_SIZE];
+    let mut values = VaArguments { list: args };
+    let mut output = NarrowOutput {
+        buffer: out.as_mut_ptr(),
+        capacity: out.len(),
+        position: 0,
+    };
+    // DbgPrint truncates diagnostics to its fixed internal buffer. The formatter's overflow error
+    // only means the tail was dropped; emit the bounded prefix that was rendered successfully.
+    let _ = unsafe { nt_ntdll::printf::format_narrow(format, &mut values, &mut output) };
+    unsafe { dbg_emit_stack_bytes(&out[..output.position]) };
+    STATUS_SUCCESS
+}
+
 fn dbg_print_filter_allows(component: u32, level: u32) -> bool {
     if component == u32::MAX || level == nt_ntdll::dbg::level::ERROR {
         return true;
@@ -5252,17 +5267,14 @@ unsafe fn dbg_emit_formatted(
     STATUS_SUCCESS
 }
 
-/// `DbgPrint(PCSTR Format, ...) -> ULONG` — variadic on the C side. We declare only the fixed
-/// `Format` arg (the Win64 ABI leaves the variadic tail in the caller's registers/stack, which Rust
-/// cannot safely read without a real `c_variadic` export). The literal format string is still emitted
-/// through our ntdll DebugService path, so diagnostics are no longer dropped; callers that already
-/// pass a `va_list` use `vDbgPrint*`, which renders substitutions below.
+/// `DbgPrint(PCSTR Format, ...) -> ULONG` — render the Win64 variadic arguments through the shared
+/// NT printf engine and emit the bounded result through ntdll's DebugService path.
 ///
 /// # Safety
-/// Called with the C DbgPrint ABI; the anonymous variadic tail is intentionally unread.
+/// Called with the C DbgPrint ABI; every argument must match its format conversion.
 #[export_name = "DbgPrint"]
-pub unsafe extern "C" fn dbg_print(format: *const u8) -> NtStatus {
-    unsafe { dbg_emit_literal(format) }
+pub unsafe extern "C" fn dbg_print(format: *const u8, args: ...) -> NtStatus {
+    unsafe { dbg_emit_variadic(format, args) }
 }
 
 /// `DbgBreakPoint()` — `int 3`. On x86_64 issue the breakpoint; a no-op elsewhere.
@@ -24514,28 +24526,34 @@ fn debug_filter_enabled(component: u32, level: u32) -> bool {
     nt_ntdll::dbg::debug_filter_state(win2000, component_mask, level)
 }
 
-/// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. The direct variadic
-/// export cannot consume anonymous varargs from Rust, so it emits the literal format string after
-/// applying the debug-filter gate. `vDbgPrintEx*` below handles callers that provide a `va_list`.
+/// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Applies the native
+/// debug-filter gate, renders the variadic tail, and emits the bounded result.
 ///
 /// # Safety
-/// Called with the C DbgPrintEx ABI; the anonymous variadic tail is intentionally unread.
+/// Called with the C DbgPrintEx ABI; every argument must match its format conversion.
 #[export_name = "DbgPrintEx"]
-pub unsafe extern "C" fn dbg_print_ex(component: u32, level: u32, format: *const u8) -> NtStatus {
+pub unsafe extern "C" fn dbg_print_ex(
+    component: u32,
+    level: u32,
+    format: *const u8,
+    args: ...,
+) -> NtStatus {
     if !dbg_print_filter_allows(component, level) {
         return STATUS_SUCCESS;
     }
-    unsafe { dbg_emit_literal(format) }
+    unsafe { dbg_emit_variadic(format, args) }
 }
 
-/// `DbgPrintReturnControlC(PCSTR Format, ...) -> ULONG`. Checked-build print helper; direct varargs
-/// are unreadable from this Rust ABI, so emit the literal format through the debug service.
+/// `DbgPrintReturnControlC(PCSTR Format, ...) -> ULONG`. Checked-build variadic print helper.
 ///
 /// # Safety
-/// Called with the C DbgPrint ABI; the anonymous variadic tail is intentionally unread.
+/// Called with the C DbgPrint ABI; every argument must match its format conversion.
 #[export_name = "DbgPrintReturnControlC"]
-pub unsafe extern "C" fn dbg_print_return_control_c(format: *const u8) -> NtStatus {
-    unsafe { dbg_emit_literal(format) }
+pub unsafe extern "C" fn dbg_print_return_control_c(
+    format: *const u8,
+    args: ...,
+) -> NtStatus {
+    unsafe { dbg_emit_variadic(format, args) }
 }
 
 /// `DbgQueryDebugFilterState(ULONG ComponentId, ULONG Level) -> NTSTATUS/BOOLEAN`.
