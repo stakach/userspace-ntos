@@ -9003,14 +9003,15 @@ pub unsafe extern "C" fn chkstk() {
     core::arch::naked_asm!("ret");
 }
 
-/// `_local_unwind(void* frame, void* target)` — MSVC SEH local unwind helper. The full unwinder is
-/// the `RtlUnwind`/`__C_specific_handler` machinery (target-side seam); the local-unwind entry is a
-/// no-op on the non-exception boot path (no `__finally` frames run during normal init).
+/// `_local_unwind(void* frame, void* target)` — MSVC SEH local unwind helper. ReactOS delegates
+/// directly to `RtlUnwind(frame, target, NULL, 0)` so intervening termination handlers execute.
 ///
 /// # Safety
 /// Called by compiler-emitted SEH prologue/epilogue code only.
 #[export_name = "_local_unwind"]
-pub unsafe extern "C" fn local_unwind(_frame: *mut c_void, _target: *mut c_void) {}
+pub unsafe extern "C" fn local_unwind(frame: *mut c_void, target: *mut c_void) {
+    unsafe { rtl_unwind(frame, target, core::ptr::null_mut(), core::ptr::null_mut()) };
+}
 
 /// `VerSetConditionMask(ULONGLONG mask, DWORD type, BYTE cond) -> ULONGLONG` — the version-info
 /// condition accumulator (`ntdll` export used by `VerifyVersionInfo`). Packs the 3-bit condition for
