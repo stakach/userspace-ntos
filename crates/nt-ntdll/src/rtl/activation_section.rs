@@ -208,10 +208,11 @@ pub fn build_dll_redirection_section(redirects: &[DllRedirect]) -> Result<Vec<u8
             if load_from.iter().any(|unit| *unit == b'%' as u16) {
                 flags |= DLL_REDIRECTION_PATH_EXPAND;
             }
-            if !load_from
-                .last()
-                .copied()
-                .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
+            if !load_from.is_empty()
+                && !load_from
+                    .last()
+                    .copied()
+                    .is_some_and(|unit| unit == b'\\' as u16 || unit == b'/' as u16)
             {
                 flags |= DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME;
             }
@@ -355,6 +356,7 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
             }
             let mut raw_total_path_length = 0usize;
             let mut aligned_total_path_length = 0usize;
+            let mut aligned_spans_in_bounds = true;
             for segment_index in 0..path_count {
                 let segment_offset = path_segment_offset
                     .checked_add(
@@ -376,6 +378,9 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
                 {
                     return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
                 }
+                aligned_spans_in_bounds &= path_offset
+                    .checked_add(path_storage)
+                    .is_some_and(|end| end <= section.len());
                 raw_total_path_length = raw_total_path_length
                     .checked_add(path_length)
                     .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
@@ -385,6 +390,7 @@ pub fn validate_dll_redirection_section(section: &[u8]) -> Result<DllRedirection
             }
             if total_path_length != raw_total_path_length
                 && total_path_length != aligned_total_path_length
+                || total_path_length == aligned_total_path_length && !aligned_spans_in_bounds
             {
                 return Err(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
             }
@@ -1684,10 +1690,7 @@ mod tests {
         let data = found.data_offset as usize;
 
         assert_eq!(found.data_length, 28);
-        assert_eq!(
-            read_u32(&section, data + 4),
-            Ok(DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME)
-        );
+        assert_eq!(read_u32(&section, data + 4), Ok(0));
         assert_eq!(read_u32(&section, data + 8), Ok(0));
         assert_eq!(read_u32(&section, data + 12), Ok(1));
         assert_eq!(read_u32(&section, data + 20), Ok(0));

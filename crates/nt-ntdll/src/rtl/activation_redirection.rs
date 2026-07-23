@@ -8,6 +8,7 @@ use super::{
     activation_section::{
         DllRedirectionData, DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME,
         DLL_REDIRECTION_PATH_OMITS_ASSEMBLY_ROOT,
+        DLL_REDIRECTION_PATH_SYSTEM_DEFAULT_REDIRECTED_SYSTEM32_DLL,
     },
     strings,
 };
@@ -94,6 +95,10 @@ pub fn absolute_path_is_system32(original: &[u16], system_root: &[u16]) -> bool 
     expected.extend_from_slice(trim_trailing_separators(system_root));
     expected.extend("\\System32".bytes().map(u16::from));
     unicode_eq_ci(parent, &expected)
+}
+
+pub fn redirection_applies_to_path(flags: u32, path_is_relative: bool) -> bool {
+    path_is_relative || flags & DLL_REDIRECTION_PATH_SYSTEM_DEFAULT_REDIRECTED_SYSTEM32_DLL != 0
 }
 
 pub fn compose_redirected_path(
@@ -268,6 +273,12 @@ mod tests {
             &wide("C:\\comctl32.dll"),
             &wide("C:\\ReactOS")
         ));
+        assert!(redirection_applies_to_path(0, true));
+        assert!(!redirection_applies_to_path(0, false));
+        assert!(redirection_applies_to_path(
+            DLL_REDIRECTION_PATH_SYSTEM_DEFAULT_REDIRECTED_SYSTEM32_DLL,
+            false
+        ));
     }
 
     #[test]
@@ -402,6 +413,41 @@ mod tests {
                 flags: DLL_REDIRECTION_PATH_INCLUDES_BASE_NAME,
                 path_segments: vec![wide("bin\\mapped.dll")],
             }
+        );
+
+        let empty_section = super::super::activation_section::build_dll_redirection_section(&[
+            super::super::activation::DllRedirect {
+                name: wide("empty.dll"),
+                load_from: Some(Vec::new()),
+            },
+        ])
+        .unwrap();
+        let empty_match = super::super::activation_section::find_dll_redirection(
+            &empty_section,
+            &wide("empty.dll"),
+        )
+        .unwrap()
+        .unwrap();
+        let empty =
+            super::super::activation_section::decode_dll_redirection(&empty_section, empty_match)
+                .unwrap();
+        assert_eq!(
+            empty,
+            DllRedirectionData {
+                flags: 0,
+                path_segments: vec![Vec::new()],
+            }
+        );
+        assert_eq!(
+            compose_redirected_path(
+                &empty,
+                &wide("C:\\app\\sample.manifest"),
+                &[],
+                &wide("C:\\ReactOS"),
+                &wide("empty.dll"),
+            )
+            .unwrap(),
+            wide("empty.dll")
         );
     }
 }

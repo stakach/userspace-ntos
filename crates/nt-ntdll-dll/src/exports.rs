@@ -12212,6 +12212,7 @@ unsafe fn isolation_actctx_path(
     lookup_name: &[u16],
     path_is_relative: bool,
     system_root: &[u16],
+    existence_only: bool,
 ) -> Result<Option<Vec<u16>>, NtStatus> {
     if !path_is_relative
         && !nt_ntdll::rtl::activation_redirection::absolute_path_is_system32(
@@ -12245,6 +12246,10 @@ unsafe fn isolation_actctx_path(
                 return Err(status);
             }
         };
+        if existence_only && path_is_relative {
+            unsafe { activation_context_release(context) };
+            return Ok(Some(Vec::new()));
+        }
         let redirection =
             match nt_ntdll::rtl::activation_section::decode_dll_redirection(
                 &object.dll_redirect_section,
@@ -12256,6 +12261,17 @@ unsafe fn isolation_actctx_path(
                     return Err(status);
                 }
             };
+        if !nt_ntdll::rtl::activation_redirection::redirection_applies_to_path(
+            redirection.flags,
+            path_is_relative,
+        ) {
+            unsafe { activation_context_release(context) };
+            continue;
+        }
+        if existence_only {
+            unsafe { activation_context_release(context) };
+            return Ok(Some(Vec::new()));
+        }
         let path = (|| -> Result<Vec<u16>, NtStatus> {
             let mut path = nt_ntdll::rtl::activation_redirection::compose_redirected_path(
                 &redirection,
@@ -12489,6 +12505,7 @@ pub unsafe extern "system" fn rtl_dos_apply_file_isolation_redirection_ustr(
             &prepared.lookup_name,
             prepared.path_is_relative,
             &system_root,
+            static_string.is_null() && dynamic_string.is_null(),
         ) {
             Ok(Some(path)) => path,
             Ok(None) => return STATUS_SXS_KEY_NOT_FOUND,
