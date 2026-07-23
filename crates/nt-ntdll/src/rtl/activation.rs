@@ -271,21 +271,26 @@ pub const RUN_LEVEL_AS_INVOKER: u32 = 1;
 pub const RUN_LEVEL_HIGHEST_AVAILABLE: u32 = 2;
 pub const RUN_LEVEL_REQUIRE_ADMIN: u32 = 3;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivationAssembly {
+    pub source: Vec<u16>,
+    pub manifest_path: Vec<u16>,
+    pub assembly_directory: Vec<u16>,
+    pub encoded_assembly_identity: Vec<u16>,
+    pub manifest: Vec<u8>,
+    pub dll_redirects: Vec<DllRedirect>,
+}
+
 #[repr(C)]
 pub struct ActivationContextObject {
     magic: AtomicU32,
     references: AtomicU32,
     flags: AtomicU32,
-    pub source: Vec<u16>,
     pub application_directory: Vec<u16>,
-    pub assembly_directory: Vec<u16>,
-    pub encoded_assembly_identity: Vec<u16>,
-    pub file_count: u32,
+    pub assemblies: Vec<ActivationAssembly>,
     pub compatibility: Vec<CompatibilityElement>,
     pub run_level: u32,
     pub ui_access: u32,
-    pub manifest: Vec<u8>,
-    pub dll_redirects: Vec<DllRedirect>,
     pub dll_redirect_section: Vec<u8>,
     pub window_class_redirect_section: Vec<u8>,
     pub clr_surrogate_section: Vec<u8>,
@@ -355,21 +360,41 @@ impl ActivationContextObject {
         application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
         encoded_assembly_identity: Vec<u16>,
     ) -> Self {
-        let file_count = u32::try_from(dll_redirects.len()).unwrap_or(u32::MAX);
+        let manifest_path = source.clone();
+        let mut assemblies = Vec::with_capacity(1);
+        assemblies.push(ActivationAssembly {
+            source,
+            manifest_path,
+            assembly_directory: Vec::new(),
+            encoded_assembly_identity,
+            manifest,
+            dll_redirects,
+        });
+        Self::new_with_assemblies(
+            assemblies,
+            dll_redirect_section,
+            window_class_redirect_section,
+            clr_surrogate_section,
+            application_settings,
+        )
+    }
+
+    pub fn new_with_assemblies(
+        assemblies: Vec<ActivationAssembly>,
+        dll_redirect_section: Vec<u8>,
+        window_class_redirect_section: Vec<u8>,
+        clr_surrogate_section: Vec<u8>,
+        application_settings: Vec<super::activation_manifest::ManifestApplicationSetting>,
+    ) -> Self {
         Self {
             magic: AtomicU32::new(ACTCTX_MAGIC),
             references: AtomicU32::new(1),
             flags: AtomicU32::new(0),
-            source,
             application_directory: Vec::new(),
-            assembly_directory: Vec::new(),
-            encoded_assembly_identity,
-            file_count,
+            assemblies,
             compatibility: Vec::new(),
             run_level: RUN_LEVEL_UNSPECIFIED,
             ui_access: 0,
-            manifest,
-            dll_redirects,
             dll_redirect_section,
             window_class_redirect_section,
             clr_surrogate_section,

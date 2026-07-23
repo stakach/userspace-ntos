@@ -10,9 +10,9 @@ use alloc::vec::Vec;
 
 use crate::NtStatus;
 
-#[cfg(test)]
-use super::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT;
-use super::activation::{MAX_MANIFEST_BYTES, STATUS_SXS_CANT_GEN_ACTCTX};
+use super::activation::{
+    MAX_MANIFEST_BYTES, STATUS_SXS_CANT_GEN_ACTCTX, STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+};
 use super::activation_manifest::{
     parse_manifest_details, AssemblyIdentity, ManifestDependency, ParsedManifestDetails,
 };
@@ -31,6 +31,9 @@ pub struct ActivationManifestSource {
     pub assembly_directory: Vec<u16>,
     /// Raw manifest bytes retained for activation-context query information.
     pub manifest: Vec<u8>,
+    /// Shared WinSxS assemblies permit a newer build/revision; private assemblies require exact
+    /// version equality.
+    pub shared: bool,
 }
 
 /// A normalized assembly request passed to the injected manifest catalog.
@@ -107,8 +110,9 @@ struct PendingDependency {
 ///
 /// Identity matching follows ReactOS: name, architecture, and public-key token compare
 /// case-insensitively; language absence or `*` is a wildcard; major/minor are exact; and candidate
-/// build/revision may be newer than requested. The assembly `type` attribute is not part of
-/// identity matching.
+/// build/revision may be newer than requested for shared WinSxS manifests. Private manifests
+/// require all four version components to match exactly. The assembly `type` attribute is not part
+/// of identity matching.
 pub fn resolve_activation_dependencies<C: ActivationManifestCatalog>(
     root: ActivationManifestSource,
     current_processor_architecture: Option<&[u16]>,
@@ -150,31 +154,50 @@ pub fn resolve_activation_dependencies<C: ActivationManifestCatalog>(
         let pending = &queue[cursor];
         let required = pending.required;
         let depth = pending.depth;
-        let source = catalog.resolve(&pending.request)?;
+        let source = match catalog.resolve(&pending.request) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                if required {
+                    return Err(STATUS_SXS_CANT_GEN_ACTCTX);
+                }
+                cursor += 1;
+                continue;
+            }
+            Err(status) => {
+                if required {
+                    return Err(status);
+                }
+                cursor += 1;
+                continue;
+            }
+        };
         cursor += 1;
 
-        let Some(source) = source else {
-            if required {
+        let candidate = (|| {
+            if assemblies.len() >= limits.max_assemblies {
                 return Err(STATUS_SXS_CANT_GEN_ACTCTX);
             }
-            continue;
+            let next_manifest_bytes = manifest_bytes
+                .checked_add(source.manifest.len())
+                .filter(|total| *total <= limits.max_manifest_bytes)
+                .ok_or(STATUS_SXS_CANT_GEN_ACTCTX)?;
+            let details = parse_manifest_details(&source.manifest)?;
+            if !assembly_request_matches_source(
+                &queue[cursor - 1].request,
+                &details.root.assembly_identity,
+                details.root_language.as_deref(),
+                source.shared,
+            ) {
+                return Err(STATUS_SXS_CANT_GEN_ACTCTX);
+            }
+            Ok((details, next_manifest_bytes))
+        })();
+        let (details, next_manifest_bytes) = match candidate {
+            Ok(candidate) => candidate,
+            Err(_) if !required => continue,
+            Err(status) => return Err(status),
         };
-        if assemblies.len() >= limits.max_assemblies {
-            return Err(STATUS_SXS_CANT_GEN_ACTCTX);
-        }
-        manifest_bytes = manifest_bytes
-            .checked_add(source.manifest.len())
-            .filter(|total| *total <= limits.max_manifest_bytes)
-            .ok_or(STATUS_SXS_CANT_GEN_ACTCTX)?;
-
-        let details = parse_manifest_details(&source.manifest)?;
-        if !assembly_request_matches(
-            &queue[cursor - 1].request,
-            &details.root.assembly_identity,
-            details.root_language.as_deref(),
-        ) {
-            return Err(STATUS_SXS_CANT_GEN_ACTCTX);
-        }
+        manifest_bytes = next_manifest_bytes;
 
         let roster_index = assemblies
             .len()
@@ -316,6 +339,16 @@ pub fn assembly_request_matches(
         && language_matches(request.language.as_deref(), candidate_language)
 }
 
+fn assembly_request_matches_source(
+    request: &AssemblyRequest,
+    candidate_identity: &AssemblyIdentity,
+    candidate_language: Option<&[u16]>,
+    shared: bool,
+) -> bool {
+    assembly_request_matches(request, candidate_identity, candidate_language)
+        && (shared || request.identity.version == candidate_identity.version)
+}
+
 fn request_is_satisfied_by(request: &AssemblyRequest, candidate: &AssemblyRequest) -> bool {
     assembly_request_matches(request, &candidate.identity, candidate.language.as_deref())
 }
@@ -347,6 +380,226 @@ fn is_wildcard(value: &[u16]) -> bool {
     value == [b'*' as u16]
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WinsxsManifestCandidateRank {
+    pub non_builtin: bool,
+    pub build: u16,
+    pub revision: u16,
+}
+
+/// Build ReactOS's WinSxS manifest enumeration pattern for a normalized request.
+///
+/// `None` means the identity lacks one of the fields required for shared-assembly lookup.
+pub fn winsxs_manifest_pattern(request: &AssemblyRequest) -> Result<Option<Vec<u16>>, NtStatus> {
+    let (Some(architecture), Some(name), Some(token)) = (
+        request.identity.processor_architecture.as_deref(),
+        request.identity.name.as_deref(),
+        request.identity.public_key_token.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if architecture.is_empty() || name.is_empty() || token.is_empty() {
+        return Ok(None);
+    }
+    let language = match request.language.as_deref() {
+        Some(language)
+            if !language.is_empty()
+                && !equal_unicode_string(language, &ascii_units("neutral"), true) =>
+        {
+            language
+        }
+        _ => &[b'*' as u16],
+    };
+
+    let mut pattern = Vec::new();
+    pattern
+        .try_reserve(
+            architecture
+                .len()
+                .checked_add(name.len())
+                .and_then(|length| length.checked_add(token.len()))
+                .and_then(|length| length.checked_add(language.len()))
+                .and_then(|length| length.checked_add(48))
+                .ok_or(STATUS_NO_MEMORY)?,
+        )
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    pattern.extend_from_slice(architecture);
+    pattern.push(b'_' as u16);
+    pattern.extend_from_slice(name);
+    pattern.push(b'_' as u16);
+    pattern.extend_from_slice(token);
+    pattern.push(b'_' as u16);
+    append_decimal(&mut pattern, request.identity.version[0])?;
+    pattern.push(b'.' as u16);
+    append_decimal(&mut pattern, request.identity.version[1])?;
+    pattern.extend_from_slice(&ascii_units(".*.*_"));
+    pattern.extend_from_slice(language);
+    pattern.extend_from_slice(&ascii_units("_*.manifest"));
+    Ok(Some(pattern))
+}
+
+/// Build the private-assembly directory identity exposed by activation-context queries.
+pub fn private_assembly_directory_name(request: &AssemblyRequest) -> Result<Vec<u16>, NtStatus> {
+    let none = [b'n' as u16, b'o' as u16, b'n' as u16, b'e' as u16];
+    let architecture = request
+        .identity
+        .processor_architecture
+        .as_deref()
+        .unwrap_or(&none);
+    let name = request.identity.name.as_deref().unwrap_or(&none);
+    let token = request
+        .identity
+        .public_key_token
+        .as_deref()
+        .unwrap_or(&none);
+    let language = request.language.as_deref().unwrap_or(&none);
+
+    let capacity = architecture
+        .len()
+        .checked_add(name.len())
+        .and_then(|length| length.checked_add(token.len()))
+        .and_then(|length| length.checked_add(language.len()))
+        .and_then(|length| length.checked_add(48))
+        .ok_or(STATUS_NO_MEMORY)?;
+    let mut directory = Vec::new();
+    directory
+        .try_reserve(capacity)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    directory.extend_from_slice(architecture);
+    directory.push(b'_' as u16);
+    directory.extend_from_slice(name);
+    directory.push(b'_' as u16);
+    directory.extend_from_slice(token);
+    directory.push(b'_' as u16);
+    for (index, component) in request.identity.version.iter().copied().enumerate() {
+        if index != 0 {
+            directory.push(b'.' as u16);
+        }
+        append_decimal(&mut directory, component)?;
+    }
+    directory.push(b'_' as u16);
+    directory.extend_from_slice(language);
+    directory.extend_from_slice(&ascii_units("_deadbeef"));
+    Ok(directory)
+}
+
+/// Validate and rank one filename returned for [`winsxs_manifest_pattern`].
+pub fn rank_winsxs_manifest_candidate(
+    request: &AssemblyRequest,
+    filename: &[u16],
+) -> Result<Option<WinsxsManifestCandidateRank>, NtStatus> {
+    let Some(pattern) = winsxs_manifest_pattern(request)? else {
+        return Ok(None);
+    };
+    let version_wildcard = ascii_units(".*.*_");
+    let wildcard = pattern
+        .windows(version_wildcard.len())
+        .position(|units| units == version_wildcard.as_slice())
+        .ok_or(STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
+    let mut prefix = pattern[..wildcard].to_vec();
+    prefix.push(b'.' as u16);
+    if filename.len() <= prefix.len()
+        || !equal_unicode_string(&filename[..prefix.len()], &prefix, true)
+        || !ends_with_ascii_ci(filename, ".manifest")
+    {
+        return Ok(None);
+    }
+
+    let mut cursor = prefix.len();
+    let Some(build) = parse_decimal_component(filename, &mut cursor, b'.' as u16) else {
+        return Ok(None);
+    };
+    let Some(revision) = parse_decimal_component(filename, &mut cursor, b'_' as u16) else {
+        return Ok(None);
+    };
+    if cursor >= filename.len() {
+        return Ok(None);
+    }
+    let requested = (request.identity.version[2], request.identity.version[3]);
+    if (build, revision) < requested {
+        return Ok(None);
+    }
+    let Some(language_end) = filename[cursor..]
+        .iter()
+        .position(|unit| *unit == b'_' as u16)
+        .map(|offset| cursor + offset)
+    else {
+        return Ok(None);
+    };
+    let language = &filename[cursor..language_end];
+    if language.is_empty() {
+        return Ok(None);
+    }
+    if let Some(requested_language) = request.language.as_deref().filter(|language| {
+        !language.is_empty()
+            && !is_wildcard(language)
+            && !equal_unicode_string(language, &ascii_units("neutral"), true)
+    }) {
+        if !equal_unicode_string(language, requested_language, true) {
+            return Ok(None);
+        }
+    }
+    let trailer_start = language_end + 1;
+    if trailer_start >= filename.len() {
+        return Ok(None);
+    }
+    let builtin = equal_unicode_string(
+        &filename[trailer_start..],
+        &ascii_units("deadbeef.manifest"),
+        true,
+    );
+    Ok(Some(WinsxsManifestCandidateRank {
+        non_builtin: !builtin,
+        build,
+        revision,
+    }))
+}
+
+fn append_decimal(output: &mut Vec<u16>, value: u16) -> Result<(), NtStatus> {
+    let mut divisor = 10_000u16;
+    while divisor > 1 && value / divisor == 0 {
+        divisor /= 10;
+    }
+    loop {
+        output.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
+        output.push(b'0' as u16 + (value / divisor) % 10);
+        if divisor == 1 {
+            return Ok(());
+        }
+        divisor /= 10;
+    }
+}
+
+fn parse_decimal_component(input: &[u16], cursor: &mut usize, delimiter: u16) -> Option<u16> {
+    let start = *cursor;
+    let mut value = 0u16;
+    while *cursor < input.len() && input[*cursor] != delimiter {
+        let unit = input[*cursor];
+        if !(b'0' as u16..=b'9' as u16).contains(&unit) {
+            return None;
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(unit - b'0' as u16))?;
+        *cursor += 1;
+    }
+    if *cursor == start || *cursor >= input.len() {
+        return None;
+    }
+    *cursor += 1;
+    Some(value)
+}
+
+fn ascii_units(value: &str) -> Vec<u16> {
+    value.bytes().map(u16::from).collect()
+}
+
+fn ends_with_ascii_ci(value: &[u16], suffix: &str) -> bool {
+    let suffix = ascii_units(suffix);
+    value.len() >= suffix.len()
+        && equal_unicode_string(&value[value.len() - suffix.len()..], &suffix, true)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -363,7 +616,14 @@ mod tests {
             manifest_path: wide(&alloc::format!("{name}.manifest")),
             assembly_directory: wide(name),
             manifest: manifest.to_vec(),
+            shared: true,
         }
+    }
+
+    fn private_source(name: &str, manifest: &[u8]) -> ActivationManifestSource {
+        let mut source = source(name, manifest);
+        source.shared = false;
+        source
     }
 
     struct MockCatalog {
@@ -635,6 +895,17 @@ mod tests {
             [6, 0, 3, 0]
         );
 
+        let mut catalog = MockCatalog::new(vec![(wide("dep"), private_source("dep", newer))]);
+        assert_eq!(
+            resolve_activation_dependencies(
+                source("root", request),
+                None,
+                ActivationResolverLimits::default(),
+                &mut catalog
+            ),
+            Err(STATUS_SXS_CANT_GEN_ACTCTX)
+        );
+
         let older = br#"<assembly manifestVersion="1.0">
           <assemblyIdentity name="dep" version="6.0.2.3"/>
         </assembly>"#;
@@ -648,6 +919,29 @@ mod tests {
             ),
             Err(STATUS_SXS_CANT_GEN_ACTCTX)
         );
+    }
+
+    #[test]
+    fn optional_invalid_or_mismatched_candidates_are_skipped() {
+        let root = br#"<assembly manifestVersion="1.0"><assemblyIdentity name="root"/>
+          <dependency optional="yes"><dependentAssembly><assemblyIdentity name="bad"/>
+          </dependentAssembly></dependency>
+          <dependency><dependentAssembly allowDelayedBinding="true">
+          <assemblyIdentity name="wrong"/></dependentAssembly></dependency></assembly>"#;
+        let wrong =
+            br#"<assembly manifestVersion="1.0"><assemblyIdentity name="other"/></assembly>"#;
+        let mut catalog = MockCatalog::new(vec![
+            (wide("bad"), source("bad", b"not xml")),
+            (wide("wrong"), source("wrong", wrong)),
+        ]);
+        let resolved = resolve_activation_dependencies(
+            source("root", root),
+            None,
+            ActivationResolverLimits::default(),
+            &mut catalog,
+        )
+        .unwrap();
+        assert_eq!(resolved.assemblies.len(), 1);
     }
 
     #[test]
@@ -678,6 +972,81 @@ mod tests {
                 &mut mismatched
             ),
             Err(STATUS_SXS_CANT_GEN_ACTCTX)
+        );
+    }
+
+    #[test]
+    fn builds_and_ranks_winsxs_manifest_candidates() {
+        let request = AssemblyRequest {
+            identity: AssemblyIdentity {
+                name: Some(wide("microsoft.windows.common-controls")),
+                processor_architecture: Some(wide("amd64")),
+                public_key_token: Some(wide("6595b64144ccf1df")),
+                version: [6, 0, 0, 0],
+                ..AssemblyIdentity::default()
+            },
+            language: Some(wide("neutral")),
+        };
+        assert_eq!(
+            winsxs_manifest_pattern(&request).unwrap().unwrap(),
+            wide("amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.*.*_*_*.manifest")
+        );
+        assert_eq!(
+            private_assembly_directory_name(&request).unwrap(),
+            wide(
+                "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.0.0_neutral_deadbeef"
+            )
+        );
+        let builtin = rank_winsxs_manifest_candidate(
+            &request,
+            &wide(
+                "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest",
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        let native = rank_winsxs_manifest_candidate(
+            &request,
+            &wide(
+                "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.3000.1_en-us_native.manifest",
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            builtin,
+            WinsxsManifestCandidateRank {
+                non_builtin: false,
+                build: 2600,
+                revision: 2982,
+            }
+        );
+        assert!(native > builtin);
+
+        let mut localized = request.clone();
+        localized.language = Some(wide("en-us"));
+        assert_eq!(
+            rank_winsxs_manifest_candidate(
+                &localized,
+                &wide(
+                    "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.3000.1_fr-fr_native.manifest",
+                ),
+            )
+            .unwrap(),
+            None
+        );
+
+        let mut newer_request = request;
+        newer_request.identity.version = [6, 0, 2601, 0];
+        assert_eq!(
+            rank_winsxs_manifest_candidate(
+                &newer_request,
+                &wide(
+                    "amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest",
+                ),
+            )
+            .unwrap(),
+            None
         );
     }
 }

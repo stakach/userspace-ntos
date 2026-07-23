@@ -215,12 +215,24 @@ fn find_entry_by_name(
 
 /// `find_first_entry` — the first entry whose directory-ness matches `want_dir` (used for the
 /// LANG_NEUTRAL "just take the first language" fallback).
-fn find_first_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<usize> {
+pub fn find_first_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<usize> {
     let (named, ids) = dir_counts(rsrc, dir_off)?;
     for pos in 0..(named + ids) {
         let e = dir_entry(rsrc, dir_off, pos)?;
         if e.is_directory() == want_dir {
             return Some(e.child_offset());
+        }
+    }
+    None
+}
+
+/// Return the first numeric-id entry whose directory-ness matches `want_dir`.
+pub fn find_first_id_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<usize> {
+    let (named, ids) = dir_counts(rsrc, dir_off)?;
+    for pos in named..named.checked_add(ids)? {
+        let entry = dir_entry(rsrc, dir_off, pos)?;
+        if entry.is_directory() == want_dir {
+            return Some(entry.child_offset());
         }
     }
     None

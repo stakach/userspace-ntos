@@ -1123,6 +1123,8 @@ const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 #[cfg(target_arch = "x86_64")]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 #[cfg(target_arch = "x86_64")]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(target_arch = "x86_64")]
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 #[cfg(target_arch = "x86_64")]
 const FILE_GENERIC_READ: u32 = 0x0012_0089;
@@ -1297,6 +1299,51 @@ unsafe fn boot_nt_open_file(
             iosb,
             share_access,
             open_options,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn boot_nt_query_directory_file(
+    file_handle: u64,
+    iosb: *mut [u64; 2],
+    buffer: *mut c_void,
+    length: u32,
+    information_class: u32,
+    return_single_entry: u8,
+    pattern: *const UnicodeString,
+    restart_scan: u8,
+) -> NtStatus {
+    type NtQueryDirectoryFile = unsafe extern "system" fn(
+        u64,
+        u64,
+        *mut c_void,
+        *mut c_void,
+        *mut [u64; 2],
+        *mut c_void,
+        u32,
+        u32,
+        u8,
+        *const UnicodeString,
+        u8,
+    ) -> NtStatus;
+    // SAFETY: forwards the exact x64 NtQueryDirectoryFile ABI to the generated trap stub.
+    unsafe {
+        core::mem::transmute::<unsafe extern "C" fn(), NtQueryDirectoryFile>(
+            nt_ntdll::trap_stubs::nt_query_directory_file,
+        )(
+            file_handle,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            iosb,
+            buffer,
+            length,
+            information_class,
+            return_single_entry,
+            pattern,
+            restart_scan,
         )
     }
 }
@@ -12272,10 +12319,15 @@ unsafe fn isolation_actctx_path(
             return Ok(Some(Vec::new()));
         }
         let path = (|| -> Result<Vec<u16>, NtStatus> {
+            let assembly = found
+                .assembly_roster_index
+                .checked_sub(1)
+                .and_then(|index| object.assemblies.get(index as usize))
+                .ok_or(nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT)?;
             let mut path = nt_ntdll::rtl::activation_redirection::compose_redirected_path(
                 &redirection,
-                &object.source,
-                &object.assembly_directory,
+                &assembly.manifest_path,
+                &assembly.assembly_directory,
                 system_root,
                 lookup_name,
             )?;
@@ -13209,7 +13261,7 @@ unsafe fn open_activation_file(nt_path: &[u16]) -> Result<u64, NtStatus> {
             FILE_GENERIC_READ,
             &attributes,
             &mut iosb,
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             FILE_SYNCHRONOUS_IO_NONALERT,
         )
     };
@@ -13314,6 +13366,342 @@ unsafe fn read_associated_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtSt
     };
     let _ = unsafe { boot_nt_close(handle) };
     result
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_activation_directory(nt_path: &[u16]) -> Result<u64, NtStatus> {
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    let path_bytes = nt_path
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or(STATUS_NAME_TOO_LONG)?;
+    let mut name = UnicodeString::default();
+    name.length = path_bytes;
+    name.maximum_length = path_bytes;
+    name.buffer = nt_path.as_ptr() as u64;
+    let attributes = boot_status_object_attributes(&name);
+    let mut handle = 0u64;
+    let mut iosb = [0u64; 2];
+    let status = unsafe {
+        boot_nt_open_file(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut iosb,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        Ok(handle)
+    } else {
+        Err(status)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn append_activation_path(base: &[u16], suffix: &[u16]) -> Result<Vec<u16>, NtStatus> {
+    let separator = !base.is_empty()
+        && !base
+            .last()
+            .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16);
+    let capacity = base
+        .len()
+        .checked_add(usize::from(separator))
+        .and_then(|length| length.checked_add(suffix.len()))
+        .ok_or(STATUS_NO_MEMORY)?;
+    let mut path = Vec::new();
+    path.try_reserve_exact(capacity)
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    path.extend_from_slice(base);
+    if separator {
+        path.push(b'\\' as u16);
+    }
+    path.extend_from_slice(suffix);
+    Ok(path)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn activation_path_missing(status: NtStatus) -> bool {
+    matches!(status, STATUS_NO_SUCH_FILE | 0xC000_0034 | 0xC000_003A)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(align(8))]
+struct ActivationDirectoryBuffer([u8; 8192]);
+
+#[cfg(target_arch = "x86_64")]
+struct TargetActivationManifestCatalog {
+    system_root: Vec<u16>,
+    application_directory: Vec<u16>,
+    root_manifest_directory: Vec<u16>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl TargetActivationManifestCatalog {
+    unsafe fn resolve_winsxs(
+        &mut self,
+        request: &nt_ntdll::rtl::activation_dependency::AssemblyRequest,
+    ) -> Result<Option<nt_ntdll::rtl::activation_dependency::ActivationManifestSource>, NtStatus>
+    {
+        const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const STATUS_NO_MORE_FILES: NtStatus = 0x8000_0006;
+
+        let Some(pattern) =
+            nt_ntdll::rtl::activation_dependency::winsxs_manifest_pattern(request)?
+        else {
+            return Ok(None);
+        };
+        if pattern.len() > 260 {
+            return Ok(None);
+        }
+        let manifests_leaf: Vec<u16> = "winsxs\\manifests".encode_utf16().collect();
+        let manifests_directory = append_activation_path(&self.system_root, &manifests_leaf)?;
+        let resolved_directory =
+            match nt_ntdll::rtl::activation::resolve_manifest_source(
+                &manifests_directory,
+                None,
+                &[],
+            ) {
+                Some(path) => path,
+                None => return Ok(None),
+            };
+        let pattern_bytes = pattern
+            .len()
+            .checked_mul(2)
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or(STATUS_NAME_TOO_LONG)?;
+        let mut pattern_string = UnicodeString::default();
+        pattern_string.length = pattern_bytes;
+        pattern_string.maximum_length = pattern_bytes;
+        pattern_string.buffer = pattern.as_ptr() as u64;
+        let directory = match unsafe { open_activation_directory(&resolved_directory.nt_path) } {
+            Ok(handle) => handle,
+            Err(_) => return Ok(None),
+        };
+
+        let mut buffer = ActivationDirectoryBuffer([0; 8192]);
+        let mut iosb = [0u64; 2];
+        let mut restart = 1u8;
+        let mut best: Option<(
+            nt_ntdll::rtl::activation_dependency::WinsxsManifestCandidateRank,
+            Vec<u16>,
+        )> = None;
+        let enumeration = (|| -> Result<(), NtStatus> {
+            loop {
+                iosb = [0; 2];
+                let status = unsafe {
+                    boot_nt_query_directory_file(
+                        directory,
+                        &mut iosb,
+                        buffer.0.as_mut_ptr().cast(),
+                        buffer.0.len() as u32,
+                        FILE_BOTH_DIRECTORY_INFORMATION,
+                        0,
+                        &pattern_string,
+                        restart,
+                    )
+                };
+                restart = 0;
+                if status == STATUS_NO_MORE_FILES || activation_path_missing(status) {
+                    return Ok(());
+                }
+                if status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW {
+                    return Ok(());
+                }
+                let information = usize::try_from(iosb[1]).unwrap_or(usize::MAX);
+                if information == 0 {
+                    return Ok(());
+                }
+                if information > buffer.0.len() {
+                    return Err(
+                        nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                    );
+                }
+                let mut offset = 0usize;
+                loop {
+                    if information.saturating_sub(offset) < 94 {
+                        return Err(
+                            nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                        );
+                    }
+                    let record = &buffer.0[offset..information];
+                    let next = u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize;
+                    let attributes = u32::from_le_bytes(record[56..60].try_into().unwrap());
+                    let name_bytes =
+                        u32::from_le_bytes(record[60..64].try_into().unwrap()) as usize;
+                    let name_end = 94usize.checked_add(name_bytes).ok_or(
+                        nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                    )?;
+                    if name_bytes & 1 != 0 || name_end > record.len() {
+                        return Err(
+                            nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                        );
+                    }
+                    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+                        let mut name = Vec::new();
+                        name.try_reserve_exact(name_bytes / 2)
+                            .map_err(|_| STATUS_NO_MEMORY)?;
+                        for bytes in record[94..name_end].chunks_exact(2) {
+                            name.push(u16::from_le_bytes([bytes[0], bytes[1]]));
+                        }
+                        if let Some(rank) =
+                            nt_ntdll::rtl::activation_dependency::rank_winsxs_manifest_candidate(
+                                request, &name,
+                            )?
+                        {
+                            if best.as_ref().is_none_or(|(current, _)| rank > *current) {
+                                best = Some((rank, name));
+                            }
+                        }
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    if next < 94 || next > information - offset {
+                        return Err(
+                            nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                        );
+                    }
+                    offset += next;
+                }
+            }
+        })();
+        let _ = unsafe { boot_nt_close(directory) };
+        enumeration?;
+
+        let Some((_, filename)) = best else {
+            return Ok(None);
+        };
+        let manifest_path = append_activation_path(&manifests_directory, &filename)?;
+        let resolved = nt_ntdll::rtl::activation::resolve_manifest_source(
+            &manifest_path,
+            None,
+            &[],
+        )
+        .ok_or(STATUS_NO_SUCH_FILE)?;
+        let manifest = match unsafe { read_activation_manifest_file(&resolved.nt_path) } {
+            Ok(manifest) => manifest,
+            Err(status) if activation_path_missing(status) => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        let extension_length = ".manifest".len();
+        let assembly_directory = filename[..filename.len() - extension_length].to_vec();
+        Ok(Some(
+            nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
+                source: manifest_path.clone(),
+                manifest_path,
+                assembly_directory,
+                manifest,
+                shared: true,
+            },
+        ))
+    }
+
+    unsafe fn resolve_private(
+        &mut self,
+        request: &nt_ntdll::rtl::activation_dependency::AssemblyRequest,
+    ) -> Result<Option<nt_ntdll::rtl::activation_dependency::ActivationManifestSource>, NtStatus>
+    {
+        let Some(name) = request.identity.name.as_deref() else {
+            return Ok(None);
+        };
+        let assembly_directory =
+            nt_ntdll::rtl::activation_dependency::private_assembly_directory_name(request)?;
+        for directory in [&self.application_directory, &self.root_manifest_directory] {
+            let direct_stem = append_activation_path(directory, name)?;
+            let nested_directory = append_activation_path(directory, name)?;
+            let nested_stem = append_activation_path(&nested_directory, name)?;
+            for stem in [&direct_stem, &nested_stem] {
+                let mut dll_path = stem.clone();
+                dll_path
+                    .try_reserve_exact(".dll".len())
+                    .map_err(|_| STATUS_NO_MEMORY)?;
+                dll_path.extend(".dll".bytes().map(u16::from));
+                if let Some(resolved) = nt_ntdll::rtl::activation::resolve_manifest_source(
+                    &dll_path,
+                    None,
+                    &[],
+                ) {
+                    let embedded = unsafe {
+                        read_activation_file(
+                            &resolved.nt_path,
+                            nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES,
+                            STATUS_INVALID_IMAGE_FORMAT,
+                        )
+                    }
+                    .and_then(|image| {
+                        let bytes =
+                            nt_ntdll::rtl::pe_manifest::extract_first_manifest_resource(&image)?;
+                        copy_activation_manifest_bytes(bytes)
+                    });
+                    if let Ok(manifest) = embedded {
+                        return Ok(Some(
+                            nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
+                                source: resolved.dos_path.clone(),
+                                manifest_path: resolved.dos_path,
+                                assembly_directory: assembly_directory.clone(),
+                                manifest,
+                                shared: false,
+                            },
+                        ));
+                    }
+                }
+
+                let mut manifest_path = stem.clone();
+                manifest_path
+                    .try_reserve_exact(".manifest".len())
+                    .map_err(|_| STATUS_NO_MEMORY)?;
+                manifest_path.extend(".manifest".bytes().map(u16::from));
+                let Some(resolved) = nt_ntdll::rtl::activation::resolve_manifest_source(
+                    &manifest_path,
+                    None,
+                    &[],
+                ) else {
+                    continue;
+                };
+                match unsafe { read_activation_manifest_file(&resolved.nt_path) } {
+                    Ok(manifest) => {
+                        return Ok(Some(
+                            nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
+                                source: resolved.dos_path.clone(),
+                                manifest_path: resolved.dos_path,
+                                assembly_directory: assembly_directory.clone(),
+                                manifest,
+                                shared: false,
+                            },
+                        ));
+                    }
+                    Err(status) if activation_path_missing(status) => {}
+                    Err(status) => return Err(status),
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl nt_ntdll::rtl::activation_dependency::ActivationManifestCatalog
+    for TargetActivationManifestCatalog
+{
+    fn resolve(
+        &mut self,
+        request: &nt_ntdll::rtl::activation_dependency::AssemblyRequest,
+    ) -> Result<
+        Option<nt_ntdll::rtl::activation_dependency::ActivationManifestSource>,
+        NtStatus,
+    > {
+        // SAFETY: the catalog runs inside ntdll with process-owned buffers and native syscall stubs.
+        unsafe {
+            match self.resolve_winsxs(request)? {
+                Some(source) => Ok(Some(source)),
+                None => self.resolve_private(request),
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -13654,11 +14042,32 @@ pub unsafe extern "system" fn rtl_create_activation_context(
             } else {
                 Vec::new()
             };
-        let (mut manifest, source, associated_manifest) = match source_mode {
+        let (mut manifest, source, mut manifest_path, associated_manifest) = match source_mode {
             nt_ntdll::rtl::activation::ActivationContextSourceMode::LoadedModuleResource => {
-                let (resource_name, _) = match copy_actctx_resource_name(descriptor.resource_name) {
-                    Ok(resource_name) => resource_name,
+                let (resource_name, numeric_resource) =
+                    match copy_actctx_resource_name(descriptor.resource_name) {
+                        Ok(resource_name) => resource_name,
+                        Err(status) => return status,
+                    };
+                let source = match copy_ldr_full_name(descriptor.module) {
+                    Ok(source) => source,
                     Err(status) => return status,
+                };
+                let cwd = peb_current_directory();
+                let resolved = match nt_ntdll::rtl::activation::resolve_manifest_source(
+                    &source,
+                    None,
+                    &cwd,
+                ) {
+                    Some(resolved) => resolved,
+                    None => return STATUS_NO_SUCH_FILE,
+                };
+                let sidecar = match nt_ntdll::rtl::activation::associated_manifest_source(
+                    &resolved,
+                    numeric_resource,
+                ) {
+                    Some(sidecar) => sidecar,
+                    None => return STATUS_NO_MEMORY,
                 };
                 let resource_value = match &resource_name {
                     nt_ntdll::rtl::pe_manifest::ManifestResourceName::Id(id) => *id as usize,
@@ -13671,46 +14080,66 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     resource_value,
                     descriptor.language_id as usize,
                 ];
-                let mut data_entry = core::ptr::null_mut();
-                let status = ldr_find_resource_u(
-                    descriptor.module as *mut c_void,
-                    resource_path.as_ptr().cast(),
-                    3,
-                    &mut data_entry,
-                );
-                if status != STATUS_SUCCESS {
-                    return status;
-                }
-                let mut manifest_address = core::ptr::null_mut();
-                let mut manifest_size = 0u32;
-                let status = ldr_access_resource(
-                    descriptor.module as *mut c_void,
-                    data_entry,
-                    &mut manifest_address,
-                    &mut manifest_size,
-                );
-                if status != STATUS_SUCCESS {
-                    return status;
-                }
-                if manifest_address.is_null()
-                    || manifest_size == 0
-                    || manifest_size as usize > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
-                {
-                    return nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT;
-                }
-                let bytes = core::slice::from_raw_parts(
-                    manifest_address as *const u8,
-                    manifest_size as usize,
-                );
-                let manifest = match copy_activation_manifest_bytes(bytes) {
-                    Ok(manifest) => manifest,
+                let primary = (|| -> Result<Vec<u8>, NtStatus> {
+                    let mut data_entry = core::ptr::null_mut();
+                    let status = ldr_find_resource_u(
+                        descriptor.module as *mut c_void,
+                        resource_path.as_ptr().cast(),
+                        3,
+                        &mut data_entry,
+                    );
+                    if status != STATUS_SUCCESS {
+                        return Err(status);
+                    }
+                    let mut manifest_address = core::ptr::null_mut();
+                    let mut manifest_size = 0u32;
+                    let status = ldr_access_resource(
+                        descriptor.module as *mut c_void,
+                        data_entry,
+                        &mut manifest_address,
+                        &mut manifest_size,
+                    );
+                    if status != STATUS_SUCCESS {
+                        return Err(status);
+                    }
+                    if manifest_address.is_null()
+                        || manifest_size == 0
+                        || manifest_size as usize
+                            > nt_ntdll::rtl::activation::MAX_MANIFEST_BYTES
+                    {
+                        return Err(
+                            nt_ntdll::rtl::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT,
+                        );
+                    }
+                    let bytes = core::slice::from_raw_parts(
+                        manifest_address as *const u8,
+                        manifest_size as usize,
+                    );
+                    copy_activation_manifest_bytes(bytes)
+                })();
+                match primary {
+                    Ok(manifest) => (
+                        manifest,
+                        resolved.dos_path.clone(),
+                        resolved.dos_path,
+                        Some(sidecar),
+                    ),
+                    Err(status)
+                        if status != nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX =>
+                    {
+                        let manifest = match read_associated_manifest_file(&sidecar.nt_path) {
+                            Ok(manifest) => manifest,
+                            Err(status) => return status,
+                        };
+                        (
+                            manifest,
+                            resolved.dos_path,
+                            sidecar.dos_path,
+                            None,
+                        )
+                    }
                     Err(status) => return status,
-                };
-                let source = match copy_ldr_full_name(descriptor.module) {
-                    Ok(source) => source,
-                    Err(status) => return status,
-                };
-                (manifest, source, None)
+                }
             }
             nt_ntdll::rtl::activation::ActivationContextSourceMode::ManifestFile => {
                 let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
@@ -13730,7 +14159,12 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(manifest) => manifest,
                     Err(status) => return status,
                 };
-                (manifest, resolved.dos_path, None)
+                (
+                    manifest,
+                    resolved.dos_path.clone(),
+                    resolved.dos_path,
+                    None,
+                )
             }
             nt_ntdll::rtl::activation::ActivationContextSourceMode::PeFileResource => {
                 let source = match copy_utf16_z_bounded(descriptor.source as *const u16, 32 * 1024) {
@@ -13777,7 +14211,12 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     copy_activation_manifest_bytes(bytes)
                 });
                 match primary {
-                    Ok(manifest) => (manifest, resolved.dos_path, Some(sidecar)),
+                    Ok(manifest) => (
+                        manifest,
+                        resolved.dos_path.clone(),
+                        resolved.dos_path,
+                        Some(sidecar),
+                    ),
                     Err(status)
                         if status == nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX =>
                     {
@@ -13788,73 +14227,33 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                             Ok(manifest) => manifest,
                             Err(status) => return status,
                         };
-                        (manifest, resolved.dos_path, None)
+                        (
+                            manifest,
+                            resolved.dos_path,
+                            sidecar.dos_path,
+                            None,
+                        )
                     }
                 }
             }
         };
-        let parse_details = |bytes: &[u8]| {
-            let details = nt_ntdll::rtl::activation_manifest::parse_manifest_details(bytes)?;
-            if details.dependencies.is_empty() {
-                Ok(details)
-            } else {
-                Err(nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX)
-            }
-        };
-        let details = match parse_details(&manifest) {
-            Ok(details) => details,
-            Err(status)
-                if status != nt_ntdll::rtl::activation::STATUS_SXS_CANT_GEN_ACTCTX
-                    && associated_manifest.is_some() =>
+        if let Err(primary_status) =
+            nt_ntdll::rtl::activation_manifest::parse_manifest_details(&manifest)
+        {
+            let Some(sidecar) = associated_manifest.as_ref() else {
+                return primary_status;
+            };
+            manifest = match read_associated_manifest_file(&sidecar.nt_path) {
+                Ok(manifest) => manifest,
+                Err(status) => return status,
+            };
+            manifest_path = sidecar.dos_path.clone();
+            if let Err(status) =
+                nt_ntdll::rtl::activation_manifest::parse_manifest_details(&manifest)
             {
-                let sidecar = associated_manifest.as_ref().unwrap();
-                manifest = match read_associated_manifest_file(&sidecar.nt_path) {
-                    Ok(manifest) => manifest,
-                    Err(status) => return status,
-                };
-                match parse_details(&manifest) {
-                    Ok(details) => details,
-                    Err(status) => return status,
-                }
+                return status;
             }
-            Err(status) => return status,
-        };
-        let encoded_assembly_identity =
-            match nt_ntdll::rtl::activation_manifest::encode_assembly_identity(
-                &details.root.assembly_identity,
-            ) {
-                Ok(identity) => identity,
-                Err(status) => return status,
-            };
-        let dll_redirect_section =
-            match nt_ntdll::rtl::activation_section::build_dll_redirection_section(
-                &details.root.dll_redirects,
-            ) {
-                Ok(section) => section,
-                Err(status) => return status,
-            };
-        let window_class_redirect_section =
-            match nt_ntdll::rtl::activation_section::build_window_class_redirection_section(&[
-                nt_ntdll::rtl::activation_section::WindowClassAssembly {
-                    version: details.root.assembly_identity.version,
-                    files: &details.root.dll_redirects,
-                    classes: &details.window_classes,
-                },
-            ]) {
-                Ok(section) => section,
-                Err(status) => return status,
-            };
-        let clr_surrogate_section =
-            match nt_ntdll::rtl::activation_section::build_clr_surrogate_section(&[
-                nt_ntdll::rtl::activation_section::ClrSurrogateAssembly {
-                    surrogates: &details.clr_surrogates,
-                },
-            ]) {
-                Ok(section) => section,
-                Err(status) => return status,
-            };
-        let application_settings = details.application_settings;
-        let parsed = details.root;
+        }
         let application_directory =
             if descriptor.flags & nt_ntdll::rtl::activation::ACTCTX_FLAG_APPLICATION_NAME_VALID != 0
             {
@@ -13886,6 +14285,129 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Err(status) => return status,
                 }
             };
+        let root_manifest_directory = match parent_directory_with_separator(&manifest_path) {
+            Ok(directory) => directory,
+            Err(status) => return status,
+        };
+        let mut catalog = TargetActivationManifestCatalog {
+            system_root: isolation_system_root(),
+            application_directory: application_directory.clone(),
+            root_manifest_directory,
+        };
+        let root_source =
+            nt_ntdll::rtl::activation_dependency::ActivationManifestSource {
+                source,
+                manifest_path,
+                assembly_directory,
+                manifest,
+                shared: false,
+            };
+        let native_architecture: Vec<u16> = "amd64".encode_utf16().collect();
+        let mut resolved =
+            match nt_ntdll::rtl::activation_dependency::resolve_activation_dependencies(
+                root_source,
+                Some(&native_architecture),
+                nt_ntdll::rtl::activation_dependency::ActivationResolverLimits::default(),
+                &mut catalog,
+            ) {
+                Ok(resolved) => resolved,
+                Err(status) => return status,
+            };
+
+        let mut dll_assemblies = Vec::new();
+        let mut window_assemblies = Vec::new();
+        let mut clr_assemblies = Vec::new();
+        if dll_assemblies
+            .try_reserve_exact(resolved.assemblies.len())
+            .is_err()
+            || window_assemblies
+                .try_reserve_exact(resolved.assemblies.len())
+                .is_err()
+            || clr_assemblies
+                .try_reserve_exact(resolved.assemblies.len())
+                .is_err()
+        {
+            return STATUS_NO_MEMORY;
+        }
+        for assembly in &resolved.assemblies {
+            dll_assemblies.push(
+                nt_ntdll::rtl::activation_section::DllRedirectAssembly {
+                    redirects: &assembly.details.root.dll_redirects,
+                },
+            );
+            window_assemblies.push(
+                nt_ntdll::rtl::activation_section::WindowClassAssembly {
+                    version: assembly.details.root.assembly_identity.version,
+                    files: &assembly.details.root.dll_redirects,
+                    classes: &assembly.details.window_classes,
+                },
+            );
+            clr_assemblies.push(
+                nt_ntdll::rtl::activation_section::ClrSurrogateAssembly {
+                    surrogates: &assembly.details.clr_surrogates,
+                },
+            );
+        }
+        let dll_redirect_section =
+            match nt_ntdll::rtl::activation_section::build_dll_redirection_section_for_assemblies(
+                &dll_assemblies,
+            ) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
+        let window_class_redirect_section =
+            match nt_ntdll::rtl::activation_section::build_window_class_redirection_section(
+                &window_assemblies,
+            ) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
+        let clr_surrogate_section =
+            match nt_ntdll::rtl::activation_section::build_clr_surrogate_section(&clr_assemblies) {
+                Ok(section) => section,
+                Err(status) => return status,
+            };
+        drop(dll_assemblies);
+        drop(window_assemblies);
+        drop(clr_assemblies);
+
+        let (compatibility, run_level, ui_access) = {
+            let root = &mut resolved.assemblies[0].details.root;
+            (
+                core::mem::take(&mut root.compatibility),
+                root.run_level,
+                root.ui_access,
+            )
+        };
+        let application_settings =
+            core::mem::take(&mut resolved.assemblies[0].details.application_settings);
+        let mut assemblies = Vec::new();
+        if assemblies
+            .try_reserve_exact(resolved.assemblies.len())
+            .is_err()
+        {
+            return STATUS_NO_MEMORY;
+        }
+        for resolved_assembly in resolved.assemblies {
+            if u32::try_from(resolved_assembly.details.root.dll_redirects.len()).is_err() {
+                return STATUS_NO_MEMORY;
+            }
+            let encoded_assembly_identity =
+                match nt_ntdll::rtl::activation_manifest::encode_assembly_identity(
+                    &resolved_assembly.details.root.assembly_identity,
+                ) {
+                    Ok(identity) => identity,
+                    Err(status) => return status,
+                };
+            assemblies.push(nt_ntdll::rtl::activation::ActivationAssembly {
+                source: resolved_assembly.source.source,
+                manifest_path: resolved_assembly.source.manifest_path,
+                assembly_directory: resolved_assembly.source.assembly_directory,
+                encoded_assembly_identity,
+                manifest: resolved_assembly.source.manifest,
+                dll_redirects: resolved_assembly.details.root.dll_redirects,
+            });
+        }
         let memory = crate::process_heap_alloc(core::mem::size_of::<
             nt_ntdll::rtl::activation::ActivationContextObject,
         >()) as *mut nt_ntdll::rtl::activation::ActivationContextObject;
@@ -13894,22 +14416,18 @@ pub unsafe extern "system" fn rtl_create_activation_context(
         }
         core::ptr::write(
             memory,
-            nt_ntdll::rtl::activation::ActivationContextObject::new(
-                source,
-                manifest,
-                parsed.dll_redirects,
+            nt_ntdll::rtl::activation::ActivationContextObject::new_with_assemblies(
+                assemblies,
                 dll_redirect_section,
                 window_class_redirect_section,
                 clr_surrogate_section,
                 application_settings,
-                encoded_assembly_identity,
             ),
         );
         (*memory).application_directory = application_directory;
-        (*memory).assembly_directory = assembly_directory;
-        (*memory).compatibility = parsed.compatibility;
-        (*memory).run_level = parsed.run_level;
-        (*memory).ui_access = parsed.ui_access;
+        (*memory).compatibility = compatibility;
+        (*memory).run_level = run_level;
+        (*memory).ui_access = ui_access;
         let status = activation_context_register(memory);
         if status != STATUS_SUCCESS {
             core::ptr::drop_in_place(memory);
@@ -14096,9 +14614,16 @@ pub unsafe extern "system" fn rtl_find_activation_context_section_string(
                         }
                     }
                     nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_SECTION_WINDOW_CLASS_REDIRECTION => {
+                        let assembly_count = match u32::try_from(object.assemblies.len()) {
+                            Ok(count) => count,
+                            Err(_) => {
+                                activation_context_release(context);
+                                return STATUS_NO_MEMORY;
+                            }
+                        };
                         match nt_ntdll::rtl::activation_section::find_window_class_redirection(
                             &object.window_class_redirect_section,
-                            1,
+                            assembly_count,
                             key_name,
                         ) {
                             Ok(Some(found)) => (
@@ -14364,21 +14889,29 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
             return STATUS_INVALID_PARAMETER;
         };
         let object = &*object_ptr;
-        let manifest_path = (!object.source.is_empty()).then_some(object.source.as_slice());
+        let assembly_count = match u32::try_from(object.assemblies.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                activation_context_release(selected);
+                return STATUS_NO_MEMORY;
+            }
+        };
+        let root_assembly = object.assemblies.first();
+        let root_manifest_path = root_assembly
+            .filter(|assembly| !assembly.manifest_path.is_empty())
+            .map(|assembly| assembly.manifest_path.as_slice());
         let application_directory = (!object.application_directory.is_empty())
             .then_some(object.application_directory.as_slice());
-        let assembly_directory = (!object.assembly_directory.is_empty())
-            .then_some(object.assembly_directory.as_slice());
         let status = if info_class == 2 {
             let query = nt_ntdll::rtl::activation_query::DetailedQuery {
-                format_version: 1,
-                assembly_count: 1,
-                root_manifest_path_type: if manifest_path.is_some() {
+                format_version: u32::from(root_assembly.is_some()),
+                assembly_count,
+                root_manifest_path_type: if root_manifest_path.is_some() {
                     nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE
                 } else {
                     nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_NONE
                 },
-                root_manifest_path: manifest_path,
+                root_manifest_path,
                 root_configuration_path_type:
                     nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_NONE,
                 root_configuration_path: None,
@@ -14418,14 +14951,31 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                 return STATUS_INVALID_PARAMETER;
             }
             let roster_index = core::ptr::read_unaligned(sub_instance as *const u32);
-            if let Err(status) =
-                nt_ntdll::rtl::activation_query::validate_roster_index(roster_index, 1)
-            {
-                activation_context_release(selected);
-                return status;
-            }
+            let assembly_index =
+                match nt_ntdll::rtl::activation_query::validate_roster_index(
+                    roster_index,
+                    assembly_count,
+                ) {
+                    Ok(index) => index,
+                    Err(status) => {
+                        activation_context_release(selected);
+                        return status;
+                    }
+                };
+            let assembly = &object.assemblies[assembly_index];
+            let manifest_path = (!assembly.manifest_path.is_empty())
+                .then_some(assembly.manifest_path.as_slice());
+            let assembly_directory = (!assembly.assembly_directory.is_empty())
+                .then_some(assembly.assembly_directory.as_slice());
+            let file_count = match u32::try_from(assembly.dll_redirects.len()) {
+                Ok(count) => count,
+                Err(_) => {
+                    activation_context_release(selected);
+                    return STATUS_NO_MEMORY;
+                }
+            };
             let query = nt_ntdll::rtl::activation_query::AssemblyDetailedQuery {
-                encoded_assembly_identity: Some(&object.encoded_assembly_identity),
+                encoded_assembly_identity: Some(&assembly.encoded_assembly_identity),
                 manifest_path_type: if manifest_path.is_some() {
                     nt_ntdll::rtl::activation_query::ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE
                 } else {
@@ -14433,7 +14983,7 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                 },
                 manifest_path,
                 assembly_directory_name: assembly_directory,
-                file_count: object.file_count,
+                file_count,
             };
             match nt_ntdll::rtl::activation_query::assembly_detailed_required_size(&query) {
                 Err(status) => status,
@@ -14472,20 +15022,19 @@ pub unsafe extern "system" fn rtl_query_information_activation_context(
                     (sub_instance as *const u8).add(4) as *const u32,
                 ),
             };
-            let (_, file_index) = match
-                nt_ntdll::rtl::activation_query::validate_file_query_index(
-                    index,
-                    &[object.dll_redirects.len()],
-                )
-            {
-                Ok(indices) => indices,
-                Err(status) => {
-                    activation_context_release(selected);
-                    return status;
-                }
+            let Some(assembly) = object.assemblies.get(index.assembly_index as usize) else {
+                activation_context_release(selected);
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(file) = assembly
+                .dll_redirects
+                .get(index.file_index_in_assembly as usize)
+            else {
+                activation_context_release(selected);
+                return STATUS_INVALID_PARAMETER;
             };
             let query = nt_ntdll::rtl::activation_query::FileDetailedQuery {
-                file_name: Some(&object.dll_redirects[file_index].name),
+                file_name: Some(&file.name),
             };
             match nt_ntdll::rtl::activation_query::file_detailed_required_size(&query) {
                 Err(status) => status,

@@ -112,6 +112,33 @@ pub fn extract_manifest_resource<'a>(
         .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)
 }
 
+/// Extract the first numeric `RT_MANIFEST` name and its first language leaf.
+///
+/// ReactOS uses this order for private assembly DLLs when no resource name is supplied.
+pub fn extract_first_manifest_resource(image: &[u8]) -> Result<&[u8], NtStatus> {
+    let pe = nt_pe_loader::PeFile::parse(image).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+    let directory = pe
+        .headers()
+        .data_directory(nt_pe_loader::DIRECTORY_ENTRY_RESOURCE);
+    if directory.virtual_address == 0 || directory.size < pe_resource::DIR_SIZE as u32 {
+        return Err(STATUS_RESOURCE_DATA_NOT_FOUND);
+    }
+    let rsrc = pe
+        .bytes_at_rva(directory.virtual_address, directory.size as usize)
+        .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
+    let manifest_directory =
+        pe_resource::find_entry(rsrc, &ResName::Id(24), &ResName::Id(0), &[], false, 1, true)
+            .map_err(find_status)?;
+    let name_directory = pe_resource::find_first_id_entry(rsrc, manifest_directory.offset, true)
+        .ok_or(STATUS_RESOURCE_NAME_NOT_FOUND)?;
+    let data_entry = pe_resource::find_first_entry(rsrc, name_directory, false)
+        .ok_or(STATUS_RESOURCE_LANG_NOT_FOUND)?;
+    let (data_rva, size) =
+        pe_resource::data_entry(rsrc, data_entry).ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
+    pe.bytes_at_rva(data_rva, size as usize)
+        .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -242,6 +269,7 @@ mod tests {
             extract_manifest_resource(&image, &ManifestResourceName::Id(1), 0),
             Ok(&b"neutral"[..])
         );
+        assert_eq!(extract_first_manifest_resource(&image), Ok(&b"neutral"[..]));
     }
 
     #[test]
