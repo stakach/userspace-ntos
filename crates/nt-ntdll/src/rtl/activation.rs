@@ -28,6 +28,7 @@ pub const MAX_ACTIVATION_PE_BYTES: usize = u32::MAX as usize;
 
 pub const ACTCTX_MAGIC: u32 = 0xC07E_3E11;
 pub const ACTCTX_FAKE_HANDLE: usize = 0x00F0_0BAA;
+pub const ACTIVATION_CONTEXT_ZOMBIFIED: u32 = 0x0000_0001;
 pub const ACTCTX_FLAG_PROCESSOR_ARCHITECTURE_VALID: u32 = 0x01;
 pub const ACTCTX_FLAG_LANGID_VALID: u32 = 0x02;
 pub const ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID: u32 = 0x04;
@@ -274,6 +275,7 @@ pub const RUN_LEVEL_REQUIRE_ADMIN: u32 = 3;
 pub struct ActivationContextObject {
     magic: AtomicU32,
     references: AtomicU32,
+    flags: AtomicU32,
     pub source: Vec<u16>,
     pub application_directory: Vec<u16>,
     pub assembly_directory: Vec<u16>,
@@ -353,6 +355,7 @@ impl ActivationContextObject {
         Self {
             magic: AtomicU32::new(ACTCTX_MAGIC),
             references: AtomicU32::new(1),
+            flags: AtomicU32::new(0),
             source,
             application_directory: Vec::new(),
             assembly_directory: Vec::new(),
@@ -374,6 +377,16 @@ impl ActivationContextObject {
 
     pub fn reference_count(&self) -> u32 {
         self.references.load(Ordering::Acquire)
+    }
+
+    pub fn is_zombified(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & ACTIVATION_CONTEXT_ZOMBIFIED != 0
+    }
+
+    /// Mark the context zombified without changing its validity or reference lifetime.
+    pub fn zombify(&self) {
+        self.flags
+            .fetch_or(ACTIVATION_CONTEXT_ZOMBIFIED, Ordering::AcqRel);
     }
 
     pub fn try_add_ref(&self) -> bool {
@@ -841,6 +854,32 @@ mod tests {
         assert!(!object.is_valid());
         assert!(!object.try_add_ref());
         assert!(!object.release_ref());
+    }
+
+    #[test]
+    fn zombifying_activation_object_is_idempotent_and_preserves_lifetime() {
+        let object = ActivationContextObject::new(
+            Vec::new(),
+            b"<assembly/>".to_vec(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!object.is_zombified());
+        assert_eq!(object.reference_count(), 1);
+
+        object.zombify();
+        object.zombify();
+        assert!(object.is_zombified());
+        assert!(object.is_valid());
+        assert_eq!(object.reference_count(), 1);
+        assert!(object.try_add_ref());
+        assert_eq!(object.reference_count(), 2);
+        assert!(!object.release_ref());
+        assert!(object.is_zombified());
+        assert!(object.release_ref());
+        assert!(!object.is_valid());
     }
 
     #[test]

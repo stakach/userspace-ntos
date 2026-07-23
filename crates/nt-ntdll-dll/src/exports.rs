@@ -13210,17 +13210,42 @@ pub unsafe extern "system" fn rtl_release_activation_context(act_ctx: *mut c_voi
     let _ = act_ctx;
 }
 
-/// `RtlZombifyActivationContext(PVOID ActCtx) -> NTSTATUS` — ReactOS only implements its internal
-/// fake handle; real zombie state remains unsupported.
+/// `RtlZombifyActivationContext(PVOID ActCtx) -> NTSTATUS` — idempotently mark a registered
+/// activation context as zombified without changing its references or usability.
 ///
 /// # Safety
 /// `act_ctx` an activation-context sentinel.
 #[export_name = "RtlZombifyActivationContext"]
 pub unsafe extern "system" fn rtl_zombify_activation_context(act_ctx: *mut c_void) -> NtStatus {
     if act_ctx as usize == nt_ntdll::rtl::activation::ACTCTX_FAKE_HANDLE {
+        return STATUS_SUCCESS;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value = act_ctx as usize;
+        if value <= 1 || value == usize::MAX {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let _guard = match unsafe { acquire_activation_context_lock() } {
+            Ok(guard) => guard,
+            Err(status) => return status,
+        };
+        let registry = unsafe { &*core::ptr::addr_of!(RTL_ACTIVATION_CONTEXT_REGISTRY) };
+        if !registry.contains(value) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let object =
+            unsafe { &*(value as *const nt_ntdll::rtl::activation::ActivationContextObject) };
+        if !object.is_valid() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        object.zombify();
         STATUS_SUCCESS
-    } else {
-        0xC000_0002 // STATUS_NOT_IMPLEMENTED
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = act_ctx;
+        STATUS_NOT_IMPLEMENTED
     }
 }
 
